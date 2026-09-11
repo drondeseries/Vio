@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
@@ -242,24 +243,275 @@ func TestApplyRemuxDBEvidenceUsesPrecomputedKey(t *testing.T) {
 func TestAllowDeferredProbeMatchesMainBehaviorWhenRemuxDBDisabled(t *testing.T) {
 	// RemuxDB disabled: the gate is main's plain deferProbe flag, so an
 	// evidence-poor candidate still defers and never blocks start.
-	if !allowDeferredProbe(true, false, "", "", "", "") {
+	if !allowDeferredProbe(true, false, "", "", "", "", "", "", "") {
 		t.Fatal("disabled RemuxDB should defer without metadata evidence")
 	}
-	if allowDeferredProbe(false, false, "1080p", "1080p", "h264", "h264") {
+	if allowDeferredProbe(false, false, "", "1080p", "1080p", "h264", "h264", "", "") {
 		t.Fatal("deferProbe=false must never allow deferral")
 	}
 
 	// RemuxDB enabled: keep the metadata-confidence gate.
-	if allowDeferredProbe(true, true, "", "", "", "") {
+	if allowDeferredProbe(true, true, "", "", "", "", "", "", "") {
 		t.Fatal("enabled RemuxDB should not defer without resolution/codec evidence")
 	}
-	if !allowDeferredProbe(true, true, "1080p", "", "h264", "") {
-		t.Fatal("enabled RemuxDB should defer with transient evidence")
+	if !allowDeferredProbe(true, true, "", "1080p", "", "h264", "", "", "") {
+		t.Fatal("enabled RemuxDB should defer with local evidence")
 	}
-	if !allowDeferredProbe(true, true, "", "1080p", "", "h264") {
+	if !allowDeferredProbe(true, true, "", "", "1080p", "", "h264", "", "") {
 		t.Fatal("enabled RemuxDB should defer with candidate evidence")
 	}
-	if allowDeferredProbe(true, true, "1080p", "", "", "") {
+	if allowDeferredProbe(true, true, "", "1080p", "", "", "", "", "") {
 		t.Fatal("enabled RemuxDB needs both resolution and codec evidence")
+	}
+
+	// Strict RemuxDB match (info_hash, indexer_guid, size) can defer with RemuxDB evidence.
+	for _, strictMethod := range []remuxdb.MatchMethod{remuxdb.MatchInfoHash, remuxdb.MatchIndexerGUID, remuxdb.MatchSize} {
+		if !allowDeferredProbe(true, true, strictMethod, "", "", "", "", "1080p", "h264") {
+			t.Fatalf("strict RemuxDB match %s should defer with remux evidence", strictMethod)
+		}
+	}
+
+	// Loose RemuxDB match (size_tags with 1% variance, filename stem) must NOT defer without local/candidate evidence.
+	for _, looseMethod := range []remuxdb.MatchMethod{remuxdb.MatchSizeTags, remuxdb.MatchFilename} {
+		if allowDeferredProbe(true, true, looseMethod, "", "", "", "", "1080p", "h264") {
+			t.Fatalf("loose RemuxDB match %s must not defer with only remux evidence", looseMethod)
+		}
+		// But if local or candidate has resolution and codec, deferral is allowed.
+		if !allowDeferredProbe(true, true, looseMethod, "1080p", "", "h264", "", "1080p", "h264") {
+			t.Fatalf("loose RemuxDB match %s should defer when local evidence exists", looseMethod)
+		}
+		if !allowDeferredProbe(true, true, looseMethod, "", "1080p", "", "h264", "1080p", "h264") {
+			t.Fatalf("loose RemuxDB match %s should defer when candidate evidence exists", looseMethod)
+		}
+	}
+}
+
+func TestRemuxDBEvidenceDoesNotMakeUnprobedFileSkipProbe(t *testing.T) {
+	// An unprobed file has no VideoTracks and Container="virtual".
+	unprobedFile := &models.MediaFile{
+		ContentID: "movie-tmdb-1",
+		FilePath:  "virtual://movie/tt0000001",
+		Container: "virtual",
+	}
+
+	// Before RemuxDB evidence is applied, skipProbe checks on unprobedFile must be false.
+	hasVideo := completeVirtualVideoEvidenceV3(unprobedFile)
+	hasAudio := completeVirtualAudioEvidenceV3(unprobedFile)
+	hasContainer := completeVirtualContainerEvidenceV3(unprobedFile)
+	skipProbe := hasVideo && hasAudio && hasContainer
+	if skipProbe {
+		t.Fatal("unprobed file must not skip probe before RemuxDB")
+	}
+
+	// Even after RemuxDB evidence is backfilled, the skipProbe decision was made beforehand,
+	// ensuring untrusted crowdsourced tracks never bypass local probing or set ProbeProvenanceVerified.
+	matched := map[string]remuxdb.Evidence{
+		"virtual://movie/tt0000001?result=a": {
+			CodecVideo:  "h264",
+			Resolution:  "1080p",
+			Container:   "mkv",
+			VideoTracks: []remuxdb.TrackDetail{{Kind: "video", Codec: "h264", Width: 1920, Height: 1080}},
+			AudioTracks: []remuxdb.TrackDetail{{Kind: "audio", Codec: "aac", Channels: 2}},
+		},
+	}
+	backfilled := applyRemuxDBEvidence(unprobedFile, matched, "virtual://movie/tt0000001?result=a")
+	if len(backfilled.VideoTracks) == 0 {
+		t.Fatal("expected RemuxDB evidence to backfill transient tracks")
+	}
+
+	// If skipProbe were evaluated on backfilled, it would be true - which is why evaluating
+	// skipProbe BEFORE applyRemuxDBEvidence is the critical hardening invariant.
+	if completeVirtualVideoEvidenceV3(backfilled) && completeVirtualAudioEvidenceV3(backfilled) && completeVirtualContainerEvidenceV3(backfilled) {
+		// Verify that unprobedFile itself remains untouched and unprobed
+		if len(unprobedFile.VideoTracks) != 0 {
+			t.Fatal("source unprobed file was mutated")
+		}
+	}
+}
+
+func TestRemuxDBSubmissionQueueBounded(t *testing.T) {
+	h := &PlaybackHandler{
+		RemuxDBConfig: func(context.Context) remuxdb.Config {
+			return remuxdb.Config{
+				Enabled:       true,
+				SubmitEnabled: true,
+				Token:         "tok-test",
+				BaseURL:       "http://127.0.0.1:9999",
+			}
+		},
+	}
+	// Initializing queue
+	probed := &models.MediaFile{
+		ContentID:   "movie-tmdb-1",
+		ReleaseName: "Release.2024.1080p.mkv",
+		Duration:    3600,
+		VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}},
+	}
+	cand := VirtualPlaybackStream{
+		URI: "virtual://movie/tt0000001?info_hash=0123456789abcdef0123456789abcdef01234567",
+	}
+
+	// Submit one probe; should enqueue without panic or blocking
+	h.maybeSubmitRemuxDBEvidence(context.Background(), probed, cand)
+	if h.remuxSubmitCh == nil {
+		t.Fatal("expected remuxSubmitCh to be initialized")
+	}
+	if cap(h.remuxSubmitCh) != remuxSubmitQueueSize {
+		t.Fatalf("channel capacity = %d, want %d", cap(h.remuxSubmitCh), remuxSubmitQueueSize)
+	}
+}
+
+func TestRemuxDBEvidenceNeverPersistedWhenProberNil(t *testing.T) {
+	calls := 0
+	ts := remuxTestServer(t, &calls)
+	defer ts.Close()
+
+	persisted := false
+	h := &PlaybackHandler{
+		RemuxDBConfig: func(context.Context) remuxdb.Config {
+			return remuxdb.Config{Enabled: true, BaseURL: ts.URL}
+		},
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
+			return "https://provider.example/stream.mp4", nil
+		}),
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{
+				{URI: "virtual://movie/tt0000001?result=a", FileSize: 28980000000, Resolution: "1080p", CodecVideo: "h264"},
+			}, nil
+		}),
+		VirtualFileMetadataSaver: func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+			persisted = true
+			return nil
+		},
+		VirtualPlaybackSourceProber:            nil,
+		VirtualPlaybackSourceProberWithHeaders: nil,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := &models.MediaFile{ID: 10, ContentID: "movie-tmdb-1", FilePath: "virtual://movie/tt0000001"}
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource failed: %v", err)
+	}
+	if !resolved.AppliedRemux {
+		t.Fatal("expected AppliedRemux to be true")
+	}
+	if resolved.Provenance == ProbeProvenanceVerified {
+		t.Fatal("expected Provenance not to be ProbeProvenanceVerified")
+	}
+	if persisted {
+		t.Fatal("unverified crowdsourced RemuxDB metadata was persisted to media_files")
+	}
+}
+
+func TestRemuxDBCatalogRuntimeFallbackNeverSubmitted(t *testing.T) {
+	h := &PlaybackHandler{
+		RemuxDBConfig: func(context.Context) remuxdb.Config {
+			return remuxdb.Config{
+				Enabled:       true,
+				SubmitEnabled: true,
+				Token:         "tok-test",
+				BaseURL:       "http://127.0.0.1:9999",
+			}
+		},
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
+			return "https://provider.example/stream.mp4", nil
+		}),
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{
+				{URI: "virtual://series/tt0000001/1/1?result=a&info_hash=0123456789abcdef0123456789abcdef01234567", Label: "Show.S01E01.1080p.mkv", FileSize: 1000000000, Resolution: "1080p", CodecVideo: "h264"},
+			}, nil
+		}),
+		// Prober returns probed file with video track but 0 duration
+		VirtualPlaybackSourceProber: func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
+			p := *file
+			p.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+			// Ensure probed duration is 0
+			p.Duration = 0
+			return &p, nil
+		},
+		EpisodeLookup: testEpisodeLookup{
+			episode: &models.Episode{ContentID: "ep-1", Runtime: 45}, // 45 minutes = 2700s
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := &models.MediaFile{ID: 10, ContentID: "series-tmdb-1", EpisodeID: "ep-1", FilePath: "virtual://series/tt0000001/1/1", ReleaseName: "Show.S01E01.1080p.mkv"}
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource failed: %v", err)
+	}
+	// Verify resolved file gets fallback duration for player playback
+	if resolved.File.Duration != 2700 {
+		t.Fatalf("resolved duration = %d, want 2700 (catalog fallback)", resolved.File.Duration)
+	}
+	// Verify nothing was submitted to RemuxDB queue because empiricalDuration == 0
+	if len(h.remuxSubmitCh) > 0 {
+		t.Fatal("catalog fallback duration was submitted to RemuxDB!")
+	}
+}
+
+func TestRemuxDBSubmitsEmpiricalMeasuredDuration(t *testing.T) {
+	var submittedPayload remuxdb.SubmissionPayload
+	submitted := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/mediainfo" && r.Method == http.MethodPost {
+			_ = json.NewDecoder(r.Body).Decode(&submittedPayload)
+			select {
+			case submitted <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	h := &PlaybackHandler{
+		RemuxDBConfig: func(context.Context) remuxdb.Config {
+			return remuxdb.Config{
+				Enabled:       true,
+				SubmitEnabled: true,
+				Token:         "tok-test",
+				BaseURL:       ts.URL,
+			}
+		},
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
+			return "https://provider.example/stream.mp4", nil
+		}),
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{
+				{URI: "virtual://series/tt0000001/1/1?result=a&info_hash=0123456789abcdef0123456789abcdef01234567", Label: "Show.S01E01.1080p.mkv", FileSize: 1000000000, Resolution: "1080p", CodecVideo: "h264"},
+			}, nil
+		}),
+		// Prober returns probed file with video track and empirically measured duration
+		VirtualPlaybackSourceProber: func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
+			p := *file
+			p.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+			p.Duration = 3600 // measured by probe
+			return &p, nil
+		},
+		EpisodeLookup: testEpisodeLookup{
+			episode: &models.Episode{ContentID: "ep-1", Runtime: 60}, // 60 minutes = 3600s
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := &models.MediaFile{ID: 10, ContentID: "series-tmdb-1", EpisodeID: "ep-1", FilePath: "virtual://series/tt0000001/1/1", ReleaseName: "Show.S01E01.1080p.mkv"}
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource failed: %v", err)
+	}
+	if resolved.File.Duration != 3600 {
+		t.Fatalf("resolved duration = %d, want 3600", resolved.File.Duration)
+	}
+	select {
+	case <-submitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for probe submission")
+	}
+	if submittedPayload.Duration != 3600 {
+		t.Fatalf("submitted duration = %v, want 3600 (empirical duration, NOT 2700 fallback)", submittedPayload.Duration)
 	}
 }

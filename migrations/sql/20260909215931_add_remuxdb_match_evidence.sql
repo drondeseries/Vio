@@ -19,10 +19,15 @@ CREATE TABLE IF NOT EXISTS public.remuxdb_match_evidence (
     audio_tracks       jsonb NOT NULL DEFAULT '[]'::jsonb,
     subtitle_tracks    jsonb NOT NULL DEFAULT '[]'::jsonb,
     matched_at         timestamp with time zone NOT NULL DEFAULT now(),
-    CONSTRAINT remuxdb_match_evidence_pkey PRIMARY KEY (content_id, episode_id, media_folder_id, candidate_uri)
+    expires_at         timestamp with time zone NOT NULL DEFAULT (now() + interval '30 days'),
+    CONSTRAINT remuxdb_match_evidence_pkey PRIMARY KEY (content_id, episode_id, media_folder_id, candidate_uri),
+    CONSTRAINT remuxdb_match_evidence_content_id_fkey FOREIGN KEY (content_id) REFERENCES public.media_items (content_id) ON DELETE CASCADE,
+    CONSTRAINT remuxdb_match_evidence_media_folder_id_fkey FOREIGN KEY (media_folder_id) REFERENCES public.media_folders (id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_remuxdb_match_evidence_content
     ON public.remuxdb_match_evidence (content_id, episode_id, media_folder_id);
+CREATE INDEX IF NOT EXISTS idx_remuxdb_match_evidence_expires_at
+    ON public.remuxdb_match_evidence (expires_at);
 
 -- +goose Down
 DROP TABLE IF EXISTS public.remuxdb_match_evidence;

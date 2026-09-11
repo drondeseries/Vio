@@ -1,6 +1,6 @@
 {
   "api_version": 1,
-  "revision": 8,
+  "revision": 9,
   "option_sets": {
     "playback_audio_languages": {
       "type": "language_tag",
@@ -1140,6 +1140,58 @@
       "description": "Show the Audiobooks section in navigation.",
       "recommended_control": "switch",
       "notes": "Contract-known local: an opt-in navigation surface, hidden by default, with existing Apple (AppNavPreferences.showAudiobooks) and Android parity. Android stores it locally at nav.show_audiobooks.local."
+    },
+    {
+      "key": "remuxdb.enabled",
+      "introduced_in": 9,
+      "persistence": "remote",
+      "allowed_scopes": ["account"],
+      "resolution_order": ["account", "default"],
+      "value_schema": { "type": "boolean" },
+      "default_value": false,
+      "category": "providers",
+      "label": "RemuxDB stream metadata",
+      "description": "Look up crowdsourced stream metadata for cold virtual files.",
+      "recommended_control": "switch"
+    },
+    {
+      "key": "remuxdb.base_url",
+      "introduced_in": 9,
+      "persistence": "remote",
+      "allowed_scopes": ["account"],
+      "resolution_order": ["account", "default"],
+      "value_schema": { "type": "string", "max_length": 2048 },
+      "default_value": "https://remuxdb.1632022.xyz",
+      "category": "providers",
+      "label": "RemuxDB base URL",
+      "description": "Base URL of the RemuxDB API service.",
+      "recommended_control": "text"
+    },
+    {
+      "key": "remuxdb.token",
+      "introduced_in": 9,
+      "persistence": "remote",
+      "allowed_scopes": ["account"],
+      "resolution_order": ["account", "default"],
+      "value_schema": { "type": "string", "max_length": 1024 },
+      "default_value": "",
+      "category": "providers",
+      "label": "RemuxDB API token",
+      "description": "API token for RemuxDB submissions.",
+      "recommended_control": "text"
+    },
+    {
+      "key": "remuxdb.submit_enabled",
+      "introduced_in": 9,
+      "persistence": "remote",
+      "allowed_scopes": ["account"],
+      "resolution_order": ["account", "default"],
+      "value_schema": { "type": "boolean" },
+      "default_value": false,
+      "category": "providers",
+      "label": "Contribute to RemuxDB",
+      "description": "Submit probed stream metadata to RemuxDB to help the community.",
+      "recommended_control": "switch"
     }
   ]
 }

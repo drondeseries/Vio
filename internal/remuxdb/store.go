@@ -149,7 +149,7 @@ func (s *Store) Get(ctx context.Context, contentID, episodeID string, folderID i
 		       resolution, hdr, hdr_known, duration, bitrate,
 		       video_tracks, audio_tracks, subtitle_tracks
 		FROM remuxdb_match_evidence
-		WHERE content_id=$1 AND episode_id=$2 AND media_folder_id=$3 AND candidate_uri=$4`,
+		WHERE content_id=$1 AND episode_id=$2 AND media_folder_id=$3 AND candidate_uri=$4 AND expires_at > now()`,
 		contentID, episodeID, folderID, candidateURI).Scan(
 		&ev.ContentID, &ev.EpisodeID, &ev.MediaFolderID, &ev.CandidateURI, &method,
 		&ev.MatchedSize, &ev.MatchedHash, &ev.Container, &ev.CodecVideo, &ev.CodecAudio,
@@ -209,8 +209,8 @@ func (s *Store) Record(ctx context.Context, ev Evidence) error {
 			content_id, episode_id, media_folder_id, candidate_uri, match_method,
 			matched_size, matched_content_hash, container, codec_video, codec_audio,
 			resolution, hdr, hdr_known, duration, bitrate,
-			video_tracks, audio_tracks, subtitle_tracks, matched_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW())
+			video_tracks, audio_tracks, subtitle_tracks, matched_at, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW() + interval '30 days')
 		ON CONFLICT (content_id, episode_id, media_folder_id, candidate_uri)
 		DO UPDATE SET match_method=EXCLUDED.match_method,
 			matched_size=EXCLUDED.matched_size,
@@ -226,7 +226,8 @@ func (s *Store) Record(ctx context.Context, ev Evidence) error {
 			video_tracks=EXCLUDED.video_tracks,
 			audio_tracks=EXCLUDED.audio_tracks,
 			subtitle_tracks=EXCLUDED.subtitle_tracks,
-			matched_at=NOW()`,
+			matched_at=NOW(),
+			expires_at=NOW() + interval '30 days'`,
 		ev.ContentID, ev.EpisodeID, ev.MediaFolderID, ev.CandidateURI, string(ev.MatchMethod),
 		ev.MatchedSize, ev.MatchedHash, ev.Container, ev.CodecVideo, ev.CodecAudio,
 		ev.Resolution, ev.HDR, ev.HDRKnown, ev.Duration, ev.Bitrate,
@@ -235,4 +236,16 @@ func (s *Store) Record(ctx context.Context, ev Evidence) error {
 		return fmt.Errorf("record remuxdb match evidence: %w", err)
 	}
 	return nil
+}
+
+// PruneExpired deletes evidence rows whose expires_at timestamp is in the past.
+func (s *Store) PruneExpired(ctx context.Context) (int64, error) {
+	if s == nil || s.pool == nil {
+		return 0, nil
+	}
+	tag, err := s.pool.Exec(ctx, `DELETE FROM remuxdb_match_evidence WHERE expires_at <= now()`)
+	if err != nil {
+		return 0, fmt.Errorf("prune expired remuxdb match evidence: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }

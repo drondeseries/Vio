@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/Silo-Server/silo-server/internal/settingskeys"
 )
 
 // Server setting keys for the RemuxDB integration. The base URL ships with
@@ -12,10 +14,10 @@ import (
 // it at a mirror when the URL changes. The token is optional and enables
 // write access (crowdsourced submissions).
 const (
-	SettingEnabled       = "remuxdb.enabled"
-	SettingBaseURL       = "remuxdb.base_url"
-	SettingToken         = "remuxdb.token"
-	SettingSubmitEnabled = "remuxdb.submit_enabled"
+	SettingEnabled       = settingskeys.RemuxdbEnabled
+	SettingBaseURL       = settingskeys.RemuxdbBaseUrl
+	SettingToken         = settingskeys.RemuxdbToken
+	SettingSubmitEnabled = settingskeys.RemuxdbSubmitEnabled
 )
 
 // SettingsStore reads server_settings. Satisfied by

@@ -9,7 +9,7 @@
  */
 
 export const SETTINGS_API_VERSION = 1;
-export const SETTINGS_REVISION = 8;
+export const SETTINGS_REVISION = 9;
 
 export interface SettingSuggestedOption {
   value: string;
@@ -225,6 +225,14 @@ export const SETTING_KEYS = {
   PLAYER_SUBTITLE_SYNC_MS: "player.subtitle_sync_ms",
   /** Video sizing */
   PLAYER_VIDEO_GRAVITY: "player.video_gravity",
+  /** RemuxDB base URL */
+  REMUXDB_BASE_URL: "remuxdb.base_url",
+  /** RemuxDB stream metadata */
+  REMUXDB_ENABLED: "remuxdb.enabled",
+  /** Contribute to RemuxDB */
+  REMUXDB_SUBMIT_ENABLED: "remuxdb.submit_enabled",
+  /** RemuxDB API token */
+  REMUXDB_TOKEN: "remuxdb.token",
   /** Search scope */
   SEARCH_MEDIA_SCOPE: "search.media_scope",
   /** Match device caption settings */
@@ -956,6 +964,66 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
       { value: "fill", label: "Fill", introducedIn: 1 },
       { value: "stretch", label: "Stretch", introducedIn: 1 },
     ],
+  },
+  "remuxdb.base_url": {
+    key: "remuxdb.base_url",
+    type: "string",
+    nullable: false,
+    persistence: "remote",
+    introducedIn: 9,
+    scopes: ["account"],
+    scopeIntroducedIn: [9],
+    resolutionOrder: ["account", "default"],
+    defaultValue: "https://remuxdb.1632022.xyz",
+    label: "RemuxDB base URL",
+    description: "Base URL of the RemuxDB API service.",
+    category: "providers",
+    control: "text",
+  },
+  "remuxdb.enabled": {
+    key: "remuxdb.enabled",
+    type: "boolean",
+    nullable: false,
+    persistence: "remote",
+    introducedIn: 9,
+    scopes: ["account"],
+    scopeIntroducedIn: [9],
+    resolutionOrder: ["account", "default"],
+    defaultValue: false,
+    label: "RemuxDB stream metadata",
+    description: "Look up crowdsourced stream metadata for cold virtual files.",
+    category: "providers",
+    control: "switch",
+  },
+  "remuxdb.submit_enabled": {
+    key: "remuxdb.submit_enabled",
+    type: "boolean",
+    nullable: false,
+    persistence: "remote",
+    introducedIn: 9,
+    scopes: ["account"],
+    scopeIntroducedIn: [9],
+    resolutionOrder: ["account", "default"],
+    defaultValue: false,
+    label: "Contribute to RemuxDB",
+    description: "Submit probed stream metadata to RemuxDB to help the community.",
+    category: "providers",
+    control: "switch",
+  },
+  "remuxdb.token": {
+    key: "remuxdb.token",
+    type: "string",
+    nullable: false,
+    persistence: "remote",
+    introducedIn: 9,
+    scopes: ["account"],
+    scopeIntroducedIn: [9],
+    resolutionOrder: ["account", "default"],
+    defaultValue: "",
+    label: "RemuxDB API token",
+    description: "API token for RemuxDB submissions.",
+    category: "providers",
+    control: "text",
   },
   "search.media_scope": {
     key: "search.media_scope",

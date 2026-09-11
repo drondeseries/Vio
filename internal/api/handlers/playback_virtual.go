@@ -313,6 +313,7 @@ type resolvedVirtualPlaybackSource struct {
 	File           *models.MediaFile
 	ProbeSucceeded bool
 	Provenance     ProbeProvenance
+	AppliedRemux   bool
 }
 
 // resolveVirtualPlaybackSource chooses a ranked provider-neutral result,
@@ -520,9 +521,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 			}
 		}
-		if backfilled := applyRemuxDBEvidence(&transient, remuxMatches, origKey); backfilled != &transient {
-			transient = *backfilled
-		}
+		localResolution := transient.Resolution
+		localCodec := transient.CodecVideo
 		hasCompleteVideoEvidence := completeVirtualVideoEvidenceV3(&transient)
 		hasCompleteAudioEvidence := completeVirtualAudioEvidenceV3(&transient)
 		hasCompleteContainerEvidence := completeVirtualContainerEvidenceV3(&transient)
@@ -548,7 +548,23 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
 			}, nil
 		}
-		allowDefer := allowDeferredProbe(deferProbe, remuxEnabled, transient.Resolution, cand.Resolution, transient.CodecVideo, cand.CodecVideo)
+		ev, _ := remuxMatches[origKey]
+		appliedRemux := false
+		if backfilled := applyRemuxDBEvidence(&transient, remuxMatches, origKey); backfilled != &transient {
+			transient = *backfilled
+			appliedRemux = true
+		}
+		allowDefer := allowDeferredProbe(
+			deferProbe,
+			remuxEnabled,
+			ev.MatchMethod,
+			localResolution,
+			cand.Resolution,
+			localCodec,
+			cand.CodecVideo,
+			ev.Resolution,
+			ev.CodecVideo,
+		)
 		if allowDefer {
 			h.pinVirtualSticky(stickyKey, cand.URI)
 			mergeVirtualCandidateTracks(&transient, cand)
@@ -563,6 +579,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 				probeURL := streamURL
 				probeTransient := transient
+				probeTransient.Duration = 0
 				if len(transient.VideoTracks) > 0 {
 					probeTransient.VideoTracks = append([]models.VideoTrack(nil), transient.VideoTracks...)
 				}
@@ -609,20 +626,23 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 						h.unpinVirtualSticky(stickyKey, probeCand.URI)
 						return
 					}
+					empiricalDuration := probed.Duration
 					if probeTransient.ID > 0 {
 						probed.ID = probeTransient.ID
 						probed.MediaFolderID = probeTransient.MediaFolderID
 					}
+					if empiricalDuration > 0 {
+						h.maybeSubmitRemuxDBEvidence(bgCtx, probed, probeCand)
+					}
 					if probeTransient.Duration > 0 && probed.Duration <= 0 {
 						probed.Duration = probeTransient.Duration
 					}
-					h.maybeSubmitRemuxDBEvidence(bgCtx, probed, probeCand)
 					mergeVirtualCandidateTracks(probed, probeCand)
 					h.persistVirtualMetadataBounded(bgCtx, targetID, probeCand.URI, probed)
 				}()
 			}
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, AppliedRemux: appliedRemux,
 			}, nil
 		}
 		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
@@ -632,11 +652,22 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, AppliedRemux: appliedRemux,
 			}, nil
 		}
+		syncProbeFile := transient
+		syncProbeFile.Duration = 0
+		if len(transient.VideoTracks) > 0 {
+			syncProbeFile.VideoTracks = append([]models.VideoTrack(nil), transient.VideoTracks...)
+		}
+		if len(transient.AudioTracks) > 0 {
+			syncProbeFile.AudioTracks = append([]models.AudioTrack(nil), transient.AudioTracks...)
+		}
+		if len(transient.SubtitleTracks) > 0 {
+			syncProbeFile.SubtitleTracks = append([]models.SubtitleTrack(nil), transient.SubtitleTracks...)
+		}
 		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
-		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &transient, cand.RequestHeaders)
+		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &syncProbeFile, cand.RequestHeaders)
 		probeCancel()
 		if probeErr != nil || probed == nil {
 			slog.DebugContext(r.Context(), "virtual stream probe timed out or failed; using candidate metadata", "component", "api", "candidate_uri", cand.URI, "error", probeErr)
@@ -646,21 +677,24 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, AppliedRemux: appliedRemux,
 			}, nil
 		}
+		empiricalDuration := probed.Duration
 		if transient.ID > 0 {
 			probed.ID = transient.ID
 			probed.MediaFolderID = transient.MediaFolderID
 		}
+		if empiricalDuration > 0 {
+			h.maybeSubmitRemuxDBEvidence(attemptCtx, probed, cand)
+		}
 		if transient.Duration > 0 && probed.Duration <= 0 {
 			probed.Duration = transient.Duration
 		}
-		h.maybeSubmitRemuxDBEvidence(attemptCtx, probed, cand)
 		mergeVirtualCandidateTracks(probed, cand)
 		h.maybeTriggerSubtitleSearch(probeCtx, probed, cand)
 		return &resolvedVirtualPlaybackSource{
-			URL: streamURL, URI: cand.URI, OwnerID: oid, File: probed, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
+			URL: streamURL, URI: cand.URI, OwnerID: oid, File: probed, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,
 		}, nil
 	}
 
@@ -683,7 +717,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			attemptErr = errors.Join(attemptErr, err)
 			continue
 		}
-		if result.Provenance == ProbeProvenanceVerified || (h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
+		if result.Provenance == ProbeProvenanceVerified || (!result.AppliedRemux && h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
 			// Content ground truth: a probed duration wildly different from the
 			// catalog runtime means the provider handed us mislabeled content.
 			// Skip persisting its metadata onto this content's rows and rotate.
@@ -1088,15 +1122,20 @@ const (
 // allowDeferredProbe reports whether the virtual probe may be pushed to the
 // background. With RemuxDB disabled it follows the caller's deferProbe flag
 // exactly (the pre-RemuxDB behavior); when RemuxDB is enabled it additionally
-// requires some resolution and codec evidence so a deferred probe starts with
-// meaningful metadata confidence.
+// requires resolution and codec evidence so a deferred probe starts with
+// meaningful metadata confidence. Loose RemuxDB matches (1% size variance or
+// filename stem) are unverified guesses and must not allow probe deferral
+// without local catalog or candidate declarations.
 func allowDeferredProbe(
 	deferProbe bool,
 	remuxEnabled bool,
-	transientResolution string,
+	matchMethod remuxdb.MatchMethod,
+	localResolution string,
 	candResolution string,
-	transientCodec string,
+	localCodec string,
 	candCodec string,
+	remuxResolution string,
+	remuxCodec string,
 ) bool {
 	if !deferProbe {
 		return false
@@ -1104,8 +1143,24 @@ func allowDeferredProbe(
 	if !remuxEnabled {
 		return true
 	}
-	return (transientResolution != "" || candResolution != "") &&
-		(transientCodec != "" || candCodec != "")
+	isLoose := matchMethod == remuxdb.MatchSizeTags || matchMethod == remuxdb.MatchFilename
+	res := localResolution
+	if res == "" {
+		res = candResolution
+	}
+	if !isLoose && res == "" {
+		res = remuxResolution
+	}
+
+	codec := localCodec
+	if codec == "" {
+		codec = candCodec
+	}
+	if !isLoose && codec == "" {
+		codec = remuxCodec
+	}
+
+	return res != "" && codec != ""
 }
 
 // remuxEvidenceKey returns a stable key identifying one concrete provider
@@ -1283,6 +1338,17 @@ func (h *PlaybackHandler) matchRemuxDBCandidates(ctx context.Context, file *mode
 	return matched, true
 }
 
+type remuxSubmitTask struct {
+	payload remuxdb.SubmissionPayload
+	baseURL string
+	token   string
+}
+
+const (
+	remuxSubmitQueueSize = 64
+	remuxSubmitWorkers   = 2
+)
+
 func (h *PlaybackHandler) maybeSubmitRemuxDBEvidence(ctx context.Context, probed *models.MediaFile, cand VirtualPlaybackStream) {
 	if h == nil || probed == nil {
 		return
@@ -1310,16 +1376,34 @@ func (h *PlaybackHandler) maybeSubmitRemuxDBEvidence(ctx context.Context, probed
 	if !ok {
 		return
 	}
-	go func() {
-		submitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
-		client := remuxdb.NewClient(cfg.BaseURL, cfg.Token)
-		if err := client.SubmitProbe(submitCtx, payload); err != nil {
-			slog.DebugContext(submitCtx, "remuxdb probe submission failed", "component", "api", "filename", payload.Filename, "error", err)
-		} else {
-			slog.InfoContext(submitCtx, "remuxdb probe submitted", "component", "api", "filename", payload.Filename, "kind", payload.Kind)
+	h.remuxSubmitOnce.Do(func() {
+		h.remuxSubmitCh = make(chan remuxSubmitTask, remuxSubmitQueueSize)
+		for range remuxSubmitWorkers {
+			go func() {
+				for task := range h.remuxSubmitCh {
+					submitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					client := remuxdb.NewClient(task.baseURL, task.token)
+					if err := client.SubmitProbe(submitCtx, task.payload); err != nil {
+						slog.DebugContext(submitCtx, "remuxdb probe submission failed", "component", "api", "filename", task.payload.Filename, "error", err)
+					} else {
+						slog.InfoContext(submitCtx, "remuxdb probe submitted", "component", "api", "filename", task.payload.Filename, "kind", task.payload.Kind)
+					}
+					cancel()
+				}
+			}()
 		}
-	}()
+	})
+	task := remuxSubmitTask{
+		payload: payload,
+		baseURL: cfg.BaseURL,
+		token:   cfg.Token,
+	}
+	select {
+	case h.remuxSubmitCh <- task:
+	default:
+		slog.WarnContext(ctx, "remuxdb submission queue full; dropping probe submission",
+			"component", "api", "filename", payload.Filename)
+	}
 }
 
 func applyRemuxDBEvidence(file *models.MediaFile, matched map[string]remuxdb.Evidence, key string) *models.MediaFile {

@@ -48,7 +48,13 @@ import { SettingField } from "./SettingField";
  * settings; the subtitle providers have their own endpoints. The form is
  * still mounted so the page reads one sensitive-status list for every tile.
  */
-const KEYS = ["mdblist.api_key", "remuxdb.enabled", "remuxdb.base_url", "remuxdb.token"];
+const KEYS = [
+  "mdblist.api_key",
+  "remuxdb.enabled",
+  "remuxdb.base_url",
+  "remuxdb.token",
+  "remuxdb.submit_enabled",
+];
 
 // ---------------------------------------------------------------------------
 // Shared tile plumbing
@@ -519,6 +525,7 @@ const REMUXDB_DEFAULT_URL = "https://remuxdb.1632022.xyz";
 function RemuxDBTile({
   savedEnabled,
   savedUrl,
+  savedSubmitEnabled,
   sensitiveConfigured,
   restartKeys,
   expanded,
@@ -529,6 +536,7 @@ function RemuxDBTile({
 }: {
   savedEnabled: string;
   savedUrl: string;
+  savedSubmitEnabled: string;
   sensitiveConfigured: string[];
   restartKeys: RestartKeyMatcher;
   expanded: boolean;
@@ -540,8 +548,10 @@ function RemuxDBTile({
   const updateSettings = useUpdateServerSettings();
   const checkConnection = useCheckAdminSettingsConnection();
   const savedOn = savedEnabled === "true";
+  const savedSubmitOn = savedSubmitEnabled === "true";
   const [enabled, setEnabled] = useState(savedOn);
   const [url, setUrl] = useState(savedUrl);
+  const [submitEnabled, setSubmitEnabled] = useState(savedSubmitOn);
   const [token, setToken] = useState("");
   const [testing, setTesting] = useState(false);
 
@@ -549,13 +559,18 @@ function RemuxDBTile({
     if (expanded) {
       setEnabled(savedOn);
       setUrl(savedUrl);
+      setSubmitEnabled(savedSubmitOn);
       setToken("");
     }
-  }, [expanded, savedOn, savedUrl]);
+  }, [expanded, savedOn, savedUrl, savedSubmitOn]);
 
   const tokenConfigured = sensitiveConfigured.includes("remuxdb.token");
   const effectiveUrl = url.trim() || savedUrl.trim() || REMUXDB_DEFAULT_URL;
-  const hasDraft = enabled !== savedOn || url !== savedUrl || token.trim() !== "";
+  const hasDraft =
+    enabled !== savedOn ||
+    url !== savedUrl ||
+    submitEnabled !== savedSubmitOn ||
+    token.trim() !== "";
   useReportUnsavedChanges(hasDraft);
 
   async function save() {
@@ -567,6 +582,7 @@ function RemuxDBTile({
       await updateSettings.mutateAsync({
         "remuxdb.enabled": enabled ? "true" : "false",
         "remuxdb.base_url": url.trim() || savedUrl.trim() || REMUXDB_DEFAULT_URL,
+        "remuxdb.submit_enabled": submitEnabled ? "true" : "false",
         ...(token.trim() !== "" ? { "remuxdb.token": token.trim() } : {}),
       });
       setToken("");
@@ -664,6 +680,26 @@ function RemuxDBTile({
         }}
         onKeep={() => setToken("")}
       />
+      <SettingField
+        label="Contribute stream probes"
+        settingKey="remuxdb.submit_enabled"
+        type="toggle"
+        description="Submit locally probed stream metadata back to RemuxDB to help other users. Requires an API token."
+        dirty={submitEnabled !== savedSubmitOn}
+        value={submitEnabled ? "true" : "false"}
+        onChange={(v) => {
+          if (test) onTested(undefined);
+          setSubmitEnabled(v === "true");
+        }}
+      />
+      <div className="text-muted-foreground space-y-1 rounded-md border p-3 text-xs">
+        <p className="text-foreground font-medium">Contribution disclosure</p>
+        <p>
+          When enabled, successful stream probes submit technical container and track metadata
+          (codecs, dimensions, channel layouts, measured durations, and release infohashes/indexer
+          GUIDs) to RemuxDB. No user accounts, viewing history, or IP addresses are submitted.
+        </p>
+      </div>
       <ProviderPanelActions test={test}>
         <Button
           type="button"
@@ -779,6 +815,7 @@ export default function ProvidersSettings() {
             <RemuxDBTile
               savedEnabled={form.getValue("remuxdb.enabled")}
               savedUrl={form.getValue("remuxdb.base_url")}
+              savedSubmitEnabled={form.getValue("remuxdb.submit_enabled")}
               sensitiveConfigured={form.sensitiveConfigured}
               restartKeys={restartKeys}
               expanded={expandedTile === "remuxdb"}

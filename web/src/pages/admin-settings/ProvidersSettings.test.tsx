@@ -517,7 +517,7 @@ describe("RemuxDB tile", () => {
     expect(within(tile).getByPlaceholderText("https://remuxdb.1632022.xyz")).toBeInTheDocument();
   });
 
-  it("saves enabled, URL, and a drafted token", async () => {
+  it("saves enabled, URL, submit_enabled, and a drafted token", async () => {
     const user = userEvent.setup();
     mocks.updateSettings.mockResolvedValue({});
     render(<ProvidersSettings />);
@@ -535,6 +535,42 @@ describe("RemuxDB tile", () => {
       "remuxdb.enabled": "true",
       "remuxdb.base_url": "https://mirror.example.com",
       "remuxdb.token": "tok-123",
+      "remuxdb.submit_enabled": "false",
+    });
+  });
+
+  it("displays the contribution disclosure notice and toggles submit_enabled", async () => {
+    const user = userEvent.setup();
+    mocks.updateSettings.mockResolvedValue({});
+    settingsValues = {
+      "remuxdb.enabled": "true",
+      "remuxdb.base_url": "https://remuxdb.1632022.xyz",
+      "remuxdb.submit_enabled": "false",
+    };
+    render(<ProvidersSettings />);
+
+    const tile = screen.getByRole("group", { name: "RemuxDB" });
+    await user.click(within(tile).getByRole("button", { name: "Manage" }));
+
+    // Verify disclosure notice is rendered
+    expect(within(tile).getByText("Contribution disclosure")).toBeInTheDocument();
+    expect(
+      within(tile).getByText(
+        /successful stream probes submit technical container and track metadata/,
+      ),
+    ).toBeInTheDocument();
+
+    // Verify toggle is present and can be toggled
+    const submitSwitch = within(tile).getByRole("switch", { name: "Contribute stream probes" });
+    expect(submitSwitch).toHaveAttribute("aria-checked", "false");
+    await user.click(submitSwitch);
+    expect(submitSwitch).toHaveAttribute("aria-checked", "true");
+
+    await user.click(within(tile).getByRole("button", { name: "Save" }));
+    expect(mocks.updateSettings).toHaveBeenCalledWith({
+      "remuxdb.enabled": "true",
+      "remuxdb.base_url": "https://remuxdb.1632022.xyz",
+      "remuxdb.submit_enabled": "true",
     });
   });
 

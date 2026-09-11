@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/Silo-Server/silo-server/internal/secret"
+	"github.com/Silo-Server/silo-server/internal/settingskeys"
 )
 
 // SettingsStore is the read/write surface over server_settings shared by the
@@ -65,10 +66,10 @@ var SensitiveSettingKeys = map[string]bool{
 	"redis.sentinel_password": true,
 
 	// Metadata / list-provider API keys.
-	"tmdb.api_key":    true,
-	"mdblist.api_key": true,
-	"introdb.api_key": true,
-	"remuxdb.token":   true,
+	"tmdb.api_key":            true,
+	"mdblist.api_key":         true,
+	"introdb.api_key":         true,
+	settingskeys.RemuxdbToken: true,
 
 	// Shared AI endpoint API keys (+ legacy subtitle_ai alias the loader still
 	// falls back to; the legacy row is never renamed because ciphertext is

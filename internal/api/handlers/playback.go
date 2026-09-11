@@ -344,6 +344,8 @@ type PlaybackHandler struct {
 	DeviceCapabilitySource                 *providerDeviceCapabilitySource
 	RemuxDBConfig                          func(ctx context.Context) remuxdb.Config
 	RemuxDBStore                           *remuxdb.Store
+	remuxSubmitOnce                        sync.Once
+	remuxSubmitCh                          chan remuxSubmitTask
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through
