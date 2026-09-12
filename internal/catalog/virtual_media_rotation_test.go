@@ -26,7 +26,7 @@ func TestVirtualMediaRotationPreservesFileID(t *testing.T) {
 	}
 	defer pool.Close()
 
-	r := NewVirtualMediaRegistrar(pool)
+	r := newReleasedVirtualMediaRegistrar(pool)
 	libID := ensureVirtualTestLibrary(t, pool)
 	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, libID) })
 
@@ -36,6 +36,8 @@ func TestVirtualMediaRotationPreservesFileID(t *testing.T) {
 		LibraryID:      strconv.Itoa(libID),
 		Title:          "Rotation Probe Film",
 		IMDbID:         "tt99999991",
+		TMDBID:         "99999991",
+		Year:           2020,
 		RuntimeMinutes: 100,
 		VirtualURI:     "virtual://movie/tt99999991?result=hash-one",
 		Container:      "mkv",

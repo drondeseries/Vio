@@ -118,10 +118,17 @@ type VirtualReconcileResult struct {
 // VirtualMediaRegistrar owns transactional catalog registration for virtual
 // sources. Plugins submit stable external identifiers and URIs; they never
 // receive database access or depend on Silo's table layout.
-type VirtualMediaRegistrar struct{ pool *pgxpool.Pool }
+type VirtualMediaRegistrar struct {
+	pool                *pgxpool.Pool
+	TMDBDigitalReleases TMDBDigitalReleaseChecker
+	ReleaseOverrides    ReleaseOverrideLookup
+	EpisodeReleaseDates interface {
+		EpisodeReleaseDates(context.Context, int, int) (map[int]time.Time, error)
+	}
+}
 
 func NewVirtualMediaRegistrar(pool *pgxpool.Pool) *VirtualMediaRegistrar {
-	return &VirtualMediaRegistrar{pool: pool}
+	return &VirtualMediaRegistrar{pool: pool, ReleaseOverrides: NewReleaseOverrideRepository(pool)}
 }
 
 func (r *VirtualMediaRegistrar) Upsert(ctx context.Context, in VirtualMedia) (*VirtualMediaResult, error) {
@@ -137,9 +144,66 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	}
 	if in.MediaType == "series" {
 		in = r.normalizeSeriesVirtualMedia(ctx, in)
+		in = r.fillEpisodeReleaseDates(ctx, in)
 	}
 	if err := validateVirtualMedia(in); err != nil {
 		return nil, err
+	}
+	var releaseSnapshot []ReleaseOverride
+	eligible := false
+	permitViaPhysical := false
+	movieIDs := releaseIdentities("movie", in.TMDBID, "", in.IMDbID, 0, 0)
+	if in.MediaType == "movie" {
+		// Resolve the full alias set before deciding whether provider
+		// evidence is needed: a stored past override permits without any
+		// provider call, and a stored future override blocks. Skipped only
+		// when override reads are unwired (then no stored aliases can be
+		// consulted and behavior matches the pre-override gate).
+		if r.ReleaseOverrides != nil {
+			var err error
+			movieIDs, err = releaseIdentitiesForContent(ctx, r.pool, "movie", virtualContentID(in), "movie", in.TMDBID, "", in.IMDbID, 0, 0)
+			if err != nil {
+				return nil, err
+			}
+		}
+		// Single decision from the captured entries at one evaluation
+		// time; the transaction-time revalidation below re-decides from
+		// its own validated snapshot.
+		now := time.Now().UTC()
+		var err error
+		releaseSnapshot, err = captureReleaseOverrides(ctx, r.ReleaseOverrides, movieIDs)
+		if err != nil {
+			return nil, err
+		}
+		allowed, active := decideReleaseOverrides(now, releaseSnapshot)
+		switch {
+		case active:
+			eligible = allowed
+		default:
+			// Possession proves release even when provider data is
+			// missing, negative, or dated in the future. Requires
+			// override wiring so the unwired fail-fast path stays
+			// database-free.
+			if r.ReleaseOverrides != nil {
+				physical, err := hasPhysicalMediaFiles(ctx, r.pool, virtualContentID(in))
+				if err != nil {
+					return nil, err
+				}
+				if physical {
+					eligible, permitViaPhysical = true, true
+					break
+				}
+			}
+			if isFutureDate(in.Year, "") {
+				eligible = false
+			} else {
+				tmdbID, _ := strconv.Atoi(strings.TrimSpace(in.TMDBID))
+				eligible, err = newTheatricalReleaseGate(r.TMDBDigitalReleases).lookupProvider(ctx, tmdbID)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 	folderID, _ := strconv.Atoi(in.LibraryID)
 	source := normalizedVirtualSource(in.Source)
@@ -148,6 +212,14 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 		return nil, fmt.Errorf("begin virtual media transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Exclusive content lock first (see lockReleaseContentTx): registration
+	// that owns item metadata can insert or change scalar aliases, so it is
+	// an alias writer. No shared-to-exclusive upgrade happens later.
+	if in.MediaType == "movie" || in.MediaType == "series" {
+		if err := lockReleaseContentTx(ctx, tx, virtualContentID(in), true); err != nil {
+			return nil, fmt.Errorf("lock release content: %w", err)
+		}
+	}
 	if err := lockVirtualMediaInstallation(ctx, tx, installationID); err != nil {
 		return nil, err
 	}
@@ -164,10 +236,48 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	if !virtualLibraryCompatible(folderType, in.MediaType) {
 		return nil, fmt.Errorf("%w: %s cannot be added to %s library", ErrInvalidVirtualMedia, in.MediaType, folderType)
 	}
+	if err := validateReleaseSnapshotTx(ctx, tx, releaseSnapshot); err != nil {
+		return nil, err
+	}
 	contentID := virtualContentID(in)
 	ownsItemMetadata, err := upsertVirtualMediaItem(ctx, tx, installationID, source, contentID, in)
 	if err != nil {
 		return nil, err
+	}
+	if in.MediaType == "movie" && r.ReleaseOverrides != nil {
+		// The item row is locked and the exclusive content lock (taken at
+		// transaction start) holds alias writers out, so this is the
+		// authoritative alias set. Membership must match the pre-
+		// transaction snapshot exactly: a removed alias must not retain
+		// authority through its captured override, and an added alias must
+		// be decided on, not silently unioned. Either case is a retryable
+		// conflict because the pre-transaction verdict is stale.
+		freshIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", contentID, "movie", in.TMDBID, "", in.IMDbID, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		if len(releaseSnapshot) > 0 && !releaseIdentitySetsEqual(snapshotIdentities(releaseSnapshot), freshIDs) {
+			return nil, fmt.Errorf("%w: release alias set changed during registration", ErrReleaseOverrideConflict)
+		}
+		freshEntries, err := captureReleaseOverridesTx(ctx, tx, freshIDs)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateReleaseSnapshotTx(ctx, tx, freshEntries); err != nil {
+			return nil, err
+		}
+		if allowed, active := decideReleaseOverrides(time.Now().UTC(), freshEntries); active {
+			eligible = allowed
+		} else if permitViaPhysical {
+			// Re-verify possession inside the transaction: files are
+			// managed outside this lock protocol.
+			physical, err := hasPhysicalMediaFiles(ctx, tx, contentID)
+			if err != nil {
+				return nil, err
+			}
+			eligible = physical
+		}
+		movieIDs = freshIDs
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO media_item_libraries(content_id,media_folder_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, contentID, folderID); err != nil {
 		return nil, fmt.Errorf("link virtual media: %w", err)
@@ -183,35 +293,51 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 		return nil, fmt.Errorf("claim virtual media source: %w", err)
 	}
 
+	if in.MediaType == "movie" {
+		reason := ""
+		if !eligible {
+			reason = "no_home_release"
+		}
+		if err := recordReleaseMetadata(ctx, tx, movieIDs, reason); err != nil {
+			return nil, err
+		}
+	}
 	filePaths := make([]string, 0, virtualMediaFileCount(in))
 	episodes := 0
 	if in.MediaType == "series" {
+		// Resolve the series alias template once: incoming IDs unioned
+		// with stored scalars and provider-table rows. Incoming aliases
+		// gate every episode even when metadata ownership prevents
+		// persisting them.
+		seriesTemplate, err := releaseIdentitiesForContent(ctx, tx, "episode", contentID, "series", in.TMDBID, in.TVDBID, in.IMDbID, 1, 1)
+		if err != nil {
+			return nil, err
+		}
 		for _, ep := range in.Episodes {
-			if err := upsertVirtualEpisode(ctx, tx, contentID, folderID, installationID, ownsItemMetadata, ep); err != nil {
+			playable, epPaths, err := upsertVirtualEpisode(ctx, tx, contentID, folderID, installationID, ownsItemMetadata, seriesTemplate, ep)
+			if err != nil {
 				return nil, err
 			}
-			if len(ep.Variants) > 0 {
-				for _, variant := range ep.Variants {
-					filePaths = append(filePaths, variant.VirtualURI)
-				}
-			} else {
-				filePaths = append(filePaths, ep.VirtualURI)
+			if playable {
+				filePaths = append(filePaths, epPaths...)
+				episodes++
 			}
-			episodes++
 		}
 	} else {
-		if len(in.Variants) > 0 {
-			for _, v := range in.Variants {
-				if err := upsertVirtualFileVariant(ctx, tx, contentID, "", folderID, installationID, v, in.RuntimeMinutes); err != nil {
+		if eligible {
+			if len(in.Variants) > 0 {
+				for _, v := range in.Variants {
+					if err := upsertVirtualFileVariant(ctx, tx, contentID, "", folderID, installationID, v, in.RuntimeMinutes); err != nil {
+						return nil, err
+					}
+					filePaths = append(filePaths, v.VirtualURI)
+				}
+			} else if in.VirtualURI != "" {
+				if err := upsertVirtualFileWithMeta(ctx, tx, contentID, "", folderID, installationID, in.VirtualURI, runtimeSeconds(in.RuntimeMinutes), in); err != nil {
 					return nil, err
 				}
-				filePaths = append(filePaths, v.VirtualURI)
+				filePaths = append(filePaths, in.VirtualURI)
 			}
-		} else {
-			if err := upsertVirtualFileWithMeta(ctx, tx, contentID, "", folderID, installationID, in.VirtualURI, runtimeSeconds(in.RuntimeMinutes), in); err != nil {
-				return nil, err
-			}
-			filePaths = append(filePaths, in.VirtualURI)
 		}
 	}
 	if err := syncVirtualFileSourceClaims(ctx, tx, installationID, source, contentID, folderID, filePaths); err != nil {
@@ -359,7 +485,7 @@ func virtualMediaFileCount(in VirtualMedia) int {
 	for _, episode := range in.Episodes {
 		if len(episode.Variants) > 0 {
 			total += len(episode.Variants)
-		} else {
+		} else if episode.VirtualURI != "" {
 			total++
 		}
 	}
@@ -381,35 +507,38 @@ func syncVirtualFileSourceClaims(ctx context.Context, tx pgx.Tx, installationID 
 			updated_at=NOW()`, installationID, source, contentID, folderID, filePaths); err != nil {
 		return fmt.Errorf("claim virtual media files: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		WITH stale AS (
-			DELETE FROM virtual_media_file_source_claims
-			WHERE plugin_installation_id=$1
-			  AND source_key=$2
-			  AND content_id=$3
-			  AND media_folder_id=$4
-			  AND NOT (file_path=ANY($5::text[]))
-			RETURNING file_path
-		)
-		DELETE FROM media_files mf
-		USING stale
-		WHERE mf.content_id=$3
-		  AND mf.media_folder_id=$4
-		  AND mf.file_path=stale.file_path
-		  AND mf.virtual_owner_installation_id=$1
-		  AND NOT EXISTS(
-			SELECT 1 FROM library_collection_items lci
-			WHERE lci.media_item_id=$3
-		  )
-		  AND NOT EXISTS(
-			SELECT 1 FROM virtual_media_file_source_claims vmfsc
-			WHERE vmfsc.plugin_installation_id=$1
-			  AND vmfsc.content_id=$3
-			  AND vmfsc.media_folder_id=$4
-			  AND vmfsc.file_path=stale.file_path
-			  AND vmfsc.source_key<>$2
-		  )`, installationID, source, contentID, folderID, filePaths); err != nil {
-		return fmt.Errorf("remove stale virtual media files: %w", err)
+	rows, err := tx.Query(ctx, `
+		DELETE FROM virtual_media_file_source_claims
+		WHERE plugin_installation_id=$1
+		  AND source_key=$2
+		  AND content_id=$3
+		  AND media_folder_id=$4
+		  AND NOT (file_path=ANY($5::text[]))
+		RETURNING file_path`, installationID, source, contentID, folderID, filePaths)
+	if err != nil {
+		return fmt.Errorf("delete stale virtual file claims: %w", err)
+	}
+	deletedPaths, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("collect stale virtual file paths: %w", err)
+	}
+	if len(deletedPaths) > 0 {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM media_files mf
+			WHERE mf.content_id=$1
+			  AND mf.media_folder_id=$2
+			  AND mf.file_path=ANY($3::text[])
+			  AND mf.virtual_owner_installation_id=$4
+			  AND (mf.container='virtual' OR mf.file_path LIKE 'virtual://%')
+			  AND NOT EXISTS(
+				SELECT 1 FROM virtual_media_file_source_claims vmfsc
+				WHERE vmfsc.plugin_installation_id=$4
+				  AND vmfsc.content_id=$1
+				  AND vmfsc.media_folder_id=$2
+				  AND vmfsc.file_path=mf.file_path
+			  )`, contentID, folderID, deletedPaths, installationID); err != nil {
+			return fmt.Errorf("remove stale virtual media files: %w", err)
+		}
 	}
 	return nil
 }
@@ -447,12 +576,15 @@ func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, insta
 	// Safety guard: an empty keep list with existing claims means the plugin
 	// lost its monitored state (restart, file corruption, provider outage).
 	// Wiping everything would remove all virtual URIs for users, so refuse.
-	if len(keepIDs) == 0 {
+	// Item-scoped sources (e.g. "request:...") represent single requests and
+	// may be legitimately withdrawn with an empty keep list.
+	if len(keepIDs) == 0 && !strings.HasPrefix(source, "request:") {
 		var existingCount int
 		if err := tx.QueryRow(ctx, `
 			SELECT COUNT(*) FROM virtual_media_source_claims
-			WHERE plugin_installation_id=$1 AND source_key=$2`,
-			installationID, source).Scan(&existingCount); err != nil {
+			WHERE plugin_installation_id=$1 AND source_key=$2
+			  AND (cardinality($3::int[])=0 OR media_folder_id=ANY($3::int[]))`,
+			installationID, source, libraryIDs).Scan(&existingCount); err != nil {
 			return result, fmt.Errorf("virtual reconciliation guard check: %w", err)
 		}
 		if existingCount > 0 {
@@ -503,6 +635,15 @@ func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, insta
 		  AND vmsc.media_folder_id=stale.media_folder_id`); err != nil {
 		return result, fmt.Errorf("delete stale virtual source claims: %w", err)
 	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM virtual_media_file_source_claims vmfsc
+		USING stale_virtual_source_claims stale
+		WHERE vmfsc.plugin_installation_id=stale.plugin_installation_id
+		  AND vmfsc.source_key=stale.source_key
+		  AND vmfsc.content_id=stale.content_id
+		  AND vmfsc.media_folder_id=stale.media_folder_id`); err != nil {
+		return result, fmt.Errorf("delete stale virtual file source claims: %w", err)
+	}
 	fileTag, err := tx.Exec(ctx, `
 		DELETE FROM media_files mf
 		USING stale_virtual_file_claims stale
@@ -510,10 +651,7 @@ func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, insta
 		  AND mf.media_folder_id=stale.media_folder_id
 		  AND mf.file_path=stale.file_path
 		  AND mf.virtual_owner_installation_id=stale.plugin_installation_id
-		  AND NOT EXISTS(
-			SELECT 1 FROM library_collection_items lci
-			WHERE lci.media_item_id=stale.content_id
-		  )
+		  AND (mf.container='virtual' OR mf.file_path LIKE 'virtual://%')
 		  AND NOT EXISTS(
 			SELECT 1 FROM virtual_media_file_source_claims remaining
 			WHERE remaining.plugin_installation_id=stale.plugin_installation_id
@@ -589,6 +727,7 @@ func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, insta
 		  AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.content_id = mi.content_id)
 		  AND NOT EXISTS (SELECT 1 FROM library_collection_items lci WHERE lci.media_item_id = mi.content_id)
 		  AND NOT EXISTS (SELECT 1 FROM virtual_media_source_claims vmsc WHERE vmsc.content_id=mi.content_id)
+		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)
 		RETURNING mi.content_id`)
 	if err != nil {
 		return result, fmt.Errorf("delete stale virtual media: %w", err)
@@ -854,6 +993,7 @@ func RemoveVirtualMediaInstallation(ctx context.Context, tx pgx.Tx, installation
 		        AND vmsc.owns_item_metadata
 		        AND vmsc.plugin_installation_id<>$1
 		  )
+		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)
 		RETURNING mi.content_id`, installationID)
 	if err != nil {
 		return result, fmt.Errorf("delete orphaned virtual media items: %w", err)
@@ -1013,7 +1153,7 @@ func validateVirtualMedia(in VirtualMedia) error {
 		}
 		if len(episode.Variants) > 0 {
 			fileCount += len(episode.Variants)
-		} else {
+		} else if episode.VirtualURI != "" {
 			fileCount++
 		}
 	}
@@ -1074,9 +1214,6 @@ func validateVirtualEpisode(ep VirtualEpisode, index int, seenURIs map[string]st
 	}
 	if ep.RuntimeMinutes < 0 || ep.RuntimeMinutes > 24*60 {
 		return fmt.Errorf("%w: episodes[%d].runtime_minutes is out of range", ErrInvalidVirtualMedia, index)
-	}
-	if ep.VirtualURI == "" && len(ep.Variants) == 0 {
-		return fmt.Errorf("%w: episodes[%d] requires VirtualURI or Variants", ErrInvalidVirtualMedia, index)
 	}
 	if len(ep.Variants) > maxVirtualVariantsPerMedia {
 		return fmt.Errorf("%w: episodes[%d].variants exceeds %d entries", ErrInvalidVirtualMedia, index, maxVirtualVariantsPerMedia)
@@ -1286,7 +1423,7 @@ func virtualLibraryCompatible(folderType, mediaType string) bool {
 	return folderType == "mixed" || (mediaType == "movie" && folderType == "movies") || (mediaType == "series" && folderType == "series")
 }
 
-func upsertVirtualEpisode(ctx context.Context, tx pgx.Tx, seriesID string, folderID, installationID int, ownsItemMetadata bool, ep VirtualEpisode) error {
+func upsertVirtualEpisode(ctx context.Context, tx pgx.Tx, seriesID string, folderID, installationID int, ownsItemMetadata bool, seriesTemplate []ReleaseIdentity, ep VirtualEpisode) (bool, []string, error) {
 	seasonID := fmt.Sprintf("%s-%d", strings.Replace(seriesID, "series-", "season-", 1), ep.SeasonNumber)
 	episodeID := fmt.Sprintf("%s-%d-%d", strings.Replace(seriesID, "series-", "episode-", 1), ep.SeasonNumber, ep.EpisodeNumber)
 	var persistedSeasonID string
@@ -1300,7 +1437,7 @@ func upsertVirtualEpisode(ctx context.Context, tx pgx.Tx, seriesID string, folde
 		RETURNING content_id`,
 		seasonID, seriesID, ep.SeasonNumber, fmt.Sprintf("Season %d", ep.SeasonNumber), nullTime(ep.AirDate), ownsItemMetadata,
 	).Scan(&persistedSeasonID); err != nil {
-		return fmt.Errorf("upsert virtual season: %w", err)
+		return false, nil, fmt.Errorf("upsert virtual season: %w", err)
 	}
 	var persistedEpisodeID string
 	if err := tx.QueryRow(ctx, `
@@ -1320,31 +1457,101 @@ func upsertVirtualEpisode(ctx context.Context, tx pgx.Tx, seriesID string, folde
 		episodeID, seriesID, persistedSeasonID, ep.SeasonNumber, ep.EpisodeNumber,
 		ep.Title, ep.Overview, nullTime(ep.AirDate), ep.RuntimeMinutes, ep.StillPath, ownsItemMetadata,
 	).Scan(&persistedEpisodeID); err != nil {
-		return fmt.Errorf("upsert virtual episode: %w", err)
+		return false, nil, fmt.Errorf("upsert virtual episode: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO episode_libraries(episode_id,media_folder_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, persistedEpisodeID, folderID); err != nil {
-		return fmt.Errorf("link virtual episode: %w", err)
+		return false, nil, fmt.Errorf("link virtual episode: %w", err)
 	}
+
+	// Map the caller-resolved series template (incoming plus stored
+	// aliases) onto this episode's coordinates.
+	episodeIDs := make([]ReleaseIdentity, 0, len(seriesTemplate))
+	for _, t := range seriesTemplate {
+		t.SeasonNumber = ep.SeasonNumber
+		t.EpisodeNumber = ep.EpisodeNumber
+		if t.Validate() == nil {
+			episodeIDs = append(episodeIDs, t)
+		}
+	}
+	episodeIDs = sortReleaseIdentities(episodeIDs)
+	// An active override on any alias wins outright; only with no active
+	// override do local possession and provider/air-date evidence apply.
+	// In particular a future override blocks even a locally proven episode
+	// (existing physical files are preserved, new virtual files are not
+	// created).
+	eligible, overridden := false, false
+	if len(episodeIDs) > 0 {
+		// Lock the full alias set so a concurrent override write on any
+		// alias serializes against the eligibility read below.
+		if err := lockReleaseIdentitiesTx(ctx, tx, episodeIDs); err != nil {
+			return false, nil, err
+		}
+		// Single captured decision at one evaluation time.
+		entries, err := captureReleaseOverridesTx(ctx, tx, episodeIDs)
+		if err != nil {
+			return false, nil, err
+		}
+		if allowed, active := decideReleaseOverrides(time.Now().UTC(), entries); active {
+			eligible, overridden = allowed, true
+		}
+	}
+	if !overridden {
+		var locallyProven bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(SELECT 1 FROM episodes WHERE content_id=$1 AND metadata_source='local')
+			    OR EXISTS(SELECT 1 FROM media_files WHERE episode_id=$1 AND container<>'virtual' AND file_path NOT LIKE 'virtual://%')`,
+			persistedEpisodeID).Scan(&locallyProven); err != nil {
+			return false, nil, fmt.Errorf("check virtual episode provenance: %w", err)
+		}
+		if locallyProven {
+			eligible = true
+		} else if err := tx.QueryRow(ctx, `SELECT COALESCE(verified_episode_release_at(series_id,season_number,episode_number,air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp(),false) FROM episodes WHERE content_id=$1`, persistedEpisodeID).Scan(&eligible); err != nil {
+			return false, nil, fmt.Errorf("check virtual episode release: %w", err)
+		}
+	}
+	reason := ""
+	if !eligible {
+		reason = "future_date"
+		if ep.AirDate.IsZero() {
+			reason = "missing_date"
+		}
+	}
+	if err := recordReleaseMetadata(ctx, tx, episodeIDs, reason); err != nil {
+		return false, nil, err
+	}
+	if !eligible {
+		return false, nil, nil
+	}
+
+	var createdPaths []string
 	if len(ep.Variants) > 0 {
 		for _, v := range ep.Variants {
 			if err := upsertVirtualFileVariant(ctx, tx, seriesID, persistedEpisodeID, folderID, installationID, v, ep.RuntimeMinutes); err != nil {
-				return err
+				return false, nil, err
 			}
+			createdPaths = append(createdPaths, v.VirtualURI)
 		}
-		return nil
+		return true, createdPaths, nil
 	}
-	return upsertVirtualFileWithMeta(ctx, tx, seriesID, persistedEpisodeID, folderID, installationID, ep.VirtualURI, runtimeSeconds(ep.RuntimeMinutes), VirtualMedia{
-		Resolution:        ep.Resolution,
-		CodecVideo:        ep.CodecVideo,
-		CodecAudio:        ep.CodecAudio,
-		HDR:               ep.HDR,
-		Bitrate:           ep.Bitrate,
-		FileSize:          ep.FileSize,
-		Container:         ep.Container,
-		SourceType:        ep.SourceType,
-		AudioLanguages:    ep.AudioLanguages,
-		SubtitleLanguages: ep.SubtitleLanguages,
-	})
+	if ep.VirtualURI != "" {
+		if err := upsertVirtualFileWithMeta(ctx, tx, seriesID, persistedEpisodeID, folderID, installationID, ep.VirtualURI, runtimeSeconds(ep.RuntimeMinutes), VirtualMedia{
+			Resolution:        ep.Resolution,
+			CodecVideo:        ep.CodecVideo,
+			CodecAudio:        ep.CodecAudio,
+			HDR:               ep.HDR,
+			Bitrate:           ep.Bitrate,
+			FileSize:          ep.FileSize,
+			Container:         ep.Container,
+			SourceType:        ep.SourceType,
+			AudioLanguages:    ep.AudioLanguages,
+			SubtitleLanguages: ep.SubtitleLanguages,
+		}); err != nil {
+			return false, nil, err
+		}
+		createdPaths = append(createdPaths, ep.VirtualURI)
+		return true, createdPaths, nil
+	}
+	return false, nil, nil
 }
 
 //nolint:unused // Retained for compatibility with dormant integration paths.
@@ -1599,6 +1806,35 @@ func nullTime(t time.Time) any {
 		return nil
 	}
 	return t
+}
+
+func (r *VirtualMediaRegistrar) fillEpisodeReleaseDates(ctx context.Context, in VirtualMedia) VirtualMedia {
+	tmdbID, err := strconv.Atoi(in.TMDBID)
+	if err != nil || tmdbID <= 0 || r.EpisodeReleaseDates == nil {
+		return in
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	seasons := make(map[int]map[int]time.Time)
+	for i := range in.Episodes {
+		ep := &in.Episodes[i]
+		if !ep.AirDate.IsZero() || ep.SeasonNumber <= 0 || ep.EpisodeNumber <= 0 {
+			continue
+		}
+		dates, found := seasons[ep.SeasonNumber]
+		if !found {
+			if len(seasons) >= 20 {
+				break
+			}
+			dates, err = r.EpisodeReleaseDates.EpisodeReleaseDates(ctx, tmdbID, ep.SeasonNumber)
+			if err != nil {
+				dates = nil
+			}
+			seasons[ep.SeasonNumber] = dates
+		}
+		ep.AirDate = dates[ep.EpisodeNumber]
+	}
+	return in
 }
 
 func (r *VirtualMediaRegistrar) normalizeSeriesVirtualMedia(ctx context.Context, in VirtualMedia) VirtualMedia {

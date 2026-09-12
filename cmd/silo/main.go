@@ -1382,6 +1382,7 @@ func main() {
 	var pluginInstallationStore *plugins.InstallationStore
 	var pluginRuntimeConfigStore *plugins.RuntimeConfigStore
 	var pluginHTTPProxy *plugins.HTTPProxy
+	var virtualRegistrar *catalog.VirtualMediaRegistrar
 	var requestVirtualMetadataRefresh func(context.Context, string) error
 	pluginAutoUpdateDone := make(chan struct{})
 	var pluginAutoUpdater *plugins.AutoUpdateService
@@ -1389,7 +1390,7 @@ func main() {
 		pluginCacheDir := resolvePluginCacheDir()
 		repositoryStore := plugins.NewRepositoryStore(deps.DB)
 		installationStore := plugins.NewInstallationStore(deps.DB)
-		virtualRegistrar := catalog.NewVirtualMediaRegistrar(deps.DB)
+		virtualRegistrar = catalog.NewVirtualMediaRegistrar(deps.DB)
 		runtimeConfigStore := plugins.NewRuntimeConfigStore(deps.DB, deps.SecretCipher)
 		catalogService := plugins.NewCatalogService(repositoryStore, plugins.CatalogServiceOptions{
 			SiloAPIVersion: plugins.DefaultSiloAPIVersion,
@@ -1460,6 +1461,7 @@ func main() {
 					},
 				),
 				reconciler: virtualRegistrar,
+				overrides:  virtualRegistrar,
 			},
 			InstalledPlugins: pluginhost.InstalledPluginListerFunc(
 				func(ctx context.Context) ([]pluginhost.InstalledPluginRecord, error) {
@@ -2431,6 +2433,10 @@ func main() {
 		discoverAdapter := api.NewTMDBDiscoverAdapter(cfg.TMDBAPIKey)
 		collectionService.TMDBDiscovers = discoverAdapter
 		collectionService.TMDBDigitalReleases = discoverAdapter
+		if virtualRegistrar != nil {
+			virtualRegistrar.TMDBDigitalReleases = discoverAdapter
+			virtualRegistrar.EpisodeReleaseDates = discoverAdapter
+		}
 		deps.CollectionService = collectionService
 		collectionSyncScheduler = catalog.NewCollectionSyncScheduler(collectionRepo, collectionService, slog.Default())
 
@@ -4023,6 +4029,16 @@ type virtualCatalogHostAdapter struct {
 	reconciler interface {
 		ReconcileVirtualMedia(context.Context, int, string, []string, []int) (catalog.VirtualReconcileResult, error)
 	}
+	overrides interface {
+		LookupReleaseOverrides(context.Context, []catalog.ReleaseIdentity) ([]catalog.ReleaseOverride, error)
+	}
+}
+
+func (a virtualCatalogHostAdapter) LookupReleaseOverrides(ctx context.Context, ids []catalog.ReleaseIdentity) ([]catalog.ReleaseOverride, error) {
+	if a.overrides == nil {
+		return nil, errors.New("release override reader is not configured")
+	}
+	return a.overrides.LookupReleaseOverrides(ctx, ids)
 }
 
 func (a virtualCatalogHostAdapter) UpsertVirtualMedia(ctx context.Context, installationID int, req catalog.VirtualMedia) (*catalog.VirtualMediaResult, error) {

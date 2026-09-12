@@ -2558,6 +2558,12 @@ func (s *MetadataService) persistItemAndProviderIDsOnceTx(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// Exclusive content lock before the first item write: release readers
+	// take this lock shared before their item-row locks, so taking it here
+	// first keeps writer and reader orders identical (content before rows).
+	if err := catalog.LockReleaseContent(ctx, tx, item.ContentID, true); err != nil {
+		return fmt.Errorf("lock release content for metadata persist: %w", err)
+	}
 	if err := itemRepo.UpsertTx(ctx, tx, item); err != nil {
 		return fmt.Errorf("upserting item: %w", err)
 	}

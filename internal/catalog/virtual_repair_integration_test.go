@@ -97,7 +97,7 @@ func TestCollectionSchedulerRepairsAcceptedVirtualMember(t *testing.T) {
 		INSERT INTO media_folders(id,name,type,enabled) VALUES(3904,'Recovery','movies',true);
 		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config,sync_schedule,next_sync_at) VALUES('scheduled-repair','scheduled-repair','Recovery','tmdb',3904,'{"mode":"tmdb_preset","preset":"popular","virtual_playback":true}','0 * * * *',NOW()-INTERVAL '1 hour');
 		INSERT INTO library_collection_libraries(collection_id,library_id) VALUES('scheduled-repair',3904);
-		INSERT INTO media_items(content_id,type,title,sort_title,tmdb_id,status) VALUES('movie-tmdb-3904','movie','Recovery','Recovery','3904','matched');
+		INSERT INTO media_items(content_id,type,title,sort_title,tmdb_id,status,year) VALUES('movie-tmdb-3904','movie','Recovery','Recovery','3904','matched',2000);
 		INSERT INTO media_item_libraries(content_id,media_folder_id) VALUES('movie-tmdb-3904',3904);
 		INSERT INTO library_collection_items(collection_id,media_item_id,position) VALUES('scheduled-repair','movie-tmdb-3904',0)`); err != nil {
 		t.Fatal(err)
@@ -116,6 +116,7 @@ func TestCollectionSchedulerRepairsAcceptedVirtualMember(t *testing.T) {
 	})
 	collections := NewLibraryCollectionRepository(pool)
 	service := NewLibraryCollectionService(collections, NewItemRepository(pool), NewLibraryItemRepository(pool), nil)
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{3904: true}}
 	service.TMDBCollections = &mockTMDBFailSyncFetcher{entries: []TMDBCollectionEntry{{ID: 3904, MediaType: "movie", Title: "Recovery", ReleaseDate: "2000-01-01"}}}
 	var calls int
 	service.VirtualVariants = func(context.Context, string, string) ([]VirtualPlaybackVariant, error) {
@@ -249,6 +250,7 @@ func TestCollectionSyncFetchFailureAndNormalAcceptance(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := NewLibraryCollectionService(NewLibraryCollectionRepository(pool), NewItemRepository(pool), NewLibraryItemRepository(pool), nil)
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{969: true}}
 	fetcher := &mockTMDBFailSyncFetcher{err: errors.New("source unavailable"), entries: []TMDBCollectionEntry{{ID: 969, MediaType: "movie", Title: "Fresh", ReleaseDate: "2000-01-01"}}}
 	service.TMDBCollections = fetcher
 	service.VirtualVariants = func(context.Context, string, string) ([]VirtualPlaybackVariant, error) {
@@ -269,6 +271,19 @@ func TestCollectionSyncFetchFailureAndNormalAcceptance(t *testing.T) {
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM library_collection_items member JOIN virtual_media_file_source_claims claim ON claim.content_id=member.media_item_id AND claim.source_key='collection:atomic-sync' WHERE member.collection_id='atomic-sync' AND claim.staged_until IS NULL`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("accepted claims: count=%d error=%v", count, err)
+	}
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{err: context.DeadlineExceeded}
+	if _, err := service.SyncCollectionWithOptions(ctx, "atomic-sync", SyncCollectionOptions{SkipCollage: true}); !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("expected release lookup failure, got %v", err)
+	}
+	for _, query := range []string{
+		`SELECT count(*) FROM library_collection_items WHERE collection_id='atomic-sync'`,
+		`SELECT count(*) FROM virtual_media_file_source_claims WHERE source_key='collection:atomic-sync'`,
+		`SELECT count(*) FROM media_files WHERE content_id='movie-tmdb-969'`,
+	} {
+		if err := pool.QueryRow(ctx, query).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("release outage changed accepted state: count=%d error=%v", count, err)
+		}
 	}
 }
 
@@ -732,6 +747,7 @@ func TestEnsureCollectionItemMaterialized_PreservesLocalFiles(t *testing.T) {
 		Type:      "movie",
 		Title:     "Local Preserved Movie",
 		SortTitle: "Local Preserved Movie",
+		Year:      2020,
 		TmdbID:    "991",
 		Status:    "matched",
 	}
@@ -754,6 +770,7 @@ func TestEnsureCollectionItemMaterialized_PreservesLocalFiles(t *testing.T) {
 	repo := NewItemRepository(pool)
 	collRepo := NewLibraryCollectionRepository(pool)
 	service := NewLibraryCollectionService(collRepo, repo, nil, nil)
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{991: true}}
 	service.VirtualVariants = func(_ context.Context, uri, mediaType string) ([]VirtualPlaybackVariant, error) {
 		return []VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
@@ -877,6 +894,7 @@ func TestVirtualCollection_MultiCollectionSharedClaimAndRemoval(t *testing.T) {
 		Type:      "movie",
 		Title:     "Shared Virtual Movie",
 		SortTitle: "Shared Virtual Movie",
+		Year:      2020,
 		TmdbID:    "985",
 		Status:    "matched",
 	}
@@ -894,6 +912,7 @@ func TestVirtualCollection_MultiCollectionSharedClaimAndRemoval(t *testing.T) {
 	repo := NewItemRepository(pool)
 	collRepo := NewLibraryCollectionRepository(pool)
 	service := NewLibraryCollectionService(collRepo, repo, nil, nil)
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{985: true}}
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]VirtualPlaybackVariant, error) {
 		return []VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
@@ -1125,6 +1144,7 @@ func TestVirtualCollection_Concurrency_RepairAndRemove(t *testing.T) {
 		ContentID: movieID,
 		Type:      "movie",
 		Title:     "Concurrent Remove Movie",
+		Year:      2020,
 		TmdbID:    "987",
 		Status:    "matched",
 	}
@@ -1140,6 +1160,7 @@ func TestVirtualCollection_Concurrency_RepairAndRemove(t *testing.T) {
 	repo := NewItemRepository(pool)
 	collRepo := NewLibraryCollectionRepository(pool)
 	service := NewLibraryCollectionService(collRepo, repo, nil, nil)
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{987: true}}
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]VirtualPlaybackVariant, error) {
 		return []VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
@@ -1357,7 +1378,7 @@ func TestVirtualCollection_ProviderFailureResilienceAndStarvation(t *testing.T) 
 		cid := fmt.Sprintf("movie-starve-%02d", i+1)
 		title := fmt.Sprintf("Starve Movie %02d", i+1)
 		tmdbID := fmt.Sprintf("989%02d", i+1)
-		it := &models.MediaItem{ContentID: cid, Type: "movie", Title: title, TmdbID: tmdbID, Status: "matched"}
+		it := &models.MediaItem{ContentID: cid, Type: "movie", Title: title, Year: 2020, TmdbID: tmdbID, Status: "matched"}
 		items[i] = it
 		if err := repo.Upsert(ctx, it); err != nil {
 			t.Fatalf("seed item %d: %v", i, err)
@@ -1377,7 +1398,12 @@ func TestVirtualCollection_ProviderFailureResilienceAndStarvation(t *testing.T) 
 	var providerHealthy atomic.Bool
 	providerHealthy.Store(false)
 
+	checker := &fakeDigitalReleaseChecker{released: map[int]bool{}}
+	for i := 1; i <= 55; i++ {
+		checker.released[98900+i] = true
+	}
 	service := NewLibraryCollectionService(collRepo, repo, nil, nil)
+	service.TMDBDigitalReleases = checker
 	service.VirtualVariants = func(_ context.Context, uri, mediaType string) ([]VirtualPlaybackVariant, error) {
 		// First 50 items (1..50) fail when providerHealthy is false
 		for i := 1; i <= 50; i++ {
@@ -1815,7 +1841,7 @@ func TestEnsureCollectionItemMaterialized_DeduplicatesDesiredVariants(t *testing
 		t.Fatalf("seed collection library: %v", err)
 	}
 
-	item := &models.MediaItem{ContentID: itemID, Type: "movie", Title: "Dedup Movie", TmdbID: "9920", Status: "matched"}
+	item := &models.MediaItem{ContentID: itemID, Type: "movie", Title: "Dedup Movie", Year: 2020, TmdbID: "9920", Status: "matched"}
 	repo := NewItemRepository(pool)
 	if err := repo.Upsert(ctx, item); err != nil {
 		t.Fatalf("seed item: %v", err)
@@ -1828,6 +1854,7 @@ func TestEnsureCollectionItemMaterialized_DeduplicatesDesiredVariants(t *testing
 
 	collRepo := NewLibraryCollectionRepository(pool)
 	service := NewLibraryCollectionService(collRepo, repo, nil, nil)
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{9920: true}}
 	// Return duplicate variants from provider
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]VirtualPlaybackVariant, error) {
 		return []VirtualPlaybackVariant{
@@ -1922,6 +1949,7 @@ func TestVirtualCollection_FailedSyncBeforeMembershipLeavesNoOrphanClaimsOrFiles
 	}
 
 	service := NewLibraryCollectionService(collRepo, repo, nil, nil)
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{9931: true, 9932: true}}
 	service.TMDBCollections = &mockTMDBFailSyncFetcher{
 		entries: []TMDBCollectionEntry{
 			{MediaType: "movie", Title: "New Movie 1", ID: 9931, ReleaseDate: "2020-01-01"},
@@ -2147,7 +2175,12 @@ func TestVirtualCollection_Concurrency_RealSyncAndRepair(t *testing.T) {
 
 	repo := NewItemRepository(pool)
 	collRepo := NewLibraryCollectionRepository(pool)
+	checker := &fakeDigitalReleaseChecker{released: map[int]bool{}}
+	for i := 1; i <= 6; i++ {
+		checker.released[9950+i] = true
+	}
 	service := NewLibraryCollectionService(collRepo, repo, nil, nil)
+	service.TMDBDigitalReleases = checker
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]VirtualPlaybackVariant, error) {
 		return []VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
@@ -2163,7 +2196,7 @@ func TestVirtualCollection_Concurrency_RealSyncAndRepair(t *testing.T) {
 	baseInputs := make([]LibraryCollectionItemInput, 6)
 	for i := 0; i < 6; i++ {
 		cid := fmt.Sprintf("movie-concurrent-%d", i+1)
-		items[i] = &models.MediaItem{ContentID: cid, Type: "movie", Title: fmt.Sprintf("Movie %d", i+1), TmdbID: fmt.Sprintf("995%d", i+1), Status: "matched"}
+		items[i] = &models.MediaItem{ContentID: cid, Type: "movie", Title: fmt.Sprintf("Movie %d", i+1), Year: 2020, TmdbID: fmt.Sprintf("995%d", i+1), Status: "matched"}
 		if err := repo.Upsert(ctx, items[i]); err != nil {
 			t.Fatalf("seed item %d: %v", i, err)
 		}
@@ -3006,6 +3039,7 @@ func TestVirtualCollection_FailedCleanupPreservesAcceptedAndForeignClaims(t *tes
 	itemRepo := NewItemRepository(pool)
 	collRepo := NewLibraryCollectionRepository(pool)
 	service := NewLibraryCollectionService(collRepo, itemRepo, NewLibraryItemRepository(pool), nil)
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{3005: true, 3006: true, 3007: true}}
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]VirtualPlaybackVariant, error) {
 		return []VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
@@ -3017,7 +3051,7 @@ func TestVirtualCollection_FailedCleanupPreservesAcceptedAndForeignClaims(t *tes
 		{keptID, "3006"},
 		{foreignID, "3007"},
 	} {
-		if err := itemRepo.Upsert(ctx, &models.MediaItem{ContentID: tc.id, Type: "movie", Title: tc.id, SortTitle: tc.id, TmdbID: tc.tmdbID, Status: "matched"}); err != nil {
+		if err := itemRepo.Upsert(ctx, &models.MediaItem{ContentID: tc.id, Type: "movie", Title: tc.id, SortTitle: tc.id, Year: 2020, TmdbID: tc.tmdbID, Status: "matched"}); err != nil {
 			t.Fatalf("seed item %s: %v", tc.id, err)
 		}
 	}

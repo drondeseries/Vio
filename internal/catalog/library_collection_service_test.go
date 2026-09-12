@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -594,13 +595,23 @@ func TestTraktCandidatesByPriority_MovieUsesTMDBBeforeIMDb(t *testing.T) {
 func TestCollectionPreparationDoesNotRequireRepository(t *testing.T) {
 	tracker := &collectionVirtualCreationTracker{}
 	ctx := context.WithValue(context.Background(), collectionVirtualCreationTrackerKey{}, tracker)
-	service := &LibraryCollectionService{VirtualVariants: func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
-		return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
-	}}
+	service := &LibraryCollectionService{
+		VirtualVariants: func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+			return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+		},
+		TMDBDigitalReleases: &fakeDigitalReleaseChecker{released: map[int]bool{100: true}},
+	}
 	collection := &models.LibraryCollection{ID: "prepared", LibraryIDs: []int{1}, SourceConfig: json.RawMessage(`{"virtual_playback":true}`)}
-	item, err := service.createVirtualCollectionItem(ctx, collection, "movie", "Prepared", 2000, "tt1234567", 0, 0)
+	releaseDate := time.Now().UTC().Format("2006") + "-01-01"
+	if service.releaseGate(ctx).skipTheatricalMovie(ctx, 100, "", "Prepared", time.Now().UTC().Year(), releaseDate) {
+		t.Fatal("released movie skipped")
+	}
+	item, err := service.createVirtualCollectionItem(ctx, collection, "movie", "Prepared", time.Now().UTC().Year(), "tt1234567", 100, 0, releaseDate)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if item.ReleaseDate == nil || *item.ReleaseDate != releaseDate || service.TMDBDigitalReleases.(*fakeDigitalReleaseChecker).calls[100] != 1 {
+		t.Fatal("release metadata or verified evidence was lost during preparation")
 	}
 	if got := tracker.items[item.ContentID]; got.item == nil || len(got.variants) != 1 {
 		t.Fatalf("prepared state = %+v", got)
@@ -683,13 +694,65 @@ func TestAcceptPreparedItemsDisabledPlaybackClearsRetainedClaims(t *testing.T) {
 	}
 }
 
+// fakeTMDBPresetFetcher is a stand-in for the TMDB preset adapter in tests
+// that exercise sync gating without provider access.
+type fakeTMDBPresetFetcher struct {
+	entries []TMDBCollectionEntry
+	err     error
+}
+
+func (f *fakeTMDBPresetFetcher) GetCollectionPreset(_ context.Context, _, _, _ string, _ int) ([]TMDBCollectionEntry, error) {
+	return f.entries, f.err
+}
+
+func TestTMDBPresetSyncKeepsPhysicalMovieDuringProviderOutage(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.WithValue(context.Background(), collectionVirtualCreationTrackerKey{}, &collectionVirtualCreationTracker{})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(3201,'Physical','movies',true);
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+		VALUES('preset-physical','preset-physical','Physical','manual',3201,'{"virtual_playback":true}');
+		INSERT INTO library_collection_libraries(collection_id,library_id) VALUES('preset-physical',3201);
+		INSERT INTO media_items(content_id,type,title,sort_title,status,tmdb_id,imdb_id)
+		VALUES('movie-physical-keep','movie','Physical Keep','Physical Keep','matched','424242','tt4242424');
+		INSERT INTO media_item_libraries(content_id,media_folder_id) VALUES('movie-physical-keep',3201);
+		INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container)
+		VALUES('movie-physical-keep',3201,'/local/keep.mkv',1024,'mkv')`); err != nil {
+		t.Fatalf("seed physical movie: %v", err)
+	}
+	service := NewLibraryCollectionService(NewLibraryCollectionRepository(pool), NewItemRepository(pool), NewLibraryItemRepository(pool), nil)
+	service.TMDBCollections = &fakeTMDBPresetFetcher{entries: []TMDBCollectionEntry{{
+		ID: 424242, MediaType: "movie", Title: "Physical Keep",
+		IMDbID: "tt4242424", ReleaseDate: "2010-05-15",
+	}}}
+	// The home-release provider is down: incomplete evidence must not evict
+	// a locally playable member.
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{err: errors.New("tmdb down")}
+	collection := &models.LibraryCollection{ID: "preset-physical", LibraryID: 3201, LibraryIDs: []int{3201}, CollectionType: "manual", SourceConfig: json.RawMessage(`{"virtual_playback":true}`)}
+	run, err := service.syncTMDBPresetCollection(ctx, collection, libraryCollectionSourceConfig{Preset: "popular", MediaType: "movie"}, SyncCollectionOptions{SkipCollage: true})
+	if err != nil {
+		t.Fatalf("preset sync failed: %v", err)
+	}
+	if run.Message != "Matched 1 of 1 entries" {
+		t.Fatalf("run message = %q, want the physical member retained", run.Message)
+	}
+	var members int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM library_collection_items WHERE collection_id='preset-physical' AND media_item_id='movie-physical-keep'`).Scan(&members); err != nil {
+		t.Fatal(err)
+	}
+	if members != 1 {
+		t.Fatal("provider outage evicted a physical collection member")
+	}
+}
+
 func TestMaterializeVirtualPlaybackPropagatesError(t *testing.T) {
 	service := &LibraryCollectionService{
 		VirtualVariants: func(_ context.Context, _, _ string) ([]VirtualPlaybackVariant, error) {
 			return nil, errors.New("plugin connection failure")
 		},
+		TMDBDigitalReleases: &fakeDigitalReleaseChecker{released: map[int]bool{100: true}},
 	}
-	item := &models.MediaItem{Type: "movie", ImdbID: "tt1234567", TmdbID: "100", Title: "Seeking a Friend"}
+	item := &models.MediaItem{Type: "movie", ImdbID: "tt1234567", TmdbID: "100", Title: "Seeking a Friend", Year: 2012}
 	contentID, _ := virtualPlaybackContentID(item)
 	item.ContentID = contentID
 
@@ -701,5 +764,367 @@ func TestMaterializeVirtualPlaybackPropagatesError(t *testing.T) {
 	err := service.materializeVirtualPlayback(context.Background(), collection, item)
 	if err == nil || !strings.Contains(err.Error(), "getting virtual profile variants: plugin connection failure") {
 		t.Fatalf("expected getting virtual profile variants error, got: %v", err)
+	}
+}
+
+func TestCollectionManualAndRepairReleaseErrorsPrecedeStorage(t *testing.T) {
+	service := &LibraryCollectionService{TMDBDigitalReleases: &fakeDigitalReleaseChecker{err: context.DeadlineExceeded}}
+	collection := &models.LibraryCollection{ID: "release-failure", LibraryIDs: []int{1}, SourceConfig: json.RawMessage(`{"virtual_playback":true}`)}
+	item := &models.MediaItem{ContentID: "movie-tmdb-100", Type: "movie", Title: "Released", TmdbID: "100", Year: 2000}
+	for _, membership := range []bool{false, true} {
+		if _, err := service.EnsureCollectionItemMaterializedWithOptions(context.Background(), collection, item, VirtualMaterializeOptions{RequireMembership: membership}); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("membership=%v: lookup failure was lost or storage accessed: %v", membership, err)
+		}
+	}
+}
+
+func TestEnsureCollectionItemMaterializedRejectsFutureDatedMovie(t *testing.T) {
+	service := &LibraryCollectionService{
+		VirtualVariants: func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+			return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+		},
+	}
+	futureYear := time.Now().Year() + 2
+	item := &models.MediaItem{Type: "movie", ImdbID: "tt9999999", Title: "Future Movie", Year: futureYear}
+	contentID, _ := virtualPlaybackContentID(item)
+	item.ContentID = contentID
+
+	collection := &models.LibraryCollection{
+		ID:           "test-collection",
+		LibraryIDs:   []int{1},
+		SourceConfig: json.RawMessage(`{"virtual_playback": true}`),
+	}
+	err := service.materializeVirtualPlayback(context.Background(), collection, item)
+	if err == nil || !strings.Contains(err.Error(), "movie is not yet released") {
+		t.Fatalf("expected future movie to be rejected, got: %v", err)
+	}
+}
+
+func TestEnsureCollectionItemMaterializedChecksDigitalReleasesWhenConfigured(t *testing.T) {
+	checker := &fakeDigitalReleaseChecker{released: map[int]bool{100: false, 200: true}}
+	service := &LibraryCollectionService{
+		TMDBDigitalReleases: checker,
+		VirtualVariants: func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+			return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+		},
+	}
+	collection := &models.LibraryCollection{
+		ID:           "test-collection",
+		LibraryIDs:   []int{1},
+		SourceConfig: json.RawMessage(`{"virtual_playback": true}`),
+	}
+
+	unreleased := &models.MediaItem{Type: "movie", ImdbID: "tt100", TmdbID: "100", Title: "Theatrical Only", Year: 2024}
+	unreleased.ContentID, _ = virtualPlaybackContentID(unreleased)
+	if err := service.materializeVirtualPlayback(context.Background(), collection, unreleased); err == nil || !strings.Contains(err.Error(), "movie has no confirmed home release") {
+		t.Fatalf("expected unreleased movie to be rejected, got: %v", err)
+	}
+
+	tracker := &collectionVirtualCreationTracker{}
+	ctx := context.WithValue(context.Background(), collectionVirtualCreationTrackerKey{}, tracker)
+	released := &models.MediaItem{Type: "movie", ImdbID: "tt200", TmdbID: "200", Title: "Digitally Released", Year: 2024}
+	released.ContentID, _ = virtualPlaybackContentID(released)
+	res, err := service.EnsureCollectionItemMaterializedWithOptions(ctx, collection, released, VirtualMaterializeOptions{RequireMembership: false})
+	if err != nil {
+		t.Fatalf("expected released movie to materialize, got: %v", err)
+	}
+	if res.ContentID != released.ContentID {
+		t.Fatalf("materialize result ContentID = %q, want %q", res.ContentID, released.ContentID)
+	}
+}
+
+func TestCollectionAcceptanceBlocksAliasAttachedAfterPreparation(t *testing.T) {
+	sfx := uniqueReleaseSuffix(t)
+	tmdbID := "4244" + sfx
+	imdbID := "tt424244" + sfx[:6]
+	movieID := "movie-tmdb-" + tmdbID
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(972,'AliasRace','movies',true);
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+		VALUES('alias-race','alias-race','Alias Race','manual',972,'{"virtual_playback":true}');
+		INSERT INTO library_collection_libraries(collection_id,library_id) VALUES('alias-race',972);
+		INSERT INTO media_items(content_id,type,title,sort_title,status,tmdb_id)
+		VALUES('`+movieID+`','movie','Alias Race','Alias Race','matched','`+tmdbID+`');
+		INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,probe_source,virtual_owner_installation_id)
+		VALUES('`+movieID+`',972,'virtual://movie/`+tmdbID+`?profile=1080p',0,'virtual','virtual_collection',11)`); err != nil {
+		t.Fatalf("seed virtual member: %v", err)
+	}
+	service := NewLibraryCollectionService(NewLibraryCollectionRepository(pool), NewItemRepository(pool), NewLibraryItemRepository(pool), nil)
+	tmdbInt, err := strconv.Atoi(tmdbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{tmdbInt: true}}
+	service.VirtualVariants = func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+		return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+	}
+	collection := &models.LibraryCollection{ID: "alias-race", LibraryID: 972, LibraryIDs: []int{972}, CollectionType: "manual", SourceConfig: json.RawMessage(`{"virtual_playback":true}`)}
+	tracker := &collectionVirtualCreationTracker{}
+	prepCtx := context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, tracker)
+	item, err := service.items.GetByID(ctx, movieID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.EnsureCollectionItemMaterializedWithOptions(prepCtx, collection, item, VirtualMaterializeOptions{RequireMembership: false}); err != nil {
+		t.Fatalf("preparation failed: %v", err)
+	}
+	// Between preparation and acceptance, enrichment attaches an IMDb alias
+	// that already carries a future override. Acceptance must observe the
+	// current alias set rather than the prepared snapshot.
+	if _, err := pool.Exec(ctx, `
+		UPDATE media_items SET imdb_id='`+imdbID+`' WHERE content_id='`+movieID+`';
+		INSERT INTO media_item_provider_ids(content_id,item_type,provider,provider_id)
+		VALUES('`+movieID+`','movie','imdb','`+imdbID+`');
+		INSERT INTO verified_release_override_history
+		(media_type,provider,provider_id,season_number,episode_number,revision,action,release_at,evidence_note,actor_account_id)
+		VALUES('movie','imdb','`+imdbID+`',0,0,1,'set','2099-01-01T00:00:00Z','verified future',1)`); err != nil {
+		t.Fatalf("attach alias with future override: %v", err)
+	}
+	// Acceptance must refuse the stale preparation with a retryable
+	// conflict rather than deciding on the changed alias set.
+	err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
+	if err == nil || !errors.Is(err, ErrReleaseOverrideConflict) && !strings.Contains(err.Error(), "alias set changed") {
+		t.Fatalf("acceptance missed the attached alias: %v", err)
+	}
+	// Fresh preparation observes the attached future alias and blocks.
+	tracker2 := &collectionVirtualCreationTracker{}
+	prepCtx2 := context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, tracker2)
+	item2, err := service.items.GetByID(ctx, movieID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.EnsureCollectionItemMaterializedWithOptions(prepCtx2, collection, item2, VirtualMaterializeOptions{RequireMembership: false}); err == nil {
+		t.Fatal("expected repreparation to block on the attached future override")
+	}
+}
+
+func TestTMDBPresetSyncUsesStoredAliasOutsideTargetLibrary(t *testing.T) {
+	sfx := uniqueReleaseSuffix(t)
+	tmdbID := "4251" + sfx
+	imdbID := "tt4251" + sfx[:6]
+	movieID := "movie-tmdb-" + tmdbID
+	tmdbInt, err := strconv.Atoi(tmdbID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.WithValue(context.Background(), collectionVirtualCreationTrackerKey{}, &collectionVirtualCreationTracker{})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(3202,'Elsewhere','movies',true),(3203,'Target','movies',true);
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+		VALUES('preset-alias','preset-alias','Alias','manual',3203,'{"virtual_playback":true}');
+		INSERT INTO library_collection_libraries(collection_id,library_id) VALUES('preset-alias',3203);
+		INSERT INTO media_items(content_id,type,title,sort_title,status,tmdb_id,imdb_id)
+		VALUES('`+movieID+`','movie','Elsewhere Movie','Elsewhere Movie','matched','`+tmdbID+`','`+imdbID+`');
+		INSERT INTO media_item_libraries(content_id,media_folder_id) VALUES('`+movieID+`',3202);
+		INSERT INTO verified_release_override_history
+		(media_type,provider,provider_id,season_number,episode_number,revision,action,release_at,evidence_note,actor_account_id)
+		VALUES('movie','imdb','`+imdbID+`',0,0,1,'set','2020-01-01T00:00:00Z','verified past',1)`); err != nil {
+		t.Fatalf("seed out-of-library movie with past alias override: %v", err)
+	}
+	service := NewLibraryCollectionService(NewLibraryCollectionRepository(pool), NewItemRepository(pool), NewLibraryItemRepository(pool), nil)
+	// The TMDB source entry carries no IMDb alias and the provider reports
+	// theatrical-only; the stored past alias outside the target library
+	// must still permit virtual materialization into it.
+	service.TMDBCollections = &fakeTMDBPresetFetcher{entries: []TMDBCollectionEntry{{
+		ID: tmdbInt, MediaType: "movie", Title: "Elsewhere Movie", ReleaseDate: "2010-05-15",
+	}}}
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{tmdbInt: false}}
+	service.VirtualVariants = func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+		return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+	}
+	collection := &models.LibraryCollection{ID: "preset-alias", LibraryID: 3203, LibraryIDs: []int{3203}, CollectionType: "manual", SourceConfig: json.RawMessage(`{"virtual_playback":true}`)}
+	run, err := service.syncTMDBPresetCollection(ctx, collection, libraryCollectionSourceConfig{Preset: "popular", MediaType: "movie", VirtualPlayback: true}, SyncCollectionOptions{SkipCollage: true})
+	if err != nil {
+		t.Fatalf("preset sync failed: %v", err)
+	}
+	if run.Message != "Matched 1 of 1 entries" {
+		t.Fatalf("run message = %q, want the stored alias to permit", run.Message)
+	}
+}
+
+func TestMultiItemAcceptanceCompletesWithConcurrentOverrideMutation(t *testing.T) {
+	sfx := uniqueReleaseSuffix(t)
+	tmdbA := "4252" + sfx
+	tmdbB := "4253" + sfx
+	movieA := "movie-tmdb-" + tmdbA
+	movieB := "movie-tmdb-" + tmdbB
+	tmdbIntA, err := strconv.Atoi(tmdbA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmdbIntB, err := strconv.Atoi(tmdbB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(3204,'MultiDebt','movies',true);
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+		VALUES('multi-debt','multi-debt','Multi Debt','manual',3204,'{"virtual_playback":true}');
+		INSERT INTO library_collection_libraries(collection_id,library_id) VALUES('multi-debt',3204);
+		INSERT INTO media_items(content_id,type,title,sort_title,status,tmdb_id)
+		VALUES('`+movieA+`','movie','Debt A','Debt A','matched','`+tmdbA+`'),
+		      ('`+movieB+`','movie','Debt B','Debt B','matched','`+tmdbB+`');
+		INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,probe_source,virtual_owner_installation_id)
+		VALUES('`+movieA+`',3204,'virtual://movie/`+tmdbA+`?profile=1080p',0,'virtual','virtual_collection',11),
+		      ('`+movieB+`',3204,'virtual://movie/`+tmdbB+`?profile=1080p',0,'virtual','virtual_collection',11);
+		INSERT INTO users(username,role,enabled) VALUES('override-multi-`+sfx+`','admin',true)`); err != nil {
+		t.Fatalf("seed multi-item fixtures: %v", err)
+	}
+	var actor int
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE username='override-multi-`+sfx+`'`).Scan(&actor); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, actor) })
+	newService := func() *LibraryCollectionService {
+		service := NewLibraryCollectionService(NewLibraryCollectionRepository(pool), NewItemRepository(pool), NewLibraryItemRepository(pool), nil)
+		service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{tmdbIntA: true, tmdbIntB: true}}
+		service.VirtualVariants = func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+			return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+		}
+		return service
+	}
+	collection := &models.LibraryCollection{ID: "multi-debt", LibraryID: 3204, LibraryIDs: []int{3204}, CollectionType: "manual", SourceConfig: json.RawMessage(`{"virtual_playback":true}`)}
+	prepare := func(t *testing.T) (context.Context, *LibraryCollectionService) {
+		t.Helper()
+		service := newService()
+		tracker := &collectionVirtualCreationTracker{}
+		prepCtx := context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, tracker)
+		for _, id := range []string{movieA, movieB} {
+			item, err := service.items.GetByID(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.EnsureCollectionItemMaterializedWithOptions(prepCtx, collection, item, VirtualMaterializeOptions{RequireMembership: false}); err != nil {
+				t.Fatalf("prepare %s: %v", id, err)
+			}
+		}
+		return prepCtx, service
+	}
+	isDeadlock := func(err error) bool {
+		return err != nil && strings.Contains(strings.ToLower(err.Error()), "deadlock")
+	}
+	// Concurrent mutation of B's identity while acceptance runs: every
+	// participant must complete; only deadlock errors fail this phase.
+	prepCtx, service := prepare(t)
+	done := make(chan error, 4)
+	go func() {
+		done <- service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieA}, {MediaItemID: movieB}})
+	}()
+	for i := 0; i < 3; i++ {
+		go func() {
+			_, err := NewReleaseOverrideRepository(pool).Mutate(context.Background(), actor, ReleaseOverrideMutation{
+				ReleaseIdentity: ReleaseIdentity{MediaType: "movie", Provider: "tmdb", ProviderID: tmdbB},
+				ReleaseAt:       "2099-01-01",
+				EvidenceNote:    "verified future",
+			}, false)
+			done <- err
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		select {
+		case err := <-done:
+			if isDeadlock(err) {
+				t.Fatalf("deadlock between acceptance and override mutation: %v", err)
+			}
+		case <-time.After(120 * time.Second):
+			t.Fatal("acceptance/mutation did not complete")
+		}
+	}
+	// Convergence is deterministic: B carries a committed future override
+	// (exactly one of the racing mutations wins revision 0->1), so fresh
+	// preparation must refuse B while A still prepares, and the winning
+	// mutation's debt enqueue must have landed for B.
+	service3 := newService()
+	tracker3 := &collectionVirtualCreationTracker{}
+	prepCtx3 := context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, tracker3)
+	itemA, err := service3.items.GetByID(ctx, movieA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service3.EnsureCollectionItemMaterializedWithOptions(prepCtx3, collection, itemA, VirtualMaterializeOptions{RequireMembership: false}); err != nil {
+		t.Fatalf("reprepare A: %v", err)
+	}
+	itemB, err := service3.items.GetByID(ctx, movieB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service3.EnsureCollectionItemMaterializedWithOptions(prepCtx3, collection, itemB, VirtualMaterializeOptions{RequireMembership: false}); err == nil {
+		t.Fatal("expected the committed future override to block B on convergence")
+	}
+	var debts int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM metadata_refresh_debt WHERE content_id=$1`, movieB).Scan(&debts); err != nil {
+		t.Fatal(err)
+	}
+	if debts != 1 {
+		t.Fatalf("override mutation debt rows for B = %d, want 1", debts)
+	}
+}
+
+func TestCollectionAcceptanceConflictsOnRemovedPermittingAlias(t *testing.T) {
+	sfx := uniqueReleaseSuffix(t)
+	tmdbID := "4254" + sfx
+	imdbID := "tt4254" + sfx[:6]
+	movieID := "movie-tmdb-" + tmdbID
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(3205,'AliasRemoved','movies',true);
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+		VALUES('alias-removed','alias-removed','Alias Removed','manual',3205,'{"virtual_playback":true}');
+		INSERT INTO library_collection_libraries(collection_id,library_id) VALUES('alias-removed',3205);
+		INSERT INTO media_items(content_id,type,title,sort_title,status,tmdb_id,imdb_id)
+		VALUES('`+movieID+`','movie','Alias Removed','Alias Removed','matched','`+tmdbID+`','`+imdbID+`');
+		INSERT INTO media_item_provider_ids(content_id,item_type,provider,provider_id)
+		VALUES('`+movieID+`','movie','imdb','`+imdbID+`');
+		INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,probe_source,virtual_owner_installation_id)
+		VALUES('`+movieID+`',3205,'virtual://movie/`+tmdbID+`?profile=1080p',0,'virtual','virtual_collection',11);
+		INSERT INTO verified_release_override_history
+		(media_type,provider,provider_id,season_number,episode_number,revision,action,release_at,evidence_note,actor_account_id)
+		VALUES('movie','imdb','`+imdbID+`',0,0,1,'set','2020-01-01T00:00:00Z','verified past',1)`); err != nil {
+		t.Fatalf("seed movie with permitting alias: %v", err)
+	}
+	service := NewLibraryCollectionService(NewLibraryCollectionRepository(pool), NewItemRepository(pool), NewLibraryItemRepository(pool), nil)
+	// The provider is unreachable: only the stored past override can permit.
+	service.TMDBDigitalReleases = &fakeDigitalReleaseChecker{err: errors.New("tmdb down")}
+	service.VirtualVariants = func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+		return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+	}
+	collection := &models.LibraryCollection{ID: "alias-removed", LibraryID: 3205, LibraryIDs: []int{3205}, CollectionType: "manual", SourceConfig: json.RawMessage(`{"virtual_playback":true}`)}
+	tracker := &collectionVirtualCreationTracker{}
+	prepCtx := context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, tracker)
+	item, err := service.items.GetByID(ctx, movieID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.EnsureCollectionItemMaterializedWithOptions(prepCtx, collection, item, VirtualMaterializeOptions{RequireMembership: false}); err != nil {
+		t.Fatalf("preparation via past alias failed: %v", err)
+	}
+	// Enrichment corrects the mistaken alias away before acceptance. The
+	// obsolete past override must not retain authority: acceptance conflicts
+	// instead of materializing without current evidence.
+	if _, err := pool.Exec(ctx, `
+		UPDATE media_items SET imdb_id='' WHERE content_id='`+movieID+`';
+		DELETE FROM media_item_provider_ids WHERE content_id='`+movieID+`' AND provider='imdb'`); err != nil {
+		t.Fatalf("remove mistaken alias: %v", err)
+	}
+	err = service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieID}})
+	if err == nil || !errors.Is(err, ErrReleaseOverrideConflict) && !strings.Contains(err.Error(), "alias set changed") {
+		t.Fatalf("acceptance used the removed alias: %v", err)
+	}
+	// Fresh preparation without the alias has neither override nor provider
+	// evidence and must fail closed.
+	tracker2 := &collectionVirtualCreationTracker{}
+	prepCtx2 := context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, tracker2)
+	item2, err := service.items.GetByID(ctx, movieID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.EnsureCollectionItemMaterializedWithOptions(prepCtx2, collection, item2, VirtualMaterializeOptions{RequireMembership: false}); err == nil {
+		t.Fatal("expected fail-closed preparation without alias or evidence")
 	}
 }

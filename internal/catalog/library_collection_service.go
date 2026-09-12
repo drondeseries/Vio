@@ -86,9 +86,6 @@ type TMDBDiscoverFetcher interface {
 	Discover(ctx context.Context, mediaType string, params TMDBDiscoverParams, limit int) ([]TMDBCollectionEntry, error)
 }
 
-// TMDBDigitalReleaseChecker reports whether a TMDB movie has had any Digital,
-// Physical, or TV release. Implementations must fail open: only a definitive
-// false (theatrical-only on record) may gate an entry out.
 type TMDBDigitalReleaseChecker interface {
 	HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error)
 }
@@ -96,54 +93,68 @@ type TMDBDigitalReleaseChecker interface {
 // theatricalReleaseGate memoizes digital-release lookups for one sync run so
 // overlapping entries cost a single TMDB call per title.
 type theatricalReleaseGate struct {
-	checker TMDBDigitalReleaseChecker
-	lookup  func(ctx context.Context, tmdbID int) bool
-	memo    map[int]bool
+	checker        TMDBDigitalReleaseChecker
+	lookup         func(ctx context.Context, tmdbID int) (bool, error)
+	lookupProvider func(ctx context.Context, tmdbID int) (bool, error)
+	memo           map[int]bool
+	overrides      ReleaseOverrideLookup
+	// canonicalIDs unions source-entry IDs with a catalog-resident same
+	// movie's IDs. Nil outside collection sync; set by releaseGate.
+	canonicalIDs func(ctx context.Context, tmdbID int, imdbID string) (int, string)
 }
 
-func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker) *theatricalReleaseGate {
+func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker, overrides ...ReleaseOverrideLookup) *theatricalReleaseGate {
 	gate := &theatricalReleaseGate{checker: checker, memo: map[int]bool{}}
-	gate.lookup = func(ctx context.Context, tmdbID int) bool {
+	if len(overrides) > 0 {
+		gate.overrides = overrides[0]
+	}
+	// lookupProvider is provider evidence only: memoized TMDB digital-release
+	// answers with no override evaluation. Override decisions belong to the
+	// callers' validated snapshots.
+	lookupProvider := func(ctx context.Context, tmdbID int) (bool, error) {
 		if cached, ok := gate.memo[tmdbID]; ok {
-			return cached
+			return cached, nil
 		}
-		digital := true // fail open: TMDB outage must not stall a sync
-		if gate.checker != nil {
-			baseCtx := ctx
-			if baseCtx == nil {
-				baseCtx = context.Background()
-			}
-			checkCtx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
-			released, err := gate.checker.HasDigitalRelease(checkCtx, tmdbID)
-			cancel()
-			if err == nil {
-				digital = released
-			}
+		if gate.checker == nil || tmdbID <= 0 {
+			return false, fmt.Errorf("%w: movie home release evidence unavailable", ErrProviderUnavailable)
+		}
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		digital, err := gate.checker.HasDigitalRelease(checkCtx, tmdbID)
+		if err != nil {
+			return false, fmt.Errorf("%w: movie home release lookup: %w", ErrProviderUnavailable, err)
 		}
 		gate.memo[tmdbID] = digital
-		return digital
+		return digital, nil
+	}
+	gate.lookupProvider = lookupProvider
+	// lookup preserves the historical override-aware behavior for direct
+	// callers; release flows decide from validated snapshots and use
+	// lookupProvider for evidence.
+	gate.lookup = func(ctx context.Context, tmdbID int) (bool, error) {
+		if tmdbID > 0 {
+			allowed, active, err := releaseOverrideDecision(ctx, gate.overrides, releaseIdentities("movie", strconv.Itoa(tmdbID), "", "", 0, 0))
+			if err != nil || active {
+				return allowed, err
+			}
+		}
+		return lookupProvider(ctx, tmdbID)
 	}
 	return gate
 }
 
-// isPastTheatricalWindow reports whether a movie's release year or release date
-// definitively places it beyond any plausible theatrical exclusivity window (e.g.
-// older than 180 days or from a prior year), allowing us to skip remote TMDB
-// digital-release queries.
-func isPastTheatricalWindow(year int, releaseDate string) bool {
+func isFutureDate(year int, releaseDate string) bool {
 	now := time.Now().UTC()
-	currentYear := now.Year()
-
 	rd := strings.TrimSpace(releaseDate)
 	if len(rd) >= 10 {
 		rd = rd[:10]
 	}
 	if rd != "" {
 		if t, err := time.Parse("2006-01-02", rd); err == nil {
-			if now.Sub(t) > 180*24*time.Hour {
-				return true
-			}
-			return false
+			return t.After(now)
 		}
 		if len(rd) == 4 && year == 0 {
 			if y, err := strconv.Atoi(rd); err == nil {
@@ -151,32 +162,77 @@ func isPastTheatricalWindow(year int, releaseDate string) bool {
 			}
 		}
 	}
-
-	if year > 0 && year < currentYear-1 {
-		return true
-	}
-	if year > 0 && year < currentYear && now.Month() > time.June {
-		return true
+	if year > 0 {
+		return year > now.Year()
 	}
 	return false
 }
 
-// skipTheatricalMovie reports whether a movie entry must be skipped because it
-// is still theatrical-only. Movies without a TMDB ID cannot be checked and
-// fall through to the caller's existing date gates. Backlog and catalog titles
-// whose theatrical window has long closed bypass TMDB calls entirely.
-func (g *theatricalReleaseGate) skipTheatricalMovie(ctx context.Context, tmdbID int, title string, year int, releaseDate string) bool {
-	if g == nil || g.checker == nil || tmdbID <= 0 {
+// canonicalMovieIDs unions source-entry IDs with a catalog-resident same
+// movie's IDs so a stored permitting alias is visible to the prefilter even
+// when the resident item lives outside the target libraries. Lookup failures
+// degrade to the entry IDs; the authoritative decision still runs later.
+func (s *LibraryCollectionService) canonicalMovieIDs(ctx context.Context, tmdbID int, imdbID string) (int, string) {
+	if s == nil || s.items == nil {
+		return tmdbID, imdbID
+	}
+	tmdbText := ""
+	if tmdbID > 0 {
+		tmdbText = strconv.Itoa(tmdbID)
+	}
+	if tmdbText == "" && imdbID == "" {
+		return tmdbID, imdbID
+	}
+	item, err := s.items.GetByExternalID(ctx, tmdbText, imdbID, "", "movie")
+	if err != nil || item == nil {
+		return tmdbID, imdbID
+	}
+	if tmdbID <= 0 {
+		if n, convErr := strconv.Atoi(strings.TrimSpace(item.TmdbID)); convErr == nil && n > 0 {
+			tmdbID = n
+		}
+	}
+	if imdbID == "" {
+		imdbID = strings.TrimSpace(item.ImdbID)
+	}
+	return tmdbID, imdbID
+}
+
+func (g *theatricalReleaseGate) skipTheatricalMovie(ctx context.Context, tmdbID int, imdbID, title string, year int, releaseDate string) bool {
+	// Union the source entry with a catalog-resident same movie so a stored
+	// permitting alias is visible even outside the target libraries.
+	if g.canonicalIDs != nil {
+		tmdbID, imdbID = g.canonicalIDs(ctx, tmdbID, imdbID)
+	}
+	tmdbText := ""
+	if tmdbID > 0 {
+		tmdbText = strconv.Itoa(tmdbID)
+	}
+	// The prefilter sees the complete source identity set so an override on
+	// any alias (e.g. a past IMDb override for a TMDB-listed entry) applies
+	// before the entry can be rejected.
+	if ids := releaseIdentities("movie", tmdbText, "", imdbID, 0, 0); len(ids) > 0 {
+		allowed, active, err := releaseOverrideDecision(ctx, g.overrides, ids)
+		if err != nil || active {
+			if err != nil && ctx != nil {
+				if tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker); tracker != nil {
+					tracker.err = err
+				}
+			}
+			return err != nil || !allowed
+		}
+	}
+	if isFutureDate(year, releaseDate) {
+		return true
+	}
+	released, err := g.lookupProvider(ctx, tmdbID)
+	if err != nil {
+		// Inconclusive (no TMDB identity or provider failure): do not reject
+		// here. The authoritative materialization decision records the error
+		// if a virtual item is actually created.
 		return false
 	}
-	if isPastTheatricalWindow(year, releaseDate) {
-		return false
-	}
-	if g.lookup(ctx, tmdbID) {
-		return false
-	}
-	slog.DebugContext(ctx, "Collection sync: skipping theatrical-only movie", "component", "catalog", "title", title, "tmdb_id", tmdbID)
-	return true
+	return !released
 }
 
 // TraktCollectionFetcher abstracts the Trakt discovery API.
@@ -252,13 +308,56 @@ type LibraryCollectionService struct {
 }
 
 type collectionVirtualCreationTracker struct {
-	items map[string]preparedCollectionItem
-	err   error
+	items       map[string]preparedCollectionItem
+	err         error
+	releaseGate *theatricalReleaseGate
+}
+
+// movieReleaseIdentities unions an item's scalar external IDs with its
+// stored provider-table aliases for override decisions. Alias-read failures
+// are returned: callers must not decide on a potentially partial set.
+func (s *LibraryCollectionService) movieReleaseIdentities(ctx context.Context, item *models.MediaItem) ([]ReleaseIdentity, error) {
+	if item == nil {
+		return nil, nil
+	}
+	if s == nil || s.collections == nil || s.collections.pool == nil || item.ContentID == "" {
+		return releaseIdentities("movie", item.TmdbID, "", item.ImdbID, 0, 0), nil
+	}
+	return releaseIdentitiesForContent(ctx, s.collections.pool, "movie", item.ContentID, "movie", item.TmdbID, "", item.ImdbID, 0, 0)
+}
+
+// hasPhysicalMovieFiles reports whether the catalog holds a non-virtual
+// file for the item, used as release evidence of last resort.
+func (s *LibraryCollectionService) hasPhysicalMovieFiles(ctx context.Context, item *models.MediaItem) (bool, error) {
+	if s == nil || s.collections == nil || s.collections.pool == nil || item == nil || item.ContentID == "" {
+		return false, nil
+	}
+	return hasPhysicalMediaFiles(ctx, s.collections.pool, item.ContentID)
+}
+
+func (s *LibraryCollectionService) releaseGate(ctx context.Context) *theatricalReleaseGate {
+	var overrides ReleaseOverrideLookup
+	if s.items != nil && s.items.pool != nil {
+		overrides = NewReleaseOverrideRepository(s.items.pool)
+	}
+	newGate := func() *theatricalReleaseGate {
+		gate := newTheatricalReleaseGate(s.TMDBDigitalReleases, overrides)
+		gate.canonicalIDs = s.canonicalMovieIDs
+		return gate
+	}
+	if tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker); tracker != nil {
+		if tracker.releaseGate == nil {
+			tracker.releaseGate = newGate()
+		}
+		return tracker.releaseGate
+	}
+	return newGate()
 }
 
 type preparedCollectionItem struct {
-	item     *models.MediaItem
-	variants []VirtualPlaybackVariant
+	item            *models.MediaItem
+	variants        []VirtualPlaybackVariant
+	releaseSnapshot []ReleaseOverride
 }
 
 type collectionVirtualCreationTrackerKey struct{}
@@ -558,6 +657,60 @@ func (s *LibraryCollectionService) EnsureCollectionItemMaterializedWithOptions(
 	}
 
 	tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker)
+	if item.Type == "movie" {
+		relDate := ""
+		if item.ReleaseDate != nil {
+			relDate = *item.ReleaseDate
+		}
+		gate := s.releaseGate(ctx)
+		// Decide over every known alias (scalars plus provider-table rows)
+		// so a stored alias the source entry omitted cannot bypass an
+		// override recorded against it.
+		movieIDs, err := s.movieReleaseIdentities(ctx, item)
+		if err != nil {
+			return nil, err
+		}
+		// Single decision from the captured entries at one evaluation time.
+		now := time.Now().UTC()
+		opts.releaseSnapshot, err = captureReleaseOverrides(ctx, gate.overrides, movieIDs)
+		if err != nil {
+			return nil, err
+		}
+		allowed, active := decideReleaseOverrides(now, opts.releaseSnapshot)
+		if !active && isFutureDate(item.Year, relDate) {
+			err := fmt.Errorf("%w: movie is not yet released", ErrProviderUnavailable)
+			if tracker != nil {
+				tracker.err = err
+			}
+			return nil, err
+		}
+		tmdbID, _ := strconv.Atoi(item.TmdbID)
+		released, lookupErr := allowed, error(nil)
+		if !active {
+			released, lookupErr = gate.lookupProvider(ctx, tmdbID)
+		}
+		if !active && (lookupErr != nil || !released) {
+			// Possession proves release when provider evidence is
+			// missing or negative. Active overrides still win above.
+			physical, err := s.hasPhysicalMovieFiles(ctx, item)
+			if err != nil {
+				return nil, err
+			}
+			if physical {
+				released, lookupErr = true, nil
+			}
+		}
+		if lookupErr != nil || !released {
+			err := lookupErr
+			if err == nil {
+				err = fmt.Errorf("%w: movie has no confirmed home release", ErrProviderUnavailable)
+			}
+			if tracker != nil {
+				tracker.err = err
+			}
+			return nil, err
+		}
+	}
 	var variants []VirtualPlaybackVariant
 	if s.VirtualVariants != nil {
 		uri, err := virtualPlaybackItemURI(item)
@@ -584,7 +737,7 @@ func (s *LibraryCollectionService) EnsureCollectionItemMaterializedWithOptions(
 			tracker.items = make(map[string]preparedCollectionItem)
 		}
 		copyItem := *item
-		tracker.items[item.ContentID] = preparedCollectionItem{item: &copyItem, variants: variants}
+		tracker.items[item.ContentID] = preparedCollectionItem{item: &copyItem, variants: variants, releaseSnapshot: opts.releaseSnapshot}
 		return &MaterializeResult{ContentID: item.ContentID, MediaType: item.Type}, nil
 	}
 
@@ -782,7 +935,7 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 		if limit != nil && *limit > 0 && len(materializeEntries) > *limit {
 			materializeEntries = materializeEntries[:*limit]
 		}
-		theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
+		theatricalGate := s.releaseGate(ctx)
 		preCandidateSet := make(map[string]struct{})
 		for _, entry := range materializeEntries {
 			itemType := mdbListEntryItemType(entry)
@@ -807,7 +960,7 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 			}
 		}
 		for _, entry := range materializeEntries {
-			if isUnreleasedYearOrDate(entry.ReleaseYear, entry.Released) {
+			if mdbListEntryItemType(entry) != "movie" && isFutureDate(entry.ReleaseYear, entry.Released) {
 				slog.DebugContext(ctx, "MDBList sync: skipping unreleased entry", "component", "catalog", "title", entry.Title, "year", entry.ReleaseYear)
 				continue
 			}
@@ -849,7 +1002,7 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 				}
 				continue
 			}
-			if itemType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, entry.ReleaseYear, entry.Released) {
+			if itemType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.IMDbID, entry.Title, entry.ReleaseYear, entry.Released) {
 				slog.InfoContext(ctx, "MDBList sync: skipping theatrical-only movie", "component", "catalog", "title", entry.Title, "tmdb_id", entry.ID)
 				continue
 			}
@@ -857,6 +1010,9 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 				Type: itemType, Title: entry.Title,
 				SortTitle: entry.Title, Year: entry.ReleaseYear, ImdbID: entry.IMDbID,
 				TmdbID: fmt.Sprintf("%d", entry.ID), Status: "matched",
+			}
+			if entry.Released != "" {
+				item.ReleaseDate = &entry.Released
 			}
 			if entry.ID <= 0 {
 				item.TmdbID = ""
@@ -1078,30 +1234,34 @@ func (s *LibraryCollectionService) syncTMDBPresetCollection(ctx context.Context,
 	duplicateCount := 0
 	scannedEntries := 0
 	limitReached := false
-	theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
+	theatricalGate := s.releaseGate(ctx)
 
 	for i, entry := range results {
 		scannedEntries = i + 1
-		if tmdbEntryIsUnreleased(entry) {
+		if entry.MediaType != "movie" && tmdbEntryIsUnreleased(entry) {
 			slog.DebugContext(ctx, "TMDB preset sync: skipping unreleased entry", "component", "catalog",
 				"rank", i+1, "title", entry.Title, "release_date", entry.ReleaseDate)
 			unmatchedCount++
 			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (release: %s)", entry.Title, entry.ReleaseDate))
 			continue
 		}
-		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, 0, entry.ReleaseDate) {
-			unmatchedCount++
-			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
-			continue
-		}
+		entryYear := tmdbReleaseYear(entry.ReleaseDate)
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
 		}
 		if item == nil {
+			// No library-resident match: the release gate applies only to
+			// new virtual candidates. Existing catalog items (physical or
+			// previously gated virtuals) are accepted without re-gating.
+			if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.IMDbID, entry.Title, entryYear, entry.ReleaseDate) {
+				unmatchedCount++
+				warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
+				continue
+			}
 			if cfg.VirtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID) {
 				var vErr error
-				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, entryYear, entry.IMDbID, entry.ID, entry.TVDBID, entry.ReleaseDate)
 				if vErr != nil {
 					if ctx.Err() != nil {
 						return nil, vErr
@@ -1273,30 +1433,33 @@ func (s *LibraryCollectionService) syncTMDBFranchiseCollection(ctx context.Conte
 	duplicateCount := 0
 	scannedEntries := 0
 	limitReached := false
-	theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
+	theatricalGate := s.releaseGate(ctx)
 
 	for i, entry := range results {
 		scannedEntries = i + 1
-		if tmdbEntryIsUnreleased(entry) {
+		if entry.MediaType != "movie" && tmdbEntryIsUnreleased(entry) {
 			slog.DebugContext(ctx, "TMDB franchise sync: skipping unreleased entry", "component", "catalog",
 				"rank", i+1, "title", entry.Title, "release_date", entry.ReleaseDate)
 			unmatchedCount++
 			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (release: %s)", entry.Title, entry.ReleaseDate))
 			continue
 		}
-		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, 0, entry.ReleaseDate) {
-			unmatchedCount++
-			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
-			continue
-		}
+		entryYear := tmdbReleaseYear(entry.ReleaseDate)
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
 		}
 		if item == nil {
+			// No library-resident match: the release gate applies only to
+			// new virtual candidates.
+			if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.IMDbID, entry.Title, entryYear, entry.ReleaseDate) {
+				unmatchedCount++
+				warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
+				continue
+			}
 			if cfg.VirtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID) {
 				var vErr error
-				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, entryYear, entry.IMDbID, entry.ID, entry.TVDBID, entry.ReleaseDate)
 				if vErr != nil {
 					if ctx.Err() != nil {
 						return nil, vErr
@@ -1479,30 +1642,33 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 	duplicateCount := 0
 	scannedEntries := 0
 	limitReached := false
-	theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
+	theatricalGate := s.releaseGate(ctx)
 
 	for i, entry := range results {
 		scannedEntries = i + 1
-		if tmdbEntryIsUnreleased(entry) {
+		if entry.MediaType != "movie" && tmdbEntryIsUnreleased(entry) {
 			slog.DebugContext(ctx, "TMDB discover sync: skipping unreleased entry", "component", "catalog",
 				"rank", i+1, "title", entry.Title, "release_date", entry.ReleaseDate)
 			unmatchedCount++
 			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (release: %s)", entry.Title, entry.ReleaseDate))
 			continue
 		}
-		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, 0, entry.ReleaseDate) {
-			unmatchedCount++
-			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
-			continue
-		}
+		entryYear := tmdbReleaseYear(entry.ReleaseDate)
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
 		}
 		if item == nil {
+			// No library-resident match: the release gate applies only to
+			// new virtual candidates.
+			if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.IMDbID, entry.Title, entryYear, entry.ReleaseDate) {
+				unmatchedCount++
+				warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
+				continue
+			}
 			if cfg.VirtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID) {
 				var vErr error
-				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, entryYear, entry.IMDbID, entry.ID, entry.TVDBID, entry.ReleaseDate)
 				if vErr != nil {
 					if ctx.Err() != nil {
 						return nil, vErr
@@ -1761,18 +1927,13 @@ func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, c
 	duplicateCount := 0
 	scannedEntries := 0
 	limitReached := false
-	theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
+	theatricalGate := s.releaseGate(ctx)
 
 	for i, entry := range results {
 		scannedEntries = i + 1
-		if isUnreleasedYearOrDate(entry.Year, "") {
+		if entry.MediaType != "movie" && isFutureDate(entry.Year, "") {
 			slog.DebugContext(ctx, "Trakt sync: skipping unreleased entry", "component", "catalog", "title", entry.Title, "year", entry.Year)
 			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (year: %d)", entry.Title, entry.Year))
-			continue
-		}
-		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.TMDBID, entry.Title, entry.Year, "") {
-			unmatchedCount++
-			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
 			continue
 		}
 		item, err := s.resolveTraktEntry(ctx, collection.LibraryIDs, entry)
@@ -1780,6 +1941,13 @@ func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, c
 			return nil, err
 		}
 		if item == nil {
+			// No library-resident match: the release gate applies only to
+			// new virtual candidates.
+			if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.TMDBID, entry.IMDbID, entry.Title, entry.Year, "") {
+				unmatchedCount++
+				warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
+				continue
+			}
 			if virtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.TMDBID, entry.TVDBID) {
 				var vErr error
 				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, entry.Year, entry.IMDbID, entry.TMDBID, entry.TVDBID)
@@ -1887,12 +2055,15 @@ func (s *LibraryCollectionService) recordFailedCollectionSync(ctx context.Contex
 	})
 }
 
-func (s *LibraryCollectionService) createVirtualCollectionItem(ctx context.Context, collection *models.LibraryCollection, mediaType, title string, year int, imdbID string, tmdbID, tvdbID int) (*models.MediaItem, error) {
+func (s *LibraryCollectionService) createVirtualCollectionItem(ctx context.Context, collection *models.LibraryCollection, mediaType, title string, year int, imdbID string, tmdbID, tvdbID int, releaseDate ...string) (*models.MediaItem, error) {
 	itemType := "movie"
 	if mediaType == "show" || mediaType == "tv" || mediaType == "series" {
 		itemType = "series"
 	}
 	item := &models.MediaItem{Type: itemType, Title: title, SortTitle: title, Year: year, ImdbID: strings.TrimSpace(imdbID), Status: "matched"}
+	if len(releaseDate) > 0 && releaseDate[0] != "" {
+		item.ReleaseDate = &releaseDate[0]
+	}
 	if tmdbID > 0 {
 		item.TmdbID = fmt.Sprintf("%d", tmdbID)
 	}
@@ -2239,10 +2410,26 @@ func isUnreleasedYearOrDate(year int, releaseDate string) bool {
 		}
 		if len(rd) == 4 {
 			if y, err := strconv.Atoi(rd); err == nil {
-				return y > currentYear
+				return y >= currentYear
 			}
 		}
+		// Unparseable non-empty date fails closed.
+		return true
 	}
 
-	return year > currentYear
+	if year > 0 {
+		return year >= currentYear
+	}
+	// Undated fails closed.
+	return true
+}
+
+func tmdbReleaseYear(releaseDate string) int {
+	rd := strings.TrimSpace(releaseDate)
+	if len(rd) >= 4 {
+		if y, err := strconv.Atoi(rd[:4]); err == nil && y > 0 {
+			return y
+		}
+	}
+	return 0
 }

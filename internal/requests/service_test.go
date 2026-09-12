@@ -917,6 +917,22 @@ func TestReconcileRequestsRetiresStalledQueuedTargetOnPresence(t *testing.T) {
 
 // Inside the horizon the router still owns the target — presence must not
 // short-circuit a submission that may simply be young.
+func TestReconcileRequestsKeepsMonitoredQueuedTargetOnPresence(t *testing.T) {
+	store, service, _ := seedStalledPresenceRequest(t, StatusQueued, 30*24*time.Hour)
+	store.targets["req-1"][0].ExternalStatus = "monitored"
+	result, err := service.ReconcileRequests(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := store.ListTargets(context.Background(), "req-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Completed != 0 || targets[0].Status != StatusQueued || targets[0].ExternalStatus != "monitored" || store.requests["req-1"].Status != StatusQueued {
+		t.Fatalf("monitored request retired: result=%+v targets=%+v", result, targets)
+	}
+}
+
 func TestReconcileRequestsKeepsRecentQueuedTargetOnPresence(t *testing.T) {
 	store, service, _ := seedStalledPresenceRequest(t, StatusQueued, time.Hour)
 

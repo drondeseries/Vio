@@ -733,8 +733,7 @@ func (r *ItemRepository) FindCollectionItemsMissingVirtualBase(ctx context.Conte
 		              WHERE ep.series_id = mi.content_id
 		                AND ep.season_number > 0
 		                AND ep.episode_number > 0
-		                AND ep.air_date IS NOT NULL
-		                AND ep.air_date <= CURRENT_DATE
+		                AND verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
 		                AND (
 		                    NOT EXISTS (
 		                        SELECT 1 FROM media_files mf
@@ -806,8 +805,7 @@ func (r *ItemRepository) ItemNeedsVirtualMaterialization(ctx context.Context, co
 						WHERE ep.series_id = $1
 						  AND ep.season_number > 0
 						  AND ep.episode_number > 0
-						  AND ep.air_date IS NOT NULL
-						  AND ep.air_date <= CURRENT_DATE
+						  AND verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
 						  AND NOT EXISTS (
 							SELECT 1 FROM media_files mf
 							WHERE mf.episode_id = ep.content_id
@@ -882,8 +880,7 @@ func (r *ItemRepository) CollectionItemNeedsVirtualMaterialization(ctx context.C
 						WHERE ep.series_id = $1
 						  AND ep.season_number > 0
 						  AND ep.episode_number > 0
-						  AND ep.air_date IS NOT NULL
-						  AND ep.air_date <= CURRENT_DATE
+						  AND verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
 						  AND (
 							NOT EXISTS (
 								SELECT 1 FROM media_files mf
@@ -1819,6 +1816,14 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItemWithVariants(ctx context.
 		  )`, item.ContentID); err != nil {
 		return false, fmt.Errorf("marking collection virtual item ownership: %w", err)
 	}
+	// Episode release locks precede the debt write below (see
+	// lockReleaseContentTx): override mutation takes identity locks before
+	// its own debt write, so every path orders locks before debt rows.
+	if mediaType == "series" {
+		if err := materializeVirtualPlaybackEpisodesTx(ctx, tx, item.ContentID); err != nil {
+			return false, err
+		}
+	}
 	// Virtual items are database-only and therefore never pass through the
 	// scanner's normal metadata-refresh enqueue path.  Queue core metadata
 	// enrichment in the same transaction so a newly materialized item gets
@@ -1834,11 +1839,6 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItemWithVariants(ctx context.
 			updated_at = NOW()`, item.ContentID); err != nil {
 		return false, fmt.Errorf("queueing virtual item metadata refresh: %w", err)
 	}
-	if mediaType == "series" {
-		if err := materializeVirtualPlaybackEpisodesTx(ctx, tx, item.ContentID); err != nil {
-			return false, err
-		}
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit virtual item transaction: %w", err)
 	}
@@ -1850,6 +1850,26 @@ type VirtualMaterializeOptions struct {
 	RequireMembership bool
 	accepting         bool
 	sourceConfig      json.RawMessage
+	releaseSnapshot   []ReleaseOverride
+	// deferDebtWrite skips the refresh-debt write so a multi-item caller
+	// can emit all debt rows after every item's release locks and
+	// eligibility decisions complete (see lockReleaseContentTx ordering).
+	deferDebtWrite bool
+}
+
+// queueVirtualItemRefreshDebtTx records metadata-enrichment debt for one
+// content item inside the caller's transaction.
+func queueVirtualItemRefreshDebtTx(ctx context.Context, tx pgx.Tx, contentID string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO metadata_refresh_debt (
+			target_type, content_id, priority, reason_mask, next_refresh_at, updated_at
+		) VALUES ('item', $1, 150, 8, NOW(), NOW())
+		ON CONFLICT (target_type, content_id) DO UPDATE SET
+			priority = GREATEST(metadata_refresh_debt.priority, EXCLUDED.priority),
+			reason_mask = metadata_refresh_debt.reason_mask | EXCLUDED.reason_mask,
+			next_refresh_at = LEAST(metadata_refresh_debt.next_refresh_at, EXCLUDED.next_refresh_at),
+			updated_at = NOW()`, contentID)
+	return err
 }
 
 // EnsureVirtualCollectionItemMaterialized ensures a collection-owned item has its
@@ -1911,6 +1931,14 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 	}
 	virtualPath, err := virtualPlaybackItemURI(item)
 	if err != nil {
+		return nil, err
+	}
+	// Content lock first (see lockReleaseContentTx): alias writers take it
+	// exclusively, so the alias set resolved below cannot change under us.
+	if err := lockReleaseContentTx(ctx, tx, item.ContentID, false); err != nil {
+		return nil, err
+	}
+	if err := validateReleaseSnapshotTx(ctx, tx, opts.releaseSnapshot); err != nil {
 		return nil, err
 	}
 
@@ -2013,8 +2041,10 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 	}
 
 	// Lock 3: Row lock media_items to check existing type and preserve catalog invariants.
-	var existingType string
-	err = tx.QueryRow(ctx, `SELECT type FROM media_items WHERE content_id=$1 FOR UPDATE`, item.ContentID).Scan(&existingType)
+	// Fresh scalar IDs are loaded here (not trusted from the caller) so a
+	// stale prepared item cannot smuggle removed aliases into the gate.
+	var existingType, rowTmdbID, rowImdbID string
+	err = tx.QueryRow(ctx, `SELECT type, COALESCE(tmdb_id,''), COALESCE(imdb_id,'') FROM media_items WHERE content_id=$1 FOR UPDATE`, item.ContentID).Scan(&existingType, &rowTmdbID, &rowImdbID)
 	switch {
 	case err == nil:
 		if existingType != mediaType {
@@ -2024,8 +2054,36 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 		if err := r.UpsertTx(ctx, tx, item); err != nil {
 			return nil, err
 		}
+		rowTmdbID, rowImdbID = item.TmdbID, item.ImdbID
 	default:
 		return nil, fmt.Errorf("checking canonical virtual item: %w", err)
+	}
+
+	// Authoritative movie gate: with the item row locked and alias writers
+	// held out by the content lock, resolve the current full alias set and
+	// require it to match the prepared snapshot. A changed membership is a
+	// retryable conflict: removed aliases must not retain authority, and
+	// added aliases must go through preparation, not silent union.
+	if mediaType == "movie" {
+		movieIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", item.ContentID, "movie", rowTmdbID, "", rowImdbID, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		if len(opts.releaseSnapshot) > 0 || len(movieIDs) > 0 {
+			if len(opts.releaseSnapshot) > 0 && !releaseIdentitySetsEqual(snapshotIdentities(opts.releaseSnapshot), movieIDs) {
+				return nil, fmt.Errorf("%w: release alias set changed after preparation", ErrReleaseOverrideConflict)
+			}
+			fresh, err := captureReleaseOverridesTx(ctx, tx, movieIDs)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateReleaseSnapshotTx(ctx, tx, fresh); err != nil {
+				return nil, err
+			}
+			if allowed, active := decideReleaseOverrides(time.Now().UTC(), fresh); active && !allowed {
+				return nil, fmt.Errorf("%w: verified release override blocks materialization", ErrProviderUnavailable)
+			}
+		}
 	}
 
 	if isMember {
@@ -2338,19 +2396,9 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 		return nil, fmt.Errorf("marking collection virtual reconciliation attempt: %w", err)
 	}
 
-	// Metadata refresh debt
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO metadata_refresh_debt (
-			target_type, content_id, priority, reason_mask, next_refresh_at, updated_at
-		) VALUES ('item', $1, 150, 8, NOW(), NOW())
-		ON CONFLICT (target_type, content_id) DO UPDATE SET
-			priority = GREATEST(metadata_refresh_debt.priority, EXCLUDED.priority),
-			reason_mask = metadata_refresh_debt.reason_mask | EXCLUDED.reason_mask,
-			next_refresh_at = LEAST(metadata_refresh_debt.next_refresh_at, EXCLUDED.next_refresh_at),
-			updated_at = NOW()`, item.ContentID); err != nil {
-		return nil, fmt.Errorf("queueing virtual item metadata refresh: %w", err)
-	}
-
+	// Episode release locks precede the debt write below (see
+	// lockReleaseContentTx): override mutation takes identity locks before
+	// its own debt write, so every path orders locks before debt rows.
 	episodesMaterialized := 0
 	if mediaType == "series" {
 		epCreated, epExisting, distinctEps, epErr := materializeVirtualPlaybackEpisodesDetailedTx(ctx, tx, item.ContentID, collectionID, isMember)
@@ -2360,6 +2408,14 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 		filesCreated += epCreated
 		filesExisting += epExisting
 		episodesMaterialized = distinctEps
+	}
+
+	// Metadata refresh debt. Deferred by multi-item acceptance until every
+	// item's release locks and decisions complete (see lockReleaseContentTx).
+	if !opts.deferDebtWrite {
+		if err := queueVirtualItemRefreshDebtTx(ctx, tx, item.ContentID); err != nil {
+			return nil, fmt.Errorf("queueing virtual item metadata refresh: %w", err)
+		}
 	}
 	return &MaterializeResult{
 		ContentID:            item.ContentID,
@@ -2881,8 +2937,18 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			JOIN episodes ep ON ep.series_id=bases.content_id
 			WHERE ep.season_number>0
 			  AND ep.episode_number>0
-			  AND ep.air_date IS NOT NULL
-			  AND ep.air_date<=CURRENT_DATE
+			  AND (
+			      verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
+			      -- Same local-provenance fallback as materialization:
+			      -- locally proven episodes are releasable without dates.
+			      OR ep.metadata_source='local'
+			      OR EXISTS(
+			          SELECT 1 FROM media_files proven
+			          WHERE proven.episode_id=ep.content_id
+			            AND proven.container<>'virtual'
+			            AND proven.file_path NOT LIKE 'virtual://%'
+			      )
+			  )
 			  AND (
 			      NOT EXISTS (
 			      SELECT 1 FROM media_files mf
@@ -2922,10 +2988,18 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			        AND (collection_claim.source_key = 'collection' OR collection_claim.source_key LIKE 'collection:%')
 			  )
 			  AND (
-			      ep.air_date IS NULL
-			      OR ep.air_date>CURRENT_DATE
+			      NOT COALESCE(verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp(),false)
 			      OR ep.season_number<=0
 			      OR ep.episode_number<=0
+			  )
+			  -- Locally proven episodes keep their files under the same
+			  -- fallback materialization applies; they are not stale.
+			  AND COALESCE(ep.metadata_source,'')<>'local'
+			  AND NOT EXISTS(
+			      SELECT 1 FROM media_files proven
+			      WHERE proven.episode_id=ep.content_id
+			        AND proven.container<>'virtual'
+			        AND proven.file_path NOT LIKE 'virtual://%'
 			  )
 		)
 		SELECT nr.content_id
@@ -3005,6 +3079,12 @@ func materializeVirtualPlaybackEpisodesTx(ctx context.Context, tx pgx.Tx, series
 	return err
 }
 
+// materializeVirtualEpisodesEvalHook runs between release-lock acquisition
+// and eligibility evaluation in episode materialization. It is nil in
+// production; tests use it to interleave concurrent override writes or
+// catalog changes deterministically.
+var materializeVirtualEpisodesEvalHook func()
+
 func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx, seriesID, collectionID string, linkLibraries bool) (filesCreated, filesExisting, distinctEpisodes int, err error) {
 	rows, err := tx.Query(ctx, `
 		SELECT mf.media_folder_id, mf.virtual_owner_installation_id, mf.file_path,
@@ -3083,37 +3163,144 @@ func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx
 		return 0, 0, 0, nil
 	}
 
-	episodeRows, err := tx.Query(ctx, `
-		SELECT content_id, season_number, episode_number
-		FROM episodes
-		WHERE series_id=$1
-		  AND season_number > 0
-		  AND episode_number > 0
-		  AND air_date IS NOT NULL
-		  AND air_date <= CURRENT_DATE
-		ORDER BY season_number, episode_number`, seriesID)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("list released virtual episodes: %w", err)
+	// Content lock first (see lockReleaseContentTx): alias writers take it
+	// exclusively, so the candidate set below cannot gain aliases under us.
+	if err := lockReleaseContentTx(ctx, tx, seriesID, false); err != nil {
+		return 0, 0, 0, err
 	}
 	type episodeCoordinate struct {
 		id      string
 		season  int
 		episode int
 	}
-	var episodes []episodeCoordinate
-	for episodeRows.Next() {
-		var episode episodeCoordinate
-		if err := episodeRows.Scan(&episode.id, &episode.season, &episode.episode); err != nil {
-			episodeRows.Close()
-			return 0, 0, 0, fmt.Errorf("scan released virtual episode: %w", err)
+	// Enumerate the stable candidate set with no release filter, lock every
+	// candidate's identities, then evaluate. Later reads can only shrink
+	// this set: newly eligible episodes wait for their own run instead of
+	// entering under unlocked identities.
+	var candidates []episodeCoordinate
+	candidateRows, err := tx.Query(ctx, `
+		SELECT content_id, season_number, episode_number
+		FROM episodes
+		WHERE series_id=$1 AND season_number > 0 AND episode_number > 0
+		ORDER BY season_number, episode_number`, seriesID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("list virtual episode candidates: %w", err)
+	}
+	for candidateRows.Next() {
+		var candidate episodeCoordinate
+		if err := candidateRows.Scan(&candidate.id, &candidate.season, &candidate.episode); err != nil {
+			candidateRows.Close()
+			return 0, 0, 0, fmt.Errorf("scan virtual episode candidate: %w", err)
 		}
-		episodes = append(episodes, episode)
+		candidates = append(candidates, candidate)
 	}
-	if err := episodeRows.Err(); err != nil {
-		episodeRows.Close()
-		return 0, 0, 0, fmt.Errorf("iterate released virtual episodes: %w", err)
+	if err := candidateRows.Err(); err != nil {
+		candidateRows.Close()
+		return 0, 0, 0, fmt.Errorf("iterate virtual episode candidates: %w", err)
 	}
-	episodeRows.Close()
+	candidateRows.Close()
+	template, err := releaseIdentitiesForContent(ctx, tx, "episode", seriesID, "series", "", "", "", 1, 1)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	byCoordinate := make(map[episodeCoordinate][]ReleaseIdentity, len(candidates))
+	lockIDs := make([]ReleaseIdentity, 0, len(candidates)*len(template))
+	for _, candidate := range candidates {
+		ids := make([]ReleaseIdentity, 0, len(template))
+		for _, t := range template {
+			t.SeasonNumber = candidate.season
+			t.EpisodeNumber = candidate.episode
+			ids = append(ids, t)
+			lockIDs = append(lockIDs, t)
+		}
+		byCoordinate[candidate] = ids
+	}
+	if err := lockReleaseIdentitiesTx(ctx, tx, lockIDs); err != nil {
+		return 0, 0, 0, fmt.Errorf("lock release identities: %w", err)
+	}
+	if materializeVirtualEpisodesEvalHook != nil {
+		materializeVirtualEpisodesEvalHook()
+	}
+	// One captured decision per locked identity at a single evaluation
+	// time; provider/air-date evidence and local fallback apply only where
+	// no active override decides.
+	captured, err := captureReleaseOverridesTx(ctx, tx, lockIDs)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	byIdentity := make(map[ReleaseIdentity]ReleaseOverride, len(captured))
+	for _, o := range captured {
+		byIdentity[o.ReleaseIdentity] = o
+	}
+	now := time.Now().UTC()
+	verdict := make(map[episodeCoordinate]bool, len(candidates))
+	decided := make(map[episodeCoordinate]bool, len(candidates))
+	for candidate, ids := range byCoordinate {
+		entries := make([]ReleaseOverride, 0, len(ids))
+		for _, id := range ids {
+			if o, ok := byIdentity[id]; ok {
+				entries = append(entries, o)
+			}
+		}
+		if allowed, active := decideReleaseOverrides(now, entries); active {
+			verdict[candidate] = allowed
+			decided[candidate] = true
+		}
+	}
+	byID := make(map[string]episodeCoordinate, len(candidates))
+	for _, candidate := range candidates {
+		byID[candidate.id] = candidate
+	}
+	evalRows, err := tx.Query(ctx, `
+		SELECT ep.content_id,
+			COALESCE(verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp(),false),
+			COALESCE(ep.metadata_source='local'
+				OR EXISTS(
+					SELECT 1 FROM media_files mf
+					WHERE mf.episode_id=ep.content_id
+					  AND mf.container<>'virtual'
+					  AND mf.file_path NOT LIKE 'virtual://%'
+				),false)
+		FROM episodes ep
+		WHERE ep.series_id=$1 AND ep.season_number > 0 AND ep.episode_number > 0`, seriesID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("evaluate virtual episode releases: %w", err)
+	}
+	var episodes []episodeCoordinate
+	for evalRows.Next() {
+		var id string
+		var dateReleased, locallyProven bool
+		if err := evalRows.Scan(&id, &dateReleased, &locallyProven); err != nil {
+			evalRows.Close()
+			return 0, 0, 0, fmt.Errorf("scan virtual episode release: %w", err)
+		}
+		candidate, ok := byID[id]
+		if !ok {
+			// Not in the locked candidate set (inserted concurrently):
+			// leave it for its own run.
+			continue
+		}
+		if decided[candidate] {
+			if verdict[candidate] {
+				episodes = append(episodes, candidate)
+			}
+			continue
+		}
+		if dateReleased || locallyProven {
+			episodes = append(episodes, candidate)
+		}
+	}
+	if err := evalRows.Err(); err != nil {
+		evalRows.Close()
+		return 0, 0, 0, fmt.Errorf("iterate virtual episode releases: %w", err)
+	}
+	evalRows.Close()
+	sort.Slice(episodes, func(i, j int) bool {
+		if episodes[i].season != episodes[j].season {
+			return episodes[i].season < episodes[j].season
+		}
+		return episodes[i].episode < episodes[j].episode
+	})
 
 	if len(episodes) == 0 {
 		if err := cleanupStaleVirtualEpisodesTx(ctx, tx, seriesID, collectionID, nil, nil, nil); err != nil {
@@ -5143,6 +5330,14 @@ func lookupExternalIDsSQL() string {
 			JOIN media_item_libraries mil ON mil.content_id = mi.content_id
 			JOIN media_folders mf ON mf.id = mil.media_folder_id
 			WHERE mf.enabled = true
+			  AND EXISTS (
+				SELECT 1 FROM media_files mf_playable
+				WHERE (mf_playable.content_id = mi.content_id
+				       OR EXISTS (SELECT 1 FROM episodes ep WHERE ep.content_id = mf_playable.episode_id AND ep.series_id = mi.content_id))
+				  AND mf_playable.media_folder_id = mil.media_folder_id
+				  AND mf_playable.missing_since IS NULL
+				  AND (mi.type <> 'series' OR mf_playable.episode_id IS NOT NULL)
+			  )
 		),
 		provider_matches AS (
 			SELECT r.query_tmdb_id, mi.content_id, r.provider, mil.media_folder_id::text, mi.title, r.ord,
@@ -5156,6 +5351,14 @@ func lookupExternalIDsSQL() string {
 			JOIN media_item_libraries mil ON mil.content_id = mi.content_id
 			JOIN media_folders mf ON mf.id = mil.media_folder_id
 			WHERE mf.enabled = true
+			  AND EXISTS (
+				SELECT 1 FROM media_files mf_playable
+				WHERE (mf_playable.content_id = mi.content_id
+				       OR EXISTS (SELECT 1 FROM episodes ep WHERE ep.content_id = mf_playable.episode_id AND ep.series_id = mi.content_id))
+				  AND mf_playable.media_folder_id = mil.media_folder_id
+				  AND mf_playable.missing_since IS NULL
+				  AND (mi.type <> 'series' OR mf_playable.episode_id IS NOT NULL)
+			  )
 		)
 		SELECT DISTINCT ON (query_tmdb_id)
 		       query_tmdb_id, content_id, provider, media_folder_id, title

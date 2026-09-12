@@ -49,7 +49,8 @@ type RequestService interface {
 }
 
 type RequestsHandler struct {
-	service RequestService
+	service          RequestService
+	ReleaseOverrides ReleaseOverrideStore
 }
 
 func NewRequestsHandler(service RequestService) *RequestsHandler {
@@ -374,6 +375,8 @@ func (h *RequestsHandler) HandleGetStatus(w http.ResponseWriter, r *http.Request
 		writeRequestServiceError(w, err)
 		return
 	}
+	status.ReleaseDateOverrides = h.ReleaseOverrides != nil
+	status.NeedsReleaseMetadata = h.ReleaseOverrides != nil
 	writeJSON(w, http.StatusOK, status)
 }
 
