@@ -1924,6 +1924,14 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 	result = escalated
 	timings.mark("remux_escalation")
 	appendStartWarningsV3(&result, warnings)
+	// session_transport_commit measures everything startPlannedPlaybackV3 does:
+	// session creation, recipe/subtitle persistence (SaveAttempt is durable
+	// before this mark), route registration, and the transport commit. Nothing
+	// is deferred past it. For the locally-servable identity/direct and
+	// progressive-remux shapes the client URL is /stream/<session>, whose
+	// remux/transcode ffmpeg is started lazily by StreamHandler on the first
+	// request, so no transport spawn or manifest wait is included here. The
+	// mark only covers an eager local HLS/transcode startup for HLS deliveries.
 	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, result, clientInfo)
 	timings.mark("session_transport_commit")
 	if statusErr != nil {
