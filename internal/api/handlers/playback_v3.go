@@ -1750,6 +1750,29 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 	}
 	timings.mark("audio_preference")
 	effectiveFile := requestedFile
+	// downloadedSubtitleInventoryV3 is an indexed read, and the planner appends
+	// the inventory after the effective file's own external and embedded tracks
+	// (BuildSubtitleInventoryV3). A candidate therefore needs its own inventory,
+	// so it cannot be hoisted to a single value across alternates. The same file
+	// can still be planned more than once in one start (a subtitle-miss degrade,
+	// or the transport-failure retry), so memoize by file ID for the duration of
+	// this start instead of re-querying.
+	subtitleInventoryByFileID := map[int][]playback.SubtitleInventoryEntryV3{}
+	subtitleInventoryFor := func(file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
+		if file == nil {
+			return nil
+		}
+		if file.ID != 0 {
+			if inventory, ok := subtitleInventoryByFileID[file.ID]; ok {
+				return inventory
+			}
+		}
+		inventory := h.downloadedSubtitleInventoryV3(r.Context(), file)
+		if file.ID != 0 {
+			subtitleInventoryByFileID[file.ID] = inventory
+		}
+		return inventory
+	}
 	settings, settingsErr := h.plannerSettingsV3Result(r.Context())
 	timings.mark("planner_settings")
 	if err := preflightPlaybackFile(r.Context(), effectiveFile, h.MissingMarker, h.EventsHub); err != nil {
@@ -1769,7 +1792,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 		Request: req, RequestedFile: requestedFile, EffectiveFile: effectiveFile,
 		AudioTrackIndex: audioIndex, Settings: settings,
 		Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(),
-		AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile),
+		AdditionalSubtitles: subtitleInventoryFor(effectiveFile),
 	})
 	timings.mark("planning")
 	if terminalAllowsAlternateFileV3(result.Terminal) && shouldTryAlternateFileV3(req.QualityPreference) && req.FileSelection != playback.FileSelectionExplicitV3 {
@@ -1815,7 +1838,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 					if err := preflightPlaybackFile(r.Context(), candidateFile, h.MissingMarker, h.EventsHub); err != nil {
 						continue
 					}
-					candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateReq, RequestedFile: requestedFile, EffectiveFile: candidateFile, AudioTrackIndex: candidateAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidateFile)})
+					candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateReq, RequestedFile: requestedFile, EffectiveFile: candidateFile, AudioTrackIndex: candidateAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AdditionalSubtitles: subtitleInventoryFor(candidateFile)})
 					// A retryable tone-map discovery failure converts to
 					// transcode_start_failed below; that verdict will not
 					// change for a sibling file, so stop here.
@@ -1861,7 +1884,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 						Request: degradeReq, RequestedFile: requestedFile, EffectiveFile: subtitleMissFile,
 						AudioTrackIndex: subtitleMissAudioIndex, Settings: settings,
 						Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), subtitleMissFile), Now: time.Now(),
-						AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), subtitleMissFile),
+						AdditionalSubtitles: subtitleInventoryFor(subtitleMissFile),
 					})
 					clampPlannerTargetResolution(&degradeResult, subtitleMissFile)
 					if degradeResult.Terminal == nil {
@@ -1958,7 +1981,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 							AudioTrackIndex: alternateAudio, Settings: settings,
 							Registry:        h.transformationRegistryV3(r.Context()),
 							DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), alternate), Now: time.Now(),
-							AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), alternate),
+							AdditionalSubtitles: subtitleInventoryFor(alternate),
 						})
 						clampPlannerTargetResolution(&alternateResult, alternate)
 						if alternateResult.Terminal == nil {
