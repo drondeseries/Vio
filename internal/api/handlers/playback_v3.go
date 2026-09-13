@@ -289,31 +289,53 @@ func (h *PlaybackHandler) transformationRegistryV3(ctx context.Context) *playbac
 	return registry
 }
 
+// v3LocalToneMapNegativeTTL bounds how long an incomplete-but-error-free local
+// probe result is reused before the probe is retried. It mirrors the tonemap
+// package's own probeNegativeTTL so a missing executor that hardware contention
+// hid from one probe is retried on the same cadence there and here.
+const v3LocalToneMapNegativeTTL = 15 * time.Second
+
 // localToneMapCapabilitiesV3 returns a defensive copy of the capabilities
 // validated for the current local FFmpeg, backend, and device configuration.
 func (h *PlaybackHandler) localToneMapCapabilitiesV3(ctx context.Context) (tonemap.Capabilities, error) {
+	capabilities, _, err := h.localToneMapCapabilitiesWithBackendV3(ctx)
+	return capabilities, err
+}
+
+// localToneMapCapabilitiesWithBackendV3 is localToneMapCapabilitiesV3 plus the
+// resolved hardware backend the probe ran against, which the caller needs to
+// judge whether the inventory is complete.
+func (h *PlaybackHandler) localToneMapCapabilitiesWithBackendV3(ctx context.Context) (tonemap.Capabilities, string, error) {
 	cfg := h.playbackConfig()
 	ffmpegPath := playback.ResolveFFmpegPath(cfg.FFmpegPath)
 	hwDevice := strings.TrimSpace(cfg.HWDevice)
 	resolved := playback.ResolveHWAccelWithFFmpegContext(ctx, cfg.HWAccel, cfg.FFmpegPath, hwDevice)
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, resolved, err
 	}
 	probe := tonemap.Probe
 	if h.v3ToneMapProbe != nil {
 		probe = h.v3ToneMapProbe
 	}
 	capabilities, err := probe(ctx, ffmpegPath, resolved, hwDevice)
-	return append(tonemap.Capabilities(nil), capabilities...), err
+	return append(tonemap.Capabilities(nil), capabilities...), resolved, err
 }
 
 // localToneMapCapabilitiesCachedV3 returns the local tone-map inventory,
 // probing at most once per process. It mirrors transformationRegistryV3: the
 // local FFmpeg binary and hardware configuration are fixed for the process
-// lifetime, so a successful probe is reused for every later playback start. A
-// failed probe is deliberately not cached, so a transient failure (a busy
-// encoder, a timeout) is retried by the next caller instead of being frozen
-// for the life of the process.
+// lifetime, so a complete, successful probe is reused for every later playback
+// start.
+//
+// A failed probe is deliberately not cached, so a transient failure (a busy
+// encoder, a timeout) is retried by the next caller instead of being frozen for
+// the life of the process. An error-free but incomplete inventory is treated
+// the same way for a shorter interval: the probe can report a nil error while a
+// configured hardware executor is missing (temporary device contention, a
+// driver that has not finished coming up), and a nil error alone must not freeze
+// that verdict for the process lifetime. Incomplete results are reused only for
+// v3LocalToneMapNegativeTTL so a recovery is picked up within one negative
+// window without every caller re-running the smoke matrix in the meantime.
 //
 // The first caller still pays for the probe on its own context. The startup
 // warmup is expected to have paid it already; when it has not, falling back to
@@ -325,15 +347,35 @@ func (h *PlaybackHandler) localToneMapCapabilitiesCachedV3(ctx context.Context) 
 		h.v3LocalToneMapMu.Unlock()
 		return capabilities, nil
 	}
+	if now := time.Now(); !h.v3LocalToneMapNegativeUntil.IsZero() && now.Before(h.v3LocalToneMapNegativeUntil) {
+		// An incomplete result is still being negative-cached: serve it without
+		// re-running the probe so a burst of starts cannot hammer the encoder.
+		capabilities := append(tonemap.Capabilities(nil), h.v3LocalToneMapCaps...)
+		h.v3LocalToneMapMu.Unlock()
+		return capabilities, nil
+	}
 	h.v3LocalToneMapMu.Unlock()
 
-	capabilities, err := h.localToneMapCapabilitiesV3(ctx)
+	capabilities, resolvedBackend, err := h.localToneMapCapabilitiesWithBackendV3(ctx)
 	if err != nil {
 		return capabilities, err
 	}
+	complete := tonemap.CapabilitiesComplete(capabilities, resolvedBackend)
 	h.v3LocalToneMapMu.Lock()
+	if h.v3LocalToneMapCached {
+		// A concurrent complete probe already won the lifetime cache; keep its
+		// inventory rather than overwriting it with this (possibly older) result.
+		cached := append(tonemap.Capabilities(nil), h.v3LocalToneMapCaps...)
+		h.v3LocalToneMapMu.Unlock()
+		return cached, nil
+	}
 	h.v3LocalToneMapCaps = append(tonemap.Capabilities(nil), capabilities...)
-	h.v3LocalToneMapCached = true
+	if complete {
+		h.v3LocalToneMapCached = true
+		h.v3LocalToneMapNegativeUntil = time.Time{}
+	} else {
+		h.v3LocalToneMapNegativeUntil = time.Now().Add(v3LocalToneMapNegativeTTL)
+	}
 	h.v3LocalToneMapMu.Unlock()
 	return capabilities, nil
 }

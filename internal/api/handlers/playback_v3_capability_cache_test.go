@@ -22,10 +22,7 @@ func TestHLSToneMapCapabilityInventoryV3CachesLocalProbeAcrossStarts(t *testing.
 	var probes atomic.Int32
 	handler.v3ToneMapProbe = func(context.Context, string, string, string) (tonemap.Capabilities, error) {
 		probes.Add(1)
-		return tonemap.Capabilities{{
-			Mode: tonemap.ModeSoftware, Backend: tonemap.BackendSoftware,
-			Filter: tonemap.SoftwareFilterBT2390, SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ},
-		}}, nil
+		return completeSoftwareCapabilities(), nil
 	}
 
 	for i := 0; i < 2; i++ {
@@ -39,6 +36,66 @@ func TestHLSToneMapCapabilityInventoryV3CachesLocalProbeAcrossStarts(t *testing.
 	}
 	if got := probes.Load(); got != 1 {
 		t.Fatalf("local probe calls = %d, want 1 for two planning inventories", got)
+	}
+}
+
+// completeSoftwareCapabilities returns an inventory the tonemap package calls
+// complete for a host with no configured hardware backend.
+func completeSoftwareCapabilities() tonemap.Capabilities {
+	return tonemap.Capabilities{{
+		Mode: tonemap.ModeSoftware, Backend: tonemap.BackendSoftware,
+		Filter: tonemap.SoftwareFilterBT2390, SourceKinds: tonemap.AllSourceKinds(),
+	}}
+}
+
+// TestLocalToneMapCapabilitiesCachedV3DoesNotLifetimeCacheIncomplete pins the
+// incomplete half of the cache contract: an error-free probe that is missing a
+// configured executor class (the tonemap probe reports that with a nil error)
+// must not be frozen for the process lifetime. It is reused only inside the
+// negative TTL, then retried so recovery is picked up.
+func TestLocalToneMapCapabilitiesCachedV3DoesNotLifetimeCacheIncomplete(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	var calls atomic.Int32
+	handler.v3ToneMapProbe = func(context.Context, string, string, string) (tonemap.Capabilities, error) {
+		calls.Add(1)
+		return tonemap.Capabilities{{
+			Mode: tonemap.ModeSoftware, Backend: tonemap.BackendSoftware,
+			Filter: tonemap.SoftwareFilterBT2390, SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ},
+		}}, nil
+	}
+
+	inventory, err := handler.localToneMapCapabilitiesCachedV3(context.Background())
+	if err != nil {
+		t.Fatalf("incomplete probe: %v", err)
+	}
+	if !inventory.Supports(tonemap.ModeSoftware, tonemap.SourcePQ) {
+		t.Fatalf("incomplete inventory = %#v, want the partial software capability", inventory)
+	}
+	// Inside the negative window the partial result is reused without a probe.
+	if _, err := handler.localToneMapCapabilitiesCachedV3(context.Background()); err != nil {
+		t.Fatalf("negative-window probe: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("probe calls inside negative window = %d, want 1", got)
+	}
+
+	// Once the negative window elapses the probe runs again and its complete
+	// result is cached for the process lifetime.
+	handler.v3LocalToneMapMu.Lock()
+	handler.v3LocalToneMapNegativeUntil = time.Now().Add(-time.Second)
+	handler.v3LocalToneMapMu.Unlock()
+	handler.v3ToneMapProbe = func(context.Context, string, string, string) (tonemap.Capabilities, error) {
+		calls.Add(1)
+		return completeSoftwareCapabilities(), nil
+	}
+	if got, err := handler.localToneMapCapabilitiesCachedV3(context.Background()); err != nil || !got.Supports(tonemap.ModeSoftware, tonemap.SourceSDRBT2020) {
+		t.Fatalf("recovered inventory = %#v, %v; want the complete inventory", got, err)
+	}
+	if _, err := handler.localToneMapCapabilitiesCachedV3(context.Background()); err != nil {
+		t.Fatalf("cached complete probe: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("probe calls = %d, want 2 (incomplete reused, retry cached)", got)
 	}
 }
 

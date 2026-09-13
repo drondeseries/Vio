@@ -369,12 +369,16 @@ type PlaybackHandler struct {
 
 	// v3LocalToneMapMu guards the process-lifetime local tone-map inventory.
 	// Unlike the per-node inventory it is not refreshed on a TTL: the local
-	// FFmpeg/hardware configuration is fixed for the process, so a successful
+	// FFmpeg/hardware configuration is fixed for the process, so a complete
 	// probe is reused for every start exactly like v3Registry. A failed probe
-	// is not cached and is retried by the next caller.
-	v3LocalToneMapMu     sync.Mutex
-	v3LocalToneMapCaps   tonemap.Capabilities
-	v3LocalToneMapCached bool
+	// is not cached and is retried by the next caller. An error-free but
+	// incomplete inventory is cached only until v3LocalToneMapNegativeUntil,
+	// so a hardware executor hidden by transient contention is re-probed
+	// instead of being frozen at software-only for the process lifetime.
+	v3LocalToneMapMu            sync.Mutex
+	v3LocalToneMapCaps          tonemap.Capabilities
+	v3LocalToneMapCached        bool
+	v3LocalToneMapNegativeUntil time.Time
 	// v3NodeProbeBudgets holds what each node last said a capability read of it
 	// costs, guarded by v3NodeCapabilitiesMu. It is kept apart from the
 	// inventory above because the two are invalidated for different reasons: an
