@@ -63,13 +63,14 @@ func waitForWarmEntry(t *testing.T, handler *PlaybackHandler, session *playback.
 		TrackIndex:    trackIndex,
 		SourceCodec:   codec,
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	// The warm runs detached and, under a loaded CI runner, can take well past a
+	// few seconds to resolve the relay and finish its fake extraction. Poll a
+	// non-mutating committed-entry check: polling via ServeExtract would start a
+	// fill for the same identity, which makes the warm's beginFill return nil
+	// ("another fill in flight") and abandon the warm permanently.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
-		if err := handler.SubtitleCache.ServeExtract(rec, req, opts, func(context.Context, playback.StreamExtractOpts) error {
-			return errors.New("cache miss: warm identity did not match serve identity")
-		}); err == nil {
+		if handler.SubtitleCache.HasCommittedTextEntry("unused", opts.CacheIdentity, trackIndex, codec, "") {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -182,7 +183,7 @@ func TestScheduleVirtualWarmAfterTransportIsDetached(t *testing.T) {
 
 	select {
 	case <-entered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("detached warm never reached relay resolution")
 	}
 	close(release)
