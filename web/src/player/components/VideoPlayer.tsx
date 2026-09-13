@@ -36,6 +36,7 @@ import type {
 } from "../realtime-protocol";
 import { resolvePendingSeekTime } from "../utils/pendingSeek";
 import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
+import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import { HlsStartupGuard } from "../utils/hlsStartupGuard";
 import { isSafariBrowserV3, resolveHLSEngineV3 } from "../utils/hlsEngine";
 import { isFirefoxUserAgent } from "../utils/browser";
@@ -102,6 +103,29 @@ const LIVE_SUBTITLE_INDEX = 1_000_000;
 // Resume playback once translated cues cover at least this far ahead of the
 // playhead; a hard cap also resumes so we never wait forever.
 const TRANSLATION_RESUME_TIMEOUT_MS = 30_000;
+
+/**
+ * Whether `nativeSeconds` lies inside a buffered range: any target inside a
+ * buffered range seeks locally.
+ *
+ * The plan's timeline says what the server *can* serve; the element's buffer
+ * says what it already has. Buffered bytes are playable without any server
+ * interaction, so a target that is already buffered — at any distance from the
+ * current playhead — must not be handed to the reanchor path just because the
+ * plan reports `can_seek_anywhere=false` or the growing manifest has not
+ * published the target yet. The range is half-open: `buffered.start(i)` is
+ * inside and `buffered.end(i)` is not, so landing exactly on a buffered edge
+ * still reanchors rather than stalling on the next missing chunk.
+ */
+function isTimeBuffered(video: HTMLVideoElement, nativeSeconds: number): boolean {
+  const buffered = video.buffered;
+  for (let i = 0; i < buffered.length; i++) {
+    if (nativeSeconds >= buffered.start(i) && buffered.end(i) > nativeSeconds) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Matches a subtitle track by identity — the fields that describe the same
@@ -407,8 +431,12 @@ export function VideoPlayer({
   const subtitleSelectionWasManualRef = useRef(false);
   // Previous effective media file and subtitle inventory, so a version switch
   // can remap a manual subtitle selection to the equivalent track in the new
-  // file's inventory by identity rather than by raw index.
+  // file's inventory by identity rather than by raw index. The virtual URI is
+  // part of the identity because the server collapses a neutral virtual row to
+  // a concrete candidate while keeping `effective_media_file_id` unchanged, so
+  // a candidate rotation under the same id is only visible in the URI.
   const lastEffectiveMediaFileIdRef = useRef<number | null>(null);
+  const lastEffectiveVirtualUriRef = useRef<string | null>(null);
   const lastSubtitleTracksRef = useRef<PlayerSubtitleInfo[]>([]);
   // Staged identity remap from a version switch, applied by the auto-select
   // effect before any selection logic runs against the new inventory.
@@ -564,11 +592,24 @@ export function VideoPlayer({
   const qualityOptions = useMemo(() => qualityOptionsFromPlanV3(plan), [plan]);
 
   // The file the server actually planned against, which is not necessarily the
-  // one that was asked for — a fallback to an alternate version shows up here.
+  // one that was asked for. When the plan resolved a neutral virtual row to a
+  // concrete candidate, `effective_virtual_uri` names that candidate by path;
+  // matching there is what makes the version menu light the working row.
   const effectiveVersion = useMemo(
-    () => versions.find((v) => v.file_id === plan.effective_media_file_id) ?? selectedVersion,
-    [plan.effective_media_file_id, selectedVersion, versions],
+    () =>
+      resolveEffectiveVersion(versions, {
+        mediaFileId: activeFileId ?? plan.effective_media_file_id,
+        effectiveVirtualUri: plan.effective_virtual_uri ?? null,
+      }) ?? selectedVersion,
+    [
+      activeFileId,
+      plan.effective_media_file_id,
+      plan.effective_virtual_uri,
+      selectedVersion,
+      versions,
+    ],
   );
+  const effectiveFileId = effectiveVersion?.file_id ?? plan.effective_media_file_id;
 
   // Resolve source status for the quality menu.
   // A version is "Playing" if it's the effective source.
@@ -598,15 +639,19 @@ export function VideoPlayer({
           fileId: v.file_id,
           label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}${audioPart}`,
           releaseName: prettifyReleaseName(v.release_name ?? v.file_name),
-          isCurrentSource: v.file_id === plan.effective_media_file_id,
+          isCurrentSource: v.file_id === effectiveFileId,
           isRequestedSource:
-            (v.file_id === pendingSwitchFileId && v.file_id !== plan.effective_media_file_id) ||
-            (v.file_id === plan.requested_media_file_id &&
-              v.file_id !== plan.effective_media_file_id),
+            (v.file_id === pendingSwitchFileId && v.file_id !== effectiveFileId) ||
+            (v.file_id === plan.requested_media_file_id && v.file_id !== effectiveFileId),
           failed: v.failed,
+          // The catalog's liveness flag is not part of `PlayerFileVersion`, but
+          // the watch-detail rows VideoPlayer receives carry it. Surface it so a
+          // version the media page hides as "Unavailable" is not selectable here
+          // with no warning.
+          unavailable: (v as PlayerFileVersion & { available?: boolean }).available === false,
         };
       }),
-    [versions, plan.effective_media_file_id, plan.requested_media_file_id, pendingSwitchFileId],
+    [versions, effectiveFileId, plan.requested_media_file_id, pendingSwitchFileId],
   );
 
   // Any stream restart (transcode restart on seek, quality/audio switch,
@@ -884,6 +929,18 @@ export function VideoPlayer({
       setCurrentTime(seconds);
 
       const nativeSeconds = toPlayerTime(seconds, timelineOffsetRef.current);
+
+      // Buffer-first: bytes already in the element's buffer play without any
+      // server round trip, so a target inside them is a local seek no matter
+      // what `canSeekAnywhere` claims or what window the server last planned.
+      // This is what keeps a ±skip step seamless on routes that report
+      // can_seek_anywhere=false. Falling through to the seekable/reanchor
+      // checks still rebuilds a genuinely unbuffered far seek.
+      if (isTimeBuffered(video, nativeSeconds)) {
+        video.currentTime = nativeSeconds;
+        return true;
+      }
+
       if (canSeekAnywhere) {
         if (isHlsStream) video.currentTime = nativeSeconds;
         else handleSeek(nativeSeconds);
@@ -982,13 +1039,13 @@ export function VideoPlayer({
     return {
       positionSeconds,
       durationSeconds,
-      lastFileId: activeFileId ?? selectedVersion?.file_id,
+      lastFileId: effectiveVersion?.file_id ?? activeFileId ?? selectedVersion?.file_id,
       lastResolution: selectedVersion?.resolution,
       lastHDR: selectedVersion?.hdr,
       lastCodecVideo: selectedVersion?.codec_video,
       lastEditionKey: selectedVersion?.edition_key,
     };
-  }, [activeFileId, currentTime, duration, selectedVersion]);
+  }, [activeFileId, currentTime, duration, effectiveVersion, selectedVersion]);
 
   useEffect(() => {
     if (!watchTogetherRoomId || !watchTogether.closedReason || leaveInProgressRef.current) {
@@ -2477,12 +2534,18 @@ export function VideoPlayer({
   // staged in a ref and applied by the auto-select effect.
   useEffect(() => {
     const effectiveFileId = plan.effective_media_file_id;
+    const effectiveVirtualUri = plan.effective_virtual_uri ?? null;
     const previousFileId = lastEffectiveMediaFileIdRef.current;
+    const previousVirtualUri = lastEffectiveVirtualUriRef.current;
     lastEffectiveMediaFileIdRef.current = effectiveFileId;
+    lastEffectiveVirtualUriRef.current = effectiveVirtualUri;
     const previousTracks = lastSubtitleTracksRef.current;
     lastSubtitleTracksRef.current = effectiveSubtitleTracks;
 
-    if (previousFileId === null || previousFileId === effectiveFileId) {
+    if (
+      previousFileId === null ||
+      (previousFileId === effectiveFileId && previousVirtualUri === effectiveVirtualUri)
+    ) {
       return;
     }
     if (!subtitleSelectionWasManualRef.current) {
@@ -2510,7 +2573,12 @@ export function VideoPlayer({
       // Nothing matches in the new inventory: reset to auto-select.
       subtitleSelectionWasManualRef.current = false;
     }
-  }, [activeSubtitleIndex, effectiveSubtitleTracks, plan.effective_media_file_id]);
+  }, [
+    activeSubtitleIndex,
+    effectiveSubtitleTracks,
+    plan.effective_media_file_id,
+    plan.effective_virtual_uri,
+  ]);
 
   // A refusal pin belongs only to the session that rejected the automatic
   // selection. Clear it before the auto-selection effect evaluates a new
@@ -2560,7 +2628,7 @@ export function VideoPlayer({
     const effectiveMode = normalizeSubtitleMode(subtitleMode);
     const audioLang =
       audioTracks[activeAudioIndex]?.language?.trim() ||
-      resolveVersionAudioLanguage(selectedVersion, activeAudioIndex);
+      resolveVersionAudioLanguage(effectiveVersion, activeAudioIndex);
 
     const match = resolveSubtitleAutoSelect({
       mode: effectiveMode,
@@ -2589,9 +2657,8 @@ export function VideoPlayer({
     profileLanguage,
     audioTracks,
     activeAudioIndex,
-    selectedVersion,
+    effectiveVersion,
     sessionId,
-    plan.effective_media_file_id,
   ]);
 
   // -- Control callbacks --

@@ -72,7 +72,7 @@ const fileColumns = `id, content_id, episode_id, extra_id, season_number, episod
 	multiple_pps, multiple_pps_scan_size, multiple_pps_scan_mtime,
 	probe_source, probe_updated_at, probe_version, match_attempted_at, missing_since, failed_at,
 	first_seen_scan_run_id, created_at, updated_at,
-	virtual_owner_installation_id`
+	virtual_owner_installation_id, last_delivered_at`
 
 const overlayFileColumns = `content_id, episode_id, media_folder_id, file_path,
 	codec_video, codec_audio, resolution, audio_channels, hdr, container,
@@ -99,7 +99,7 @@ const mfFileColumns = `mf.id, mf.content_id, mf.episode_id, mf.extra_id, mf.seas
 	mf.multiple_pps, mf.multiple_pps_scan_size, mf.multiple_pps_scan_mtime,
 	mf.probe_source, mf.probe_updated_at, mf.probe_version, mf.match_attempted_at, mf.missing_since, mf.failed_at,
 	mf.first_seen_scan_run_id, mf.created_at, mf.updated_at,
-	mf.virtual_owner_installation_id`
+	mf.virtual_owner_installation_id, mf.last_delivered_at`
 
 // scanMediaFile scans a single row into a *models.MediaFile.
 func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
@@ -139,6 +139,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	var chapterThumbnailRetryAfter *time.Time
 	var videoTracksJSON, audioTracksJSON, subtitleTracksJSON, externalSubtitlesJSON, chaptersJSON []byte
 	var virtualOwnerInstallationID *int
+	var lastDeliveredAt *time.Time
 
 	err := row.Scan(
 		&f.ID,
@@ -232,6 +233,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&f.CreatedAt,
 		&f.UpdatedAt,
 		&virtualOwnerInstallationID,
+		&lastDeliveredAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -259,6 +261,9 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	if virtualOwnerInstallationID != nil {
 		f.VirtualOwnerInstallationID = *virtualOwnerInstallationID
 		f.VirtualOwnerInstallationSet = true
+	}
+	if lastDeliveredAt != nil {
+		f.LastDeliveredAt = lastDeliveredAt
 	}
 	if canonicalRootPath != nil {
 		f.CanonicalRootPath = *canonicalRootPath
@@ -476,6 +481,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		var chapterThumbnailRetryAfter *time.Time
 		var videoTracksJSON, audioTracksJSON, subtitleTracksJSON, externalSubtitlesJSON, chaptersJSON []byte
 		var virtualOwnerInstallationID *int
+		var lastDeliveredAt *time.Time
 
 		err := rows.Scan(
 			&f.ID,
@@ -569,6 +575,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&f.CreatedAt,
 			&f.UpdatedAt,
 			&virtualOwnerInstallationID,
+			&lastDeliveredAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning media file row: %w", err)
@@ -699,6 +706,9 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		if virtualOwnerInstallationID != nil {
 			f.VirtualOwnerInstallationID = *virtualOwnerInstallationID
 			f.VirtualOwnerInstallationSet = true
+		}
+		if lastDeliveredAt != nil {
+			f.LastDeliveredAt = lastDeliveredAt
 		}
 		f.MarkersSource = markersSource
 		f.MarkersConfidence = markersConfidence
@@ -1206,7 +1216,7 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			) VALUES (
 				$1, NULLIF($2,''), $3, $4, $5,
 				NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, 'virtual',
-				NULLIF($10,0), $11, '', '', $12, $13, 'virtual', NOW(), $14
+				NULLIF($10,0), $11, '', '', $12, $13, 'virtual', NULL, $14
 			)
 			ON CONFLICT (file_path, virtual_owner_installation_id, media_folder_id)
 				WHERE virtual_owner_installation_id IS NOT NULL
@@ -1227,7 +1237,10 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				audio_tracks=EXCLUDED.audio_tracks,
 				subtitle_tracks=EXCLUDED.subtitle_tracks,
 				probe_source='virtual',
-				probe_updated_at=NOW(),
+				-- Registration is not a probe: preserve any existing real probe
+				-- timestamp (NULL stays NULL) so the probe repair gate can fill
+				-- real track inventory later.
+				probe_updated_at = CASE WHEN media_files.probe_updated_at IS NULL THEN NULL ELSE media_files.probe_updated_at END,
 				missing_since=NULL,
 				-- A fresh listing means the provider still offers this release;
 				-- the failed flag is a runtime signal, not a permanent verdict.
@@ -1284,7 +1297,28 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 	}
 	rows.Close()
 	if len(stale) > 0 && len(keep) > 0 {
-		if _, err := tx.Exec(ctx, `DELETE FROM media_files WHERE id = ANY($1::bigint[])`, stale); err != nil {
+		// Retention: candidate identity is a provider result id that can churn
+		// between listings, but a version a user actually played is recorded as
+		// user_watch_progress.last_file_id. Keep stale rows that are still
+		// someone's last-played file so a known-working version does not vanish
+		// from the version list when the provider re-lists with new result ids.
+		// A retained row keeps its failed_at; if it was healthy it stays
+		// selectable (a fresh listing would clear failed_at), so it remains
+		// visible until the provider truly stops offering it.
+		//
+		// A row that actually delivered media bytes (last_delivered_at set) is
+		// retained on the same principle even if no progress row points at it:
+		// "once worked" is stronger evidence than "recently listed". These
+		// retained rows have no cleanup path here; a future retention TTL may
+		// prune them (not implemented).
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM media_files
+			WHERE id = ANY($1::bigint[])
+			  AND last_delivered_at IS NULL
+			  AND NOT EXISTS (
+				SELECT 1 FROM user_watch_progress p
+				WHERE p.last_file_id = media_files.id
+			  )`, stale); err != nil {
 			return fmt.Errorf("delete stale virtual candidates: %w", err)
 		}
 	}
@@ -1306,9 +1340,33 @@ func virtualCandidateGroup(raw string) (string, bool) {
 	return parsed.String(), true
 }
 
+// VirtualCandidateDeliveryGrace is how long after a virtual candidate's last
+// successful delivery a later failure is forgiven (failed_at is not stamped).
+// A release that played recently should not be branded dead because the
+// provider flapped today: within the window the row stays selectable and the
+// auto-pick keeps preferring it for a re-verify. After the window, an absence
+// of fresh delivery evidence means a failure stamps normally. The same window
+// guards the transport no-bytes marker.
+const VirtualCandidateDeliveryGrace = 7 * 24 * time.Hour
+
+// virtualCandidateFailureGracePredicate is the SQL predicate that any failed_at
+// stamp site applies: known-good rows inside the delivery grace are skipped,
+// while rows that never delivered (or whose last delivery is stale) stamp as
+// before. It consumes the query's next placeholder as the grace in seconds. The
+// transport no-bytes marker in NewRouter applies the equivalent predicate
+// directly (it does not go through this package); keep the two in sync if the
+// rule changes.
+const virtualCandidateFailureGracePredicate = `(last_delivered_at IS NULL OR last_delivered_at < NOW() - make_interval(secs => $4))`
+
 // MarkVirtualCandidateFailed stamps a virtual candidate row as known-bad after
 // a transport produced no bytes (corrupted NZB, dead provider URL). The
 // auto-pick skips failed candidates; a fresh listing clears the flag.
+//
+// A known-good row (last_delivered_at set) inside VirtualCandidateDeliveryGrace
+// is not stamped: the failure is treated as a transient flap and the candidate
+// stays eligible for the next auto-pick. This is the "prefer a release that
+// once delivered" rule, paired with the retention guard in
+// ReplaceVirtualCandidates that never deletes known-good rows.
 //
 // The write is fenced on the candidate identity the caller actually inspected:
 // expectedFilePath must still be the row's file_path and observedFailedAt must
@@ -1324,7 +1382,10 @@ func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID 
 	if fileID <= 0 {
 		return nil
 	}
-	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3`, fileID, expectedFilePath, observedFailedAt)
+	query := `UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
+		WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3
+		  AND ` + virtualCandidateFailureGracePredicate
+	_, err := r.pool.Exec(ctx, query, fileID, expectedFilePath, observedFailedAt, VirtualCandidateDeliveryGrace.Seconds())
 	return err
 }
 
@@ -1349,7 +1410,8 @@ func (r *FileRepository) ClearVirtualCandidateFailed(ctx context.Context, fileID
 	return err
 }
 
-// MarkVirtualCandidateRecovered clears a virtual candidate's failed_at stamp
+// MarkVirtualCandidateRecovered records durable delivery evidence for a
+// virtual candidate: it clears the failed_at stamp and sets last_delivered_at
 // after that candidate actually delivered media bytes to a client. This is the
 // transport-delivery counterpart to ClearVirtualCandidateFailed: the caller
 // passes the candidate identity the transport served (the row's file_path AT
@@ -1357,7 +1419,11 @@ func (r *FileRepository) ClearVirtualCandidateFailed(ctx context.Context, fileID
 // failure timestamp observed when the transport started, so the write only
 // lands when the row still describes the delivered candidate in the observed
 // health state. A rotated row (now describing candidate B) or a newer failure
-// stamp on candidate A is never cleared by a late delivery of A.
+// stamp on candidate A is never cleared or re-stamped by a late delivery of A.
+//
+// The two column writes are deliberately one UPDATE: delivery evidence and the
+// failed_at clear happen atomically, so a reader never sees a cleared stamp
+// without the corresponding delivery timestamp (or vice versa).
 func (r *FileRepository) MarkVirtualCandidateRecovered(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error {
 	if r == nil || r.pool == nil {
 		return errors.New("file repository is not configured")
@@ -1365,7 +1431,7 @@ func (r *FileRepository) MarkVirtualCandidateRecovered(ctx context.Context, file
 	if fileID <= 0 || strings.TrimSpace(deliveredFilePath) == "" {
 		return nil
 	}
-	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, deliveredFilePath, observedFailedAt)
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, last_delivered_at = NOW(), updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, deliveredFilePath, observedFailedAt)
 	return err
 }
 
@@ -2434,7 +2500,24 @@ func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) 
 func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int, expectedPath, replacementPath string) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE media_files
-		SET file_path = $1
+		SET file_path = $1,
+			-- The replacement is a different provider candidate. Probe and
+			-- delivery evidence belongs to the candidate that produced it, so
+			-- clear it: otherwise the replacement looks probed and recently
+			-- delivered (optimistic-start eligibility) without either.
+			probe_updated_at = NULL,
+			probe_source = NULL,
+			last_delivered_at = NULL,
+			resolution = NULL,
+			codec_video = NULL,
+			codec_audio = NULL,
+			audio_channels = NULL,
+			container = 'virtual',
+			hdr = false,
+			bitrate = NULL,
+			video_tracks = '[]'::jsonb,
+			audio_tracks = '[]'::jsonb,
+			subtitle_tracks = '[]'::jsonb
 		WHERE id = $2 AND file_path = $3`, replacementPath, fileID, expectedPath)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -2476,19 +2559,61 @@ func (r *FileRepository) GetByPath(ctx context.Context, path string) (*models.Me
 	return scanMediaFile(r.pool.QueryRow(ctx, query, path))
 }
 
+// virtualNeutralLikePrefix builds a left-anchored LIKE pattern covering every
+// stored path for a neutral virtual key. The neutral key's query string is
+// dropped: a provider candidate URI may carry result= in any parameter
+// position, so only the scheme/host/path is guaranteed to prefix it. The
+// prefix is escaped with the backslash escape character declared by the caller
+// so a literal %, _ or \ in the path cannot widen the match.
+func virtualNeutralLikePrefix(neutralPath string) string {
+	base := neutralPath
+	if i := strings.IndexByte(base, '?'); i >= 0 {
+		base = base[:i]
+	}
+	var b strings.Builder
+	b.Grow(len(base) + 1)
+	for i := 0; i < len(base); i++ {
+		switch c := base[i]; c {
+		case '\\', '%', '_':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('%')
+	return b.String()
+}
+
 // GetVirtualCandidateByNeutralPath retrieves a virtual candidate while ignoring
-// the provider's rotating result selection.
+// the provider's rotating result selection. The stored path is matched with a
+// left-anchored LIKE so the lookup is sargable; the exact neutral key is then
+// confirmed in Go because a bare neutral key is also a prefix of sibling URIs
+// (for example a longer content id under the same scheme/host/path).
 func (r *FileRepository) GetVirtualCandidateByNeutralPath(ctx context.Context, neutralPath, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
 	query := `SELECT ` + fileColumns + `
 		FROM media_files
 		WHERE virtual_owner_installation_id = $1
 		  AND content_id = $2
 		  AND COALESCE(episode_id, '') = COALESCE($3, '')
-		  AND regexp_replace(regexp_replace(file_path, '[?&]result=[^&]*', '', 'g'), '[?&]$', '') = $4
+		  AND file_path LIKE $4 ESCAPE '\'
 		  AND missing_since IS NULL
-		ORDER BY id
-		LIMIT 1`
-	return scanMediaFile(r.pool.QueryRow(ctx, query, ownerInstallationID, contentID, episodeID, neutralPath))
+		ORDER BY id`
+	rows, err := r.pool.Query(ctx, query, ownerInstallationID, contentID, episodeID, virtualNeutralLikePrefix(neutralPath))
+	if err != nil {
+		return nil, fmt.Errorf("querying virtual candidate by neutral path: %w", err)
+	}
+	defer rows.Close()
+	files, err := scanMediaFiles(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		if stripVirtualResultParam(file.FilePath) == neutralPath {
+			return file, nil
+		}
+	}
+	return nil, ErrFileNotFound
 }
 
 // IsActivePath reports whether path is the exact logical path of a media file

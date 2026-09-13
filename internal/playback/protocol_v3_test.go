@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"reflect"
@@ -150,6 +151,47 @@ func TestStartRequestV3FileSelectionValidation(t *testing.T) {
 	req.FileSelection = FileSelectionV3("user-picked")
 	if _, err := req.NormalizeAndValidate(); err == nil {
 		t.Fatal("invalid file_selection accepted")
+	}
+}
+
+// TestStartRequestV3ForceRelinkDecode covers the wire round-trip for the
+// force_relink override: an explicit value survives JSON decode, and an omitted
+// value stays off the wire and decodes as false.
+func TestStartRequestV3ForceRelinkDecode(t *testing.T) {
+	req := validStartRequestV3()
+	req.ForceRelink = true
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"force_relink":true`)) {
+		t.Fatalf("force_relink missing from encoded start request: %s", body)
+	}
+	var decoded StartRequestV3
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.ForceRelink {
+		t.Fatal("force_relink did not survive JSON decode")
+	}
+	if _, err := decoded.NormalizeAndValidate(); err != nil {
+		t.Fatalf("decoded force_relink request rejected: %v", err)
+	}
+
+	// Omitted force_relink must stay off the wire and decode as false.
+	body, err = json.Marshal(validStartRequestV3())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(body, []byte("force_relink")) {
+		t.Fatalf("omitted force_relink must not be encoded: %s", body)
+	}
+	decoded = StartRequestV3{}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ForceRelink {
+		t.Fatal("omitted force_relink decoded as true")
 	}
 }
 
@@ -3652,5 +3694,40 @@ func TestPlanPlaybackV3AudioInventoryComesFromTheEffectiveFile(t *testing.T) {
 		if got.Index != want.Index || got.Codec != want.Codec || got.Language != want.Language {
 			t.Errorf("inventory[%d] = %+v, want %+v (from the effective file)", i, got, want)
 		}
+	}
+}
+
+// effective_virtual_uri is a UI-only plan field: it must survive a protocol
+// round trip when set and disappear under omitempty when the effective source
+// is not a virtual candidate.
+func TestPlanV3EffectiveVirtualURIRoundTrip(t *testing.T) {
+	plan := PlanV3{ProtocolVersion: ProtocolV3, RequestedMediaFileID: 41, EffectiveMediaFileID: 42, EffectiveVirtualURI: "virtual://movie/tt1234567?result=working"}
+
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v", err)
+	}
+	if _, ok := raw["effective_virtual_uri"]; !ok {
+		t.Fatalf("effective_virtual_uri missing from %s", encoded)
+	}
+	var decoded PlanV3
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.EffectiveVirtualURI != plan.EffectiveVirtualURI {
+		t.Fatalf("decoded URI = %q, want %q", decoded.EffectiveVirtualURI, plan.EffectiveVirtualURI)
+	}
+
+	empty := PlanV3{ProtocolVersion: ProtocolV3, RequestedMediaFileID: 41, EffectiveMediaFileID: 42}
+	encodedEmpty, err := json.Marshal(empty)
+	if err != nil {
+		t.Fatalf("marshal empty: %v", err)
+	}
+	if bytes.Contains(encodedEmpty, []byte("effective_virtual_uri")) {
+		t.Fatalf("empty plan serialized effective_virtual_uri: %s", encodedEmpty)
 	}
 }

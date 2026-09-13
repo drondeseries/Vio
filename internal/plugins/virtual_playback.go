@@ -307,7 +307,7 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 			RequestHeaders: cloneHeaderMap(candidate.GetRequestHeaders()),
 			ExpiresAt:      exp,
 		}
-		s.storeResolvedStream(virtualPath, userID, profileID, routing.OwnerInstallationID, stream)
+		s.storeResolvedStreamContext(ctx, virtualPath, userID, profileID, routing.OwnerInstallationID, stream)
 		return stream, nil
 	}
 
@@ -342,7 +342,7 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 				RequestHeaders: cloneHeaderMap(candidate.GetRequestHeaders()),
 				ExpiresAt:      exp,
 			}
-			s.storeResolvedStream(virtualPath, userID, profileID, routing.OwnerInstallationID, stream)
+			s.storeResolvedStreamContext(ctx, virtualPath, userID, profileID, routing.OwnerInstallationID, stream)
 			return stream, nil
 		}
 	}
@@ -1749,6 +1749,12 @@ const (
 	resolvedURLMemoTTL           = 5 * time.Minute
 	resolvedURLMemoMax           = 256
 	resolvedURLMemoSweepInterval = 5 * time.Second
+	// resolvedURLMemoStaleGrace lets an expired memo entry keep serving while a
+	// background refresh replaces it, so a playback start that lands during a
+	// provider URL rotation is not forced into a synchronous re-resolve. It is
+	// capped at one TTL so a stale entry is never served more than 2×
+	// resolvedURLMemoTTL after it was resolved.
+	resolvedURLMemoStaleGrace = resolvedURLMemoTTL
 	// maxResolvedRefreshChain bounds background warm-refresh cycles per
 	// resolved URL: ~6 × 290s ≈ 29 minutes of warmth, enough to cover
 	// extended browsing sessions without an immortal goroutine/timer chain.
@@ -1759,38 +1765,70 @@ func resolvedURLMemoKey(virtualPath string, userID int, profileID string, ownerI
 	return fmt.Sprintf("%s\x00%d\x00%s\x00%d", virtualPath, userID, profileID, ownerInstallationID)
 }
 
-func (s *Service) lookupResolvedStream(virtualPath string, userID int, profileID string, ownerInstallationID int) (ResolvedVirtualStream, bool) {
-	if s == nil {
-		return ResolvedVirtualStream{}, false
-	}
-	key := resolvedURLMemoKey(virtualPath, userID, profileID, ownerInstallationID)
-	s.resolvedURLsMu.Lock()
-	defer s.resolvedURLsMu.Unlock()
-	entry, ok := s.resolvedURLs[key]
-	if !ok {
-		return ResolvedVirtualStream{}, false
-	}
-	now := time.Now()
-	expired := false
-	if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
-		expired = true
-	} else if now.Sub(entry.resolvedAt) > resolvedURLMemoTTL {
-		expired = true
-	}
-	if expired {
-		if entry.cancel != nil {
-			entry.cancel()
-		}
-		delete(s.resolvedURLs, key)
-		return ResolvedVirtualStream{}, false
-	}
+func resolvedStreamFromEntry(entry resolvedURLEntry) ResolvedVirtualStream {
 	return ResolvedVirtualStream{
 		URL:            entry.url,
 		URI:            entry.uri,
 		CandidateID:    entry.candidateID,
 		RequestHeaders: cloneHeaderMap(entry.requestHeaders),
 		ExpiresAt:      entry.expiresAt,
-	}, true
+	}
+}
+
+func (s *Service) lookupResolvedStream(virtualPath string, userID int, profileID string, ownerInstallationID int) (ResolvedVirtualStream, bool) {
+	if s == nil {
+		return ResolvedVirtualStream{}, false
+	}
+	key := resolvedURLMemoKey(virtualPath, userID, profileID, ownerInstallationID)
+	s.resolvedURLsMu.Lock()
+	entry, ok := s.resolvedURLs[key]
+	if !ok {
+		s.resolvedURLsMu.Unlock()
+		return ResolvedVirtualStream{}, false
+	}
+	now := time.Now()
+	// A provider-declared expiry is a hard bound: the URL is dead, so it is
+	// never served even inside the TTL stale grace.
+	if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+		if entry.cancel != nil {
+			entry.cancel()
+		}
+		delete(s.resolvedURLs, key)
+		s.resolvedURLsMu.Unlock()
+		return ResolvedVirtualStream{}, false
+	}
+	age := now.Sub(entry.resolvedAt)
+	if age <= resolvedURLMemoTTL {
+		stream := resolvedStreamFromEntry(entry)
+		s.resolvedURLsMu.Unlock()
+		return stream, true
+	}
+	// Expired. Serve stale within the bounded grace while exactly one
+	// background refresh replaces it, unless the last refresh definitively
+	// failed. Concurrent callers join the in-flight refresh instead of each
+	// spawning their own.
+	if age <= resolvedURLMemoTTL+resolvedURLMemoStaleGrace && !entry.refreshFailed {
+		kickRefresh := false
+		if !entry.refreshInFlight {
+			entry.refreshInFlight = true
+			s.resolvedURLs[key] = entry
+			kickRefresh = true
+		}
+		stream := resolvedStreamFromEntry(entry)
+		depth := entry.refreshes
+		generation := s.resolvedURLsGeneration
+		s.resolvedURLsMu.Unlock()
+		if kickRefresh {
+			go s.refreshResolvedURL(context.Background(), virtualPath, userID, profileID, ownerInstallationID, depth, generation)
+		}
+		return stream, true
+	}
+	if entry.cancel != nil {
+		entry.cancel()
+	}
+	delete(s.resolvedURLs, key)
+	s.resolvedURLsMu.Unlock()
+	return ResolvedVirtualStream{}, false
 }
 
 func (s *Service) lookupResolvedURL(virtualPath string, userID int, profileID string, ownerInstallationID int) string {
@@ -1802,7 +1840,31 @@ func (s *Service) lookupResolvedURL(virtualPath string, userID int, profileID st
 }
 
 func (s *Service) storeResolvedStream(virtualPath string, userID int, profileID string, ownerInstallationID int, stream ResolvedVirtualStream) {
-	s.storeResolvedStreamDepth(virtualPath, userID, profileID, ownerInstallationID, stream, 0)
+	s.storeResolvedStreamContext(context.Background(), virtualPath, userID, profileID, ownerInstallationID, stream)
+}
+
+// resolvedURLGenerationKey carries the resolvedURLsGeneration a detached
+// refresh started in. It rides the resolve context so the store inside
+// ResolveVirtualPlaybackDetailedWithRouting publishes under the generation the
+// caller observed rather than the (possibly post-Clear) current one.
+type resolvedURLGenerationKey struct{}
+
+func withResolvedURLGeneration(ctx context.Context, generation uint64) context.Context {
+	return context.WithValue(ctx, resolvedURLGenerationKey{}, generation)
+}
+
+// storeResolvedStreamContext stores a resolved stream under the generation
+// carried by ctx, or the current generation when ctx carries none. A refresh
+// kicked before Clear carries its pre-Clear generation, so the store is dropped
+// in storeResolvedStreamDepth instead of recreating the flushed memo.
+func (s *Service) storeResolvedStreamContext(ctx context.Context, virtualPath string, userID int, profileID string, ownerInstallationID int, stream ResolvedVirtualStream) {
+	s.resolvedURLsMu.Lock()
+	generation, ok := ctx.Value(resolvedURLGenerationKey{}).(uint64)
+	if !ok {
+		generation = s.resolvedURLsGeneration
+	}
+	s.resolvedURLsMu.Unlock()
+	s.storeResolvedStreamDepth(virtualPath, userID, profileID, ownerInstallationID, stream, 0, generation)
 }
 
 func (s *Service) storeResolvedURL(virtualPath string, userID int, profileID string, ownerInstallationID int, url string, expiresAt ...time.Time) {
@@ -1822,7 +1884,11 @@ func (s *Service) storeResolvedURL(virtualPath string, userID int, profileID str
 // is reached the entry is stored WITHOUT re-arming the refresh timer and
 // simply ages out at the memo TTL. This bounds each memo's lifetime to an
 // active playback startup window instead of the process lifetime.
-func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profileID string, ownerInstallationID int, stream ResolvedVirtualStream, depth int) {
+//
+// generation is the resolvedURLsGeneration the caller observed when it started
+// resolving. A result from a superseded generation (Clear happened while the
+// refresh was in flight) is dropped rather than repopulating the memo.
+func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profileID string, ownerInstallationID int, stream ResolvedVirtualStream, depth int, generation uint64) {
 	if s == nil || stream.URL == "" {
 		return
 	}
@@ -1835,6 +1901,16 @@ func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profi
 	key := resolvedURLMemoKey(virtualPath, userID, profileID, ownerInstallationID)
 	s.resolvedURLsMu.Lock()
 	defer s.resolvedURLsMu.Unlock()
+	// The cache was flushed while this result was in flight: publishing it
+	// would recreate obsolete URLs and headers after Clear().
+	if s.resolvedURLsGeneration != generation {
+		return
+	}
+	// A newer entry already landed under this key: never overwrite it with a
+	// result produced for an older generation.
+	if existing, ok := s.resolvedURLs[key]; ok && existing.generation > generation {
+		return
+	}
 	if s.resolvedURLs == nil {
 		s.resolvedURLs = make(map[string]resolvedURLEntry)
 	}
@@ -1842,11 +1918,13 @@ func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profi
 	// Evict expired entries on a throttled cadence rather than on every write,
 	// so the steady-state store path stays cheap. Lookup still deletes the
 	// single stale key it touches, and the capacity guard below re-bounds the
-	// map, so expired URLs are never served long and the map never grows
-	// without bound.
+	// map, so entries are never kept past their provider expiry or the bounded
+	// stale grace and the map never grows without bound.
 	if now.After(s.resolvedURLsNextSweep) {
 		for k, entry := range s.resolvedURLs {
-			if (!entry.expiresAt.IsZero() && now.After(entry.expiresAt)) || now.Sub(entry.resolvedAt) > resolvedURLMemoTTL {
+			hardExpired := !entry.expiresAt.IsZero() && now.After(entry.expiresAt)
+			pastGrace := now.Sub(entry.resolvedAt) > resolvedURLMemoTTL+resolvedURLMemoStaleGrace
+			if hardExpired || pastGrace {
 				if entry.cancel != nil {
 					entry.cancel()
 				}
@@ -1889,6 +1967,7 @@ func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profi
 			requestHeaders: cloneHeaderMap(stream.RequestHeaders),
 			resolvedAt:     now,
 			expiresAt:      stream.ExpiresAt,
+			generation:     generation,
 		}
 		return
 	}
@@ -1901,6 +1980,7 @@ func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profi
 		expiresAt:      stream.ExpiresAt,
 		cancel:         bgCancel,
 		refreshes:      depth + 1,
+		generation:     generation,
 	}
 	// Spawn a background refresh that wakes 10s before the TTL expires,
 	// keeping the memo warm for active playback sessions.
@@ -1910,28 +1990,72 @@ func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profi
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			s.refreshResolvedURL(bgCtx, virtualPath, userID, profileID, ownerInstallationID, depth)
+			s.refreshResolvedURL(bgCtx, virtualPath, userID, profileID, ownerInstallationID, depth, generation)
 		case <-bgCtx.Done():
 		}
 	}()
 }
 
 // refreshResolvedURL re-resolves a provider URL in the background to keep the
-// memo warm before the TTL expires. If the re-resolution fails the
-// existing entry stays until natural expiry.
-func (s *Service) refreshResolvedURL(ctx context.Context, virtualPath string, userID int, profileID string, ownerInstallationID int, depth int) {
-	if s == nil || ctx.Err() != nil {
+// memo warm before the TTL expires. If the re-resolution fails the existing
+// entry stays until natural expiry, but the failure is recorded so the entry is
+// not served as stale: a provider that definitively refused to renew the URL
+// must not have it pinned past its memo TTL.
+func (s *Service) refreshResolvedURL(ctx context.Context, virtualPath string, userID int, profileID string, ownerInstallationID int, depth int, generation uint64) {
+	if s == nil {
+		return
+	}
+	if s.afterResolvedURLRefresh != nil {
+		defer s.afterResolvedURLRefresh()
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if s.installations == nil || s.host == nil {
+		// Not fully wired (e.g. a bare Service in a memo unit test); clear any
+		// in-flight marker so a later stale lookup can retry.
+		s.noteResolvedURLRefreshFailure(virtualPath, userID, profileID, ownerInstallationID, generation)
 		return
 	}
 	// Bypass the memo: this refresh exists to obtain a FRESH provider URL.
 	// Reading our own nearly-expired memo would be a no-op that pins potentially
-	// stale URLs past their rotation lifetime.
-	res, err := s.ResolveVirtualPlaybackDetailedWithRouting(ctx, virtualPath, userID, profileID, VirtualPlaybackRouting{OwnerInstallationID: ownerInstallationID}, true, nil, "")
+	// stale URLs past their rotation lifetime. The resolve context carries the
+	// generation so the store inside it is dropped if Clear flushed the memo
+	// while this refresh was in flight.
+	res, err := s.ResolveVirtualPlaybackDetailedWithRouting(withResolvedURLGeneration(ctx, generation), virtualPath, userID, profileID, VirtualPlaybackRouting{OwnerInstallationID: ownerInstallationID}, true, nil, "")
 	if err != nil || res.URL == "" {
 		slog.DebugContext(ctx, "virtual URL background refresh failed", "component", "plugins", "virtual_path", virtualPath, "error", err)
+		s.noteResolvedURLRefreshFailure(virtualPath, userID, profileID, ownerInstallationID, generation)
 		return
 	}
-	s.storeResolvedStreamDepth(virtualPath, userID, profileID, ownerInstallationID, res, depth)
+	s.storeResolvedStreamDepth(virtualPath, userID, profileID, ownerInstallationID, res, depth, generation)
+}
+
+// noteResolvedURLRefreshFailure records a definitive background-refresh failure
+// for the key and clears the in-flight marker. A stale entry carrying the
+// failure flag is dropped on the next lookup rather than served. A failure from
+// a superseded generation is ignored so it cannot mar a valid entry stored
+// after Clear.
+func (s *Service) noteResolvedURLRefreshFailure(virtualPath string, userID int, profileID string, ownerInstallationID int, generation uint64) {
+	if s == nil {
+		return
+	}
+	key := resolvedURLMemoKey(virtualPath, userID, profileID, ownerInstallationID)
+	s.resolvedURLsMu.Lock()
+	defer s.resolvedURLsMu.Unlock()
+	if s.resolvedURLsGeneration != generation {
+		return
+	}
+	entry, ok := s.resolvedURLs[key]
+	if !ok {
+		return
+	}
+	if entry.generation > generation {
+		return
+	}
+	entry.refreshFailed = true
+	entry.refreshInFlight = false
+	s.resolvedURLs[key] = entry
 }
 
 // Clear flushes all in-memory virtual playback caches (streams, profiles,
@@ -1951,6 +2075,11 @@ func (s *Service) Clear() {
 	s.virtualVariantsCache = nil
 	s.virtualVariantsMu.Unlock()
 	s.resolvedURLsMu.Lock()
+	// Bump the generation before dropping the map: a refresh already in flight
+	// (or one whose goroutine has not started yet) captured the old generation
+	// and will drop its result in storeResolvedStreamDepth instead of
+	// recreating obsolete URLs and headers.
+	s.resolvedURLsGeneration++
 	for _, entry := range s.resolvedURLs {
 		if entry.cancel != nil {
 			entry.cancel()

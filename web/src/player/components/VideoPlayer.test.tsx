@@ -103,7 +103,8 @@ vi.mock("hls.js", () => ({
   },
 }));
 vi.mock("./PlayerControls", () => ({
-  SKIP_BACK_SECONDS: 10,
+  SKIP_BUTTON_SECONDS: 30,
+  SKIP_BACK_SECONDS: 30,
   SKIP_FORWARD_SECONDS: 30,
   PlayerControls: vi.fn(
     (props: {
@@ -193,6 +194,22 @@ function setMediaError(video: HTMLVideoElement, message: string) {
   });
 }
 
+/** Installs a fake `TimeRanges` list so tests can drive buffer/seek checks. */
+function setTimeRanges(
+  video: HTMLVideoElement,
+  property: "buffered" | "seekable",
+  ranges: Array<[number, number]>,
+) {
+  Object.defineProperty(video, property, {
+    configurable: true,
+    value: {
+      length: ranges.length,
+      start: (index: number) => ranges[index]?.[0] ?? 0,
+      end: (index: number) => ranges[index]?.[1] ?? 0,
+    } as TimeRanges,
+  });
+}
+
 describe("VideoPlayer plan failure recovery", () => {
   beforeEach(() => {
     realtimeOptions.current = null;
@@ -256,7 +273,8 @@ describe("VideoPlayer plan failure recovery", () => {
         controls.current?.onSurfaceTap?.(leftTap);
         controls.current?.onSurfaceTap?.(leftTap);
       });
-      expect(playerSeek).toHaveBeenCalledWith(40);
+      // Double-tap reuses the 30s back-button constant (50 - 30).
+      expect(playerSeek).toHaveBeenCalledWith(20);
     } finally {
       vi.useRealTimers();
       vi.unstubAllGlobals();
@@ -1212,6 +1230,127 @@ describe("VideoPlayer translation handoff", () => {
   });
 });
 
+describe("VideoPlayer buffered-first seeking", () => {
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    subtitleTimeline.textOffsetSeconds = null;
+    subtitleTimeline.assOffsetSeconds = null;
+    subtitleHooks.vttSourceChanged = null;
+    subtitleHooks.assSourceChanged = null;
+    hlsJS.supported = false;
+    hlsJS.constructed.mockClear();
+    toastError.mockClear();
+    playerSeek.mockClear();
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  // The growing-manifest/remux routes force can_seek_anywhere=false, so they
+  // exercise the path that used to fall straight through to the reanchor.
+  const nonSeekablePlan = () =>
+    fixturePlanV3({
+      ...directPlan,
+      timeline: { ...directPlan.timeline, can_seek_anywhere: false },
+    });
+
+  function renderSeekFixture(position: number, buffered: Array<[number, number]>) {
+    const onReanchorSeek = vi.fn();
+    const { container } = renderPlayer({ plan: nonSeekablePlan(), onReanchorSeek });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: position,
+    });
+    setTimeRanges(video, "buffered", buffered);
+    setTimeRanges(video, "seekable", []);
+    return { video, onReanchorSeek };
+  }
+
+  function seekControls() {
+    return controls.current as unknown as {
+      currentTime: number;
+      onSeek: (seconds: number) => void;
+    };
+  }
+
+  it("skips 30s forward into the buffer without a reanchor", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 80]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    playerSeek.mockClear();
+    act(() => seekControls().onSeek(seekControls().currentTime + 30));
+
+    expect(onReanchorSeek).not.toHaveBeenCalled();
+    expect(video.currentTime).toBe(40);
+  });
+
+  it("skips 30s backward into the buffer without a reanchor", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(60, [[0, 80]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(60));
+
+    playerSeek.mockClear();
+    act(() => seekControls().onSeek(seekControls().currentTime - 30));
+
+    expect(onReanchorSeek).not.toHaveBeenCalled();
+    expect(video.currentTime).toBe(30);
+  });
+
+  it("seeks locally to a target just inside the buffer edge", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 40]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    act(() => seekControls().onSeek(39.9));
+
+    expect(onReanchorSeek).not.toHaveBeenCalled();
+    expect(video.currentTime).toBe(39.9);
+  });
+
+  it("still reanchors when the target sits exactly on the buffered end", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 40]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    act(() => seekControls().onSeek(seekControls().currentTime + 30));
+
+    expect(onReanchorSeek).toHaveBeenCalledWith(40);
+    expect(video.currentTime).toBe(10);
+  });
+
+  it("still reanchors when the target is outside every buffered range", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 40]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    act(() => seekControls().onSeek(100));
+
+    expect(onReanchorSeek).toHaveBeenCalledWith(100);
+    expect(video.currentTime).toBe(10);
+  });
+
+  it("keeps a random seek inside the buffer on the local path", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 200]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    act(() => seekControls().onSeek(150));
+
+    expect(onReanchorSeek).not.toHaveBeenCalled();
+    expect(video.currentTime).toBe(150);
+  });
+});
+
 describe("VideoPlayer version switch UX", () => {
   beforeEach(() => {
     realtimeOptions.current = null;
@@ -1280,6 +1419,56 @@ describe("VideoPlayer version switch UX", () => {
     };
     expect(props.versions?.find((v) => v.fileId === 99)?.isRequestedSource).toBe(true);
     expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
+  });
+
+  it("marks the path-matched candidate as Current Source for a resolved virtual row", () => {
+    const virtualRow = {
+      ...versionA,
+      file_id: 100,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=all",
+    };
+    const candidateRow = {
+      ...versionA,
+      file_id: 7,
+      file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
+    };
+    const plan = fixturePlanV3({
+      requested_media_file_id: 100,
+      effective_media_file_id: 100,
+      effective_virtual_uri: candidateRow.file_path,
+    });
+
+    renderPlayer({ plan, versions: [virtualRow, candidateRow], activeFileId: 100 });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{ fileId: number; isCurrentSource: boolean; isRequestedSource: boolean }>;
+    };
+    // The collapsed VIRTUAL id stays in the plan, so only the path match can
+    // light the concrete candidate the server is actually playing.
+    expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
+    expect(props.versions?.find((v) => v.fileId === 100)?.isCurrentSource).toBe(false);
+  });
+
+  it("leaves the file_id match current when no effective virtual URI is published", () => {
+    renderPlayer({ versions: [versionA, versionB], activeFileId: 7 });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{ fileId: number; isCurrentSource: boolean }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
+    expect(props.versions?.find((v) => v.fileId === 99)?.isCurrentSource).toBe(false);
+  });
+
+  it("flags a version the catalog reports unavailable so the menu can warn", () => {
+    const unavailableVersion = { ...versionB, available: false };
+    renderPlayer({ versions: [versionA, unavailableVersion], activeFileId: 7 });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{ fileId: number; unavailable?: boolean }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 99)?.unavailable).toBe(true);
+    expect(props.versions?.find((v) => v.fileId === 7)?.unavailable).toBe(false);
   });
 
   it("shows the quality ellipsis only for quality replans, not track changes", async () => {
@@ -1467,5 +1656,105 @@ describe("VideoPlayer version switch UX", () => {
     // Auto-select with mode "always" and preferred language "en" finds no
     // English track, so subtitles reset to off.
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+  });
+
+  it("remaps a manual subtitle selection when the effective virtual URI rotates under the same id", async () => {
+    const virtualRow = {
+      ...versionA,
+      file_id: 100,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=all",
+    };
+    const candidateA = {
+      ...versionA,
+      file_id: 7,
+      file_path: "/media/Movies/Example (2024)/Example.A.mkv",
+    };
+    const candidateB = {
+      ...versionA,
+      file_id: 8,
+      file_path: "/media/Movies/Example (2024)/Example.B.mkv",
+    };
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const frenchTrack: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:1",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "external",
+      url: "/stream/session-1/subtitles/1.vtt",
+    };
+    const initialPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:virtual-a",
+      plan_attempt_key: "v3:virtual-a",
+      requested_media_file_id: 100,
+      effective_media_file_id: 100,
+      effective_virtual_uri: candidateA.file_path,
+    });
+    const { rerenderPlayer } = renderPlayer({
+      plan: initialPlan,
+      versions: [virtualRow, candidateA],
+      activeFileId: 100,
+      subtitleUrls: [englishTrack, frenchTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    // The viewer manually picks French (index 1).
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+
+    // The collapsed id stays 100; only the concrete candidate rotates. The new
+    // candidate's inventory reorders tracks so the raw index would silently
+    // switch to English, while the identity remap keeps French.
+    const rotatedPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:virtual-b",
+      plan_attempt_key: "v3:virtual-b",
+      requested_media_file_id: 100,
+      effective_media_file_id: 100,
+      effective_virtual_uri: candidateB.file_path,
+    });
+    const frenchInNewCandidate: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 8,
+      track_id: "file:8:subtitle:0",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "external",
+      url: "/stream/session-100/subtitles/0.vtt",
+    };
+    const englishInNewCandidate: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 8,
+      track_id: "file:8:subtitle:1",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-100/subtitles/1.vtt",
+    };
+    rerenderPlayer({
+      plan: rotatedPlan,
+      planRevision: 2,
+      subtitleUrls: [frenchInNewCandidate, englishInNewCandidate],
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
   });
 });

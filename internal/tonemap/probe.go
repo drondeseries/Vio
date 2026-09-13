@@ -114,7 +114,7 @@ func probeCached(ctx context.Context, ffmpegPath, hardwareBackend, hardwareDevic
 			return nil, err
 		}
 		entry := probeCacheEntry{capabilities: append(Capabilities(nil), result...)}
-		if !probeCapabilitiesComplete(result, hardwareBackend) {
+		if !CapabilitiesComplete(result, hardwareBackend) {
 			entry.expiresAt = now().Add(probeNegativeTTL)
 		}
 		probeCache.Lock()
@@ -252,11 +252,13 @@ func probeCacheEntryCurrent(entry probeCacheEntry, now time.Time) bool {
 	return entry.expiresAt.IsZero() || now.Before(entry.expiresAt)
 }
 
-// probeCapabilitiesComplete reports whether discovery found a reusable result
-// for every executor class it was asked to inspect. A software capability does
-// not make a missing configured hardware executor permanent: temporary device
-// contention must be retried after the negative-cache interval.
-func probeCapabilitiesComplete(capabilities Capabilities, hardwareBackend string) bool {
+// CapabilitiesComplete reports whether discovery found a reusable result for
+// every executor class it was asked to inspect. A software capability does not
+// make a missing configured hardware executor permanent: temporary device
+// contention must be retried after the negative-cache interval. Callers that
+// cache an inventory beyond the probe's own negative TTL must gate on this so a
+// temporarily incomplete result is not frozen for the process lifetime.
+func CapabilitiesComplete(capabilities Capabilities, hardwareBackend string) bool {
 	if !capabilityCoversAllSourceKinds(capabilities, ModeSoftware, BackendSoftware) {
 		return false
 	}

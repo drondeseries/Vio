@@ -105,14 +105,27 @@ type Service struct {
 	virtualVariantsMu    sync.Mutex
 	virtualVariantsCache map[string]virtualVariantsCacheEntry
 
-	// resolvedURLsMu guards a very short-lived memo of provider URLs resolved
+	// resolvedURLsMu guards a short-lived memo of provider URLs resolved
 	// during playback start. The same virtual URI is resolved once for probing
 	// and again when the transport opens; this memo bridges that gap so the
-	// provider is not contacted twice per playback start. Entries live for
-	// seconds, never longer — provider URLs rotate and must not be cached.
+	// provider is not contacted twice per playback start. Entries are fresh for
+	// resolvedURLMemoTTL and may be served stale for a further
+	// resolvedURLMemoStaleGrace while a background refresh replaces them, so a
+	// playback start that races a URL rotation is not forced into a synchronous
+	// provider fetch.
 	resolvedURLsMu        sync.Mutex
 	resolvedURLs          map[string]resolvedURLEntry
 	resolvedURLsNextSweep time.Time
+	// resolvedURLsGeneration fences background refreshes across Clear. A
+	// detached refresh that resolves after the cache was flushed carries the
+	// generation it started in, and storeResolvedStreamDepth drops a result
+	// from a superseded generation instead of recreating obsolete URLs and
+	// headers. Guarded by resolvedURLsMu.
+	resolvedURLsGeneration uint64
+	// afterResolvedURLRefresh is a test seam invoked when refreshResolvedURL
+	// returns, so a test can wait for a detached refresh to complete. Nil
+	// outside tests.
+	afterResolvedURLRefresh func()
 }
 
 // resolvedURLEntry is a single memoized provider URL. resolvedAt keeps the
@@ -130,6 +143,17 @@ type resolvedURLEntry struct {
 	// Chains are capped so a memo only stays warm for an active playback
 	// startup window instead of living for the lifetime of the process.
 	refreshes int
+	// refreshFailed records a definitive provider failure on the last
+	// background refresh (error or empty URL). A stale entry with this set is
+	// dropped instead of served: extending it would pin a URL the provider has
+	// already refused to renew.
+	refreshFailed bool
+	// refreshInFlight marks a background refresh kicked by a stale lookup so
+	// concurrent callers join it instead of stampeding the provider.
+	refreshInFlight bool
+	// generation is the resolvedURLsGeneration the entry was stored under. A
+	// refresh started for an older generation must not overwrite a newer entry.
+	generation uint64
 }
 
 // SetEventDispatcher wires the EventDispatcher into the Service. The

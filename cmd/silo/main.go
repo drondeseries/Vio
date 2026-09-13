@@ -3102,15 +3102,15 @@ func main() {
 			}
 			ffprobePath := scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)
 			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
-			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
+			compatVirtualSourceProberWithHeaders := func(ctx context.Context, sourceURL string, file *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
 				return virtualProbeCache.Probe(ctx, sourceURL, file, func(probeCtx context.Context, probeURL string, probeFile *models.MediaFile) (*models.MediaFile, error) {
 					var relayURL string
 					var cleanup func()
 					var err error
 					if pluginService.InstallationAllowsInsecure(context.Background(), probeFile.VirtualOwnerInstallationID) {
-						relayURL, cleanup, err = virtualRelay.RegisterInsecure(probeCtx, probeURL)
+						relayURL, cleanup, err = virtualRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
 					} else {
-						relayURL, cleanup, err = virtualRelay.Register(probeCtx, probeURL)
+						relayURL, cleanup, err = virtualRelay.RegisterWithHeaders(probeCtx, probeURL, headers)
 					}
 					if err != nil {
 						return probeFile, err
@@ -3120,6 +3120,29 @@ func main() {
 						return playback.DVRPUStrippable(dvCtx, cfg.Playback.FFmpegPath, input)
 					})
 				})
+			}
+			compatDeps.VirtualSourceProberWithHeaders = compatVirtualSourceProberWithHeaders
+			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
+				return compatVirtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
+			}
+			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error {
+				if deps.DB == nil {
+					return nil
+				}
+				vStr := string(videoTracks)
+				if vStr == "" || vStr == "null" {
+					vStr = "[]"
+				}
+				aStr := string(audioTracks)
+				if aStr == "" || aStr == "null" {
+					aStr = "[]"
+				}
+				sStr := string(subtitleTracks)
+				if sStr == "" || sStr == "null" {
+					sStr = "[]"
+				}
+				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath)
+				return err
 			}
 		}
 
@@ -3190,6 +3213,9 @@ func main() {
 
 			if deps.FileRepo != nil {
 				compatDeps.FileResolver = deps.FileRepo
+				compatDeps.VirtualCandidateFileLookup = func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
+					return deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+				}
 			}
 
 			compatDeps.SubtitleRepo = subtitles.NewPgRepository(deps.DB, deps.SecretCipher)

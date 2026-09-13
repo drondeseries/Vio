@@ -366,6 +366,19 @@ type PlaybackHandler struct {
 	v3ToneMapProbe       func(context.Context, string, string, string) (tonemap.Capabilities, error)
 	v3NodeCapabilitiesMu sync.Mutex
 	v3NodeCapabilities   map[string]v3NodeCapabilityCache
+
+	// v3LocalToneMapMu guards the process-lifetime local tone-map inventory.
+	// Unlike the per-node inventory it is not refreshed on a TTL: the local
+	// FFmpeg/hardware configuration is fixed for the process, so a complete
+	// probe is reused for every start exactly like v3Registry. A failed probe
+	// is not cached and is retried by the next caller. An error-free but
+	// incomplete inventory is cached only until v3LocalToneMapNegativeUntil,
+	// so a hardware executor hidden by transient contention is re-probed
+	// instead of being frozen at software-only for the process lifetime.
+	v3LocalToneMapMu            sync.Mutex
+	v3LocalToneMapCaps          tonemap.Capabilities
+	v3LocalToneMapCached        bool
+	v3LocalToneMapNegativeUntil time.Time
 	// v3NodeProbeBudgets holds what each node last said a capability read of it
 	// costs, guarded by v3NodeCapabilitiesMu. It is kept apart from the
 	// inventory above because the two are invalidated for different reasons: an
@@ -383,6 +396,7 @@ type PlaybackHandler struct {
 	// lock as the invalidation counter, so a refresh cannot release its slot in
 	// between an invalidation and that invalidation's claim on it.
 	v3NodeCapabilityRefresh map[string]struct{}
+	v3RefresherOnce         sync.Once // starts the background capability refresher once; see StartCapabilityWarmupV3
 	v3EventOnce             sync.Once
 	v3EventQueue            chan playback.RouteEventRecordV3
 	v3AudioPreferenceMu     sync.Mutex
@@ -1072,6 +1086,23 @@ func resolvedPlaybackAudioLanguage(ctx context.Context, store userstore.UserStor
 
 // --- Persistence helpers ---
 
+// progressPersistenceFile resolves which media_files row progress and version
+// hints should record. A virtual session binds VirtualSourceURI to the exact
+// candidate selected and probed at plan time; that candidate is a different
+// catalog row from the neutral requested row, so preferring the requested row
+// leaves last_file_id pointing at the neutral VIRTUAL version and the media
+// page never adopts the version that actually played. Fall back to the
+// requested/effective session IDs when the candidate row cannot be resolved
+// (for example it was replaced between resolve and persist).
+func (h *PlaybackHandler) progressPersistenceFile(ctx context.Context, session *playback.Session) (*models.MediaFile, error) {
+	if session != nil && session.VirtualSourceURI != "" && h.VirtualFileLookup != nil {
+		if file, err := h.VirtualFileLookup(ctx, session.VirtualSourceURI); err == nil && file != nil && file.ID > 0 {
+			return file, nil
+		}
+	}
+	return h.loadFileByPreferredID(ctx, requestedMediaFileID(session), session.MediaFileID)
+}
+
 // persistProgress saves the current playback position to the UserStore.
 // It resolves the mediaFileID to a mediaItemID via the file resolver.
 // Errors are logged but do not fail the HTTP request.
@@ -1090,7 +1121,7 @@ func (h *PlaybackHandler) persistProgress(ctx context.Context, session *playback
 		return
 	}
 
-	file, err := h.loadFileByPreferredID(ctx, requestedMediaFileID(session), session.MediaFileID)
+	file, err := h.progressPersistenceFile(ctx, session)
 	targetID := playbackProgressTarget(file)
 	if err != nil || targetID == "" {
 		return // file not found or not yet matched to a media item
@@ -1131,7 +1162,7 @@ func (h *PlaybackHandler) persistStopAndHistory(ctx context.Context, session *pl
 		return watchstate.PlaybackStopResult{}
 	}
 
-	file, err := h.loadFileByPreferredID(ctx, requestedMediaFileID(session), session.MediaFileID)
+	file, err := h.progressPersistenceFile(ctx, session)
 	targetID := playbackProgressTarget(file)
 	if err != nil || targetID == "" {
 		return watchstate.PlaybackStopResult{}

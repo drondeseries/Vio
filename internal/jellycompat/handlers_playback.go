@@ -320,13 +320,16 @@ type PlaybackHandler struct {
 	// and before lifecycle-locked publication. Production leaves it nil.
 	compatLocalTranscodeReady func(*playback.TranscodeSession)
 
-	DeviceProfilePersister       DeviceProfilePersister
-	VirtualMediaResolver         VirtualMediaResolver
-	VirtualMediaRefreshResolver  VirtualMediaRefreshResolver
-	VirtualMediaDetailedResolver VirtualMediaDetailedResolver
-	VirtualPlaybackStreamLister  VirtualPlaybackStreamLister
-	VirtualSourceProber          VirtualSourceProber
-	RemoteStreamRelay            RemoteStreamRelay
+	DeviceProfilePersister         DeviceProfilePersister
+	VirtualMediaResolver           VirtualMediaResolver
+	VirtualMediaRefreshResolver    VirtualMediaRefreshResolver
+	VirtualMediaDetailedResolver   VirtualMediaDetailedResolver
+	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
+	VirtualSourceProber            VirtualSourceProber
+	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
+	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	VirtualCandidateFileLookup     VirtualCandidateFileLookup
+	RemoteStreamRelay              RemoteStreamRelay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for private/local stream URLs. When
 	// nil or false, virtual streams are proxied through the strict SSRF-protected

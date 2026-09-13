@@ -1193,8 +1193,16 @@ func NewRouter(deps Dependencies) chi.Router {
 			streamHandler.AllowInsecureVirtual = playbackHandler.AllowInsecureVirtual
 		}
 		if deps.DB != nil {
+			// Transport no-bytes failure path. Same delivered-grace rule as
+			// scanner.MarkVirtualCandidateFailed: a candidate that delivered
+			// bytes within scanner.VirtualCandidateDeliveryGrace is not branded
+			// dead by a single later failure, so the auto-pick keeps preferring
+			// and re-verifying it.
 			streamHandler.VirtualCandidateFailMarker = func(ctx context.Context, fileID int) error {
-				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW() WHERE id = $1`, fileID)
+				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
+					WHERE id = $1
+					  AND (last_delivered_at IS NULL OR last_delivered_at < NOW() - make_interval(secs => $2))`,
+					fileID, scanner.VirtualCandidateDeliveryGrace.Seconds())
 				return err
 			}
 			// The recovered marker clears a known-bad stamp after the candidate
@@ -1204,6 +1212,28 @@ func NewRouter(deps Dependencies) chi.Router {
 			// delivered, or a newer failure on the delivered candidate, is
 			// never cleared by a late delivery signal.
 			streamHandler.VirtualCandidateRecoveredMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateRecovered
+			// Repeated input demux failures from a local transcode mean the
+			// virtual candidate is bad, not that the transport should keep
+			// rebuilding. Stamp the effective row known-bad (CAS-fenced on its
+			// file_path) so the next failure recovery rotates candidates.
+			//
+			// This callback is wired only for the integrated/local executor
+			// (TranscodeManager.OnDemuxFailure, forwarded in
+			// playback_transport.go). A remote transcode node runs its own
+			// ffmpeg and returns only manifest/segment bytes to this process:
+			// its stderr is captured by the node's own log sink
+			// (transcodenode.Server.SetFFmpegLogSink) and never reaches the
+			// server, so the same bad source selected on a node is not stamped
+			// and the session can loop rebuilding it. Closing that gap needs
+			// node-side work to detect the repeated demux failure and report
+			// the candidate identity; there is deliberately no stderr
+			// forwarding protocol invented here.
+			playbackHandler.TranscodeManager().OnDemuxFailure = func(ctx context.Context, fileID int, expectedFilePath string) error {
+				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(expectedFilePath)), "virtual://") {
+					return nil
+				}
+				return scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed(ctx, fileID, expectedFilePath, nil)
+			}
 			playbackHandler.VirtualFileUpdater = func(ctx context.Context, fileID int, newFilePath string) error {
 				_, _ = deps.DB.Exec(ctx, `DELETE FROM media_files WHERE file_path=$1 AND id != $2 AND virtual_owner_installation_id IS NOT NULL`, newFilePath, fileID)
 				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET file_path=$1, updated_at=now() WHERE id=$2`, newFilePath, fileID)
@@ -1222,8 +1252,7 @@ func NewRouter(deps Dependencies) chi.Router {
 				if sStr == "" || sStr == "null" {
 					sStr = "[]"
 				}
-				query := `UPDATE media_files SET video_tracks=$1::jsonb, audio_tracks=$2::jsonb, subtitle_tracks=$3::jsonb, resolution=NULLIF($4,''), codec_video=NULLIF($5,''), codec_audio=NULLIF($6,''), container=NULLIF($7,''), hdr=$8, bitrate=NULLIF($9,0), duration=CASE WHEN $10 > 0 THEN $10 ELSE duration END, audio_channels=COALESCE((SELECT (elem->>'channels')::int FROM jsonb_array_elements(CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END) elem LIMIT 1), audio_channels), updated_at=now() WHERE id=$11 AND (NULLIF($12, '') IS NULL OR file_path=$12)`
-				_, err := deps.DB.Exec(ctx, query, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath)
+				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath)
 				return err
 			}
 		}
@@ -1420,7 +1449,15 @@ func NewRouter(deps Dependencies) chi.Router {
 				if title == "" {
 					return
 				}
-				results, err := subtitleManager.Search(ctx, subtitles.SearchRequest{
+				// Download the best match per language, then tell any open
+				// playback session about each new track so its subtitle menu
+				// updates mid-session. The notifier is assigned later in this
+				// function; the closure only runs after wiring completes.
+				var readyNotifier subtitles.SubtitleReadyNotifier
+				if subtitleAINotifier != nil {
+					readyNotifier = subtitleAINotifier
+				}
+				subtitles.DownloadBestMatches(ctx, subtitleManager, readyNotifier, fileID, subtitles.SearchRequest{
 					IMDbID:    imdbID,
 					Title:     title,
 					Year:      year,
@@ -1428,26 +1465,6 @@ func NewRouter(deps Dependencies) chi.Router {
 					Episode:   episode,
 					Languages: languages,
 				})
-				if err != nil || len(results.Results) == 0 {
-					return
-				}
-				// Download the best match per language.
-				for _, lang := range languages {
-					for _, r := range results.Results {
-						if !strings.EqualFold(r.Language, lang) {
-							continue
-						}
-						_, dlErr := subtitleManager.Download(ctx, subtitles.DownloadRequest{
-							ProviderName: r.Provider, SubtitleID: r.ID,
-							Language:    r.Language,
-							ReleaseName: r.ReleaseName, MediaFileID: fileID,
-							HearingImpaired: r.HearingImpaired,
-						})
-						if dlErr == nil {
-							break // one good match per language is enough
-						}
-					}
-				}
 			}
 		}
 		if recsRepoForStale != nil {

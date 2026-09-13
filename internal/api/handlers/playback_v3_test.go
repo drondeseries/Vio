@@ -4139,6 +4139,140 @@ func TestRemapSubtitleSelectionV3RejectsNegativeIndex(t *testing.T) {
 	}
 }
 
+// The identity remap covers a carried selection by language/format. When it
+// cannot find a counterpart it reports a non-terminal miss and leaves the
+// selection in place, so the handler can keep hunting among the other
+// candidates for one that honors it and degrade to subtitles-off only after
+// all of them have been tried. The prod failure was a carried ordinal (20+)
+// resumed onto a 3-track edition, where nothing matches; the handler's degrade
+// path keeps playback alive instead of hard-failing the start.
+func TestRemapSubtitleSelectionV3MissSignalsDegrade(t *testing.T) {
+	source := &models.MediaFile{ID: 1, SubtitleTracks: []models.SubtitleTrack{{Language: "eng", Codec: "subrip"}}}
+	target := &models.MediaFile{ID: 2, SubtitleTracks: []models.SubtitleTrack{{Language: "fra", Codec: "subrip"}}}
+	request := playback.StartRequestV3{
+		SubtitleTrackIndex: new(0),
+		SubtitleTrackID:    playback.TrackIDV3(source.ID, "subtitle", 0),
+	}
+	handler := &PlaybackHandler{}
+	if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); !errors.Is(err, errSubtitleUnavailableInTargetV3) {
+		t.Fatalf("remap miss err = %v, want errSubtitleUnavailableInTargetV3", err)
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 0 || request.SubtitleTrackID == "" {
+		t.Fatalf("remap miss must preserve the selection for the caller: index=%v id=%q", request.SubtitleTrackIndex, request.SubtitleTrackID)
+	}
+}
+
+// A carried audio ordinal from a richer version (or an explicit pick the
+// effective edition lacks) degrades to the file's default track instead of
+// failing the start. Only a malformed identity stays a client error.
+func TestResolveV3AudioIndexOutOfRangeDegradesToDefault(t *testing.T) {
+	file := &models.MediaFile{ID: 7, AudioTracks: []models.AudioTrack{
+		{Codec: "aac", Language: "eng", Channels: 2},
+		{Codec: "ac3", Language: "fra", Channels: 6, Default: true},
+	}}
+	index := 20
+	got, err := resolveV3AudioIndex(file, "", &index)
+	if err != nil {
+		t.Fatalf("out-of-range audio index must degrade, not error: %v", err)
+	}
+	if want := directPlayAudioTrackIndex(file); got != want {
+		t.Fatalf("index = %d, want default %d", got, want)
+	}
+	if _, err := resolveV3AudioIndex(file, "junk", nil); err == nil {
+		t.Fatal("malformed audio identity was accepted")
+	}
+}
+
+// The carried-audio path mirrors subtitles: a missing source version or a
+// malformed identity degrades to the server's already-resolved track (ok=false)
+// instead of returning an error that would terminal the start.
+func TestResolveCarriedAudioTrackV3DegradesWhenSourceMissing(t *testing.T) {
+	target := &models.MediaFile{ID: 5, AudioTracks: []models.AudioTrack{
+		{Codec: "aac", Default: true}, {Codec: "ac3"},
+	}}
+	handler := &PlaybackHandler{}
+	if got, ok := handler.resolveCarriedAudioTrackV3(context.Background(), playback.TrackIDV3(target.ID, "audio", 1), target); !ok || got != 1 {
+		t.Fatalf("same-file carried audio = (%d, %v), want (1, true)", got, ok)
+	}
+	if got, ok := handler.resolveCarriedAudioTrackV3(context.Background(), playback.TrackIDV3(999, "audio", 0), target); ok {
+		t.Fatalf("missing source version = (%d, true), want ok=false", got)
+	}
+	if _, ok := handler.resolveCarriedAudioTrackV3(context.Background(), "not-a-track-id", target); ok {
+		t.Fatal("malformed carried identity must not resolve")
+	}
+}
+
+// downloadedSubtitleRepoByFile returns a distinct downloaded-subtitle list per
+// media file, unlike handlerMockSubtitleRepo which returns one list regardless
+// of file. Remap tests need the two versions' rows to differ.
+type downloadedSubtitleRepoByFile struct {
+	subtitles.Repository
+	byFile map[int][]subtitles.DownloadedSubtitle
+}
+
+func (r downloadedSubtitleRepoByFile) ListDownloadedSubtitles(_ context.Context, mediaFileID int) ([]subtitles.DownloadedSubtitle, error) {
+	return append([]subtitles.DownloadedSubtitle(nil), r.byFile[mediaFileID]...), nil
+}
+
+func (r downloadedSubtitleRepoByFile) GetDownloadedSubtitle(_ context.Context, id int) (*subtitles.DownloadedSubtitle, error) {
+	for _, list := range r.byFile {
+		for i := range list {
+			if list[i].ID == id {
+				copy := list[i]
+				return &copy, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func TestRemapSubtitleSelectionV3PrefersDownloadedSubtitleID(t *testing.T) {
+	source := &models.MediaFile{ID: 1}
+	target := &models.MediaFile{ID: 2}
+	repo := downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+		source.ID: {{ID: 71, MediaFileID: source.ID, Language: "eng", Format: subtitles.FormatSRT}},
+		// Two same-language/format rows with the empty release name virtual
+		// rows persist. Only the stable id distinguishes them.
+		target.ID: {
+			{ID: 72, MediaFileID: target.ID, Language: "eng", Format: subtitles.FormatSRT},
+			{ID: 71, MediaFileID: target.ID, Language: "eng", Format: subtitles.FormatSRT},
+		},
+	}}
+	handler := &PlaybackHandler{SubtitleRepo: repo}
+	index := 0
+	request := playback.StartRequestV3{SubtitleTrackIndex: &index}
+	if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+		t.Fatalf("remap failed: %v", err)
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+		t.Fatalf("remap index = %v, want 1 (id-matched row)", request.SubtitleTrackIndex)
+	}
+	if request.SubtitleTrackID != playback.TrackIDV3(target.ID, "subtitle", 1) {
+		t.Fatalf("remap id = %q, want target index 1 identity", request.SubtitleTrackID)
+	}
+}
+
+func TestRemapSubtitleSelectionV3FallsBackToReleaseNameWithoutIDs(t *testing.T) {
+	source := &models.MediaFile{ID: 3}
+	target := &models.MediaFile{ID: 4}
+	repo := downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+		source.ID: {{Language: "eng", Format: subtitles.FormatSRT, ReleaseName: "release-a"}},
+		target.ID: {
+			{Language: "eng", Format: subtitles.FormatSRT, ReleaseName: "release-b"},
+			{Language: "eng", Format: subtitles.FormatSRT, ReleaseName: "release-a"},
+		},
+	}}
+	handler := &PlaybackHandler{SubtitleRepo: repo}
+	index := 0
+	request := playback.StartRequestV3{SubtitleTrackIndex: &index}
+	if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+		t.Fatalf("remap failed: %v", err)
+	}
+	if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+		t.Fatalf("remap index = %v, want 1 (release-name match)", request.SubtitleTrackIndex)
+	}
+}
+
 func TestRouteEventV3HasPerUserLimitAcrossAttemptIDs(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	for i := 0; i < 600; i++ {
@@ -4231,22 +4365,29 @@ func TestHandleReplanPlaybackV3PreservesOmittedSubtitleAndReportsUnavailableInFa
 		PlanAttemptID: "subtitle-version-attempt-0001", PlanAttemptKey: currentKey,
 		AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1, QualityPreference: "1080p",
 		// A non-track-change replan may omit an unchanged subtitle identity.
-		// The server must preserve it, then fail explicitly because the 1080p
-		// fallback has no equivalent track. Clearing it would incorrectly make
-		// the alternate version playable with subtitles off.
+		// The server carries it onto the 1080p fallback. That fallback has no
+		// equivalent track, and after every candidate has been tried the
+		// carried selection degrades to subtitles-off rather than terminalling
+		// playback: the session must still open even without the subtitle.
 		SelectedTracks:        playback.SelectedTracksV3{Audio: started.PlaybackPlan.SelectedTracks.Audio},
 		Capabilities:          startRequest.Capabilities,
 		ClientPlaybackContext: startRequest.ClientPlaybackContext,
 	})
-	if response.Terminal == nil || response.Terminal.Reason != "subtitle_unavailable_in_version" || response.Terminal.Retryable {
+	if response.Terminal != nil || response.PlaybackPlan == nil {
 		t.Fatalf("fallback terminal = %#v, plan = %#v", response.Terminal, response.PlaybackPlan)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("fallback effective file = %d, want %d", response.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
+	}
+	if response.PlaybackPlan.Subtitle.Mode != playback.SubtitleOffV3 || response.PlaybackPlan.SelectedTracks.Subtitle != nil {
+		t.Fatalf("fallback subtitles = %#v / %#v, want off with no selection", response.PlaybackPlan.Subtitle, response.PlaybackPlan.SelectedTracks.Subtitle)
 	}
 	record, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.NormalizedRequest.SubtitleTrackID != startRequest.SubtitleTrackID || record.CurrentPlan.SelectedTracks.Subtitle == nil {
-		t.Fatalf("terminal fallback changed durable subtitle selection: %#v", record)
+	if record.NormalizedRequest.SubtitleTrackID != "" || record.NormalizedRequest.SubtitleTrackIndex != nil {
+		t.Fatalf("degraded fallback kept the durable subtitle selection: %#v", record.NormalizedRequest)
 	}
 }
 
@@ -4717,6 +4858,180 @@ func TestHandleReplanPlaybackV3SidecarChangeReusesCopyHLSTransport(t *testing.T)
 	}
 }
 
+// TestHandleReplanPlaybackV3SeekReanchorReusesCopyHLSTransport verifies that a
+// seek reanchor with an identical recipe and route keeps the active HLS
+// generation. The segment layer restarts FFmpeg in place for targets past the
+// produced head; rebuilding the transport here would add a teardown/respawn and
+// (for virtual sources) a provider re-resolution that the seek did not need.
+func TestHandleReplanPlaybackV3SeekReanchorReusesCopyHLSTransport(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.Container = "mkv"
+	file.FilePath = writePlaybackTestMediaFile(t, "movie.mkv")
+	file.ExternalSubtitles = []models.ExternalSubtitle{
+		{Path: writePlaybackTestMediaFile(t, "movie.de.srt"), Language: "de", Format: "srt"},
+	}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.Capabilities.Containers = []string{"m3u8"}
+	startRequest.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassHLSV3: {
+			Enabled: true, SupportedOnDevice: true,
+			Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true},
+		},
+	}
+	german := 0
+	startRequest.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", german)
+	startRequest.SubtitleTrackIndex = &german
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+	if started.PlaybackPlan.Delivery != playback.DeliveryRemuxHLSV3 {
+		t.Fatalf("start plan = %#v, want copy HLS", started.PlaybackPlan)
+	}
+	before := handler.tm.GetTranscodeSession(started.SessionID)
+	if before == nil {
+		t.Fatal("start created no local HLS transport")
+	}
+	t.Cleanup(func() { handler.tm.CloseTranscodeSession(started.SessionID, "") })
+	beforeOpts := before.Opts()
+	beforeTimeline := started.PlaybackPlan.Timeline
+	beforeURL := started.PlaybackPlan.Stream.URL
+	beforeGeneration := before.SegmentGeneration()
+	before.ReportSegmentDownloaded(25)
+	beforeRequested := before.LastRequestedSegment()
+
+	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "seek-reanchor-reuse-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "seek-reanchor-plan-attempt-0001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		QualityPreference:     startRequest.QualityPreference,
+		PositionSeconds:       120,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if replanned.PlaybackPlan == nil {
+		t.Fatalf("seek reanchor returned no plan: outcome=%s terminal=%+v", replanned.Outcome, replanned.Terminal)
+	}
+	after := handler.tm.GetTranscodeSession(started.SessionID)
+	if after != before {
+		t.Fatalf("seek reanchor rebuilt the HLS transport: before=%p after=%p", before, after)
+	}
+	if !after.IsRunning() {
+		t.Fatal("seek reanchor stopped the active HLS transport")
+	}
+	if after.SegmentGeneration() != beforeGeneration {
+		t.Fatalf("seek reanchor restarted FFmpeg: generation %d -> %d", beforeGeneration, after.SegmentGeneration())
+	}
+	if afterOpts := after.Opts(); afterOpts.OutputDir != beforeOpts.OutputDir || afterOpts.SeekSeconds != beforeOpts.SeekSeconds || afterOpts.StartSegmentNumber != beforeOpts.StartSegmentNumber {
+		t.Fatalf("seek reanchor changed HLS generation: before=%#v after=%#v", beforeOpts, afterOpts)
+	}
+	if after.LastRequestedSegment() != beforeRequested {
+		t.Fatalf("seek reanchor reset throttle progress: before=%d after=%d", beforeRequested, after.LastRequestedSegment())
+	}
+	if replanned.PlaybackPlan.PlanID != started.PlaybackPlan.PlanID {
+		t.Fatalf("seek reanchor changed plan identity: %q -> %q", started.PlaybackPlan.PlanID, replanned.PlaybackPlan.PlanID)
+	}
+	if replanned.PlaybackPlan.Stream.URL != beforeURL {
+		t.Fatalf("seek reanchor changed stream URL: %q -> %q", beforeURL, replanned.PlaybackPlan.Stream.URL)
+	}
+	afterTimeline := replanned.PlaybackPlan.Timeline
+	if afterTimeline.StreamOriginSeconds != beforeTimeline.StreamOriginSeconds ||
+		afterTimeline.TimelineOffsetSeconds != beforeTimeline.TimelineOffsetSeconds ||
+		!reflect.DeepEqual(afterTimeline.SeekWindowStartSeconds, beforeTimeline.SeekWindowStartSeconds) ||
+		afterTimeline.CanSeekAnywhere != beforeTimeline.CanSeekAnywhere ||
+		afterTimeline.SeekRestoration != beforeTimeline.SeekRestoration {
+		t.Fatalf("seek reanchor changed stream window: timeline %#v -> %#v", beforeTimeline, afterTimeline)
+	}
+	if afterTimeline.SourceStartSeconds != 120 || afterTimeline.PlayerStartSeconds != max(0, 120-beforeTimeline.StreamOriginSeconds) {
+		t.Fatalf("seek reanchor lost requested position: timeline %#v", afterTimeline)
+	}
+}
+
+// TestHandleReplanPlaybackV3SeekReanchorRebuildsProgressiveTransport pins the
+// fix for the in-place-seek regression: a server_remux_progressive response is
+// one continuous byte stream, not a segment-addressable manifest, so a
+// reanchor on it must rebuild the transport instead of reusing the URL the
+// client is already reading. Reusing it left the player no bytes at the target
+// and it snapped back (web) or stalled (Android).
+func TestHandleReplanPlaybackV3SeekReanchorRebuildsProgressiveTransport(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.Container = "mkv"
+	file.FilePath = writePlaybackTestMediaFile(t, "movie.mkv")
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	stubCopySeekAnchorV3(handler)
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassProgressiveV3: {
+			Enabled: true, SupportedOnDevice: true,
+			Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true},
+		},
+	}
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+	if started.PlaybackPlan.Delivery != playback.DeliveryRemuxProgressiveV3 {
+		t.Fatalf("start plan = %#v, want progressive remux", started.PlaybackPlan)
+	}
+	beforeURL := started.PlaybackPlan.Stream.URL
+
+	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "seek-reanchor-progressive-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "seek-reanchor-progressive-attempt-0001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		QualityPreference:     startRequest.QualityPreference,
+		PositionSeconds:       120,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if replanned.PlaybackPlan == nil {
+		t.Fatalf("seek reanchor returned no plan: outcome=%s terminal=%+v", replanned.Outcome, replanned.Terminal)
+	}
+	afterURL := replanned.PlaybackPlan.Stream.URL
+	if afterURL == beforeURL {
+		t.Fatalf("progressive seek reanchor reused the active transport URL %q", beforeURL)
+	}
+	parsed, err := url.Parse(afterURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.Query().Get("seek"); got != "120" {
+		t.Fatalf("progressive seek reanchor stream URL %q has seek=%q, want the rebuilt 120 target", afterURL, got)
+	}
+	if replanned.PlaybackPlan.Timeline.SourceStartSeconds != 120 {
+		t.Fatalf("progressive seek reanchor timeline = %#v", replanned.PlaybackPlan.Timeline)
+	}
+}
+
 func TestSidecarOnlyHLSReplanKeepsEffectiveToneMapFallback(t *testing.T) {
 	currentPlan := playback.PlanV3{
 		PlanID:               "current-plan",
@@ -4821,6 +5136,70 @@ func TestHasActiveReusableTransportV3Progressive(t *testing.T) {
 	// transcode-manager session or node URL alone.
 	if handler.hasActiveReusableTransportV3(localProgressive, playback.DeliveryRemuxHLSV3) {
 		t.Fatal("HLS delivery was deemed reusable from progressive-only routing evidence")
+	}
+}
+
+func TestSeekReanchorWithinActiveWindowV3(t *testing.T) {
+	start := 30.0
+	end := 90.0
+	hlsBase := playback.PlanV3{Delivery: playback.DeliveryRemuxHLSV3}
+	openPlan := hlsBase
+	openPlan.Timeline = playback.TimelineV3{SeekWindowStartSeconds: &start}
+	closedPlan := hlsBase
+	closedPlan.Timeline = playback.TimelineV3{SeekWindowStartSeconds: &start, SeekWindowEndSeconds: &end}
+	unbounded := hlsBase
+
+	if seekReanchorWithinActiveWindowV3(openPlan, 29.99) {
+		t.Fatal("target before the window start must not reuse the active transport")
+	}
+	if !seekReanchorWithinActiveWindowV3(openPlan, start) {
+		t.Fatal("target at the window start must reuse the active transport")
+	}
+	// An open end intentionally allows forward jumps: the segment layer
+	// restarts FFmpeg in place for targets past the produced head.
+	if !seekReanchorWithinActiveWindowV3(openPlan, 10_000) {
+		t.Fatal("forward jump against an open window end must reuse the active transport")
+	}
+	if seekReanchorWithinActiveWindowV3(closedPlan, end+0.01) {
+		t.Fatal("target past a closed window end must not reuse the active transport")
+	}
+	if !seekReanchorWithinActiveWindowV3(unbounded, 0) {
+		t.Fatal("an unbounded window must reuse the active transport")
+	}
+	// A can_seek_anywhere plan publishes no window start, but the reused
+	// generation still begins at a known stream origin. A target before that
+	// origin cannot be served in place: the segment layer declines with
+	// ErrSegmentNotFound and the client pays a 404 -> rebuild, so the reanchor
+	// must rebuild directly. An unknown (zero) origin keeps the permissive path.
+	originBound := hlsBase
+	originBound.Timeline = playback.TimelineV3{StreamOriginSeconds: 600, CanSeekAnywhere: true}
+	if seekReanchorWithinActiveWindowV3(originBound, 599.99) {
+		t.Fatal("target before a known stream origin must not reuse the active transport")
+	}
+	if !seekReanchorWithinActiveWindowV3(originBound, 600) {
+		t.Fatal("target at the known stream origin must reuse the active transport")
+	}
+	if !seekReanchorWithinActiveWindowV3(originBound, 10_000) {
+		t.Fatal("forward jump past a known stream origin must reuse the active transport")
+	}
+
+	// A progressive remux is a single continuous byte stream, not a
+	// segment-addressable manifest: no target can be served in place, no matter
+	// how permissive the window looks. Reusing it hands the client a URL whose
+	// bytes never move to the requested position.
+	progressiveOpen := playback.PlanV3{
+		Delivery: playback.DeliveryRemuxProgressiveV3,
+		Timeline: playback.TimelineV3{SeekWindowStartSeconds: &start},
+	}
+	if seekReanchorWithinActiveWindowV3(progressiveOpen, start) {
+		t.Fatal("progressive remux must not reuse its transport for an in-window seek")
+	}
+	if seekReanchorWithinActiveWindowV3(progressiveOpen, 10_000) {
+		t.Fatal("progressive remux must not reuse its transport for a forward seek")
+	}
+	progressiveUnbounded := playback.PlanV3{Delivery: playback.DeliveryRemuxProgressiveV3}
+	if seekReanchorWithinActiveWindowV3(progressiveUnbounded, 0) {
+		t.Fatal("progressive remux must rebuild even with an unbounded window")
 	}
 }
 
@@ -6372,6 +6751,11 @@ func TestHandleReplanPlaybackV3SkipsRehydrationOfUnchangedVirtualCandidate(t *te
 	complete.ID = 500
 	complete.FilePath = "virtual://movie/tt-replan-skip?result=pinned"
 	complete.VirtualOwnerInstallationID = 5
+	// The row carries complete evidence, but only a real probe makes it an
+	// "already probed" row that may skip re-probing. Without the stamp the
+	// resolver must treat the inventory as unverified and probe it.
+	probedAt := time.Now().Add(-time.Hour)
+	complete.ProbeUpdatedAt = &probedAt
 	files := map[int]*models.MediaFile{complete.ID: complete}
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
 	stubCopySeekAnchorV3(handler)
