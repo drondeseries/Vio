@@ -1284,24 +1284,37 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	response := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 	virtualActive := virtualResolved && session != nil && session.VirtualSourceURI != ""
 
+	// Virtual relay inputs never enter the payload cache under their rotating
+	// URL; key on the pinned source + effective ordinal instead. The identity
+	// is computed before the drift probe so a committed artifact can
+	// short-circuit it, and recomputed after a remap to keep the warm and
+	// serve keys aligned. The handler owns the detached warm
+	// (warmVirtualSubtitleAfterWindowMiss), because this request's relay
+	// registration is released when the request ends; the cache's own detached
+	// warm is therefore disabled for virtual inputs.
+	if virtualActive {
+		opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+		opts.DisableBackgroundWarm = true
+	}
+
 	// Row-vs-evidence drift (flagged in handleSubtitle) means the catalog row
 	// no longer describes the release this session planned against. Probe the
 	// live relay input once before any spawn or header commit and re-map the
 	// plan ordinal onto a same-class live track when the pinned release
 	// rotated. Mandatory for PGS, whose .sup response commits 200 before
 	// ffmpeg spawns and therefore can never be retrofitted after a failed map.
-	if virtualActive && driftSuspected && !h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts) {
-		writeSubtitleSourceChanged(w)
-		return
-	}
-
-	// Virtual relay inputs never enter the payload cache under their rotating
-	// URL; key on the pinned source + effective ordinal instead (the identity
-	// must reflect any drift remap above), and never run a detached warm
-	// against a request-scoped relay registration.
-	if virtualActive {
+	// A committed full-track text artifact pins the plan-time release, and a
+	// cached-text input remaps to its sole stream, so the probe is unnecessary
+	// then — skip its multi-second tax and serve the warm.
+	if virtualActive && driftSuspected && !h.hasCommittedTextSubtitleEntry(&opts) {
+		if !h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts) {
+			writeSubtitleSourceChanged(w)
+			return
+		}
+		// The probe may have remapped the ordinal; the cache identity must
+		// track the effective map so a remapped extraction lands under its own
+		// key.
 		opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
-		opts.DisableBackgroundWarm = true
 	}
 
 	extractErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle)
@@ -1351,6 +1364,83 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			return
 		}
 	}
+
+	// The windowed request just read the remote source and, by design,
+	// committed nothing. Populate the full-track cache so the next window hits
+	// the small artifact instead of re-demuxing the source.
+	h.warmVirtualSubtitleAfterWindowMiss(r.Context(), file, session, opts, virtualActive)
+}
+
+// hasCommittedTextSubtitleEntry reports whether the virtual serve identity
+// already has a committed full-track text artifact. When true, the windowed
+// extract reads that artifact instead of the container, so the row-vs-evidence
+// drift probe can be skipped: the artifact pins the plan-time release and the
+// post-remap ordinal cannot affect the output (a cached-text input remaps to
+// its sole stream). Bitmap (PGS) codecs always read as false so their
+// mandatory probe is unchanged.
+func (h *StreamHandler) hasCommittedTextSubtitleEntry(opts *playback.StreamExtractOpts) bool {
+	if h == nil || h.SubtitleCache == nil || opts == nil {
+		return false
+	}
+	return h.SubtitleCache.HasCommittedTextEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat)
+}
+
+// warmVirtualSubtitleAfterWindowMiss starts a detached full-track warm for a
+// windowed virtual text request that could not be served from the cache. It is
+// called after the window itself has streamed, so the warm cannot contend with
+// the triggering request's own read.
+//
+// The warm resolves and holds its own relay registration: the request's
+// registration is released when the request ends, which is exactly why the
+// cache's own detached warm is disabled for virtual inputs
+// (opts.DisableBackgroundWarm). Resolution happens lazily inside the extract
+// closure, so the cache's warm budget (warmSem) and in-flight coalescing
+// (beginFill) gate it before any remote work: concurrent window misses on the
+// same serve identity resolve once and demux once. The registration is
+// released exactly once, after the warm settles.
+func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(ctx context.Context, file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool) {
+	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
+		return
+	}
+	if opts.CacheIdentity == "" {
+		return
+	}
+	// Only text tracks get this handler-owned warm. PGS keeps its existing
+	// window path (its mandatory drift probe and progressive .sup handling are
+	// deliberately unchanged).
+	if playback.IsPGS(opts.SourceCodec) {
+		return
+	}
+	// Full-track requests already fill the cache inline through ServeExtract's
+	// tee; only explicit windows need a detached warm.
+	if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
+		return
+	}
+	// A committed entry means this request served its window from the cached
+	// artifact; nothing to warm.
+	if h.hasCommittedTextSubtitleEntry(&opts) {
+		return
+	}
+
+	warmCtx := context.WithoutCancel(ctx)
+	go func() {
+		var cleanup func()
+		defer func() {
+			if cleanup != nil {
+				cleanup()
+			}
+		}()
+		extract := func(extractCtx context.Context, extractOpts playback.StreamExtractOpts) error {
+			resolved, resolvedCleanup, err := h.resolveVirtualInputURI(warmCtx, file, session.UserID, session.ProfileID, false)
+			if err != nil {
+				return fmt.Errorf("resolve virtual input for subtitle warm: %w", err)
+			}
+			cleanup = resolvedCleanup
+			extractOpts.InputPath = resolved.URL
+			return playback.StreamExtractSubtitle(extractCtx, extractOpts)
+		}
+		<-h.SubtitleCache.WarmTrackInBackground(opts, extract)
+	}()
 }
 
 // verifyVirtualSubtitleLayout probes the live relay input once and, when its

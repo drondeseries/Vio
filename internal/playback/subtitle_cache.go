@@ -148,12 +148,9 @@ func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opt
 	// Reuse the media-stream deadline so progress continues while stalled
 	// connections still have a bounded write lifetime.
 	w = httpstream.NewRollingDeadlineWriter(w)
-	_, format := streamExtractOutput(opts.SourceCodec, opts.TargetFormat)
+	format := subtitleCacheFormat(opts.SourceCodec, opts.TargetFormat)
 	if format == subtitleFormatSUP {
 		return c.ServeSUPExtract(w, r, opts, extract)
-	}
-	if format == subtitleMuxerWebVTT {
-		format = SubtitleFormatVTTV3
 	}
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	if format == subtitleFormatASS {
@@ -245,6 +242,37 @@ func (c *SubtitleCache) serveCached(w http.ResponseWriter, r *http.Request, opts
 	w.Header().Set("Cache-Control", "private, no-cache")
 	http.ServeContent(w, r, "", modTime, cached)
 	return true
+}
+
+// subtitleCacheFormat maps a codec/target pair to the cache format token,
+// normalizing ffmpeg's "webvtt" muxer name to the cache's "vtt" token. It is
+// the one mapping ServeExtract, WarmTrackInBackground, and committed-entry
+// queries share, so a lookup can never disagree with a fill.
+func subtitleCacheFormat(codec, targetFormat string) string {
+	_, format := streamExtractOutput(codec, targetFormat)
+	if format == subtitleMuxerWebVTT {
+		return SubtitleFormatVTTV3
+	}
+	return format
+}
+
+// HasCommittedTextEntry reports whether a committed full-track text (VTT/ASS)
+// artifact exists for the given source identity + track ordinal. codec and
+// targetFormat are the same values passed to ServeExtract, and the format is
+// derived through the same mapping, so true means a windowed ServeExtract for
+// those options will read the cached artifact instead of re-demuxing the
+// source. A bitmap (PGS) codec, an unkeyable source, or a nil cache reads as
+// false.
+func (c *SubtitleCache) HasCommittedTextEntry(inputPath, cacheIdentity string, trackIndex int, codec, targetFormat string) bool {
+	if c == nil {
+		return false
+	}
+	format := subtitleCacheFormat(codec, targetFormat)
+	if format != SubtitleFormatVTTV3 && format != subtitleFormatASS {
+		return false
+	}
+	_, _, ok := c.cachedFormatEntryPath(inputPath, cacheIdentity, trackIndex, format)
+	return ok
 }
 
 // ServeSUPExtract serves the .sup extract for one source+track described by
@@ -434,10 +462,7 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 // bucket race is simply re-kicked by the next windowed miss.
 func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SUPExtractFunc) <-chan struct{} {
 	done := make(chan struct{})
-	_, format := streamExtractOutput(opts.SourceCodec, opts.TargetFormat)
-	if format == subtitleMuxerWebVTT {
-		format = SubtitleFormatVTTV3
-	}
+	format := subtitleCacheFormat(opts.SourceCodec, opts.TargetFormat)
 	if c == nil || extract == nil || c.dir() == "" || format == "" {
 		close(done)
 		return done
@@ -801,6 +826,13 @@ func fontBundleCacheFileName(identity string, modTime time.Time, size int64) str
 // ordinal the extraction will actually map, after any drift remap). Staleness
 // is bounded by the same generation bucket subtitleCacheSource
 // applies to identity-keyed entries.
+//
+// The hash is deliberately ordinal-based: folding in a container track id
+// would change every key and orphan entries committed by earlier releases.
+// Across a drift remap the start-path warm, which keys on the plan ordinal,
+// can therefore miss the post-remap serve identity; the serve-path window warm
+// is the authoritative populator and re-keys to the post-remap ordinal, so an
+// orphaned plan-ordinal entry self-heals on the next window.
 func VirtualSubtitleCacheIdentity(fileID int, virtualSourceURI string, trackIndex int) string {
 	pinned := ""
 	if parsed, err := url.Parse(strings.TrimSpace(virtualSourceURI)); err == nil {

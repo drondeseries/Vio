@@ -293,6 +293,117 @@ func TestServeExtractTextWindowedMissWarmsOnce(t *testing.T) {
 	}
 }
 
+// A windowed text miss on a virtual identity with the cache's own warm
+// disabled (the handler owns the warm for request-scoped relay inputs) must
+// still stream the window from the source and must not commit a full-track
+// entry itself.
+func TestServeExtractTextWindowedVirtualMissSkipsCacheWarm(t *testing.T) {
+	c, source := newTestCache(t)
+	windowed := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "subrip",
+		TrackIndex:            0,
+		SeekSeconds:           600,
+		DurationSeconds:       600,
+		CacheIdentity:         "virtual-result-abc",
+		DisableBackgroundWarm: true,
+	}
+	var (
+		warmCalls, windowCalls int
+		got                    StreamExtractOpts
+	)
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), windowed, func(_ context.Context, opts StreamExtractOpts) error {
+		if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
+			warmCalls++
+			return nil
+		}
+		windowCalls++
+		got = opts
+		_, err := io.WriteString(opts.Writer, "WINDOW SLICE")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if windowCalls != 1 || warmCalls != 0 {
+		t.Fatalf("extract calls: window=%d warm=%d, want window=1 warm=0", windowCalls, warmCalls)
+	}
+	if got.InputPath != source || got.InputIsExtractedText != "" {
+		t.Fatalf("windowed extract must read the original source: %+v", got)
+	}
+	if rec.Body.String() != "WINDOW SLICE" {
+		t.Fatalf("windowed body = %q", rec.Body.String())
+	}
+	if c.HasCommittedTextEntry(source, windowed.CacheIdentity, 0, "subrip", "") {
+		t.Fatal("a virtual window miss must not commit a full-track entry")
+	}
+}
+
+// HasCommittedTextEntry derives the cache format from codec/target exactly as
+// ServeExtract does, so the handler's pre-probe check can never disagree with
+// the artifact a windowed serve would read. Bitmap codecs and a nil cache read
+// as false.
+func TestHasCommittedTextEntryFormatAndBitmap(t *testing.T) {
+	c, source := newTestCache(t)
+
+	// Commit a VTT artifact through the real full-track serve path.
+	full := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", TrackIndex: 0}
+	if err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle", nil), full, func(_ context.Context, opts StreamExtractOpts) error {
+		_, err := io.WriteString(opts.Writer, "FULL VTT TRACK")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !c.HasCommittedTextEntry(source, "", 0, "subrip", "") {
+		t.Fatal("vtt entry must be visible for subrip with the default target")
+	}
+	if !c.HasCommittedTextEntry(source, "", 0, "subrip", "vtt") {
+		t.Fatal("vtt entry must be visible for a forced vtt target")
+	}
+	if !c.HasCommittedTextEntry(source, "", 0, "subrip", ".VTT") {
+		t.Fatal("vtt entry must be visible for a case-insensitive target")
+	}
+	if c.HasCommittedTextEntry(source, "", 0, "ass", "") {
+		t.Fatal("ass must not read the vtt entry")
+	}
+	if c.HasCommittedTextEntry(source, "", 1, "subrip", "") {
+		t.Fatal("a different track ordinal must not read the vtt entry")
+	}
+	if c.HasCommittedTextEntry(source, "", 0, "hdmv_pgs_subtitle", "") {
+		t.Fatal("pgs must never read as a committed text entry")
+	}
+	var nilCache *SubtitleCache
+	if nilCache.HasCommittedTextEntry(source, "", 0, "subrip", "") {
+		t.Fatal("nil cache must read as a miss")
+	}
+}
+
+// HasCommittedTextEntry is identity-keyed for a virtual source: the same
+// generation bucket and identity that a warm commits under is what the serve
+// path queries, so a handler can trust a hit to be the artifact it will read.
+func TestHasCommittedTextEntryVirtualIdentity(t *testing.T) {
+	c, source := newTestCache(t)
+	const identity = "virtual-result-window-1"
+	fill := c.beginFill(source, identity, 0, subtitleFormatASS)
+	if fill == nil {
+		t.Fatal("failed to reserve identity-keyed fill")
+	}
+	if _, err := fill.Tee(io.Discard).Write([]byte("[Script Info]\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fill.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if !c.HasCommittedTextEntry(source, identity, 0, "ass", "") {
+		t.Fatal("committed ass entry must be visible under its virtual identity")
+	}
+	if c.HasCommittedTextEntry(source, "virtual-result-other", 0, "ass", "") {
+		t.Fatal("a different virtual identity must not read the entry")
+	}
+}
+
 // A full-track request that misses the cache while another fill for the same
 // key is in flight must wait for that fill and serve its committed bytes — a
 // plan-time warm is not duplicated by the first client fetch. Exactly one

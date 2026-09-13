@@ -55,10 +55,13 @@ type StreamExtractOpts struct {
 	// windows purely on a supplied position, so its renderer either
 	// receives the complete script or a self-contained slice it asked for.
 	AllowWindow bool
-	// DisableBackgroundWarm prevents a windowed PGS miss from starting a
-	// detached full-track extract. Remote relay inputs use request-scoped
-	// registrations, so a detached warm must not outlive that registration.
-	// Local files leave this false and retain the normal cache-warm behavior.
+	// DisableBackgroundWarm prevents a windowed text or PGS miss from
+	// starting a detached full-track extract. Remote relay inputs use
+	// request-scoped registrations, so a detached warm must not outlive that
+	// registration; the stream handler resolves and holds its own
+	// registration for a virtual window miss instead
+	// (StreamHandler.warmVirtualSubtitleAfterWindowMiss). Local files leave
+	// this false and retain the normal cache-warm behavior.
 	DisableBackgroundWarm bool
 	// InputIsExtractedSup marks InputPath as a cached full-track .sup
 	// elementary stream (a previous full extract, produced with -copyts so
