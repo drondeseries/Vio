@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -233,7 +235,7 @@ func TestVirtualTextWindowWarmKeysOnServeOrdinalAfterRemap(t *testing.T) {
 	// This is the identity the remapped serve path computes; the warm must
 	// commit under it.
 	serveIdentity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, remappedOrdinal)
-	handler.warmVirtualSubtitleAfterWindowMiss(context.Background(), file, session, playback.StreamExtractOpts{
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
 		InputPath:       "unused",
 		CacheIdentity:   serveIdentity,
 		TrackIndex:      remappedOrdinal,
@@ -263,7 +265,7 @@ func TestVirtualTextWindowWarmSkipsPGSAndNonVirtual(t *testing.T) {
 	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
 
 	// PGS returns before any goroutine or cache work.
-	handler.warmVirtualSubtitleAfterWindowMiss(context.Background(), file, session, playback.StreamExtractOpts{
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
 		InputPath:       "unused",
 		CacheIdentity:   identity,
 		TrackIndex:      0,
@@ -273,7 +275,7 @@ func TestVirtualTextWindowWarmSkipsPGSAndNonVirtual(t *testing.T) {
 		FFmpegPath:      filepath.Join(dir, "ffmpeg"),
 	}, true)
 	// A non-virtual handler (virtualActive false) is a no-op.
-	handler.warmVirtualSubtitleAfterWindowMiss(context.Background(), file, session, playback.StreamExtractOpts{
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, playback.StreamExtractOpts{
 		InputPath:       "unused",
 		CacheIdentity:   identity,
 		TrackIndex:      0,
@@ -286,4 +288,237 @@ func TestVirtualTextWindowWarmSkipsPGSAndNonVirtual(t *testing.T) {
 	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
 		t.Fatalf("no warm should run for PGS or non-virtual requests: %v", err)
 	}
+}
+
+// A detached virtual text warm that cannot resolve its relay input must not pin
+// the cache's warm slot and in-flight fill forever: resolution runs on a child
+// of the extraction context, so a stuck resolver is canceled when the resolve
+// budget expires and a later warm can take the slot.
+func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	oldTimeout := virtualSubtitleWarmResolveTimeout
+	virtualSubtitleWarmResolveTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { virtualSubtitleWarmResolveTimeout = oldTimeout })
+
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+
+	var calls atomic.Int32
+	entered := make(chan struct{}, 2)
+	released := make(chan struct{}, 2)
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		if calls.Add(1) <= 2 {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			released <- struct{}{}
+			return ResolvedVirtualMedia{}, ctx.Err()
+		}
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:1/video.mkv"}, nil
+	})
+
+	optsFor := func(track int) playback.StreamExtractOpts {
+		return playback.StreamExtractOpts{
+			InputPath:       "unused",
+			CacheIdentity:   playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, track),
+			TrackIndex:      track,
+			SourceCodec:     "subrip",
+			SeekSeconds:     600,
+			DurationSeconds: 600,
+			FFmpegPath:      filepath.Join(dir, "ffmpeg"),
+		}
+	}
+
+	// Occupy both warm slots with resolvers that block until canceled.
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(0), true)
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(1), true)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("blocked warm resolver never started")
+		}
+	}
+
+	// With both slots held, a third warm is dropped rather than queued.
+	handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(2), true)
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("a warm extracted while both slots were held: %v", err)
+	}
+
+	// The resolve deadline must cancel both resolvers and release the slots.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-released:
+		case <-time.After(2 * time.Second):
+			t.Fatal("blocked warm resolver was not canceled by the resolve deadline")
+		}
+	}
+
+	// A retried warm can now take a slot and commit.
+	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 2)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		handler.warmVirtualSubtitleAfterWindowMiss(file, session, optsFor(2), true)
+		if handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 2, "subrip", "") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("retried warm never committed after the resolve deadline released the slots")
+}
+
+// A virtual PGS (.sup) response commits 200 before ffmpeg spawns, so a drift
+// probe that cannot establish the live layout must fail closed with a
+// retryable error rather than let an unvalidated extraction commit a possibly
+// truncated track. Text/ASS keeps its post-spawn map-error net and proceeds.
+func TestVirtualSubtitleProbeFailureFailsClosedForPGS(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+
+	t.Run("pgs_fails_closed", func(t *testing.T) {
+		dir := t.TempDir()
+		argsLog := filepath.Join(dir, "ffmpeg.args")
+		handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+			"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\nprintf 'SUP'\n")
+		writeExecutableScript(t, filepath.Join(dir, "ffprobe"), "#!/bin/sh\nexit 1\n")
+		file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle"}}
+		session.VirtualSubtitleTracks = file.SubtitleTracks
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, true)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("PGS probe failure = %d %q, want retryable 503 before any 200", rec.Code, rec.Body.String())
+		}
+		if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+			t.Fatalf("ffmpeg spawned after a failed PGS probe: %v", err)
+		}
+	})
+
+	t.Run("text_still_proceeds", func(t *testing.T) {
+		dir := t.TempDir()
+		argsLog := filepath.Join(dir, "ffmpeg.args")
+		handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+			"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+		writeExecutableScript(t, filepath.Join(dir, "ffprobe"), "#!/bin/sh\nexit 1\n")
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
+		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, true)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+			t.Fatalf("text probe failure = %d %q, want 200 with the post-spawn net", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// A cold virtual font fetch returns a pending response within its short client
+// budget while the extraction keeps running. The detached flight, not the HTTP
+// waiter, owns the relay registration: releasing it at handler return would
+// leave ffprobe/ffmpeg opening a relay entry that no longer exists.
+func TestHandleSubtitleFontsKeepsRelayForDetachedFlight(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	restore := setFontBundleClientWait(50 * time.Millisecond)
+	defer restore()
+
+	dir := t.TempDir()
+	urlLog := filepath.Join(dir, "font.url")
+	gate := filepath.Join(dir, "font.gate")
+	probeScript := "#!/bin/sh\n" +
+		"for a in \"$@\"; do url=\"$a\"; done\n" +
+		"printf '%s' \"$url\" > '" + urlLog + "'\n" +
+		"while [ ! -f '" + gate + "' ]; do sleep 0.01; done\n" +
+		fontProbeJSON
+	writeExecutableScript(t, filepath.Join(dir, "ffprobe"), probeScript)
+	writeExecutableScript(t, filepath.Join(dir, "ffmpeg"), fontFFmpegDumpScript(filepath.Join(dir, "dump.log")))
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("provider-media"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	virtualURI := "virtual://movie/tt-fonts?result=cand-fonts"
+	file := &models.MediaFile{ID: 42, ContentID: "movie-fonts", FilePath: virtualURI,
+		SubtitleTracks:             []models.SubtitleTrack{{Index: 4, Codec: "ass"}},
+		VirtualOwnerInstallationID: 5,
+	}
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.UpdateStreamState(session.ID, playback.SessionStreamState{
+		VirtualSourceSet:                 true,
+		VirtualSourceURI:                 virtualURI,
+		VirtualSourceOwnerInstallationID: 5,
+		VirtualSubtitleEvidenceSet:       true,
+		VirtualSubtitleTracks:            file.SubtitleTracks,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewStreamHandler(manager, testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = playbackTestConfig(filepath.Join(dir, "ffmpeg"), dir)
+	handler.SubtitleCache = playback.NewSubtitleCache(func() string { return dir })
+	handler.RemoteStreamRelay = remotestream.NewRelay()
+	t.Cleanup(func() { _ = handler.RemoteStreamRelay.Close(context.Background()) })
+	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		return ResolvedVirtualMedia{URL: upstream.URL + "/video.mkv"}, nil
+	})
+
+	recorder := httptest.NewRecorder()
+	handler.HandleSubtitleFonts(recorder, fontBundleHTTPRequest(session.ID, "0"))
+	if recorder.Code != http.StatusOK || strings.TrimSpace(recorder.Body.String()) != "[]" {
+		t.Fatalf("cold font fetch = %d %q, want 200 pending bundle", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get(fontBundlePendingHeader); got != "true" {
+		t.Fatalf("pending marker = %q, want true", got)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("pending Cache-Control = %q, want no-store", got)
+	}
+
+	relayURL := waitForLoggedURL(t, urlLog)
+	resp, err := http.Get(relayURL)
+	if err != nil {
+		t.Fatalf("relay GET after handler return: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("relay URL after handler return = %d, want 200; the HTTP waiter released the flight's source", resp.StatusCode)
+	}
+
+	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := fontBundleCacheKey(file, virtualURI, handler.ffmpegPath())
+	if !pollHandlerFontBundle(t, handler.SubtitleCache, key) {
+		t.Fatal("detached extraction never committed after the HTTP waiter returned")
+	}
+}
+
+func waitForLoggedURL(t *testing.T, path string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil {
+			if u := strings.TrimSpace(string(data)); u != "" {
+				return u
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("font extraction never recorded its relay input URL")
+	return ""
 }

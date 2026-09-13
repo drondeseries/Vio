@@ -987,27 +987,28 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	inputPath := file.FilePath
-	releaseInput := func() {}
-	if virtualFontSource && hasVirtualMediaResolver(h) {
-		var resolved ResolvedVirtualMedia
-		resolved, releaseInput, err = h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
-		if err != nil {
-			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
-			return
-		}
-		inputPath = resolved.URL
-	}
-	defer releaseInput()
-
 	if h.SubtitleCache == nil {
-		// No cache configured: keep the historical uncached path.
-		fonts, err := playback.ExtractAttachedSubtitleFonts(r.Context(), inputPath, h.ffmpegPath())
-		if err != nil {
+		// No cache configured: keep the historical uncached path, resolved and
+		// released within the request.
+		inputPath := file.FilePath
+		releaseInput := func() {}
+		if virtualFontSource && hasVirtualMediaResolver(h) {
+			var resolved ResolvedVirtualMedia
+			resolved, releaseInput, err = h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
+			if err != nil {
+				writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
+				return
+			}
+			inputPath = resolved.URL
+		}
+		defer releaseInput()
+
+		fonts, extractErr := playback.ExtractAttachedSubtitleFonts(r.Context(), inputPath, h.ffmpegPath())
+		if extractErr != nil {
 			slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
 				"file_id", file.ID,
 				"track", trackIndex,
-				"error", err,
+				"error", extractErr,
 			)
 			writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 			return
@@ -1021,14 +1022,37 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	bundle, ready, err := h.SubtitleCache.ExtractFontBundleWithin(r.Context(), cacheKey, fontBundleClientWait, func(ctx context.Context) ([]byte, error) {
-		fonts, extractErr := playback.ExtractAttachedSubtitleFonts(ctx, inputPath, h.ffmpegPath())
+	// The detached single-flight owns the virtual relay registration: it is
+	// resolved inside the extract closure and released when that closure
+	// returns, so a cold HTTP-led flight that outlives the short client wait
+	// still has a valid source for the whole extraction. Releasing at HTTP
+	// return instead would let ffmpeg start against a relay entry that no
+	// longer exists.
+	localPath := file.FilePath
+	bundle, ready, err := h.SubtitleCache.ExtractFontBundleWithin(r.Context(), cacheKey, fontBundleClientWait, func(extractCtx context.Context) ([]byte, error) {
+		inputPath := localPath
+		releaseInput := func() {}
+		if virtualFontSource && hasVirtualMediaResolver(h) {
+			resolved, cleanup, resolveErr := h.resolveVirtualInputURI(extractCtx, file, session.UserID, session.ProfileID, false)
+			if resolveErr != nil {
+				return nil, fmt.Errorf("%w: %w", errVirtualFontResolve, resolveErr)
+			}
+			inputPath = resolved.URL
+			releaseInput = cleanup
+		}
+		defer releaseInput()
+
+		fonts, extractErr := playback.ExtractAttachedSubtitleFonts(extractCtx, inputPath, h.ffmpegPath())
 		if extractErr != nil {
 			return nil, extractErr
 		}
 		return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
 	})
 	if err != nil {
+		if errors.Is(err, errVirtualFontResolve) {
+			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
+			return
+		}
 		slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
 			"file_id", file.ID,
 			"track", trackIndex,
@@ -1039,16 +1063,23 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	}
 	if !ready {
 		// The extraction is still running detached. Hold the request only for
-		// fontBundleClientWait, then hand the client a valid empty bundle so it
-		// falls back to default fonts immediately; the single-flighted
-		// extraction keeps running and lands in the cache for the next fetch.
-		slog.DebugContext(r.Context(), "subtitle font bundle extraction in flight; serving empty bundle",
+		// fontBundleClientWait, then hand the client a distinguishable,
+		// uncacheable pending bundle so it falls back to default fonts
+		// immediately and re-fetches; the single-flighted extraction keeps
+		// running and lands in the cache for that next fetch.
+		slog.DebugContext(r.Context(), "subtitle font bundle extraction in flight; serving pending bundle",
 			"component", "api", "file_id", file.ID, "track", trackIndex)
-		writeFontBundleResponse(w, emptyFontBundle)
+		writePendingFontBundleResponse(w)
 		return
 	}
 	writeFontBundleResponse(w, bundle)
 }
+
+// errVirtualFontResolve marks a font-bundle extraction failure caused by the
+// virtual relay resolution rather than the extraction itself, so the HTTP
+// handler can answer with the provider-resolution status instead of a generic
+// extraction failure.
+var errVirtualFontResolve = errors.New("virtual font bundle resolve failed")
 
 // fontBundleClientWait bounds how long the font-bundle handler waits for a
 // cold extraction before returning an empty bundle. It must stay well below
@@ -1092,6 +1123,24 @@ func writeFontBundleResponse(w http.ResponseWriter, bundle []byte) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "private, max-age=600")
 	_, _ = w.Write(bundle)
+}
+
+// fontBundlePendingHeader marks a font-bundle response whose extraction is
+// still in flight. The web client treats either this header or a no-store
+// Cache-Control as pending: it must not persist the empty body as a definitive
+// font-less result and instead re-fetches for the completed bundle.
+const fontBundlePendingHeader = "X-Silo-Font-Bundle-Pending"
+
+// writePendingFontBundleResponse writes a valid empty bundle for an extraction
+// that is still running. Unlike a definitive font-less file, it is marked
+// pending and uncacheable, so a client cannot retain the empty state for ten
+// minutes while the real bundle is being produced.
+func writePendingFontBundleResponse(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set(fontBundlePendingHeader, "true")
+	_, _ = w.Write(emptyFontBundle)
 }
 
 func (h *StreamHandler) syncSessionsNow(ctx context.Context, reason string) {
@@ -1225,6 +1274,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// preserving the whole script for native consumers); PGS window consumers
 	// opt in with ?windowed=1.
 	allowWindow, seek, duration := subtitleExtractWindow(r, outFormat)
+	windowRequested := subtitleWindowRequested(r)
 	slog.InfoContext(r.Context(), "subtitle stream requested", "component", "api",
 		"file_id", file.ID,
 		"embedded_index", embeddedIndex,
@@ -1243,6 +1293,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		SeekSeconds:     seek,
 		DurationSeconds: duration,
 		AllowWindow:     allowWindow,
+		WindowRequested: windowRequested,
 		FFmpegPath:      h.ffmpegPath(),
 	}
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve
@@ -1306,18 +1357,55 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// A committed full-track text artifact pins the plan-time release, and a
 	// cached-text input remaps to its sole stream, so the probe is unnecessary
 	// then — skip its multi-second tax and serve the warm.
-	if virtualActive && driftSuspected && !h.hasCommittedTextSubtitleEntry(&opts) {
-		if !h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts) {
+	if virtualActive && driftSuspected {
+		if artifact, ok := h.resolveCommittedTextSubtitleEntry(&opts); ok {
+			// A committed full-track text artifact pins the plan-time release and
+			// a windowed extract reads it instead of the container, so the live
+			// probe is unnecessary. Pin the exact artifact: the serve uses that
+			// path (or reports ErrCommittedTextArtifactGone) rather than
+			// re-resolving, so a generation-bucket rollover or eviction cannot
+			// turn the validated artifact into an unvalidated source extract.
+			opts.PinnedTextArtifact = &artifact
+		} else {
+			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts)
+			if !proceed {
+				writeSubtitleSourceChanged(w)
+				return
+			}
+			if probeErr != nil && playback.IsPGS(track.Codec) {
+				// PGS (.sup) commits 200 before ffmpeg spawns, so a probe that
+				// could not establish the live layout must fail closed here,
+				// before any header write, with a retryable error. Text/ASS
+				// keeps its post-spawn map-error safety net instead.
+				writeSubtitleSourceUnavailable(w)
+				return
+			}
+			// The probe may have remapped the ordinal; the cache identity must
+			// track the effective map so a remapped extraction lands under its
+			// own key.
+			opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+		}
+	}
+
+	_, extractErr := h.SubtitleCache.ServeExtractWithResult(response, r, opts, playback.StreamExtractSubtitle)
+	if errors.Is(extractErr, playback.ErrCommittedTextArtifactGone) {
+		// The artifact that allowed the drift probe to be skipped was evicted
+		// before the serve read it. No response has been written, so drop the
+		// pin, validate the live layout, and retry rather than stream an
+		// unvalidated source extract.
+		opts.PinnedTextArtifact = nil
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts)
+		if !proceed {
 			writeSubtitleSourceChanged(w)
 			return
 		}
-		// The probe may have remapped the ordinal; the cache identity must
-		// track the effective map so a remapped extraction lands under its own
-		// key.
+		if probeErr != nil && playback.IsPGS(track.Codec) {
+			writeSubtitleSourceUnavailable(w)
+			return
+		}
 		opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+		_, extractErr = h.SubtitleCache.ServeExtractWithResult(response, r, opts, playback.StreamExtractSubtitle)
 	}
-
-	extractErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle)
 	if extractErr != nil {
 		playback.LogSubtitleStreamError(r.Context(), extractErr, file.ID, embeddedIndex)
 		if r.Context().Err() != nil {
@@ -1338,8 +1426,13 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// relay URL once — no second resolve — and re-map; a source that still
 		// cannot satisfy the requested representation gets a clean retryable 4xx
 		// instead of a 500.
-		if !h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts) {
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts)
+		if !proceed {
 			writeSubtitleSourceChanged(w)
+			return
+		}
+		if probeErr != nil && playback.IsPGS(opts.SourceCodec) {
+			writeSubtitleSourceUnavailable(w)
 			return
 		}
 		// The retry may have remapped to a different live ordinal; the cache
@@ -1368,22 +1461,41 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// The windowed request just read the remote source and, by design,
 	// committed nothing. Populate the full-track cache so the next window hits
 	// the small artifact instead of re-demuxing the source.
-	h.warmVirtualSubtitleAfterWindowMiss(r.Context(), file, session, opts, virtualActive)
+	h.warmVirtualSubtitleAfterWindowMiss(file, session, opts, virtualActive)
 }
 
-// hasCommittedTextSubtitleEntry reports whether the virtual serve identity
-// already has a committed full-track text artifact. When true, the windowed
-// extract reads that artifact instead of the container, so the row-vs-evidence
-// drift probe can be skipped: the artifact pins the plan-time release and the
-// post-remap ordinal cannot affect the output (a cached-text input remaps to
-// its sole stream). Bitmap (PGS) codecs always read as false so their
-// mandatory probe is unchanged.
-func (h *StreamHandler) hasCommittedTextSubtitleEntry(opts *playback.StreamExtractOpts) bool {
+// resolveCommittedTextSubtitleEntry resolves the committed full-track text
+// artifact that a windowed extract for this identity would read, returning a
+// binding token. Callers that skip track-identity validation because the
+// artifact pins the plan-time release must pin this token on the options: the
+// serve then reads that exact path (or reports
+// ErrCommittedTextArtifactGone) rather than re-resolving, so a generation-bucket
+// rollover or eviction between the identity check and the read cannot turn the
+// validated artifact into an unvalidated source extract. Bitmap (PGS) codecs, an
+// unkeyable source, and a nil cache read as false.
+func (h *StreamHandler) resolveCommittedTextSubtitleEntry(opts *playback.StreamExtractOpts) (playback.CommittedTextArtifact, bool) {
 	if h == nil || h.SubtitleCache == nil || opts == nil {
-		return false
+		return playback.CommittedTextArtifact{}, false
 	}
-	return h.SubtitleCache.HasCommittedTextEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat)
+	return h.SubtitleCache.ResolveCommittedTextEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat)
 }
+
+// hasCommittedTextSubtitleEntry reports whether such an artifact currently
+// exists. It is a non-binding presence check used only for warm admission
+// decisions; callers that skip track-identity validation must use
+// resolveCommittedTextSubtitleEntry and pin the returned token.
+func (h *StreamHandler) hasCommittedTextSubtitleEntry(opts *playback.StreamExtractOpts) bool {
+	_, ok := h.resolveCommittedTextSubtitleEntry(opts)
+	return ok
+}
+
+// virtualSubtitleWarmResolveTimeout bounds the relay resolution a detached
+// virtual subtitle warm performs. It is a child of the extraction context the
+// cache hands the warm, so resolution can never outlive extraction; a resolver
+// that never returns is canceled with the extraction instead of pinning the
+// cache's warm slot and in-flight fill for the whole extraction budget. Tests
+// override it to keep the release assertion fast.
+var virtualSubtitleWarmResolveTimeout = 2 * time.Minute
 
 // warmVirtualSubtitleAfterWindowMiss starts a detached full-track warm for a
 // windowed virtual text request that could not be served from the cache. It is
@@ -1394,11 +1506,12 @@ func (h *StreamHandler) hasCommittedTextSubtitleEntry(opts *playback.StreamExtra
 // registration is released when the request ends, which is exactly why the
 // cache's own detached warm is disabled for virtual inputs
 // (opts.DisableBackgroundWarm). Resolution happens lazily inside the extract
-// closure, so the cache's warm budget (warmSem) and in-flight coalescing
-// (beginFill) gate it before any remote work: concurrent window misses on the
-// same serve identity resolve once and demux once. The registration is
-// released exactly once, after the warm settles.
-func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(ctx context.Context, file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool) {
+// closure on a context derived from the extraction context, so the cache's warm
+// budget (warmSem) and in-flight coalescing (beginFill) gate it before any
+// remote work and a stuck resolver cannot pin either: concurrent window misses
+// on the same serve identity resolve once and demux once, and the registration
+// is released exactly once when the warm settles.
+func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFile, session *playback.Session, opts playback.StreamExtractOpts, virtualActive bool) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil || !virtualActive {
 		return
 	}
@@ -1422,7 +1535,6 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(ctx context.Context, 
 		return
 	}
 
-	warmCtx := context.WithoutCancel(ctx)
 	go func() {
 		var cleanup func()
 		defer func() {
@@ -1431,7 +1543,13 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(ctx context.Context, 
 			}
 		}()
 		extract := func(extractCtx context.Context, extractOpts playback.StreamExtractOpts) error {
-			resolved, resolvedCleanup, err := h.resolveVirtualInputURI(warmCtx, file, session.UserID, session.ProfileID, false)
+			// Resolve on a child of the extraction context, never the detached
+			// request context: a resolver that hangs is canceled when the warm
+			// budget is exhausted, releasing the warm slot and fill instead of
+			// holding them forever.
+			resolveCtx, cancel := context.WithTimeout(extractCtx, virtualSubtitleWarmResolveTimeout)
+			defer cancel()
+			resolved, resolvedCleanup, err := h.resolveVirtualInputURI(resolveCtx, file, session.UserID, session.ProfileID, false)
 			if err != nil {
 				return fmt.Errorf("resolve virtual input for subtitle warm: %w", err)
 			}
@@ -1446,18 +1564,19 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(ctx context.Context, 
 // verifyVirtualSubtitleLayout probes the live relay input once and, when its
 // subtitle layout drifted from the plan-time evidence this session captured,
 // re-maps the extract options onto a same-class live track. It reports whether
-// extraction may proceed. False means a successful probe positively found that
-// the live source cannot satisfy the requested representation — rotation to a
-// different subtitle class, or an ambiguous or absent match — and the caller
-// must answer with a clean retryable 4xx before ffmpeg spawns or headers
-// commit. A probe that fails to run is deliberately not fatal: it is not
-// evidence of rotation, so extraction proceeds on the plan ordinal (a genuine
-// rotation still surfaces via the post-spawn map error for text/ASS). Virtual
-// inputs are request-local probe state; the session's published evidence is
-// never rewritten.
-func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, session *playback.Session, opts *playback.StreamExtractOpts) bool {
+// extraction may proceed, plus the probe error when the probe itself could not
+// run. proceed=false means a successful probe positively found that the live
+// source cannot satisfy the requested representation — rotation to a different
+// subtitle class, or an ambiguous or absent match — and the caller must answer
+// with a clean retryable 4xx before ffmpeg spawns or headers commit. A non-nil
+// probeErr is not evidence of rotation; text/ASS callers deliberately proceed
+// on the plan ordinal (a genuine rotation still surfaces via the post-spawn map
+// error), while a PGS caller must fail closed because its .sup response commits
+// 200 before ffmpeg spawns. Virtual inputs are request-local probe state; the
+// session's published evidence is never rewritten.
+func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, session *playback.Session, opts *playback.StreamExtractOpts) (bool, error) {
 	if session == nil || opts == nil || strings.TrimSpace(opts.InputPath) == "" {
-		return true
+		return true, nil
 	}
 	liveTracks, err := playback.ProbeSubtitleLayout(ctx, h.ffmpegPath(), opts.InputPath)
 	if err != nil {
@@ -1467,17 +1586,19 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 		// still caught for text/ASS by the post-spawn map-error safety net, and
 		// treating a probe failure as a rotation produced a churn loop when the
 		// relay itself was what timed out. Only a probe that SUCCEEDS and
-		// positively reports a different layout warrants a 409.
+		// positively reports a different layout warrants a 409. The error is
+		// returned so a bitmap caller can fail closed instead of committing a
+		// possibly-truncated .sup.
 		slog.WarnContext(ctx, "virtual subtitle layout probe failed", "component", "api",
 			"track_codec", requestedTrack.Codec,
 			"error", err)
-		return true
+		return true, err
 	}
 	if playback.SubtitleLayoutsEqual(liveTracks, session.VirtualSubtitleTracks) {
 		// The pinned release is unchanged — the catalog row was re-probed
 		// against a different candidate. The plan ordinal already names the
 		// live layout.
-		return true
+		return true, nil
 	}
 	liveOrdinal, liveTrack, matched := playback.MatchEmbeddedSubtitleTrack(requestedTrack, liveTracks)
 	if !matched {
@@ -1485,7 +1606,7 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 			"requested_codec", requestedTrack.Codec,
 			"requested_language", requestedTrack.Language,
 			"live_subtitle_count", len(liveTracks))
-		return false
+		return false, nil
 	}
 	// Class preservation is the hard rule: the URL extension was minted at
 	// plan time, so a re-map may only land on a codec whose extraction uses
@@ -1494,7 +1615,7 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 		slog.WarnContext(ctx, "virtual subtitle remap rejected: output muxer mismatch", "component", "api",
 			"plan_codec", requestedTrack.Codec,
 			"live_codec", liveTrack.Codec)
-		return false
+		return false, nil
 	}
 	planOrdinal := opts.TrackIndex
 	opts.TrackIndex = liveOrdinal
@@ -1504,7 +1625,7 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 		"live_ordinal", liveOrdinal,
 		"codec", liveTrack.Codec,
 		"language", liveTrack.Language)
-	return true
+	return true, nil
 }
 
 // writeSubtitleSourceChanged answers a clean retryable 4xx when a virtual
@@ -1517,12 +1638,23 @@ func writeSubtitleSourceChanged(w http.ResponseWriter) {
 		"The selected subtitle track changed on the media source; retry")
 }
 
+// writeSubtitleSourceUnavailable answers a retryable 503 when a virtual bitmap
+// (PGS) source's live layout could not be established before its .sup response
+// would commit 200. A .sup commits its status before ffmpeg spawns and has no
+// post-spawn recovery, so the server fails closed rather than stream a
+// possibly-truncated track; the client can retry once the source settles.
+func writeSubtitleSourceUnavailable(w http.ResponseWriter) {
+	writeError(w, http.StatusServiceUnavailable, "subtitle_source_unavailable",
+		"Unable to verify the subtitle source; retry")
+}
+
 // subtitleExtractWindow resolves the extraction window for an embedded
 // subtitle request from its explicit query parameters. WebVTT and ASS slices
-// read ?position/?duration directly; because StreamExtractOpts only windows
-// ASS when SeekSeconds > 0, a duration-only ASS request stays whole-track.
-// PGS requires the explicit ?windowed=1 opt-in via PGSWindowRequest so a
-// whole-track consumer never silently loses cues outside an implicit window.
+// read ?position/?duration directly; the explicit window intent is carried
+// separately on StreamExtractOpts.WindowRequested (see subtitleWindowRequested)
+// so a position=0 window is not mistaken for a whole-track fetch. PGS requires
+// the explicit ?windowed=1 opt-in via PGSWindowRequest so a whole-track consumer
+// never silently loses cues outside an implicit window.
 func subtitleExtractWindow(r *http.Request, outFormat string) (allowWindow bool, seek, duration float64) {
 	switch outFormat {
 	case "vtt", subtitleFormatASS:
@@ -1531,6 +1663,22 @@ func subtitleExtractWindow(r *http.Request, outFormat string) (allowWindow bool,
 		return playback.PGSWindowRequest(r.URL.Query())
 	}
 	return false, 0, 0
+}
+
+// subtitleWindowRequested reports whether the caller explicitly asked for a
+// bounded window by supplying a position parameter. A present position counts
+// even at zero: position=0&duration=600 is the first bounded slice, whereas a
+// request that omits position (and duration) is a whole-track fetch. Only an
+// explicit position sets the intent; a duration-only request keeps its existing
+// behavior (text is still capped by DurationSeconds, ASS stays whole-track), so
+// this cannot silently turn an ordinary artifact fetch into a window.
+func subtitleWindowRequested(r *http.Request) bool {
+	raw := strings.TrimSpace(r.URL.Query().Get("position"))
+	if raw == "" {
+		return false
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	return err == nil && v >= 0 && !math.IsInf(v, 0) && !math.IsNaN(v)
 }
 
 // subtitleSeekPosition uses only the caller's explicit position. Session

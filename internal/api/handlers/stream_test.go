@@ -1471,6 +1471,34 @@ func TestSubtitleExtractWindowPGSStillRequiresOptIn(t *testing.T) {
 	}
 }
 
+// An explicit position parameter, even zero, requests a bounded window; an
+// absent position (including a duration-only startup fetch) keeps the
+// whole-track default. Without this distinction position=0&duration=600 was
+// indistinguishable from a full fetch and re-demuxed the entire source.
+func TestSubtitleWindowRequestedNeedsExplicitPosition(t *testing.T) {
+	cases := []struct {
+		query string
+		want  bool
+	}{
+		{"", false},
+		{"?duration=600", false},
+		{"?position=0", true},
+		{"?position=0&duration=600", true},
+		{"?position=120&duration=600", true},
+		{"?position=", false},
+		{"?position=invalid", false},
+		{"?position=-1", false},
+		{"?position=NaN", false},
+		{"?position=+Inf", false},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/subtitles/0.vtt"+tc.query, nil)
+		if got := subtitleWindowRequested(req); got != tc.want {
+			t.Errorf("query %q windowRequested = %v, want %v", tc.query, got, tc.want)
+		}
+	}
+}
+
 func TestEmbeddedSubtitleExtractionFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name, script string
@@ -1534,10 +1562,11 @@ func virtualLayoutHandler(ffprobePath string) *StreamHandler {
 }
 
 // A drift probe that fails to run (context canceled, relay timeout) is not
-// evidence that the pinned source rotated. The request must proceed with the
-// planned ordinal — for every codec, PGS included — instead of answering 409
-// and forcing the client to replan. A positive mismatch is the only signal
-// that warrants a replan.
+// evidence that the pinned source rotated. verifyVirtualSubtitleLayout reports
+// the failure alongside "proceed" so the caller decides: text/ASS proceeds with
+// the planned ordinal and lets the post-spawn map net catch a genuine rotation,
+// while a PGS caller fails closed because its .sup commits 200 before ffmpeg
+// spawns. A positive mismatch is the only signal that warrants a replan.
 func TestVerifyVirtualSubtitleLayoutProbeFailureProceedsWithPlan(t *testing.T) {
 	for _, codec := range []string{"ass", "hdmv_pgs_subtitle"} {
 		t.Run(codec, func(t *testing.T) {
@@ -1553,8 +1582,12 @@ func TestVerifyVirtualSubtitleLayoutProbeFailureProceedsWithPlan(t *testing.T) {
 			}
 			requested := models.SubtitleTrack{Index: 3, Codec: codec}
 
-			if !handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts) {
+			proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts)
+			if !proceed {
 				t.Fatal("probe failure must serve the planned ordinal, not force a replan")
+			}
+			if probeErr == nil {
+				t.Fatal("probe failure must be reported so a bitmap caller can fail closed")
 			}
 			if opts.TrackIndex != 3 || opts.SourceCodec != codec {
 				t.Fatalf("plan ordinal/codec must be preserved: %+v", opts)
@@ -1579,7 +1612,8 @@ func TestVerifyVirtualSubtitleLayoutPositiveMismatchForcesReplan(t *testing.T) {
 	}
 	requested := models.SubtitleTrack{Index: 0, Codec: "ass", Language: "eng"}
 
-	if handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts) {
+	proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts)
+	if proceed || probeErr != nil {
 		t.Fatal("a positively different live layout must force a 409 replan")
 	}
 }
