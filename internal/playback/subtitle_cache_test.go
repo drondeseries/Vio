@@ -50,6 +50,46 @@ func TestServeExtractTextCacheVariants(t *testing.T) {
 	}
 }
 
+// A windowed ASS request must take the windowed branch and stream its own
+// slice rather than waiting on or starting a whole-track fill: a full-track
+// ASS demux over a virtual relay takes ~100s, which is the stall this path
+// removes. Mirrors the windowed VTT tests.
+func TestServeExtractWindowedASSStreamsWithoutFullTrackFill(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		TrackIndex:            0,
+		SeekSeconds:           120,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+	}
+	var got StreamExtractOpts
+	calls := 0
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass?position=120&duration=600", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+		calls++
+		got = o
+		_, err := io.WriteString(o.Writer, "[Script Info]\n")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want 1 (window only)", calls)
+	}
+	if got.SeekSeconds != 120 || got.DurationSeconds != 600 {
+		t.Fatalf("window parameters not preserved: %+v", got)
+	}
+	if rec.Body.String() != "[Script Info]\n" {
+		t.Fatalf("windowed body = %q", rec.Body.String())
+	}
+	if f, _, ok := c.lookup(source, "", 0, subtitleFormatASS); ok {
+		_ = f.Close()
+		t.Fatal("windowed ASS extract must not commit a full-track entry")
+	}
+}
+
 func TestServeExtractTextWindowDoesNotPoisonFullTrack(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", DurationSeconds: 600}

@@ -1439,6 +1439,38 @@ func TestSubtitleExplicitWindow(t *testing.T) {
 	}
 }
 
+// ASS requests read the same explicit ?position/?duration window as WebVTT:
+// the web client's JASSUB renderer asks for a slice as playback approaches
+// the tail, and the server must window those requests instead of demuxing the
+// complete track over the relay.
+func TestSubtitleExtractWindowASSReadsExplicitWindow(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/subtitles/0.ass?position=120.5&duration=600", nil)
+	allow, seek, duration := subtitleExtractWindow(req, subtitleFormatASS)
+	if allow || seek != 120.5 || duration != 600 {
+		t.Fatalf("ASS window = (%v, %v, %v), want (false, 120.5, 600)", allow, seek, duration)
+	}
+
+	// Absent params leave the whole-track defaults.
+	req = httptest.NewRequest(http.MethodGet, "/subtitles/0.ass", nil)
+	if allow, seek, duration := subtitleExtractWindow(req, subtitleFormatASS); allow || seek != 0 || duration != 0 {
+		t.Fatalf("default ASS window = (%v, %v, %v), want zeros", allow, seek, duration)
+	}
+}
+
+// PGS windowing still requires the explicit ?windowed=1 opt-in: the ASS path
+// must not enable AllowWindow for PGS.
+func TestSubtitleExtractWindowPGSStillRequiresOptIn(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/subtitles/0.sup?position=120&duration=600", nil)
+	if allow, seek, duration := subtitleExtractWindow(req, subtitleFormatSUP); allow || seek != 0 || duration != 0 {
+		t.Fatalf("PGS without windowed=1 = (%v, %v, %v), want zeros", allow, seek, duration)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/subtitles/0.sup?windowed=1&position=120&duration=600", nil)
+	allow, seek, duration := subtitleExtractWindow(req, subtitleFormatSUP)
+	if !allow || seek != 120 || duration != 600 {
+		t.Fatalf("PGS opt-in = (%v, %v, %v), want (true, 120, 600)", allow, seek, duration)
+	}
+}
+
 func TestEmbeddedSubtitleExtractionFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name, script string

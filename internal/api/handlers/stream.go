@@ -1220,17 +1220,11 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 
 	// A subtitle URL describes the complete track unless the caller supplies
 	// an explicit window. Native players fetch once and must retain cues beyond
-	// ten minutes and before a resumed playback position. ASS stays whole;
-	// PGS window consumers opt in with windowed=1.
-	var seek, duration float64
-	var allowWindow bool
-	switch outFormat {
-	case "vtt":
-		seek = subtitleSeekPosition(r)
-		duration = subtitleWindowDuration(r)
-	case subtitleFormatSUP:
-		allowWindow, seek, duration = playback.PGSWindowRequest(r.URL.Query())
-	}
+	// ten minutes and before a resumed playback position. WebVTT and ASS honor
+	// explicit ?position/?duration (ASS windows only when a position is given,
+	// preserving the whole script for native consumers); PGS window consumers
+	// opt in with ?windowed=1.
+	allowWindow, seek, duration := subtitleExtractWindow(r, outFormat)
 	slog.InfoContext(r.Context(), "subtitle stream requested", "component", "api",
 		"file_id", file.ID,
 		"embedded_index", embeddedIndex,
@@ -1428,6 +1422,22 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 func writeSubtitleSourceChanged(w http.ResponseWriter) {
 	writeError(w, http.StatusConflict, "subtitle_source_changed",
 		"The selected subtitle track changed on the media source; retry")
+}
+
+// subtitleExtractWindow resolves the extraction window for an embedded
+// subtitle request from its explicit query parameters. WebVTT and ASS slices
+// read ?position/?duration directly; because StreamExtractOpts only windows
+// ASS when SeekSeconds > 0, a duration-only ASS request stays whole-track.
+// PGS requires the explicit ?windowed=1 opt-in via PGSWindowRequest so a
+// whole-track consumer never silently loses cues outside an implicit window.
+func subtitleExtractWindow(r *http.Request, outFormat string) (allowWindow bool, seek, duration float64) {
+	switch outFormat {
+	case "vtt", subtitleFormatASS:
+		return false, subtitleSeekPosition(r), subtitleWindowDuration(r)
+	case subtitleFormatSUP:
+		return playback.PGSWindowRequest(r.URL.Query())
+	}
+	return false, 0, 0
 }
 
 // subtitleSeekPosition uses only the caller's explicit position. Session
