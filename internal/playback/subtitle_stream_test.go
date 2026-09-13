@@ -262,6 +262,8 @@ func TestStreamExtractArgs_ASSWithoutWindowIntentIgnoresDuration(t *testing.T) {
 // survive, and the output must be smaller than the whole script because the
 // late cue is outside the window. Argument assertions alone cannot prove the
 // bound, so this drives the real ffmpeg binary.
+//
+//nolint:misspell // the ASS event keyword is spelled "Dialogue:".
 func TestStreamExtractSubtitleExplicitZeroWindowBounded(t *testing.T) {
 	bin, err := exec.LookPath("ffmpeg")
 	if err != nil {

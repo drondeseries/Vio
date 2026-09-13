@@ -5486,7 +5486,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// actually gave up: the retry is the next hop, so demoting first would
 	// strand the session on a route that has no decode-mode dimension. Every
 	// other transport failure demotes exactly as before.
-	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) && !(decodeFailureClassificationV3(req.Failure.Classification) && h.softwareDecodeRetryPendingV3(record, req)) {
+	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) && (!decodeFailureClassificationV3(req.Failure.Classification) || !h.softwareDecodeRetryPendingV3(record, req)) {
 		// Demote on both copies: the record (the durable attempt this replan
 		// may still terminal-persist) and the seeded start, whose payload the
 		// success commit writes back via updated.NormalizedRequest. Demoting
