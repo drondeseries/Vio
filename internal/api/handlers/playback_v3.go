@@ -4728,7 +4728,7 @@ func (h *PlaybackHandler) HandleReplanPlaybackV3(w http.ResponseWriter, r *http.
 	// that depends on the durable start request; the authoritative merge and a
 	// second full validation happen after the attempt is loaded below.
 	preflightReq := req
-	if preflightReq.ClientFeatures == nil {
+	if len(preflightReq.ClientFeatures) == 0 {
 		preflightReq.ClientFeatures = []string{playback.FeatureClientVideoTransforms}
 	}
 	if err := preflightReq.Validate(); err != nil {
@@ -4769,11 +4769,12 @@ func (h *PlaybackHandler) HandleReplanPlaybackV3(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusConflict, "stale_playback_plan", "The failed plan is no longer current")
 		return
 	}
-	// Replan feature advertisement is optional. Validate transformations against
-	// the durable start-time features when the client omits the unchanged list;
-	// otherwise a valid replan can be rejected before executeReplanV3 gets the
-	// chance to perform the same merge.
-	if req.ClientFeatures == nil {
+	// Replan feature advertisement is optional. An omitted list and an
+	// explicitly empty list both mean "unchanged"; validate transformations
+	// against the durable start-time features in either case, otherwise a valid
+	// replan can be rejected before executeReplanV3 gets the chance to perform
+	// the same merge.
+	if len(req.ClientFeatures) == 0 {
 		req.ClientFeatures = append([]string(nil), record.NormalizedRequest.ClientFeatures...)
 	}
 

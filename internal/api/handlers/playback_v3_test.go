@@ -1471,6 +1471,104 @@ func TestHandleReplanPlaybackV3UpdatesSelectedAudioAndReplaysIdempotently(t *tes
 	}
 }
 
+// A replan may repeat the start-time capability advertisement in an abbreviated
+// form. An explicitly empty client_features list is what some clients emit when
+// they have nothing new to advertise; it must be treated exactly like an omitted
+// list, whose authoritative value is the durable start request. Keeping an empty
+// list as-is drops client_video_transformations_v1 and makes the replan's own
+// client-executor delivery fail validation.
+func TestHandleReplanPlaybackV3MergesEmptyClientFeaturesFromDurableRecord(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		sendEmpty bool
+	}{
+		{name: "explicitly empty", sendEmpty: true},
+		{name: "omitted"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file := v3HandlerFixtureFile(t)
+			file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "spa"})
+			manager := playback.NewSessionManager(0, 0)
+			handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+			handler.JWTSecret = "test-secret"
+			stubCopySeekAnchorV3(handler)
+			handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+			handler.ItemAccess = allowAllPlaybackItemAccess{}
+			startRequest := v3HandlerStartRequest()
+			startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{Enabled: true, SupportedOnDevice: true}
+			startRequest.ClientFeatures = append(startRequest.ClientFeatures, playback.FeatureClientVideoTransforms)
+			delivery := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+			delivery.Transformations = []playback.TransformationV3{{Name: playback.ClientDV7ToDV81V3, Executor: playback.ExecutorClientV3, RecipeVersion: playback.ClientDVTransformVersionV3}}
+			startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = delivery
+
+			startReq := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext())
+			startRR := httptest.NewRecorder()
+			handler.HandleStartPlayback(startRR, startReq)
+			if startRR.Code != http.StatusCreated {
+				t.Fatalf("start status = %d, body = %s", startRR.Code, startRR.Body.String())
+			}
+			var started playback.DecisionResponseV3
+			if err := json.Unmarshal(startRR.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil {
+				t.Fatalf("start response: err=%v response=%#v", err, started)
+			}
+			audioIndex := 1
+			failedKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+			replan := playback.ReplanRequestV3{
+				ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: startRequest.PlaybackAttemptID,
+				ReplanRequestID: "empty-features-0001", FailedPlanID: started.PlaybackPlan.PlanID,
+				PlanAttemptID: "empty-features-attempt-0001", PlanAttemptKey: failedKey,
+				AttemptedPlanKeys: []string{failedKey}, AttemptCount: 1,
+				QualityPreference: "original", PositionSeconds: 12,
+				SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: playback.TrackIDV3(file.ID, "audio", audioIndex), Index: &audioIndex}},
+				Failure:               playback.FailureV3{Classification: "audio_renderer_error"},
+				Capabilities:          startRequest.Capabilities,
+				ClientPlaybackContext: startRequest.ClientPlaybackContext,
+			}
+			body, err := json.Marshal(replan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.sendEmpty {
+				// json.Marshal drops an empty client_features list because the
+				// replan field is omitempty. Inject the literal empty array a
+				// client can still emit so the decoded value is non-nil empty.
+				var payload map[string]json.RawMessage
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatal(err)
+				}
+				payload["client_features"] = json.RawMessage("[]")
+				if body, err = json.Marshal(payload); err != nil {
+					t.Fatal(err)
+				}
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/"+started.SessionID+"/replan", strings.NewReader(string(body))).WithContext(newAuthorizedPlaybackContext())
+			req = withPlaybackRouteParam(req, "session_id", started.SessionID)
+			rr := httptest.NewRecorder()
+			handler.HandleReplanPlaybackV3(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("replan status = %d, body = %s", rr.Code, rr.Body.String())
+			}
+			var response playback.DecisionResponseV3
+			if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Terminal != nil {
+				t.Fatalf("replan terminal = %#v, want accepted plan", response.Terminal)
+			}
+			if response.PlaybackPlan == nil {
+				t.Fatal("replan returned no plan")
+			}
+			record, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !playback.HasFeatureV3(record.NormalizedRequest.ClientFeatures, playback.FeatureClientVideoTransforms) {
+				t.Fatalf("replan client_features lost durable start features: %#v", record.NormalizedRequest.ClientFeatures)
+			}
+		})
+	}
+}
+
 func streamClaimsFromPlanURL(t *testing.T, rawURL, secret string) *streamtoken.Claims {
 	t.Helper()
 	u, err := url.Parse(rawURL)
