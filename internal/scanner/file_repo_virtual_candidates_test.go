@@ -983,3 +983,103 @@ func TestGetByIDExposesLastDeliveredAt(t *testing.T) {
 		t.Fatalf("last_delivered_at = %v, want nil for a never-delivered row", never.LastDeliveredAt)
 	}
 }
+
+// TestReplaceVirtualResultPin_ResetsCandidateEvidence requires a migrated
+// database via SILO_TEST_DATABASE_URL. Moving a pin to a different provider
+// candidate must discard the old candidate's probe and delivery evidence:
+// otherwise the replacement inherits optimistic-start eligibility and a probe
+// stamp for bytes it never delivered or had probed.
+func TestReplaceVirtualResultPin_ResetsCandidateEvidence(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("virtual-pin-evidence-%d", suffix)
+	deadPath := fmt.Sprintf("virtual://movie/tt%d?result=dead-candidate", suffix)
+	livePath := fmt.Sprintf("virtual://movie/tt%d?result=live-winner", suffix)
+
+	var folderID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("Pin Evidence %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_item_libraries WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_items(content_id,type,title,status,genres)
+		VALUES($1,'movie','Pin Evidence Item','matched','{}'::text[])`, contentID); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_item_libraries(content_id,media_folder_id)
+		VALUES($1,$2)`, contentID, folderID); err != nil {
+		t.Fatalf("seed item library: %v", err)
+	}
+
+	probedAt := time.Now().Add(-time.Hour).Truncate(time.Millisecond)
+	var fileID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(
+			content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,
+			probe_source,probe_updated_at,last_delivered_at,
+			resolution,codec_video,codec_audio,hdr,bitrate,
+			video_tracks,audio_tracks,subtitle_tracks)
+		VALUES($1,$2,$3,0,'mkv',5,'virtual',$4,$4,
+			'2160p','hevc','eac3',true,5000,
+			'[{"codec":"hevc","width":3840,"height":2160,"frame_rate":"23.976"}]'::jsonb,
+			'[{"codec":"eac3","channels":6,"language":"eng"}]'::jsonb,
+			'[{"codec":"srt","language":"eng"}]'::jsonb)
+		RETURNING id`, contentID, folderID, deadPath, probedAt).Scan(&fileID); err != nil {
+		t.Fatalf("seed probed pinned virtual file: %v", err)
+	}
+
+	repo := NewFileRepository(pool)
+	replaced, err := repo.ReplaceVirtualResultPin(ctx, fileID, deadPath, livePath)
+	if err != nil {
+		t.Fatalf("ReplaceVirtualResultPin error: %v", err)
+	}
+	if !replaced {
+		t.Fatal("ReplaceVirtualResultPin returned false on matching path")
+	}
+
+	file, err := repo.GetByPath(ctx, livePath)
+	if err != nil {
+		t.Fatalf("load replaced row: %v", err)
+	}
+	if file == nil {
+		t.Fatal("replaced row not found")
+	}
+	if file.ProbeUpdatedAt != nil {
+		t.Fatalf("probe_updated_at = %v, want nil after pin replacement", file.ProbeUpdatedAt)
+	}
+	if file.LastDeliveredAt != nil {
+		t.Fatalf("last_delivered_at = %v, want nil after pin replacement", file.LastDeliveredAt)
+	}
+	if file.ProbeSource != "" {
+		t.Fatalf("probe_source = %q, want empty after pin replacement", file.ProbeSource)
+	}
+	if file.Resolution != "" || file.CodecVideo != "" || file.CodecAudio != "" {
+		t.Fatalf("candidate metadata survived replacement: resolution=%q codecVideo=%q codecAudio=%q",
+			file.Resolution, file.CodecVideo, file.CodecAudio)
+	}
+	if file.Container == "mkv" {
+		t.Fatalf("probed container survived replacement: %q", file.Container)
+	}
+	if len(file.VideoTracks) != 0 || len(file.AudioTracks) != 0 || len(file.SubtitleTracks) != 0 {
+		t.Fatalf("track evidence survived replacement: video=%d audio=%d subtitle=%d",
+			len(file.VideoTracks), len(file.AudioTracks), len(file.SubtitleTracks))
+	}
+}

@@ -2500,7 +2500,24 @@ func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) 
 func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int, expectedPath, replacementPath string) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE media_files
-		SET file_path = $1
+		SET file_path = $1,
+			-- The replacement is a different provider candidate. Probe and
+			-- delivery evidence belongs to the candidate that produced it, so
+			-- clear it: otherwise the replacement looks probed and recently
+			-- delivered (optimistic-start eligibility) without either.
+			probe_updated_at = NULL,
+			probe_source = NULL,
+			last_delivered_at = NULL,
+			resolution = NULL,
+			codec_video = NULL,
+			codec_audio = NULL,
+			audio_channels = NULL,
+			container = 'virtual',
+			hdr = false,
+			bitrate = NULL,
+			video_tracks = '[]'::jsonb,
+			audio_tracks = '[]'::jsonb,
+			subtitle_tracks = '[]'::jsonb
 		WHERE id = $2 AND file_path = $3`, replacementPath, fileID, expectedPath)
 	if err != nil {
 		var pgErr *pgconn.PgError
