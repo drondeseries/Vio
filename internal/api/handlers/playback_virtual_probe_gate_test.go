@@ -226,7 +226,7 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 // back to the candidate-declared metadata.
 func TestResolveVirtualProbeFailureDamperSkipsRepeatProbe(t *testing.T) {
 	uri := "virtual://movie/tt-negative-cache?result=cand-1"
-	key := virtualProbeFailureKey(uri)
+	key := virtualProbeFailureKey(uri, 5)
 	virtualProbeFailures.clear(key)
 	t.Cleanup(func() { virtualProbeFailures.clear(key) })
 
@@ -270,7 +270,7 @@ func TestResolveVirtualProbeFailureDamperSkipsRepeatProbe(t *testing.T) {
 // not damped by stale state.
 func TestResolveVirtualProbeSuccessClearsFailureMarker(t *testing.T) {
 	uri := "virtual://movie/tt-negative-cache-ok?result=cand-1"
-	key := virtualProbeFailureKey(uri)
+	key := virtualProbeFailureKey(uri, 5)
 	virtualProbeFailures.clear(key)
 	t.Cleanup(func() { virtualProbeFailures.clear(key) })
 
@@ -748,4 +748,172 @@ func TestResolveVirtualOptimisticOnlyOnDeferredStart(t *testing.T) {
 	if got := atomic.LoadInt32(&detailedCalls); got != 1 {
 		t.Fatalf("detailed resolver called %d times, want 1 for a synchronous caller", got)
 	}
+}
+
+// resolveVirtualDamperFile builds a virtual row pointing at one provider
+// candidate under a shared neutral path.
+func resolveVirtualDamperFile(owner int, id int, uri string) *models.MediaFile {
+	return &models.MediaFile{
+		ID:                         id,
+		ContentID:                  "movie-damper",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: owner,
+	}
+}
+
+func resolveVirtualDamperLister(uri string) VirtualPlaybackStreamLister {
+	return VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand", URI: uri, Resolution: "1080p",
+			CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+		}}, nil
+	})
+}
+
+// A probe failure recorded for one provider candidate must not damp a different
+// candidate that happens to share the same neutral (result-less) virtual path:
+// the provider rotates result= hashes for the same release, and a dead hash
+// must not hide a healthy sibling.
+func TestResolveVirtualProbeDamperIsolatesCandidates(t *testing.T) {
+	const owner = 5
+	uriA := "virtual://movie/tt-damper-cand-isolation?result=cand-a"
+	uriB := "virtual://movie/tt-damper-cand-isolation?result=cand-b"
+
+	resolve := func(h *PlaybackHandler, file *models.MediaFile) resolvedVirtualPlaybackSource {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0, false)
+		if err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+		return resolved
+	}
+
+	// Candidate A fails its probe; the failure is remembered for A only.
+	probeACalls := 0
+	hA := virtualProbeGateCandidateHandler(resolveVirtualDamperFile(owner, 910, uriA), resolveVirtualDamperLister(uriA),
+		func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+			probeACalls++
+			return nil, errors.New("probe A failed")
+		}, nil)
+	resolvedA := resolve(hA, resolveVirtualDamperFile(owner, 910, uriA))
+	if probeACalls != 1 || resolvedA.Provenance != ProbeProvenanceFailed {
+		t.Fatalf("candidate A: probeCalls=%d provenance=%q, want 1/failed", probeACalls, resolvedA.Provenance)
+	}
+
+	// Candidate B under the same neutral path must still be probed.
+	probeBCalls := 0
+	hB := virtualProbeGateCandidateHandler(resolveVirtualDamperFile(owner, 911, uriB), resolveVirtualDamperLister(uriB),
+		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			probeBCalls++
+			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
+			return f, nil
+		}, nil)
+	resolvedB := resolve(hB, resolveVirtualDamperFile(owner, 911, uriB))
+	if probeBCalls != 1 {
+		t.Fatalf("candidate B probeCalls=%d, want 1: a failure for candidate A damped candidate B", probeBCalls)
+	}
+	if resolvedB.Provenance != ProbeProvenanceVerified {
+		t.Fatalf("candidate B provenance=%q, want verified", resolvedB.Provenance)
+	}
+}
+
+// The damper key must include installation ownership: the same candidate URI
+// resolved for two owners is two independent probes.
+func TestResolveVirtualProbeDamperIsolatesOwners(t *testing.T) {
+	uri := "virtual://movie/tt-damper-owner-isolation?result=cand-1"
+
+	resolve := func(h *PlaybackHandler, owner int) resolvedVirtualPlaybackSource {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		resolved, err := h.resolveVirtualPlaybackSource(req, resolveVirtualDamperFile(owner, 920, uri), "profile-1", false, nil, "", "", 0, false)
+		if err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+		return resolved
+	}
+
+	// Owner 5 exhausts its probe budget for this candidate.
+	probeCalls5 := 0
+	h5 := virtualProbeGateCandidateHandler(resolveVirtualDamperFile(5, 920, uri), resolveVirtualDamperLister(uri),
+		func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+			probeCalls5++
+			return nil, errors.New("probe owner 5 failed")
+		}, nil)
+	if resolved := resolve(h5, 5); probeCalls5 != 1 || resolved.Provenance != ProbeProvenanceFailed {
+		t.Fatalf("owner 5: probeCalls=%d provenance=%q, want 1/failed", probeCalls5, resolved.Provenance)
+	}
+
+	// Owner 6 must probe the same candidate independently.
+	probeCalls6 := 0
+	h6 := virtualProbeGateCandidateHandler(resolveVirtualDamperFile(6, 921, uri), resolveVirtualDamperLister(uri),
+		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			probeCalls6++
+			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
+			return f, nil
+		}, nil)
+	resolved6 := resolve(h6, 6)
+	if probeCalls6 != 1 {
+		t.Fatalf("owner 6 probeCalls=%d, want 1: owner 5's failure damped owner 6", probeCalls6)
+	}
+	if resolved6.Provenance != ProbeProvenanceVerified {
+		t.Fatalf("owner 6 provenance=%q, want verified", resolved6.Provenance)
+	}
+}
+
+// The repeat-play fast path may only bind the candidate the row actually points
+// at. A BestResultCache hit can flip noResult=false and rank a different
+// release to index 0; without an identity check the fast path pins that
+// different candidate and copies the row's probed inventory onto it.
+func TestResolveVirtualRepeatPlayFastPathRequiresCandidateIdentity(t *testing.T) {
+	t.Run("promotedCandidateMismatch", func(t *testing.T) {
+		detailedCalls, legacyCalls := 0, 0
+		h := virtualRepeatPlayHandler(&detailedCalls, &legacyCalls)
+		h.BestResultCache = NewVirtualBestResultCache(time.Hour, 16)
+
+		file := virtualRepeatPlayFile("virtual://movie/tt-best-mismatch")
+		neutral := virtualPlaybackNeutralKey(file.FilePath)
+		owner := file.VirtualOwnerInstallationID
+		stickyKey := bestResultCacheKey(file.ContentID, neutral, owner, "")
+		h.pinVirtualSticky(stickyKey, neutral+"?result=cand-pinned")
+		promoted := neutral + "?result=cand-promoted"
+		h.BestResultCache.set(bestResultCacheKey(file.ContentID, neutral, owner, ""), []VirtualPlaybackStream{{
+			URI: promoted, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+		}}, time.Now())
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+		if err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+		if detailedCalls != 1 {
+			t.Fatalf("detailed resolver called %d times, want 1: fast path bound a candidate the row does not point at", detailedCalls)
+		}
+		if resolved.URI != promoted {
+			t.Fatalf("resolved URI = %q, want resolved promoted candidate %q", resolved.URI, promoted)
+		}
+	})
+
+	t.Run("persistedMatch", func(t *testing.T) {
+		detailedCalls, legacyCalls := 0, 0
+		h := virtualRepeatPlayHandler(&detailedCalls, &legacyCalls)
+		file := virtualRepeatPlayFile("virtual://movie/tt-best-match?result=cand-1")
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+		if err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+		if detailedCalls != 0 {
+			t.Fatalf("detailed resolver called %d times, want 0 for a persisted match", detailedCalls)
+		}
+		if resolved.URI != file.FilePath {
+			t.Fatalf("resolved URI = %q, want persisted %q", resolved.URI, file.FilePath)
+		}
+	})
 }
