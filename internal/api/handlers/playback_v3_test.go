@@ -4956,6 +4956,127 @@ func TestHandleReplanPlaybackV3SidecarChangeReusesCopyHLSTransport(t *testing.T)
 	}
 }
 
+// TestHandleReplanPlaybackV3SidecarChangeReusesOriginalHTTPTransport pins the
+// fix for the direct-play reload regression: a text-sidecar subtitle switch on
+// an original_http session must keep the active transport. Before the fix the
+// replan minted a fresh signed stream URL, and the client tore down and
+// remounted the media element even though the A/V bytes were unchanged.
+func TestHandleReplanPlaybackV3SidecarChangeReusesOriginalHTTPTransport(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.ExternalSubtitles = []models.ExternalSubtitle{
+		{Path: writePlaybackTestMediaFile(t, "movie.de.srt"), Language: "de", Format: "srt"},
+		{Path: writePlaybackTestMediaFile(t, "movie.en.srt"), Language: "en", Format: "srt"},
+	}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	// A signing secret is required: without it playbackStreamURL appends no
+	// token, every direct-play URL is the bare /stream/{sessionID}, and the
+	// regression this test guards cannot reproduce.
+	handler.JWTSecret = "sidecar-direct-signing-secret"
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	stubCopySeekAnchorV3(handler)
+
+	startRequest := v3HandlerStartRequest()
+	german := 0
+	startRequest.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", german)
+	startRequest.SubtitleTrackIndex = &german
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+	if started.PlaybackPlan.Delivery != playback.DeliveryOriginalHTTPV3 || started.PlaybackPlan.Subtitle.Mode != playback.SubtitleRenderV3 {
+		t.Fatalf("start plan = %#v, want original_http with sidecar subtitle", started.PlaybackPlan)
+	}
+	beforeURL := started.PlaybackPlan.Stream.URL
+	beforeExpires := started.PlaybackPlan.ExpiresAt
+	if beforeURL == "" || !strings.Contains(beforeURL, "token=") {
+		t.Fatalf("direct-play start URL %q carries no token", beforeURL)
+	}
+
+	english := 1
+	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "sidecar-direct-track-change-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "sidecar-direct-plan-attempt-0001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       120,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: started.PlaybackPlan.SelectedTracks.Audio, Subtitle: &playback.TrackIdentityV3{ID: playback.TrackIDV3(file.ID, "subtitle", english), Index: &english}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if replanned.PlaybackPlan == nil || replanned.PlaybackPlan.SelectedTracks.Subtitle == nil ||
+		replanned.PlaybackPlan.SelectedTracks.Subtitle.Index == nil || *replanned.PlaybackPlan.SelectedTracks.Subtitle.Index != english {
+		t.Fatalf("replanned subtitle = %#v", replanned.PlaybackPlan)
+	}
+	if replanned.PlaybackPlan.Stream.URL != beforeURL {
+		t.Fatalf("sidecar-only replan minted a new original-http URL: %q -> %q", beforeURL, replanned.PlaybackPlan.Stream.URL)
+	}
+	if replanned.PlaybackPlan.PlanID == started.PlaybackPlan.PlanID || replanned.PlaybackPlan.PlanAttemptKey == started.PlaybackPlan.PlanAttemptKey {
+		t.Fatal("subtitle identity changed without minting a distinct plan identity")
+	}
+	if replanned.PlaybackPlan.ExpiresAt != beforeExpires {
+		t.Fatalf("sidecar-only replan changed expiry: %q -> %q", beforeExpires, replanned.PlaybackPlan.ExpiresAt)
+	}
+	session, err := manager.GetSession(started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.RoutingWorkload != string(noderouting.WorkloadDirectPlay) || session.RoutingExecution == "" {
+		t.Fatalf("direct-play routing not committed: workload=%q execution=%q", session.RoutingWorkload, session.RoutingExecution)
+	}
+	record, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.FrozenRecipe.SubtitleTrackIndex != english {
+		t.Fatalf("durable sidecar selection = %#v", record)
+	}
+
+	// Negative control: a replan whose candidate no longer plans the active
+	// delivery must rebuild. Disabling original_http forces a progressive-remux
+	// candidate, the reuse proof refuses the delivery change, and a fresh signed
+	// URL is minted.
+	negativeContext := startRequest.ClientPlaybackContext
+	negativeContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassProgressiveV3: {
+			Enabled: true, SupportedOnDevice: true,
+			Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true},
+		},
+	}
+	rebuilt := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationTrackChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "sidecar-direct-delivery-change-0001",
+		FailedPlanID:          replanned.PlaybackPlan.PlanID,
+		PlanAttemptID:         "sidecar-direct-delivery-change-attempt-0001",
+		PlanAttemptKey:        replanned.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          2,
+		PositionSeconds:       120,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: replanned.PlaybackPlan.SelectedTracks.Audio, Subtitle: &playback.TrackIdentityV3{ID: playback.TrackIDV3(file.ID, "subtitle", german), Index: &german}},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: negativeContext,
+	})
+	if rebuilt.PlaybackPlan == nil {
+		t.Fatalf("delivery-change replan returned no plan: outcome=%s terminal=%+v", rebuilt.Outcome, rebuilt.Terminal)
+	}
+	if rebuilt.PlaybackPlan.Delivery == playback.DeliveryOriginalHTTPV3 {
+		t.Fatalf("delivery-change replan kept original_http: %#v", rebuilt.PlaybackPlan)
+	}
+	if rebuilt.PlaybackPlan.Stream.URL == beforeURL {
+		t.Fatalf("delivery-change replan reused the original-http URL %q", beforeURL)
+	}
+}
+
 // TestHandleReplanPlaybackV3SeekReanchorReusesCopyHLSTransport verifies that a
 // seek reanchor with an identical recipe and route keeps the active HLS
 // generation. The segment layer restarts FFmpeg in place for targets past the
@@ -5204,6 +5325,41 @@ func TestSidecarOnlyReuseReplanProgressiveDelivery(t *testing.T) {
 	}
 }
 
+func TestSidecarOnlyReuseReplanOriginalHTTPDelivery(t *testing.T) {
+	currentPlan := playback.PlanV3{
+		PlanID:               "current-plan",
+		Delivery:             playback.DeliveryOriginalHTTPV3,
+		Stream:               playback.StreamV3{URL: "/stream/session-1?token=old"},
+		RequestedMediaFileID: 1,
+		EffectiveMediaFileID: 1,
+	}
+	candidatePlan := currentPlan
+	candidatePlan.PlanID = "candidate-plan"
+	currentRecipe := playback.FreezeExecutableRecipeV3(playback.PlannerResultV3{
+		Plan: &currentPlan, PlayMethod: playback.PlayDirect,
+	})
+	candidateRecipe := playback.FreezeExecutableRecipeV3(playback.PlannerResultV3{
+		Plan: &candidatePlan, PlayMethod: playback.PlayDirect,
+	})
+	record := &playback.AttemptRecordV3{
+		EffectiveMediaFileID: 1,
+		CurrentPlan:          currentPlan,
+		FrozenRecipe:         currentRecipe,
+	}
+	record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID = "output-context"
+
+	if _, ok := sidecarOnlyReuseReplanV3(record, &candidatePlan, candidateRecipe, "output-context"); !ok {
+		t.Fatal("byte-identical original-http sidecar replan did not reuse the active transport")
+	}
+
+	// A delivery mismatch must still refuse reuse.
+	drifted := candidatePlan
+	drifted.Delivery = playback.DeliveryRemuxProgressiveV3
+	if _, ok := sidecarOnlyReuseReplanV3(record, &drifted, candidateRecipe, "output-context"); ok {
+		t.Fatal("original-http sidecar replan reused across a delivery change")
+	}
+}
+
 func TestHasActiveReusableTransportV3Progressive(t *testing.T) {
 	manager := playback.NewSessionManager(0, 0)
 	handler := NewPlaybackHandler(manager)
@@ -5234,6 +5390,31 @@ func TestHasActiveReusableTransportV3Progressive(t *testing.T) {
 	// transcode-manager session or node URL alone.
 	if handler.hasActiveReusableTransportV3(localProgressive, playback.DeliveryRemuxHLSV3) {
 		t.Fatal("HLS delivery was deemed reusable from progressive-only routing evidence")
+	}
+
+	// Direct HTTP has no transcode-manager session and stores no transcode node
+	// URL (a proxy egress lands in RoutingEgressNodeURL), so its committed
+	// routing facts are the active-transport evidence.
+	direct := &playback.Session{
+		ID:               "direct-local",
+		RoutingWorkload:  string(noderouting.WorkloadDirectPlay),
+		RoutingExecution: string(noderouting.ExecutionNone),
+	}
+	if !handler.hasActiveReusableTransportV3(direct, playback.DeliveryOriginalHTTPV3) {
+		t.Fatal("direct play with committed routing was not reusable")
+	}
+	// An uncommitted or reconstructed-old direct session has an empty execution
+	// and must rebuild rather than reuse a URL nothing is serving.
+	directUncommitted := &playback.Session{
+		ID:              "direct-uncommitted",
+		RoutingWorkload: string(noderouting.WorkloadDirectPlay),
+	}
+	if handler.hasActiveReusableTransportV3(directUncommitted, playback.DeliveryOriginalHTTPV3) {
+		t.Fatal("direct play without committed routing execution was reusable")
+	}
+	// The direct branch must not leak into HLS deliveries either.
+	if handler.hasActiveReusableTransportV3(direct, playback.DeliveryRemuxHLSV3) {
+		t.Fatal("HLS delivery was deemed reusable from direct-play-only routing evidence")
 	}
 }
 

@@ -6097,6 +6097,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			"playback_session_id", session.ID,
 			"previous_plan_id", record.CurrentPlanID,
 			"plan_id", result.Plan.PlanID,
+			"delivery", result.Plan.Delivery,
 		)
 	} else {
 		var transportErr *transportErrorV3
@@ -6539,12 +6540,16 @@ func isHLSDeliveryV3(delivery playback.DeliveryV3) bool {
 
 // reuseEligibleDeliveryV3 reports whether a delivery keeps a single addressable
 // stream window whose bytes do not change when a sidecar-only track switch
-// replans. HLS generations are keyed to the session, and a local progressive
-// remux is served lazily from /stream/{sessionID}, so both survive a subtitle
-// switch without a client remount. Direct HTTP is excluded: it is a fresh URL
-// per plan.
+// replans. HLS generations are keyed to the session, and both a local
+// progressive remux and a direct HTTP play are served lazily from
+// /stream/{sessionID}, so they survive a subtitle switch without a client
+// remount. Direct HTTP is included because its URL is transport-stable while
+// the route is unchanged: the only per-plan variation was the signed token,
+// which the reuse path preserves verbatim. The reused token still carries the
+// active plan's claims.
 func reuseEligibleDeliveryV3(delivery playback.DeliveryV3) bool {
-	return delivery == playback.DeliveryRemuxProgressiveV3 ||
+	return delivery == playback.DeliveryOriginalHTTPV3 ||
+		delivery == playback.DeliveryRemuxProgressiveV3 ||
 		delivery == playback.DeliveryRemuxHLSV3 ||
 		delivery == playback.DeliveryTranscodeHLSV3
 }
@@ -6622,7 +6627,8 @@ func sameEffectiveAVRecipeV3(left, right playback.EffectiveRecipeV3) bool {
 		optionalIntEqualV3(left.AudioChannels, right.AudioChannels) && left.AudioLayout == right.AudioLayout
 }
 
-// reusedHLSTransportV3 reconstructs transport facts for an existing HLS session.
+// reusedHLSTransportV3 reconstructs transport facts for an existing HLS or
+// identity (direct-play/progressive-remux) session.
 func reusedHLSTransportV3(session *playback.Session, streamURL string) preparedTransportV3 {
 	transport := preparedTransportV3{url: streamURL}
 	if session != nil {
@@ -6684,6 +6690,15 @@ func (h *PlaybackHandler) hasActiveReusableTransportV3(session *playback.Session
 		// facts are its active-transport evidence; remote/proxy progressive
 		// already returned above via TranscodeNodeURL.
 		return session.RoutingWorkload == string(noderouting.WorkloadRemux) && session.RoutingExecution != ""
+	}
+	if delivery == playback.DeliveryOriginalHTTPV3 {
+		// Direct HTTP is likewise served from the live session by
+		// /stream/{sessionID} and holds no transcode-manager session, so the
+		// checks above do not cover it: direct play stores any egress proxy in
+		// RoutingEgressNodeURL, never TranscodeNodeURL. Committed routing facts
+		// are the active-transport evidence. An uncommitted or reconstructed-old
+		// session has an empty execution and must rebuild.
+		return session.RoutingWorkload == string(noderouting.WorkloadDirectPlay) && session.RoutingExecution != ""
 	}
 	return false
 }
