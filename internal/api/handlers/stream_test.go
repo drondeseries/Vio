@@ -1511,3 +1511,75 @@ func TestEmbeddedSubtitleExtractionFailures(t *testing.T) {
 		})
 	}
 }
+
+// writeFakeFFprobe installs an executable named "ffprobe" that emits the given
+// stdout and exit status, so ProbeSubtitleLayout uses it verbatim (the
+// resolver treats a path whose basename contains "ffprobe" as the probe
+// binary itself).
+func writeFakeFFprobe(t *testing.T, script string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "ffprobe")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+func virtualLayoutHandler(ffprobePath string) *StreamHandler {
+	handler := NewStreamHandler(nil, nil)
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: ffprobePath}
+	}
+	return handler
+}
+
+// A drift probe that fails to run (context canceled, relay timeout) is not
+// evidence that the pinned source rotated. The request must proceed with the
+// planned ordinal — for every codec, PGS included — instead of answering 409
+// and forcing the client to replan. A positive mismatch is the only signal
+// that warrants a replan.
+func TestVerifyVirtualSubtitleLayoutProbeFailureProceedsWithPlan(t *testing.T) {
+	for _, codec := range []string{"ass", "hdmv_pgs_subtitle"} {
+		t.Run(codec, func(t *testing.T) {
+			handler := virtualLayoutHandler(writeFakeFFprobe(t, "exit 1"))
+			opts := &playback.StreamExtractOpts{
+				InputPath:   "/relay/pinned/stream.mkv",
+				TrackIndex:  3,
+				SourceCodec: codec,
+			}
+			session := &playback.Session{
+				ID:                    "sess",
+				VirtualSubtitleTracks: []models.SubtitleTrack{{Index: 3, Codec: codec}},
+			}
+			requested := models.SubtitleTrack{Index: 3, Codec: codec}
+
+			if !handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts) {
+				t.Fatal("probe failure must serve the planned ordinal, not force a replan")
+			}
+			if opts.TrackIndex != 3 || opts.SourceCodec != codec {
+				t.Fatalf("plan ordinal/codec must be preserved: %+v", opts)
+			}
+		})
+	}
+}
+
+// A probe that succeeds and positively reports a different layout must keep
+// the existing 409 behavior.
+func TestVerifyVirtualSubtitleLayoutPositiveMismatchForcesReplan(t *testing.T) {
+	probe := `printf '%s' '{"streams":[{"id":"1","index":0,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}]}'`
+	handler := virtualLayoutHandler(writeFakeFFprobe(t, probe))
+	opts := &playback.StreamExtractOpts{
+		InputPath:   "/relay/pinned/stream.mkv",
+		TrackIndex:  0,
+		SourceCodec: "ass",
+	}
+	session := &playback.Session{
+		ID:                    "sess",
+		VirtualSubtitleTracks: []models.SubtitleTrack{{Index: 0, Codec: "ass"}},
+	}
+	requested := models.SubtitleTrack{Index: 0, Codec: "ass", Language: "eng"}
+
+	if handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts) {
+		t.Fatal("a positively different live layout must force a 409 replan")
+	}
+}

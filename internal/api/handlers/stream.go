@@ -1356,11 +1356,13 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 // verifyVirtualSubtitleLayout probes the live relay input once and, when its
 // subtitle layout drifted from the plan-time evidence this session captured,
 // re-maps the extract options onto a same-class live track. It reports whether
-// extraction may proceed. False means the live source cannot satisfy the
-// requested representation — rotation to a different subtitle class, an
-// ambiguous or absent match, or an unverifiable layout for a PGS request whose
-// .sup response commits 200 before ffmpeg spawns — and the caller must answer
-// with a clean retryable 4xx before ffmpeg spawns or headers commit. Virtual
+// extraction may proceed. False means a successful probe positively found that
+// the live source cannot satisfy the requested representation — rotation to a
+// different subtitle class, or an ambiguous or absent match — and the caller
+// must answer with a clean retryable 4xx before ffmpeg spawns or headers
+// commit. A probe that fails to run is deliberately not fatal: it is not
+// evidence of rotation, so extraction proceeds on the plan ordinal (a genuine
+// rotation still surfaces via the post-spawn map error for text/ASS). Virtual
 // inputs are request-local probe state; the session's published evidence is
 // never rewritten.
 func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, session *playback.Session, opts *playback.StreamExtractOpts) bool {
@@ -1369,16 +1371,17 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 	}
 	liveTracks, err := playback.ProbeSubtitleLayout(ctx, h.ffmpegPath(), opts.InputPath)
 	if err != nil {
-		// The live layout could not be inspected under a suspected rotation.
-		// PGS is unforgiving: its .sup response commits 200 before ffmpeg
-		// spawns, so an unverified spawn risks an unrecoverable mid-response
-		// abort — refuse rather than risk it. Text/ASS extracts fail before
-		// headers are committed, so the post-spawn safety net can still recover
-		// a rotated source; keep the plan ordinal.
+		// A probe failure (context canceled, relay timeout, transient upstream
+		// error) is not evidence that the pinned source rotated. Serve the
+		// planned ordinal rather than forcing a replan: a genuine rotation is
+		// still caught for text/ASS by the post-spawn map-error safety net, and
+		// treating a probe failure as a rotation produced a churn loop when the
+		// relay itself was what timed out. Only a probe that SUCCEEDS and
+		// positively reports a different layout warrants a 409.
 		slog.WarnContext(ctx, "virtual subtitle layout probe failed", "component", "api",
 			"track_codec", requestedTrack.Codec,
 			"error", err)
-		return !playback.IsPGS(requestedTrack.Codec)
+		return true
 	}
 	if playback.SubtitleLayoutsEqual(liveTracks, session.VirtualSubtitleTracks) {
 		// The pinned release is unchanged — the catalog row was re-probed
