@@ -4468,6 +4468,22 @@ func (h *PlaybackHandler) updateV3SessionState(ctx context.Context, session *pla
 	return h.sessionMgr.UpdateStreamState(session.ID, h.v3SessionStreamState(ctx, session, file, result, transport, mode))
 }
 
+// virtualSubtitleWarmSourceURI picks the source URI the text-subtitle warm
+// keys its cache identities on. The live session's bound URI wins when set —
+// that is the value updateV3SessionState writes and the serve path reads — and
+// otherwise the effective file's pinned URI is used, because the start path's
+// session copy predates the state write. Mirrors warmVirtualFontBundleV3 so
+// the warm and serve identities agree.
+func virtualSubtitleWarmSourceURI(session *playback.Session, file *models.MediaFile) string {
+	if session != nil && session.VirtualSourceURI != "" {
+		return session.VirtualSourceURI
+	}
+	if file != nil {
+		return file.FilePath
+	}
+	return ""
+}
+
 // warmVirtualSubtitlesV3 pre-warms the subtitle cache for a virtual source's
 // embedded tracks right after a successful plan + transport commit. The serve
 // path always fetches text subtitles windowed (the client appends
@@ -4489,7 +4505,19 @@ func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *p
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil {
 		return
 	}
-	if !isVirtualPlaybackFile(file) || session.VirtualSourceURI == "" {
+	if !isVirtualPlaybackFile(file) {
+		return
+	}
+	// The start path holds a session copy captured before UpdateStreamState
+	// wrote VirtualSourceURI, so the warm must key off the effective file's
+	// pinned URI or it silently no-ops exactly where it matters most. Mirror
+	// warmVirtualFontBundleV3: prefer the live session's bound URI when it has
+	// one, otherwise fall back to the effective file. Both name the same
+	// release the serve path binds (updateV3SessionState sets
+	// state.VirtualSourceURI = file.FilePath), so the warm and serve cache
+	// identities agree.
+	virtualURI := virtualSubtitleWarmSourceURI(session, file)
+	if virtualURI == "" {
 		return
 	}
 	tracks := session.VirtualSubtitleTracks
@@ -4515,7 +4543,7 @@ func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *p
 		wg.Add(1)
 		done := h.SubtitleCache.WarmTrackInBackground(playback.StreamExtractOpts{
 			InputPath:     resolved.URL,
-			CacheIdentity: playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, i),
+			CacheIdentity: playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, i),
 			TrackIndex:    i,
 			SourceCodec:   tracks[i].Codec,
 			FFmpegPath:    h.playbackConfig().FFmpegPath,
@@ -4530,7 +4558,9 @@ func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *p
 	// relay's 24h lifetime, so a lost release never pins a slot forever.
 	go func() {
 		wg.Wait()
-		cleanup()
+		if cleanup != nil {
+			cleanup()
+		}
 	}()
 }
 
