@@ -19,8 +19,8 @@ type StreamExtractOpts struct {
 	// InputPath is the path to the source media file.
 	InputPath string
 	// CacheIdentity is a credential-free, stable identity for a transient
-	// remote input. When set, subtitle caching uses a bounded ten-minute
-	// generation instead of requiring os.Stat on InputPath.
+	// remote input. When set, subtitle caching uses a bounded generation
+	// instead of requiring os.Stat on InputPath.
 	CacheIdentity string
 	// TrackIndex is the subtitle stream ordinal within the container
 	// (matches ffmpeg's `0:s:N` specifier). Callers pass the same index
@@ -36,8 +36,10 @@ type StreamExtractOpts struct {
 	// SeekSeconds asks ffmpeg to start demuxing at this position. For
 	// text-event codecs this is the key win — ffmpeg skips the prefix of
 	// the container instead of scanning from byte 0 to produce earlier
-	// cues the client will never display. Ignored for ASS because its
-	// renderer fetches the complete script once.
+	// cues the client will never display. ASS participates when a position
+	// is supplied: each window re-emits a self-contained script header, so
+	// a windowed extraction is safe. A zero position preserves the
+	// whole-script behavior native ASS renderers rely on.
 	SeekSeconds float64
 	// DurationSeconds bounds the extract to a window of this length,
 	// using an absolute ffmpeg output endpoint. Zero means "until end of file".
@@ -49,8 +51,9 @@ type StreamExtractOpts struct {
 	// By default PGS is never windowed because clients fetch the .sup
 	// stream exactly once and consume it whole; a client that explicitly
 	// opts in (via ?windowed=1) re-requests fresh windows itself as
-	// playback moves outside coverage. ASS ignores this flag so its
-	// renderer receives the complete script and event timeline.
+	// playback moves outside coverage. ASS does not consult this flag: it
+	// windows purely on a supplied position, so its renderer either
+	// receives the complete script or a self-contained slice it asked for.
 	AllowWindow bool
 	// DisableBackgroundWarm prevents a windowed PGS miss from starting a
 	// detached full-track extract. Remote relay inputs use request-scoped
@@ -171,16 +174,24 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 	}
 
 	// Input seek (before -i) is the fast variant: ffmpeg jumps near the
-	// requested position before demuxing. ASS ignores it because its
-	// renderer fetches the complete script and event timeline once.
-	// PGS defaults to non-windowed too: a client that fetches the .sup
+	// requested position before demuxing. Text codecs always use it; ASS
+	// uses it when the caller supplies a position (see below). PGS
+	// defaults to non-windowed too: a client that fetches the .sup
 	// stream exactly once and consumes it whole needs the complete track
 	// from offset 0 — windowing would silently drop every cue outside
 	// the window. Clients that manage their own sliding window opt in
 	// via AllowWindow; -copyts below keeps the windowed output on
 	// absolute source timestamps so cues stay in sync. The same logic
 	// governs the -t duration cap below.
-	windowable := !IsASS(opts.SourceCodec) && (!IsPGS(opts.SourceCodec) || opts.AllowWindow)
+	//
+	// Windowed ASS is safe because the ASS muxer writes the script header
+	// (styles and font references) from the container extradata on every
+	// extraction, so each window is a self-contained script; -copyts keeps
+	// its events on the source timeline, which the client's JASSUB
+	// `timeOffset` relies on. Without a position the whole script is
+	// emitted, so native clients that fetch .ass once are unaffected.
+	windowable := (!IsPGS(opts.SourceCodec) || opts.AllowWindow) &&
+		(!IsASS(opts.SourceCodec) || opts.SeekSeconds > 0)
 	seekApplied := opts.SeekSeconds > 0 && windowable
 	if seekApplied {
 		args = append(args, "-ss", strconv.FormatFloat(opts.SeekSeconds, 'f', 3, 64))
