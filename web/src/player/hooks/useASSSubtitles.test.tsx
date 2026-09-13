@@ -7,7 +7,11 @@ import type { PlayerSubtitleInfo } from "../types";
 // Capture the options every JASSUB instance is constructed with, plus the
 // instances themselves so tests can observe later timeOffset updates.
 const constructorOpts: Array<Record<string, unknown>> = [];
-const instances: Array<{ timeOffset: number; resize: ReturnType<typeof vi.fn> }> = [];
+const instances: Array<{
+  timeOffset: number;
+  resize: ReturnType<typeof vi.fn>;
+  destroy: ReturnType<typeof vi.fn>;
+}> = [];
 let rendererReady: Promise<void> = Promise.resolve();
 
 vi.mock("jassub", () => {
@@ -26,8 +30,10 @@ vi.mock("jassub", () => {
   return { default: MockJASSUB };
 });
 
-function makeVideoRef(): RefObject<HTMLVideoElement | null> {
-  return { current: document.createElement("video") };
+function makeVideoRef(readyState = 0): RefObject<HTMLVideoElement | null> {
+  const video = document.createElement("video");
+  Object.defineProperty(video, "readyState", { value: readyState, configurable: true });
+  return { current: video };
 }
 
 const arabicTrack: PlayerSubtitleInfo = {
@@ -524,6 +530,75 @@ describe("useASSSubtitles subtitle source changed", () => {
       expect(fetch).toHaveBeenCalledTimes(2);
       expect(constructorOpts).toHaveLength(1);
       expect(state).toHaveBeenLastCalledWith("ready");
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("useASSSubtitles windowed ASS extraction", () => {
+  it("requests a bounded ASS window positioned before the playhead", async () => {
+    const videoRef = makeVideoRef(1);
+    videoRef.current!.currentTime = 100;
+
+    // origin 30s, so source time = player 100 + origin 30. A 20s lead starts
+    // the window at 110 and the 600s duration bounds the extraction.
+    renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 30, 0));
+
+    await waitFor(() => expect(constructorOpts).toHaveLength(1));
+
+    const url = String(vi.mocked(fetch).mock.calls[0]![0]);
+    expect(url).toContain("position=110&duration=600");
+    expect(url.startsWith(germanTrack.url)).toBe(true);
+  });
+
+  it("fetches the next window as playback nears the end and swaps it in", async () => {
+    const videoRef = makeVideoRef(1);
+
+    renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    await waitFor(() => expect(constructorOpts).toHaveLength(1));
+    expect(String(vi.mocked(fetch).mock.calls[0]![0])).toContain("position=0&duration=600");
+
+    // Cross into the 60s prefetch lead of window [0, 600].
+    videoRef.current!.currentTime = 590;
+    videoRef.current!.dispatchEvent(new Event("timeupdate"));
+
+    await waitFor(() => expect(constructorOpts).toHaveLength(2));
+    expect(String(vi.mocked(fetch).mock.calls[1]![0])).toContain("position=570&duration=600");
+    // Atomic swap: the outgoing instance is destroyed only after the new
+    // window has been constructed (and readied), so the old script keeps
+    // rendering through the gap instead of flashing empty.
+    expect(instances).toHaveLength(2);
+    expect(instances[0]!.destroy).toHaveBeenCalledTimes(1);
+    expect(instances[1]!.destroy).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the whole-track URL after bounded windowed retries", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(fetch).mockRejectedValue(new Error("extraction failed"));
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() => useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0));
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      for (let i = 0; i < 3; i += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(5_000);
+        });
+      }
+
+      const urls = vi.mocked(fetch).mock.calls.map((call) => String(call[0]));
+      const windowed = `${germanTrack.url}?position=0&duration=600`;
+      // Bounded retries all target the same window URL...
+      expect(urls.slice(0, 3)).toEqual([windowed, windowed, windowed]);
+      // ...then the param-less whole-track URL is tried instead of looping on
+      // the window that keeps failing.
+      expect(urls[3]).toBe(germanTrack.url);
+      expect(urls.filter((url) => url === windowed)).toHaveLength(3);
     } finally {
       unmount();
       error.mockRestore();
