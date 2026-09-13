@@ -1526,3 +1526,293 @@ func TestSubtitleCacheTextRejectsSourceChangedDuringExtraction(t *testing.T) {
 		t.Fatal("old extract cached under replacement source")
 	}
 }
+
+// Explicit position=0 is a window (WindowRequested), so ServeExtract must
+// take the windowed branch and must not run the full-track fill/serve path
+// for the whole source.
+func TestServeExtractExplicitZeroWindowDoesNotFullTrack(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		WindowRequested:       true,
+		SeekSeconds:           0,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+	}
+	var got StreamExtractOpts
+	calls := 0
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass?position=0&duration=600", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+		calls++
+		got = o
+		_, err := io.WriteString(o.Writer, "[Script Info]\n")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want 1", calls)
+	}
+	if got.InputIsExtractedText != "" {
+		t.Fatalf("explicit-zero window must read the source, got input %q", got.InputIsExtractedText)
+	}
+	if !got.WindowRequested || got.SeekSeconds != 0 || got.DurationSeconds != 600 {
+		t.Fatalf("window parameters not preserved: %+v", got)
+	}
+	if f, _, ok := c.lookup(source, "", 0, subtitleFormatASS); ok {
+		_ = f.Close()
+		t.Fatal("windowed extract must not commit a full-track entry")
+	}
+}
+
+// ResolveCommittedTextEntry binds the exact artifact; passing the token back
+// through PinnedTextArtifact makes ServeExtract use that artifact without
+// re-resolving, so a generation rollover between the identity check and the
+// read cannot turn a validated artifact into a miss. The pinned path here is
+// one a fresh lookup cannot produce, proving the token is authoritative.
+func TestPinnedTextArtifactServedWithoutReResolution(t *testing.T) {
+	c, source := newTestCache(t)
+	if err := os.MkdirAll(c.dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(c.dir(), "pinned-external.ass")
+	if err := os.WriteFile(external, []byte("[Script Info]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := c.cachedFormatEntryPath(source, "", 0, subtitleFormatASS); ok {
+		t.Fatal("test requires no normally resolvable entry")
+	}
+	token := CommittedTextArtifact{path: external, format: subtitleFormatASS}
+	opts := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		WindowRequested:       true,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+		PinnedTextArtifact:    &token,
+	}
+	var got StreamExtractOpts
+	rec := httptest.NewRecorder()
+	result, err := c.ServeExtractWithResult(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+		got = o
+		_, err := io.WriteString(o.Writer, "WINDOW SLICE")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ServedCommittedArtifact {
+		t.Fatal("pinned artifact must be reported as served")
+	}
+	if got.InputPath != external || got.InputIsExtractedText != subtitleFormatASS {
+		t.Fatalf("serve must use the pinned artifact: %+v", got)
+	}
+	if rec.Body.String() != "WINDOW SLICE" {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// A committed artifact can be evicted between the identity check and the
+// read. When the caller pinned it, ServeExtractWithResult must not silently
+// fall back to an unvalidated source extract: it reports the miss so the
+// caller can revalidate and retry.
+func TestPinnedTextArtifactEvictionDoesNotFallBackToSource(t *testing.T) {
+	c, source := newTestCache(t)
+	fill := c.beginFill(source, "", 0, subtitleFormatASS)
+	if fill == nil {
+		t.Fatal("failed to reserve fill")
+	}
+	if _, err := fill.Tee(io.Discard).Write([]byte("[Script Info]\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fill.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	token, ok := c.ResolveCommittedTextEntry(source, "", 0, "ass", "")
+	if !ok {
+		t.Fatal("expected a committed artifact to resolve")
+	}
+	if err := os.Remove(token.path); err != nil {
+		t.Fatal(err)
+	}
+	extracted := false
+	opts := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		WindowRequested:       true,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+		PinnedTextArtifact:    &token,
+	}
+	result, err := c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), opts, func(context.Context, StreamExtractOpts) error {
+		extracted = true
+		return nil
+	})
+	if !errors.Is(err, ErrCommittedTextArtifactGone) {
+		t.Fatalf("error = %v, want ErrCommittedTextArtifactGone", err)
+	}
+	if extracted {
+		t.Fatal("evicted pinned artifact must not fall back to a source extract")
+	}
+	if result.ServedCommittedArtifact {
+		t.Fatal("no artifact was served")
+	}
+}
+
+// ServeExtractWithResult reports a windowed serve that used the committed
+// artifact, and a window miss that did not — the signal a caller uses to
+// decide whether track-identity validation can be skipped.
+func TestServeExtractResultReportsCommittedArtifact(t *testing.T) {
+	c, source := newTestCache(t)
+
+	// Cold window miss: nothing committed, so the artifact was not served.
+	windowed := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		TrackIndex:            0,
+		WindowRequested:       true,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+	}
+	result, err := c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), windowed, func(_ context.Context, o StreamExtractOpts) error {
+		_, err := io.WriteString(o.Writer, "SLICE")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ServedCommittedArtifact {
+		t.Fatal("cold window miss must not report a committed artifact")
+	}
+
+	// Commit a full-track artifact, then serve a window from it.
+	full := StreamExtractOpts{InputPath: source, SourceCodec: "ass", TrackIndex: 0}
+	if err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), full, func(_ context.Context, o StreamExtractOpts) error {
+		_, err := io.WriteString(o.Writer, "FULL TRACK")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var served StreamExtractOpts
+	result, err = c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), windowed, func(_ context.Context, o StreamExtractOpts) error {
+		served = o
+		_, err := io.WriteString(o.Writer, "SLICE")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ServedCommittedArtifact {
+		t.Fatal("windowed serve from a committed artifact must report it")
+	}
+	if served.InputIsExtractedText != subtitleFormatASS {
+		t.Fatalf("windowed serve must read the cached artifact: %+v", served)
+	}
+}
+
+// A warm that fails must put its identity in a cooldown so repeated windowed
+// misses do not each spawn a full-track remote read. An immediate retry is
+// suppressed; once the cooldown expires the next attempt runs.
+func TestWarmTrackInBackgroundFailedWarmCooldown(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "ass", TrackIndex: 0}
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	extract := func(_ context.Context, _ StreamExtractOpts) error {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return errors.New("relay unavailable")
+	}
+	<-c.WarmTrackInBackground(opts, extract)
+	mu.Lock()
+	if calls != 1 {
+		t.Fatalf("first warm calls = %d, want 1", calls)
+	}
+	mu.Unlock()
+
+	// Immediate retry: suppressed by the failure cooldown.
+	<-c.WarmTrackInBackground(opts, extract)
+	mu.Lock()
+	if calls != 1 {
+		t.Fatalf("immediate retry calls = %d, want still 1 (cooldown)", calls)
+	}
+	mu.Unlock()
+
+	// Expire the cooldown; the next attempt runs.
+	key, ok := c.formatEntryKey(source, "", 0, subtitleFormatASS)
+	if !ok {
+		t.Fatal("failed to compute warm key")
+	}
+	c.warmMu.Lock()
+	guard := c.warmGuard[key]
+	guard.retryAt = time.Now().Add(-time.Second)
+	c.warmGuard[key] = guard
+	c.warmMu.Unlock()
+	<-c.WarmTrackInBackground(opts, extract)
+	mu.Lock()
+	if calls != 2 {
+		t.Fatalf("post-cooldown warm calls = %d, want 2", calls)
+	}
+	mu.Unlock()
+}
+
+// A successful warm clears the identity's cooldown.
+func TestWarmOutcomeSuccessClearsCooldown(t *testing.T) {
+	c, _ := newTestCache(t)
+	const key = "identity"
+	c.noteWarmOutcome(key, false, time.Now())
+	if c.warmAdmitted(key, time.Now()) {
+		t.Fatal("failed warm must gate admission")
+	}
+	c.noteWarmOutcome(key, true, time.Now())
+	if !c.warmAdmitted(key, time.Now()) {
+		t.Fatal("successful warm must clear the cooldown")
+	}
+}
+
+// A canceled warm (relay gone) must still close its done channel and release
+// its warm slot, so the caller's deferred relay-registration cleanup runs and
+// no slot leaks. The cancellation is recorded as a failure, gating an
+// immediate re-spawn.
+func TestWarmTrackInBackgroundCancellationReleasesSlot(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{
+		InputPath:     source,
+		SourceCodec:   "ass",
+		TrackIndex:    0,
+		CacheIdentity: "virtual-cancel-1",
+	}
+	done := c.WarmTrackInBackground(opts, func(context.Context, StreamExtractOpts) error {
+		return context.Canceled
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm done never closed after cancellation")
+	}
+	// Every warm slot is free again.
+	for i := 0; i < subtitleCacheWarmSlots; i++ {
+		select {
+		case c.warmSem <- struct{}{}:
+		default:
+			t.Fatal("warm slot leaked after cancellation")
+		}
+	}
+	for i := 0; i < subtitleCacheWarmSlots; i++ {
+		<-c.warmSem
+	}
+	// The canceled warm counts as a failure, so an immediate retry is gated.
+	calls := 0
+	<-c.WarmTrackInBackground(opts, func(context.Context, StreamExtractOpts) error {
+		calls++
+		return nil
+	})
+	if calls != 0 {
+		t.Fatalf("immediate retry after cancellation ran %d times, want 0", calls)
+	}
+}

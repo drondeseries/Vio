@@ -36,11 +36,24 @@ type StreamExtractOpts struct {
 	// SeekSeconds asks ffmpeg to start demuxing at this position. For
 	// text-event codecs this is the key win — ffmpeg skips the prefix of
 	// the container instead of scanning from byte 0 to produce earlier
-	// cues the client will never display. ASS participates when a position
-	// is supplied: each window re-emits a self-contained script header, so
-	// a windowed extraction is safe. A zero position preserves the
-	// whole-script behavior native ASS renderers rely on.
+	// cues the client will never display. ASS participates when a window is
+	// requested (see WindowRequested) or a nonzero position is supplied:
+	// each window re-emits a self-contained script header, so a windowed
+	// extraction is safe. A zero position is a valid window start when the
+	// caller asked for a bounded window; without a window request it
+	// preserves the whole-script behavior native ASS renderers rely on.
 	SeekSeconds float64
+	// WindowRequested marks that the caller explicitly asked for a bounded
+	// window (from ?position and/or ?duration) rather than a whole-track
+	// fetch. It is deliberately separate from SeekSeconds because
+	// position=0 is a valid window start: a client that sends
+	// position=0&duration=600 wants bounded output on the source timeline,
+	// not the whole script. Callers set this whenever the request carried an
+	// explicit position or duration parameter, even when the value is zero.
+	// ASS windows iff this is set or SeekSeconds > 0; legacy duration-only
+	// direct callers that leave it unset keep whole-track behavior, and PGS
+	// still gates windowing on AllowWindow.
+	WindowRequested bool
 	// DurationSeconds bounds the extract to a window of this length,
 	// using an absolute ffmpeg output endpoint. Zero means "until end of file".
 	// A bounded window lets the client consume one fetch to completion
@@ -52,8 +65,9 @@ type StreamExtractOpts struct {
 	// stream exactly once and consume it whole; a client that explicitly
 	// opts in (via ?windowed=1) re-requests fresh windows itself as
 	// playback moves outside coverage. ASS does not consult this flag: it
-	// windows purely on a supplied position, so its renderer either
-	// receives the complete script or a self-contained slice it asked for.
+	// windows when WindowRequested is set (or on a nonzero position), so
+	// its renderer either receives the complete script or a self-contained
+	// slice it asked for.
 	AllowWindow bool
 	// DisableBackgroundWarm prevents a windowed text or PGS miss from
 	// starting a detached full-track extract. Remote relay inputs use
@@ -84,6 +98,16 @@ type StreamExtractOpts struct {
 	// cut from the cache is byte-compatible with one cut from the source.
 	// Empty means InputPath is the original container.
 	InputIsExtractedText string
+	// PinnedTextArtifact, when non-nil, is a committed full-track text cache
+	// entry resolved by ResolveCommittedTextEntry. ServeExtract uses its
+	// exact path as the windowed extract input instead of re-resolving, so a
+	// caller that skipped track-identity validation based on that artifact
+	// is guaranteed to serve the same validated bytes (a generation-bucket
+	// rollover between check and read cannot turn it into a miss). If the
+	// artifact has been evicted by serve time, ServeExtractWithResult fails
+	// before writing a response with ErrCommittedTextArtifactGone so the
+	// caller can revalidate and retry.
+	PinnedTextArtifact *CommittedTextArtifact
 	// FFmpegPath overrides the ffmpeg binary lookup.
 	FFmpegPath string
 	// Writer receives ffmpeg's stdout bytes as they arrive. When it
@@ -178,24 +202,31 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 
 	// Input seek (before -i) is the fast variant: ffmpeg jumps near the
 	// requested position before demuxing. Text codecs always use it; ASS
-	// uses it when the caller supplies a position (see below). PGS
-	// defaults to non-windowed too: a client that fetches the .sup
-	// stream exactly once and consumes it whole needs the complete track
-	// from offset 0 — windowing would silently drop every cue outside
-	// the window. Clients that manage their own sliding window opt in
-	// via AllowWindow; -copyts below keeps the windowed output on
+	// uses it when a window was requested (WindowRequested) or the caller
+	// supplies a nonzero position. PGS defaults to non-windowed: a client
+	// that fetches the .sup stream exactly once and consumes it whole needs
+	// the complete track from offset 0 — windowing would silently drop every
+	// cue outside the window. Clients that manage their own sliding window
+	// opt in via AllowWindow; -copyts below keeps the windowed output on
 	// absolute source timestamps so cues stay in sync. The same logic
 	// governs the -t duration cap below.
+	//
+	// A window request is not the same as a nonzero position: a client that
+	// sends position=0&duration=600 wants the first bounded slice, and
+	// treating SeekSeconds==0 as "whole track" made every startup fetch
+	// demux the entire file. seekApplied therefore follows the window
+	// intent, so explicit-zero emits `-ss 0`.
 	//
 	// Windowed ASS is safe because the ASS muxer writes the script header
 	// (styles and font references) from the container extradata on every
 	// extraction, so each window is a self-contained script; -copyts keeps
 	// its events on the source timeline, which the client's JASSUB
-	// `timeOffset` relies on. Without a position the whole script is
+	// `timeOffset` relies on. Without a window request the whole script is
 	// emitted, so native clients that fetch .ass once are unaffected.
+	windowRequested := opts.WindowRequested || opts.SeekSeconds > 0
 	windowable := (!IsPGS(opts.SourceCodec) || opts.AllowWindow) &&
-		(!IsASS(opts.SourceCodec) || opts.SeekSeconds > 0)
-	seekApplied := opts.SeekSeconds > 0 && windowable
+		(!IsASS(opts.SourceCodec) || windowRequested)
+	seekApplied := windowRequested && windowable
 	if seekApplied {
 		args = append(args, "-ss", strconv.FormatFloat(opts.SeekSeconds, 'f', 3, 64))
 	}
@@ -250,6 +281,15 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 		"-f", outFormat,
 		"pipe:1",
 	)
+}
+
+// windowIntent reports whether the caller asked for a bounded window rather
+// than a whole-track fetch. It drives the cache's choice between the
+// full-track fill/serve path and the windowed serve path: an explicit
+// position=0 (or a duration-only request) is a window, and routing it to the
+// full-track path would re-demux the whole source on normal startup.
+func (o StreamExtractOpts) windowIntent() bool {
+	return o.WindowRequested || o.SeekSeconds > 0 || o.DurationSeconds > 0
 }
 
 // PGSWindowRequest reports whether a subtitle request explicitly opts in

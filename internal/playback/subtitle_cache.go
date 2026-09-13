@@ -50,6 +50,12 @@ type SubtitleCache struct {
 	mu       sync.Mutex
 	inflight map[string]*SubtitleCacheFill
 
+	// warmMu guards warmGuard, the per-identity failed-warm cooldown. It is
+	// separate from mu so admission never contends with in-flight fill
+	// bookkeeping.
+	warmMu    sync.Mutex
+	warmGuard map[string]subtitleWarmGuard
+
 	// warmSem bounds concurrent background warms server-wide (each warm
 	// demuxes an entire source file — heavy sequential IO). Acquisition is
 	// non-blocking: warms beyond the budget are dropped, not queued; the
@@ -113,7 +119,26 @@ const (
 	// The cap stops a pathological run of failing fills from wedging a request
 	// indefinitely when its context has no deadline.
 	subtitleFillWaitRetries = 3
+	// subtitleWarmFailureBaseCooldown is the first backoff after a warm for
+	// one identity fails or is abandoned. Repeated windowed misses on a
+	// source that cannot be warmed (provider error, broken relay,
+	// unreadable file) would otherwise each spawn a full-track remote read —
+	// the two warm slots bound concurrency, not total bytes or cluster load.
+	// A failed identity is suppressed for this long before the next attempt.
+	subtitleWarmFailureBaseCooldown = time.Minute
+	// subtitleWarmFailureMaxCooldown caps the exponential backoff so a
+	// permanently broken source is retried eventually instead of never (the
+	// generation bucket, not the cooldown, is what re-keys it after a real
+	// source rotation).
+	subtitleWarmFailureMaxCooldown = 30 * time.Minute
 )
+
+// subtitleWarmGuard is the per-identity warm admission state: how many
+// consecutive warms failed and the earliest time the next one may start.
+type subtitleWarmGuard struct {
+	failures int
+	retryAt  time.Time
+}
 
 // SUPExtractFunc runs one ffmpeg subtitle extract described by opts, writing
 // output to opts.Writer. Production callers pass StreamExtractSubtitle;
@@ -130,6 +155,7 @@ func NewSubtitleCache(transcodeDir func() string) *SubtitleCache {
 		transcodeDir: transcodeDir,
 		maxBytes:     defaultSubtitleCacheMaxBytes,
 		inflight:     make(map[string]*SubtitleCacheFill),
+		warmGuard:    make(map[string]subtitleWarmGuard),
 		warmSem:      make(chan struct{}, subtitleCacheWarmSlots),
 	}
 }
@@ -140,9 +166,42 @@ func NewSubtitleCache(transcodeDir func() string) *SubtitleCache {
 // Only one request fills the cache; a request that arrives while a fill is in
 // flight waits for it to commit and serves the cached entry (a failed fill
 // falls back to a fresh attempt, then to an uncached stream).
+//
+// It is ServeExtractWithResult without the serve report. Callers that need to
+// know whether a committed artifact was served — for example to decide whether
+// track identity still needs validation — use ServeExtractWithResult.
 func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, extract SUPExtractFunc) error {
+	_, err := c.ServeExtractWithResult(w, r, opts, extract)
+	return err
+}
+
+// ServeExtractResult reports how a serve was satisfied.
+type ServeExtractResult struct {
+	// ServedCommittedArtifact is true when the response body came from the
+	// committed full-track cache artifact resolved for the request identity:
+	// served directly for a whole-track request, or used as the input of a
+	// windowed extract. False means the response was produced by a fresh
+	// extract of the source or a live fill.
+	//
+	// A caller must not treat cache presence alone as proof of track
+	// identity. It should resolve the artifact with ResolveCommittedTextEntry,
+	// skip validation only when that returns a token, and pass the token back
+	// through StreamExtractOpts.PinnedTextArtifact. If the pinned artifact is
+	// gone by serve time this method returns ErrCommittedTextArtifactGone
+	// instead of silently falling back to an unvalidated source extract.
+	ServedCommittedArtifact bool
+}
+
+// ErrCommittedTextArtifactGone is returned by ServeExtractWithResult when the
+// caller pinned a resolved committed text artifact (PinnedTextArtifact) but
+// the artifact no longer exists by serve time. No response is written, so the
+// caller can revalidate the live track identity and retry rather than stream
+// an unvalidated source extract.
+var ErrCommittedTextArtifactGone = errors.New("committed subtitle artifact no longer available")
+
+func (c *SubtitleCache) ServeExtractWithResult(w http.ResponseWriter, r *http.Request, opts StreamExtractOpts, extract SUPExtractFunc) (ServeExtractResult, error) {
 	if err := r.Context().Err(); err != nil {
-		return err
+		return ServeExtractResult{}, err
 	}
 	// Full demuxes can outlive the API listener's absolute write timeout.
 	// Reuse the media-stream deadline so progress continues while stalled
@@ -150,16 +209,18 @@ func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opt
 	w = httpstream.NewRollingDeadlineWriter(w)
 	format := subtitleCacheFormat(opts.SourceCodec, opts.TargetFormat)
 	if format == subtitleFormatSUP {
-		return c.ServeSUPExtract(w, r, opts, extract)
+		return ServeExtractResult{}, c.ServeSUPExtract(w, r, opts, extract)
 	}
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	if format == subtitleFormatASS {
 		w.Header().Set("Content-Type", "text/x-ssa; charset=utf-8")
 	}
+	var result ServeExtractResult
 	var fill *SubtitleCacheFill
-	if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
+	if !opts.windowIntent() {
 		if c.serveCached(w, r, opts, format) {
-			return nil
+			result.ServedCommittedArtifact = true
+			return result, nil
 		}
 		var wait <-chan struct{}
 		fill, wait = c.beginFillOrWait(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
@@ -168,17 +229,19 @@ func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opt
 			// to settle instead of running a second full demux, then serve the
 			// entry it committed.
 			if err := waitForSubtitleFill(r.Context(), wait); err != nil {
-				return err
+				return result, err
 			}
 			if c.serveCached(w, r, opts, format) {
-				return nil
+				result.ServedCommittedArtifact = true
+				return result, nil
 			}
 			fill, wait = c.beginFillOrWait(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
 		}
 		if fill != nil && c.serveCached(w, r, opts, format) {
 			// A previous owner may have committed between lookup and reservation.
 			fill.Discard()
-			return nil
+			result.ServedCommittedArtifact = true
+			return result, nil
 		}
 	} else {
 		// Windowed text fetches are position-dependent slices, so they are
@@ -192,12 +255,29 @@ func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opt
 		// disable only the background warm (a detached fill must not outlive
 		// the request-scoped relay registration) while an already-populated
 		// entry must still be served instead of re-demuxing the source.
-		if cachedPath, _, ok := c.cachedFormatEntryPath(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format); ok {
-			slog.DebugContext(r.Context(), "windowed text subtitle extract using cached full track",
-				"input", opts.InputPath, "track", opts.TrackIndex, "cache_entry", cachedPath)
-			opts.InputPath = cachedPath
-			opts.InputIsExtractedText = format
-		} else if !opts.DisableBackgroundWarm {
+		//
+		// A pinned artifact (from ResolveCommittedTextEntry) is used by its
+		// exact path rather than re-resolved, so a generation-bucket rollover
+		// between the caller's identity check and this serve cannot turn a
+		// validated artifact into a miss. If the pinned file has been
+		// evicted, fail before the response is committed so the caller can
+		// revalidate and retry.
+		artifact, ok := c.resolveCommittedTextArtifact(opts)
+		if ok {
+			if _, statErr := os.Stat(artifact.path); statErr == nil {
+				slog.DebugContext(r.Context(), "windowed text subtitle extract using cached full track",
+					"input", opts.InputPath, "track", opts.TrackIndex, "cache_entry", artifact.path)
+				opts.InputPath = artifact.path
+				opts.InputIsExtractedText = artifact.format
+				result.ServedCommittedArtifact = true
+			} else if opts.PinnedTextArtifact != nil {
+				// The caller validated identity against this exact artifact
+				// and it is now gone. Falling back to the source here would
+				// serve an unvalidated ordinal, so surface the miss instead.
+				return ServeExtractResult{}, ErrCommittedTextArtifactGone
+			}
+		}
+		if !result.ServedCommittedArtifact && !opts.DisableBackgroundWarm {
 			c.WarmTrackInBackground(opts, extract)
 		}
 	}
@@ -217,7 +297,7 @@ func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opt
 				"input", opts.InputPath, "track", opts.TrackIndex, "format", format, "error", commitErr)
 		}
 	}
-	return err
+	return result, err
 }
 
 // waitForSubtitleFill blocks until the in-flight fill identified by wait
@@ -256,22 +336,75 @@ func subtitleCacheFormat(codec, targetFormat string) string {
 	return format
 }
 
+// CommittedTextArtifact is a resolved reference to a committed full-track
+// text (VTT/ASS) cache entry. ResolveCommittedTextEntry binds the exact cache
+// path under the current invalidation coordinates; a caller can hand the token
+// back through StreamExtractOpts.PinnedTextArtifact so the serve uses that
+// same artifact rather than re-resolving it. Cache presence alone is not proof
+// of track identity: the token is what makes the identity check and the read
+// consistent, so only a token — never HasCommittedTextEntry's bool — may be
+// used to skip validation.
+type CommittedTextArtifact struct {
+	path   string
+	format string
+}
+
+// ResolveCommittedTextEntry resolves the committed full-track text artifact
+// for the given source identity + track ordinal and returns a token that pins
+// its exact path. codec and targetFormat are the same values passed to
+// ServeExtract, and the format is derived through the same mapping, so the
+// token is exactly what a windowed ServeExtract would read. ok is false for a
+// bitmap (PGS) codec, an unkeyable source, a missing entry, or a nil cache.
+//
+// Unlike HasCommittedTextEntry, the returned token is bound to the resolved
+// path: passing it back via StreamExtractOpts.PinnedTextArtifact guarantees
+// ServeExtractWithResult serves that artifact (or reports
+// ErrCommittedTextArtifactGone), so a generation-bucket rollover or an
+// eviction between the identity check and the read cannot silently invalidate
+// the decision. Callers that skip track-identity validation because an
+// artifact exists must use this method and the pinned token.
+func (c *SubtitleCache) ResolveCommittedTextEntry(inputPath, cacheIdentity string, trackIndex int, codec, targetFormat string) (CommittedTextArtifact, bool) {
+	if c == nil {
+		return CommittedTextArtifact{}, false
+	}
+	format := subtitleCacheFormat(codec, targetFormat)
+	if format != SubtitleFormatVTTV3 && format != subtitleFormatASS {
+		return CommittedTextArtifact{}, false
+	}
+	path, _, ok := c.cachedFormatEntryPath(inputPath, cacheIdentity, trackIndex, format)
+	if !ok {
+		return CommittedTextArtifact{}, false
+	}
+	return CommittedTextArtifact{path: path, format: format}, true
+}
+
+// resolveCommittedTextArtifact returns the artifact ServeExtract should use:
+// the caller's pinned token when present (authoritative), otherwise a fresh
+// resolution for an unpinned request.
+func (c *SubtitleCache) resolveCommittedTextArtifact(opts StreamExtractOpts) (CommittedTextArtifact, bool) {
+	if opts.PinnedTextArtifact != nil {
+		return *opts.PinnedTextArtifact, true
+	}
+	return c.ResolveCommittedTextEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat)
+}
+
 // HasCommittedTextEntry reports whether a committed full-track text (VTT/ASS)
 // artifact exists for the given source identity + track ordinal. codec and
 // targetFormat are the same values passed to ServeExtract, and the format is
-// derived through the same mapping, so true means a windowed ServeExtract for
-// those options will read the cached artifact instead of re-demuxing the
-// source. A bitmap (PGS) codec, an unkeyable source, or a nil cache reads as
-// false.
+// derived through the same mapping.
+//
+// This is a non-binding snapshot: because the check and the read are separate
+// operations, a hit does not prove the track identity a later ServeExtract
+// will read (a generation-bucket rollover or eviction can turn that read into
+// a miss). Callers that intend to skip track-identity validation must resolve
+// the artifact with ResolveCommittedTextEntry and pin it via
+// StreamExtractOpts.PinnedTextArtifact instead. A bitmap (PGS) codec, an
+// unkeyable source, or a nil cache reads as false.
 func (c *SubtitleCache) HasCommittedTextEntry(inputPath, cacheIdentity string, trackIndex int, codec, targetFormat string) bool {
 	if c == nil {
 		return false
 	}
-	format := subtitleCacheFormat(codec, targetFormat)
-	if format != SubtitleFormatVTTV3 && format != subtitleFormatASS {
-		return false
-	}
-	_, _, ok := c.cachedFormatEntryPath(inputPath, cacheIdentity, trackIndex, format)
+	_, ok := c.ResolveCommittedTextEntry(inputPath, cacheIdentity, trackIndex, codec, targetFormat)
 	return ok
 }
 
@@ -386,6 +519,69 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 	return extract(r.Context(), opts)
 }
 
+// formatEntryKey computes the in-flight/cache key for a source identity,
+// track ordinal, and format without creating a fill. It mirrors
+// beginFillOrWait's key derivation exactly, so warm admission and the fill it
+// guards always agree. ok is false when the cache is disabled or the source
+// cannot be keyed.
+func (c *SubtitleCache) formatEntryKey(inputPath, cacheIdentity string, trackIndex int, format string) (string, bool) {
+	if c == nil || c.dir() == "" {
+		return "", false
+	}
+	identity, modTime, size, ok := subtitleCacheSource(inputPath, cacheIdentity, time.Now())
+	if !ok {
+		return "", false
+	}
+	return subtitleCacheFormatKey(identity, trackIndex, modTime, size, format), true
+}
+
+// warmAdmitted reports whether a background warm may start for the cache key,
+// rate-limiting identities whose warm recently failed or was abandoned. It
+// reads only; noteWarmOutcome records the result.
+func (c *SubtitleCache) warmAdmitted(key string, now time.Time) bool {
+	if c == nil {
+		return false
+	}
+	c.warmMu.Lock()
+	defer c.warmMu.Unlock()
+	guard, ok := c.warmGuard[key]
+	if !ok {
+		return true
+	}
+	return !now.Before(guard.retryAt)
+}
+
+// noteWarmOutcome records a warm result for the cache key. Success clears the
+// identity's backoff; failure (or abandonment) increments it and sets an
+// exponentially growing retry time capped at
+// subtitleWarmFailureMaxCooldown, so repeated windowed misses on a source
+// that cannot be warmed do not each spawn a full-track remote read.
+func (c *SubtitleCache) noteWarmOutcome(key string, success bool, now time.Time) {
+	if c == nil || key == "" {
+		return
+	}
+	c.warmMu.Lock()
+	defer c.warmMu.Unlock()
+	if success {
+		delete(c.warmGuard, key)
+		return
+	}
+	if c.warmGuard == nil {
+		c.warmGuard = make(map[string]subtitleWarmGuard)
+	}
+	guard := c.warmGuard[key]
+	guard.failures++
+	backoff := subtitleWarmFailureBaseCooldown
+	for i := 1; i < guard.failures && backoff < subtitleWarmFailureMaxCooldown; i++ {
+		backoff *= 2
+	}
+	if backoff > subtitleWarmFailureMaxCooldown {
+		backoff = subtitleWarmFailureMaxCooldown
+	}
+	guard.retryAt = now.Add(backoff)
+	c.warmGuard[key] = guard
+}
+
 // WarmInBackground starts a detached full-track extract that fills the cache
 // entry for opts' source+track, so future windowed requests can extract from
 // the small cached .sup instead of the original file. The warm runs on a
@@ -393,10 +589,20 @@ func (c *SubtitleCache) serveWindowedSUP(w http.ResponseWriter, r *http.Request,
 // that triggered it. BeginFill's in-flight coalescing guarantees at most one
 // fill per track (a concurrent client-driven fill wins and the warm is
 // skipped), and warmSem bounds warms server-wide: beyond the budget the warm
-// is dropped, not queued — the next windowed miss re-attempts it. A nil
-// receiver is a no-op.
+// is dropped, not queued — the next windowed miss re-attempts it. A failed
+// warm puts the identity in a cooldown so repeated misses do not each spawn a
+// fresh full-track remote read. A nil receiver is a no-op.
 func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtractFunc) {
 	if c == nil || extract == nil {
+		return
+	}
+	key, keyOK := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, subtitleFormatSUP)
+	if !keyOK {
+		return
+	}
+	if !c.warmAdmitted(key, time.Now()) {
+		slog.Debug("subtitle cache warm skipped: failure cooldown",
+			"input", opts.InputPath, "track", opts.TrackIndex)
 		return
 	}
 	select {
@@ -418,6 +624,7 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 	// and writes only to the cache temp file (no response writer).
 	opts.SeekSeconds = 0
 	opts.DurationSeconds = 0
+	opts.WindowRequested = false
 	opts.AllowWindow = false
 	opts.InputIsExtractedSup = false
 	opts.Writer = fill.Tee(io.Discard)
@@ -432,16 +639,19 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 			"input", opts.InputPath, "track", opts.TrackIndex)
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
+			c.noteWarmOutcome(key, false, time.Now())
 			slog.Warn("subtitle cache warm failed",
 				"input", opts.InputPath, "track", opts.TrackIndex,
 				"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
 			return
 		}
 		if err := fill.Commit(); err != nil {
+			c.noteWarmOutcome(key, false, time.Now())
 			slog.Warn("subtitle cache warm commit failed",
 				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
 			return
 		}
+		c.noteWarmOutcome(key, true, time.Now())
 		slog.Info("subtitle cache warm finished",
 			"input", opts.InputPath, "track", opts.TrackIndex,
 			"elapsed_ms", time.Since(start).Milliseconds())
@@ -451,10 +661,16 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 // WarmTrackInBackground starts a detached full-track extract for one subtitle
 // track in any output format (text VTT/ASS or bitmap .sup), so the first
 // client fetch — full-track or windowed — hits the cache instead of paying a
-// full remote demux. The returned channel closes exactly once when the warm
-// finished (success or failure) or was skipped (warm slots busy, another fill
-// in flight, cache disabled, already cached); callers use it to release a
+// full remote demux. The returned channel closes exactly once on every path:
+// when the warm finished (success or failure), and when it was skipped (warm
+// slots busy, another fill in flight, cache disabled, already cached, or the
+// identity is in its failure cooldown). Callers use it to release a
 // request-scoped relay registration the warm held open.
+//
+// A warm whose extract fails is not retried immediately: noteWarmOutcome puts
+// the identity in an exponentially growing cooldown, so repeated windowed
+// misses do not each spawn a fresh full-track remote read (bandwidth
+// amplification). The cooldown clears on the next successful commit.
 //
 // Staleness for identity-keyed (virtual) sources follows the same generation
 // bucket as every other cache lookup: an entry committed under an
@@ -469,6 +685,17 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 	}
 	// Already committed under the current bucket: nothing to warm.
 	if _, _, ok := c.cachedFormatEntryPath(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format); ok {
+		close(done)
+		return done
+	}
+	key, keyOK := c.formatEntryKey(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if !keyOK {
+		close(done)
+		return done
+	}
+	if !c.warmAdmitted(key, time.Now()) {
+		slog.Debug("subtitle cache warm skipped: failure cooldown",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
 		close(done)
 		return done
 	}
@@ -493,6 +720,7 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 	// and writes only to the cache temp file (no response writer).
 	opts.SeekSeconds = 0
 	opts.DurationSeconds = 0
+	opts.WindowRequested = false
 	opts.AllowWindow = false
 	opts.InputIsExtractedSup = false
 	opts.InputIsExtractedText = ""
@@ -509,16 +737,19 @@ func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SU
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
 		if err := extract(ctx, opts); err != nil {
 			fill.Discard()
+			c.noteWarmOutcome(key, false, time.Now())
 			slog.Warn("subtitle cache warm failed",
 				"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
 				"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
 			return
 		}
 		if err := fill.Commit(); err != nil {
+			c.noteWarmOutcome(key, false, time.Now())
 			slog.Warn("subtitle cache warm commit failed",
 				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
 			return
 		}
+		c.noteWarmOutcome(key, true, time.Now())
 		slog.Info("subtitle cache warm finished",
 			"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
 			"elapsed_ms", time.Since(start).Milliseconds())
