@@ -277,23 +277,12 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 				return nil, err
 			}
 			eligible = physical
-		} else {
-			// Without an active override on fresh identities and without physical possession,
-			// re-verify provider release evidence for fresh identities so a removed alias's
-			// override cannot smuggle an unreleased movie in. A missing or
-			// malformed TMDB identity fails closed: provider failure and
-			// absent evidence never imply release.
-			trimmedTMDB := strings.TrimSpace(in.TMDBID)
-			tmdbID, convErr := strconv.Atoi(trimmedTMDB)
-			if trimmedTMDB == "" || convErr != nil || tmdbID <= 0 {
-				return nil, fmt.Errorf("%w: movie has no usable TMDB identity for release verification", ErrProviderUnavailable)
-			}
-			providerReleased, err := newTheatricalReleaseGate(r.TMDBDigitalReleases).lookupProvider(ctx, tmdbID)
-			if err != nil {
-				return nil, err
-			}
-			eligible = providerReleased && !isFutureDate(in.Year, "")
 		}
+		// Otherwise eligible retains the pre-transaction provider verdict:
+		// the exclusive content lock prevents alias changes, so the
+		// pre-transaction lookup remains valid and must not be repeated
+		// while holding locks (provider latency would block all alias
+		// writers).
 		movieIDs = freshIDs
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO media_item_libraries(content_id,media_folder_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, contentID, folderID); err != nil {

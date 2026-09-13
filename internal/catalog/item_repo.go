@@ -2075,10 +2075,19 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 	// require it to match the prepared snapshot. A changed membership is a
 	// retryable conflict: removed aliases must not retain authority, and
 	// added aliases must go through preparation, not silent union.
+	// Explicit preparation is enforced below: any movie with stored release
+	// identities must arrive prepared (override evaluation done). New items
+	// with no stored aliases are exempt.
 	if mediaType == "movie" {
 		movieIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", item.ContentID, "movie", item.TmdbID, item.TvdbID, item.ImdbID, 0, 0)
 		if err != nil {
 			return nil, err
+		}
+		// Enforce explicit preparation: callers that did not prepare must not reach
+		// the override gate with stored identities. New items (no stored aliases)
+		// are exempt.
+		if !opts.preparedExplicitly && len(movieIDs) > 0 {
+			return nil, fmt.Errorf("%w: movie has stored release identities but was not prepared with override evaluation", ErrReleaseOverrideConflict)
 		}
 		if opts.preparedExplicitly || len(movieIDs) > 0 {
 			if len(opts.releaseSnapshot) > 0 && !releaseIdentitySetsEqual(snapshotIdentities(opts.releaseSnapshot), movieIDs) {
@@ -3380,24 +3389,60 @@ func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx
 		return episodes[i].episode < episodes[j].episode
 	})
 
-	if len(episodes) == 0 {
+	if len(candidates) == 0 {
 		if err := cleanupStaleVirtualEpisodesTx(ctx, tx, seriesID, collectionID, nil, nil, nil); err != nil {
 			return 0, 0, 0, err
 		}
 		return 0, 0, 0, nil
 	}
 
-	distinctEpisodes = len(episodes)
-	expectedPaths := make([]string, 0, len(bases)*len(episodes))
-	expectedOwners := make([]int64, 0, len(bases)*len(episodes))
-	expectedFolders := make([]int, 0, len(bases)*len(episodes))
+	// The expected set covers ALL evaluated candidates (the truncated
+	// batch), not just the released subset. Candidates beyond the release
+	// gate still own virtual files/claims from prior passes; excluding
+	// them here would let cleanup delete files for episodes 501+ that
+	// simply were not released in this pass.
+	expectedPaths := make([]string, 0, len(bases)*len(candidates))
+	expectedOwners := make([]int64, 0, len(bases)*len(candidates))
+	expectedFolders := make([]int, 0, len(bases)*len(candidates))
 
 	type episodeFileKey struct {
 		path     string
 		ownerID  int64
 		folderID int
 	}
-	seenEpisodes := make(map[episodeFileKey]struct{}, len(bases)*len(episodes))
+	seenEpisodes := make(map[episodeFileKey]struct{}, len(bases)*len(candidates))
+
+	for _, base := range bases {
+		parsed, _ := url.Parse(base.filePath)
+		identifier := strings.TrimPrefix(parsed.EscapedPath(), "/")
+		for _, candidate := range candidates {
+			episodeURI := &url.URL{
+				Scheme:   "virtual",
+				Host:     "series",
+				Path:     fmt.Sprintf("/%s/%d/%d", identifier, candidate.season, candidate.episode),
+				RawQuery: parsed.RawQuery,
+			}
+			path := episodeURI.String()
+			key := episodeFileKey{path: path, ownerID: int64(base.ownerID), folderID: base.folderID}
+			if _, seen := seenEpisodes[key]; seen {
+				continue
+			}
+			seenEpisodes[key] = struct{}{}
+			expectedPaths = append(expectedPaths, path)
+			expectedOwners = append(expectedOwners, int64(base.ownerID))
+			expectedFolders = append(expectedFolders, base.folderID)
+		}
+	}
+
+	if len(episodes) == 0 {
+		if err := cleanupStaleVirtualEpisodesTx(ctx, tx, seriesID, collectionID, expectedOwners, expectedPaths, expectedFolders); err != nil {
+			return 0, 0, 0, err
+		}
+		return 0, 0, 0, nil
+	}
+
+	distinctEpisodes = len(episodes)
+	seenMaterialized := make(map[episodeFileKey]struct{}, len(bases)*len(episodes))
 
 	for _, base := range bases {
 		parsed, _ := url.Parse(base.filePath)
@@ -3411,13 +3456,10 @@ func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx
 			}
 			path := episodeURI.String()
 			key := episodeFileKey{path: path, ownerID: int64(base.ownerID), folderID: base.folderID}
-			if _, seen := seenEpisodes[key]; seen {
+			if _, seen := seenMaterialized[key]; seen {
 				continue
 			}
-			seenEpisodes[key] = struct{}{}
-			expectedPaths = append(expectedPaths, path)
-			expectedOwners = append(expectedOwners, int64(base.ownerID))
-			expectedFolders = append(expectedFolders, base.folderID)
+			seenMaterialized[key] = struct{}{}
 			ps := base.probeSource
 			if ps == "" {
 				ps = "virtual_collection"
