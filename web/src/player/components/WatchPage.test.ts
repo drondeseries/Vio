@@ -1,7 +1,9 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient } from "@tanstack/react-query";
 import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { itemKeys } from "@/hooks/queries/keys";
 import { fixturePlanV3 } from "../protocol-v3.fixtures";
 import { derivePersistedSubtitleMode } from "../utils/subtitleMode";
 import type { UsePlaybackSessionResult } from "../hooks/usePlaybackSession";
@@ -17,6 +19,9 @@ const videoPlayerMock = vi.hoisted(() => vi.fn());
 const toastErrorMock = vi.hoisted(() => vi.fn());
 const fetchWatchDetailMock = vi.hoisted(() => vi.fn());
 const fetchQueryMock = vi.hoisted(() => vi.fn());
+// When set, `useQueryClient` hands back this real client instead of the
+// pass-through fake so a test can exercise the react-query cache itself.
+const queryClientOverride = vi.hoisted(() => ({ current: null as unknown }));
 
 vi.mock("../hooks/usePlaybackSession", () => ({
   usePlaybackSession: playbackSessionMock,
@@ -38,9 +43,13 @@ vi.mock("../context/PlayerConfigContext", () => ({
     getDeviceId: () => "test-device",
   }),
 }));
-vi.mock("@tanstack/react-query", () => ({
-  useQueryClient: () => ({ fetchQuery: fetchQueryMock }),
-}));
+vi.mock("@tanstack/react-query", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@tanstack/react-query")>();
+  return {
+    ...actual,
+    useQueryClient: () => queryClientOverride.current ?? { fetchQuery: fetchQueryMock },
+  };
+});
 vi.mock("@/playback/watchPlaybackContext", () => ({
   useWatchPlaybackController: () => ({ startPlayback: vi.fn() }),
 }));
@@ -133,6 +142,7 @@ beforeEach(() => {
   // covered in items.test.ts.
   fetchQueryMock.mockReset();
   fetchQueryMock.mockImplementation((options: { queryFn: () => unknown }) => options.queryFn());
+  queryClientOverride.current = null;
 });
 
 describe("derivePersistedSubtitleMode", () => {
@@ -898,5 +908,45 @@ describe("WatchPage live inventory refresh", () => {
     });
 
     expect(applyAudioInventory).not.toHaveBeenCalled();
+  });
+});
+
+describe("WatchPage chapter refresh", () => {
+  it("fetches past a fresh chapterless cache entry and only then spends the repair attempt", async () => {
+    playbackSessionMock.mockReturnValue(playbackSession({ subtitleUrls: [planSubtitle] }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClientOverride.current = client;
+    const chapterlessVersion: PlayerFileVersion = { ...version, chapters: [] };
+    // The mounted query already holds a fresh payload without chapters; a
+    // cache-first read would consume the single attempt without a request.
+    client.setQueryData(itemKeys.watchDetail("content-1", undefined, undefined), {
+      versions: [chapterlessVersion],
+    });
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [
+        {
+          ...version,
+          chapters: [
+            { index: 0, title: "Chapter", start_seconds: 0, end_seconds: 3600, source: "test" },
+          ],
+        },
+      ],
+    });
+
+    const { rerender } = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [chapterlessVersion] }),
+    );
+
+    await waitFor(() => expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1));
+
+    // The attempt was spent on the real fetch: re-running the effect for the
+    // same file must not issue a second request.
+    rerender(
+      createElement(WatchPage, { ...watchPageProps, versions: [{ ...chapterlessVersion }] }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
   });
 });

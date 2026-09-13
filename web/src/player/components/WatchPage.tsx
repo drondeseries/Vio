@@ -443,10 +443,13 @@ export function WatchPage({
     }
     chapterRefreshAttemptsRef.current.add(session.mediaFileId);
 
+    // Force the read past the mounted query's stale window. A fresh cached
+    // payload that still lacks chapters would otherwise be returned without a
+    // network request, spending this file's single repair attempt for nothing.
     void queryClient.fetchQuery({
       queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
       queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
-      staleTime: WATCH_DETAIL_STALE_TIME_MS,
+      staleTime: 0,
     });
   }, [
     contentId,
