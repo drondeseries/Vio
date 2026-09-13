@@ -1057,6 +1057,87 @@ describe("WatchPage live inventory refresh", () => {
     expect(refreshSubtitles).toHaveBeenCalledTimes(1);
   });
 
+  it("requests a subtitle replan when another virtual row carries the probed tracks", async () => {
+    const refreshSubtitles = vi.fn();
+    // A first-play plan has not yet learned the effective candidate, so the
+    // resolved version is the collapsed virtual row with no probed tracks.
+    // The probe persisted the embedded tracks to the candidate row instead.
+    const collapsedVirtualVersion = {
+      ...virtualVersion,
+      file_id: 7,
+      file_path: "virtual://movie/tt1",
+      subtitle_tracks: [],
+    };
+    const candidateVersion = {
+      ...virtualVersion,
+      file_id: 8,
+      file_path: "virtual://movie/tt1?result=all",
+      subtitle_tracks: [{ index: 13, language: "en", codec: "ass", title: "English" }],
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        effectiveVirtualUri: null,
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [],
+        refreshSubtitles,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [collapsedVirtualVersion, candidateVersion],
+    });
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [collapsedVirtualVersion, candidateVersion],
+      }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    // The candidate's probed tracks must trigger the no-op replan even though
+    // the resolved-version snapshot stays empty.
+    expect(refreshSubtitles).toHaveBeenCalledTimes(1);
+  });
+
+  it("exhausts the attempt budget without replanning when no row has probed tracks", async () => {
+    const refreshSubtitles = vi.fn();
+    const collapsed = {
+      ...virtualVersion,
+      file_id: 7,
+      file_path: "virtual://movie/tt1",
+      subtitle_tracks: [],
+    };
+    const candidate = {
+      ...virtualVersion,
+      file_id: 8,
+      file_path: "virtual://movie/tt1?result=all",
+      subtitle_tracks: [],
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        effectiveVirtualUri: null,
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [],
+        refreshSubtitles,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({ versions: [collapsed, candidate] });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [collapsed, candidate] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(5);
+    expect(refreshSubtitles).not.toHaveBeenCalled();
+  });
+
   it("does not poll when the plan already has a selectable subtitle entry", async () => {
     playbackSessionMock.mockReturnValue(
       playbackSession({ planAudioTracks: richerAudioTracks, subtitleUrls: [planSubtitle] }),

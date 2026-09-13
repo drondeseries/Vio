@@ -340,7 +340,20 @@ export function WatchPage({
             applyAudioInventory(nextAudioTracks);
             audioComplete = true;
           }
-          const nextSubtitleTracks = version.subtitle_tracks ?? [];
+          const resolvedSubtitleTracks = version.subtitle_tracks ?? [];
+          // Probe repair persists embedded tracks to the effective candidate's
+          // file row, which a first-play plan may not identify yet (no
+          // `effective_virtual_uri`, so `resolveEffectiveVersion` returns the
+          // collapsed row). Fall back to any row the probe actually wrote so
+          // the no-op replan can pull the inventory in instead of waiting on a
+          // resolved snapshot that stays empty.
+          const nextSubtitleTracks =
+            resolvedSubtitleTracks.length > 0
+              ? resolvedSubtitleTracks
+              : isVirtualActiveFile
+                ? (detail.versions.find((candidate) => (candidate.subtitle_tracks?.length ?? 0) > 0)
+                    ?.subtitle_tracks ?? [])
+                : resolvedSubtitleTracks;
           if (
             !hasSelectableSessionSubtitles(current.subtitleUrls) &&
             nextSubtitleTracks.length > 0
