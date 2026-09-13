@@ -28,10 +28,24 @@ export const INVENTORY_REFRESH_MAX_ATTEMPTS = 5;
 // Wall-clock backstop: failed requests do not count toward the attempt cap, so
 // a persistent error loop also needs an absolute deadline to stop at.
 export const INVENTORY_REFRESH_DEADLINE_MS = 5 * 60_000;
+// Early cadence for the first attempts. A virtual file's probe typically
+// persists its inventory within seconds of the optimistic start, so the first
+// reads must not wait a full 20 s interval to see it.
+export const INVENTORY_REFRESH_EARLY_DELAYS_MS: readonly number[] = [2_000, 4_000, 8_000];
 // Must match `useWatchDetail`'s staleTime so the inventory poll, chapter
 // refresh, and realtime marker reconcile share the mounted query's cache
 // instead of each issuing an independent fetch.
 const WATCH_DETAIL_STALE_TIME_MS = 30_000;
+
+/**
+ * Delay before the next inventory poll. `attempt` is the number of polls
+ * already scheduled, so 0 yields the first early delay. Once the inventory is
+ * found the poll is complete and the delay is 0 (no further poll).
+ */
+export function inventoryPollDelayMs(attempt: number, found: boolean): number {
+  if (found) return 0;
+  return INVENTORY_REFRESH_EARLY_DELAYS_MS[attempt] ?? INVENTORY_REFRESH_INTERVAL_MS;
+}
 
 function patchChapterThumbnail(
   versions: PlayerFileVersion[],
@@ -261,6 +275,9 @@ export function WatchPage({
     const sessionId = session.sessionId;
     let cancelled = false;
     let completedAttempts = 0;
+    // Counts every scheduled attempt, successful or not, so the early cadence
+    // advances even when requests fail and the completed-attempt cap does not.
+    let scheduledAttempts = 0;
     let timer: number | null = null;
     let audioComplete = !needsAudio;
     let subtitlesComplete = !needsSubtitles;
@@ -268,7 +285,21 @@ export function WatchPage({
     // fetch cannot poll past the safety window.
     const deadline = Date.now() + INVENTORY_REFRESH_DEADLINE_MS;
 
+    const scheduleNextPoll = () => {
+      if (cancelled) return;
+      const delay = inventoryPollDelayMs(scheduledAttempts, audioComplete && subtitlesComplete);
+      if (delay === 0) return;
+      if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS) return;
+      if (Date.now() >= deadline) return;
+      scheduledAttempts += 1;
+      timer = window.setTimeout(() => void poll(), delay);
+    };
+
     const poll = async () => {
+      // The first attempt must read past the mounted query's stale window: a
+      // payload fetched at page mount would otherwise come back from the cache
+      // without a request, hiding the inventory the probe just persisted.
+      const isFirstAttempt = scheduledAttempts === 1;
       try {
         // Shared with the mounted `useWatchDetail` query: the same key means a
         // poll inside the stale window reuses that payload, and concurrent
@@ -276,7 +307,7 @@ export function WatchPage({
         const detail = await queryClient.fetchQuery({
           queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
           queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
-          staleTime: WATCH_DETAIL_STALE_TIME_MS,
+          staleTime: isFirstAttempt ? 0 : WATCH_DETAIL_STALE_TIME_MS,
         });
         if (cancelled) return;
         // Only completed responses count toward the cap; transient fetch
@@ -320,13 +351,10 @@ export function WatchPage({
       } catch {
         // Best effort; a later attempt may still succeed.
       }
-      if (cancelled || (audioComplete && subtitlesComplete)) return;
-      if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS) return;
-      if (Date.now() >= deadline) return;
-      timer = window.setTimeout(() => void poll(), INVENTORY_REFRESH_INTERVAL_MS);
+      scheduleNextPoll();
     };
 
-    timer = window.setTimeout(() => void poll(), INVENTORY_REFRESH_INTERVAL_MS);
+    scheduleNextPoll();
 
     return () => {
       cancelled = true;
