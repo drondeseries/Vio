@@ -1818,4 +1818,88 @@ describe("VideoPlayer version switch UX", () => {
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
   });
+
+  it("selects descriptor-identical track_id-less subtitles independently", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    const trackA: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "embedded",
+      url: "/stream/session-1/subtitles/0.vtt?file_id=7&embedded_stream_index=0",
+    };
+    const trackB: PlayerSubtitleInfo = {
+      ...trackA,
+      index: 1,
+      url: "/stream/session-1/subtitles/1.vtt?file_id=7&embedded_stream_index=1",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [trackA, trackB],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+      onSubtitleTrackChange,
+    });
+
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledWith(0, expect.anything()));
+    const callsAfterAutoSelect = onSubtitleTrackChange.mock.calls.length;
+
+    // The server acknowledges the auto-selection by ordinal. Its inventory
+    // carries no `track_id`, so the descriptor tuple alone cannot tell the two
+    // streams apart; only the embedded stream index can.
+    const acknowledgedPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:ack-identityless",
+      plan_attempt_key: "v3:ack-identityless",
+      subtitle: {
+        mode: "render",
+        inventory: [
+          {
+            track_id: "",
+            combined_index: 0,
+            source: "embedded",
+            codec: "srt",
+            language: "en",
+            label: "English",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=7&embedded_stream_index=0",
+          },
+          {
+            track_id: "",
+            combined_index: 1,
+            source: "embedded",
+            codec: "srt",
+            language: "en",
+            label: "English",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/1.vtt?file_id=7&embedded_stream_index=1",
+          },
+        ],
+      },
+      selected_tracks: {
+        audio: { id: "file:7:audio:0", index: 0 },
+        subtitle: { id: "", index: 0 },
+      },
+    });
+    rerenderPlayer({ plan: acknowledgedPlan, planRevision: 2 });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    // Picking the sibling must send its own request instead of being swallowed
+    // as "the plan already has this descriptor".
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+    await waitFor(() =>
+      expect(onSubtitleTrackChange.mock.calls.length).toBeGreaterThan(callsAfterAutoSelect),
+    );
+    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(1, expect.anything());
+  });
 });

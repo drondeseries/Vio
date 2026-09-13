@@ -6,8 +6,9 @@ import { isSubtitleSourceChanged } from "../utils/subtitleSourceChanged";
 import {
   fallbackFontForSubtitle,
   forceASSFontFamily,
-  loadSubtitleFontBundle,
+  loadSubtitleFontBundleResult,
   loadSubtitleFallbackFontData,
+  type SubtitleFontBundleResult,
 } from "../utils/subtitleFonts";
 // Liberation Sans (SIL OFL 1.1; license colocated as liberation-sans.LICENSE),
 // the font JASSUB uses as its built-in Latin default, taken verbatim from
@@ -46,6 +47,12 @@ const ASS_STALL_TIMEOUT_MS = 60_000;
 const ASS_WINDOW_MAX_ATTEMPTS = 3;
 // Retry backoff after a failed windowed attempt.
 const ASS_RETRY_BACKOFF_MS = 5_000;
+// Bounded background refresh of a font bundle the server reported as pending
+// (empty bundle, extraction still running). It stops as soon as fonts arrive
+// or a definitive font-less bundle is reported, so it can never poll forever.
+const ASS_FONT_REFRESH_MAX_ATTEMPTS = 3;
+// Backoff between pending-font refresh attempts.
+const ASS_FONT_REFRESH_BACKOFF_MS = 5_000;
 
 /** `url` with the bounded window query the VTT path also uses. */
 function appendSubtitleWindow(url: string, position: number): string {
@@ -63,24 +70,30 @@ async function loadSubtitleFontBundleWithinBudget(
   url: string,
   signal: AbortSignal,
   onSourceChanged?: () => void,
-): Promise<Uint8Array[]> {
-  const fontPromise = loadSubtitleFontBundle(url, signal, onSourceChanged);
+): Promise<SubtitleFontBundleResult> {
+  const fontPromise = loadSubtitleFontBundleResult(url, signal, onSourceChanged);
   let budgetTimer: ReturnType<typeof setTimeout> | null = null;
-  const budgetMiss = new Promise<Uint8Array[]>((resolve) => {
-    budgetTimer = setTimeout(() => resolve([]), FONT_BUNDLE_BUDGET_MS);
+  const budgetMiss = new Promise<SubtitleFontBundleResult>((resolve) => {
+    // A budget miss means the bytes have not arrived yet, not that the track
+    // has none: mark it pending so a bounded background refresh adopts them
+    // into the live renderer when the extraction completes.
+    budgetTimer = setTimeout(() => resolve({ fonts: [], pending: true }), FONT_BUNDLE_BUDGET_MS);
   });
   try {
-    const fonts = await Promise.race([fontPromise, budgetMiss]);
+    const result = await Promise.race([fontPromise, budgetMiss]);
     // The race is settled on the font result; never leave the budget timer
     // dangling to fire into a settled pipeline.
     if (budgetTimer !== null) clearTimeout(budgetTimer);
-    return fonts;
+    return result;
   } catch (err) {
     if (budgetTimer !== null) clearTimeout(budgetTimer);
-    if ((err as Error).name !== "AbortError") {
-      console.error(`[useASSSubtitles] Failed to load subtitle font bundle ${url}:`, err);
+    if ((err as Error).name === "AbortError") {
+      return { fonts: [], pending: false };
     }
-    return [];
+    console.error(`[useASSSubtitles] Failed to load subtitle font bundle ${url}:`, err);
+    // A transient failure is retryable, independently of whether the server
+    // marked the bundle pending.
+    return { fonts: [], pending: true };
   }
 }
 
@@ -163,13 +176,18 @@ export function useASSSubtitles(
     }
 
     let cancelled = false;
-    let controller = new AbortController();
+    // Exactly one attempt (initial load or boundary/seek refresh) runs at a
+    // time; its AbortController is the cancel handle for seek supersession and
+    // teardown.
+    let activeController: AbortController | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    let timeout: ReturnType<typeof setTimeout> | null = null;
     // Set when the subtitle fetch answers 409 subtitle_source_changed: the
-    // source rotated under this plan, so the outer retry must not re-run the
-    // whole pipeline against the same stale URL.
+    // source rotated under this plan, so the retry must not re-run the whole
+    // pipeline against the same stale URL.
     let sourceChangedSignaled = false;
+    // Set when a seek cancels the in-flight attempt: the aborted request must
+    // not count against the attempt budget, and the replacement restarts it.
+    let supersededBySeek = false;
 
     // Sliding-window state. The first window is anchored just behind the
     // playhead so the cue already on screen is included. `windowEnd` is
@@ -183,23 +201,110 @@ export function useASSSubtitles(
         ASS_WINDOW_LEAD_SECONDS,
     );
     let windowEnd = windowStart + ASS_WINDOW_DURATION_SECONDS;
+    // Consecutive windowed failures since the last successful window, shared by
+    // the initial load and boundary refreshes so the 3→1→terminal budget is one
+    // finite policy. `terminal` latches after the whole-track fallback fails:
+    // no further attempts, ever.
     let windowFailures = 0;
-    let refreshing = false;
-    let refreshRetryAt = 0;
-    let refreshController: AbortController | null = null;
-    let pendingRefreshStart: number | null = null;
+    let terminal = false;
+    let busy = false;
+    // Newest seek target queued while an attempt is in flight.
+    let pendingStart: number | null = null;
 
     // Fonts belong to the track, not the window: resolve them once (after the
-    // first window's text lands) and reuse them for every later window.
+    // first window's text lands) and reuse them for every later window. A
+    // pending bundle leaves `attached` empty but is NOT final: a bounded
+    // background refresh adopts the completed bytes into the live instance.
     let fontState: {
       attached: Uint8Array[];
       fallbackFont: ReturnType<typeof fallbackFontForSubtitle>;
       fallbackFontData: Uint8Array[] | null;
     } | null = null;
+    let fontBundlePending = false;
+    let fontRefreshAttempts = 0;
+    let fontRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let fontRefreshController: AbortController | null = null;
 
     /** Source-time position of the playhead (player clock + stream origin). */
     function sourcePosition(): number {
       return (video!.readyState > 0 ? video!.currentTime : 0) + sourceOriginRef.current;
+    }
+
+    /**
+     * Attaches a completed font bundle to the live renderer without reloading
+     * the subtitle script or the track: libass picks the newly registered fonts
+     * up on the next repaint.
+     */
+    function adoptFontsIntoLiveInstance(fonts: Uint8Array[]) {
+      const instance = jassubRef.current;
+      if (!instance || fonts.length === 0) return;
+      const renderer = (
+        instance as unknown as {
+          renderer?: { addFonts?: (values: Uint8Array[]) => Promise<unknown> };
+        }
+      ).renderer;
+      if (!renderer?.addFonts) return;
+      void Promise.resolve(renderer.addFonts(fonts))
+        .then(() => instance.ready)
+        .then(() => {
+          if (jassubRef.current === instance) return instance.resize(true);
+        })
+        .catch((err) => {
+          console.error("[useASSSubtitles] Failed to attach refreshed fonts:", err);
+        });
+    }
+
+    /**
+     * Re-fetches a font bundle the server reported as pending and hot-swaps it
+     * into the live renderer when it completes. Finite: it stops on fonts, on a
+     * definitive font-less bundle, or after ASS_FONT_REFRESH_MAX_ATTEMPTS.
+     */
+    async function refreshPendingFonts() {
+      fontRefreshTimer = null;
+      if (cancelled || !fontBundlePending || !activeFontBundleUrl) return;
+      if (fontRefreshAttempts >= ASS_FONT_REFRESH_MAX_ATTEMPTS) return;
+      fontRefreshAttempts += 1;
+      const controller = new AbortController();
+      fontRefreshController = controller;
+      try {
+        const result = await loadSubtitleFontBundleResult(
+          activeFontBundleUrl,
+          controller.signal,
+          onSourceChangedRef.current ?? undefined,
+        );
+        if (cancelled) return;
+        if (!result.pending) {
+          // Definitive answer (fonts or a genuinely font-less file): stop.
+          fontBundlePending = false;
+          if (result.fonts.length > 0) {
+            if (fontState) fontState.attached = result.fonts;
+            adoptFontsIntoLiveInstance(result.fonts);
+          }
+          return;
+        }
+      } catch (err) {
+        if ((err as Error).name !== "AbortError") {
+          console.error(
+            `[useASSSubtitles] Failed to refresh subtitle font bundle ${activeFontBundleUrl}:`,
+            err,
+          );
+        }
+      } finally {
+        if (fontRefreshController === controller) fontRefreshController = null;
+      }
+      if (fontBundlePending && fontRefreshAttempts < ASS_FONT_REFRESH_MAX_ATTEMPTS) {
+        fontRefreshTimer = setTimeout(
+          () => void refreshPendingFonts(),
+          ASS_FONT_REFRESH_BACKOFF_MS,
+        );
+      }
+    }
+
+    function scheduleFontRefresh() {
+      if (cancelled || !fontBundlePending || !activeFontBundleUrl) return;
+      if (fontRefreshTimer !== null) return;
+      if (fontRefreshAttempts >= ASS_FONT_REFRESH_MAX_ATTEMPTS) return;
+      fontRefreshTimer = setTimeout(() => void refreshPendingFonts(), ASS_FONT_REFRESH_BACKOFF_MS);
     }
 
     /** Resolve the per-track font state once, reusing it across windows. */
@@ -211,11 +316,13 @@ export function useASSSubtitles(
       // delays subtitle appearance. JASSUB renders with fallback fonts
       // meanwhile, and the budget-losing fetch continues in the background.
       if (activeFontBundleUrl) {
-        attachedFontData = await loadSubtitleFontBundleWithinBudget(
+        const result = await loadSubtitleFontBundleWithinBudget(
           activeFontBundleUrl,
           signal,
           onSourceChangedRef.current ?? undefined,
         );
+        attachedFontData = result.fonts;
+        fontBundlePending = result.pending;
       }
       // libass renders missing glyphs with its *default* font — it does not
       // search other loaded fonts for coverage. JASSUB's built-in default
@@ -237,6 +344,9 @@ export function useASSSubtitles(
         }
       }
       fontState = { attached: attachedFontData, fallbackFont, fallbackFontData };
+      // A pending bundle must not persist as "this track has no fonts": fetch
+      // the completed bytes in the background and hot-swap them in.
+      if (fontBundlePending) scheduleFontRefresh();
       return fontState;
     }
 
@@ -376,94 +486,102 @@ export function useASSSubtitles(
       onLoadStateRef.current?.("ready");
     }
 
-    async function load() {
-      controller = new AbortController();
-      const attemptController = controller;
-      const start = windowStart;
-      const wholeTrack = usingWholeTrack;
-      let progress = () => {};
-      const stalled = new Promise<never>((_, reject) => {
-        progress = () => {
-          if (cancelled || attemptController.signal.aborted) return;
-          if (timeout !== null) clearTimeout(timeout);
-          timeout = setTimeout(() => {
-            attemptController.abort();
-            reject(new Error("Subtitle loading stalled"));
-          }, ASS_STALL_TIMEOUT_MS);
-        };
-        progress();
-      });
+    /**
+     * One bounded attempt at `start`. Arming the watchdog before any network
+     * work means a pre-header hang times out and counts as a failed attempt
+     * instead of blocking the pipeline forever. Success resets the shared
+     * budget inside `initJASSUB`; failure applies the one finite policy:
+     * 3 windowed attempts, then 1 whole-track fallback, then terminal.
+     */
+    async function attempt(start: number, wholeTrack: boolean) {
+      if (cancelled || terminal || busy) return;
+      busy = true;
+      supersededBySeek = false;
+      const attemptController = new AbortController();
+      activeController = attemptController;
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      const progress = () => {
+        if (cancelled || attemptController.signal.aborted) return;
+        if (timeout !== null) clearTimeout(timeout);
+        timeout = setTimeout(() => attemptController.abort(), ASS_STALL_TIMEOUT_MS);
+      };
+      // Arm the watchdog before the fetch, not on first progress.
+      progress();
       try {
-        await Promise.race([initJASSUB(controller.signal, progress, start, wholeTrack), stalled]);
+        await initJASSUB(attemptController.signal, progress, start, wholeTrack);
       } catch (err) {
         if (cancelled) return;
-        attemptController.abort();
+        // A signaled source change must not re-run against the same stale URL;
+        // the rebuilt JASSUB comes from the main effect re-running when the
+        // refresh adopts a new plan and activeUrl changes.
+        if (sourceChangedSignaled) return;
+        if (supersededBySeek) {
+          // A seek cancelled this request to replace it: do not count it.
+          return;
+        }
         console.error("[useASSSubtitles] Unable to load subtitles:", err);
         onLoadStateRef.current?.("error");
-        // A signaled source change must not re-run the pipeline against the
-        // same stale URL; the rebuilt JASSUB comes from the main effect
-        // re-running when the refresh adopts a new plan and activeUrl changes.
-        if (sourceChangedSignaled) return;
-        if (!usingWholeTrack && windowFailures + 1 >= ASS_WINDOW_MAX_ATTEMPTS) {
-          // Bounded windowed retries exhausted: request the param-less
-          // whole-track URL once instead of hammering one failing window.
-          usingWholeTrack = true;
+        if (wholeTrack) {
+          // The whole-track fallback failed too: terminal, no retry loop.
+          terminal = true;
+          return;
         }
         windowFailures += 1;
-        retryTimer = setTimeout(() => void load(), ASS_RETRY_BACKOFF_MS);
+        if (windowFailures >= ASS_WINDOW_MAX_ATTEMPTS) {
+          // Bounded windowed retries exhausted: request the param-less
+          // whole-track URL once instead of hammering the failing window.
+          usingWholeTrack = true;
+        }
+        const retryStart = usingWholeTrack
+          ? windowStart
+          : Math.max(0, sourcePosition() - ASS_WINDOW_LEAD_SECONDS);
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          void attempt(retryStart, usingWholeTrack);
+        }, ASS_RETRY_BACKOFF_MS);
       } finally {
         if (timeout !== null) clearTimeout(timeout);
-      }
-    }
-
-    async function refreshWindow(start: number) {
-      refreshing = true;
-      refreshController = new AbortController();
-      const refresh = refreshController;
-      let timer: ReturnType<typeof setTimeout> | null = null;
-      const progress = () => {
-        if (timer !== null) clearTimeout(timer);
-        timer = setTimeout(() => refresh.abort(), ASS_STALL_TIMEOUT_MS);
-      };
-      try {
-        await initJASSUB(refresh.signal, progress, start, false);
-      } catch (err) {
-        if (!cancelled && (err as Error).name !== "AbortError") {
-          console.error("[useASSSubtitles] Unable to refresh subtitle window:", err);
-          // Keep what is already on screen; retry the boundary after a
-          // backoff so a failing extraction cannot storm the server.
-          onLoadStateRef.current?.("error");
-          refreshRetryAt = Date.now() + ASS_RETRY_BACKOFF_MS;
+        if (activeController === attemptController) activeController = null;
+        busy = false;
+        const next = pendingStart;
+        pendingStart = null;
+        if (next !== null && !cancelled && !terminal) {
+          void attempt(next, false);
         }
-      } finally {
-        if (timer !== null) clearTimeout(timer);
-        refreshing = false;
-        if (refreshController === refresh) refreshController = null;
-        const pending = pendingRefreshStart;
-        pendingRefreshStart = null;
-        if (pending !== null && !cancelled) void refreshWindow(pending);
       }
     }
 
     function maybeRefreshWindow() {
-      if (cancelled || usingWholeTrack || !jassubRef.current) return;
+      if (cancelled || terminal || usingWholeTrack || !jassubRef.current) return;
       const source = sourcePosition();
       const outside = source < windowStart - 1 || source > windowEnd + 1;
       const nearEnd = !outside && source > windowEnd - ASS_WINDOW_PREFETCH_LEAD_SECONDS;
       if (!outside && !nearEnd) return;
-      if (refreshing) {
-        // A seek while a window is in flight must win: remember the newest
-        // target and start it once the current load settles.
-        if (outside) pendingRefreshStart = Math.max(0, source - ASS_WINDOW_LEAD_SECONDS);
-        return;
-      }
-      if (Date.now() < refreshRetryAt) return;
       // Restart a full lead behind the playhead so the replacement window
       // overlaps the cue currently on screen regardless of why it fired.
-      void refreshWindow(Math.max(0, source - ASS_WINDOW_LEAD_SECONDS));
+      const target = Math.max(0, source - ASS_WINDOW_LEAD_SECONDS);
+      if (busy) {
+        // A seek while an attempt is in flight must win: cancel it and restart
+        // the budget at the new position once it settles.
+        if (outside) {
+          supersededBySeek = true;
+          windowFailures = 0;
+          usingWholeTrack = false;
+          if (retryTimer !== null) {
+            clearTimeout(retryTimer);
+            retryTimer = null;
+          }
+          activeController?.abort();
+          pendingStart = target;
+        }
+        return;
+      }
+      // A scheduled retry owns the next attempt; event-driven refreshes wait.
+      if (retryTimer !== null) return;
+      void attempt(target, false);
     }
 
-    void load();
+    void attempt(windowStart, false);
     video.addEventListener("timeupdate", maybeRefreshWindow);
     video.addEventListener("seeking", maybeRefreshWindow);
     video.addEventListener("seeked", maybeRefreshWindow);
@@ -471,9 +589,9 @@ export function useASSSubtitles(
     return () => {
       cancelled = true;
       if (retryTimer !== null) clearTimeout(retryTimer);
-      if (timeout !== null) clearTimeout(timeout);
-      controller.abort();
-      refreshController?.abort();
+      if (fontRefreshTimer !== null) clearTimeout(fontRefreshTimer);
+      fontRefreshController?.abort();
+      activeController?.abort();
       video.removeEventListener("timeupdate", maybeRefreshWindow);
       video.removeEventListener("seeking", maybeRefreshWindow);
       video.removeEventListener("seeked", maybeRefreshWindow);

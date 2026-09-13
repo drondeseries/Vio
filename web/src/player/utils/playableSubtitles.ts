@@ -42,6 +42,12 @@ export function resolvePlayableSubtitles(
  * combined ordinal the server assigns it. A replan that re-mints the inventory
  * (or the server resolving the selection to a different ordinal for the same
  * asset) changes `index` but leaves these fields alone.
+ *
+ * When `track_id` is absent the descriptor tuple alone can name several real,
+ * distinct tracks (a file with two embedded `eng|srt|forced` streams, say).
+ * `source` plus the sidecar artifact identity (`streamIndex` from the embedded
+ * container index, or `artifactId` from the external path key / downloaded row
+ * id) keep those tracks apart instead of conflating them.
  */
 export interface SubtitleTrackIdentity {
   /** Combined ordinal the client echoes back on a track change. */
@@ -54,6 +60,12 @@ export interface SubtitleTrackIdentity {
   hearingImpaired?: boolean;
   /** True when the server can only deliver this track by burning it in. */
   burnInOnly?: boolean;
+  /** Delivery source (`embedded` | `external` | `downloaded`). */
+  source?: string | null;
+  /** Embedded container stream index, when the sidecar URL publishes one. */
+  streamIndex?: number | null;
+  /** Sidecar path/artifact identity (external key or downloaded row id). */
+  artifactId?: string | null;
 }
 
 function normalizeIdentityValue(value: string | null | undefined): string {
@@ -61,12 +73,90 @@ function normalizeIdentityValue(value: string | null | undefined): string {
 }
 
 function subtitleDescriptorKey(identity: SubtitleTrackIdentity): string {
-  return [
+  const parts = [
     normalizeIdentityValue(identity.language),
     normalizeIdentityValue(identity.codec),
     identity.forced ? "forced" : "",
     identity.hearingImpaired ? "hearing_impaired" : "",
-  ].join("|");
+  ];
+  // Append the artifact discriminators only when any is present, so an identity
+  // that predates them (a synthesized or older-plan track) keeps the historical
+  // descriptor-only key and still dedupes across a re-mint.
+  const source = normalizeIdentityValue(identity.source);
+  const streamIndex = identity.streamIndex != null ? String(identity.streamIndex) : "";
+  const artifactId = normalizeIdentityValue(identity.artifactId);
+  if (source || streamIndex || artifactId) {
+    parts.push(source, streamIndex, artifactId);
+  }
+  return parts.join("|");
+}
+
+const EMBEDDED_SUBTITLE_STREAM_INDEX_PARAM = "embedded_stream_index";
+const EXTERNAL_SUBTITLE_KEY_PARAM = "external_subtitle_key";
+const DOWNLOADED_SUBTITLE_ID_PARAM = "downloaded_subtitle_id";
+
+/**
+ * Extracts the stable sidecar artifact discriminator from a track URL. The
+ * server binds external sidecars to a hashed path key, embedded tracks to the
+ * container stream index, and downloaded rows to their row id; these survive an
+ * inventory re-mint that changes the combined ordinal. Session ids, combined
+ * ordinals and access tokens in the URL are deliberately ignored.
+ */
+export function subtitleArtifactIdentity(url: string | null | undefined): {
+  streamIndex: number | null;
+  artifactId: string | null;
+} {
+  if (!url) return { streamIndex: null, artifactId: null };
+  let parsed: URL;
+  try {
+    parsed = new URL(url, "http://silo.local");
+  } catch {
+    return { streamIndex: null, artifactId: null };
+  }
+  const rawStreamIndex = parsed.searchParams.get(EMBEDDED_SUBTITLE_STREAM_INDEX_PARAM);
+  const streamIndex =
+    rawStreamIndex !== null && /^\d+$/.test(rawStreamIndex) ? Number(rawStreamIndex) : null;
+  const externalKey = parsed.searchParams.get(EXTERNAL_SUBTITLE_KEY_PARAM);
+  const downloadedId = parsed.searchParams.get(DOWNLOADED_SUBTITLE_ID_PARAM);
+  const artifactId = externalKey ?? (downloadedId ? `downloaded:${downloadedId}` : null);
+  return { streamIndex, artifactId };
+}
+
+/**
+ * Builds the stable identity for a selectable track from its player shape,
+ * populating the discriminator fields so `track_id`-less inventories cannot
+ * conflate distinct assets.
+ */
+export function subtitleTrackIdentityFromInfo(
+  track: Pick<
+    PlayerSubtitleInfo,
+    | "index"
+    | "track_id"
+    | "language"
+    | "codec"
+    | "forced"
+    | "hearing_impaired"
+    | "burn_in_only"
+    | "source"
+    | "url"
+    | "font_bundle_url"
+  >,
+): SubtitleTrackIdentity {
+  const { streamIndex, artifactId } = subtitleArtifactIdentity(
+    track.url || track.font_bundle_url || null,
+  );
+  return {
+    index: track.index,
+    trackId: track.track_id ?? null,
+    language: track.language ?? null,
+    codec: track.codec ?? null,
+    forced: track.forced,
+    hearingImpaired: track.hearing_impaired,
+    burnInOnly: track.burn_in_only === true,
+    source: track.source ?? null,
+    streamIndex,
+    artifactId,
+  };
 }
 
 /**

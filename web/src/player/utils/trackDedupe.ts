@@ -1,4 +1,5 @@
 import type { PlayerAudioTrack, PlayerSubtitleInfo } from "../types";
+import { subtitleArtifactIdentity } from "./playableSubtitles";
 
 /**
  * A probed audio track paired with the position it occupied in the inventory
@@ -88,6 +89,13 @@ export function dedupeAudioTracks(tracks: PlayerAudioTrack[]): DedupedAudioTrack
  * collapse as before.
  */
 function subtitleIdentity(track: PlayerSubtitleInfo): string {
+  // `track_id` is the per-asset discriminator. When it is absent the sidecar
+  // artifact (embedded container stream index, external path key, or downloaded
+  // row id) still separates two streams with identical descriptors and labels,
+  // so neither becomes unreachable in the menu.
+  const { streamIndex, artifactId } = subtitleArtifactIdentity(
+    track.url || track.font_bundle_url || null,
+  );
   return [
     normalize(track.source),
     normalize(track.codec),
@@ -98,6 +106,8 @@ function subtitleIdentity(track: PlayerSubtitleInfo): string {
     // into it when the inventory is mapped, so the label is the title here.
     normalize(track.label),
     normalize(track.track_id),
+    streamIndex != null ? String(streamIndex) : "",
+    normalize(artifactId),
   ].join("|");
 }
 

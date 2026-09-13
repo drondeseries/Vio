@@ -68,6 +68,8 @@ import {
 } from "../utils/mediaTimeline";
 import {
   pendingServerSubtitleSelection,
+  subtitleArtifactIdentity,
+  subtitleTrackIdentityFromInfo,
   subtitleTrackIdentityKey,
   type SubtitleTrackIdentity,
 } from "../utils/playableSubtitles";
@@ -2486,15 +2488,8 @@ export function VideoPlayer({
       : null;
   const activeSubtitleIdentity = useMemo<SubtitleTrackIdentity | null>(() => {
     if (activeSubtitleIndex === null) return null;
-    return {
-      index: activeSubtitleIndex,
-      trackId: activeSubtitleTrack?.track_id ?? null,
-      language: activeSubtitleTrack?.language ?? null,
-      codec: activeSubtitleTrack?.codec ?? null,
-      forced: activeSubtitleTrack?.forced,
-      hearingImpaired: activeSubtitleTrack?.hearing_impaired,
-      burnInOnly: activeSubtitleTrack?.burn_in_only === true,
-    };
+    if (activeSubtitleTrack) return subtitleTrackIdentityFromInfo(activeSubtitleTrack);
+    return { index: activeSubtitleIndex };
   }, [activeSubtitleIndex, activeSubtitleTrack]);
   // The plan's authoritative selection resolved against its own inventory, so
   // the comparison uses the asset identity rather than the ordinal the inventory
@@ -2507,6 +2502,7 @@ export function VideoPlayer({
         (selected.index !== undefined && entry.combined_index === selected.index) ||
         (selected.id !== "" && entry.track_id === selected.id),
     );
+    const { streamIndex, artifactId } = subtitleArtifactIdentity(item?.url ?? null);
     return {
       index: selected.index ?? item?.combined_index ?? null,
       trackId: selected.id ?? item?.track_id ?? null,
@@ -2515,6 +2511,9 @@ export function VideoPlayer({
       forced: item?.forced,
       hearingImpaired: item?.hearing_impaired,
       burnInOnly: item?.delivery === "burn_in_only",
+      source: item?.source ?? null,
+      streamIndex,
+      artifactId,
     };
   }, [plan.selected_tracks.subtitle, plan.subtitle.inventory]);
 

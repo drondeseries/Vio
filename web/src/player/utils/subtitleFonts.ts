@@ -79,8 +79,20 @@ const fontDataCache = new Map<string, Promise<Uint8Array[]>>();
 const MAX_FONT_BUNDLE_CACHE_ENTRIES = 4;
 const MAX_FONT_BUNDLE_CACHE_BYTES = 64 * 1024 * 1024;
 
+/**
+ * The outcome of one font-bundle fetch. `pending` is true when the server
+ * answered with an empty bundle while its extraction was still in flight (the
+ * response carries the cache-busting pending marker); a definitive font-less
+ * file answers empty without it. A pending result must never be retained as a
+ * final "this track has no fonts" state — the client re-fetches it.
+ */
+export interface SubtitleFontBundleResult {
+  fonts: Uint8Array[];
+  pending: boolean;
+}
+
 interface FontBundleCacheEntry {
-  promise: Promise<Uint8Array[]>;
+  promise: Promise<SubtitleFontBundleResult>;
   bytes: number;
 }
 
@@ -89,6 +101,20 @@ const fontBundleCache = new Map<string, FontBundleCacheEntry>();
 interface SubtitleFontBundleItem {
   name: string;
   data: string;
+}
+
+/**
+ * The response header the server sets on an in-flight font bundle. A definitive
+ * font-less file stays cacheable and does not carry it. Pending bundles are also
+ * served with `Cache-Control: no-store`; either signal marks the response.
+ */
+export const FONT_BUNDLE_PENDING_HEADER = "X-Silo-Font-Bundle-Pending";
+
+function isPendingFontBundleResponse(response: Response): boolean {
+  const marker = response.headers?.get?.(FONT_BUNDLE_PENDING_HEADER);
+  if (marker === "true" || marker === "1") return true;
+  const cacheControl = response.headers?.get?.("Cache-Control") ?? "";
+  return cacheControl.toLowerCase().includes("no-store");
 }
 
 /**
@@ -132,11 +158,18 @@ export function loadSubtitleFallbackFontData(font: SubtitleFallbackFont): Promis
   return promise;
 }
 
-export function loadSubtitleFontBundle(
+/**
+ * Fetches a font bundle and reports whether the server was still producing it.
+ * A pending (in-flight) bundle is never cached: the next window, the prefetch,
+ * or the bounded font refresh must be able to fetch the completed bytes. A
+ * definitive bundle (fonts, or a cacheable empty one for a genuinely font-less
+ * file) is cached as before.
+ */
+export function loadSubtitleFontBundleResult(
   url: string,
   signal?: AbortSignal,
   onSourceChanged?: () => void,
-): Promise<Uint8Array[]> {
+): Promise<SubtitleFontBundleResult> {
   const cacheKey = fontBundleCacheKey(url);
   const cached = fontBundleCache.get(cacheKey);
   if (cached) {
@@ -146,33 +179,39 @@ export function loadSubtitleFontBundle(
   }
 
   const entry: FontBundleCacheEntry = {
-    promise: Promise.resolve([]),
+    promise: Promise.resolve({ fonts: [], pending: false }),
     bytes: 0,
   };
   const promise = fetch(url, { signal })
-    .then(async (response) => {
+    .then(async (response): Promise<SubtitleFontBundleResult> => {
       if (!response.ok) {
         if (response.status === 409) {
           // Virtual release rotation made the font URL stale; signal the
           // player to refresh the subtitle inventory. The text fetcher
           // usually fires first, but the font prefetch at plan adoption
-          // can hit this before any text fetch.
+          // can hit this before any text fetch. Mark it pending so the empty
+          // result is never cached.
           onSourceChanged?.();
-          return [];
+          return { fonts: [], pending: true };
         }
         throw new Error(`HTTP ${response.status}`);
       }
-      return (await response.json()) as SubtitleFontBundleItem[];
+      const pending = isPendingFontBundleResponse(response);
+      const items = (await response.json()) as SubtitleFontBundleItem[];
+      return { fonts: items.map((item) => base64ToBytes(item.data)), pending };
     })
-    .then((items) => items.map((item) => base64ToBytes(item.data)))
-    .then((fonts) => {
-      entry.bytes = totalByteLength(fonts);
-      if (entry.bytes > MAX_FONT_BUNDLE_CACHE_BYTES) {
+    .then((result) => {
+      if (result.pending) {
         fontBundleCache.delete(cacheKey);
       } else {
-        evictFontBundleCache();
+        entry.bytes = totalByteLength(result.fonts);
+        if (entry.bytes > MAX_FONT_BUNDLE_CACHE_BYTES) {
+          fontBundleCache.delete(cacheKey);
+        } else {
+          evictFontBundleCache();
+        }
       }
-      return fonts;
+      return result;
     });
 
   // Do not poison the cache with transient network errors or aborted requests.
@@ -184,6 +223,14 @@ export function loadSubtitleFontBundle(
   fontBundleCache.set(cacheKey, entry);
   evictFontBundleCache();
   return cachedPromise;
+}
+
+export function loadSubtitleFontBundle(
+  url: string,
+  signal?: AbortSignal,
+  onSourceChanged?: () => void,
+): Promise<Uint8Array[]> {
+  return loadSubtitleFontBundleResult(url, signal, onSourceChanged).then((result) => result.fonts);
 }
 
 function totalByteLength(chunks: Uint8Array[]): number {

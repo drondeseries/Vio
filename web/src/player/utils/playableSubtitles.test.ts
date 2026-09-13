@@ -5,6 +5,8 @@ import {
   isSameSubtitleTrack,
   pendingServerSubtitleSelection,
   resolvePlayableSubtitles,
+  subtitleArtifactIdentity,
+  subtitleTrackIdentityFromInfo,
   subtitleTrackIdentityKey,
   type SubtitleTrackIdentity,
 } from "./playableSubtitles";
@@ -142,6 +144,137 @@ describe("subtitle track identity", () => {
     expect(subtitleTrackIdentityKey(identity({ index: 3, language: "en", codec: "srt" }))).toBe(
       "desc:en|srt||",
     );
+  });
+
+  it("keeps descriptor-identical embedded tracks distinct without a track_id", () => {
+    const first = identity({
+      index: 1,
+      language: "en",
+      codec: "srt",
+      source: "embedded",
+      streamIndex: 0,
+    });
+    const second = identity({
+      index: 2,
+      language: "en",
+      codec: "srt",
+      source: "embedded",
+      streamIndex: 1,
+    });
+    expect(isSameSubtitleTrack(first, second)).toBe(false);
+    expect(subtitleTrackIdentityKey(first)).not.toBe(subtitleTrackIdentityKey(second));
+    // Selecting one does not settle the other: the second must be requested,
+    // not silently dropped as already-satisfied.
+    expect(pendingServerSubtitleSelection(first, second)).toBe(2);
+  });
+
+  it("distinguishes external sidecars by their artifact key", () => {
+    const first = identity({
+      index: 0,
+      language: "en",
+      codec: "srt",
+      source: "external",
+      artifactId: "aaa",
+    });
+    const second = identity({
+      index: 1,
+      language: "en",
+      codec: "srt",
+      source: "external",
+      artifactId: "bbb",
+    });
+    expect(isSameSubtitleTrack(first, second)).toBe(false);
+  });
+
+  it("treats the same artifact at a re-minted ordinal as settled", () => {
+    const planSelected = identity({
+      index: 7,
+      language: "en",
+      codec: "srt",
+      source: "embedded",
+      streamIndex: 2,
+    });
+    const active = identity({
+      index: 2,
+      language: "en",
+      codec: "srt",
+      source: "embedded",
+      streamIndex: 2,
+    });
+    expect(isSameSubtitleTrack(planSelected, active)).toBe(true);
+  });
+});
+
+describe("subtitleArtifactIdentity", () => {
+  it("extracts the embedded container stream index", () => {
+    expect(
+      subtitleArtifactIdentity(
+        "/api/v1/stream/s/subtitles/5.ass?file_id=7&embedded_stream_index=2&token=t",
+      ),
+    ).toEqual({ streamIndex: 2, artifactId: null });
+  });
+
+  it("extracts the external sidecar path key", () => {
+    expect(
+      subtitleArtifactIdentity(
+        "/api/v1/stream/s/subtitles/0.vtt?file_id=7&external_subtitle_key=abc",
+      ),
+    ).toEqual({ streamIndex: null, artifactId: "abc" });
+  });
+
+  it("extracts the downloaded row identity", () => {
+    expect(
+      subtitleArtifactIdentity(
+        "/api/v1/stream/s/subtitles/1.vtt?file_id=7&downloaded_subtitle_id=44",
+      ),
+    ).toEqual({ streamIndex: null, artifactId: "downloaded:44" });
+  });
+
+  it("returns no discriminator for an empty or unparseable url", () => {
+    expect(subtitleArtifactIdentity("")).toEqual({ streamIndex: null, artifactId: null });
+    expect(subtitleArtifactIdentity(null)).toEqual({ streamIndex: null, artifactId: null });
+  });
+});
+
+describe("subtitleTrackIdentityFromInfo", () => {
+  function track(overrides: Partial<PlayerSubtitleInfo>): PlayerSubtitleInfo {
+    return makeSubtitle(overrides);
+  }
+
+  it("builds collision-safe identities for track_id-less embedded tracks", () => {
+    const first = subtitleTrackIdentityFromInfo(
+      track({
+        index: 1,
+        language: "en",
+        codec: "srt",
+        source: "embedded",
+        url: "/api/v1/stream/s/subtitles/1.vtt?file_id=7&embedded_stream_index=0",
+      }),
+    );
+    const second = subtitleTrackIdentityFromInfo(
+      track({
+        index: 2,
+        language: "en",
+        codec: "srt",
+        source: "embedded",
+        url: "/api/v1/stream/s/subtitles/2.vtt?file_id=7&embedded_stream_index=1",
+      }),
+    );
+    expect(isSameSubtitleTrack(first, second)).toBe(false);
+    expect(pendingServerSubtitleSelection(first, second)).toBe(2);
+  });
+
+  it("prefers track_id over the sidecar artifact", () => {
+    const id = subtitleTrackIdentityFromInfo(
+      track({
+        index: 1,
+        track_id: "file:7:subtitle:1",
+        language: "en",
+        codec: "srt",
+        url: "/api/v1/stream/s/subtitles/1.vtt?file_id=7&embedded_stream_index=0",
+      }),
+    );
+    expect(subtitleTrackIdentityKey(id)).toBe("id:file:7:subtitle:1");
   });
 });
 

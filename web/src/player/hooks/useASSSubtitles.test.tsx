@@ -11,6 +11,10 @@ const instances: Array<{
   timeOffset: number;
   resize: ReturnType<typeof vi.fn>;
   destroy: ReturnType<typeof vi.fn>;
+  renderer: {
+    setTrackByUrl: ReturnType<typeof vi.fn>;
+    addFonts: ReturnType<typeof vi.fn>;
+  };
 }> = [];
 let rendererReady: Promise<void> = Promise.resolve();
 
@@ -18,7 +22,10 @@ vi.mock("jassub", () => {
   class MockJASSUB {
     timeOffset = 0;
     ready = rendererReady;
-    renderer = { setTrackByUrl: vi.fn().mockResolvedValue(undefined) };
+    renderer = {
+      setTrackByUrl: vi.fn().mockResolvedValue(undefined),
+      addFonts: vi.fn().mockResolvedValue(true),
+    };
     constructor(opts: Record<string, unknown>) {
       constructorOpts.push(opts);
       this.timeOffset = (opts.timeOffset as number) ?? 0;
@@ -87,6 +94,53 @@ function mockFontBundleResponse(bytes: string): Response {
     status: 200,
     json: vi.fn().mockResolvedValue([{ name: "Attached.ttf", data: btoa(bytes) }]),
   } as unknown as Response;
+}
+
+function responseHeaders(entries: Record<string, string>): Headers {
+  const lower = Object.fromEntries(Object.entries(entries).map(([k, v]) => [k.toLowerCase(), v]));
+  return { get: (name: string) => lower[name.toLowerCase()] ?? null } as unknown as Headers;
+}
+
+/** A pending (in-flight) font bundle: empty body plus the no-store marker. */
+function pendingFontBundleResponse(): Response {
+  return {
+    ok: true,
+    status: 200,
+    headers: responseHeaders({ "Cache-Control": "no-store" }),
+    json: vi.fn().mockResolvedValue([]),
+  } as unknown as Response;
+}
+
+/** A definitive font-less bundle: empty body but cacheable, no pending marker. */
+function definitiveEmptyFontBundleResponse(): Response {
+  return {
+    ok: true,
+    status: 200,
+    headers: responseHeaders({ "Cache-Control": "private, max-age=600" }),
+    json: vi.fn().mockResolvedValue([]),
+  } as unknown as Response;
+}
+
+/** A pending bundle identified by the explicit marker header. */
+function pendingHeaderFontBundleResponse(): Response {
+  return {
+    ok: true,
+    status: 200,
+    headers: responseHeaders({ "X-Silo-Font-Bundle-Pending": "true" }),
+    json: vi.fn().mockResolvedValue([]),
+  } as unknown as Response;
+}
+
+/** A response that never resolves until its request signal aborts. */
+function hangingResponse(signal: AbortSignal): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 beforeEach(() => {
@@ -602,6 +656,295 @@ describe("useASSSubtitles windowed ASS extraction", () => {
     } finally {
       unmount();
       error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("useASSSubtitles bounded retry/watchdog policy", () => {
+  it("abandons a pre-header hang at the stall timeout and retries", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    let calls = 0;
+    vi.mocked(fetch).mockImplementation((_input, init) => {
+      calls += 1;
+      if (calls === 1) return hangingResponse(init?.signal as AbortSignal);
+      return Promise.resolve(mockFetchResponse("[Script Info]"));
+    });
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // No response headers ever arrive, so only the pre-armed watchdog can
+      // break the hang.
+      expect(calls).toBe(1);
+      expect(state).toHaveBeenLastCalledWith("loading");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(state).toHaveBeenLastCalledWith("error");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(calls).toBe(2);
+      expect(constructorOpts).toHaveLength(1);
+      expect(state).toHaveBeenLastCalledWith("ready");
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops after the whole-track fallback fails (terminal, no loop)", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    vi.mocked(fetch).mockRejectedValue(new Error("extraction failed"));
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // Three windowed attempts, then the single whole-track fallback.
+      for (let i = 0; i < 4; i += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(5_000);
+        });
+      }
+      expect(fetch).toHaveBeenCalledTimes(4);
+      expect(String(vi.mocked(fetch).mock.calls[3]![0])).toBe(germanTrack.url);
+      expect(state).toHaveBeenLastCalledWith("error");
+      // Terminal: no further attempts, even much later.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      expect(fetch).toHaveBeenCalledTimes(4);
+      expect(constructorOpts).toHaveLength(0);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds a stalled window refresh at the stall timeout and recovers", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    let calls = 0;
+    vi.mocked(fetch).mockImplementation((_input, init) => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve(mockFetchResponse("[Script Info]"));
+      if (calls === 2) return hangingResponse(init?.signal as AbortSignal);
+      return Promise.resolve(mockFetchResponse("[Script Info]"));
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(constructorOpts).toHaveLength(1);
+      await act(async () => {
+        videoRef.current!.currentTime = 590;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // The refresh fetch hangs before any headers. Without the pre-armed
+      // watchdog this would block every later refresh.
+      expect(calls).toBe(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(state).toHaveBeenLastCalledWith("error");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(calls).toBe(3);
+      expect(constructorOpts).toHaveLength(2);
+      expect(state).toHaveBeenLastCalledWith("ready");
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels an in-flight refresh on seek and restarts the attempt budget", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    let calls = 0;
+    const refreshSignals: AbortSignal[] = [];
+    vi.mocked(fetch).mockImplementation((_input, init) => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve(mockFetchResponse("[Script Info]"));
+      if (calls === 2) {
+        const signal = init?.signal as AbortSignal;
+        refreshSignals.push(signal);
+        return hangingResponse(signal);
+      }
+      return Promise.resolve(mockFetchResponse("[Script Info]"));
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      await act(async () => {
+        videoRef.current!.currentTime = 590;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(calls).toBe(2);
+      expect(refreshSignals[0]!.aborted).toBe(false);
+      // Seek far away while the refresh is in flight: it must be cancelled and
+      // replaced by an attempt at the new position.
+      await act(async () => {
+        videoRef.current!.currentTime = 3000;
+        videoRef.current!.dispatchEvent(new Event("seeking"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(refreshSignals[0]!.aborted).toBe(true);
+      expect(calls).toBe(3);
+      expect(String(vi.mocked(fetch).mock.calls[2]![0])).toContain("position=2980&duration=600");
+      expect(constructorOpts).toHaveLength(2);
+      expect(state).toHaveBeenLastCalledWith("ready");
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("useASSSubtitles pending font bundles", () => {
+  it("adopts completed fonts from a pending bundle without reloading", async () => {
+    vi.useFakeTimers();
+    const state = vi.fn();
+    const track = { ...attachedFontTrack, font_bundle_url: "/fonts/pending-adopt" };
+    let fontCalls = 0;
+    vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input);
+      if (url === track.font_bundle_url) {
+        fontCalls += 1;
+        return Promise.resolve(
+          fontCalls === 1 ? pendingFontBundleResponse() : mockFontBundleResponse("completed"),
+        );
+      }
+      return Promise.resolve(
+        mockFetchResponse("[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello"),
+      );
+    });
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [track], track.index, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // Pending: rendered immediately with fallback/default fonts only.
+      expect(constructorOpts).toHaveLength(1);
+      expect(constructorOpts[0]!.fonts).toBeUndefined();
+      expect(state).toHaveBeenLastCalledWith("ready");
+      // The bounded background refresh fetches the completed bundle and
+      // hot-swaps it into the live instance.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fontCalls).toBe(2);
+      expect(instances[0]!.renderer.addFonts).toHaveBeenCalledWith([expect.any(Uint8Array)]);
+      expect(instances).toHaveLength(1);
+      expect(instances[0]!.destroy).not.toHaveBeenCalled();
+
+      // A later window reuses the adopted fonts without another font fetch.
+      await act(async () => {
+        videoRef.current!.currentTime = 590;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fontCalls).toBe(2);
+      expect(constructorOpts).toHaveLength(2);
+      expect(constructorOpts[1]!.fonts).toEqual([expect.any(Uint8Array)]);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("honors the explicit pending marker header", async () => {
+    vi.useFakeTimers();
+    const track = { ...attachedFontTrack, font_bundle_url: "/fonts/pending-marker" };
+    let fontCalls = 0;
+    vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input);
+      if (url === track.font_bundle_url) {
+        fontCalls += 1;
+        return Promise.resolve(
+          fontCalls === 1 ? pendingHeaderFontBundleResponse() : mockFontBundleResponse("done"),
+        );
+      }
+      return Promise.resolve(mockFetchResponse("[Script Info]"));
+    });
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [track], track.index, false, 0, 0),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fontCalls).toBe(2);
+      expect(instances[0]!.renderer.addFonts).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not refresh a definitive font-less bundle", async () => {
+    vi.useFakeTimers();
+    const track = { ...attachedFontTrack, font_bundle_url: "/fonts/definitive-empty" };
+    let fontCalls = 0;
+    vi.mocked(fetch).mockImplementation((input) => {
+      const url = String(input);
+      if (url === track.font_bundle_url) {
+        fontCalls += 1;
+        return Promise.resolve(definitiveEmptyFontBundleResponse());
+      }
+      return Promise.resolve(mockFetchResponse("[Script Info]"));
+    });
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [track], track.index, false, 0, 0),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fontCalls).toBe(1);
+      // No bounded refresh poll: a cacheable empty bundle is final.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(fontCalls).toBe(1);
+    } finally {
+      unmount();
       vi.useRealTimers();
     }
   });
