@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -16,16 +17,138 @@ import (
 const (
 	maxConcurrentCopySeekProbes = 4
 	copySeekProbeTimeout        = 15 * time.Second
+
+	// copySeekAnchorCacheTTL bounds how long a resolved anchor is reused. The
+	// anchor is a property of the source bytes at a seek position, not of the
+	// transport URL used to reach them: a virtual source resolves to the same
+	// underlying release for the lifetime of a session's candidate. The probe
+	// costs roughly 1.9s of session startup, so a short in-process TTL removes
+	// that cost from resume starts, replans, and concurrent starts at the same
+	// position without risking a stale anchor.
+	copySeekAnchorCacheTTL = 10 * time.Minute
+	// copySeekAnchorCacheMax bounds the cache. Entries are tiny and the live
+	// working set is the distinct (source, position) pairs being resumed.
+	copySeekAnchorCacheMax = 256
 )
 
 var (
 	copySeekProbeGroup singleflight.Group
 	copySeekProbeSlots = make(chan struct{}, maxConcurrentCopySeekProbes)
+	// copySeekAnchors is the process-wide resolved-anchor cache. Tests replace
+	// it to inject a clock and probe runner.
+	copySeekAnchors = &copySeekAnchorCache{
+		entries:    make(map[string]copySeekAnchorCacheEntry),
+		ttl:        copySeekAnchorCacheTTL,
+		maxEntries: copySeekAnchorCacheMax,
+		probe:      resolveCopySeekAnchor,
+	}
 )
 
 type copySeekAnchor struct {
 	seconds float64
 	segment int
+}
+
+// anchorProbeRunner runs the FFmpeg observation that produces an anchor. It is
+// a seam so tests can exercise caching without spawning a process.
+type anchorProbeRunner func(
+	ctx context.Context,
+	ffmpegPath string,
+	inputPath string,
+	requestedSeekSeconds float64,
+	segmentDuration int,
+) (float64, int, error)
+
+type copySeekAnchorCacheEntry struct {
+	anchor    copySeekAnchor
+	expiresAt time.Time
+}
+
+// copySeekAnchorCache memoizes anchors by stable source identity so a resume
+// start does not pay for a fresh FFmpeg probe. now and probe are injectable for
+// tests and default to time.Now and the real probe.
+type copySeekAnchorCache struct {
+	mu         sync.Mutex
+	entries    map[string]copySeekAnchorCacheEntry
+	ttl        time.Duration
+	maxEntries int
+	now        func() time.Time
+	probe      anchorProbeRunner
+}
+
+func (c *copySeekAnchorCache) clock() time.Time {
+	if c != nil && c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *copySeekAnchorCache) get(key string) (copySeekAnchor, bool) {
+	if c == nil || key == "" {
+		return copySeekAnchor{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok {
+		return copySeekAnchor{}, false
+	}
+	if !c.clock().Before(entry.expiresAt) {
+		delete(c.entries, key)
+		return copySeekAnchor{}, false
+	}
+	return entry.anchor, true
+}
+
+func (c *copySeekAnchorCache) set(key string, anchor copySeekAnchor) {
+	if c == nil || key == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]copySeekAnchorCacheEntry)
+	}
+	now := c.clock()
+	// Drop expired entries first so a bounded cache is not crowded by entries
+	// that will never be served again.
+	for k, entry := range c.entries {
+		if !now.Before(entry.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+	for len(c.entries) >= c.maxEntries {
+		var oldestKey string
+		var oldest time.Time
+		for k, entry := range c.entries {
+			if oldestKey == "" || entry.expiresAt.Before(oldest) {
+				oldestKey, oldest = k, entry.expiresAt
+			}
+		}
+		delete(c.entries, oldestKey)
+	}
+	c.entries[key] = copySeekAnchorCacheEntry{anchor: anchor, expiresAt: now.Add(c.ttl)}
+}
+
+// copySeekAnchorCacheKey identifies one (source, seek position) observation. The
+// resolved FFmpeg path stays in the key because a different build can copy a
+// different packet at the same position.
+func copySeekAnchorCacheKey(ffmpegPath, sourceIdentity string, requestedSeekSeconds float64, segmentDuration int) string {
+	return strings.Join([]string{
+		ffmpegPath,
+		sourceIdentity,
+		strconv.FormatFloat(requestedSeekSeconds, 'f', 6, 64),
+		strconv.Itoa(segmentDuration),
+	}, "\x00")
+}
+
+// copySeekAnchorProbe returns the configured probe runner, falling back to the
+// real FFmpeg probe when a test has not installed one.
+func (c *copySeekAnchorCache) probeRunner() anchorProbeRunner {
+	if c != nil && c.probe != nil {
+		return c.probe
+	}
+	return resolveCopySeekAnchor
 }
 
 // ResolveCopySeekAnchor returns the keyframe timestamp FFmpeg's input seek will
@@ -46,6 +169,27 @@ func ResolveCopySeekAnchor(
 	requestedSeekSeconds float64,
 	segmentDuration int,
 ) (float64, int, error) {
+	return ResolveCopySeekAnchorForSource(
+		ctx, ffmpegPath, inputPath, inputPath, requestedSeekSeconds, segmentDuration,
+	)
+}
+
+// ResolveCopySeekAnchorForSource is ResolveCopySeekAnchor with a stable source
+// identity for the cache and singleflight key. inputPath is the concrete probe
+// target: for a virtual source it is the per-call pinned-IP relay URL.
+// sourceIdentity is the provider-neutral URI or on-disk path that names the
+// same source across calls, so concurrent resume starts that resolve to
+// different relay URLs still share one probe. The anchor is a property of the
+// source bytes at the requested position, and the caller's candidate points at
+// one underlying release for the session, so a short-TTL cache is safe.
+func ResolveCopySeekAnchorForSource(
+	ctx context.Context,
+	ffmpegPath string,
+	sourceIdentity string,
+	inputPath string,
+	requestedSeekSeconds float64,
+	segmentDuration int,
+) (float64, int, error) {
 	if requestedSeekSeconds <= 0 {
 		return 0, 0, nil
 	}
@@ -57,13 +201,24 @@ func ResolveCopySeekAnchor(
 	}
 
 	resolvedFFmpegPath := ResolveFFmpegPath(ffmpegPath)
-	key := strings.Join([]string{
-		resolvedFFmpegPath,
-		inputPath,
-		strconv.FormatFloat(requestedSeekSeconds, 'f', 6, 64),
-		strconv.Itoa(segmentDuration),
-	}, "\x00")
+	identity := strings.TrimSpace(sourceIdentity)
+	if identity == "" {
+		identity = inputPath
+	}
+	key := copySeekAnchorCacheKey(resolvedFFmpegPath, identity, requestedSeekSeconds, segmentDuration)
+
+	// Fast path: a previous call already resolved this anchor. This is what
+	// turns a repeat resume at the same position into a zero-probe start.
+	if anchor, ok := copySeekAnchors.get(key); ok {
+		return anchor.seconds, anchor.segment, nil
+	}
+
 	resultCh := copySeekProbeGroup.DoChan(key, func() (any, error) {
+		// Another caller may have populated the cache between the fast-path
+		// check and this closure starting.
+		if anchor, ok := copySeekAnchors.get(key); ok {
+			return anchor, nil
+		}
 		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), copySeekProbeTimeout)
 		defer cancel()
 		select {
@@ -72,8 +227,15 @@ func ResolveCopySeekAnchor(
 		case <-probeCtx.Done():
 			return copySeekAnchor{}, probeCtx.Err()
 		}
-		seconds, segment, err := resolveCopySeekAnchor(probeCtx, resolvedFFmpegPath, inputPath, requestedSeekSeconds, segmentDuration)
-		return copySeekAnchor{seconds: seconds, segment: segment}, err
+		seconds, segment, err := copySeekAnchors.probeRunner()(probeCtx, resolvedFFmpegPath, inputPath, requestedSeekSeconds, segmentDuration)
+		if err != nil {
+			// Probe failures are not cached: a transient upstream timeout must
+			// be retried by the next caller rather than pinned for the TTL.
+			return copySeekAnchor{}, err
+		}
+		anchor := copySeekAnchor{seconds: seconds, segment: segment}
+		copySeekAnchors.set(key, anchor)
+		return anchor, nil
 	})
 
 	select {

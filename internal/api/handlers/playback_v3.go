@@ -2746,9 +2746,18 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				anchorInput = res.URL
 				releaseAnchor = cleanup
 			}
-			resolver := h.copySeekAnchor
-			if resolver == nil {
-				resolver = playback.ResolveCopySeekAnchor
+			// The stable source identity is the un-resolved file path: for a
+			// virtual file that is the provider-neutral URI, identical across
+			// concurrent starts even though each start pins its own relay URL.
+			// Cache and singleflight key on it so identical probes coalesce
+			// and survive across requests.
+			sourceIdentity := file.FilePath
+			ffmpegPath := h.playbackConfig().FFmpegPath
+			probeAnchor := func(probeCtx context.Context) (float64, int, error) {
+				if h.copySeekAnchor != nil {
+					return h.copySeekAnchor(probeCtx, ffmpegPath, anchorInput, requested, 2)
+				}
+				return playback.ResolveCopySeekAnchorForSource(probeCtx, ffmpegPath, sourceIdentity, anchorInput, requested, 2)
 			}
 			// Virtual upstreams occasionally serve a range request slowly
 			// enough to blow the anchor probe budget. One bounded retry
@@ -2758,7 +2767,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// it is skipped.
 			var err error
 			for attempt := 1; attempt <= 2; attempt++ {
-				origin, startSegment, err = resolver(ctx, h.playbackConfig().FFmpegPath, anchorInput, requested, 2)
+				origin, startSegment, err = probeAnchor(ctx)
 				if err == nil || ctx.Err() != nil {
 					break
 				}
