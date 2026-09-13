@@ -48,6 +48,13 @@ func NewNextUpRepository(pool *pgxpool.Pool, storeProvider userstore.UserStorePr
 }
 
 // ListNextUp returns the next unwatched episode per series for the given user.
+//
+// The active progress backend decides how the anchor walk reaches watch
+// progress. A Postgres-backed store (the default) keeps the original SQL that
+// joins user_watch_progress directly. Any other store — notably the per-user
+// SQLite backend — has no rows in those Postgres tables, so its progress is
+// read through the store and fed into the same anchor/next-episode SQL as
+// unnest snapshots. See PostgresAnchorStore.
 func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]NextUpResult, error) {
 	if r.storeProvider == nil || q.UserID <= 0 || q.ProfileID == "" {
 		return nil, nil
@@ -58,67 +65,26 @@ func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]Nex
 		limit = 20
 	}
 
+	store, err := r.storeProvider.ForUser(ctx, q.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("getting user store: %w", err)
+	}
+	// A nil store (test doubles that predate capability detection) or an
+	// explicit Postgres marker keeps the original direct-query path.
+	usePostgresAnchors := store == nil || postgresBackedAnchors(store)
+
 	var results []NextUpResult
-	if q.SeriesID != "" {
-		query, args := buildListNextUpQuery(q, limit, nil)
-		rows, err := r.pool.Query(ctx, query, args...)
-		if err != nil {
-			return nil, fmt.Errorf("querying next-up episodes: %w", err)
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var res NextUpResult
-			if err := rows.Scan(
-				&res.ContentID, &res.SeriesID, &res.SeriesTitle,
-				&res.SeasonNumber, &res.EpisodeNumber, &res.CompletedAt,
-			); err != nil {
-				return nil, fmt.Errorf("scanning next-up row: %w", err)
-			}
-			results = append(results, res)
-		}
-		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("iterating next-up rows: %w", err)
-		}
+	if usePostgresAnchors {
+		results, err = r.listNextUpPostgres(ctx, q, limit)
 	} else {
-		remaining := limit
-		var cursor *nextUpWalkCursor
-		batchesRun := 0
-		exhausted := false
-
-		// Every batch resumes below the previous compound frontier, so appending
-		// batches preserves strictly descending (updated_at, media_item_id) order.
-		for batch := 0; batch < nextUpAnchorMaxBatches; batch++ {
-			batchResults, frontier, err := r.listNextUpBatch(ctx, q, remaining, cursor)
-			if err != nil {
-				return nil, err
-			}
-			batchesRun++
-			results = append(results, batchResults...)
-			remaining -= len(batchResults)
-
-			if remaining <= 0 {
-				exhausted = true
-				break
-			}
-			if frontier == nil || frontier.n < nextUpAnchorMaxSeries {
-				exhausted = true
-				break
-			}
-			cursor = &frontier.nextUpWalkCursor
-		}
-
-		if !exhausted && remaining > 0 {
-			slog.WarnContext(ctx, "next-up anchor walk hit batch cap; eligible series tail left unscanned",
-				"component", "catalog",
-				"profile_id", q.ProfileID,
-				"batches", batchesRun,
-				"results_found", len(results))
-		}
+		results, err = r.listNextUpSnapshots(ctx, q, limit, store)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	if q.EnableResumable {
-		resumable, rErr := r.listResumableFirstEpisodes(ctx, q)
+		resumable, rErr := r.listResumableFirstEpisodes(ctx, q, store, usePostgresAnchors)
 		if rErr != nil {
 			return nil, rErr
 		}
@@ -144,6 +110,269 @@ func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]Nex
 	}
 
 	return results, nil
+}
+
+// postgresBackedAnchors reports whether the store's progress rows live in the
+// Postgres tables the catalog queries directly. Stores that do not implement
+// PostgresAnchorStore are assumed not to (the safe answer: read snapshots).
+func postgresBackedAnchors(store userstore.UserStore) bool {
+	marker, ok := store.(userstore.PostgresAnchorStore)
+	return ok && marker.NextUpAnchorsBackedByPostgres()
+}
+
+// listNextUpPostgres runs the direct user_watch_progress anchor walk.
+func (r *NextUpRepository) listNextUpPostgres(ctx context.Context, q NextUpQuery, limit int) ([]NextUpResult, error) {
+	var results []NextUpResult
+	if q.SeriesID != "" {
+		query, args := buildListNextUpQuery(q, limit, nil)
+		rows, err := r.pool.Query(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("querying next-up episodes: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var res NextUpResult
+			if err := rows.Scan(
+				&res.ContentID, &res.SeriesID, &res.SeriesTitle,
+				&res.SeasonNumber, &res.EpisodeNumber, &res.CompletedAt,
+			); err != nil {
+				return nil, fmt.Errorf("scanning next-up row: %w", err)
+			}
+			results = append(results, res)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterating next-up rows: %w", err)
+		}
+		return results, nil
+	}
+
+	remaining := limit
+	var cursor *nextUpWalkCursor
+	batchesRun := 0
+	exhausted := false
+
+	// Every batch resumes below the previous compound frontier, so appending
+	// batches preserves strictly descending (updated_at, media_item_id) order.
+	for batch := 0; batch < nextUpAnchorMaxBatches; batch++ {
+		batchResults, frontier, err := r.listNextUpBatch(ctx, q, remaining, cursor)
+		if err != nil {
+			return nil, err
+		}
+		batchesRun++
+		results = append(results, batchResults...)
+		remaining -= len(batchResults)
+
+		if remaining <= 0 {
+			exhausted = true
+			break
+		}
+		if frontier == nil || frontier.n < nextUpAnchorMaxSeries {
+			exhausted = true
+			break
+		}
+		cursor = &frontier.nextUpWalkCursor
+	}
+
+	if !exhausted && remaining > 0 {
+		slog.WarnContext(ctx, "next-up anchor walk hit batch cap; eligible series tail left unscanned",
+			"component", "catalog",
+			"profile_id", q.ProfileID,
+			"batches", batchesRun,
+			"results_found", len(results))
+	}
+
+	return results, nil
+}
+
+// nextUpSnapshotPageSize is one store page of progress snapshots. It matches
+// the superseded-episode walk's page size so both snapshot readers share the
+// same store access shape.
+const nextUpSnapshotPageSize = 500
+
+// nextUpSnapshotMaxPages caps how many completed/in-progress pages one Next Up
+// request reads from a store whose rows are not in Postgres. The walk's own
+// 96-series/10-batch bound applies on top, but without this cap a large
+// back-catalog would page forever before the walk sees a series. Five pages
+// (2500 rows) matches the continue-watching superseded walk's guard; hitting it
+// logs and leaves only the oldest tail unscanned.
+const nextUpSnapshotMaxPages = 5
+
+// nextUpResumableScanLimit preserves the shipped in-progress scan window for
+// the resumable-first-episode branch.
+const nextUpResumableScanLimit = 100
+
+// nextUpSnapshotSource carries the progress snapshots a non-Postgres store
+// supplied for one Next Up query. Completed entries drive the anchor walk;
+// in-progress entries drive the "a newer partial watch suppresses next-up"
+// gate; the union drives the next-episode exclusion. The anchor/next-episode
+// SQL joins these instead of user_watch_progress.
+type nextUpSnapshotSource struct {
+	completedIDs         []string
+	completedUpdatedAts  []time.Time
+	inProgressIDs        []string
+	inProgressUpdatedAts []time.Time
+	anyProgressIDs       []string
+}
+
+// newNextUpSnapshotSource splits completed/in-progress snapshots into the
+// parallel arrays the SQL unnest CTEs consume.
+func newNextUpSnapshotSource(completed, inProgress []ProgressSnapshot) nextUpSnapshotSource {
+	src := nextUpSnapshotSource{
+		completedIDs:        make([]string, len(completed)),
+		completedUpdatedAts: make([]time.Time, len(completed)),
+	}
+	for i, snapshot := range completed {
+		src.completedIDs[i] = snapshot.ContentID
+		src.completedUpdatedAts[i] = snapshot.UpdatedAt
+	}
+	src.inProgressIDs, src.inProgressUpdatedAts = splitProgressSnapshots(inProgress)
+
+	// anyProgressIDs is the completed ∪ in-progress set the next-episode
+	// exclusion checks. A rewatch can appear in both listings; dedup keeps the
+	// array small and the membership test is a set lookup either way.
+	seen := make(map[string]struct{}, len(completed)+len(inProgress))
+	src.anyProgressIDs = make([]string, 0, len(completed)+len(inProgress))
+	for _, snapshot := range completed {
+		if _, ok := seen[snapshot.ContentID]; ok {
+			continue
+		}
+		seen[snapshot.ContentID] = struct{}{}
+		src.anyProgressIDs = append(src.anyProgressIDs, snapshot.ContentID)
+	}
+	for _, snapshot := range inProgress {
+		if _, ok := seen[snapshot.ContentID]; ok {
+			continue
+		}
+		seen[snapshot.ContentID] = struct{}{}
+		src.anyProgressIDs = append(src.anyProgressIDs, snapshot.ContentID)
+	}
+	return src
+}
+
+// loadNextUpProgressSnapshots pages a profile's progress rows of one status
+// through the store and returns them newest-first. Paging stops when the store
+// is exhausted, when a row falls before cutoff (the listing is updated_at
+// DESC, so every later row is older), or at nextUpSnapshotMaxPages. The
+// returned bool reports whether the page cap — not the data — ended the walk.
+func loadNextUpProgressSnapshots(ctx context.Context, store userstore.UserStore, profileID, status string, cutoff *time.Time) ([]ProgressSnapshot, bool, error) {
+	var snapshots []ProgressSnapshot
+	for page := 0; page < nextUpSnapshotMaxPages; page++ {
+		entries, err := store.ListProgress(ctx, profileID, status, nextUpSnapshotPageSize, page*nextUpSnapshotPageSize)
+		if err != nil {
+			return nil, false, fmt.Errorf("listing %s progress: %w", status, err)
+		}
+		for _, snapshot := range ProgressSnapshots(entries) {
+			if cutoff != nil && snapshot.UpdatedAt.Before(*cutoff) {
+				return snapshots, false, nil
+			}
+			snapshots = append(snapshots, snapshot)
+		}
+		if len(entries) < nextUpSnapshotPageSize {
+			return snapshots, false, nil
+		}
+	}
+	return snapshots, true, nil
+}
+
+// listNextUpSnapshots is the non-Postgres counterpart of listNextUpPostgres:
+// it reads progress through the store and runs the same anchor/next-episode SQL
+// over unnest snapshots.
+func (r *NextUpRepository) listNextUpSnapshots(ctx context.Context, q NextUpQuery, limit int, store userstore.UserStore) ([]NextUpResult, error) {
+	completed, capped, err := loadNextUpProgressSnapshots(ctx, store, q.ProfileID, "completed", q.DateCutoff)
+	if err != nil {
+		return nil, err
+	}
+	if capped {
+		slog.WarnContext(ctx, "next-up snapshot walk hit page cap; completed-history tail left unscanned",
+			"component", "catalog",
+			"profile_id", q.ProfileID,
+			"pages", nextUpSnapshotMaxPages)
+	}
+	if len(completed) == 0 {
+		return nil, nil
+	}
+
+	// In-progress rows are not cutoff-bounded: an old resume point can still
+	// block a next-up episode from being surfaced.
+	inProgress, _, err := loadNextUpProgressSnapshots(ctx, store, q.ProfileID, "in_progress", nil)
+	if err != nil {
+		return nil, err
+	}
+	src := newNextUpSnapshotSource(completed, inProgress)
+
+	if q.SeriesID != "" {
+		query, args := buildListNextUpSnapshotQuery(q, limit, nil, src)
+		rows, err := r.pool.Query(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("querying next-up episodes: %w", err)
+		}
+		defer rows.Close()
+
+		var results []NextUpResult
+		for rows.Next() {
+			var res NextUpResult
+			if err := rows.Scan(
+				&res.ContentID, &res.SeriesID, &res.SeriesTitle,
+				&res.SeasonNumber, &res.EpisodeNumber, &res.CompletedAt,
+			); err != nil {
+				return nil, fmt.Errorf("scanning next-up row: %w", err)
+			}
+			results = append(results, res)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterating next-up rows: %w", err)
+		}
+		return results, nil
+	}
+
+	remaining := limit
+	var cursor *nextUpWalkCursor
+	batchesRun := 0
+	exhausted := false
+	var results []NextUpResult
+
+	for batch := 0; batch < nextUpAnchorMaxBatches; batch++ {
+		batchResults, frontier, err := r.listNextUpSnapshotBatch(ctx, q, remaining, cursor, src)
+		if err != nil {
+			return nil, err
+		}
+		batchesRun++
+		results = append(results, batchResults...)
+		remaining -= len(batchResults)
+
+		if remaining <= 0 {
+			exhausted = true
+			break
+		}
+		if frontier == nil || frontier.n < nextUpAnchorMaxSeries {
+			exhausted = true
+			break
+		}
+		cursor = &frontier.nextUpWalkCursor
+	}
+
+	if !exhausted && remaining > 0 {
+		slog.WarnContext(ctx, "next-up snapshot anchor walk hit batch cap; eligible series tail left unscanned",
+			"component", "catalog",
+			"profile_id", q.ProfileID,
+			"batches", batchesRun,
+			"results_found", len(results))
+	}
+
+	return results, nil
+}
+
+// listNextUpSnapshotBatch runs one global anchor batch over snapshot arrays.
+func (r *NextUpRepository) listNextUpSnapshotBatch(
+	ctx context.Context,
+	q NextUpQuery,
+	limit int,
+	cursor *nextUpWalkCursor,
+	src nextUpSnapshotSource,
+) ([]NextUpResult, *nextUpWalkFrontier, error) {
+	query, args := buildListNextUpSnapshotQuery(q, limit, cursor, src)
+	return r.queryNextUpBatch(ctx, query, args)
 }
 
 type nextUpWalkCursor struct {
@@ -175,6 +404,13 @@ func (r *NextUpRepository) listNextUpBatch(
 	cursor *nextUpWalkCursor,
 ) ([]NextUpResult, *nextUpWalkFrontier, error) {
 	query, args := buildListNextUpQuery(q, limit, cursor)
+	return r.queryNextUpBatch(ctx, query, args)
+}
+
+// queryNextUpBatch runs one global anchor batch and scans the shared
+// frontier-plus-row result shape. Postgres and snapshot batches use it so the
+// frontier contract stays in one place.
+func (r *NextUpRepository) queryNextUpBatch(ctx context.Context, query string, args []interface{}) ([]NextUpResult, *nextUpWalkFrontier, error) {
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("querying next-up episodes: %w", err)
@@ -219,6 +455,41 @@ func (r *NextUpRepository) listNextUpBatch(
 		return nil, nil, fmt.Errorf("iterating next-up rows: %w", err)
 	}
 	return results, frontier, nil
+}
+
+// nextUpNextEpisodeExclusionPostgres hides the next episode when the user
+// already has completed or in-progress progress on it, read straight from the
+// shared Postgres progress table.
+const nextUpNextEpisodeExclusionPostgres = `AND NOT EXISTS (
+				  SELECT 1 FROM user_watch_progress uwp2
+				  WHERE uwp2.user_id = $1
+				    AND uwp2.profile_id = $2
+				    AND uwp2.media_item_id = e2.content_id
+				    AND (uwp2.completed = TRUE OR uwp2.position_seconds > 0)
+			  )`
+
+// nextUpNextEpisodeExclusionSnapshots is the same exclusion over the progress
+// snapshots the caller fed in, for stores whose rows are not in Postgres.
+const nextUpNextEpisodeExclusionSnapshots = `AND NOT EXISTS (
+				  SELECT 1 FROM nextup_any_progress nap
+				  WHERE nap.media_item_id = e2.content_id
+			  )`
+
+// nextUpNextEpisodeLateral picks the first episode after the series anchor that
+// has an available file and no existing progress. Shared so the Postgres and
+// snapshot anchor paths select the next episode by identical semantics; they
+// differ only in the exclusion predicate naming the progress source.
+func nextUpNextEpisodeLateral(exclusion string) string {
+	return fmt.Sprintf(`JOIN LATERAL (
+			SELECT e2.content_id, e2.series_id, e2.season_number, e2.episode_number
+			FROM episodes e2
+			WHERE e2.series_id = es.series_id
+			  AND (e2.season_number, e2.episode_number) > (es.season_number, es.episode_number)
+			  AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e2.content_id AND mf.missing_since IS NULL)
+			  %s
+			ORDER BY e2.season_number, e2.episode_number
+			LIMIT 1
+		) next_ep ON true`, exclusion)
 }
 
 func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (string, []interface{}) {
@@ -442,24 +713,10 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 			es.updated_at
 		FROM %s es
 		JOIN media_items si ON si.content_id = es.series_id
-		JOIN LATERAL (
-			SELECT e2.content_id, e2.series_id, e2.season_number, e2.episode_number
-			FROM episodes e2
-			WHERE e2.series_id = es.series_id
-			  AND (e2.season_number, e2.episode_number) > (es.season_number, es.episode_number)
-			  AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e2.content_id AND mf.missing_since IS NULL)
-			  AND NOT EXISTS (
-				  SELECT 1 FROM user_watch_progress uwp2
-				  WHERE uwp2.user_id = $1
-				    AND uwp2.profile_id = $2
-				    AND uwp2.media_item_id = e2.content_id
-				    AND (uwp2.completed = TRUE OR uwp2.position_seconds > 0)
-			  )
-			ORDER BY e2.season_number, e2.episode_number
-			LIMIT 1
-		) next_ep ON true
+		%s
 		ORDER BY es.updated_at DESC
-		LIMIT $3`, completedEpisodesCTE, inProgressExclusion, sourceTable)
+		LIMIT $3`, completedEpisodesCTE, inProgressExclusion, sourceTable,
+			nextUpNextEpisodeLateral(nextUpNextEpisodeExclusionPostgres))
 		return query, args
 	}
 
@@ -473,24 +730,9 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 			es.updated_at AS completed_at
 		FROM %s es
 		JOIN media_items si ON si.content_id = es.series_id
-		JOIN LATERAL (
-			SELECT e2.content_id, e2.series_id, e2.season_number, e2.episode_number
-			FROM episodes e2
-			WHERE e2.series_id = es.series_id
-			  AND (e2.season_number, e2.episode_number) > (es.season_number, es.episode_number)
-			  AND EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e2.content_id AND mf.missing_since IS NULL)
-			  AND NOT EXISTS (
-				  SELECT 1 FROM user_watch_progress uwp2
-				  WHERE uwp2.user_id = $1
-				    AND uwp2.profile_id = $2
-				    AND uwp2.media_item_id = e2.content_id
-				    AND (uwp2.completed = TRUE OR uwp2.position_seconds > 0)
-			  )
-			ORDER BY e2.season_number, e2.episode_number
-			LIMIT 1
-		) next_ep ON true
+		%s
 		ORDER BY es.updated_at DESC
-		LIMIT $3`, sourceTable)
+		LIMIT $3`, sourceTable, nextUpNextEpisodeLateral(nextUpNextEpisodeExclusionPostgres))
 
 	query := fmt.Sprintf(`
 		WITH %s
@@ -518,6 +760,284 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 			%s
 		) r ON true
 		ORDER BY r.completed_at DESC NULLS LAST`, completedEpisodesCTE, inProgressExclusion, resultQuery)
+
+	return query, args
+}
+
+// buildListNextUpSnapshotQuery mirrors buildListNextUpQuery for stores whose
+// progress is not in Postgres. The completed and in-progress snapshots arrive
+// as parallel unnest arrays; the anchor walk, per-series dedup, episode
+// tie-break, DateCutoff, 96-series/10-batch bound, and next-episode selection
+// keep the same semantics. Hidden filtering and profile scoping already
+// happened in the store's ListProgress, so the SQL does not repeat them.
+//
+// Args: $1 completed IDs, $2 completed updated_at, $3 limit, then (optional)
+// series filter, date cutoff, walk cursor, and finally the any-progress and
+// in-progress arrays the exclusions consume.
+func buildListNextUpSnapshotQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor, src nextUpSnapshotSource) (string, []interface{}) {
+	args := []interface{}{src.completedIDs, src.completedUpdatedAts, limit}
+	argIdx := 4
+
+	seriesFilter := ""
+	if q.SeriesID != "" {
+		seriesFilter = fmt.Sprintf(" AND e.series_id = $%d", argIdx)
+		args = append(args, q.SeriesID)
+		argIdx++
+	}
+
+	dateCutoffFilter := ""
+	if q.DateCutoff != nil {
+		dateCutoffFilter = fmt.Sprintf(" AND uwp.updated_at >= $%d", argIdx)
+		args = append(args, *q.DateCutoff)
+		argIdx++
+	}
+
+	cursorFilter := ""
+	seedSeen := "ARRAY[pick.series_id]"
+	if q.SeriesID == "" && cursor != nil {
+		cursorUpdatedAtArg := argIdx
+		cursorMediaItemIDArg := argIdx + 1
+		cursorSeenArg := argIdx + 2
+		cursorFilter = fmt.Sprintf(`
+				  AND (uwp.updated_at, uwp.media_item_id) < ($%d, $%d)
+				  AND NOT (e.series_id = ANY($%d))`, cursorUpdatedAtArg, cursorMediaItemIDArg, cursorSeenArg)
+		seedSeen = fmt.Sprintf("$%d::text[] || pick.series_id", cursorSeenArg)
+		args = append(args, cursor.updatedAt, cursor.mediaItemID, cursor.seen)
+		argIdx += 3
+	}
+
+	anyProgressArg := argIdx
+	args = append(args, src.anyProgressIDs)
+	argIdx++
+	inProgressArg := argIdx
+	args = append(args, src.inProgressIDs)
+	argIdx++
+	inProgressUpdatedArg := argIdx
+	args = append(args, src.inProgressUpdatedAts)
+
+	progressCTEs := fmt.Sprintf(`completed_progress(media_item_id, updated_at) AS (
+			SELECT * FROM unnest($1::text[], $2::timestamptz[])
+		),
+		nextup_any_progress(media_item_id) AS (
+			SELECT * FROM unnest($%d::text[])
+		),
+		nextup_in_progress(media_item_id, updated_at) AS (
+			SELECT * FROM unnest($%d::text[], $%d::timestamptz[])
+		)`, anyProgressArg, inProgressArg, inProgressUpdatedArg)
+
+	inProgressExclusion := ""
+	if !q.EnableResumable {
+		inProgressExclusion = `
+		,
+		eligible_series AS (
+			SELECT ce.*
+			FROM completed_episodes ce
+			WHERE NOT EXISTS (
+				SELECT 1 FROM nextup_in_progress ip
+				JOIN episodes e_ip ON e_ip.content_id = ip.media_item_id
+				WHERE e_ip.series_id = ce.series_id
+				  AND ip.updated_at > ce.updated_at
+			)
+		)`
+	}
+
+	sourceTable := "completed_episodes"
+	if !q.EnableResumable {
+		sourceTable = "eligible_series"
+	}
+
+	anchorLateral := `JOIN LATERAL (
+				SELECT e_a.season_number, e_a.episode_number
+				FROM episodes e_a
+				JOIN completed_progress uwp_a
+				  ON uwp_a.media_item_id = e_a.content_id
+				 AND uwp_a.updated_at = pick.updated_at
+				WHERE e_a.series_id = pick.series_id
+				ORDER BY e_a.season_number DESC, e_a.episode_number DESC
+				LIMIT 1
+			) anchor ON TRUE`
+
+	var completedEpisodesCTE string
+	if q.SeriesID != "" {
+		completedEpisodesCTE = fmt.Sprintf(`%s,
+		completed_episodes AS (
+			SELECT DISTINCT ON (e.series_id)
+				e.series_id,
+				e.season_number,
+				e.episode_number,
+				uwp.updated_at
+			FROM completed_progress uwp
+			JOIN episodes e ON e.content_id = uwp.media_item_id
+			WHERE TRUE
+			  %s
+			  %s
+			ORDER BY e.series_id, uwp.updated_at DESC, e.season_number DESC, e.episode_number DESC
+		)`, progressCTEs, seriesFilter, dateCutoffFilter)
+	} else {
+		completedEpisodesCTE = fmt.Sprintf(`RECURSIVE %s,
+		walk AS (
+			(
+				SELECT
+					pick.series_id,
+					anchor.season_number,
+					anchor.episode_number,
+					pick.updated_at,
+					pick.media_item_id,
+					%s AS seen,
+					1 AS n
+				FROM (
+					SELECT e.series_id, uwp.updated_at, uwp.media_item_id
+					FROM completed_progress uwp
+					JOIN episodes e ON e.content_id = uwp.media_item_id
+					WHERE TRUE
+					  %s
+					  %s
+					ORDER BY uwp.updated_at DESC, uwp.media_item_id DESC
+					LIMIT 1
+				) pick
+				%s
+			)
+			UNION ALL
+			SELECT
+				pick.series_id,
+				anchor.season_number,
+				anchor.episode_number,
+				pick.updated_at,
+				pick.media_item_id,
+				w.seen || pick.series_id,
+				w.n + 1
+			FROM walk w
+			JOIN LATERAL (
+				SELECT e.series_id, uwp.updated_at, uwp.media_item_id
+				FROM completed_progress uwp
+				JOIN episodes e ON e.content_id = uwp.media_item_id
+				WHERE (uwp.updated_at, uwp.media_item_id) < (w.updated_at, w.media_item_id)
+				  AND NOT (e.series_id = ANY(w.seen))
+				  %s
+				ORDER BY uwp.updated_at DESC, uwp.media_item_id DESC
+				LIMIT 1
+			) pick ON true
+			%s
+			WHERE w.n < %d
+		),
+		completed_episodes AS (
+			SELECT series_id, season_number, episode_number, updated_at
+			FROM walk
+		)`, progressCTEs, seedSeen, cursorFilter, dateCutoffFilter, anchorLateral,
+			dateCutoffFilter, anchorLateral, nextUpAnchorMaxSeries)
+	}
+
+	if q.SeriesID != "" {
+		query := fmt.Sprintf(`
+		WITH %s
+		%s
+		SELECT
+			next_ep.content_id,
+			next_ep.series_id,
+			si.title,
+			next_ep.season_number,
+			next_ep.episode_number,
+			es.updated_at
+		FROM %s es
+		JOIN media_items si ON si.content_id = es.series_id
+		%s
+		ORDER BY es.updated_at DESC
+		LIMIT $3`, completedEpisodesCTE, inProgressExclusion, sourceTable,
+			nextUpNextEpisodeLateral(nextUpNextEpisodeExclusionSnapshots))
+		return query, args
+	}
+
+	resultQuery := fmt.Sprintf(`
+		SELECT
+			next_ep.content_id,
+			next_ep.series_id,
+			si.title,
+			next_ep.season_number,
+			next_ep.episode_number,
+			es.updated_at AS completed_at
+		FROM %s es
+		JOIN media_items si ON si.content_id = es.series_id
+		%s
+		ORDER BY es.updated_at DESC
+		LIMIT $3`, sourceTable, nextUpNextEpisodeLateral(nextUpNextEpisodeExclusionSnapshots))
+
+	query := fmt.Sprintf(`
+		WITH %s
+		%s
+		,
+		frontier AS (
+			SELECT w.updated_at, w.media_item_id, w.seen, w.n
+			FROM walk w
+			ORDER BY w.n DESC
+			LIMIT 1
+		)
+		SELECT
+			f.updated_at AS frontier_updated_at,
+			f.media_item_id AS frontier_media_item_id,
+			f.seen AS frontier_seen,
+			f.n AS frontier_n,
+			r.content_id,
+			r.series_id,
+			r.title,
+			r.season_number,
+			r.episode_number,
+			r.completed_at
+		FROM frontier f
+		LEFT JOIN (
+			%s
+		) r ON true
+		ORDER BY r.completed_at DESC NULLS LAST`, completedEpisodesCTE, inProgressExclusion, resultQuery)
+
+	return query, args
+}
+
+// buildListResumableFirstEpisodesSnapshotQuery is the snapshot form of
+// buildListResumableFirstEpisodesQuery: in-progress and completed progress
+// arrive from the store as unnest arrays rather than user_watch_progress. The
+// completed-series gate and the SeriesID gate-drop keep the shipped semantics.
+func buildListResumableFirstEpisodesSnapshotQuery(q NextUpQuery, inProgress, completed []ProgressSnapshot) (string, []interface{}) {
+	inProgressIDs, inProgressUpdatedAts := splitProgressSnapshots(inProgress)
+	completedIDs := make([]string, len(completed))
+	for i, snapshot := range completed {
+		completedIDs[i] = snapshot.ContentID
+	}
+	args := []interface{}{inProgressIDs, inProgressUpdatedAts, completedIDs}
+
+	seriesFilter := ""
+	if q.SeriesID != "" {
+		args = append(args, q.SeriesID)
+		seriesFilter = fmt.Sprintf(" AND e.series_id = $%d", len(args))
+	}
+
+	completedSeriesGate := ""
+	if q.SeriesID == "" {
+		completedSeriesGate = `
+		  AND NOT EXISTS (
+			  SELECT 1 FROM episodes e_c
+			  WHERE e_c.series_id = e.series_id
+			    AND e_c.content_id = ANY($3)
+		  )`
+	}
+
+	query := fmt.Sprintf(`
+		WITH nextup_resumable_progress(media_item_id, updated_at) AS (
+			SELECT * FROM unnest($1::text[], $2::timestamptz[])
+		),
+		nextup_completed(media_item_id) AS (
+			SELECT * FROM unnest($3::text[])
+		)
+		SELECT DISTINCT ON (e.series_id)
+			e.content_id,
+			e.series_id,
+			si.title,
+			e.season_number,
+			e.episode_number,
+			ip.updated_at
+		FROM nextup_resumable_progress ip
+		JOIN episodes e ON e.content_id = ip.media_item_id
+		JOIN media_items si ON si.content_id = e.series_id
+		WHERE TRUE%s%s
+		ORDER BY e.series_id, ip.updated_at DESC`, seriesFilter, completedSeriesGate)
 
 	return query, args
 }
@@ -593,13 +1113,12 @@ func buildListResumableFirstEpisodesQuery(q NextUpQuery, inProgressIDs []string)
 //     tile is for, so the no-completed-episodes gate would defeat the
 //     endpoint's purpose. ListNextUp also flips its dedup priority to let
 //     this row win over the completed-next row from the main query.
-func (r *NextUpRepository) listResumableFirstEpisodes(ctx context.Context, q NextUpQuery) ([]NextUpResult, error) {
-	store, err := r.storeProvider.ForUser(ctx, q.UserID)
-	if err != nil {
-		return nil, fmt.Errorf("getting user store: %w", err)
+func (r *NextUpRepository) listResumableFirstEpisodes(ctx context.Context, q NextUpQuery, store userstore.UserStore, usePostgresAnchors bool) ([]NextUpResult, error) {
+	if store == nil {
+		return nil, nil
 	}
 
-	inProgressEntries, err := store.ListProgress(ctx, q.ProfileID, "in_progress", 100, 0)
+	inProgressEntries, err := store.ListProgress(ctx, q.ProfileID, "in_progress", nextUpResumableScanLimit, 0)
 	if err != nil {
 		return nil, fmt.Errorf("listing in-progress: %w", err)
 	}
@@ -607,12 +1126,23 @@ func (r *NextUpRepository) listResumableFirstEpisodes(ctx context.Context, q Nex
 		return nil, nil
 	}
 
-	inProgressIDs := make([]string, 0, len(inProgressEntries))
-	for _, entry := range inProgressEntries {
-		inProgressIDs = append(inProgressIDs, entry.MediaItemID)
+	var query string
+	var args []interface{}
+	if usePostgresAnchors {
+		inProgressIDs := make([]string, 0, len(inProgressEntries))
+		for _, entry := range inProgressEntries {
+			inProgressIDs = append(inProgressIDs, entry.MediaItemID)
+		}
+		query, args = buildListResumableFirstEpisodesQuery(q, inProgressIDs)
+	} else {
+		// The completed-series gate needs the profile's completed episodes,
+		// which live in the store rather than Postgres for this backend.
+		completedSnaps, _, cErr := loadNextUpProgressSnapshots(ctx, store, q.ProfileID, "completed", q.DateCutoff)
+		if cErr != nil {
+			return nil, cErr
+		}
+		query, args = buildListResumableFirstEpisodesSnapshotQuery(q, ProgressSnapshots(inProgressEntries), completedSnaps)
 	}
-
-	query, args := buildListResumableFirstEpisodesQuery(q, inProgressIDs)
 
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {

@@ -56,6 +56,16 @@ CREATE TABLE IF NOT EXISTS watch_progress (
     PRIMARY KEY (profile_id, media_item_id)
 );
 
+-- Next Up pages a profile's completed progress newest-first and stops at a
+-- DateCutoff. The primary key (profile_id, media_item_id) can seek the profile
+-- but cannot order by updated_at or filter on completed, so without this index
+-- every Next Up page sorts the profile's whole watch_progress table. The
+-- partial-free shape (completed is a low-cardinality leading filter after
+-- profile_id) matches SQLite's index planner; created idempotently on every
+-- open, so existing databases pick it up.
+CREATE INDEX IF NOT EXISTS idx_watch_progress_profile_completed_updated
+    ON watch_progress (profile_id, completed, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS watch_history (
     id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL,
