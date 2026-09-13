@@ -85,6 +85,81 @@ func TestStartRequestV3Validation(t *testing.T) {
 	}
 }
 
+// An un-negotiated client transformation is unavailable for this session, not
+// a malformed request: strip it and warn instead of refusing the whole
+// delivery. Server transformations and the delivery's own flags are untouched.
+func TestStartRequestV3UnnegotiatedClientTransformationIsSkipped(t *testing.T) {
+	req := validStartRequestV3()
+	delivery := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []TransformationV3{
+		{Name: ClientDV7ToDV81V3, Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3},
+		{Name: "server_transform", Executor: ExecutorServerV3, RecipeVersion: "1"},
+	}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	warnings, err := req.NormalizeAndValidate()
+	if err != nil {
+		t.Fatalf("un-negotiated client transformation rejected the request: %v", err)
+	}
+	if !hasDegradationWarningV3(warnings, "client_transformation_not_negotiated") {
+		t.Fatalf("warnings = %#v, want client_transformation_not_negotiated", warnings)
+	}
+	got := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	if len(got.Transformations) != 1 || got.Transformations[0].Name != "server_transform" {
+		t.Fatalf("transformations = %#v, want only the server transformation", got.Transformations)
+	}
+	if !got.Enabled || !got.SupportedOnDevice {
+		t.Fatalf("delivery flags changed: %#v", got)
+	}
+}
+
+// A server-executor transformation never depends on the client feature
+// negotiation flag, so it must pass through with no warning.
+func TestStartRequestV3ServerTransformationNeedsNoClientFeatures(t *testing.T) {
+	req := validStartRequestV3()
+	delivery := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []TransformationV3{{Name: "server_transform", Executor: ExecutorServerV3, RecipeVersion: "1"}}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	warnings, err := req.NormalizeAndValidate()
+	if err != nil {
+		t.Fatalf("server transformation rejected: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", warnings)
+	}
+	if got := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3].Transformations; len(got) != 1 || got[0].Name != "server_transform" {
+		t.Fatalf("transformations = %#v, want the server transformation", got)
+	}
+}
+
+// Structurally malformed transformations stay hard errors: the degrade path is
+// only for a well-formed transformation the client did not negotiate.
+func TestStartRequestV3MalformedTransformationStillRejected(t *testing.T) {
+	req := validStartRequestV3()
+	delivery := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []TransformationV3{{Name: "", Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3}}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("transformation with an empty name was accepted")
+	}
+}
+
+func TestStartRequestV3DuplicateTransformationStillRejected(t *testing.T) {
+	req := validStartRequestV3()
+	delivery := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []TransformationV3{
+		{Name: ClientDV7ToDV81V3, Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3},
+		{Name: ClientDV7ToDV81V3, Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3},
+	}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("duplicate delivery transformation was accepted")
+	}
+}
+
 func TestStartRequestV3CarriedAudioTrackIDValidation(t *testing.T) {
 	req := validStartRequestV3()
 	req.CarriedAudioTrackID = strings.Repeat("a", 129)
