@@ -967,29 +967,9 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 
 	// Build the font-bundle cache key before any virtual resolve: the identity
 	// must never depend on the resolved relay URL, which rotates per
-	// registration. Virtual rows key on the pinned "result=" candidate id (the
-	// 10-minute generation bucket bounds staleness); local rows key on the file
-	// row's mtime+size so a re-probed or replaced file reads as a miss.
+	// registration. Shared with the playback pre-warm so the two cannot drift.
 	virtualFontSource := isVirtualPlaybackFile(file) && session.VirtualSourceURI != ""
-	var cacheKey playback.FontBundleKey
-	if virtualFontSource {
-		cacheKey = playback.FontBundleKey{
-			FileID:       file.ID,
-			PinnedResult: virtualResultCandidateID(session.VirtualSourceURI),
-			FFmpegPath:   h.ffmpegPath(),
-		}
-	} else {
-		mtimeUnixNano := int64(0)
-		if file.FileModifiedAt != nil {
-			mtimeUnixNano = file.FileModifiedAt.UnixNano()
-		}
-		cacheKey = playback.FontBundleKey{
-			FileID:        file.ID,
-			Size:          file.FileSize,
-			MtimeUnixNano: mtimeUnixNano,
-			FFmpegPath:    h.ffmpegPath(),
-		}
-	}
+	cacheKey := fontBundleCacheKey(file, session.VirtualSourceURI, h.ffmpegPath())
 
 	// Virtual keys without a pinned result= param are intentionally
 	// uncacheable: the identity would be unstable without the candidate
@@ -1041,7 +1021,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	bundle, err := h.SubtitleCache.ExtractFontBundle(r.Context(), cacheKey, func(ctx context.Context) ([]byte, error) {
+	bundle, ready, err := h.SubtitleCache.ExtractFontBundleWithin(r.Context(), cacheKey, fontBundleClientWait, func(ctx context.Context) ([]byte, error) {
 		fonts, extractErr := playback.ExtractAttachedSubtitleFonts(ctx, inputPath, h.ffmpegPath())
 		if extractErr != nil {
 			return nil, extractErr
@@ -1057,7 +1037,51 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 		return
 	}
+	if !ready {
+		// The extraction is still running detached. Hold the request only for
+		// fontBundleClientWait, then hand the client a valid empty bundle so it
+		// falls back to default fonts immediately; the single-flighted
+		// extraction keeps running and lands in the cache for the next fetch.
+		slog.DebugContext(r.Context(), "subtitle font bundle extraction in flight; serving empty bundle",
+			"component", "api", "file_id", file.ID, "track", trackIndex)
+		writeFontBundleResponse(w, emptyFontBundle)
+		return
+	}
 	writeFontBundleResponse(w, bundle)
+}
+
+// fontBundleClientWait bounds how long the font-bundle handler waits for a
+// cold extraction before returning an empty bundle. It must stay well below
+// the web client's FONT_BUNDLE_BUDGET_MS (3s) so the client never waits on the
+// server; the extraction continues in the background.
+var fontBundleClientWait = 2 * time.Second
+
+// emptyFontBundle is the valid, empty JSON bundle served when an extraction is
+// still in flight or has no fonts to return.
+var emptyFontBundle = []byte("[]")
+
+// fontBundleCacheKey builds the FontBundleKey for a media file the same way the
+// stream font handler does, and is shared with the playback-time pre-warm so
+// the two can never drift. Virtual rows key on the pinned result candidate
+// because relay URLs rotate per registration; local rows key on the file row's
+// size and mtime so a re-probed or replaced file reads as a miss.
+func fontBundleCacheKey(file *models.MediaFile, virtualSourceURI, ffmpegPath string) playback.FontBundleKey {
+	if file != nil && isVirtualPlaybackFile(file) && virtualSourceURI != "" {
+		return playback.FontBundleKey{
+			FileID:       file.ID,
+			PinnedResult: virtualResultCandidateID(virtualSourceURI),
+			FFmpegPath:   ffmpegPath,
+		}
+	}
+	key := playback.FontBundleKey{FFmpegPath: ffmpegPath}
+	if file != nil {
+		key.FileID = file.ID
+		key.Size = file.FileSize
+		if file.FileModifiedAt != nil {
+			key.MtimeUnixNano = file.FileModifiedAt.UnixNano()
+		}
+	}
+	return key
 }
 
 // writeFontBundleResponse writes an encoded font-bundle payload with the

@@ -88,10 +88,16 @@ const (
 	// minutes, so a source that rotated can never be served past the bucket
 	// boundary.
 	subtitleCacheGenerationBucket = 10 * time.Minute
-	// subtitleFontBundleExtractTimeout bounds one shared font-bundle
-	// extraction. The extraction runs detached from the leading request (see
-	// ExtractFontBundle), so a hung upstream cannot pin a flight forever.
-	subtitleFontBundleExtractTimeout = 60 * time.Second
+	// subtitleFontBundleExtractTimeout bounds one detached font-bundle
+	// extraction. The extraction runs single-flighted and detached from the
+	// request that triggered it, and its successful result is written through
+	// to disk. A cold relay carrying a large anime font set (up to 47
+	// attachments, each a network open) can take minutes, so the old 60s
+	// ceiling discarded work before it could ever be stored — the reason every
+	// retry repeated the same failure. Five minutes keeps a hard bound while
+	// letting a cold extraction finish; the HTTP path degrades to an empty
+	// bundle after its short client wait long before this fires.
+	subtitleFontBundleExtractTimeout = 5 * time.Minute
 )
 
 // SUPExtractFunc runs one ffmpeg subtitle extract described by opts, writing
@@ -722,30 +728,22 @@ func (c *SubtitleCache) LookupFontBundle(key FontBundleKey) ([]byte, bool) {
 	return data, true
 }
 
-// ExtractFontBundle returns the encoded font-bundle JSON for the key, reusing
-// a committed disk entry when present and otherwise running extract once under
-// single-flight and writing the result through to disk for every waiter. The
-// extraction runs on a context detached from the leading request (bounded to
-// subtitleFontBundleExtractTimeout), so a canceled leader does not fail the
-// shared work other callers are waiting on.
-func (c *SubtitleCache) ExtractFontBundle(ctx context.Context, key FontBundleKey, extract func(context.Context) ([]byte, error)) ([]byte, error) {
-	if c == nil {
-		return extract(ctx)
-	}
-	if data, ok := c.LookupFontBundle(key); ok {
-		return data, nil
-	}
+// startFontBundleFlight registers or joins the single-flight extraction for
+// key and returns the caller's result channel. The extraction runs on its own
+// goroutine (singleflight.DoChan) on a context detached from every caller and
+// bounded by subtitleFontBundleExtractTimeout, so a canceled waiter never
+// cancels the shared work. The bool is false when the key cannot be resolved
+// to a stable cache identity, in which case the caller extracts uncached.
+func (c *SubtitleCache) startFontBundleFlight(ctx context.Context, key FontBundleKey, extract func(context.Context) ([]byte, error)) (<-chan singleflight.Result, bool) {
 	identity, modTime, size, ok := key.source(time.Now())
 	if !ok {
-		// Not reliably keyable (e.g. a local row without mtime/size): extract
-		// uncached, matching the DV RPU memo's fallback.
-		return extract(ctx)
+		return nil, false
 	}
 	// The flight key carries the invalidation coordinates too, so concurrent
 	// requests for a changed source version (different mtime/size) do not
 	// coalesce onto the stale version's extraction.
 	flightKey := fmt.Sprintf("fontbundle:%s-%d-%d", identity, modTime.UnixNano(), size)
-	v, err, _ := c.fontBundleFlight.Do(flightKey, func() (any, error) {
+	ch := c.fontBundleFlight.DoChan(flightKey, func() (any, error) {
 		// Another caller may have committed the entry while we waited to lead.
 		if data, ok := c.LookupFontBundle(key); ok {
 			return data, nil
@@ -761,11 +759,142 @@ func (c *SubtitleCache) ExtractFontBundle(ctx context.Context, key FontBundleKey
 		}
 		return data, nil
 	})
+	return ch, true
+}
+
+// fontBundleFlightOutcome converts a singleflight result into the cache API's
+// (data, ready, err) shape. A timeout or cancellation is "pending", not an
+// error: a client-facing caller degrades to an empty bundle while the
+// detached flight keeps running. A definitive extractor failure (no usable
+// attachment, malformed input) is surfaced so the handler can return 500.
+func fontBundleFlightOutcome(res singleflight.Result) ([]byte, bool, error) {
+	if res.Err != nil {
+		if errors.Is(res.Err, context.DeadlineExceeded) || errors.Is(res.Err, context.Canceled) {
+			return nil, false, nil
+		}
+		return nil, false, res.Err
+	}
+	data, _ := res.Val.([]byte)
+	return data, true, nil
+}
+
+// ExtractFontBundle returns the encoded font-bundle JSON for the key, reusing
+// a committed disk entry when present and otherwise running extract once under
+// single-flight and writing the result through to disk for every waiter. The
+// extraction runs detached from the leading request (bounded to
+// subtitleFontBundleExtractTimeout), so a canceled leader does not fail the
+// shared work other callers are waiting on. Callers that must not block on a
+// cold extraction use ExtractFontBundleWithin instead.
+func (c *SubtitleCache) ExtractFontBundle(ctx context.Context, key FontBundleKey, extract func(context.Context) ([]byte, error)) ([]byte, error) {
+	if data, ok := c.LookupFontBundle(key); ok {
+		return data, nil
+	}
+	if c == nil {
+		return extract(ctx)
+	}
+	resultCh, ok := c.startFontBundleFlight(ctx, key, extract)
+	if !ok {
+		// Not reliably keyable (e.g. a local row without mtime/size): extract
+		// uncached, matching the DV RPU memo's fallback.
+		return extract(ctx)
+	}
+	data, ready, err := fontBundleFlightOutcome(<-resultCh)
 	if err != nil {
 		return nil, err
 	}
-	data, _ := v.([]byte)
+	if !ready {
+		// The shared flight timed out; the blocking API has no pending state.
+		return nil, context.DeadlineExceeded
+	}
 	return data, nil
+}
+
+// ExtractFontBundleWithin serves a cached font bundle for key, or starts (or
+// joins) the detached single-flight extraction and waits up to wait for it.
+// It returns (data, true, nil) when a bundle is available, (nil, false, nil)
+// when the extraction is still running — the caller should serve an empty
+// bundle and let the flight land in the disk cache — or (nil, false, err) on
+// a definitive extractor failure. A wait <= 0 still registers the flight but
+// returns immediately, so concurrent requests coalesce instead of each
+// starting their own extraction. A nil cache or an unkeyable local row falls
+// back to a synchronous extract.
+func (c *SubtitleCache) ExtractFontBundleWithin(ctx context.Context, key FontBundleKey, wait time.Duration, extract func(context.Context) ([]byte, error)) ([]byte, bool, error) {
+	if data, ok := c.LookupFontBundle(key); ok {
+		return data, true, nil
+	}
+	if c == nil {
+		data, err := extract(ctx)
+		return data, err == nil, err
+	}
+	resultCh, ok := c.startFontBundleFlight(ctx, key, extract)
+	if !ok {
+		data, err := extract(ctx)
+		return data, err == nil, err
+	}
+	if wait <= 0 {
+		return nil, false, nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case res := <-resultCh:
+		return fontBundleFlightOutcome(res)
+	case <-timer.C:
+		return nil, false, nil
+	case <-ctx.Done():
+		// The caller gave up; the detached flight keeps running for the cache.
+		return nil, false, nil
+	}
+}
+
+// WarmFontBundleInBackground starts a detached, single-flighted font-bundle
+// extraction for key so a later HTTP fetch hits the disk cache instead of
+// paying the cold relay cost. It shares fontBundleFlight, the disk cache, and
+// the extraction budget with ExtractFontBundleWithin, so a warm racing an HTTP
+// request coalesces onto a single ffmpeg run. The returned channel closes when
+// the warm settled (ran, failed, was skipped, or another fill held a warm
+// slot); callers use it to release a request-scoped relay registration. A nil
+// receiver or disabled cache is a no-op.
+func (c *SubtitleCache) WarmFontBundleInBackground(key FontBundleKey, extract func(context.Context) ([]byte, error)) <-chan struct{} {
+	done := make(chan struct{})
+	if c == nil || extract == nil || c.dir() == "" {
+		close(done)
+		return done
+	}
+	if _, ok := c.LookupFontBundle(key); ok {
+		close(done)
+		return done
+	}
+	select {
+	case c.warmSem <- struct{}{}:
+	default:
+		slog.Debug("font bundle warm skipped: all warm slots busy", "file_id", key.FileID)
+		close(done)
+		return done
+	}
+	resultCh, ok := c.startFontBundleFlight(context.Background(), key, extract)
+	if !ok {
+		<-c.warmSem
+		close(done)
+		return done
+	}
+	// Wait for the shared flight even when this warm joined one led by another
+	// caller: the caller's relay registration must outlive the extraction that
+	// may be using it.
+	go func() {
+		defer close(done)
+		defer func() { <-c.warmSem }()
+		start := time.Now()
+		_, _, err := fontBundleFlightOutcome(<-resultCh)
+		if err != nil {
+			slog.Warn("font bundle warm failed",
+				"file_id", key.FileID, "elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+			return
+		}
+		slog.Info("font bundle warm finished",
+			"file_id", key.FileID, "elapsed_ms", time.Since(start).Milliseconds())
+	}()
+	return done
 }
 
 // fontBundleEntryPath resolves the committed cache-entry path for the key and

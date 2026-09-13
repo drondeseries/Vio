@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -219,6 +220,221 @@ func TestExtractFontBundleLeaderCancellationDoesNotFailWaiters(t *testing.T) {
 	}
 	if err := <-leaderDone; err != nil {
 		t.Fatalf("leader failed after cancellation: %v", err)
+	}
+}
+
+// waitForFontBundle polls until key has a committed entry, failing the test
+// if it never lands. Polling on observable cache state keeps the wait free of
+// fixed sleeps that are flaky under load.
+func waitForFontBundle(t *testing.T, c *SubtitleCache, key FontBundleKey) []byte {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if data, ok := c.LookupFontBundle(key); ok {
+			return data
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("font bundle was never committed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A request whose extraction is still in flight must return promptly so the
+// handler can serve an empty bundle instead of holding a 60s connection. The
+// detached extraction must keep running and commit for the next fetch.
+func TestExtractFontBundleWithinReturnsPendingWhileInFlight(t *testing.T) {
+	c := newFontCache(t)
+	key := FontBundleKey{FileID: 7, PinnedResult: "result-inflight", FFmpegPath: "/usr/bin/ffmpeg"}
+
+	release := make(chan struct{})
+	var calls atomic.Int64
+	extract := func(context.Context) ([]byte, error) {
+		calls.Add(1)
+		<-release
+		return []byte("late bundle"), nil
+	}
+
+	start := time.Now()
+	data, ready, err := c.ExtractFontBundleWithin(t.Context(), key, 40*time.Millisecond, extract)
+	if err != nil {
+		t.Fatalf("pending extraction returned error: %v", err)
+	}
+	if ready {
+		t.Fatalf("pending extraction reported ready with %q", data)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("bounded wait took %s, want prompt return", elapsed)
+	}
+
+	close(release)
+	if got := string(waitForFontBundle(t, c, key)); got != "late bundle" {
+		t.Fatalf("detached extraction committed %q, want late bundle", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("extractor ran %d times, want 1", got)
+	}
+}
+
+// The pending/fast-empty path must still register the shared flight so
+// concurrent requests coalesce onto a single extraction.
+func TestExtractFontBundleWithinCoalescesParallelRequests(t *testing.T) {
+	c := newFontCache(t)
+	key := FontBundleKey{FileID: 7, PinnedResult: "result-stampede", FFmpegPath: "/usr/bin/ffmpeg"}
+
+	release := make(chan struct{})
+	var calls atomic.Int64
+	extract := func(context.Context) ([]byte, error) {
+		calls.Add(1)
+		<-release
+		return []byte("shared"), nil
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			data, ready, err := c.ExtractFontBundleWithin(context.Background(), key, 30*time.Millisecond, extract)
+			if err != nil || ready || data != nil {
+				t.Errorf("parallel pending request = (%q, %v, %v), want pending", data, ready, err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(release)
+
+	if got := string(waitForFontBundle(t, c, key)); got != "shared" {
+		t.Fatalf("committed bundle = %q, want shared", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("extractor ran %d times, want exactly 1", got)
+	}
+}
+
+// A definitive, non-timeout failure is the only case that should surface to
+// the caller (which turns it into a 500); ambiguous timeouts are handled as
+// pending so the client degrades to default fonts.
+func TestExtractFontBundleWithinReportsDefinitiveFailure(t *testing.T) {
+	c := newFontCache(t)
+	key := FontBundleKey{FileID: 7, PinnedResult: "result-fail", FFmpegPath: "/usr/bin/ffmpeg"}
+	want := errors.New("malformed container")
+
+	data, ready, err := c.ExtractFontBundleWithin(t.Context(), key, time.Second, func(context.Context) ([]byte, error) {
+		return nil, want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
+	}
+	if ready || data != nil {
+		t.Fatalf("failed extraction returned (%q, ready=%v)", data, ready)
+	}
+}
+
+func TestExtractFontBundleWithinTreatsTimeoutAsPending(t *testing.T) {
+	c := newFontCache(t)
+	key := FontBundleKey{FileID: 7, PinnedResult: "result-timeout", FFmpegPath: "/usr/bin/ffmpeg"}
+
+	data, ready, err := c.ExtractFontBundleWithin(t.Context(), key, time.Second, func(context.Context) ([]byte, error) {
+		return nil, context.DeadlineExceeded
+	})
+	if err != nil {
+		t.Fatalf("timeout surfaced as an error: %v", err)
+	}
+	if ready || data != nil {
+		t.Fatalf("timed-out extraction returned (%q, ready=%v), want pending", data, ready)
+	}
+}
+
+// The pre-warm path shares the disk cache and single-flight with the HTTP
+// path, and its done channel lets the caller release a request-scoped relay
+// registration exactly once after the extraction settles.
+func TestWarmFontBundleInBackgroundFillsCache(t *testing.T) {
+	c := newFontCache(t)
+	key := FontBundleKey{FileID: 7, PinnedResult: "result-warm", FFmpegPath: "/usr/bin/ffmpeg"}
+
+	var calls atomic.Int64
+	done := c.WarmFontBundleInBackground(key, func(context.Context) ([]byte, error) {
+		calls.Add(1)
+		return []byte("warmed"), nil
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm did not settle")
+	}
+	if got := string(waitForFontBundle(t, c, key)); got != "warmed" {
+		t.Fatalf("warmed bundle = %q", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("extractor ran %d times, want 1", got)
+	}
+}
+
+func TestWarmFontBundleInBackgroundSkipsCached(t *testing.T) {
+	c := newFontCache(t)
+	key := FontBundleKey{FileID: 7, PinnedResult: "result-warm-cached", FFmpegPath: "/usr/bin/ffmpeg"}
+	if _, err := c.ExtractFontBundle(t.Context(), key, func(context.Context) ([]byte, error) {
+		return []byte("already"), nil
+	}); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	var calls atomic.Int64
+	done := c.WarmFontBundleInBackground(key, func(context.Context) ([]byte, error) {
+		calls.Add(1)
+		return []byte("re-extract"), nil
+	})
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cached warm did not settle")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("cached warm re-ran extractor %d times, want 0", got)
+	}
+}
+
+// The warm must join the same flight an HTTP request would start, so a warm
+// racing a request cannot fan out into two ffmpeg runs.
+func TestWarmFontBundleSharesFlightWithExtractWithin(t *testing.T) {
+	c := newFontCache(t)
+	key := FontBundleKey{FileID: 7, PinnedResult: "result-warm-race", FFmpegPath: "/usr/bin/ffmpeg"}
+
+	release := make(chan struct{})
+	var calls atomic.Int64
+	entered := make(chan struct{}, 1)
+	extract := func(context.Context) ([]byte, error) {
+		calls.Add(1)
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		return []byte("raced"), nil
+	}
+
+	warmDone := c.WarmFontBundleInBackground(key, extract)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("warm never entered the extractor")
+	}
+	// A request arriving while the warm leads waits (briefly) and then returns
+	// pending; it must not start a second extraction.
+	_, ready, err := c.ExtractFontBundleWithin(t.Context(), key, 20*time.Millisecond, extract)
+	if err != nil || ready {
+		t.Fatalf("racing request = (ready=%v, err=%v), want pending", ready, err)
+	}
+	close(release)
+	select {
+	case <-warmDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm did not settle")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("extractor ran %d times, want exactly 1", got)
 	}
 }
 
