@@ -2321,6 +2321,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	// scrobbles or analysis work for the short-lived session they roll back.
 	h.raceCopySafetyV3(effectiveFile.ID, result.Plan)
 	h.warmVirtualSubtitlesV3(r.Context(), session, effectiveFile)
+	h.warmVirtualFontBundleV3(r.Context(), session, effectiveFile)
 	h.enqueuePlaybackStartSideEffectsV3(r.Context(), session, effectiveFile, userID, profileID, plannedAudioTrackIndexV3(result, audioIndex))
 	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, Event: playback.RouteEventPlanSelectedV3, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
 	return response, nil
@@ -4531,6 +4532,88 @@ func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *p
 		wg.Wait()
 		cleanup()
 	}()
+}
+
+// warmVirtualFontBundleV3 pre-warms the font-bundle cache for a virtual
+// source's effective file when it carries at least one ASS/SSA embedded track.
+// Font bundles are keyed per file (not per track), so exactly one extraction is
+// scheduled however many ASS tracks the release has. It mirrors
+// warmVirtualSubtitlesV3: it resolves its own relay registration, runs the
+// extraction detached under the cache's warm budget, and holds the relay open
+// until the extraction settles — a relay URL released mid-extract would 404
+// under ffmpeg. Best-effort by design: resolution failure, warm-slot
+// exhaustion, and an already-cached bundle all degrade to the existing
+// cold-serve path with no user-visible error. The returned channel closes when
+// the warm settled (or was skipped); production ignores it.
+func (h *PlaybackHandler) warmVirtualFontBundleV3(ctx context.Context, session *playback.Session, file *models.MediaFile) <-chan struct{} {
+	done := make(chan struct{})
+	if h == nil || h.SubtitleCache == nil || file == nil || session == nil {
+		close(done)
+		return done
+	}
+	if !isVirtualPlaybackFile(file) {
+		close(done)
+		return done
+	}
+	// The start path holds a session copy captured before UpdateStreamState
+	// wrote VirtualSourceURI, so the effective file's URI is the reliable
+	// source; prefer the live session when it has one. Both name the same
+	// release the serve path will bind.
+	virtualURI := file.FilePath
+	if session.VirtualSourceURI != "" {
+		virtualURI = session.VirtualSourceURI
+	}
+	if virtualURI == "" {
+		close(done)
+		return done
+	}
+	tracks := session.VirtualSubtitleTracks
+	if len(tracks) == 0 {
+		tracks = file.SubtitleTracks
+	}
+	hasASS := false
+	for _, track := range tracks {
+		if playback.IsASS(track.Codec) {
+			hasASS = true
+			break
+		}
+	}
+	if !hasASS {
+		close(done)
+		return done
+	}
+	ffmpegPath := h.playbackConfig().FFmpegPath
+	cacheKey := fontBundleCacheKey(file, virtualURI, ffmpegPath)
+	if cacheKey.PinnedResult == "" {
+		// Uncacheable without the pinned candidate anchor: the identity would
+		// rotate with the relay URL, so there is nothing stable to warm.
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		resolved, cleanup, err := h.resolveVirtualInputURI(
+			context.WithoutCancel(ctx), file.FilePath, file.VirtualOwnerInstallationID,
+			session.UserID, session.ProfileID, false, nil, "",
+		)
+		if err != nil {
+			slog.DebugContext(ctx, "virtual font bundle pre-warm skipped: resolve failed",
+				"component", "api", "file_id", file.ID, "error", err)
+			return
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+		warmDone := h.SubtitleCache.WarmFontBundleInBackground(cacheKey, func(extractCtx context.Context) ([]byte, error) {
+			fonts, extractErr := playback.ExtractAttachedSubtitleFonts(extractCtx, resolved.URL, ffmpegPath)
+			if extractErr != nil {
+				return nil, extractErr
+			}
+			return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
+		})
+		<-warmDone
+	}()
+	return done
 }
 
 func plannedAudioTrackIndexV3(result playback.PlannerResultV3, fallback int) int {
