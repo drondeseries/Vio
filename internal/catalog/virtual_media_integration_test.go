@@ -3,9 +3,10 @@ package catalog
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,9 +78,9 @@ func newVirtualMediaTestPool(t *testing.T) *pgxpool.Pool {
 }
 
 // waitForBlockedAdvisoryLock polls pg_locks until another backend holds an
-// ungranted advisory lock, proving a concurrent writer actually queued
-// behind held locks rather than running sequentially.
-func waitForBlockedAdvisoryLock(t *testing.T, pool *pgxpool.Pool, timeout time.Duration) {
+// ungranted advisory lock (optionally matching a specific lockKey), proving a
+// concurrent writer actually queued behind held locks rather than running sequentially.
+func waitForBlockedAdvisoryLock(t *testing.T, pool *pgxpool.Pool, lockKey string, timeout time.Duration) {
 	t.Helper()
 	ctx := context.Background()
 	var self int
@@ -89,7 +90,16 @@ func waitForBlockedAdvisoryLock(t *testing.T, pool *pgxpool.Pool, timeout time.D
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		var blocked int
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted AND pid <> $1`, self).Scan(&blocked); err != nil {
+		var err error
+		if lockKey != "" {
+			err = pool.QueryRow(ctx, `
+				SELECT count(*) FROM pg_locks 
+				WHERE locktype='advisory' AND NOT granted AND pid <> $1 
+				  AND ((classid::bigint << 32) | (objid::bigint & 4294967295)) = hashtextextended($2, 0)`, self, lockKey).Scan(&blocked)
+		} else {
+			err = pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted AND pid <> $1`, self).Scan(&blocked)
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
 		if blocked > 0 {
@@ -100,20 +110,21 @@ func waitForBlockedAdvisoryLock(t *testing.T, pool *pgxpool.Pool, timeout time.D
 	t.Fatal("concurrent writer never queued behind the held release locks")
 }
 
+var testReleaseSuffixCounter atomic.Uint64
+
 // uniqueReleaseSuffix returns per-run digits for provider identities written
 // to append-only tables (override history, metadata queue, provider IDs, and
-// content-keyed claims). Canonical numeric schemes accept the result.
+// content-keyed claims). Canonical numeric schemes accept the result. The
+// scheme combines the process ID, nanosecond time, and an atomic counter so
+// concurrent test processes cannot collide within the same second.
 func uniqueReleaseSuffix(t *testing.T) string {
 	t.Helper()
-	n := time.Now().UnixNano()
-	if n < 0 {
-		n = -n
+	c := testReleaseSuffixCounter.Add(1)
+	ns := time.Now().UnixNano()
+	if ns < 0 {
+		ns = -ns
 	}
-	s := strconv.FormatInt(n, 10)
-	for len(s) < 10 {
-		s = "0" + s
-	}
-	return s[len(s)-10:]
+	return fmt.Sprintf("%02d%06d%02d", os.Getpid()%100, uint64(ns/1000)%1000000, c%100)
 }
 
 func TestPresenceRequiresFileInMatchingEnabledLibrary(t *testing.T) {
@@ -2337,7 +2348,8 @@ func TestEpisodeMaterializationSerializesWithConcurrentOverrideWrite(t *testing.
 	// Prove the writer actually queued behind the held release locks
 	// before releasing materialization: otherwise the test could pass
 	// with effectively sequential execution.
-	waitForBlockedAdvisoryLock(t, pool, 30*time.Second)
+	overrideLockKey := ReleaseIdentity{MediaType: "episode", Provider: "tvdb", ProviderID: tvdbID, SeasonNumber: 1, EpisodeNumber: 1}.lockKey()
+	waitForBlockedAdvisoryLock(t, pool, overrideLockKey, 30*time.Second)
 	// Let materialization commit first: its decision predates the override.
 	close(releaseHook)
 	select {
@@ -2357,14 +2369,14 @@ func TestEpisodeMaterializationSerializesWithConcurrentOverrideWrite(t *testing.
 		t.Fatal("override write deadlocked with materialization")
 	}
 	var files int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path='`+episodePath+`'`, seriesID).Scan(&files); err != nil || files != 1 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path=$2`, seriesID, episodePath).Scan(&files); err != nil || files != 1 {
 		t.Fatalf("pre-override decision must stand: files=%d err=%v", files, err)
 	}
 	// A follow-up run observes the committed override and withdraws the file.
 	if err := repo.MaterializeVirtualPlaybackEpisodes(ctx, seriesID); err != nil {
 		t.Fatalf("follow-up materialization failed: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path='virtual://series/tvdb/209/1/1'`, seriesID).Scan(&files); err != nil || files != 0 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path=$2`, seriesID, episodePath).Scan(&files); err != nil || files != 0 {
 		t.Fatalf("committed future override must withdraw the file: files=%d err=%v", files, err)
 	}
 }

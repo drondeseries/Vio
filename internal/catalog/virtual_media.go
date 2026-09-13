@@ -247,17 +247,22 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	if in.MediaType == "movie" && r.ReleaseOverrides != nil {
 		// The item row is locked and the exclusive content lock (taken at
 		// transaction start) holds alias writers out, so this is the
-		// authoritative alias set. Membership must match the pre-
-		// transaction snapshot exactly: a removed alias must not retain
-		// authority through its captured override, and an added alias must
-		// be decided on, not silently unioned. Either case is a retryable
-		// conflict because the pre-transaction verdict is stale.
+		// authoritative alias set. External alias modifications trigger a
+		// conflict, while registrar self-corrections (where ownsItemMetadata is true)
+		// are allowed as long as the post-mutation identities are covered by the
+		// evaluated snapshot.
 		freshIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", contentID, "movie", in.TMDBID, "", in.IMDbID, 0, 0)
 		if err != nil {
 			return nil, err
 		}
-		if len(releaseSnapshot) > 0 && !releaseIdentitySetsEqual(snapshotIdentities(releaseSnapshot), freshIDs) {
-			return nil, fmt.Errorf("%w: release alias set changed during registration", ErrReleaseOverrideConflict)
+		if len(releaseSnapshot) > 0 {
+			if ownsItemMetadata {
+				if !releaseIdentitiesCovered(snapshotIdentities(releaseSnapshot), freshIDs) {
+					return nil, fmt.Errorf("%w: release alias set changed during registration", ErrReleaseOverrideConflict)
+				}
+			} else if !releaseIdentitySetsEqual(snapshotIdentities(releaseSnapshot), freshIDs) {
+				return nil, fmt.Errorf("%w: release alias set changed during registration", ErrReleaseOverrideConflict)
+			}
 		}
 		freshEntries, err := captureReleaseOverridesTx(ctx, tx, freshIDs)
 		if err != nil {
@@ -276,6 +281,22 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 				return nil, err
 			}
 			eligible = physical
+		} else {
+			// Without an active override on fresh identities and without physical possession,
+			// re-verify provider release evidence for fresh identities so a removed alias's
+			// override cannot smuggle an unreleased movie in. A missing or
+			// malformed TMDB identity fails closed: provider failure and
+			// absent evidence never imply release.
+			trimmedTMDB := strings.TrimSpace(in.TMDBID)
+			tmdbID, convErr := strconv.Atoi(trimmedTMDB)
+			if trimmedTMDB == "" || convErr != nil || tmdbID <= 0 {
+				return nil, fmt.Errorf("%w: movie has no usable TMDB identity for release verification", ErrProviderUnavailable)
+			}
+			providerReleased, err := newTheatricalReleaseGate(r.TMDBDigitalReleases).lookupProvider(ctx, tmdbID)
+			if err != nil {
+				return nil, err
+			}
+			eligible = providerReleased && !isFutureDate(in.Year, "")
 		}
 		movieIDs = freshIDs
 	}

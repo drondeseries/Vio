@@ -110,12 +110,17 @@ DELETE /api/v1/admin/literary-works/{work_id}/items/{content_id}	non-media
 GET /api/v1/admin/markers/files/{fileId}/history	non-media
 GET /api/v1/admin/markers/history	non-media
 GET /api/v1/admin/markers/items/{id}/history	non-media
+GET /api/v1/admin/needs-release-metadata	non-media
+POST /api/v1/admin/needs-release-metadata/retry	non-media
 DELETE /api/v1/admin/notifications/push/relay	non-media
 POST /api/v1/admin/notifications/push/relay/register	non-media
 GET /api/v1/admin/playback-history	non-media
 GET /api/v1/admin/playback-routing/capabilities	non-media
 GET /api/v1/admin/rate-limits/config	non-media
 PUT /api/v1/admin/rate-limits/config	non-media
+DELETE /api/v1/admin/release-overrides	non-media
+GET /api/v1/admin/release-overrides	non-media
+PUT /api/v1/admin/release-overrides	non-media
 GET /api/v1/admin/request-integrations	non-media
 POST /api/v1/admin/request-integrations	non-media
 DELETE /api/v1/admin/request-integrations/{id}	non-media

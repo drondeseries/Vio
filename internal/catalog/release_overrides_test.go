@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"testing"
@@ -200,5 +201,48 @@ func TestReleaseOverrideConflictingAliasesFailClosed(t *testing.T) {
 	lookup := memoryReleaseOverrides{ids[0]: {ReleaseAt: &past}, ids[1]: {ReleaseAt: &future}}
 	if allowed, active, err := releaseOverrideDecision(context.Background(), lookup, ids); err != nil || allowed || !active {
 		t.Fatalf("%v %v %v", allowed, active, err)
+	}
+}
+
+func TestValidateReleaseSnapshotRevisionPresence(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	var actor int
+	if err := pool.QueryRow(ctx, `INSERT INTO users(username,role,enabled) VALUES($1,'admin',true) RETURNING id`, fmt.Sprintf("snapshot-%s", uniqueReleaseSuffix(t))).Scan(&actor); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM users WHERE id=$1`, actor) })
+	repo := NewReleaseOverrideRepository(pool)
+	// Canonical TMDB provider IDs: no leading zeros. UnixNano values are
+	// 19-digit and distinct after the offset, unlike uniqueReleaseSuffix.
+	base := time.Now().UnixNano()
+	recorded := ReleaseIdentity{MediaType: "movie", Provider: "tmdb", ProviderID: strconv.FormatInt(base, 10)}
+	made, err := repo.Mutate(ctx, actor, ReleaseOverrideMutation{ReleaseIdentity: recorded, ReleaseAt: "2020-01-01", EvidenceNote: "verified publication"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if made.Revision != 1 {
+		t.Fatalf("recorded revision = %d, want 1", made.Revision)
+	}
+	unrecorded := ReleaseIdentity{MediaType: "movie", Provider: "tmdb", ProviderID: strconv.FormatInt(base+1+int64(os.Getpid()%1000), 10)}
+	validate := func(snapshot []ReleaseOverride) error {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		return validateReleaseSnapshotTx(ctx, tx, snapshot)
+	}
+	if err := validate([]ReleaseOverride{{ReleaseIdentity: recorded, Revision: made.Revision}}); err != nil {
+		t.Fatalf("matching revision rejected: %v", err)
+	}
+	if err := validate([]ReleaseOverride{{ReleaseIdentity: recorded, Revision: made.Revision + 1}}); !errors.Is(err, ErrReleaseOverrideConflict) {
+		t.Fatalf("mismatched revision = %v, want conflict", err)
+	}
+	if err := validate([]ReleaseOverride{{ReleaseIdentity: unrecorded}}); err != nil {
+		t.Fatalf("never-recorded zero revision rejected: %v", err)
+	}
+	if err := validate([]ReleaseOverride{{ReleaseIdentity: unrecorded, Revision: 3}}); !errors.Is(err, ErrReleaseOverrideConflict) {
+		t.Fatalf("unrecorded nonzero revision = %v, want conflict", err)
 	}
 }

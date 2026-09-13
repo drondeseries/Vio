@@ -1412,9 +1412,9 @@ func (r *ItemRepository) upsert(ctx context.Context, execer itemExecer, item *mo
 			rating_tmdb = EXCLUDED.rating_tmdb,
 			rating_rt_critic = EXCLUDED.rating_rt_critic,
 			rating_rt_audience = EXCLUDED.rating_rt_audience,
-			imdb_id = EXCLUDED.imdb_id,
-			tmdb_id = EXCLUDED.tmdb_id,
-			tvdb_id = EXCLUDED.tvdb_id,
+			imdb_id = COALESCE(NULLIF(EXCLUDED.imdb_id, ''), media_items.imdb_id),
+			tmdb_id = COALESCE(NULLIF(EXCLUDED.tmdb_id, ''), media_items.tmdb_id),
+			tvdb_id = COALESCE(NULLIF(EXCLUDED.tvdb_id, ''), media_items.tvdb_id),
 			poster_path = EXCLUDED.poster_path,
 			poster_source_path = EXCLUDED.poster_source_path,
 			poster_thumbhash = EXCLUDED.poster_thumbhash,
@@ -2065,7 +2065,7 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 	// retryable conflict: removed aliases must not retain authority, and
 	// added aliases must go through preparation, not silent union.
 	if mediaType == "movie" {
-		movieIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", item.ContentID, "movie", rowTmdbID, "", rowImdbID, 0, 0)
+		movieIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", item.ContentID, "movie", item.TmdbID, item.TvdbID, item.ImdbID, 0, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -2938,16 +2938,33 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			WHERE ep.season_number>0
 			  AND ep.episode_number>0
 			  AND (
-			      verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
-			      -- Same local-provenance fallback as materialization:
-			      -- locally proven episodes are releasable without dates.
-			      OR ep.metadata_source='local'
-			      OR EXISTS(
-			          SELECT 1 FROM media_files proven
-			          WHERE proven.episode_id=ep.content_id
-			            AND proven.container<>'virtual'
-			            AND proven.file_path NOT LIKE 'virtual://%'
-			      )
+			      CASE 
+			          WHEN EXISTS (
+			              SELECT 1 FROM verified_release_override_history h
+			              JOIN (
+			                  SELECT 'tmdb'::text AS provider, tmdb_id AS provider_id FROM media_items WHERE content_id=ep.series_id
+			                  UNION SELECT 'tvdb', tvdb_id FROM media_items WHERE content_id=ep.series_id
+			                  UNION SELECT 'imdb', imdb_id FROM media_items WHERE content_id=ep.series_id
+			                  UNION SELECT provider, provider_id FROM media_item_provider_ids WHERE content_id=ep.series_id AND item_type='series'
+			              ) i USING (provider, provider_id)
+			              WHERE h.media_type='episode' AND h.season_number=ep.season_number AND h.episode_number=ep.episode_number
+			                AND h.release_at IS NOT NULL
+			          ) THEN (
+			              verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
+			          )
+			          ELSE (
+			              -- No override history: possession alone proves
+			              -- release. A bare air_date never authorizes
+			              -- materialization without verified evidence.
+			              ep.metadata_source='local'
+			              OR EXISTS(
+			                  SELECT 1 FROM media_files proven
+			                  WHERE proven.episode_id=ep.content_id
+			                    AND proven.container<>'virtual'
+			                    AND proven.file_path NOT LIKE 'virtual://%'
+			              )
+			          )
+			      END
 			  )
 			  AND (
 			      NOT EXISTS (
@@ -2988,18 +3005,40 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			        AND (collection_claim.source_key = 'collection' OR collection_claim.source_key LIKE 'collection:%')
 			  )
 			  AND (
-			      NOT COALESCE(verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp(),false)
+			      (
+			          CASE 
+			              WHEN EXISTS (
+			                  SELECT 1 FROM verified_release_override_history h
+			                  JOIN (
+			                      SELECT 'tmdb'::text AS provider, tmdb_id AS provider_id FROM media_items WHERE content_id=ep.series_id
+			                      UNION SELECT 'tvdb', tvdb_id FROM media_items WHERE content_id=ep.series_id
+			                      UNION SELECT 'imdb', imdb_id FROM media_items WHERE content_id=ep.series_id
+			                      UNION SELECT provider, provider_id FROM media_item_provider_ids WHERE content_id=ep.series_id AND item_type='series'
+			                  ) i USING (provider, provider_id)
+			                  WHERE h.media_type='episode' AND h.season_number=ep.season_number AND h.episode_number=ep.episode_number
+			                    AND h.release_at IS NOT NULL
+			              ) THEN (
+			                  verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') > statement_timestamp()
+			              )
+			              ELSE (
+			                  -- No override history: an existing virtual
+			                  -- file is stale only when the episode is
+			                  -- neither locally proven nor physically
+			                  -- possessed. Bare air_date transitions do
+			                  -- not drive staleness without verified
+			                  -- evidence.
+			                  COALESCE(ep.metadata_source,'')<>'local'
+			                  AND NOT EXISTS(
+			                      SELECT 1 FROM media_files proven
+			                      WHERE proven.episode_id=ep.content_id
+			                        AND proven.container<>'virtual'
+			                        AND proven.file_path NOT LIKE 'virtual://%'
+			                  )
+			              )
+			          END
+			      )
 			      OR ep.season_number<=0
 			      OR ep.episode_number<=0
-			  )
-			  -- Locally proven episodes keep their files under the same
-			  -- fallback materialization applies; they are not stale.
-			  AND COALESCE(ep.metadata_source,'')<>'local'
-			  AND NOT EXISTS(
-			      SELECT 1 FROM media_files proven
-			      WHERE proven.episode_id=ep.content_id
-			        AND proven.container<>'virtual'
-			        AND proven.file_path NOT LIKE 'virtual://%'
 			  )
 		)
 		SELECT nr.content_id
@@ -5065,6 +5104,43 @@ func (r *ItemRepository) UpdateMetadataTx(ctx context.Context, tx pgx.Tx, conten
 	}
 	if err := r.searchIndexEvents.EnqueueUpsert(ctx, tx, contentID); err != nil {
 		return fmt.Errorf("enqueueing catalog search metadata update: %w", err)
+	}
+	return nil
+}
+
+// UpdateStatus updates only the status and updated_at columns of media_items.
+// It avoids full-row upserts that could clobber concurrent alias updates.
+func (r *ItemRepository) UpdateStatus(ctx context.Context, contentID, status string) error {
+	if r == nil || r.pool == nil {
+		return ErrItemNotFound
+	}
+	tag, err := r.pool.Exec(ctx, `UPDATE media_items SET status = $2, updated_at = NOW() WHERE content_id = $1`, contentID, status)
+	if err != nil {
+		return fmt.Errorf("update item status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrItemNotFound
+	}
+	return nil
+}
+
+// UpdateEpisodeMetadataState updates only the episode metadata completeness
+// columns and updated_at on media_items, preventing full-row upserts from clobbering aliases.
+func (r *ItemRepository) UpdateEpisodeMetadataState(ctx context.Context, seriesID string, incomplete bool, lastCheckedAt *time.Time) error {
+	if r == nil || r.pool == nil {
+		return ErrItemNotFound
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE media_items 
+		SET episode_metadata_incomplete = $2,
+		    episode_metadata_last_checked_at = $3,
+		    updated_at = NOW()
+		WHERE content_id = $1`, seriesID, incomplete, lastCheckedAt)
+	if err != nil {
+		return fmt.Errorf("update episode metadata state: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrItemNotFound
 	}
 	return nil
 }

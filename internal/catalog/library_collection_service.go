@@ -18,6 +18,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/collage"
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TMDBCollectionEntry is a lightweight TMDB preset result used by the collection sync.
@@ -100,7 +102,10 @@ type theatricalReleaseGate struct {
 	overrides      ReleaseOverrideLookup
 	// canonicalIDs unions source-entry IDs with a catalog-resident same
 	// movie's IDs. Nil outside collection sync; set by releaseGate.
-	canonicalIDs func(ctx context.Context, tmdbID int, imdbID string) (int, string)
+	// Conflicts fail closed: on error the entry IDs are kept and the
+	// error is recorded on the collection tracker so the sync surfaces
+	// it instead of deciding on a partial identity set.
+	canonicalIDs func(ctx context.Context, tmdbID int, imdbID string) (int, string, error)
 }
 
 func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker, overrides ...ReleaseOverrideLookup) *theatricalReleaseGate {
@@ -170,39 +175,127 @@ func isFutureDate(year int, releaseDate string) bool {
 
 // canonicalMovieIDs unions source-entry IDs with a catalog-resident same
 // movie's IDs so a stored permitting alias is visible to the prefilter even
-// when the resident item lives outside the target libraries. Lookup failures
-// degrade to the entry IDs; the authoritative decision still runs later.
-func (s *LibraryCollectionService) canonicalMovieIDs(ctx context.Context, tmdbID int, imdbID string) (int, string) {
+// when the resident item lives outside the target libraries. Conflicting
+// owners across the supplied aliases fail closed to the entry IDs (no
+// arbitrary LIMIT 1 winner); query errors are returned to the caller so
+// infrastructure failure is never confused with absence.
+func (s *LibraryCollectionService) canonicalMovieIDs(ctx context.Context, tmdbID int, imdbID string) (int, string, error) {
+	return s.canonicalMovieIdentities(ctx, tmdbID, imdbID)
+}
+
+// canonicalMovieIdentities is the error-returning core of canonicalMovieIDs.
+// Multiple distinct content owners across the supplied aliases is a conflict:
+// the entry IDs are returned along with an error so callers can fail closed.
+func (s *LibraryCollectionService) canonicalMovieIdentities(ctx context.Context, tmdbID int, imdbID string) (int, string, error) {
 	if s == nil || s.items == nil {
-		return tmdbID, imdbID
+		return tmdbID, imdbID, nil
 	}
 	tmdbText := ""
 	if tmdbID > 0 {
 		tmdbText = strconv.Itoa(tmdbID)
 	}
+	imdbID = strings.TrimSpace(imdbID)
 	if tmdbText == "" && imdbID == "" {
-		return tmdbID, imdbID
+		return tmdbID, imdbID, nil
 	}
 	item, err := s.items.GetByExternalID(ctx, tmdbText, imdbID, "", "movie")
-	if err != nil || item == nil {
-		return tmdbID, imdbID
+	if err != nil && !errors.Is(err, ErrItemNotFound) {
+		return tmdbID, imdbID, fmt.Errorf("resolve canonical movie by external ID: %w", err)
 	}
-	if tmdbID <= 0 {
-		if n, convErr := strconv.Atoi(strings.TrimSpace(item.TmdbID)); convErr == nil && n > 0 {
-			tmdbID = n
+	contentIDs := map[string]struct{}{}
+	if item != nil {
+		contentIDs[item.ContentID] = struct{}{}
+	}
+	pool := (*pgxpool.Pool)(nil)
+	if s.collections != nil {
+		pool = s.collections.pool
+	}
+	// Always merge primary and alias-table owners: a primary hit on one
+	// alias must not mask a divergent owner recorded for the other alias
+	// in the provider table.
+	if pool != nil {
+		rows, err := pool.Query(ctx, `
+			SELECT DISTINCT content_id FROM media_item_provider_ids
+			WHERE item_type = 'movie' AND (
+				(provider = 'tmdb' AND provider_id = $1 AND $1 <> '') OR
+				(provider = 'imdb' AND provider_id = $2 AND $2 <> '')
+			)`, tmdbText, imdbID)
+		if err != nil {
+			return tmdbID, imdbID, fmt.Errorf("resolve canonical movie by provider alias: %w", err)
+		}
+		cids, qerr := pgx.CollectRows(rows, pgx.RowTo[string])
+		if qerr != nil {
+			return tmdbID, imdbID, fmt.Errorf("collect canonical movie aliases: %w", qerr)
+		}
+		for _, cid := range cids {
+			if cid != "" {
+				contentIDs[cid] = struct{}{}
+			}
 		}
 	}
-	if imdbID == "" {
-		imdbID = strings.TrimSpace(item.ImdbID)
+	if len(contentIDs) > 1 {
+		return tmdbID, imdbID, fmt.Errorf("%w: tmdb %q and imdb %q resolve to %d distinct movies", ErrReleaseOverrideConflict, tmdbText, imdbID, len(contentIDs))
 	}
-	return tmdbID, imdbID
+	if item == nil {
+		for cid := range contentIDs {
+			loaded, lerr := s.items.GetByID(ctx, cid)
+			if lerr != nil {
+				return tmdbID, imdbID, fmt.Errorf("load canonical movie %q: %w", cid, lerr)
+			}
+			item = loaded
+		}
+	}
+	contentID := ""
+	if item != nil {
+		contentID = item.ContentID
+		if tmdbID <= 0 {
+			if n, convErr := strconv.Atoi(strings.TrimSpace(item.TmdbID)); convErr == nil && n > 0 {
+				tmdbID = n
+			}
+		}
+		if imdbID == "" {
+			imdbID = strings.TrimSpace(item.ImdbID)
+		}
+	}
+	if contentID != "" && pool != nil {
+		if imdbID == "" {
+			var provIMDb string
+			if qerr := pool.QueryRow(ctx, `SELECT provider_id FROM media_item_provider_ids WHERE content_id = $1 AND provider = 'imdb' LIMIT 1`, contentID).Scan(&provIMDb); qerr != nil && !errors.Is(qerr, pgx.ErrNoRows) {
+				return tmdbID, imdbID, fmt.Errorf("backfill canonical imdb alias: %w", qerr)
+			} else if qerr == nil {
+				imdbID = strings.TrimSpace(provIMDb)
+			}
+		}
+		if tmdbID <= 0 {
+			var provTMDB string
+			if qerr := pool.QueryRow(ctx, `SELECT provider_id FROM media_item_provider_ids WHERE content_id = $1 AND provider = 'tmdb' LIMIT 1`, contentID).Scan(&provTMDB); qerr != nil && !errors.Is(qerr, pgx.ErrNoRows) {
+				return tmdbID, imdbID, fmt.Errorf("backfill canonical tmdb alias: %w", qerr)
+			} else if qerr == nil {
+				if n, convErr := strconv.Atoi(strings.TrimSpace(provTMDB)); convErr == nil && n > 0 {
+					tmdbID = n
+				}
+			}
+		}
+	}
+	return tmdbID, imdbID, nil
 }
 
 func (g *theatricalReleaseGate) skipTheatricalMovie(ctx context.Context, tmdbID int, imdbID, title string, year int, releaseDate string) bool {
 	// Union the source entry with a catalog-resident same movie so a stored
 	// permitting alias is visible even outside the target libraries.
+	// Canonical conflicts fail closed: the entry is skipped and the error
+	// is recorded so the sync surfaces it instead of deciding on stale IDs.
 	if g.canonicalIDs != nil {
-		tmdbID, imdbID = g.canonicalIDs(ctx, tmdbID, imdbID)
+		resolvedTMDB, resolvedIMDb, canonicalErr := g.canonicalIDs(ctx, tmdbID, imdbID)
+		if canonicalErr != nil {
+			if ctx != nil {
+				if tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker); tracker != nil {
+					tracker.err = canonicalErr
+				}
+			}
+			return true
+		}
+		tmdbID, imdbID = resolvedTMDB, resolvedIMDb
 	}
 	tmdbText := ""
 	if tmdbID > 0 {
@@ -677,27 +770,26 @@ func (s *LibraryCollectionService) EnsureCollectionItemMaterializedWithOptions(
 			return nil, err
 		}
 		allowed, active := decideReleaseOverrides(now, opts.releaseSnapshot)
-		if !active && isFutureDate(item.Year, relDate) {
-			err := fmt.Errorf("%w: movie is not yet released", ErrProviderUnavailable)
-			if tracker != nil {
-				tracker.err = err
-			}
-			return nil, err
-		}
-		tmdbID, _ := strconv.Atoi(item.TmdbID)
-		released, lookupErr := allowed, error(nil)
+		released := allowed
+		var lookupErr error
 		if !active {
-			released, lookupErr = gate.lookupProvider(ctx, tmdbID)
-		}
-		if !active && (lookupErr != nil || !released) {
-			// Possession proves release when provider evidence is
-			// missing or negative. Active overrides still win above.
+			// One eligibility rule across all paths: active overrides first,
+			// then physical possession, then provider/date evidence.
 			physical, err := s.hasPhysicalMovieFiles(ctx, item)
 			if err != nil {
 				return nil, err
 			}
 			if physical {
-				released, lookupErr = true, nil
+				released = true
+			} else if isFutureDate(item.Year, relDate) {
+				err := fmt.Errorf("%w: movie is not yet released", ErrProviderUnavailable)
+				if tracker != nil {
+					tracker.err = err
+				}
+				return nil, err
+			} else {
+				tmdbID, _ := strconv.Atoi(item.TmdbID)
+				released, lookupErr = gate.lookupProvider(ctx, tmdbID)
 			}
 		}
 		if lookupErr != nil || !released {

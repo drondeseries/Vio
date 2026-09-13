@@ -274,6 +274,18 @@ func releaseIdentitySetsEqual(a, b []ReleaseIdentity) bool {
 	return true
 }
 
+// releaseIdentitiesCovered reports whether every identity in subset is present
+// in the superset.
+func releaseIdentitiesCovered(superset, subset []ReleaseIdentity) bool {
+	set := releaseIdentitySet(superset)
+	for _, id := range subset {
+		if _, ok := set[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // snapshotIdentities extracts the identity set covered by captured entries.
 func snapshotIdentities(entries []ReleaseOverride) []ReleaseIdentity {
 	ids := make([]ReleaseIdentity, 0, len(entries))
@@ -393,19 +405,27 @@ func hasPhysicalMediaFiles(ctx context.Context, q releaseAliasQuerier, contentID
 // lockReleaseIdentitiesTx takes shared transaction-scoped advisory locks on
 // every identity so a concurrent override write (exclusive lock) serializes
 // against this transaction's eligibility read. Keys are acquired in sorted
-// order for a deterministic global sequence.
+// order for a deterministic global sequence, batched in a single round-trip.
 func lockReleaseIdentitiesTx(ctx context.Context, tx pgx.Tx, ids []ReleaseIdentity) error {
-	for _, id := range sortReleaseIdentities(ids) {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))`, id.lockKey()); err != nil {
-			return err
-		}
+	deduped := dedupeReleaseIdentities(ids)
+	if len(deduped) == 0 {
+		return nil
 	}
-	return nil
+	sorted := sortReleaseIdentities(deduped)
+	keys := make([]string, 0, len(sorted))
+	for _, id := range sorted {
+		keys = append(keys, id.lockKey())
+	}
+	_, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock_shared(hashtextextended(k, 0))
+		FROM unnest($1::text[]) WITH ORDINALITY AS t(k, ord)
+		ORDER BY ord`, keys)
+	return err
 }
 
 func releaseIdentities(mediaType, tmdbID, tvdbID, imdbID string, season, episode int) []ReleaseIdentity {
 	ids := make([]ReleaseIdentity, 0, 3)
-	for _, pair := range [][2]string{{"tmdb", tmdbID}, {"tvdb", tvdbID}, {"imdb", imdbID}} {
+	for _, pair := range [][2]string{{"tmdb", strings.TrimSpace(tmdbID)}, {"tvdb", strings.TrimSpace(tvdbID)}, {"imdb", strings.TrimSpace(imdbID)}} {
 		if pair[1] == "" {
 			continue
 		}
@@ -434,15 +454,33 @@ func captureReleaseOverrides(ctx context.Context, lookup ReleaseOverrideLookup, 
 }
 
 func validateReleaseSnapshotTx(ctx context.Context, tx pgx.Tx, snapshot []ReleaseOverride) error {
+	if len(snapshot) == 0 {
+		return nil
+	}
+	ids := snapshotIdentities(snapshot)
+	if err := lockReleaseIdentitiesTx(ctx, tx, ids); err != nil {
+		return err
+	}
+	currents, err := captureReleaseOverridesTx(ctx, tx, ids)
+	if err != nil {
+		return err
+	}
+	currentBySeq := make(map[ReleaseIdentity]int64, len(currents))
+	for _, cur := range currents {
+		currentBySeq[cur.ReleaseIdentity] = cur.Revision
+	}
 	for _, expected := range snapshot {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))`, expected.lockKey()); err != nil {
-			return err
+		// Absence must be explicit: a missing key means no override row
+		// exists, which only matches a zero-revision (never-recorded)
+		// expectation. A recorded revision can never be zero.
+		current, ok := currentBySeq[expected.ReleaseIdentity]
+		if !ok {
+			if expected.Revision != 0 {
+				return ErrReleaseOverrideConflict
+			}
+			continue
 		}
-		current, err := scanReleaseOverride(tx.QueryRow(ctx, releaseOverrideSelect+` ORDER BY revision DESC LIMIT 1`, expected.MediaType, expected.Provider, expected.ProviderID, expected.SeasonNumber, expected.EpisodeNumber), expected.ReleaseIdentity)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-		if current.Revision != expected.Revision {
+		if current != expected.Revision {
 			return ErrReleaseOverrideConflict
 		}
 	}

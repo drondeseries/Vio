@@ -71,6 +71,8 @@ type metadataItemRepo interface {
 	GetByExternalID(ctx context.Context, tmdbID, imdbID, tvdbID, itemType string) (*models.MediaItem, error)
 	GetByTitleYearType(ctx context.Context, title string, year int, itemType string) (*models.MediaItem, error)
 	Upsert(ctx context.Context, item *models.MediaItem) error
+	UpdateStatus(ctx context.Context, contentID, status string) error
+	UpdateEpisodeMetadataState(ctx context.Context, seriesID string, incomplete bool, lastCheckedAt *time.Time) error
 	IncrementRefreshFailure(ctx context.Context, contentID string) error
 	ReplacePeople(ctx context.Context, contentID string, people []models.ItemPerson) error
 	ListUnmatchedByFolderAndPathPrefix(ctx context.Context, folderID int, pathPrefix string, limit int) ([]string, error)
@@ -5569,16 +5571,10 @@ type episodeLinkHint struct {
 }
 
 func (s *MetadataService) updateEpisodeMetadataState(ctx context.Context, seriesID string, incomplete bool, lastCheckedAt *time.Time) {
-	item, err := s.itemRepo.GetByID(ctx, seriesID)
-	if err != nil {
-		slog.WarnContext(ctx, "metadata: failed to load series item for episode metadata state", "component", "metadata",
-			"series_id", seriesID, "error", err)
+	if s == nil || s.itemRepo == nil || seriesID == "" {
 		return
 	}
-
-	item.EpisodeMetadataIncomplete = incomplete
-	item.EpisodeMetadataLastCheckedAt = lastCheckedAt
-	if err := s.itemRepo.Upsert(ctx, item); err != nil {
+	if err := s.itemRepo.UpdateEpisodeMetadataState(ctx, seriesID, incomplete, lastCheckedAt); err != nil {
 		slog.WarnContext(ctx, "metadata: failed to update episode metadata state", "component", "metadata",
 			"series_id", seriesID, "error", err)
 	}
@@ -6390,13 +6386,8 @@ func (s *MetadataService) updateItemStatus(ctx context.Context, contentID, statu
 		return fmt.Errorf("content id is required to update item status")
 	}
 
-	existing, err := s.itemRepo.GetByID(ctx, contentID)
-	if err != nil {
-		return fmt.Errorf("loading item %s before status update: %w", contentID, err)
-	}
-	existing.Status = status
-	if err := s.itemRepo.Upsert(ctx, existing); err != nil {
-		return fmt.Errorf("upserting item %s with status %s: %w", contentID, status, err)
+	if err := s.itemRepo.UpdateStatus(ctx, contentID, status); err != nil {
+		return fmt.Errorf("updating item %s status to %s: %w", contentID, status, err)
 	}
 	return nil
 }

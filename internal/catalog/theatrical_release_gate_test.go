@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -100,6 +101,25 @@ func TestTheatricalReleaseGatePrefilterUsesFullIdentitySet(t *testing.T) {
 	gate = newTheatricalReleaseGate(&fakeDigitalReleaseChecker{err: errors.New("tmdb down")}, pastOnly)
 	if gate.skipTheatricalMovie(ctx, 0, "tt1234567", "IMDb Only", 2020, "") {
 		t.Fatal("past IMDb override must carry an IMDb-only entry")
+	}
+}
+
+func TestTheatricalReleaseGateCanonicalConflictFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	conflict := errors.New("tmdb \"1\" and imdb \"tt1\" resolve to 2 distinct movies")
+	gate := newTheatricalReleaseGate(&fakeDigitalReleaseChecker{released: map[int]bool{1: true}})
+	gate.canonicalIDs = func(_ context.Context, tmdbID int, imdbID string) (int, string, error) {
+		return tmdbID, imdbID, conflict
+	}
+	tracker := &collectionVirtualCreationTracker{}
+	gatedCtx := context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, tracker)
+	// Even with provider evidence of release, a canonical conflict must
+	// skip the entry and surface the error on the tracker.
+	if !gate.skipTheatricalMovie(gatedCtx, 1, "tt1", "Conflict", 2020, "") {
+		t.Fatal("canonical conflict must skip the entry")
+	}
+	if !errors.Is(tracker.err, conflict) && (tracker.err == nil || !strings.Contains(tracker.err.Error(), "distinct movies")) {
+		t.Fatalf("canonical conflict must poison the sync: %v", tracker.err)
 	}
 }
 
