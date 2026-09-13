@@ -1352,6 +1352,11 @@ func TestResolveAndProbeVirtualSourceProbesUnprobedRowAndPersists(t *testing.T) 
 			close(saverDone)
 			return nil
 		},
+		// No concrete candidate row: the save must fall back to the neutral
+		// row's own id and file_path so the id+file_path fence still matches.
+		VirtualCandidateFileLookup: func(context.Context, string, string, string, int) (*models.MediaFile, error) {
+			return nil, errors.New("candidate row not found")
+		},
 	}
 
 	resolved, err := h.resolveAndProbeVirtualSource(context.Background(), file, 1, "profile-1")
@@ -1376,14 +1381,88 @@ func TestResolveAndProbeVirtualSourceProbesUnprobedRowAndPersists(t *testing.T) 
 	case <-time.After(2 * time.Second):
 		t.Fatal("probed inventory was not persisted through the saver dep")
 	}
-	if savedID != 42 || savedPath != candidateURI {
-		t.Fatalf("persist target id=%d path=%q, want 42/%q", savedID, savedPath, candidateURI)
+	if savedID != 42 || savedPath != file.FilePath {
+		t.Fatalf("persist target id=%d path=%q, want neutral 42/%q", savedID, savedPath, file.FilePath)
+	}
+	if savedPath == candidateURI {
+		t.Fatalf("persist fence = %q, must not be the unprobed candidate URI", savedPath)
 	}
 	if !strings.Contains(savedVideo, "hevc") || strings.Contains(savedVideo, "h264") {
 		t.Fatalf("persisted video tracks = %s, want probed hevc", savedVideo)
 	}
 	if !strings.Contains(savedAudio, "eac3") {
 		t.Fatalf("persisted audio tracks = %s, want probed eac3", savedAudio)
+	}
+}
+
+// When the concrete candidate row exists, the probed inventory must persist
+// against that row's id and file_path: the probed transient carries the neutral
+// row's ID but the candidate's path, and the bound UPDATE fences on both.
+func TestResolveAndProbeVirtualSourcePersistsToCandidateRow(t *testing.T) {
+	candidateURI := "virtual://movie/tt0133093?profile=1080p&result=stable"
+	file := &models.MediaFile{
+		ID:                         42,
+		FilePath:                   "virtual://movie/tt0133093?profile=1080p",
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 7,
+	}
+	candidateRow := &models.MediaFile{
+		ID:                         99,
+		FilePath:                   candidateURI,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 7,
+	}
+
+	saverDone := make(chan struct{})
+	var savedID int
+	var savedPath string
+	var lookupPath, lookupContent string
+	var lookupOwner int
+
+	h := &PlaybackHandler{
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(context.Context, string, int, int, string) (string, error) {
+			return "https://provider.example/stream.mkv", nil
+		}),
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{{URI: candidateURI, Container: "mkv", OwnerInstallationID: 7}}, nil
+		}),
+		VirtualSourceProber: func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			probed := *f
+			return &probed, nil
+		},
+		VirtualCandidateFileLookup: func(_ context.Context, path, contentID string, _ string, ownerInstallationID int) (*models.MediaFile, error) {
+			lookupPath = path
+			lookupContent = contentID
+			lookupOwner = ownerInstallationID
+			return candidateRow, nil
+		},
+		VirtualFileMetadataSaver: func(_ context.Context, fileID int, expectedFilePath string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+			savedID = fileID
+			savedPath = expectedFilePath
+			close(saverDone)
+			return nil
+		},
+	}
+
+	if _, err := h.resolveAndProbeVirtualSource(context.Background(), file, 1, "profile-1"); err != nil {
+		t.Fatalf("resolveAndProbeVirtualSource: %v", err)
+	}
+
+	select {
+	case <-saverDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("probed inventory was not persisted through the saver dep")
+	}
+	if savedID != 99 || savedPath != candidateURI {
+		t.Fatalf("persist target id=%d path=%q, want candidate 99/%q", savedID, savedPath, candidateURI)
+	}
+	// The lookup must be keyed provider-neutrally so a rotating result= pick
+	// cannot miss the sibling row.
+	if lookupPath != file.FilePath {
+		t.Fatalf("lookup path = %q, want neutral %q", lookupPath, file.FilePath)
+	}
+	if lookupContent != file.ContentID || lookupOwner != file.VirtualOwnerInstallationID {
+		t.Fatalf("lookup identity content=%q owner=%d", lookupContent, lookupOwner)
 	}
 }
 

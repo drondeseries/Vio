@@ -3213,6 +3213,9 @@ func main() {
 
 			if deps.FileRepo != nil {
 				compatDeps.FileResolver = deps.FileRepo
+				compatDeps.VirtualCandidateFileLookup = func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
+					return deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+				}
 			}
 
 			compatDeps.SubtitleRepo = subtitles.NewPgRepository(deps.DB, deps.SecretCipher)

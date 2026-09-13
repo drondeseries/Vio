@@ -120,6 +120,12 @@ type VirtualSourceProber func(context.Context, string, *models.MediaFile) (*mode
 // the resolver returns RequestHeaders.
 type VirtualSourceProberWithHeaders func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error)
 
+// VirtualCandidateFileLookup resolves the catalog row for a concrete virtual
+// candidate URI, matching provider-neutral siblings when no exact row exists.
+// It mirrors internal/api/handlers.VirtualCandidateFileLookup so jellycompat can
+// persist probe metadata against the row it actually belongs to.
+type VirtualCandidateFileLookup func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error)
+
 // VirtualFileMetadataSaver persists a probed virtual inventory back to the
 // catalog row, mirroring internal/api/handlers.VirtualFileMetadataSaver.
 // jellycompat cannot import internal/api/handlers (that package imports
@@ -332,7 +338,7 @@ func (h *PlaybackHandler) resolveAndProbeVirtualSource(ctx context.Context, file
 					probed.Duration = transient.Duration
 				}
 				mergeCompatCandidateTracks(probed, candidate)
-				h.persistCompatVirtualMetadata(ctx, probed)
+				h.persistCompatVirtualMetadata(ctx, probed, file, uri)
 				return resolvedCompatVirtualSource{file: probed, uri: uri, ownerID: ownerID}, nil
 			}
 			// Resolution or probe failed. Fall back to the candidate-declared
@@ -393,7 +399,14 @@ func (h *PlaybackHandler) probeVirtualSourceWithHeaders(ctx context.Context, sou
 // back to the catalog row in the background, mirroring the native
 // persistVirtualMetadataBounded pattern. It stamps probe_updated_at through the
 // bound SQL so the next play takes the fast candidate-merge path.
-func (h *PlaybackHandler) persistCompatVirtualMetadata(ctx context.Context, file *models.MediaFile) {
+//
+// The probed transient carries the neutral row's ID but the concrete
+// candidate's file_path, and the bound UPDATE fences on both id and file_path.
+// Persisting those two directly would match zero rows, so the concrete
+// candidate row is resolved first and the save targets it; when no such row
+// exists the neutral row's own id and path are used so the stamp at least lands
+// on the row that exists.
+func (h *PlaybackHandler) persistCompatVirtualMetadata(ctx context.Context, file *models.MediaFile, neutral *models.MediaFile, candidateURI string) {
 	if h == nil || h.VirtualFileMetadataSaver == nil || file == nil || file.ID <= 0 {
 		return
 	}
@@ -401,15 +414,38 @@ func (h *PlaybackHandler) persistCompatVirtualMetadata(ctx context.Context, file
 	audioJSON := marshalCompatTracks(file.AudioTracks)
 	subJSON := marshalCompatTracks(file.SubtitleTracks)
 	res, vCodec, aCodec, container, hdr, bitrate, duration := file.Resolution, file.CodecVideo, file.CodecAudio, file.Container, file.HDR, file.Bitrate, file.Duration
-	expectedFilePath := file.FilePath
-	targetID := file.ID
 	go func() {
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
+		targetID, expectedFilePath := h.compatVirtualPersistTarget(persistCtx, file, neutral, candidateURI)
 		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, expectedFilePath, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration); err != nil {
 			slog.ErrorContext(persistCtx, "compat virtual metadata persist failed", "component", "jellycompat", "file_id", targetID, "error", err)
 		}
 	}()
+}
+
+// compatVirtualPersistTarget returns the row id and file_path fence the probe
+// inventory belongs to. It prefers the concrete candidate row resolved through
+// VirtualCandidateFileLookup; when the lookup is unwired or finds no row it
+// falls back to the neutral row's own id and path, which always satisfies the
+// bound UPDATE's id+file_path fence.
+func (h *PlaybackHandler) compatVirtualPersistTarget(ctx context.Context, probed, neutral *models.MediaFile, candidateURI string) (int, string) {
+	if probed == nil {
+		return 0, ""
+	}
+	if neutral == nil {
+		return probed.ID, probed.FilePath
+	}
+	if h.VirtualCandidateFileLookup == nil {
+		return neutral.ID, neutral.FilePath
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	candidate, err := h.VirtualCandidateFileLookup(lookupCtx, compatVirtualNeutralURI(candidateURI), neutral.ContentID, neutral.EpisodeID, neutral.VirtualOwnerInstallationID)
+	if err != nil || candidate == nil || candidate.ID <= 0 {
+		return neutral.ID, neutral.FilePath
+	}
+	return candidate.ID, candidate.FilePath
 }
 
 // marshalCompatTracks renders track slices as JSON arrays, never a bare null,

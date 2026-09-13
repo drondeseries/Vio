@@ -124,6 +124,7 @@ type Dependencies struct {
 	VirtualSourceProber            VirtualSourceProber
 	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
 	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	VirtualCandidateFileLookup     VirtualCandidateFileLookup
 	RemoteStreamRelay              RemoteStreamRelay
 	// AllowInsecureVirtual reports whether a plugin installation has explicitly
 	// enabled allow_insecure_http for private/local stream URLs. When nil or
