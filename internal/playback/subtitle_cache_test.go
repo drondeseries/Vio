@@ -207,47 +207,209 @@ func TestServeExtractTextWindowedMissWarmsOnce(t *testing.T) {
 	}
 }
 
-func TestServeExtractTextConcurrentViewerDoesNotWaitForFill(t *testing.T) {
+// A full-track request that misses the cache while another fill for the same
+// key is in flight must wait for that fill and serve its committed bytes — a
+// plan-time warm is not duplicated by the first client fetch. Exactly one
+// extract (the warm) runs.
+func TestServeExtractTextWaitsForInFlightFillAndServesCommitted(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
 	started, release := make(chan struct{}), make(chan struct{})
-	firstDone := make(chan error, 1)
+	done := c.WarmTrackInBackground(opts, func(ctx context.Context, o StreamExtractOpts) error {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		_, err := io.WriteString(o.Writer, "WARM TRACK")
+		return err
+	})
+	<-started
+
+	clientDone := make(chan error, 1)
+	rec := httptest.NewRecorder()
 	go func() {
-		firstDone <- c.ServeExtract(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/subtitle", nil), opts, func(ctx context.Context, opts StreamExtractOpts) error {
-			close(started)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			_, err := io.WriteString(opts.Writer, "complete owner track")
+		clientDone <- c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			_, err := io.WriteString(o.Writer, "CLIENT TRACK")
 			return err
 		})
 	}()
-	<-started
-	defer func() {
-		close(release)
-		if err := <-firstDone; err != nil {
-			t.Error(err)
-		}
-	}()
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	rec := httptest.NewRecorder()
-	err := c.ServeExtract(rec, httptest.NewRequestWithContext(ctx, http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, opts StreamExtractOpts) error {
-		_, err := io.WriteString(opts.Writer, "independent viewer track")
-		return err
-	})
-	if err != nil {
+
+	// The client must be waiting on the warm, not running its own demux.
+	select {
+	case err := <-clientDone:
+		t.Fatalf("client returned before the warm committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-clientDone; err != nil {
 		t.Fatal(err)
 	}
-	if rec.Body.String() != "independent viewer track" {
-		t.Fatalf("body = %q", rec.Body.String())
+	<-done
+
+	if got := rec.Body.String(); got != "WARM TRACK" {
+		t.Fatalf("client body = %q, want the warm's committed bytes", got)
 	}
-	// The second viewer must not publish or discard the first viewer's fill.
-	if f, _, ok := c.lookup(source, "", 0, "vtt"); ok {
-		_ = f.Close()
-		t.Fatal("concurrent viewer published another viewer's fill")
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("extract ran %d times, want exactly 1 (the warm)", calls)
+	}
+}
+
+// With no in-flight fill the cold path streams from its own extract unchanged.
+func TestServeExtractTextColdPathStreamsImmediately(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+	calls := 0
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+		calls++
+		_, err := io.WriteString(o.Writer, "COLD TRACK")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("cold path extract calls = %d, want 1", calls)
+	}
+	if got := rec.Body.String(); got != "COLD TRACK" {
+		t.Fatalf("cold body = %q", got)
+	}
+}
+
+// When the fill a request is waiting on fails without committing, the waiter
+// must take over the reservation and extract its own response rather than
+// hanging or dereferencing a nil fill.
+func TestServeExtractTextInFlightFillFailureRetries(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+
+	held := c.beginFill(source, "", 0, SubtitleFormatVTTV3)
+	if held == nil {
+		t.Fatal("failed to hold the in-flight fill")
+	}
+
+	clientDone := make(chan error, 1)
+	rec := httptest.NewRecorder()
+	go func() {
+		clientDone <- c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+			_, err := io.WriteString(o.Writer, "CLIENT TRACK")
+			return err
+		})
+	}()
+
+	select {
+	case err := <-clientDone:
+		t.Fatalf("client returned before the held fill settled: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The holder fails: no entry lands, so the waiter re-attempts the fill.
+	held.Discard()
+
+	if err := <-clientDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Body.String(); got != "CLIENT TRACK" {
+		t.Fatalf("body = %q", got)
+	}
+	f, _, ok := c.lookup(source, "", 0, SubtitleFormatVTTV3)
+	if !ok {
+		t.Fatal("waiter's takeover extract was not committed")
+	}
+	_ = f.Close()
+}
+
+// A canceled waiter returns its context error instead of blocking until the
+// in-flight fill finishes, and must not touch the holder's fill.
+func TestServeExtractTextWaitHonorsContextCancel(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+
+	held := c.beginFill(source, "", 0, SubtitleFormatVTTV3)
+	if held == nil {
+		t.Fatal("failed to hold the in-flight fill")
+	}
+	defer held.Discard()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	extracted := false
+	err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/subtitle", nil), opts, func(context.Context, StreamExtractOpts) error {
+		extracted = true
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline", err)
+	}
+	if extracted {
+		t.Fatal("canceled waiter must not extract")
+	}
+}
+
+// The SUP full-track path gets the same treatment: a request arriving while a
+// fill is in flight waits and serves the committed .sup instead of running a
+// duplicate full demux.
+func TestServeSUPExtractWaitsForInFlightFill(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := supExtractOpts(source, 0)
+
+	held := c.beginFill(source, "", 0, subtitleFormatSUP)
+	if held == nil {
+		t.Fatal("failed to hold the in-flight fill")
+	}
+
+	extracted := false
+	clientDone := make(chan error, 1)
+	rec := httptest.NewRecorder()
+	go func() {
+		clientDone <- c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+			extracted = true
+			_, err := o.Writer.Write([]byte("CLIENT SUP"))
+			return err
+		})
+	}()
+
+	select {
+	case err := <-clientDone:
+		t.Fatalf("client returned before the fill committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The holder commits: the waiter must serve these bytes from cache.
+	if _, err := held.Tee(io.Discard).Write([]byte("SUP PAYLOAD")); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-clientDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Body.String(); got != "SUP PAYLOAD" {
+		t.Fatalf("client body = %q, want the committed .sup", got)
+	}
+	// A committed entry is served with Last-Modified, never a streamed 200.
+	if rec.Header().Get("Last-Modified") == "" {
+		t.Fatal("waited serve must be a cached ServeContent response")
+	}
+	if extracted {
+		t.Fatal("waited request must not run its own extract")
 	}
 }
 
