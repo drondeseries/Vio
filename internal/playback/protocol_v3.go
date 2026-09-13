@@ -349,7 +349,15 @@ func validCapabilityEvidenceV3(v CapabilityEvidenceV3) bool {
 	return v == EvidenceExactV3 || v == EvidencePlatformAttestedV3 || v == EvidenceDeclaredV3
 }
 
-func normalizeAndValidateVideoCapabilitiesV3(c *ClientCodecCapabilitiesV3, features []string) error {
+// validateVideoCapabilitiesStructureV3 performs the non-mutating structural
+// checks on the video half of the shared capability payload. It is the
+// validation half of the normalize/validate split: a replan is rejected for
+// malformed values, but nothing is rewritten or dropped, because the durable
+// request is normalized exactly once — after its features are merged — and the
+// degradation warnings from that single normalization must remain
+// discoverable. Length checks measure the trimmed value, because normalization
+// trims before checking.
+func validateVideoCapabilitiesStructureV3(c *ClientCodecCapabilitiesV3, features []string) error {
 	if !validCapabilityEvidenceV3(c.VideoEvidence) {
 		return errors.New("video_evidence is required and must be exact, platform_attested, or declared")
 	}
@@ -362,17 +370,15 @@ func normalizeAndValidateVideoCapabilitiesV3(c *ClientCodecCapabilitiesV3, featu
 		}
 	}
 	for _, values := range [][]string{c.CodecsVideo, c.CodecsVideoHardware} {
-		for i := range values {
-			values[i] = strings.ToLower(strings.TrimSpace(values[i]))
-			if len(values[i]) > 128 {
+		for _, value := range values {
+			if len(strings.TrimSpace(value)) > 128 {
 				return errors.New("capability value exceeds supported size")
 			}
 		}
 	}
 	for i := range c.VideoDecode {
 		entry := &c.VideoDecode[i]
-		entry.Codec = strings.ToLower(strings.TrimSpace(entry.Codec))
-		if entry.Codec == "" || len(entry.DecoderName) > 128 || entry.MaxWidth < 0 || entry.MaxHeight < 0 || entry.MaxFrameRate < 0 || entry.MaxBitrateKbps < 0 {
+		if strings.TrimSpace(entry.Codec) == "" || len(entry.DecoderName) > 128 || entry.MaxWidth < 0 || entry.MaxHeight < 0 || entry.MaxFrameRate < 0 || entry.MaxBitrateKbps < 0 {
 			return errors.New("invalid detailed video capability")
 		}
 		if len(entry.Profiles) > 64 || len(entry.Levels) > 64 || len(entry.BitDepths) > 64 {
@@ -385,6 +391,19 @@ func normalizeAndValidateVideoCapabilitiesV3(c *ClientCodecCapabilitiesV3, featu
 		}
 	}
 	return nil
+}
+
+// normalizeVideoCapabilitiesV3 rewrites the video half of the payload into its
+// canonical form. Structural validation must have run first.
+func normalizeVideoCapabilitiesV3(c *ClientCodecCapabilitiesV3) {
+	for _, values := range [][]string{c.CodecsVideo, c.CodecsVideoHardware} {
+		for i := range values {
+			values[i] = strings.ToLower(strings.TrimSpace(values[i]))
+		}
+	}
+	for i := range c.VideoDecode {
+		c.VideoDecode[i].Codec = strings.ToLower(strings.TrimSpace(c.VideoDecode[i].Codec))
+	}
 }
 
 type ClientCodecCapabilitiesV3 struct {
@@ -1137,9 +1156,14 @@ func (r *ReplanRequestV3) Validate() error {
 			return errors.New("client feature exceeds supported size")
 		}
 	}
-	// Replan validation has no response channel for degradation warnings; the
-	// execution path re-normalizes the merged start request and surfaces them.
-	if _, err := validateCapabilitiesV3(&r.Capabilities, &r.ClientPlaybackContext, r.ClientFeatures); err != nil {
+	// Replan validation is structural only. It must not normalize or drop
+	// anything: the handler merges the attempt's durable features into the
+	// replan's, and the execution path then normalizes the merged start request
+	// exactly once and surfaces the resulting degradation warnings on the plan.
+	// A normalizing Validate here would drop an un-negotiated transformation
+	// before that merge, and the single execution-time normalization could no
+	// longer rediscover it to warn the client.
+	if err := validateCapabilitiesStructureV3(&r.Capabilities, &r.ClientPlaybackContext, r.ClientFeatures); err != nil {
 		return err
 	}
 	return nil
@@ -1158,22 +1182,163 @@ func validateSelectedTrackIdentityV3(kind string, track *TrackIdentityV3) error 
 	return nil
 }
 
-// validateCapabilitiesV3 validates and normalizes the shared capability
-// payload. features carries the request's top-level client_features — the
-// only feature-advertisement location in the contract. It returns the
-// degradation warnings produced while normalizing, such as dropping a client
-// transformation the client did not negotiate.
-func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackContextV3, features []string) ([]DegradationWarningV3, error) {
-	var warnings []DegradationWarningV3
-	if err := normalizeAndValidateVideoCapabilitiesV3(c, features); err != nil {
-		return nil, err
+// validateCapabilitiesStructureV3 performs the non-mutating structural checks
+// on the shared capability payload and is the validation half of the
+// normalize/validate split. features carries the request's top-level
+// client_features — the only feature-advertisement location in the contract —
+// and is used only for its bound. Nothing here rewrites or drops a value, so it
+// cannot consume the evidence a later single normalization needs to report a
+// degradation warning.
+func validateCapabilitiesStructureV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackContextV3, features []string) error {
+	if c == nil || ctx == nil {
+		return errors.New("client capabilities are required")
+	}
+	if err := validateVideoCapabilitiesStructureV3(c, features); err != nil {
+		return err
 	}
 	if !validCapabilityEvidenceV3(c.AudioEvidence) {
-		return nil, errors.New("audio_evidence is required and must be exact, platform_attested, or declared")
+		return errors.New("audio_evidence is required and must be exact, platform_attested, or declared")
 	}
 	if len(c.CodecsVideo) > 64 || len(c.CodecsVideoHardware) > 64 || len(c.CodecsAudio) > 64 || len(c.Containers) > 64 || len(c.VideoDecode) > 64 || len(ctx.Deliveries) > 16 || len(ctx.Device.Platform) > 32 || len(ctx.FormFactor) > 32 {
-		return nil, errors.New("capability list exceeds supported size")
+		return errors.New("capability list exceeds supported size")
 	}
+	deviceValues := []string{
+		ctx.Device.OSVersion, ctx.Device.Manufacturer, ctx.Device.Model,
+		ctx.Output.CurrentSink, ctx.Output.SinkType, ctx.Output.OutputContextID,
+	}
+	for _, value := range deviceValues {
+		if len(value) > 128 {
+			return errors.New("device capability value exceeds supported size")
+		}
+	}
+	if len(ctx.Device.PlatformDetails) > 16 {
+		return errors.New("platform_details exceeds supported size")
+	}
+	for key, value := range ctx.Device.PlatformDetails {
+		if key == "" || len(key) > 128 || len(value) > 128 {
+			return errors.New("platform_details entry exceeds supported size")
+		}
+	}
+	for _, values := range [][]string{c.CodecsAudio, c.Containers} {
+		for _, value := range values {
+			// Normalization trims before enforcing the bound, so measure the
+			// trimmed value here too; a heavily padded string must not be
+			// rejected by structural validation only to be accepted later.
+			if len(strings.TrimSpace(value)) > 128 {
+				return errors.New("capability value exceeds supported size")
+			}
+		}
+	}
+	for _, hdr := range []*HDRCapabilitiesV3{c.HDRDetails, ctx.Output.HDRDetails} {
+		if err := validateHDRCapabilitiesV3(hdr); err != nil {
+			return err
+		}
+	}
+	if display := ctx.Output.Display; display != nil {
+		evidence := strings.ToLower(strings.TrimSpace(display.HDREvidence))
+		switch evidence {
+		case OutputHDREvidenceExactV3, OutputHDREvidenceUnknownV3:
+		default:
+			return errors.New("output display hdr_evidence must be exact or unknown")
+		}
+		if len(display.DisplayID) > 64 {
+			return errors.New("output display id exceeds supported size")
+		}
+		if err := validateHDRCapabilitiesV3(display.HDRTypes); err != nil {
+			return err
+		}
+		// An exact display record is the raw panel fact; output.hdr_details
+		// is supposed to be its intersection with the decoder. Reject a
+		// contradiction where hdr_details claims a range the panel does not
+		// carry rather than let planning pick whichever one it reads first.
+		if evidence == OutputHDREvidenceExactV3 && ctx.Output.HDRDetails != nil {
+			panel := display.HDRTypes
+			if panel == nil {
+				panel = &HDRCapabilitiesV3{}
+			}
+			out := ctx.Output.HDRDetails
+			if out.HDR10 && !panel.HDR10 || out.HDR10Plus && !panel.HDR10Plus || out.HLG && !panel.HLG {
+				return errors.New("output hdr_details claims a range the exact display record does not carry")
+			}
+			for _, profile := range out.DolbyVisionProfiles {
+				if !containsIntV3(panel.DolbyVisionProfiles, profile) {
+					return errors.New("output hdr_details claims a dolby vision profile the exact display record does not carry")
+				}
+			}
+			// Numeric bounds are ceilings: hdr_details may be tighter than
+			// the panel (the decoder narrows it) but never looser.
+			if boundExceedsV3(out.HDR10MaxWidth, panel.HDR10MaxWidth) || boundExceedsV3(out.HDR10MaxHeight, panel.HDR10MaxHeight) ||
+				boundExceedsFloatV3(out.HDR10MaxFrameRate, panel.HDR10MaxFrameRate) || boundExceedsV3(out.HDR10MaxBitrateKbps, panel.HDR10MaxBitrateKbps) {
+				return errors.New("output hdr_details hdr10 limits exceed the exact display record")
+			}
+			for _, capability := range out.DolbyVisionProfileLevels {
+				for _, panelCapability := range panel.DolbyVisionProfileLevels {
+					if panelCapability.Profile == capability.Profile && capability.MaxLevel > panelCapability.MaxLevel {
+						return errors.New("output hdr_details dolby vision level exceeds the exact display record")
+					}
+				}
+			}
+		}
+	}
+	for name, delivery := range ctx.Deliveries {
+		if len(name) > 64 || len(delivery.Containers) > 64 || len(delivery.VideoCodecs) > 64 || len(delivery.AudioDecodeCodecs) > 64 || len(delivery.AudioPassthroughCodecs) > 64 || len(delivery.Features) > 64 || len(delivery.ValidatedClaims) > 64 || len(delivery.Transformations) > 16 {
+			return errors.New("delivery capability exceeds supported size")
+		}
+		if err := validateHDRCapabilitiesV3(delivery.HDRDetails); err != nil {
+			return err
+		}
+		for _, values := range [][]string{delivery.Containers, delivery.VideoCodecs, delivery.AudioDecodeCodecs, delivery.AudioPassthroughCodecs, delivery.Features, delivery.ValidatedClaims} {
+			for _, value := range values {
+				if len(value) > 64 {
+					return errors.New("delivery capability value exceeds supported size")
+				}
+			}
+		}
+		if len(delivery.Subtitles.NativeEmbedded) > 16 {
+			return errors.New("native subtitle capability list exceeds supported size")
+		}
+		for i := range delivery.Subtitles.NativeEmbedded {
+			native := &delivery.Subtitles.NativeEmbedded[i]
+			container := strings.ToLower(strings.TrimSpace(native.Container))
+			if container == "" || len(container) > 32 || len(native.Codecs) == 0 || len(native.Codecs) > 32 {
+				return errors.New("invalid native subtitle capability")
+			}
+			if native.TrackIdentity != subtitleIdentityFFmpegV3 && native.TrackIdentity != subtitleIdentityContainerV3 {
+				return errors.New("invalid native subtitle track identity")
+			}
+			for _, codec := range native.Codecs {
+				if strings.TrimSpace(codec) == "" || len(codec) > 64 {
+					return errors.New("invalid native subtitle codec")
+				}
+			}
+		}
+		if err := validateDeliveryTransformationsStructureV3(&delivery); err != nil {
+			return err
+		}
+	}
+	for _, passthrough := range []*AudioPassthroughV3{c.AudioPassthrough, ctx.Output.AudioPassthrough} {
+		if passthrough == nil {
+			continue
+		}
+		if len(passthrough.PassthroughCodecs) > 64 || len(passthrough.Entries) > 64 || passthrough.MaxChannels < 0 || passthrough.MaxChannels > 64 {
+			return errors.New("audio passthrough capability exceeds supported size")
+		}
+		for _, entry := range passthrough.Entries {
+			if len(entry.Codec) > 64 || len(entry.ChannelCounts) > 32 || len(entry.Layouts) > 32 {
+				return errors.New("audio passthrough entry exceeds supported size")
+			}
+		}
+	}
+	return nil
+}
+
+// normalizeCapabilitiesV3 is the mutation half of the
+// structural-validate/normalize split. It canonicalizes the shared capability
+// payload in place and returns the degradation warnings produced while dropping
+// a client transformation the merged feature list did not negotiate.
+// validateCapabilitiesStructureV3 must have accepted the payload first.
+func normalizeCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackContextV3, features []string) ([]DegradationWarningV3, error) {
+	normalizeVideoCapabilitiesV3(c)
 	// Version, build, and channel are diagnostic labels, so an over-long value is
 	// worth clamping and never worth refusing playback over. The header route
 	// (X-Silo-Client-Version / -Build / -Channel) clamps with the same helper; rejecting
@@ -1182,112 +1347,20 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 	ctx.AppVersion = normalizeClientMetadataValue(ctx.AppVersion, 64)
 	ctx.AppBuild = normalizeClientMetadataValue(ctx.AppBuild, 64)
 	ctx.AppChannel = normalizeClientMetadataValue(ctx.AppChannel, 32)
-	deviceValues := []string{
-		ctx.Device.OSVersion, ctx.Device.Manufacturer, ctx.Device.Model,
-		ctx.Output.CurrentSink, ctx.Output.SinkType, ctx.Output.OutputContextID,
-	}
-	for _, value := range deviceValues {
-		if len(value) > 128 {
-			return nil, errors.New("device capability value exceeds supported size")
-		}
-	}
-	if len(ctx.Device.PlatformDetails) > 16 {
-		return nil, errors.New("platform_details exceeds supported size")
-	}
-	for key, value := range ctx.Device.PlatformDetails {
-		if key == "" || len(key) > 128 || len(value) > 128 {
-			return nil, errors.New("platform_details entry exceeds supported size")
-		}
-	}
 	for _, values := range [][]string{c.CodecsAudio, c.Containers} {
 		for i := range values {
 			values[i] = strings.ToLower(strings.TrimSpace(values[i]))
-			if len(values[i]) > 128 {
-				return nil, errors.New("capability value exceeds supported size")
-			}
-		}
-	}
-	for _, hdr := range []*HDRCapabilitiesV3{c.HDRDetails, ctx.Output.HDRDetails} {
-		if err := validateHDRCapabilitiesV3(hdr); err != nil {
-			return nil, err
 		}
 	}
 	if display := ctx.Output.Display; display != nil {
 		display.HDREvidence = strings.ToLower(strings.TrimSpace(display.HDREvidence))
-		switch display.HDREvidence {
-		case OutputHDREvidenceExactV3, OutputHDREvidenceUnknownV3:
-		default:
-			return nil, errors.New("output display hdr_evidence must be exact or unknown")
-		}
-		if len(display.DisplayID) > 64 {
-			return nil, errors.New("output display id exceeds supported size")
-		}
-		if err := validateHDRCapabilitiesV3(display.HDRTypes); err != nil {
-			return nil, err
-		}
-		// An exact display record is the raw panel fact; output.hdr_details
-		// is supposed to be its intersection with the decoder. Reject a
-		// contradiction where hdr_details claims a range the panel does not
-		// carry rather than let planning pick whichever one it reads first.
-		if display.HDREvidence == OutputHDREvidenceExactV3 && ctx.Output.HDRDetails != nil {
-			panel := display.HDRTypes
-			if panel == nil {
-				panel = &HDRCapabilitiesV3{}
-			}
-			out := ctx.Output.HDRDetails
-			if out.HDR10 && !panel.HDR10 || out.HDR10Plus && !panel.HDR10Plus || out.HLG && !panel.HLG {
-				return nil, errors.New("output hdr_details claims a range the exact display record does not carry")
-			}
-			for _, profile := range out.DolbyVisionProfiles {
-				if !containsIntV3(panel.DolbyVisionProfiles, profile) {
-					return nil, errors.New("output hdr_details claims a dolby vision profile the exact display record does not carry")
-				}
-			}
-			// Numeric bounds are ceilings: hdr_details may be tighter than
-			// the panel (the decoder narrows it) but never looser.
-			if boundExceedsV3(out.HDR10MaxWidth, panel.HDR10MaxWidth) || boundExceedsV3(out.HDR10MaxHeight, panel.HDR10MaxHeight) ||
-				boundExceedsFloatV3(out.HDR10MaxFrameRate, panel.HDR10MaxFrameRate) || boundExceedsV3(out.HDR10MaxBitrateKbps, panel.HDR10MaxBitrateKbps) {
-				return nil, errors.New("output hdr_details hdr10 limits exceed the exact display record")
-			}
-			for _, capability := range out.DolbyVisionProfileLevels {
-				for _, panelCapability := range panel.DolbyVisionProfileLevels {
-					if panelCapability.Profile == capability.Profile && capability.MaxLevel > panelCapability.MaxLevel {
-						return nil, errors.New("output hdr_details dolby vision level exceeds the exact display record")
-					}
-				}
-			}
-		}
 	}
+	var warnings []DegradationWarningV3
 	for name, delivery := range ctx.Deliveries {
-		if len(name) > 64 || len(delivery.Containers) > 64 || len(delivery.VideoCodecs) > 64 || len(delivery.AudioDecodeCodecs) > 64 || len(delivery.AudioPassthroughCodecs) > 64 || len(delivery.Features) > 64 || len(delivery.ValidatedClaims) > 64 || len(delivery.Transformations) > 16 {
-			return nil, errors.New("delivery capability exceeds supported size")
-		}
-		if err := validateHDRCapabilitiesV3(delivery.HDRDetails); err != nil {
-			return nil, err
-		}
-		for _, values := range [][]string{delivery.Containers, delivery.VideoCodecs, delivery.AudioDecodeCodecs, delivery.AudioPassthroughCodecs, delivery.Features, delivery.ValidatedClaims} {
-			for _, value := range values {
-				if len(value) > 64 {
-					return nil, errors.New("delivery capability value exceeds supported size")
-				}
-			}
-		}
-		if len(delivery.Subtitles.NativeEmbedded) > 16 {
-			return nil, errors.New("native subtitle capability list exceeds supported size")
-		}
 		for i := range delivery.Subtitles.NativeEmbedded {
 			native := &delivery.Subtitles.NativeEmbedded[i]
 			native.Container = strings.ToLower(strings.TrimSpace(native.Container))
-			if native.Container == "" || len(native.Container) > 32 || len(native.Codecs) == 0 || len(native.Codecs) > 32 {
-				return nil, errors.New("invalid native subtitle capability")
-			}
-			if native.TrackIdentity != subtitleIdentityFFmpegV3 && native.TrackIdentity != subtitleIdentityContainerV3 {
-				return nil, errors.New("invalid native subtitle track identity")
-			}
 			for j, codec := range native.Codecs {
-				if strings.TrimSpace(codec) == "" || len(codec) > 64 {
-					return nil, errors.New("invalid native subtitle codec")
-				}
 				native.Codecs[j] = normalizeNativeSubtitleCodecV3(codec)
 			}
 		}
@@ -1301,29 +1374,61 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 		}
 		ctx.Deliveries[name] = delivery
 	}
-	for _, passthrough := range []*AudioPassthroughV3{c.AudioPassthrough, ctx.Output.AudioPassthrough} {
-		if passthrough == nil {
-			continue
-		}
-		if len(passthrough.PassthroughCodecs) > 64 || len(passthrough.Entries) > 64 || passthrough.MaxChannels < 0 || passthrough.MaxChannels > 64 {
-			return nil, errors.New("audio passthrough capability exceeds supported size")
-		}
-		for _, entry := range passthrough.Entries {
-			if len(entry.Codec) > 64 || len(entry.ChannelCounts) > 32 || len(entry.Layouts) > 32 {
-				return nil, errors.New("audio passthrough entry exceeds supported size")
-			}
-		}
-	}
 	return warnings, nil
 }
 
-// normalizeDeliveryTransformationsV3 validates and normalizes one delivery's
-// transformations. Structurally malformed or duplicate transformations stay
-// hard errors. A well-formed client transformation the client did not
-// negotiate is unavailable for this session: it is dropped with a degradation
-// warning rather than failing an otherwise valid delivery.
-func normalizeDeliveryTransformationsV3(delivery *DeliveryCapabilityV3, features []string) ([]TransformationV3, []DegradationWarningV3, error) {
+// validateCapabilitiesV3 validates and normalizes the shared capability payload
+// in one call, returning the degradation warnings normalization produced. It is
+// the start-request entry point; replan validation calls the structural half
+// alone so the merged start request owns the single normalization that drops
+// un-negotiated transformations.
+func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackContextV3, features []string) ([]DegradationWarningV3, error) {
+	if err := validateCapabilitiesStructureV3(c, ctx, features); err != nil {
+		return nil, err
+	}
+	return normalizeCapabilitiesV3(c, ctx, features)
+}
+
+// validateDeliveryTransformationsStructureV3 is the non-mutating structural
+// half of delivery-transformation handling. Structurally malformed or duplicate
+// transformations are hard errors; nothing is rewritten or dropped here.
+func validateDeliveryTransformationsStructureV3(delivery *DeliveryCapabilityV3) error {
 	seenTransformations := make(map[string]struct{}, len(delivery.Transformations))
+	for i := range delivery.Transformations {
+		transformation := delivery.Transformations[i]
+		name := strings.ToLower(strings.TrimSpace(transformation.Name))
+		executor := strings.ToLower(strings.TrimSpace(transformation.Executor))
+		recipeVersion := strings.TrimSpace(transformation.RecipeVersion)
+		if name == "" || len(name) > 64 ||
+			(executor != ExecutorClientV3 && executor != ExecutorServerV3) ||
+			recipeVersion == "" || len(recipeVersion) > 32 ||
+			len(transformation.ValidatedClaims) > 32 {
+			return errors.New("invalid delivery transformation capability")
+		}
+		key := executor + ":" + name + ":" + recipeVersion
+		if _, exists := seenTransformations[key]; exists {
+			return errors.New("duplicate delivery transformation capability")
+		}
+		seenTransformations[key] = struct{}{}
+		for _, claim := range transformation.ValidatedClaims {
+			if len(claim) > 128 {
+				return errors.New("transformation claim exceeds supported size")
+			}
+		}
+	}
+	return nil
+}
+
+// normalizeDeliveryTransformationsV3 normalizes one delivery's transformations
+// and drops, with a degradation warning, a well-formed client transformation
+// the merged feature list did not negotiate. The drop is deliberately a
+// normalization step, not a validation step: a replan's structural validation
+// must leave the transformation in place so this single call can rediscover it
+// and report the warning.
+func normalizeDeliveryTransformationsV3(delivery *DeliveryCapabilityV3, features []string) ([]TransformationV3, []DegradationWarningV3, error) {
+	if err := validateDeliveryTransformationsStructureV3(delivery); err != nil {
+		return nil, nil, err
+	}
 	kept := make([]TransformationV3, 0, len(delivery.Transformations))
 	var warnings []DegradationWarningV3
 	for i := range delivery.Transformations {
@@ -1331,22 +1436,6 @@ func normalizeDeliveryTransformationsV3(delivery *DeliveryCapabilityV3, features
 		transformation.Name = strings.ToLower(strings.TrimSpace(transformation.Name))
 		transformation.Executor = strings.ToLower(strings.TrimSpace(transformation.Executor))
 		transformation.RecipeVersion = strings.TrimSpace(transformation.RecipeVersion)
-		if transformation.Name == "" || len(transformation.Name) > 64 ||
-			(transformation.Executor != "client" && transformation.Executor != "server") ||
-			transformation.RecipeVersion == "" || len(transformation.RecipeVersion) > 32 ||
-			len(transformation.ValidatedClaims) > 32 {
-			return nil, nil, errors.New("invalid delivery transformation capability")
-		}
-		key := transformation.Executor + ":" + transformation.Name + ":" + transformation.RecipeVersion
-		if _, exists := seenTransformations[key]; exists {
-			return nil, nil, errors.New("duplicate delivery transformation capability")
-		}
-		seenTransformations[key] = struct{}{}
-		for _, claim := range transformation.ValidatedClaims {
-			if len(claim) > 128 {
-				return nil, nil, errors.New("transformation claim exceeds supported size")
-			}
-		}
 		if transformation.Executor == ExecutorClientV3 &&
 			(!delivery.Enabled || !delivery.SupportedOnDevice || !HasFeatureV3(features, FeatureClientVideoTransforms)) {
 			warnings = append(warnings, DegradationWarningV3{
@@ -1358,6 +1447,59 @@ func normalizeDeliveryTransformationsV3(delivery *DeliveryCapabilityV3, features
 		kept = append(kept, transformation)
 	}
 	return kept, warnings, nil
+}
+
+// CloneDeliveryCapabilitiesV3 returns a deep copy of a client's negotiated
+// delivery map. A plain struct copy shares every backing slice, so a caller
+// overlaying one request's deliveries onto a durable one must clone first:
+// normalization writes those slices in place, and a mutation through the
+// durable request must not reach the request that supplied them (or vice
+// versa). A nil map clones to nil, preserving "no deliveries advertised".
+func CloneDeliveryCapabilitiesV3(deliveries map[string]DeliveryCapabilityV3) map[string]DeliveryCapabilityV3 {
+	if deliveries == nil {
+		return nil
+	}
+	cloned := make(map[string]DeliveryCapabilityV3, len(deliveries))
+	for name, delivery := range deliveries {
+		cloned[name] = cloneDeliveryCapabilityV3(delivery)
+	}
+	return cloned
+}
+
+func cloneDeliveryCapabilityV3(delivery DeliveryCapabilityV3) DeliveryCapabilityV3 {
+	delivery.Containers = append([]string(nil), delivery.Containers...)
+	delivery.VideoCodecs = append([]string(nil), delivery.VideoCodecs...)
+	delivery.AudioDecodeCodecs = append([]string(nil), delivery.AudioDecodeCodecs...)
+	delivery.AudioPassthroughCodecs = append([]string(nil), delivery.AudioPassthroughCodecs...)
+	delivery.Features = append([]string(nil), delivery.Features...)
+	delivery.ValidatedClaims = append([]string(nil), delivery.ValidatedClaims...)
+	delivery.HDRDetails = cloneHDRCapabilitiesV3(delivery.HDRDetails)
+	if delivery.MaxChannels != nil {
+		maxChannels := *delivery.MaxChannels
+		delivery.MaxChannels = &maxChannels
+	}
+	delivery.Transformations = append([]TransformationV3(nil), delivery.Transformations...)
+	for i := range delivery.Transformations {
+		delivery.Transformations[i].ValidatedClaims = append([]string(nil), delivery.Transformations[i].ValidatedClaims...)
+	}
+	delivery.Subtitles.NativeEmbedded = append([]NativeEmbeddedSubtitleCapabilityV3(nil), delivery.Subtitles.NativeEmbedded...)
+	for i := range delivery.Subtitles.NativeEmbedded {
+		delivery.Subtitles.NativeEmbedded[i].Codecs = append([]string(nil), delivery.Subtitles.NativeEmbedded[i].Codecs...)
+	}
+	return delivery
+}
+
+func cloneHDRCapabilitiesV3(hdr *HDRCapabilitiesV3) *HDRCapabilitiesV3 {
+	if hdr == nil {
+		return nil
+	}
+	cloned := *hdr
+	cloned.DolbyVisionProfiles = append([]int(nil), hdr.DolbyVisionProfiles...)
+	cloned.DolbyVisionProfileLevels = append([]DolbyVisionProfileCapabilityV3(nil), hdr.DolbyVisionProfileLevels...)
+	for i := range cloned.DolbyVisionProfileLevels {
+		cloned.DolbyVisionProfileLevels[i].BLCompatibilityIDs = append([]int(nil), hdr.DolbyVisionProfileLevels[i].BLCompatibilityIDs...)
+	}
+	return &cloned
 }
 
 func validateHDRCapabilitiesV3(hdr *HDRCapabilitiesV3) error {

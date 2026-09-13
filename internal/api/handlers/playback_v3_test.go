@@ -5008,6 +5008,18 @@ func TestHandleReplanPlaybackV3SidecarChangeReusesOriginalHTTPTransport(t *testi
 	time.Sleep(time.Until(time.Unix(time.Now().Unix()+1, 0)) + 10*time.Millisecond)
 
 	english := 1
+	// P1-6: the replan omits client_features (the handler merges the durable
+	// start-time features, which do not include client_video_transformations_v1)
+	// and advertises an un-negotiated client transformation. Structural Validate
+	// must leave it in place; the single merged normalization drops it and the
+	// returned plan must carry the degradation warning.
+	replanContext := startRequest.ClientPlaybackContext
+	replanContext.Deliveries = playback.CloneDeliveryCapabilitiesV3(startRequest.ClientPlaybackContext.Deliveries)
+	directDelivery := replanContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	directDelivery.Transformations = []playback.TransformationV3{
+		{Name: playback.ClientDV7ToDV81V3, Executor: playback.ExecutorClientV3, RecipeVersion: playback.ClientDVTransformVersionV3},
+	}
+	replanContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = directDelivery
 	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
 		ProtocolVersion:       playback.ProtocolV3,
 		Operation:             playback.ReplanOperationTrackChangeV3,
@@ -5020,11 +5032,21 @@ func TestHandleReplanPlaybackV3SidecarChangeReusesOriginalHTTPTransport(t *testi
 		PositionSeconds:       120,
 		SelectedTracks:        playback.SelectedTracksV3{Audio: started.PlaybackPlan.SelectedTracks.Audio, Subtitle: &playback.TrackIdentityV3{ID: playback.TrackIDV3(file.ID, "subtitle", english), Index: &english}},
 		Capabilities:          startRequest.Capabilities,
-		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+		ClientPlaybackContext: replanContext,
 	})
 	if replanned.PlaybackPlan == nil || replanned.PlaybackPlan.SelectedTracks.Subtitle == nil ||
 		replanned.PlaybackPlan.SelectedTracks.Subtitle.Index == nil || *replanned.PlaybackPlan.SelectedTracks.Subtitle.Index != english {
 		t.Fatalf("replanned subtitle = %#v", replanned.PlaybackPlan)
+	}
+	if !slices.ContainsFunc(replanned.PlaybackPlan.DegradationWarnings, func(warning playback.DegradationWarningV3) bool {
+		return warning.Code == "client_transformation_not_negotiated"
+	}) {
+		t.Fatalf("replan dropped an un-negotiated transform without a warning: %#v", replanned.PlaybackPlan.DegradationWarnings)
+	}
+	if slices.ContainsFunc(replanned.PlaybackPlan.Transformations, func(transformation playback.TransformationV3) bool {
+		return transformation.Name == playback.ClientDV7ToDV81V3
+	}) {
+		t.Fatalf("un-negotiated client transform survived into the plan: %#v", replanned.PlaybackPlan.Transformations)
 	}
 	if replanned.PlaybackPlan.Stream.URL != beforeURL {
 		t.Fatalf("sidecar-only replan minted a new original-http URL: %q -> %q", beforeURL, replanned.PlaybackPlan.Stream.URL)
@@ -5048,6 +5070,23 @@ func TestHandleReplanPlaybackV3SidecarChangeReusesOriginalHTTPTransport(t *testi
 	}
 	if record.FrozenRecipe.SubtitleTrackIndex != english {
 		t.Fatalf("durable sidecar selection = %#v", record)
+	}
+
+	// NEW-8: the reused credential is session- and file-bound, not plan-bound,
+	// so it must still authorize after the plan that minted it is retired.
+	// Verify it instead of trusting its presence.
+	reusedClaims, verifyErr := streamtoken.Verify(streamTokenFromURLV3(beforeURL), handler.JWTSecret)
+	if verifyErr != nil {
+		t.Fatalf("reused stream credential after replan and retirement: %v", verifyErr)
+	}
+	if reusedClaims.SessionID != started.SessionID {
+		t.Fatalf("reused credential session = %q, want %q", reusedClaims.SessionID, started.SessionID)
+	}
+	if reusedClaims.MediaFileID != file.ID {
+		t.Fatalf("reused credential media file = %d, want %d", reusedClaims.MediaFileID, file.ID)
+	}
+	if record.CurrentPlanID != replanned.PlaybackPlan.PlanID || record.CurrentPlanID == started.PlaybackPlan.PlanID {
+		t.Fatalf("old plan not retired: current=%q replanned=%q started=%q", record.CurrentPlanID, replanned.PlaybackPlan.PlanID, started.PlaybackPlan.PlanID)
 	}
 
 	// Negative control: a replan whose candidate no longer plans the active
@@ -5366,6 +5405,100 @@ func TestSidecarOnlyReuseReplanOriginalHTTPDelivery(t *testing.T) {
 	drifted.Delivery = playback.DeliveryRemuxProgressiveV3
 	if _, ok := sidecarOnlyReuseReplanV3(record, &drifted, candidateRecipe, "output-context"); ok {
 		t.Fatal("original-http sidecar replan reused across a delivery change")
+	}
+}
+
+// NEW-8: preserving a prior signed stream URL is only safe while the credential
+// still authorizes the live session's resource. A fresh, correctly bound
+// credential is reused verbatim; one bound to another media file, or close to
+// expiry, is re-minted in place under the same session and path so playback is
+// not restarted.
+func TestAuthorizeReusedStreamCredentialV3(t *testing.T) {
+	const secret = "reused-credential-secret"
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = secret
+	session := &playback.Session{ID: "reuse-session", UserID: 7, ProfileID: "profile-1", MediaFileID: 42, PlayMethod: playback.PlayDirect}
+	session.RoutingWorkload = string(noderouting.WorkloadDirectPlay)
+	session.RoutingExecution = string(noderouting.ExecutionNone)
+	card := identityRecipeCard(session)
+
+	sign := func(ttl time.Duration, mutate func(*streamtoken.Claims)) string {
+		claims := card.ToClaims()
+		if mutate != nil {
+			mutate(&claims)
+		}
+		token, err := streamtoken.Sign(claims, secret, ttl)
+		if err != nil {
+			t.Fatalf("sign token: %v", err)
+		}
+		return token
+	}
+
+	// A fresh, correctly bound credential is reused byte-for-byte.
+	freshToken := sign(playback.MaxTokenTTL, nil)
+	freshURL := appendStreamToken("/stream/"+session.ID, freshToken)
+	freshStream := playback.StreamV3{URL: freshURL}
+	refreshed, ok := handler.authorizeReusedStreamCredentialV3(session, &freshStream)
+	if !ok || refreshed {
+		t.Fatalf("fresh credential: refreshed=%v ok=%v, want false true", refreshed, ok)
+	}
+	if freshStream.URL != freshURL {
+		t.Fatalf("fresh credential URL changed: %q", freshStream.URL)
+	}
+
+	// A near-expiry credential is re-minted in place: same session and path, a
+	// new token with a full lifetime, claims bound to the same resource.
+	nearToken := sign(5*time.Minute, nil)
+	nearStream := playback.StreamV3{URL: appendStreamToken("/stream/"+session.ID+"?seek=12", nearToken)}
+	refreshed, ok = handler.authorizeReusedStreamCredentialV3(session, &nearStream)
+	if !ok || !refreshed {
+		t.Fatalf("near-expiry credential: refreshed=%v ok=%v, want true true", refreshed, ok)
+	}
+	if !strings.HasPrefix(nearStream.URL, "/stream/"+session.ID+"?") {
+		t.Fatalf("refreshed credential left the session path: %q", nearStream.URL)
+	}
+	if !strings.Contains(nearStream.URL, "seek=12") {
+		t.Fatalf("refreshed credential dropped unrelated query parameters: %q", nearStream.URL)
+	}
+	minted := streamTokenFromURLV3(nearStream.URL)
+	if minted == nearToken {
+		t.Fatal("near-expiry token was not replaced")
+	}
+	mintedClaims, err := streamtoken.Verify(minted, secret)
+	if err != nil {
+		t.Fatalf("verify refreshed token: %v", err)
+	}
+	if mintedClaims.SessionID != session.ID || mintedClaims.MediaFileID != session.MediaFileID {
+		t.Fatalf("refreshed claims = %+v, want session %q file %d", mintedClaims, session.ID, session.MediaFileID)
+	}
+	if mintedClaims.ExpiresAt == nil || time.Until(mintedClaims.ExpiresAt.Time) <= reusedStreamCredentialRefreshMarginV3 {
+		t.Fatalf("refreshed credential expires too soon: %+v", mintedClaims.ExpiresAt)
+	}
+
+	// A credential bound to another media file cannot be reused verbatim; it is
+	// re-minted for this session's resource.
+	wrongFileToken := sign(playback.MaxTokenTTL, func(claims *streamtoken.Claims) { claims.MediaFileID = 99 })
+	wrongFileStream := playback.StreamV3{URL: appendStreamToken("/stream/"+session.ID, wrongFileToken)}
+	refreshed, ok = handler.authorizeReusedStreamCredentialV3(session, &wrongFileStream)
+	if !ok || !refreshed {
+		t.Fatalf("mismatched credential: refreshed=%v ok=%v, want true true", refreshed, ok)
+	}
+	repairedClaims, err := streamtoken.Verify(streamTokenFromURLV3(wrongFileStream.URL), secret)
+	if err != nil {
+		t.Fatalf("verify repaired token: %v", err)
+	}
+	if repairedClaims.MediaFileID != session.MediaFileID {
+		t.Fatalf("repaired credential media file = %d, want %d", repairedClaims.MediaFileID, session.MediaFileID)
+	}
+
+	// A URL with no signed credential (header-authenticated lane) is untouched.
+	headerStream := playback.StreamV3{URL: "/stream/" + session.ID}
+	refreshed, ok = handler.authorizeReusedStreamCredentialV3(session, &headerStream)
+	if !ok || refreshed {
+		t.Fatalf("credential-free URL: refreshed=%v ok=%v, want false true", refreshed, ok)
+	}
+	if headerStream.URL != "/stream/"+session.ID {
+		t.Fatalf("credential-free URL changed: %q", headerStream.URL)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -2195,11 +2196,14 @@ func (d playbackStartRequestDigestsV3) matches(stored string) bool {
 }
 
 func appendStartWarningsV3(result *playback.PlannerResultV3, warnings []playback.DegradationWarningV3) {
-	if result == nil || len(warnings) == 0 {
+	if result == nil || len(warnings) == 0 || result.Plan == nil {
 		return
 	}
-	if result.Plan != nil {
-		result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, warnings...)
+	for _, warning := range warnings {
+		if slices.Contains(result.Plan.DegradationWarnings, warning) {
+			continue
+		}
+		result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, warning)
 	}
 }
 
@@ -4892,15 +4896,11 @@ func (h *PlaybackHandler) HandleReplanPlaybackV3(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid replan request")
 		return
 	}
-	// Reject malformed identity/bounds before doing any session lookup. When
-	// client_features is omitted, temporarily allow the only validation rule
-	// that depends on the durable start request; the authoritative merge and a
-	// second full validation happen after the attempt is loaded below.
-	preflightReq := req
-	if len(preflightReq.ClientFeatures) == 0 {
-		preflightReq.ClientFeatures = []string{playback.FeatureClientVideoTransforms}
-	}
-	if err := preflightReq.Validate(); err != nil {
+	// Reject malformed identity/bounds before doing any session lookup.
+	// Validate is structural only — it neither normalizes nor drops a
+	// capability — so this preflight cannot consume the un-negotiated
+	// transformations the single post-merge normalization must later report.
+	if err := req.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid replan request")
 		return
 	}
@@ -5568,6 +5568,13 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		start.BandwidthCapKbps = copyOptionalIntV3(req.BandwidthCapKbps)
 		start.Capabilities = req.Capabilities
 		start.ClientPlaybackContext = req.ClientPlaybackContext
+		// The overlay above aliases the replan body's deliveries map, which
+		// every shallow copy made since decode — the preflight request
+		// included — also points at. Deep-clone it here so the single
+		// normalization the merged start request runs cannot write through to
+		// req, and a later preflight mutation cannot leak into the durable
+		// request stored on the attempt.
+		start.ClientPlaybackContext.Deliveries = playback.CloneDeliveryCapabilitiesV3(req.ClientPlaybackContext.Deliveries)
 		// The client's capability payload just replaced the seeded one.
 		// Re-apply the durable record's server-side delivery demotions so a
 		// route a previous failure recovery abandoned stays disabled — the
@@ -5747,6 +5754,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	var effectiveFile *models.MediaFile
 	var preparedTransport *preparedTransportV3
 	var artifactRecipe playback.ExecutableRecipeV3
+	// replanCapabilityWarnings holds the degradation warnings produced by the
+	// one normalization of the merged start request, so they can be surfaced on
+	// whichever plan this replan ultimately returns.
+	var replanCapabilityWarnings []playback.DegradationWarningV3
 	transportPrepared := false
 
 	if virtualRehydrationFailed {
@@ -5873,9 +5884,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				message: "The requested seek position is beyond the end of the selected media source.",
 			}
 		}
-		if _, err := start.NormalizeAndValidate(); err != nil {
+		warnings, err := start.NormalizeAndValidate()
+		if err != nil {
 			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "invalid_replan", message: err.Error()}
 		}
+		// This is the single normalization of the merged start request. Keep
+		// its degradation warnings, including the drop of a client
+		// transformation the merged feature list did not negotiate, and attach
+		// them to the plan once it is selected.
+		replanCapabilityWarnings = warnings
 		audioIndex := 0
 		if !seekReanchor {
 			if dropStaleAudioTrackIdentityV3(r.Context(), effectiveFile, start.AudioTrackID) {
@@ -6082,6 +6099,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}, clientInfo.LogAttrs()...)...)
 		return playback.NewTerminalResponseFromTerminalV3(result.Terminal), *record, nil, nil
 	}
+	// Surface the warnings from the merged start request's single
+	// normalization on the selected plan. A seek reanchor replays the durable
+	// plan, which may already carry the same warning from its own start, so the
+	// helper skips duplicates.
+	appendStartWarningsV3(&result, replanCapabilityWarnings)
 	slog.InfoContext(r.Context(), "playback replan decided", append([]any{
 		logComponentKey, "playback",
 		"outcome", "plan",
@@ -6159,39 +6181,61 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	var transport preparedTransportV3
 	if transportPrepared && preparedTransport != nil {
 		transport = *preparedTransport
-	} else if transportReused {
-		// A sidecar selection changes the plan and subtitle artifact, but it does
-		// not change the bytes FFmpeg produces. Keep the active HLS generation and
-		// its transport window so a client remount cannot strand itself between
-		// the killed old window and a replacement window that starts elsewhere.
-		// The requested source position still belongs to this replan: translate it
-		// onto the reused window instead of rewinding to the previous plan's start.
-		result.Plan.Stream = record.CurrentPlan.Stream
-		reusedTimeline := record.CurrentPlan.Timeline
-		reusedTimeline.SourceStartSeconds = result.Plan.Timeline.SourceStartSeconds
-		reusedTimeline.PlayerStartSeconds = max(0, reusedTimeline.SourceStartSeconds-reusedTimeline.StreamOriginSeconds)
-		result.Plan.Timeline = reusedTimeline
-		result.Plan.ExpiresAt = record.CurrentPlan.ExpiresAt
-		transport = reusedHLSTransportV3(session, record.CurrentPlan.Stream.URL)
-		slog.InfoContext(r.Context(), "protocol v3 replan reused active A/V transport",
-			logComponentKey, playbackLogValueV3,
-			"playback_session_id", session.ID,
-			"previous_plan_id", record.CurrentPlanID,
-			"plan_id", result.Plan.PlanID,
-			"delivery", result.Plan.Delivery,
-		)
 	} else {
-		var transportErr *transportErrorV3
-		transport, transportErr = h.prepareTransportV3(r, session, effectiveFile, result, mode)
-		if transportErr != nil {
-			return playback.DecisionResponseV3{}, *record, nil, transportErr
+		reusedStream := record.CurrentPlan.Stream
+		credentialRefreshed := false
+		if transportReused {
+			// Preserving the prior credential is only safe while it still
+			// authorizes the live session for this resource. The old plan is
+			// about to be retired, and a signed stream token is session- and
+			// file-bound rather than plan-bound, so retirement alone does not
+			// invalidate it — but an expired, mismatched, or near-expiry
+			// credential is re-minted in place, keeping the session and
+			// transport identity so playback is not restarted.
+			credentialRefreshed, transportReused = h.authorizeReusedStreamCredentialV3(session, &reusedStream)
 		}
-		applyTransportToneMapModeV3(&result, transport)
-		// Transport preparation can only attest the executor's tone-map mode;
-		// every other frozen identity field was validated above. Copy that one
-		// receipt into the already validated recipe instead of rerunning a
-		// fallible subtitle-identity freeze after authority publication.
-		artifactRecipe.ToneMapMode = result.ToneMapMode
+		if transportReused {
+			// A sidecar selection changes the plan and subtitle artifact, but it
+			// does not change the bytes FFmpeg produces. Keep the active
+			// generation and its transport window so a client remount cannot
+			// strand itself between the killed old window and a replacement
+			// window that starts elsewhere. The requested source position still
+			// belongs to this replan: translate it onto the reused window
+			// instead of rewinding to the previous plan's start.
+			result.Plan.Stream = reusedStream
+			reusedTimeline := record.CurrentPlan.Timeline
+			reusedTimeline.SourceStartSeconds = result.Plan.Timeline.SourceStartSeconds
+			reusedTimeline.PlayerStartSeconds = max(0, reusedTimeline.SourceStartSeconds-reusedTimeline.StreamOriginSeconds)
+			result.Plan.Timeline = reusedTimeline
+			result.Plan.ExpiresAt = record.CurrentPlan.ExpiresAt
+			if credentialRefreshed {
+				// The credential now carries a full lifetime; the published plan
+				// expiry must not outlive it.
+				result.Plan.ExpiresAt = playback.NewPlanExpiryV3(time.Now())
+			}
+			transport = reusedHLSTransportV3(session, reusedStream.URL)
+			slog.InfoContext(r.Context(), "protocol v3 replan reused active A/V transport",
+				logComponentKey, playbackLogValueV3,
+				"playback_session_id", session.ID,
+				"previous_plan_id", record.CurrentPlanID,
+				"plan_id", result.Plan.PlanID,
+				"delivery", result.Plan.Delivery,
+				"credential_refreshed", credentialRefreshed,
+			)
+		} else {
+			var transportErr *transportErrorV3
+			transport, transportErr = h.prepareTransportV3(r, session, effectiveFile, result, mode)
+			if transportErr != nil {
+				return playback.DecisionResponseV3{}, *record, nil, transportErr
+			}
+			applyTransportToneMapModeV3(&result, transport)
+			// Transport preparation can only attest the executor's tone-map
+			// mode; every other frozen identity field was validated above. Copy
+			// that one receipt into the already validated recipe instead of
+			// rerunning a fallible subtitle-identity freeze after authority
+			// publication.
+			artifactRecipe.ToneMapMode = result.ToneMapMode
+		}
 	}
 	result.Plan.Stream.URL = transport.url
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: playback.ServerFeaturesV3(), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
@@ -6734,6 +6778,114 @@ func sameEffectiveAVRecipeV3(left, right playback.EffectiveRecipeV3) bool {
 		optionalIntEqualV3(left.BitrateKbps, right.BitrateKbps) &&
 		left.DynamicRange == right.DynamicRange &&
 		optionalIntEqualV3(left.AudioChannels, right.AudioChannels) && left.AudioLayout == right.AudioLayout
+}
+
+// reusedStreamCredentialRefreshMarginV3 is how much of a reused signed stream
+// credential's lifetime must remain before a transport may reuse it verbatim.
+// A credential closer to expiry is re-minted in place.
+const reusedStreamCredentialRefreshMarginV3 = time.Hour
+
+// authorizeReusedStreamCredentialV3 proves that the signed credential carried by
+// a reused stream URL still authorizes the live session and its resource, and
+// re-mints it in place when it is missing, mismatched, or close to expiry. It
+// exists because preserving record.CurrentPlan.Stream verbatim is only safe
+// while that credential remains valid: retiring the plan does not retire a
+// session-bound token, so the credential is bound to the session and the media
+// file, not to the plan. A credential that no longer proves that binding — or
+// that is about to expire — must be re-minted rather than reused.
+//
+// Only the st query parameter is re-signed; the URL path, its other query
+// parameters, and the session identity are untouched, so a sidecar-only replan
+// cannot force a remount. A URL with no st credential (header-authenticated
+// attempts, signing disabled, or a proxy path token) is returned unchanged:
+// there is no plan-scoped credential here to validate.
+//
+// The returned bool is whether the credential was re-minted. ok is false when
+// the URL's credential cannot be proven to authorize the resource and could not
+// be refreshed, in which case the caller must rebuild the transport.
+func (h *PlaybackHandler) authorizeReusedStreamCredentialV3(session *playback.Session, stream *playback.StreamV3) (refreshed bool, ok bool) {
+	if h == nil || session == nil || stream == nil {
+		return false, false
+	}
+	token := streamTokenFromURLV3(stream.URL)
+	if token == "" || h.JWTSecret == "" {
+		// No signed credential to validate. Header-authenticated attempts
+		// deliberately publish a credential-free URL, and an empty signing
+		// secret cannot mint or verify one; both preserve the URL byte-for-byte.
+		return false, true
+	}
+	if claims, err := streamtoken.Verify(token, h.JWTSecret); err == nil && claims.SessionID == session.ID &&
+		(session.MediaFileID == 0 || claims.MediaFileID == session.MediaFileID) {
+		if claims.ExpiresAt != nil && time.Until(claims.ExpiresAt.Time) > reusedStreamCredentialRefreshMarginV3 {
+			return false, true
+		}
+		// A verified, correctly bound credential that is close to expiry is
+		// re-signed from its own claims, so a transcode recipe is preserved
+		// exactly rather than rebuilt from session identity.
+		if fresh, signErr := streamtoken.Sign(*claims, h.JWTSecret, playback.MaxTokenTTL); signErr == nil && fresh != "" {
+			stream.URL = setStreamTokenV3(stream.URL, fresh)
+			return true, true
+		}
+	}
+	// The credential could not be verified, was bound to another resource, or
+	// could not be re-signed from its own claims. A session whose identity
+	// recipe the server can reconstruct without the token gets a fresh
+	// credential; anything else must rebuild.
+	card, identityReconstructable := h.identityReconstructableCardV3(session)
+	if !identityReconstructable {
+		return false, false
+	}
+	fresh := h.signSessionToken(card, false)
+	if fresh == "" {
+		return false, false
+	}
+	stream.URL = setStreamTokenV3(stream.URL, fresh)
+	return true, true
+}
+
+// identityReconstructableCardV3 reports whether a session's stream credential
+// can be re-minted from its own identity, and returns that card. Only direct
+// and remux sessions can: a transcode session's recipe lives in the token, not
+// in the Session, so it must keep the verified claims it was issued with.
+func (h *PlaybackHandler) identityReconstructableCardV3(session *playback.Session) (playback.RecipeCard, bool) {
+	if session == nil {
+		return playback.RecipeCard{}, false
+	}
+	switch session.PlayMethod {
+	case playback.PlayDirect, playback.PlayRemux:
+		return identityRecipeCard(session), true
+	default:
+		return playback.RecipeCard{}, false
+	}
+}
+
+// streamTokenFromURLV3 extracts the native signed-credential query parameter
+// from a stream URL. An absent or unparseable URL yields "".
+func streamTokenFromURLV3(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Query().Get(streamTokenParam)
+}
+
+// setStreamTokenV3 replaces a stream URL's signed-credential query parameter,
+// preserving every other query parameter and the URL path.
+func setStreamTokenV3(rawURL, token string) string {
+	if token == "" {
+		return rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return appendStreamToken(rawURL, token)
+	}
+	query := parsed.Query()
+	query.Set(streamTokenParam, token)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 // reusedHLSTransportV3 reconstructs transport facts for an existing HLS or
