@@ -584,7 +584,7 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 			  )
 			  %s
 			  %s
-			ORDER BY e.series_id, uwp.updated_at DESC, e.season_number DESC, e.episode_number DESC
+			ORDER BY e.series_id, uwp.updated_at DESC, e.season_number DESC, e.episode_number DESC, e.content_id
 		)`, seriesFilter, dateCutoffFilter)
 	} else {
 		// Picking the series and picking which of its episodes to anchor on are
@@ -623,7 +623,7 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 					    AND hhi.media_item_id = uwp_a.media_item_id
 					    AND uwp_a.updated_at <= hhi.hidden_before
 				  )
-				ORDER BY e_a.season_number DESC, e_a.episode_number DESC
+				ORDER BY e_a.season_number DESC, e_a.episode_number DESC, e_a.content_id
 				LIMIT 1
 			) anchor ON TRUE`
 
@@ -714,7 +714,7 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 		FROM %s es
 		JOIN media_items si ON si.content_id = es.series_id
 		%s
-		ORDER BY es.updated_at DESC
+		ORDER BY es.updated_at DESC, es.series_id
 		LIMIT $3`, completedEpisodesCTE, inProgressExclusion, sourceTable,
 			nextUpNextEpisodeLateral(nextUpNextEpisodeExclusionPostgres))
 		return query, args
@@ -731,7 +731,7 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 		FROM %s es
 		JOIN media_items si ON si.content_id = es.series_id
 		%s
-		ORDER BY es.updated_at DESC
+		ORDER BY es.updated_at DESC, es.series_id
 		LIMIT $3`, sourceTable, nextUpNextEpisodeLateral(nextUpNextEpisodeExclusionPostgres))
 
 	query := fmt.Sprintf(`
@@ -759,7 +759,7 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 		LEFT JOIN (
 			%s
 		) r ON true
-		ORDER BY r.completed_at DESC NULLS LAST`, completedEpisodesCTE, inProgressExclusion, resultQuery)
+		ORDER BY r.completed_at DESC NULLS LAST, r.series_id`, completedEpisodesCTE, inProgressExclusion, resultQuery)
 
 	return query, args
 }
@@ -853,7 +853,7 @@ func buildListNextUpSnapshotQuery(q NextUpQuery, limit int, cursor *nextUpWalkCu
 				  ON uwp_a.media_item_id = e_a.content_id
 				 AND uwp_a.updated_at = pick.updated_at
 				WHERE e_a.series_id = pick.series_id
-				ORDER BY e_a.season_number DESC, e_a.episode_number DESC
+				ORDER BY e_a.season_number DESC, e_a.episode_number DESC, e_a.content_id
 				LIMIT 1
 			) anchor ON TRUE`
 
@@ -871,7 +871,7 @@ func buildListNextUpSnapshotQuery(q NextUpQuery, limit int, cursor *nextUpWalkCu
 			WHERE TRUE
 			  %s
 			  %s
-			ORDER BY e.series_id, uwp.updated_at DESC, e.season_number DESC, e.episode_number DESC
+			ORDER BY e.series_id, uwp.updated_at DESC, e.season_number DESC, e.episode_number DESC, e.content_id
 		)`, progressCTEs, seriesFilter, dateCutoffFilter)
 	} else {
 		completedEpisodesCTE = fmt.Sprintf(`RECURSIVE %s,
@@ -941,7 +941,7 @@ func buildListNextUpSnapshotQuery(q NextUpQuery, limit int, cursor *nextUpWalkCu
 		FROM %s es
 		JOIN media_items si ON si.content_id = es.series_id
 		%s
-		ORDER BY es.updated_at DESC
+		ORDER BY es.updated_at DESC, es.series_id
 		LIMIT $3`, completedEpisodesCTE, inProgressExclusion, sourceTable,
 			nextUpNextEpisodeLateral(nextUpNextEpisodeExclusionSnapshots))
 		return query, args
@@ -958,7 +958,7 @@ func buildListNextUpSnapshotQuery(q NextUpQuery, limit int, cursor *nextUpWalkCu
 		FROM %s es
 		JOIN media_items si ON si.content_id = es.series_id
 		%s
-		ORDER BY es.updated_at DESC
+		ORDER BY es.updated_at DESC, es.series_id
 		LIMIT $3`, sourceTable, nextUpNextEpisodeLateral(nextUpNextEpisodeExclusionSnapshots))
 
 	query := fmt.Sprintf(`
@@ -986,7 +986,7 @@ func buildListNextUpSnapshotQuery(q NextUpQuery, limit int, cursor *nextUpWalkCu
 		LEFT JOIN (
 			%s
 		) r ON true
-		ORDER BY r.completed_at DESC NULLS LAST`, completedEpisodesCTE, inProgressExclusion, resultQuery)
+		ORDER BY r.completed_at DESC NULLS LAST, r.series_id`, completedEpisodesCTE, inProgressExclusion, resultQuery)
 
 	return query, args
 }

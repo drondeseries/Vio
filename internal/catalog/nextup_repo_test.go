@@ -150,6 +150,30 @@ func TestBuildListNextUpQuery_GlobalBoundsAnchorScan(t *testing.T) {
 	}
 }
 
+// TestBuildListNextUpQuery_DeterministicOrderTieBreakers pins the stable
+// series-id tie-breaker on final ordering and the content-id tie-breaker inside
+// the per-series anchor, so series sharing a completion timestamp no longer
+// order nondeterministically and a LIMIT boundary selects a stable set.
+func TestBuildListNextUpQuery_DeterministicOrderTieBreakers(t *testing.T) {
+	t.Parallel()
+
+	query, _ := buildListNextUpQuery(NextUpQuery{UserID: 7, ProfileID: "profile-1"}, 20, nil)
+	for _, fragment := range []string{
+		"ORDER BY es.updated_at DESC, es.series_id",
+		"ORDER BY r.completed_at DESC NULLS LAST, r.series_id",
+		"ORDER BY e_a.season_number DESC, e_a.episode_number DESC, e_a.content_id",
+	} {
+		if !strings.Contains(query, fragment) {
+			t.Fatalf("expected deterministic tie-breaker %q, got:\n%s", fragment, query)
+		}
+	}
+
+	seriesQuery, _ := buildListNextUpQuery(NextUpQuery{UserID: 7, ProfileID: "profile-1", SeriesID: "series-1"}, 20, nil)
+	if !strings.Contains(seriesQuery, "ORDER BY es.updated_at DESC, es.series_id") {
+		t.Fatalf("series-scoped query missing deterministic tie-breaker:\n%s", seriesQuery)
+	}
+}
+
 func TestBuildListNextUpQuery_GlobalDateCutoffAppliesToEveryWalkStep(t *testing.T) {
 	t.Parallel()
 

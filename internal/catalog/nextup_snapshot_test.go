@@ -94,6 +94,9 @@ func TestBuildListNextUpSnapshotQuery_Shape(t *testing.T) {
 		"FROM completed_progress uwp",
 		"SELECT 1 FROM nextup_any_progress nap",
 		"ORDER BY uwp.updated_at DESC, uwp.media_item_id DESC",
+		"ORDER BY es.updated_at DESC, es.series_id",
+		"ORDER BY r.completed_at DESC NULLS LAST, r.series_id",
+		"ORDER BY e_a.season_number DESC, e_a.episode_number DESC, e_a.content_id",
 		"LIMIT $3",
 	}
 	for _, fragment := range expectedFragments {
@@ -379,6 +382,66 @@ func TestNextUpRepository_SQLiteSnapshots_HiddenThenRecompletedRestoresEligibili
 	assertNextUpContentIDs(t, results, seriesID+"-e2")
 }
 
+// TestNextUpRepository_SQLiteSnapshots_HiddenBoundaryAndItemScope pins the two
+// hidden-history semantics the review calls out: the cutoff is inclusive
+// (hidden_before == updated_at hides the item), and hiding is item-scoped, so a
+// hidden newest completion falls back to the next older unhidden completion
+// rather than being suppressed at the series level. If series-level hiding is
+// intended, this test is where that decision becomes explicit.
+func TestNextUpRepository_SQLiteSnapshots_HiddenBoundaryAndItemScope(t *testing.T) {
+	pool := newNextUpTestPool(t)
+	ctx := context.Background()
+	prefix := fmt.Sprintf("nextup-sqlite-hidebound-%d", time.Now().UnixNano())
+	seriesID := prefix + "-series"
+
+	userID, _, folderID := seedNextUpTestOwner(t, ctx, pool, prefix)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id = $1`, seriesID)
+	})
+
+	seedNextUpSeries(t, ctx, pool, seriesID, prefix+" HideBoundary")
+	seedNextUpEpisodes(t, ctx, pool,
+		[]string{seriesID + "-e1", seriesID + "-e2", seriesID + "-e3"},
+		[]string{seriesID, seriesID, seriesID},
+		[]int{1, 2, 3},
+	)
+	seedNextUpFiles(t, ctx, pool, folderID, []string{seriesID + "-e2", seriesID + "-e3"})
+
+	store := newNextUpSQLiteStore(t)
+	profileID := "sqlite-profile"
+	older := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	newer := older.Add(time.Hour)
+	setSQLiteProgress(t, store, profileID, seriesID+"-e1", 0, true, older)
+	setSQLiteProgress(t, store, profileID, seriesID+"-e2", 0, true, newer)
+
+	repo := NewNextUpRepository(pool, sqliteSnapshotProvider{store: store})
+	results, err := repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, Limit: 20})
+	if err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	assertNextUpContentIDs(t, results, seriesID+"-e3")
+
+	// A cutoff strictly before the completion leaves it visible.
+	if err := store.RemoveHistoryItems(ctx, profileID, []string{seriesID + "-e2"}, newer.Add(-time.Second)); err != nil {
+		t.Fatalf("pre-equality hide: %v", err)
+	}
+	results, err = repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, Limit: 20})
+	if err != nil {
+		t.Fatalf("pre-equality: %v", err)
+	}
+	assertNextUpContentIDs(t, results, seriesID+"-e3")
+
+	// A cutoff equal to the completion hides it (the comparison is inclusive).
+	if err := store.RemoveHistoryItems(ctx, profileID, []string{seriesID + "-e2"}, newer); err != nil {
+		t.Fatalf("equality hide: %v", err)
+	}
+	results, err = repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, Limit: 20})
+	if err != nil {
+		t.Fatalf("equality: %v", err)
+	}
+	assertNextUpContentIDs(t, results, seriesID+"-e2")
+}
+
 func TestNextUpRepository_SQLiteSnapshots_ResumableMergePriority(t *testing.T) {
 	pool := newNextUpTestPool(t)
 	ctx := context.Background()
@@ -555,6 +618,25 @@ func TestNextUpRepository_SQLiteSnapshots_EqualTimestampAnchorsBothSeries(t *tes
 		t.Fatalf("ListNextUp: %v", err)
 	}
 	assertNextUpContentIDs(t, results, seriesA+"-e2", seriesB+"-e2")
+
+	// Series sharing a completion timestamp must order deterministically by
+	// series id, so repeated calls (and any LIMIT boundary) select the same
+	// series rather than returning a nondeterministic subset.
+	for i := 0; i < 5; i++ {
+		repeat, err := repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, Limit: 20})
+		if err != nil {
+			t.Fatalf("ListNextUp repeat %d: %v", i, err)
+		}
+		if len(repeat) != len(results) {
+			t.Fatalf("repeat %d returned %d rows, want %d", i, len(repeat), len(results))
+		}
+		for j := range results {
+			if repeat[j].ContentID != results[j].ContentID {
+				t.Fatalf("repeat %d row %d = %s, want stable %s (ties must be ordered by series id)",
+					i, j, repeat[j].ContentID, results[j].ContentID)
+			}
+		}
+	}
 }
 
 func TestNextUpRepository_SQLiteSnapshots_NoNextEpisode(t *testing.T) {
