@@ -1448,12 +1448,20 @@ func upsertVirtualFileWithMeta(ctx context.Context, tx pgx.Tx, contentID, episod
 		if _, err := tx.Exec(ctx, `
 			UPDATE media_files SET
 				file_path=$4, file_size=$11, container=$12, media_folder_id=$3,
-				probe_source=CASE WHEN probe_source='virtual_collection' THEN probe_source ELSE 'virtual' END,
+				probe_source=CASE
+					WHEN probe_source='virtual_collection' THEN probe_source
+					WHEN probe_updated_at IS NOT NULL THEN NULL
+					ELSE 'virtual'
+				END,
 				-- Registration stores the row and its declared display hints; it
-				-- is not a probe. Preserve the existing probe_updated_at: a
-				-- never-probed row stays NULL (so the repair gate can see it
-				-- needs a real probe) and an already-probed row keeps its value.
-				probe_updated_at=CASE WHEN probe_updated_at IS NULL THEN NULL ELSE probe_updated_at END,
+				-- is not a probe. A row a real probe already stamped is no longer
+				-- verified once the hints replace its probed inventory, so clear
+				-- the stamp and let the next play re-probe. Never-probed rows
+				-- stay NULL; collection-owned rows keep their stamp.
+				probe_updated_at=CASE
+					WHEN probe_source='virtual_collection' THEN probe_updated_at
+					ELSE NULL
+				END,
 				missing_since=NULL, updated_at=now(),
 				resolution=NULLIF($6,''), codec_video=NULLIF($7,''), codec_audio=NULLIF($8,''),
 				hdr=$9, bitrate=NULLIF($10,0),
@@ -1485,11 +1493,17 @@ func upsertVirtualFileWithMeta(ctx context.Context, tx pgx.Tx, contentID, episod
 			container=EXCLUDED.container,
 			probe_source=CASE
 				WHEN media_files.probe_source='virtual_collection' THEN media_files.probe_source
+				WHEN media_files.probe_updated_at IS NOT NULL THEN NULL
 				ELSE 'virtual'
 			END,
-			-- Registration is not a probe: preserve the target row's
-			-- probe_updated_at instead of stamping a probe that never ran.
-			probe_updated_at=CASE WHEN media_files.probe_updated_at IS NULL THEN NULL ELSE media_files.probe_updated_at END,
+			-- Registration is not a probe, and it overwrites the target row's
+			-- probed inventory with provider hints. A row a real probe had
+			-- stamped is no longer verified: clear the stamp so the next play
+			-- re-probes. Collection-owned rows keep their stamp.
+			probe_updated_at=CASE
+				WHEN media_files.probe_source='virtual_collection' THEN media_files.probe_updated_at
+				ELSE NULL
+			END,
 			missing_since=NULL,
 			updated_at=now(),
 			resolution=EXCLUDED.resolution,
@@ -1543,12 +1557,20 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 		if _, err := tx.Exec(ctx, `
 			UPDATE media_files SET
 				file_path=$4, file_size=$12, container=$13, media_folder_id=$3,
-				probe_source=CASE WHEN probe_source='virtual_collection' THEN probe_source ELSE 'virtual' END,
+				probe_source=CASE
+					WHEN probe_source='virtual_collection' THEN probe_source
+					WHEN probe_updated_at IS NOT NULL THEN NULL
+					ELSE 'virtual'
+				END,
 				-- Registration stores the row and its declared display hints; it
-				-- is not a probe. Preserve the existing probe_updated_at: a
-				-- never-probed row stays NULL (so the repair gate can see it
-				-- needs a real probe) and an already-probed row keeps its value.
-				probe_updated_at=CASE WHEN probe_updated_at IS NULL THEN NULL ELSE probe_updated_at END,
+				-- is not a probe. A row a real probe already stamped is no longer
+				-- verified once the hints replace its probed inventory, so clear
+				-- the stamp and let the next play re-probe. Never-probed rows
+				-- stay NULL; collection-owned rows keep their stamp.
+				probe_updated_at=CASE
+					WHEN probe_source='virtual_collection' THEN probe_updated_at
+					ELSE NULL
+				END,
 				missing_since=NULL, updated_at=now(),
 				resolution=NULLIF($6,''), codec_video=NULLIF($7,''), codec_audio=NULLIF($8,''),
 				hdr=$9, bitrate=NULLIF($10,0), edition_raw=$11, release_name='', release_group='',
@@ -1579,11 +1601,17 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 			container=EXCLUDED.container,
 			probe_source=CASE
 				WHEN media_files.probe_source='virtual_collection' THEN media_files.probe_source
+				WHEN media_files.probe_updated_at IS NOT NULL THEN NULL
 				ELSE 'virtual'
 			END,
-			-- Registration is not a probe: preserve the target row's
-			-- probe_updated_at instead of stamping a probe that never ran.
-			probe_updated_at=CASE WHEN media_files.probe_updated_at IS NULL THEN NULL ELSE media_files.probe_updated_at END,
+			-- Registration is not a probe, and it overwrites the target row's
+			-- probed inventory with provider hints. A row a real probe had
+			-- stamped is no longer verified: clear the stamp so the next play
+			-- re-probes. Collection-owned rows keep their stamp.
+			probe_updated_at=CASE
+				WHEN media_files.probe_source='virtual_collection' THEN media_files.probe_updated_at
+				ELSE NULL
+			END,
 			missing_since=NULL,
 			updated_at=now(),
 			resolution=EXCLUDED.resolution,
