@@ -247,20 +247,16 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 	if in.MediaType == "movie" && r.ReleaseOverrides != nil {
 		// The item row is locked and the exclusive content lock (taken at
 		// transaction start) holds alias writers out, so this is the
-		// authoritative alias set. External alias modifications trigger a
-		// conflict, while registrar self-corrections (where ownsItemMetadata is true)
-		// are allowed as long as the post-mutation identities are covered by the
-		// evaluated snapshot.
+		// authoritative alias set. The evaluated snapshot must be a subset of
+		// the fresh identities: removed aliases lose authority, while new
+		// aliases from registrar self-correction or metadata enrichment are
+		// accepted as long as every snapshot alias survives.
 		freshIDs, err := releaseIdentitiesForContent(ctx, tx, "movie", contentID, "movie", in.TMDBID, "", in.IMDbID, 0, 0)
 		if err != nil {
 			return nil, err
 		}
 		if len(releaseSnapshot) > 0 {
-			if ownsItemMetadata {
-				if !releaseIdentitiesCovered(snapshotIdentities(releaseSnapshot), freshIDs) {
-					return nil, fmt.Errorf("%w: release alias set changed during registration", ErrReleaseOverrideConflict)
-				}
-			} else if !releaseIdentitySetsEqual(snapshotIdentities(releaseSnapshot), freshIDs) {
+			if !releaseIdentitiesCovered(snapshotIdentities(releaseSnapshot), freshIDs) {
 				return nil, fmt.Errorf("%w: release alias set changed during registration", ErrReleaseOverrideConflict)
 			}
 		}

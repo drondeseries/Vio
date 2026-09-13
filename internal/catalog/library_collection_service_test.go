@@ -1008,32 +1008,100 @@ func TestMultiItemAcceptanceCompletesWithConcurrentOverrideMutation(t *testing.T
 	isDeadlock := func(err error) bool {
 		return err != nil && strings.Contains(strings.ToLower(err.Error()), "deadlock")
 	}
-	// Concurrent mutation of B's identity while acceptance runs: every
-	// participant must complete; only deadlock errors fail this phase.
+	isRevisionConflict := func(err error) bool {
+		return errors.Is(err, ErrReleaseOverrideConflict)
+	}
+	// Deterministic concurrency coverage. The participants share
+	// overlapping resources: acceptance takes content locks on movieA and
+	// movieB (sorted) plus the collection row, and validates a snapshot
+	// covering B's release identity with a shared lock; each mutate takes
+	// the exclusive lock on that same B identity before its revision 0->1
+	// insert plus debt write. A start barrier releases all four
+	// goroutines into the same contention window instead of running
+	// sequentially, so the scheduler interleaves the acceptance-vs-mutate
+	// and mutate-vs-mutate orderings through the same locks. Convergence
+	// holds either way because the acceptance decision predates the
+	// override. Expected classes are whitelisted: acceptance succeeds on
+	// its pre-override snapshot while exactly one mutate wins revision
+	// 0->1 and the losers observe a revision conflict. Deadlocks or any
+	// other error class fail.
 	prepCtx, service := prepare(t)
-	done := make(chan error, 4)
+	start := make(chan struct{})
+	acceptDone := make(chan error, 1)
+	mutateDone := make(chan error, 3)
 	go func() {
-		done <- service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieA}, {MediaItemID: movieB}})
+		<-start
+		acceptDone <- service.acceptCollectionItems(prepCtx, collection, []LibraryCollectionItemInput{{MediaItemID: movieA}, {MediaItemID: movieB}})
 	}()
 	for i := 0; i < 3; i++ {
 		go func() {
+			<-start
 			_, err := NewReleaseOverrideRepository(pool).Mutate(context.Background(), actor, ReleaseOverrideMutation{
 				ReleaseIdentity: ReleaseIdentity{MediaType: "movie", Provider: "tmdb", ProviderID: tmdbB},
 				ReleaseAt:       "2099-01-01",
 				EvidenceNote:    "verified future",
 			}, false)
-			done <- err
+			mutateDone <- err
 		}()
 	}
-	for i := 0; i < 4; i++ {
+	close(start)
+	select {
+	case err := <-acceptDone:
+		if isDeadlock(err) {
+			t.Fatalf("deadlock between acceptance and override mutation: %v", err)
+		}
+		if err != nil {
+			t.Fatalf("acceptance must succeed with a pre-override snapshot: %v", err)
+		}
+	case <-time.After(120 * time.Second):
+		t.Fatal("acceptance did not complete")
+	}
+	wins, conflicts := 0, 0
+	for i := 0; i < 3; i++ {
 		select {
-		case err := <-done:
+		case err := <-mutateDone:
 			if isDeadlock(err) {
-				t.Fatalf("deadlock between acceptance and override mutation: %v", err)
+				t.Fatalf("deadlock between override mutations: %v", err)
+			}
+			switch {
+			case err == nil:
+				wins++
+			case isRevisionConflict(err):
+				conflicts++
+			default:
+				t.Fatalf("unexpected override mutation error class: %v", err)
 			}
 		case <-time.After(120 * time.Second):
-			t.Fatal("acceptance/mutation did not complete")
+			t.Fatal("override mutations did not complete")
 		}
+	}
+	if wins != 1 || conflicts != 2 {
+		t.Fatalf("override race settled wins=%d conflicts=%d, want exactly 1 win and 2 revision conflicts", wins, conflicts)
+	}
+	// Atomic effects: exactly one committed revision for B, the
+	// acceptance's membership writes landed, and the winner's debt
+	// enqueue is durable.
+	var revisions int
+	var maxRevision int64
+	if err := pool.QueryRow(ctx, `SELECT count(*), COALESCE(max(revision),0) FROM verified_release_override_history WHERE media_type='movie' AND provider='tmdb' AND provider_id=$1`, tmdbB).Scan(&revisions, &maxRevision); err != nil {
+		t.Fatal(err)
+	}
+	if revisions != 1 || maxRevision != 1 {
+		t.Fatalf("override history rows=%d maxRevision=%d, want 1 row at revision 1", revisions, maxRevision)
+	}
+	var members int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM library_collection_items WHERE collection_id='multi-debt'`).Scan(&members); err != nil {
+		t.Fatal(err)
+	}
+	if members != 2 {
+		t.Fatalf("collection members after race = %d, want 2 (acceptance must be atomic)", members)
+	}
+	var movieBTargeted int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM metadata_refresh_debt WHERE content_id=$1 AND target_type='item'`, movieB).Scan(&movieBTargeted); err != nil {
+		t.Fatal(err)
+	}
+	if movieBTargeted != 1 {
+		t.Fatalf("metadata_refresh_debt rows targeting B = %d, want 1 (winner's enqueue must be durable)", movieBTargeted)
 	}
 	// Convergence is deterministic: B carries a committed future override
 	// (exactly one of the racing mutations wins revision 0->1), so fresh

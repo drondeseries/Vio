@@ -105,6 +105,11 @@ type theatricalReleaseGate struct {
 	// Conflicts fail closed: on error the entry IDs are kept and the
 	// error is recorded on the collection tracker so the sync surfaces
 	// it instead of deciding on a partial identity set.
+	//
+	// canonicalFullIDs returns the canonical content ID plus the complete
+	// identity set including provider-table matches. Used by the prefilter
+	// to ensure override decisions see every known alias.
+	canonicalFullIDs func(ctx context.Context, tmdbID int, imdbID string) (string, []ReleaseIdentity, error)
 	canonicalIDs func(ctx context.Context, tmdbID int, imdbID string) (int, string, error)
 }
 
@@ -280,6 +285,77 @@ func (s *LibraryCollectionService) canonicalMovieIdentities(ctx context.Context,
 	return tmdbID, imdbID, nil
 }
 
+// canonicalMovieFullIdentities resolves the canonical content ID and the
+// complete identity set including provider-table matches. It returns all
+// known release aliases so callers can make full override decisions.
+// Lookup errors are propagated: incomplete discovery must never be treated
+// as permission to make a definitive rejection.
+func (s *LibraryCollectionService) canonicalMovieFullIdentities(ctx context.Context, tmdbID int, imdbID string) (string, []ReleaseIdentity, error) {
+	if s == nil || s.items == nil {
+		return "", nil, nil
+	}
+	tmdbText := ""
+	if tmdbID > 0 {
+		tmdbText = strconv.Itoa(tmdbID)
+	}
+	imdbID = strings.TrimSpace(imdbID)
+	if tmdbText == "" && imdbID == "" {
+		return "", nil, nil
+	}
+	item, err := s.items.GetByExternalID(ctx, tmdbText, imdbID, "", "movie")
+	if err != nil && !errors.Is(err, ErrItemNotFound) {
+		return "", nil, fmt.Errorf("resolve canonical movie by external ID: %w", err)
+	}
+	contentIDs := map[string]struct{}{}
+	if item != nil {
+		contentIDs[item.ContentID] = struct{}{}
+	}
+	pool := (*pgxpool.Pool)(nil)
+	if s.collections != nil {
+		pool = s.collections.pool
+	}
+	if pool != nil {
+		rows, err := pool.Query(ctx, `
+			SELECT DISTINCT content_id FROM media_item_provider_ids
+			WHERE item_type = 'movie' AND (
+				(provider = 'tmdb' AND provider_id = $1 AND $1 <> '') OR
+				(provider = 'imdb' AND provider_id = $2 AND $2 <> '')
+			)`, tmdbText, imdbID)
+		if err != nil {
+			return "", nil, fmt.Errorf("resolve canonical movie by provider alias: %w", err)
+		}
+		cids, qerr := pgx.CollectRows(rows, pgx.RowTo[string])
+		if qerr != nil {
+			return "", nil, fmt.Errorf("collect canonical movie aliases: %w", qerr)
+		}
+		for _, cid := range cids {
+			if cid != "" {
+				contentIDs[cid] = struct{}{}
+			}
+		}
+	}
+	if len(contentIDs) > 1 {
+		return "", nil, fmt.Errorf("%w: tmdb %q and imdb %q resolve to %d distinct movies", ErrReleaseOverrideConflict, tmdbText, imdbID, len(contentIDs))
+	}
+	contentID := ""
+	if item != nil {
+		contentID = item.ContentID
+	} else {
+		for cid := range contentIDs {
+			contentID = cid
+		}
+	}
+	if contentID == "" {
+		return "", releaseIdentities("movie", tmdbText, "", imdbID, 0, 0), nil
+	}
+	// Use the content-lock-safe resolution for the canonical item's full identity set.
+	ids, idErr := releaseIdentitiesForContent(ctx, pool, "movie", contentID, "movie", tmdbText, "", imdbID, 0, 0)
+	if idErr != nil {
+		return contentID, nil, idErr
+	}
+	return contentID, ids, nil
+}
+
 func (g *theatricalReleaseGate) skipTheatricalMovie(ctx context.Context, tmdbID int, imdbID, title string, year int, releaseDate string) bool {
 	// Union the source entry with a catalog-resident same movie so a stored
 	// permitting alias is visible even outside the target libraries.
@@ -303,8 +379,22 @@ func (g *theatricalReleaseGate) skipTheatricalMovie(ctx context.Context, tmdbID 
 	}
 	// The prefilter sees the complete source identity set so an override on
 	// any alias (e.g. a past IMDb override for a TMDB-listed entry) applies
-	// before the entry can be rejected.
-	if ids := releaseIdentities("movie", tmdbText, "", imdbID, 0, 0); len(ids) > 0 {
+	// before the entry can be rejected. When canonicalFullIDs is available,
+	// use the complete identity set including provider-table matches.
+	ids := releaseIdentities("movie", tmdbText, "", imdbID, 0, 0)
+	if g.canonicalFullIDs != nil {
+		if _, fullIDs, fullErr := g.canonicalFullIDs(ctx, tmdbID, imdbID); fullErr != nil {
+			if ctx != nil {
+				if tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker); tracker != nil {
+					tracker.err = fullErr
+				}
+			}
+			return true
+		} else if len(fullIDs) > 0 {
+			ids = fullIDs
+		}
+	}
+	if len(ids) > 0 {
 		allowed, active, err := releaseOverrideDecision(ctx, g.overrides, ids)
 		if err != nil || active {
 			if err != nil && ctx != nil {
@@ -436,6 +526,7 @@ func (s *LibraryCollectionService) releaseGate(ctx context.Context) *theatricalR
 	newGate := func() *theatricalReleaseGate {
 		gate := newTheatricalReleaseGate(s.TMDBDigitalReleases, overrides)
 		gate.canonicalIDs = s.canonicalMovieIDs
+		gate.canonicalFullIDs = s.canonicalMovieFullIdentities
 		return gate
 	}
 	if tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker); tracker != nil {
@@ -672,6 +763,28 @@ func virtualPlaybackIdentityAvailable(mediaType, imdbID string, tmdbID, tvdbID i
 	return err == nil
 }
 
+// observeCollectionMovieReleaseRejection records a best-effort queue entry
+// when a collection movie is rejected for release reasons, so the admin
+// queue reflects all blocked work (not just registrar-originated blocks).
+func (s *LibraryCollectionService) observeCollectionMovieReleaseRejection(ctx context.Context, ids []ReleaseIdentity, reason string) {
+	if s == nil || s.collections == nil || s.collections.pool == nil || len(ids) == 0 || reason == "" {
+		return
+	}
+	tx, err := s.collections.pool.Begin(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "collection release observation: failed to begin tx", "error", err)
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // best-effort observation; commit failure is logged
+	if err := recordReleaseMetadata(ctx, tx, ids, reason); err != nil {
+		slog.WarnContext(ctx, "collection release observation: record failed", "reason", reason, "error", err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.WarnContext(ctx, "collection release observation: commit failed", "reason", reason, "error", err)
+	}
+}
+
 func (s *LibraryCollectionService) queueVirtualMetadataRefresh(contentID string) {
 	contentID = strings.TrimSpace(contentID)
 	if s == nil || s.RefreshVirtualItem == nil || contentID == "" {
@@ -769,6 +882,7 @@ func (s *LibraryCollectionService) EnsureCollectionItemMaterializedWithOptions(
 		if err != nil {
 			return nil, err
 		}
+		opts.preparedExplicitly = true
 		allowed, active := decideReleaseOverrides(now, opts.releaseSnapshot)
 		released := allowed
 		var lookupErr error
@@ -783,6 +897,7 @@ func (s *LibraryCollectionService) EnsureCollectionItemMaterializedWithOptions(
 				released = true
 			} else if isFutureDate(item.Year, relDate) {
 				err := fmt.Errorf("%w: movie is not yet released", ErrProviderUnavailable)
+				s.observeCollectionMovieReleaseRejection(ctx, movieIDs, "future_date")
 				if tracker != nil {
 					tracker.err = err
 				}
@@ -797,6 +912,7 @@ func (s *LibraryCollectionService) EnsureCollectionItemMaterializedWithOptions(
 			if err == nil {
 				err = fmt.Errorf("%w: movie has no confirmed home release", ErrProviderUnavailable)
 			}
+			s.observeCollectionMovieReleaseRejection(ctx, movieIDs, "no_home_release")
 			if tracker != nil {
 				tracker.err = err
 			}

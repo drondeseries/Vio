@@ -1043,6 +1043,12 @@ const (
 	fuzzyRerankMaxTitleTokens = 64
 	fuzzyRerankMaxTokenRunes  = 64
 	fuzzyRerankMaxTitleBytes  = 1024
+
+	// maxVirtualEpisodeReconciliationBatch caps the number of episode
+	// candidates evaluated per reconciliation pass to bound the lock and
+	// override-capture batch size. Episodes beyond the budget wait for the
+	// next reconciliation cycle.
+	maxVirtualEpisodeReconciliationBatch = 500
 )
 
 // trgmWordSimilarityThreshold pins pg_trgm.strict_word_similarity_threshold
@@ -1851,6 +1857,11 @@ type VirtualMaterializeOptions struct {
 	accepting         bool
 	sourceConfig      json.RawMessage
 	releaseSnapshot   []ReleaseOverride
+	// preparedExplicitly marks that the caller explicitly evaluated release
+	// overrides for this materialization. Nil snapshot + false means the
+	// caller never prepared; nil snapshot + true would be invalid. Empty
+	// snapshot + true means "prepared, no active override found."
+	preparedExplicitly bool
 	// deferDebtWrite skips the refresh-debt write so a multi-item caller
 	// can emit all debt rows after every item's release locks and
 	// eligibility decisions complete (see lockReleaseContentTx ordering).
@@ -2069,7 +2080,7 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 		if err != nil {
 			return nil, err
 		}
-		if len(opts.releaseSnapshot) > 0 || len(movieIDs) > 0 {
+		if opts.preparedExplicitly || len(movieIDs) > 0 {
 			if len(opts.releaseSnapshot) > 0 && !releaseIdentitySetsEqual(snapshotIdentities(opts.releaseSnapshot), movieIDs) {
 				return nil, fmt.Errorf("%w: release alias set changed after preparation", ErrReleaseOverrideConflict)
 			}
@@ -2949,6 +2960,16 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			              ) i USING (provider, provider_id)
 			              WHERE h.media_type='episode' AND h.season_number=ep.season_number AND h.episode_number=ep.episode_number
 			                AND h.release_at IS NOT NULL
+			                AND NOT EXISTS (
+			                  SELECT 1 FROM verified_release_override_history h2
+			                  WHERE h2.media_type=h.media_type
+			                    AND h2.provider=h.provider
+			                    AND h2.provider_id=h.provider_id
+			                    AND h2.season_number=h.season_number
+			                    AND h2.episode_number=h.episode_number
+			                    AND h2.revision > h.revision
+			              )
+			              AND h.release_at <= statement_timestamp()
 			          ) THEN (
 			              verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') <= statement_timestamp()
 			          )
@@ -3017,6 +3038,16 @@ func (r *ItemRepository) ReconcileReleasedCollectionVirtualEpisodes(ctx context.
 			                  ) i USING (provider, provider_id)
 			                  WHERE h.media_type='episode' AND h.season_number=ep.season_number AND h.episode_number=ep.episode_number
 			                    AND h.release_at IS NOT NULL
+			                    AND NOT EXISTS (
+			                      SELECT 1 FROM verified_release_override_history h2
+			                      WHERE h2.media_type=h.media_type
+			                        AND h2.provider=h.provider
+			                        AND h2.provider_id=h.provider_id
+			                        AND h2.season_number=h.season_number
+			                        AND h2.episode_number=h.episode_number
+			                        AND h2.revision > h.revision
+			                  )
+			                  AND h.release_at <= statement_timestamp()
 			              ) THEN (
 			                  verified_episode_release_at(ep.series_id,ep.season_number,ep.episode_number,ep.air_date::timestamp AT TIME ZONE 'UTC') > statement_timestamp()
 			              )
@@ -3238,6 +3269,11 @@ func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx
 		return 0, 0, 0, fmt.Errorf("iterate virtual episode candidates: %w", err)
 	}
 	candidateRows.Close()
+	// Bound the per-pass work: episodes beyond the budget wait for the
+	// next reconciliation cycle rather than inflating lock and batch sizes.
+	if len(candidates) > maxVirtualEpisodeReconciliationBatch {
+		candidates = candidates[:maxVirtualEpisodeReconciliationBatch]
+	}
 	template, err := releaseIdentitiesForContent(ctx, tx, "episode", seriesID, "series", "", "", "", 1, 1)
 	if err != nil {
 		return 0, 0, 0, err
@@ -3260,10 +3296,13 @@ func materializeVirtualPlaybackEpisodesDetailedTx(ctx context.Context, tx pgx.Tx
 	if materializeVirtualEpisodesEvalHook != nil {
 		materializeVirtualEpisodesEvalHook()
 	}
+	// Deduplicate lock identities before the override capture batch so
+	// each unique identity is queried once rather than once per candidate.
+	dedupedLockIDs := dedupeReleaseIdentities(lockIDs)
 	// One captured decision per locked identity at a single evaluation
 	// time; provider/air-date evidence and local fallback apply only where
 	// no active override decides.
-	captured, err := captureReleaseOverridesTx(ctx, tx, lockIDs)
+	captured, err := captureReleaseOverridesTx(ctx, tx, dedupedLockIDs)
 	if err != nil {
 		return 0, 0, 0, err
 	}

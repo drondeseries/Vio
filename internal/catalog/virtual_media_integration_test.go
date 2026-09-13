@@ -80,12 +80,23 @@ func newVirtualMediaTestPool(t *testing.T) *pgxpool.Pool {
 // waitForBlockedAdvisoryLock polls pg_locks until another backend holds an
 // ungranted advisory lock (optionally matching a specific lockKey), proving a
 // concurrent writer actually queued behind held locks rather than running sequentially.
+// It captures the intended writer database and lock key, excludes the
+// test's own PID, and logs the observed advisory lock holders on timeout
+// so a mismatch (wrong key, wrong backend, no queuing) is diagnosable
+// instead of a bare timeout.
 func waitForBlockedAdvisoryLock(t *testing.T, pool *pgxpool.Pool, lockKey string, timeout time.Duration) {
 	t.Helper()
 	ctx := context.Background()
 	var self int
-	if err := pool.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&self); err != nil {
+	var dbName string
+	if err := pool.QueryRow(ctx, "SELECT pg_backend_pid(), current_database()").Scan(&self, &dbName); err != nil {
 		t.Fatal(err)
+	}
+	var wantHash int64
+	if lockKey != "" {
+		if err := pool.QueryRow(ctx, `SELECT hashtextextended($1, 0)`, lockKey).Scan(&wantHash); err != nil {
+			t.Fatal(err)
+		}
 	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -93,8 +104,8 @@ func waitForBlockedAdvisoryLock(t *testing.T, pool *pgxpool.Pool, lockKey string
 		var err error
 		if lockKey != "" {
 			err = pool.QueryRow(ctx, `
-				SELECT count(*) FROM pg_locks 
-				WHERE locktype='advisory' AND NOT granted AND pid <> $1 
+				SELECT count(*) FROM pg_locks
+				WHERE locktype='advisory' AND NOT granted AND pid <> $1
 				  AND ((classid::bigint << 32) | (objid::bigint & 4294967295)) = hashtextextended($2, 0)`, self, lockKey).Scan(&blocked)
 		} else {
 			err = pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted AND pid <> $1`, self).Scan(&blocked)
@@ -107,7 +118,29 @@ func waitForBlockedAdvisoryLock(t *testing.T, pool *pgxpool.Pool, lockKey string
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("concurrent writer never queued behind the held release locks")
+	rows, qerr := pool.Query(ctx, `
+		SELECT l.pid, l.granted,
+		       ((l.classid::bigint << 32) | (l.objid::bigint & 4294967295)),
+		       COALESCE(a.datname, ''), COALESCE(a.query, ''), COALESCE(a.wait_event_type, ''), COALESCE(a.wait_event, '')
+		FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+		WHERE l.locktype='advisory' AND l.pid <> $1
+		ORDER BY l.pid`, self)
+	if qerr != nil {
+		t.Fatalf("concurrent writer never queued behind the held release locks (db=%q lockKey=%q wantHash=%d self=%d): could not dump pg_locks: %v", dbName, lockKey, wantHash, self, qerr)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pid int
+		var granted bool
+		var keyHash int64
+		var datname, query, waitType, waitEvent string
+		if err := rows.Scan(&pid, &granted, &keyHash, &datname, &query, &waitType, &waitEvent); err != nil {
+			t.Logf("pg_locks dump scan failed: %v", err)
+			break
+		}
+		t.Logf("advisory lock: pid=%d granted=%v keyHash=%d datname=%q query=%q wait=%s/%s (want lockKey=%q wantHash=%d self=%d db=%q)", pid, granted, keyHash, datname, query, waitType, waitEvent, lockKey, wantHash, self, dbName)
+	}
+	t.Fatalf("concurrent writer never queued behind the held release locks (db=%q lockKey=%q wantHash=%d self=%d)", dbName, lockKey, wantHash, self)
 }
 
 var testReleaseSuffixCounter atomic.Uint64
@@ -115,16 +148,13 @@ var testReleaseSuffixCounter atomic.Uint64
 // uniqueReleaseSuffix returns per-run digits for provider identities written
 // to append-only tables (override history, metadata queue, provider IDs, and
 // content-keyed claims). Canonical numeric schemes accept the result. The
-// scheme combines the process ID, nanosecond time, and an atomic counter so
-// concurrent test processes cannot collide within the same second.
+// scheme combines the process ID with an atomic counter so concurrent tests
+// and processes get deterministic, collision-free suffixes without
+// timestamp-based collisions.
 func uniqueReleaseSuffix(t *testing.T) string {
 	t.Helper()
 	c := testReleaseSuffixCounter.Add(1)
-	ns := time.Now().UnixNano()
-	if ns < 0 {
-		ns = -ns
-	}
-	return fmt.Sprintf("%02d%06d%02d", os.Getpid()%100, uint64(ns/1000)%1000000, c%100)
+	return fmt.Sprintf("%02d%05d", os.Getpid()%100, c%100000)
 }
 
 func TestPresenceRequiresFileInMatchingEnabledLibrary(t *testing.T) {

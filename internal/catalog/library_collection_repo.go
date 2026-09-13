@@ -859,7 +859,7 @@ func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, s
 		if candidate.item == nil || candidate.item.ContentID != id {
 			return errors.New("invalid prepared collection item")
 		}
-		if _, err := items.ensureVirtualCollectionItemMaterializedTx(ctx, tx, snapshot.ID, candidate.item, libraries, candidate.variants, VirtualMaterializeOptions{accepting: true, releaseSnapshot: candidate.releaseSnapshot, deferDebtWrite: true}); err != nil {
+		if _, err := items.ensureVirtualCollectionItemMaterializedTx(ctx, tx, snapshot.ID, candidate.item, libraries, candidate.variants, VirtualMaterializeOptions{accepting: true, releaseSnapshot: candidate.releaseSnapshot, preparedExplicitly: true, deferDebtWrite: true}); err != nil {
 			return err
 		}
 		debtContentIDs = append(debtContentIDs, id)
