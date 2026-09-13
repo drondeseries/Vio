@@ -109,10 +109,11 @@ export function useASSSubtitles(
   // and every URL for the active track is stale. The caller must refresh the
   // plan's subtitle inventory; retrying the same URL can never succeed.
   onSourceChanged?: () => void,
-  // Plan identity: forces the ASS effect to re-run on a new plan even when
-  // the subtitle URL is coincidentally identical (e.g. a rotation replan
-  // that re-mints the same effective file/track URL).
-  planId?: string,
+  // The effective subtitle source generation. It survives plan swaps and only
+  // changes when the underlying source identity changes, so a subtitle-only
+  // replan does not tear down JASSUB and immediately refetch a possibly-still-
+  // stale URL. A genuine source change still rebuilds.
+  sourceGeneration = 0,
 ): { isActive: boolean } {
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
@@ -487,7 +488,7 @@ export function useASSSubtitles(
     // videoRef is a stable ref object. streamOriginSeconds is read from
     // sourceOriginRef inside the async function to always get the latest value.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeUrl, activeLanguage, activeFontBundleUrl, isDetached, planId]);
+  }, [activeUrl, activeLanguage, activeFontBundleUrl, isDetached, sourceGeneration]);
 
   // Update JASSUB's time offset when either the media timeline remaps or
   // the user nudges subtitle sync. Avoids destroying and recreating the

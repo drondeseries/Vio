@@ -66,7 +66,11 @@ import {
   toMediaTime,
   toPlayerTime,
 } from "../utils/mediaTimeline";
-import { pendingServerSubtitleSelection } from "../utils/playableSubtitles";
+import {
+  pendingServerSubtitleSelection,
+  subtitleTrackIdentityKey,
+  type SubtitleTrackIdentity,
+} from "../utils/playableSubtitles";
 import {
   copyWatchTogetherInvite,
   endWatchTogetherRoom,
@@ -660,18 +664,39 @@ export function VideoPlayer({
   // freezes on screen. Bump a generation on every settled stream change so
   // useSubtitleTracks rebuilds its track against the new element; the rebuild
   // carries loaded cues and window coverage over, so it costs no refetch.
+  // Keyed on the transport revision, not the plan revision: a text-sidecar
+  // replan reuses the element and must not rebuild the track.
   const [subtitleStreamGeneration, setSubtitleStreamGeneration] = useState(0);
-  const lastSubtitlePlanRevisionRef = useRef<number | null>(null);
+  const lastSubtitleTransportRevisionRef = useRef<number | null>(null);
   useEffect(() => {
     if (!isPlayerReady) return;
     const changed =
-      lastSubtitlePlanRevisionRef.current !== null &&
-      lastSubtitlePlanRevisionRef.current !== planRevision;
-    lastSubtitlePlanRevisionRef.current = planRevision;
+      lastSubtitleTransportRevisionRef.current !== null &&
+      lastSubtitleTransportRevisionRef.current !== effectiveTransportRevision;
+    lastSubtitleTransportRevisionRef.current = effectiveTransportRevision;
     if (changed) {
       setSubtitleStreamGeneration((generation) => generation + 1);
     }
-  }, [isPlayerReady, planRevision]);
+  }, [effectiveTransportRevision, isPlayerReady]);
+
+  // The effective subtitle source identity. A virtual release that rotates to a
+  // new concrete candidate changes this; a plan that only re-mints subtitle
+  // URLs or re-orders the inventory does not. The 409 source-change signal is
+  // deduped per generation (below and in the two subtitle hooks) so the
+  // refresh -> replan -> refetch cycle cannot restart on a new plan id.
+  const [subtitleSourceGeneration, setSubtitleSourceGeneration] = useState(0);
+  const lastSubtitleSourceIdentityRef = useRef<string | null>(null);
+  useEffect(() => {
+    const identity = `${sessionId}|${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}`;
+    if (lastSubtitleSourceIdentityRef.current === null) {
+      lastSubtitleSourceIdentityRef.current = identity;
+      return;
+    }
+    if (lastSubtitleSourceIdentityRef.current !== identity) {
+      lastSubtitleSourceIdentityRef.current = identity;
+      setSubtitleSourceGeneration((generation) => generation + 1);
+    }
+  }, [sessionId, plan.effective_media_file_id, plan.effective_virtual_uri]);
 
   const isFirefoxBrowser =
     typeof navigator !== "undefined" && isFirefoxUserAgent(navigator.userAgent);
@@ -1228,18 +1253,20 @@ export function VideoPlayer({
     );
   }, []);
 
-  // Dedupe signals per plan: a virtual release that rotated under this plan
-  // makes every subtitle URL stale. Refresh the plan's subtitle inventory
-  // exactly like the subtitle menu's "refresh" action — a track_change that
-  // changes nothing re-mints the URLs against the live layout while the A/V
-  // transport stays untouched. Once a plan is signaled, further 409s for it
-  // (windowed VTT and ASS both fire) are ignored until a new plan lands.
-  const subtitleSourceChangedPlanIdRef = useRef<string | null>(null);
+  // Dedupe signals per source generation: a virtual release that rotated under
+  // this plan makes every subtitle URL stale. Refresh the plan's subtitle
+  // inventory exactly like the subtitle menu's "refresh" action — a
+  // track_change that changes nothing re-mints the URLs against the live layout
+  // while the A/V transport stays untouched. The generation survives plan
+  // swaps, so the refresh's own replan does not re-arm the signal: further 409s
+  // (windowed VTT and ASS both fire) are ignored until the source identity
+  // itself changes.
+  const subtitleSourceChangedGenerationRef = useRef<number | null>(null);
   const handleSubtitleSourceChanged = useCallback(() => {
-    if (subtitleSourceChangedPlanIdRef.current === plan.plan_id) return;
-    subtitleSourceChangedPlanIdRef.current = plan.plan_id;
+    if (subtitleSourceChangedGenerationRef.current === subtitleSourceGeneration) return;
+    subtitleSourceChangedGenerationRef.current = subtitleSourceGeneration;
     onRefreshSubtitles?.(getSubtitleStartPosition());
-  }, [getSubtitleStartPosition, onRefreshSubtitles, plan.plan_id]);
+  }, [getSubtitleStartPosition, onRefreshSubtitles, subtitleSourceGeneration]);
 
   const resumeFromTranslationPause = useCallback(() => {
     if (translationResumeTimerRef.current !== null) {
@@ -2425,6 +2452,7 @@ export function VideoPlayer({
     subtitleStreamGeneration,
     setTextSubtitleState,
     handleSubtitleSourceChanged,
+    subtitleSourceGeneration,
   );
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
@@ -2437,7 +2465,7 @@ export function VideoPlayer({
     subtitleDelayMs,
     setASSSubtitleState,
     handleSubtitleSourceChanged,
-    plan.plan_id,
+    subtitleSourceGeneration,
   );
   // Prefetch ASS font bundles at plan adoption so a later track selection hits
   // the in-memory font cache instead of a cold server extraction. Purely a
@@ -2456,6 +2484,40 @@ export function VideoPlayer({
     activeSubtitleIndex !== null
       ? (effectiveSubtitleTracks.find((track) => track.index === activeSubtitleIndex) ?? null)
       : null;
+  const activeSubtitleIdentity = useMemo<SubtitleTrackIdentity | null>(() => {
+    if (activeSubtitleIndex === null) return null;
+    return {
+      index: activeSubtitleIndex,
+      trackId: activeSubtitleTrack?.track_id ?? null,
+      language: activeSubtitleTrack?.language ?? null,
+      codec: activeSubtitleTrack?.codec ?? null,
+      forced: activeSubtitleTrack?.forced,
+      hearingImpaired: activeSubtitleTrack?.hearing_impaired,
+      burnInOnly: activeSubtitleTrack?.burn_in_only === true,
+    };
+  }, [activeSubtitleIndex, activeSubtitleTrack]);
+  // The plan's authoritative selection resolved against its own inventory, so
+  // the comparison uses the asset identity rather than the ordinal the inventory
+  // happened to assign this plan.
+  const planSelectedSubtitleIdentity = useMemo<SubtitleTrackIdentity | null>(() => {
+    const selected = plan.selected_tracks.subtitle;
+    if (!selected) return null;
+    const item = plan.subtitle.inventory.find(
+      (entry) =>
+        (selected.index !== undefined && entry.combined_index === selected.index) ||
+        (selected.id !== "" && entry.track_id === selected.id),
+    );
+    return {
+      index: selected.index ?? item?.combined_index ?? null,
+      trackId: selected.id ?? item?.track_id ?? null,
+      language: item?.language ?? null,
+      codec: item?.codec ?? null,
+      forced: item?.forced,
+      hearingImpaired: item?.hearing_impaired,
+      burnInOnly: item?.delivery === "burn_in_only",
+    };
+  }, [plan.selected_tracks.subtitle, plan.subtitle.inventory]);
+
   const requestedSubtitleTrackChangeRef = useRef<string | null>(null);
   useEffect(() => {
     // Live AI cues belong to the client overlay, not the server inventory.
@@ -2465,17 +2527,24 @@ export function VideoPlayer({
       return;
     }
     const desiredServerIndex = pendingServerSubtitleSelection(
-      plan.subtitle.mode,
-      plan.selected_tracks.subtitle?.index ?? null,
-      activeSubtitleIndex,
-      activeSubtitleTrack?.burn_in_only === true,
+      planSelectedSubtitleIdentity,
+      activeSubtitleIdentity,
     );
     if (desiredServerIndex === undefined) {
       requestedSubtitleTrackChangeRef.current = null;
       return;
     }
 
-    const requestKey = `${plan.plan_id}:${desiredServerIndex ?? "none"}`;
+    // Key on the stable requested identity plus the source generation, never on
+    // plan_id: a persistent mismatch (e.g. the server resolved the selection to
+    // `off`, or re-minted the inventory) must not re-fire a request on every
+    // plan. A settled plan clears the ref above, so a later user action on the
+    // same identity can still request once.
+    const requestIdentity =
+      desiredServerIndex === null || activeSubtitleIdentity === null
+        ? "off"
+        : `track:${subtitleTrackIdentityKey(activeSubtitleIdentity)}`;
+    const requestKey = `${subtitleSourceGeneration}:${requestIdentity}`;
     if (requestedSubtitleTrackChangeRef.current === requestKey) return;
     requestedSubtitleTrackChangeRef.current = requestKey;
 
@@ -2490,12 +2559,11 @@ export function VideoPlayer({
     );
     onSubtitleTrackChange?.(desiredServerIndex, position);
   }, [
+    activeSubtitleIdentity,
     activeSubtitleIndex,
-    activeSubtitleTrack?.burn_in_only,
     onSubtitleTrackChange,
-    plan.plan_id,
-    plan.selected_tracks.subtitle?.index,
-    plan.subtitle.mode,
+    planSelectedSubtitleIdentity,
+    subtitleSourceGeneration,
   ]);
 
   // A refused replan leaves the previous stream playing, so the selection has

@@ -537,4 +537,62 @@ describe("subtitle source changed", () => {
       vi.useRealTimers();
     }
   });
+
+  it("does not signal onSourceChanged again when a rebuilt track retries the same source generation", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValue(errorResponse(409, { error: "subtitle_source_changed" }));
+    const videoRef = makeVideoRef();
+    const onSourceChanged = vi.fn();
+    const { rerender, unmount } = renderHook(
+      ({
+        streamGeneration,
+        sourceGeneration,
+      }: {
+        streamGeneration: number;
+        sourceGeneration: number;
+      }) =>
+        useSubtitleTracks(
+          videoRef,
+          [srtTrack],
+          1,
+          0,
+          0,
+          { current: 7200 },
+          { current: 0 },
+          undefined,
+          null,
+          streamGeneration,
+          undefined,
+          onSourceChanged,
+          sourceGeneration,
+        ),
+      { initialProps: { streamGeneration: 0, sourceGeneration: 0 } },
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).toHaveBeenCalledTimes(1);
+
+      // A stream reload rebuilds the fetcher (a new effect instance) but the
+      // source generation is unchanged: the 409 must not restart the cycle.
+      rerender({ streamGeneration: 1, sourceGeneration: 0 });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).toHaveBeenCalledTimes(1);
+
+      // A genuine source change re-arms the signal exactly once.
+      rerender({ streamGeneration: 1, sourceGeneration: 1 });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).toHaveBeenCalledTimes(2);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });

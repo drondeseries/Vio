@@ -516,6 +516,47 @@ describe("VideoPlayer plan failure recovery", () => {
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
     expect(toastError).toHaveBeenCalledOnce();
   });
+
+  it("does not re-request an unresolved sidecar selection on every plan", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    const sidecarTrack: PlayerSubtitleInfo = {
+      index: 2,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:2",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/2.vtt",
+    };
+    const planA = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:aaa",
+      plan_attempt_key: "v3:aaa",
+    });
+    const { rerenderPlayer } = renderPlayer({
+      plan: planA,
+      subtitleUrls: [sidecarTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+      onSubtitleTrackChange,
+    });
+
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1));
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0);
+
+    // The server resolved the selection to `off`/absent, so the UI identity is
+    // still outstanding. A replan that only mints a new plan id must not send
+    // the same request again; the guard holds until the plan acknowledges it.
+    const planB = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:bbb",
+      plan_attempt_key: "v3:bbb",
+    });
+    rerenderPlayer({ plan: planB });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(2));
+    expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("VideoPlayer intro skip prompt", () => {
@@ -1074,24 +1115,44 @@ describe("VideoPlayer translation handoff", () => {
     }
   });
 
-  it("refreshes the subtitle inventory once per plan_id on a source-changed signal", async () => {
+  it("refreshes the subtitle inventory once per source generation on a source-changed signal", async () => {
     const onRefreshSubtitles = vi.fn();
-    const planA = fixturePlanV3({ plan_id: "plan:aaa", plan_attempt_key: "v3:aaa" });
+    const planA = fixturePlanV3({
+      plan_id: "plan:aaa",
+      plan_attempt_key: "v3:aaa",
+      effective_virtual_uri: "virtual://release/a.mkv",
+    });
     const { rerenderPlayer } = renderPlayer({ plan: planA, onRefreshSubtitles });
     expect(subtitleHooks.vttSourceChanged).toBeTypeOf("function");
     expect(subtitleHooks.assSourceChanged).toBeTypeOf("function");
 
     // The VTT window fetch and the ASS fetch can both see the rotation; both
-    // signals for the same plan must collapse into a single refresh.
+    // signals for the same source must collapse into a single refresh.
     act(() => subtitleHooks.vttSourceChanged?.());
     act(() => subtitleHooks.assSourceChanged?.());
     expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
 
-    // A new plan (the refresh's own replan re-mints the URLs) re-arms the
-    // signal: the next rotation for it refreshes again.
-    const planB = fixturePlanV3({ plan_id: "plan:bbb", plan_attempt_key: "v3:bbb" });
+    // The refresh's own replan mints a new plan id but the source identity is
+    // unchanged: it must NOT re-arm the signal and restart the cycle.
+    const planB = fixturePlanV3({
+      plan_id: "plan:bbb",
+      plan_attempt_key: "v3:bbb",
+      effective_virtual_uri: "virtual://release/a.mkv",
+    });
     rerenderPlayer({ plan: planB });
     act(() => subtitleHooks.vttSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
+
+    // A genuine source change (a new resolved candidate) re-arms it exactly
+    // once more.
+    const planC = fixturePlanV3({
+      plan_id: "plan:ccc",
+      plan_attempt_key: "v3:ccc",
+      effective_virtual_uri: "virtual://release/b.mkv",
+    });
+    rerenderPlayer({ plan: planC });
+    act(() => subtitleHooks.vttSourceChanged?.());
+    act(() => subtitleHooks.assSourceChanged?.());
     expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
   });
 
