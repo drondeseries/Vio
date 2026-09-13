@@ -87,10 +87,15 @@ const (
 	// beyond this is stuck and should release its slot.
 	subtitleCacheWarmTimeout = 30 * time.Minute
 	// subtitleCacheGenerationBucket bounds the staleness of identity-keyed
-	// (remote / virtual / generated) cache entries: the key rotates every ten
-	// minutes, so a source that rotated can never be served past the bucket
-	// boundary.
-	subtitleCacheGenerationBucket = 10 * time.Minute
+	// (remote / virtual / generated) cache entries. The identity already pins
+	// the provider result candidate id, so a release that actually rotates
+	// produces a different key; for subtitles the bucket is only residual
+	// insurance against the same pinned id later serving changed bytes. It was
+	// ten minutes, which discarded a warmed ASS/SUP artifact between plays and
+	// forced a full ~100s relay demux on the next request. A day keeps a
+	// warmed artifact across a viewing session while still bounding that
+	// residual risk.
+	subtitleCacheGenerationBucket = 24 * time.Hour
 	// subtitleFontBundleExtractTimeout bounds one detached font-bundle
 	// extraction. The extraction runs single-flighted and detached from the
 	// request that triggered it, and its successful result is written through
@@ -423,8 +428,8 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 // in flight, cache disabled, already cached); callers use it to release a
 // request-scoped relay registration the warm held open.
 //
-// Staleness for identity-keyed (virtual) sources follows the same 10-minute
-// generation bucket as every other cache lookup: an entry committed under an
+// Staleness for identity-keyed (virtual) sources follows the same generation
+// bucket as every other cache lookup: an entry committed under an
 // earlier bucket is not found by later lookups, so a warm that loses its
 // bucket race is simply re-kicked by the next windowed miss.
 func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SUPExtractFunc) <-chan struct{} {
@@ -761,7 +766,7 @@ type FontBundleKey struct {
 // source resolves the stable cache identity and invalidation coordinates for
 // the key, mirroring subtitleCacheSource's two modes. Local rows use the file
 // row's mtime/size verbatim (no generation bucket); virtual rows key on the
-// pinned result id plus a 10-minute generation bucket so a rotated source can
+// pinned result id plus a generation bucket so a rotated source can
 // never be served past the bucket boundary. ok is false for rows that cannot
 // be keyed reliably (a local row without a usable mtime/size), which callers
 // treat as "do not cache" — the same fallback the DV RPU memo uses.
@@ -794,7 +799,7 @@ func fontBundleCacheFileName(identity string, modTime time.Time, size int64) str
 // defeat the cache, so the identity is built from the pinned provider-neutral
 // URI's "result=" candidate id plus the effective ffmpeg track ordinal (the
 // ordinal the extraction will actually map, after any drift remap). Staleness
-// is bounded by the same 10-minute generation bucket subtitleCacheSource
+// is bounded by the same generation bucket subtitleCacheSource
 // applies to identity-keyed entries.
 func VirtualSubtitleCacheIdentity(fileID int, virtualSourceURI string, trackIndex int) string {
 	pinned := ""

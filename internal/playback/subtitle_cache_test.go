@@ -90,6 +90,52 @@ func TestServeExtractWindowedASSStreamsWithoutFullTrackFill(t *testing.T) {
 	}
 }
 
+// A warmed virtual subtitle artifact must survive well past the old
+// ten-minute generation bucket. The key already pins the provider result id,
+// so a rotated release produces a different identity; the bucket is only
+// residual insurance against the same pinned id serving changed bytes. A
+// ten-minute bucket threw away a ~100s ASS warm between plays.
+func TestVirtualSubtitleCacheArtifactSurvivesPastTenMinuteBucket(t *testing.T) {
+	c, source := newTestCache(t)
+	const identity = "virtual-result-stable-id"
+	fill := c.beginFill(source, identity, 0, subtitleFormatASS)
+	if fill == nil {
+		t.Fatal("failed to reserve identity-keyed fill")
+	}
+	if _, err := fill.Tee(io.Discard).Write([]byte("[Script Info]\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fill.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Anchor mid-bucket so an 11-minute advance stays inside any bucket wider
+	// than ~22 minutes (the durable value) while the old 10-minute bucket
+	// always rotates. The artifact must still resolve to the same entry.
+	bucketSeconds := int64(subtitleCacheGenerationBucket / time.Second)
+	base := fill.srcMtime.Add(time.Duration(bucketSeconds/2) * time.Second)
+	later := base.Add(11 * time.Minute)
+
+	resolve := func(at time.Time) string {
+		resolved, modTime, size, ok := subtitleCacheSource(source, identity, at)
+		if !ok {
+			t.Fatalf("identity-keyed source must resolve at %v", at)
+		}
+		return filepath.Join(c.dir(), subtitleCacheFormatKey(resolved, 0, modTime, size, subtitleFormatASS))
+	}
+	committed := resolve(base)
+	if laterPath := resolve(later); laterPath != committed {
+		t.Fatalf("virtual subtitle artifact rotated after 11 minutes:\n got %s\nwant %s", laterPath, committed)
+	}
+	if _, err := os.Stat(committed); err != nil {
+		t.Fatalf("warmed artifact not on disk after the generation advance: %v", err)
+	}
+	// The live lookup (which uses the wall clock) still serves it.
+	if _, _, ok := c.cachedFormatEntryPath(source, identity, 0, subtitleFormatASS); !ok {
+		t.Fatal("identity-keyed artifact not served by the live lookup")
+	}
+}
+
 func TestServeExtractTextWindowDoesNotPoisonFullTrack(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", DurationSeconds: 600}
