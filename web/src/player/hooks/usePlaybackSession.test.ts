@@ -401,7 +401,11 @@ describe("usePlaybackSession quality changes", () => {
       expect(result.current.error).toBeTruthy();
     });
 
-    act(() => result.current.refreshSubtitles(120));
+    act(() => {
+      // Deliberately not awaited: these tests drive the replan manually so the
+      // promise must not block `act` on a queued/in-flight replan.
+      void result.current.refreshSubtitles(120);
+    });
     await waitFor(() => expect(replanCount).toBe(2));
 
     const replanBodies = fetchMock.mock.calls
@@ -977,7 +981,11 @@ describe("usePlaybackSession output capability changes", () => {
     );
     await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
 
-    act(() => result.current.refreshSubtitles(120));
+    act(() => {
+      // Deliberately not awaited: these tests drive the replan manually so the
+      // promise must not block `act` on a queued/in-flight replan.
+      void result.current.refreshSubtitles(120);
+    });
     await waitFor(() => expect(replanBodies).toHaveLength(1));
     act(() => setHDR(false));
     act(() => result.current.reanchorSeek(555));
@@ -1761,7 +1769,11 @@ describe("usePlaybackSession replans", () => {
     );
     await waitFor(() => expect(result.current.plan).not.toBeNull());
 
-    act(() => result.current.refreshSubtitles(120));
+    act(() => {
+      // Deliberately not awaited: these tests drive the replan manually so the
+      // promise must not block `act` on a queued/in-flight replan.
+      void result.current.refreshSubtitles(120);
+    });
     await waitFor(() => expect(replanBodies).toHaveLength(1));
 
     act(() => {
@@ -1852,7 +1864,11 @@ describe("usePlaybackSession replans", () => {
     );
     await waitFor(() => expect(result.current.plan).not.toBeNull());
 
-    act(() => result.current.refreshSubtitles(120));
+    act(() => {
+      // Deliberately not awaited: these tests drive the replan manually so the
+      // promise must not block `act` on a queued/in-flight replan.
+      void result.current.refreshSubtitles(120);
+    });
     await waitFor(() => expect(replanBodies).toHaveLength(1));
 
     act(() => {

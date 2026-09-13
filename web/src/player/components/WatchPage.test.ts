@@ -743,6 +743,36 @@ describe("WatchPage live inventory refresh", () => {
     expect(refreshSubtitles).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps polling after a failed subtitle replan and stops once one succeeds", async () => {
+    const refreshSubtitles = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [],
+        refreshSubtitles,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [
+        {
+          ...virtualVersion,
+          subtitle_tracks: [{ index: 13, language: "en", codec: "pgs", title: "English" }],
+        },
+      ],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 4);
+    });
+
+    // The first replan failed, so the inventory is not complete and the poll
+    // runs again; the second adopts a plan and completes the loop early.
+    expect(refreshSubtitles).toHaveBeenCalledTimes(2);
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(2);
+  });
+
   it("stops after the attempt cap when the inventory never fills in", async () => {
     playbackSessionMock.mockReturnValue(
       playbackSession({

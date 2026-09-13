@@ -307,9 +307,14 @@ export function WatchPage({
           if (current.subtitleUrls.length === 0 && nextSubtitleTracks.length > 0) {
             // The catalog carries no playable URLs; a no-op track_change
             // replan re-reads the plan's inventory (URLs included) without
-            // changing the A/V transport, so the stream keeps playing.
-            refreshSubtitles(playbackPositionRef.current);
-            subtitlesComplete = true;
+            // changing the A/V transport, so the stream keeps playing. Only
+            // treat the inventory as filled once a fresh plan actually lands:
+            // a transient replan failure must not end the retry budget.
+            const filled = await refreshSubtitles(playbackPositionRef.current);
+            if (cancelled) return;
+            if (filled || sessionRef.current.subtitleUrls.length > 0) {
+              subtitlesComplete = true;
+            }
           }
         }
       } catch {

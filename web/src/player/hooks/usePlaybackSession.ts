@@ -151,8 +151,13 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
   invalidatePlan: (planId: string, reason: string, currentPosition: number) => Promise<boolean>;
   /** `seek_reanchor` replan when the target lies outside the seekable window. */
   reanchorSeek: (positionSeconds: number) => void;
-  /** Re-reads the subtitle inventory by replanning with the selection unchanged. */
-  refreshSubtitles: (currentPosition: number) => void;
+  /**
+   * Re-reads the subtitle inventory by replanning with the selection unchanged.
+   * Resolves to whether a fresh plan carrying the inventory was adopted, so a
+   * caller polling for late subtitles can tell a real fill-in from a transient
+   * replan failure.
+   */
+  refreshSubtitles: (currentPosition: number) => Promise<boolean>;
   /** Folds a realtime-delivered inventory entry in without a server round trip. */
   applySubtitleTrack: (track: SubtitleInventoryItemV3) => void;
   /**
@@ -1469,9 +1474,9 @@ export function usePlaybackSession(
    * included — without excluding the route already playing.
    */
   const refreshSubtitles = useCallback(
-    (currentPosition: number) => {
-      if (!planRef.current) return;
-      void replan({ operation: "track_change", positionSeconds: currentPosition });
+    async (currentPosition: number): Promise<boolean> => {
+      if (!planRef.current) return false;
+      return replan({ operation: "track_change", positionSeconds: currentPosition });
     },
     [replan],
   );
