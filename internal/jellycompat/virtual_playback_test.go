@@ -300,6 +300,69 @@ func TestRegisterVirtualInputForwardsRequestHeaders(t *testing.T) {
 	}
 }
 
+// A probe of a provider URL that requires the caller's request headers must use
+// the header-aware prober so it is authenticated like the playback relay; the
+// plain prober is left for legacy embeddings and nil headers.
+func TestProbeCompatVirtualSourcePassesRequestHeaders(t *testing.T) {
+	uri := "virtual://movie/tt0133093?profile=1080p&result=stable"
+	headers := map[string]string{"Referer": "https://stream.example/player"}
+	file := &models.MediaFile{ID: 42, FilePath: uri, Container: "virtual", VirtualOwnerInstallationID: 7}
+
+	var headerCalls, plainCalls int
+	var gotHeaders map[string]string
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "https://provider.example/stream.mkv", URI: uri, RequestHeaders: headers}, nil
+		}),
+		VirtualSourceProberWithHeaders: func(_ context.Context, _ string, f *models.MediaFile, hdrs map[string]string) (*models.MediaFile, error) {
+			headerCalls++
+			gotHeaders = hdrs
+			probed := *f
+			return &probed, nil
+		},
+		VirtualSourceProber: func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
+			plainCalls++
+			return nil, errors.New("plain prober must not run when the header-aware variant is wired")
+		},
+	}
+
+	probed, ok := h.probeCompatVirtualSource(context.Background(), file, uri, 7, 1, "profile-1")
+	if !ok || probed == nil {
+		t.Fatalf("probeCompatVirtualSource ok=%v probed=%v", ok, probed)
+	}
+	if headerCalls != 1 || plainCalls != 0 {
+		t.Fatalf("header prober calls=%d plain calls=%d, want 1/0", headerCalls, plainCalls)
+	}
+	if gotHeaders["Referer"] != headers["Referer"] {
+		t.Fatalf("prober headers = %#v, want provider headers", gotHeaders)
+	}
+}
+
+// Without a header-aware prober the plain variant stays the fallback, even
+// when the resolver supplies headers (older embeddings).
+func TestProbeCompatVirtualSourceFallsBackToPlainProber(t *testing.T) {
+	uri := "virtual://movie/tt0133093?profile=1080p"
+	headers := map[string]string{"Referer": "https://stream.example/player"}
+	file := &models.MediaFile{ID: 42, FilePath: uri, Container: "virtual", VirtualOwnerInstallationID: 7}
+
+	plainCalls := 0
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "https://provider.example/stream.mkv", URI: uri, RequestHeaders: headers}, nil
+		}),
+		VirtualSourceProber: func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			plainCalls++
+			probed := *f
+			return &probed, nil
+		},
+	}
+
+	probed, ok := h.probeCompatVirtualSource(context.Background(), file, uri, 7, 1, "profile-1")
+	if !ok || probed == nil || plainCalls != 1 {
+		t.Fatalf("ok=%v probed=%v plainCalls=%d, want true/non-nil/1", ok, probed, plainCalls)
+	}
+}
+
 func TestHandleDownloadReusesBoundVirtualSource(t *testing.T) {
 	codec := NewResourceIDCodec()
 	contentID := "movie-1"

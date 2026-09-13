@@ -3102,15 +3102,15 @@ func main() {
 			}
 			ffprobePath := scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)
 			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
-			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
+			compatVirtualSourceProberWithHeaders := func(ctx context.Context, sourceURL string, file *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
 				return virtualProbeCache.Probe(ctx, sourceURL, file, func(probeCtx context.Context, probeURL string, probeFile *models.MediaFile) (*models.MediaFile, error) {
 					var relayURL string
 					var cleanup func()
 					var err error
 					if pluginService.InstallationAllowsInsecure(context.Background(), probeFile.VirtualOwnerInstallationID) {
-						relayURL, cleanup, err = virtualRelay.RegisterInsecure(probeCtx, probeURL)
+						relayURL, cleanup, err = virtualRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
 					} else {
-						relayURL, cleanup, err = virtualRelay.Register(probeCtx, probeURL)
+						relayURL, cleanup, err = virtualRelay.RegisterWithHeaders(probeCtx, probeURL, headers)
 					}
 					if err != nil {
 						return probeFile, err
@@ -3120,6 +3120,10 @@ func main() {
 						return playback.DVRPUStrippable(dvCtx, cfg.Playback.FFmpegPath, input)
 					})
 				})
+			}
+			compatDeps.VirtualSourceProberWithHeaders = compatVirtualSourceProberWithHeaders
+			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
+				return compatVirtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
 			}
 			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error {
 				if deps.DB == nil {

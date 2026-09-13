@@ -113,6 +113,13 @@ func (f VirtualPlaybackStreamListerFunc) ListVirtualPlaybackStreams(ctx context.
 
 type VirtualSourceProber func(context.Context, string, *models.MediaFile) (*models.MediaFile, error)
 
+// VirtualSourceProberWithHeaders probes a provider URL through the same relay
+// credentials the playback transport uses. Provider URLs that require replaying
+// the caller's request headers (Referer/Origin/User-Agent) fail the probe when
+// those headers are dropped, so the header-aware variant is preferred whenever
+// the resolver returns RequestHeaders.
+type VirtualSourceProberWithHeaders func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error)
+
 // VirtualFileMetadataSaver persists a probed virtual inventory back to the
 // catalog row, mirroring internal/api/handlers.VirtualFileMetadataSaver.
 // jellycompat cannot import internal/api/handlers (that package imports
@@ -315,7 +322,7 @@ func (h *PlaybackHandler) resolveAndProbeVirtualSource(ctx context.Context, file
 		// probe_updated_at so later plays can take the fast candidate-merge
 		// path. Already-probed rows skip this entirely (no probe-per-play),
 		// matching the native probe gate.
-		if file.ProbeUpdatedAt == nil && h.VirtualSourceProber != nil {
+		if file.ProbeUpdatedAt == nil && (h.VirtualSourceProber != nil || h.VirtualSourceProberWithHeaders != nil) {
 			if probed, ok := h.probeCompatVirtualSource(ctx, &transient, uri, ownerID, userID, profileID); ok {
 				if transient.ID > 0 {
 					probed.ID = transient.ID
@@ -345,7 +352,7 @@ func (h *PlaybackHandler) resolveAndProbeVirtualSource(ctx context.Context, file
 // URL cannot be resolved or the probe fails, so the caller falls back to the
 // candidate-declared inventory.
 func (h *PlaybackHandler) probeCompatVirtualSource(ctx context.Context, transient *models.MediaFile, uri string, ownerID, userID int, profileID string) (*models.MediaFile, bool) {
-	if h == nil || h.VirtualSourceProber == nil || transient == nil || !isCompatVirtualPath(uri) {
+	if h == nil || (h.VirtualSourceProber == nil && h.VirtualSourceProberWithHeaders == nil) || transient == nil || !isCompatVirtualPath(uri) {
 		return nil, false
 	}
 	resolved, err := h.resolveVirtualTransportForIdentity(ctx, userID, profileID, PlaybackMediaSource{
@@ -358,11 +365,28 @@ func (h *PlaybackHandler) probeCompatVirtualSource(ctx context.Context, transien
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, compatVirtualProbeTimeout)
 	defer cancel()
-	probed, err := h.VirtualSourceProber(probeCtx, resolved.URL, transient)
+	probed, err := h.probeVirtualSourceWithHeaders(probeCtx, resolved.URL, transient, resolved.RequestHeaders)
 	if err != nil || probed == nil {
 		return nil, false
 	}
 	return probed, true
+}
+
+// probeVirtualSourceWithHeaders prefers the header-aware prober so a probe of a
+// provider URL that validates the caller's request headers is authenticated the
+// same way the playback relay is. The plain variant stays the fallback for
+// nil headers and older embeddings.
+func (h *PlaybackHandler) probeVirtualSourceWithHeaders(ctx context.Context, sourceURL string, file *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
+	if h == nil {
+		return file, errors.New("playback handler is not configured")
+	}
+	if h.VirtualSourceProberWithHeaders != nil {
+		return h.VirtualSourceProberWithHeaders(ctx, sourceURL, file, headers)
+	}
+	if h.VirtualSourceProber != nil {
+		return h.VirtualSourceProber(ctx, sourceURL, file)
+	}
+	return file, errors.New("virtual playback source prober is not configured")
 }
 
 // persistCompatVirtualMetadata stamps a successfully probed virtual inventory

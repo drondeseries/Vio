@@ -117,13 +117,14 @@ type Dependencies struct {
 	// Virtual playback dependencies are optional. When configured, Jellyfin
 	// clients negotiate and transport virtual files through the same provider
 	// resolution and transient probing pipeline as native clients.
-	VirtualMediaResolver         VirtualMediaResolver
-	VirtualMediaRefreshResolver  VirtualMediaRefreshResolver
-	VirtualMediaDetailedResolver VirtualMediaDetailedResolver
-	VirtualPlaybackStreamLister  VirtualPlaybackStreamLister
-	VirtualSourceProber          VirtualSourceProber
-	VirtualFileMetadataSaver     VirtualFileMetadataSaver
-	RemoteStreamRelay            RemoteStreamRelay
+	VirtualMediaResolver           VirtualMediaResolver
+	VirtualMediaRefreshResolver    VirtualMediaRefreshResolver
+	VirtualMediaDetailedResolver   VirtualMediaDetailedResolver
+	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
+	VirtualSourceProber            VirtualSourceProber
+	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
+	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	RemoteStreamRelay              RemoteStreamRelay
 	// AllowInsecureVirtual reports whether a plugin installation has explicitly
 	// enabled allow_insecure_http for private/local stream URLs. When nil or
 	// false, virtual streams use the strict SSRF-protected relay path.
