@@ -382,12 +382,12 @@ func TestNextUpRepository_SQLiteSnapshots_HiddenThenRecompletedRestoresEligibili
 	assertNextUpContentIDs(t, results, seriesID+"-e2")
 }
 
-// TestNextUpRepository_SQLiteSnapshots_HiddenBoundaryAndItemScope pins the two
-// hidden-history semantics the review calls out: the cutoff is inclusive
-// (hidden_before == updated_at hides the item), and hiding is item-scoped, so a
-// hidden newest completion falls back to the next older unhidden completion
-// rather than being suppressed at the series level. If series-level hiding is
-// intended, this test is where that decision becomes explicit.
+// TestNextUpRepository_SQLiteSnapshots_HiddenBoundaryAndItemScope pins the
+// hidden-history semantics the review calls out. RemoveHistoryItems deletes the
+// completion row and records a watermark, so hiding is item-scoped: the older
+// unhidden completion then anchors the series and the rail resurfaces with the
+// hidden episode as next up. A completion written at or before the watermark is
+// suppressed; one after it restores the anchor.
 func TestNextUpRepository_SQLiteSnapshots_HiddenBoundaryAndItemScope(t *testing.T) {
 	pool := newNextUpTestPool(t)
 	ctx := context.Background()
@@ -421,25 +421,40 @@ func TestNextUpRepository_SQLiteSnapshots_HiddenBoundaryAndItemScope(t *testing.
 	}
 	assertNextUpContentIDs(t, results, seriesID+"-e3")
 
-	// A cutoff strictly before the completion leaves it visible.
-	if err := store.RemoveHistoryItems(ctx, profileID, []string{seriesID + "-e2"}, newer.Add(-time.Second)); err != nil {
-		t.Fatalf("pre-equality hide: %v", err)
+	// Hiding the newest completion deletes it and records the watermark. The
+	// older completion then anchors the series, so the rail resurfaces with the
+	// hidden episode as next up: hiding is item-scoped, not series-scoped. If
+	// series-level suppression is intended, this assertion is the one to change.
+	hiddenBefore := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
+	if err := store.RemoveHistoryItems(ctx, profileID, []string{seriesID + "-e2"}, hiddenBefore); err != nil {
+		t.Fatalf("hide: %v", err)
 	}
 	results, err = repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, Limit: 20})
 	if err != nil {
-		t.Fatalf("pre-equality: %v", err)
-	}
-	assertNextUpContentIDs(t, results, seriesID+"-e3")
-
-	// A cutoff equal to the completion hides it (the comparison is inclusive).
-	if err := store.RemoveHistoryItems(ctx, profileID, []string{seriesID + "-e2"}, newer); err != nil {
-		t.Fatalf("equality hide: %v", err)
-	}
-	results, err = repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, Limit: 20})
-	if err != nil {
-		t.Fatalf("equality: %v", err)
+		t.Fatalf("after hide: %v", err)
 	}
 	assertNextUpContentIDs(t, results, seriesID+"-e2")
+
+	// A completion at the watermark is suppressed (the comparison is inclusive),
+	// so the older anchor still stands.
+	if err := store.SetProgressAt(ctx, profileID, seriesID+"-e2", 0, 0, true, hiddenBefore); err != nil {
+		t.Fatalf("completion at watermark: %v", err)
+	}
+	results, err = repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, Limit: 20})
+	if err != nil {
+		t.Fatalf("at watermark: %v", err)
+	}
+	assertNextUpContentIDs(t, results, seriesID+"-e2")
+
+	// A completion after the watermark restores the newest anchor.
+	if err := store.SetProgressAt(ctx, profileID, seriesID+"-e2", 0, 0, true, hiddenBefore.Add(time.Second)); err != nil {
+		t.Fatalf("completion after watermark: %v", err)
+	}
+	results, err = repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, Limit: 20})
+	if err != nil {
+		t.Fatalf("after watermark: %v", err)
+	}
+	assertNextUpContentIDs(t, results, seriesID+"-e3")
 }
 
 // TestNextUpRepository_SQLiteSnapshots_SeriesAndDateFilters exercises the
