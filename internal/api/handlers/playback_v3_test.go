@@ -4970,8 +4970,8 @@ func TestHandleReplanPlaybackV3SidecarChangeReusesOriginalHTTPTransport(t *testi
 	manager := playback.NewSessionManager(0, 0)
 	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
 	// A signing secret is required: without it playbackStreamURL appends no
-	// token, every direct-play URL is the bare /stream/{sessionID}, and the
-	// regression this test guards cannot reproduce.
+	// signed credential, every direct-play URL is the bare /stream/{sessionID},
+	// and the regression this test guards cannot reproduce.
 	handler.JWTSecret = "sidecar-direct-signing-secret"
 	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
 	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
@@ -4994,9 +4994,18 @@ func TestHandleReplanPlaybackV3SidecarChangeReusesOriginalHTTPTransport(t *testi
 	}
 	beforeURL := started.PlaybackPlan.Stream.URL
 	beforeExpires := started.PlaybackPlan.ExpiresAt
-	if beforeURL == "" || !strings.Contains(beforeURL, "token=") {
-		t.Fatalf("direct-play start URL %q carries no token", beforeURL)
+	// The default request advertises no header_authenticated_media_v1, so this
+	// is the legacy token lane: the URL must carry the signed stream credential
+	// (?st=). A credential-free URL would mean the header-authenticated lane,
+	// which is stable before the production change and cannot prove anything.
+	tokenParam := streamTokenParam + "="
+	if beforeURL == "" || !strings.Contains(beforeURL, tokenParam) {
+		t.Fatalf("direct-play start URL %q carries no signed stream credential (%s)", beforeURL, tokenParam)
 	}
+	// Sign stamps iat/exp at second granularity. Cross the boundary so that a
+	// rebuild (the pre-change behavior) necessarily re-signs to a different URL;
+	// without this the old code could mint a byte-identical token and pass.
+	time.Sleep(time.Until(time.Unix(time.Now().Unix()+1, 0)) + 10*time.Millisecond)
 
 	english := 1
 	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
