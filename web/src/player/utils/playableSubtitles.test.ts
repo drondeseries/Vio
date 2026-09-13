@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { PlayerSubtitleInfo } from "../types";
-import { pendingServerSubtitleSelection, resolvePlayableSubtitles } from "./playableSubtitles";
+import {
+  hasSelectableSessionSubtitles,
+  pendingServerSubtitleSelection,
+  resolvePlayableSubtitles,
+} from "./playableSubtitles";
 
 function makeSubtitle(overrides: Partial<PlayerSubtitleInfo> = {}): PlayerSubtitleInfo {
   return {
@@ -67,6 +71,26 @@ describe("resolvePlayableSubtitles", () => {
     });
 
     expect(resolvePlayableSubtitles([], [fallbackTrack])).toEqual([fallbackTrack]);
+  });
+});
+
+describe("hasSelectableSessionSubtitles", () => {
+  it("is true when a session track carries a stream url", () => {
+    expect(hasSelectableSessionSubtitles([makeSubtitle({ url: "/stream/session/0" })])).toBe(true);
+  });
+
+  it("is true for a burn-in-only track without a url", () => {
+    expect(hasSelectableSessionSubtitles([makeSubtitle({ burn_in_only: true, url: "" })])).toBe(
+      true,
+    );
+  });
+
+  it("is false for a published track that is neither fetchable nor burn-in-only", () => {
+    expect(hasSelectableSessionSubtitles([makeSubtitle({ url: "" })])).toBe(false);
+  });
+
+  it("is false for an empty inventory", () => {
+    expect(hasSelectableSessionSubtitles([])).toBe(false);
   });
 });
 

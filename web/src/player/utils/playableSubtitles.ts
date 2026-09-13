@@ -15,6 +15,16 @@ function isSelectableSessionTrack(track: PlayerSubtitleInfo): boolean {
   return hasPlayableUrl(track) || track.burn_in_only === true;
 }
 
+/**
+ * Whether the plan's own inventory offers anything the menu can render. A
+ * published-but-unselectable entry (no URL and not `burn_in_only`) does not
+ * count, so callers that gate on "the menu is still empty" keep looking for
+ * the probe's real inventory instead of treating the placeholder as complete.
+ */
+export function hasSelectableSessionSubtitles(sessionTracks: PlayerSubtitleInfo[]): boolean {
+  return sessionTracks.some(isSelectableSessionTrack);
+}
+
 export function resolvePlayableSubtitles(
   sessionTracks: PlayerSubtitleInfo[],
   fallbackTracks: PlayerSubtitleInfo[],

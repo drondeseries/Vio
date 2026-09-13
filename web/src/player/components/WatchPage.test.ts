@@ -1026,6 +1026,50 @@ describe("WatchPage live inventory refresh", () => {
 
     expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
   });
+
+  it("still polls when the plan's only subtitle entry is not selectable", async () => {
+    const refreshSubtitles = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: richerAudioTracks,
+        // No URL and not burn-in only: the menu renders nothing from it, so the
+        // poll must keep looking for the probe's real inventory.
+        subtitleUrls: [{ ...planSubtitle, url: "" }],
+        refreshSubtitles,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [
+        {
+          ...virtualVersion,
+          subtitle_tracks: [{ index: 13, language: "en", codec: "pgs", title: "English" }],
+        },
+      ],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+    expect(refreshSubtitles).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not poll when the plan already has a selectable subtitle entry", async () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ planAudioTracks: richerAudioTracks, subtitleUrls: [planSubtitle] }),
+    );
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    expect(fetchWatchDetailMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("WatchPage chapter refresh", () => {

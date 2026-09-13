@@ -6,7 +6,10 @@ import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
 import { playerFetch } from "../player-fetch";
-import { resolvePlayableSubtitles } from "../utils/playableSubtitles";
+import {
+  hasSelectableSessionSubtitles,
+  resolvePlayableSubtitles,
+} from "../utils/playableSubtitles";
 import { patchVersionMarkers, resolveActiveVersionMarkers } from "../utils/watchPageMarkers";
 import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import { buildSubtitleChoiceRequests } from "../utils/subtitleChoicePersistence";
@@ -268,7 +271,10 @@ export function WatchPage({
     }
 
     const needsAudio = isVirtualActiveFile && session.planAudioTracks.length <= 1;
-    const needsSubtitles = session.subtitleUrls.length === 0;
+    // Gate on what the menu can actually render, not on whether the plan
+    // published any entry: a non-selectable placeholder must not suppress the
+    // poll, or the probed embedded tracks never reach the menu.
+    const needsSubtitles = playableSubtitles.length === 0;
     if (!needsAudio && !needsSubtitles) return;
 
     const mediaFileId = session.mediaFileId;
@@ -335,7 +341,10 @@ export function WatchPage({
             audioComplete = true;
           }
           const nextSubtitleTracks = version.subtitle_tracks ?? [];
-          if (current.subtitleUrls.length === 0 && nextSubtitleTracks.length > 0) {
+          if (
+            !hasSelectableSessionSubtitles(current.subtitleUrls) &&
+            nextSubtitleTracks.length > 0
+          ) {
             // The catalog carries no playable URLs; a no-op track_change
             // replan re-reads the plan's inventory (URLs included) without
             // changing the A/V transport, so the stream keeps playing. Only
@@ -343,7 +352,7 @@ export function WatchPage({
             // a transient replan failure must not end the retry budget.
             const filled = await refreshSubtitles(playbackPositionRef.current);
             if (cancelled) return;
-            if (filled || sessionRef.current.subtitleUrls.length > 0) {
+            if (filled || hasSelectableSessionSubtitles(sessionRef.current.subtitleUrls)) {
               subtitlesComplete = true;
             }
           }
