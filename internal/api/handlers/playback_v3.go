@@ -4354,7 +4354,11 @@ func (h *PlaybackHandler) grantManifestURLV3(ctx context.Context, card playback.
 // sourceExecutionMetadataV3 freezes the source facts used by a remote executor.
 func sourceExecutionMetadataV3(file *models.MediaFile, result playback.PlannerResultV3) playback.SourceExecutionMetadataV3 {
 	if result.FrozenSourceMetadata != nil {
-		return scopeToneMapSourceMetadataV3(*result.FrozenSourceMetadata, result.ToneMapMode)
+		metadata := *result.FrozenSourceMetadata
+		if result.Plan != nil && result.Plan.EffectiveRecipe.SoftwareVideoDecode {
+			metadata.SoftwareVideoDecode = true
+		}
+		return scopeToneMapSourceMetadataV3(metadata, result.ToneMapMode)
 	}
 	if file == nil {
 		return playback.SourceExecutionMetadataV3{}
@@ -4364,11 +4368,15 @@ func sourceExecutionMetadataV3(file *models.MediaFile, result playback.PlannerRe
 	if len(file.VideoTracks) > 0 {
 		track = file.VideoTracks[0]
 	}
+	softwareDecode := playback.RequiresSoftwareVideoDecode(videoCodec, profile, bitDepth)
+	if result.Plan != nil {
+		softwareDecode = softwareDecode || result.Plan.EffectiveRecipe.SoftwareVideoDecode
+	}
 	metadata := playback.SourceExecutionMetadataV3{
 		VideoCodec:                 videoCodec,
 		VideoProfile:               profile,
 		VideoBitDepth:              bitDepth,
-		SoftwareVideoDecode:        playback.RequiresSoftwareVideoDecode(videoCodec, profile, bitDepth),
+		SoftwareVideoDecode:        softwareDecode,
 		DurationSeconds:            float64(file.Duration),
 		ToneMapSourceKind:          result.ToneMapSourceKind,
 		ToneMapPreflightRequired:   result.ToneMapPreflightRequired,
@@ -5473,7 +5481,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// a client-authority change: a fresh start of the same file still negotiates
 	// normally, and an explicit user retry can re-enable the route by going
 	// through a new start.
-	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) {
+	// A decode failure defers the demotion while a software-decode variant of
+	// the same server-transcode delivery is still untried and the live decoder
+	// actually gave up: the retry is the next hop, so demoting first would
+	// strand the session on a route that has no decode-mode dimension. Every
+	// other transport failure demotes exactly as before.
+	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) && !(decodeFailureClassificationV3(req.Failure.Classification) && h.softwareDecodeRetryPendingV3(record, req)) {
 		// Demote on both copies: the record (the durable attempt this replan
 		// may still terminal-persist) and the seeded start, whose payload the
 		// success commit writes back via updated.NormalizedRequest. Demoting
@@ -5628,6 +5641,40 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	replacementManager, ok := h.sessionMgr.(replacementStateManagerV3)
 	if !ok {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "internal_error", message: "The live session manager does not support atomic replacement."}
+	}
+	// Reactive software-decode recovery. A hardware decoder can reject a source
+	// the planner believed it could decode (POC/reference-picture failures from
+	// the first frame). The planner has no way to express a software-decode
+	// retry, so when the live transcode session reports the decoder gave up,
+	// force the next server-transcode plan onto the software decode path. This
+	// stays client-driven: the retry happens inside the existing
+	// failure_recovery replan, with no server->client command.
+	forceSoftwareDecode := false
+	decodeFailureSample := ""
+	decodeFailureCount := 0
+	decodeAttemptDetail := ""
+	if operation == playback.ReplanOperationFailureRecoveryV3 &&
+		record.CurrentPlan.Delivery == playback.DeliveryTranscodeHLSV3 &&
+		!record.CurrentPlan.EffectiveRecipe.SoftwareVideoDecode &&
+		planHasVideoEncodeV3(record.CurrentPlan) {
+		executedHWAccel := strings.TrimSpace(session.TranscodeHWAccel)
+		if executedHWAccel != "" && !strings.EqualFold(executedHWAccel, playback.HWAccelNone) &&
+			!playback.RequiresSoftwareVideoDecode(record.CurrentPlan.Source.VideoCodec, record.CurrentPlan.Source.VideoProfile, record.CurrentPlan.Source.BitDepth) {
+			if ts := h.tm.GetTranscodeSession(record.SessionID); ts != nil && ts.IsDecodeFailed() {
+				forceSoftwareDecode = softwareDecodeVariantPendingV3(record, req)
+				if forceSoftwareDecode {
+					decodeFailureSample, decodeFailureCount = ts.DecodeFailureEvidence()
+				}
+			}
+		}
+	} else if operation == playback.ReplanOperationFailureRecoveryV3 &&
+		record.CurrentPlan.Delivery == playback.DeliveryTranscodeHLSV3 &&
+		record.CurrentPlan.EffectiveRecipe.SoftwareVideoDecode &&
+		planHasVideoEncodeV3(record.CurrentPlan) {
+		// The software variant was the plan that just failed, so both decoder
+		// modes are exhausted. Name them on the terminal detail so it is not
+		// empty when the planner returns adaptation_exhausted.
+		decodeAttemptDetail = fmt.Sprintf("hardware and software video decode both attempted for %s (hw_accel=%s)", record.CurrentPlan.Delivery, strings.TrimSpace(session.TranscodeHWAccel))
 	}
 	virtualRehydrationFailed := false
 	var virtualRehydrationErr error
@@ -5883,7 +5930,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				}
 			}
 		} else {
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail})
 			clampPlannerTargetResolution(&result, effectiveFile)
 		}
 		if outputChange && result.Terminal != nil && effectiveFile.ID != currentEffectiveFile.ID {
@@ -5902,7 +5949,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			if err != nil {
 				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "track_unavailable", message: err.Error()}
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail})
 			clampPlannerTargetResolution(&result, effectiveFile)
 		}
 		if terminalAllowsAlternateFileV3(result.Terminal) && (replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
@@ -5985,6 +6032,35 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	result = retryIncompleteToneMapPlanningV3(result, toneMapCapabilityErr)
 	result = retryIncompletePlaybackSettingsV3(result, plannerSettingsErr)
 	h.clarifyOriginalQuality4KTerminalV3(r.Context(), result.Terminal, requestedFile, replanAlternateFilePinnedByOriginalQualityV3(operation, start.QualityPreference))
+	if decodeAttemptDetail != "" && result.Terminal != nil && strings.TrimSpace(result.Terminal.Detail) == "" {
+		// The software decode mode was the plan that just failed. Name both
+		// attempted decode modes on any terminal so an exhausted route never
+		// reports an empty detail.
+		result.Terminal.Detail = decodeAttemptDetail
+	}
+	if forceSoftwareDecode {
+		// The software retry is a deliberate quality trade, not a silent
+		// fallback: record it on the plan so clients can surface it, and emit
+		// one classifier line carrying the decoder evidence that triggered it.
+		if result.Plan != nil {
+			result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.DegradationWarningV3{
+				Code:    degradationSoftwareDecodeFallbackV3,
+				Message: "The hardware video decoder could not decode this source; retrying with software decoding.",
+			})
+		}
+		slog.WarnContext(r.Context(), "playback software decode fallback",
+			logComponentKey, "playback",
+			"session_id", record.SessionID,
+			"operation", string(operation),
+			"delivery", record.CurrentPlan.Delivery,
+			"hw_accel", strings.TrimSpace(session.TranscodeHWAccel),
+			"source_video_codec", record.CurrentPlan.Source.VideoCodec,
+			"source_video_profile", record.CurrentPlan.Source.VideoProfile,
+			"source_video_bit_depth", record.CurrentPlan.Source.BitDepth,
+			"decode_failure_sample", decodeFailureSample,
+			"decode_failure_count", decodeFailureCount,
+		)
+	}
 	// One decision line per replan, mirroring the start endpoint's record:
 	// replans choose routes (and terminals) just as consequential, and an
 	// unlogged terminal made client reports impossible to reconstruct from
@@ -6001,6 +6077,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			"requested_file_id", record.RequestedMediaFileID,
 			"effective_file_id", effectiveFile.ID,
 			"quality_preference", start.QualityPreference,
+			"software_video_decode", forceSoftwareDecode,
+			"decode_failure_count", decodeFailureCount,
 		}, clientInfo.LogAttrs()...)...)
 		return playback.NewTerminalResponseFromTerminalV3(result.Terminal), *record, nil, nil
 	}
@@ -6020,6 +6098,9 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		"target_bitrate_kbps", result.TargetBitrateKbps,
 		"quality_preference", start.QualityPreference,
 		"bandwidth_estimate_kbps", intOrZeroHandlerV3(start.BandwidthEstimateKbps),
+		"software_video_decode", forceSoftwareDecode,
+		"decode_failure_count", decodeFailureCount,
+		"decode_failure_sample", decodeFailureSample,
 	}, clientInfo.LogAttrs()...)...)
 	mode := headerAuthenticatedMediaV3(start.ClientFeatures)
 	_, reservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
@@ -6170,7 +6251,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			event = playback.RouteEventRuntimeCorrectionSucceededV3
 			clientModel = start.ClientPlaybackContext.Device.Model
 		}
-		h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, PlanAttemptID: req.PlanAttemptID, PlanAttemptKey: playback.PlanAttemptKeyV3(*result.Plan, start.ClientPlaybackContext.Output.OutputContextID, nil), Event: event, FallbackReason: req.Failure.Classification, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: start.ClientPlaybackContext.Output.OutputContextID}, UserID: session.UserID, ProfileID: session.ProfileID, ClientName: session.ClientName, ClientVersion: session.ClientVersion, ClientBuild: session.ClientBuild, ClientChannel: session.ClientChannel, ClientModel: clientModel})
+		h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, PlanAttemptID: req.PlanAttemptID, PlanAttemptKey: playback.PlanAttemptKeyV3(*result.Plan, start.ClientPlaybackContext.Output.OutputContextID, nil), Event: event, FallbackReason: req.Failure.Classification, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: start.ClientPlaybackContext.Output.OutputContextID, Diagnostics: softwareDecodeRouteDiagnosticsV3(forceSoftwareDecode, session, decodeFailureSample, decodeFailureCount)}, UserID: session.UserID, ProfileID: session.ProfileID, ClientName: session.ClientName, ClientVersion: session.ClientVersion, ClientBuild: session.ClientBuild, ClientChannel: session.ClientChannel, ClientModel: clientModel})
 	}
 	transport.rollback = func() {
 		originalRollback()
@@ -6187,6 +6268,28 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	}
 	reservationHandedOff = true
 	return response, updated, &transport, nil
+}
+
+// softwareDecodeRouteDiagnosticsV3 records the reactive software-decode
+// fallback and the decoder evidence on the durable plan-selected route event.
+// It returns nil for an ordinary replan so the event shape is unchanged.
+func softwareDecodeRouteDiagnosticsV3(force bool, session *playback.Session, sample string, count int) map[string]string {
+	if !force {
+		return nil
+	}
+	diagnostics := map[string]string{
+		"software_video_decode": "true",
+		"decode_failure_count":  strconv.Itoa(count),
+	}
+	if session != nil {
+		if hw := strings.TrimSpace(session.TranscodeHWAccel); hw != "" {
+			diagnostics["hw_accel"] = hw
+		}
+	}
+	if strings.TrimSpace(sample) != "" {
+		diagnostics["decode_failure_sample"] = sample
+	}
+	return diagnostics
 }
 
 // applyTransportToneMapModeV3 records an executor fallback in the result before
@@ -6252,6 +6355,12 @@ func (h *PlaybackHandler) freezeExecutableRecipeV3(_ context.Context, file *mode
 		recipe.SourceVideoProfile = sourceMetadata.VideoProfile
 		recipe.SourceVideoBitDepth = sourceMetadata.VideoBitDepth
 		recipe.SoftwareVideoDecode = sourceMetadata.SoftwareVideoDecode
+		if result.Plan != nil && result.Plan.EffectiveRecipe.SoftwareVideoDecode {
+			// The plan, not the source facts, is authoritative for a reactive
+			// software-decode retry: freeze the decode mode so a reconstruct
+			// cannot re-enable the hardware decoder that just failed.
+			recipe.SoftwareVideoDecode = true
+		}
 		recipe.SourceDurationSeconds = sourceMetadata.DurationSeconds
 		recipe.ToneMapDVConfigPresent = sourceMetadata.ToneMapDVConfigPresent
 		recipe.ToneMapDVBLCompatIDPresent = sourceMetadata.ToneMapDVBLCompatIDPresent
@@ -7404,6 +7513,68 @@ func failureRecoveryAbandonedDeliveryV3(operation playback.ReplanOperationV3, fa
 	return transportFailureClassificationsV3[failureClassificationKeyV3(failureClassification)]
 }
 
+// planHasVideoEncodeV3 reports whether a plan carries a real video encode.
+// Only such a plan has a decode-mode dimension: a copy/remux route cannot
+// recover from a decoder failure by changing decode mode.
+func planHasVideoEncodeV3(plan playback.PlanV3) bool {
+	for _, transformation := range plan.Transformations {
+		if transformation.Name == playback.TransformationVideoToH264V3 {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeFailureClassificationV3 reports whether a client failure classification
+// indicts the video decoder specifically. Only these defer delivery demotion
+// for a pending software-decode variant; other transport failures demote as
+// before.
+func decodeFailureClassificationV3(classification string) bool {
+	switch failureClassificationKeyV3(classification) {
+	case "decoder_failure", "decode_error":
+		return true
+	default:
+		return false
+	}
+}
+
+// softwareDecodeVariantPendingV3 reports whether the failed plan still has an
+// untried software-decode variant of the same server-transcode HLS delivery.
+// When one is pending, a transport failure must not demote the whole delivery:
+// the decoded error indicts the hardware decoder, not the route. A delivery
+// with no decode-mode dimension has no such variant and demotes as before.
+func softwareDecodeVariantPendingV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) bool {
+	if record == nil || record.CurrentPlan.Delivery != playback.DeliveryTranscodeHLSV3 {
+		return false
+	}
+	if record.CurrentPlan.EffectiveRecipe.SoftwareVideoDecode || !planHasVideoEncodeV3(record.CurrentPlan) {
+		return false
+	}
+	softwarePlan := record.CurrentPlan
+	softwarePlan.EffectiveRecipe.SoftwareVideoDecode = true
+	// The durable plan key is always computed with no local mutations (see
+	// finalizePlanIdentityV3); a software variant that already became the
+	// current plan carries that same key, so compare against it directly.
+	key := playback.PlanAttemptKeyV3(softwarePlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	attempted := append([]string(nil), req.AttemptedPlanKeys...)
+	if !containsStringExactV3(attempted, req.PlanAttemptKey) {
+		attempted = append(attempted, req.PlanAttemptKey)
+	}
+	return !containsStringExactV3(attempted, key)
+}
+
+// softwareDecodeRetryPendingV3 reports whether a decode failure on the current
+// plan should defer delivery demotion for a software-decode retry. It requires
+// both the structural variant and the live decoder verdict, so a remote or
+// undetected decode failure still demotes as before.
+func (h *PlaybackHandler) softwareDecodeRetryPendingV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) bool {
+	if !softwareDecodeVariantPendingV3(record, req) {
+		return false
+	}
+	ts := h.tm.GetTranscodeSession(record.SessionID)
+	return ts != nil && ts.IsDecodeFailed()
+}
+
 // demoteDeliveryCapabilityV3 disables one delivery class in the context's
 // capability payload and clears its validated claims (the DV base-layer
 // fallback among them), so the planner cannot reselect the delivery for the
@@ -7434,6 +7605,10 @@ func demoteDeliveryCapabilityV3(request *playback.StartRequestV3, delivery playb
 // from a delivery the client itself advertised as unsupported (also
 // Enabled=false). Only the marker form is re-applied across replans.
 const demoteDeliveryReasonV3 = "transport_failed_demoted_by_server"
+
+// degradationSoftwareDecodeFallbackV3 marks a plan that deliberately switched
+// to CPU video decoding after the hardware decoder rejected the source.
+const degradationSoftwareDecodeFallbackV3 = "software_decode_fallback"
 
 // demotedDeliveryClassesV3 lists the delivery classes the durable request
 // demotes (server-side demotion marker written by a previous failure

@@ -2291,6 +2291,91 @@ func TestPlanAttemptedV3RequiresExactKeyMatch(t *testing.T) {
 	}
 }
 
+// TestSoftwareVideoDecodeIdentityDifferentiatesDecodeModes verifies the
+// reactive software-decode retry is a distinct attempt from the hardware plan
+// it replaces, while the default (false) variant keeps the historical identity
+// byte-for-byte: the token is appended only when the flag is set.
+func TestSoftwareVideoDecodeIdentityDifferentiatesDecodeModes(t *testing.T) {
+	plan := PlanV3{
+		PlanID:          "plan:hardware",
+		Delivery:        DeliveryTranscodeHLSV3,
+		Stream:          StreamV3{Protocol: StreamHLSV3, Container: "hls"},
+		EffectiveRecipe: EffectiveRecipeV3{VideoCodec: "h264", AudioCodec: "aac"},
+		Subtitle:        SubtitleDecisionV3{Mode: SubtitleOffV3},
+		Transformations: []TransformationV3{
+			{Name: TransformationVideoToH264V3, Executor: ExecutorServerV3, RecipeVersion: TransformationVideoToH264RecipeVersionV3},
+		},
+	}
+	software := plan
+	software.EffectiveRecipe.SoftwareVideoDecode = true
+
+	hardwareID := DeterministicPlanIDV3("attempt-1", 1, 1, plan)
+	if got := DeterministicPlanIDV3("attempt-1", 1, 1, plan); got != hardwareID {
+		t.Fatalf("false variant PlanID is not stable: %q != %q", got, hardwareID)
+	}
+	softwareID := DeterministicPlanIDV3("attempt-1", 1, 1, software)
+	if softwareID == hardwareID {
+		t.Fatal("software variant shares the hardware plan identity")
+	}
+
+	hardwareKey := PlanAttemptKeyV3(plan, "route-1", nil)
+	if got := PlanAttemptKeyV3(plan, "route-1", nil); got != hardwareKey {
+		t.Fatalf("false variant PlanAttemptKey is not stable: %q != %q", got, hardwareKey)
+	}
+	softwareKey := PlanAttemptKeyV3(software, "route-1", nil)
+	if softwareKey == hardwareKey {
+		t.Fatal("software variant shares the hardware attempt key")
+	}
+
+	// The hardware key must not exclude the software retry; only the software
+	// key marks the software variant as attempted.
+	if planAttemptedV3(software, "route-1", []string{hardwareKey}) {
+		t.Fatal("hardware attempt key excluded the untried software variant")
+	}
+	if !planAttemptedV3(software, "route-1", []string{softwareKey}) {
+		t.Fatal("software attempt key did not mark the software variant attempted")
+	}
+}
+
+// TestPlanPlaybackV3ForceSoftwareVideoDecodeMarksTranscodePlan verifies the
+// reactive retry flag reaches the plan's effective recipe and changes the
+// route identity, while an unforced transcode stays hardware.
+func TestPlanPlaybackV3ForceSoftwareVideoDecodeMarksTranscodePlan(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.CodecVideo = "vp9"
+	file.CodecAudio = "opus"
+	file.VideoTracks[0] = models.VideoTrack{
+		Codec: "vp9", Profile: "Profile 0", Level: -99,
+		Width: 1080, Height: 1920, FrameRate: "24.000", Bitrate: 2_797,
+		BitDepth: 8, PixelFormat: "yuv420p", VideoRange: "SDR",
+		VideoRangeType: "SDR", ColorRange: "tv", ColorTransfer: "bt709",
+	}
+	file.AudioTracks[0] = models.AudioTrack{Codec: "opus", Channels: 2, Layout: "stereo"}
+	req := validStartRequestV3()
+	req.Capabilities.VideoEvidence = EvidencePlatformAttestedV3
+	req.Capabilities.AudioEvidence = EvidencePlatformAttestedV3
+	settings := PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}
+
+	hardware := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: settings, Registry: testTransformationRegistryV3()})
+	if hardware.Plan == nil || hardware.Plan.Delivery != DeliveryTranscodeHLSV3 {
+		t.Fatalf("hardware result = %s", ExplainPlannerResultV3(hardware))
+	}
+	if hardware.Plan.EffectiveRecipe.SoftwareVideoDecode {
+		t.Fatal("unforced transcode plan was marked software decode")
+	}
+
+	software := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: settings, Registry: testTransformationRegistryV3(), ForceSoftwareVideoDecode: true})
+	if software.Plan == nil || software.Plan.Delivery != DeliveryTranscodeHLSV3 {
+		t.Fatalf("software result = %s", ExplainPlannerResultV3(software))
+	}
+	if !software.Plan.EffectiveRecipe.SoftwareVideoDecode {
+		t.Fatal("forced transcode plan was not marked software decode")
+	}
+	if software.Plan.PlanID == hardware.Plan.PlanID {
+		t.Fatal("forced software plan shares the hardware plan identity")
+	}
+}
+
 func TestStartRequestV3ValidationBoundsInnerLists(t *testing.T) {
 	longValue := strings.Repeat("x", 65)
 	cases := []struct {

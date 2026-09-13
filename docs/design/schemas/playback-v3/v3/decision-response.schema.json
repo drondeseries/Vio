@@ -521,6 +521,10 @@
         },
         "audio_layout": {
           "type": "string"
+        },
+        "software_video_decode": {
+          "type": "boolean",
+          "description": "True when this route decodes video on the CPU while keeping the hardware encoder, because the executed hardware decoder rejected the source. Absent for ordinary routes."
         }
       },
       "additionalProperties": true

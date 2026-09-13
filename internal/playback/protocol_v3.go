@@ -729,6 +729,12 @@ type EffectiveRecipeV3 struct {
 	DynamicRange     string   `json:"dynamic_range,omitempty"`
 	AudioChannels    *int     `json:"audio_channels,omitempty"`
 	AudioLayout      string   `json:"audio_layout,omitempty"`
+	// SoftwareVideoDecode marks a route that keeps its hardware encoder but
+	// decodes the source on the CPU. It is set only by reactive failure
+	// recovery after the executed hardware decoder rejected the source, and it
+	// participates in plan identity so the software retry is a distinct
+	// attempt from the hardware plan it replaces.
+	SoftwareVideoDecode bool `json:"software_video_decode,omitempty"`
 }
 
 type SourceDescriptorV3 struct {
