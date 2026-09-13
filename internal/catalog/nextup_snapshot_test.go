@@ -442,6 +442,83 @@ func TestNextUpRepository_SQLiteSnapshots_HiddenBoundaryAndItemScope(t *testing.
 	assertNextUpContentIDs(t, results, seriesID+"-e2")
 }
 
+// TestNextUpRepository_SQLiteSnapshots_SeriesAndDateFilters exercises the
+// optional SeriesID and DateCutoff filters alone and together, asserting the
+// returned episodes (not just the SQL shape), including the placeholder binding
+// where the series filter and the cutoff share the same statement.
+func TestNextUpRepository_SQLiteSnapshots_SeriesAndDateFilters(t *testing.T) {
+	pool := newNextUpTestPool(t)
+	ctx := context.Background()
+	prefix := fmt.Sprintf("nextup-sqlite-filter-%d", time.Now().UnixNano())
+	seriesA := prefix + "-a"
+	seriesB := prefix + "-b"
+
+	userID, _, folderID := seedNextUpTestOwner(t, ctx, pool, prefix)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id = ANY($1)`, []string{seriesA, seriesB})
+	})
+
+	seedNextUpSeries(t, ctx, pool, seriesA, prefix+" A")
+	seedNextUpSeries(t, ctx, pool, seriesB, prefix+" B")
+	seedNextUpEpisodes(t, ctx, pool,
+		[]string{seriesA + "-e1", seriesA + "-e2", seriesB + "-e1", seriesB + "-e2"},
+		[]string{seriesA, seriesA, seriesB, seriesB},
+		[]int{1, 2, 1, 2},
+	)
+	seedNextUpFiles(t, ctx, pool, folderID, []string{seriesA + "-e2", seriesB + "-e2"})
+
+	store := newNextUpSQLiteStore(t)
+	profileID := "sqlite-profile"
+	older := time.Now().UTC().Add(-72 * time.Hour).Truncate(time.Second)
+	newer := older.Add(time.Hour)
+	setSQLiteProgress(t, store, profileID, seriesA+"-e1", 0, true, older)
+	setSQLiteProgress(t, store, profileID, seriesB+"-e1", 0, true, newer)
+
+	repo := NewNextUpRepository(pool, sqliteSnapshotProvider{store: store})
+
+	results, err := repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, SeriesID: seriesA, Limit: 20})
+	if err != nil {
+		t.Fatalf("series filter: %v", err)
+	}
+	assertNextUpContentIDs(t, results, seriesA+"-e2")
+
+	cutoff := older.Add(30 * time.Minute)
+	results, err = repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, DateCutoff: &cutoff, Limit: 20})
+	if err != nil {
+		t.Fatalf("date filter: %v", err)
+	}
+	assertNextUpContentIDs(t, results, seriesB+"-e2")
+
+	results, err = repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: profileID, SeriesID: seriesA, DateCutoff: &cutoff, Limit: 20})
+	if err != nil {
+		t.Fatalf("series+date filter: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("series+date should exclude the older series, got %+v", results)
+	}
+}
+
+// TestNextUpRepository_SQLiteSnapshots_EmptyHistoryResumableEnabled covers the
+// empty-history case with resumable enabled: no completed anchors and no
+// in-progress rows must return no results without error.
+func TestNextUpRepository_SQLiteSnapshots_EmptyHistoryResumableEnabled(t *testing.T) {
+	pool := newNextUpTestPool(t)
+	ctx := context.Background()
+	prefix := fmt.Sprintf("nextup-sqlite-empty-%d", time.Now().UnixNano())
+
+	userID, _, _ := seedNextUpTestOwner(t, ctx, pool, prefix)
+	store := newNextUpSQLiteStore(t)
+	repo := NewNextUpRepository(pool, sqliteSnapshotProvider{store: store})
+
+	results, err := repo.ListNextUp(ctx, NextUpQuery{UserID: userID, ProfileID: "sqlite-profile", EnableResumable: true, Limit: 20})
+	if err != nil {
+		t.Fatalf("empty history resumable: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("empty history must return no anchors, got %+v", results)
+	}
+}
+
 func TestNextUpRepository_SQLiteSnapshots_ResumableMergePriority(t *testing.T) {
 	pool := newNextUpTestPool(t)
 	ctx := context.Background()

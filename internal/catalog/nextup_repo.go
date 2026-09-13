@@ -507,6 +507,10 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 	if q.DateCutoff != nil {
 		dateCutoffFilter = fmt.Sprintf(" AND uwp.updated_at >= $%d", argIdx)
 		args = append(args, *q.DateCutoff)
+		// Advance the placeholder cursor: the walk cursor below must bind after
+		// the date cutoff, or a continued (second+) batch would bind its
+		// updated_at/media_item_id/seen to the cutoff's placeholders.
+		argIdx++
 	}
 
 	// seedSeen is projected alongside the seed's picked series, which the global

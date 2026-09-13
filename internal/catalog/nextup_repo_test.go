@@ -192,6 +192,74 @@ func TestBuildListNextUpQuery_GlobalDateCutoffAppliesToEveryWalkStep(t *testing.
 	}
 }
 
+// TestBuildListNextUpQuery_OptionalParamBinding pins the placeholder/arg order
+// for every SeriesID/DateCutoff/cursor combination. The walk cursor must bind
+// after the date cutoff, so a continued (second+) batch never reuses the
+// cutoff's placeholders.
+func TestBuildListNextUpQuery_OptionalParamBinding(t *testing.T) {
+	t.Parallel()
+
+	cutoff := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second)
+	cursor := &nextUpWalkCursor{
+		updatedAt:   time.Now().UTC().Truncate(time.Second),
+		mediaItemID: "ep-2",
+		seen:        []string{"series-1"},
+	}
+
+	t.Run("bare", func(t *testing.T) {
+		query, args := buildListNextUpQuery(NextUpQuery{UserID: 7, ProfileID: "p"}, 20, nil)
+		if len(args) != 3 {
+			t.Fatalf("bare args = %v, want [user profile limit]", args)
+		}
+		if strings.Contains(query, "AND e.series_id = $4") || strings.Contains(query, "AND uwp.updated_at >= $4") {
+			t.Fatalf("bare query bound an optional param:\n%s", query)
+		}
+	})
+
+	t.Run("series only", func(t *testing.T) {
+		query, args := buildListNextUpQuery(NextUpQuery{UserID: 7, ProfileID: "p", SeriesID: "s"}, 20, nil)
+		if len(args) != 4 || args[3] != "s" {
+			t.Fatalf("series args = %v, want series at $4", args)
+		}
+		if !strings.Contains(query, "AND e.series_id = $4") {
+			t.Fatalf("missing series placeholder $4:\n%s", query)
+		}
+	})
+
+	t.Run("date only", func(t *testing.T) {
+		query, args := buildListNextUpQuery(NextUpQuery{UserID: 7, ProfileID: "p", DateCutoff: &cutoff}, 20, nil)
+		if len(args) != 4 || args[3] != cutoff {
+			t.Fatalf("date args = %v, want cutoff at $4", args)
+		}
+		if !strings.Contains(query, "AND uwp.updated_at >= $4") {
+			t.Fatalf("missing date placeholder $4:\n%s", query)
+		}
+	})
+
+	t.Run("series and date", func(t *testing.T) {
+		query, args := buildListNextUpQuery(NextUpQuery{UserID: 7, ProfileID: "p", SeriesID: "s", DateCutoff: &cutoff}, 20, nil)
+		if len(args) != 5 || args[3] != "s" || args[4] != cutoff {
+			t.Fatalf("series+date args = %v, want series $4 then cutoff $5", args)
+		}
+		if !strings.Contains(query, "AND e.series_id = $4") || !strings.Contains(query, "AND uwp.updated_at >= $5") {
+			t.Fatalf("expected series $4 then date $5:\n%s", query)
+		}
+	})
+
+	t.Run("date and cursor", func(t *testing.T) {
+		query, args := buildListNextUpQuery(NextUpQuery{UserID: 7, ProfileID: "p", DateCutoff: &cutoff}, 20, cursor)
+		if len(args) != 7 || args[3] != cutoff || args[4] != cursor.updatedAt || args[5] != cursor.mediaItemID {
+			t.Fatalf("cursor must bind after the cutoff, args = %v", args)
+		}
+		if !strings.Contains(query, "AND uwp.updated_at >= $4") {
+			t.Fatalf("missing date placeholder $4:\n%s", query)
+		}
+		if !strings.Contains(query, "(uwp.updated_at, uwp.media_item_id) < ($5, $6)") || !strings.Contains(query, "ANY($7)") {
+			t.Fatalf("cursor placeholders must shift past the cutoff:\n%s", query)
+		}
+	})
+}
+
 func TestBuildListNextUpQuery_SeriesScopedKeepsUnboundedAnchor(t *testing.T) {
 	t.Parallel()
 
