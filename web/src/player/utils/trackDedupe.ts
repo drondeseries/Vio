@@ -76,7 +76,17 @@ export function dedupeAudioTracks(tracks: PlayerAudioTrack[]): DedupedAudioTrack
   return deduped;
 }
 
-/** Stable presentation identity for a subtitle track, excluding its ordinal. */
+/**
+ * Stable presentation identity for a subtitle track.
+ *
+ * The server publishes one inventory item per ordinal and selection is by
+ * `track.index`, so two streams with identical descriptors but distinct
+ * `track_id`s are distinct selectable assets and must not collapse — otherwise
+ * the hidden ordinal is unreachable and a server-side auto-selection of it has
+ * no visible row. `track_id` is the per-asset discriminator; tracks that carry
+ * none (synthesized or older plans) keep the descriptor-only identity and
+ * collapse as before.
+ */
 function subtitleIdentity(track: PlayerSubtitleInfo): string {
   return [
     normalize(track.source),
@@ -87,16 +97,18 @@ function subtitleIdentity(track: PlayerSubtitleInfo): string {
     // The player only carries the resolved label; `embedded_title` is folded
     // into it when the inventory is mapped, so the label is the title here.
     normalize(track.label),
+    normalize(track.track_id),
   ].join("|");
 }
 
 /**
- * Collapses probed subtitle streams whose menu rows are identical.
+ * Collapses probed subtitle streams whose menu rows are identical *and* belong
+ * to the same server inventory asset.
  *
  * The plan's `index` (the combined ordinal the server assigned) is the
  * selection identity and is preserved on the retained entry. Tracks that differ
- * in forced, hearing-impaired, source, codec, language or title are legitimately
- * distinct options and are never collapsed.
+ * in forced, hearing-impaired, source, codec, language, title or `track_id` are
+ * legitimately distinct options and are never collapsed.
  */
 export function dedupeSubtitleTracks(tracks: PlayerSubtitleInfo[]): PlayerSubtitleInfo[] {
   const seen = new Set<string>();

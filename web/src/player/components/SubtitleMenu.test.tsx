@@ -25,17 +25,21 @@ function subtitleTrack(overrides: Partial<PlayerSubtitleInfo> = {}): PlayerSubti
   };
 }
 
-function renderMenu(tracks: PlayerSubtitleInfo[], onSelect = vi.fn()) {
+function renderMenu(
+  tracks: PlayerSubtitleInfo[],
+  onSelect = vi.fn(),
+  activeIndex: number | null = null,
+) {
   const view = render(
     createElement(SubtitleMenu, {
       tracks,
-      activeIndex: null,
+      activeIndex,
       onSelect,
       delayMs: 0,
       onDelayChange: () => {},
     }),
   );
-  fireEvent.click(screen.getByRole("button", { name: "Enable captions" }));
+  fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
   return { view, onSelect };
 }
 
@@ -66,5 +70,36 @@ describe("SubtitleMenu", () => {
 
     // Off + three distinct tracks + Appearance.
     expect(screen.getAllByRole("menuitem")).toHaveLength(5);
+  });
+
+  it("keeps identically labelled tracks with distinct track ids and selects the second", () => {
+    const { onSelect } = renderMenu([
+      subtitleTrack({ index: 13, track_id: "file:7:subtitle:13" }),
+      subtitleTrack({ index: 14, track_id: "file:7:subtitle:14" }),
+    ]);
+
+    // Off + two distinct tracks + Appearance.
+    expect(screen.getAllByRole("menuitem")).toHaveLength(4);
+    const trackRows = screen.getAllByRole("menuitem", { name: /English/ });
+    expect(trackRows).toHaveLength(2);
+
+    fireEvent.click(trackRows[1] as HTMLElement);
+    expect(onSelect).toHaveBeenCalledWith(14);
+  });
+
+  it("marks the second identically labelled track active when the server selected it", () => {
+    renderMenu(
+      [
+        subtitleTrack({ index: 13, track_id: "file:7:subtitle:13" }),
+        subtitleTrack({ index: 14, track_id: "file:7:subtitle:14" }),
+      ],
+      vi.fn(),
+      14,
+    );
+
+    const trackRows = screen.getAllByRole("menuitem", { name: /English/ });
+    expect(trackRows).toHaveLength(2);
+    expect(trackRows[0]?.textContent).not.toContain("✓");
+    expect(trackRows[1]?.textContent).toContain("✓");
   });
 });

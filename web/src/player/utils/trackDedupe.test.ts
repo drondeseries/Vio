@@ -127,4 +127,30 @@ describe("dedupeSubtitleTracks", () => {
 
     expect(deduped).toHaveLength(2);
   });
+
+  it("keeps identically labelled tracks with distinct track ids", () => {
+    // The server publishes one inventory item per ordinal, each with its own
+    // track_id. Both are real, selectable assets and must stay in the menu.
+    const deduped = dedupeSubtitleTracks([
+      subtitleTrack({ index: 13, track_id: "file:7:subtitle:13" }),
+      subtitleTrack({ index: 14, track_id: "file:7:subtitle:14" }),
+    ]);
+
+    expect(deduped).toHaveLength(2);
+    expect(deduped.map((track) => track.track_id)).toEqual([
+      "file:7:subtitle:13",
+      "file:7:subtitle:14",
+    ]);
+  });
+
+  it("still collapses descriptor twins that share a track id", () => {
+    // Same inventory asset listed twice (same track_id) is a true duplicate.
+    const deduped = dedupeSubtitleTracks([
+      subtitleTrack({ index: 13, track_id: "file:7:subtitle:13" }),
+      subtitleTrack({ index: 13, track_id: "file:7:subtitle:13" }),
+    ]);
+
+    expect(deduped).toHaveLength(1);
+    expect(deduped[0]?.index).toBe(13);
+  });
 });
