@@ -1022,6 +1022,90 @@ func TestResolvedURLMemoStaleRefreshSingleFlight(t *testing.T) {
 	waitForResolvedURLValue(t, service, path, 7, "p1", 101, "https://1.1.1.1/fresh")
 }
 
+// Clear() must fence a detached refresh: a refresh already in flight when the
+// memo is flushed must not repopulate obsolete URLs or headers. The generation
+// captured at kick time has to travel through the resolve so the store inside
+// it is dropped, not just the refresh's own trailing store.
+func TestResolvedURLMemoClearDropsInFlightRefresh(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enterOnce sync.Once
+	service, calls := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			enterOnce.Do(func() { close(entered) })
+			<-release
+			return virtualResponse(virtualCandidate("fresh", "https://1.1.1.1/fresh")), nil
+		},
+	)
+	refreshed := make(chan struct{})
+	service.afterResolvedURLRefresh = func() { close(refreshed) }
+
+	const path = "virtual://movie/tt1234"
+	key := resolvedURLMemoKey(path, 7, "p1", 101)
+	seedResolvedURLEntry(service, key, "https://1.1.1.1/stale", resolvedURLMemoTTL+time.Minute)
+
+	if res, ok := service.lookupResolvedStream(path, 7, "p1", 101); !ok || res.URL != "https://1.1.1.1/stale" {
+		t.Fatalf("stale lookup = (%#v, %v), want cached stale URL served", res, ok)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background refresh never reached the provider")
+	}
+
+	service.Clear()
+	close(release)
+	select {
+	case <-refreshed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("detached refresh did not finish")
+	}
+
+	service.resolvedURLsMu.Lock()
+	entries := len(service.resolvedURLs)
+	service.resolvedURLsMu.Unlock()
+	if entries != 0 {
+		t.Fatalf("Clear left %d resolved URL entries after an in-flight refresh repopulated the memo", entries)
+	}
+	if got := service.lookupResolvedURL(path, 7, "p1", 101); got != "" {
+		t.Fatalf("lookup after Clear = %q, want empty", got)
+	}
+	if got := calls[101].Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+// The generation fence must not break the happy path: a detached refresh with
+// no intervening Clear still publishes its fresh URL.
+func TestResolvedURLMemoDetachedRefreshPublishesWithoutClear(t *testing.T) {
+	service, calls := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			return virtualResponse(virtualCandidate("fresh", "https://1.1.1.1/fresh")), nil
+		},
+	)
+	refreshed := make(chan struct{})
+	service.afterResolvedURLRefresh = func() { close(refreshed) }
+
+	const path = "virtual://movie/tt1234"
+	key := resolvedURLMemoKey(path, 7, "p1", 101)
+	seedResolvedURLEntry(service, key, "https://1.1.1.1/stale", resolvedURLMemoTTL+time.Minute)
+
+	if res, ok := service.lookupResolvedStream(path, 7, "p1", 101); !ok || res.URL != "https://1.1.1.1/stale" {
+		t.Fatalf("stale lookup = (%#v, %v), want cached stale URL served", res, ok)
+	}
+	select {
+	case <-refreshed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("detached refresh did not finish")
+	}
+	if got := service.lookupResolvedURL(path, 7, "p1", 101); got != "https://1.1.1.1/fresh" {
+		t.Fatalf("lookup = %q, want refreshed URL", got)
+	}
+	if got := calls[101].Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
 func TestVirtualStreamRequestRejectsTraversalAndMalformedEpisodes(t *testing.T) {
 	for _, raw := range []string{
 		"virtual://series/tt123/1",

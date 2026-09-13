@@ -116,6 +116,16 @@ type Service struct {
 	resolvedURLsMu        sync.Mutex
 	resolvedURLs          map[string]resolvedURLEntry
 	resolvedURLsNextSweep time.Time
+	// resolvedURLsGeneration fences background refreshes across Clear. A
+	// detached refresh that resolves after the cache was flushed carries the
+	// generation it started in, and storeResolvedStreamDepth drops a result
+	// from a superseded generation instead of recreating obsolete URLs and
+	// headers. Guarded by resolvedURLsMu.
+	resolvedURLsGeneration uint64
+	// afterResolvedURLRefresh is a test seam invoked when refreshResolvedURL
+	// returns, so a test can wait for a detached refresh to complete. Nil
+	// outside tests.
+	afterResolvedURLRefresh func()
 }
 
 // resolvedURLEntry is a single memoized provider URL. resolvedAt keeps the
@@ -141,6 +151,9 @@ type resolvedURLEntry struct {
 	// refreshInFlight marks a background refresh kicked by a stale lookup so
 	// concurrent callers join it instead of stampeding the provider.
 	refreshInFlight bool
+	// generation is the resolvedURLsGeneration the entry was stored under. A
+	// refresh started for an older generation must not overwrite a newer entry.
+	generation uint64
 }
 
 // SetEventDispatcher wires the EventDispatcher into the Service. The
