@@ -508,4 +508,88 @@ function buildApiHeaders(options: RequestInit = {}): Record<string, string> {
   return headers;
 }
 
+// ---------------------------------------------------------------------------
+// v1 legacy helpers — kept for fork-origin code paths that have not yet
+// migrated to the typed v2 request boundary. New code should use v2().
+// ---------------------------------------------------------------------------
+
+function fallbackApiErrorMessage(res: Response): string {
+  const statusText = res.statusText.trim();
+  if (statusText) return statusText;
+  if (res.status === 401) return "Authentication required.";
+  if (res.status === 403) return "You do not have permission to perform this action.";
+  if (res.status === 404) return "Requested resource was not found.";
+  if (res.status >= 500) return "Request failed. Please try again.";
+  if (res.status > 0) return `Request failed (${res.status}).`;
+  return "Request failed.";
+}
+
+function normalizeApiError(apiErr: Partial<ApiError> | null, res: Response): ApiError {
+  const payload = apiErr && typeof apiErr === "object" ? apiErr : {};
+  const code =
+    typeof payload.error === "string" && payload.error.trim() ? payload.error : "unknown";
+  const message =
+    typeof payload.message === "string" && payload.message.trim()
+      ? payload.message.trim()
+      : fallbackApiErrorMessage(res);
+  return { ...payload, error: code, message };
+}
+
+interface ParsedApiError {
+  apiErr: ApiError;
+  raw?: unknown;
+}
+
+async function parseApiError(res: Response): Promise<ParsedApiError> {
+  let apiErr: Partial<ApiError> = {};
+  let raw: unknown;
+  try {
+    raw = await res.json();
+    if (raw && typeof raw === "object") apiErr = raw as Partial<ApiError>;
+  } catch {
+    // response wasn't JSON
+  }
+  return { apiErr: normalizeApiError(apiErr, res), raw };
+}
+
+function apiClientErrorFrom(status: number, parsed: ParsedApiError): ApiClientError {
+  const err = new ApiClientError(status, parsed.apiErr.error, parsed.apiErr.message, parsed.apiErr);
+  err.body = parsed.raw;
+  return err;
+}
+
+async function readApiResponse<T>(res: Response): Promise<T> {
+  if (res.status === 204 || res.status === 205) return undefined as T;
+  const text = await res.text();
+  if (text.trim() === "") return undefined as T;
+  return JSON.parse(text) as T;
+}
+
+/** Performs an authenticated v1 API request, throwing on non-2xx responses. */
+export async function apiResponse(path: string, options: RequestInit = {}): Promise<Response> {
+  const { res, requestProfileId, requestProfileToken } = await fetchWithSession(
+    `/api/v1${path}`,
+    options,
+  );
+  if (!res.ok) {
+    const parsed = await parseApiError(res);
+    if (
+      res.status === 403 &&
+      parsed.apiErr.error === "profile_unverified" &&
+      getProfileId() === requestProfileId &&
+      getProfileToken() === requestProfileToken
+    ) {
+      setProfileToken(null);
+      profileUnverifiedListener?.();
+    }
+    throw apiClientErrorFrom(res.status, parsed);
+  }
+  return res;
+}
+
+/** Typed v1 API call. New code should use the v2 request boundary. */
+export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  return readApiResponse<T>(await apiResponse(path, options));
+}
+
 export const API_BLOB_MAX_BYTES = 512 * 1024 * 1024;

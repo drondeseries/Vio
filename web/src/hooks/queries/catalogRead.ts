@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
 
+import { api } from "@/api/client";
 import type {
   EpisodesResponse,
   FileVersion,

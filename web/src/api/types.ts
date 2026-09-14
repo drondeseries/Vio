@@ -451,7 +451,7 @@ export interface ScanRun {
   mode: "library" | "subtree" | "file";
   path?: string;
   trigger: string;
-  status: "accepted" | "running" | "completed" | "failed" | "cancelled";
+  status: AutoscanScanStatus;
   started_at?: string;
   completed_at?: string;
   error_message?: string;
@@ -2244,7 +2244,7 @@ export interface AutoscanEventScanRun {
   mode: "library" | "subtree" | "file";
   path?: string;
   trigger: string;
-  status: "accepted" | "running" | "completed" | "failed" | "cancelled";
+  status: AutoscanScanStatus;
   requested_at?: string;
   started_at?: string;
   completed_at?: string;
@@ -2279,7 +2279,7 @@ export interface AutoscanEventsResponse {
   offset: number;
 }
 
-export type AutoscanScanStatus = "accepted" | "running" | "completed" | "failed" | "cancelled";
+export type AutoscanScanStatus = "accepted" | "running" | "completed" | "failed" | "canceled";
 
 export interface AutoscanScan {
   id: string;

@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { api } from "@/api/client";
 import { V2ProblemError } from "@/api/v2/request";
 import {
   getAdminRequestSettingsV2,
@@ -33,6 +34,7 @@ import type {
   CreateMediaRequestInput,
   DiscoverBrowseKind,
   LoadRequestIntegrationOptionsRequest,
+  MediaRequest,
   RequestIntegration,
   RequestListParams,
   RequestSearchMediaType,

@@ -1101,6 +1101,9 @@ function IntegrationEditor({
   }, [options, descriptor]);
 
   const saving = createIntegration.isPending || updateIntegration.isPending;
+  // New instances must carry an API key (there's no saved key to fall back on);
+  // edits may leave it blank to keep the stored key (has_api_key).
+  const hasApiKey = form.api_key_ref.trim().length > 0 || form.has_api_key;
   // schemaValid is reported by SchemaForm via onValidityChange. With no descriptor
   // (no plugin form) there's nothing to validate, so the chrome checks govern.
   const canSave =

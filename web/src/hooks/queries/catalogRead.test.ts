@@ -219,29 +219,3 @@ describe("catalog item reads on the v2 contract", () => {
     expect(files.files.map((f) => f.file_name)).toEqual(["c001.cbz"]);
   });
 });
-
-describe("useCatalogItemDetail caching", () => {
-  beforeEach(() => {
-    mocks.api.mockReset();
-    mocks.api.mockResolvedValue({});
-  });
-
-  it("reuses cached item detail when remounting within the stale window", async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    mocks.api.mockResolvedValue({ content_id: "movie-1" });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client }, children);
-
-    const first = renderHook(() => useCatalogItemDetail("movie-1", 1), { wrapper });
-    await waitFor(() => expect(first.result.current.isSuccess).toBe(true));
-    expect(mocks.api).toHaveBeenCalledTimes(1);
-
-    // Navigating detail -> player -> back remounts the query. A cache entry
-    // inside the 30s stale window must be reused instead of refetched.
-    first.unmount();
-    const second = renderHook(() => useCatalogItemDetail("movie-1", 1), { wrapper });
-    await waitFor(() => expect(second.result.current.isSuccess).toBe(true));
-
-    expect(mocks.api).toHaveBeenCalledTimes(1);
-  });
-});

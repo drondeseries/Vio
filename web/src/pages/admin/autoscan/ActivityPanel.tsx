@@ -151,7 +151,7 @@ function scanStatusClass(status: AutoscanEventScanRun["status"] | ScanRun["statu
       return "border-sky-500/30 bg-sky-500/10 text-sky-500";
     case "accepted":
       return "border-muted-foreground/25 bg-muted/60 text-muted-foreground";
-    case "cancelled":
+    case "canceled":
       return "border-amber-500/30 bg-amber-500/10 text-amber-500";
   }
 }
@@ -942,7 +942,7 @@ export default function ActivityPanel() {
                   <SelectItem value="running">Running</SelectItem>
                   <SelectItem value="completed">Completed</SelectItem>
                   <SelectItem value="failed">Failed</SelectItem>
-                  <SelectItem value="cancelled">Cancelled</SelectItem>
+                  <SelectItem value="canceled">Cancelled</SelectItem>
                 </SelectContent>
               </Select>
             ) : (

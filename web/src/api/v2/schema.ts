@@ -15233,7 +15233,10 @@ export interface components {
       codec?: string;
       default: boolean;
       embedded_title?: string;
+      /** Format: int64 */
+      index?: number;
       language?: string;
+      languages?: string[];
       layout?: string;
       profile?: string;
       /** Format: int64 */
@@ -16035,14 +16038,11 @@ export interface components {
     };
     ClientCapabilities: {
       audio_passthrough_codecs?: string[];
-      client_features?: string[];
       codecs_audio: string[];
       codecs_video: string[];
       containers: string[];
       hdr: boolean;
       max_resolution: string;
-      video_decode?: components["schemas"]["VideoDecodeCapabilityV3"][];
-      video_evidence?: string;
     };
     ClientCodecCapabilitiesV3: {
       audio_evidence: string;
@@ -17631,6 +17631,7 @@ export interface components {
       frame_rate?: number;
       /** Format: int64 */
       height?: number;
+      software_video_decode?: boolean;
       video_codec?: string;
       video_sample_entry?: string;
       /** Format: int64 */
@@ -20234,6 +20235,7 @@ export interface components {
       notify_continue_watching?: boolean;
       notify_favorites?: boolean;
       notify_next_up?: boolean;
+      notify_ratings?: boolean;
       notify_requests?: boolean;
       notify_watchlist?: boolean;
       /** @enum {string} */
@@ -20269,6 +20271,7 @@ export interface components {
       notify_continue_watching: boolean;
       notify_favorites: boolean;
       notify_next_up: boolean;
+      notify_ratings: boolean;
       notify_requests: boolean;
       notify_watchlist: boolean;
       /** @enum {string} */
@@ -20284,6 +20287,7 @@ export interface components {
       notify_continue_watching?: boolean;
       notify_favorites?: boolean;
       notify_next_up?: boolean;
+      notify_ratings?: boolean;
       notify_requests?: boolean;
       notify_watchlist?: boolean;
       url?: string;
@@ -24019,6 +24023,7 @@ export interface components {
       item_ids: string[];
     };
     TerminalV3: {
+      detail?: string;
       message: string;
       reason: string;
       retryable: boolean;
@@ -28347,7 +28352,7 @@ export interface operations {
         cursor?: string;
         limit?: number;
         q?: string;
-        status?: "" | "accepted" | "running" | "completed" | "failed" | "cancelled";
+        status?: "" | "accepted" | "running" | "completed" | "failed" | "canceled";
       };
       header?: {
         /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { isProfileRequestContextCurrent, type ProfileRequestContextSnapshot } from "@/api/client";
 import { v2, V2ProblemError, type V2Query, type V2Result } from "@/api/v2/request";
 import type { paths } from "@/api/v2/schema";
+import { useOptionalAuth } from "@/hooks/useAuth";
 import { storage } from "@/utils/storage";
 import {
   SETTING_DEFINITIONS,

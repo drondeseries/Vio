@@ -100,6 +100,7 @@ export function ScanActivityWidget() {
 
 function ScanStatus({ status }: { status: AutoscanScanStatus }) {
   const tone = scanStatusTone(status);
+  if (!tone) return null;
   const Icon = tone.icon;
   return (
     <span className={cn("flex items-center gap-1 text-[11px] font-medium", tone.className)}>
@@ -121,9 +122,11 @@ function scanStatusTone(status: AutoscanScanStatus) {
       return { label: "Failed", icon: AlertTriangle, className: "text-destructive" };
     case "running":
       return { label: "Running", icon: Loader2, className: "text-sky-500" };
-    case "cancelled":
+    case "canceled":
       return { label: "Cancelled", icon: CircleSlash, className: "text-amber-500" };
     case "accepted":
       return { label: "Queued", icon: Clock, className: "text-muted-foreground" };
+    default:
+      return null;
   }
 }

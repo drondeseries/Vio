@@ -17,7 +17,7 @@ import {
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ApiClientError } from "@/api/client";
+import { ApiClientError, api } from "@/api/client";
 import type {
   CreateLibraryCollectionRequest,
   ImportMDBListCollectionRequest,

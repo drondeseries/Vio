@@ -127,7 +127,7 @@ export function PluginConfigForm({
     loadOptionsRef.current
       .mutateAsync({ installationId })
       .then((loaded) => {
-        setDynamicOptions(loaded ?? {});
+        setDynamicOptions(loaded ?? ({} as Record<string, SchemaOption[]>));
       })
       .catch(() => {
         // Silently swallow — fields degrade to empty dropdowns.

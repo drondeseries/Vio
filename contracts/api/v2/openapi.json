@@ -15116,8 +15116,18 @@
           "embedded_title": {
             "type": "string"
           },
+          "index": {
+            "format": "int64",
+            "type": "integer"
+          },
           "language": {
             "type": "string"
+          },
+          "languages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "layout": {
             "type": "string"
@@ -17361,12 +17371,6 @@
             },
             "type": "array"
           },
-          "client_features": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
           "codecs_audio": {
             "items": {
               "type": "string"
@@ -17389,15 +17393,6 @@
             "type": "boolean"
           },
           "max_resolution": {
-            "type": "string"
-          },
-          "video_decode": {
-            "items": {
-              "$ref": "#/components/schemas/VideoDecodeCapabilityV3"
-            },
-            "type": "array"
-          },
-          "video_evidence": {
             "type": "string"
           }
         },
@@ -21854,6 +21849,9 @@
           "height": {
             "format": "int64",
             "type": "integer"
+          },
+          "software_video_decode": {
+            "type": "boolean"
           },
           "video_codec": {
             "type": "string"
@@ -28212,6 +28210,9 @@
           "notify_next_up": {
             "type": "boolean"
           },
+          "notify_ratings": {
+            "type": "boolean"
+          },
           "notify_requests": {
             "type": "boolean"
           },
@@ -28309,6 +28310,9 @@
           "notify_next_up": {
             "type": "boolean"
           },
+          "notify_ratings": {
+            "type": "boolean"
+          },
           "notify_requests": {
             "type": "boolean"
           },
@@ -28338,6 +28342,7 @@
           "notify_continue_watching",
           "notify_next_up",
           "notify_requests",
+          "notify_ratings",
           "consecutive_failures",
           "disabled_reason",
           "last_success_at",
@@ -28375,6 +28380,9 @@
             "type": "boolean"
           },
           "notify_next_up": {
+            "type": "boolean"
+          },
+          "notify_ratings": {
             "type": "boolean"
           },
           "notify_requests": {
@@ -37354,6 +37362,9 @@
       "TerminalV3": {
         "additionalProperties": false,
         "properties": {
+          "detail": {
+            "type": "string"
+          },
           "message": {
             "type": "string"
           },
@@ -45406,7 +45417,7 @@
                 "running",
                 "completed",
                 "failed",
-                "cancelled"
+                "canceled"
               ],
               "type": "string"
             }

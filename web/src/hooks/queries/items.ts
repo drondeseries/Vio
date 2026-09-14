@@ -1,6 +1,7 @@
 import { getAdminItemImages, applyAdminItemImage } from "@/api/v2/adminImages";
 import { getAdminItemFiles, splitAdminItem } from "@/api/v2/adminSplit";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/api/client";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import type {
   ApplyItemImageRequest,
@@ -27,6 +28,10 @@ import {
   updateCatalogItemDetail,
 } from "./mediaSurfaceRefresh";
 import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
+
+function itemPathID(id: string): string {
+  return encodeURIComponent(id);
+}
 
 export async function fetchWatchDetail(
   id: string,
