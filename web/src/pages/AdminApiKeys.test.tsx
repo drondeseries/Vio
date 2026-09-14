@@ -35,12 +35,13 @@ vi.mock("@/hooks/queries/admin/apiKeys", () => ({
         {
           items: [
             {
-              id: 7,
-              user_id: 1,
+              id: "7",
+              user_id: "1",
               username: "admin",
               label: "CI",
-              key: "silo_listed_key_0123456789",
+              key_prefix: "silo_listed",
               rate_tier: "standard",
+              scopes: [],
               created_at: "2026-09-01T00:00:00Z",
             },
           ],
@@ -49,16 +50,34 @@ vi.mock("@/hooks/queries/admin/apiKeys", () => ({
     },
     isLoading: false,
   }),
-  useAdminCreateApiKey: () => ({ mutate: mocks.createKey, isPending: false }),
+  useAdminCreateApiKey: () => ({
+    mutateAsync: mocks.createKey,
+    isPending: false,
+    reset: vi.fn(),
+  }),
   useAdminDeleteApiKey: () => ({ mutate: vi.fn() }),
   useAdminUpdateApiKeyTier: () => ({ mutate: vi.fn() }),
+}));
+
+vi.mock("@/api/v2/adminApiKeys", () => ({
+  captureAdminApiKeyAuthority: () => ({
+    serverOrigin: "https://test.local",
+    authContextVersion: 1,
+    profileId: "1",
+  }),
+  adminApiKeyScope: () => "test-scope",
+  getAdminApiKey: vi.fn(),
+}));
+
+vi.mock("@/api/client", () => ({
+  isCapturedProfileAuthorityActive: () => true,
 }));
 
 const CREATED_KEY = "silo_created_key_9876543210";
 
 async function createKey() {
   await userEvent.click(screen.getByRole("button", { name: /Create Key/ }));
-  await userEvent.type(screen.getByPlaceholderText(/CI\/CD Pipeline/), "Deploy bot");
+  await userEvent.type(screen.getByLabelText("Label"), "Deploy bot");
   await userEvent.click(screen.getByRole("button", { name: "Create" }));
   await screen.findByText(CREATED_KEY);
 }
@@ -70,20 +89,14 @@ describe("AdminApiKeys", () => {
     mocks.toastError.mockReset();
     mocks.toastSuccess.mockReset();
     mocks.createKey.mockReset();
-    mocks.createKey.mockImplementation((_body, options) => {
-      options.onSuccess({ key: CREATED_KEY });
-    });
+    mocks.createKey.mockResolvedValue({ key: CREATED_KEY });
   });
 
-  it("copies a listed key through the shared clipboard helper", async () => {
+  it("lists keys by prefix only; the full secret is never available to copy", () => {
     render(<AdminApiKeys />);
 
-    await userEvent.click(screen.getByRole("button", { name: "Copy API key CI" }));
-
-    await waitFor(() =>
-      expect(mocks.copyTextToClipboard).toHaveBeenCalledWith("silo_listed_key_0123456789"),
-    );
-    expect(mocks.toastSuccess).toHaveBeenCalledWith("Copied to clipboard");
+    expect(screen.getByText("silo_listed…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Copy API key/ })).not.toBeInTheDocument();
   });
 
   it("closes the create dialog once the new key is copied", async () => {
@@ -93,6 +106,7 @@ describe("AdminApiKeys", () => {
     await userEvent.click(screen.getByRole("button", { name: /Copy & Close/ }));
 
     await waitFor(() => expect(mocks.copyTextToClipboard).toHaveBeenCalledWith(CREATED_KEY));
+    expect(mocks.toastSuccess).toHaveBeenCalledWith("Copied to clipboard");
     await waitFor(() => expect(screen.queryByText(CREATED_KEY)).not.toBeInTheDocument());
   });
 
@@ -104,12 +118,10 @@ describe("AdminApiKeys", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /Copy & Close/ }));
 
-    await waitFor(() =>
-      expect(mocks.toastError).toHaveBeenCalledWith(
-        "Couldn't copy — select the key and copy it manually",
-      ),
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn't copy — select the key and copy it manually",
     );
-    expect(mocks.toastSuccess).not.toHaveBeenCalledWith("Copied to clipboard");
+    expect(mocks.toastSuccess).not.toHaveBeenCalled();
     expect(screen.getByText(CREATED_KEY)).toBeInTheDocument();
   });
 });

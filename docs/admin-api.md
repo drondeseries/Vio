@@ -426,6 +426,14 @@ than browsing, so the entry has to identify itself. Node selection reads it:
 see "Scratch admission" below. It is also what labels the node's own
 `streamapp_node_disk_*` series `scratch` instead of `library-N`.
 
+`last_stats.build` is the build the node reported on that same health check,
+in the shape of `GET /admin/system/build` (`display`, `revision`, `dirty`,
+`build_number`, `built_at`, `available`). It is diagnostic only — the
+dashboard uses it to flag a node whose `revision` differs from the server's
+during a rollout — and is omitted on a node predating build reporting. Unlike
+the resource fields it is present on a node that cannot be sampled, so a
+`last_stats` object may carry `build` and nothing else.
+
 ### Scratch admission
 
 A transcode writes HLS segments to its node's scratch volume for the whole life
@@ -1848,14 +1856,17 @@ session applies once. `/terminate` is ported separately below with a different
 contract: it revokes first and notifies second.
 
 Every request body carries `command_id` (a client-allocated canonical UUID) and
-`sequence` (a client-allocated positive integer that must rise within the
-session), plus optional `reason` and `deadline_ms` (bounded to 10000, default
+`sequence` (a client-allocated positive integer, at most 2^53-1 so every
+client can represent it exactly, that must rise within the session), plus optional `reason` and `deadline_ms` (bounded to 10000, default
 3000; ignored by message). Message adds a required `message` and optional
 `title`. Allocate the identity once per intended command and preserve the
 whole body on retry.
 
 The server keeps one ledger per playback session in the process that serves
-the session's realtime lane and answers deterministically:
+the session's realtime lane. The ledger is bounded per session and released
+with the session: terminate and the stop fallback drop it directly, and a
+throttled sweep on the command path prunes the ledgers of sessions that ended
+by any other route. It answers deterministically:
 
 - A new identity above the latest applied sequence is dispatched once: `202`
   with `{command_id, sequence, outcome: "applied", delivery}`.
@@ -1864,7 +1875,11 @@ the session's realtime lane and answers deterministically:
 - The same `command_id` with different content is `409 idempotency_conflict`.
 - A new identity whose sequence is at or below the latest applied sequence is
   `409 conflict` and is never dispatched, so a delayed retry of a pause that
-  lands after a resume cannot revert the newer state.
+  lands after a resume cannot revert the newer state. The refusal carries the
+  latest applied sequence in the `X-Silo-Latest-Sequence` response header (a
+  decimal integer). Several administrators share one ledger but no counter:
+  a client whose allocation runs behind another's raises its floor above the
+  reported value and reissues; the header is absent on other conflicts.
 - Pause, resume and message require a live realtime lane (`409 conflict`
   otherwise). Stop without a lane answers `delivery: "fallback_scheduled"` and
   the server ends the session after the deadline, as on the bridge.
@@ -1876,7 +1891,8 @@ the session's realtime lane and answers deterministically:
 administrator. Commands enforce the demo restriction; capability reads do not.
 The web session actions send
 pause, resume, stop and message through these operations under captured
-administrator authority and allocate a fresh identity per click; terminate
+administrator authority, allocate a fresh identity per click, and raise the
+allocation floor from a stale refusal's `X-Silo-Latest-Sequence`; terminate
 stays on the bridge.
 
 

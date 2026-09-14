@@ -76,3 +76,50 @@ func TestRunPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestRunIdenticalDocumentsIgnoresApprovals: a push to the base branch diffs
+// the commit against itself, so the approvals the merged pull request
+// carried must not be reported as stale there.
+func TestRunIdenticalDocumentsIgnoresApprovals(t *testing.T) {
+	dir := t.TempDir()
+	doc := filepath.Join(dir, "openapi.json")
+	if err := os.WriteFile(doc, contracts.OpenAPI, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	contractsDir := filepath.Join(dir, "contracts")
+	if err := os.Mkdir(contractsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := contracts.FS.ReadFile(contractspec.ApprovalsSchemaPath)
+	if err := os.WriteFile(filepath.Join(contractsDir, contractspec.ApprovalsSchemaPath), schema, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	approvals := contractspec.ApprovalsFile{Approvals: []contractspec.Approval{{
+		OperationID: "getSystemInfo",
+		ChangeID:    "response-property-removed",
+		Fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Reason:      "Carried over from a merged pull request.",
+		ApprovedIn:  "#0",
+	}}}
+	raw, _ := json.Marshal(approvals)
+	if err := os.WriteFile(filepath.Join(contractsDir, contractspec.ApprovalsPath), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(doc, doc, contractsDir); err != nil {
+		t.Fatalf("identical documents with a carried approval failed: %v", err)
+	}
+	// The same approval against a real, unrelated diff is still stale.
+	var mutated map[string]any
+	if err := json.Unmarshal(contracts.OpenAPI, &mutated); err != nil {
+		t.Fatal(err)
+	}
+	mutated["info"].(map[string]any)["title"] = "changed"
+	revBytes, _ := json.Marshal(mutated)
+	revision := filepath.Join(dir, "revision.json")
+	if err := os.WriteFile(revision, revBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(doc, revision, contractsDir); !errors.Is(err, contractspec.ErrBreaking) {
+		t.Fatalf("stale approval against a real diff passed: %v", err)
+	}
+}

@@ -363,7 +363,11 @@ The foundation is `internal/apiv2`. These facts about it are not derivable from 
   policy (`internal/contractspec`): pre-lock, a breaking change against the merge base needs
   an exact entry — operation id, rule id, fingerprint — in
   `contracts/api/v2/breaking-approvals.json`; once `contracts/api/v2/LOCKED` exists no entry
-  applies. `TestCommittedArtifactMatchesRouter` reconciles the assembled router with the
+  applies. An approval lives only on the pull request that needs it: an entry matching no
+  change in the diff fails the gate, so the next pull request removes entries that have
+  merged (the record is the file's history and the entry's `approved_in`), and a push whose
+  merge base is the commit itself compares identical documents and consults no approval.
+  `TestCommittedArtifactMatchesRouter` reconciles the assembled router with the
   committed artifact plus the closed plugin-content mount inventory, in both directions. The
   retained `/api/v1/health` and `/api/v1/ready` probes and the opt-in, dedicated `/metrics`
   listener are operator-facing and deliberately absent from the artifact and from generated

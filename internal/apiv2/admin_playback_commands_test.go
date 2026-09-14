@@ -90,6 +90,7 @@ func TestAdminPlaybackCommandsTransport(t *testing.T) {
 			before := len(f.calls)
 			for _, invalid := range []string{
 				strings.Replace(tc.body, `"sequence":7`, `"sequence":0`, 1),
+				strings.Replace(tc.body, `"sequence":7`, `"sequence":9007199254740992`, 1),
 				strings.Replace(tc.body, `"3fa85f64-5717-4562-b3fc-2c963f66afa6"`, `"not-a-uuid"`, 1),
 				strings.Replace(tc.body, `"deadline_ms":250`, `"deadline_ms":20000`, 1),
 				strings.Replace(tc.body, `"reason":"bedtime"`, `"reason":"bedtime","position":5`, 1),
@@ -123,6 +124,22 @@ func TestAdminPlaybackCommandsTransport(t *testing.T) {
 			} {
 				f.err = mapping.err
 				requireProblem(t, do(t, h, http.MethodPost, path, tc.body, admin), mapping.want)
+			}
+			f.err = nil
+
+			// A stale refusal carries the winning sequence so the client can
+			// allocate above it; other conflicts do not.
+			f.err = &handlers.AdminPlaybackCommandStaleError{Latest: 12}
+			rec = do(t, h, http.MethodPost, path, tc.body, admin)
+			requireProblem(t, rec, TypeConflict)
+			if got := rec.Header().Get(LatestSequenceHeader); got != "12" {
+				t.Fatalf("%s = %q, want 12", LatestSequenceHeader, got)
+			}
+			f.err = handlers.ErrAdminPlaybackRealtimeRequired
+			rec = do(t, h, http.MethodPost, path, tc.body, admin)
+			requireProblem(t, rec, TypeConflict)
+			if got := rec.Header().Get(LatestSequenceHeader); got != "" {
+				t.Fatalf("%s on a lane conflict = %q", LatestSequenceHeader, got)
 			}
 			f.err = nil
 

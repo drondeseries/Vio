@@ -45,6 +45,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Copy, Plus, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import { formatDate } from "@/lib/datetime";
 
 type Tier = AdminAPIKeyMetadata["rate_tier"];
@@ -374,12 +376,17 @@ function CreateApiKeyForm({
     }
   }
   async function copy() {
+    // The key is shown once, so a failed copy must leave the dialog open.
+    // copyTextToClipboard falls back to execCommand on insecure origins,
+    // where navigator.clipboard is undefined (#985).
     try {
-      await navigator.clipboard.writeText(secret!);
-      onClose();
+      await copyTextToClipboard(secret!);
     } catch {
-      setError("Copy failed. Select and copy the key before closing.");
+      setError("Couldn't copy — select the key and copy it manually");
+      return;
     }
+    toast.success("Copied to clipboard");
+    onClose();
   }
   if (secret)
     return (

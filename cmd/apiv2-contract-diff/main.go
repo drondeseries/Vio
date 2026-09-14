@@ -11,6 +11,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -50,6 +51,16 @@ func run(basePath, revisionPath, contractsDir string) error {
 	approvals, err := contractspec.LoadApprovals(os.DirFS(contractsDir))
 	if err != nil {
 		return err
+	}
+	// A push to the base branch compares the commit with itself: the merge
+	// base is HEAD and both documents are the same bytes. There is no change
+	// to approve, so the approvals a just-merged pull request carried are not
+	// stale here; they are pruned by the next pull request, whose diff
+	// against the new base no longer contains them. The allowlist is still
+	// loaded above so a malformed file fails on every branch.
+	if bytes.Equal(baseDoc, revisionDoc) {
+		fmt.Println("apiv2-contract-diff: base and revision are identical; nothing to compare")
+		return nil
 	}
 	_, statErr := os.Stat(filepath.Join(contractsDir, contractspec.LockMarkerPath))
 	locked := statErr == nil
