@@ -20,6 +20,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 )
 
 // TMDBCollectionEntry is a lightweight TMDB preset result used by the collection sync.
@@ -99,6 +100,8 @@ type theatricalReleaseGate struct {
 	lookup         func(ctx context.Context, tmdbID int) (bool, error)
 	lookupProvider func(ctx context.Context, tmdbID int) (bool, error)
 	memo           map[int]bool
+	memoMu         sync.Mutex
+	inflight       singleflight.Group
 	overrides      ReleaseOverrideLookup
 	// canonicalIDs unions source-entry IDs with a catalog-resident same
 	// movie's IDs. Nil outside collection sync; set by releaseGate.
@@ -120,9 +123,11 @@ func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker, overrides ...Re
 	}
 	// lookupProvider is provider evidence only: memoized TMDB digital-release
 	// answers with no override evaluation. Override decisions belong to the
-	// callers' validated snapshots.
+	// callers' validated snapshots. The memo is mutex-guarded and concurrent
+	// callers for the same id collapse into one TMDB call via singleflight so
+	// prefetch and the sequential pass cannot duplicate work.
 	lookupProvider := func(ctx context.Context, tmdbID int) (bool, error) {
-		if cached, ok := gate.memo[tmdbID]; ok {
+		if cached, ok := gate.memoValue(tmdbID); ok {
 			return cached, nil
 		}
 		if gate.checker == nil || tmdbID <= 0 {
@@ -131,14 +136,24 @@ func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker, overrides ...Re
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		digital, err := gate.checker.HasDigitalRelease(checkCtx, tmdbID)
+		value, err, _ := gate.inflight.Do(strconv.Itoa(tmdbID), func() (any, error) {
+			if cached, ok := gate.memoValue(tmdbID); ok {
+				return cached, nil
+			}
+			checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			digital, err := gate.checker.HasDigitalRelease(checkCtx, tmdbID)
+			if err != nil {
+				return false, fmt.Errorf("%w: movie home release lookup: %w", ErrProviderUnavailable, err)
+			}
+			gate.memoStore(tmdbID, digital)
+			return digital, nil
+		})
 		if err != nil {
-			return false, fmt.Errorf("%w: movie home release lookup: %w", ErrProviderUnavailable, err)
+			return false, err
 		}
-		gate.memo[tmdbID] = digital
-		return digital, nil
+		released, _ := value.(bool)
+		return released, nil
 	}
 	gate.lookupProvider = lookupProvider
 	// lookup preserves the historical override-aware behavior for direct
@@ -154,6 +169,71 @@ func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker, overrides ...Re
 		return lookupProvider(ctx, tmdbID)
 	}
 	return gate
+}
+
+// theatricalPrefetchWorkers bounds the concurrent TMDB release lookups issued
+// when warming the gate memo before a sequential materialize loop.
+const theatricalPrefetchWorkers = 6
+
+func (g *theatricalReleaseGate) memoValue(tmdbID int) (bool, bool) {
+	g.memoMu.Lock()
+	defer g.memoMu.Unlock()
+	value, ok := g.memo[tmdbID]
+	return value, ok
+}
+
+func (g *theatricalReleaseGate) memoStore(tmdbID int, released bool) {
+	g.memoMu.Lock()
+	g.memo[tmdbID] = released
+	g.memoMu.Unlock()
+}
+
+// prefetch warms the memo for tmdbIDs with a small bounded worker pool so a
+// batch of unmatched movies does not serialize N x 5s TMDB calls. Each lookup
+// keeps the 5s per-call bound and single-flight dedupe. Errors are swallowed:
+// the sequential gate callers fail open on inconclusive evidence and retry.
+func (g *theatricalReleaseGate) prefetch(ctx context.Context, tmdbIDs []int) {
+	if g == nil || len(tmdbIDs) == 0 || g.checker == nil {
+		// No provider to warm: the sequential gate fails open immediately, so
+		// spinning up workers would only churn.
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	workers := theatricalPrefetchWorkers
+	if len(tmdbIDs) < workers {
+		workers = len(tmdbIDs)
+	}
+	ids := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for id := range ids {
+				if ctx.Err() != nil {
+					return
+				}
+				// Fail open: the sequential pass re-evaluates this id and
+				// defers to the authoritative materialization decision.
+				if _, err := g.lookupProvider(ctx, id); err != nil {
+					continue
+				}
+			}
+		}()
+	}
+	for _, id := range tmdbIDs {
+		select {
+		case <-ctx.Done():
+			close(ids)
+			wg.Wait()
+			return
+		case ids <- id:
+		}
+	}
+	close(ids)
+	wg.Wait()
 }
 
 func isFutureDate(year int, releaseDate string) bool {
@@ -1171,6 +1251,40 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 			if preErr != nil {
 				return nil, preErr
 			}
+		}
+		// The sequential loop below consults the theatrical gate only for
+		// movie entries that reach it: a TMDB id, a non-future release date
+		// (future entries short-circuit inside the gate without a lookup), no
+		// matching catalog candidate (a candidate takes the repair/continue
+		// path), and an available virtual identity. Prefetch exactly those ids
+		// so the loop's per-movie TMDB lookups become memo hits rather than N
+		// serial calls bounded at 5s each.
+		prefetchSet := map[int]struct{}{}
+		for _, entry := range materializeEntries {
+			if mdbListEntryItemType(entry) != "movie" || entry.ID <= 0 {
+				continue
+			}
+			if isFutureDate(entry.ReleaseYear, entry.Released) {
+				continue
+			}
+			tvdbID := 0
+			if entry.TVDBID != nil {
+				tvdbID = *entry.TVDBID
+			}
+			if !virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, tvdbID) {
+				continue
+			}
+			if len(pickCandidatesByPriority(movieLookup, entry, "movie")) > 0 {
+				continue
+			}
+			prefetchSet[entry.ID] = struct{}{}
+		}
+		if len(prefetchSet) > 0 {
+			prefetchIDs := make([]int, 0, len(prefetchSet))
+			for id := range prefetchSet {
+				prefetchIDs = append(prefetchIDs, id)
+			}
+			theatricalGate.prefetch(ctx, prefetchIDs)
 		}
 		for _, entry := range materializeEntries {
 			if mdbListEntryItemType(entry) != "movie" && isFutureDate(entry.ReleaseYear, entry.Released) {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -262,6 +263,74 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+// blockingRoundTripper blocks until the request context is done, so callers
+// can prove fetchMDBListEntries propagates deadline and cancellation rather
+// than hanging on a stalled MDBList socket.
+type blockingRoundTripper struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	b.once.Do(func() {
+		if b.started != nil {
+			close(b.started)
+		}
+	})
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+func TestFetchMDBListEntriesHonorsContextDeadline(t *testing.T) {
+	t.Parallel()
+
+	transport := &blockingRoundTripper{started: make(chan struct{})}
+	svc := &LibraryCollectionService{httpClient: &http.Client{Transport: transport}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := svc.fetchMDBListEntries(ctx, "https://mdblist.com/lists/example-user/watchlist")
+	select {
+	case <-transport.started:
+	default:
+		t.Fatal("HTTP transport was never dialed")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fetchMDBListEntries deadline error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestFetchMDBListEntriesHonorsContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	transport := &blockingRoundTripper{started: make(chan struct{})}
+	svc := &LibraryCollectionService{httpClient: &http.Client{Transport: transport}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := svc.fetchMDBListEntries(ctx, "https://mdblist.com/lists/example-user/watchlist")
+		result <- err
+	}()
+
+	select {
+	case <-transport.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("HTTP transport was never dialed")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("fetchMDBListEntries cancel error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetchMDBListEntries did not return after cancellation")
+	}
 }
 
 func TestTraktCandidatesByPriority_ShowUsesTVDBBeforeTMDB(t *testing.T) {

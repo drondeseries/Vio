@@ -128,7 +128,7 @@ func TestCollectionSchedulerRepairsAcceptedVirtualMember(t *testing.T) {
 	}
 	scheduler := NewCollectionSyncScheduler(collections, service, slog.New(slog.DiscardHandler))
 	for attempt := range 2 {
-		data, err := scheduler.RunOnce(ctx)
+		data, err := scheduler.RunOnce(ctx, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

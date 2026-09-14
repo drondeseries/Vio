@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // ErrMDBListURL is returned when a caller-supplied list URL is not an
@@ -81,11 +82,18 @@ func ValidateMDBListURL(raw string) error {
 // MDBListHTTPClient returns a clone of base whose redirects are re-checked
 // against ValidateMDBListURL so an mdblist.com 3xx cannot bounce the fetch
 // onto loopback or RFC1918. A nil base uses http.DefaultClient.
+//
+// The clone gets a default 30s timeout when the base has none, so a stalled
+// MDBList socket cannot hang a collection sync forever. An explicit non-zero
+// base timeout is preserved. http.DefaultClient itself is never mutated.
 func MDBListHTTPClient(base *http.Client) *http.Client {
 	if base == nil {
 		base = http.DefaultClient
 	}
 	clone := *base
+	if clone.Timeout == 0 {
+		clone.Timeout = 30 * time.Second
+	}
 	parentRedirect := base.CheckRedirect
 	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if req == nil || req.URL == nil {

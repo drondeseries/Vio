@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestNormalizeMDBListURL(t *testing.T) {
@@ -175,5 +176,40 @@ func TestMDBListHTTPClientRejectsPrivateRedirect(t *testing.T) {
 	}
 	if err := client.CheckRedirect(req, []*http.Request{req}); !errors.Is(err, ErrMDBListURL) {
 		t.Fatalf("CheckRedirect = %v, want ErrMDBListURL", err)
+	}
+}
+
+func TestMDBListHTTPClientAppliesDefaultTimeout(t *testing.T) {
+	t.Parallel()
+
+	base := &http.Client{}
+	client := MDBListHTTPClient(base)
+	if client.Timeout != 30*time.Second {
+		t.Fatalf("clone timeout = %v, want 30s default", client.Timeout)
+	}
+	if base.Timeout != 0 {
+		t.Fatalf("base client mutated: timeout = %v, want 0", base.Timeout)
+	}
+}
+
+func TestMDBListHTTPClientPreservesExplicitTimeout(t *testing.T) {
+	t.Parallel()
+
+	base := &http.Client{Timeout: 7 * time.Second}
+	client := MDBListHTTPClient(base)
+	if client.Timeout != 7*time.Second {
+		t.Fatalf("clone timeout = %v, want explicit 7s preserved", client.Timeout)
+	}
+}
+
+func TestMDBListHTTPClientNilBaseGetsDefaultTimeout(t *testing.T) {
+	t.Parallel()
+
+	client := MDBListHTTPClient(nil)
+	if client.Timeout != 30*time.Second {
+		t.Fatalf("nil-base clone timeout = %v, want 30s default", client.Timeout)
+	}
+	if http.DefaultClient.Timeout != 0 {
+		t.Fatalf("http.DefaultClient mutated: timeout = %v", http.DefaultClient.Timeout)
 	}
 }
