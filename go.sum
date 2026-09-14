@@ -86,8 +86,8 @@ github.com/dgryski/trifles v0.0.0-20230903005119-f50d829f2e54 h1:SG7nF6SRlWhcT7c
 github.com/dgryski/trifles v0.0.0-20230903005119-f50d829f2e54/go.mod h1:if7Fbed8SFyPtHLHbg49SI7NAdJiC5WIA09pe59rfAA=
 github.com/dlclark/regexp2 v1.11.0 h1:G/nrcoOa7ZXlpoa/91N3X7mM3r8eIlMBBJZvsz/mxKI=
 github.com/dlclark/regexp2 v1.11.0/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
-github.com/drondeseries/silo-plugin-sdk v0.0.0-20260914121707-dcbd1b1347e6 h1:Ogf8xjTRE/jDx5SdKsYfEUZ+QjuBFkl1PA/dV8V5KmA=
-github.com/drondeseries/silo-plugin-sdk v0.0.0-20260914121707-dcbd1b1347e6/go.mod h1:abwsCEKuPAAgeAqpNGbwoaut2eQlC/Kj97u89Vvg9qM=
+github.com/drondeseries/silo-plugin-sdk v0.0.0-20260914125412-8303ed048fb3 h1:/teqa9wYon88FB7is09Z9cMoGT9mc4HZ5iqUo+bFtRs=
+github.com/drondeseries/silo-plugin-sdk v0.0.0-20260914125412-8303ed048fb3/go.mod h1:abwsCEKuPAAgeAqpNGbwoaut2eQlC/Kj97u89Vvg9qM=
 github.com/dunglas/httpsfv v1.1.0 h1:Jw76nAyKWKZKFrpMMcL76y35tOpYHqQPzHQiwDvpe54=
 github.com/dunglas/httpsfv v1.1.0/go.mod h1:zID2mqw9mFsnt7YC3vYQ9/cjq30q41W+1AnDwH8TiMg=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
