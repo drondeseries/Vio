@@ -26,6 +26,7 @@ var _ userstore.UserStore = (*SQLiteUserStore)(nil)
 var _ userstore.DeviceRegistry = (*SQLiteUserStore)(nil)
 var _ userstore.DeviceProfileRegistry = (*SQLiteUserStore)(nil)
 var _ userstore.WatchedBatchWriter = (*SQLiteUserStore)(nil)
+var _ userstore.NextUpStateStore = (*SQLiteUserStore)(nil)
 
 // --- Profiles ---
 
@@ -125,6 +126,13 @@ func (s *SQLiteUserStore) ListProgressSince(_ context.Context, profileID, cursor
 		return nil, cursor, err
 	}
 	return rows, strconv.FormatInt(next, 10), nil
+}
+
+// ListNextUpStatePage exposes the profile-scoped Next Up state page through the
+// optional userstore.NextUpStateStore capability. The context is forwarded so a
+// canceled request returns the context error rather than a short page.
+func (s *SQLiteUserStore) ListNextUpStatePage(ctx context.Context, profileID string, cursor *userstore.NextUpStateCursor, limit int) (userstore.NextUpStatePage, error) {
+	return ListNextUpStatePage(ctx, s.db, profileID, cursor, limit)
 }
 
 func (s *SQLiteUserStore) AddHistory(_ context.Context, entry userstore.WatchHistoryEntry) error {

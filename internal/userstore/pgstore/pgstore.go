@@ -21,6 +21,7 @@ var _ userstore.UserStore = (*PostgresUserStore)(nil)
 var _ userstore.DeviceRegistry = (*PostgresUserStore)(nil)
 var _ userstore.WatchedBatchWriter = (*PostgresUserStore)(nil)
 var _ userstore.PostgresAnchorStore = (*PostgresUserStore)(nil)
+var _ userstore.NextUpStateStore = (*PostgresUserStore)(nil)
 
 // NextUpAnchorsBackedByPostgres reports that this store's progress rows are the
 // shared Postgres tables the catalog already queries, so Next Up can join

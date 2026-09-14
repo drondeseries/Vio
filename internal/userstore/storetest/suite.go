@@ -4,6 +4,8 @@ package storetest
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -184,6 +186,329 @@ func testCollectionSortPreferences(t *testing.T, newStore func(t *testing.T) use
 		}
 		if pref != nil {
 			t.Fatalf("%s preference survived profile recreation: %+v", kind, pref)
+		}
+	}
+}
+
+// NextUpStateHiddenSeeder is an optional test seam for the Next Up state
+// conformance suite. The public store API timestamp-adjusts or suppresses any
+// progress write at or before a hidden-history watermark, so it cannot build
+// the hidden+progress combinations the provider's read predicate must handle.
+// Stores implement this in their test files against the raw tables; it is not
+// part of the production userstore API.
+type NextUpStateHiddenSeeder interface {
+	SeedHiddenHistoryItem(ctx context.Context, profileID, mediaItemID string, hiddenBefore time.Time) error
+}
+
+// RunNextUpState runs the Next Up state paging conformance suite against an
+// implementation of the optional userstore.NextUpStateStore capability.
+func RunNextUpState(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	t.Run("PagingAndExhaustion", func(t *testing.T) { testNextUpStatePaging(t, newStore) })
+	t.Run("OrderingTies", func(t *testing.T) { testNextUpStateOrderingTies(t, newStore) })
+	t.Run("IncludedRows", func(t *testing.T) { testNextUpStateIncludedRows(t, newStore) })
+	t.Run("HiddenWatermark", func(t *testing.T) { testNextUpStateHiddenWatermark(t, newStore) })
+	t.Run("ProfileIsolation", func(t *testing.T) { testNextUpStateProfileIsolation(t, newStore) })
+	t.Run("Cancellation", func(t *testing.T) { testNextUpStateCancellation(t, newStore) })
+	t.Run("InvalidLimit", func(t *testing.T) { testNextUpStateInvalidLimit(t, newStore) })
+}
+
+func nextUpStateStore(t *testing.T, store userstore.UserStore) userstore.NextUpStateStore {
+	t.Helper()
+	nextUp, ok := store.(userstore.NextUpStateStore)
+	if !ok {
+		t.Fatalf("store %T does not implement userstore.NextUpStateStore", store)
+	}
+	return nextUp
+}
+
+func seedNextUpEntry(t *testing.T, store userstore.UserStore, profileID, mediaItemID string, position float64, completed bool, updatedAt time.Time) {
+	t.Helper()
+	if err := store.SetProgressAt(context.Background(), profileID, mediaItemID, position, 3600, completed, updatedAt); err != nil {
+		t.Fatalf("SetProgressAt(%s): %v", mediaItemID, err)
+	}
+}
+
+func assertNextUpPage(t *testing.T, page userstore.NextUpStatePage, wantIDs []string, wantExhausted bool) {
+	t.Helper()
+	if len(page.Entries) != len(wantIDs) {
+		t.Fatalf("page entries = %+v, want media items %v", page.Entries, wantIDs)
+	}
+	for i, wantID := range wantIDs {
+		if page.Entries[i].MediaItemID != wantID {
+			t.Fatalf("page entries = %+v, want media items %v", page.Entries, wantIDs)
+		}
+	}
+	if page.Exhausted != wantExhausted {
+		t.Fatalf("page Exhausted = %v, want %v (entries %+v)", page.Exhausted, wantExhausted, page.Entries)
+	}
+	if wantExhausted && page.Next != nil {
+		t.Fatalf("exhausted page returned Next = %+v", page.Next)
+	}
+	if !wantExhausted && page.Next == nil {
+		t.Fatal("non-exhausted page returned nil Next")
+	}
+}
+
+// drainNextUpState pages until exhaustion and returns every entry in order,
+// asserting the Next/Exhausted contract at each step.
+func drainNextUpState(t *testing.T, store userstore.NextUpStateStore, profileID string, limit int) []userstore.NextUpStateEntry {
+	t.Helper()
+	var all []userstore.NextUpStateEntry
+	var cursor *userstore.NextUpStateCursor
+	for page := 0; ; page++ {
+		if page > 100 {
+			t.Fatal("next up state paging did not terminate")
+		}
+		res, err := store.ListNextUpStatePage(context.Background(), profileID, cursor, limit)
+		if err != nil {
+			t.Fatalf("ListNextUpStatePage(page %d): %v", page, err)
+		}
+		all = append(all, res.Entries...)
+		if res.Exhausted {
+			if res.Next != nil {
+				t.Fatalf("exhausted page %d returned a non-nil Next", page)
+			}
+			return all
+		}
+		if res.Next == nil {
+			t.Fatalf("non-exhausted page %d returned a nil Next", page)
+		}
+		cursor = res.Next
+	}
+}
+
+func testNextUpStatePaging(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	ctx := context.Background()
+	store := newStore(t)
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p1", Name: "Next Up"}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	nextUp := nextUpStateStore(t, store)
+
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		seedNextUpEntry(t, store, "p1", fmt.Sprintf("item-%d", i), 60, false, base.Add(-time.Duration(i)*time.Minute))
+	}
+
+	page1, err := nextUp.ListNextUpStatePage(ctx, "p1", nil, 2)
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	assertNextUpPage(t, page1, []string{"item-0", "item-1"}, false)
+	if page1.Next.MediaItemID != "item-1" || !page1.Next.UpdatedAt.Equal(base.Add(-time.Minute)) {
+		t.Fatalf("page 1 Next = %+v, want item-1 at %s", page1.Next, base.Add(-time.Minute))
+	}
+
+	page2, err := nextUp.ListNextUpStatePage(ctx, "p1", page1.Next, 2)
+	if err != nil {
+		t.Fatalf("page 2: %v", err)
+	}
+	assertNextUpPage(t, page2, []string{"item-2", "item-3"}, false)
+
+	page3, err := nextUp.ListNextUpStatePage(ctx, "p1", page2.Next, 2)
+	if err != nil {
+		t.Fatalf("page 3: %v", err)
+	}
+	assertNextUpPage(t, page3, []string{"item-4"}, true)
+
+	// An empty profile yields an exhausted empty page, never an empty
+	// non-exhausted page.
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: "empty", Name: "Empty"}); err != nil {
+		t.Fatalf("CreateProfile(empty): %v", err)
+	}
+	empty, err := nextUp.ListNextUpStatePage(ctx, "empty", nil, 5)
+	if err != nil {
+		t.Fatalf("empty profile page: %v", err)
+	}
+	if len(empty.Entries) != 0 || !empty.Exhausted || empty.Next != nil {
+		t.Fatalf("empty profile page = %+v, want empty and exhausted", empty)
+	}
+}
+
+func testNextUpStateOrderingTies(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	ctx := context.Background()
+	store := newStore(t)
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p1", Name: "Ties"}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	nextUp := nextUpStateStore(t, store)
+
+	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	seedNextUpEntry(t, store, "p1", "tie-a", 60, false, base)
+	seedNextUpEntry(t, store, "p1", "tie-b", 60, false, base)
+	seedNextUpEntry(t, store, "p1", "older", 60, false, base.Add(-time.Minute))
+
+	// Same updated_at is broken by media_item_id DESC, so tie-b sorts ahead of
+	// tie-a and the cursor never skips or repeats a tied row.
+	all := drainNextUpState(t, nextUp, "p1", 10)
+	if len(all) != 3 || all[0].MediaItemID != "tie-b" || all[1].MediaItemID != "tie-a" || all[2].MediaItemID != "older" {
+		t.Fatalf("order = %+v, want [tie-b tie-a older]", all)
+	}
+
+	// A one-row page landing on a tied boundary must resume cleanly: the cursor
+	// is the full (updated_at, media_item_id) pair, so the next page skips only
+	// the returned tie-b row and keeps tie-a.
+	first, err := nextUp.ListNextUpStatePage(ctx, "p1", nil, 1)
+	if err != nil {
+		t.Fatalf("tied page 1: %v", err)
+	}
+	assertNextUpPage(t, first, []string{"tie-b"}, false)
+	second, err := nextUp.ListNextUpStatePage(ctx, "p1", first.Next, 1)
+	if err != nil {
+		t.Fatalf("tied page 2: %v", err)
+	}
+	assertNextUpPage(t, second, []string{"tie-a"}, false)
+	third, err := nextUp.ListNextUpStatePage(ctx, "p1", second.Next, 1)
+	if err != nil {
+		t.Fatalf("tied page 3: %v", err)
+	}
+	assertNextUpPage(t, third, []string{"older"}, true)
+}
+
+func testNextUpStateIncludedRows(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	ctx := context.Background()
+	store := newStore(t)
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p1", Name: "Included"}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	nextUp := nextUpStateStore(t, store)
+
+	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	seedNextUpEntry(t, store, "p1", "completed", 0, true, base)
+	seedNextUpEntry(t, store, "p1", "in-progress", 60, false, base.Add(time.Minute))
+	// A rewatch: the row is fully watched (completed latched) but a later
+	// partial resume point was written, e.g. UpdateProgress after completion.
+	seedNextUpEntry(t, store, "p1", "rewatch", 0, true, base.Add(2*time.Minute))
+	if err := store.UpdateProgress(ctx, "p1", "rewatch", 30, 100, userstore.ProgressThresholds{}); err != nil {
+		t.Fatalf("UpdateProgress(rewatch): %v", err)
+	}
+	// A row with neither a completion nor a resume point does not contribute.
+	seedNextUpEntry(t, store, "p1", "idle", 0, false, base.Add(3*time.Minute))
+
+	all := drainNextUpState(t, nextUp, "p1", 10)
+	if len(all) != 3 {
+		t.Fatalf("entries = %+v, want completed, in-progress and rewatch", all)
+	}
+	byID := make(map[string]userstore.NextUpStateEntry, len(all))
+	for _, entry := range all {
+		byID[entry.MediaItemID] = entry
+	}
+	if _, ok := byID["idle"]; ok {
+		t.Fatalf("idle row (completed=false, position=0) was included: %+v", all)
+	}
+	if entry, ok := byID["completed"]; !ok || !entry.Completed || entry.Position != 0 {
+		t.Fatalf("completed row missing or wrong: %+v", all)
+	}
+	if entry, ok := byID["in-progress"]; !ok || entry.Completed || entry.Position != 60 {
+		t.Fatalf("in-progress row missing or wrong: %+v", all)
+	}
+	// A completed row can still carry a live resume point (rewatch).
+	if entry, ok := byID["rewatch"]; !ok || !entry.Completed || entry.Position != 30 {
+		t.Fatalf("rewatch row missing or wrong: %+v", all)
+	}
+}
+
+func testNextUpStateHiddenWatermark(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	ctx := context.Background()
+	store := newStore(t)
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p1", Name: "Hidden"}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	nextUp := nextUpStateStore(t, store)
+	seeder, ok := store.(NextUpStateHiddenSeeder)
+	if !ok {
+		t.Fatalf("store %T does not implement the Next Up hidden-history test seeder", store)
+	}
+
+	base := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	seedNextUpEntry(t, store, "p1", "visible-older-watermark", 60, false, base)
+	seedNextUpEntry(t, store, "p1", "hidden-equal-watermark", 60, false, base)
+	seedNextUpEntry(t, store, "p1", "hidden-newer-watermark", 60, false, base)
+	seedNextUpEntry(t, store, "p1", "hidden-completed", 0, true, base)
+
+	// Hidden when hidden_before >= updated_at. The boundary is inclusive, so
+	// the equal case is hidden too.
+	if err := seeder.SeedHiddenHistoryItem(ctx, "p1", "visible-older-watermark", base.Add(-time.Second)); err != nil {
+		t.Fatalf("seed hidden (older): %v", err)
+	}
+	if err := seeder.SeedHiddenHistoryItem(ctx, "p1", "hidden-equal-watermark", base); err != nil {
+		t.Fatalf("seed hidden (equal): %v", err)
+	}
+	if err := seeder.SeedHiddenHistoryItem(ctx, "p1", "hidden-newer-watermark", base.Add(time.Second)); err != nil {
+		t.Fatalf("seed hidden (newer): %v", err)
+	}
+	if err := seeder.SeedHiddenHistoryItem(ctx, "p1", "hidden-completed", base); err != nil {
+		t.Fatalf("seed hidden (completed): %v", err)
+	}
+
+	all := drainNextUpState(t, nextUp, "p1", 10)
+	if len(all) != 1 || all[0].MediaItemID != "visible-older-watermark" {
+		t.Fatalf("entries = %+v, want only visible-older-watermark", all)
+	}
+}
+
+func testNextUpStateProfileIsolation(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	ctx := context.Background()
+	store := newStore(t)
+	for _, id := range []string{"p1", "p2"} {
+		if err := store.CreateProfile(ctx, userstore.Profile{ID: id, Name: id}); err != nil {
+			t.Fatalf("CreateProfile(%s): %v", id, err)
+		}
+	}
+	nextUp := nextUpStateStore(t, store)
+
+	base := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	seedNextUpEntry(t, store, "p1", "p1-item", 60, false, base)
+	seedNextUpEntry(t, store, "p2", "p2-item", 60, false, base)
+
+	p1 := drainNextUpState(t, nextUp, "p1", 10)
+	if len(p1) != 1 || p1[0].MediaItemID != "p1-item" {
+		t.Fatalf("p1 entries = %+v, want [p1-item]", p1)
+	}
+	p2 := drainNextUpState(t, nextUp, "p2", 10)
+	if len(p2) != 1 || p2[0].MediaItemID != "p2-item" {
+		t.Fatalf("p2 entries = %+v, want [p2-item]", p2)
+	}
+
+	// A hidden watermark another profile wrote for the same media item must not
+	// hide this profile's row.
+	if seeder, ok := store.(NextUpStateHiddenSeeder); ok {
+		if err := seeder.SeedHiddenHistoryItem(ctx, "p2", "p1-item", base.Add(time.Hour)); err != nil {
+			t.Fatalf("seed cross-profile hidden: %v", err)
+		}
+		p1 = drainNextUpState(t, nextUp, "p1", 10)
+		if len(p1) != 1 || p1[0].MediaItemID != "p1-item" {
+			t.Fatalf("p1 entries after cross-profile watermark = %+v, want [p1-item]", p1)
+		}
+	}
+}
+
+func testNextUpStateCancellation(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	store := newStore(t)
+	if err := store.CreateProfile(context.Background(), userstore.Profile{ID: "p1", Name: "Cancel"}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	nextUp := nextUpStateStore(t, store)
+	seedNextUpEntry(t, store, "p1", "item-1", 60, false, time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC))
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := nextUp.ListNextUpStatePage(canceled, "p1", nil, 10)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled page error = %v, want context.Canceled", err)
+	}
+}
+
+func testNextUpStateInvalidLimit(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	ctx := context.Background()
+	store := newStore(t)
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: "p1", Name: "Limit"}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	nextUp := nextUpStateStore(t, store)
+	for _, limit := range []int{0, -1} {
+		if _, err := nextUp.ListNextUpStatePage(ctx, "p1", nil, limit); !errors.Is(err, userstore.ErrNextUpStateInvalidLimit) {
+			t.Fatalf("limit %d error = %v, want ErrNextUpStateInvalidLimit", limit, err)
 		}
 	}
 }

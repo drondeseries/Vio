@@ -184,6 +184,152 @@ func TestPostgresSettingValues(t *testing.T) {
 	})
 }
 
+// SeedHiddenHistoryItem implements storetest's Next Up hidden-history test
+// seam against the raw shared Postgres table. It lives in the test build only:
+// the public store API timestamp-adjusts or suppresses any write at or before
+// a hidden watermark, so the conformance suite cannot construct a hidden
+// progress row any other way.
+func (s *PostgresUserStore) SeedHiddenHistoryItem(ctx context.Context, profileID, mediaItemID string, hiddenBefore time.Time) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO user_history_hidden_items (user_id, profile_id, media_item_id, hidden_before, updated_at)
+		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (user_id, profile_id, media_item_id) DO UPDATE SET
+			hidden_before = EXCLUDED.hidden_before,
+			updated_at = EXCLUDED.updated_at`,
+		s.userID, profileID, mediaItemID, hiddenBefore.UTC())
+	return err
+}
+
+// TestPostgresNextUpState runs the Next Up state provider conformance suite
+// against the Postgres backend. The per-user SQLite backend runs the same suite
+// in internal/userdb. Skips unless SILO_TEST_DATABASE_URL is set and the
+// hidden-history migration is applied.
+func TestPostgresNextUpState(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	var table *string
+	err = pool.QueryRow(ctx, `SELECT table_name FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'user_history_hidden_items'`).Scan(&table)
+	if errors.Is(err, pgx.ErrNoRows) || table == nil {
+		t.Skip("user_history_hidden_items migration has not been applied")
+	}
+	if err != nil {
+		t.Fatalf("check migration: %v", err)
+	}
+
+	storetest.RunNextUpState(t, func(t *testing.T) userstore.UserStore {
+		var userID int
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO users (username, role) VALUES ($1, 'user') RETURNING id`,
+			fmt.Sprintf("conf-nextup-%d", time.Now().UnixNano()),
+		).Scan(&userID); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = pool.Exec(ctx, `DELETE FROM user_watch_progress WHERE user_id = $1`, userID)
+			_, _ = pool.Exec(ctx, `DELETE FROM user_history_hidden_items WHERE user_id = $1`, userID)
+			_, _ = pool.Exec(ctx, `DELETE FROM user_profiles WHERE user_id = $1`, userID)
+			_, _ = pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
+		})
+		return newStore(pool, userID)
+	})
+}
+
+// TestPostgresNextUpStateAccountIsolation pins the account half of the scope
+// rule: two accounts may share a profile id and media item ids, but one
+// account's progress and hidden watermarks must never leak into the other's
+// page. The shared suite covers profile isolation within one account.
+func TestPostgresNextUpStateAccountIsolation(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	var table *string
+	err = pool.QueryRow(ctx, `SELECT table_name FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'user_history_hidden_items'`).Scan(&table)
+	if errors.Is(err, pgx.ErrNoRows) || table == nil {
+		t.Skip("user_history_hidden_items migration has not been applied")
+	}
+	if err != nil {
+		t.Fatalf("check migration: %v", err)
+	}
+
+	userIDs := make([]int, 0, 2)
+	for i := 0; i < 2; i++ {
+		var userID int
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO users (username, role) VALUES ($1, 'user') RETURNING id`,
+			fmt.Sprintf("conf-nextup-account-%d-%d", time.Now().UnixNano(), i),
+		).Scan(&userID); err != nil {
+			t.Fatalf("seed user %d: %v", i, err)
+		}
+		userIDs = append(userIDs, userID)
+	}
+	t.Cleanup(func() {
+		for _, userID := range userIDs {
+			_, _ = pool.Exec(ctx, `DELETE FROM user_watch_progress WHERE user_id = $1`, userID)
+			_, _ = pool.Exec(ctx, `DELETE FROM user_history_hidden_items WHERE user_id = $1`, userID)
+			_, _ = pool.Exec(ctx, `DELETE FROM user_profiles WHERE user_id = $1`, userID)
+			_, _ = pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
+		}
+	})
+
+	const profileID = "shared-profile"
+	base := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	storeA := newStore(pool, userIDs[0])
+	storeB := newStore(pool, userIDs[1])
+	if err := storeA.SetProgressAt(ctx, profileID, "item-a", 60, 3600, false, base); err != nil {
+		t.Fatalf("storeA SetProgressAt: %v", err)
+	}
+	if err := storeB.SetProgressAt(ctx, profileID, "item-b", 60, 3600, false, base); err != nil {
+		t.Fatalf("storeB SetProgressAt: %v", err)
+	}
+
+	pageA, err := storeA.ListNextUpStatePage(ctx, profileID, nil, 10)
+	if err != nil {
+		t.Fatalf("storeA page: %v", err)
+	}
+	if len(pageA.Entries) != 1 || pageA.Entries[0].MediaItemID != "item-a" {
+		t.Fatalf("storeA entries = %+v, want [item-a]", pageA.Entries)
+	}
+	pageB, err := storeB.ListNextUpStatePage(ctx, profileID, nil, 10)
+	if err != nil {
+		t.Fatalf("storeB page: %v", err)
+	}
+	if len(pageB.Entries) != 1 || pageB.Entries[0].MediaItemID != "item-b" {
+		t.Fatalf("storeB entries = %+v, want [item-b]", pageB.Entries)
+	}
+
+	// A watermark written by account B, even for account A's media item id,
+	// must not hide account A's row.
+	if err := storeB.SeedHiddenHistoryItem(ctx, profileID, "item-a", base.Add(time.Hour)); err != nil {
+		t.Fatalf("storeB seed hidden: %v", err)
+	}
+	pageA, err = storeA.ListNextUpStatePage(ctx, profileID, nil, 10)
+	if err != nil {
+		t.Fatalf("storeA page after cross-account watermark: %v", err)
+	}
+	if len(pageA.Entries) != 1 || pageA.Entries[0].MediaItemID != "item-a" {
+		t.Fatalf("storeA entries after cross-account watermark = %+v, want [item-a]", pageA.Entries)
+	}
+}
+
 // deleteUserAssertingCascade removes a seeded user and fails the test if the
 // delete errors or any named child table still holds the user's rows — i.e.
 // if an ON DELETE CASCADE these cleanups rely on ever goes missing.
