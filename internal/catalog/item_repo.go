@@ -453,7 +453,7 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 	for _, stmt := range []string{
 		`DELETE FROM user_watch_progress p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM user_watch_history p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
-		`DELETE FROM playback_history_admin p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
+		`DELETE FROM admin_playback_history p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM user_history_hidden_items p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM user_favorites p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM user_ratings p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,

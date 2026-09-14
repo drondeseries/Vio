@@ -1186,3 +1186,181 @@ func TestResolveVirtualRepeatPlayFastPathRequiresCandidateIdentity(t *testing.T)
 		}
 	})
 }
+
+// A candidate-declared 2160p must survive the resolution precedence gate: a
+// stored row with empty Resolution adopts the candidate label, and only a
+// truly-empty (stored + candidate) resolution falls back to the 1080p
+// baseline. No-prober branch (prober nil, deferProbe false).
+func TestCandidateResolutionPreferredOverBaseline(t *testing.T) {
+	uri := "virtual://movie/tt-cand-res-pref?result=cand-2160p"
+	stored := &models.MediaFile{
+		ID:                         401,
+		ContentID:                  "movie-1",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-2160p", URI: uri, Resolution: "2160p",
+			CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+		}}, nil
+	})
+	h := virtualProbeGateCandidateHandler(stored, lister, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := *stored
+	resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.File == nil || resolved.File.Resolution != "2160p" {
+		t.Fatalf("resolution=%v, want declared 2160p (must not be clobbered to 1080p baseline)", resolved.File)
+	}
+	if resolved.ResolutionAssumed {
+		t.Error("candidate-declared 2160p must not set ResolutionAssumed")
+	}
+	if resolved.Provenance != ProbeProvenanceDeclared {
+		t.Errorf("provenance=%q, want declared", resolved.Provenance)
+	}
+}
+
+// Track evidence wins over candidate blobs: existing hevc/eac3 tracks must
+// not be overwritten by candidate h264/aac declarations, and a second merge
+// must be a no-op.
+func TestTrackCodecPreferredOverCandidate(t *testing.T) {
+	file := &models.MediaFile{
+		Resolution:  "1080p",
+		VideoTracks: []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},
+		AudioTracks: []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}},
+	}
+	candidate := VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+	}
+
+	mergeVirtualCandidateTracks(file, candidate)
+	if file.CodecVideo != "hevc" {
+		t.Fatalf("CodecVideo=%q, want hevc from track evidence", file.CodecVideo)
+	}
+	if file.CodecAudio != "eac3" {
+		t.Fatalf("CodecAudio=%q, want eac3 from track evidence", file.CodecAudio)
+	}
+
+	beforeVideo, beforeAudio := file.CodecVideo, file.CodecAudio
+	beforeVideoTracks, beforeAudioTracks := len(file.VideoTracks), len(file.AudioTracks)
+	beforeVideoCodec, beforeAudioCodec := file.VideoTracks[0].Codec, file.AudioTracks[0].Codec
+
+	mergeVirtualCandidateTracks(file, candidate)
+	if file.CodecVideo != beforeVideo || file.CodecAudio != beforeAudio {
+		t.Fatalf("second merge changed codecs to %q/%q, want %q/%q", file.CodecVideo, file.CodecAudio, beforeVideo, beforeAudio)
+	}
+	if len(file.VideoTracks) != beforeVideoTracks || len(file.AudioTracks) != beforeAudioTracks {
+		t.Fatalf("second merge changed track counts to %d/%d, want %d/%d",
+			len(file.VideoTracks), len(file.AudioTracks), beforeVideoTracks, beforeAudioTracks)
+	}
+	if file.VideoTracks[0].Codec != beforeVideoCodec || file.AudioTracks[0].Codec != beforeAudioCodec {
+		t.Fatalf("second merge changed track codecs to %q/%q, want %q/%q",
+			file.VideoTracks[0].Codec, file.AudioTracks[0].Codec, beforeVideoCodec, beforeAudioCodec)
+	}
+}
+
+// Repeated merges with the same candidate must converge: fields and track
+// slices after the 1st vs 3rd call must be identical.
+func TestMergeIdempotentAcrossRepeatedCandidates(t *testing.T) {
+	candidate := VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+	}
+	file := &models.MediaFile{}
+
+	mergeVirtualCandidateTracks(file, candidate)
+	if len(file.VideoTracks) == 0 || len(file.AudioTracks) == 0 {
+		t.Fatalf("first merge produced no tracks: %#v", file)
+	}
+	snapVideo, snapAudio := file.CodecVideo, file.CodecAudio
+	snapContainer, snapResolution := file.Container, file.Resolution
+	snapVideoLen, snapAudioLen := len(file.VideoTracks), len(file.AudioTracks)
+	snapVideoCodec, snapAudioCodec := file.VideoTracks[0].Codec, file.AudioTracks[0].Codec
+
+	mergeVirtualCandidateTracks(file, candidate)
+	mergeVirtualCandidateTracks(file, candidate)
+
+	if file.CodecVideo != snapVideo {
+		t.Errorf("CodecVideo=%q after 3 merges, want %q after 1", file.CodecVideo, snapVideo)
+	}
+	if file.CodecAudio != snapAudio {
+		t.Errorf("CodecAudio=%q after 3 merges, want %q after 1", file.CodecAudio, snapAudio)
+	}
+	if file.Container != snapContainer {
+		t.Errorf("Container=%q after 3 merges, want %q after 1", file.Container, snapContainer)
+	}
+	if file.Resolution != snapResolution {
+		t.Errorf("Resolution=%q after 3 merges, want %q after 1", file.Resolution, snapResolution)
+	}
+	if len(file.VideoTracks) != snapVideoLen {
+		t.Fatalf("VideoTracks=%d after 3 merges, want %d after 1", len(file.VideoTracks), snapVideoLen)
+	}
+	if len(file.AudioTracks) != snapAudioLen {
+		t.Fatalf("AudioTracks=%d after 3 merges, want %d after 1", len(file.AudioTracks), snapAudioLen)
+	}
+	if file.VideoTracks[0].Codec != snapVideoCodec {
+		t.Errorf("VideoTracks[0].Codec=%q after 3 merges, want %q after 1", file.VideoTracks[0].Codec, snapVideoCodec)
+	}
+	if file.AudioTracks[0].Codec != snapAudioCodec {
+		t.Errorf("AudioTracks[0].Codec=%q after 3 merges, want %q after 1", file.AudioTracks[0].Codec, snapAudioCodec)
+	}
+}
+
+// No-prober declared path persists DECLARED (non-assumed) metadata: the
+// persistence gate in playback_virtual.go (resolve loop, `!AppliedRemux &&
+// !ResolutionAssumed && prober == nil`) persists declared candidates, unlike
+// the assumed-baseline gate which skips persistence. The saver runs in a
+// background goroutine via persistVirtualMetadataBounded, so the test waits
+// for the async call.
+func TestDeclaredNoProberCandidateResolutionPersists(t *testing.T) {
+	uri := "virtual://movie/tt-noprober-declared-persist?result=cand-2160p"
+	stored := &models.MediaFile{
+		ID:                         402,
+		ContentID:                  "movie-1",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-2160p", URI: uri, Resolution: "2160p",
+			CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+		}}, nil
+	})
+	var saverCalls int32
+	saverDone := make(chan struct{}, 1)
+	saver := func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+		atomic.AddInt32(&saverCalls, 1)
+		select {
+		case saverDone <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+	h := virtualProbeGateCandidateHandler(stored, lister, nil, saver)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := *stored
+	resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.File == nil || resolved.File.Resolution != "2160p" {
+		t.Fatalf("resolution=%v, want declared 2160p", resolved.File)
+	}
+	if resolved.ResolutionAssumed {
+		t.Error("candidate-declared 2160p must not set ResolutionAssumed")
+	}
+	select {
+	case <-saverDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("declared non-assumed metadata was not persisted via saver")
+	}
+	if got := atomic.LoadInt32(&saverCalls); got != 1 {
+		t.Fatalf("saver called %d times, want 1 for declared metadata", got)
+	}
+}

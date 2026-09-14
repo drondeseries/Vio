@@ -786,6 +786,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		)
 		if allowDefer {
 			h.pinVirtualSticky(stickyKey, cand.URI)
+			// Resolution precedence: stored evidence wins; otherwise adopt
+			// the candidate's declared label; only when both are absent is
+			// the 1080p baseline assumed. Only the last case marks
+			// ResolutionAssumed, so a declared 2160p is never clobbered.
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
 			resolutionAssumed := transient.Resolution == ""
 			if resolutionAssumed {
 				transient.Resolution = "1080p"
@@ -829,6 +836,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}, nil
 		}
 		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
+			// Resolution precedence: stored evidence wins; otherwise adopt
+			// the candidate's declared label; only when both are absent is
+			// the 1080p baseline assumed. Only the last case marks
+			// ResolutionAssumed, so a declared 2160p is never clobbered.
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
 			resolutionAssumed := transient.Resolution == ""
 			if resolutionAssumed {
 				transient.Resolution = "1080p"
@@ -844,6 +858,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 		probeKey := virtualProbeFailureKey(cand.URI, oid)
 		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
+			// Resolution precedence: stored evidence wins; otherwise adopt
+			// the candidate's declared label; only when both are absent is
+			// the 1080p baseline assumed. Only the last case marks
+			// ResolutionAssumed, so a declared 2160p is never clobbered.
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
 			resolutionAssumed := transient.Resolution == ""
 			if resolutionAssumed {
 				transient.Resolution = "1080p"
@@ -967,8 +988,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 	}
 	if firstResolved != nil {
-		if len(candidates) > 0 {
-			mergeVirtualCandidateTracks(firstResolved.File, candidates[0])
+		// Re-merge against the candidate that actually produced this result,
+		// not candidates[0]: after failover the usable source may come from
+		// a later candidate, and merging the wrong candidate contaminates
+		// tracks with another release's metadata.
+		for _, candidate := range candidates {
+			if firstResolved.URI != "" && candidate.URI == firstResolved.URI {
+				mergeVirtualCandidateTracks(firstResolved.File, candidate)
+				break
+			}
 		}
 		if firstResolved.Provenance == ProbeProvenanceVerified {
 			targetID := file.ID
@@ -1818,13 +1846,11 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	if probed.Resolution == "" {
 		probed.Resolution = candidate.Resolution
 	}
+	// Top-level codec derivation defers to the track-evidence-first blocks
+	// below (lines ~1883+, ~1903+): existing tracks win over candidate blobs,
+	// and the final CodecVideo/CodecAudio assignment happens there exactly
+	// once so merge stays idempotent.
 	hasResolution := probed.Resolution != ""
-	if probed.CodecVideo == "" && (hasResolution || candidate.CodecVideo != "") {
-		probed.CodecVideo = candidate.CodecVideo
-	}
-	if probed.CodecAudio == "" && (hasResolution || candidate.CodecAudio != "") {
-		probed.CodecAudio = candidate.CodecAudio
-	}
 	if !probed.HDR && candidate.HDR != "" {
 		probed.HDR = true
 	}
