@@ -15,7 +15,11 @@ const (
 	DefaultMarkerProviderTimeout = 30 * time.Second
 	DefaultAnalyzerTimeout       = 5 * time.Minute
 	DefaultControlTimeout        = 10 * time.Second
+<<<<<<< Updated upstream
 	DefaultScheduledTaskTimeout  = 10 * time.Minute
+=======
+	DefaultScheduledTaskTimeout  = 2 * time.Minute
+>>>>>>> Stashed changes
 	// DefaultScanSourceTimeout covers a single PollChanges call. Most scan
 	// sources return quickly, but filesystem-backed sources may need a longer
 	// bounded window for an initial baseline; cooperative plugins should still

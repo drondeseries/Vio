@@ -41,6 +41,7 @@ func (e *localPlaybackStartupError) Unwrap() error {
 }
 
 func (h *PlaybackHandler) startLocalPlaybackTransport(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+<<<<<<< Updated upstream
 	// Tone-map hardware/software selection and retries are owned by the v3
 	// planner (softwareToneMapRetryOptsV3) and the compat recipe resolver; this
 	// primitive starts exactly the executor it was given.
@@ -317,6 +318,14 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	}
 	res.URL = relayURL
 	return res, cleanup, nil
+=======
+	inputPath, err := resolveVirtualMediaPath(ctx, h.VirtualMediaResolver, opts.InputPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve transcode input: %w", err)
+	}
+	opts.InputPath = inputPath
+	return playback.StartTranscode(context.WithoutCancel(ctx), opts)
+>>>>>>> Stashed changes
 }
 
 // startRemotePlaybackTransport is the shared remote-node launch primitive.
@@ -324,9 +333,17 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 // their existing public error envelopes while executing identical transport
 // startup and response parsing.
 func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, nodeURL string, request transcodenode.TranscodeStartRequest) (transcodenode.TranscodeStartResponse, int, error) {
+<<<<<<< Updated upstream
 	if strings.HasPrefix(strings.ToLower(request.InputPath), virtualPlaybackPrefix) {
 		return transcodenode.TranscodeStartResponse{}, 0, errors.New("virtual sources require an integrated transcode transport")
 	}
+=======
+	inputPath, err := resolveVirtualMediaPath(ctx, h.VirtualMediaResolver, request.InputPath)
+	if err != nil {
+		return transcodenode.TranscodeStartResponse{}, 0, fmt.Errorf("resolve transcode input: %w", err)
+	}
+	request.InputPath = inputPath
+>>>>>>> Stashed changes
 	body, err := json.Marshal(request)
 	if err != nil {
 		return transcodenode.TranscodeStartResponse{}, 0, err

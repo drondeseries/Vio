@@ -805,6 +805,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		)
 		AttachRequestRouter(requestSvc, deps.PluginService)
 		requestSvc.SetCatalogChangeNotifier(sections.InvalidateResolvedListCache)
+<<<<<<< Updated upstream
 		requestSvc.SetVirtualMediaCleanup(func(ctx context.Context, req mediarequests.Request) error {
 			tvdbID := ""
 			if req.TVDBID != nil {
@@ -812,6 +813,8 @@ func newChiRouter(deps Dependencies) chi.Router {
 			}
 			return itemRepo.CleanupRequestVirtualMedia(ctx, string(req.MediaType), req.TMDBID, tvdbID, req.IMDbID)
 		})
+=======
+>>>>>>> Stashed changes
 		requestSvc.SetGroupPolicyProvider(accessGroupStore)
 		if userRepo != nil {
 			requestSvc.SetUserRepository(userRepo)
@@ -1354,6 +1357,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			playbackHandler.VirtualPlaybackSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
 				return virtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
 			}
+		}
+		playbackHandler.VirtualMediaResolver = deps.PluginHTTPProxy
+		if streamHandler != nil {
+			streamHandler.VirtualMediaResolver = deps.PluginHTTPProxy
 		}
 		if deps.DB != nil {
 			playbackHandler.PlanStoreV3 = planstore.NewPostgres(deps.DB)

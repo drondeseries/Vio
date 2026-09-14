@@ -679,6 +679,7 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	return terminalPlannerResultV3("adaptation_unavailable", "No validated playback route is available for this source and output route.", false)
 }
 
+<<<<<<< Updated upstream
 // Native HLS consumers use hvc1/dvh1 byte recipes. Web MediaSource clients
 // keep the server's existing FFmpeg-default labeling unless they explicitly
 // advertise the delivery-scoped native-HLS feature.
@@ -694,6 +695,14 @@ func hlsVideoSampleEntryV3(source SourceDescriptorV3, request StartRequestV3, dv
 		return VideoSampleEntryDVH1
 	}
 	return VideoSampleEntryHVC1
+=======
+func isDynamicStreamSourceV3(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	path := strings.ToLower(file.FilePath)
+	return strings.HasSuffix(path, ".strm") || strings.EqualFold(file.Container, "strm") || strings.HasPrefix(path, "aiostreams://") || strings.HasPrefix(path, "virtual://")
+>>>>>>> Stashed changes
 }
 
 // availableQualitiesV3 publishes the server ladder rungs a client could

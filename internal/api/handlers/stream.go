@@ -78,6 +78,7 @@ type StreamHandler struct {
 	// SubtitleCache stores complete embedded subtitle extracts under the transcode
 	// dir so repeat selections skip the whole-file ffmpeg demux. May be nil
 	// (tests / minimal setups) — extraction then always streams uncached.
+<<<<<<< Updated upstream
 	SubtitleCache *playback.SubtitleCache
 	SubtitleRepo  subtitles.Repository // optional; enables S3-sourced subtitles
 	S3Client      subtitles.S3Client   // optional; needed for fetching S3 subtitles
@@ -105,6 +106,13 @@ type StreamHandler struct {
 	// Metadata-only liveness checks resolve URLs without opening media and
 	// must never clear it.
 	VirtualCandidateRecoveredMarker func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error
+=======
+	SubtitleCache        *playback.SubtitleCache
+	SubtitleRepo         subtitles.Repository // optional; enables S3-sourced subtitles
+	S3Client             subtitles.S3Client   // optional; needed for fetching S3 subtitles
+	S3Bucket             string               // bucket for subtitle storage
+	VirtualMediaResolver VirtualMediaResolver
+>>>>>>> Stashed changes
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -408,11 +416,17 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 
 	switch session.PlayMethod {
 	case playback.PlayDirect:
+		streamPath, err := resolveVirtualMediaPath(r.Context(), h.VirtualMediaResolver, file.FilePath)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "virtual_media_resolution_failed", "Failed to resolve virtual media stream")
+			return
+		}
 		if err := h.sessionMgr.BeginTransport(sessionID); err == nil {
 			defer func() {
 				_ = h.sessionMgr.EndTransport(sessionID)
 			}()
 		}
+<<<<<<< Updated upstream
 		if isVirtualPlaybackFile(file) {
 			streamWriter := httpstream.NewRollingDeadlineWriter(w)
 			targetURL, err := url.Parse(inputPath)
@@ -507,10 +521,18 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := playback.ServeDirectPlay(w, r, inputPath); err != nil {
+=======
+		if err := playback.ServeDirectPlay(w, r, streamPath); err != nil {
+>>>>>>> Stashed changes
 			h.handleTransportStartFailure(r.Context(), session, file, err)
 		}
 
 	case playback.PlayRemux:
+		streamPath, err := resolveVirtualMediaPath(r.Context(), h.VirtualMediaResolver, file.FilePath)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "virtual_media_resolution_failed", "Failed to resolve virtual media stream")
+			return
+		}
 		if err := h.sessionMgr.BeginTransport(sessionID); err == nil {
 			defer func() {
 				_ = h.sessionMgr.EndTransport(sessionID)
@@ -522,6 +544,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				seekSeconds = s
 			}
 		}
+<<<<<<< Updated upstream
 		// An audio-only source muxes an audio-only fMP4. The v3 plan promises
 		// audio/mp4 for it, and a declared-tier client refuses to attach a
 		// source buffer whose advertised type its probe rejected — so the
@@ -591,6 +614,10 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			if remuxErr != nil {
 				h.handleTransportStartFailure(r.Context(), session, file, remuxErr)
 			}
+=======
+		if err := playback.ServeRemuxWithDVMode(w, r, streamPath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, file.PrimaryDVProfile(), session.RemuxDVMode, h.ffmpegPath()); err != nil {
+			h.handleTransportStartFailure(r.Context(), session, file, err)
+>>>>>>> Stashed changes
 		}
 
 	case playback.PlayTranscode:

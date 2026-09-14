@@ -107,7 +107,11 @@ func preflightPlaybackFile(
 	}
 
 	lower := strings.ToLower(file.FilePath)
+<<<<<<< Updated upstream
 	if strings.HasPrefix(lower, "virtual://") {
+=======
+	if strings.HasPrefix(lower, "aiostreams://") || strings.HasPrefix(lower, "virtual://") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+>>>>>>> Stashed changes
 		return nil
 	}
 
@@ -122,15 +126,25 @@ func preflightPlaybackFile(
 	return nil
 }
 
+<<<<<<< Updated upstream
 func resolveVirtualMediaPath(ctx context.Context, resolver VirtualMediaResolver, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
 	lower := strings.ToLower(path)
 	if !strings.HasPrefix(lower, "virtual://") {
+=======
+func resolveVirtualMediaPath(ctx context.Context, resolver VirtualMediaResolver, path string) (string, error) {
+	lower := strings.ToLower(path)
+	if !strings.HasPrefix(lower, "aiostreams://") && !strings.HasPrefix(lower, "virtual://") {
+>>>>>>> Stashed changes
 		return path, nil
 	}
 	if resolver == nil {
 		return "", fmt.Errorf("virtual media resolver is not configured")
 	}
+<<<<<<< Updated upstream
 	resolved, err := resolver.ResolveVirtualMedia(ctx, path, ownerInstallationID, userID, profileID)
+=======
+	resolved, err := resolver.ResolveVirtualMedia(ctx, path)
+>>>>>>> Stashed changes
 	if err != nil {
 		return "", err
 	}
