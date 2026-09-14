@@ -42,6 +42,8 @@ interface SubtitleTrackCarryover {
   windowEnd: number;
   atEOF: boolean;
   hasFetched: boolean;
+  /** Source generation the carried cues were fetched under. */
+  sourceGeneration: number;
 }
 
 /** Strip VTT formatting tags, keeping only the text content. */
@@ -140,12 +142,21 @@ export function useSubtitleTracks(
   // active track is stale. The caller must refresh the plan's subtitle
   // inventory; retrying the same URL can never succeed.
   onSourceChanged?: () => void,
+  // The effective subtitle source generation. It survives plan swaps and only
+  // changes when the underlying source identity changes, so the marker below
+  // can suppress the refresh -> replan -> 409 cycle that a new plan id would
+  // otherwise re-arm.
+  sourceGeneration = 0,
 ): string[] {
   const [activeCueTexts, setActiveCueTexts] = useState<string[]>([]);
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
   const onSourceChangedRef = useRef(onSourceChanged);
   onSourceChangedRef.current = onSourceChanged;
+  // The source generation that already emitted a source-changed signal. Held in
+  // a ref (unlike the per-effect `sourceChangedSignaled`) so a rebuilt track
+  // from the refresh's own replan does not signal the same rotation again.
+  const signaledSourceGenerationRef = useRef<number | null>(null);
 
   // Latest stream origin, readable from stable callbacks (maybeFetch) without
   // retriggering the main effect.
@@ -223,7 +234,16 @@ export function useSubtitleTracks(
     // every restored cue, including cues newly visible after an origin change.
     const carried = carryoverRef.current;
     carryoverRef.current = null;
-    const restored = carried && carried.url === activeUrl && !activeIsLive ? carried : null;
+    // Carry cues over only when the URL AND the source generation are the same:
+    // a rebuild caused by a genuine source change must refetch rather than
+    // replay the rotated source's old cues. A stream-reload rebuild keeps both.
+    const restored =
+      carried &&
+      carried.url === activeUrl &&
+      carried.sourceGeneration === sourceGeneration &&
+      !activeIsLive
+        ? carried
+        : null;
     // HLS clears every native TextTrack when it attaches a new stream. Keep
     // source cues independently so that cleanup after that clear can still
     // restore the fetched window, rather than marking an empty track covered.
@@ -335,7 +355,13 @@ export function useSubtitleTracks(
         if (!resp.ok || !resp.body) {
           if (await isSubtitleSourceChanged(resp)) {
             sourceChangedSignaled = true;
-            onSourceChangedRef.current?.();
+            // One signal per source generation: the refresh replan adopts a new
+            // plan whose rebuilt fetcher would otherwise signal the same
+            // rotation again, restarting the cycle.
+            if (signaledSourceGenerationRef.current !== sourceGeneration) {
+              signaledSourceGenerationRef.current = sourceGeneration;
+              onSourceChangedRef.current?.();
+            }
           } else {
             // Non-ok responses (including 404/415) fall through to the finally
             // block, which schedules a bounded exponential-backoff retry. A
@@ -512,6 +538,7 @@ export function useSubtitleTracks(
           windowEnd,
           atEOF,
           hasFetched,
+          sourceGeneration,
         };
       }
       clearCues();
@@ -528,8 +555,19 @@ export function useSubtitleTracks(
     // the track. The update effects below shift existing cues in place instead.
     // `streamGeneration` IS included: a stream restart reloads the <video>
     // element and orphans the current track, so it must be rebuilt.
+    // `sourceGeneration` is included so a genuine source change rebuilds the
+    // track; a plan swap that leaves the source identity alone does not.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeUrl, activeCodec, activeLang, activeIsLive, liveTrackKey, streamGeneration, videoRef]);
+  }, [
+    activeUrl,
+    activeCodec,
+    activeLang,
+    activeIsLive,
+    liveTrackKey,
+    streamGeneration,
+    sourceGeneration,
+    videoRef,
+  ]);
 
   // Re-base already-loaded cues when the media timeline remaps — e.g. a
   // copy-mode session restarting at a new position after an out-of-window

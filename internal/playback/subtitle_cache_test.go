@@ -50,6 +50,92 @@ func TestServeExtractTextCacheVariants(t *testing.T) {
 	}
 }
 
+// A windowed ASS request must take the windowed branch and stream its own
+// slice rather than waiting on or starting a whole-track fill: a full-track
+// ASS demux over a virtual relay takes ~100s, which is the stall this path
+// removes. Mirrors the windowed VTT tests.
+func TestServeExtractWindowedASSStreamsWithoutFullTrackFill(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		TrackIndex:            0,
+		SeekSeconds:           120,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+	}
+	var got StreamExtractOpts
+	calls := 0
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass?position=120&duration=600", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+		calls++
+		got = o
+		_, err := io.WriteString(o.Writer, "[Script Info]\n")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want 1 (window only)", calls)
+	}
+	if got.SeekSeconds != 120 || got.DurationSeconds != 600 {
+		t.Fatalf("window parameters not preserved: %+v", got)
+	}
+	if rec.Body.String() != "[Script Info]\n" {
+		t.Fatalf("windowed body = %q", rec.Body.String())
+	}
+	if f, _, ok := c.lookup(source, "", 0, subtitleFormatASS); ok {
+		_ = f.Close()
+		t.Fatal("windowed ASS extract must not commit a full-track entry")
+	}
+}
+
+// A warmed virtual subtitle artifact must survive well past the old
+// ten-minute generation bucket. The key already pins the provider result id,
+// so a rotated release produces a different identity; the bucket is only
+// residual insurance against the same pinned id serving changed bytes. A
+// ten-minute bucket threw away a ~100s ASS warm between plays.
+func TestVirtualSubtitleCacheArtifactSurvivesPastTenMinuteBucket(t *testing.T) {
+	c, source := newTestCache(t)
+	const identity = "virtual-result-stable-id"
+	fill := c.beginFill(source, identity, 0, subtitleFormatASS)
+	if fill == nil {
+		t.Fatal("failed to reserve identity-keyed fill")
+	}
+	if _, err := fill.Tee(io.Discard).Write([]byte("[Script Info]\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fill.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Anchor mid-bucket so an 11-minute advance stays inside any bucket wider
+	// than ~22 minutes (the durable value) while the old 10-minute bucket
+	// always rotates. The artifact must still resolve to the same entry.
+	bucketSeconds := int64(subtitleCacheGenerationBucket / time.Second)
+	base := fill.srcMtime.Add(time.Duration(bucketSeconds/2) * time.Second)
+	later := base.Add(11 * time.Minute)
+
+	resolve := func(at time.Time) string {
+		resolved, modTime, size, ok := subtitleCacheSource(source, identity, at)
+		if !ok {
+			t.Fatalf("identity-keyed source must resolve at %v", at)
+		}
+		return filepath.Join(c.dir(), subtitleCacheFormatKey(resolved, 0, modTime, size, subtitleFormatASS))
+	}
+	committed := resolve(base)
+	if laterPath := resolve(later); laterPath != committed {
+		t.Fatalf("virtual subtitle artifact rotated after 11 minutes:\n got %s\nwant %s", laterPath, committed)
+	}
+	if _, err := os.Stat(committed); err != nil {
+		t.Fatalf("warmed artifact not on disk after the generation advance: %v", err)
+	}
+	// The live lookup (which uses the wall clock) still serves it.
+	if _, _, ok := c.cachedFormatEntryPath(source, identity, 0, subtitleFormatASS); !ok {
+		t.Fatal("identity-keyed artifact not served by the live lookup")
+	}
+}
+
 func TestServeExtractTextWindowDoesNotPoisonFullTrack(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", DurationSeconds: 600}
@@ -207,47 +293,320 @@ func TestServeExtractTextWindowedMissWarmsOnce(t *testing.T) {
 	}
 }
 
-func TestServeExtractTextConcurrentViewerDoesNotWaitForFill(t *testing.T) {
+// A windowed text miss on a virtual identity with the cache's own warm
+// disabled (the handler owns the warm for request-scoped relay inputs) must
+// still stream the window from the source and must not commit a full-track
+// entry itself.
+func TestServeExtractTextWindowedVirtualMissSkipsCacheWarm(t *testing.T) {
+	c, source := newTestCache(t)
+	windowed := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "subrip",
+		TrackIndex:            0,
+		SeekSeconds:           600,
+		DurationSeconds:       600,
+		CacheIdentity:         "virtual-result-abc",
+		DisableBackgroundWarm: true,
+	}
+	var (
+		warmCalls, windowCalls int
+		got                    StreamExtractOpts
+	)
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), windowed, func(_ context.Context, opts StreamExtractOpts) error {
+		if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
+			warmCalls++
+			return nil
+		}
+		windowCalls++
+		got = opts
+		_, err := io.WriteString(opts.Writer, "WINDOW SLICE")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if windowCalls != 1 || warmCalls != 0 {
+		t.Fatalf("extract calls: window=%d warm=%d, want window=1 warm=0", windowCalls, warmCalls)
+	}
+	if got.InputPath != source || got.InputIsExtractedText != "" {
+		t.Fatalf("windowed extract must read the original source: %+v", got)
+	}
+	if rec.Body.String() != "WINDOW SLICE" {
+		t.Fatalf("windowed body = %q", rec.Body.String())
+	}
+	if c.HasCommittedTextEntry(source, windowed.CacheIdentity, 0, "subrip", "") {
+		t.Fatal("a virtual window miss must not commit a full-track entry")
+	}
+}
+
+// HasCommittedTextEntry derives the cache format from codec/target exactly as
+// ServeExtract does, so the handler's pre-probe check can never disagree with
+// the artifact a windowed serve would read. Bitmap codecs and a nil cache read
+// as false.
+func TestHasCommittedTextEntryFormatAndBitmap(t *testing.T) {
+	c, source := newTestCache(t)
+
+	// Commit a VTT artifact through the real full-track serve path.
+	full := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", TrackIndex: 0}
+	if err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle", nil), full, func(_ context.Context, opts StreamExtractOpts) error {
+		_, err := io.WriteString(opts.Writer, "FULL VTT TRACK")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !c.HasCommittedTextEntry(source, "", 0, "subrip", "") {
+		t.Fatal("vtt entry must be visible for subrip with the default target")
+	}
+	if !c.HasCommittedTextEntry(source, "", 0, "subrip", "vtt") {
+		t.Fatal("vtt entry must be visible for a forced vtt target")
+	}
+	if !c.HasCommittedTextEntry(source, "", 0, "subrip", ".VTT") {
+		t.Fatal("vtt entry must be visible for a case-insensitive target")
+	}
+	if c.HasCommittedTextEntry(source, "", 0, "ass", "") {
+		t.Fatal("ass must not read the vtt entry")
+	}
+	if c.HasCommittedTextEntry(source, "", 1, "subrip", "") {
+		t.Fatal("a different track ordinal must not read the vtt entry")
+	}
+	if c.HasCommittedTextEntry(source, "", 0, "hdmv_pgs_subtitle", "") {
+		t.Fatal("pgs must never read as a committed text entry")
+	}
+	var nilCache *SubtitleCache
+	if nilCache.HasCommittedTextEntry(source, "", 0, "subrip", "") {
+		t.Fatal("nil cache must read as a miss")
+	}
+}
+
+// HasCommittedTextEntry is identity-keyed for a virtual source: the same
+// generation bucket and identity that a warm commits under is what the serve
+// path queries, so a handler can trust a hit to be the artifact it will read.
+func TestHasCommittedTextEntryVirtualIdentity(t *testing.T) {
+	c, source := newTestCache(t)
+	const identity = "virtual-result-window-1"
+	fill := c.beginFill(source, identity, 0, subtitleFormatASS)
+	if fill == nil {
+		t.Fatal("failed to reserve identity-keyed fill")
+	}
+	if _, err := fill.Tee(io.Discard).Write([]byte("[Script Info]\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fill.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if !c.HasCommittedTextEntry(source, identity, 0, "ass", "") {
+		t.Fatal("committed ass entry must be visible under its virtual identity")
+	}
+	if c.HasCommittedTextEntry(source, "virtual-result-other", 0, "ass", "") {
+		t.Fatal("a different virtual identity must not read the entry")
+	}
+}
+
+// A full-track request that misses the cache while another fill for the same
+// key is in flight must wait for that fill and serve its committed bytes — a
+// plan-time warm is not duplicated by the first client fetch. Exactly one
+// extract (the warm) runs.
+func TestServeExtractTextWaitsForInFlightFillAndServesCommitted(t *testing.T) {
 	c, source := newTestCache(t)
 	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
 	started, release := make(chan struct{}), make(chan struct{})
-	firstDone := make(chan error, 1)
+	done := c.WarmTrackInBackground(opts, func(ctx context.Context, o StreamExtractOpts) error {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		_, err := io.WriteString(o.Writer, "WARM TRACK")
+		return err
+	})
+	<-started
+
+	clientDone := make(chan error, 1)
+	rec := httptest.NewRecorder()
 	go func() {
-		firstDone <- c.ServeExtract(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/subtitle", nil), opts, func(ctx context.Context, opts StreamExtractOpts) error {
-			close(started)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			_, err := io.WriteString(opts.Writer, "complete owner track")
+		clientDone <- c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			_, err := io.WriteString(o.Writer, "CLIENT TRACK")
 			return err
 		})
 	}()
-	<-started
-	defer func() {
-		close(release)
-		if err := <-firstDone; err != nil {
-			t.Error(err)
-		}
-	}()
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	rec := httptest.NewRecorder()
-	err := c.ServeExtract(rec, httptest.NewRequestWithContext(ctx, http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, opts StreamExtractOpts) error {
-		_, err := io.WriteString(opts.Writer, "independent viewer track")
-		return err
-	})
-	if err != nil {
+
+	// The client must be waiting on the warm, not running its own demux.
+	select {
+	case err := <-clientDone:
+		t.Fatalf("client returned before the warm committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-clientDone; err != nil {
 		t.Fatal(err)
 	}
-	if rec.Body.String() != "independent viewer track" {
-		t.Fatalf("body = %q", rec.Body.String())
+	<-done
+
+	if got := rec.Body.String(); got != "WARM TRACK" {
+		t.Fatalf("client body = %q, want the warm's committed bytes", got)
 	}
-	// The second viewer must not publish or discard the first viewer's fill.
-	if f, _, ok := c.lookup(source, "", 0, "vtt"); ok {
-		_ = f.Close()
-		t.Fatal("concurrent viewer published another viewer's fill")
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("extract ran %d times, want exactly 1 (the warm)", calls)
+	}
+}
+
+// With no in-flight fill the cold path streams from its own extract unchanged.
+func TestServeExtractTextColdPathStreamsImmediately(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+	calls := 0
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+		calls++
+		_, err := io.WriteString(o.Writer, "COLD TRACK")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("cold path extract calls = %d, want 1", calls)
+	}
+	if got := rec.Body.String(); got != "COLD TRACK" {
+		t.Fatalf("cold body = %q", got)
+	}
+}
+
+// When the fill a request is waiting on fails without committing, the waiter
+// must take over the reservation and extract its own response rather than
+// hanging or dereferencing a nil fill.
+func TestServeExtractTextInFlightFillFailureRetries(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+
+	held := c.beginFill(source, "", 0, SubtitleFormatVTTV3)
+	if held == nil {
+		t.Fatal("failed to hold the in-flight fill")
+	}
+
+	clientDone := make(chan error, 1)
+	rec := httptest.NewRecorder()
+	go func() {
+		clientDone <- c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+			_, err := io.WriteString(o.Writer, "CLIENT TRACK")
+			return err
+		})
+	}()
+
+	select {
+	case err := <-clientDone:
+		t.Fatalf("client returned before the held fill settled: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The holder fails: no entry lands, so the waiter re-attempts the fill.
+	held.Discard()
+
+	if err := <-clientDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Body.String(); got != "CLIENT TRACK" {
+		t.Fatalf("body = %q", got)
+	}
+	f, _, ok := c.lookup(source, "", 0, SubtitleFormatVTTV3)
+	if !ok {
+		t.Fatal("waiter's takeover extract was not committed")
+	}
+	_ = f.Close()
+}
+
+// A canceled waiter returns its context error instead of blocking until the
+// in-flight fill finishes, and must not touch the holder's fill.
+func TestServeExtractTextWaitHonorsContextCancel(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "subrip"}
+
+	held := c.beginFill(source, "", 0, SubtitleFormatVTTV3)
+	if held == nil {
+		t.Fatal("failed to hold the in-flight fill")
+	}
+	defer held.Discard()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	extracted := false
+	err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/subtitle", nil), opts, func(context.Context, StreamExtractOpts) error {
+		extracted = true
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline", err)
+	}
+	if extracted {
+		t.Fatal("canceled waiter must not extract")
+	}
+}
+
+// The SUP full-track path gets the same treatment: a request arriving while a
+// fill is in flight waits and serves the committed .sup instead of running a
+// duplicate full demux.
+func TestServeSUPExtractWaitsForInFlightFill(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := supExtractOpts(source, 0)
+
+	held := c.beginFill(source, "", 0, subtitleFormatSUP)
+	if held == nil {
+		t.Fatal("failed to hold the in-flight fill")
+	}
+
+	extracted := false
+	clientDone := make(chan error, 1)
+	rec := httptest.NewRecorder()
+	go func() {
+		clientDone <- c.ServeSUPExtract(rec, httptest.NewRequest(http.MethodGet, "/sub.sup", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+			extracted = true
+			_, err := o.Writer.Write([]byte("CLIENT SUP"))
+			return err
+		})
+	}()
+
+	select {
+	case err := <-clientDone:
+		t.Fatalf("client returned before the fill committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The holder commits: the waiter must serve these bytes from cache.
+	if _, err := held.Tee(io.Discard).Write([]byte("SUP PAYLOAD")); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-clientDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Body.String(); got != "SUP PAYLOAD" {
+		t.Fatalf("client body = %q, want the committed .sup", got)
+	}
+	// A committed entry is served with Last-Modified, never a streamed 200.
+	if rec.Header().Get("Last-Modified") == "" {
+		t.Fatal("waited serve must be a cached ServeContent response")
+	}
+	if extracted {
+		t.Fatal("waited request must not run its own extract")
 	}
 }
 
@@ -1165,5 +1524,295 @@ func TestSubtitleCacheTextRejectsSourceChangedDuringExtraction(t *testing.T) {
 	}
 	if _, ok := cache.LookupText(source, 0, "srt"); ok {
 		t.Fatal("old extract cached under replacement source")
+	}
+}
+
+// Explicit position=0 is a window (WindowRequested), so ServeExtract must
+// take the windowed branch and must not run the full-track fill/serve path
+// for the whole source.
+func TestServeExtractExplicitZeroWindowDoesNotFullTrack(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		WindowRequested:       true,
+		SeekSeconds:           0,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+	}
+	var got StreamExtractOpts
+	calls := 0
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass?position=0&duration=600", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+		calls++
+		got = o
+		_, err := io.WriteString(o.Writer, "[Script Info]\n")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("extract calls = %d, want 1", calls)
+	}
+	if got.InputIsExtractedText != "" {
+		t.Fatalf("explicit-zero window must read the source, got input %q", got.InputIsExtractedText)
+	}
+	if !got.WindowRequested || got.SeekSeconds != 0 || got.DurationSeconds != 600 {
+		t.Fatalf("window parameters not preserved: %+v", got)
+	}
+	if f, _, ok := c.lookup(source, "", 0, subtitleFormatASS); ok {
+		_ = f.Close()
+		t.Fatal("windowed extract must not commit a full-track entry")
+	}
+}
+
+// ResolveCommittedTextEntry binds the exact artifact; passing the token back
+// through PinnedTextArtifact makes ServeExtract use that artifact without
+// re-resolving, so a generation rollover between the identity check and the
+// read cannot turn a validated artifact into a miss. The pinned path here is
+// one a fresh lookup cannot produce, proving the token is authoritative.
+func TestPinnedTextArtifactServedWithoutReResolution(t *testing.T) {
+	c, source := newTestCache(t)
+	if err := os.MkdirAll(c.dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(c.dir(), "pinned-external.ass")
+	if err := os.WriteFile(external, []byte("[Script Info]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := c.cachedFormatEntryPath(source, "", 0, subtitleFormatASS); ok {
+		t.Fatal("test requires no normally resolvable entry")
+	}
+	token := CommittedTextArtifact{path: external, format: subtitleFormatASS}
+	opts := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		WindowRequested:       true,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+		PinnedTextArtifact:    &token,
+	}
+	var got StreamExtractOpts
+	rec := httptest.NewRecorder()
+	result, err := c.ServeExtractWithResult(rec, httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+		got = o
+		_, err := io.WriteString(o.Writer, "WINDOW SLICE")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ServedCommittedArtifact {
+		t.Fatal("pinned artifact must be reported as served")
+	}
+	if got.InputPath != external || got.InputIsExtractedText != subtitleFormatASS {
+		t.Fatalf("serve must use the pinned artifact: %+v", got)
+	}
+	if rec.Body.String() != "WINDOW SLICE" {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+// A committed artifact can be evicted between the identity check and the
+// read. When the caller pinned it, ServeExtractWithResult must not silently
+// fall back to an unvalidated source extract: it reports the miss so the
+// caller can revalidate and retry.
+func TestPinnedTextArtifactEvictionDoesNotFallBackToSource(t *testing.T) {
+	c, source := newTestCache(t)
+	fill := c.beginFill(source, "", 0, subtitleFormatASS)
+	if fill == nil {
+		t.Fatal("failed to reserve fill")
+	}
+	if _, err := fill.Tee(io.Discard).Write([]byte("[Script Info]\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fill.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	token, ok := c.ResolveCommittedTextEntry(source, "", 0, "ass", "")
+	if !ok {
+		t.Fatal("expected a committed artifact to resolve")
+	}
+	if err := os.Remove(token.path); err != nil {
+		t.Fatal(err)
+	}
+	extracted := false
+	opts := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		WindowRequested:       true,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+		PinnedTextArtifact:    &token,
+	}
+	result, err := c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), opts, func(context.Context, StreamExtractOpts) error {
+		extracted = true
+		return nil
+	})
+	if !errors.Is(err, ErrCommittedTextArtifactGone) {
+		t.Fatalf("error = %v, want ErrCommittedTextArtifactGone", err)
+	}
+	if extracted {
+		t.Fatal("evicted pinned artifact must not fall back to a source extract")
+	}
+	if result.ServedCommittedArtifact {
+		t.Fatal("no artifact was served")
+	}
+}
+
+// ServeExtractWithResult reports a windowed serve that used the committed
+// artifact, and a window miss that did not — the signal a caller uses to
+// decide whether track-identity validation can be skipped.
+func TestServeExtractResultReportsCommittedArtifact(t *testing.T) {
+	c, source := newTestCache(t)
+
+	// Cold window miss: nothing committed, so the artifact was not served.
+	windowed := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "ass",
+		TrackIndex:            0,
+		WindowRequested:       true,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+	}
+	result, err := c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), windowed, func(_ context.Context, o StreamExtractOpts) error {
+		_, err := io.WriteString(o.Writer, "SLICE")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ServedCommittedArtifact {
+		t.Fatal("cold window miss must not report a committed artifact")
+	}
+
+	// Commit a full-track artifact, then serve a window from it.
+	full := StreamExtractOpts{InputPath: source, SourceCodec: "ass", TrackIndex: 0}
+	if err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), full, func(_ context.Context, o StreamExtractOpts) error {
+		_, err := io.WriteString(o.Writer, "FULL TRACK")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var served StreamExtractOpts
+	result, err = c.ServeExtractWithResult(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.ass", nil), windowed, func(_ context.Context, o StreamExtractOpts) error {
+		served = o
+		_, err := io.WriteString(o.Writer, "SLICE")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ServedCommittedArtifact {
+		t.Fatal("windowed serve from a committed artifact must report it")
+	}
+	if served.InputIsExtractedText != subtitleFormatASS {
+		t.Fatalf("windowed serve must read the cached artifact: %+v", served)
+	}
+}
+
+// A warm that fails must put its identity in a cooldown so repeated windowed
+// misses do not each spawn a full-track remote read. An immediate retry is
+// suppressed; once the cooldown expires the next attempt runs.
+func TestWarmTrackInBackgroundFailedWarmCooldown(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{InputPath: source, SourceCodec: "ass", TrackIndex: 0}
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	extract := func(_ context.Context, _ StreamExtractOpts) error {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return errors.New("relay unavailable")
+	}
+	<-c.WarmTrackInBackground(opts, extract)
+	mu.Lock()
+	if calls != 1 {
+		t.Fatalf("first warm calls = %d, want 1", calls)
+	}
+	mu.Unlock()
+
+	// Immediate retry: suppressed by the failure cooldown.
+	<-c.WarmTrackInBackground(opts, extract)
+	mu.Lock()
+	if calls != 1 {
+		t.Fatalf("immediate retry calls = %d, want still 1 (cooldown)", calls)
+	}
+	mu.Unlock()
+
+	// Expire the cooldown; the next attempt runs.
+	key, ok := c.formatEntryKey(source, "", 0, subtitleFormatASS)
+	if !ok {
+		t.Fatal("failed to compute warm key")
+	}
+	c.warmMu.Lock()
+	guard := c.warmGuard[key]
+	guard.retryAt = time.Now().Add(-time.Second)
+	c.warmGuard[key] = guard
+	c.warmMu.Unlock()
+	<-c.WarmTrackInBackground(opts, extract)
+	mu.Lock()
+	if calls != 2 {
+		t.Fatalf("post-cooldown warm calls = %d, want 2", calls)
+	}
+	mu.Unlock()
+}
+
+// A successful warm clears the identity's cooldown.
+func TestWarmOutcomeSuccessClearsCooldown(t *testing.T) {
+	c, _ := newTestCache(t)
+	const key = "identity"
+	c.noteWarmOutcome(key, false, time.Now())
+	if c.warmAdmitted(key, time.Now()) {
+		t.Fatal("failed warm must gate admission")
+	}
+	c.noteWarmOutcome(key, true, time.Now())
+	if !c.warmAdmitted(key, time.Now()) {
+		t.Fatal("successful warm must clear the cooldown")
+	}
+}
+
+// A canceled warm (relay gone) must still close its done channel and release
+// its warm slot, so the caller's deferred relay-registration cleanup runs and
+// no slot leaks. The cancellation is recorded as a failure, gating an
+// immediate re-spawn.
+func TestWarmTrackInBackgroundCancellationReleasesSlot(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := StreamExtractOpts{
+		InputPath:     source,
+		SourceCodec:   "ass",
+		TrackIndex:    0,
+		CacheIdentity: "virtual-cancel-1",
+	}
+	done := c.WarmTrackInBackground(opts, func(context.Context, StreamExtractOpts) error {
+		return context.Canceled
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warm done never closed after cancellation")
+	}
+	// Every warm slot is free again.
+	for i := 0; i < subtitleCacheWarmSlots; i++ {
+		select {
+		case c.warmSem <- struct{}{}:
+		default:
+			t.Fatal("warm slot leaked after cancellation")
+		}
+	}
+	for i := 0; i < subtitleCacheWarmSlots; i++ {
+		<-c.warmSem
+	}
+	// The canceled warm counts as a failure, so an immediate retry is gated.
+	calls := 0
+	<-c.WarmTrackInBackground(opts, func(context.Context, StreamExtractOpts) error {
+		calls++
+		return nil
+	})
+	if calls != 0 {
+		t.Fatalf("immediate retry after cancellation ran %d times, want 0", calls)
 	}
 }

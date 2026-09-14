@@ -268,6 +268,174 @@ func (s *PostgresUserStore) ListProgressSince(ctx context.Context, profileID, cu
 	return results, strconv.FormatInt(next, 10), nil
 }
 
+// ListNextUpStatePage reads one Next Up state page for a profile within this
+// store's account, newest first. See userstore.NextUpStateStore for the full
+// contract.
+//
+// The page predicate `completed = TRUE OR position_seconds > 0` spans the two
+// existing partial indexes rather than a single one, so a naive OR would make
+// the planner scan the whole profile and sort. Instead each disjoint half is
+// read through its own index-bounded, keyset-bounded branch and the branches
+// are merged:
+//   - completed rows ride idx_uwp_profile_completed_cursor
+//     (user_id, profile_id, updated_at DESC, media_item_id DESC) WHERE completed
+//     = TRUE, so the (updated_at, media_item_id) comparison is one ordered seek;
+//   - in-progress rows ride idx_uwp_profile_in_progress
+//     (user_id, profile_id, updated_at DESC) WHERE completed = FALSE.
+//
+// The halves are disjoint (completed TRUE vs FALSE) so the union needs no
+// distinct. Each branch reads limit+1 rows, the merge reads limit+1, and the
+// shared exhaustion rule still holds: a result of at most limit rows means both
+// branches were fully drained. The hidden-history NOT EXISTS probe rides the
+// user_history_hidden_items (user_id, profile_id, media_item_id) primary key.
+func (s *PostgresUserStore) ListNextUpStatePage(ctx context.Context, profileID string, cursor *userstore.NextUpStateCursor, limit int) (userstore.NextUpStatePage, error) {
+	if limit <= 0 {
+		return userstore.NextUpStatePage{}, userstore.ErrNextUpStateInvalidLimit
+	}
+	if err := ctx.Err(); err != nil {
+		return userstore.NextUpStatePage{}, err
+	}
+
+	args := []any{s.userID, profileID}
+	keyset := ""
+	if cursor != nil {
+		keyset = `
+		  AND (uwp.updated_at, uwp.media_item_id) < ($3, $4)`
+		args = append(args, cursor.UpdatedAt.UTC(), cursor.MediaItemID)
+	}
+	// The same limit placeholder is shared by both branches and the outer merge.
+	limitPlaceholder := "$" + strconv.Itoa(len(args)+1)
+	args = append(args, limit+1)
+
+	query := `
+		SELECT merged.media_item_id, merged.completed, merged.position_seconds, merged.updated_at
+		FROM (
+			(SELECT uwp.media_item_id, uwp.completed, uwp.position_seconds, uwp.updated_at
+			 FROM user_watch_progress uwp
+			 WHERE uwp.user_id = $1
+			   AND uwp.profile_id = $2
+			   AND uwp.completed = TRUE
+			   AND NOT EXISTS (
+				SELECT 1
+				FROM user_history_hidden_items hhi
+				WHERE hhi.user_id = uwp.user_id
+				  AND hhi.profile_id = uwp.profile_id
+				  AND hhi.media_item_id = uwp.media_item_id
+				  AND hhi.hidden_before >= uwp.updated_at
+			   )` + keyset + `
+			 ORDER BY uwp.updated_at DESC, uwp.media_item_id DESC
+			 LIMIT ` + limitPlaceholder + `)
+			UNION ALL
+			(SELECT uwp.media_item_id, uwp.completed, uwp.position_seconds, uwp.updated_at
+			 FROM user_watch_progress uwp
+			 WHERE uwp.user_id = $1
+			   AND uwp.profile_id = $2
+			   AND uwp.completed = FALSE
+			   AND uwp.position_seconds > 0
+			   AND NOT EXISTS (
+				SELECT 1
+				FROM user_history_hidden_items hhi
+				WHERE hhi.user_id = uwp.user_id
+				  AND hhi.profile_id = uwp.profile_id
+				  AND hhi.media_item_id = uwp.media_item_id
+				  AND hhi.hidden_before >= uwp.updated_at
+			   )` + keyset + `
+			 ORDER BY uwp.updated_at DESC, uwp.media_item_id DESC
+			 LIMIT ` + limitPlaceholder + `)
+		) merged
+		ORDER BY merged.updated_at DESC, merged.media_item_id DESC
+		LIMIT ` + limitPlaceholder
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return userstore.NextUpStatePage{}, fmt.Errorf("listing next up state page: %w", err)
+	}
+	defer rows.Close()
+
+	entries := make([]userstore.NextUpStateEntry, 0, limit+1)
+	for rows.Next() {
+		var entry userstore.NextUpStateEntry
+		var updatedAt time.Time
+		if err := rows.Scan(&entry.MediaItemID, &entry.Completed, &entry.Position, &updatedAt); err != nil {
+			return userstore.NextUpStatePage{}, fmt.Errorf("scanning next up state row: %w", err)
+		}
+		entry.UpdatedAt = updatedAt.UTC()
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return userstore.NextUpStatePage{}, fmt.Errorf("iterating next up state rows: %w", err)
+	}
+	// A cancellation that lands after the last row was scanned must surface as
+	// the context error, never as a short page the caller would treat as
+	// authoritative.
+	if err := ctx.Err(); err != nil {
+		return userstore.NextUpStatePage{}, err
+	}
+
+	return userstore.NextUpStatePageFromEntries(entries, limit), nil
+}
+
+// ListNextUpStateForItems returns the exact Next Up state rows for the given
+// media item ids, scoped to this store's account and the profile. See
+// userstore.NextUpStateStore for the full contract.
+//
+// Unlike ListNextUpStatePage there is no keyset and no sort: the caller already
+// chose the items, and order is unspecified. Empty input short-circuits before
+// touching the pool.
+//
+// Indexes: user_watch_progress_pkey (user_id, profile_id, media_item_id) serves
+// the id equality list, and the user_history_hidden_items_pkey
+// (user_id, profile_id, media_item_id) serves the hidden NOT EXISTS probe.
+func (s *PostgresUserStore) ListNextUpStateForItems(ctx context.Context, profileID string, mediaItemIDs []string) ([]userstore.NextUpStateEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(mediaItemIDs) == 0 {
+		return nil, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT uwp.media_item_id, uwp.completed, uwp.position_seconds, uwp.updated_at
+		FROM user_watch_progress uwp
+		WHERE uwp.user_id = $1
+		  AND uwp.profile_id = $2
+		  AND uwp.media_item_id = ANY($3::text[])
+		  AND (uwp.completed = TRUE OR uwp.position_seconds > 0)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM user_history_hidden_items hhi
+			WHERE hhi.user_id = uwp.user_id
+			  AND hhi.profile_id = uwp.profile_id
+			  AND hhi.media_item_id = uwp.media_item_id
+			  AND hhi.hidden_before >= uwp.updated_at
+		  )`, s.userID, profileID, mediaItemIDs)
+	if err != nil {
+		return nil, fmt.Errorf("listing next up state for items: %w", err)
+	}
+	defer rows.Close()
+
+	entries := make([]userstore.NextUpStateEntry, 0, len(mediaItemIDs))
+	for rows.Next() {
+		var entry userstore.NextUpStateEntry
+		var updatedAt time.Time
+		if err := rows.Scan(&entry.MediaItemID, &entry.Completed, &entry.Position, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scanning next up state item row: %w", err)
+		}
+		entry.UpdatedAt = updatedAt.UTC()
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating next up state item rows: %w", err)
+	}
+	// A cancellation that lands after the last row was scanned must surface as
+	// the context error, never as a short result the caller would treat as exact.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	return entries, nil
+}
+
 func (s *PostgresUserStore) MarkWatched(ctx context.Context, profileID, mediaItemID string, duration float64) error {
 	if duration < 0 {
 		duration = 0

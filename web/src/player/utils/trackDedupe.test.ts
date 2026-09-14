@@ -153,4 +153,37 @@ describe("dedupeSubtitleTracks", () => {
     expect(deduped).toHaveLength(1);
     expect(deduped[0]?.index).toBe(13);
   });
+
+  it("keeps identical track_id-less streams apart by their embedded stream index", () => {
+    const deduped = dedupeSubtitleTracks([
+      subtitleTrack({
+        index: 0,
+        url: "/stream/session-1/subtitles/0.vtt?file_id=7&embedded_stream_index=0",
+      }),
+      subtitleTrack({
+        index: 1,
+        url: "/stream/session-1/subtitles/1.vtt?file_id=7&embedded_stream_index=1",
+      }),
+    ]);
+
+    expect(deduped).toHaveLength(2);
+    expect(deduped.map((track) => track.index)).toEqual([0, 1]);
+  });
+
+  it("keeps identical track_id-less sidecars apart by their external path key", () => {
+    const deduped = dedupeSubtitleTracks([
+      subtitleTrack({
+        index: 0,
+        source: "external",
+        url: "/stream/session-1/subtitles/0.vtt?file_id=7&external_subtitle_key=aaa",
+      }),
+      subtitleTrack({
+        index: 1,
+        source: "external",
+        url: "/stream/session-1/subtitles/1.vtt?file_id=7&external_subtitle_key=bbb",
+      }),
+    ]);
+
+    expect(deduped).toHaveLength(2);
+  });
 });

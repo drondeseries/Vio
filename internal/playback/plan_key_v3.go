@@ -37,6 +37,9 @@ func DeterministicPlanIDV3(attemptID string, requestedFileID, effectiveFileID in
 	parts = appendEmbeddedSubtitleIdentityV3(parts, plan.Subtitle.Embedded)
 	parts = appendVideoSampleEntryIdentityV3(parts, plan.EffectiveRecipe.VideoSampleEntry)
 	parts = appendQuirkIdentityV3(parts, plan)
+	if plan.EffectiveRecipe.SoftwareVideoDecode {
+		parts = append(parts, "sw_decode=true")
+	}
 	parts = append(parts, PlanRecipeVersionV3)
 	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
 	return "plan:" + hex.EncodeToString(sum[:16])
@@ -68,6 +71,9 @@ func PlanAttemptKeyV3(plan PlanV3, outputContextID string, localMutations []stri
 	parts = appendEmbeddedSubtitleIdentityV3(parts, plan.Subtitle.Embedded)
 	parts = appendVideoSampleEntryIdentityV3(parts, plan.EffectiveRecipe.VideoSampleEntry)
 	parts = appendQuirkIdentityV3(parts, plan)
+	if plan.EffectiveRecipe.SoftwareVideoDecode {
+		parts = append(parts, "sw_decode=true")
+	}
 	parts = append(parts,
 		outputContextID,
 		strings.Join(mutations, ","),

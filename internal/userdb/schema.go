@@ -56,6 +56,33 @@ CREATE TABLE IF NOT EXISTS watch_progress (
     PRIMARY KEY (profile_id, media_item_id)
 );
 
+-- Next Up pages a profile's completed progress newest-first and stops at a
+-- DateCutoff. The primary key (profile_id, media_item_id) can seek the profile
+-- but cannot order by updated_at or filter on completed, so without this index
+-- every Next Up page sorts the profile's whole watch_progress table. The
+-- partial-free shape (completed is a low-cardinality leading filter after
+-- profile_id) matches SQLite's index planner and still serves completed-only
+-- listings (e.g. ListProgress "completed"); created idempotently on every open,
+-- so existing databases pick it up.
+CREATE INDEX IF NOT EXISTS idx_watch_progress_profile_completed_updated
+    ON watch_progress (profile_id, completed, updated_at DESC);
+
+-- The index above can seek a profile but interleaves the two completed values
+-- and lacks media_item_id, so the Next Up state page's global
+-- (updated_at DESC, media_item_id DESC) order cannot ride it: SQLite scanned the
+-- profile and ran a TEMP B-TREE sort on every page. This index matches that
+-- order exactly, so the keyset seek is ordered and LIMIT stops at the page
+-- instead of sorting the profile. On a 100k-row profile the state page dropped
+-- from ~32ms to <1ms and the TEMP B-TREE disappeared. The index deliberately
+-- omits completed/position_seconds: as a covering index SQLite also chose it for
+-- the item-scoped lookup (ListNextUpStateForItems) instead of the
+-- (profile_id, media_item_id) primary key, turning an equality seek into a full
+-- profile scan (measured 1.6ms -> 11.6ms for 500 ids). Order-only keeps the
+-- primary key for that lookup. Created idempotently on every open, so existing
+-- databases pick it up.
+CREATE INDEX IF NOT EXISTS idx_watch_progress_profile_nextup_page
+    ON watch_progress (profile_id, updated_at DESC, media_item_id DESC);
+
 CREATE TABLE IF NOT EXISTS watch_history (
     id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL,

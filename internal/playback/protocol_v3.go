@@ -349,7 +349,15 @@ func validCapabilityEvidenceV3(v CapabilityEvidenceV3) bool {
 	return v == EvidenceExactV3 || v == EvidencePlatformAttestedV3 || v == EvidenceDeclaredV3
 }
 
-func normalizeAndValidateVideoCapabilitiesV3(c *ClientCodecCapabilitiesV3, features []string) error {
+// validateVideoCapabilitiesStructureV3 performs the non-mutating structural
+// checks on the video half of the shared capability payload. It is the
+// validation half of the normalize/validate split: a replan is rejected for
+// malformed values, but nothing is rewritten or dropped, because the durable
+// request is normalized exactly once — after its features are merged — and the
+// degradation warnings from that single normalization must remain
+// discoverable. Length checks measure the trimmed value, because normalization
+// trims before checking.
+func validateVideoCapabilitiesStructureV3(c *ClientCodecCapabilitiesV3, features []string) error {
 	if !validCapabilityEvidenceV3(c.VideoEvidence) {
 		return errors.New("video_evidence is required and must be exact, platform_attested, or declared")
 	}
@@ -362,17 +370,15 @@ func normalizeAndValidateVideoCapabilitiesV3(c *ClientCodecCapabilitiesV3, featu
 		}
 	}
 	for _, values := range [][]string{c.CodecsVideo, c.CodecsVideoHardware} {
-		for i := range values {
-			values[i] = strings.ToLower(strings.TrimSpace(values[i]))
-			if len(values[i]) > 128 {
+		for _, value := range values {
+			if len(strings.TrimSpace(value)) > 128 {
 				return errors.New("capability value exceeds supported size")
 			}
 		}
 	}
 	for i := range c.VideoDecode {
 		entry := &c.VideoDecode[i]
-		entry.Codec = strings.ToLower(strings.TrimSpace(entry.Codec))
-		if entry.Codec == "" || len(entry.DecoderName) > 128 || entry.MaxWidth < 0 || entry.MaxHeight < 0 || entry.MaxFrameRate < 0 || entry.MaxBitrateKbps < 0 {
+		if strings.TrimSpace(entry.Codec) == "" || len(entry.DecoderName) > 128 || entry.MaxWidth < 0 || entry.MaxHeight < 0 || entry.MaxFrameRate < 0 || entry.MaxBitrateKbps < 0 {
 			return errors.New("invalid detailed video capability")
 		}
 		if len(entry.Profiles) > 64 || len(entry.Levels) > 64 || len(entry.BitDepths) > 64 {
@@ -385,6 +391,19 @@ func normalizeAndValidateVideoCapabilitiesV3(c *ClientCodecCapabilitiesV3, featu
 		}
 	}
 	return nil
+}
+
+// normalizeVideoCapabilitiesV3 rewrites the video half of the payload into its
+// canonical form. Structural validation must have run first.
+func normalizeVideoCapabilitiesV3(c *ClientCodecCapabilitiesV3) {
+	for _, values := range [][]string{c.CodecsVideo, c.CodecsVideoHardware} {
+		for i := range values {
+			values[i] = strings.ToLower(strings.TrimSpace(values[i]))
+		}
+	}
+	for i := range c.VideoDecode {
+		c.VideoDecode[i].Codec = strings.ToLower(strings.TrimSpace(c.VideoDecode[i].Codec))
+	}
 }
 
 type ClientCodecCapabilitiesV3 struct {
@@ -729,6 +748,12 @@ type EffectiveRecipeV3 struct {
 	DynamicRange     string   `json:"dynamic_range,omitempty"`
 	AudioChannels    *int     `json:"audio_channels,omitempty"`
 	AudioLayout      string   `json:"audio_layout,omitempty"`
+	// SoftwareVideoDecode marks a route that keeps its hardware encoder but
+	// decodes the source on the CPU. It is set only by reactive failure
+	// recovery after the executed hardware decoder rejected the source, and it
+	// participates in plan identity so the software retry is a distinct
+	// attempt from the hardware plan it replaces.
+	SoftwareVideoDecode bool `json:"software_video_decode,omitempty"`
 }
 
 type SourceDescriptorV3 struct {
@@ -1003,7 +1028,8 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 			return nil, errors.New("client feature exceeds supported size")
 		}
 	}
-	if err := validateCapabilitiesV3(&r.Capabilities, &r.ClientPlaybackContext, r.ClientFeatures); err != nil {
+	warnings, err := validateCapabilitiesV3(&r.Capabilities, &r.ClientPlaybackContext, r.ClientFeatures)
+	if err != nil {
 		return nil, err
 	}
 	if err := validateTrackPairV3(r.FileID, "audio", r.AudioTrackID, r.AudioTrackIndex); err != nil {
@@ -1018,9 +1044,9 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	quality, changed := NormalizeQualityV3(r.QualityPreference)
 	r.QualityPreference = quality
 	if changed {
-		return []DegradationWarningV3{{Code: "quality_preference_normalized", Message: "Unknown quality preference was normalized to auto."}}, nil
+		warnings = append(warnings, DegradationWarningV3{Code: "quality_preference_normalized", Message: "Unknown quality preference was normalized to auto."})
 	}
-	return nil, nil
+	return warnings, nil
 }
 
 func NormalizeQualityV3(value string) (string, bool) {
@@ -1130,7 +1156,17 @@ func (r *ReplanRequestV3) Validate() error {
 			return errors.New("client feature exceeds supported size")
 		}
 	}
-	return validateCapabilitiesV3(&r.Capabilities, &r.ClientPlaybackContext, r.ClientFeatures)
+	// Replan validation is structural only. It must not normalize or drop
+	// anything: the handler merges the attempt's durable features into the
+	// replan's, and the execution path then normalizes the merged start request
+	// exactly once and surfaces the resulting degradation warnings on the plan.
+	// A normalizing Validate here would drop an un-negotiated transformation
+	// before that merge, and the single execution-time normalization could no
+	// longer rediscover it to warn the client.
+	if err := validateCapabilitiesStructureV3(&r.Capabilities, &r.ClientPlaybackContext, r.ClientFeatures); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validateSelectedTrackIdentityV3(kind string, track *TrackIdentityV3) error {
@@ -1146,11 +1182,18 @@ func validateSelectedTrackIdentityV3(kind string, track *TrackIdentityV3) error 
 	return nil
 }
 
-// validateCapabilitiesV3 validates and normalizes the shared capability
-// payload. features carries the request's top-level client_features — the
-// only feature-advertisement location in the contract.
-func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackContextV3, features []string) error {
-	if err := normalizeAndValidateVideoCapabilitiesV3(c, features); err != nil {
+// validateCapabilitiesStructureV3 performs the non-mutating structural checks
+// on the shared capability payload and is the validation half of the
+// normalize/validate split. features carries the request's top-level
+// client_features — the only feature-advertisement location in the contract —
+// and is used only for its bound. Nothing here rewrites or drops a value, so it
+// cannot consume the evidence a later single normalization needs to report a
+// degradation warning.
+func validateCapabilitiesStructureV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackContextV3, features []string) error {
+	if c == nil || ctx == nil {
+		return errors.New("client capabilities are required")
+	}
+	if err := validateVideoCapabilitiesStructureV3(c, features); err != nil {
 		return err
 	}
 	if !validCapabilityEvidenceV3(c.AudioEvidence) {
@@ -1159,14 +1202,6 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 	if len(c.CodecsVideo) > 64 || len(c.CodecsVideoHardware) > 64 || len(c.CodecsAudio) > 64 || len(c.Containers) > 64 || len(c.VideoDecode) > 64 || len(ctx.Deliveries) > 16 || len(ctx.Device.Platform) > 32 || len(ctx.FormFactor) > 32 {
 		return errors.New("capability list exceeds supported size")
 	}
-	// Version, build, and channel are diagnostic labels, so an over-long value is
-	// worth clamping and never worth refusing playback over. The header route
-	// (X-Silo-Client-Version / -Build / -Channel) clamps with the same helper; rejecting
-	// here would mean the same string plays from a header and 400s from the
-	// body.
-	ctx.AppVersion = normalizeClientMetadataValue(ctx.AppVersion, 64)
-	ctx.AppBuild = normalizeClientMetadataValue(ctx.AppBuild, 64)
-	ctx.AppChannel = normalizeClientMetadataValue(ctx.AppChannel, 32)
 	deviceValues := []string{
 		ctx.Device.OSVersion, ctx.Device.Manufacturer, ctx.Device.Model,
 		ctx.Output.CurrentSink, ctx.Output.SinkType, ctx.Output.OutputContextID,
@@ -1185,9 +1220,11 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 		}
 	}
 	for _, values := range [][]string{c.CodecsAudio, c.Containers} {
-		for i := range values {
-			values[i] = strings.ToLower(strings.TrimSpace(values[i]))
-			if len(values[i]) > 128 {
+		for _, value := range values {
+			// Normalization trims before enforcing the bound, so measure the
+			// trimmed value here too; a heavily padded string must not be
+			// rejected by structural validation only to be accepted later.
+			if len(strings.TrimSpace(value)) > 128 {
 				return errors.New("capability value exceeds supported size")
 			}
 		}
@@ -1198,8 +1235,8 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 		}
 	}
 	if display := ctx.Output.Display; display != nil {
-		display.HDREvidence = strings.ToLower(strings.TrimSpace(display.HDREvidence))
-		switch display.HDREvidence {
+		evidence := strings.ToLower(strings.TrimSpace(display.HDREvidence))
+		switch evidence {
 		case OutputHDREvidenceExactV3, OutputHDREvidenceUnknownV3:
 		default:
 			return errors.New("output display hdr_evidence must be exact or unknown")
@@ -1214,7 +1251,7 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 		// is supposed to be its intersection with the decoder. Reject a
 		// contradiction where hdr_details claims a range the panel does not
 		// carry rather than let planning pick whichever one it reads first.
-		if display.HDREvidence == OutputHDREvidenceExactV3 && ctx.Output.HDRDetails != nil {
+		if evidence == OutputHDREvidenceExactV3 && ctx.Output.HDRDetails != nil {
 			panel := display.HDRTypes
 			if panel == nil {
 				panel = &HDRCapabilitiesV3{}
@@ -1262,49 +1299,22 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 		}
 		for i := range delivery.Subtitles.NativeEmbedded {
 			native := &delivery.Subtitles.NativeEmbedded[i]
-			native.Container = strings.ToLower(strings.TrimSpace(native.Container))
-			if native.Container == "" || len(native.Container) > 32 || len(native.Codecs) == 0 || len(native.Codecs) > 32 {
+			container := strings.ToLower(strings.TrimSpace(native.Container))
+			if container == "" || len(container) > 32 || len(native.Codecs) == 0 || len(native.Codecs) > 32 {
 				return errors.New("invalid native subtitle capability")
 			}
 			if native.TrackIdentity != subtitleIdentityFFmpegV3 && native.TrackIdentity != subtitleIdentityContainerV3 {
 				return errors.New("invalid native subtitle track identity")
 			}
-			for j, codec := range native.Codecs {
+			for _, codec := range native.Codecs {
 				if strings.TrimSpace(codec) == "" || len(codec) > 64 {
 					return errors.New("invalid native subtitle codec")
 				}
-				native.Codecs[j] = normalizeNativeSubtitleCodecV3(codec)
 			}
 		}
-		seenTransformations := make(map[string]struct{}, len(delivery.Transformations))
-		for i := range delivery.Transformations {
-			transformation := &delivery.Transformations[i]
-			transformation.Name = strings.ToLower(strings.TrimSpace(transformation.Name))
-			transformation.Executor = strings.ToLower(strings.TrimSpace(transformation.Executor))
-			transformation.RecipeVersion = strings.TrimSpace(transformation.RecipeVersion)
-			if transformation.Name == "" || len(transformation.Name) > 64 ||
-				(transformation.Executor != "client" && transformation.Executor != "server") ||
-				transformation.RecipeVersion == "" || len(transformation.RecipeVersion) > 32 ||
-				len(transformation.ValidatedClaims) > 32 {
-				return errors.New("invalid delivery transformation capability")
-			}
-			if transformation.Executor == ExecutorClientV3 {
-				if !delivery.Enabled || !delivery.SupportedOnDevice || !HasFeatureV3(features, FeatureClientVideoTransforms) {
-					return errors.New("client transformation capability is not enabled")
-				}
-			}
-			key := transformation.Executor + ":" + transformation.Name + ":" + transformation.RecipeVersion
-			if _, exists := seenTransformations[key]; exists {
-				return errors.New("duplicate delivery transformation capability")
-			}
-			seenTransformations[key] = struct{}{}
-			for _, claim := range transformation.ValidatedClaims {
-				if len(claim) > 128 {
-					return errors.New("transformation claim exceeds supported size")
-				}
-			}
+		if err := validateDeliveryTransformationsStructureV3(&delivery); err != nil {
+			return err
 		}
-		ctx.Deliveries[name] = delivery
 	}
 	for _, passthrough := range []*AudioPassthroughV3{c.AudioPassthrough, ctx.Output.AudioPassthrough} {
 		if passthrough == nil {
@@ -1320,6 +1330,176 @@ func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCon
 		}
 	}
 	return nil
+}
+
+// normalizeCapabilitiesV3 is the mutation half of the
+// structural-validate/normalize split. It canonicalizes the shared capability
+// payload in place and returns the degradation warnings produced while dropping
+// a client transformation the merged feature list did not negotiate.
+// validateCapabilitiesStructureV3 must have accepted the payload first.
+func normalizeCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackContextV3, features []string) ([]DegradationWarningV3, error) {
+	normalizeVideoCapabilitiesV3(c)
+	// Version, build, and channel are diagnostic labels, so an over-long value is
+	// worth clamping and never worth refusing playback over. The header route
+	// (X-Silo-Client-Version / -Build / -Channel) clamps with the same helper; rejecting
+	// here would mean the same string plays from a header and 400s from the
+	// body.
+	ctx.AppVersion = normalizeClientMetadataValue(ctx.AppVersion, 64)
+	ctx.AppBuild = normalizeClientMetadataValue(ctx.AppBuild, 64)
+	ctx.AppChannel = normalizeClientMetadataValue(ctx.AppChannel, 32)
+	for _, values := range [][]string{c.CodecsAudio, c.Containers} {
+		for i := range values {
+			values[i] = strings.ToLower(strings.TrimSpace(values[i]))
+		}
+	}
+	if display := ctx.Output.Display; display != nil {
+		display.HDREvidence = strings.ToLower(strings.TrimSpace(display.HDREvidence))
+	}
+	var warnings []DegradationWarningV3
+	for name, delivery := range ctx.Deliveries {
+		for i := range delivery.Subtitles.NativeEmbedded {
+			native := &delivery.Subtitles.NativeEmbedded[i]
+			native.Container = strings.ToLower(strings.TrimSpace(native.Container))
+			for j, codec := range native.Codecs {
+				native.Codecs[j] = normalizeNativeSubtitleCodecV3(codec)
+			}
+		}
+		kept, transformWarnings, err := normalizeDeliveryTransformationsV3(&delivery, features)
+		if err != nil {
+			return nil, err
+		}
+		warnings = append(warnings, transformWarnings...)
+		if len(delivery.Transformations) > 0 {
+			delivery.Transformations = kept
+		}
+		ctx.Deliveries[name] = delivery
+	}
+	return warnings, nil
+}
+
+// validateCapabilitiesV3 validates and normalizes the shared capability payload
+// in one call, returning the degradation warnings normalization produced. It is
+// the start-request entry point; replan validation calls the structural half
+// alone so the merged start request owns the single normalization that drops
+// un-negotiated transformations.
+func validateCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackContextV3, features []string) ([]DegradationWarningV3, error) {
+	if err := validateCapabilitiesStructureV3(c, ctx, features); err != nil {
+		return nil, err
+	}
+	return normalizeCapabilitiesV3(c, ctx, features)
+}
+
+// validateDeliveryTransformationsStructureV3 is the non-mutating structural
+// half of delivery-transformation handling. Structurally malformed or duplicate
+// transformations are hard errors; nothing is rewritten or dropped here.
+func validateDeliveryTransformationsStructureV3(delivery *DeliveryCapabilityV3) error {
+	seenTransformations := make(map[string]struct{}, len(delivery.Transformations))
+	for i := range delivery.Transformations {
+		transformation := delivery.Transformations[i]
+		name := strings.ToLower(strings.TrimSpace(transformation.Name))
+		executor := strings.ToLower(strings.TrimSpace(transformation.Executor))
+		recipeVersion := strings.TrimSpace(transformation.RecipeVersion)
+		if name == "" || len(name) > 64 ||
+			(executor != ExecutorClientV3 && executor != ExecutorServerV3) ||
+			recipeVersion == "" || len(recipeVersion) > 32 ||
+			len(transformation.ValidatedClaims) > 32 {
+			return errors.New("invalid delivery transformation capability")
+		}
+		key := executor + ":" + name + ":" + recipeVersion
+		if _, exists := seenTransformations[key]; exists {
+			return errors.New("duplicate delivery transformation capability")
+		}
+		seenTransformations[key] = struct{}{}
+		for _, claim := range transformation.ValidatedClaims {
+			if len(claim) > 128 {
+				return errors.New("transformation claim exceeds supported size")
+			}
+		}
+	}
+	return nil
+}
+
+// normalizeDeliveryTransformationsV3 normalizes one delivery's transformations
+// and drops, with a degradation warning, a well-formed client transformation
+// the merged feature list did not negotiate. The drop is deliberately a
+// normalization step, not a validation step: a replan's structural validation
+// must leave the transformation in place so this single call can rediscover it
+// and report the warning.
+func normalizeDeliveryTransformationsV3(delivery *DeliveryCapabilityV3, features []string) ([]TransformationV3, []DegradationWarningV3, error) {
+	if err := validateDeliveryTransformationsStructureV3(delivery); err != nil {
+		return nil, nil, err
+	}
+	kept := make([]TransformationV3, 0, len(delivery.Transformations))
+	var warnings []DegradationWarningV3
+	for i := range delivery.Transformations {
+		transformation := delivery.Transformations[i]
+		transformation.Name = strings.ToLower(strings.TrimSpace(transformation.Name))
+		transformation.Executor = strings.ToLower(strings.TrimSpace(transformation.Executor))
+		transformation.RecipeVersion = strings.TrimSpace(transformation.RecipeVersion)
+		if transformation.Executor == ExecutorClientV3 &&
+			(!delivery.Enabled || !delivery.SupportedOnDevice || !HasFeatureV3(features, FeatureClientVideoTransforms)) {
+			warnings = append(warnings, DegradationWarningV3{
+				Code:    "client_transformation_not_negotiated",
+				Message: fmt.Sprintf("Client video transformation %s was not negotiated and is skipped.", transformation.Name),
+			})
+			continue
+		}
+		kept = append(kept, transformation)
+	}
+	return kept, warnings, nil
+}
+
+// CloneDeliveryCapabilitiesV3 returns a deep copy of a client's negotiated
+// delivery map. A plain struct copy shares every backing slice, so a caller
+// overlaying one request's deliveries onto a durable one must clone first:
+// normalization writes those slices in place, and a mutation through the
+// durable request must not reach the request that supplied them (or vice
+// versa). A nil map clones to nil, preserving "no deliveries advertised".
+func CloneDeliveryCapabilitiesV3(deliveries map[string]DeliveryCapabilityV3) map[string]DeliveryCapabilityV3 {
+	if deliveries == nil {
+		return nil
+	}
+	cloned := make(map[string]DeliveryCapabilityV3, len(deliveries))
+	for name, delivery := range deliveries {
+		cloned[name] = cloneDeliveryCapabilityV3(delivery)
+	}
+	return cloned
+}
+
+func cloneDeliveryCapabilityV3(delivery DeliveryCapabilityV3) DeliveryCapabilityV3 {
+	delivery.Containers = append([]string(nil), delivery.Containers...)
+	delivery.VideoCodecs = append([]string(nil), delivery.VideoCodecs...)
+	delivery.AudioDecodeCodecs = append([]string(nil), delivery.AudioDecodeCodecs...)
+	delivery.AudioPassthroughCodecs = append([]string(nil), delivery.AudioPassthroughCodecs...)
+	delivery.Features = append([]string(nil), delivery.Features...)
+	delivery.ValidatedClaims = append([]string(nil), delivery.ValidatedClaims...)
+	delivery.HDRDetails = cloneHDRCapabilitiesV3(delivery.HDRDetails)
+	if delivery.MaxChannels != nil {
+		maxChannels := *delivery.MaxChannels
+		delivery.MaxChannels = &maxChannels
+	}
+	delivery.Transformations = append([]TransformationV3(nil), delivery.Transformations...)
+	for i := range delivery.Transformations {
+		delivery.Transformations[i].ValidatedClaims = append([]string(nil), delivery.Transformations[i].ValidatedClaims...)
+	}
+	delivery.Subtitles.NativeEmbedded = append([]NativeEmbeddedSubtitleCapabilityV3(nil), delivery.Subtitles.NativeEmbedded...)
+	for i := range delivery.Subtitles.NativeEmbedded {
+		delivery.Subtitles.NativeEmbedded[i].Codecs = append([]string(nil), delivery.Subtitles.NativeEmbedded[i].Codecs...)
+	}
+	return delivery
+}
+
+func cloneHDRCapabilitiesV3(hdr *HDRCapabilitiesV3) *HDRCapabilitiesV3 {
+	if hdr == nil {
+		return nil
+	}
+	cloned := *hdr
+	cloned.DolbyVisionProfiles = append([]int(nil), hdr.DolbyVisionProfiles...)
+	cloned.DolbyVisionProfileLevels = append([]DolbyVisionProfileCapabilityV3(nil), hdr.DolbyVisionProfileLevels...)
+	for i := range cloned.DolbyVisionProfileLevels {
+		cloned.DolbyVisionProfileLevels[i].BLCompatibilityIDs = append([]int(nil), hdr.DolbyVisionProfileLevels[i].BLCompatibilityIDs...)
+	}
+	return &cloned
 }
 
 func validateHDRCapabilitiesV3(hdr *HDRCapabilitiesV3) error {

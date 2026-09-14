@@ -1439,6 +1439,66 @@ func TestSubtitleExplicitWindow(t *testing.T) {
 	}
 }
 
+// ASS requests read the same explicit ?position/?duration window as WebVTT:
+// the web client's JASSUB renderer asks for a slice as playback approaches
+// the tail, and the server must window those requests instead of demuxing the
+// complete track over the relay.
+func TestSubtitleExtractWindowASSReadsExplicitWindow(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/subtitles/0.ass?position=120.5&duration=600", nil)
+	allow, seek, duration := subtitleExtractWindow(req, subtitleFormatASS)
+	if allow || seek != 120.5 || duration != 600 {
+		t.Fatalf("ASS window = (%v, %v, %v), want (false, 120.5, 600)", allow, seek, duration)
+	}
+
+	// Absent params leave the whole-track defaults.
+	req = httptest.NewRequest(http.MethodGet, "/subtitles/0.ass", nil)
+	if allow, seek, duration := subtitleExtractWindow(req, subtitleFormatASS); allow || seek != 0 || duration != 0 {
+		t.Fatalf("default ASS window = (%v, %v, %v), want zeros", allow, seek, duration)
+	}
+}
+
+// PGS windowing still requires the explicit ?windowed=1 opt-in: the ASS path
+// must not enable AllowWindow for PGS.
+func TestSubtitleExtractWindowPGSStillRequiresOptIn(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/subtitles/0.sup?position=120&duration=600", nil)
+	if allow, seek, duration := subtitleExtractWindow(req, subtitleFormatSUP); allow || seek != 0 || duration != 0 {
+		t.Fatalf("PGS without windowed=1 = (%v, %v, %v), want zeros", allow, seek, duration)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/subtitles/0.sup?windowed=1&position=120&duration=600", nil)
+	allow, seek, duration := subtitleExtractWindow(req, subtitleFormatSUP)
+	if !allow || seek != 120 || duration != 600 {
+		t.Fatalf("PGS opt-in = (%v, %v, %v), want (true, 120, 600)", allow, seek, duration)
+	}
+}
+
+// An explicit position parameter, even zero, requests a bounded window; an
+// absent position (including a duration-only startup fetch) keeps the
+// whole-track default. Without this distinction position=0&duration=600 was
+// indistinguishable from a full fetch and re-demuxed the entire source.
+func TestSubtitleWindowRequestedNeedsExplicitPosition(t *testing.T) {
+	cases := []struct {
+		query string
+		want  bool
+	}{
+		{"", false},
+		{"?duration=600", false},
+		{"?position=0", true},
+		{"?position=0&duration=600", true},
+		{"?position=120&duration=600", true},
+		{"?position=", false},
+		{"?position=invalid", false},
+		{"?position=-1", false},
+		{"?position=NaN", false},
+		{"?position=+Inf", false},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/subtitles/0.vtt"+tc.query, nil)
+		if got := subtitleWindowRequested(req); got != tc.want {
+			t.Errorf("query %q windowRequested = %v, want %v", tc.query, got, tc.want)
+		}
+	}
+}
+
 func TestEmbeddedSubtitleExtractionFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name, script string
@@ -1477,5 +1537,83 @@ func TestEmbeddedSubtitleExtractionFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// writeFakeFFprobe installs an executable named "ffprobe" that emits the given
+// stdout and exit status, so ProbeSubtitleLayout uses it verbatim (the
+// resolver treats a path whose basename contains "ffprobe" as the probe
+// binary itself).
+func writeFakeFFprobe(t *testing.T, script string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "ffprobe")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+func virtualLayoutHandler(ffprobePath string) *StreamHandler {
+	handler := NewStreamHandler(nil, nil)
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: ffprobePath}
+	}
+	return handler
+}
+
+// A drift probe that fails to run (context canceled, relay timeout) is not
+// evidence that the pinned source rotated. verifyVirtualSubtitleLayout reports
+// the failure alongside "proceed" so the caller decides: text/ASS proceeds with
+// the planned ordinal and lets the post-spawn map net catch a genuine rotation,
+// while a PGS caller fails closed because its .sup commits 200 before ffmpeg
+// spawns. A positive mismatch is the only signal that warrants a replan.
+func TestVerifyVirtualSubtitleLayoutProbeFailureProceedsWithPlan(t *testing.T) {
+	for _, codec := range []string{"ass", "hdmv_pgs_subtitle"} {
+		t.Run(codec, func(t *testing.T) {
+			handler := virtualLayoutHandler(writeFakeFFprobe(t, "exit 1"))
+			opts := &playback.StreamExtractOpts{
+				InputPath:   "/relay/pinned/stream.mkv",
+				TrackIndex:  3,
+				SourceCodec: codec,
+			}
+			session := &playback.Session{
+				ID:                    "sess",
+				VirtualSubtitleTracks: []models.SubtitleTrack{{Index: 3, Codec: codec}},
+			}
+			requested := models.SubtitleTrack{Index: 3, Codec: codec}
+
+			proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts)
+			if !proceed {
+				t.Fatal("probe failure must serve the planned ordinal, not force a replan")
+			}
+			if probeErr == nil {
+				t.Fatal("probe failure must be reported so a bitmap caller can fail closed")
+			}
+			if opts.TrackIndex != 3 || opts.SourceCodec != codec {
+				t.Fatalf("plan ordinal/codec must be preserved: %+v", opts)
+			}
+		})
+	}
+}
+
+// A probe that succeeds and positively reports a different layout must keep
+// the existing 409 behavior.
+func TestVerifyVirtualSubtitleLayoutPositiveMismatchForcesReplan(t *testing.T) {
+	probe := `printf '%s' '{"streams":[{"id":"1","index":0,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}]}'`
+	handler := virtualLayoutHandler(writeFakeFFprobe(t, probe))
+	opts := &playback.StreamExtractOpts{
+		InputPath:   "/relay/pinned/stream.mkv",
+		TrackIndex:  0,
+		SourceCodec: "ass",
+	}
+	session := &playback.Session{
+		ID:                    "sess",
+		VirtualSubtitleTracks: []models.SubtitleTrack{{Index: 0, Codec: "ass"}},
+	}
+	requested := models.SubtitleTrack{Index: 0, Codec: "ass", Language: "eng"}
+
+	proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts)
+	if proceed || probeErr != nil {
+		t.Fatal("a positively different live layout must force a 409 replan")
 	}
 }

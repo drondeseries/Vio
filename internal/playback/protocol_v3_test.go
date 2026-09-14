@@ -85,6 +85,81 @@ func TestStartRequestV3Validation(t *testing.T) {
 	}
 }
 
+// An un-negotiated client transformation is unavailable for this session, not
+// a malformed request: strip it and warn instead of refusing the whole
+// delivery. Server transformations and the delivery's own flags are untouched.
+func TestStartRequestV3UnnegotiatedClientTransformationIsSkipped(t *testing.T) {
+	req := validStartRequestV3()
+	delivery := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []TransformationV3{
+		{Name: ClientDV7ToDV81V3, Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3},
+		{Name: "server_transform", Executor: ExecutorServerV3, RecipeVersion: "1"},
+	}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	warnings, err := req.NormalizeAndValidate()
+	if err != nil {
+		t.Fatalf("un-negotiated client transformation rejected the request: %v", err)
+	}
+	if !hasDegradationWarningV3(warnings, "client_transformation_not_negotiated") {
+		t.Fatalf("warnings = %#v, want client_transformation_not_negotiated", warnings)
+	}
+	got := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	if len(got.Transformations) != 1 || got.Transformations[0].Name != "server_transform" {
+		t.Fatalf("transformations = %#v, want only the server transformation", got.Transformations)
+	}
+	if !got.Enabled || !got.SupportedOnDevice {
+		t.Fatalf("delivery flags changed: %#v", got)
+	}
+}
+
+// A server-executor transformation never depends on the client feature
+// negotiation flag, so it must pass through with no warning.
+func TestStartRequestV3ServerTransformationNeedsNoClientFeatures(t *testing.T) {
+	req := validStartRequestV3()
+	delivery := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []TransformationV3{{Name: "server_transform", Executor: ExecutorServerV3, RecipeVersion: "1"}}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	warnings, err := req.NormalizeAndValidate()
+	if err != nil {
+		t.Fatalf("server transformation rejected: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %#v, want none", warnings)
+	}
+	if got := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3].Transformations; len(got) != 1 || got[0].Name != "server_transform" {
+		t.Fatalf("transformations = %#v, want the server transformation", got)
+	}
+}
+
+// Structurally malformed transformations stay hard errors: the degrade path is
+// only for a well-formed transformation the client did not negotiate.
+func TestStartRequestV3MalformedTransformationStillRejected(t *testing.T) {
+	req := validStartRequestV3()
+	delivery := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []TransformationV3{{Name: "", Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3}}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("transformation with an empty name was accepted")
+	}
+}
+
+func TestStartRequestV3DuplicateTransformationStillRejected(t *testing.T) {
+	req := validStartRequestV3()
+	delivery := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []TransformationV3{
+		{Name: ClientDV7ToDV81V3, Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3},
+		{Name: ClientDV7ToDV81V3, Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3},
+	}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("duplicate delivery transformation was accepted")
+	}
+}
+
 func TestStartRequestV3CarriedAudioTrackIDValidation(t *testing.T) {
 	req := validStartRequestV3()
 	req.CarriedAudioTrackID = strings.Repeat("a", 129)
@@ -332,7 +407,10 @@ func TestReplanRequestV3OperationDefaultsAndValidates(t *testing.T) {
 	}
 }
 
-func TestReplanRequestV3ValidationRetainsClientBuildChannelNormalization(t *testing.T) {
+// Replan validation is structural: it must not clamp the diagnostic client
+// labels, because normalization belongs to the merged start request. This pins
+// that the raw value survives Validate and the merged start still clamps it.
+func TestReplanRequestV3ValidationLeavesClientBuildChannelForMergedNormalization(t *testing.T) {
 	start := validStartRequestV3()
 	request := ReplanRequestV3{
 		ProtocolVersion:       ProtocolV3,
@@ -347,16 +425,32 @@ func TestReplanRequestV3ValidationRetainsClientBuildChannelNormalization(t *test
 		Capabilities:          start.Capabilities,
 		ClientPlaybackContext: start.ClientPlaybackContext,
 	}
-	request.ClientPlaybackContext.AppBuild = strings.Repeat("build", 20) + "\x00ignored"
-	request.ClientPlaybackContext.AppChannel = strings.Repeat("channel", 10) + "\x00ignored"
+	rawBuild := strings.Repeat("build", 20) + "\x00ignored"
+	rawChannel := strings.Repeat("channel", 10) + "\x00ignored"
+	request.ClientPlaybackContext.AppBuild = rawBuild
+	request.ClientPlaybackContext.AppChannel = rawChannel
 
 	if err := request.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
-	if got, want := request.ClientPlaybackContext.AppBuild, strings.Repeat("build", 12)+"buil"; got != want {
+	if got := request.ClientPlaybackContext.AppBuild; got != rawBuild {
+		t.Fatalf("structural Validate rewrote app_build = %q, want raw %q", got, rawBuild)
+	}
+	if got := request.ClientPlaybackContext.AppChannel; got != rawChannel {
+		t.Fatalf("structural Validate rewrote app_channel = %q, want raw %q", got, rawChannel)
+	}
+
+	merged := start
+	merged.Capabilities = request.Capabilities
+	merged.ClientPlaybackContext = request.ClientPlaybackContext
+	merged.ClientPlaybackContext.Deliveries = CloneDeliveryCapabilitiesV3(request.ClientPlaybackContext.Deliveries)
+	if _, err := merged.NormalizeAndValidate(); err != nil {
+		t.Fatalf("merged NormalizeAndValidate() error = %v", err)
+	}
+	if got, want := merged.ClientPlaybackContext.AppBuild, strings.Repeat("build", 12)+"buil"; got != want {
 		t.Fatalf("normalized app_build = %q, want %q", got, want)
 	}
-	if got, want := request.ClientPlaybackContext.AppChannel, strings.Repeat("channel", 4)+"chan"; got != want {
+	if got, want := merged.ClientPlaybackContext.AppChannel, strings.Repeat("channel", 4)+"chan"; got != want {
 		t.Fatalf("normalized app_channel = %q, want %q", got, want)
 	}
 }
@@ -373,7 +467,7 @@ func TestStartRequestV3NormalizesUnicodeAppVersionAndStripsControls(t *testing.T
 	}
 }
 
-func TestReplanRequestV3NormalizesUnicodeAppVersionAndStripsControls(t *testing.T) {
+func TestReplanRequestV3NormalizesUnicodeAppVersionOnMergedStart(t *testing.T) {
 	start := validStartRequestV3()
 	request := ReplanRequestV3{
 		ProtocolVersion:       ProtocolV3,
@@ -388,13 +482,152 @@ func TestReplanRequestV3NormalizesUnicodeAppVersionAndStripsControls(t *testing.
 		Capabilities:          start.Capabilities,
 		ClientPlaybackContext: start.ClientPlaybackContext,
 	}
-	request.ClientPlaybackContext.AppVersion = "\x00" + strings.Repeat("δ", 70) + "\nignored"
+	rawVersion := "\x00" + strings.Repeat("δ", 70) + "\nignored"
+	request.ClientPlaybackContext.AppVersion = rawVersion
 
 	if err := request.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
-	if got, want := request.ClientPlaybackContext.AppVersion, strings.Repeat("δ", 64); got != want {
+	if got := request.ClientPlaybackContext.AppVersion; got != rawVersion {
+		t.Fatalf("structural Validate rewrote app_version = %q, want raw %q", got, rawVersion)
+	}
+
+	merged := start
+	merged.Capabilities = request.Capabilities
+	merged.ClientPlaybackContext = request.ClientPlaybackContext
+	merged.ClientPlaybackContext.Deliveries = CloneDeliveryCapabilitiesV3(request.ClientPlaybackContext.Deliveries)
+	if _, err := merged.NormalizeAndValidate(); err != nil {
+		t.Fatalf("merged NormalizeAndValidate() error = %v", err)
+	}
+	if got, want := merged.ClientPlaybackContext.AppVersion, strings.Repeat("δ", 64); got != want {
 		t.Fatalf("normalized app_version = %q, want %q", got, want)
+	}
+}
+
+// P1-6: replan validation must be structural. A normalization during Validate
+// used to drop an un-negotiated client transformation before the durable
+// features were merged, and the single execution-time normalization could no
+// longer rediscover it. This pins that the transformation survives Validate,
+// that the merged start normalization drops it with a warning, and that the
+// drop does not reach the original request.
+func TestReplanRequestV3ValidatePreservesUnnegotiatedTransformation(t *testing.T) {
+	start := validStartRequestV3()
+	delivery := start.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []TransformationV3{
+		{Name: ClientDV7ToDV81V3, Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3},
+		{Name: "server_transform", Executor: ExecutorServerV3, RecipeVersion: "1"},
+	}
+	start.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	request := ReplanRequestV3{
+		ProtocolVersion: ProtocolV3,
+		// Empty client_features means "unchanged": the handler merges the
+		// durable start-time features before normalizing.
+		ClientFeatures:        nil,
+		PlaybackAttemptID:     start.PlaybackAttemptID,
+		ReplanRequestID:       "replan-unnegotiated-0001",
+		FailedPlanID:          "plan:unnegotiated-0001",
+		PlanAttemptID:         "plan-attempt-unnegotiated-0001",
+		PlanAttemptKey:        "v3:0000000000000001",
+		AttemptCount:          1,
+		QualityPreference:     start.QualityPreference,
+		Failure:               FailureV3{Classification: "parser_failure"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if got := len(request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3].Transformations); got != 2 {
+		t.Fatalf("structural Validate dropped transformations: got %d, want 2", got)
+	}
+
+	merged := start
+	merged.ClientFeatures = append([]string(nil), start.ClientFeatures...)
+	merged.Capabilities = request.Capabilities
+	merged.ClientPlaybackContext = request.ClientPlaybackContext
+	merged.ClientPlaybackContext.Deliveries = CloneDeliveryCapabilitiesV3(request.ClientPlaybackContext.Deliveries)
+	warnings, err := merged.NormalizeAndValidate()
+	if err != nil {
+		t.Fatalf("merged NormalizeAndValidate() error = %v", err)
+	}
+	if !hasDegradationWarningV3(warnings, "client_transformation_not_negotiated") {
+		t.Fatalf("warnings = %#v, want client_transformation_not_negotiated", warnings)
+	}
+	got := merged.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3].Transformations
+	if len(got) != 1 || got[0].Name != "server_transform" {
+		t.Fatalf("merged transformations = %#v, want only the server transformation", got)
+	}
+	// The clone isolated the merged request from the replan body.
+	if n := len(request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3].Transformations); n != 2 {
+		t.Fatalf("merged normalization reached the original request: got %d transformations, want 2", n)
+	}
+}
+
+func TestCloneDeliveryCapabilitiesV3IsDeep(t *testing.T) {
+	maxChannels := 8
+	original := map[string]DeliveryCapabilityV3{
+		DeliveryClassOriginalHTTPV3: {
+			Enabled:                true,
+			SupportedOnDevice:      true,
+			Containers:             []string{"mp4"},
+			VideoCodecs:            []string{"h264"},
+			AudioDecodeCodecs:      []string{"aac"},
+			AudioPassthroughCodecs: []string{"eac3"},
+			Features:               []string{"feature"},
+			ValidatedClaims:        []string{"claim"},
+			MaxChannels:            &maxChannels,
+			HDRDetails: &HDRCapabilitiesV3{
+				HDR10:               true,
+				DolbyVisionProfiles: []int{8},
+				DolbyVisionProfileLevels: []DolbyVisionProfileCapabilityV3{
+					{Profile: 8, MaxLevel: 6, BLCompatibilityIDs: []int{1}},
+				},
+			},
+			Subtitles: DeliverySubtitleCapabilitiesV3{
+				NativeEmbedded: []NativeEmbeddedSubtitleCapabilityV3{
+					{Container: "mp4", Codecs: []string{"ttml"}, TrackIdentity: subtitleIdentityContainerV3},
+				},
+			},
+			Transformations: []TransformationV3{
+				{Name: ClientDV7ToDV81V3, Executor: ExecutorClientV3, RecipeVersion: ClientDVTransformVersionV3, ValidatedClaims: []string{"claim"}},
+			},
+		},
+	}
+	cloned := CloneDeliveryCapabilitiesV3(original)
+	delivery := cloned[DeliveryClassOriginalHTTPV3]
+	delivery.Containers[0] = "mkv"
+	delivery.VideoCodecs[0] = "hevc"
+	delivery.AudioDecodeCodecs[0] = "opus"
+	delivery.AudioPassthroughCodecs[0] = "truehd"
+	delivery.Features[0] = "mutated"
+	delivery.ValidatedClaims[0] = "mutated"
+	*delivery.MaxChannels = 2
+	delivery.HDRDetails.DolbyVisionProfiles[0] = 5
+	delivery.HDRDetails.DolbyVisionProfileLevels[0].BLCompatibilityIDs[0] = 2
+	delivery.Subtitles.NativeEmbedded[0].Codecs[0] = "webvtt"
+	delivery.Transformations[0].ValidatedClaims[0] = "mutated"
+	cloned[DeliveryClassOriginalHTTPV3] = delivery
+
+	got := original[DeliveryClassOriginalHTTPV3]
+	if got.Containers[0] != "mp4" || got.VideoCodecs[0] != "h264" || got.AudioDecodeCodecs[0] != "aac" ||
+		got.AudioPassthroughCodecs[0] != "eac3" || got.Features[0] != "feature" || got.ValidatedClaims[0] != "claim" {
+		t.Fatalf("clone shares string slices with the original: %#v", got)
+	}
+	if *got.MaxChannels != 8 {
+		t.Fatalf("clone shares MaxChannels: %d", *got.MaxChannels)
+	}
+	if got.HDRDetails.DolbyVisionProfiles[0] != 8 || got.HDRDetails.DolbyVisionProfileLevels[0].BLCompatibilityIDs[0] != 1 {
+		t.Fatalf("clone shares HDR slices: %#v", got.HDRDetails)
+	}
+	if got.Subtitles.NativeEmbedded[0].Codecs[0] != "ttml" {
+		t.Fatalf("clone shares native subtitle codecs: %#v", got.Subtitles.NativeEmbedded)
+	}
+	if got.Transformations[0].ValidatedClaims[0] != "claim" {
+		t.Fatalf("clone shares transformation claims: %#v", got.Transformations)
+	}
+	if CloneDeliveryCapabilitiesV3(nil) != nil {
+		t.Fatal("nil deliveries should clone to nil")
 	}
 }
 
@@ -2213,6 +2446,91 @@ func TestPlanAttemptedV3RequiresExactKeyMatch(t *testing.T) {
 	}
 	if planAttemptedV3(plan, "1", []string{strings.ToUpper(key)}) {
 		t.Fatal("case-folded attempt key must not match an exact hash")
+	}
+}
+
+// TestSoftwareVideoDecodeIdentityDifferentiatesDecodeModes verifies the
+// reactive software-decode retry is a distinct attempt from the hardware plan
+// it replaces, while the default (false) variant keeps the historical identity
+// byte-for-byte: the token is appended only when the flag is set.
+func TestSoftwareVideoDecodeIdentityDifferentiatesDecodeModes(t *testing.T) {
+	plan := PlanV3{
+		PlanID:          "plan:hardware",
+		Delivery:        DeliveryTranscodeHLSV3,
+		Stream:          StreamV3{Protocol: StreamHLSV3, Container: "hls"},
+		EffectiveRecipe: EffectiveRecipeV3{VideoCodec: "h264", AudioCodec: "aac"},
+		Subtitle:        SubtitleDecisionV3{Mode: SubtitleOffV3},
+		Transformations: []TransformationV3{
+			{Name: TransformationVideoToH264V3, Executor: ExecutorServerV3, RecipeVersion: TransformationVideoToH264RecipeVersionV3},
+		},
+	}
+	software := plan
+	software.EffectiveRecipe.SoftwareVideoDecode = true
+
+	hardwareID := DeterministicPlanIDV3("attempt-1", 1, 1, plan)
+	if got := DeterministicPlanIDV3("attempt-1", 1, 1, plan); got != hardwareID {
+		t.Fatalf("false variant PlanID is not stable: %q != %q", got, hardwareID)
+	}
+	softwareID := DeterministicPlanIDV3("attempt-1", 1, 1, software)
+	if softwareID == hardwareID {
+		t.Fatal("software variant shares the hardware plan identity")
+	}
+
+	hardwareKey := PlanAttemptKeyV3(plan, "route-1", nil)
+	if got := PlanAttemptKeyV3(plan, "route-1", nil); got != hardwareKey {
+		t.Fatalf("false variant PlanAttemptKey is not stable: %q != %q", got, hardwareKey)
+	}
+	softwareKey := PlanAttemptKeyV3(software, "route-1", nil)
+	if softwareKey == hardwareKey {
+		t.Fatal("software variant shares the hardware attempt key")
+	}
+
+	// The hardware key must not exclude the software retry; only the software
+	// key marks the software variant as attempted.
+	if planAttemptedV3(software, "route-1", []string{hardwareKey}) {
+		t.Fatal("hardware attempt key excluded the untried software variant")
+	}
+	if !planAttemptedV3(software, "route-1", []string{softwareKey}) {
+		t.Fatal("software attempt key did not mark the software variant attempted")
+	}
+}
+
+// TestPlanPlaybackV3ForceSoftwareVideoDecodeMarksTranscodePlan verifies the
+// reactive retry flag reaches the plan's effective recipe and changes the
+// route identity, while an unforced transcode stays hardware.
+func TestPlanPlaybackV3ForceSoftwareVideoDecodeMarksTranscodePlan(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.CodecVideo = "vp9"
+	file.CodecAudio = "opus"
+	file.VideoTracks[0] = models.VideoTrack{
+		Codec: "vp9", Profile: "Profile 0", Level: -99,
+		Width: 1080, Height: 1920, FrameRate: "24.000", Bitrate: 2_797,
+		BitDepth: 8, PixelFormat: "yuv420p", VideoRange: "SDR",
+		VideoRangeType: "SDR", ColorRange: "tv", ColorTransfer: "bt709",
+	}
+	file.AudioTracks[0] = models.AudioTrack{Codec: "opus", Channels: 2, Layout: "stereo"}
+	req := validStartRequestV3()
+	req.Capabilities.VideoEvidence = EvidencePlatformAttestedV3
+	req.Capabilities.AudioEvidence = EvidencePlatformAttestedV3
+	settings := PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}
+
+	hardware := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: settings, Registry: testTransformationRegistryV3()})
+	if hardware.Plan == nil || hardware.Plan.Delivery != DeliveryTranscodeHLSV3 {
+		t.Fatalf("hardware result = %s", ExplainPlannerResultV3(hardware))
+	}
+	if hardware.Plan.EffectiveRecipe.SoftwareVideoDecode {
+		t.Fatal("unforced transcode plan was marked software decode")
+	}
+
+	software := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: settings, Registry: testTransformationRegistryV3(), ForceSoftwareVideoDecode: true})
+	if software.Plan == nil || software.Plan.Delivery != DeliveryTranscodeHLSV3 {
+		t.Fatalf("software result = %s", ExplainPlannerResultV3(software))
+	}
+	if !software.Plan.EffectiveRecipe.SoftwareVideoDecode {
+		t.Fatal("forced transcode plan was not marked software decode")
+	}
+	if software.Plan.PlanID == hardware.Plan.PlanID {
+		t.Fatal("forced software plan shares the hardware plan identity")
 	}
 }
 

@@ -238,6 +238,16 @@ type TranscodeSession struct {
 	demuxErrorCount  int
 	lastDemuxErrorAt time.Time
 	demuxStamped     bool
+	// decodeErrorCount counts decoder failure lines within the current decay
+	// window; lastDecodeErrorAt timestamps the newest and decodeSample keeps a
+	// representative matched line for diagnostics. decodeStamped is set once
+	// the count crosses decodeErrorThreshold, which reports that the executed
+	// hardware decoder rejected the source and a software retry is warranted.
+	// Guarded by mu.
+	decodeErrorCount  int
+	lastDecodeErrorAt time.Time
+	decodeSample      string
+	decodeStamped     bool
 	// generationStartedAt is when the currently-owning ffmpeg process was
 	// spawned. Output in the shared directory older than this timestamp was
 	// written by a previous generation (or a previous session sharing the
@@ -341,6 +351,16 @@ const maxPersistedFFmpegChars = 2000
 const (
 	demuxErrorThreshold = 3
 	demuxErrorDecay     = 60 * time.Second
+)
+
+// Decoder failure classification. A hardware decoder that cannot construct a
+// reference picture set emits a fatal line for every frame from the first one,
+// so a source it rejects crosses decodeErrorThreshold within milliseconds
+// while an isolated warning never approaches it. The window decays so failures
+// separated by a long healthy stretch do not accumulate into a false stamp.
+const (
+	decodeErrorThreshold = 10
+	decodeErrorDecay     = 60 * time.Second
 )
 
 // ManifestStartupTimeout is the maximum wait for FFmpeg's first safe playback
@@ -3914,6 +3934,83 @@ func demuxInputErrorLine(line string) bool {
 	return strings.Contains(line, "Error during demuxing")
 }
 
+// decodeErrorLine reports whether an FFmpeg stderr line is a decoder rejecting
+// the source bitstream. Only decoder failures count; encoder, muxer, output,
+// HLS, and network chatter ([h264_qsv], Error writing, Broken pipe, HTTP error,
+// reconnecting) never match, mirroring demuxInputErrorLine's discipline.
+func decodeErrorLine(line string) bool {
+	switch {
+	case strings.Contains(line, "Could not find ref with POC"):
+		return true
+	case strings.Contains(line, "Error constructing the frame RPS"):
+		return true
+	case strings.Contains(line, "Failed to decode"):
+		return true
+	case strings.Contains(line, "decode_slice_header error"):
+		return true
+	default:
+		return false
+	}
+}
+
+// observeDecodeError records one decoder failure line and reports whether it is
+// the occurrence that crosses the known-bad threshold. The counter resets when
+// more than decodeErrorDecay elapsed since the previous failure, so decoder
+// blips that recover are forgiven. It reports true at most once per session:
+// decodeStamped is set under mu before returning, keeping the marker
+// idempotent when concurrent stderr lines arrive. A software-decode plan or a
+// copy target never stamps: a decoder error there is a bad bitstream, not
+// evidence that a hardware decoder should be replaced by a software one.
+func (s *TranscodeSession) observeDecodeError(now time.Time, sample string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.decodeStamped || s.opts.SoftwareVideoDecode || strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
+		return false
+	}
+	if !s.lastDecodeErrorAt.IsZero() && now.Sub(s.lastDecodeErrorAt) > decodeErrorDecay {
+		s.decodeErrorCount = 0
+	}
+	s.decodeErrorCount++
+	s.lastDecodeErrorAt = now
+	if strings.TrimSpace(sample) != "" {
+		s.decodeSample = sample
+	}
+	if s.decodeErrorCount < decodeErrorThreshold {
+		return false
+	}
+	s.decodeStamped = true
+	return true
+}
+
+// IsDecodeFailed reports whether repeated decoder failures stamped this
+// session's hardware decoder as unable to handle the source. The handler reads
+// it during failure recovery to decide whether to attempt a software-decode
+// rebuild at replan.
+func (s *TranscodeSession) IsDecodeFailed() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.decodeStamped
+}
+
+// DecodeFailureEvidence returns a representative matched stderr line and the
+// number of decoder failures counted for this session, for the replan decision
+// log and the durable route event. Both are zero for a session that never
+// matched a decoder failure.
+func (s *TranscodeSession) DecodeFailureEvidence() (string, int) {
+	if s == nil {
+		return "", 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.decodeSample, s.decodeErrorCount
+}
+
 // observeDemuxError records one input demux failure and reports whether it is
 // the occurrence that crosses the known-bad threshold. The counter resets when
 // more than demuxErrorDecay elapsed since the previous failure, so blips that
@@ -3989,6 +4086,9 @@ func (s *TranscodeSession) logFFmpegLine(ctx context.Context, line string) {
 		if s.observeDemuxError(time.Now()) {
 			s.notifyDemuxFailure(ctx)
 		}
+	}
+	if decodeErrorLine(line) {
+		s.observeDecodeError(time.Now(), line)
 	}
 	if s == nil || s.opts.FFmpegLogSink == nil {
 		return

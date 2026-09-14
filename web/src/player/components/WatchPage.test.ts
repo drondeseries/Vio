@@ -11,6 +11,7 @@ import type { PlayerAudioTrack, PlayerFileVersion, WatchPageProps } from "../typ
 import {
   INVENTORY_REFRESH_DEADLINE_MS,
   INVENTORY_REFRESH_INTERVAL_MS,
+  inventoryPollDelayMs,
   WatchPage,
 } from "./WatchPage";
 
@@ -152,6 +153,23 @@ describe("derivePersistedSubtitleMode", () => {
 
   it("persists off when subtitles are disabled", () => {
     expect(derivePersistedSubtitleMode(null)).toBe("off");
+  });
+});
+
+describe("inventoryPollDelayMs", () => {
+  it("runs the first attempts on a short early cadence", () => {
+    expect(inventoryPollDelayMs(0, false)).toBe(2_000);
+    expect(inventoryPollDelayMs(1, false)).toBe(4_000);
+    expect(inventoryPollDelayMs(2, false)).toBe(8_000);
+  });
+
+  it("settles into the steady interval after the early attempts", () => {
+    expect(inventoryPollDelayMs(3, false)).toBe(INVENTORY_REFRESH_INTERVAL_MS);
+    expect(inventoryPollDelayMs(10, false)).toBe(INVENTORY_REFRESH_INTERVAL_MS);
+  });
+
+  it("returns zero once the inventory is found so polling stops", () => {
+    expect(inventoryPollDelayMs(0, true)).toBe(0);
   });
 });
 
@@ -666,8 +684,10 @@ describe("WatchPage live inventory refresh", () => {
       }),
     );
 
+    // The first attempt runs on the early cadence; one poll is enough to
+    // observe the candidate row's inventory.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS);
+      await vi.advanceTimersByTimeAsync(2_000);
     });
 
     expect(applyAudioInventory).toHaveBeenCalledWith(richerAudioTracks);
@@ -746,8 +766,10 @@ describe("WatchPage live inventory refresh", () => {
 
     render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
 
+    // The first attempt runs on the early cadence, not the 20 s steady
+    // interval, so a probe that landed within seconds is seen immediately.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.advanceTimersByTimeAsync(2_000);
     });
 
     expect(refreshSubtitles).toHaveBeenCalledTimes(1);
@@ -855,10 +877,10 @@ describe("WatchPage live inventory refresh", () => {
       await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_DEADLINE_MS * 2);
     });
 
-    // One request per interval until the five-minute deadline, then none.
-    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(
-      INVENTORY_REFRESH_DEADLINE_MS / INVENTORY_REFRESH_INTERVAL_MS,
-    );
+    // One request per scheduled delay (2 s, 4 s, 8 s, then the steady 20 s
+    // interval) until the five-minute deadline, then none. 18 attempts land by
+    // the time the deadline check stops scheduling.
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(18);
   });
 
   it("discards a slow response that lands after the session switched files", async () => {
@@ -908,6 +930,226 @@ describe("WatchPage live inventory refresh", () => {
     });
 
     expect(applyAudioInventory).not.toHaveBeenCalled();
+  });
+
+  it("polls the catalog on the first early attempt, not after 20 s", async () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ planAudioTracks: richerAudioTracks, subtitleUrls: [] }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({ versions: [{ ...virtualVersion }] });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a 2 s then 4 s cadence before settling into the steady interval", async () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ planAudioTracks: richerAudioTracks, subtitleUrls: [] }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({ versions: [{ ...virtualVersion }] });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    // First attempt at 2 s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+
+    // The next attempt is 4 s later (at 6 s), not 20 s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_999);
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops polling once the first attempt fills the inventory", async () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: [{ codec: "eac3", channels: 6, layout: "5.1", language: "eng" }],
+        subtitleUrls: [planSubtitle],
+        applyAudioInventory: vi.fn(),
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, audio_tracks: richerAudioTracks }],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("forces a real fetch on the first attempt even when the cache is fresh", async () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ planAudioTracks: richerAudioTracks, subtitleUrls: [] }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClientOverride.current = client;
+    // A payload cached at page mount (< staleTime old) without the probed
+    // inventory; a cache-first read would return it and waste the attempt.
+    client.setQueryData(itemKeys.watchDetail("content-1", undefined, undefined), {
+      versions: [{ ...virtualVersion }],
+    });
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [
+        {
+          ...virtualVersion,
+          subtitle_tracks: [{ index: 13, language: "en", codec: "pgs", title: "English" }],
+        },
+      ],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still polls when the plan's only subtitle entry is not selectable", async () => {
+    const refreshSubtitles = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: richerAudioTracks,
+        // No URL and not burn-in only: the menu renders nothing from it, so the
+        // poll must keep looking for the probe's real inventory.
+        subtitleUrls: [{ ...planSubtitle, url: "" }],
+        refreshSubtitles,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [
+        {
+          ...virtualVersion,
+          subtitle_tracks: [{ index: 13, language: "en", codec: "pgs", title: "English" }],
+        },
+      ],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+    expect(refreshSubtitles).toHaveBeenCalledTimes(1);
+  });
+
+  it("requests a subtitle replan when another virtual row carries the probed tracks", async () => {
+    const refreshSubtitles = vi.fn();
+    // A first-play plan has not yet learned the effective candidate, so the
+    // resolved version is the collapsed virtual row with no probed tracks.
+    // The probe persisted the embedded tracks to the candidate row instead.
+    const collapsedVirtualVersion = {
+      ...virtualVersion,
+      file_id: 7,
+      file_path: "virtual://movie/tt1",
+      subtitle_tracks: [],
+    };
+    const candidateVersion = {
+      ...virtualVersion,
+      file_id: 8,
+      file_path: "virtual://movie/tt1?result=all",
+      subtitle_tracks: [{ index: 13, language: "en", codec: "ass", title: "English" }],
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        effectiveVirtualUri: null,
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [],
+        refreshSubtitles,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [collapsedVirtualVersion, candidateVersion],
+    });
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [collapsedVirtualVersion, candidateVersion],
+      }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    // The candidate's probed tracks must trigger the no-op replan even though
+    // the resolved-version snapshot stays empty.
+    expect(refreshSubtitles).toHaveBeenCalledTimes(1);
+  });
+
+  it("exhausts the attempt budget without replanning when no row has probed tracks", async () => {
+    const refreshSubtitles = vi.fn();
+    const collapsed = {
+      ...virtualVersion,
+      file_id: 7,
+      file_path: "virtual://movie/tt1",
+      subtitle_tracks: [],
+    };
+    const candidate = {
+      ...virtualVersion,
+      file_id: 8,
+      file_path: "virtual://movie/tt1?result=all",
+      subtitle_tracks: [],
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        effectiveVirtualUri: null,
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [],
+        refreshSubtitles,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({ versions: [collapsed, candidate] });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [collapsed, candidate] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(5);
+    expect(refreshSubtitles).not.toHaveBeenCalled();
+  });
+
+  it("does not poll when the plan already has a selectable subtitle entry", async () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ planAudioTracks: richerAudioTracks, subtitleUrls: [planSubtitle] }),
+    );
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    expect(fetchWatchDetailMock).not.toHaveBeenCalled();
   });
 });
 

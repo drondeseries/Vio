@@ -943,6 +943,42 @@ func TestBuildFFmpegArgs_H264High10DerivesSoftwareDecodeFromSourceFacts(t *testi
 	}
 }
 
+// TestBuildFFmpegArgs_ReactiveSoftwareDecodeForHEVCQSV covers the reactive
+// recovery shape: an HEVC source the hardware decoder rejected is decoded on
+// the CPU while QSV still encodes. The hardware decode args must be absent and
+// the software frames uploaded before the hardware encoder.
+func TestBuildFFmpegArgs_ReactiveSoftwareDecodeForHEVCQSV(t *testing.T) {
+	args := buildFFmpegArgs(TranscodeOpts{
+		InputPath:           "/media/movie-hevc.mkv",
+		OutputDir:           "/tmp/out",
+		SessionID:           "session-reactive-sw",
+		SourceVideoCodec:    "hevc",
+		SourceVideoProfile:  "Main",
+		SourceVideoBitDepth: 8,
+		SoftwareVideoDecode: true,
+		TargetCodecVideo:    "h264",
+		TargetCodecAudio:    "aac",
+		SegmentDuration:     2,
+		HWAccel:             "qsv",
+		TargetResolution:    "1080p",
+	})
+
+	joined := strings.Join(args, " ")
+	for _, forbidden := range []string{"-hwaccel vaapi", "-hwaccel_output_format vaapi", "hwdownload"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("reactive software decode must not request hardware decode %q: %s", forbidden, joined)
+		}
+	}
+	for _, required := range []string{
+		"hwupload,hwmap=derive_device=qsv",
+		"-c:v h264_qsv",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("reactive software decode recipe missing %q: %s", required, joined)
+		}
+	}
+}
+
 func TestBuildFFmpegArgs_H264High10UploadsBeforeHardwareToneMap(t *testing.T) {
 	for _, test := range []struct {
 		name    string

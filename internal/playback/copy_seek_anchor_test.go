@@ -2,13 +2,17 @@ package playback
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -231,5 +235,205 @@ func TestResolveCopySeekAnchorMatchesRealLongGOPHEVC(t *testing.T) {
 		if got != VideoSampleEntryHVC1 {
 			t.Fatalf("copy HLS sample entry = %q, want only %q", tag, VideoSampleEntryHVC1)
 		}
+	}
+}
+
+// resetCopySeekAnchorCache swaps in an isolated cache with an injectable clock
+// and probe runner, restoring the process-wide cache when the test ends.
+func resetCopySeekAnchorCache(t *testing.T, now func() time.Time, probe anchorProbeRunner) *copySeekAnchorCache {
+	t.Helper()
+	previous := copySeekAnchors
+	cache := &copySeekAnchorCache{
+		entries:    make(map[string]copySeekAnchorCacheEntry),
+		ttl:        copySeekAnchorCacheTTL,
+		maxEntries: copySeekAnchorCacheMax,
+		now:        now,
+		probe:      probe,
+	}
+	copySeekAnchors = cache
+	t.Cleanup(func() { copySeekAnchors = previous })
+	return cache
+}
+
+func TestResolveCopySeekAnchorForSourceCachesByStableIdentity(t *testing.T) {
+	var calls int
+	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		calls++
+		return requested - 1, int((requested - 1) / float64(segmentDuration)), nil
+	})
+
+	for i := range 2 {
+		// Each call resolves a fresh relay URL for the same virtual source.
+		inputPath := fmt.Sprintf("http://relay/stream/%d", i)
+		anchor, segment, err := ResolveCopySeekAnchorForSource(context.Background(), "ffmpeg", "virtual://movie/42", inputPath, 120, 2)
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		if anchor != 119 || segment != 59 {
+			t.Fatalf("call %d anchor = %v segment = %d; want 119, 59", i, anchor, segment)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("probe calls = %d, want 1 (second call must hit the stable-identity cache)", calls)
+	}
+}
+
+func TestResolveCopySeekAnchorForSourceSeparatesPositionAndIdentity(t *testing.T) {
+	var calls int
+	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
+		calls++
+		return requested, 0, nil
+	})
+	ctx := context.Background()
+	for _, probe := range []struct {
+		identity  string
+		inputPath string
+		requested float64
+	}{
+		{"virtual://movie/a", "http://relay/a", 30},
+		{"virtual://movie/a", "http://relay/a", 60},
+		{"virtual://movie/b", "http://relay/b", 30},
+	} {
+		if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", probe.identity, probe.inputPath, probe.requested, 2); err != nil {
+			t.Fatalf("probe %+v: %v", probe, err)
+		}
+	}
+	if calls != 3 {
+		t.Fatalf("probe calls = %d, want 3 (position and identity are part of the key)", calls)
+	}
+}
+
+func TestResolveCopySeekAnchorForSourceReProbesAfterTTL(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	var calls int
+	resetCopySeekAnchorCache(t, func() time.Time { return now }, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
+		calls++
+		return requested, 0, nil
+	})
+	ctx := context.Background()
+	call := func() {
+		t.Helper()
+		if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/ttl", "http://relay/ttl", 90, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	call()
+	now = now.Add(copySeekAnchorCacheTTL - time.Second)
+	call()
+	if calls != 1 {
+		t.Fatalf("probe calls before expiry = %d, want 1", calls)
+	}
+	now = now.Add(2 * time.Second)
+	call()
+	if calls != 2 {
+		t.Fatalf("probe calls after expiry = %d, want 2", calls)
+	}
+}
+
+func TestResolveCopySeekAnchorForSourceDoesNotCacheProbeFailures(t *testing.T) {
+	var calls int
+	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
+		calls++
+		if calls == 1 {
+			return 0, 0, errors.New("transient upstream timeout")
+		}
+		return requested, 1, nil
+	})
+	ctx := context.Background()
+	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/retry", "http://relay/retry", 45, 2); err == nil {
+		t.Fatal("first probe error was swallowed")
+	}
+	anchor, segment, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/retry", "http://relay/retry", 45, 2)
+	if err != nil {
+		t.Fatalf("second probe: %v", err)
+	}
+	if anchor != 45 || segment != 1 {
+		t.Fatalf("second probe anchor = %v segment = %d; want 45, 1", anchor, segment)
+	}
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2 (failures are never cached)", calls)
+	}
+}
+
+func TestResolveCopySeekAnchorCacheBoundedToMaxEntries(t *testing.T) {
+	tick := time.Unix(1_000, 0)
+	var calls int
+	cache := resetCopySeekAnchorCache(t, func() time.Time {
+		tick = tick.Add(time.Millisecond)
+		return tick
+	}, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
+		calls++
+		return requested, 0, nil
+	})
+	ctx := context.Background()
+	total := copySeekAnchorCacheMax + 1
+	for i := range total {
+		identity := "virtual://movie/" + strconv.Itoa(i)
+		if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", identity, identity, 60, 2); err != nil {
+			t.Fatalf("probe %d: %v", i, err)
+		}
+	}
+	if calls != total {
+		t.Fatalf("probe calls = %d, want %d", calls, total)
+	}
+	if len(cache.entries) != copySeekAnchorCacheMax {
+		t.Fatalf("cache entries = %d, want %d", len(cache.entries), copySeekAnchorCacheMax)
+	}
+	oldestKey := copySeekAnchorCacheKey("ffmpeg", "virtual://movie/0", 60, 2)
+	if _, ok := cache.entries[oldestKey]; ok {
+		t.Fatal("oldest entry was not evicted")
+	}
+	newestKey := copySeekAnchorCacheKey("ffmpeg", "virtual://movie/"+strconv.Itoa(total-1), 60, 2)
+	if _, ok := cache.entries[newestKey]; !ok {
+		t.Fatal("newest entry was evicted")
+	}
+}
+
+func TestResolveCopySeekAnchorForSourceCoalescesConcurrentIdenticalProbes(t *testing.T) {
+	var calls int32
+	release := make(chan struct{})
+	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		return requested - 5, 12, nil
+	})
+	ctx := context.Background()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			// Distinct relay URLs still name the same stable source identity.
+			anchor, segment, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/parallel", fmt.Sprintf("http://relay/%d", i), 80, 2)
+			if err == nil && (anchor != 75 || segment != 12) {
+				err = fmt.Errorf("anchor = %v segment = %d; want 75, 12", anchor, segment)
+			}
+			errs <- err
+		}(i)
+	}
+	close(start)
+	// Let at least one probe start, then release it. singleflight admits one
+	// closure per key, so the peer either joins the flight or hits the cache.
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&calls) == 0 {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatal("probe never started")
+		}
+		runtime.Gosched()
+	}
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("probe calls = %d, want 1", got)
 	}
 }

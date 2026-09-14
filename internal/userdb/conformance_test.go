@@ -20,6 +20,29 @@ func newConformanceStore(t *testing.T) userstore.UserStore {
 	return NewSQLiteUserStore(db.DB)
 }
 
+// SeedHiddenHistoryItem implements storetest's Next Up hidden-history test
+// seam against the raw per-user SQLite table. It lives in the test build only:
+// the public store API timestamp-adjusts or suppresses any write at or before
+// a hidden watermark, so the conformance suite cannot construct a hidden
+// progress row any other way.
+func (s *SQLiteUserStore) SeedHiddenHistoryItem(ctx context.Context, profileID, mediaItemID string, hiddenBefore time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO hidden_history_items (profile_id, media_item_id, hidden_before, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(profile_id, media_item_id) DO UPDATE SET
+			hidden_before = excluded.hidden_before,
+			updated_at = excluded.updated_at`,
+		profileID, mediaItemID, hiddenBefore.UTC().Format(time.RFC3339), nowUTC())
+	return err
+}
+
+// TestSQLiteNextUpState runs the Next Up state provider conformance suite
+// against the per-user SQLite backend. The Postgres backend runs the same suite
+// in internal/userstore/pgstore.
+func TestSQLiteNextUpState(t *testing.T) {
+	storetest.RunNextUpState(t, newConformanceStore)
+}
+
 // TestSQLiteProgressSince runs the offline-sync progress-reconciliation
 // conformance test (invariant 1) against the real SQLite backend, exercising the
 // synced_seq stamping triggers and event_at LWW comparison.

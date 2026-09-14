@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -2183,11 +2184,14 @@ func (d playbackStartRequestDigestsV3) matches(stored string) bool {
 }
 
 func appendStartWarningsV3(result *playback.PlannerResultV3, warnings []playback.DegradationWarningV3) {
-	if result == nil || len(warnings) == 0 {
+	if result == nil || len(warnings) == 0 || result.Plan == nil {
 		return
 	}
-	if result.Plan != nil {
-		result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, warnings...)
+	for _, warning := range warnings {
+		if slices.Contains(result.Plan.DegradationWarnings, warning) {
+			continue
+		}
+		result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, warning)
 	}
 }
 
@@ -2308,7 +2312,13 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	// retries that lose the idempotency race must not emit duplicate provider
 	// scrobbles or analysis work for the short-lived session they roll back.
 	h.raceCopySafetyV3(effectiveFile.ID, result.Plan)
-	h.warmVirtualSubtitlesV3(r.Context(), session, effectiveFile)
+	// The transport is committed above. Run the virtual subtitle and font warms
+	// detached from this start request: each resolves its own relay registration
+	// and demuxes the remote source, and running them on the response path let
+	// full remote reads race the just-committed video transport. Scheduling here
+	// keeps the transport start uncontended while the first client subtitle or
+	// font fetch still finds a warm (or in-flight) entry.
+	h.scheduleVirtualWarmAfterTransportV3(r.Context(), session, effectiveFile, result.SubtitleTrackIndex)
 	h.enqueuePlaybackStartSideEffectsV3(r.Context(), session, effectiveFile, userID, profileID, plannedAudioTrackIndexV3(result, audioIndex))
 	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, Event: playback.RouteEventPlanSelectedV3, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
 	return response, nil
@@ -2734,9 +2744,18 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				anchorInput = res.URL
 				releaseAnchor = cleanup
 			}
-			resolver := h.copySeekAnchor
-			if resolver == nil {
-				resolver = playback.ResolveCopySeekAnchor
+			// The stable source identity is the un-resolved file path: for a
+			// virtual file that is the provider-neutral URI, identical across
+			// concurrent starts even though each start pins its own relay URL.
+			// Cache and singleflight key on it so identical probes coalesce
+			// and survive across requests.
+			sourceIdentity := file.FilePath
+			ffmpegPath := h.playbackConfig().FFmpegPath
+			probeAnchor := func(probeCtx context.Context) (float64, int, error) {
+				if h.copySeekAnchor != nil {
+					return h.copySeekAnchor(probeCtx, ffmpegPath, anchorInput, requested, 2)
+				}
+				return playback.ResolveCopySeekAnchorForSource(probeCtx, ffmpegPath, sourceIdentity, anchorInput, requested, 2)
 			}
 			// Virtual upstreams occasionally serve a range request slowly
 			// enough to blow the anchor probe budget. One bounded retry
@@ -2746,7 +2765,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// it is skipped.
 			var err error
 			for attempt := 1; attempt <= 2; attempt++ {
-				origin, startSegment, err = resolver(ctx, h.playbackConfig().FFmpegPath, anchorInput, requested, 2)
+				origin, startSegment, err = probeAnchor(ctx)
 				if err == nil || ctx.Err() != nil {
 					break
 				}
@@ -4327,7 +4346,11 @@ func (h *PlaybackHandler) grantManifestURLV3(ctx context.Context, card playback.
 // sourceExecutionMetadataV3 freezes the source facts used by a remote executor.
 func sourceExecutionMetadataV3(file *models.MediaFile, result playback.PlannerResultV3) playback.SourceExecutionMetadataV3 {
 	if result.FrozenSourceMetadata != nil {
-		return scopeToneMapSourceMetadataV3(*result.FrozenSourceMetadata, result.ToneMapMode)
+		metadata := *result.FrozenSourceMetadata
+		if result.Plan != nil && result.Plan.EffectiveRecipe.SoftwareVideoDecode {
+			metadata.SoftwareVideoDecode = true
+		}
+		return scopeToneMapSourceMetadataV3(metadata, result.ToneMapMode)
 	}
 	if file == nil {
 		return playback.SourceExecutionMetadataV3{}
@@ -4337,11 +4360,15 @@ func sourceExecutionMetadataV3(file *models.MediaFile, result playback.PlannerRe
 	if len(file.VideoTracks) > 0 {
 		track = file.VideoTracks[0]
 	}
+	softwareDecode := playback.RequiresSoftwareVideoDecode(videoCodec, profile, bitDepth)
+	if result.Plan != nil {
+		softwareDecode = softwareDecode || result.Plan.EffectiveRecipe.SoftwareVideoDecode
+	}
 	metadata := playback.SourceExecutionMetadataV3{
 		VideoCodec:                 videoCodec,
 		VideoProfile:               profile,
 		VideoBitDepth:              bitDepth,
-		SoftwareVideoDecode:        playback.RequiresSoftwareVideoDecode(videoCodec, profile, bitDepth),
+		SoftwareVideoDecode:        softwareDecode,
 		DurationSeconds:            float64(file.Duration),
 		ToneMapSourceKind:          result.ToneMapSourceKind,
 		ToneMapPreflightRequired:   result.ToneMapPreflightRequired,
@@ -4446,37 +4473,107 @@ func (h *PlaybackHandler) updateV3SessionState(ctx context.Context, session *pla
 	return h.sessionMgr.UpdateStreamState(session.ID, h.v3SessionStreamState(ctx, session, file, result, transport, mode))
 }
 
-// warmVirtualSubtitlesV3 pre-warms the subtitle cache for a virtual source's
-// embedded tracks right after a successful plan + transport commit. The serve
-// path always fetches text subtitles windowed (the client appends
-// position/duration), so a first click otherwise pays a full remote demux
-// against a fresh relay registration; a committed full-track entry turns
-// every windowed fetch into a near-instant scan of a small cached artifact
-// instead. PGS already gets this fast path from serveWindowedSUP; this warm
-// supplies the entry so both classes start instant.
-//
-// The warm resolves its own relay registration (the transport's is held by
-// the transcode session, not shareable) and holds it open until every track's
-// warm finishes — a relay URL released mid-warm would 404 under ffmpeg.
-// Best-effort by design: resolution failure, warm-slot exhaustion, and cache
-// misses (the 10-minute generation bucket rotates) all degrade to the
-// existing cold-serve path with no user-visible error. The selected plan
-// ordinal is warmed first so the initial default-track click benefits even
-// when the warm semaphore drops later tracks.
-func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *playback.Session, file *models.MediaFile) {
+// virtualSubtitleWarmSourceURI picks the source URI the text-subtitle warm
+// keys its cache identities on. The live session's bound URI wins when set —
+// that is the value updateV3SessionState writes and the serve path reads — and
+// otherwise the effective file's pinned URI is used, because the start path's
+// session copy predates the state write. Mirrors warmVirtualFontBundleV3 so
+// the warm and serve identities agree.
+func virtualSubtitleWarmSourceURI(session *playback.Session, file *models.MediaFile) string {
+	if session != nil && session.VirtualSourceURI != "" {
+		return session.VirtualSourceURI
+	}
+	if file != nil {
+		return file.FilePath
+	}
+	return ""
+}
+
+// scheduleVirtualWarmAfterTransportV3 runs the virtual subtitle and font-bundle
+// warms detached from the start request, after the transport commit. Both warms
+// resolve their own relay registration and demux the remote source; running
+// them inline on the response path let full remote reads race the
+// just-committed video transport and inflated startup. Detaching keeps the
+// transport start uncontended while the first client subtitle/font fetch still
+// finds a warm (or in-flight fill) entry. Best-effort: a nil cache or file is a
+// no-op.
+func (h *PlaybackHandler) scheduleVirtualWarmAfterTransportV3(ctx context.Context, session *playback.Session, file *models.MediaFile, selectedSubtitleIndex int) {
 	if h == nil || h.SubtitleCache == nil || file == nil || session == nil {
 		return
 	}
-	if !isVirtualPlaybackFile(file) || session.VirtualSourceURI == "" {
+	if !isVirtualPlaybackFile(file) {
+		// Local files keep their existing serve-path warming; this detour is
+		// only for virtual relay sources, which resolve a request-scoped
+		// registration the warm must own.
+		return
+	}
+	warmCtx := context.WithoutCancel(ctx)
+	go func() {
+		h.warmVirtualSubtitlesV3(warmCtx, session, file, selectedSubtitleIndex)
+		h.warmVirtualFontBundleV3(warmCtx, session, file)
+	}()
+}
+
+// warmVirtualSubtitlesV3 pre-warms the subtitle cache for a virtual source's
+// selected embedded track after the transport commit. The serve path always
+// fetches text subtitles windowed (the client appends position/duration), so a
+// first click otherwise pays a full remote demux against a fresh relay
+// registration; a committed full-track entry turns every windowed fetch into a
+// near-instant scan of a small cached artifact instead. PGS already gets this
+// fast path from serveWindowedSUP; this warm supplies the entry so both classes
+// start instant.
+//
+// Only the session's selected embedded track is warmed. The windowed serve
+// branch looks the cache up by the full-track key — cachedFormatEntryPath
+// carries no window component — and, on a hit, runs the client's windowed
+// extract against that artifact. A bounded-window artifact committed under the
+// same key would look like a complete track and silently truncate every window
+// past the warmed slice, so a correct warm must extract the whole track. Warming
+// exactly the selected track (instead of every track) and running detached after
+// the transport commit keeps the startup path free of competing remote demuxes.
+//
+// The warm resolves its own relay registration (the transport's is held by
+// the transcode session, not shareable) and holds it open until the track's
+// warm finishes — a relay URL released mid-warm would 404 under ffmpeg.
+// Best-effort by design: resolution failure, warm-slot exhaustion, and cache
+// misses (the 24h generation bucket rotates) all degrade to the existing
+// cold-serve path with no user-visible error.
+func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *playback.Session, file *models.MediaFile, selectedSubtitleIndex int) {
+	if h == nil || h.SubtitleCache == nil || file == nil || session == nil {
+		return
+	}
+	if !isVirtualPlaybackFile(file) {
+		return
+	}
+	// Resolve the selected combined subtitle index (externals, then embedded,
+	// then downloaded) to its inventory segment. Only an embedded selection has
+	// an extractable container stream; external and downloaded selections are
+	// served by other paths and need no virtual warm.
+	location, ok := classifySubtitleIndexV3(file, selectedSubtitleIndex)
+	if !ok || location.source != playback.SubtitleSourceEmbeddedV3 {
+		return
+	}
+	// The start path holds a session copy captured before UpdateStreamState
+	// wrote VirtualSourceURI, so the warm must key off the effective file's
+	// pinned URI or it silently no-ops exactly where it matters most. Mirror
+	// warmVirtualFontBundleV3: prefer the live session's bound URI when it has
+	// one, otherwise fall back to the effective file. Both name the same
+	// release the serve path binds (updateV3SessionState sets
+	// state.VirtualSourceURI = file.FilePath), so the warm and serve cache
+	// identities agree.
+	virtualURI := virtualSubtitleWarmSourceURI(session, file)
+	if virtualURI == "" {
 		return
 	}
 	tracks := session.VirtualSubtitleTracks
-	if len(tracks) == 0 {
+	if len(tracks) <= location.offset {
 		// Fall back to the catalog row's inventory when the session carries
-		// no virtual evidence (a drift remap or a rotated candidate).
+		// no virtual evidence (a drift remap or a rotated candidate) or a
+		// shorter layout than the selected ordinal.
 		tracks = file.SubtitleTracks
 	}
-	if len(tracks) == 0 {
+	trackIndex := location.offset
+	if trackIndex < 0 || trackIndex >= len(tracks) {
 		return
 	}
 	resolved, cleanup, err := h.resolveVirtualInputURI(
@@ -4488,28 +4585,104 @@ func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *p
 			"component", "api", "file_id", file.ID, "error", err)
 		return
 	}
-	var wg sync.WaitGroup
-	for i := range tracks {
-		wg.Add(1)
-		done := h.SubtitleCache.WarmTrackInBackground(playback.StreamExtractOpts{
-			InputPath:     resolved.URL,
-			CacheIdentity: playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, i),
-			TrackIndex:    i,
-			SourceCodec:   tracks[i].Codec,
-			FFmpegPath:    h.playbackConfig().FFmpegPath,
-		}, playback.StreamExtractSubtitle)
-		go func() {
-			<-done
-			wg.Done()
-		}()
-	}
-	// Release the relay registration exactly once, after every warm settled
+	warmDone := h.SubtitleCache.WarmTrackInBackground(playback.StreamExtractOpts{
+		InputPath:     resolved.URL,
+		CacheIdentity: playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, trackIndex),
+		TrackIndex:    trackIndex,
+		SourceCodec:   tracks[trackIndex].Codec,
+		FFmpegPath:    h.playbackConfig().FFmpegPath,
+	}, playback.StreamExtractSubtitle)
+	// Release the relay registration exactly once, after the warm settled
 	// (ran, failed, or was skipped). The entry itself is also bounded by the
 	// relay's 24h lifetime, so a lost release never pins a slot forever.
 	go func() {
-		wg.Wait()
-		cleanup()
+		<-warmDone
+		if cleanup != nil {
+			cleanup()
+		}
 	}()
+}
+
+// warmVirtualFontBundleV3 pre-warms the font-bundle cache for a virtual
+// source's effective file when it carries at least one ASS/SSA embedded track.
+// Font bundles are keyed per file (not per track), so exactly one extraction is
+// scheduled however many ASS tracks the release has. It mirrors
+// warmVirtualSubtitlesV3: it resolves its own relay registration, runs the
+// extraction detached under the cache's warm budget, and holds the relay open
+// until the extraction settles — a relay URL released mid-extract would 404
+// under ffmpeg. Best-effort by design: resolution failure, warm-slot
+// exhaustion, and an already-cached bundle all degrade to the existing
+// cold-serve path with no user-visible error. The returned channel closes when
+// the warm settled (or was skipped); production ignores it.
+func (h *PlaybackHandler) warmVirtualFontBundleV3(ctx context.Context, session *playback.Session, file *models.MediaFile) <-chan struct{} {
+	done := make(chan struct{})
+	if h == nil || h.SubtitleCache == nil || file == nil || session == nil {
+		close(done)
+		return done
+	}
+	if !isVirtualPlaybackFile(file) {
+		close(done)
+		return done
+	}
+	// The start path holds a session copy captured before UpdateStreamState
+	// wrote VirtualSourceURI, so the effective file's URI is the reliable
+	// source; prefer the live session when it has one. Both name the same
+	// release the serve path will bind.
+	virtualURI := file.FilePath
+	if session.VirtualSourceURI != "" {
+		virtualURI = session.VirtualSourceURI
+	}
+	if virtualURI == "" {
+		close(done)
+		return done
+	}
+	tracks := session.VirtualSubtitleTracks
+	if len(tracks) == 0 {
+		tracks = file.SubtitleTracks
+	}
+	hasASS := false
+	for _, track := range tracks {
+		if playback.IsASS(track.Codec) {
+			hasASS = true
+			break
+		}
+	}
+	if !hasASS {
+		close(done)
+		return done
+	}
+	ffmpegPath := h.playbackConfig().FFmpegPath
+	cacheKey := fontBundleCacheKey(file, virtualURI, ffmpegPath)
+	if cacheKey.PinnedResult == "" {
+		// Uncacheable without the pinned candidate anchor: the identity would
+		// rotate with the relay URL, so there is nothing stable to warm.
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		resolved, cleanup, err := h.resolveVirtualInputURI(
+			context.WithoutCancel(ctx), file.FilePath, file.VirtualOwnerInstallationID,
+			session.UserID, session.ProfileID, false, nil, "",
+		)
+		if err != nil {
+			slog.DebugContext(ctx, "virtual font bundle pre-warm skipped: resolve failed",
+				"component", "api", "file_id", file.ID, "error", err)
+			return
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+		warmDone := h.SubtitleCache.WarmFontBundleInBackground(cacheKey, func(extractCtx context.Context) ([]byte, error) {
+			fonts, extractErr := playback.ExtractAttachedSubtitleFonts(extractCtx, resolved.URL, ffmpegPath)
+			if extractErr != nil {
+				return nil, extractErr
+			}
+			return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
+		})
+		<-warmDone
+	}()
+	return done
 }
 
 func plannedAudioTrackIndexV3(result playback.PlannerResultV3, fallback int) int {
@@ -4732,6 +4905,9 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	// client_features is omitted, temporarily allow the only validation rule
 	// that depends on the durable start request; the authoritative merge and a
 	// second full validation happen after the attempt is loaded below.
+	// Validate is structural only — it neither normalizes nor drops a
+	// capability — so this preflight cannot consume the un-negotiated
+	// transformations the single post-merge normalization must later report.
 	preflightReq := req
 	if preflightReq.ClientFeatures == nil {
 		preflightReq.ClientFeatures = []string{playback.FeatureClientVideoTransforms}
@@ -4766,11 +4942,12 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if record.PlaybackAttemptID != req.PlaybackAttemptID {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "The failed plan is no longer current")
 	}
-	// Replan feature advertisement is optional. Validate transformations against
-	// the durable start-time features when the client omits the unchanged list;
-	// otherwise a valid replan can be rejected before executeReplanV3 gets the
-	// chance to perform the same merge.
-	if req.ClientFeatures == nil {
+	// Replan feature advertisement is optional. An omitted list and an
+	// explicitly empty list both mean "unchanged"; validate transformations
+	// against the durable start-time features in either case, otherwise a valid
+	// replan can be rejected before executeReplanV3 gets the chance to perform
+	// the same merge.
+	if len(req.ClientFeatures) == 0 {
 		req.ClientFeatures = append([]string(nil), record.NormalizedRequest.ClientFeatures...)
 	}
 
@@ -5311,7 +5488,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// a client-authority change: a fresh start of the same file still negotiates
 	// normally, and an explicit user retry can re-enable the route by going
 	// through a new start.
-	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) {
+	// A decode failure defers the demotion while a software-decode variant of
+	// the same server-transcode delivery is still untried and the live decoder
+	// actually gave up: the retry is the next hop, so demoting first would
+	// strand the session on a route that has no decode-mode dimension. Every
+	// other transport failure demotes exactly as before.
+	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) && (!decodeFailureClassificationV3(req.Failure.Classification) || !h.softwareDecodeRetryPendingV3(record, req)) {
 		// Demote on both copies: the record (the durable attempt this replan
 		// may still terminal-persist) and the seeded start, whose payload the
 		// success commit writes back via updated.NormalizedRequest. Demoting
@@ -5399,6 +5581,13 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		start.BandwidthCapKbps = copyOptionalIntV3(req.BandwidthCapKbps)
 		start.Capabilities = req.Capabilities
 		start.ClientPlaybackContext = req.ClientPlaybackContext
+		// The overlay above aliases the replan body's deliveries map, which
+		// every shallow copy made since decode — the preflight request
+		// included — also points at. Deep-clone it here so the single
+		// normalization the merged start request runs cannot write through to
+		// req, and a later preflight mutation cannot leak into the durable
+		// request stored on the attempt.
+		start.ClientPlaybackContext.Deliveries = playback.CloneDeliveryCapabilitiesV3(req.ClientPlaybackContext.Deliveries)
 		// The client's capability payload just replaced the seeded one.
 		// Re-apply the durable record's server-side delivery demotions so a
 		// route a previous failure recovery abandoned stays disabled — the
@@ -5473,6 +5662,40 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if !ok {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "internal_error", message: "The live session manager does not support atomic replacement."}
 	}
+	// Reactive software-decode recovery. A hardware decoder can reject a source
+	// the planner believed it could decode (POC/reference-picture failures from
+	// the first frame). The planner has no way to express a software-decode
+	// retry, so when the live transcode session reports the decoder gave up,
+	// force the next server-transcode plan onto the software decode path. This
+	// stays client-driven: the retry happens inside the existing
+	// failure_recovery replan, with no server->client command.
+	forceSoftwareDecode := false
+	decodeFailureSample := ""
+	decodeFailureCount := 0
+	decodeAttemptDetail := ""
+	if operation == playback.ReplanOperationFailureRecoveryV3 &&
+		record.CurrentPlan.Delivery == playback.DeliveryTranscodeHLSV3 &&
+		!record.CurrentPlan.EffectiveRecipe.SoftwareVideoDecode &&
+		planHasVideoEncodeV3(record.CurrentPlan) {
+		executedHWAccel := strings.TrimSpace(session.TranscodeHWAccel)
+		if executedHWAccel != "" && !strings.EqualFold(executedHWAccel, playback.HWAccelNone) &&
+			!playback.RequiresSoftwareVideoDecode(record.CurrentPlan.Source.VideoCodec, record.CurrentPlan.Source.VideoProfile, record.CurrentPlan.Source.BitDepth) {
+			if ts := h.tm.GetTranscodeSession(record.SessionID); ts != nil && ts.IsDecodeFailed() {
+				forceSoftwareDecode = softwareDecodeVariantPendingV3(record, req)
+				if forceSoftwareDecode {
+					decodeFailureSample, decodeFailureCount = ts.DecodeFailureEvidence()
+				}
+			}
+		}
+	} else if operation == playback.ReplanOperationFailureRecoveryV3 &&
+		record.CurrentPlan.Delivery == playback.DeliveryTranscodeHLSV3 &&
+		record.CurrentPlan.EffectiveRecipe.SoftwareVideoDecode &&
+		planHasVideoEncodeV3(record.CurrentPlan) {
+		// The software variant was the plan that just failed, so both decoder
+		// modes are exhausted. Name them on the terminal detail so it is not
+		// empty when the planner returns adaptation_exhausted.
+		decodeAttemptDetail = fmt.Sprintf("hardware and software video decode both attempted for %s (hw_accel=%s)", record.CurrentPlan.Delivery, strings.TrimSpace(session.TranscodeHWAccel))
+	}
 	virtualRehydrationFailed := false
 	var virtualRehydrationErr error
 	if isVirtualPlaybackFile(currentEffectiveFile) {
@@ -5545,6 +5768,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	var preparedTransport *preparedTransportV3
 	var artifactRecipe playback.ExecutableRecipeV3
 	var mode mediaAuthModeV3
+	// replanCapabilityWarnings holds the degradation warnings produced by the
+	// one normalization of the merged start request, so they can be surfaced on
+	// whichever plan this replan ultimately returns.
+	var replanCapabilityWarnings []playback.DegradationWarningV3
 	transportPrepared := false
 
 	if virtualRehydrationFailed {
@@ -5671,9 +5898,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				message: "The requested seek position is beyond the end of the selected media source.",
 			}
 		}
-		if _, err := start.NormalizeAndValidate(); err != nil {
+		warnings, err := start.NormalizeAndValidate()
+		if err != nil {
 			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "invalid_replan", message: err.Error()}
 		}
+		// This is the single normalization of the merged start request. Keep
+		// its degradation warnings, including the drop of a client
+		// transformation the merged feature list did not negotiate, and attach
+		// them to the plan once it is selected.
+		replanCapabilityWarnings = warnings
 		audioIndex := 0
 		if !seekReanchor {
 			if dropStaleAudioTrackIdentityV3(r.Context(), effectiveFile, start.AudioTrackID) {
@@ -5728,7 +5961,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				}
 			}
 		} else {
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail})
 			clampPlannerTargetResolution(&result, effectiveFile)
 		}
 		if outputChange && result.Terminal != nil && effectiveFile.ID != currentEffectiveFile.ID {
@@ -5747,7 +5980,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			if err != nil {
 				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "track_unavailable", message: err.Error()}
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail})
 			clampPlannerTargetResolution(&result, effectiveFile)
 		}
 		if terminalAllowsAlternateFileV3(result.Terminal) && (replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
@@ -5830,6 +6063,35 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	result = retryIncompleteToneMapPlanningV3(result, toneMapCapabilityErr)
 	result = retryIncompletePlaybackSettingsV3(result, plannerSettingsErr)
 	h.clarifyOriginalQuality4KTerminalV3(r.Context(), result.Terminal, requestedFile, replanAlternateFilePinnedByOriginalQualityV3(operation, start.QualityPreference))
+	if decodeAttemptDetail != "" && result.Terminal != nil && strings.TrimSpace(result.Terminal.Detail) == "" {
+		// The software decode mode was the plan that just failed. Name both
+		// attempted decode modes on any terminal so an exhausted route never
+		// reports an empty detail.
+		result.Terminal.Detail = decodeAttemptDetail
+	}
+	if forceSoftwareDecode {
+		// The software retry is a deliberate quality trade, not a silent
+		// fallback: record it on the plan so clients can surface it, and emit
+		// one classifier line carrying the decoder evidence that triggered it.
+		if result.Plan != nil {
+			result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.DegradationWarningV3{
+				Code:    degradationSoftwareDecodeFallbackV3,
+				Message: "The hardware video decoder could not decode this source; retrying with software decoding.",
+			})
+		}
+		slog.WarnContext(r.Context(), "playback software decode fallback",
+			logComponentKey, "playback",
+			"session_id", record.SessionID,
+			"operation", string(operation),
+			"delivery", record.CurrentPlan.Delivery,
+			"hw_accel", strings.TrimSpace(session.TranscodeHWAccel),
+			"source_video_codec", record.CurrentPlan.Source.VideoCodec,
+			"source_video_profile", record.CurrentPlan.Source.VideoProfile,
+			"source_video_bit_depth", record.CurrentPlan.Source.BitDepth,
+			"decode_failure_sample", decodeFailureSample,
+			"decode_failure_count", decodeFailureCount,
+		)
+	}
 	// One decision line per replan, mirroring the start endpoint's record:
 	// replans choose routes (and terminals) just as consequential, and an
 	// unlogged terminal made client reports impossible to reconstruct from
@@ -5846,9 +6108,16 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			"requested_file_id", record.RequestedMediaFileID,
 			"effective_file_id", effectiveFile.ID,
 			"quality_preference", start.QualityPreference,
+			"software_video_decode", forceSoftwareDecode,
+			"decode_failure_count", decodeFailureCount,
 		}, clientInfo.LogAttrs()...)...)
 		return playback.NewTerminalResponseFromTerminalV3(result.Terminal), *record, nil, nil
 	}
+	// Surface the warnings from the merged start request's single
+	// normalization on the selected plan. A seek reanchor replays the durable
+	// plan, which may already carry the same warning from its own start, so the
+	// helper skips duplicates.
+	appendStartWarningsV3(&result, replanCapabilityWarnings)
 	slog.InfoContext(r.Context(), "playback replan decided", append([]any{
 		logComponentKey, "playback",
 		"outcome", "plan",
@@ -5865,6 +6134,9 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		"target_bitrate_kbps", result.TargetBitrateKbps,
 		"quality_preference", start.QualityPreference,
 		"bandwidth_estimate_kbps", intOrZeroHandlerV3(start.BandwidthEstimateKbps),
+		"software_video_decode", forceSoftwareDecode,
+		"decode_failure_count", decodeFailureCount,
+		"decode_failure_sample", decodeFailureSample,
 	}, clientInfo.LogAttrs()...)...)
 	mode = headerAuthenticatedMediaV3(start.ClientFeatures)
 	_, reservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
@@ -5923,46 +6195,69 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	var transport preparedTransportV3
 	if transportPrepared && preparedTransport != nil {
 		transport = *preparedTransport
-	} else if transportReused {
-		// A sidecar selection changes the plan and subtitle artifact, but it does
-		// not change the bytes FFmpeg produces. Keep the active HLS generation and
-		// its transport window so a client remount cannot strand itself between
-		// the killed old window and a replacement window that starts elsewhere.
-		// The requested source position still belongs to this replan: translate it
-		// onto the reused window instead of rewinding to the previous plan's start.
-		result.Plan.Stream = record.CurrentPlan.Stream
-		reusedTimeline := record.CurrentPlan.Timeline
-		reusedTimeline.SourceStartSeconds = result.Plan.Timeline.SourceStartSeconds
-		reusedTimeline.PlayerStartSeconds = max(0, reusedTimeline.SourceStartSeconds-reusedTimeline.StreamOriginSeconds)
-		result.Plan.Timeline = reusedTimeline
-		result.Plan.ExpiresAt = record.CurrentPlan.ExpiresAt
-		transport = reusedHLSTransportV3(session, record.CurrentPlan.Stream.URL)
-		slog.InfoContext(r.Context(), "protocol v3 replan reused active A/V transport",
-			logComponentKey, playbackLogValueV3,
-			"playback_session_id", session.ID,
-			"previous_plan_id", record.CurrentPlanID,
-			"plan_id", result.Plan.PlanID,
-		)
 	} else {
-		var transportErr *transportErrorV3
-		transportRequest := r
-		if proxyOriginRecovery {
-			policy := h.playbackRoutingPolicyForContextV3(r.Context())
-			policy.DirectPlayEgress = config.PlaybackEgressAPIOnly
-			policy.RemuxEgress = config.PlaybackEgressAPIOnly
-			policy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
-			transportRequest = r.WithContext(withPlaybackRoutingPolicySnapshotV3(r.Context(), policy))
+		reusedStream := record.CurrentPlan.Stream
+		credentialRefreshed := false
+		if transportReused {
+			// Preserving the prior credential is only safe while it still
+			// authorizes the live session for this resource. The old plan is
+			// about to be retired, and a signed stream token is session- and
+			// file-bound rather than plan-bound, so retirement alone does not
+			// invalidate it — but an expired, mismatched, or near-expiry
+			// credential is re-minted in place, keeping the session and
+			// transport identity so playback is not restarted.
+			credentialRefreshed, transportReused = h.authorizeReusedStreamCredentialV3(session, &reusedStream)
 		}
-		transport, transportErr = h.prepareTransportV3(transportRequest, session, effectiveFile, result, mode)
-		if transportErr != nil {
-			return playback.DecisionResponseV3{}, *record, nil, transportErr
+		if transportReused {
+			// A sidecar selection changes the plan and subtitle artifact, but it
+			// does not change the bytes FFmpeg produces. Keep the active
+			// generation and its transport window so a client remount cannot
+			// strand itself between the killed old window and a replacement
+			// window that starts elsewhere. The requested source position still
+			// belongs to this replan: translate it onto the reused window
+			// instead of rewinding to the previous plan's start.
+			result.Plan.Stream = reusedStream
+			reusedTimeline := record.CurrentPlan.Timeline
+			reusedTimeline.SourceStartSeconds = result.Plan.Timeline.SourceStartSeconds
+			reusedTimeline.PlayerStartSeconds = max(0, reusedTimeline.SourceStartSeconds-reusedTimeline.StreamOriginSeconds)
+			result.Plan.Timeline = reusedTimeline
+			result.Plan.ExpiresAt = record.CurrentPlan.ExpiresAt
+			if credentialRefreshed {
+				// The credential now carries a full lifetime; the published plan
+				// expiry must not outlive it.
+				result.Plan.ExpiresAt = playback.NewPlanExpiryV3(time.Now())
+			}
+			transport = reusedHLSTransportV3(session, reusedStream.URL)
+			slog.InfoContext(r.Context(), "protocol v3 replan reused active A/V transport",
+				logComponentKey, playbackLogValueV3,
+				"playback_session_id", session.ID,
+				"previous_plan_id", record.CurrentPlanID,
+				"plan_id", result.Plan.PlanID,
+				"delivery", result.Plan.Delivery,
+				"credential_refreshed", credentialRefreshed,
+			)
+		} else {
+			var transportErr *transportErrorV3
+			transportRequest := r
+			if proxyOriginRecovery {
+				policy := h.playbackRoutingPolicyForContextV3(r.Context())
+				policy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+				policy.RemuxEgress = config.PlaybackEgressAPIOnly
+				policy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
+				transportRequest = r.WithContext(withPlaybackRoutingPolicySnapshotV3(r.Context(), policy))
+			}
+			transport, transportErr = h.prepareTransportV3(transportRequest, session, effectiveFile, result, mode)
+			if transportErr != nil {
+				return playback.DecisionResponseV3{}, *record, nil, transportErr
+			}
+			applyTransportToneMapModeV3(&result, transport)
+			// Transport preparation can only attest the executor's tone-map
+			// mode; every other frozen identity field was validated above. Copy
+			// that one receipt into the already validated recipe instead of
+			// rerunning a fallible subtitle-identity freeze after authority
+			// publication.
+			artifactRecipe.ToneMapMode = result.ToneMapMode
 		}
-		applyTransportToneMapModeV3(&result, transport)
-		// Transport preparation can only attest the executor's tone-map mode;
-		// every other frozen identity field was validated above. Copy that one
-		// receipt into the already validated recipe instead of rerunning a
-		// fallible subtitle-identity freeze after authority publication.
-		artifactRecipe.ToneMapMode = result.ToneMapMode
 	}
 	result.Plan.Stream.URL = transport.url
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: playback.ServerFeaturesV3(), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
@@ -6022,7 +6317,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			event = playback.RouteEventRuntimeCorrectionSucceededV3
 			clientModel = start.ClientPlaybackContext.Device.Model
 		}
-		h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, PlanAttemptID: req.PlanAttemptID, PlanAttemptKey: playback.PlanAttemptKeyV3(*result.Plan, start.ClientPlaybackContext.Output.OutputContextID, nil), Event: event, FallbackReason: req.Failure.Classification, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: start.ClientPlaybackContext.Output.OutputContextID}, UserID: session.UserID, ProfileID: session.ProfileID, ClientName: session.ClientName, ClientVersion: session.ClientVersion, ClientBuild: session.ClientBuild, ClientChannel: session.ClientChannel, ClientModel: clientModel})
+		h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, PlanAttemptID: req.PlanAttemptID, PlanAttemptKey: playback.PlanAttemptKeyV3(*result.Plan, start.ClientPlaybackContext.Output.OutputContextID, nil), Event: event, FallbackReason: req.Failure.Classification, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: start.ClientPlaybackContext.Output.OutputContextID, Diagnostics: softwareDecodeRouteDiagnosticsV3(forceSoftwareDecode, session, decodeFailureSample, decodeFailureCount)}, UserID: session.UserID, ProfileID: session.ProfileID, ClientName: session.ClientName, ClientVersion: session.ClientVersion, ClientBuild: session.ClientBuild, ClientChannel: session.ClientChannel, ClientModel: clientModel})
 	}
 	transport.rollback = func() {
 		originalRollback()
@@ -6039,6 +6334,28 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	}
 	reservationHandedOff = true
 	return response, updated, &transport, nil
+}
+
+// softwareDecodeRouteDiagnosticsV3 records the reactive software-decode
+// fallback and the decoder evidence on the durable plan-selected route event.
+// It returns nil for an ordinary replan so the event shape is unchanged.
+func softwareDecodeRouteDiagnosticsV3(force bool, session *playback.Session, sample string, count int) map[string]string {
+	if !force {
+		return nil
+	}
+	diagnostics := map[string]string{
+		"software_video_decode": "true",
+		"decode_failure_count":  strconv.Itoa(count),
+	}
+	if session != nil {
+		if hw := strings.TrimSpace(session.TranscodeHWAccel); hw != "" {
+			diagnostics["hw_accel"] = hw
+		}
+	}
+	if strings.TrimSpace(sample) != "" {
+		diagnostics["decode_failure_sample"] = sample
+	}
+	return diagnostics
 }
 
 // applyTransportToneMapModeV3 records an executor fallback in the result before
@@ -6104,6 +6421,12 @@ func (h *PlaybackHandler) freezeExecutableRecipeV3(_ context.Context, file *mode
 		recipe.SourceVideoProfile = sourceMetadata.VideoProfile
 		recipe.SourceVideoBitDepth = sourceMetadata.VideoBitDepth
 		recipe.SoftwareVideoDecode = sourceMetadata.SoftwareVideoDecode
+		if result.Plan != nil && result.Plan.EffectiveRecipe.SoftwareVideoDecode {
+			// The plan, not the source facts, is authoritative for a reactive
+			// software-decode retry: freeze the decode mode so a reconstruct
+			// cannot re-enable the hardware decoder that just failed.
+			recipe.SoftwareVideoDecode = true
+		}
 		recipe.SourceDurationSeconds = sourceMetadata.DurationSeconds
 		recipe.ToneMapDVConfigPresent = sourceMetadata.ToneMapDVConfigPresent
 		recipe.ToneMapDVBLCompatIDPresent = sourceMetadata.ToneMapDVBLCompatIDPresent
@@ -6392,12 +6715,16 @@ func isHLSDeliveryV3(delivery playback.DeliveryV3) bool {
 
 // reuseEligibleDeliveryV3 reports whether a delivery keeps a single addressable
 // stream window whose bytes do not change when a sidecar-only track switch
-// replans. HLS generations are keyed to the session, and a local progressive
-// remux is served lazily from /stream/{sessionID}, so both survive a subtitle
-// switch without a client remount. Direct HTTP is excluded: it is a fresh URL
-// per plan.
+// replans. HLS generations are keyed to the session, and both a local
+// progressive remux and a direct HTTP play are served lazily from
+// /stream/{sessionID}, so they survive a subtitle switch without a client
+// remount. Direct HTTP is included because its URL is transport-stable while
+// the route is unchanged: the only per-plan variation was the signed token,
+// which the reuse path preserves verbatim. The reused token still carries the
+// active plan's claims.
 func reuseEligibleDeliveryV3(delivery playback.DeliveryV3) bool {
-	return delivery == playback.DeliveryRemuxProgressiveV3 ||
+	return delivery == playback.DeliveryOriginalHTTPV3 ||
+		delivery == playback.DeliveryRemuxProgressiveV3 ||
 		delivery == playback.DeliveryRemuxHLSV3 ||
 		delivery == playback.DeliveryTranscodeHLSV3
 }
@@ -6475,7 +6802,116 @@ func sameEffectiveAVRecipeV3(left, right playback.EffectiveRecipeV3) bool {
 		optionalIntEqualV3(left.AudioChannels, right.AudioChannels) && left.AudioLayout == right.AudioLayout
 }
 
-// reusedHLSTransportV3 reconstructs transport facts for an existing HLS session.
+// reusedStreamCredentialRefreshMarginV3 is how much of a reused signed stream
+// credential's lifetime must remain before a transport may reuse it verbatim.
+// A credential closer to expiry is re-minted in place.
+const reusedStreamCredentialRefreshMarginV3 = time.Hour
+
+// authorizeReusedStreamCredentialV3 proves that the signed credential carried by
+// a reused stream URL still authorizes the live session and its resource, and
+// re-mints it in place when it is missing, mismatched, or close to expiry. It
+// exists because preserving record.CurrentPlan.Stream verbatim is only safe
+// while that credential remains valid: retiring the plan does not retire a
+// session-bound token, so the credential is bound to the session and the media
+// file, not to the plan. A credential that no longer proves that binding — or
+// that is about to expire — must be re-minted rather than reused.
+//
+// Only the st query parameter is re-signed; the URL path, its other query
+// parameters, and the session identity are untouched, so a sidecar-only replan
+// cannot force a remount. A URL with no st credential (header-authenticated
+// attempts, signing disabled, or a proxy path token) is returned unchanged:
+// there is no plan-scoped credential here to validate.
+//
+// The returned bool is whether the credential was re-minted. ok is false when
+// the URL's credential cannot be proven to authorize the resource and could not
+// be refreshed, in which case the caller must rebuild the transport.
+func (h *PlaybackHandler) authorizeReusedStreamCredentialV3(session *playback.Session, stream *playback.StreamV3) (refreshed bool, ok bool) {
+	if h == nil || session == nil || stream == nil {
+		return false, false
+	}
+	token := streamTokenFromURLV3(stream.URL)
+	if token == "" || h.JWTSecret == "" {
+		// No signed credential to validate. Header-authenticated attempts
+		// deliberately publish a credential-free URL, and an empty signing
+		// secret cannot mint or verify one; both preserve the URL byte-for-byte.
+		return false, true
+	}
+	if claims, err := streamtoken.Verify(token, h.JWTSecret); err == nil && claims.SessionID == session.ID &&
+		(session.MediaFileID == 0 || claims.MediaFileID == session.MediaFileID) {
+		if claims.ExpiresAt != nil && time.Until(claims.ExpiresAt.Time) > reusedStreamCredentialRefreshMarginV3 {
+			return false, true
+		}
+		// A verified, correctly bound credential that is close to expiry is
+		// re-signed from its own claims, so a transcode recipe is preserved
+		// exactly rather than rebuilt from session identity.
+		if fresh, signErr := streamtoken.Sign(*claims, h.JWTSecret, playback.MaxTokenTTL); signErr == nil && fresh != "" {
+			stream.URL = setStreamTokenV3(stream.URL, fresh)
+			return true, true
+		}
+	}
+	// The credential could not be verified, was bound to another resource, or
+	// could not be re-signed from its own claims. A session whose identity
+	// recipe the server can reconstruct without the token gets a fresh
+	// credential; anything else must rebuild.
+	card, identityReconstructable := h.identityReconstructableCardV3(session)
+	if !identityReconstructable {
+		return false, false
+	}
+	fresh := h.signSessionToken(card, false)
+	if fresh == "" {
+		return false, false
+	}
+	stream.URL = setStreamTokenV3(stream.URL, fresh)
+	return true, true
+}
+
+// identityReconstructableCardV3 reports whether a session's stream credential
+// can be re-minted from its own identity, and returns that card. Only direct
+// and remux sessions can: a transcode session's recipe lives in the token, not
+// in the Session, so it must keep the verified claims it was issued with.
+func (h *PlaybackHandler) identityReconstructableCardV3(session *playback.Session) (playback.RecipeCard, bool) {
+	if session == nil {
+		return playback.RecipeCard{}, false
+	}
+	switch session.PlayMethod {
+	case playback.PlayDirect, playback.PlayRemux:
+		return identityRecipeCard(session), true
+	default:
+		return playback.RecipeCard{}, false
+	}
+}
+
+// streamTokenFromURLV3 extracts the native signed-credential query parameter
+// from a stream URL. An absent or unparseable URL yields "".
+func streamTokenFromURLV3(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Query().Get(streamTokenParam)
+}
+
+// setStreamTokenV3 replaces a stream URL's signed-credential query parameter,
+// preserving every other query parameter and the URL path.
+func setStreamTokenV3(rawURL, token string) string {
+	if token == "" {
+		return rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return appendStreamToken(rawURL, token)
+	}
+	query := parsed.Query()
+	query.Set(streamTokenParam, token)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+// reusedHLSTransportV3 reconstructs transport facts for an existing HLS or
+// identity (direct-play/progressive-remux) session.
 func reusedHLSTransportV3(session *playback.Session, streamURL string) preparedTransportV3 {
 	transport := preparedTransportV3{url: streamURL}
 	if session != nil {
@@ -6537,6 +6973,15 @@ func (h *PlaybackHandler) hasActiveReusableTransportV3(session *playback.Session
 		// facts are its active-transport evidence; remote/proxy progressive
 		// already returned above via TranscodeNodeURL.
 		return session.RoutingWorkload == string(noderouting.WorkloadRemux) && session.RoutingExecution != ""
+	}
+	if delivery == playback.DeliveryOriginalHTTPV3 {
+		// Direct HTTP is likewise served from the live session by
+		// /stream/{sessionID} and holds no transcode-manager session, so the
+		// checks above do not cover it: direct play stores any egress proxy in
+		// RoutingEgressNodeURL, never TranscodeNodeURL. Committed routing facts
+		// are the active-transport evidence. An uncommitted or reconstructed-old
+		// session has an empty execution and must rebuild.
+		return session.RoutingWorkload == string(noderouting.WorkloadDirectPlay) && session.RoutingExecution != ""
 	}
 	return false
 }
@@ -7242,6 +7687,68 @@ func failureRecoveryAbandonedDeliveryV3(operation playback.ReplanOperationV3, fa
 	return transportFailureClassificationsV3[failureClassificationKeyV3(failureClassification)]
 }
 
+// planHasVideoEncodeV3 reports whether a plan carries a real video encode.
+// Only such a plan has a decode-mode dimension: a copy/remux route cannot
+// recover from a decoder failure by changing decode mode.
+func planHasVideoEncodeV3(plan playback.PlanV3) bool {
+	for _, transformation := range plan.Transformations {
+		if transformation.Name == playback.TransformationVideoToH264V3 {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeFailureClassificationV3 reports whether a client failure classification
+// indicts the video decoder specifically. Only these defer delivery demotion
+// for a pending software-decode variant; other transport failures demote as
+// before.
+func decodeFailureClassificationV3(classification string) bool {
+	switch failureClassificationKeyV3(classification) {
+	case "decoder_failure", "decode_error":
+		return true
+	default:
+		return false
+	}
+}
+
+// softwareDecodeVariantPendingV3 reports whether the failed plan still has an
+// untried software-decode variant of the same server-transcode HLS delivery.
+// When one is pending, a transport failure must not demote the whole delivery:
+// the decoded error indicts the hardware decoder, not the route. A delivery
+// with no decode-mode dimension has no such variant and demotes as before.
+func softwareDecodeVariantPendingV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) bool {
+	if record == nil || record.CurrentPlan.Delivery != playback.DeliveryTranscodeHLSV3 {
+		return false
+	}
+	if record.CurrentPlan.EffectiveRecipe.SoftwareVideoDecode || !planHasVideoEncodeV3(record.CurrentPlan) {
+		return false
+	}
+	softwarePlan := record.CurrentPlan
+	softwarePlan.EffectiveRecipe.SoftwareVideoDecode = true
+	// The durable plan key is always computed with no local mutations (see
+	// finalizePlanIdentityV3); a software variant that already became the
+	// current plan carries that same key, so compare against it directly.
+	key := playback.PlanAttemptKeyV3(softwarePlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	attempted := append([]string(nil), req.AttemptedPlanKeys...)
+	if !containsStringExactV3(attempted, req.PlanAttemptKey) {
+		attempted = append(attempted, req.PlanAttemptKey)
+	}
+	return !containsStringExactV3(attempted, key)
+}
+
+// softwareDecodeRetryPendingV3 reports whether a decode failure on the current
+// plan should defer delivery demotion for a software-decode retry. It requires
+// both the structural variant and the live decoder verdict, so a remote or
+// undetected decode failure still demotes as before.
+func (h *PlaybackHandler) softwareDecodeRetryPendingV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) bool {
+	if !softwareDecodeVariantPendingV3(record, req) {
+		return false
+	}
+	ts := h.tm.GetTranscodeSession(record.SessionID)
+	return ts != nil && ts.IsDecodeFailed()
+}
+
 // demoteDeliveryCapabilityV3 disables one delivery class in the context's
 // capability payload and clears its validated claims (the DV base-layer
 // fallback among them), so the planner cannot reselect the delivery for the
@@ -7272,6 +7779,10 @@ func demoteDeliveryCapabilityV3(request *playback.StartRequestV3, delivery playb
 // from a delivery the client itself advertised as unsupported (also
 // Enabled=false). Only the marker form is re-applied across replans.
 const demoteDeliveryReasonV3 = "transport_failed_demoted_by_server"
+
+// degradationSoftwareDecodeFallbackV3 marks a plan that deliberately switched
+// to CPU video decoding after the hardware decoder rejected the source.
+const degradationSoftwareDecodeFallbackV3 = "software_decode_fallback"
 
 // demotedDeliveryClassesV3 lists the delivery classes the durable request
 // demotes (server-side demotion marker written by a previous failure

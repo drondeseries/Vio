@@ -132,28 +132,201 @@ func TestStreamExtractArgs_TextCodecIsWindowed(t *testing.T) {
 	}
 }
 
-// ASS and PGS streams are fetched once and consumed whole by their
-// client-side renderers, so by default seek/duration windowing must never
-// apply even when the handler passes nonzero values.
-func TestStreamExtractArgs_WholeTrackCodecsIgnoreWindow(t *testing.T) {
-	for _, codec := range []string{"ass", "hdmv_pgs_subtitle"} {
+// PGS streams are fetched once and consumed whole by their client-side
+// renderers, so by default seek/duration windowing must never apply even when
+// the handler passes nonzero values. (ASS is windowed only when the caller
+// supplies a position; see TestStreamExtractArgs_WindowedASS.)
+func TestStreamExtractArgs_WholeTrackPGSIgnoresWindow(t *testing.T) {
+	codec := "hdmv_pgs_subtitle"
+	args := streamExtractArgs(StreamExtractOpts{
+		InputPath:       "/media/movie.mkv",
+		TrackIndex:      0,
+		SourceCodec:     codec,
+		SeekSeconds:     120,
+		DurationSeconds: 600,
+	})
+
+	if slices.Contains(args, "-ss") {
+		t.Errorf("%s extract must not seek the input: %v", codec, args)
+	}
+	if slices.Contains(args, "-to") {
+		t.Errorf("%s extract must not cap the read duration: %v", codec, args)
+	}
+	if !slices.Contains(args, "copy") {
+		t.Errorf("%s extract must copy the source stream: %v", codec, args)
+	}
+}
+
+// A caller-supplied position makes ASS windowable: the input is seeked with
+// -ss, the output capped with -to at the absolute window end, and -copyts
+// keeps events on the source timeline. The ASS muxer re-emits the script
+// header (styles) from the container extradata on every extraction, so each
+// window is a self-contained script and the client's JASSUB timeOffset stays
+// correct.
+func TestStreamExtractArgs_WindowedASS(t *testing.T) {
+	args := streamExtractArgs(StreamExtractOpts{
+		InputPath:       "/media/movie.mkv",
+		TrackIndex:      1,
+		SourceCodec:     "ass",
+		SeekSeconds:     120,
+		DurationSeconds: 600,
+	})
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-ss 120.000") {
+		t.Fatalf("windowed ASS extract should seek the input: %s", joined)
+	}
+	ssIdx := slices.Index(args, "-ss")
+	inIdx := slices.Index(args, "-i")
+	if ssIdx < 0 || inIdx < 0 || ssIdx > inIdx {
+		t.Fatalf("-ss must be an input option (before -i): %s", joined)
+	}
+	if !strings.Contains(joined, "-to 720.000") {
+		t.Fatalf("windowed ASS extract should cap to the absolute window end: %s", joined)
+	}
+	if !strings.Contains(joined, "-copyts") || !strings.Contains(joined, "-avoid_negative_ts disabled") {
+		t.Fatalf("windowed ASS extract must preserve absolute source timestamps: %s", joined)
+	}
+	if !strings.Contains(joined, "-c:s copy") || !strings.Contains(joined, "-f ass pipe:1") {
+		t.Fatalf("windowed ASS extract should still copy the ass stream: %s", joined)
+	}
+}
+
+// Absent a position, ASS keeps today's whole-track behavior byte-for-byte,
+// so native clients that fetch the complete script once are unaffected even
+// when a duration is present.
+func TestStreamExtractArgs_ASSWithoutPositionIgnoresWindow(t *testing.T) {
+	args := streamExtractArgs(StreamExtractOpts{
+		InputPath:       "/media/movie.mkv",
+		TrackIndex:      0,
+		SourceCodec:     "ass",
+		DurationSeconds: 600,
+	})
+
+	if slices.Contains(args, "-ss") || slices.Contains(args, "-to") {
+		t.Fatalf("duration-only ASS extract must not window: %v", args)
+	}
+	baseline := streamExtractArgs(StreamExtractOpts{
+		InputPath:   "/media/movie.mkv",
+		TrackIndex:  0,
+		SourceCodec: "ass",
+	})
+	if !slices.Equal(args, baseline) {
+		t.Fatalf("no-window ASS args changed:\n got %v\nwant %v", args, baseline)
+	}
+}
+
+// Explicit position=0 is a valid window start, not a whole-track fetch.
+// streamExtractArgs must emit `-ss 0`, `-copyts`, and `-to <duration>` so a
+// client that opens at position 0 with a duration gets bounded output on the
+// source timeline instead of a full-file demux.
+func TestStreamExtractArgs_ExplicitZeroWindowRequested(t *testing.T) {
+	for _, codec := range []string{"ass", "subrip"} {
 		args := streamExtractArgs(StreamExtractOpts{
 			InputPath:       "/media/movie.mkv",
 			TrackIndex:      0,
 			SourceCodec:     codec,
-			SeekSeconds:     120,
+			WindowRequested: true,
+			SeekSeconds:     0,
 			DurationSeconds: 600,
 		})
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "-ss 0.000") {
+			t.Fatalf("%s explicit-zero window must seek to 0: %s", codec, joined)
+		}
+		if !strings.Contains(joined, "-to 600.000") {
+			t.Fatalf("%s explicit-zero window must cap at the window end: %s", codec, joined)
+		}
+		if !strings.Contains(joined, "-copyts") {
+			t.Fatalf("%s explicit-zero window must preserve absolute timestamps: %s", codec, joined)
+		}
+	}
+}
 
-		if slices.Contains(args, "-ss") {
-			t.Errorf("%s extract must not seek the input: %v", codec, args)
+// WindowRequested is the gate for ASS, not DurationSeconds: a legacy direct
+// caller that supplies only a duration (no window intent) keeps whole-track
+// output.
+func TestStreamExtractArgs_ASSWithoutWindowIntentIgnoresDuration(t *testing.T) {
+	args := streamExtractArgs(StreamExtractOpts{
+		InputPath:       "/media/movie.mkv",
+		SourceCodec:     "ass",
+		DurationSeconds: 600,
+	})
+	if slices.Contains(args, "-ss") || slices.Contains(args, "-to") {
+		t.Fatalf("window intent absent: ASS must stay whole-track: %v", args)
+	}
+}
+
+// Explicit position=0 must produce a genuinely bounded extract, not a
+// whole-track demux: absolute cue timestamps and the ASS script header must
+// survive, and the output must be smaller than the whole script because the
+// late cue is outside the window. Argument assertions alone cannot prove the
+// bound, so this drives the real ffmpeg binary.
+//
+//nolint:misspell // the ASS event keyword is spelled "Dialogue:".
+func TestStreamExtractSubtitleExplicitZeroWindowBounded(t *testing.T) {
+	bin, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg is required to verify explicit-zero windowing")
+	}
+	source := filepath.Join(t.TempDir(), "captions.ass")
+	const fixture = `[Script Info]
+Title: Window test
+ScriptType: v4.00+
+PlayResX: 384
+PlayResY: 288
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,16,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Early cue
+Dialogue: 0,0:11:00.00,0:11:02.00,Default,,0,0,0,,Late cue
+`
+	if err := os.WriteFile(source, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	extract := func(windowed bool) string {
+		t.Helper()
+		var output bytes.Buffer
+		opts := StreamExtractOpts{
+			InputPath:       source,
+			SourceCodec:     "ass",
+			WindowRequested: windowed,
+			DurationSeconds: 600,
+			FFmpegPath:      bin,
+			Writer:          &output,
 		}
-		if slices.Contains(args, "-to") {
-			t.Errorf("%s extract must not cap the read duration: %v", codec, args)
+		if err := StreamExtractSubtitle(t.Context(), opts); err != nil {
+			t.Fatal(err)
 		}
-		if !slices.Contains(args, "copy") {
-			t.Errorf("%s extract must copy the source stream: %v", codec, args)
-		}
+		return output.String()
+	}
+
+	whole := extract(false)
+	windowed := extract(true)
+
+	if !strings.Contains(whole, "Late cue") {
+		t.Fatalf("whole-track extract must include the late cue: %q", whole)
+	}
+	if strings.Contains(windowed, "Late cue") {
+		t.Fatalf("explicit-zero window must exclude the cue at 11:00: %q", windowed)
+	}
+	if !strings.Contains(windowed, "Early cue") {
+		t.Fatalf("explicit-zero window must retain the in-window cue: %q", windowed)
+	}
+	if !strings.Contains(windowed, "0:00:01.00,0:00:03.00") {
+		t.Fatalf("window must preserve absolute source timestamps, got %q", windowed)
+	}
+	if !strings.Contains(windowed, "[Script Info]") || !strings.Contains(windowed, "[V4+ Styles]") {
+		t.Fatalf("window must retain the ASS script header/styles, got %q", windowed)
+	}
+	if len(windowed) >= len(whole) {
+		t.Fatalf("explicit-zero window output (%d bytes) must be smaller than the whole script (%d bytes)",
+			len(windowed), len(whole))
 	}
 }
 
@@ -232,23 +405,22 @@ func TestStreamExtractArgs_ExtractedSupInput(t *testing.T) {
 	}
 }
 
-// AllowWindow must not truncate the script consumed by an ASS renderer that
-// fetches the complete event timeline once.
-func TestStreamExtractArgs_ASSIgnoresAllowWindow(t *testing.T) {
+// AllowWindow is a PGS-only opt-in: it must not by itself window ASS. ASS
+// windows exactly when the caller supplies a position (SeekSeconds > 0).
+func TestStreamExtractArgs_ASSWindowDrivenByPositionNotAllowWindow(t *testing.T) {
 	args := streamExtractArgs(StreamExtractOpts{
 		InputPath:       "/media/movie.mkv",
 		TrackIndex:      0,
 		SourceCodec:     "ass",
-		SeekSeconds:     120,
 		DurationSeconds: 600,
 		AllowWindow:     true,
 	})
 
 	if slices.Contains(args, "-ss") {
-		t.Errorf("ass extract must not seek the input even with AllowWindow: %v", args)
+		t.Errorf("AllowWindow alone must not seek ASS: %v", args)
 	}
 	if slices.Contains(args, "-to") {
-		t.Errorf("ass extract must not cap the read duration even with AllowWindow: %v", args)
+		t.Errorf("AllowWindow alone must not cap ASS: %v", args)
 	}
 }
 

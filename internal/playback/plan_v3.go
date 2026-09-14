@@ -72,6 +72,16 @@ type PlannerInputV3 struct {
 	Now                 time.Time
 	AttemptedKeys       []string
 	AdditionalSubtitles []SubtitleInventoryEntryV3
+	// ForceSoftwareVideoDecode asks the planner to mark the resulting
+	// server-transcode plan as a software-decode variant. It is set only by
+	// reactive failure recovery after the live hardware decoder rejected the
+	// source, so the plan identity and frozen recipe carry the decode mode and
+	// a restart cannot put the failing hardware decoder back.
+	ForceSoftwareVideoDecode bool
+	// DecodeAttemptDetail is a diagnostic line naming the decode modes already
+	// attempted when the planner exhausts a server-transcode route after a
+	// decoder failure. It is surfaced on the terminal so `detail` is not empty.
+	DecodeAttemptDetail string
 }
 
 // SourceExecutionMetadataV3 is the immutable source probe snapshot used to
@@ -988,6 +998,10 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	plan.Stream = StreamV3{Protocol: StreamHLSV3, Container: "hls", MIMEType: "application/vnd.apple.mpegurl", Headers: map[string]string{}, HeaderRefresh: HeaderRefreshNoneV3}
 	plan.EffectiveRecipe.VideoCodec = "h264"
 	plan.EffectiveRecipe.AudioCodec = "aac"
+	// A reactive software-decode retry is a distinct route from the hardware
+	// plan it replaces. The flag is frozen into the recipe so restarts and
+	// later seek reanchors keep decoding on the CPU.
+	plan.EffectiveRecipe.SoftwareVideoDecode = base.EffectiveRecipe.SoftwareVideoDecode || input.ForceSoftwareVideoDecode
 	plan.EffectiveRecipe.Width = intPointerV3(quality.Width)
 	plan.EffectiveRecipe.Height = intPointerV3(quality.Height)
 	plan.EffectiveRecipe.BitrateKbps = intPointerV3(quality.BitrateKbps)
@@ -1043,6 +1057,9 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	}
 	finalizePlanIdentityV3(&plan, input.Request.PlaybackAttemptID, input.Request.ClientPlaybackContext.Output.OutputContextID)
 	if planAttemptedV3(plan, input.Request.ClientPlaybackContext.Output.OutputContextID, input.AttemptedKeys) {
+		if input.DecodeAttemptDetail != "" {
+			return terminalPlannerResultV3WithDetail("adaptation_exhausted", "All compatible playback recipes have already failed for this output route.", input.DecodeAttemptDetail, false)
+		}
 		return terminalPlannerResultV3("adaptation_exhausted", "All compatible playback recipes have already failed for this output route.", false)
 	}
 	return PlannerResultV3{Plan: &plan, PlayMethod: PlayTranscode, TranscodeAudio: true, TargetVideoCodec: "h264", TargetAudioCodec: "aac", SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, true), TargetAudioChannels: targetAudioChannels, TargetResolution: quality.Label, TargetBitrateKbps: quality.BitrateKbps, SubtitleTrackIndex: subtitle.SelectedIndex, SubtitleTransportTrackIndex: subtitle.TransportIndex, SubtitleBurnIn: subtitle.RequiresBurn, SubtitleCodec: subtitle.Codec, DownloadedSubtitleID: subtitle.DownloadedSubtitleID, ToneMapPolicy: toneMapPolicy, ToneMapMode: toneMapMode, ToneMapSourceKind: toneMapSourceKind, ToneMapRecipeVersion: toneMapRecipeVersionV3(toneMapOK), ToneMapPreflightRequired: toneMapResolution.PreflightRequired, ToneMapSourceRevision: toneMapRevision}

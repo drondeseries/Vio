@@ -526,6 +526,47 @@ describe("VideoPlayer plan failure recovery", () => {
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
     expect(toastError).toHaveBeenCalledOnce();
   });
+
+  it("does not re-request an unresolved sidecar selection on every plan", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    const sidecarTrack: PlayerSubtitleInfo = {
+      index: 2,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:2",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/2.vtt",
+    };
+    const planA = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:aaa",
+      plan_attempt_key: "v3:aaa",
+    });
+    const { rerenderPlayer } = renderPlayer({
+      plan: planA,
+      subtitleUrls: [sidecarTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+      onSubtitleTrackChange,
+    });
+
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1));
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(2, 0);
+
+    // The server resolved the selection to `off`/absent, so the UI identity is
+    // still outstanding. A replan that only mints a new plan id must not send
+    // the same request again; the guard holds until the plan acknowledges it.
+    const planB = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:bbb",
+      plan_attempt_key: "v3:bbb",
+    });
+    rerenderPlayer({ plan: planB });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(2));
+    expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("VideoPlayer intro skip prompt", () => {
@@ -1282,24 +1323,44 @@ describe("VideoPlayer translation handoff", () => {
     }
   });
 
-  it("refreshes the subtitle inventory once per plan_id on a source-changed signal", async () => {
+  it("refreshes the subtitle inventory once per source generation on a source-changed signal", async () => {
     const onRefreshSubtitles = vi.fn();
-    const planA = fixturePlanV3({ plan_id: "plan:aaa", plan_attempt_key: "v3:aaa" });
+    const planA = fixturePlanV3({
+      plan_id: "plan:aaa",
+      plan_attempt_key: "v3:aaa",
+      effective_virtual_uri: "virtual://release/a.mkv",
+    });
     const { rerenderPlayer } = renderPlayer({ plan: planA, onRefreshSubtitles });
     expect(subtitleHooks.vttSourceChanged).toBeTypeOf("function");
     expect(subtitleHooks.assSourceChanged).toBeTypeOf("function");
 
     // The VTT window fetch and the ASS fetch can both see the rotation; both
-    // signals for the same plan must collapse into a single refresh.
+    // signals for the same source must collapse into a single refresh.
     act(() => subtitleHooks.vttSourceChanged?.());
     act(() => subtitleHooks.assSourceChanged?.());
     expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
 
-    // A new plan (the refresh's own replan re-mints the URLs) re-arms the
-    // signal: the next rotation for it refreshes again.
-    const planB = fixturePlanV3({ plan_id: "plan:bbb", plan_attempt_key: "v3:bbb" });
+    // The refresh's own replan mints a new plan id but the source identity is
+    // unchanged: it must NOT re-arm the signal and restart the cycle.
+    const planB = fixturePlanV3({
+      plan_id: "plan:bbb",
+      plan_attempt_key: "v3:bbb",
+      effective_virtual_uri: "virtual://release/a.mkv",
+    });
     rerenderPlayer({ plan: planB });
     act(() => subtitleHooks.vttSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
+
+    // A genuine source change (a new resolved candidate) re-arms it exactly
+    // once more.
+    const planC = fixturePlanV3({
+      plan_id: "plan:ccc",
+      plan_attempt_key: "v3:ccc",
+      effective_virtual_uri: "virtual://release/b.mkv",
+    });
+    rerenderPlayer({ plan: planC });
+    act(() => subtitleHooks.vttSourceChanged?.());
+    act(() => subtitleHooks.assSourceChanged?.());
     expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
   });
 
@@ -1964,5 +2025,89 @@ describe("VideoPlayer version switch UX", () => {
     });
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+  });
+
+  it("selects descriptor-identical track_id-less subtitles independently", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    const trackA: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "embedded",
+      url: "/stream/session-1/subtitles/0.vtt?file_id=7&embedded_stream_index=0",
+    };
+    const trackB: PlayerSubtitleInfo = {
+      ...trackA,
+      index: 1,
+      url: "/stream/session-1/subtitles/1.vtt?file_id=7&embedded_stream_index=1",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [trackA, trackB],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+      onSubtitleTrackChange,
+    });
+
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledWith(0, expect.anything()));
+    const callsAfterAutoSelect = onSubtitleTrackChange.mock.calls.length;
+
+    // The server acknowledges the auto-selection by ordinal. Its inventory
+    // carries no `track_id`, so the descriptor tuple alone cannot tell the two
+    // streams apart; only the embedded stream index can.
+    const acknowledgedPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:ack-identityless",
+      plan_attempt_key: "v3:ack-identityless",
+      subtitle: {
+        mode: "render",
+        inventory: [
+          {
+            track_id: "",
+            combined_index: 0,
+            source: "embedded",
+            codec: "srt",
+            language: "en",
+            label: "English",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=7&embedded_stream_index=0",
+          },
+          {
+            track_id: "",
+            combined_index: 1,
+            source: "embedded",
+            codec: "srt",
+            language: "en",
+            label: "English",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/1.vtt?file_id=7&embedded_stream_index=1",
+          },
+        ],
+      },
+      selected_tracks: {
+        audio: { id: "file:7:audio:0", index: 0 },
+        subtitle: { id: "", index: 0 },
+      },
+    });
+    rerenderPlayer({ plan: acknowledgedPlan, planRevision: 2 });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    // Picking the sibling must send its own request instead of being swallowed
+    // as "the plan already has this descriptor".
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+    await waitFor(() =>
+      expect(onSubtitleTrackChange.mock.calls.length).toBeGreaterThan(callsAfterAutoSelect),
+    );
+    expect(onSubtitleTrackChange).toHaveBeenLastCalledWith(1, expect.anything());
   });
 });

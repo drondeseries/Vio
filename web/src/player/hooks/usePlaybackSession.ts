@@ -250,6 +250,13 @@ function isSameAVTransport(prev: PlanV3 | null, next: PlanV3): boolean {
   if (prev.selected_tracks.audio?.index !== next.selected_tracks.audio?.index) return false;
   if (prev.timeline.stream_origin_seconds !== next.timeline.stream_origin_seconds) return false;
   if (prev.timeline.can_seek_anywhere !== next.timeline.can_seek_anywhere) return false;
+  // A text-sidecar selection (or a `track_change` that re-mints the same
+  // sidecar URLs) does not change the produced A/V bytes, so it must not bump
+  // the transport revision. Only a burn-in route changes the picture, and only
+  // it makes the selected subtitle track part of the transport identity. The
+  // server reuses the active transport for a sidecar-only replan, so the URL
+  // compared above stays identical; if it did not, that URL change is a real
+  // transport change and must reload the element.
   if (prev.subtitle.mode === "burn_in" || next.subtitle.mode === "burn_in") {
     if (prev.subtitle.mode !== next.subtitle.mode) return false;
     if (prev.subtitle.track_id !== next.subtitle.track_id) return false;

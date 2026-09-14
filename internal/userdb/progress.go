@@ -622,6 +622,160 @@ func ListProgressSince(db *sql.DB, profileID string, cursor int64, limit int) ([
 	return results, next, nil
 }
 
+// ListNextUpStatePage reads one Next Up state page for a profile, newest
+// first. See userstore.NextUpStateStore for the full contract.
+//
+// Rows come from watch_progress; hidden_history_items hides a row when its
+// hidden_before watermark is at or after the row's updated_at (inclusive), so a
+// row is excluded when `updated_at <= hidden_before`. The order and keyset are
+// (updated_at DESC, media_item_id DESC), matching the Postgres provider, which
+// is safe because SQLite stores updated_at as RFC3339 UTC text whose lexical
+// order is chronological order.
+//
+// Index: the profile_id equality seeks idx_watch_progress_profile_completed_updated
+// (profile_id, completed, updated_at DESC); because that index interleaves the
+// two completed values and lacks media_item_id, the global
+// (updated_at DESC, media_item_id DESC) order needs a temp B-tree sort over the
+// profile's matching rows. An index whose key order exactly matches this page
+// would need a migration and is deferred past this phase. The hidden-history
+// NOT EXISTS probe uses the hidden_history_items (profile_id, media_item_id)
+// primary key.
+func ListNextUpStatePage(ctx context.Context, db *sql.DB, profileID string, cursor *userstore.NextUpStateCursor, limit int) (userstore.NextUpStatePage, error) {
+	if limit <= 0 {
+		return userstore.NextUpStatePage{}, userstore.ErrNextUpStateInvalidLimit
+	}
+	if err := ctx.Err(); err != nil {
+		return userstore.NextUpStatePage{}, err
+	}
+
+	query := `
+		SELECT wp.media_item_id, wp.completed, wp.position_seconds, wp.updated_at
+		FROM watch_progress wp
+		WHERE wp.profile_id = ?
+		  AND (wp.completed = 1 OR wp.position_seconds > 0)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM hidden_history_items hhi
+			WHERE hhi.profile_id = wp.profile_id
+			  AND hhi.media_item_id = wp.media_item_id
+			  AND hhi.hidden_before >= wp.updated_at
+		  )`
+	args := []any{profileID}
+	if cursor != nil {
+		query += `
+		  AND (wp.updated_at < ? OR (wp.updated_at = ? AND wp.media_item_id < ?))`
+		updatedAt := cursor.UpdatedAt.UTC().Format(time.RFC3339)
+		args = append(args, updatedAt, updatedAt, cursor.MediaItemID)
+	}
+	query += `
+		ORDER BY wp.updated_at DESC, wp.media_item_id DESC
+		LIMIT ?`
+	args = append(args, limit+1)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return userstore.NextUpStatePage{}, fmt.Errorf("listing next up state page: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	entries := make([]userstore.NextUpStateEntry, 0, limit+1)
+	for rows.Next() {
+		var entry userstore.NextUpStateEntry
+		var updatedAt string
+		if err := rows.Scan(&entry.MediaItemID, &entry.Completed, &entry.Position, &updatedAt); err != nil {
+			return userstore.NextUpStatePage{}, fmt.Errorf("scanning next up state row: %w", err)
+		}
+		parsed, err := time.Parse(time.RFC3339, updatedAt)
+		if err != nil {
+			return userstore.NextUpStatePage{}, fmt.Errorf("parsing next up state updated_at %q: %w", updatedAt, err)
+		}
+		entry.UpdatedAt = parsed.UTC()
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return userstore.NextUpStatePage{}, fmt.Errorf("iterating next up state rows: %w", err)
+	}
+	// A cancellation that lands after the last row was scanned must surface as
+	// the context error, never as a short page the caller would treat as
+	// authoritative.
+	if err := ctx.Err(); err != nil {
+		return userstore.NextUpStatePage{}, err
+	}
+
+	return userstore.NextUpStatePageFromEntries(entries, limit), nil
+}
+
+// ListNextUpStateForItems returns the exact Next Up state rows for the given
+// media item ids, scoped to one profile. See userstore.NextUpStateStore for the
+// full contract.
+//
+// Unlike ListNextUpStatePage there is no keyset and no sort: the caller already
+// chose the items, and order is unspecified. Empty input short-circuits before
+// touching the database.
+//
+// Index: the watch_progress (profile_id, media_item_id) primary key serves the
+// id equality list, and the hidden_history_items (profile_id, media_item_id)
+// primary key serves the hidden NOT EXISTS probe.
+func ListNextUpStateForItems(ctx context.Context, db *sql.DB, profileID string, mediaItemIDs []string) ([]userstore.NextUpStateEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(mediaItemIDs) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(mediaItemIDs))
+	args := make([]any, 0, len(mediaItemIDs)+1)
+	args = append(args, profileID)
+	for i, mediaItemID := range mediaItemIDs {
+		placeholders[i] = "?"
+		args = append(args, mediaItemID)
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT wp.media_item_id, wp.completed, wp.position_seconds, wp.updated_at
+		FROM watch_progress wp
+		WHERE wp.profile_id = ?
+		  AND wp.media_item_id IN (`+strings.Join(placeholders, ",")+`)
+		  AND (wp.completed = 1 OR wp.position_seconds > 0)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM hidden_history_items hhi
+			WHERE hhi.profile_id = wp.profile_id
+			  AND hhi.media_item_id = wp.media_item_id
+			  AND hhi.hidden_before >= wp.updated_at
+		  )`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing next up state for items: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	entries := make([]userstore.NextUpStateEntry, 0, len(mediaItemIDs))
+	for rows.Next() {
+		var entry userstore.NextUpStateEntry
+		var updatedAt string
+		if err := rows.Scan(&entry.MediaItemID, &entry.Completed, &entry.Position, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scanning next up state item row: %w", err)
+		}
+		parsed, err := time.Parse(time.RFC3339, updatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parsing next up state item updated_at %q: %w", updatedAt, err)
+		}
+		entry.UpdatedAt = parsed.UTC()
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating next up state item rows: %w", err)
+	}
+	// A cancellation that lands after the last row was scanned must surface as
+	// the context error, never as a short result the caller would treat as exact.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	return entries, nil
+}
+
 func ListProgressByMediaItems(db *sql.DB, profileID string, mediaItemIDs []string) (map[string]WatchProgress, error) {
 	result := make(map[string]WatchProgress, len(mediaItemIDs))
 	if len(mediaItemIDs) == 0 {
