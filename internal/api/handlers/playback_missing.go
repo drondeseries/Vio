@@ -107,7 +107,7 @@ func preflightPlaybackFile(
 	}
 
 	lower := strings.ToLower(file.FilePath)
-	if strings.HasPrefix(lower, "virtual://") {
+	if strings.HasPrefix(lower, "aiostreams://") || strings.HasPrefix(lower, "virtual://") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
 		return nil
 	}
 
@@ -124,7 +124,7 @@ func preflightPlaybackFile(
 
 func resolveVirtualMediaPath(ctx context.Context, resolver VirtualMediaResolver, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
 	lower := strings.ToLower(path)
-	if !strings.HasPrefix(lower, "virtual://") {
+	if !strings.HasPrefix(lower, "aiostreams://") && !strings.HasPrefix(lower, "virtual://") {
 		return path, nil
 	}
 	if resolver == nil {

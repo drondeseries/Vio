@@ -23,7 +23,6 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/telemetry"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -70,6 +69,7 @@ type BucketConfig struct {
 
 // Client wraps an AWS SDK v2 S3 client configured for a specific bucket.
 type Client struct {
+	role           string
 	s3Client       *s3.Client
 	presignClient  *s3.PresignClient
 	bucket         string
@@ -101,7 +101,7 @@ func NewClient(cfg BucketConfig) *Client {
 	role := telemetry.Role(cfg.Role)
 	s3Client := s3.New(s3.Options{
 		APIOptions:   []func(*middleware.Stack) error{observeS3(role)},
-		HTTPClient:   observedHTTPClient{inner: awshttp.NewBuildableClient(), role: role},
+		HTTPClient:   observedHTTPClient{inner: sharedHTTPClient(), role: role},
 		Region:       region,
 		BaseEndpoint: aws.String(cfg.Endpoint),
 		Credentials: credentials.NewStaticCredentialsProvider(
@@ -131,6 +131,7 @@ func NewClient(cfg BucketConfig) *Client {
 	keyPrefix := NormalizeKeyPrefix(cfg.KeyPrefix)
 
 	return &Client{
+		role:           role,
 		s3Client:       s3Client,
 		presignClient:  presignClient,
 		bucket:         cfg.Bucket,
@@ -489,7 +490,9 @@ func (c *Client) ObjectAvailable(ctx context.Context, bucket, key string) (bool,
 	}
 	req.Header.Set("Range", "bytes=0-0")
 
-	resp, err := http.DefaultClient.Do(req)
+	// The probe shares the S3 transport and its dial metrics: external
+	// delivery GETs are part of the same verifier burst as the storage HEADs.
+	resp, err := observedHTTPClient{inner: sharedDeliveryHTTPClient, role: c.role}.Do(req)
 	if err != nil {
 		// The underlying url.Error includes the signed URL, so do not wrap it:
 		// token-auth query values must never reach logs.

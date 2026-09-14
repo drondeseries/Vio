@@ -190,11 +190,19 @@ type VirtualPlaybackVariant struct {
 	OwnerInstallationID int
 }
 
-func isPGDeadlock(err error) bool {
+// isPGTransient reports Postgres errors that are safe to retry: deadlocks
+// (40P01), serialization failures (40001), and lock timeouts (55P03). The
+// purge sweep touches media_files/media_items/claims under concurrent
+// virtual reconcile writers, so all three surface here.
+func isPGTransient(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "40P01") || strings.Contains(strings.ToLower(err.Error()), "deadlock detected")
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+	return strings.Contains(msg, "40P01") || strings.Contains(lower, "deadlock detected") ||
+		strings.Contains(msg, "40001") || strings.Contains(lower, "could not serialize") ||
+		strings.Contains(msg, "55P03") || strings.Contains(lower, "lock timeout")
 }
 
 // VirtualPurgeOptions filters an administrative virtual-item purge. Zero
@@ -221,12 +229,12 @@ type VirtualPurgeResult struct {
 func (r *ItemRepository) PurgeVirtualPlaybackItems(ctx context.Context, opts VirtualPurgeOptions) (VirtualPurgeResult, error) {
 	var result VirtualPurgeResult
 	var err error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 5; attempt++ {
 		result, err = r.purgeVirtualPlaybackItemsOnce(ctx, opts)
-		if err == nil || !isPGDeadlock(err) {
+		if err == nil || !isPGTransient(err) {
 			return result, err
 		}
-		time.Sleep(time.Duration(150*(1<<attempt)) * time.Millisecond)
+		time.Sleep(time.Duration(200*(attempt+1)) * time.Millisecond)
 	}
 	return result, err
 }
@@ -241,6 +249,14 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 		return result, fmt.Errorf("begin virtual playback purge: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Exclusive purge barrier: writers hold this shared so concurrent
+	// upserts, registrations, and materializations proceed in parallel.
+	// The purge takes exclusive to block all of them while it deletes
+	// media_files (firing the episode_catalog_entries trigger).
+	if err := requestlock.LockPurgeBarrierExclusive(ctx, tx); err != nil {
+		return result, fmt.Errorf("lock purge barrier: %w", err)
+	}
 
 	if _, err := tx.Exec(ctx, `
 		CREATE TEMP TABLE purge_virtual_items ON COMMIT DROP AS
@@ -317,8 +333,14 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 		  )`, opts.LibraryID, opts.InstallationID); err != nil {
 		return result, fmt.Errorf("delete empty virtual source claims: %w", err)
 	}
-	fileResult, err := tx.Exec(ctx, `
-		DELETE FROM media_files mf
+	// Acquire the candidate file rows in deterministic PK order first.
+	// Postgres DELETE has no ORDER BY, so concurrent deleters would
+	// otherwise lock rows in scan order and can deadlock against each
+	// other (and against reconcile writers). Locking via an ordered
+	// SELECT ... FOR UPDATE makes every deleter take row locks in the
+	// same sequence; the DELETE below then re-locks rows already held.
+	if _, err := tx.Exec(ctx, `
+		SELECT 1 FROM media_files mf
 		WHERE (mf.container = 'virtual' OR mf.file_path LIKE 'virtual://%')
 		  AND ($1 = 0 OR mf.media_folder_id = $1)
 		  AND ($2 = 0 OR mf.virtual_owner_installation_id = $2
@@ -333,7 +355,28 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 		      WHERE remaining.content_id = COALESCE(NULLIF(mf.content_id, ''), (SELECT ep.series_id FROM episodes ep WHERE ep.content_id = mf.episode_id))
 		        AND remaining.media_folder_id = mf.media_folder_id
 		        AND remaining.file_path = mf.file_path
-		  ))`, opts.LibraryID, opts.InstallationID)
+		  ))
+		ORDER BY mf.id
+		FOR UPDATE`, opts.LibraryID, opts.InstallationID); err != nil {
+		return result, fmt.Errorf("lock virtual files: %w", err)
+	}
+	fileResult, err := tx.Exec(ctx, `
+		DELETE FROM media_files mf
+		WHERE (mf.container = 'virtual' OR mf.file_path LIKE 'virtual://%')
+		  AND ($1 = 0 OR mf.media_folder_id = $1)
+		  AND ($2 = 0 OR mf.virtual_owner_installation_id = $2
+		      OR (mf.virtual_owner_installation_id = 0 AND EXISTS (
+		          SELECT 1 FROM media_items mi
+		          LEFT JOIN episodes ep ON ep.content_id = mf.episode_id
+		          WHERE (mi.content_id = mf.content_id OR mi.content_id = ep.series_id)
+		            AND mi.virtual_owner_installation_id = $2
+		      )))
+	  AND ($2 = 0 OR NOT EXISTS (
+	      SELECT 1 FROM virtual_media_file_source_claims remaining
+	      WHERE remaining.content_id = COALESCE(NULLIF(mf.content_id, ''), (SELECT ep.series_id FROM episodes ep WHERE ep.content_id = mf.episode_id))
+	        AND remaining.media_folder_id = mf.media_folder_id
+	        AND remaining.file_path = mf.file_path
+	  ))`, opts.LibraryID, opts.InstallationID)
 	if err != nil {
 		return result, fmt.Errorf("delete virtual files: %w", err)
 	}
@@ -453,7 +496,7 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 	for _, stmt := range []string{
 		`DELETE FROM user_watch_progress p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM user_watch_history p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
-		`DELETE FROM playback_history_admin p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
+		`DELETE FROM admin_playback_history p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM user_history_hidden_items p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM user_favorites p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM user_ratings p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
@@ -1355,6 +1398,13 @@ func (r *ItemRepository) Upsert(ctx context.Context, item *models.MediaItem) err
 		return fmt.Errorf("begin media item upsert tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Shared purge barrier: allows concurrent writers but excludes them
+	// during the purge sweep. Protects against the AB-BA cycle where
+	// DELETE fires the episode_catalog_entries trigger while this
+	// transaction INSERTs into the same index.
+	if err := requestlock.LockPurgeBarrierShared(ctx, tx); err != nil {
+		return fmt.Errorf("lock purge barrier: %w", err)
+	}
 
 	if err := r.upsert(ctx, tx, item); err != nil {
 		return err
@@ -1917,6 +1967,12 @@ func (r *ItemRepository) EnsureVirtualCollectionItemMaterializedWithOptions(
 		return nil, fmt.Errorf("begin virtual item transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Shared purge barrier: allows concurrent writers but excludes them
+	// during the purge sweep. Taken before the per-item content lock so
+	// both sides order the shared lock first.
+	if err := requestlock.LockPurgeBarrierShared(ctx, tx); err != nil {
+		return nil, fmt.Errorf("lock purge barrier: %w", err)
+	}
 	opts.RequireMembership = true
 	result, err := r.ensureVirtualCollectionItemMaterializedTx(ctx, tx, collectionID, item, targetLibraryIDs, variants, opts)
 	if err != nil {

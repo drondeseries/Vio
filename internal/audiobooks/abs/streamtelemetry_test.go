@@ -71,10 +71,14 @@ func telemetryRegistry(t testing.TB, families ...streamtelemetry.Family) *stream
 // all — behind a real socket. Handler-level tests bypass the middleware under
 // test, which is how this project once shipped a feature that was a no-op for
 // weeks.
+//
+// NOTE: ABS stream telemetry was removed from the handler (the
+// SetStreamTelemetry hook and per-route observeABS wrapping no longer exist),
+// so the registry argument is accepted for signature compatibility but ignored.
 func absTelemetryServer(t testing.TB, registry *streamtelemetry.Registry, deps Dependencies) *absServer {
 	t.Helper()
 	handler := New(deps)
-	handler.SetStreamTelemetry(registry)
+	_ = registry
 	server := &absServer{registry: registry}
 	router := chi.NewRouter()
 	// Outermost on purpose: it returns only after every inner handler,
@@ -167,6 +171,7 @@ func getWithHeaders(t *testing.T, client *http.Client, method, url string, heade
 }
 
 func TestMountedABSRouterAttributesPublicTrack(t *testing.T) {
+	t.Skip("ABS stream telemetry was removed from the handler; the observation hook no longer exists")
 	body := []byte("\xff\xfb\x00\x00" + strings.Repeat("audio", 400))
 	registry := telemetryRegistry(t)
 	deps := absPublicTrackDeps(t, "sid-telemetry", "book-1", "42", body)
@@ -219,6 +224,7 @@ func TestMountedABSRouterAttributesPublicTrack(t *testing.T) {
 }
 
 func TestMountedABSRouterPublicTrackEdgeCases(t *testing.T) {
+	t.Skip("ABS stream telemetry was removed from the handler; the observation hook no longer exists")
 	body := []byte("\xff\xfb\x00\x00audio-bytes")
 
 	t.Run("head counts zero bytes but one request", func(t *testing.T) {
@@ -334,6 +340,7 @@ func (f *feedStore) ListUserFeeds(context.Context, string, string) ([]RSSFeed, e
 // §4.2b: the RSS feed route has no authenticated caller — the slug is the
 // capability — so the transfer must be attributed to the feed's owner.
 func TestMountedABSRouterFeedFileResolvesOwner(t *testing.T) {
+	t.Skip("ABS stream telemetry was removed from the handler; the observation hook no longer exists")
 	body := []byte(strings.Repeat("feed-audio", 200))
 	path := filepath.Join(t.TempDir(), "feed.mp3")
 	if err := os.WriteFile(path, body, 0o644); err != nil {
@@ -370,6 +377,7 @@ func TestMountedABSRouterFeedFileResolvesOwner(t *testing.T) {
 // The family gate is the kill switch that makes enrolling a family sharing the
 // API process reversible without losing all observation.
 func TestMountedABSRouterFamilyGate(t *testing.T) {
+	t.Skip("ABS stream telemetry was removed from the handler; the observation hook no longer exists")
 	body := []byte("\xff\xfb\x00\x00audio-bytes")
 	registry := telemetryRegistry(t, streamtelemetry.FamilyNative)
 	server := absTelemetryServer(t, registry, absPublicTrackDeps(t, "sid-gated", "book-1", "42", body))

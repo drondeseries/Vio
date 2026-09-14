@@ -3,7 +3,11 @@ import { usePlayerConfig } from "../context/PlayerConfigContext";
 import type { PlayerConfig } from "../context/PlayerConfigContext";
 import { startPlaybackV2 } from "../start-v2";
 import { hasSequencedProgress, stopSequencedSession } from "../session-mutations";
-import { describePlanTerminal, describePlaybackTransportError, type PlaybackPolicyErrorDescription } from "../playback-errors";
+import {
+  describePlanTerminal,
+  describePlaybackTransportError,
+  type PlaybackPolicyErrorDescription,
+} from "../playback-errors";
 import { useCodecDetection } from "./useCodecDetection";
 import {
   buildClientCapabilitiesV3,
