@@ -974,7 +974,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if result.File != nil && result.File.ID > 0 {
 				targetID = result.File.ID
 			}
-			h.persistVirtualMetadataBounded(r.Context(), targetID, result.File.FilePath, result.File)
+			h.persistVirtualMetadataBounded(r.Context(), targetID, result.File.FilePath, result.File, result.Provenance == ProbeProvenanceVerified)
 			// The filtered candidate list is already cached device-neutrally
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
@@ -1003,7 +1003,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if firstResolved.File != nil && firstResolved.File.ID > 0 {
 				targetID = firstResolved.File.ID
 			}
-			h.persistVirtualMetadataBounded(r.Context(), targetID, firstResolved.File.FilePath, firstResolved.File)
+			h.persistVirtualMetadataBounded(r.Context(), targetID, firstResolved.File.FilePath, firstResolved.File, true)
 		}
 		return *firstResolved, nil
 	}
@@ -1112,7 +1112,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 		probed.Duration = probeTransient.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	h.persistVirtualMetadataBounded(bgCtx, targetID, probeCand.URI, probed)
+	h.persistVirtualMetadataBounded(bgCtx, targetID, probeCand.URI, probed, true)
 }
 
 // revalidateVirtualCandidateBackground resolves the provider URL for a
@@ -1193,9 +1193,9 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 // probe gate can recognize the row as really probed and stop re-probing it on
 // every start. virtual_collection rows keep their existing stamp: that source
 // is owned by the collection registration path, not playback.
-const VirtualFileMetadataUpdateSQL = `UPDATE media_files SET video_tracks=$1::jsonb, audio_tracks=$2::jsonb, subtitle_tracks=$3::jsonb, resolution=NULLIF($4,''), codec_video=NULLIF($5,''), codec_audio=NULLIF($6,''), container=NULLIF($7,''), hdr=$8, bitrate=NULLIF($9,0), duration=CASE WHEN $10 > 0 THEN $10 ELSE duration END, audio_channels=COALESCE((SELECT (elem->>'channels')::int FROM jsonb_array_elements(CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END) elem LIMIT 1), audio_channels), probe_source=CASE WHEN media_files.probe_source='virtual_collection' THEN media_files.probe_source ELSE 'virtual' END, probe_updated_at=CASE WHEN media_files.probe_source='virtual_collection' THEN media_files.probe_updated_at ELSE now() END, updated_at=now() WHERE id=$11 AND (NULLIF($12, '') IS NULL OR file_path=$12)`
+const VirtualFileMetadataUpdateSQL = `UPDATE media_files SET video_tracks=$1::jsonb, audio_tracks=$2::jsonb, subtitle_tracks=$3::jsonb, resolution=NULLIF($4,''), codec_video=NULLIF($5,''), codec_audio=NULLIF($6,''), container=NULLIF($7,''), hdr=$8, bitrate=NULLIF($9,0), duration=CASE WHEN $10 > 0 THEN $10 ELSE duration END, audio_channels=COALESCE((SELECT (elem->>'channels')::int FROM jsonb_array_elements(CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END) elem LIMIT 1), audio_channels), probe_source=CASE WHEN media_files.probe_source='virtual_collection' OR NOT $13::boolean THEN media_files.probe_source ELSE 'virtual' END, probe_updated_at=CASE WHEN media_files.probe_source='virtual_collection' OR NOT $13::boolean THEN media_files.probe_updated_at ELSE now() END, updated_at=now() WHERE id=$11 AND (NULLIF($12, '') IS NULL OR file_path=$12) AND ($13::boolean OR media_files.probe_updated_at IS NULL)`
 
-func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, targetID int, expectedFilePath string, file *models.MediaFile) {
+func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, targetID int, expectedFilePath string, file *models.MediaFile, stampProbe bool) {
 	if h == nil || h.VirtualFileMetadataSaver == nil || file == nil || targetID <= 0 {
 		return
 	}
@@ -1206,7 +1206,7 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, tar
 	go func() {
 		persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer persistCancel()
-		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, expectedFilePath, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration); err != nil {
+		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, expectedFilePath, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration, stampProbe); err != nil {
 			slog.ErrorContext(persistCtx, "virtual metadata persist failed", "component", "api", "file_id", targetID, "error", err)
 		}
 	}()
@@ -1275,7 +1275,7 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 			// tracks (wrong audio languages, phantom subtitle tracks) while the
 			// stream serves the substitute's real ones.
 			if resolved.File != nil && resolved.Provenance == ProbeProvenanceVerified {
-				h.persistVirtualMetadataBounded(ctx, file.ID, stream.URI, resolved.File)
+				h.persistVirtualMetadataBounded(ctx, file.ID, stream.URI, resolved.File, true)
 			}
 			return resolved
 		}

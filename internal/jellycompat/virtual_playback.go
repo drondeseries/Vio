@@ -131,7 +131,7 @@ type VirtualCandidateFileLookup func(ctx context.Context, path, contentID, episo
 // jellycompat cannot import internal/api/handlers (that package imports
 // jellycompat), so cmd/silo binds this to handlers.VirtualFileMetadataUpdateSQL
 // and the UPDATE execution there.
-type VirtualFileMetadataSaver func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error
+type VirtualFileMetadataSaver func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error
 
 // RemoteStreamRelay is the credential-hiding, SSRF-protected transport shared
 // by direct delivery and FFmpeg inputs.
@@ -418,7 +418,7 @@ func (h *PlaybackHandler) persistCompatVirtualMetadata(ctx context.Context, file
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		targetID, expectedFilePath := h.compatVirtualPersistTarget(persistCtx, file, neutral, candidateURI)
-		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, expectedFilePath, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration); err != nil {
+		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, expectedFilePath, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration, true); err != nil {
 			slog.ErrorContext(persistCtx, "compat virtual metadata persist failed", "component", "jellycompat", "file_id", targetID, "error", err)
 		}
 	}()

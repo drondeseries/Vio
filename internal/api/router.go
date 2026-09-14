@@ -1301,7 +1301,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET file_path=$1, updated_at=now() WHERE id=$2`, newFilePath, fileID)
 				return err
 			}
-			playbackHandler.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error {
+			playbackHandler.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error {
 				vStr := string(videoTracks)
 				if vStr == "" || vStr == "null" {
 					vStr = "[]"
@@ -1314,7 +1314,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				if sStr == "" || sStr == "null" {
 					sStr = "[]"
 				}
-				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath)
+				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath, stampProbe)
 				return err
 			}
 		}

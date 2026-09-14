@@ -592,7 +592,7 @@ func TestFallbackResolveStaleVirtualSourcePersistsSubstituteMetadata(t *testing.
 			updatedPath = newFilePath
 			return nil
 		},
-		VirtualFileMetadataSaver: func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error {
+		VirtualFileMetadataSaver: func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error {
 			savedFileID = fileID
 			savedPath = expectedFilePath
 			savedAudio = append([]byte(nil), audioTracks...)

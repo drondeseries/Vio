@@ -193,7 +193,7 @@ type VirtualFileUpdateFunc func(ctx context.Context, fileID int, newFilePath str
 
 // VirtualFileMetadataSaver persists probed track inventory, duration, and codec/container
 // facts so subsequent v3 plans can use complete evidence without re-probing.
-type VirtualFileMetadataSaver func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error
+type VirtualFileMetadataSaver func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error
 
 // SubtitleSearchTrigger fires a background subtitle search when a virtual
 // stream enters playback without embedded or external subtitle tracks.

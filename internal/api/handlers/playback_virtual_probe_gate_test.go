@@ -86,7 +86,7 @@ func TestResolveProbesUnprobedVirtualRowDespiteCandidateDeclarations(t *testing.
 			f.Container = "mkv"
 			return f, nil
 		},
-		func(_ context.Context, _ int, _ string, videoTracks, audioTracks, subtitleTracks []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+		func(_ context.Context, _ int, _ string, videoTracks, audioTracks, subtitleTracks []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
 			savedVideo = videoTracks
 			savedAudio = audioTracks
 			savedSubs = subtitleTracks
@@ -218,6 +218,16 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 	}
 	if !strings.Contains(sql, "ELSE now() END") {
 		t.Fatalf("metadata update does not stamp probe_updated_at with now(): %s", sql)
+	}
+	// Declared (unprobed) persists must not stamp the row as probed: the
+	// stamp is gated on the $13 stampProbe flag.
+	if !strings.Contains(sql, "OR NOT $13::boolean") {
+		t.Fatalf("metadata update does not gate probe stamp on stampProbe flag: %s", sql)
+	}
+	// A delayed declared write must not overwrite a verified row that was
+	// stamped after the declared read.
+	if !strings.Contains(sql, "($13::boolean OR media_files.probe_updated_at IS NULL)") {
+		t.Fatalf("metadata update does not guard declared writes against verified rows: %s", sql)
 	}
 }
 
@@ -465,7 +475,7 @@ func TestNoProberBaselineDoesNotPersistAssumedMetadata(t *testing.T) {
 		}}, nil
 	})
 	var persisted bool
-	saver := func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+	saver := func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
 		persisted = true
 		return nil
 	}
@@ -908,7 +918,7 @@ func TestResolveVirtualOptimisticStartWithinDeliveryGrace(t *testing.T) {
 			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
 			return f, nil
 		},
-		VirtualFileMetadataSaver: func(_ context.Context, _ int, expectedFilePath string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+		VirtualFileMetadataSaver: func(_ context.Context, _ int, expectedFilePath string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
 			saverDone <- expectedFilePath
 			return nil
 		},
@@ -1333,7 +1343,7 @@ func TestDeclaredNoProberCandidateResolutionPersists(t *testing.T) {
 	})
 	var saverCalls int32
 	saverDone := make(chan struct{}, 1)
-	saver := func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+	saver := func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
 		atomic.AddInt32(&saverCalls, 1)
 		select {
 		case saverDone <- struct{}{}:

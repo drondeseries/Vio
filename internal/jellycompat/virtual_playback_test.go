@@ -1344,7 +1344,7 @@ func TestResolveAndProbeVirtualSourceProbesUnprobedRowAndPersists(t *testing.T) 
 			probed.SubtitleTracks = []models.SubtitleTrack{{Codec: "srt", Language: "eng"}}
 			return &probed, nil
 		},
-		VirtualFileMetadataSaver: func(_ context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+		VirtualFileMetadataSaver: func(_ context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
 			savedID = fileID
 			savedPath = expectedFilePath
 			savedVideo = string(videoTracks)
@@ -1436,7 +1436,7 @@ func TestResolveAndProbeVirtualSourcePersistsToCandidateRow(t *testing.T) {
 			lookupOwner = ownerInstallationID
 			return candidateRow, nil
 		},
-		VirtualFileMetadataSaver: func(_ context.Context, fileID int, expectedFilePath string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+		VirtualFileMetadataSaver: func(_ context.Context, fileID int, expectedFilePath string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
 			savedID = fileID
 			savedPath = expectedFilePath
 			close(saverDone)
@@ -1537,7 +1537,7 @@ func TestResolveAndProbeVirtualSourceFallsBackOnProbeError(t *testing.T) {
 		VirtualSourceProber: func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
 			return nil, errors.New("probe timed out")
 		},
-		VirtualFileMetadataSaver: func(context.Context, int, string, []byte, []byte, []byte, string, string, string, string, bool, int, int) error {
+		VirtualFileMetadataSaver: func(context.Context, int, string, []byte, []byte, []byte, string, string, string, string, bool, int, int, bool) error {
 			saverCalls++
 			return nil
 		},
