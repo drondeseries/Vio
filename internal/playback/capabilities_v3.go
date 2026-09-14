@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"unicode"
@@ -534,6 +535,16 @@ func normalizeBitrateKbpsV3(value int) int {
 	return value
 }
 
+// parseWxHResolution parses a "WIDTHxHEIGHT" resolution string.
+func parseWxHResolution(value string) (int, int, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var w, h int
+	if _, err := fmt.Sscanf(value, "%dx%d", &w, &h); err == nil && w > 0 && h > 0 && w <= 32768 && h <= 32768 {
+		return w, h, true
+	}
+	return 0, 0, false
+}
+
 func dimensionsFromResolutionV3(value string) (int, int) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "4320p", "8k":
@@ -547,6 +558,9 @@ func dimensionsFromResolutionV3(value string) (int, int) {
 	case "480p", "sd":
 		return 854, 480
 	default:
+		if w, h, ok := parseWxHResolution(value); ok {
+			return w, h
+		}
 		return 0, 0
 	}
 }

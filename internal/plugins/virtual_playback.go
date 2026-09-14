@@ -1283,11 +1283,18 @@ func streamsFromVirtualResult(virtualPath string, result *pluginv1.VirtualStream
 		if candidate.GetExpiresAt() != nil && candidate.GetExpiresAt().IsValid() {
 			exp = candidate.GetExpiresAt().AsTime()
 		}
+		resolution := candidate.GetResolution().GetLabel()
+		if resolution == "" {
+			w, h := candidate.GetResolution().GetWidth(), candidate.GetResolution().GetHeight()
+			if w > 0 && h > 0 {
+				resolution = fmt.Sprintf("%dx%d", w, h)
+			}
+		}
 		streams = append(streams, VirtualPlaybackStream{
 			ID:                  candidate.GetCandidateId(),
 			Label:               label,
 			URI:                 virtualCandidateURI(virtualPath, candidate.GetCandidateId()),
-			Resolution:          candidate.GetResolution().GetLabel(),
+			Resolution:          resolution,
 			CodecVideo:          candidate.GetVideoCodec(),
 			CodecAudio:          candidate.GetAudioCodec(),
 			HasAtmos:            candidate.GetHasAtmos(),

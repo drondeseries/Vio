@@ -1562,6 +1562,9 @@ func resolutionHeightV3(v string) int {
 	if strings.EqualFold(v, "4k") {
 		return 2160
 	}
+	if _, h, ok := parseWxHResolution(v); ok {
+		return h
+	}
 	return value
 }
 func resolutionLabelV3(h int) string {

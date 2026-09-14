@@ -98,7 +98,7 @@ export async function prefetchVirtualPlayback(
   fileIds: number[],
   options?: RequestInit,
 ): Promise<void> {
-  await api<void>("/playback/prefetch", {
+  await api("/playback/prefetch", {
     ...options,
     method: "POST",
     headers: { "Content-Type": "application/json", ...(options?.headers ?? {}) },

@@ -110,7 +110,7 @@ type theatricalReleaseGate struct {
 	// identity set including provider-table matches. Used by the prefilter
 	// to ensure override decisions see every known alias.
 	canonicalFullIDs func(ctx context.Context, tmdbID int, imdbID string) (string, []ReleaseIdentity, error)
-	canonicalIDs func(ctx context.Context, tmdbID int, imdbID string) (int, string, error)
+	canonicalIDs     func(ctx context.Context, tmdbID int, imdbID string) (int, string, error)
 }
 
 func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker, overrides ...ReleaseOverrideLookup) *theatricalReleaseGate {
