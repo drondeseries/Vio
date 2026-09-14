@@ -113,7 +113,7 @@ func StartBackgroundOrphanCleanup(component, dir string, cleanup func() (int, er
 }
 
 // StartPeriodicOrphanCleanup runs an immediate background sweep and then repeats
-// it every interval until ctx is cancelled. The startup sweep only reclaims dirs
+// it every interval until ctx is canceled. The startup sweep only reclaims dirs
 // orphaned by an ungraceful prior shutdown; the periodic re-run additionally
 // bounds "untracked orphan" accumulation (a dir whose owning session was dropped
 // without its RemoveAll succeeding) on a process that stays up for weeks. When

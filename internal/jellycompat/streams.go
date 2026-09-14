@@ -287,7 +287,7 @@ func compatSourceHasSurroundAudio(source PlaybackMediaSource) bool {
 func compatRecipeMatchesSource(recipe *playback.RecipeCard, source PlaybackMediaSource) bool {
 	return recipe != nil &&
 		recipe.MediaFileID == source.FileID &&
-		recipe.AudioTrackIndex == compatAudioTrackIndexOrDefault(source) &&
+		recipe.AudioTrackIndex == compatAudioOrdinalOrDefault(source) &&
 		recipe.SourceAudioChannels == compatHLSRecipeSourceAudioChannels(source) &&
 		recipe.CopyVideoMPEGTS == source.HLSRemuxMPEGTS
 }
@@ -351,6 +351,8 @@ var errAudioDownmixCapabilityUnavailable = errors.New("audio downmix capability 
 // moved on. The client may retry through the master route, which builds and
 // persists a fresh recipe from the frozen source.
 var errCompatRecipeSourceMismatch = errors.New("transcode recipe does not match the selected media source")
+
+var errVirtualPrepUnavailable = errors.New("virtual playback preparation failed")
 
 // errCompatHLSRemuxAudioUnsupported prevents an audio-copy playlist from
 // switching to a track the negotiated device profile cannot carry in fMP4.
@@ -431,6 +433,10 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 		playSession, source, err = h.createStaticPlaySession(r.Context(), session, routeID, mediaSourceID, clientPlaySessionID)
 	}
 	if err != nil {
+		if errors.Is(err, errVirtualPrepUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+			return
+		}
 		writeError(w, http.StatusNotFound, "NotFound", "Playback session not found")
 		return
 	}
@@ -455,15 +461,6 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 	}
 	attachCompatStream(r.Context(), session, playSession, source.FileID)
 
-	playSession, err = h.ensureUpstreamPlayback(r.Context(), session, playSession.ID, *source, method)
-	if err != nil {
-		writeCompatUpstreamError(w, err)
-		return
-	}
-	// The attach above is a no-op on the first request of a session, which has
-	// no upstream id yet. Now it does, and no byte has been written.
-	attachCompatStream(r.Context(), session, playSession, source.FileID)
-
 	if h.fileResolver == nil {
 		writeError(w, http.StatusInternalServerError, "ServerError", "File resolver not available")
 		return
@@ -474,12 +471,158 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Fallback binding for unpinned or partially reconstructed virtual sources
+	// before upstream playback starts so the session and reconstruction card
+	// capture the provider-neutral identity.
+	if isCompatVirtualSource(*source) || isCompatVirtualFile(file) {
+		if source.VirtualSourceURI == "" {
+			if isCompatVirtualPath(source.Version.FilePath) || strings.EqualFold(strings.TrimSpace(source.Version.Container), "virtual") {
+				prepared, vURI, vOwner, prepErr := h.prepareVirtualPlaybackVersion(r.Context(), session, source.Version)
+				if prepErr != nil {
+					slog.WarnContext(r.Context(), "jellycompat fallback virtual resolution failed", "component", "jellycompat",
+						"file_id", source.FileID, "error", prepErr)
+					writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+					return
+				}
+				if vURI != "" {
+					source.Version = prepared
+					source.VirtualSourceURI = vURI
+					source.VirtualSourceOwnerInstallationID = vOwner
+					if updateErr := h.playbackStore.Update(playSession.ID, func(ps *PlaybackSession) error {
+						for i := range ps.MediaSources {
+							if ps.MediaSources[i].FileID == source.FileID {
+								ps.MediaSources[i].Version = prepared
+								ps.MediaSources[i].VirtualSourceURI = vURI
+								ps.MediaSources[i].VirtualSourceOwnerInstallationID = vOwner
+							}
+						}
+						return nil
+					}); updateErr != nil {
+						slog.WarnContext(r.Context(), "failed to persist repaired virtual source to playback store", "component", "jellycompat",
+							"session_id", playSession.ID, "error", updateErr)
+						writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to persist playback session state")
+						return
+					}
+				}
+			} else if isCompatVirtualFile(file) {
+				resolved, prepErr := h.resolveAndProbeVirtualSource(r.Context(), file, session.StreamAppUserID, session.ProfileID)
+				if prepErr != nil {
+					slog.WarnContext(r.Context(), "jellycompat fallback virtual file resolution failed", "component", "jellycompat",
+						"file_id", source.FileID, "error", prepErr)
+					writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+					return
+				}
+				if resolved.uri != "" {
+					prepared := applyVirtualProbeToVersion(source.Version, resolved.file)
+					source.Version = prepared
+					source.VirtualSourceURI = resolved.uri
+					source.VirtualSourceOwnerInstallationID = resolved.ownerID
+					if updateErr := h.playbackStore.Update(playSession.ID, func(ps *PlaybackSession) error {
+						for i := range ps.MediaSources {
+							if ps.MediaSources[i].FileID == source.FileID {
+								ps.MediaSources[i].Version = prepared
+								ps.MediaSources[i].VirtualSourceURI = resolved.uri
+								ps.MediaSources[i].VirtualSourceOwnerInstallationID = resolved.ownerID
+							}
+						}
+						return nil
+					}); updateErr != nil {
+						slog.WarnContext(r.Context(), "failed to persist repaired virtual source to playback store", "component", "jellycompat",
+							"session_id", playSession.ID, "error", updateErr)
+						writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to persist playback session state")
+						return
+					}
+				}
+			}
+		}
+	}
+
+	playSession, err = h.ensureUpstreamPlayback(r.Context(), session, playSession.ID, *source, method)
+	if err != nil {
+		writeCompatUpstreamError(w, err)
+		return
+	}
+	// The attach above is a no-op on the first request of a session, which has
+	// no upstream id yet. Now it does, and no byte has been written.
+	attachCompatStream(r.Context(), session, playSession, source.FileID)
+
 	seekSeconds := seekSecondsFromTicks(r.URL.Query().Get("StartTimeTicks"))
 	if d := float64(source.Version.Duration); d > 0 && seekSeconds > d {
 		seekSeconds = d
 	}
+
+	// Mark an in-flight media transport, mirroring the native stream handler:
+	// a long-lived direct-play, proxy, or remux range transfer emits no progress
+	// reports, and without the transport marker stale cleanup reaps the session
+	// mid-stream.
+	if h.sessionMgr != nil && playSession.UpstreamSessionID != "" {
+		if err := h.sessionMgr.BeginTransport(playSession.UpstreamSessionID); err == nil {
+			upstreamSessionID := playSession.UpstreamSessionID
+			defer func() {
+				_ = h.sessionMgr.EndTransport(upstreamSessionID)
+			}()
+		}
+	}
+
+	// A virtual source is served through the SSRF-protected relay (direct proxy)
+	// or remuxed using the relay loopback input (for audio/container adaptation).
+	// We never open raw virtual:// paths locally.
+	if isCompatVirtualSource(*source) || isCompatVirtualFile(file) {
+		switch method {
+		case "remux":
+			audioTrackIndex := -1
+			if resolvedAudioTrackIndex, ok := compatAudioOrdinal(*source); ok {
+				audioTrackIndex = resolvedAudioTrackIndex
+			}
+			sourceAudioChannels := 0
+			if source.TranscodeAudio {
+				sourceAudioChannels = compatSourceAudioChannels(*source)
+				if sourceAudioChannels > 0 {
+					if capabilityErr := h.requireLocalAudioDownmixCapability(r.Context(), sourceAudioChannels); capabilityErr != nil {
+						h.teardownPlaySession(context.WithoutCancel(r.Context()), playSession, nil, nil)
+						writeCompatTranscodeError(w, capabilityErr)
+						return
+					}
+				}
+			}
+			inputPath, releaseInput, regErr := h.registerVirtualInput(r.Context(), session, *source, false)
+			if regErr != nil {
+				h.teardownPlaySession(context.WithoutCancel(r.Context()), playSession, nil, nil)
+				writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to resolve virtual playback source for remux")
+				return
+			}
+			defer releaseInput()
+
+			vFile := virtualMediaFileForSource(file, *source)
+			_ = playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, source.TranscodeAudio, audioTrackIndex, vFile.PrimaryDVProfile(), playback.RemuxServeOptions{
+				ContentType:         playback.RemuxContentType(vFile.IsAudioOnly()),
+				AudioOnly:           vFile.IsAudioOnly(),
+				FFmpegPath:          h.FFmpegPath,
+				SourceAudioChannels: sourceAudioChannels,
+			})
+			return
+
+		default:
+			if streamErr := h.serveVirtualDirect(w, r, session, *source); streamErr != nil {
+				// A provider resolution or relay failure means playback cannot be
+				// constructed here; report it as a 502 PlaybackUnavailable rather
+				// than a misleading per-file 404.
+				h.teardownPlaySession(context.WithoutCancel(r.Context()), playSession, nil, nil)
+				writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to stream virtual playback source")
+			}
+			return
+		}
+	}
+
 	requiresAudioBoost := method == string(playback.PlayRemux) && source.TranscodeAudio && compatSourceAudioChannels(*source) > 0
 	routingPolicy := h.playbackRoutingPolicy()
+	if isCompatVirtualSource(*source) {
+		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.VideoTranscodeExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
+	}
 	decision := h.resolveCompatIdentityRouteWithPolicy(r.Context(), playSession.UpstreamSessionID, method, source.Version.Bitrate, requiresAudioBoost, routingPolicy)
 	if !decision.Selected() {
 		h.teardownPlaySession(context.WithoutCancel(r.Context()), playSession, nil, nil)
@@ -541,22 +684,10 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Mark an in-flight media transport, mirroring the native stream handler:
-	// a long-lived direct-play range transfer emits no progress reports, and
-	// without the transport marker stale cleanup reaps the session mid-stream.
-	if h.sessionMgr != nil && playSession.UpstreamSessionID != "" {
-		if err := h.sessionMgr.BeginTransport(playSession.UpstreamSessionID); err == nil {
-			upstreamSessionID := playSession.UpstreamSessionID
-			defer func() {
-				_ = h.sessionMgr.EndTransport(upstreamSessionID)
-			}()
-		}
-	}
-
 	switch method {
 	case "remux":
 		audioTrackIndex := -1
-		if resolvedAudioTrackIndex, ok := compatAudioTrackIndex(*source); ok {
+		if resolvedAudioTrackIndex, ok := compatAudioOrdinal(*source); ok {
 			audioTrackIndex = resolvedAudioTrackIndex
 		}
 		sourceAudioChannels := 0
@@ -609,6 +740,21 @@ func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	var virtualSourceURI string
+	var virtualOwnerID int
+	if source := h.boundVirtualDownloadSource(session, newCaseInsensitiveQuery(r.URL.Query()).Get("PlaySessionId"), version.FileID, firstNonEmpty(r.URL.Query().Get("mediaSourceId"), r.URL.Query().Get("MediaSourceId"))); source != nil {
+		version = source.Version
+		virtualSourceURI = source.VirtualSourceURI
+		virtualOwnerID = source.VirtualSourceOwnerInstallationID
+	} else if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
+		var prepareErr error
+		version, virtualSourceURI, virtualOwnerID, prepareErr = h.prepareVirtualPlaybackVersion(r.Context(), session, version)
+		if prepareErr != nil {
+			writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to resolve virtual playback")
+			return
+		}
+	}
+
 	if h.fileResolver == nil {
 		writeError(w, http.StatusInternalServerError, "ServerError", "File resolver not available")
 		return
@@ -618,9 +764,46 @@ func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "NotFound", "Media file not found")
 		return
 	}
-	// §4.2b: a download has a user but no stable playback session, so it is a
-	// Transfer rather than a logical session.
-	attachCompatTransfer(r.Context(), session, version.FileID)
+
+	if virtualSourceURI != "" {
+		source := PlaybackMediaSource{
+			FileID: version.FileID, Version: version,
+			VirtualSourceURI:                 virtualSourceURI,
+			VirtualSourceOwnerInstallationID: virtualOwnerID,
+		}
+		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(virtualDownloadName(version)))
+		if streamErr := h.serveVirtualDirect(w, r, session, source); streamErr != nil {
+			writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to stream virtual playback")
+		}
+		return
+	}
+
+	if isCompatVirtualFile(file) || isCompatVirtualPath(version.FilePath) {
+		playSessionID := firstNonEmpty(r.URL.Query().Get("PlaySessionId"), r.URL.Query().Get("playSessionId"))
+		mediaSourceID := firstNonEmpty(r.URL.Query().Get("MediaSourceId"), r.URL.Query().Get("mediaSourceId"))
+		boundSource := h.boundVirtualDownloadSource(session, playSessionID, version.FileID, mediaSourceID)
+		var source PlaybackMediaSource
+		if boundSource != nil {
+			source = *boundSource
+		} else {
+			resolved, err := h.resolveAndProbeVirtualSource(r.Context(), file, session.StreamAppUserID, session.ProfileID)
+			if err != nil {
+				writeCompatUpstreamError(w, err)
+				return
+			}
+			source = PlaybackMediaSource{
+				FileID:                           version.FileID,
+				Version:                          applyVirtualProbeToVersion(version, resolved.file),
+				VirtualSourceURI:                 resolved.uri,
+				VirtualSourceOwnerInstallationID: resolved.ownerID,
+			}
+		}
+		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(virtualDownloadName(source.Version)))
+		if err := h.serveVirtualDirect(w, r, session, source); err != nil {
+			writeCompatUpstreamError(w, err)
+		}
+		return
+	}
 
 	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(filepath.Base(file.FilePath)))
 	_ = playback.ServeDirectPlay(w, r, file.FilePath)
@@ -698,6 +881,13 @@ func (h *PlaybackHandler) HandleMasterManifest(w http.ResponseWriter, r *http.Re
 	localRouteSelected := false
 	localRoutingWorkload := noderouting.Workload("")
 	routingPolicy := h.playbackRoutingPolicy()
+	if isCompatVirtualSource(*source) {
+		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.VideoTranscodeExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
+	}
 	var lastPreparationErr error
 	for attempts := 0; attempts < 32; attempts++ {
 		decision, routeErr := h.resolveCompatHLSRouteWithPolicy(r.Context(), upstreamSession, file, *source, requiredToneMapMode, excludedNodes, excludedShapes, routingPolicy)
@@ -1755,7 +1945,9 @@ func (h *PlaybackHandler) cleanupPlaySession(
 	upstreamSession *playback.Session,
 	transcodeNodeURL string,
 ) {
-	h.tm.CloseTranscodeSession(playSession.UpstreamSessionID, transcodeNodeURL)
+	if h.tm != nil {
+		h.tm.CloseTranscodeSession(playSession.UpstreamSessionID, transcodeNodeURL)
+	}
 	if h.sessionMgr != nil {
 		_ = h.sessionMgr.StopSession(playSession.UpstreamSessionID)
 	}
@@ -2130,7 +2322,7 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 				"error", selectionErr,
 			)
 		} else if updatedSource != nil {
-			if resolvedAudioTrackIndex, ok := compatAudioTrackIndex(*updatedSource); ok {
+			if resolvedAudioTrackIndex, ok := compatAudioOrdinal(*updatedSource); ok {
 				audioTrackIndex = resolvedAudioTrackIndex
 			}
 			audioRestarted = restarted
@@ -2221,7 +2413,7 @@ func (h *PlaybackHandler) upstreamRecipeCard(ps *PlaybackSession, cs *Session, s
 	if ps != nil && ps.Recipe != nil {
 		card = *ps.Recipe
 	} else if method == "remux" {
-		card = playback.NewRemuxRecipeCard(ps.UpstreamSessionID, cs.StreamAppUserID, cs.ProfileID, source.FileID, source.TranscodeAudio, compatAudioTrackIndexOrDefault(source))
+		card = playback.NewRemuxRecipeCard(ps.UpstreamSessionID, cs.StreamAppUserID, cs.ProfileID, source.FileID, source.TranscodeAudio, compatAudioOrdinalOrDefault(source))
 		if source.TranscodeAudio {
 			card.SourceAudioChannels = compatSourceAudioChannels(source)
 		}
@@ -2230,6 +2422,10 @@ func (h *PlaybackHandler) upstreamRecipeCard(ps *PlaybackSession, cs *Session, s
 	}
 	if ps != nil && !ps.CreatedAt.IsZero() {
 		card.OriginalStartedAt = ps.CreatedAt
+	}
+	if isCompatVirtualSource(source) {
+		card.InputPath = source.VirtualSourceURI
+		card.VirtualSourceOwnerInstallationID = source.VirtualSourceOwnerInstallationID
 	}
 	if ps != nil && ps.RoutingAssignment != nil {
 		card.RoutingWorkload = ps.RoutingAssignment.Workload
@@ -2402,6 +2598,20 @@ func (h *PlaybackHandler) ensureUpstreamPlayback(ctx context.Context, compatSess
 	if err != nil {
 		return nil, err
 	}
+	if isCompatVirtualSource(source) {
+		setter, ok := h.sessionMgr.(virtualSourceSetter)
+		if !ok {
+			_ = h.sessionMgr.StopSession(session.ID)
+			return nil, errors.New("session manager cannot bind a virtual playback source")
+		}
+		if err := setter.SetVirtualSource(session.ID, source.VirtualSourceURI, source.VirtualSourceOwnerInstallationID); err != nil {
+			_ = h.sessionMgr.StopSession(session.ID)
+			return nil, fmt.Errorf("bind virtual playback source: %w", err)
+		}
+		if rebound, getErr := h.sessionMgr.GetSession(session.ID); getErr == nil && rebound != nil {
+			session = rebound
+		}
+	}
 	_ = h.syncUpstreamAudioSelection(&PlaybackSession{
 		UpstreamSessionID:  session.ID,
 		UpstreamPlayMethod: method,
@@ -2517,7 +2727,7 @@ func (h *PlaybackHandler) ensureTranscodeSessionWithToneMapMode(
 	requiredToneMapMode tonemap.Mode,
 ) (*playback.TranscodeSession, error) {
 	sourceAudioChannels := compatHLSRecipeSourceAudioChannels(source)
-	audioTrackIndex := compatAudioTrackIndexOrDefault(source)
+	audioTrackIndex := compatAudioOrdinalOrDefault(source)
 	if existing := h.tm.GetTranscodeSession(upstreamSessionID); existing != nil && compatTranscodeSessionUsesToneMapMode(existing, requiredToneMapMode) {
 		if compatLiveTranscodeMatchesAudioSource(existing, source) {
 			return existing, nil
@@ -2789,7 +2999,7 @@ func compatLiveTranscodeMatchesAudioSource(transcodeSession *playback.TranscodeS
 		return false
 	}
 	opts := transcodeSession.Opts()
-	return opts.AudioTrackIndex == compatAudioTrackIndexOrDefault(source) &&
+	return opts.AudioTrackIndex == compatAudioOrdinalOrDefault(source) &&
 		opts.SourceAudioChannels == compatHLSRecipeSourceAudioChannels(source) &&
 		opts.CopyVideoMPEGTS == source.HLSRemuxMPEGTS
 }
@@ -3029,7 +3239,7 @@ func (h *PlaybackHandler) syncUpstreamAudioSelection(playSession *PlaybackSessio
 	if h.sessionMgr == nil || playSession == nil || playSession.UpstreamSessionID == "" {
 		return nil
 	}
-	audioTrackIndex, ok := compatAudioTrackIndex(source)
+	audioTrackIndex, ok := compatAudioOrdinal(source)
 	if !ok {
 		return nil
 	}
@@ -3050,7 +3260,7 @@ func (h *PlaybackHandler) restartCompatTranscodeForAudioSelection(
 		return false, nil
 	}
 
-	audioTrackIndex, ok := compatAudioTrackIndex(source)
+	audioTrackIndex, ok := compatAudioOrdinal(source)
 	if !ok {
 		return false, nil
 	}
@@ -3145,9 +3355,30 @@ func (h *PlaybackHandler) createStaticPlaySession(ctx context.Context, session *
 	playSessionID := h.codec.EncodeStringID(EncodedIDPlaySession, uuidNewString())
 	sources := make([]PlaybackMediaSource, 0, len(detail.Versions))
 	allow4KTranscode := h.allow4KVideoTranscode(ctx)
+	hadVirtualPrepErr := false
 	for _, version := range detail.Versions {
-		source := h.buildPlaybackSource(routeID, playSessionID, version, DeviceProfile{}, playbackInfoRequest{}, allow4KTranscode)
+		prepared := version
+		virtualURI := ""
+		virtualOwnerID := 0
+		if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
+			var prepErr error
+			prepared, virtualURI, virtualOwnerID, prepErr = h.prepareVirtualPlaybackVersion(ctx, session, version)
+			if prepErr != nil {
+				hadVirtualPrepErr = true
+				slog.WarnContext(ctx, "jellycompat static virtual source resolution failed", "component", "jellycompat",
+					"file_id", version.FileID, "error", prepErr)
+				continue
+			}
+		}
+		source := h.buildPlaybackSourceWithVirtual(routeID, playSessionID, prepared, DeviceProfile{}, playbackInfoRequest{}, allow4KTranscode, virtualURI, virtualOwnerID)
 		sources = append(sources, source)
+	}
+
+	if len(sources) == 0 {
+		if hadVirtualPrepErr {
+			return nil, nil, errVirtualPrepUnavailable
+		}
+		return nil, nil, ErrSessionNotFound
 	}
 
 	ps := &PlaybackSession{

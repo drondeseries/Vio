@@ -48,6 +48,7 @@ const mocks = vi.hoisted(() => {
     useSimilarItems: vi.fn(),
     useAuth: vi.fn(),
     useCurrentProfile: vi.fn(),
+    useVersionLiveness: vi.fn(),
     startPlayback: vi.fn(),
   };
 });
@@ -95,6 +96,12 @@ vi.mock("@/hooks/queries/qualityPreference", () => ({
   // The resolution cap comes from the settings contract; these tests render
   // without a QueryClient, so the hook stands in for the resolved answer.
   useQualityPreference: (fallback?: string | null) => fallback ?? null,
+}));
+
+vi.mock("@/hooks/queries/versionLiveness", () => ({
+  // These tests render without a QueryClient; the liveness check is a no-op
+  // that leaves item metadata untouched.
+  useVersionLiveness: (...args: unknown[]) => mocks.useVersionLiveness(...args),
 }));
 
 vi.mock("@/hooks/useCurrentProfile", () => ({
@@ -253,6 +260,8 @@ describe("MovieContent", () => {
     mocks.useSimilarItems.mockReturnValue({ data: { items: [] }, isLoading: false });
     mocks.useAuth.mockReturnValue({ user: null });
     mocks.useCurrentProfile.mockReturnValue({ profile: null });
+    mocks.useVersionLiveness.mockClear();
+    mocks.useVersionLiveness.mockReturnValue(new Map<number, boolean>());
   });
 
   it("updates hero metadata when the selected version changes", () => {
@@ -390,5 +399,57 @@ describe("MovieContent", () => {
       canCurateMetadata: false,
       canEditMarkers: true,
     });
+  });
+
+  it("does not pass playHref or restartHref when the movie has no versions or play targets", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent
+          item={makeMovieItem({
+            versions: [],
+            playback_variants: [],
+            play_content_id: undefined,
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      playHref: undefined,
+      restartHref: undefined,
+    });
+  });
+
+  it("passes playHref when the movie has a play target but no local versions", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent
+          item={makeMovieItem({
+            versions: [],
+            playback_variants: [],
+            play_content_id: "virtual-target-1",
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      playHref: "/watch/movie-1",
+    });
+  });
+
+  it("checks liveness for the default-selected version before any picker opens", () => {
+    const standard = makeFileVersion({ file_id: 1, resolution: "1080p" });
+    const uhd = makeFileVersion({ file_id: 2, resolution: "2160p" });
+
+    render(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent item={makeMovieItem({ versions: [standard, uhd] })} />
+      </MemoryRouter>,
+    );
+
+    const firstCall = mocks.useVersionLiveness.mock.calls[0];
+    expect(firstCall?.[0]).toEqual([expect.objectContaining({ file_id: 2 })]);
+    expect(firstCall?.[1]).toBe(true);
   });
 });

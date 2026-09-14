@@ -191,6 +191,37 @@ export function buildPrePlaySubtitleCandidates(
   const inventory = buildVersionSubtitleInventory(tracks, downloaded);
   const all: PrePlaySubtitleCandidate[] = [];
 
+  // Dense combined ordinals, mirroring the server's BuildSubtitleInventoryV3
+  // order (external → embedded → downloaded): the ordinal is the candidate's
+  // position in that combined list, computed over the UNSORTED catalog order.
+  // Never the container stream index. Keys mirror VersionSubtitleInventoryRow
+  // identity (`source:index`) with the catalog enumeration index as the
+  // no-explicit-index fallback, so lookups always hit.
+  const trackList = tracks ?? [];
+  const denseOrdinalByKey = new Map<string, number>();
+  const externalCount = trackList.filter((track) => track.external).length;
+  let externalOrdinal = 0;
+  let embeddedOrdinal = 0;
+  for (const [catalogIndex, track] of trackList.entries()) {
+    const source = track.external ? "external" : "embedded";
+    const dense = source === "external" ? externalOrdinal++ : externalCount + embeddedOrdinal++;
+    denseOrdinalByKey.set(`${source}:${track.index ?? catalogIndex}`, dense);
+  }
+  let nextOrdinal = trackList.length;
+  for (const subtitle of downloaded ?? []) {
+    denseOrdinalByKey.set(`downloaded:${subtitle.id}`, nextOrdinal);
+    nextOrdinal++;
+  }
+
+  const denseOrdinalFor = (row: VersionSubtitleInventoryRow): number | undefined => {
+    if (row.source === "downloaded") {
+      return row.downloadedSubtitleId == null
+        ? undefined
+        : denseOrdinalByKey.get(`downloaded:${row.downloadedSubtitleId}`);
+    }
+    return denseOrdinalByKey.get(`${row.source}:${row.index}`);
+  };
+
   const mapBuiltIn = (rows: VersionSubtitleInventoryRow[], source: "embedded" | "external") =>
     rows.map((row, index) => {
       const track = (tracks ?? []).find(
@@ -208,7 +239,11 @@ export function buildPrePlaySubtitleCandidates(
           label,
           forced: row.forced,
           hearing_impaired: row.hearingImpaired,
-          track_index: row.index,
+          // Dense combined ordinal in the server's inventory order
+          // (external → embedded → downloaded) — NOT the container stream
+          // index, which is non-dense (2,3,4 after video 0 + audio 1) and
+          // would offset track resolution if ever sent as an ordinal.
+          track_index: denseOrdinalFor(row),
         },
         summary: formatSubtitleCandidateSummary(row),
       };
@@ -218,6 +253,7 @@ export function buildPrePlaySubtitleCandidates(
 
   const embedded = mapBuiltIn(inventory.embedded, "embedded");
   const external = mapBuiltIn(inventory.external, "external");
+
   const downloadedRows = inventory.downloaded.map((row) => {
     const match = (downloaded ?? []).find((subtitle) => subtitle.id === row.downloadedSubtitleId);
     const label = match ? normalizeDownloadedLabel(match) : row.releaseName || row.languageLabel;
@@ -231,6 +267,8 @@ export function buildPrePlaySubtitleCandidates(
         forced: row.forced,
         hearing_impaired: row.hearingImpaired,
         downloaded_subtitle_id: row.downloadedSubtitleId,
+        // Dense combined ordinal — see the built-in comment above.
+        track_index: denseOrdinalFor(row),
       },
       summary: formatSubtitleCandidateSummary(row),
     };

@@ -132,11 +132,19 @@ func (s *PersonRefreshService) refreshPersonWithProviders(
 			Language:    "en",
 		})
 		if err != nil {
-			slog.WarnContext(ctx, "person refresh: provider detail lookup failed", "component", "metadata",
-				"provider", provider.Slug(),
-				"person_id", id,
-				"error", err,
-			)
+			if isProvider404(err) || strings.Contains(err.Error(), "404") {
+				slog.DebugContext(ctx, "person refresh: provider detail not found", "component", "metadata",
+					"provider", provider.Slug(),
+					"person_id", id,
+					"error", err,
+				)
+			} else {
+				slog.WarnContext(ctx, "person refresh: provider detail lookup failed", "component", "metadata",
+					"provider", provider.Slug(),
+					"person_id", id,
+					"error", err,
+				)
+			}
 			continue
 		}
 		if result == nil {
@@ -221,6 +229,7 @@ func (s *PersonRefreshService) enqueuePersonPhoto(ctx context.Context, person mo
 	}
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *PersonRefreshService) cachePersonPhoto(
 	ctx context.Context,
 	person models.Person,

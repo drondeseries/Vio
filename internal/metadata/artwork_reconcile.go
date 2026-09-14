@@ -1000,7 +1000,7 @@ func (r *ArtworkCacheReconciler) verifyAndReset(ctx context.Context, s artworkSw
 		case v.err != nil:
 			stats.Errors++
 			stats.SweepErrors++
-			slog.Warn("artwork reconcile: object check failed; leaving row untouched",
+			slog.WarnContext(ctx, "artwork reconcile: object check failed; leaving row untouched",
 				"surface", s.name, "key", batch[i].path, "error", v.err)
 		case v.missing:
 			row := batch[i]
@@ -1016,7 +1016,7 @@ func (r *ArtworkCacheReconciler) verifyAndReset(ctx context.Context, s artworkSw
 				set = s.resetSet()
 			} else {
 				set = s.clearSet
-				slog.Warn("artwork reconcile: cached image missing with no re-downloadable source; cleared",
+				slog.WarnContext(ctx, "artwork reconcile: cached image missing with no re-downloadable source; cleared",
 					"surface", s.name, "key", row.path, "row", strings.Join(row.keys, "/"))
 			}
 			pgBatch.Queue(fmt.Sprintf(`UPDATE %s SET %s WHERE %s AND %s = $%d`,
@@ -1210,7 +1210,7 @@ func (r *ArtworkCacheReconciler) reconcileChapterBatch(ctx context.Context, batc
 		if err := json.Unmarshal(f.raw, &f.chapters); err != nil {
 			stats.Errors++
 			stats.SweepErrors++
-			slog.Warn("artwork reconcile: unparseable chapters JSON; skipping file", "file_id", f.id, "error", err)
+			slog.WarnContext(ctx, "artwork reconcile: unparseable chapters JSON; skipping file", "file_id", f.id, "error", err)
 			f.chapters = nil
 			continue
 		}
@@ -1236,7 +1236,7 @@ func (r *ArtworkCacheReconciler) reconcileChapterBatch(ctx context.Context, batc
 		case v.err != nil:
 			stats.Errors++
 			stats.SweepErrors++
-			slog.Warn("artwork reconcile: chapter thumbnail check failed; leaving chapter untouched",
+			slog.WarnContext(ctx, "artwork reconcile: chapter thumbnail check failed; leaving chapter untouched",
 				"file_id", batch[ref.file].id, "key", keys[vi], "error", v.err)
 		case v.missing:
 			ch := batch[ref.file].chapters[ref.chapter]
@@ -1271,7 +1271,7 @@ func (r *ArtworkCacheReconciler) reconcileChapterBatch(ctx context.Context, batc
 			return fmt.Errorf("artwork reconcile: updating chapters for file %d: %w", f.id, err)
 		}
 		if tag.RowsAffected() == 0 {
-			slog.Debug("artwork reconcile: chapters changed concurrently; skipped", "file_id", f.id)
+			slog.DebugContext(ctx, "artwork reconcile: chapters changed concurrently; skipped", "file_id", f.id)
 		}
 	}
 	return nil

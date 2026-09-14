@@ -3,7 +3,6 @@ package taskmanager_test
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"reflect"
 	"sync"
@@ -449,7 +448,7 @@ func TestTaskManagerTriggerSkipsConditionalTaskOnPreflightError(t *testing.T) {
 		triggerRepo,
 		historyRepo,
 		factory,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		slog.New(slog.DiscardHandler),
 	)
 	task := &conditionalStubTask{
 		stubTask:        stubTask{key: "conditional"},

@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 const (
@@ -508,24 +510,40 @@ type ClientPlaybackContextV3 struct {
 }
 
 type StartRequestV3 struct {
-	ProtocolVersion            int                       `json:"protocol_version"`
-	ClientFeatures             []string                  `json:"client_features"`
-	FileID                     int                       `json:"file_id"`
-	ProfileID                  string                    `json:"profile_id"`
-	PlaybackAttemptID          string                    `json:"playback_attempt_id"`
-	QualityPreference          string                    `json:"quality_preference"`
-	SubtitleFidelityPreference SubtitleFidelityV3        `json:"subtitle_fidelity_preference"`
-	StartPosition              *float64                  `json:"start_position,omitempty"`
-	ProgressPersistence        ProgressPersistenceV3     `json:"progress_persistence,omitempty"`
-	AudioTrackID               string                    `json:"audio_track_id,omitempty"`
-	AudioTrackIndex            *int                      `json:"audio_track_index,omitempty"`
-	SubtitleTrackID            string                    `json:"subtitle_track_id,omitempty"`
-	SubtitleTrackIndex         *int                      `json:"subtitle_track_index,omitempty"`
-	Metered                    bool                      `json:"metered"`
-	BandwidthEstimateKbps      *int                      `json:"bandwidth_estimate_kbps,omitempty"`
-	BandwidthCapKbps           *int                      `json:"bandwidth_cap_kbps,omitempty"`
-	Capabilities               ClientCodecCapabilitiesV3 `json:"client_capabilities"`
-	ClientPlaybackContext      ClientPlaybackContextV3   `json:"client_playback_context"`
+	ProtocolVersion            int                   `json:"protocol_version"`
+	ClientFeatures             []string              `json:"client_features"`
+	FileID                     int                   `json:"file_id"`
+	ProfileID                  string                `json:"profile_id"`
+	PlaybackAttemptID          string                `json:"playback_attempt_id"`
+	QualityPreference          string                `json:"quality_preference"`
+	SubtitleFidelityPreference SubtitleFidelityV3    `json:"subtitle_fidelity_preference"`
+	StartPosition              *float64              `json:"start_position,omitempty"`
+	ProgressPersistence        ProgressPersistenceV3 `json:"progress_persistence,omitempty"`
+	AudioTrackID               string                `json:"audio_track_id,omitempty"`
+	AudioTrackIndex            *int                  `json:"audio_track_index,omitempty"`
+	// CarriedAudioTrackID is the file-bound audio identity (file:<id>:audio:<ordinal>)
+	// the viewer had selected on a previously playing version. The server re-resolves
+	// it onto the requested file's inventory by track family instead of raw ordinal.
+	// Optional and additive: absent means the server owns audio selection (profile or
+	// series preference), exactly as before.
+	CarriedAudioTrackID string `json:"carried_audio_track_id,omitempty"`
+	SubtitleTrackID     string `json:"subtitle_track_id,omitempty"`
+	SubtitleTrackIndex  *int   `json:"subtitle_track_index,omitempty"`
+	// FileSelection distinguishes an explicit user version pick from an
+	// auto/default selection. Absent means auto, preserving existing client
+	// behavior; an explicit pick pins the requested file and disables the
+	// start-path alternate-file fallback.
+	FileSelection FileSelectionV3 `json:"file_selection,omitempty"`
+	// ForceRelink asks the server to fetch a fresh provider listing for an
+	// explicitly re-selected version instead of trusting the cached or pinned
+	// candidate. It is only meaningful alongside an explicit file_selection;
+	// absent means the server keeps its existing listing/cache behavior.
+	ForceRelink           bool                      `json:"force_relink,omitempty"`
+	Metered               bool                      `json:"metered"`
+	BandwidthEstimateKbps *int                      `json:"bandwidth_estimate_kbps,omitempty"`
+	BandwidthCapKbps      *int                      `json:"bandwidth_cap_kbps,omitempty"`
+	Capabilities          ClientCodecCapabilitiesV3 `json:"client_capabilities"`
+	ClientPlaybackContext ClientPlaybackContextV3   `json:"client_playback_context"`
 }
 
 // ProgressPersistenceV3 declares which side owns durable item resume/history.
@@ -536,6 +554,17 @@ type ProgressPersistenceV3 string
 const (
 	ProgressPersistenceServerV3 ProgressPersistenceV3 = "server"
 	ProgressPersistenceClientV3 ProgressPersistenceV3 = "client"
+)
+
+// FileSelectionV3 declares whether the requested file_id is an explicit user
+// version pick or an auto/default selection. An explicit pick must not be
+// silently swapped for an alternate version when the plan is terminal; the
+// server refuses instead and points the client at the version list.
+type FileSelectionV3 string
+
+const (
+	FileSelectionAutoV3     FileSelectionV3 = "auto"
+	FileSelectionExplicitV3 FileSelectionV3 = "explicit"
 )
 
 type TrackIdentityV3 struct {
@@ -865,32 +894,45 @@ type PlanV3 struct {
 	// PlanAttemptKey is the server-computed opaque loop-prevention token for
 	// this plan. Clients store the keys of attempted plans and echo them in
 	// attempted_plan_keys on replan; they never compute keys themselves.
-	PlanAttemptKey         string                 `json:"plan_attempt_key"`
-	SessionID              string                 `json:"session_id,omitempty"`
-	ExpiresAt              string                 `json:"expires_at,omitempty"`
-	Delivery               DeliveryV3             `json:"delivery"`
-	Stream                 StreamV3               `json:"stream"`
-	Timeline               TimelineV3             `json:"timeline"`
-	SelectedTracks         SelectedTracksV3       `json:"selected_tracks"`
-	EffectiveRecipe        EffectiveRecipeV3      `json:"effective_recipe"`
-	Claims                 ValidationClaimsV3     `json:"claims"`
-	Subtitle               SubtitleDecisionV3     `json:"subtitle"`
-	Transformations        []TransformationV3     `json:"transformations"`
-	AppliedQuirks          []AppliedQuirkV3       `json:"applied_quirks"`
-	RuntimeCorrections     []string               `json:"runtime_corrections"`
-	AvailableQualities     []AvailableQualityV3   `json:"available_qualities"`
-	DegradationWarnings    []DegradationWarningV3 `json:"degradation_warnings"`
-	DecisionReason         string                 `json:"decision_reason"`
-	RequestedMediaFileID   int                    `json:"requested_media_file_id"`
-	EffectiveMediaFileID   int                    `json:"effective_media_file_id"`
-	Source                 SourceDescriptorV3     `json:"source"`
-	SubtitleFidelityPolicy string                 `json:"subtitle_fidelity_policy"`
+	PlanAttemptKey       string                 `json:"plan_attempt_key"`
+	SessionID            string                 `json:"session_id,omitempty"`
+	ExpiresAt            string                 `json:"expires_at,omitempty"`
+	Delivery             DeliveryV3             `json:"delivery"`
+	Stream               StreamV3               `json:"stream"`
+	Timeline             TimelineV3             `json:"timeline"`
+	SelectedTracks       SelectedTracksV3       `json:"selected_tracks"`
+	EffectiveRecipe      EffectiveRecipeV3      `json:"effective_recipe"`
+	Claims               ValidationClaimsV3     `json:"claims"`
+	Subtitle             SubtitleDecisionV3     `json:"subtitle"`
+	Transformations      []TransformationV3     `json:"transformations"`
+	AppliedQuirks        []AppliedQuirkV3       `json:"applied_quirks"`
+	RuntimeCorrections   []string               `json:"runtime_corrections"`
+	AvailableQualities   []AvailableQualityV3   `json:"available_qualities"`
+	DegradationWarnings  []DegradationWarningV3 `json:"degradation_warnings"`
+	DecisionReason       string                 `json:"decision_reason"`
+	RequestedMediaFileID int                    `json:"requested_media_file_id"`
+	EffectiveMediaFileID int                    `json:"effective_media_file_id"`
+	// EffectiveVirtualURI is the provider-neutral virtual:// candidate URI the
+	// planner selected and probed when it substituted a real candidate for a
+	// neutral catalog row. UI-only: clients use it to keep the version menu in
+	// sync with the version that actually played. It is deliberately excluded
+	// from plan identity hashing, like the inventory fields above.
+	EffectiveVirtualURI    string             `json:"effective_virtual_uri,omitempty"`
+	Source                 SourceDescriptorV3 `json:"source"`
+	SubtitleFidelityPolicy string             `json:"subtitle_fidelity_policy"`
+	// AudioTracks is the authoritative per-track audio inventory of the
+	// effective source, mirroring the subtitle inventory. Clients should
+	// prefer it over item metadata: after a version fallback the effective
+	// file can differ from the requested catalog row, and only this list
+	// reflects the tracks the plan actually plays.
+	AudioTracks []models.AudioTrack `json:"audio_tracks,omitempty"`
 }
 
 type TerminalV3 struct {
 	Reason    string `json:"reason"`
 	Message   string `json:"message"`
 	Retryable bool   `json:"retryable"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 type DecisionResponseV3 struct {
@@ -938,6 +980,12 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	if r.ProgressPersistence == ProgressPersistenceClientV3 && r.StartPosition == nil {
 		return nil, errors.New("start_position is required when progress_persistence is client")
 	}
+	if r.FileSelection == "" {
+		r.FileSelection = FileSelectionAutoV3
+	}
+	if r.FileSelection != FileSelectionAutoV3 && r.FileSelection != FileSelectionExplicitV3 {
+		return nil, errors.New("file_selection is invalid")
+	}
 	if err := validateOptionalBoundedIntV3(r.BandwidthEstimateKbps, 100, 1_000_000, "bandwidth_estimate_kbps"); err != nil {
 		return nil, err
 	}
@@ -961,6 +1009,9 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	if err := validateTrackPairV3(r.FileID, "audio", r.AudioTrackID, r.AudioTrackIndex); err != nil {
 		return nil, err
 	}
+	if len(r.CarriedAudioTrackID) > 128 {
+		return nil, errors.New("carried_audio_track_id is too long")
+	}
 	if err := validateTrackPairV3(r.FileID, "subtitle", r.SubtitleTrackID, r.SubtitleTrackIndex); err != nil {
 		return nil, err
 	}
@@ -980,12 +1031,18 @@ func NormalizeQualityV3(value string) (string, bool) {
 		return QualityOriginalV3, false
 	case "2160p", "4k", "uhd":
 		return "2160p", false
-	case "1080p", "fhd":
+	case "1080p", "fhd", "1080p-8":
+		// 1080p-8 is a legacy 1080p variant (8-bit encode); it is not a
+		// distinct ladder rung, so it normalizes to the plain 1080p rung.
 		return "1080p", false
 	case "720p", "hd":
 		return "720p", false
 	case "480p", "sd":
 		return "480p", false
+	case "420p":
+		return "420p", false
+	case "328p":
+		return "328p", false
 	default:
 		if rung, ok := ladderRungForLabelV3(value); ok {
 			return rung.Label, false
@@ -1385,6 +1442,14 @@ func NewTerminalResponseV3(reason, message string, retryable bool) DecisionRespo
 		Outcome:         OutcomeAdaptationUnavailableV3,
 		Terminal:        &TerminalV3{Reason: reason, Message: message, Retryable: retryable},
 	}
+}
+
+// NewTerminalResponseFromTerminalV3 builds a decision response from an existing
+// terminal, preserving the diagnostic detail line.
+func NewTerminalResponseFromTerminalV3(terminal *TerminalV3) DecisionResponseV3 {
+	response := NewTerminalResponseV3(terminal.Reason, terminal.Message, terminal.Retryable)
+	response.Terminal.Detail = terminal.Detail
+	return response
 }
 
 func NewPlanExpiryV3(now time.Time) string { return now.Add(MaxTokenTTL).UTC().Format(time.RFC3339) }

@@ -15,6 +15,15 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// isVirtualMediaFile reports whether a row is a plugin-provided virtual source
+// (virtual:// URI, container "virtual"). Such rows are read through their
+// resolved provider URL by the virtual playback pipeline, never through the
+// virtual:// path as a local file.
+func isVirtualMediaFile(file *models.MediaFile) bool {
+	return file != nil &&
+		(strings.HasPrefix(file.FilePath, "virtual://") || strings.EqualFold(file.Container, "virtual"))
+}
+
 // NeedsCriticalProbeRepair reports whether playback-critical probe metadata is
 // missing and the file should be reprobed before making playback decisions.
 func NeedsCriticalProbeRepair(file *models.MediaFile) bool {
@@ -27,6 +36,14 @@ func NeedsCriticalProbeRepair(file *models.MediaFile) bool {
 	// them, so requiring probe metadata re-ran ffprobe on every detail/watch
 	// load and never converged.
 	if file.BaseType == "ebook" {
+		return false
+	}
+	// Virtual rows (virtual:// URIs, container "virtual") are probed by the
+	// virtual playback pipeline with the provider's resolved URL, never by
+	// local ffprobe: the virtual:// URI is not a readable file. Requiring
+	// repair here re-ran a doomed local ffprobe on every replay/replan and
+	// logged "ffprobe failed for virtual://..." each time without converging.
+	if isVirtualMediaFile(file) {
 		return false
 	}
 	if file.HasLegacyAttachedPictureVideo() {
@@ -76,6 +93,15 @@ func NeedsCriticalProbeRepair(file *models.MediaFile) bool {
 		if videoTracksHaveLegacyDVProvenance(file.VideoTracks) {
 			return true
 		}
+	}
+	// A probed video row without any bitrate fails the playback planner's
+	// completeness gate forever while looking healthy to this check. The
+	// FileSize guard keeps the trigger convergent: with size and duration
+	// known, applyProbeData's implied-bitrate fallback always fills the
+	// field on the reprobe. Rows without a known size are left alone —
+	// reprobing them could never populate a value.
+	if file.Bitrate <= 0 && file.FileSize > 0 {
+		return true
 	}
 	if file.Chapters == nil {
 		return true
@@ -181,6 +207,63 @@ func (r copySafetyResult) matches(file *models.MediaFile) bool {
 		return r.mtime == nil && file.FileModifiedAt == nil
 	}
 	return sameFileModifiedAt(r.mtime, *file.FileModifiedAt)
+}
+
+// errVirtualProbeNoTracks reports that ffprobe exited successfully against a
+// virtual source but described no audio and no video stream. Remote relays can
+// return a parseable but empty stream table when the analysis window is too
+// short; treating that as success stamps a never-probed row with ProbeSource and
+// a fresh ProbeUpdatedAt, so the row looks probed while carrying empty track
+// arrays. A real virtual source always carries at least one stream, so a
+// fully-empty result is inconclusive and must surface as a failure.
+var errVirtualProbeNoTracks = errors.New("virtual probe returned no audio or video streams")
+
+// ProbeVirtualSource probes a virtual (plugin-provided) stream for playback
+// metadata without letting the provider's signed URL replace the canonical
+// virtual URI on the resulting row.
+func ProbeVirtualSource(
+	ctx context.Context,
+	ffprobePath, ffmpegPath, sourceURL string,
+	file *models.MediaFile,
+	dvStripProbe func(context.Context, string) bool,
+) (*models.MediaFile, error) {
+	if file == nil {
+		return nil, nil
+	}
+	probe, err := ProbeFile(ctx, ffprobePath, sourceURL)
+	if err != nil {
+		return file, err
+	}
+	if probe == nil || (len(probe.AudioTracks) == 0 && len(probe.VideoTracks) == 0) {
+		return file, errVirtualProbeNoTracks
+	}
+	updated := *file
+	applyProbeData(&updated, probe, "virtual")
+	// Technical metadata belongs to this playback attempt, but the source
+	// identity must remain the canonical virtual URI. Persisting or carrying a
+	// provider's signed URL beyond the probe makes restart/resume depend on an
+	// expiring credential and can leak it through plans and recipe cards.
+	updated.FilePath = file.FilePath
+	if needsCopySafetyProbe(&updated) {
+		scanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		multi, scanErr := DetectMultiplePPSH264(scanCtx, ffmpegPath, sourceURL)
+		cancel()
+		if scanErr != nil {
+			updated = *fileWithCopySafety(&updated, nil, true)
+		} else {
+			updated = *fileWithMultiplePPS(&updated, multi)
+		}
+	}
+	if dvStripProbe != nil && len(updated.VideoTracks) > 0 {
+		track := updated.VideoTracks[0]
+		if track.DVProfile == 7 || track.DVProfile == 8 {
+			value := dvStripProbe(ctx, sourceURL)
+			tracks := append([]models.VideoTrack(nil), updated.VideoTracks...)
+			tracks[0].DVRPUStrippable = &value
+			updated.VideoTracks = tracks
+		}
+	}
+	return &updated, nil
 }
 
 func NewPlaybackProbeEnsurer(fileRepo *FileRepository, ffprobePath, ffmpegPath string, timeout time.Duration) *PlaybackProbeEnsurer {
@@ -461,6 +544,12 @@ func (e *PlaybackProbeEnsurer) ensureCriticalProbe(ctx context.Context, file *mo
 // media_files row, and only then runs the bitstream scan — so a restart no
 // longer re-reads the opening seconds of every browsed H.264 file.
 func (e *PlaybackProbeEnsurer) ensureCopySafety(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error) {
+	// Virtual rows are scanned by the virtual pipeline (ProbeVirtualSource)
+	// against the resolved provider URL, never against the local virtual://
+	// URI. A scan here would exec ffmpeg on an unreadable path.
+	if isVirtualMediaFile(file) {
+		return file, nil
+	}
 	ffmpegPath := strings.TrimSpace(e.binaries().ffmpegPath)
 	if !needsCopySafetyProbe(file) || ffmpegPath == "" {
 		return file, nil

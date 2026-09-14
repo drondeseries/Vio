@@ -694,7 +694,7 @@ func (h *WatchTogetherHandler) HandleRoomWebSocket(w http.ResponseWriter, r *htt
 	if err != nil {
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	h.serveRoomConnection(r.Context(), conn, roomID, claims.UserID, profileID)
 }

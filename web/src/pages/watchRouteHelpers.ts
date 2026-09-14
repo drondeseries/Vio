@@ -26,6 +26,12 @@ export interface WatchRouteRequest {
   prePlaySubtitleSelection?: PrePlaySubtitleSelection | null;
   returnHref?: string;
   requestKey: string;
+  /** True when `fileId` was explicitly chosen by the viewer on the media page. */
+  explicitFileSelection?: boolean;
+  /** When true, the server should force a re-link/re-query of the virtual file
+   *  on this start attempt. Only set when the viewer explicitly picks an
+   *  unavailable version. */
+  forceRelink?: boolean;
 }
 
 export interface WatchPlaybackStartInput {
@@ -39,6 +45,11 @@ export interface WatchPlaybackStartInput {
   prePlaySubtitleMode?: "auto" | "off" | "explicit";
   prePlaySubtitleSelection?: PrePlaySubtitleSelection | null;
   returnHref?: string;
+  explicitFileSelection?: boolean;
+  /** When true, the server should force a re-link/re-query of the virtual file
+   *  on this start attempt. Only set when the viewer explicitly picks an
+   *  unavailable version. */
+  forceRelink?: boolean;
 }
 
 function parseOptionalInt(value: string | null): number | undefined {
@@ -58,6 +69,8 @@ function buildWatchRouteRequestKey(
   audioTrackIndex: number | undefined,
   prePlaySubtitleMode: "auto" | "off" | "explicit" | undefined,
   prePlaySubtitleSelection: PrePlaySubtitleSelection | null | undefined,
+  explicitFileSelection: boolean | undefined,
+  forceRelink: boolean | undefined,
 ): string {
   return JSON.stringify([
     contentId,
@@ -69,6 +82,8 @@ function buildWatchRouteRequestKey(
     audioTrackIndex ?? null,
     prePlaySubtitleMode ?? null,
     prePlaySubtitleSelection ?? null,
+    explicitFileSelection ?? null,
+    forceRelink ?? null,
   ]);
 }
 
@@ -83,6 +98,8 @@ export function createWatchRouteRequest({
   prePlaySubtitleMode,
   prePlaySubtitleSelection,
   returnHref,
+  explicitFileSelection,
+  forceRelink,
 }: WatchPlaybackStartInput): WatchRouteRequest {
   return {
     contentId,
@@ -95,6 +112,8 @@ export function createWatchRouteRequest({
     prePlaySubtitleMode,
     prePlaySubtitleSelection,
     returnHref,
+    explicitFileSelection,
+    forceRelink,
     requestKey: buildWatchRouteRequestKey(
       contentId,
       fileId,
@@ -105,6 +124,8 @@ export function createWatchRouteRequest({
       audioTrackIndex,
       prePlaySubtitleMode,
       prePlaySubtitleSelection,
+      explicitFileSelection,
+      forceRelink,
     ),
   };
 }
@@ -400,6 +421,8 @@ export function buildWatchPageProps({
     forceInitialPosition: request.restart,
     qualityPreference,
     explicitAudioTrackIndex: request.audioTrackIndex ?? null,
+    explicitFileSelection: request.explicitFileSelection,
+    forceRelink: request.forceRelink,
     initialSubtitleTrackIndexByFileId: initialSubtitleTrackIndexes.start,
     initialBitmapSubtitleTrackIndexByFileId: initialSubtitleTrackIndexes.bitmap,
     preferredSubtitleLanguage,

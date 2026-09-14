@@ -224,7 +224,7 @@ func (a *Analyzer) AnalyzeEpisode(ctx context.Context, episodeID string) (RunSum
 	if err := a.extractor.Preflight(ctx); err != nil {
 		summary.ChromaprintSupported = false
 		summary.ChromaprintSupportMessage = err.Error()
-		return summary, nil
+		return summary, nil //nolint:nilerr // Unsupported chromaprint is reported through the analysis summary.
 	}
 	summary.ChromaprintSupported = true
 
@@ -643,7 +643,7 @@ func (a *Analyzer) refineChromaprintSegment(ctx context.Context, candidate Candi
 	refined, ok, err := a.chromaprintRefiner.RefineChromaprintStart(ctx, candidate, segment)
 	if err != nil {
 		summary.DialogueRefinementErrors++
-		a.logger.WarnContext(ctx, "intro marker dialogue refinement failed", "file_id", candidate.FileID, "path", candidate.FilePath, "error", err)
+		a.logger.WarnContext(ctx, "intro marker dialog refinement failed", "file_id", candidate.FileID, "path", candidate.FilePath, "error", err)
 		return segment
 	}
 	if ok {

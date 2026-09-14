@@ -269,7 +269,7 @@ func (h *AdminLogsHandler) serveLogStream(w http.ResponseWriter, r *http.Request
 	})
 	defer unsubscribe()
 
-	conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
 	})

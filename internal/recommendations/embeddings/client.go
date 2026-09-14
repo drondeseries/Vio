@@ -128,7 +128,7 @@ func (c *Client) embedOpenAI(ctx context.Context, texts []string) ([][]float32, 
 		}
 
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		// Rate limited — wait using Retry-After header or exponential backoff.
 		if resp.StatusCode == http.StatusTooManyRequests {
@@ -154,7 +154,7 @@ func (c *Client) embedOpenAI(ctx context.Context, texts []string) ([][]float32, 
 		// Non-retryable error (4xx except 429).
 		return nil, fmt.Errorf("embedding API returned %d: %s", resp.StatusCode, string(respBody))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var embResp embeddingResponse
 	if err := json.NewDecoder(resp.Body).Decode(&embResp); err != nil {
@@ -212,7 +212,7 @@ func (c *Client) embedGemini(ctx context.Context, texts []string) ([][]float32, 
 		}
 
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if attempt >= maxAttempts-1 {
@@ -235,7 +235,7 @@ func (c *Client) embedGemini(ctx context.Context, texts []string) ([][]float32, 
 
 		return nil, fmt.Errorf("gemini embedding API returned %d: %s", resp.StatusCode, string(respBody))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var gresp geminiEmbedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&gresp); err != nil {

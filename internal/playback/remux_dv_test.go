@@ -325,7 +325,7 @@ func TestLegacyRemuxDropsTheStripForAnUnstrippableSource(t *testing.T) {
 	}
 	// Drain to EOF so the stand-in has finished recording before it is killed.
 	_, _ = io.ReadAll(session)
-	session.Close()
+	_ = session.Close()
 
 	recorded, err := os.ReadFile(argLog)
 	if err != nil {
@@ -338,7 +338,7 @@ func TestLegacyRemuxDropsTheStripForAnUnstrippableSource(t *testing.T) {
 
 // The explicit v3 recipe has already promised the client HDR10. Reaching it
 // with an unstrippable source means a session or stream token minted before
-// the verdict was known, and neither honouring nor silently dropping the strip
+// the verdict was known, and neither honoring nor silently dropping the strip
 // is right: fail so the request gets a definite error instead of a stalled
 // stream, and so the next start re-plans onto a route that works.
 func TestExplicitStripRecipeRefusesAnUnstrippableSource(t *testing.T) {
@@ -347,7 +347,7 @@ func TestExplicitStripRecipeRefusesAnUnstrippableSource(t *testing.T) {
 
 	session, err := StartRemuxWithDVMode(context.Background(), path, "mp4", 0, false, -1, 7, RemuxDVStripToHDR10V3, bin)
 	if err == nil {
-		session.Close()
+		_ = session.Close()
 		t.Fatal("the explicit HDR10 strip accepted a source it cannot strip")
 	}
 	if !strings.Contains(err.Error(), "cannot be stripped") {

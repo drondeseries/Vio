@@ -142,7 +142,7 @@ func invitationProblem(err error, public bool) *Problem {
 		return NewProblem(TypeConflict, "The invitation changed; reload before continuing.")
 	case errors.Is(err, invitations.ErrEmailTaken):
 		return NewProblem(TypeConflict, "An account already uses this email or username.")
-	case errors.Is(err, invitations.ErrInvalidEmail), errors.Is(err, invitations.ErrAdminGrouped):
+	case errors.Is(err, invitations.ErrInvalidEmail):
 		return NewProblem(TypeValidationFailed, "Invalid invitation configuration.")
 	case errors.Is(err, invitations.ErrRoleNotAllowed):
 		return NewProblem(TypePermissionDenied, "The requested role is not allowed.")

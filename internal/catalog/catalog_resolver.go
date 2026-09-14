@@ -470,7 +470,7 @@ func (r *CatalogResolver) resolveSectionSource(ctx context.Context, req CatalogR
 	case "genre", "custom_filter":
 		def, err := parseCatalogSectionQueryDefinition(section.Config)
 		if err != nil {
-			return nil, fmt.Errorf("%w: parsing section query definition: %v", ErrInvalidCatalogRequest, err)
+			return nil, fmt.Errorf("%w: parsing section query definition: %w", ErrInvalidCatalogRequest, err)
 		}
 		if section.Scope == "library" && section.LibraryID != nil {
 			def.LibraryIDs = []int{*section.LibraryID}
@@ -692,7 +692,7 @@ func (r *CatalogResolver) resolveLibraryCollectionItems(
 func (r *CatalogResolver) resolveLiveLibraryCollectionSource(ctx context.Context, req CatalogRequest, access AccessFilter, collection *models.LibraryCollection) (*CatalogResult, error) {
 	def, err := parseCatalogCollectionQueryDefinition(collection.QueryDefinition)
 	if err != nil {
-		return nil, fmt.Errorf("%w: parsing library collection query_definition: %v", ErrInvalidCatalogRequest, err)
+		return nil, fmt.Errorf("%w: parsing library collection query_definition: %w", ErrInvalidCatalogRequest, err)
 	}
 	if len(collection.LibraryIDs) > 0 {
 		def.LibraryIDs = intersectCatalogDefinitionLibraries(def.LibraryIDs, collection.LibraryIDs)
@@ -785,7 +785,7 @@ func (r *CatalogResolver) resolveUserCollectionItems(
 	if IsLiveQueryType(collection.CollectionType) {
 		def, err := parseCatalogCollectionQueryDefinition([]byte(collection.QueryDefinition))
 		if err != nil {
-			return nil, fmt.Errorf("%w: parsing user collection query_definition: %v", ErrInvalidCatalogRequest, err)
+			return nil, fmt.Errorf("%w: parsing user collection query_definition: %w", ErrInvalidCatalogRequest, err)
 		}
 		def = ApplySmartCollectionItemLimit(def)
 		if catalogRequestHasOverlay(req) || strings.TrimSpace(collection.DisplayQueryDefinition) != "" {
@@ -2115,7 +2115,7 @@ func (r *CatalogResolver) loadCollectionSourceBaseItems(ctx context.Context, req
 		if IsLiveQueryType(collection.CollectionType) || catalogCollectionUsesLiveQuery(collection.QueryDefinition) {
 			def, err := parseCatalogCollectionQueryDefinition(collection.QueryDefinition)
 			if err != nil {
-				return nil, fmt.Errorf("%w: parsing library collection query_definition: %v", ErrInvalidCatalogRequest, err)
+				return nil, fmt.Errorf("%w: parsing library collection query_definition: %w", ErrInvalidCatalogRequest, err)
 			}
 			if len(collection.LibraryIDs) > 0 {
 				def.LibraryIDs = intersectCatalogDefinitionLibraries(def.LibraryIDs, collection.LibraryIDs)
@@ -2147,7 +2147,7 @@ func (r *CatalogResolver) loadCollectionSourceBaseItems(ctx context.Context, req
 		if IsLiveQueryType(collection.CollectionType) {
 			def, err := parseCatalogCollectionQueryDefinition([]byte(collection.QueryDefinition))
 			if err != nil {
-				return nil, fmt.Errorf("%w: parsing user collection query_definition: %v", ErrInvalidCatalogRequest, err)
+				return nil, fmt.Errorf("%w: parsing user collection query_definition: %w", ErrInvalidCatalogRequest, err)
 			}
 			items, err = r.resolveCollectionQueryBaseItems(ctx, ApplySmartCollectionItemLimit(def), access)
 			if err != nil {
@@ -2289,6 +2289,7 @@ func intersectContentIDs(ids []string, allowed []string) []string {
 	return intersection
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (r *CatalogResolver) fetchAllBrowseCandidates(ctx context.Context, req CatalogRequest, access AccessFilter) ([]*models.MediaItem, error) {
 	filters, earlyEmpty, err := catalogBrowseFilters(req, access)
 	if err != nil {

@@ -61,7 +61,10 @@ func (q *RefreshQueue) Dequeue() (RefreshEntry, bool) {
 		return RefreshEntry{}, false
 	}
 
-	entry := heap.Pop(&q.entries).(*RefreshEntry)
+	entry, ok := heap.Pop(&q.entries).(*RefreshEntry)
+	if !ok {
+		return RefreshEntry{}, false
+	}
 	delete(q.byID, entry.ContentID)
 	return *entry, true
 }
@@ -84,7 +87,10 @@ func (h refHeap) Swap(i, j int) {
 	h[j].index = j
 }
 func (h *refHeap) Push(x any) {
-	entry := x.(*RefreshEntry)
+	entry, ok := x.(*RefreshEntry)
+	if !ok {
+		return
+	}
 	entry.index = len(*h)
 	*h = append(*h, entry)
 }

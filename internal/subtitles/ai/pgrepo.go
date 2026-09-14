@@ -40,8 +40,8 @@ func scanJob(row pgx.Row) (*Job, error) {
 }
 
 // transcribeQuotaCountSQL counts a user's quota-consuming transcription jobs.
-// Failed/cancelled rows with zero progress never did ASR work (engine
-// unreachable, bad media file, cancelled before start) and are excluded so
+// Failed/canceled rows with zero progress never did ASR work (engine
+// unreachable, bad media file, canceled before start) and are excluded so
 // server-side faults don't lock the user out; terminal rows with progress > 0
 // consumed compute and still count. Shared by the quota status endpoint and
 // the insert-time guard so the number shown always matches the one enforced.
@@ -169,7 +169,7 @@ func (r *PgJobRepository) CountTranscribeJobsByUserSince(ctx context.Context, us
 
 // UpdateProgress, CompleteJob, and FailJob only transition a job that is still
 // active ("pending"/"running"). The guard makes them no-ops on an already
-// terminal row, so a job that was cancelled or reaped as stale can never be
+// terminal row, so a job that was canceled or reaped as stale can never be
 // resurrected by a late write from its own worker goroutine.
 func (r *PgJobRepository) UpdateProgress(ctx context.Context, id int64, status JobStatus, progress float64, message string) error {
 	_, err := r.pool.Exec(ctx,

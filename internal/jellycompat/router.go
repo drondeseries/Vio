@@ -1,6 +1,7 @@
 package jellycompat
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,16 +17,15 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/config"
-	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // NewRouter builds the Jellyfin-compatibility router.
 func NewRouter(deps Dependencies) chi.Router {
-	declareJellycompatMediaRoutes()
 	deps = withDefaults(deps)
 
 	r := chi.NewRouter()
@@ -45,7 +45,7 @@ func NewRouter(deps Dependencies) chi.Router {
 		MaxAge:           86400,
 	}))
 	r.Use(normalizeCompatPathMiddleware)
-	r.Use(httpstream.CompressExcept(5, skipCompatMediaCompression, "application/json"))
+	r.Use(middleware.Compress(5, "application/json"))
 	if debugPath := os.Getenv("JELLYCOMPAT_DEBUG_LOG"); debugPath != "" {
 		rotator := &lumberjack.Logger{
 			Filename:   debugPath,
@@ -106,6 +106,26 @@ func NewRouter(deps Dependencies) chi.Router {
 	}
 	userDataHandler := NewUserDataHandler(deps.ContentService, deps.UserDataService, deps.IDCodec, deps.Config)
 	playbackHandler := NewPlaybackHandler(deps.Config, deps.ContentService, deps.IDCodec, deps.DeviceProfiles, deps.PlaybackStore, deps.SessionMgr, deps.FileResolver, deps.UserStoreProvider)
+	// Persist the capability profile Jellyfin clients report so native
+	// candidate ranking can be device-aware. The persister resolves the
+	// session's native user through the shared store provider; without a
+	// provider (DB-less/test mode) persistence is disabled.
+	if deps.UserStoreProvider != nil {
+		playbackHandler.DeviceProfilePersister = DeviceProfilePersisterFunc(func(ctx context.Context, userID int, profile userstore.DeviceCapabilityProfile) {
+			store, err := deps.UserStoreProvider.ForUser(ctx, userID)
+			if err != nil {
+				slog.WarnContext(ctx, "device profile persist: user store unavailable", "component", "jellycompat", "user_id", userID, "error", err)
+				return
+			}
+			registry, ok := store.(userstore.DeviceProfileRegistry)
+			if !ok {
+				return
+			}
+			if err := registry.PutDeviceProfile(ctx, profile); err != nil {
+				slog.WarnContext(ctx, "device profile persist failed", "component", "jellycompat", "user_id", userID, "profile_id", profile.ProfileID, "device_id", profile.DeviceID, "error", err)
+			}
+		})
+	}
 	startupSegmentRetention := playbackHandler.SegmentRetentionSeconds
 	playbackHandler.SegmentRetentionSeconds = func() int {
 		if cfg := deps.CurrentConfig(); cfg != nil {
@@ -142,6 +162,16 @@ func NewRouter(deps Dependencies) chi.Router {
 	playbackHandler.SessionSyncer = deps.SessionSyncer
 	playbackHandler.WatchScrobbler = deps.WatchScrobbler
 	playbackHandler.StableIdentityResolver = deps.StableIdentityResolver
+	playbackHandler.VirtualMediaResolver = deps.VirtualMediaResolver
+	playbackHandler.VirtualMediaRefreshResolver = deps.VirtualMediaRefreshResolver
+	playbackHandler.VirtualMediaDetailedResolver = deps.VirtualMediaDetailedResolver
+	playbackHandler.VirtualPlaybackStreamLister = deps.VirtualPlaybackStreamLister
+	playbackHandler.VirtualSourceProber = deps.VirtualSourceProber
+	playbackHandler.VirtualSourceProberWithHeaders = deps.VirtualSourceProberWithHeaders
+	playbackHandler.VirtualFileMetadataSaver = deps.VirtualFileMetadataSaver
+	playbackHandler.VirtualCandidateFileLookup = deps.VirtualCandidateFileLookup
+	playbackHandler.RemoteStreamRelay = deps.RemoteStreamRelay
+	playbackHandler.AllowInsecureVirtual = deps.AllowInsecureVirtual
 	if subtitleRepo != nil {
 		playbackHandler.SubtitleRepo = subtitleRepo
 		playbackHandler.S3Client = deps.S3Client
@@ -253,7 +283,7 @@ func NewRouter(deps Dependencies) chi.Router {
 			r.Get("/Sessions", HandleSessions)
 			r.Post("/Sessions/Capabilities", playbackHandler.HandleCapabilitiesFull)
 			r.Post("/Sessions/Capabilities/Full", playbackHandler.HandleCapabilitiesFull)
-			r.Get("/Playback/BitrateTest", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Playback/BitrateTest", playbackHandler.HandleBitrateTest))
+			r.Get("/Playback/BitrateTest", playbackHandler.HandleBitrateTest)
 			r.Get("/Items/{id}/PlaybackInfo", playbackHandler.HandlePlaybackInfo)
 			r.Post("/Items/{id}/PlaybackInfo", playbackHandler.HandlePlaybackInfo)
 			r.Get("/Users/{userId}/Items/{id}/PlaybackInfo", playbackHandler.HandlePlaybackInfo)
@@ -296,7 +326,7 @@ func NewRouter(deps Dependencies) chi.Router {
 		r.Get("/Videos/{id}/remux-ts-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/remux-ts-v1/hls/{playlistId}/{segmentId}.{segmentContainer}", playbackHandler.HandleRemuxTSV1HLSSegment))
 		r.Get("/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/stream.{routeFormat}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/stream.{routeFormat}", playbackHandler.HandleSubtitleStream))
 		// Infuse probes external subtitles with an extra numeric path component before stream.{format}.
-		r.Get("/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeDeliveryIndex}/stream.{routeFormat}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeDeliveryIndex}/stream.{routeFormat}", playbackHandler.HandleSubtitleStream))
+		r.Get("/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeDeliveryIndex}/stream.{routeFormat}", playbackHandler.HandleSubtitleStream)
 	})
 
 	r.Method(http.MethodHead, "/System/Info/Public", http.HandlerFunc(systemHandler.HandlePublicInfo))

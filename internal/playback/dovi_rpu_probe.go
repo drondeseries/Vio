@@ -43,7 +43,7 @@ const (
 	// timeout is inconclusive rather than fatal: the strip is kept and nothing
 	// is cached. Sized to stay well inside the ~10s a client waits on the
 	// manifest, so a slow probe cannot itself become the spinner.
-	dvRPUProbeTimeout = 6 * time.Second
+	dvRPUProbeTimeout = 15 * time.Second
 	// The rejection markers appear in the first few lines; a broken source
 	// killed at the timeout can otherwise pile up hundreds of thousands more.
 	maxDVRPUProbeOutput = 64 << 10
@@ -53,7 +53,7 @@ const (
 )
 
 // dvRPUVerdict separates "this source rejects the strip" from "the probe did
-// not find out". Only the former may be cached: a probe cancelled with the
+// not find out". Only the former may be cached: a probe canceled with the
 // client's request, or one that timed out on a cold mount, says nothing about
 // the file and must not disable the strip for every later viewer.
 type dvRPUVerdict int
@@ -107,7 +107,7 @@ func DVRPUStrippable(ctx context.Context, ffmpegPath, inputPath string) bool {
 
 // CanStrip answers for one source, probing it if the verdict is not cached.
 // It fails open: anything that stops the probe from reaching a conclusion
-// keeps the previous strip-always behaviour, because most Profile 7 sources
+// keeps the previous strip-always behavior, because most Profile 7 sources
 // genuinely need the strip and "we did not find out" must not silently
 // disable it.
 func (p *DVRPUProbe) CanStrip(ctx context.Context, bin, inputPath string) bool {
@@ -176,8 +176,14 @@ func (p *DVRPUProbe) CanStrip(ctx context.Context, bin, inputPath string) bool {
 // inheriting the old verdict, and on the binary because a different ffmpeg
 // build can parse a different set of RPUs.
 func dvRPUProbeKey(bin, inputPath string) (string, bool) {
+	if strings.HasPrefix(strings.ToLower(inputPath), "virtual://") {
+		return "", false
+	}
 	info, err := os.Stat(inputPath)
 	if err != nil {
+		if strings.Contains(inputPath, "://") {
+			return bin + "|" + inputPath, true
+		}
 		return "", false
 	}
 	return strings.Join([]string{

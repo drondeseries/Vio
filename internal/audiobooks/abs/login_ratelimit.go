@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
-
-	"github.com/Silo-Server/silo-server/internal/clientip"
 )
 
 // loginLimitBurst caps the number of body-creds /login attempts a single
@@ -95,22 +93,11 @@ func (l *LoginLimiter) janitor() {
 }
 
 // clientIP returns the rate-limit key for a request. The standalone listener
-// is public, so spoofable forwarding headers are deliberately ignored: the key
-// is always the transport peer.
-//
-// r.RemoteAddr is not that peer once clientip.Middleware has run — it has been
-// replaced with the header-derived viewer address, which an attacker fronted by
-// any trusted proxy (including Docker's bridge) can rotate per request to get a
-// fresh bucket. PeerFromContext carries the pre-overwrite address for exactly
-// this case; RemoteAddr is only correct when the middleware is absent.
+// is public, so spoofable forwarding headers are deliberately ignored.
 func clientIP(r *http.Request) string {
-	addr := r.RemoteAddr
-	if peer := clientip.PeerFromContext(r.Context()); peer != "" {
-		addr = peer
-	}
-	host, _, err := net.SplitHostPort(addr)
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return addr
+		return r.RemoteAddr
 	}
 	return host
 }

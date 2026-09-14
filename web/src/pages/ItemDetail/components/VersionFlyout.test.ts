@@ -15,6 +15,9 @@ function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
     bitrate: overrides.bitrate ?? 0,
     file_name: overrides.file_name,
     file_path: overrides.file_path,
+    edition_raw: overrides.edition_raw,
+    release_name: overrides.release_name,
+    release_group: overrides.release_group,
     audio_tracks: overrides.audio_tracks,
     video_tracks: overrides.video_tracks,
     subtitle_tracks: overrides.subtitle_tracks,
@@ -30,6 +33,20 @@ describe("buildQualitySummary", () => {
       codec_audio: "truehd",
     });
     expect(buildQualitySummary(version)).toBe("2160p · HEVC · HDR · TrueHD");
+  });
+
+  it("labels the just-in-time virtual results action", () => {
+    expect(buildQualitySummary(makeVersion({ file_path: "virtual://movie/tt1?results=all" }))).toBe(
+      "More results…",
+    );
+  });
+
+  it("does not label returned result files as the action", () => {
+    expect(
+      buildQualitySummary(
+        makeVersion({ file_path: "virtual://movie/tt1?results=all&result=abc123" }),
+      ),
+    ).toBe("1080p · H264 · AAC");
   });
 
   it("omits HDR segment when hdr is false", () => {
@@ -74,6 +91,26 @@ describe("buildQualitySummary", () => {
     expect(buildQualitySummary(version)).toBe("2160p · HEVC · HDR · Atmos");
   });
 
+  it("appends audio languages after the audio codec", () => {
+    const version = makeVersion({
+      resolution: "1080p",
+      codec_video: "h264",
+      codec_audio: "eac3",
+      audio_tracks: [{ language: "MULTI" }, { language: "fra" }],
+    });
+    expect(buildQualitySummary(version)).toBe("1080p · H264 · EAC3");
+  });
+
+  it("shows audio languages even when the audio codec is missing", () => {
+    const version = makeVersion({
+      resolution: "1080p",
+      codec_video: "h264",
+      codec_audio: "",
+      audio_tracks: [{ language: "eng" }],
+    });
+    expect(buildQualitySummary(version)).toBe("1080p · H264");
+  });
+
   it("falls back to container for ebook-style files without video quality", () => {
     const version = makeVersion({
       resolution: "",
@@ -113,6 +150,60 @@ describe("buildDetailLine", () => {
   it("shows source hint only when file_size is zero but name matches", () => {
     const version = makeVersion({ file_size: 0, file_name: "Movie.WEB-DL.mkv" });
     expect(buildDetailLine(version)).toBe("WEB-DL");
+  });
+
+  it("shows subtitle languages in the detail line", () => {
+    const version = makeVersion({
+      file_size: 0,
+      subtitle_tracks: [{ language: "eng" }, { language: "fra" }],
+    });
+    expect(buildDetailLine(version)).toBe("");
+  });
+
+  it("leads virtual versions with the provider release name", () => {
+    const version = makeVersion({
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=abc123",
+      edition_raw: "Disclosure Day 2160p DV HDR10 TrueHD MULTI",
+      file_size: 0,
+      subtitle_tracks: [{ language: "eng" }, { language: "fra" }],
+    });
+    expect(buildDetailLine(version)).toBe("Disclosure Day 2160p DV HDR10 TrueHD MULTI");
+  });
+
+  it("keeps size and source hint for virtual versions", () => {
+    const version = makeVersion({
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=abc123",
+      edition_raw: "Movie.2160p.Remux.mkv",
+      file_size: 45 * 1024 ** 3,
+    });
+    expect(buildDetailLine(version)).toBe("Movie 2160p Remux mkv · 45.0 GB · Remux");
+  });
+
+  it("prettifies release-style separators in the release name", () => {
+    const version = makeVersion({
+      release_name: "Mission.Impossible.2023.2160p.Multi-AltMount",
+      file_size: 0,
+    });
+    expect(buildDetailLine(version)).toBe("Mission Impossible 2023 2160p Multi-AltMount");
+  });
+
+  it("leads with release_name and prefers it over edition_raw", () => {
+    const version = makeVersion({
+      edition_raw: "Provider.Raw.Label",
+      release_name: "Movie.2023.1080p.WEB-DL.x264-GRP",
+      file_size: 10 * 1024 ** 3,
+    });
+    expect(buildDetailLine(version)).toBe("Movie 2023 1080p WEB-DL x264-GRP · 10.0 GB · WEB-DL");
+  });
+
+  it("falls back to edition_raw when release_name is absent", () => {
+    const version = makeVersion({
+      edition_raw: "Movie.2023.1080p.WEB-DL.x264-GRP",
+      file_size: 0,
+    });
+    expect(buildDetailLine(version)).toBe("Movie 2023 1080p WEB-DL x264-GRP · WEB-DL");
   });
 });
 

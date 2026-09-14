@@ -3,7 +3,9 @@ package plugins
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
@@ -84,18 +86,26 @@ func (r *TaskRegistry) Tasks(ctx context.Context) ([]taskmanager.Task, error) {
 			}
 
 			binding, err := r.bindings.GetTaskBinding(ctx, installation.ID, capability.ID)
-			if err != nil && err != ErrTaskBindingNotFound {
+			if err != nil && !errors.Is(err, ErrTaskBindingNotFound) {
 				return nil, err
 			}
 			if binding != nil && !binding.Enabled {
 				continue
 			}
 
+			name := installation.PluginID + " / " + capability.ID
+			description := "Runs plugin scheduled task " + capability.ID
+			if displayName, ok := capability.Metadata["display_name"].(string); ok && strings.TrimSpace(displayName) != "" {
+				name = displayName
+			}
+			if descriptionText, ok := capability.Metadata["description"].(string); ok && strings.TrimSpace(descriptionText) != "" {
+				description = descriptionText
+			}
 			task := &pluginTask{
 				installationID: installation.ID,
 				capabilityID:   capability.ID,
-				name:           installation.PluginID + " / " + capability.ID,
-				description:    "Runs plugin scheduled task " + capability.ID,
+				name:           name,
+				description:    description,
 				resolver:       r.host,
 				triggers:       defaultPluginTaskTriggers(binding),
 			}
@@ -142,7 +152,9 @@ func (t *pluginTask) Execute(ctx context.Context, progress taskmanager.ProgressR
 		return fmt.Errorf("load plugin task client: %w", err)
 	}
 
-	response, err := client.Run(ctx, &pluginv1.RunScheduledTaskRequest{TaskKey: t.Key()})
+	// The host key includes installation identity for global uniqueness, but
+	// the plugin contract identifies the task by its manifest capability ID.
+	response, err := client.Run(ctx, &pluginv1.RunScheduledTaskRequest{TaskKey: t.capabilityID})
 	if err != nil {
 		return fmt.Errorf("run plugin task %s: %w", t.Key(), err)
 	}
@@ -156,6 +168,7 @@ func (t *pluginTask) Execute(ctx context.Context, progress taskmanager.ProgressR
 	return nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func taskBindingKey(installationID int, capabilityID string) string {
 	return fmt.Sprintf("%d/%s", installationID, capabilityID)
 }

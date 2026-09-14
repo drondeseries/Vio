@@ -306,7 +306,7 @@ func (h *ImagesHandler) resolveItemImageURLFromTag(ctx context.Context, routeID,
 	// never reach this generic resolver.
 	contentID, err := decodeContentID(h.codec, routeID)
 	if err != nil {
-		return catalog.ResolvedImageURL{}, false, nil
+		return catalog.ResolvedImageURL{}, false, nil //nolint:nilerr // An unrecognized optional image route is a cache miss.
 	}
 	return h.resolveItemImageURLFromReposWithoutSession(ctx, routeID, contentID, imageType, imageSize, tag)
 }
@@ -478,7 +478,7 @@ func (h *ImagesHandler) resolveLibraryImageURLFromTag(ctx context.Context, route
 	}
 	folder, err := h.folderRepo.GetByID(ctx, libraryID)
 	if err != nil {
-		return catalog.ResolvedImageURL{}, false, nil
+		return catalog.ResolvedImageURL{}, false, nil //nolint:nilerr // Missing optional library artwork is a cache miss.
 	}
 	if folder.PosterPath == "" || !h.imageTags.Equal(
 		imageTagSeed(routeID, "Primary", compatCardImageSize, folder.PosterPath, "", time.Time{}),
@@ -700,7 +700,7 @@ func (h *ImagesHandler) proxyImageURL(w http.ResponseWriter, r *http.Request, im
 	if client == nil {
 		client = http.DefaultClient
 	}
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:bodyclose // proxyImage owns and closes the response body.
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "UpstreamError", "Failed to load image")
 		return

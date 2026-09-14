@@ -654,7 +654,7 @@ func (s *directContentService) enrichDetailUserData(ctx context.Context, store u
 				result.UserData = catalog.SeasonUserDataFromCounts(counts[contentID])
 				return
 			}
-			slog.Warn("series watch rollup query failed, falling back to per-episode rollup", "error", err)
+			slog.WarnContext(ctx, "series watch rollup query failed, falling back to per-episode rollup", "error", err)
 		}
 		if episodesBySeries, epErr := s.episodeRepo.ListBySeriesIDs(ctx, []string{contentID}); epErr == nil {
 			episodes := episodesBySeries[contentID]
@@ -1061,7 +1061,7 @@ func (s *directContentService) enrichSeriesListUserData(ctx context.Context, ses
 			}
 			return
 		}
-		slog.Warn("series watch rollup query failed, falling back to per-episode rollup", "error", err)
+		slog.WarnContext(ctx, "series watch rollup query failed, falling back to per-episode rollup", "error", err)
 	}
 
 	episodesBySeries, err := s.episodeRepo.ListBySeriesIDs(ctx, seriesIDs)
@@ -1168,6 +1168,8 @@ func (s *directContentService) batchProgressForEpisodes(ctx context.Context, ses
 }
 
 // enrichEpisodeUserData adds user data for a single episode.
+//
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *directContentService) enrichEpisodeUserData(ctx context.Context, session *Session, ep *upstreamEpisode) {
 	if progressMap, err := s.progressForContentIDs(ctx, session, []string{ep.ContentID}); err == nil {
 		if progress, ok := progressMap[ep.ContentID]; ok {
@@ -1184,6 +1186,7 @@ func (s *directContentService) userStore(ctx context.Context, session *Session) 
 	return s.storeProvider.ForUser(ctx, session.StreamAppUserID)
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *directContentService) progressForContentIDs(ctx context.Context, session *Session, contentIDs []string) (map[string]userstore.WatchProgress, error) {
 	store, err := s.userStore(ctx, session)
 	if err != nil {

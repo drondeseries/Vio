@@ -960,7 +960,6 @@ func (s *Service) ServeDirect(ctx context.Context, w http.ResponseWriter, r *htt
 	if err != nil {
 		return err
 	}
-	notifyServeAuthorized(ctx, *target)
 	return s.serveLocalFile(ctx, w, r, target.Path, userID)
 }
 
@@ -1000,7 +999,6 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 		if err != nil {
 			return err
 		}
-		notifyServeAuthorized(ctx, *target)
 		return s.serveFileTarget(ctx, w, r, target, userID)
 	}
 
@@ -1023,6 +1021,7 @@ func (s *Service) ServeFile(ctx context.Context, w http.ResponseWriter, r *http.
 	if dl.Status == StatusPreparing {
 		return fmt.Errorf("download is preparing: %w", ErrDownloadNotActive)
 	}
+
 	// Atomically transition queued → downloading for original rows. Artifact
 	// (remux/transcode) rows are already ready by the time bytes are served.
 	if dl.Format == FormatOriginal && dl.Status == StatusQueued {
@@ -1191,7 +1190,6 @@ func (s *Service) serveDownloadBytes(ctx context.Context, w http.ResponseWriter,
 	if err != nil {
 		return err
 	}
-	notifyServeAuthorized(ctx, *target)
 	return s.serveFileTarget(ctx, w, r, target, userID)
 }
 

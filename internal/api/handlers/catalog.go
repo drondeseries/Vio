@@ -21,6 +21,8 @@ import (
 // audiobookGroupsCacheTTL matches the client's React Query staleTime: the
 // grouped author/narrator browse is cached server-side for the same window so
 // the sequential page fetches and a quick refresh reuse one aggregation.
+//
+//nolint:unused // Retained for compatibility with dormant integration paths.
 const audiobookGroupsCacheTTL = 60 * time.Second
 
 type CatalogHandler struct {
@@ -28,13 +30,17 @@ type CatalogHandler struct {
 	itemsH      *ItemsHandler
 	workSummary catalog.WorkSummaryProvider
 
+	//nolint:unused // Retained for compatibility with dormant integration paths.
 	groupsCacheOnce sync.Once
-	groupsCache     *catalog.AudiobookGroupsCache
+	//nolint:unused // Retained for compatibility with dormant integration paths.
+	groupsCache *catalog.AudiobookGroupsCache
 }
 
 // audiobookGroups returns the lazily-initialized grouped-browse cache. Built on
 // first use (only the route-mounted singleton handler serves audiobook-groups)
 // so the per-request CatalogHandler instances never spawn a cache sweeper.
+//
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (h *CatalogHandler) audiobookGroups() *catalog.AudiobookGroupsCache {
 	h.groupsCacheOnce.Do(func() {
 		h.groupsCache = catalog.NewAudiobookGroupsCache(h.itemsH.browseRepo.Pool(), audiobookGroupsCacheTTL)

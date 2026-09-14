@@ -49,6 +49,7 @@ vi.mock("@/hooks/queries/watchlist", () => ({
 
 vi.mock("@/hooks/queries/items", () => ({
   useRefreshItemMetadata: () => ({ isPending: false, mutate: vi.fn() }),
+  useDeleteMediaItem: () => ({ isPending: false, mutate: vi.fn(), mutateAsync: vi.fn() }),
   useWatchedStateMutation: () => ({
     isPending: false,
     mutateAsync: (...args: unknown[]) => mocks.toggleWatched(...args),
@@ -154,13 +155,14 @@ describe("buildMediaItemMenuModel", () => {
     });
     const actions = model.filter((item) => item.kind === "action");
 
-    expect(actions).toHaveLength(6);
+    expect(actions).toHaveLength(7);
     expect(actions[0]?.label).toBe("Play from Beginning");
     expect(actions[1]?.label).toBe("Mark Unwatched");
     expect(actions[2]?.label).toBe("View Play History");
     expect(actions[3]?.label).toBe("Refresh Metadata");
     expect(actions[4]?.label).toBe("Edit Metadata");
     expect(actions[5]?.label).toBe("Match Item");
+    expect(actions[6]?.label).toBe("Delete Item");
   });
 
   it("omits admin actions for non-admin users", () => {
@@ -194,7 +196,7 @@ describe("buildMediaItemMenuModel", () => {
     });
     const labels = model.filter((item) => item.kind === "action").map((item) => item.label);
 
-    expect(labels).toEqual(["Refresh Metadata", "Edit Metadata", "Match Item"]);
+    expect(labels).toEqual(["Refresh Metadata", "Edit Metadata", "Match Item", "Delete Item"]);
     expect(labels).not.toContain("View Play History");
   });
 

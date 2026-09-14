@@ -305,7 +305,7 @@ func (s *PostgresUserStore) ReplaceWatchlistOrder(ctx context.Context, profileID
 	if err != nil {
 		return fmt.Errorf("begin watchlist order tx: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx,
 		`UPDATE user_watchlist SET sort_index = NULL

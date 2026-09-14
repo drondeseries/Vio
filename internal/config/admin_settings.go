@@ -96,6 +96,7 @@ var adminSettingDefaults = map[string]string{
 	playbackTranscodeDirSettingKey:                   DefaultTranscodeDir,
 	playbackSegmentRetentionSettingKey:               "600",
 	"playback.hw_accel":                              "auto",
+	"playback.software_fallback":                     "allow",
 	"playback.transcode_enabled":                     "true",
 	PlaybackRoutingDirectPlayEgressSettingKey:        string(PlaybackEgressPreferProxy),
 	PlaybackRoutingRemuxExecutionSettingKey:          string(PlaybackExecutionPreferTranscode),
@@ -111,6 +112,7 @@ var adminSettingDefaults = map[string]string{
 	PlaybackTranscodeSoftwareToneMapSettingKey:       "false",
 	"playback.watched_threshold":                     "90",
 	"playback.min_resume_threshold":                  "5",
+	"playback.max_virtual_failover_attempts":         "5",
 	Allow4KTranscodeSettingKey:                       "false",
 	"enable_transcode_throttle":                      "false",
 	"transcode_throttle_seconds":                     "300",
@@ -365,6 +367,8 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 100)
 	case "playback.min_resume_threshold":
 		return normalizeAdminInt(key, value, 1, 99)
+	case "playback.max_virtual_failover_attempts":
+		return normalizeAdminInt(key, value, 1, 50)
 	case "transcode_throttle_seconds":
 		return normalizeAdminInt(key, value, 60, 86400)
 	case playbackSegmentRetentionSettingKey:
@@ -467,6 +471,8 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminEnum(key, value, "postgres", "sqlite")
 	case "playback.hw_accel":
 		return normalizeAdminEnum(key, value, "auto", "qsv", "vaapi", "nvenc", "videotoolbox", "none")
+	case "playback.software_fallback":
+		return normalizeAdminEnum(key, value, "allow", "gpu_only")
 	case PlaybackRoutingRemuxExecutionSettingKey, PlaybackRoutingVideoTranscodeExecutionSettingKey:
 		return normalizeAdminEnum(key, value,
 			string(PlaybackExecutionPreferWorker), string(PlaybackExecutionPreferTranscode),

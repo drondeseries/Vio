@@ -40,6 +40,26 @@ type DeviceSettingEntry struct {
 	UpdatedAt      string
 }
 
+// DeviceCapabilityProfile is the normalized, server-side capability set for
+// one (profile, device). It mirrors the ad-hoc X-Device-* capability headers
+// the prewarm path already consumes, so ranking has a single shape whether the
+// profile came from a Jellyfin handshake, a native capability report, or an
+// admin override.
+type DeviceCapabilityProfile struct {
+	ProfileID      string
+	DeviceID       string
+	CodecsVideo    []string
+	CodecsAudio    []string
+	Containers     []string
+	MaxResolution  string
+	HDR            bool
+	DolbyVision    bool
+	Source         string // client | admin | seed
+	Fingerprint    string
+	UpdatedAt      string
+	LastReportedAt string
+}
+
 // DeviceEntry is a durable app/device identity observed for one profile
 // within a user. It lets admins configure a device before it has overrides.
 type DeviceEntry struct {

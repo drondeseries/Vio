@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -119,7 +120,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if attempt < maxRetries {
 				backoff := retryAfterOrDefault(resp, attempt)
 				select {
@@ -133,7 +134,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		}
 
 		if resp.StatusCode >= 500 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if attempt < maxRetries {
 				backoff := time.Duration(1<<attempt) * time.Second
 				select {
@@ -148,7 +149,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			var apiErr apiError
 			if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.StatusMessage != "" {
 				return fmt.Errorf("tmdb: HTTP %d: %s", resp.StatusCode, apiErr.StatusMessage)
@@ -157,7 +158,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		}
 
 		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(dest)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if decodeErr != nil {
 			return fmt.Errorf("tmdb: decode response: %w", decodeErr)
 		}
@@ -489,10 +490,15 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 				if title == "" {
 					title = item.Name
 				}
+				releaseDate := item.ReleaseDate
+				if releaseDate == "" {
+					releaseDate = item.FirstAirDate
+				}
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: item.MediaType,
-					Title:     title,
+					ID:          item.ID,
+					MediaType:   item.MediaType,
+					Title:       title,
+					ReleaseDate: releaseDate,
 				})
 			}
 			if page >= resp.TotalPages {
@@ -506,9 +512,10 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 				}
 				for _, item := range resp.Results {
 					results = append(results, CollectionResult{
-						ID:        item.ID,
-						MediaType: "tv",
-						Title:     item.Name,
+						ID:          item.ID,
+						MediaType:   "tv",
+						Title:       item.Name,
+						ReleaseDate: item.FirstAirDate,
 					})
 				}
 				if page >= resp.TotalPages {
@@ -523,9 +530,10 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 			}
 			for _, item := range resp.Results {
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: "movie",
-					Title:     item.Title,
+					ID:          item.ID,
+					MediaType:   "movie",
+					Title:       item.Title,
+					ReleaseDate: item.ReleaseDate,
 				})
 			}
 			if page >= resp.TotalPages {
@@ -538,9 +546,10 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 			}
 			for _, item := range resp.Results {
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: "movie",
-					Title:     item.Title,
+					ID:          item.ID,
+					MediaType:   "movie",
+					Title:       item.Title,
+					ReleaseDate: item.ReleaseDate,
 				})
 			}
 			if page >= resp.TotalPages {
@@ -553,9 +562,10 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 			}
 			for _, item := range resp.Results {
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: "tv",
-					Title:     item.Name,
+					ID:          item.ID,
+					MediaType:   "tv",
+					Title:       item.Name,
+					ReleaseDate: item.FirstAirDate,
 				})
 			}
 			if page >= resp.TotalPages {
@@ -613,9 +623,10 @@ func (c *Client) Discover(ctx context.Context, mediaType string, params Discover
 			}
 			for _, item := range resp.Results {
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: "tv",
-					Title:     item.Name,
+					ID:          item.ID,
+					MediaType:   "tv",
+					Title:       item.Name,
+					ReleaseDate: item.FirstAirDate,
 				})
 			}
 			if page >= resp.TotalPages || len(resp.Results) == 0 {
@@ -630,9 +641,10 @@ func (c *Client) Discover(ctx context.Context, mediaType string, params Discover
 		}
 		for _, item := range resp.Results {
 			results = append(results, CollectionResult{
-				ID:        item.ID,
-				MediaType: "movie",
-				Title:     item.Title,
+				ID:          item.ID,
+				MediaType:   "movie",
+				Title:       item.Title,
+				ReleaseDate: item.ReleaseDate,
 			})
 		}
 		if page >= resp.TotalPages || len(resp.Results) == 0 {
@@ -1077,6 +1089,209 @@ func pickMovieCertification(rd *releaseDatesResponse) string {
 		return fallbackUS
 	}
 	return fallbackAny
+}
+
+// HasDigitalRelease reports whether a movie has any Digital, Physical, or TV
+// release date on record that is <= today — i.e. it is no longer
+// theatrical-only. Titles with no release-date data at all are treated as
+// released (true): the gate must not mass-skip poorly-populated TMDB entries,
+// and the caller's existing date-based checks already cover future releases.
+//
+// When /movie/{id}/release_dates lacks Type 4/5/6 entries, it inspects movie
+// release details for known streaming platform distributors (e.g. Netflix,
+// Apple, Disney+, Prime Video, etc.) whose release date is in the past, rather
+// than falsely treating them as theatrical-only.
+func (c *Client) HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error) {
+	var resp releaseDatesResponse
+	if err := c.doGet(ctx, fmt.Sprintf("/movie/%d/release_dates", tmdbID), &resp); err != nil {
+		return false, err
+	}
+	if len(resp.Results) == 0 {
+		return true, nil
+	}
+	if HasDigitalOrPhysicalRelease(&resp) {
+		return true, nil
+	}
+
+	// When release_dates lacks Type 4/5/6 or streaming note entries, inspect
+	// movie release details: streaming platform originals (like Netflix's
+	// "The Last House") frequently have only theatrical or premiere entries
+	// recorded in TMDB's release_dates sub-resource.
+	var movie struct {
+		ReleaseDate         string         `json:"release_date"`
+		Status              string         `json:"status"`
+		Homepage            string         `json:"homepage"`
+		Overview            string         `json:"overview"`
+		Tagline             string         `json:"tagline"`
+		ProductionCompanies []companyEntry `json:"production_companies"`
+	}
+	if err := c.doGet(ctx, fmt.Sprintf("/movie/%d", tmdbID), &movie); err == nil {
+		isStreaming := hasStreamingDistributor(movie.ProductionCompanies) ||
+			isStreamingURL(movie.Homepage) ||
+			streamingTextRegex.MatchString(movie.Overview) ||
+			streamingTextRegex.MatchString(movie.Tagline)
+		if isStreaming {
+			dateStr := strings.TrimSpace(movie.ReleaseDate)
+			if len(dateStr) >= 10 {
+				dateStr = dateStr[:10]
+			}
+			now := time.Now().UTC().Truncate(24 * time.Hour)
+			if dateStr != "" {
+				if t, err := time.Parse("2006-01-02", dateStr); err == nil && !t.After(now) {
+					return true, nil
+				}
+			} else if strings.EqualFold(movie.Status, "Released") {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
+// HasDigitalOrPhysicalRelease reports whether TMDB release dates contain a
+// Digital (4), Physical (5), or TV (6) release date that is <= today, or
+// an entry whose note indicates a known streaming service that is <= today.
+func HasDigitalOrPhysicalRelease(rd *releaseDatesResponse) bool {
+	if rd == nil {
+		return false
+	}
+	now := time.Now().UTC().Truncate(24 * time.Hour)
+	for _, country := range rd.Results {
+		for _, entry := range country.ReleaseDates {
+			isDigitalType := entry.Type == 4 || entry.Type == 5 || entry.Type == 6
+			isStreaming := isStreamingServiceName(entry.Note)
+			if isDigitalType || isStreaming {
+				dateStr := strings.TrimSpace(entry.ReleaseDate)
+				if dateStr == "" {
+					continue
+				}
+				if len(dateStr) >= 10 {
+					dateStr = dateStr[:10]
+				}
+				t, err := time.Parse("2006-01-02", dateStr)
+				if err == nil && !t.After(now) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+var (
+	streamingWordRegex = regexp.MustCompile(`(?i)\b(netflix|hulu|peacock|shudder|mubi|tubi)\b`)
+	maxWordRegex       = regexp.MustCompile(`(?i)\b(hbo\s*max|max)\b`)
+	streamingTextRegex = regexp.MustCompile(`(?i)\b(netflix\s+original|streaming\s+on\s+netflix|apple\s+original\s+films?|disney\+\s+original|hulu\s+original)\b`)
+)
+
+func isStreamingServiceName(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	lower := strings.ToLower(s)
+	// Never treat theatrical presentation formats (IMAX, Cinemax) as digital streaming.
+	if strings.Contains(lower, "imax") || strings.Contains(lower, "cinemax") {
+		return false
+	}
+	if streamingWordRegex.MatchString(s) {
+		return true
+	}
+	if maxWordRegex.MatchString(s) {
+		return true
+	}
+	multiWordKeywords := []string{
+		"apple tv",
+		"apple original",
+		"prime video",
+		"amazon prime",
+		"amazon video",
+		"disney+",
+		"disney plus",
+		"paramount+",
+		"paramount plus",
+		"criterion channel",
+		"pluto tv",
+	}
+	for _, kw := range multiWordKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasStreamingDistributor(companies []companyEntry) bool {
+	for _, company := range companies {
+		if isStreamingDistributor(company.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func isStreamingURL(rawURL string) bool {
+	rawURL = strings.ToLower(strings.TrimSpace(rawURL))
+	if rawURL == "" {
+		return false
+	}
+	domains := []string{
+		"netflix.com",
+		"tv.apple.com",
+		"apple.com/tv",
+		"primevideo.com",
+		"amazon.com",
+		"disneyplus.com",
+		"hulu.com",
+		"max.com",
+		"hbomax.com",
+		"peacocktv.com",
+		"paramountplus.com",
+		"shudder.com",
+		"mubi.com",
+		"criterionchannel.com",
+		"tubitv.com",
+	}
+	for _, d := range domains {
+		if strings.Contains(rawURL, d) {
+			return true
+		}
+	}
+	return false
+}
+
+func isStreamingDistributor(name string) bool {
+	s := strings.ToLower(strings.TrimSpace(name))
+	if s == "" {
+		return false
+	}
+	keywords := []string{
+		"netflix",
+		"apple original films",
+		"apple studios",
+		"apple tv",
+		"amazon studios",
+		"amazon mgm studios",
+		"prime video",
+		"disney+",
+		"disney plus",
+		"hulu",
+		"max originals",
+		"hbo max",
+		"peacock",
+		"paramount+",
+		"paramount plus",
+		"shudder",
+		"mubi",
+		"criterion channel",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(s, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func pickTVRating(cr *contentRatingsResponse) string {

@@ -314,10 +314,6 @@ func (failingSessionManager) BeginTransport(string) error { return nil }
 
 func (failingSessionManager) EndTransport(string) error { return nil }
 
-func (failingSessionManager) WatchTransportStop(string) (<-chan struct{}, func()) {
-	return nil, func() {}
-}
-
 func (failingSessionManager) SetRemoteTransport(string, bool) error { return nil }
 
 func (failingSessionManager) SetEffectiveMediaFileID(string, int) error { return nil }
@@ -1323,6 +1319,129 @@ func TestPersistStopAndHistory_PersistsPositiveProgressStops(t *testing.T) {
 	}
 }
 
+// virtualProgressFixture returns a neutral requested virtual row plus the
+// working candidate row it resolves to, matching the post-resolve shape where
+// the session keeps RequestedMediaFileID on the neutral row while
+// VirtualSourceURI names the candidate that actually played.
+func virtualProgressFixture() (requested, candidate *models.MediaFile) {
+	requested = &models.MediaFile{
+		ID:         42,
+		ContentID:  "movie-1",
+		FilePath:   "virtual://movie/tt1234567",
+		Resolution: "VIRTUAL",
+		Duration:   3600,
+	}
+	candidate = &models.MediaFile{
+		ID:         84,
+		ContentID:  "movie-1",
+		FilePath:   "virtual://movie/tt1234567?result=working",
+		Resolution: "1080p",
+		CodecVideo: "h264",
+		Duration:   3600,
+	}
+	return requested, candidate
+}
+
+// A virtual session must record the candidate row it actually played, not the
+// neutral requested row: last_file_id drives the media page's version
+// preference, so recording the neutral row leaves the page stuck on VIRTUAL.
+func TestPersistProgressRecordsEffectiveVirtualCandidate(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	requested, candidate := virtualProgressFixture()
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: requested})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	handler.VirtualFileLookup = func(_ context.Context, path string) (*models.MediaFile, error) {
+		if path != candidate.FilePath {
+			t.Fatalf("VirtualFileLookup(%q), want %q", path, candidate.FilePath)
+		}
+		return candidate, nil
+	}
+
+	handler.persistProgress(context.Background(), &playback.Session{
+		ID:                   "session-virtual",
+		UserID:               1,
+		ProfileID:            "profile-1",
+		MediaFileID:          candidate.ID,
+		RequestedMediaFileID: requested.ID,
+		VirtualSourceURI:     candidate.FilePath,
+		Position:             240,
+	})
+
+	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
+	if err != nil {
+		t.Fatalf("get progress: %v", err)
+	}
+	if progress == nil || progress.LastFileID == nil {
+		t.Fatalf("progress = %#v, want recorded version hints", progress)
+	}
+	if *progress.LastFileID != candidate.ID {
+		t.Fatalf("last_file_id = %d, want effective candidate %d (requested %d)", *progress.LastFileID, candidate.ID, requested.ID)
+	}
+}
+
+// When the candidate row cannot be resolved any more (replaced between resolve
+// and persist), progress falls back to the requested row rather than dropping.
+func TestPersistProgressFallsBackWhenVirtualCandidateMissing(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	requested, candidate := virtualProgressFixture()
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: requested})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	handler.VirtualFileLookup = func(context.Context, string) (*models.MediaFile, error) {
+		return nil, nil
+	}
+
+	handler.persistProgress(context.Background(), &playback.Session{
+		ID:                   "session-virtual-missing",
+		UserID:               1,
+		ProfileID:            "profile-1",
+		MediaFileID:          candidate.ID,
+		RequestedMediaFileID: requested.ID,
+		VirtualSourceURI:     candidate.FilePath,
+		Position:             240,
+	})
+
+	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
+	if err != nil {
+		t.Fatalf("get progress: %v", err)
+	}
+	if progress == nil || progress.LastFileID == nil || *progress.LastFileID != requested.ID {
+		t.Fatalf("progress = %#v, want fallback to requested file %d", progress, requested.ID)
+	}
+}
+
+// persistStopAndHistory uses the same resolution, so the final history entry
+// also adopts the candidate that played.
+func TestPersistStopAndHistoryRecordsEffectiveVirtualCandidate(t *testing.T) {
+	store := newPlaybackTestStore(t)
+	requested, candidate := virtualProgressFixture()
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: requested})
+	handler.StoreProvider = testUserStoreProvider{store: store}
+	handler.VirtualFileLookup = func(context.Context, string) (*models.MediaFile, error) {
+		return candidate, nil
+	}
+
+	handler.persistStopAndHistory(context.Background(), &playback.Session{
+		ID:                   "session-virtual-stop",
+		UserID:               1,
+		ProfileID:            "profile-1",
+		MediaFileID:          candidate.ID,
+		RequestedMediaFileID: requested.ID,
+		VirtualSourceURI:     candidate.FilePath,
+		Position:             240,
+	})
+
+	progress, err := store.GetProgress(context.Background(), "profile-1", "movie-1")
+	if err != nil {
+		t.Fatalf("get progress: %v", err)
+	}
+	if progress == nil || progress.LastFileID == nil || *progress.LastFileID != candidate.ID {
+		t.Fatalf("progress = %#v, want effective candidate %d", progress, candidate.ID)
+	}
+}
+
 func TestFindAlternateFile_DoesNotCrossEdition(t *testing.T) {
 	source := &models.MediaFile{
 		ID:         1,
@@ -1513,5 +1632,81 @@ func TestAlignedSeekSeconds(t *testing.T) {
 					tt.seek, tt.segDur, tt.targetVideo, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestClampEncodedTargetResolution(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested string
+		source    string
+		want      string
+	}{
+		{"clamps 2160p to 1080p", "2160p", "1080p", "1080p"},
+		{"keeps lower target", "720p", "1080p", "720p"},
+		{"keeps equal target", "1080p", "1080p", "1080p"},
+		{"keeps empty target", "", "1080p", ""},
+		{"keeps unknown target", "source", "1080p", "source"},
+		{"keeps target for unknown source", "2160p", "native", "2160p"},
+		{"supports low tiers", "480p", "420p", "420p"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clampEncodedTargetResolution(tt.requested, tt.source); got != tt.want {
+				t.Fatalf("clampEncodedTargetResolution(%q, %q) = %q, want %q", tt.requested, tt.source, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFindAlternateFilesMultipleCandidates(t *testing.T) {
+	source := &models.MediaFile{
+		ID:         1,
+		ContentID:  "movie-123",
+		Resolution: "2160p",
+		HDR:        true,
+	}
+	handler := &PlaybackHandler{
+		FileVersionFetcher: testPlaybackFileVersionFetcher{
+			byContent: map[string][]*models.MediaFile{
+				"movie-123": {
+					source,
+					{
+						ID:         2,
+						ContentID:  "movie-123",
+						Resolution: "1080p",
+						HDR:        true,
+						Bitrate:    8_000_000,
+					},
+					{
+						ID:         3,
+						ContentID:  "movie-123",
+						Resolution: "1080p",
+						HDR:        false,
+						Bitrate:    6_000_000,
+					},
+					{
+						ID:         4,
+						ContentID:  "movie-123",
+						Resolution: "720p",
+						HDR:        false,
+						Bitrate:    3_000_000,
+					},
+				},
+			},
+		},
+	}
+
+	alternates, err := handler.findAlternateFiles(context.Background(), source)
+	if err != nil {
+		t.Fatalf("findAlternateFiles: %v", err)
+	}
+	if len(alternates) != 3 {
+		t.Fatalf("expected 3 alternates, got %d", len(alternates))
+	}
+	// SDR before HDR, then highest resolution, then highest bitrate.
+	// Expected order: 3 (1080p SDR), 4 (720p SDR - wait: 2 is 1080p HDR, SDR preferred so 3, 4, 2)
+	if alternates[0].ID != 3 {
+		t.Errorf("alternates[0].ID = %d, want 3 (1080p SDR)", alternates[0].ID)
 	}
 }

@@ -428,36 +428,45 @@ type PersonCredit struct {
 
 // FileVersion represents a single file version available for playback.
 type FileVersion struct {
-	FileID                   int                    `json:"file_id"`
-	FileName                 string                 `json:"file_name,omitempty"`
-	FilePath                 string                 `json:"file_path,omitempty"`
-	Resolution               string                 `json:"resolution"`
-	CodecVideo               string                 `json:"codec_video"`
-	CodecAudio               string                 `json:"codec_audio"`
-	HDR                      bool                   `json:"hdr"`
-	Container                string                 `json:"container"`
-	FileSize                 int64                  `json:"file_size"`
-	Duration                 int                    `json:"duration"`
-	Bitrate                  int                    `json:"bitrate"`
-	AddedAt                  time.Time              `json:"added_at"`
-	EditionRaw               string                 `json:"edition_raw,omitempty"`
-	EditionKey               string                 `json:"edition_key,omitempty"`
-	PresentationKind         string                 `json:"presentation_kind,omitempty"`
-	PresentationGroupKey     string                 `json:"presentation_group_key,omitempty"`
-	PresentationPartIndex    int                    `json:"presentation_part_index,omitempty"`
-	PresentationPartTotal    int                    `json:"presentation_part_total,omitempty"`
-	MultiEpisodeStart        int                    `json:"multi_episode_start,omitempty"`
-	MultiEpisodeEnd          int                    `json:"multi_episode_end,omitempty"`
-	EffectiveAudioTrackIndex *int                   `json:"effective_audio_track_index,omitempty"`
-	EffectiveAudioLanguage   string                 `json:"effective_audio_language,omitempty"`
-	VideoTracks              []models.VideoTrack    `json:"video_tracks,omitempty"`
-	AudioTracks              []models.AudioTrack    `json:"audio_tracks,omitempty"`
-	SubtitleTracks           []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
-	Chapters                 []VersionChapter       `json:"chapters,omitempty"`
-	Intro                    *Marker                `json:"intro,omitempty"`
-	Credits                  *Marker                `json:"credits,omitempty"`
-	Recap                    *Marker                `json:"recap,omitempty"`
-	Preview                  *Marker                `json:"preview,omitempty"`
+	FileID                   int       `json:"file_id"`
+	FileName                 string    `json:"file_name,omitempty"`
+	FilePath                 string    `json:"file_path,omitempty"`
+	Resolution               string    `json:"resolution"`
+	CodecVideo               string    `json:"codec_video"`
+	CodecAudio               string    `json:"codec_audio"`
+	HDR                      bool      `json:"hdr"`
+	Container                string    `json:"container"`
+	FileSize                 int64     `json:"file_size"`
+	Duration                 int       `json:"duration"`
+	Bitrate                  int       `json:"bitrate"`
+	AddedAt                  time.Time `json:"added_at"`
+	EditionRaw               string    `json:"edition_raw,omitempty"`
+	EditionKey               string    `json:"edition_key,omitempty"`
+	ReleaseName              string    `json:"release_name,omitempty"`
+	ReleaseGroup             string    `json:"release_group,omitempty"`
+	PresentationKind         string    `json:"presentation_kind,omitempty"`
+	PresentationGroupKey     string    `json:"presentation_group_key,omitempty"`
+	PresentationPartIndex    int       `json:"presentation_part_index,omitempty"`
+	PresentationPartTotal    int       `json:"presentation_part_total,omitempty"`
+	MultiEpisodeStart        int       `json:"multi_episode_start,omitempty"`
+	MultiEpisodeEnd          int       `json:"multi_episode_end,omitempty"`
+	EffectiveAudioTrackIndex *int      `json:"effective_audio_track_index,omitempty"`
+	EffectiveAudioLanguage   string    `json:"effective_audio_language,omitempty"`
+	Failed                   bool      `json:"failed,omitempty"`
+	// Available reports the durable per-version health signal: a virtual
+	// candidate is available when it has not been stamped failed (failed_at is
+	// NULL), a local file when it is not marked missing (missing_since is
+	// NULL). Omitted when the version is available, so an absent field means
+	// available/unknown; false means the version is currently unavailable.
+	Available      *bool                  `json:"available,omitempty"`
+	VideoTracks    []models.VideoTrack    `json:"video_tracks,omitempty"`
+	AudioTracks    []models.AudioTrack    `json:"audio_tracks,omitempty"`
+	SubtitleTracks []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
+	Chapters       []VersionChapter       `json:"chapters,omitempty"`
+	Intro          *Marker                `json:"intro,omitempty"`
+	Credits        *Marker                `json:"credits,omitempty"`
+	Recap          *Marker                `json:"recap,omitempty"`
+	Preview        *Marker                `json:"preview,omitempty"`
 }
 
 // PlaybackVariant is one logical watch choice, optionally spanning multiple ordered parts.
@@ -686,6 +695,12 @@ type DetailService struct {
 	probeEnsurer      PlaybackProbeEnsurer
 	copySafetyRacer   CopySafetyRacer
 	chapterThumbs     ChapterThumbnailQueuer
+
+	// watchPrepareMu guards watchPrepared, the per-content memo that keeps a
+	// repeated watch-detail fetch of unchanged files from re-running the
+	// copy-safety preparation and chapter-thumbnail enqueue on every request.
+	watchPrepareMu sync.Mutex
+	watchPrepared  map[string]watchPrepareState
 
 	// resolver is built once on first use; see settingsResolver.
 	resolverOnce sync.Once
@@ -2888,8 +2903,7 @@ func (s *DetailService) GetWatchDetail(ctx context.Context, contentID string, fi
 			return nil, fmt.Errorf("fetching watch file versions: %w", err)
 		}
 		files = FilterMediaFilesByAccess(files, filter)
-		files = s.preparePlaybackFiles(ctx, files)
-		s.queueWatchPlaybackFiles(ctx, item.ContentID, item.Type, files)
+		files = s.prepareWatchFiles(ctx, item.ContentID, item.Type, files)
 		detail := s.newWatchDetail(
 			ctx,
 			item.ContentID,
@@ -2945,8 +2959,7 @@ func (s *DetailService) GetWatchDetail(ctx context.Context, contentID string, fi
 	}
 
 	files = FilterMediaFilesByAccess(files, filter)
-	files = s.preparePlaybackFiles(ctx, files)
-	s.queueWatchPlaybackFiles(ctx, episode.ContentID, "episode", files)
+	files = s.prepareWatchFiles(ctx, episode.ContentID, "episode", files)
 	detail := s.newWatchDetail(
 		ctx,
 		episode.ContentID,
@@ -3012,8 +3025,7 @@ func (s *DetailService) buildExtraWatchDetail(ctx context.Context, contentID str
 		return nil, fmt.Errorf("fetching extra watch files: %w", err)
 	}
 	files = FilterMediaFilesByAccess(files, filter)
-	files = s.preparePlaybackFiles(ctx, files)
-	s.queueWatchPlaybackFiles(ctx, extra.ContentID, "extra", files)
+	files = s.prepareWatchFiles(ctx, extra.ContentID, "extra", files)
 	detail := s.newWatchDetail(
 		ctx,
 		extra.ContentID,
@@ -3387,6 +3399,15 @@ func (s *DetailService) effectiveAudioSelectionWith(
 	if file == nil || len(file.AudioTracks) == 0 {
 		return effectiveAudioSelection{}
 	}
+	// Backfill the languages array from embedded track titles before resolving
+	// the effective language: rows probed before MULTI/DUAL languages support
+	// carry an empty array or a "mul"/"und" tag, while the displayed
+	// FileVersion.AudioTracks are backfilled by ensureTrackLanguages. Resolving
+	// against a backfilled copy keeps EffectiveAudioLanguage consistent with
+	// the tracks the client renders without mutating the caller's file.
+	backfilled := *file
+	backfilled.AudioTracks = ensureTrackLanguages(append([]models.AudioTrack(nil), file.AudioTracks...))
+	file = &backfilled
 	if r == nil || !r.valid {
 		index := playback.SelectAudioTrack(file.AudioTracks, "", nil)
 		return effectiveAudioSelection{
@@ -3527,6 +3548,54 @@ func sortAudiobookMediaFiles(files []*models.MediaFile) {
 	})
 }
 
+// ensureTrackLanguages backfills the languages array from a track's embedded
+// title when the track carries no explicit list and its language tag is absent,
+// undetermined, or multiple. Rows probed before the MULTI/DUAL languages
+// support were scanned with an empty array; re-deriving it at read time keeps
+// the version flyout complete until the probe-version re-probe catches up.
+func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
+	for i := range tracks {
+		track := &tracks[i]
+		if len(track.Languages) > 0 {
+			continue
+		}
+		if track.Language != "" && track.Language != "und" && track.Language != "mul" {
+			continue
+		}
+		if languages := lang.ParseLanguages(track.EmbeddedTitle); len(languages) > 0 {
+			track.Languages = languages
+			if track.Language == "" || track.Language == "und" || track.Language == "mul" {
+				track.Language = languages[0]
+			}
+		}
+	}
+	return tracks
+}
+
+// isVirtualMediaFile reports whether a media file row is a zero-storage
+// virtual candidate (provider-backed) rather than a local file. Virtual rows
+// carry a virtual:// path; local liveness (missing_since) never applies to
+// them, and their health signal is the failed_at stamp instead.
+func isVirtualMediaFile(f *models.MediaFile) bool {
+	return f != nil && strings.HasPrefix(f.FilePath, "virtual://")
+}
+
+// versionAvailability returns the durable per-version health signal as a
+// pointer so the JSON field is omitted when the version is available (absent
+// means available/unknown) and false when it is not: a virtual candidate is
+// unavailable when stamped failed (failed_at set), a local file when marked
+// missing (missing_since set).
+func versionAvailability(f *models.MediaFile) *bool {
+	if f == nil {
+		return nil
+	}
+	available := isVirtualMediaFile(f) && f.FailedAt == nil || !isVirtualMediaFile(f) && f.MissingSince == nil
+	if available {
+		return nil
+	}
+	return boolPtr(false)
+}
+
 func (s *DetailService) buildPlaybackInfo(
 	ctx context.Context,
 	files []*models.MediaFile,
@@ -3540,6 +3609,16 @@ func (s *DetailService) buildPlaybackInfo(
 	// Resolve the request-invariant audio preferences once; a multi-track item
 	// would otherwise re-query the profile/preference rows for every file.
 	audioResolver := s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID)
+
+	// Runtime fallbacks are request-invariant too. Every file in one call shares
+	// one item (movies, extras) and, for episode versions, one episode, so a
+	// multi-version item used to pay a fresh GetByID per version when its files
+	// carried no duration. Memoize within the call so each distinct ID costs one
+	// lookup; the zero value also records "looked up, no runtime" so a failed or
+	// empty lookup is not retried per file. Keys are the raw IDs, so a caller
+	// that ever mixes episodes still resolves each one correctly.
+	episodeDuration := make(map[string]int)
+	itemDuration := make(map[string]int)
 
 	for _, f := range files {
 		if f == nil {
@@ -3563,6 +3642,34 @@ func (s *DetailService) buildPlaybackInfo(
 			firstPreview = versionPreview
 		}
 
+		fileDuration := f.Duration
+		if fileDuration <= 0 && f.EpisodeID != "" && s.episodeRepo != nil {
+			if cached, ok := episodeDuration[f.EpisodeID]; ok {
+				fileDuration = cached
+			} else {
+				duration := 0
+				if ep, epErr := s.episodeRepo.GetByID(ctx, f.EpisodeID); epErr == nil && ep != nil && ep.Runtime > 0 {
+					duration = ep.Runtime * 60
+				}
+				episodeDuration[f.EpisodeID] = duration
+				fileDuration = duration
+			}
+		}
+		if fileDuration <= 0 && f.ContentID != "" && s.itemRepo != nil {
+			if cached, ok := itemDuration[f.ContentID]; ok {
+				fileDuration = cached
+			} else {
+				duration := 0
+				if item, itemErr := s.itemRepo.GetByID(ctx, f.ContentID); itemErr == nil && item != nil && item.Runtime > 0 {
+					duration = item.Runtime * 60
+				}
+				itemDuration[f.ContentID] = duration
+				fileDuration = duration
+			}
+		}
+
+		audioTracks := ensureTrackLanguages(append([]models.AudioTrack(nil), f.AudioTracks...))
+
 		versions = append(versions, FileVersion{
 			FileID:                   f.ID,
 			FileName:                 filepath.Base(f.FilePath),
@@ -3573,11 +3680,13 @@ func (s *DetailService) buildPlaybackInfo(
 			HDR:                      f.HDR,
 			Container:                f.Container,
 			FileSize:                 f.FileSize,
-			Duration:                 f.Duration,
+			Duration:                 fileDuration,
 			Bitrate:                  f.Bitrate,
 			AddedAt:                  f.CreatedAt,
 			EditionRaw:               f.EditionRaw,
 			EditionKey:               f.EditionKey,
+			ReleaseName:              f.ReleaseName,
+			ReleaseGroup:             f.ReleaseGroup,
 			PresentationKind:         f.PresentationKind,
 			PresentationGroupKey:     f.PresentationGroupKey,
 			PresentationPartIndex:    f.PresentationPartIndex,
@@ -3586,14 +3695,21 @@ func (s *DetailService) buildPlaybackInfo(
 			MultiEpisodeEnd:          f.MultiEpisodeEnd,
 			EffectiveAudioTrackIndex: intPtr(effectiveAudioSelection.Index),
 			EffectiveAudioLanguage:   effectiveAudioSelection.Language,
-			VideoTracks:              append([]models.VideoTrack(nil), f.VideoTracks...),
-			AudioTracks:              append([]models.AudioTrack(nil), f.AudioTracks...),
-			SubtitleTracks:           buildVersionSubtitleTracks(f),
-			Chapters:                 s.buildVersionChapters(ctx, f),
-			Intro:                    versionIntro,
-			Credits:                  versionCredits,
-			Recap:                    versionRecap,
-			Preview:                  versionPreview,
+			Failed:                   f.FailedAt != nil,
+			// Available is the durable per-version health signal: a virtual
+			// candidate is available when it has not been stamped failed
+			// (failed_at IS NULL), a local file when it is not marked missing
+			// (missing_since IS NULL). Omitted when available, so an absent
+			// field means available/unknown; false means unavailable.
+			Available:      versionAvailability(f),
+			VideoTracks:    append([]models.VideoTrack(nil), f.VideoTracks...),
+			AudioTracks:    audioTracks,
+			SubtitleTracks: buildVersionSubtitleTracks(f),
+			Chapters:       s.buildVersionChapters(ctx, f),
+			Intro:          versionIntro,
+			Credits:        versionCredits,
+			Recap:          versionRecap,
+			Preview:        versionPreview,
 		})
 
 		for _, sub := range f.SubtitleTracks {
@@ -3922,6 +4038,95 @@ func (s *DetailService) queueWatchPlaybackFiles(
 		len(fileIDs),
 	)
 	s.chapterThumbs.QueueFileIDs(ctx, fileIDs)
+}
+
+// watchPrepareTTL bounds how long a repeated watch-detail fetch trusts the
+// preparation done for the same content. Probe repair is persisted and the
+// copy-safety verdict is memoized, and chapter extraction dedupes in-flight
+// work, so within the TTL the preparation is a replay of work that is already
+// settled. Past the TTL the work is reissued so a file whose probe or
+// thumbnail generation failed still retries without waiting for a restart.
+const watchPrepareTTL = 5 * time.Minute
+
+// watchPreparedMaxEntries bounds the memo so a long-lived process that sees
+// many distinct watch targets cannot accumulate one entry per title forever. It
+// is only a ceiling: expired entries are pruned first, so a busy server sheds
+// stale targets rather than live ones.
+const watchPreparedMaxEntries = 4096
+
+// watchPrepareState records one prepared watch target: the identity of the file
+// set it was prepared against (watchFilesFingerprint) and when.
+type watchPrepareState struct {
+	fingerprint string
+	preparedAt  time.Time
+}
+
+// watchFilesFingerprint identifies a file set by the fields probe repair would
+// change: file IDs and probe_updated_at. If a rescan or repair rewrites any of
+// them the fingerprint changes and the next fetch prepares again; otherwise the
+// previous preparation is still valid.
+func watchFilesFingerprint(files []*models.MediaFile) string {
+	var b strings.Builder
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		b.WriteString(strconv.Itoa(file.ID))
+		b.WriteByte(':')
+		if file.ProbeUpdatedAt != nil {
+			b.WriteString(strconv.FormatInt(file.ProbeUpdatedAt.UnixNano(), 10))
+		}
+		b.WriteByte('|')
+	}
+	return b.String()
+}
+
+// prepareWatchFiles prepares a watch target once per unchanged file set.
+//
+// Every watch-detail fetch used to repair probe metadata, resolve the cached
+// copy-safety verdict and enqueue chapter thumbnails for all of its files. All
+// three are idempotent, but the enqueue still costs a database read per file in
+// the chapter-thumbnail worker on every page load, so a client polling watch
+// detail paid for the same unchangeable work repeatedly. This memo collapses
+// repeat fetches of an unchanged file set to a map lookup. The first fetch for
+// a target (and any fetch after the probe state changes or the TTL lapses)
+// still prepares everything.
+func (s *DetailService) prepareWatchFiles(
+	ctx context.Context,
+	contentID string,
+	contentType string,
+	files []*models.MediaFile,
+) []*models.MediaFile {
+	if s == nil {
+		return files
+	}
+	fingerprint := watchFilesFingerprint(files)
+	now := time.Now()
+
+	s.watchPrepareMu.Lock()
+	previous, seen := s.watchPrepared[contentID]
+	s.watchPrepareMu.Unlock()
+	if seen && previous.fingerprint == fingerprint && now.Sub(previous.preparedAt) < watchPrepareTTL {
+		return files
+	}
+
+	prepared := s.preparePlaybackFiles(ctx, files)
+	s.queueWatchPlaybackFiles(ctx, contentID, contentType, prepared)
+
+	s.watchPrepareMu.Lock()
+	if s.watchPrepared == nil {
+		s.watchPrepared = make(map[string]watchPrepareState)
+	}
+	if len(s.watchPrepared) >= watchPreparedMaxEntries {
+		for id, state := range s.watchPrepared {
+			if now.Sub(state.preparedAt) >= watchPrepareTTL {
+				delete(s.watchPrepared, id)
+			}
+		}
+	}
+	s.watchPrepared[contentID] = watchPrepareState{fingerprint: fingerprint, preparedAt: now}
+	s.watchPrepareMu.Unlock()
+	return prepared
 }
 
 func (s *DetailService) buildVersionChapters(ctx context.Context, file *models.MediaFile) []VersionChapter {

@@ -210,7 +210,7 @@ func (w *taskWorker) executeReserved(execCtx context.Context, cancel context.Can
 	return result
 }
 
-// requestCancel sets state to Cancelling and calls the cancel func.
+// requestCancel sets state to Canceling and calls the cancel func.
 func (w *taskWorker) requestCancel() error {
 	w.mu.Lock()
 	if w.state != TaskStateRunning {

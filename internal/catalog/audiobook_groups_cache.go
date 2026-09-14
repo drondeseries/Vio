@@ -77,7 +77,10 @@ func (c *AudiobookGroupsCache) Page(ctx context.Context, q AudiobookGroupsQuery,
 	if err != nil {
 		return nil, 0, err
 	}
-	entry := value.(*groupsCacheEntry)
+	entry, ok := value.(*groupsCacheEntry)
+	if !ok {
+		return nil, 0, fmt.Errorf("unexpected audiobook groups cache value %T", value)
+	}
 	return sliceGroups(entry.groups, q.Offset, q.Limit), entry.total, nil
 }
 

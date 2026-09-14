@@ -93,6 +93,47 @@ func TestBuildMediaStreamsCarriesAudioProfile(t *testing.T) {
 	}
 }
 
+func TestAudioTrackDisplayTitleMultiLanguageList(t *testing.T) {
+	title := audioTrackDisplayTitle(models.AudioTrack{
+		Codec:     "eac3",
+		Channels:  6,
+		Language:  "fr",
+		Languages: []string{"MULTI", "FR", "eng", "fre", "en"},
+	})
+	// The full advertised list renders joined: MULTI resolves as a name,
+	// codes map to display names, and en/eng/fre/fr dedupe onto English/French.
+	if title != "Multi/French/English - EAC3 5.1" {
+		t.Fatalf("DisplayTitle = %q", title)
+	}
+}
+
+func TestAudioTrackDisplayTitleDedupesAndSkipsPlaceholders(t *testing.T) {
+	title := audioTrackDisplayTitle(models.AudioTrack{
+		Codec:     "ac3",
+		Channels:  6,
+		Language:  "und",
+		Languages: []string{"und", "en", "eng", "Unknown", "de"},
+	})
+	if title != "English/German - AC3 5.1" {
+		t.Fatalf("DisplayTitle = %q", title)
+	}
+}
+
+func TestAudioTrackDisplayTitleFallsBackToPrimaryLanguage(t *testing.T) {
+	// Probe data predating multi-audio support carries no Languages list;
+	// the single primary language code is still rendered.
+	title := audioTrackDisplayTitle(models.AudioTrack{Codec: "eac3", Language: "eng", Channels: 6})
+	if title != "English - EAC3 5.1" {
+		t.Fatalf("DisplayTitle = %q", title)
+	}
+	// A genuinely unknown language keeps the legacy verbatim rendering
+	// (compatLanguageName uppercases the 3-letter code) rather than dropping it.
+	unknown := audioTrackDisplayTitle(models.AudioTrack{Codec: "aac", Language: "und", Channels: 2})
+	if unknown != "UND - AAC Stereo" {
+		t.Fatalf("DisplayTitle = %q", unknown)
+	}
+}
+
 func TestAudioTrackDisplayTitleWithoutProfileKeepsCodecName(t *testing.T) {
 	title := audioTrackDisplayTitle(models.AudioTrack{Codec: "eac3", Language: "eng", Channels: 6})
 	if title != "English - EAC3 5.1" {

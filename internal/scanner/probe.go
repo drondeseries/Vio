@@ -2,8 +2,10 @@ package scanner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -17,6 +19,43 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/processmetrics"
 )
+
+const (
+	maxFFprobeOutputBytes = 8 << 20
+	maxFFprobeStreams     = 256
+	maxFFprobeChapters    = 10000
+
+	// ffprobe's default analysis window (5 s / 5 MB) can finish against a
+	// relayed provider stream before any audio or video stream is visible:
+	// ffprobe exits 0 with an empty stream table, which callers then persist as
+	// a successful probe. These limits exceed the playback pipelines' caps
+	// (3 s / 5 MB — see playback/transcode.go and playback/remux.go) so the
+	// metadata probe sees the same stream table playback does.
+	probeAnalyzeDuration = "10M" // 10 s (10,000,000 us)
+	probeSizeLimit       = "32M" // 32 MiB
+)
+
+var errFFprobeOutputTooLarge = fmt.Errorf("ffprobe output exceeds %d bytes", maxFFprobeOutputBytes)
+
+type boundedProbeBuffer struct {
+	buffer   bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func (b *boundedProbeBuffer) Write(p []byte) (int, error) {
+	if len(p) > b.limit-b.buffer.Len() {
+		b.overflow = true
+		remaining := b.limit - b.buffer.Len()
+		if remaining > 0 {
+			_, _ = b.buffer.Write(p[:remaining])
+		}
+		return len(p), errFFprobeOutputTooLarge
+	}
+	return b.buffer.Write(p)
+}
+
+func (b *boundedProbeBuffer) Bytes() []byte { return b.buffer.Bytes() }
 
 // ErrPrimaryVideoNotFound reports that FFprobe completed successfully but did
 // not describe a playable primary video stream.
@@ -58,27 +97,55 @@ type ffprobeChapter struct {
 type ffprobeSideData = mediaprobe.SideData
 type ffprobeDisp = mediaprobe.Disposition
 
-// ProbeFile runs ffprobe on the given file and returns parsed ProbeData.
-// ffprobePath is the path to the ffprobe binary. filePath is the media file to probe.
-func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*ProbeData, error) {
-	cmd := exec.CommandContext(ctx, ffprobePath,
+// buildProbeArgs returns the bounded metadata-probe argv for ffprobe. It is
+// split out so tests can assert the remote-stream analysis limits without
+// executing a process.
+func buildProbeArgs(filePath string) []string {
+	return []string{
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format",
 		"-show_streams",
 		"-show_chapters",
+		"-probesize", probeSizeLimit,
+		"-analyzeduration", probeAnalyzeDuration,
 		filePath,
-	)
+	}
+}
 
-	output, err := cmd.Output()
-	processmetrics.Record(processmetrics.Probe, cmd.ProcessState, err, ctx.Err())
-	if err != nil {
+// ProbeFile runs ffprobe on the given file and returns parsed ProbeData.
+// ffprobePath is the path to the ffprobe binary. filePath is the media file to probe.
+func ProbeFile(ctx context.Context, ffprobePath string, filePath string) (*ProbeData, error) {
+	cmd := exec.CommandContext(ctx, ffprobePath, buildProbeArgs(filePath)...)
+
+	output := &boundedProbeBuffer{limit: maxFFprobeOutputBytes}
+	cmd.Stdout = output
+	if err := cmd.Run(); err != nil {
+		processmetrics.Record(processmetrics.Probe, cmd.ProcessState, err, ctx.Err())
+		// A producer may receive SIGPIPE after the bounded writer rejects its
+		// output, so the process error can mask the writer's sentinel.
+		if output.overflow || errors.Is(err, errFFprobeOutputTooLarge) {
+			return nil, errFFprobeOutputTooLarge
+		}
 		return nil, fmt.Errorf("ffprobe failed for %s: %w", filePath, err)
 	}
+	// os/exec may report a successful process exit after its stdout copy
+	// goroutine consumed the Writer error. Keep an explicit overflow bit so a
+	// provider-controlled response can never fall through to JSON parsing.
+	if output.overflow {
+		return nil, errFFprobeOutputTooLarge
+	}
+	processmetrics.Record(processmetrics.Probe, cmd.ProcessState, nil, ctx.Err())
 
 	var raw ffprobeOutput
-	if err := json.Unmarshal(output, &raw); err != nil {
+	if err := json.Unmarshal(output.Bytes(), &raw); err != nil {
 		return nil, fmt.Errorf("ffprobe JSON parse failed for %s: %w", filePath, err)
+	}
+	if len(raw.Streams) > maxFFprobeStreams {
+		return nil, fmt.Errorf("ffprobe returned %d streams (maximum %d)", len(raw.Streams), maxFFprobeStreams)
+	}
+	if len(raw.Chapters) > maxFFprobeChapters {
+		return nil, fmt.Errorf("ffprobe returned %d chapters (maximum %d)", len(raw.Chapters), maxFFprobeChapters)
 	}
 
 	probe := convertProbeData(&raw)
@@ -180,20 +247,33 @@ func convertProbeData(raw *ffprobeOutput) *ProbeData {
 				pd.HDR = isHDR(s.ColorTransfer) || normalized.DVProfile > 0 || track.HDR10Plus
 			}
 		case "audio":
+			rawLang := lang.CompatibleTag(s.Tags["language"])
+			var languages []string
+			switch lang.Canonical(rawLang) {
+			case "", "und", "mul":
+				// MULTI/DUAL releases often carry no (or an unhelpful) language
+				// tag but list the languages in the track title ("English /
+				// French"). Parse the title so the languages array has real
+				// values, and promote the first one to the display language.
+				languages = lang.ParseLanguages(s.Tags["title"])
+				if len(languages) > 0 {
+					rawLang = languages[0]
+				}
+			}
 			track := AudioTrackInfo{
+				Index:         s.Index,
 				Title:         firstNonEmpty(s.Tags["title"], s.CodecLongName, strings.ToUpper(s.CodecName)),
 				EmbeddedTitle: s.Tags["title"],
-				// Preserve BCP 47 region and script subtags (for example pt-BR
-				// versus pt-PT) just as we do for subtitle tracks.
-				Language:   lang.CompatibleTag(s.Tags["language"]),
-				Codec:      s.CodecName,
-				Profile:    s.Profile,
-				Layout:     s.ChannelLayout,
-				Channels:   s.Channels,
-				Bitrate:    parseNumeric(s.BitRate) / 1000,
-				SampleRate: parseNumeric(s.SampleRate),
-				BitDepth:   parseBitDepth(s),
-				Default:    s.Disposition.Default == 1,
+				Language:      rawLang,
+				Languages:     languages,
+				Codec:         s.CodecName,
+				Profile:       s.Profile,
+				Layout:        s.ChannelLayout,
+				Channels:      s.Channels,
+				Bitrate:       parseNumeric(s.BitRate) / 1000,
+				SampleRate:    parseNumeric(s.SampleRate),
+				BitDepth:      parseBitDepth(s),
+				Default:       s.Disposition.Default == 1,
 			}
 			pd.AudioTracks = append(pd.AudioTracks, track)
 			if pd.CodecAudio == "" {

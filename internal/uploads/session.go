@@ -317,7 +317,7 @@ func copyChunkBody(ctx context.Context, path string, offset int64, body io.Reade
 	if err != nil {
 		return 0, fmt.Errorf("open upload session file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	writer := io.NewOffsetWriter(file, offset)
 	written, err := io.Copy(writer, io.LimitReader(body, expectedSize))

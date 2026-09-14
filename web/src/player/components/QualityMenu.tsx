@@ -7,8 +7,13 @@ import { PlayerMenuSurface } from "./PlayerMenuSurface";
 export interface VersionInfo {
   fileId: number;
   label: string;
+  releaseName?: string;
   isCurrentSource: boolean;
   isRequestedSource: boolean;
+  failed?: boolean;
+  /** The catalog currently reports this version's source as gone. It stays
+   *  selectable because a play can force a re-link and retry it. */
+  unavailable?: boolean;
 }
 
 interface QualityMenuProps {
@@ -146,13 +151,26 @@ export function QualityMenu({
                     }}
                   >
                     <span className="flex min-w-0 items-center gap-2">
-                      <span className="truncate">{v.label}</span>
+                      <span className="min-w-0">
+                        <span className="block truncate">{v.label}</span>
+                        {v.releaseName && (
+                          <span className="block truncate text-[11px] text-white/50">
+                            {v.releaseName}
+                          </span>
+                        )}
+                      </span>
                       {statusLabels.length > 0 && (
                         <span className="flex flex-wrap gap-1">
                           {statusLabels.map((status) => (
                             <span
                               key={status}
-                              className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/70"
+                              className={`rounded border border-white/15 px-1.5 py-0.5 text-[10px] leading-none ${
+                                status === "Failed"
+                                  ? "border-red-500/30 bg-red-500/20 text-red-400"
+                                  : status === "Will retry on play"
+                                    ? "border-amber-500/30 bg-amber-500/15 text-amber-400"
+                                    : "bg-white/10 text-white/70"
+                              }`}
                             >
                               {status}
                             </span>
@@ -205,16 +223,18 @@ export function QualityMenu({
 }
 
 export function buildVersionStatusLabels(version: VersionInfo): string[] {
-  if (version.isCurrentSource && version.isRequestedSource) {
-    return ["Playing"];
-  }
-
   const labels: string[] = [];
   if (version.isCurrentSource) {
     labels.push("Playing");
   }
-  if (version.isRequestedSource) {
+  if (version.isRequestedSource && !version.isCurrentSource) {
     labels.push("Requested");
+  }
+  if (version.failed) {
+    labels.push("Failed");
+  }
+  if (version.unavailable) {
+    labels.push("Will retry on play");
   }
   return labels;
 }

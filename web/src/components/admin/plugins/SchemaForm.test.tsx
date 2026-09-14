@@ -287,3 +287,34 @@ it("marks a show_when-gated field as nested when it is revealed", () => {
   );
   expect(container.querySelector('[data-nested="true"]')).not.toBeNull();
 });
+
+it("renders inputs with autocomplete and password-manager ignore attributes", () => {
+  const d: PluginAdminForm = {
+    fields: [
+      {
+        key: "manifest_url",
+        label: "Manifest URL",
+        control: "TEXT",
+        required: false,
+        secret: false,
+        multiline: false,
+      },
+      {
+        key: "api_key",
+        label: "API Key",
+        control: "PASSWORD",
+        required: false,
+        secret: true,
+        multiline: false,
+      },
+    ],
+  };
+  const { container } = render(<SchemaForm descriptor={d} values={{}} onChange={vi.fn()} />);
+  const textInput = container.querySelector("#schema-manifest_url");
+  expect(textInput?.getAttribute("autocomplete")).toBe("off");
+  expect(textInput?.getAttribute("data-1p-ignore")).toBe("true");
+
+  const passwordInput = container.querySelector("#schema-api_key");
+  expect(passwordInput?.getAttribute("autocomplete")).toBe("new-password");
+  expect(passwordInput?.getAttribute("data-1p-ignore")).toBe("true");
+});

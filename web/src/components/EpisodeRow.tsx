@@ -66,9 +66,9 @@ export default function EpisodeRow({ episode, rating, watched, progress }: Episo
           />
         )}
         {hasProgress && (
-          <div className="absolute inset-x-2 bottom-1.5 h-[3px] overflow-hidden rounded-full bg-black/40">
+          <div className="bg-background/40 absolute inset-x-0 bottom-0 h-[3px]">
             <div
-              className="h-full rounded-full"
+              className="h-full rounded-r-sm"
               style={{
                 width: `${derivedProgress}%`,
                 background: "var(--primary)",

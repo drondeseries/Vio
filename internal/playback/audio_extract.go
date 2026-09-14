@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -212,7 +213,7 @@ func parseSegmentList(listPath string) map[string]float64 {
 	if err != nil {
 		return starts
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	rows, err := csv.NewReader(f).ReadAll()
 	if err != nil {
 		return starts
@@ -273,7 +274,7 @@ func (t *segmentListTailer) read(listPath string, flush bool) []segmentListEntry
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	info, err := f.Stat()
 	if err == nil && info.Size() < t.offset {
@@ -317,7 +318,7 @@ func parseSegmentListEntries(r io.Reader) []segmentListEntry {
 	var out []segmentListEntry
 	for {
 		row, err := reader.Read()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

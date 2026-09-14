@@ -29,8 +29,9 @@ import type {
   ApplyCollectionTemplateBundleJobRequest,
   ApplyCollectionTemplateBundleRequest,
 } from "@/lib/collectionTemplates";
-import { adminKeys, sectionKeys } from "../keys";
+import { adminKeys, catalogKeys, sectionKeys } from "../keys";
 import { invalidateAdminCollectionQueries } from "../collectionSurfaceRefresh";
+import { isTerminalItemDetailNotFound } from "../mediaSurfaceRefresh";
 import { runBulkDelete, type BulkDeleteProgress } from "../bulkDelete";
 
 const ADMIN_STALE_TIME = 30_000;
@@ -480,6 +481,34 @@ export function useImportTraktCollection() {
     },
     onError: (error) => {
       toast.error(error instanceof Error ? error.message : "Import failed");
+    },
+  });
+}
+
+export function usePurgeVirtualPlaybackItems() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (options?: { dryRun?: boolean; libraryId?: number; installationId?: number }) =>
+      api<{ success: boolean; files_deleted: number; items_deleted: number; message: string }>(
+        `/admin/collections/purge-virtual?${new URLSearchParams({
+          ...(options?.dryRun ? { dry_run: "true" } : {}),
+          ...(options?.libraryId ? { library_id: String(options.libraryId) } : {}),
+          ...(options?.installationId ? { installation_id: String(options.installationId) } : {}),
+        })}`,
+        { method: "POST" },
+      ),
+    onSuccess: (result) => {
+      toast.success(result.message);
+      void invalidateAdminCollectionQueries(queryClient);
+      void queryClient.invalidateQueries({ queryKey: sectionKeys.all });
+      void queryClient.invalidateQueries({
+        queryKey: catalogKeys.all,
+        predicate: (query) => !isTerminalItemDetailNotFound(query),
+      });
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Virtual library purge failed");
     },
   });
 }

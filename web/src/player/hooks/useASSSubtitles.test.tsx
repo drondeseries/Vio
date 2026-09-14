@@ -297,22 +297,16 @@ describe("ASS subtitle loading recovery", () => {
     }
   });
 
-  it("aborts a pending font request after failure and fetches fresh fonts on retry", async () => {
+  it("starts the font request only after subtitle text succeeds and fetches fresh fonts on retry", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const track = { ...attachedFontTrack, font_bundle_url: "/fonts/retry-after-failure" };
-    let fontSignal: AbortSignal | undefined;
     let fontRequests = 0;
     let subtitleRequests = 0;
-    vi.mocked(fetch).mockImplementation((input, init) => {
+    vi.mocked(fetch).mockImplementation((input) => {
       if (String(input) === track.font_bundle_url) {
-        if (++fontRequests > 1) return Promise.resolve(mockFontBundleResponse("fresh-font"));
-        fontSignal = init?.signal as AbortSignal;
-        return new Promise((_, reject) => {
-          fontSignal!.addEventListener("abort", () =>
-            reject(new DOMException("cancelled", "AbortError")),
-          );
-        });
+        fontRequests += 1;
+        return Promise.resolve(mockFontBundleResponse("fresh-font"));
       }
       if (++subtitleRequests === 1) return Promise.reject(new Error("extraction failed"));
       return Promise.resolve(mockFetchResponse("[Script Info]"));
@@ -325,11 +319,15 @@ describe("ASS subtitle loading recovery", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });
-      expect(fontSignal?.aborted).toBe(true);
+      // The first attempt fails on the subtitle TEXT, before any font request
+      // exists: the text drives the pipeline, so there is no stale in-flight
+      // font fetch to abort into the retry.
+      expect(fontRequests).toBe(0);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(5000);
       });
-      expect(fontRequests).toBe(2);
+      // Retry: text succeeds, then a fresh font bundle is fetched and attached.
+      expect(fontRequests).toBe(1);
       expect(constructorOpts).toHaveLength(1);
       expect(constructorOpts[0]!.fonts).toEqual([expect.any(Uint8Array)]);
     } finally {
@@ -401,4 +399,135 @@ it("keeps a slowly progressing ASS extraction alive beyond 30 seconds", async ()
     unmount();
     vi.useRealTimers();
   }
+});
+
+describe("useASSSubtitles font budget", () => {
+  it("constructs JASSUB with fallback fonts when the font bundle exceeds the budget", async () => {
+    vi.useFakeTimers();
+    const state = vi.fn();
+    const track = { ...arabicTrack, font_bundle_url: "/fonts/budget-exceeded" };
+    vi.mocked(fetch).mockImplementation((input) => {
+      if (String(input) === track.font_bundle_url) return new Promise(() => {});
+      return Promise.resolve(
+        mockFetchResponse("[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,مرحبا"),
+      );
+    });
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [track], track.index, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // The subtitle text resolved but the font bundle is still in flight:
+      // JASSUB must not be constructed yet, and must not hang on the font.
+      expect(constructorOpts).toHaveLength(0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      // Budget expired: JASSUB was constructed with the fallback font only
+      // (the attached bundle never resolved — NOTO_SANS_ARABIC is exactly 3
+      // font files, so a length of 3 proves no attached bytes snuck in) and
+      // reached ready without error.
+      expect(constructorOpts).toHaveLength(1);
+      expect(constructorOpts[0]!.defaultFont).toBe("noto sans arabic");
+      expect(constructorOpts[0]!.fonts).toEqual(expect.arrayContaining([expect.any(Uint8Array)]));
+      expect(constructorOpts[0]!.fonts).toHaveLength(3);
+      expect(state).toHaveBeenLastCalledWith("ready");
+      expect(state).not.toHaveBeenCalledWith("error");
+      // The slow font fetch is still in flight and harmless.
+      expect(fetch).toHaveBeenCalledWith(
+        track.font_bundle_url,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("useASSSubtitles subtitle source changed", () => {
+  it("signals onSourceChanged once on 409 subtitle_source_changed and schedules no retry", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onSourceChanged = vi.fn();
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: vi.fn().mockResolvedValue({ error: "subtitle_source_changed" }),
+    } as unknown as Response);
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(
+        videoRef,
+        [arabicTrack],
+        arabicTrack.index,
+        false,
+        0,
+        0,
+        undefined,
+        onSourceChanged,
+      ),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).toHaveBeenCalledTimes(1);
+      // The source-change signal bypasses the outer retry: the stale URL must
+      // not be fetched again.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(constructorOpts).toHaveLength(0);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the 5s retry for a generic 500 subtitle fetch", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onSourceChanged = vi.fn();
+    const state = vi.fn();
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: false, status: 500 } as unknown as Response)
+      .mockResolvedValue(mockFetchResponse("[Script Info]"));
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(
+        videoRef,
+        [arabicTrack],
+        arabicTrack.index,
+        false,
+        0,
+        0,
+        state,
+        onSourceChanged,
+      ),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).not.toHaveBeenCalled();
+      expect(state).toHaveBeenLastCalledWith("error");
+      // The 5s retry is unchanged for generic failures and recovers.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(constructorOpts).toHaveLength(1);
+      expect(state).toHaveBeenLastCalledWith("ready");
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });

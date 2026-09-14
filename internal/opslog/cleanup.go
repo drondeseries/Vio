@@ -129,7 +129,7 @@ func LoadRetentionPolicy(ctx context.Context, store SettingsStore) (RetentionPol
 
 	rawBuckets, err := store.Get(ctx, keyBucketPolicies)
 	if err != nil || strings.TrimSpace(rawBuckets) == "" {
-		return policy, nil
+		return policy, nil //nolint:nilerr // Missing/unavailable optional overrides retain the default policy.
 	}
 
 	var buckets []BucketPolicy
@@ -436,12 +436,12 @@ func scopeFilterArgs(component, level string) (string, []any, int) {
 
 func parseInt(s string) int {
 	var v int
-	fmt.Sscanf(s, "%d", &v)
+	_, _ = fmt.Sscanf(s, "%d", &v)
 	return v
 }
 
 func parseInt64(s string) int64 {
 	var v int64
-	fmt.Sscanf(s, "%d", &v)
+	_, _ = fmt.Sscanf(s, "%d", &v)
 	return v
 }

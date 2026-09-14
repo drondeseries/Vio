@@ -642,7 +642,14 @@ func TestStopFinalizationRunsOnce(t *testing.T) {
 	if won, err := store.ClaimStopFinalization(context.Background(), f.session.ID, time.Now().Add(time.Minute)); err != nil || !won {
 		t.Fatalf("seed claim: %v %v", won, err)
 	}
-	view, err := f.handler.StopPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+	// Use a short-timeout context so finalizeStopV2's lease-wait loop is
+	// interrupted by cancellation before the 60-second lease expires. Without
+	// a deadline, the loop would block for the full lease duration, re-claim
+	// after expiry, and finalize — violating the expectation that a replay
+	// that loses the claim must not tear the session down.
+	shortCtx, shortCancel := context.WithTimeout(f.ctx, 500*time.Millisecond)
+	defer shortCancel()
+	view, err := f.handler.StopPlaybackV2(shortCtx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
 	if err != nil || view.Outcome != PlaybackOutcomeReplayed || view.StopID != stopID {
 		t.Fatalf("view = %+v, %v", view, err)
 	}

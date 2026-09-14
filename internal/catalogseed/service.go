@@ -523,9 +523,9 @@ func (s *Service) ImportWithProgress(ctx context.Context, data []byte, opts Impo
 		) VALUES `,
 		fileRows, 29,
 		map[int]string{16: "::jsonb", 17: "::jsonb", 18: "::jsonb", 19: "::jsonb"},
-		` ON CONFLICT (file_path) DO NOTHING`,
+		` ON CONFLICT (file_path) WHERE virtual_owner_installation_id IS NULL DO NOTHING`,
 		`
-		ON CONFLICT (file_path) DO UPDATE SET
+		ON CONFLICT (file_path) WHERE virtual_owner_installation_id IS NULL DO UPDATE SET
 			content_id = EXCLUDED.content_id,
 			episode_id = EXCLUDED.episode_id,
 			season_number = EXCLUDED.season_number,
@@ -646,6 +646,7 @@ func (s *Service) schemaVersion(ctx context.Context) (int, error) {
 	return version, nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *Service) loadSeasons(ctx context.Context, seriesID string) ([]SeasonRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT content_id, series_id, season_number, title, overview,
@@ -683,6 +684,7 @@ func (s *Service) loadSeasons(ctx context.Context, seriesID string) ([]SeasonRec
 	return seasons, rows.Err()
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *Service) loadEpisodes(ctx context.Context, seriesID string) ([]EpisodeRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT content_id, series_id, season_id, season_number, episode_number,
@@ -730,6 +732,7 @@ func (s *Service) loadEpisodes(ctx context.Context, seriesID string) ([]EpisodeR
 	return episodes, rows.Err()
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func itemToRecord(item *models.MediaItem) ItemRecord {
 	if strings.TrimSpace(item.SortTitle) == "" {
 		if derived := titleutil.DeriveDefaultSortTitle(item.Title); derived != "" {
@@ -779,6 +782,7 @@ func itemToRecord(item *models.MediaItem) ItemRecord {
 	}
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func fileToRecord(file *models.MediaFile) FileRecord {
 	return FileRecord{
 		ContentID:         file.ContentID,
@@ -813,6 +817,7 @@ func fileToRecord(file *models.MediaFile) FileRecord {
 	}
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func encodeBundle(bundle Bundle) ([]byte, error) {
 	var raw bytes.Buffer
 	gz := gzip.NewWriter(&raw)
@@ -829,18 +834,18 @@ func encodeBundle(bundle Bundle) ([]byte, error) {
 func decodeBundle(data []byte) (*Bundle, error) {
 	gz, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("%w: opening catalog seed bundle: %v", ErrInvalidBundle, err)
+		return nil, fmt.Errorf("%w: opening catalog seed bundle: %w", ErrInvalidBundle, err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	payload, err := io.ReadAll(gz)
 	if err != nil {
-		return nil, fmt.Errorf("%w: reading catalog seed bundle: %v", ErrInvalidBundle, err)
+		return nil, fmt.Errorf("%w: reading catalog seed bundle: %w", ErrInvalidBundle, err)
 	}
 
 	var bundle Bundle
 	if err := json.Unmarshal(payload, &bundle); err != nil {
-		return nil, fmt.Errorf("%w: decoding catalog seed bundle: %v", ErrInvalidBundle, err)
+		return nil, fmt.Errorf("%w: decoding catalog seed bundle: %w", ErrInvalidBundle, err)
 	}
 	return &bundle, nil
 }
@@ -1040,6 +1045,7 @@ func isEmptyCatalogImportTarget(ctx context.Context, tx pgx.Tx) (bool, error) {
 	return empty, nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func bulkInsertItems(ctx context.Context, tx pgx.Tx, items []ItemRecord, onBatch func(processed int)) error {
 	rows := make([][]any, 0, len(items))
 	for _, item := range items {
@@ -1282,6 +1288,7 @@ func (s *Service) importEmbeddings(ctx context.Context, tx pgx.Tx, embeddings []
 	return nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func bulkInsertSeasons(ctx context.Context, tx pgx.Tx, seasons []SeasonRecord, onBatch func(processed int)) error {
 	rows := make([][]any, 0, len(seasons))
 	for _, season := range seasons {
@@ -1305,6 +1312,7 @@ func bulkInsertSeasons(ctx context.Context, tx pgx.Tx, seasons []SeasonRecord, o
 	)
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func bulkInsertEpisodes(ctx context.Context, tx pgx.Tx, episodes []EpisodeRecord, onBatch func(processed int)) error {
 	rows := make([][]any, 0, len(episodes))
 	for _, episode := range episodes {
@@ -1330,6 +1338,7 @@ func bulkInsertEpisodes(ctx context.Context, tx pgx.Tx, episodes []EpisodeRecord
 	)
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func bulkInsertFiles(ctx context.Context, tx pgx.Tx, files []FileRecord, onBatch func(processed int)) error {
 	rows := make([][]any, 0, len(files))
 	for _, file := range files {
@@ -1381,6 +1390,7 @@ func bulkInsertFiles(ctx context.Context, tx pgx.Tx, files []FileRecord, onBatch
 	)
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func bulkInsertLibraryLinks(ctx context.Context, tx pgx.Tx, links []LibraryLinkRecord, onBatch func(processed int)) error {
 	rows := make([][]any, 0, len(links))
 	for _, link := range links {
@@ -2056,6 +2066,7 @@ func batchImportItems(ctx context.Context, tx pgx.Tx, items []ItemRecord, mode C
 	return itemStates, created, updated, skipped, nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func importItem(ctx context.Context, tx pgx.Tx, item ItemRecord, mode ConflictMode) (created bool, updated bool, skipped bool, err error) {
 	if mode == ConflictModeSkipExisting {
 		tag, execErr := tx.Exec(ctx, `
@@ -2178,6 +2189,7 @@ func importItem(ctx context.Context, tx pgx.Tx, item ItemRecord, mode ConflictMo
 	return created, !created, false, nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func importSeason(ctx context.Context, tx pgx.Tx, season SeasonRecord, mode ConflictMode) (created bool, updated bool, skipped bool, err error) {
 	if mode == ConflictModeSkipExisting {
 		tag, execErr := tx.Exec(ctx, `
@@ -2223,6 +2235,7 @@ func importSeason(ctx context.Context, tx pgx.Tx, season SeasonRecord, mode Conf
 	return created, !created, false, nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func importEpisode(ctx context.Context, tx pgx.Tx, episode EpisodeRecord, mode ConflictMode) (created bool, updated bool, skipped bool, err error) {
 	seasonID := nullableString(episode.SeasonID)
 	if mode == ConflictModeSkipExisting {
@@ -2286,6 +2299,7 @@ func importEpisode(ctx context.Context, tx pgx.Tx, episode EpisodeRecord, mode C
 	return created, !created, false, nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func importFile(ctx context.Context, tx pgx.Tx, file FileRecord, mode ConflictMode) (created bool, updated bool, skipped bool, err error) {
 	videoTracksJSON, err := json.Marshal(file.VideoTracks)
 	if err != nil {
@@ -2325,7 +2339,7 @@ func importFile(ctx context.Context, tx pgx.Tx, file FileRecord, mode ConflictMo
 				$21, $22, $23, $24,
 				$25, $26, $27, $28, $29
 			)
-			ON CONFLICT (file_path) DO NOTHING`,
+			ON CONFLICT (file_path) WHERE virtual_owner_installation_id IS NULL DO NOTHING`,
 			contentID, episodeID, nilIfZero(file.SeasonNumber), nilIfZero(file.EpisodeNumber),
 			file.MediaFolderID, file.FilePath, file.FileSize, fileHash,
 			file.CodecVideo, file.CodecAudio, file.Resolution, nilIfZero(file.AudioChannels), file.HDR, file.Container,
@@ -2355,7 +2369,7 @@ func importFile(ctx context.Context, tx pgx.Tx, file FileRecord, mode ConflictMo
 			$21, $22, $23, $24,
 			$25, $26, $27, $28, $29
 		)
-		ON CONFLICT (file_path) DO UPDATE SET
+			ON CONFLICT (file_path) WHERE virtual_owner_installation_id IS NULL DO UPDATE SET
 			content_id = EXCLUDED.content_id,
 			episode_id = EXCLUDED.episode_id,
 			season_number = EXCLUDED.season_number,
@@ -2397,6 +2411,7 @@ func importFile(ctx context.Context, tx pgx.Tx, file FileRecord, mode ConflictMo
 	return created, !created, false, nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func importLibraryLink(ctx context.Context, tx pgx.Tx, link LibraryLinkRecord) (bool, error) {
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO media_item_libraries (content_id, media_folder_id, first_seen_at)
@@ -2462,6 +2477,7 @@ func sortLibraries(records []LibraryRecord) {
 	sort.Slice(records, func(i, j int) bool { return records[i].ExportedID < records[j].ExportedID })
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func cloneStrings(values []string) []string {
 	if values == nil {
 		return []string{}
@@ -2483,6 +2499,7 @@ func nonNilStrings(values []string) []string {
 	return values
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func cloneInts(values []int) []int {
 	if values == nil {
 		return []int{}
@@ -2593,6 +2610,7 @@ func toVideoTrackRecords(tracks []models.VideoTrack) []VideoTrackRecord {
 	return out
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func toAudioTrackRecords(tracks []models.AudioTrack) []AudioTrackRecord {
 	out := make([]AudioTrackRecord, 0, len(tracks))
 	for _, track := range tracks {
@@ -2613,6 +2631,7 @@ func toAudioTrackRecords(tracks []models.AudioTrack) []AudioTrackRecord {
 	return out
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func toSubtitleTrackRecords(tracks []models.SubtitleTrack) []SubtitleTrackRecord {
 	out := make([]SubtitleTrackRecord, 0, len(tracks))
 	for _, track := range tracks {
@@ -2633,6 +2652,7 @@ func toSubtitleTrackRecords(tracks []models.SubtitleTrack) []SubtitleTrackRecord
 	return out
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func toExternalSubtitleRecords(tracks []models.ExternalSubtitle) []ExternalSubtitleRecord {
 	out := make([]ExternalSubtitleRecord, 0, len(tracks))
 	for _, track := range tracks {

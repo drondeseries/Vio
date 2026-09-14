@@ -28,7 +28,7 @@ func (s *RepositoryStore) ReconcileManaged(ctx context.Context) (ManagedReposito
 	if err != nil {
 		return ManagedRepositoryReconcileResult{}, fmt.Errorf("begin managed plugin repository reconciliation: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO server_settings (key, value)
@@ -153,14 +153,14 @@ func readIncludeApprovedCommunityQuery(ctx context.Context, querier catalogSetti
 	var value string
 	err := querier.QueryRow(ctx, query, IncludeApprovedCommunityPluginsSetting).Scan(&value)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
 		return false, fmt.Errorf("read approved community plugin setting: %w", err)
 	}
 	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
 	if err != nil {
-		return false, nil
+		return false, nil //nolint:nilerr // Malformed optional settings fall back to their default.
 	}
 	return parsed, nil
 }
@@ -169,14 +169,14 @@ func readIntegerSetting(ctx context.Context, querier catalogSettingsQuerier, key
 	var value string
 	err := querier.QueryRow(ctx, `SELECT value FROM server_settings WHERE key = $1`, key).Scan(&value)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("read plugin setting %q: %w", key, err)
 	}
 	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil || parsed < 0 {
-		return 0, nil
+		return 0, nil //nolint:nilerr // Malformed optional settings fall back to their default.
 	}
 	return parsed, nil
 }
@@ -189,7 +189,7 @@ func reconcileManagedRepositories(ctx context.Context, executor catalogSettingsE
 			return 0, fmt.Errorf("check managed plugin repository %q: %w", definition.Key, err)
 		}
 
-		enabled := definition.Key == OfficialRepositoryManagedKey || includeCommunity
+		enabled := definition.SourceKind == RepositorySourceSilo || includeCommunity
 		if _, err := executor.Exec(ctx, `
 			INSERT INTO plugin_repositories (url, display_name, enabled, managed_key, source_kind)
 			VALUES ($1, $2, $3, $4, $5)

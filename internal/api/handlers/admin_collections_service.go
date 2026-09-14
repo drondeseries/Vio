@@ -443,10 +443,10 @@ func (h *LibraryCollectionHandler) importAdminTrakt(ctx context.Context, req Adm
 	var sourceURL string
 	var err error
 	if listURL != "" {
-		sourceConfig, err = buildTraktListSourceConfig(listURL, req.Limit)
+		sourceConfig, err = buildTraktListSourceConfig(listURL, req.Limit, req.VirtualPlayback)
 		sourceURL = listURL
 	} else {
-		sourceConfig, err = buildTraktSourceConfig(preset, mediaType, profileID, req.Limit)
+		sourceConfig, err = buildTraktSourceConfig(preset, mediaType, profileID, req.Limit, req.VirtualPlayback)
 		sourceURL = buildTraktSourceURL(preset, mediaType, profileID)
 	}
 	if err != nil {

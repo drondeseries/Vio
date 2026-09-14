@@ -32,7 +32,7 @@ type ArtifactStore interface {
 const remoteCatalogImportTimeout = 10 * time.Minute
 
 // Maximum wall-clock time a single admin job execution may run before its
-// context is cancelled. This is the safety net that prevents a hung
+// context is canceled. This is the safety net that prevents a hung
 // operation (e.g. an unreachable S3 endpoint) from blocking the job queue
 // indefinitely, while still giving large jobs a budget that matches their
 // actual scope.
@@ -404,7 +404,7 @@ func (r *Runner) executeLibraryRefresh(job *models.AdminJob) {
 	})
 	if err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
-			r.cancelJob(job.ID, current, total, "Library metadata refresh cancelled")
+			r.cancelJob(job.ID, current, total, "Library metadata refresh canceled")
 			return
 		}
 		msg := err.Error()
@@ -534,7 +534,7 @@ func (r *Runner) executeCatalogExport(job *models.AdminJob) {
 		return
 	}
 	tempPath := tempFile.Name()
-	defer os.Remove(tempPath)
+	defer func() { _ = os.Remove(tempPath) }()
 
 	var (
 		lastProgressUpdate time.Time
@@ -727,7 +727,7 @@ func downloadRemoteCatalogSeed(ctx context.Context, remoteURL string) ([]byte, e
 	if err != nil {
 		return nil, fmt.Errorf("downloading remote catalog seed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("downloading remote catalog seed: unexpected status %d", resp.StatusCode)
@@ -939,7 +939,7 @@ func (r *Runner) cancelJob(id string, current, total int, message string) {
 	}
 	job, err := r.repo.Cancel(ctx, id, message, time.Now().UTC().Add(r.retention))
 	if err != nil {
-		slog.Warn("admin jobs: failed to mark job cancelled", "job_id", id, "error", err)
+		slog.Warn("admin jobs: failed to mark job canceled", "job_id", id, "error", err)
 		return
 	}
 	if r.observation != nil {

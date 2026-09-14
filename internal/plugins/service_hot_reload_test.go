@@ -190,6 +190,9 @@ func (f *fakeServiceHost) Shutdown(context.Context) error {
 type fakePluginClient struct {
 	manifest              *pluginv1.PluginManifest
 	metadataProviderCalls int
+	httpRoutesClient      *pluginhost.HTTPRoutesClient
+	httpRoutesErr         error
+	virtualStreamClient   *pluginhost.VirtualStreamProviderClient
 }
 
 func (f *fakePluginClient) Manifest() *pluginv1.PluginManifest {
@@ -234,7 +237,11 @@ func (f *fakePluginClient) AuthProvider(string) (*pluginhost.AuthProviderClient,
 }
 
 func (f *fakePluginClient) HTTPRoutes(string) (*pluginhost.HTTPRoutesClient, error) {
-	return nil, nil
+	return f.httpRoutesClient, f.httpRoutesErr
+}
+
+func (f *fakePluginClient) VirtualStreamProvider(string) (*pluginhost.VirtualStreamProviderClient, error) {
+	return f.virtualStreamClient, nil
 }
 
 func (f *fakePluginClient) WatchSyncProvider(string) (*pluginhost.WatchSyncProviderClient, error) {
@@ -405,7 +412,7 @@ func writePluginArchive(t *testing.T, path string, manifest *pluginv1.PluginMani
 	if err != nil {
 		t.Fatalf("Create(%q) returned error: %v", path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	writer := zip.NewWriter(file)
 	manifestEntry, err := writer.Create("manifest.json")

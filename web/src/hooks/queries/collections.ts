@@ -32,6 +32,7 @@ import {
   invalidateUserCollectionQueries,
   invalidateAdminCollectionQueries,
 } from "./collectionSurfaceRefresh";
+import { isTerminalItemDetailNotFound } from "./mediaSurfaceRefresh";
 
 // Single fetcher for /collections — both useCollections and useCollectionGroups
 // share the cache so the page makes one network round-trip.
@@ -536,7 +537,10 @@ export function useSetCollectionSortPreference() {
           // viewer has since switched profiles: those pages belong to someone
           // else, and refetching them would cancel their in-flight first load.
           if (!isCapturedProfileAuthorityActive(profileAuth)) return;
-          queryClient.invalidateQueries({ queryKey: catalogKeys.all });
+          queryClient.invalidateQueries({
+            queryKey: catalogKeys.all,
+            predicate: (query) => !isTerminalItemDetailNotFound(query),
+          });
         });
       return queue.tail as Promise<void>;
     },

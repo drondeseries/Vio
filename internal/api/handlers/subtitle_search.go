@@ -278,7 +278,7 @@ func (h *SubtitleSearchHandler) HandleUpload(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, "bad_request", "Missing subtitle file")
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(file, subtitleUploadMaxSize+1))
 	if err != nil {
@@ -326,7 +326,7 @@ func (h *SubtitleSearchHandler) HandleDetectLanguage(w http.ResponseWriter, r *h
 		writeError(w, http.StatusBadRequest, "bad_request", "Missing subtitle file")
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(file, subtitleUploadMaxSize+1))
 	if err != nil {

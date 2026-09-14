@@ -34,6 +34,7 @@ func NewSkippedRootRepository(pool *pgxpool.Pool) *SkippedRootRepository {
 
 const skippedRootColumns = `media_folder_id, root_path, reason, sample_file_path, file_count, first_seen_at, last_seen_at`
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func scanSkippedRoot(row pgx.Row) (*models.SkippedMediaRoot, error) {
 	var root models.SkippedMediaRoot
 	if err := row.Scan(

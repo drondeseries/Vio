@@ -256,7 +256,7 @@ func (h *Handler) handleLibraryItems(w http.ResponseWriter, r *http.Request) {
 	}
 	pageSlice := collapsed[pageStart:pageEnd]
 
-	// Serialise.
+	// Serialize.
 	var results any
 	if minified {
 		mins := make([]MinifiedLibraryItem, len(pageSlice))
@@ -1005,6 +1005,8 @@ func siloFilesToAudioTracks(contentID string, files []*models.MediaFile, baseURL
 
 // slugify produces a stable ID-from-name, identical to the plugin's translate.go
 // implementation so derived IDs round-trip consistently.
+//
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func slugify(name string) string {
 	var b strings.Builder
 	prevDash := true
@@ -1023,6 +1025,7 @@ func slugify(name string) string {
 	return strings.TrimRight(b.String(), "-")
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func isLetterOrDigit(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
 }

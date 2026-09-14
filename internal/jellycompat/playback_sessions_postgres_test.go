@@ -493,7 +493,7 @@ func TestDurableCompatPlaybackStore_EmptyTokenFindByRouteNoDBScan(t *testing.T) 
 		pool := newCompatTestPool(t)
 		s := NewDurableCompatPlaybackStore(pool, time.Hour, nil)
 		// Should be a no-op (no panic, no scan); cache stays empty.
-		s.loadByCompatToken("")
+		_ = s.loadByCompatToken("")
 		if _, _, ok := s.FindByRoute("", "anything"); ok {
 			t.Fatal("empty-token FindByRoute resolved unexpectedly against DB")
 		}

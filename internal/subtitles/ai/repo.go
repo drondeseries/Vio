@@ -19,7 +19,7 @@ type JobRepository interface {
 	ListJobsByMediaFile(ctx context.Context, mediaFileID int) ([]Job, error)
 	// CountTranscribeJobsByUserSince counts the user's quota-consuming
 	// transcription jobs (transcribe / transcribe_translate) created at or
-	// after `since`. Failed or cancelled jobs that never produced any
+	// after `since`. Failed or canceled jobs that never produced any
 	// transcription work are excluded, so server-side faults don't lock the
 	// user out; jobs that burned ASR compute count even if they later failed.
 	CountTranscribeJobsByUserSince(ctx context.Context, userID int, since time.Time) (int, error)

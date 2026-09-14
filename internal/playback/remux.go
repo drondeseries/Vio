@@ -3,10 +3,13 @@ package playback
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -305,11 +308,11 @@ func startRemuxWithOptions(ctx context.Context, filePath, outputFormat string, s
 	case RemuxDVStripToHDR10V3:
 		if dvProfile != 7 && dvProfile != 8 {
 			cancel()
-			return nil, fmt.Errorf("Dolby Vision HDR10 strip requires profile 7 or 8")
+			return nil, fmt.Errorf("Dolby Vision HDR10 strip requires profile 7 or 8") //nolint:staticcheck // Dolby Vision is a proper product name.
 		}
 		if !supportsDoviRPUFilter(bin) {
 			cancel()
-			return nil, fmt.Errorf("Dolby Vision HDR10 remux requires the dovi_rpu bitstream filter")
+			return nil, fmt.Errorf("Dolby Vision HDR10 remux requires the dovi_rpu bitstream filter") //nolint:staticcheck // Dolby Vision is a proper product name.
 		}
 		// The planner refuses this recipe for a source that fails the probe,
 		// so reaching here means a session or stream token minted before the
@@ -335,7 +338,7 @@ func startRemuxWithOptions(ctx context.Context, filePath, outputFormat string, s
 			// cannot be preserved: the EL is dropped and its RPUs would
 			// dangle. Callers must strip to HDR10 or transcode instead.
 			cancel()
-			return nil, fmt.Errorf("Dolby Vision profile 7 cannot be preserved in a progressive remux")
+			return nil, fmt.Errorf("Dolby Vision profile 7 cannot be preserved in a progressive remux") //nolint:staticcheck // Dolby Vision is a proper product name.
 		}
 		tagSampleEntry = true
 	case RemuxDVRejectP7V3:
@@ -375,13 +378,6 @@ func (s *RemuxSession) Read(p []byte) (int, error) {
 	return s.outputPipe.Read(p)
 }
 
-// Abort kills the ffmpeg process without draining or reaping it.
-//
-// It exists for callers that are not the owner of the session: killing ffmpeg
-// closes the output pipe, which is what unblocks a copy loop parked in Read, and
-// the owner's deferred Close then does the draining and the wait. Close itself
-// cannot be used for that — it reads the pipe and calls cmd.Wait, neither of
-// which may run concurrently with the owner's Read.
 func (s *RemuxSession) Abort() {
 	if s == nil || s.cancel == nil {
 		return
@@ -483,16 +479,20 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 	// deadline with progress instead of the server's absolute WriteTimeout.
 	streamWriter := httpstream.NewRollingDeadlineWriter(w)
 	w = streamWriter
-	// Check file exists before starting ffmpeg to return a proper 404.
-	// Headers must be written before streaming begins, so we can't detect
-	// ffmpeg errors after WriteHeader(200) has been sent.
-	if _, err := os.Stat(filePath); err != nil {
-		if os.IsNotExist(err) {
-			http.Error(w, "file not found", http.StatusNotFound)
+	// Local files get the usual preflight. Remote inputs (resolved provider
+	// URLs and the loopback relay) are opened by FFmpeg directly; os.Stat on an
+	// HTTP URL would incorrectly return ENOENT and break every virtual remux.
+	lowerPath := strings.ToLower(strings.TrimSpace(filePath))
+	if !strings.HasPrefix(lowerPath, "http://") && !strings.HasPrefix(lowerPath, "https://") &&
+		!strings.HasPrefix(lowerPath, "virtual://") {
+		if _, err := os.Stat(filePath); err != nil {
+			if os.IsNotExist(err) {
+				http.Error(w, "file not found", http.StatusNotFound)
+				return err
+			}
+			http.Error(w, "failed to access file", http.StatusInternalServerError)
 			return err
 		}
-		http.Error(w, "failed to access file", http.StatusInternalServerError)
-		return err
 	}
 
 	session, err := startRemuxWithOptions(r.Context(), filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, opts.AudioOnly, opts.SourceAudioChannels, opts.TargetAudioChannels, opts.TargetAudioBitrateKbps)
@@ -500,7 +500,7 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 		http.Error(w, "failed to start remux", http.StatusInternalServerError)
 		return err
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	if opts.Abort != nil {
 		// Deferred after session.Close, so it runs before it: the watcher is
@@ -522,6 +522,25 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 		}()
 	}
 
+	buf := make([]byte, 32*1024) // 32 KB buffer
+	// Do not commit 200 until FFmpeg produces media bytes. A relay/provider
+	// failure is therefore still safe for the handler to retry.
+	var first []byte
+	for len(first) == 0 {
+		n, readErr := session.Read(buf)
+		if n > 0 {
+			first = buf[:n]
+		}
+		if readErr != nil {
+			if len(first) == 0 {
+				_ = session.Close()
+				http.Error(w, "failed to start remux", http.StatusBadGateway)
+				return errors.New("remux produced no output")
+			}
+			break
+		}
+	}
+
 	contentType := opts.ContentType
 	if contentType == "" {
 		contentType = containerMIME(outputFormat)
@@ -529,9 +548,14 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
+	if _, writeErr := w.Write(first); writeErr != nil {
+		return nil
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 
-	// Stream ffmpeg output to the HTTP response.
-	buf := make([]byte, 32*1024) // 32 KB buffer
+	// Stream subsequent ffmpeg output to the HTTP response.
 	for {
 		n, readErr := session.Read(buf)
 		if n > 0 {
@@ -546,4 +570,14 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 			return nil // EOF or error — done streaming.
 		}
 	}
+}
+
+//nolint:unused // Retained for compatibility with dormant integration paths.
+func isLoopbackRelayInput(filePath string) bool {
+	parsed, err := url.Parse(filePath)
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil {
+		return false
+	}
+	address := net.ParseIP(parsed.Hostname())
+	return address != nil && address.IsLoopback()
 }

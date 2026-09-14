@@ -27,9 +27,16 @@ func TestSQLiteProgressSince(t *testing.T) {
 	storetest.RunProgressSince(t, newConformanceStore)
 }
 
+// TestSQLiteDeviceProfiles runs the per-device capability registry
+// conformance tests against the per-user SQLite backend; the Postgres backend
+// runs the same suite in internal/userstore/pgstore.
+func TestSQLiteDeviceProfiles(t *testing.T) {
+	storetest.RunDeviceProfiles(t, newConformanceStore)
+}
+
 // TestSQLiteMarkWatchedBatch runs the batch mark-watched conformance test
 // (series/season mark-watched) against the real SQLite backend. The Postgres
-// backend runs the same suite in internal/userstore/pgstore, which is what
+// backend runs the same suite in internal/userdb/pgstore, which is what
 // keeps the two transactional implementations from drifting.
 func TestSQLiteMarkWatchedBatch(t *testing.T) {
 	storetest.RunMarkWatchedBatch(t, newConformanceStore)

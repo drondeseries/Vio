@@ -18,6 +18,10 @@ import (
 type StreamExtractOpts struct {
 	// InputPath is the path to the source media file.
 	InputPath string
+	// CacheIdentity is a credential-free, stable identity for a transient
+	// remote input. When set, subtitle caching uses a bounded ten-minute
+	// generation instead of requiring os.Stat on InputPath.
+	CacheIdentity string
 	// TrackIndex is the subtitle stream ordinal within the container
 	// (matches ffmpeg's `0:s:N` specifier). Callers pass the same index
 	// they would to ExtractSubtitle.
@@ -48,6 +52,11 @@ type StreamExtractOpts struct {
 	// playback moves outside coverage. ASS ignores this flag so its
 	// renderer receives the complete script and event timeline.
 	AllowWindow bool
+	// DisableBackgroundWarm prevents a windowed PGS miss from starting a
+	// detached full-track extract. Remote relay inputs use request-scoped
+	// registrations, so a detached warm must not outlive that registration.
+	// Local files leave this false and retain the normal cache-warm behavior.
+	DisableBackgroundWarm bool
 	// InputIsExtractedSup marks InputPath as a cached full-track .sup
 	// elementary stream (a previous full extract, produced with -copyts so
 	// its timestamps are absolute source PTS) rather than the original
@@ -60,6 +69,15 @@ type StreamExtractOpts struct {
 	// absolute timestamps, so windowed output is byte-compatible with a
 	// window cut from the original file.
 	InputIsExtractedSup bool
+	// InputIsExtractedText marks InputPath as a cached full-track text
+	// artifact (vtt/ass) produced by a previous non-windowed extract rather
+	// than the original media container. The demuxer is forced to the
+	// artifact's format and the mapping to `0:s:0` (same single-stream
+	// reasoning as InputIsExtractedSup), and a windowed re-extract from it
+	// carries absolute timestamps exactly like the .sup path, so a window
+	// cut from the cache is byte-compatible with one cut from the source.
+	// Empty means InputPath is the original container.
+	InputIsExtractedText string
 	// FFmpegPath overrides the ffmpeg binary lookup.
 	FFmpegPath string
 	// Writer receives ffmpeg's stdout bytes as they arrive. When it
@@ -130,6 +148,13 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 		return copyErr
 	}
 	if waitErr != nil {
+		// ExitError with non-zero status is ffmpeg reporting a real
+		// problem. Client disconnect (copy failed) manifests as the
+		// context being canceled, which surfaces here as ffmpeg being
+		// killed — propagate it as a regular cancellation error.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("ffmpeg subtitle stream failed: %w (stderr: %s)",
 			waitErr, truncateStderr(stderrBuf.String()))
 	}
@@ -163,9 +188,21 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 
 	// A cached .sup input has no container magic worth probing and exactly
 	// one stream: force the demuxer and remap to the sole stream ordinal.
+	// A cached text artifact (vtt/ass) is the same shape: force the demuxer
+	// and remap to its single stream. ffmpeg's WebVTT demuxer is registered
+	// as "webvtt" (the cache key spells it "vtt", the muxer name), and the
+	// ass demuxer accepts the artifact directly.
 	trackIndex := opts.TrackIndex
-	if opts.InputIsExtractedSup {
+	switch {
+	case opts.InputIsExtractedSup:
 		args = append(args, "-f", "sup")
+		trackIndex = 0
+	case opts.InputIsExtractedText != "":
+		inputFormat := opts.InputIsExtractedText
+		if inputFormat == SubtitleFormatVTTV3 {
+			inputFormat = subtitleMuxerWebVTT
+		}
+		args = append(args, "-f", inputFormat)
 		trackIndex = 0
 	}
 	args = append(args,
@@ -274,6 +311,22 @@ func streamExtractOutput(codec string, targetFormat ...string) (outCodec, outFor
 		return "copy", "sup"
 	}
 	return "webvtt", "webvtt"
+}
+
+// IsSubtitleStreamMapError reports whether an ffmpeg subtitle-extract failure
+// came from a stream map that named a subtitle ordinal the input does not have
+// ("matches no streams" / "for option 'map'"). A virtual release can rotate its
+// subtitle layout between planning and extraction, so a map failure against a
+// relay input means the source rotated rather than that ffmpeg is broken.
+// Conservative by design: only ffmpeg's map diagnostics match, so genuine
+// ffmpeg failures stay loud.
+func IsSubtitleStreamMapError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "matches no streams") ||
+		strings.Contains(message, "for option 'map'")
 }
 
 // LogSubtitleStreamError writes a non-fatal warning for subtitle stream

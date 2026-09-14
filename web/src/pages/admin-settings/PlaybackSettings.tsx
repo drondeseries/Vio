@@ -41,12 +41,14 @@ const TRANSCODING_ADVANCED_KEYS = [
   "playback.hw_device",
   "playback.transcode_hardware_tone_map_enabled",
   "playback.transcode_software_tone_map_enabled",
+  "playback.software_fallback",
   "enable_transcode_throttle",
   "transcode_throttle_seconds",
   "playback.chapter_thumbnail_workers",
   "playback.chapter_thumbnail_execution",
   "playback.chapter_thumbnail_hdr_policy",
   "playback.chapter_thumbnail_software_tone_map_enabled",
+  "playback.max_virtual_failover_attempts",
 ];
 
 const executionOptions = [
@@ -428,6 +430,17 @@ export default function PlaybackSettings() {
               </div>
             )}
             <SettingField
+              label="Hardware Transcode Failure"
+              type="select"
+              hint="Allow CPU fallback when GPU transcoding fails, or require GPU-only playback to avoid high CPU usage."
+              value={form.getValue("playback.software_fallback") || "allow"}
+              onChange={(v) => form.setValue("playback.software_fallback", v)}
+              options={[
+                { value: "allow", label: "Allow CPU fallback" },
+                { value: "gpu_only", label: "GPU only" },
+              ]}
+            />
+            <SettingField
               label="Enable Hardware HDR Tone Mapping"
               type="toggle"
               hint="Allows validated local or remote GPU executors to convert HDR video to SDR when transcoding."
@@ -618,6 +631,13 @@ export default function PlaybackSettings() {
             value={form.getValue("playback.min_resume_threshold")}
             onChange={(v) => form.setValue("playback.min_resume_threshold", v)}
             restartRequired={restartKeys.has("playback.min_resume_threshold")}
+          />
+          <SettingField
+            label="Max Virtual Failover Attempts"
+            type="number"
+            hint="Maximum alternate stream candidates to probe or failover across during playback startup (1–50, default: 5)"
+            value={form.getValue("playback.max_virtual_failover_attempts")}
+            onChange={(v) => form.setValue("playback.max_virtual_failover_attempts", v)}
           />
         </FieldGroup>
       </div>

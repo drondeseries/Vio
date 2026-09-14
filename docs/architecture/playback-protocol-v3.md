@@ -223,6 +223,36 @@ would have chosen for the resume point. A client that resolves resume state
 itself and sends the position explicitly gets identical behaviour — that is the
 supported way to override the server's policy.
 
+**Carrying an audio selection across a version switch.** `carried_audio_track_id`
+is the file-bound audio identity (`file:{file_id}:audio:{ordinal}`, §8) the
+viewer had selected on a previously playing version. When present, the server
+re-resolves it onto the requested file's inventory by *track family* — codec and
+language, honoring a MULTi track's full `languages[]` — rather than by raw
+ordinal, which is unstable across encodes. It is additive and optional: absent
+means the server owns audio selection (profile or series preference), exactly as
+before. It is not feature-gated; any v3 client may send it. When the carried
+identity cannot be resolved (the source version is gone, or the identity does
+not parse), the server falls back to its normal preference resolution.
+
+**Pinning an explicit version pick.** `file_selection` distinguishes an explicit
+user version pick from an auto/default selection. `explicit` pins the requested
+`file_id`: the start-path alternate-version fallback is disabled, and a terminal
+that another version of the same title could satisfy carries a version-list hint
+in its `message` instead of silently swapping files. Absent (or `auto`) keeps
+the historical behavior — the server may substitute an alternate version when
+the requested one cannot be delivered. The field is optional and
+unconditionally available; existing clients that omit it are unchanged.
+
+**Forcing a fresh relink.** `force_relink` is an optional boolean (default
+`false`). When `true`, the server re-queries the provider for a fresh virtual-
+source listing instead of trusting the cached or pinned candidate, and drops
+the stale pin when the provider no longer lists the requested candidate.
+It is meaningful only alongside an explicit `file_selection`: clients set it
+when the user explicitly retries a version the catalog marked unavailable, or
+when the user retries a retryable terminal where the provider offered no usable
+stream. Absent means the server keeps its existing listing and cache behavior,
+so clients that omit it are unchanged.
+
 ### 2.3 `POST /playback/{session_id}/replan`
 
 Asks for a different plan for an existing session — after a failure, or because
@@ -301,6 +331,27 @@ Event names are the eleven in §7.4. `diagnostics` is a string→string map, cap
 at 32 entries, and the server keeps only the keys on its allowlist (§7.5),
 truncating each value to 256 characters. Unknown keys are dropped silently; a
 client sending them is not an error, it just achieves nothing.
+
+### 2.5 `POST /playback/{session_id}/progress`
+
+Reports the live playback position and pause state for a session. Auth +
+`X-Profile-Id` required. Body: `{"position": <seconds>, "is_paused": <bool>}`.
+
+| Status | Meaning |
+| --- | --- |
+| `204` | Accepted. **No response body.** |
+| `400` | `bad_request` | Malformed body or missing `session_id` |
+| `401` | `unauthorized` | No authenticated user |
+| `403` | `forbidden` | The session belongs to another user |
+| `500` | `internal_error` | Store outage |
+
+Progress for a session that is already gone — for example a version switch
+deleted it while a 10-second progress tick was in flight — is a **benign
+no-op**, not an error: the endpoint answers `204` for a missing or expired
+session, and the client must not treat it as a failure or tear playback down.
+This is deliberate and differs from the other session-scoped endpoints, where
+an unknown session is an error. A `403` still means the session exists but is
+not the caller's; a `500` is retryable.
 
 ---
 
@@ -1110,6 +1161,19 @@ address the wrong track. (That was a real bug; this rule is the fix.)
 `playback_plan.subtitle.inventory` is the authoritative list. A client selects a
 track by echoing an entry's `track_id` or `combined_index`. It must never derive
 an ordinal by counting tracks, summing array lengths, or taking `max(index)+1`.
+
+`playback_plan.audio_tracks` is the authoritative per-track audio inventory of
+the effective source, mirroring the subtitle inventory. It is the probed
+`AudioTrack` list of the file the plan actually plays, in container order, with
+the same shape as the catalog's file-version `audio_tracks` (`index`, `title`,
+`embedded_title`, `language`, `languages`, `codec`, `profile`, `layout`,
+`channels`, `bitrate`, `sample_rate`, `bit_depth`, `default`). A client renders
+its audio menu from this list in preference to item metadata: after a version
+fallback the effective file can differ from the requested catalog row, and only
+the plan's list reflects the tracks the plan actually plays. The field is
+optional — a plan may omit it when the source has no probed audio inventory —
+and it is not part of the plan's identity (§9), exactly like the subtitle
+inventory.
 
 Each entry carries `source` (`external` | `embedded` | `downloaded`), `delivery`
 (`sidecar` | `burn_in_only`), the `forced` / `default` / `hearing_impaired`

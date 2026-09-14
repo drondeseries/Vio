@@ -76,6 +76,7 @@ type embyItem struct {
 	} `json:"UserData"`
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type embyUser struct {
 	ID string `json:"Id"`
 }
@@ -261,7 +262,7 @@ func (c *EmbyClient) doJSON(req *http.Request, out any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
@@ -303,7 +304,8 @@ func UpstreamHTTPStatus(err error) int {
 }
 
 func shouldTryAnotherBase(err error) bool {
-	httpErr, ok := err.(*embyHTTPError)
+	httpErr := &embyHTTPError{}
+	ok := errors.As(err, &httpErr)
 	if !ok {
 		return true
 	}

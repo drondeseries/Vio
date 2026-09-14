@@ -64,7 +64,7 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, dir stri
 	if err != nil {
 		return err
 	}
-	defer provider.Close()
+	defer func() { _ = provider.Close() }()
 
 	if _, err := provider.Up(ctx); err != nil {
 		return fmt.Errorf("running goose migrations: %w", err)
@@ -110,7 +110,7 @@ func MigrationStatuses(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, dir 
 	if err != nil {
 		return nil, err
 	}
-	defer provider.Close()
+	defer func() { _ = provider.Close() }()
 
 	gooseStatuses, err := provider.Status(ctx)
 	if err != nil {
@@ -293,7 +293,7 @@ func verifyLegacyVersions(ctx context.Context, conn *sql.Conn) error {
 	if err != nil {
 		return fmt.Errorf("verifying legacy schema_versions rows: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var missing []int
 	for rows.Next() {

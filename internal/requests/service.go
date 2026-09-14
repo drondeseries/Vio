@@ -68,6 +68,8 @@ type Service struct {
 	requesterIdentity RequesterIdentityResolver
 	notifier          FulfillmentNotifier
 	lifecycle         LifecycleNotifier
+	catalogChanged    func()
+	cleanupVirtual    func(context.Context, Request) error
 	Now               func() time.Time
 }
 
@@ -96,6 +98,16 @@ func NewService(store Store, tmdbClient TMDBClient, presence PresenceResolver) *
 }
 
 func (s *Service) SetRouterProvider(p RequestRouterProvider) { s.router = p }
+
+// SetCatalogChangeNotifier installs the cache/event hook used when a request
+// router may have registered media directly in the catalog during Fulfill.
+func (s *Service) SetCatalogChangeNotifier(notify func()) { s.catalogChanged = notify }
+
+// SetVirtualMediaCleanup installs the host catalog cleanup hook used when a
+// pending request is canceled. The hook must preserve physical files.
+func (s *Service) SetVirtualMediaCleanup(cleanup func(context.Context, Request) error) {
+	s.cleanupVirtual = cleanup
+}
 
 func (s *Service) SetEntitlementResolver(r EntitlementResolver) { s.entitlements = r }
 
@@ -928,7 +940,7 @@ func (s *Service) Decline(ctx context.Context, viewer Viewer, id, reason string)
 // Cancel withdraws a request that has not yet been submitted to a downstream
 // integration. Owners can cancel their own pending requests; admins can cancel
 // any active request that has not entered the fulfillment pipeline. Requests
-// already approved, queued, downloading, or completed cannot be cancelled —
+// already approved, queued, downloading, or completed cannot be canceled —
 // callers should decline (admin) or wait for completion in those cases.
 func (s *Service) Cancel(ctx context.Context, viewer Viewer, id, reason string) (*Request, error) {
 	if viewer.UserID == 0 {
@@ -955,7 +967,16 @@ func (s *Service) Cancel(ctx context.Context, viewer Viewer, id, reason string) 
 		strings.TrimSpace(req.IntegrationKind) != "" {
 		return nil, ErrInvalidState
 	}
-	return s.store.SetOutcome(ctx, req.ID, OutcomeCancelled, viewer, reason)
+	canceled, err := s.store.SetOutcome(ctx, req.ID, OutcomeCancelled, viewer, reason)
+	if err != nil {
+		return nil, err
+	}
+	if s.cleanupVirtual != nil {
+		if err := s.cleanupVirtual(ctx, *canceled); err != nil {
+			slog.WarnContext(ctx, "requests: canceled virtual media cleanup failed", "component", "requests", "request_id", req.ID, "error", err)
+		}
+	}
+	return canceled, nil
 }
 
 func (s *Service) Retry(ctx context.Context, viewer Viewer, id string) (*Request, error) {
@@ -1204,6 +1225,14 @@ func (s *Service) validateViaPlugin(ctx context.Context, in Integration) error {
 		stored, err := s.store.GetIntegration(ctx, in.ID)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return err
+		}
+		if stored != nil {
+			sameInstallation := stored.InstallationID != nil && in.InstallationID != nil && *stored.InstallationID == *in.InstallationID
+			if !sameInstallation {
+				// Credentials and plugin config belong to the selected plugin. Never
+				// carry them across when an integration is rebound to another install.
+				stored = nil
+			}
 		}
 		if stored != nil {
 			// Don't pair a stored API key with a caller-changed base URL: require the
@@ -1760,7 +1789,13 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 	s.populateRequesterIdentity(ctx, &req)
 	targets, msg, err := s.router.Fulfill(ctx, installationID, capabilityID, req, want, conns)
 	if err != nil {
-		return nil, err
+		return s.markSubmissionFailed(ctx, req.ID, actor, err)
+	}
+	// Fulfill is allowed to create virtual catalog rows before returning. Flush
+	// shared home-section membership now so Recently Added reflects the change
+	// on the user's next request instead of serving its five-minute warm entry.
+	if s.catalogChanged != nil {
+		s.catalogChanged()
 	}
 	if len(targets) == 0 {
 		if msg == "" {
@@ -1904,7 +1939,7 @@ func boolConfig(config map[string]any, key string) bool {
 func (s *Service) markSubmissionFailed(ctx context.Context, requestID string, actor Viewer, submitErr error) (*Request, error) {
 	failed, err := s.store.SetOutcome(ctx, requestID, OutcomeFailed, actor, submitErr.Error())
 	if err != nil {
-		return nil, fmt.Errorf("submit request failed: %w; mark failed: %v", submitErr, err)
+		return nil, fmt.Errorf("submit request failed: %w; mark failed: %w", submitErr, err)
 	}
 	return failed, nil
 }

@@ -1942,7 +1942,7 @@ func TestServiceSyncConnectionPreservesConnectionUpdatesAcrossFlows(t *testing.T
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := userdb.InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -2013,7 +2013,7 @@ func TestServiceExportWatchedDrainsPendingBatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := userdb.InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -2064,7 +2064,7 @@ func TestServiceSyncConnectionMarksRunFailedWhenExportTransportFails(t *testing.
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := userdb.InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -3138,7 +3138,7 @@ func TestServiceSyncConnectionDefersOnRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := userdb.InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -3500,7 +3500,7 @@ func TestServiceSyncConnectionLeavesExportsPendingOnRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := userdb.InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -3556,7 +3556,7 @@ func TestSyncDueConnectionsSkipsSiblingsOfRateLimitedAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := userdb.InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -3634,7 +3634,7 @@ func TestServiceAppliesIncrementalFavoriteTombstone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := userdb.InitSchema(db); err != nil {
 		t.Fatal(err)
 	}
@@ -3685,7 +3685,7 @@ func TestServiceIncrementalFavoriteAbsenceIsNotRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := userdb.InitSchema(db); err != nil {
 		t.Fatal(err)
 	}

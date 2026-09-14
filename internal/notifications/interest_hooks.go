@@ -64,22 +64,31 @@ func (p *interestTrackingProvider) ForUser(ctx context.Context, userID int) (use
 	// send callers down a fast path that can only fail.
 	registry, hasDevices := store.(userstore.DeviceRegistry)
 	rollup, hasRollup := store.(userstore.SeriesEpisodeRollupStore)
+	profiles, hasProfiles := store.(userstore.DeviceProfileRegistry)
 	completion, hasCompletion := store.(userstore.EpisodeParentCompletionStore)
 	var wrapped userstore.UserStore = tracked
 	switch {
 	case hasDevices && hasRollup && hasCompletion:
+		inner := &interestTrackingStoreWithDevicesAndRollup{
+			interestTrackingStore: tracked, DeviceRegistry: registry, SeriesEpisodeRollupStore: rollup,
+		}
+		if hasProfiles {
+			inner.DeviceProfileRegistry = profiles
+		}
 		wrapped = &interestTrackingStoreWithDevicesRollupAndCompletion{
-			interestTrackingStoreWithDevicesAndRollup: &interestTrackingStoreWithDevicesAndRollup{
-				interestTrackingStore: tracked, DeviceRegistry: registry, SeriesEpisodeRollupStore: rollup,
-			},
-			EpisodeParentCompletionStore: completion,
+			interestTrackingStoreWithDevicesAndRollup: inner,
+			EpisodeParentCompletionStore:              completion,
 		}
 	case hasDevices && hasCompletion:
+		inner := &interestTrackingStoreWithDevices{
+			interestTrackingStore: tracked, DeviceRegistry: registry,
+		}
+		if hasProfiles {
+			inner.DeviceProfileRegistry = profiles
+		}
 		wrapped = &interestTrackingStoreWithDevicesAndCompletion{
-			interestTrackingStoreWithDevices: &interestTrackingStoreWithDevices{
-				interestTrackingStore: tracked, DeviceRegistry: registry,
-			},
-			EpisodeParentCompletionStore: completion,
+			interestTrackingStoreWithDevices: inner,
+			EpisodeParentCompletionStore:     completion,
 		}
 	case hasRollup && hasCompletion:
 		wrapped = &interestTrackingStoreWithRollupAndCompletion{
@@ -93,15 +102,28 @@ func (p *interestTrackingProvider) ForUser(ctx context.Context, userID int) (use
 			interestTrackingStore: tracked, EpisodeParentCompletionStore: completion,
 		}
 	case hasDevices && hasRollup:
-		wrapped = &interestTrackingStoreWithDevicesAndRollup{
+		res := &interestTrackingStoreWithDevicesAndRollup{
 			interestTrackingStore:    tracked,
 			DeviceRegistry:           registry,
 			SeriesEpisodeRollupStore: rollup,
 		}
+		if hasProfiles {
+			res.DeviceProfileRegistry = profiles
+		}
+		wrapped = res
 	case hasDevices:
-		wrapped = &interestTrackingStoreWithDevices{
+		res := &interestTrackingStoreWithDevices{
 			interestTrackingStore: tracked,
 			DeviceRegistry:        registry,
+		}
+		if hasProfiles {
+			res.DeviceProfileRegistry = profiles
+		}
+		wrapped = res
+	case hasProfiles:
+		wrapped = &interestTrackingStoreWithProfiles{
+			interestTrackingStore: tracked,
+			DeviceProfileRegistry: profiles,
 		}
 	case hasRollup:
 		wrapped = &interestTrackingStoreWithRollup{
@@ -143,6 +165,12 @@ func (s *interestTrackingStore) SaveOnboardingProgress(ctx context.Context, stat
 type interestTrackingStoreWithDevices struct {
 	*interestTrackingStore
 	userstore.DeviceRegistry
+	userstore.DeviceProfileRegistry
+}
+
+type interestTrackingStoreWithProfiles struct {
+	*interestTrackingStore
+	userstore.DeviceProfileRegistry
 }
 
 // interestTrackingStoreWithRollup adds the series-rollup capability only when
@@ -161,6 +189,7 @@ type interestTrackingStoreWithRollup struct {
 type interestTrackingStoreWithDevicesAndRollup struct {
 	*interestTrackingStore
 	userstore.DeviceRegistry
+	userstore.DeviceProfileRegistry
 	userstore.SeriesEpisodeRollupStore
 }
 
@@ -190,6 +219,8 @@ var _ userstore.SettingValueCompareAndSetter = (*interestTrackingStore)(nil)
 var _ userstore.SettingMutationTransactioner = (*interestTrackingStore)(nil)
 var _ userstore.SettingValueCompareAndSetter = (*interestTrackingStoreWithDevices)(nil)
 var _ userstore.SettingMutationTransactioner = (*interestTrackingStoreWithDevices)(nil)
+var _ userstore.SettingValueCompareAndSetter = (*interestTrackingStoreWithProfiles)(nil)
+var _ userstore.SettingMutationTransactioner = (*interestTrackingStoreWithProfiles)(nil)
 
 // Optional store capabilities must survive the decorator. Embedding the
 // UserStore interface promotes only that interface's methods, so each of these

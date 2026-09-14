@@ -100,7 +100,7 @@ func (p *Provider) StartDeviceAuth(
 	if err != nil {
 		return watchsync.DeviceAuthSession{}, fmt.Errorf("send trakt device auth request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return watchsync.DeviceAuthSession{}, fmt.Errorf("trakt device auth request failed: status %d", resp.StatusCode)
@@ -614,7 +614,7 @@ func (p *Provider) do(
 	if err != nil {
 		return fmt.Errorf("send trakt request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("trakt request %s %s failed: status %d", method, path, resp.StatusCode)
 	}

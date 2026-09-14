@@ -15,6 +15,17 @@ type Provider interface {
 	Download(ctx context.Context, id string) ([]byte, SubtitleFormat, error)
 }
 
+// ConnectionTester is implemented by providers whose Search does not validate
+// their credentials. OpenSubtitles searches with a shared default API key, so
+// a search proves nothing about the configured username/password; the admin
+// connection test must call this instead to verify the account can actually
+// authenticate.
+type ConnectionTester interface {
+	// TestConnection verifies the provider's configured credentials against
+	// the upstream. Returns nil when they authenticate, an error otherwise.
+	TestConnection(ctx context.Context) error
+}
+
 // S3Client is the interface for S3 operations needed by the subtitle system.
 // Defined here for testability — the concrete implementation is s3client.Client.
 type S3Client interface {

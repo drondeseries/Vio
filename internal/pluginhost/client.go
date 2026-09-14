@@ -79,6 +79,11 @@ type HTTPRoutesClient struct {
 	timeout time.Duration
 }
 
+type VirtualStreamProviderClient struct {
+	client  pluginv1.VirtualStreamProviderClient
+	timeout time.Duration
+}
+
 type WatchSyncProviderClient struct {
 	client              pluginv1.WatchSyncProviderClient
 	deviceAuthorization pluginv1.WatchSyncDeviceAuthorizationServiceClient
@@ -86,6 +91,8 @@ type WatchSyncProviderClient struct {
 }
 
 func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.PluginManifest) *Client {
+	manifestClone := &pluginv1.PluginManifest{}
+	proto.Merge(manifestClone, manifest)
 	capabilities := make(map[string]*pluginv1.CapabilityDescriptor, len(manifest.GetCapabilities()))
 	for _, capability := range manifest.GetCapabilities() {
 		capabilities[capabilityKey(capability.GetType(), capability.GetId())] = capability
@@ -93,14 +100,16 @@ func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.Pl
 
 	return &Client{
 		installationID: installationID,
-		manifest:       proto.Clone(manifest).(*pluginv1.PluginManifest),
+		manifest:       manifestClone,
 		rpc:            rpc,
 		capabilities:   capabilities,
 	}
 }
 
 func (c *Client) Manifest() *pluginv1.PluginManifest {
-	return proto.Clone(c.manifest).(*pluginv1.PluginManifest)
+	manifest := &pluginv1.PluginManifest{}
+	proto.Merge(manifest, c.manifest)
+	return manifest
 }
 
 func (c *Client) Capabilities() []*pluginv1.CapabilityDescriptor {
@@ -109,7 +118,9 @@ func (c *Client) Capabilities() []*pluginv1.CapabilityDescriptor {
 
 	result := make([]*pluginv1.CapabilityDescriptor, 0, len(c.capabilities))
 	for _, capability := range c.capabilities {
-		result = append(result, proto.Clone(capability).(*pluginv1.CapabilityDescriptor))
+		clone := &pluginv1.CapabilityDescriptor{}
+		proto.Merge(clone, capability)
+		result = append(result, clone)
 	}
 	return result
 }
@@ -160,7 +171,7 @@ func (c *Client) ScheduledTask(capabilityID string) (*ScheduledTaskClient, error
 	}
 	return &ScheduledTaskClient{
 		client:  c.rpc.ScheduledTask(),
-		timeout: DefaultControlTimeout,
+		timeout: DefaultScheduledTaskTimeout,
 	}, nil
 }
 
@@ -214,6 +225,30 @@ func (c *Client) HTTPRoutes(capabilityID string) (*HTTPRoutesClient, error) {
 	}, nil
 }
 
+func (c *Client) VirtualStreamProvider(capabilityID string) (*VirtualStreamProviderClient, error) {
+	if err := c.requireCapability("virtual_stream_provider.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &VirtualStreamProviderClient{
+		client:  c.rpc.VirtualStreamProvider(),
+		timeout: DefaultVirtualStreamTimeout,
+	}, nil
+}
+
+func NewHTTPRoutesClientForTest(client pluginv1.HttpRoutesClient, timeout time.Duration) *HTTPRoutesClient {
+	if timeout <= 0 {
+		timeout = DefaultRouteTimeout
+	}
+	return &HTTPRoutesClient{client: client, timeout: timeout}
+}
+
+func NewVirtualStreamProviderClientForTest(client pluginv1.VirtualStreamProviderClient, timeout time.Duration) *VirtualStreamProviderClient {
+	if timeout <= 0 {
+		timeout = DefaultVirtualStreamTimeout
+	}
+	return &VirtualStreamProviderClient{client: client, timeout: timeout}
+}
+
 func (c *Client) WatchSyncProvider(capabilityID string) (*WatchSyncProviderClient, error) {
 	if err := c.requireCapability("watch_sync_provider.v1", capabilityID); err != nil {
 		return nil, err
@@ -224,7 +259,6 @@ func (c *Client) WatchSyncProvider(capabilityID string) (*WatchSyncProviderClien
 		timeout:             DefaultWatchSyncTimeout,
 	}, nil
 }
-
 func (c *Client) markUnhealthy() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -400,6 +434,18 @@ func (c *HTTPRoutesClient) Handle(ctx context.Context, req *pluginv1.HandleHTTPR
 	callCtx, cancel := ensureDeadline(ctx, c.timeout)
 	defer cancel()
 	return c.client.Handle(callCtx, req)
+}
+
+func (c *VirtualStreamProviderClient) ResolveVirtualStream(ctx context.Context, req *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ResolveVirtualStream(callCtx, req)
+}
+
+func (c *VirtualStreamProviderClient) ListVirtualStreamProfiles(ctx context.Context, req *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.ListVirtualStreamProfiles(callCtx, req)
 }
 
 func (c *WatchSyncProviderClient) ExchangeAPIKey(ctx context.Context, req *pluginv1.WatchSyncExchangeAPIKeyRequest) (*pluginv1.WatchSyncCredentialResponse, error) {

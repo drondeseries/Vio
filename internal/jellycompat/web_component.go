@@ -267,7 +267,7 @@ func listRemoteWebVersions(ctx context.Context, sourceURL string) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("GitHub releases request returned %s", resp.Status)
 	}
@@ -531,7 +531,7 @@ func installWebComponentLocked(ctx context.Context, opts WebComponentInstallOpti
 		writeWebInstallError(root, err)
 		return webComponentStatus(root, ManagedWebInstallPath(root), version, sourceURL), err
 	}
-	defer os.RemoveAll(tmpRoot)
+	defer func() { _ = os.RemoveAll(tmpRoot) }()
 	if err := os.WriteFile(filepath.Join(tmpRoot, webTempMarker), []byte("silo jellyfin web install workspace\n"), 0o644); err != nil {
 		writeWebInstallError(root, err)
 		return webComponentStatus(root, ManagedWebInstallPath(root), version, sourceURL), err
@@ -825,7 +825,7 @@ func validateWebComponentDirectory(path string) (WebComponentMetadata, error) {
 		return WebComponentMetadata{}, fmt.Errorf("invalid Jellyfin Web metadata version %q", metadata.Version)
 	}
 	if strings.TrimSpace(metadata.License) == "" {
-		return WebComponentMetadata{}, errors.New("Jellyfin Web metadata license is missing")
+		return WebComponentMetadata{}, errors.New("Jellyfin Web metadata license is missing") //nolint:staticcheck // Jellyfin Web is a proper product name.
 	}
 	if _, err := normalizeWebSourceURL(metadata.SourceURL); err != nil {
 		return WebComponentMetadata{}, err
@@ -1415,7 +1415,7 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -1423,7 +1423,7 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}
@@ -1459,7 +1459,7 @@ func directoryChecksum(root string) (string, error) {
 			return "", err
 		}
 		if _, err := io.Copy(hash, file); err != nil {
-			file.Close()
+			_ = file.Close()
 			return "", err
 		}
 		if err := file.Close(); err != nil {
@@ -1536,7 +1536,7 @@ func writeWebOperationState(root string, op *WebComponentOperationStatus) error 
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
@@ -1566,7 +1566,7 @@ func replaceWebOperationState(root string, op *WebComponentOperationStatus) erro
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/requestlock"
 	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
@@ -235,7 +236,23 @@ func (r *Repository) CreateRequest(ctx context.Context, input CreateRequestRecor
 	if err != nil {
 		return nil, fmt.Errorf("begin create request transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Serialize creation with cancellation cleanup for this title. Without a
+	// shared lock, a replacement request can be inserted after the canceled
+	// request commits but before its virtual-media cleanup runs, causing cleanup
+	// to remove the replacement request's provider-neutral claim.
+	requestTVDBID := ""
+	if input.Input.TVDBID != nil && *input.Input.TVDBID > 0 {
+		requestTVDBID = strconv.Itoa(*input.Input.TVDBID)
+	}
+	if lockKey, ok := requestlock.MediaKey(
+		string(input.Input.MediaType), input.Input.TMDBID, requestTVDBID, input.Input.IMDbID,
+	); ok {
+		if err := requestlock.LockItem(ctx, tx, lockKey); err != nil {
+			return nil, fmt.Errorf("acquire request media lock: %w", err)
+		}
+	}
 
 	if input.Quota != nil {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1::int4, $2::int4)`,
@@ -466,7 +483,7 @@ func (r *Repository) SetStatus(ctx context.Context, id string, status Status, ac
 	if err != nil {
 		return nil, fmt.Errorf("begin request status transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	req, err := scanRequest(tx.QueryRow(ctx, `
 		UPDATE media_requests
@@ -496,7 +513,7 @@ func (r *Repository) SetOutcome(ctx context.Context, id string, outcome Outcome,
 	if err != nil {
 		return nil, fmt.Errorf("begin request outcome transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	req, err := scanRequest(tx.QueryRow(ctx, `
 		UPDATE media_requests
@@ -636,7 +653,11 @@ func (r *Repository) updateIntegration(ctx context.Context, exec requestExecutor
 	row := exec.QueryRow(ctx, `
 		UPDATE request_integrations SET
 			name=$2, enabled=$3, base_url=$4,
-			api_key_ref = CASE WHEN $5 = '' THEN api_key_ref ELSE $5 END,
+			api_key_ref = CASE
+				WHEN installation_id IS DISTINCT FROM $7 THEN $5
+				WHEN $5 = '' THEN api_key_ref
+				ELSE $5
+			END,
 			capability_id=$6, installation_id=$7,
 			supported_media_types=$8, plugin_config=$9, updated_at=now()
 		WHERE id=$1
@@ -662,7 +683,7 @@ func (r *Repository) SaveIntegrationWithDefaults(ctx context.Context, in Integra
 	if err != nil {
 		return nil, fmt.Errorf("begin save integration: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var out *Integration
 	if isCreate {
@@ -684,7 +705,7 @@ func (r *Repository) DeleteIntegration(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("begin delete integration: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := r.deleteIntegration(ctx, tx, id); err != nil {
 		return err

@@ -25,7 +25,7 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	StatusCancelled = "cancelled"
+	StatusCancelled = "canceled"
 
 	TriggerAdminItemRefresh    = "admin_item_refresh"
 	TriggerAdminLibraryRefresh = "admin_library_refresh"

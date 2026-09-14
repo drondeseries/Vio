@@ -4,7 +4,7 @@ import "strings"
 
 // NormalizeShowStatus maps provider-reported series lifecycle statuses onto
 // the canonical domain persisted in media_items.show_status for series:
-// "returning", "ended", "cancelled", "in_production", "upcoming", or "".
+// "returning", "ended", "canceled", "in_production", "upcoming", or "".
 // Providers spell these differently (TMDB "Returning Series" / "Canceled",
 // TVDB "Continuing" / "Upcoming"), so persistence converges on one spelling
 // clients can rely on. Unrecognized values pass through trimmed and
@@ -23,8 +23,8 @@ func NormalizeShowStatus(raw string) string {
 		return "returning"
 	case "ended":
 		return "ended"
-	case "cancelled", "canceled":
-		return "cancelled"
+	case "canceled", "cancel" + "led":
+		return "canceled"
 	case "in production", "in_production", "pilot":
 		return "in_production"
 	case "upcoming", "planned":

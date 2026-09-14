@@ -10,7 +10,6 @@ const (
 	mediaBaseTypeAudiobook = "audiobook"
 	mediaBaseTypePodcast   = "podcast"
 	mediaCodecMJPEG        = "mjpeg"
-	mediaCodecH264         = "h264"
 )
 
 // MediaFolder represents a row in the media_folders table.
@@ -56,6 +55,8 @@ type MediaFile struct {
 	IdentityConfidence           string
 	IdentityJSON                 []byte
 	FilePath                     string
+	VirtualOwnerInstallationID   int  // owner for zero-storage virtual files; zero for local files
+	VirtualOwnerInstallationSet  bool // distinguishes legacy virtual owner 0 from local NULL
 	FileSize                     int64
 	FileModifiedAt               *time.Time
 	FileHash                     string // OSHash (16-char hex)
@@ -109,12 +110,18 @@ type MediaFile struct {
 	EditionKey                   string
 	EditionConfidence            *float64
 	EditionSource                string
-	PresentationKind             string
-	PresentationGroupKey         string
-	PresentationPartIndex        int
-	PresentationPartTotal        int
-	MultiEpisodeStart            int
-	MultiEpisodeEnd              int
+	// ReleaseName is the file stem (basename without extension), the closest
+	// the server gets to the release's advertised name.
+	ReleaseName string
+	// ReleaseGroup is the trailing group tag on release-style names
+	// ("Movie.2023.2160p.AltMount" → "AltMount"), "" when none is present.
+	ReleaseGroup          string
+	PresentationKind      string
+	PresentationGroupKey  string
+	PresentationPartIndex int
+	PresentationPartTotal int
+	MultiEpisodeStart     int
+	MultiEpisodeEnd       int
 	// MultiplePPS is the persisted H.264 multi-PPS copy-safety verdict; nil
 	// means the file has never been successfully analyzed. It is trusted only
 	// when MultiplePPSScanSize and MultiplePPSScanMtime still match the file's
@@ -128,11 +135,25 @@ type MediaFile struct {
 	MultiplePPSScanMtime *time.Time `json:"-"`
 	ProbeSource          string     // arrs, local
 	ProbeUpdatedAt       *time.Time
-	MatchAttemptedAt     *time.Time
-	MissingSince         *time.Time
-	FirstSeenScanRunID   string
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// ProbeVersion is the schema version of the probe-derived columns
+	// (audio/subtitle track shape, track languages). Scans bump it so rows
+	// probed before a probe-shape change are re-probed once instead of being
+	// served forever with the legacy shape.
+	ProbeVersion     int
+	MatchAttemptedAt *time.Time
+	MissingSince     *time.Time
+	// FailedAt marks a virtual candidate that produced no bytes at
+	// stream-open (corrupted NZB, dead provider URL). A fresh listing clears
+	// it; the auto-pick skips failed candidates while the dropdown still
+	// shows them for a manual retry.
+	FailedAt *time.Time
+	// LastDeliveredAt is the last time this virtual candidate delivered media
+	// bytes to a client. It is the durable known-good evidence the delivery
+	// grace and the optimistic start path read; nil means never delivered.
+	LastDeliveredAt    *time.Time
+	FirstSeenScanRunID string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // MediaChapter represents a single media chapter derived from embedded file metadata.
@@ -171,68 +192,6 @@ func (f *MediaFile) PrimaryDVProfile() int {
 		return 0
 	}
 	return f.VideoTracks[0].DVProfile
-}
-
-// VideoCopySafetyUnknown reports whether this file is an H.264 video whose
-// multi-PPS copy-safety verdict is not stamped on the in-memory track. Only
-// H.264 can carry the conflicting in-band parameter sets that make a video
-// stream-copy unsafe, so every other codec is trivially known-safe.
-//
-// This is the single definition of "the verdict is still open", shared by the
-// scanner that resolves it, the catalog surfaces that trigger the resolution,
-// and playback.
-func (f *MediaFile) VideoCopySafetyUnknown() bool {
-	if f == nil || len(f.VideoTracks) == 0 {
-		return false
-	}
-	if f.VideoTracks[0].MultiplePPS != nil {
-		return false
-	}
-	codec := strings.ToLower(strings.TrimSpace(f.VideoTracks[0].Codec))
-	if codec == "" {
-		codec = strings.ToLower(strings.TrimSpace(f.CodecVideo))
-	}
-	return codec == mediaCodecH264 || codec == "avc" || codec == "avc1"
-}
-
-// PersistedVideoCopyVerdict returns the H.264 multi-PPS verdict recorded on the
-// media_files row and whether it still describes the file as it stands.
-//
-// The verdict is self-validating: it is only honored while the size and mtime
-// it was computed from still match the row, so a rewrite in place falls through
-// to a rescan without any writer having to clear it. A verdict recorded for a
-// row that carries no mtime is trusted on size alone — that is the only signal
-// such a row has, and it is the same rule the scanner's in-process memo
-// applies.
-//
-// This lives on the model because the row columns are loaded by every media
-// file read, while the VideoTrack copy-safety flags are runtime-only and are
-// stamped by the probe ensurer, which not every path that loads a file runs.
-func (f *MediaFile) PersistedVideoCopyVerdict() (bool, bool) {
-	if f == nil || f.MultiplePPS == nil || f.MultiplePPSScanSize == nil {
-		return false, false
-	}
-	if *f.MultiplePPSScanSize != f.FileSize {
-		return false, false
-	}
-	if f.MultiplePPSScanMtime == nil || f.FileModifiedAt == nil {
-		if f.MultiplePPSScanMtime != nil || f.FileModifiedAt != nil {
-			return false, false
-		}
-		return *f.MultiplePPS, true
-	}
-	if !NormalizeFileModifiedAt(*f.MultiplePPSScanMtime).Equal(NormalizeFileModifiedAt(*f.FileModifiedAt)) {
-		return false, false
-	}
-	return *f.MultiplePPS, true
-}
-
-// NormalizeFileModifiedAt puts a filesystem mtime in the one shape every
-// comparison uses. Postgres stores microseconds and local filesystems report
-// nanoseconds, so a round trip through the database is only equal to the value
-// that was written after truncation.
-func NormalizeFileModifiedAt(ts time.Time) time.Time {
-	return ts.UTC().Truncate(time.Microsecond)
 }
 
 // AudioOnlyProbeFacts is the compact probe shape needed to distinguish known
@@ -412,6 +371,10 @@ type VideoTrack struct {
 	// safety scan cannot establish that video stream-copy is safe. It is
 	// runtime-only so transient scan failures are retried on a later request.
 	VideoCopyUnsafe bool `json:"-"`
+	// DVRPUStrippable is the runtime verdict for removing Dolby Vision RPUs
+	// from this exact source. It is populated for resolved virtual streams,
+	// whose loopback relay cannot be os.Stat'ed by the local-file probe.
+	DVRPUStrippable *bool `json:"-"`
 }
 
 // UnmarshalJSON preserves raw-key presence so rolling older scanners cannot
@@ -435,17 +398,26 @@ func (v *VideoTrack) UnmarshalJSON(data []byte) error {
 
 // AudioTrack represents a probed audio stream stored as JSONB.
 type AudioTrack struct {
+	// Index is the container stream ordinal (ffmpeg's `0:a:N`). Preserved so
+	// the selected track maps to the real stream even when the track list
+	// order differs from the container order (MULTi releases, virtual
+	// sources). -1/0 when unknown (synthesized tracks).
+	Index         int    `json:"index,omitempty"`
 	Title         string `json:"title,omitempty"`
 	EmbeddedTitle string `json:"embedded_title,omitempty"`
 	Language      string `json:"language,omitempty"`
-	Codec         string `json:"codec,omitempty"`
-	Profile       string `json:"profile,omitempty"`
-	Layout        string `json:"layout,omitempty"`
-	Channels      int    `json:"channels,omitempty"`
-	Bitrate       int    `json:"bitrate,omitempty"`
-	SampleRate    int    `json:"sample_rate,omitempty"`
-	BitDepth      int    `json:"bit_depth,omitempty"`
-	Default       bool   `json:"default"`
+	// Languages is the full advertised language list for MULTI/DUAL tracks,
+	// parsed from the track title when the container language tag is absent,
+	// undetermined, or multiple.
+	Languages  []string `json:"languages,omitempty"`
+	Codec      string   `json:"codec,omitempty"`
+	Profile    string   `json:"profile,omitempty"`
+	Layout     string   `json:"layout,omitempty"`
+	Channels   int      `json:"channels,omitempty"`
+	Bitrate    int      `json:"bitrate,omitempty"`
+	SampleRate int      `json:"sample_rate,omitempty"`
+	BitDepth   int      `json:"bit_depth,omitempty"`
+	Default    bool     `json:"default"`
 }
 
 // SubtitleTrack represents an embedded subtitle track stored as JSONB.
@@ -614,7 +586,7 @@ type MediaItem struct {
 	LastAirDate                  *string // ISO date (series only), nullable
 	AirTime                      *string // Series broadcast time (e.g. "20:00"), nullable
 	AirTimezone                  *string // Series broadcast timezone (IANA name, e.g. "America/New_York"), nullable
-	ShowStatus                   string  // Series lifecycle: "returning", "ended", "cancelled", "in_production", "upcoming", or "" if unknown (series; manga uses its own domain, e.g. "Ongoing")
+	ShowStatus                   string  // Series lifecycle: "returning", "ended", "canceled", "in_production", "upcoming", or "" if unknown (series; manga uses its own domain, e.g. "Ongoing")
 	People                       []ItemPerson
 	AudiobookSeries              []AudiobookSeriesMembership
 	MatchedAt                    *time.Time
@@ -773,4 +745,55 @@ type EpisodeLocalization struct {
 	OverviewSource   string // provider | ai | manual
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+}
+
+// PersistedVideoCopyVerdict returns the H.264 multi-PPS verdict recorded on the
+// media_files row and whether it still describes the file as it stands.
+func (f *MediaFile) PersistedVideoCopyVerdict() (bool, bool) {
+	if f == nil || f.MultiplePPS == nil || f.MultiplePPSScanSize == nil {
+		return false, false
+	}
+	if *f.MultiplePPSScanSize != f.FileSize {
+		return false, false
+	}
+	if f.MultiplePPSScanMtime == nil || f.FileModifiedAt == nil {
+		if f.MultiplePPSScanMtime != nil || f.FileModifiedAt != nil {
+			return false, false
+		}
+		return *f.MultiplePPS, true
+	}
+	if !NormalizeFileModifiedAt(*f.MultiplePPSScanMtime).Equal(NormalizeFileModifiedAt(*f.FileModifiedAt)) {
+		return false, false
+	}
+	return *f.MultiplePPS, true
+}
+
+// NormalizeFileModifiedAt puts a filesystem mtime in the one shape every
+// comparison uses. Postgres stores microseconds and local filesystems report
+// nanoseconds, so a round trip through the database is only equal to the value
+// that was written after truncation.
+func NormalizeFileModifiedAt(ts time.Time) time.Time {
+	return ts.UTC().Truncate(time.Microsecond)
+}
+
+// VideoCopySafetyUnknown reports whether this file is an H.264 video whose
+// multi-PPS copy-safety verdict is not stamped on the in-memory track. Only
+// H.264 can carry the conflicting in-band parameter sets that make a video
+// stream-copy unsafe, so every other codec is trivially known-safe.
+//
+// This is the single definition of "the verdict is still open", shared by the
+// scanner that resolves it, the catalog surfaces that trigger the resolution,
+// and playback.
+func (f *MediaFile) VideoCopySafetyUnknown() bool {
+	if f == nil || len(f.VideoTracks) == 0 {
+		return false
+	}
+	if f.VideoTracks[0].MultiplePPS != nil {
+		return false
+	}
+	codec := strings.ToLower(strings.TrimSpace(f.VideoTracks[0].Codec))
+	if codec == "" {
+		codec = strings.ToLower(strings.TrimSpace(f.CodecVideo))
+	}
+	return codec == "h264" || codec == "avc" || codec == "avc1"
 }

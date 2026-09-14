@@ -63,6 +63,17 @@ func New(cfg Config) *Provider {
 
 func (p *Provider) Name() string { return "opensubtitles" }
 
+// TestConnection verifies the configured username/password by logging in. A
+// search would not prove anything: it runs with the shared default API key and
+// never touches the account, so a search can succeed while downloads fail with
+// 401.
+func (p *Provider) TestConnection(ctx context.Context) error {
+	if _, err := p.ensureToken(ctx); err != nil {
+		return fmt.Errorf("opensubtitles login failed: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]subtitles.SubtitleResult, error) {
 	if err := p.limiter.Wait(ctx); err != nil {
 		return nil, err
@@ -102,7 +113,7 @@ func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]s
 	if err != nil {
 		return nil, fmt.Errorf("opensubtitles: search request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -166,7 +177,7 @@ func (p *Provider) Download(ctx context.Context, id string) ([]byte, subtitles.S
 	if err != nil {
 		return nil, "", fmt.Errorf("opensubtitles: download request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// If token expired, re-login and retry once
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -205,7 +216,7 @@ func (p *Provider) downloadWithToken(ctx context.Context, fileID int, token stri
 	if err != nil {
 		return nil, "", fmt.Errorf("opensubtitles: download request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -231,7 +242,7 @@ func (p *Provider) fetchDownloadLink(ctx context.Context, body io.Reader) ([]byt
 	if err != nil {
 		return nil, "", fmt.Errorf("opensubtitles: fetch file: %w", err)
 	}
-	defer fileResp.Body.Close()
+	defer func() { _ = fileResp.Body.Close() }()
 
 	data, err := io.ReadAll(fileResp.Body)
 	if err != nil {
@@ -267,7 +278,7 @@ func (p *Provider) ensureToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("login request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)

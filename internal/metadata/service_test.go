@@ -647,6 +647,7 @@ func (r *fakeFileRepo) setRootCandidates(folderID int, rootPath string, candidat
 	slices.Sort(r.rootCandidates[key])
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (r *fakeFileRepo) setGroupContent(folderID int, groupKeyVersion int, contentGroupKey, contentID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1086,6 +1087,7 @@ func (r *fakeScannedRootRepo) Get(_ context.Context, folderID int, rootPath stri
 	return &cp, nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (r *fakeScannedRootRepo) setRoot(root *models.ScannedMediaRoot) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1949,7 +1951,7 @@ func TestPendingItemLifecycle_UnmatchedTransition(t *testing.T) {
 
 	// Pre-create an item with status "pending".
 	contentID := "test-content-123"
-	h.itemRepo.Upsert(ctx, &models.MediaItem{
+	_ = h.itemRepo.Upsert(ctx, &models.MediaItem{
 		ContentID: contentID,
 		Status:    "pending",
 		Title:     "Test Movie",
@@ -1962,7 +1964,7 @@ func TestPendingItemLifecycle_UnmatchedTransition(t *testing.T) {
 	})
 
 	// Call updateItemStatus to simulate what the worker does on failure.
-	h.service.updateItemStatus(ctx, contentID, "unmatched")
+	_ = h.service.updateItemStatus(ctx, contentID, "unmatched")
 
 	item, err := h.itemRepo.GetByID(ctx, contentID)
 	if err != nil {
@@ -1986,7 +1988,7 @@ func TestCreateOrFindSkeleton_MovieIgnoresGroupClaimDedup(t *testing.T) {
 	}
 
 	// Also pre-seed the item so upsertLibraryMembership can find it.
-	h.itemRepo.Upsert(ctx, &models.MediaItem{
+	_ = h.itemRepo.Upsert(ctx, &models.MediaItem{
 		ContentID: existingContentID,
 		Status:    "pending",
 		Title:     "Inception",

@@ -51,6 +51,7 @@ func TestNeedsCriticalProbeRepairScanState_UsesMediaAwareAudioOnlyEvidence(t *te
 	completeAudio := scanStateFile{
 		ProbeSource:    "local",
 		ProbeUpdatedAt: &now,
+		ProbeVersion:   probeVersion,
 		Duration:       3600,
 		Container:      "mp3",
 		CodecAudio:     "mp3",
@@ -114,6 +115,7 @@ func TestNeedsCriticalProbeRepair_ProbedVideoOnlyFileIsComplete(t *testing.T) {
 	scanFile := &scanStateFile{
 		ProbeSource:    f.ProbeSource,
 		ProbeUpdatedAt: f.ProbeUpdatedAt,
+		ProbeVersion:   probeVersion,
 		Duration:       f.Duration,
 		Container:      f.Container,
 		CodecVideo:     f.CodecVideo,
@@ -196,6 +198,7 @@ func implausiblyShortLargeVideoFile(probedAt time.Time) *models.MediaFile {
 		ProbeUpdatedAt: &probedAt,
 		FileSize:       1_200_000_000,
 		Duration:       4,
+		Bitrate:        5_000,
 		Container:      "mkv",
 		CodecAudio:     "aac",
 		AudioTracks:    []models.AudioTrack{{Language: "eng"}},
@@ -221,6 +224,7 @@ func TestNeedsCriticalProbeRepair_LongVideoConverges(t *testing.T) {
 		ProbeUpdatedAt: &now,
 		FileSize:       77_507_139_196,
 		Duration:       182930,
+		Bitrate:        3_389,
 		Container:      "mp4",
 		CodecAudio:     "aac",
 		AudioTracks:    []models.AudioTrack{{Language: "eng"}},
@@ -237,6 +241,7 @@ func TestNeedsCriticalProbeRepair_LongVideoConverges(t *testing.T) {
 	scanFile := &scanStateFile{
 		ProbeSource:    f.ProbeSource,
 		ProbeUpdatedAt: f.ProbeUpdatedAt,
+		ProbeVersion:   probeVersion,
 		FileSize:       f.FileSize,
 		Duration:       f.Duration,
 		Container:      f.Container,
@@ -268,6 +273,7 @@ func TestNeedsCriticalProbeRepairScanState_LegacyShortDurationRepairs(t *testing
 	f := &scanStateFile{
 		ProbeSource:    "local",
 		ProbeUpdatedAt: &probedAt,
+		ProbeVersion:   probeVersion,
 		FileSize:       1_200_000_000,
 		Duration:       4,
 		Container:      "mkv",

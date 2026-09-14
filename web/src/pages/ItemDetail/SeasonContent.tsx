@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import type { ItemDetail } from "@/api/types";
 import { useItemEpisodes } from "@/hooks/queries/episodes";
+import { prefetchVirtualPlayback } from "@/hooks/queries/catalogRead";
 import { useRefreshItemMetadata } from "@/hooks/queries/items";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { useAuth } from "@/hooks/useAuth";
@@ -46,6 +47,17 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
   } = useItemEpisodes(item.content_id);
 
   const episodes = episodesData?.episodes ?? [];
+  useEffect(() => {
+    const fileIDs = episodes
+      .filter((episode) => !episode.user_data?.played)
+      .slice(0, 2)
+      .map((episode) => {
+        const candidate = episode.files.find((file) => file.container !== "virtual");
+        return candidate?.file_id ?? episode.files[0]?.file_id;
+      })
+      .filter((fileID): fileID is number => fileID !== undefined);
+    if (fileIDs.length > 0) void prefetchVirtualPlayback(fileIDs);
+  }, [episodes]);
   const seasonNumber = item.season_number ?? 0;
   const label = item.is_specials ? "Specials" : seasonLabel(seasonNumber, item.title);
   const seriesTitle = item.series_title ?? "Series";

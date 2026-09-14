@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
@@ -27,19 +28,39 @@ type Session struct {
 	BasePlayMethod       PlayMethod
 	TranscodeAudio       bool // when true, remux should transcode audio to AAC
 	RemuxDVMode          RemuxDVMode
-	ClientIP             string // resolved client IP for the playback session
-	ClientName           string // reported playback client name, when available
-	ClientVersion        string // reported playback client version, when available
-	ClientBuild          string // opaque reported client build identifier, when available
-	ClientChannel        string // opaque reported client distribution channel, when available
-	ClientUserAgent      string // trimmed request user agent for the playback session
-	IsJellyfinCompat     bool   // immutable origin identity for Jellyfin compatibility sessions
+	// DVProfile is the Dolby Vision profile the committed plan probed and
+	// validated. Virtual catalog rows can carry empty video_tracks while the
+	// plan's probe has ground truth, so stream time must trust the session's
+	// profile over the re-derived file value.
+	DVProfile        int
+	ClientIP         string // resolved client IP for the playback session
+	ClientName       string // reported playback client name, when available
+	ClientVersion    string // reported playback client version, when available
+	ClientBuild      string // opaque reported client build identifier, when available
+	ClientChannel    string // opaque reported client distribution channel, when available
+	ClientUserAgent  string // trimmed request user agent for the playback session
+	IsJellyfinCompat bool   // immutable origin identity for Jellyfin compatibility sessions
+	// VirtualSourceURI is the provider-neutral result selected and probed for
+	// this session. Provider URLs never enter session state; handlers resolve
+	// this URI again when a transport or subtitle input is opened.
+	VirtualSourceURI                 string
+	VirtualSourceOwnerInstallationID int
+	// VirtualSubtitleTracks and VirtualExternalSubtitles are the subtitle
+	// inventories captured at plan time. A virtual catalog row is mutable
+	// (candidate rotation re-probes it), so the serve paths must extract from
+	// the same evidence the plan promised, not whatever the row holds now.
+	VirtualSubtitleTracks      []models.SubtitleTrack
+	VirtualExternalSubtitles   []models.ExternalSubtitle
+	VirtualSubtitleEvidenceSet bool
+
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
-	// only a route identifier from legacy HLS transports where that UUID also
-	// acts as the bearer capability. It is live-session state by design: secure
-	// transports carry no reconstruction token and start a fresh attempt after
-	// an API restart.
+	// only a route (media requests must present an authenticated user) from
+	// legacy sessions whose ID doubles as a bearer credential. It is sticky for
+	// the life of the session; MediaAuthorizationSet records whether the
+	// creating request negotiated the field at all, so older persisted states
+	// keep their bearer behavior across upgrades.
 	RequireMediaAuthorization bool
+	MediaAuthorizationSet     bool
 
 	TranscodeNodeURL     string // URL of assigned transcode node (empty = local/integrated)
 	TranscodeTransportID string // remote node process identity; empty means session ID
@@ -98,37 +119,44 @@ type Session struct {
 // change after a session is created (audio track, client IP, transcode target,
 // and reported bitrate).
 type SessionStreamState struct {
-	PlayMethod                PlayMethod
-	BasePlayMethod            PlayMethod
-	AudioTrackIndex           int
-	TranscodeAudio            bool
-	RemuxDVMode               RemuxDVMode
-	ClientIP                  string
-	ClientName                string
-	ClientVersion             string
-	ClientUserAgent           string
-	StreamBitrateKbps         int
-	TargetResolution          string
-	TargetVideoCodec          string
-	TargetAudioCodec          string
-	SourceAudioChannels       int
-	TargetAudioChannels       int
-	TargetAudioBitrateKbps    int
-	TargetBitrateKbps         int
-	TranscodeHWAccel          string
-	ToneMapMode               tonemap.Mode
-	TranscodeNodeURL          string
-	TranscodeTransportID      string
-	TranscodeRouteSet         bool
-	RoutingWorkload           string
-	RoutingExecution          string
-	RoutingExecutionNodeID    int
-	RoutingExecutionNodeURL   string
-	RoutingEgress             string
-	RoutingEgressNodeID       int
-	RoutingEgressNodeURL      string
-	RequireMediaAuthorization bool
-	MediaAuthorizationSet     bool
+	PlayMethod                       PlayMethod
+	BasePlayMethod                   PlayMethod
+	AudioTrackIndex                  int
+	TranscodeAudio                   bool
+	RemuxDVMode                      RemuxDVMode
+	DVProfile                        int
+	ClientIP                         string
+	ClientName                       string
+	ClientVersion                    string
+	ClientUserAgent                  string
+	StreamBitrateKbps                int
+	TargetResolution                 string
+	TargetVideoCodec                 string
+	TargetAudioCodec                 string
+	SourceAudioChannels              int
+	TargetAudioChannels              int
+	TargetAudioBitrateKbps           int
+	TargetBitrateKbps                int
+	TranscodeHWAccel                 string
+	ToneMapMode                      tonemap.Mode
+	TranscodeNodeURL                 string
+	TranscodeTransportID             string
+	TranscodeRouteSet                bool
+	RoutingWorkload                  string
+	RoutingExecution                 string
+	RoutingExecutionNodeID           int
+	RoutingExecutionNodeURL          string
+	RoutingEgress                    string
+	RoutingEgressNodeID              int
+	RoutingEgressNodeURL             string
+	RequireMediaAuthorization        bool
+	MediaAuthorizationSet            bool
+	VirtualSourceURI                 string
+	VirtualSourceOwnerInstallationID int
+	VirtualSourceSet                 bool
+	VirtualSubtitleTracks            []models.SubtitleTrack
+	VirtualExternalSubtitles         []models.ExternalSubtitle
+	VirtualSubtitleEvidenceSet       bool
 
 	// Byte-affecting transcode recipe fields preserved so an offloaded restart
 	// (e.g. audio switch) can rebuild the exact same stream. SubtitleTrackIndex
@@ -983,8 +1011,12 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		// later remux request fails the profile check. Legacy partial updates
 		// never carry a mode and must not clobber one.
 		s.RemuxDVMode = state.RemuxDVMode
+		s.DVProfile = state.DVProfile
 	} else if state.RemuxDVMode != "" {
 		s.RemuxDVMode = state.RemuxDVMode
+		if state.DVProfile > 0 {
+			s.DVProfile = state.DVProfile
+		}
 	}
 	s.ClientIP = state.ClientIP
 	if value := normalizeClientMetadataValue(state.ClientName, 128); value != "" {
@@ -1013,8 +1045,14 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		s.RoutingEgressNodeID = state.RoutingEgressNodeID
 		s.RoutingEgressNodeURL = state.RoutingEgressNodeURL
 	}
-	if state.MediaAuthorizationSet {
-		s.RequireMediaAuthorization = state.RequireMediaAuthorization
+	if state.VirtualSourceSet {
+		s.VirtualSourceURI = state.VirtualSourceURI
+		s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
+		if state.VirtualSubtitleEvidenceSet {
+			s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
+			s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
+			s.VirtualSubtitleEvidenceSet = true
+		}
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
@@ -1030,40 +1068,47 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 // snapshotSessionStreamStateLocked captures replaceable stream fields while the manager lock is held.
 func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 	return SessionStreamState{
-		PlayMethod:                s.PlayMethod,
-		BasePlayMethod:            s.BasePlayMethod,
-		AudioTrackIndex:           s.AudioTrackIndex,
-		TranscodeAudio:            s.TranscodeAudio,
-		RemuxDVMode:               s.RemuxDVMode,
-		ClientIP:                  s.ClientIP,
-		ClientName:                s.ClientName,
-		ClientVersion:             s.ClientVersion,
-		ClientUserAgent:           s.ClientUserAgent,
-		StreamBitrateKbps:         s.StreamBitrateKbps,
-		TargetResolution:          s.TargetResolution,
-		TargetVideoCodec:          s.TargetVideoCodec,
-		TargetAudioCodec:          s.TargetAudioCodec,
-		SourceAudioChannels:       s.SourceAudioChannels,
-		TargetAudioChannels:       s.TargetAudioChannels,
-		TargetAudioBitrateKbps:    s.TargetAudioBitrateKbps,
-		TargetBitrateKbps:         s.TargetBitrateKbps,
-		TranscodeHWAccel:          s.TranscodeHWAccel,
-		ToneMapMode:               s.ToneMapMode,
-		TranscodeNodeURL:          s.TranscodeNodeURL,
-		TranscodeTransportID:      s.TranscodeTransportID,
-		TranscodeRouteSet:         true,
-		RoutingWorkload:           s.RoutingWorkload,
-		RoutingExecution:          s.RoutingExecution,
-		RoutingExecutionNodeID:    s.RoutingExecutionNodeID,
-		RoutingExecutionNodeURL:   s.RoutingExecutionNodeURL,
-		RoutingEgress:             s.RoutingEgress,
-		RoutingEgressNodeID:       s.RoutingEgressNodeID,
-		RoutingEgressNodeURL:      s.RoutingEgressNodeURL,
-		RequireMediaAuthorization: s.RequireMediaAuthorization,
-		MediaAuthorizationSet:     true,
-		SubtitleTrackIndex:        s.SubtitleTrackIndex,
-		SubtitleBurnIn:            s.SubtitleBurnIn,
-		SegmentDuration:           s.SegmentDuration,
+		PlayMethod:                       s.PlayMethod,
+		BasePlayMethod:                   s.BasePlayMethod,
+		AudioTrackIndex:                  s.AudioTrackIndex,
+		TranscodeAudio:                   s.TranscodeAudio,
+		RemuxDVMode:                      s.RemuxDVMode,
+		DVProfile:                        s.DVProfile,
+		ClientIP:                         s.ClientIP,
+		ClientName:                       s.ClientName,
+		ClientVersion:                    s.ClientVersion,
+		ClientUserAgent:                  s.ClientUserAgent,
+		StreamBitrateKbps:                s.StreamBitrateKbps,
+		TargetResolution:                 s.TargetResolution,
+		TargetVideoCodec:                 s.TargetVideoCodec,
+		TargetAudioCodec:                 s.TargetAudioCodec,
+		SourceAudioChannels:              s.SourceAudioChannels,
+		TargetAudioChannels:              s.TargetAudioChannels,
+		TargetAudioBitrateKbps:           s.TargetAudioBitrateKbps,
+		TargetBitrateKbps:                s.TargetBitrateKbps,
+		TranscodeHWAccel:                 s.TranscodeHWAccel,
+		ToneMapMode:                      s.ToneMapMode,
+		TranscodeNodeURL:                 s.TranscodeNodeURL,
+		TranscodeTransportID:             s.TranscodeTransportID,
+		TranscodeRouteSet:                true,
+		RoutingWorkload:                  s.RoutingWorkload,
+		RoutingExecution:                 s.RoutingExecution,
+		RoutingExecutionNodeID:           s.RoutingExecutionNodeID,
+		RoutingExecutionNodeURL:          s.RoutingExecutionNodeURL,
+		RoutingEgress:                    s.RoutingEgress,
+		RoutingEgressNodeID:              s.RoutingEgressNodeID,
+		RoutingEgressNodeURL:             s.RoutingEgressNodeURL,
+		RequireMediaAuthorization:        s.RequireMediaAuthorization,
+		MediaAuthorizationSet:            true,
+		SubtitleTrackIndex:               s.SubtitleTrackIndex,
+		SubtitleBurnIn:                   s.SubtitleBurnIn,
+		SegmentDuration:                  s.SegmentDuration,
+		VirtualSourceURI:                 s.VirtualSourceURI,
+		VirtualSourceOwnerInstallationID: s.VirtualSourceOwnerInstallationID,
+		VirtualSourceSet:                 true,
+		VirtualSubtitleTracks:            s.VirtualSubtitleTracks,
+		VirtualExternalSubtitles:         s.VirtualExternalSubtitles,
+		VirtualSubtitleEvidenceSet:       s.VirtualSubtitleEvidenceSet,
 	}
 }
 
@@ -1074,6 +1119,7 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.AudioTrackIndex = state.AudioTrackIndex
 	s.TranscodeAudio = state.TranscodeAudio
 	s.RemuxDVMode = state.RemuxDVMode
+	s.DVProfile = state.DVProfile
 	s.ClientIP = state.ClientIP
 	s.ClientName = state.ClientName
 	s.ClientVersion = state.ClientVersion
@@ -1098,9 +1144,34 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.RoutingEgressNodeID = state.RoutingEgressNodeID
 	s.RoutingEgressNodeURL = state.RoutingEgressNodeURL
 	s.RequireMediaAuthorization = state.RequireMediaAuthorization
+	s.VirtualSourceURI = state.VirtualSourceURI
+	s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
+	if state.VirtualSubtitleEvidenceSet {
+		s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
+		s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
+		s.VirtualSubtitleEvidenceSet = true
+	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
 	s.SegmentDuration = state.SegmentDuration
+}
+
+// SetVirtualSource binds a live session to the provider-neutral candidate that
+// was successfully resolved during planning. The caller must pass only the
+// canonical virtual URI; provider URLs are never retained in session state.
+func (m *SessionManager) SetVirtualSource(sessionID, virtualURI string, ownerInstallationID int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.VirtualSourceURI = strings.TrimSpace(virtualURI)
+	s.VirtualSourceOwnerInstallationID = ownerInstallationID
+	s.streamRevision++
+	m.touchSessionLocked(s)
+	return nil
 }
 
 // ApplyReplacement atomically updates every live-session field owned by a

@@ -805,6 +805,7 @@ func imageTagsWithSeed(signer *imageTagSigner, seed, imageURL string) map[string
 	return map[string]string{"Primary": signer.Tag(seed, imageURL)}
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func backdropTags(imageURL string) []string {
 	return backdropTagsWithSeed(nil, "", imageURL)
 }

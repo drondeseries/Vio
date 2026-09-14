@@ -268,6 +268,10 @@ type PlaybackWatchStopConfirmer interface {
 }
 
 // PlaybackHandler serves Jellyfin playback negotiation endpoints.
+type virtualSourceSetter interface {
+	SetVirtualSource(sessionID, virtualURI string, ownerInstallationID int) error
+}
+
 type PlaybackHandler struct {
 	cfg                     *config.Config
 	content                 ContentService
@@ -317,6 +321,22 @@ type PlaybackHandler struct {
 	// compatLocalTranscodeReady is a test seam invoked after manifest readiness
 	// and before lifecycle-locked publication. Production leaves it nil.
 	compatLocalTranscodeReady func(*playback.TranscodeSession)
+
+	DeviceProfilePersister         DeviceProfilePersister
+	VirtualMediaResolver           VirtualMediaResolver
+	VirtualMediaRefreshResolver    VirtualMediaRefreshResolver
+	VirtualMediaDetailedResolver   VirtualMediaDetailedResolver
+	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
+	VirtualSourceProber            VirtualSourceProber
+	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
+	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	VirtualCandidateFileLookup     VirtualCandidateFileLookup
+	RemoteStreamRelay              RemoteStreamRelay
+	// AllowInsecureVirtual reports whether the owning plugin installation has
+	// explicitly enabled allow_insecure_http for private/local stream URLs. When
+	// nil or false, virtual streams are proxied through the strict SSRF-protected
+	// relay path.
+	AllowInsecureVirtual func(installationID int) bool
 }
 
 // recipeNodePutter persists and removes a remote transcode's reconstruction
@@ -1104,6 +1124,37 @@ func NewPlaybackHandler(
 	h.tm.StartThrottler = func(ctx context.Context, session *playback.TranscodeSession) {
 		playback.StartConfiguredTranscodeThrottler(ctx, h.SettingsRepo, session)
 	}
+
+	h.tm.ResolveInput = func(ctx context.Context, mediaFileID, ownerInstallationID, userID int, profileID, canonicalPath string) (string, func(), error) {
+		if !isCompatVirtualPath(canonicalPath) {
+			return "", nil, nil
+		}
+		if (h.VirtualMediaDetailedResolver == nil && h.VirtualMediaResolver == nil) || h.RemoteStreamRelay == nil {
+			return "", nil, errors.New("virtual playback reconstruction is not configured")
+		}
+		var resolved string
+		var headers map[string]string
+		var err error
+		if h.VirtualMediaDetailedResolver != nil {
+			res, dErr := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(ctx, canonicalPath, ownerInstallationID, userID, profileID, false, nil, "")
+			if dErr != nil {
+				return "", nil, dErr
+			}
+			resolved = res.URL
+			headers = res.RequestHeaders
+		} else {
+			resolved, err = h.VirtualMediaResolver.ResolveVirtualMedia(ctx, canonicalPath, ownerInstallationID, userID, profileID)
+			if err != nil {
+				return "", nil, err
+			}
+		}
+		insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(ownerInstallationID)
+		relayURL, cleanup, err := registerRemoteStreamInputWithHeaders(ctx, h.RemoteStreamRelay, resolved, headers, insecure)
+		if err != nil {
+			return "", nil, err
+		}
+		return relayURL, cleanup, nil
+	}
 	if reg, ok := sessionMgr.(interface {
 		GetSession(string) (*playback.Session, error)
 		RegisterReconstructed(*playback.Session) *playback.Session
@@ -1221,7 +1272,7 @@ func (h *PlaybackHandler) buildProxyRedirectURL(
 	}
 
 	audioTrackIndex := 0
-	if resolvedAudioTrackIndex, ok := compatAudioTrackIndex(source); ok {
+	if resolvedAudioTrackIndex, ok := compatAudioOrdinal(source); ok {
 		audioTrackIndex = resolvedAudioTrackIndex
 	}
 
@@ -1403,7 +1454,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	}
 	if h.playbackStore != nil {
 		expectedSourceAudioChannels := compatHLSRecipeSourceAudioChannels(source)
-		expectedAudioTrackIndex := compatAudioTrackIndexOrDefault(source)
+		expectedAudioTrackIndex := compatAudioOrdinalOrDefault(source)
 		if current, ok := h.playbackStore.Get(playSessionID); ok && current.TranscodeStarted && current.Recipe != nil && current.Recipe.TranscodeNodeURL != "" &&
 			current.Recipe.MediaFileID == source.FileID &&
 			current.Recipe.SourceAudioChannels == expectedSourceAudioChannels &&
@@ -1511,7 +1562,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		TargetCodecAudio:    compatTargetAudioCodec,
 		SegmentDuration:     segmentDuration,
 		HWAccel:             h.remoteDispatchHWAccel(transcodeNodeURL),
-		AudioTrackIndex:     compatAudioTrackIndexOrDefault(source),
+		AudioTrackIndex:     compatAudioOrdinalOrDefault(source),
 		SourceAudioChannels: compatHLSRecipeSourceAudioChannels(source),
 		TotalDuration:       float64(source.Version.Duration),
 		RequireReady:        toneMapRecipe.mode != "",
@@ -1728,25 +1779,30 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	// token of their own, so without a persisted recipe a node or central restart
 	// cannot rebuild ffmpeg and segment serves 404.
 	opts := playback.TranscodeOpts{
-		SessionID:           upstreamSessionID,
-		InputPath:           reqBody.InputPath,
-		SourceVideoCodec:    reqBody.SourceVideoCodec,
-		SourceVideoProfile:  reqBody.SourceVideoProfile,
-		SourceVideoBitDepth: reqBody.SourceVideoBitDepth,
-		SeekSeconds:         reqBody.SeekSeconds,
-		StartSegmentNumber:  reqBody.StartSegmentNumber,
-		TargetCodecVideo:    reqBody.TargetCodecVideo,
-		TargetCodecAudio:    reqBody.TargetCodecAudio,
-		TargetResolution:    reqBody.TargetResolution,
-		TargetBitrateKbps:   reqBody.TargetBitrateKbps,
-		VideoSampleEntry:    reqBody.VideoSampleEntry,
-		CopyVideoMPEGTS:     reqBody.CopyVideoMPEGTS,
-		SegmentDuration:     reqBody.SegmentDuration,
-		AudioTrackIndex:     reqBody.AudioTrackIndex,
-		SourceAudioChannels: reqBody.SourceAudioChannels,
-		TargetAudioChannels: reqBody.TargetAudioChannels,
-		TotalDuration:       reqBody.TotalDuration,
-		ThrottleSeconds:     reqBody.ThrottleSeconds,
+		SessionID:                        upstreamSessionID,
+		InputPath:                        reqBody.InputPath,
+		CanonicalInputPath:               file.FilePath,
+		VirtualSourceOwnerInstallationID: source.VirtualSourceOwnerInstallationID,
+		SourceVideoCodec:                 reqBody.SourceVideoCodec,
+		SourceVideoProfile:               reqBody.SourceVideoProfile,
+		SourceVideoBitDepth:              reqBody.SourceVideoBitDepth,
+		SeekSeconds:                      reqBody.SeekSeconds,
+		StartSegmentNumber:               reqBody.StartSegmentNumber,
+		TargetCodecVideo:                 reqBody.TargetCodecVideo,
+		TargetCodecAudio:                 reqBody.TargetCodecAudio,
+		TargetResolution:                 reqBody.TargetResolution,
+		TargetBitrateKbps:                reqBody.TargetBitrateKbps,
+		VideoSampleEntry:                 reqBody.VideoSampleEntry,
+		CopyVideoMPEGTS:                  reqBody.CopyVideoMPEGTS,
+		SegmentDuration:                  reqBody.SegmentDuration,
+		AudioTrackIndex:                  reqBody.AudioTrackIndex,
+		SourceAudioChannels:              reqBody.SourceAudioChannels,
+		TargetAudioChannels:              reqBody.TargetAudioChannels,
+		TotalDuration:                    reqBody.TotalDuration,
+		ThrottleSeconds:                  reqBody.ThrottleSeconds,
+	}
+	if isCompatVirtualSource(source) {
+		opts.CanonicalInputPath = source.VirtualSourceURI
 	}
 	toneMapRecipe.apply(&opts)
 	opts.HWAccel = strings.TrimSpace(nodeResponse.HWAccel)
@@ -1910,6 +1966,7 @@ func (h *PlaybackHandler) HandleCapabilitiesFull(w http.ResponseWriter, r *http.
 	}
 	if profile.HasData() {
 		h.deviceProfiles.Put(session.Token, profile)
+		h.persistDeviceProfileFromHandshake(r, session, profile)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -1975,8 +2032,8 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	if req.MediaSourceID != "" {
 		matched := false
 		for _, version := range detail.Versions {
-			candidate := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode)
-			if mediaSourceIDsEqual(candidate.ID, req.MediaSourceID) {
+			candidateID := h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
+			if mediaSourceIDsEqual(candidateID, req.MediaSourceID) {
 				matched = true
 				break
 			}
@@ -1990,12 +2047,32 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 			req.MediaSourceID = ""
 		}
 	}
+	hadVirtualPrepErr := false
 	for _, version := range detail.Versions {
-		source := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode)
-		if req.MediaSourceID != "" && !mediaSourceIDsEqual(source.ID, req.MediaSourceID) {
+		sourceID := h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
+		if req.MediaSourceID != "" && !mediaSourceIDsEqual(sourceID, req.MediaSourceID) {
 			continue
 		}
-		if source.SupportsTranscoding && !compatHLSCopiesVideo(source) && compatVersionRequiresToneMap(version) {
+
+		prepared := version
+		virtualURI := ""
+		virtualOwnerID := 0
+		if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
+			var prepErr error
+			prepared, virtualURI, virtualOwnerID, prepErr = h.prepareVirtualPlaybackVersion(r.Context(), session, version)
+			if prepErr != nil {
+				hadVirtualPrepErr = true
+				if req.MediaSourceID != "" {
+					writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+					return
+				}
+				slog.WarnContext(r.Context(), "jellycompat virtual playback version preparation failed", "component", "jellycompat",
+					"file_id", version.FileID, "error", prepErr)
+				continue
+			}
+		}
+		source := h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, prepared, profile, req, allow4KTranscode, virtualURI, virtualOwnerID)
+		if source.SupportsTranscoding && !compatHLSCopiesVideo(source) && compatVersionRequiresToneMap(prepared) {
 			if !toneMapPolicyLoaded {
 				var policyErr error
 				toneMapPolicy, policyErr = h.toneMapPolicyResult(r.Context())
@@ -2092,6 +2169,10 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	}
 
 	if len(sourceDTOs) == 0 {
+		if hadVirtualPrepErr {
+			writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+			return
+		}
 		writeError(w, http.StatusNotFound, "NotFound", "Media source not found")
 		return
 	}
@@ -2167,6 +2248,25 @@ func (h *PlaybackHandler) buildPlaybackSource(
 	req playbackInfoRequest,
 	allow4KTranscode bool,
 ) PlaybackMediaSource {
+	return h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, version, profile, req, allow4KTranscode, "", 0)
+}
+
+// buildPlaybackSourceWithVirtual is buildPlaybackSource plus the provider-neutral
+// virtual binding resolved (and probed) during PlaybackInfo. virtualURI carries
+// the pinned candidate URI (e.g. "...&result=stable") and ownerID the owning
+// plugin installation so the stream handler can resolve just-in-time instead of
+// re-listing candidates. A virtual source is always served through the relay —
+// never by opening the raw path — so its advertised capabilities must permit
+// direct streaming regardless of local file availability.
+func (h *PlaybackHandler) buildPlaybackSourceWithVirtual(
+	routeItemID, playSessionID string,
+	version catalog.FileVersion,
+	profile DeviceProfile,
+	req playbackInfoRequest,
+	allow4KTranscode bool,
+	virtualURI string,
+	virtualOwnerID int,
+) PlaybackMediaSource {
 	sourceID := h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
 	enableDirectPlay := boolDefault(req.EnableDirectPlay, true)
 	enableDirectStream := boolDefault(req.EnableDirectStream, true)
@@ -2232,19 +2332,21 @@ func (h *PlaybackHandler) buildPlaybackSource(
 	}
 
 	return PlaybackMediaSource{
-		ID:                         sourceID,
-		FileID:                     version.FileID,
-		Version:                    version,
-		SupportsDirectPlay:         supportsDirectPlay,
-		SupportsDirectStream:       supportsDirectStream,
-		SupportsTranscoding:        supportsTranscoding,
-		HLSRemux:                   hlsRemux,
-		HLSRemuxAudioStreamIndexes: hlsRemuxAudioStreamIndexes,
-		TranscodeAudio:             transcodeAudio,
-		DefaultAudioStreamIndex:    audioIndex,
-		SelectedAudioStreamIndex:   selectedAudioIndex,
-		DefaultSubtitleStreamIndex: subtitleIndex,
-		ETag:                       mediaSourceETag(version),
+		ID:                               sourceID,
+		FileID:                           version.FileID,
+		Version:                          version,
+		SupportsDirectPlay:               supportsDirectPlay,
+		SupportsDirectStream:             supportsDirectStream,
+		SupportsTranscoding:              supportsTranscoding,
+		HLSRemux:                         hlsRemux,
+		HLSRemuxAudioStreamIndexes:       hlsRemuxAudioStreamIndexes,
+		TranscodeAudio:                   transcodeAudio,
+		DefaultAudioStreamIndex:          audioIndex,
+		SelectedAudioStreamIndex:         selectedAudioIndex,
+		DefaultSubtitleStreamIndex:       subtitleIndex,
+		ETag:                             mediaSourceETag(version),
+		VirtualSourceURI:                 virtualURI,
+		VirtualSourceOwnerInstallationID: virtualOwnerID,
 	}
 }
 
@@ -2671,6 +2773,30 @@ func compatAudioTrackIndexOrDefault(source PlaybackMediaSource) int {
 	return 0
 }
 
+// compatAudioOrdinal resolves the selected audio track's array position via
+// compatAudioTrackIndex and converts it to the audio-only stream ordinal
+// ffmpeg's `0:a:N` expects (see playback.AudioStreamOrdinal). Every value fed
+// to playback — TranscodeOpts.AudioTrackIndex, remux recipe cards, stream
+// tokens, and node start requests — must be this ordinal, never the array
+// position: the catalog can order AudioTracks differently from the container
+// order (MULTi releases, virtual sources), and `0:a:N` counts audio streams
+// only. The DTO stream-index domain (len(VideoTracks)+position) is resolved by
+// compatAudioTrackIndex and stays untouched.
+func compatAudioOrdinal(source PlaybackMediaSource) (int, bool) {
+	audioTrackIndex, ok := compatAudioTrackIndex(source)
+	if !ok {
+		return 0, false
+	}
+	return playback.AudioStreamOrdinal(source.Version.AudioTracks, audioTrackIndex), true
+}
+
+func compatAudioOrdinalOrDefault(source PlaybackMediaSource) int {
+	if ordinal, ok := compatAudioOrdinal(source); ok {
+		return ordinal
+	}
+	return 0
+}
+
 func compatSourceAudioChannels(source PlaybackMediaSource) int {
 	audioTrackIndex := compatAudioTrackIndexOrDefault(source)
 	if audioTrackIndex < 0 || audioTrackIndex >= len(source.Version.AudioTracks) {
@@ -2834,8 +2960,44 @@ func compatAudioSpatialFormat(profile string) string {
 	}
 }
 
+// compatAudioLanguagePlaceholders carry no real identity and are skipped in
+// display summaries, mirroring the web client's LANGUAGE_PLACEHOLDERS set.
+var compatAudioLanguagePlaceholders = map[string]bool{
+	"und": true, "unknown": true, "unk": true, "": true,
+}
+
+// compatAudioLanguageSummary renders the track's full advertised language list
+// ("English/French") the same way the web client summarizes MULTi tracks:
+// resolved through compatLanguageName, deduplicated on the display label
+// ("eng", "en", and "English" all collapse to "English"), with placeholder
+// codes like und/unknown skipped. An empty result means "no language
+// information" — callers keep their single-language fallback then.
+func compatAudioLanguageSummary(languages []string) string {
+	seen := make(map[string]bool, len(languages))
+	var labels []string
+	for _, code := range languages {
+		trimmed := strings.ToLower(strings.TrimSpace(code))
+		if compatAudioLanguagePlaceholders[trimmed] {
+			continue
+		}
+		label := compatLanguageName(trimmed)
+		identity := strings.ToLower(label)
+		if seen[identity] {
+			continue
+		}
+		seen[identity] = true
+		labels = append(labels, label)
+	}
+	return strings.Join(labels, "/")
+}
+
 func audioTrackDisplayTitle(track models.AudioTrack) string {
-	lang := compatLanguageName(track.Language)
+	lang := compatAudioLanguageSummary(track.Languages)
+	if lang == "" {
+		// Probe data predating multi-audio support carries no Languages list;
+		// preserve the historical single-language rendering verbatim.
+		lang = compatLanguageName(track.Language)
+	}
 	// Jellyfin prefers the ffprobe profile over the codec name in audio display
 	// titles (e.g. "DTS-HD MA", "Dolby Digital Plus + Dolby Atmos"), except the
 	// uninformative AAC "LC" profile.

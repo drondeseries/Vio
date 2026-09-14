@@ -77,6 +77,16 @@ func BuildNotificationDisplay(row DeliveryRow) NotificationDisplay {
 			display.Body = "Reason: " + truncateDisplayText(flags.Reason, displayBodyMaxLen)
 		}
 		display.ThreadID = requestThreadID(flags)
+	case DeliveryTypeRatingSet:
+		flags := parseRatingFlags(row.ReasonFlags)
+		display.Category = "rating"
+		display.Title = "Rating set"
+		display.Body = fmt.Sprintf("You rated this %d/5", flags.Rating)
+		if row.EpisodeID != nil && *row.EpisodeID != "" {
+			display.URL = "/item/" + *row.EpisodeID
+		} else if row.SeriesID != nil && *row.SeriesID != "" {
+			display.URL = "/item/" + *row.SeriesID
+		}
 	case DeliveryTypeWebhookAutoDisabled:
 		display.Category = "webhook_auto_disabled"
 		display.Title = "A webhook stopped working"

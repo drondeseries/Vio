@@ -260,6 +260,28 @@ export function useRetryMediaRequest() {
   });
 }
 
+export function useCancelMediaRequest() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, reason }: { id: string; reason?: string }) =>
+      api<MediaRequest>(`/requests/${encodeURIComponent(id)}/cancel`, {
+        method: "POST",
+        body: JSON.stringify({ reason }),
+      }),
+    onSuccess: () => {
+      toast.success("Request cancelled and removed");
+      invalidateRequestSurfaces(queryClient);
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Failed to cancel request");
+    },
+  });
+}
+
+export function useDeleteMediaRequest() {
+  return useCancelMediaRequest();
+}
+
 export function useRequestSettings() {
   return useQuery({
     queryKey: adminKeys.requestSettings(),

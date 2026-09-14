@@ -61,7 +61,7 @@ func readCollectionImageMultipart(r *http.Request, fieldName string) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	switch header.Header.Get("Content-Type") {
 	case "image/jpeg", "image/png", "image/webp":
@@ -100,7 +100,7 @@ func downloadCollectionImageURL(ctx context.Context, client *http.Client, rawURL
 	if err != nil {
 		return nil, fmt.Errorf("downloading image: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("image source returned status %d", resp.StatusCode)

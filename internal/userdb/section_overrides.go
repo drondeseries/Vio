@@ -22,7 +22,7 @@ func ListSectionOverrides(db *sql.DB, profileID, scope, libraryID string) ([]use
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var overrides []userstore.SectionOverride
 	for rows.Next() {
@@ -47,7 +47,7 @@ func SaveSectionOverrides(db *sql.DB, profileID, scope, libraryID string, overri
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.Exec(
 		`DELETE FROM profile_section_overrides WHERE profile_id = ? AND scope = ? AND COALESCE(library_id,'') = ?`,

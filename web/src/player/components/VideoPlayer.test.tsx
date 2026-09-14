@@ -27,6 +27,7 @@ const controls = vi.hoisted(() => ({
     isFullscreen?: boolean;
     onFullscreenToggle?: () => void;
     onSubtitleJobAccepted?: (jobId: string) => void;
+    onSubtitleSelect?: (index: number) => void;
   },
 }));
 const playerV2Mock = vi.hoisted(() => vi.fn());
@@ -41,6 +42,12 @@ const subtitleTimeline = vi.hoisted(() => ({
 }));
 const toastError = vi.hoisted(() => vi.fn());
 const hlsJS = vi.hoisted(() => ({ supported: false, constructed: vi.fn() }));
+// Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
+// tests can drive a subtitle_source_changed (409) signal from the outside.
+const subtitleHooks = vi.hoisted(() => ({
+  vttSourceChanged: null as null | (() => void),
+  assSourceChanged: null as null | (() => void),
+}));
 
 vi.mock("sonner", () => ({ toast: { error: toastError, success: vi.fn(), message: vi.fn() } }));
 
@@ -63,12 +70,14 @@ vi.mock("../hooks/useSubtitleTracks", () => ({
     subtitleTimeline.liveCues = args[7] as Array<{ text: string }>;
     subtitleTimeline.liveKey = args[8] as string | null;
     subtitleTimeline.streamGeneration = args[9] as number;
+    subtitleHooks.vttSourceChanged = (args[11] as (() => void) | undefined) ?? null;
     return [];
   },
 }));
 vi.mock("../hooks/useASSSubtitles", () => ({
   useASSSubtitles: (...args: unknown[]) => {
     subtitleTimeline.assOffsetSeconds = args[4] as number;
+    subtitleHooks.assSourceChanged = (args[7] as (() => void) | undefined) ?? null;
     return { isActive: false };
   },
 }));
@@ -103,7 +112,8 @@ vi.mock("hls.js", () => ({
   },
 }));
 vi.mock("./PlayerControls", () => ({
-  SKIP_BACK_SECONDS: 10,
+  SKIP_BUTTON_SECONDS: 30,
+  SKIP_BACK_SECONDS: 30,
   SKIP_FORWARD_SECONDS: 30,
   PlayerControls: vi.fn(
     (props: {
@@ -194,12 +204,30 @@ function setMediaError(video: HTMLVideoElement, message: string) {
   });
 }
 
+/** Installs a fake `TimeRanges` list so tests can drive buffer/seek checks. */
+function setTimeRanges(
+  video: HTMLVideoElement,
+  property: "buffered" | "seekable",
+  ranges: Array<[number, number]>,
+) {
+  Object.defineProperty(video, property, {
+    configurable: true,
+    value: {
+      length: ranges.length,
+      start: (index: number) => ranges[index]?.[0] ?? 0,
+      end: (index: number) => ranges[index]?.[1] ?? 0,
+    } as TimeRanges,
+  });
+}
+
 describe("VideoPlayer plan failure recovery", () => {
   beforeEach(() => {
     realtimeOptions.current = null;
     controls.current = null;
     subtitleTimeline.textOffsetSeconds = null;
     subtitleTimeline.assOffsetSeconds = null;
+    subtitleHooks.vttSourceChanged = null;
+    subtitleHooks.assSourceChanged = null;
     hlsJS.supported = false;
     hlsJS.constructed.mockClear();
     toastError.mockClear();
@@ -255,7 +283,8 @@ describe("VideoPlayer plan failure recovery", () => {
         controls.current?.onSurfaceTap?.(leftTap);
         controls.current?.onSurfaceTap?.(leftTap);
       });
-      expect(playerSeek).toHaveBeenCalledWith(40);
+      // Double-tap reuses the 30s back-button constant (50 - 30).
+      expect(playerSeek).toHaveBeenCalledWith(20);
     } finally {
       vi.useRealTimers();
       vi.unstubAllGlobals();
@@ -1188,5 +1217,752 @@ describe("VideoPlayer translation handoff", () => {
     });
 
     expect(controls.current?.isFullscreen).toBe(false);
+  });
+
+  it("preserves player when transportRevision is unchanged across plan revisions", async () => {
+    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
+    try {
+      const { rerenderPlayer } = renderPlayer({
+        planRevision: 1,
+        transportRevision: 1,
+      });
+      removeAttrSpy.mockClear();
+
+      const nextPlan = fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:subtitles-only",
+        plan_attempt_key: "v3:subtitles-only",
+      });
+      rerenderPlayer({
+        plan: nextPlan,
+        planRevision: 2,
+        transportRevision: 1,
+      });
+      expect(removeAttrSpy).not.toHaveBeenCalled();
+
+      rerenderPlayer({
+        plan: nextPlan,
+        planRevision: 3,
+        transportRevision: 2,
+      });
+      expect(removeAttrSpy).toHaveBeenCalledWith("src");
+    } finally {
+      removeAttrSpy.mockRestore();
+    }
+  });
+
+  it("warms the new transport once when transportRevision bumps and not on first load", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    try {
+      const { rerenderPlayer } = renderPlayer({
+        planRevision: 1,
+        transportRevision: 0,
+      });
+      // First load with transportRevision 0: the transport did not change, so
+      // no warm fetch fires.
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // A transport-changing replan (same URL, bumped revision) warms the
+      // stream exactly once, before the transport effect reloads the element.
+      rerenderPlayer({ planRevision: 2, transportRevision: 2 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/stream/session-1?token=token",
+        expect.objectContaining({ method: "GET", signal: expect.any(AbortSignal) }),
+      );
+
+      // The same transportRevision across a further plan revision must not
+      // refire the warm fetch.
+      rerenderPlayer({ planRevision: 3, transportRevision: 2 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("refreshes the subtitle inventory once per plan_id on a source-changed signal", async () => {
+    const onRefreshSubtitles = vi.fn();
+    const planA = fixturePlanV3({ plan_id: "plan:aaa", plan_attempt_key: "v3:aaa" });
+    const { rerenderPlayer } = renderPlayer({ plan: planA, onRefreshSubtitles });
+    expect(subtitleHooks.vttSourceChanged).toBeTypeOf("function");
+    expect(subtitleHooks.assSourceChanged).toBeTypeOf("function");
+
+    // The VTT window fetch and the ASS fetch can both see the rotation; both
+    // signals for the same plan must collapse into a single refresh.
+    act(() => subtitleHooks.vttSourceChanged?.());
+    act(() => subtitleHooks.assSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
+
+    // A new plan (the refresh's own replan re-mints the URLs) re-arms the
+    // signal: the next rotation for it refreshes again.
+    const planB = fixturePlanV3({ plan_id: "plan:bbb", plan_attempt_key: "v3:bbb" });
+    rerenderPlayer({ plan: planB });
+    act(() => subtitleHooks.vttSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not reload when only player_start_seconds changes (reused-transport replan)", async () => {
+    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
+    try {
+      const startPlan = fixturePlanV3({
+        ...directPlan,
+        timeline: {
+          ...directPlan.timeline,
+          player_start_seconds: 100,
+        },
+      });
+      const { rerenderPlayer } = renderPlayer({
+        plan: startPlan,
+        planRevision: 1,
+        transportRevision: 1,
+      });
+      removeAttrSpy.mockClear();
+
+      // A reused-transport subtitle replan rewrites player_start_seconds to the
+      // live playhead; the stream URL and transport identity are unchanged.
+      const driftedPlan = fixturePlanV3({
+        ...directPlan,
+        timeline: {
+          ...directPlan.timeline,
+          player_start_seconds: 148,
+        },
+      });
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 2,
+        transportRevision: 1,
+      });
+      expect(removeAttrSpy).not.toHaveBeenCalled();
+
+      // A genuine transport change must still tear the element down.
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 3,
+        transportRevision: 2,
+      });
+      expect(removeAttrSpy).toHaveBeenCalledWith("src");
+    } finally {
+      removeAttrSpy.mockRestore();
+    }
+  });
+
+  it("does not reload when only player_start_seconds changes on a reused HLS transport", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
+      mime === "application/vnd.apple.mpegurl" ? "probably" : "",
+    );
+    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
+    try {
+      const startPlan = fixturePlanV3({
+        timeline: {
+          ...fixturePlanV3().timeline,
+          player_start_seconds: 100,
+        },
+      });
+      const { rerenderPlayer } = renderPlayer({
+        plan: startPlan,
+        planRevision: 1,
+        transportRevision: 1,
+        streamUrl: "/api/v1/stream/session-1/master.m3u8?token=token",
+      });
+      removeAttrSpy.mockClear();
+
+      const driftedPlan = fixturePlanV3({
+        timeline: {
+          ...fixturePlanV3().timeline,
+          player_start_seconds: 148,
+        },
+      });
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 2,
+        transportRevision: 1,
+      });
+      expect(removeAttrSpy).not.toHaveBeenCalled();
+
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 3,
+        transportRevision: 2,
+      });
+      expect(removeAttrSpy).toHaveBeenCalledWith("src");
+    } finally {
+      removeAttrSpy.mockRestore();
+    }
+  });
+
+  it("rolls back an outstanding reanchor seek when its replan is refused", async () => {
+    const onReanchorSeek = vi.fn();
+    const plan = fixturePlanV3({
+      ...directPlan,
+      timeline: {
+        ...directPlan.timeline,
+        can_seek_anywhere: false,
+      },
+    });
+    const { container, rerenderPlayer } = renderPlayer({ plan, onReanchorSeek });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 12 });
+
+    act(() => {
+      (controls.current as unknown as { onSeek: (s: number) => void }).onSeek(300);
+    });
+    expect(onReanchorSeek).toHaveBeenCalledWith(300);
+    await waitFor(() =>
+      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(300),
+    );
+
+    rerenderPlayer({ replanError: "Seek reanchor refused" });
+    await waitFor(() =>
+      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(12),
+    );
+  });
+
+  it("does not move the scrubber on an unrelated replan refusal with no pending seek", async () => {
+    const { container, rerenderPlayer } = renderPlayer({});
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 50 });
+    fireEvent.timeUpdate(video);
+    await waitFor(() =>
+      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(50),
+    );
+
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 5 });
+    rerenderPlayer({ replanError: "Quality change refused" });
+    await waitFor(() =>
+      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(50),
+    );
+  });
+});
+
+describe("VideoPlayer buffered-first seeking", () => {
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    subtitleTimeline.textOffsetSeconds = null;
+    subtitleTimeline.assOffsetSeconds = null;
+    subtitleHooks.vttSourceChanged = null;
+    subtitleHooks.assSourceChanged = null;
+    hlsJS.supported = false;
+    hlsJS.constructed.mockClear();
+    toastError.mockClear();
+    playerSeek.mockClear();
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  // The growing-manifest/remux routes force can_seek_anywhere=false, so they
+  // exercise the path that used to fall straight through to the reanchor.
+  const nonSeekablePlan = () =>
+    fixturePlanV3({
+      ...directPlan,
+      timeline: { ...directPlan.timeline, can_seek_anywhere: false },
+    });
+
+  function renderSeekFixture(position: number, buffered: Array<[number, number]>) {
+    const onReanchorSeek = vi.fn();
+    const { container } = renderPlayer({ plan: nonSeekablePlan(), onReanchorSeek });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: position,
+    });
+    setTimeRanges(video, "buffered", buffered);
+    setTimeRanges(video, "seekable", []);
+    return { video, onReanchorSeek };
+  }
+
+  function seekControls() {
+    return controls.current as unknown as {
+      currentTime: number;
+      onSeek: (seconds: number) => void;
+    };
+  }
+
+  it("skips 30s forward into the buffer without a reanchor", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 80]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    playerSeek.mockClear();
+    act(() => seekControls().onSeek(seekControls().currentTime + 30));
+
+    expect(onReanchorSeek).not.toHaveBeenCalled();
+    expect(video.currentTime).toBe(40);
+  });
+
+  it("skips 30s backward into the buffer without a reanchor", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(60, [[0, 80]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(60));
+
+    playerSeek.mockClear();
+    act(() => seekControls().onSeek(seekControls().currentTime - 30));
+
+    expect(onReanchorSeek).not.toHaveBeenCalled();
+    expect(video.currentTime).toBe(30);
+  });
+
+  it("seeks locally to a target just inside the buffer edge", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 40]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    act(() => seekControls().onSeek(39.9));
+
+    expect(onReanchorSeek).not.toHaveBeenCalled();
+    expect(video.currentTime).toBe(39.9);
+  });
+
+  it("still reanchors when the target sits exactly on the buffered end", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 40]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    act(() => seekControls().onSeek(seekControls().currentTime + 30));
+
+    expect(onReanchorSeek).toHaveBeenCalledWith(40);
+    expect(video.currentTime).toBe(10);
+  });
+
+  it("still reanchors when the target is outside every buffered range", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 40]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    act(() => seekControls().onSeek(100));
+
+    expect(onReanchorSeek).toHaveBeenCalledWith(100);
+    expect(video.currentTime).toBe(10);
+  });
+
+  it("keeps a random seek inside the buffer on the local path", async () => {
+    const { video, onReanchorSeek } = renderSeekFixture(10, [[0, 200]]);
+    fireEvent.timeUpdate(video);
+    await waitFor(() => expect(seekControls().currentTime).toBe(10));
+
+    act(() => seekControls().onSeek(150));
+
+    expect(onReanchorSeek).not.toHaveBeenCalled();
+    expect(video.currentTime).toBe(150);
+  });
+});
+
+describe("VideoPlayer version switch UX", () => {
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    subtitleTimeline.textOffsetSeconds = null;
+    subtitleTimeline.assOffsetSeconds = null;
+    hlsJS.supported = false;
+    hlsJS.constructed.mockClear();
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  const versionA = {
+    file_id: 7,
+    resolution: "1080p",
+    codec_video: "h264",
+    codec_audio: "aac",
+    hdr: false,
+    container: "mp4",
+    file_size: 1,
+    duration: 3600,
+    bitrate: 1,
+  };
+  const versionB = {
+    file_id: 99,
+    resolution: "2160p",
+    codec_video: "hevc",
+    codec_audio: "aac",
+    hdr: true,
+    container: "mkv",
+    file_size: 1,
+    duration: 3600,
+    bitrate: 1,
+  };
+
+  it("lights the clicked version as Requested optimistically via pendingSwitchFileId", async () => {
+    const { rerenderPlayer } = renderPlayer({
+      versions: [versionA, versionB],
+      activeFileId: 7,
+    });
+
+    // Before the switch, the old plan names file 7 as requested.
+    let props = controls.current as unknown as {
+      versions?: Array<{
+        fileId: number;
+        isCurrentSource: boolean;
+        isRequestedSource: boolean;
+      }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 99)?.isRequestedSource).toBe(false);
+
+    // The switch is in flight: pendingSwitchFileId names the clicked version.
+    rerenderPlayer({ pendingSwitchFileId: 99 });
+    props = controls.current as unknown as {
+      versions?: Array<{
+        fileId: number;
+        isCurrentSource: boolean;
+        isRequestedSource: boolean;
+      }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 99)?.isRequestedSource).toBe(true);
+    expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
+  });
+
+  it("marks the path-matched candidate as Current Source for a resolved virtual row", () => {
+    const virtualRow = {
+      ...versionA,
+      file_id: 100,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=all",
+    };
+    const candidateRow = {
+      ...versionA,
+      file_id: 7,
+      file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
+    };
+    const plan = fixturePlanV3({
+      requested_media_file_id: 100,
+      effective_media_file_id: 100,
+      effective_virtual_uri: candidateRow.file_path,
+    });
+
+    renderPlayer({ plan, versions: [virtualRow, candidateRow], activeFileId: 100 });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{ fileId: number; isCurrentSource: boolean; isRequestedSource: boolean }>;
+    };
+    // The collapsed VIRTUAL id stays in the plan, so only the path match can
+    // light the concrete candidate the server is actually playing.
+    expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
+    expect(props.versions?.find((v) => v.fileId === 100)?.isCurrentSource).toBe(false);
+  });
+
+  it("leaves the file_id match current when no effective virtual URI is published", () => {
+    renderPlayer({ versions: [versionA, versionB], activeFileId: 7 });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{ fileId: number; isCurrentSource: boolean }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
+    expect(props.versions?.find((v) => v.fileId === 99)?.isCurrentSource).toBe(false);
+  });
+
+  it("flags a version the catalog reports unavailable so the menu can warn", () => {
+    const unavailableVersion = { ...versionB, available: false };
+    renderPlayer({ versions: [versionA, unavailableVersion], activeFileId: 7 });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{ fileId: number; unavailable?: boolean }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 99)?.unavailable).toBe(true);
+    expect(props.versions?.find((v) => v.fileId === 7)?.unavailable).toBe(false);
+  });
+
+  it("shows the quality ellipsis only for quality replans, not track changes", async () => {
+    const { rerenderPlayer } = renderPlayer({});
+
+    // A track-change replan must not flicker the quality label.
+    rerenderPlayer({ replanning: true, replanningQuality: false });
+    expect((controls.current as unknown as { isTranscoding: boolean }).isTranscoding).toBe(false);
+
+    // A quality/output replan does.
+    rerenderPlayer({ replanning: true, replanningQuality: true });
+    expect((controls.current as unknown as { isTranscoding: boolean }).isTranscoding).toBe(true);
+  });
+
+  it("remaps a manual subtitle selection by identity across a version switch", async () => {
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const frenchTrack: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:1",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "external",
+      url: "/stream/session-1/subtitles/1.vtt",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [englishTrack, frenchTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    // The viewer manually picks French (index 1).
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+
+    // The new version's inventory reorders tracks: French is now index 0 and
+    // English index 1. The raw index would silently switch to English.
+    const nextPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-version",
+      plan_attempt_key: "v3:switched-version",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    const frenchInNewFile: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:0",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "external",
+      url: "/stream/session-99/subtitles/0.vtt",
+    };
+    const englishInNewFile: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:1",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-99/subtitles/1.vtt",
+    };
+    rerenderPlayer({
+      plan: nextPlan,
+      planRevision: 2,
+      subtitleUrls: [frenchInNewFile, englishInNewFile],
+    });
+
+    // The manual French selection is remapped to the French track in the new
+    // inventory (index 0) rather than keeping the raw index 1 (English).
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+  });
+
+  it("falls back to the raw index when no identity match exists in the new inventory", async () => {
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [englishTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(0);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    const nextPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-version-2",
+      plan_attempt_key: "v3:switched-version-2",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    // The new file has a German track at index 0 — no identity match for the
+    // English selection, so the raw index 0 is kept.
+    const germanInNewFile: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:0",
+      language: "de",
+      codec: "srt",
+      label: "German",
+      source: "external",
+      url: "/stream/session-99/subtitles/0.vtt",
+    };
+    rerenderPlayer({
+      plan: nextPlan,
+      planRevision: 2,
+      subtitleUrls: [germanInNewFile],
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+  });
+
+  it("resets to auto-select when neither identity nor raw index matches", async () => {
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [englishTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(0);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    const nextPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-version-3",
+      plan_attempt_key: "v3:switched-version-3",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    // The new file has only a German track at index 5 — neither the identity
+    // nor the raw index (0) exists, so the selection resets to auto-select.
+    const germanInNewFile: PlayerSubtitleInfo = {
+      index: 5,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:5",
+      language: "de",
+      codec: "srt",
+      label: "German",
+      source: "external",
+      url: "/stream/session-99/subtitles/5.vtt",
+    };
+    rerenderPlayer({
+      plan: nextPlan,
+      planRevision: 2,
+      subtitleUrls: [germanInNewFile],
+    });
+
+    // Auto-select with mode "always" and preferred language "en" finds no
+    // English track, so subtitles reset to off.
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+  });
+
+  it("remaps a manual subtitle selection when the effective virtual URI rotates under the same id", async () => {
+    const virtualRow = {
+      ...versionA,
+      file_id: 100,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=all",
+    };
+    const candidateA = {
+      ...versionA,
+      file_id: 7,
+      file_path: "/media/Movies/Example (2024)/Example.A.mkv",
+    };
+    const candidateB = {
+      ...versionA,
+      file_id: 8,
+      file_path: "/media/Movies/Example (2024)/Example.B.mkv",
+    };
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const frenchTrack: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:1",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "external",
+      url: "/stream/session-1/subtitles/1.vtt",
+    };
+    const initialPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:virtual-a",
+      plan_attempt_key: "v3:virtual-a",
+      requested_media_file_id: 100,
+      effective_media_file_id: 100,
+      effective_virtual_uri: candidateA.file_path,
+    });
+    const { rerenderPlayer } = renderPlayer({
+      plan: initialPlan,
+      versions: [virtualRow, candidateA],
+      activeFileId: 100,
+      subtitleUrls: [englishTrack, frenchTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    // The viewer manually picks French (index 1).
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+
+    // The collapsed id stays 100; only the concrete candidate rotates. The new
+    // candidate's inventory reorders tracks so the raw index would silently
+    // switch to English, while the identity remap keeps French.
+    const rotatedPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:virtual-b",
+      plan_attempt_key: "v3:virtual-b",
+      requested_media_file_id: 100,
+      effective_media_file_id: 100,
+      effective_virtual_uri: candidateB.file_path,
+    });
+    const frenchInNewCandidate: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 8,
+      track_id: "file:8:subtitle:0",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "external",
+      url: "/stream/session-100/subtitles/0.vtt",
+    };
+    const englishInNewCandidate: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 8,
+      track_id: "file:8:subtitle:1",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-100/subtitles/1.vtt",
+    };
+    rerenderPlayer({
+      plan: rotatedPlan,
+      planRevision: 2,
+      subtitleUrls: [frenchInNewCandidate, englishInNewCandidate],
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
   });
 });

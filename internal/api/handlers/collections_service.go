@@ -97,6 +97,7 @@ func (h *CollectionHandler) Capabilities() CollectionCapabilitiesView {
 		CollectionDefaultSort:     true,
 		CollectionSortPreferences: true,
 		EffectiveCollectionSort:   true,
+		AdminItemMaterialize:      true,
 		SortPreferenceKinds:       sortPreferenceKinds,
 	}
 }

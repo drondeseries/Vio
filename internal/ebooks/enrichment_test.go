@@ -53,7 +53,7 @@ func TestFilterEbookPeopleKeepsAuthorsOnly(t *testing.T) {
 			t.Fatalf("filtered[%d].SortOrder = %d, want %d", i, p.SortOrder, i)
 		}
 	}
-	if got[0].Person.Name != "Author One" || got[1].Person.Name != "Author Two" {
+	if got[0].Name != "Author One" || got[1].Name != "Author Two" {
 		t.Fatalf("filtered author order = %+v", got)
 	}
 }
@@ -164,7 +164,7 @@ func TestRunBatchRecordsFailuresForFailedItemsOnly(t *testing.T) {
 }
 
 func TestRunBatchSkipsFailureRecordingOnCancellation(t *testing.T) {
-	items := []enrichmentItemRow{{ContentID: "cancelled-1"}}
+	items := []enrichmentItemRow{{ContentID: "canceled-1"}}
 
 	enrich := func(context.Context, enrichmentItemRow) error {
 		return fmt.Errorf("search aborted: %w", context.Canceled)
@@ -882,10 +882,10 @@ func TestMergeEbookAuthorCreditsPreservesOtherPeopleKinds(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("merged people len = %d, want 2: %+v", len(got), got)
 	}
-	if got[0].Person.ID != 20 || got[0].Kind != models.PersonKindWriter || got[0].Character != "essay" || got[0].SortOrder != 0 {
+	if got[0].ID != 20 || got[0].Kind != models.PersonKindWriter || got[0].Character != "essay" || got[0].SortOrder != 0 {
 		t.Fatalf("preserved non-author credit = %+v", got[0])
 	}
-	if got[1].Person.ID != 40 || got[1].Kind != models.PersonKindAuthor || got[1].SortOrder != 1 {
+	if got[1].ID != 40 || got[1].Kind != models.PersonKindAuthor || got[1].SortOrder != 1 {
 		t.Fatalf("provider author credit = %+v", got[1])
 	}
 }

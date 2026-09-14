@@ -569,4 +569,41 @@ describe("EpisodeContent", () => {
     );
     expect(mocks.capturedActionBarProps.value?.onRedetectIntro).toBeUndefined();
   });
+
+  it("does not pass playHref or restartHref when the episode has no versions or play targets", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            versions: [],
+            playback_variants: [],
+            play_content_id: undefined,
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      playHref: undefined,
+      restartHref: undefined,
+    });
+  });
+
+  it("passes playHref when the episode has a play target but no local versions", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            versions: [],
+            playback_variants: [],
+            play_content_id: "virtual-episode-target-1",
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      playHref: "/watch/episode-1",
+    });
+  });
 });

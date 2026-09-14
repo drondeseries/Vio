@@ -903,7 +903,7 @@ func (h *AutoscanHandler) HandleRewriteSuggestions(w http.ResponseWriter, r *htt
 
 func (h *AutoscanHandler) HandleTrigger(w http.ResponseWriter, r *http.Request) {
 	// Run the poll detached: don't block the request on a full cycle, and don't
-	// tie the poll to the request context (which is cancelled once we respond).
+	// tie the poll to the request context (which is canceled once we respond).
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
@@ -1120,9 +1120,9 @@ func (h *AutoscanHandler) HandleListScans(w http.ResponseWriter, r *http.Request
 		filter.Offset = offset
 	}
 	switch filter.Status {
-	case "", "accepted", "running", "completed", "failed", "cancelled":
+	case "", "accepted", "running", "completed", "failed", "canceled":
 	default:
-		writeError(w, http.StatusBadRequest, "bad_request", "status must be accepted, running, completed, failed, or cancelled")
+		writeError(w, http.StatusBadRequest, "bad_request", "status must be accepted, running, completed, failed, or canceled")
 		return
 	}
 

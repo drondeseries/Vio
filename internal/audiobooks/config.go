@@ -92,7 +92,7 @@ func (c *ABSConfigProvider) RefreshTTL(_ context.Context) (time.Duration, error)
 func (c *ABSConfigProvider) StandaloneLoginEnabled(ctx context.Context) (bool, error) {
 	disabled, err := c.Settings.Get(ctx, "audiobooks.abs.login_disabled")
 	if err != nil {
-		return true, nil // fail open
+		return true, nil //nolint:nilerr // Login settings fail open when the settings store is unavailable.
 	}
 	return disabled != "true", nil
 }

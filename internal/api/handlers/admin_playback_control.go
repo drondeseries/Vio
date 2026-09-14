@@ -190,7 +190,9 @@ func (h *AdminPlaybackControlHandler) handleSessionCommand(w http.ResponseWriter
 
 	fallback := func() {
 		h.playback.forgetRealtimeCommand(commandID)
-		_ = h.playback.stopPlaybackSessionByID(context.Background(), sessionID, true)
+		// Derive from the request context (without cancel) so tracing and
+		// values propagate, even though the HTTP response has been written.
+		_ = h.playback.stopPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID, true)
 	}
 
 	h.playback.rememberRealtimeCommand(commandID, sessionID, name)
@@ -220,7 +222,7 @@ func decodeOptionalJSONBody(r *http.Request, target any) error {
 	if r.Body == nil {
 		return nil
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(target); err != nil {
 		if errors.Is(err, io.EOF) {

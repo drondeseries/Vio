@@ -24,7 +24,7 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	StatusCancelled = "cancelled"
+	StatusCancelled = "canceled"
 )
 
 var (
@@ -506,7 +506,7 @@ func (r *Repository) Fail(ctx context.Context, id string, input FailJobInput) er
 
 func (r *Repository) Cancel(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job cancelled"
+		message = "Admin job canceled"
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs
@@ -546,7 +546,7 @@ func (r *Repository) Cancel(ctx context.Context, id, message string, expiresAt t
 
 func (r *Repository) CancelQueued(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job cancelled"
+		message = "Admin job canceled"
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs

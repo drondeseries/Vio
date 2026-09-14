@@ -249,6 +249,7 @@ func RunSuite(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
 	t.Run("JellycompatDisplayPrefs", func(t *testing.T) {
 		RunJellycompatDisplayPrefs(t, newStore)
 	})
+	RunDeviceProfiles(t, newStore)
 }
 
 func testProfiles(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
@@ -289,7 +290,7 @@ func testProfiles(t *testing.T, newStore func(t *testing.T) userstore.UserStore)
 	if got.Name != "Alice" {
 		t.Errorf("Name = %q, want %q", got.Name, "Alice")
 	}
-	if got.AutoSkipIntro != true {
+	if !got.AutoSkipIntro {
 		t.Errorf("AutoSkipIntro = %v, want true", got.AutoSkipIntro)
 	}
 	if !got.LibraryRestrictionsEnabled {
@@ -348,7 +349,7 @@ func testProfiles(t *testing.T, newStore func(t *testing.T) userstore.UserStore)
 	if updated.Name != "Alice Updated" {
 		t.Errorf("Updated Name = %q, want %q", updated.Name, "Alice Updated")
 	}
-	if updated.AutoSkipCredits != true {
+	if !updated.AutoSkipCredits {
 		t.Errorf("Updated AutoSkipCredits = %v, want true", updated.AutoSkipCredits)
 	}
 	if updated.LibraryRestrictionsEnabled {
@@ -2187,7 +2188,7 @@ func testProgressHints(t *testing.T, newStore func(t *testing.T) userstore.UserS
 	if wp.LastResolution == nil || *wp.LastResolution != "2160p" {
 		t.Errorf("LastResolution = %v, want %q", wp.LastResolution, "2160p")
 	}
-	if wp.LastHDR == nil || *wp.LastHDR != true {
+	if wp.LastHDR == nil || !*wp.LastHDR {
 		t.Errorf("LastHDR = %v, want true", wp.LastHDR)
 	}
 	if wp.LastCodecVideo == nil || *wp.LastCodecVideo != "hevc" {

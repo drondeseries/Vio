@@ -165,10 +165,10 @@ func TestAdminJobsHandleCancel_QueuedSnapshotFallsBackToRunningCancellation(t *t
 		},
 		promoteToRunningOnCancelQueued: true,
 	}
-	cancelled := false
+	canceled := false
 	registry := adminjob.NewCancelRegistry()
 	unregister := registry.Register("job-1", func() {
-		cancelled = true
+		canceled = true
 	})
 	defer unregister()
 
@@ -181,7 +181,7 @@ func TestAdminJobsHandleCancel_QueuedSnapshotFallsBackToRunningCancellation(t *t
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	if !cancelled {
+	if !canceled {
 		t.Fatal("expected running job cancel registry to be invoked")
 	}
 	if repo.cancelQueuedCalls != 1 {

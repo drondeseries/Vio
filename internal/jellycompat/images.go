@@ -186,7 +186,7 @@ func copyConditionalImageRequestHeaders(dst, src http.Header) {
 }
 
 func proxyImage(w http.ResponseWriter, resp *http.Response) {
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotModified {
 		copyImageProxyHeaders(w.Header(), resp.Header)

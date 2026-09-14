@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -81,12 +82,13 @@ type CreateInstallationInput struct {
 }
 
 type UpdateInstallationInput struct {
-	Version          *string
-	InstallPath      *string
-	Enabled          *bool
-	UpdatePolicy     *string
-	AvailableVersion *string
-	Capabilities     []Capability
+	Version            *string
+	InstallPath        *string
+	Enabled            *bool
+	UpdatePolicy       *string
+	AvailableVersion   *string
+	Capabilities       []Capability
+	RemoveVirtualMedia bool
 }
 
 type InstallationStore struct {
@@ -178,7 +180,7 @@ func (s *InstallationStore) Create(ctx context.Context, input CreateInstallation
 	if err != nil {
 		return nil, fmt.Errorf("begin create installation transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	updatePolicy := input.UpdatePolicy
 	if updatePolicy == "" {
@@ -299,7 +301,13 @@ func (s *InstallationStore) Update(ctx context.Context, id int, input UpdateInst
 	if err != nil {
 		return fmt.Errorf("begin update installation transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if input.RemoveVirtualMedia {
+		if _, err := catalog.RemoveVirtualMediaInstallation(ctx, tx, id); err != nil {
+			return fmt.Errorf("removing replaced virtual media: %w", err)
+		}
+	}
 
 	var setClauses []string
 	var args []any
@@ -426,12 +434,25 @@ func (s *InstallationStore) Delete(ctx context.Context, id int) error {
 		return ErrBuiltinInstallationImmutable
 	}
 
-	tag, err := s.pool.Exec(ctx, `DELETE FROM plugin_installations WHERE id = $1`, id)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin delete plugin installation transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := catalog.RemoveVirtualMediaInstallation(ctx, tx, id); err != nil {
+		return fmt.Errorf("removing virtual media for plugin installation: %w", err)
+	}
+
+	tag, err := tx.Exec(ctx, `DELETE FROM plugin_installations WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("deleting plugin installation: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrInstallationNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete plugin installation transaction: %w", err)
 	}
 
 	installDir := filepath.Dir(installation.InstallPath)

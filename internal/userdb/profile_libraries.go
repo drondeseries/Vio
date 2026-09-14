@@ -15,7 +15,7 @@ func listProfileAllowedLibraries(db *sql.DB, profileID string) ([]int, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing allowed libraries for profile %s: %w", profileID, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var libraryIDs []int
 	for rows.Next() {
@@ -46,7 +46,7 @@ func attachAllowedLibraries(db *sql.DB, profiles []Profile) error {
 	if err != nil {
 		return fmt.Errorf("listing allowed libraries: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var allowedLibraries []userstore.ProfileAllowedLibrary
 	for rows.Next() {

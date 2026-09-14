@@ -491,3 +491,100 @@ describe("subtitle loading recovery", () => {
     }
   });
 });
+
+describe("subtitle source changed", () => {
+  function errorResponse(status: number, body?: unknown) {
+    return {
+      ok: false,
+      status,
+      json: vi.fn().mockResolvedValue(body),
+    } as unknown as Response;
+  }
+
+  function renderWithSourceChanged() {
+    const videoRef = makeVideoRef();
+    const onSourceChanged = vi.fn();
+    const hook = renderHook(() =>
+      useSubtitleTracks(
+        videoRef,
+        [srtTrack],
+        1,
+        0,
+        0,
+        { current: 7200 },
+        { current: 0 },
+        undefined,
+        null,
+        0,
+        undefined,
+        onSourceChanged,
+      ),
+    );
+    return { videoRef, onSourceChanged, ...hook };
+  }
+
+  it("signals onSourceChanged once on 409 subtitle_source_changed and schedules no retry", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValue(errorResponse(409, { error: "subtitle_source_changed" }));
+    const { onSourceChanged, unmount } = renderWithSourceChanged();
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).toHaveBeenCalledTimes(1);
+      // Retrying the same stale URL can never succeed; even past the max
+      // backoff no retry may fire.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not signal onSourceChanged on a generic 500 and still backs off", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValue(errorResponse(500, { error: "internal" }));
+    const { onSourceChanged, unmount } = renderWithSourceChanged();
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).not.toHaveBeenCalled();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the generic-failure backoff path for a 404", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValue(errorResponse(404, { error: "missing" }));
+    const { onSourceChanged, unmount } = renderWithSourceChanged();
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).not.toHaveBeenCalled();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});

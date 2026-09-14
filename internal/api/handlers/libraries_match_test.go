@@ -155,7 +155,7 @@ func TestLibraryMatchRematch_DeprecatedStillRoutes(t *testing.T) {
 
 	// Verify the routes are registered by checking that a walk finds them.
 	found := map[string]bool{}
-	chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+	_ = chi.Walk(r, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 		found[method+" "+route] = true
 		return nil
 	})

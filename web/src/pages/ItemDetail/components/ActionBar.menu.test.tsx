@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it, vi } from "vitest";
@@ -12,9 +13,15 @@ vi.mock("@/components/AddToCollectionDialog", () => ({
   default: () => null,
 }));
 
+const testQueryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+function renderWithProviders(ui: React.ReactElement) {
+  return render(<QueryClientProvider client={testQueryClient}>{ui}</QueryClientProvider>);
+}
+
 describe("ActionBar detail menu", () => {
   it("uses matching icons and longest-entry sizing", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <ActionBar
           contentId="series-1"

@@ -13,8 +13,10 @@ import (
 // (all four in the reference file appear inside the first two seconds), so a
 // few seconds of headroom catches slower rotations. Kept short because the
 // window is bytes read off the media store: on remote storage the read, not
-// the demux, is what costs.
+// the demux, is what costs. Verdicts persist across restarts, so a short
+// window never re-pays the read on every first play.
 const copySafetyScanSeconds = 5
+const maxCopySafetyOutput = 1 << 20
 
 // DetectMultiplePPSH264 reports whether an H.264 stream redefines the same
 // pic_parameter_set_id in-band with more than one distinct content within the
@@ -42,8 +44,9 @@ func DetectMultiplePPSH264(ctx context.Context, ffmpegPath, filePath string) (bo
 		"-f", "h264",
 		"-",
 	)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	stdout := &boundedProbeBuffer{limit: maxCopySafetyOutput}
+	var stderr bytes.Buffer
+	cmd.Stdout = stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return false, fmt.Errorf("pps scan: %w (%s)", err, strings.TrimSpace(stderr.String()))

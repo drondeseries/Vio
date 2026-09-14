@@ -60,7 +60,7 @@ func ListFavorites(db *sql.DB, profileID string, limit, offset int) ([]Favorite,
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var favorites []Favorite
 	for rows.Next() {
@@ -181,7 +181,7 @@ func ListFavoritesByMediaItems(db *sql.DB, profileID string, mediaItemIDs []stri
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var mediaItemID string
@@ -271,7 +271,7 @@ func ListWatchlist(db *sql.DB, profileID string, limit, offset int) ([]Watchlist
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []WatchlistEntry
 	for rows.Next() {
@@ -337,7 +337,7 @@ func ListWatchlistByMediaItems(db *sql.DB, profileID string, mediaItemIDs []stri
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var mediaItemID string

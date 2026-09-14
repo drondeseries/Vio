@@ -5,6 +5,7 @@ import type { PlayerSubtitleTrackSignature, PrePlaySubtitleSelection } from "@/p
 import { useRefreshItemMetadata } from "@/hooks/queries/items";
 import { useSimilarItems } from "@/hooks/queries/recommendations";
 import { useDeleteSubtitlePreference, useSetSubtitlePreference } from "@/hooks/queries/subtitles";
+import { useVersionLiveness } from "@/hooks/queries/versionLiveness";
 import { useAuth } from "@/hooks/useAuth";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
@@ -66,6 +67,14 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
   const [subtitleSearchOpen, setSubtitleSearchOpen] = useState(false);
   const [mediaInfoOpen, setMediaInfoOpen] = useState(false);
   const [mediaInfoFileId, setMediaInfoFileId] = useState<number | null>(null);
+  // Tracks whether a version picker has been opened; the picker-open path
+  // widens the liveness probe from the default version to the whole list.
+  const [versionPickersOpened, setVersionPickersOpened] = useState(false);
+  const handleVersionPickerOpenChange = useCallback((open: boolean) => {
+    if (open) {
+      setVersionPickersOpened(true);
+    }
+  }, []);
 
   // Version selection state — drives the Play button and inline stream popovers.
   const sortedVersions = useMemo(() => sortByResolution(item.versions), [item.versions]);
@@ -88,6 +97,30 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
       userData,
     ],
   );
+
+  // Check the default-selected version as soon as the page mounts so it can't
+  // sit as an unavailable row before any liveness result exists. Only that one
+  // version is probed until a picker opens, at which point the full chunked
+  // check takes over (results are cached for 5 minutes, so re-opening does not
+  // re-fetch).
+  const livenessVersions = useMemo(
+    () =>
+      versionPickersOpened ? item.versions : defaultSelectedVersion ? [defaultSelectedVersion] : [],
+    [defaultSelectedVersion, item.versions, versionPickersOpened],
+  );
+  const versionLiveness = useVersionLiveness(livenessVersions, true);
+  const versionsWithLiveness = useMemo(
+    () =>
+      item.versions.map((version) => {
+        const available = versionLiveness.get(version.file_id);
+        if (available === undefined) {
+          return version;
+        }
+        return { ...version, available };
+      }),
+    [item.versions, versionLiveness],
+  );
+
   const [manualSelectedFileId, setManualSelectedFileId] = useState<number | null>(null);
   const selectedVersion = useMemo(
     () =>
@@ -173,9 +206,13 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
     deleteSubtitlePreference.mutate(item.content_id);
   };
 
+  const isPlayable =
+    (item.versions?.length ?? 0) > 0 ||
+    (item.playback_variants?.length ?? 0) > 0 ||
+    Boolean(item.play_content_id);
   const primaryAction = resolveLeafPrimaryAction(item, "Play");
   const restartHref =
-    primaryAction.label === "Resume" && item.versions.length > 0
+    primaryAction.label === "Resume" && isPlayable
       ? `/watch/${item.content_id}?restart=1`
       : undefined;
   const { data: similarData, isLoading: similarLoading } = useSimilarItems(item.content_id);
@@ -241,7 +278,7 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
           <MediaUserActionBar
             item={item}
             contentId={item.content_id}
-            playHref={item.versions.length > 0 ? `/watch/${item.content_id}` : undefined}
+            playHref={isPlayable ? `/watch/${item.content_id}` : undefined}
             playLabel={primaryAction.label}
             playProgress={primaryAction.progress}
             restartHref={restartHref}
@@ -285,10 +322,12 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
             onShowMediaInfo={
               canCurateMetadata && item.versions.length > 0 ? () => openMediaInfo() : undefined
             }
-            versions={item.versions}
+            versions={versionsWithLiveness}
             playbackVariants={item.playback_variants}
             selectedVersion={selectedVersion}
             onSelectVersion={handleSelectVersion}
+            onVersionPickerOpenChange={handleVersionPickerOpenChange}
+            explicitFileSelection={manualSelectedFileId != null}
             onDownload={
               user?.download_allowed && item.versions.length > 0
                 ? () => setDownloadOpen(true)

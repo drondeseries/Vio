@@ -338,7 +338,7 @@ func sourceMetadataCompatibility(kind SourceKind, source SourceMetadata) (comple
 		}
 	}
 	rangeValue := normalizeColorValue(source.ColorRange)
-	if rangeValue != "" && rangeValue != colorUnknown && rangeValue != colorUnspecified && !rangeIsLimited(rangeValue) {
+	if rangeValue != "" && rangeValue != colorUnknown && rangeValue != colorUnspecified && !rangeIsValid(rangeValue) {
 		return complete, false
 	}
 	primaries := normalizeColorValue(source.ColorPrimaries)
@@ -429,6 +429,12 @@ func colorIsBT2020(value string) bool {
 // rangeIsLimited recognizes FFmpeg's names for limited-range video levels.
 func rangeIsLimited(value string) bool {
 	return value == "tv" || value == "mpeg" || value == "limited"
+}
+
+// rangeIsValid recognizes supported color range values (limited and full);
+// virtual sources frequently report pc/full/jpeg where local files say tv.
+func rangeIsValid(value string) bool {
+	return rangeIsLimited(value) || value == "pc" || value == "full" || value == "jpeg"
 }
 
 // SourceKindFor maps already trusted dynamic-range metadata to a base signal.

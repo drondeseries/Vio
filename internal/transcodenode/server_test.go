@@ -3162,6 +3162,28 @@ func TestCopyModeReconstruct_SkipsFastSeek(t *testing.T) {
 	}
 }
 
+func TestPlaybackHWAccel(t *testing.T) {
+	for _, value := range []string{"qsv", "vaapi", "nvenc", " QSV "} {
+		if !playbackHWAccel(value) {
+			t.Errorf("playbackHWAccel(%q) = false, want true", value)
+		}
+	}
+	for _, value := range []string{"", "none", "software", "auto"} {
+		if playbackHWAccel(value) {
+			t.Errorf("playbackHWAccel(%q) = true, want false", value)
+		}
+	}
+}
+
+func TestSoftwareFallbackAllowed(t *testing.T) {
+	if !softwareFallbackAllowed("allow") {
+		t.Fatal("allow should permit software fallback")
+	}
+	if softwareFallbackAllowed("gpu_only") {
+		t.Fatal("gpu_only should disable software fallback")
+	}
+}
+
 func TestSpawnReconstructDoesNotRegisterFailedSoftwareRetry(t *testing.T) {
 	server := newTestServer(t)
 	dir := t.TempDir()
@@ -3255,7 +3277,7 @@ func TestHandleStartUsesConfiguredHWDeviceList(t *testing.T) {
 	if session == nil {
 		t.Fatal("session was not registered")
 	}
-	defer session.CloseProcess()
+	defer func() { _ = session.CloseProcess() }()
 	if got := session.Opts().HWDevice; got != "/dev/dri/renderD888" {
 		t.Fatalf("session HWDevice = %q, want one concrete device from the configured list", got)
 	}

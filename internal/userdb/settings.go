@@ -52,7 +52,7 @@ func ListSettings(db *sql.DB) ([]SettingEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing settings: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []SettingEntry
 	for rows.Next() {
@@ -118,7 +118,7 @@ func ListDevices(db *sql.DB) ([]userstore.DeviceEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing devices: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []userstore.DeviceEntry
 	for rows.Next() {
@@ -244,7 +244,7 @@ func ListDeviceSettings(db *sql.DB, key string) ([]userstore.DeviceSettingEntry,
 	if err != nil {
 		return nil, fmt.Errorf("listing device settings for key %q: %w", key, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []userstore.DeviceSettingEntry
 	for rows.Next() {
@@ -266,7 +266,7 @@ func ListAllDeviceSettings(db *sql.DB) ([]userstore.DeviceSettingEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing all device settings: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var entries []userstore.DeviceSettingEntry
 	for rows.Next() {

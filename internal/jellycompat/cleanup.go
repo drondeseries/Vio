@@ -28,7 +28,7 @@ func cleanupExpiredCompatState(ctx context.Context, repo *SessionRepository, pla
 }
 
 // StartSessionCleanup runs a background goroutine that periodically removes
-// expired compat sessions from the database. It stops when ctx is cancelled.
+// expired compat sessions from the database. It stops when ctx is canceled.
 func StartSessionCleanup(ctx context.Context, repo *SessionRepository, interval time.Duration) {
 	StartSessionCleanupWithPlaybackStore(ctx, repo, nil, interval)
 }

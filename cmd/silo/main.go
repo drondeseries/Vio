@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -91,6 +92,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/proxy"
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
+	"github.com/Silo-Server/silo-server/internal/remotestream"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 	"github.com/Silo-Server/silo-server/internal/scanner"
@@ -106,6 +108,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/taskmanager/tasks"
 	"github.com/Silo-Server/silo-server/internal/taskmanager/triggers"
 	"github.com/Silo-Server/silo-server/internal/telemetry"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
 	"github.com/Silo-Server/silo-server/internal/usercollections"
 	"github.com/Silo-Server/silo-server/internal/userdb"
@@ -357,6 +360,33 @@ func newStreamTelemetryViewCache(registry *streamtelemetry.Registry) *streamtele
 	// a second parse logs every invalid variable twice and the two calls could
 	// disagree if the environment changed between them.
 	return streamtelemetry.NewViewCache(registry, registry.ViewTTL(), slog.Default())
+}
+
+// logToneMapStartupSummary reports which tone-map executors validated for
+// this host's FFmpeg and device configuration, once, without delaying
+// startup. When transcodes are enabled and hardware acceleration was not
+// explicitly disabled yet no hardware executor validated, it warns with the
+// per-backend probe reasons — the exact answer to "why did this transcode
+// use libx264 instead of QSV". Both probes are cached and singleflighted, so
+// this also warms the caches the first transcode would otherwise fill.
+func logToneMapStartupSummary(cfg *config.Config) {
+	hwAccel := strings.TrimSpace(cfg.Playback.HWAccel)
+	hwDevice := strings.TrimSpace(cfg.Playback.HWDevice)
+	timeout := playback.CapabilityRequestTimeout(hwAccel, hwDevice)
+	probeCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	info, detectErr := playback.DetectHWAccelWithFFmpegContextResult(probeCtx, hwAccel, cfg.Playback.FFmpegPath, hwDevice)
+	var caps tonemap.Capabilities
+	var probeErr error
+	if probeCtx.Err() == nil {
+		caps, probeErr = tonemap.Probe(probeCtx, playback.ResolveFFmpegPath(cfg.Playback.FFmpegPath), info.Resolved, hwDevice)
+	}
+	summary := playback.SummarizeToneMapInventory(info, caps, hwAccel, cfg.Playback.TranscodeEnabled, detectErr, probeErr)
+	if summary.Warn {
+		slog.Warn("no hardware tone-map executor validated; HDR transcodes will use software encoding", summary.Attrs...)
+		return
+	}
+	slog.Info("hardware acceleration inventory", summary.Attrs...)
 }
 
 func resolvePluginCacheDir() string {
@@ -904,6 +934,7 @@ func main() {
 	defer stopDebugOnCancel()
 	var streamTelemetryRegistry *streamtelemetry.Registry
 	var streamTelemetryViewCache *streamtelemetry.ViewCache
+	defer appCancel()
 	restartReqCh := make(chan struct{}, 1)
 	var restartRequested atomic.Bool
 
@@ -939,8 +970,6 @@ func main() {
 			slog.Error("redis is required for this mode", "mode", mode, "error", err)
 			os.Exit(1)
 		}
-		streamTelemetryRegistry = newStreamTelemetryRegistry(appCtx, nodeID, redisClient)
-		streamTelemetryRegistry.Start(appCtx)
 
 		// Resolved before the watcher starts: NODE_URL is this process's
 		// stream_nodes identity, and the watcher needs it on its very first
@@ -976,19 +1005,14 @@ func main() {
 			os.Exit(1)
 		}
 
+		streamTelemetryRegistry = newStreamTelemetryRegistry(appCtx, nodeID, redisClient)
+		streamTelemetryRegistry.Start(appCtx)
 		tracker := nodesessions.NewTracker(redisClient, nodeURL, nodeName, mode)
 		tracker.StartRefresh(appCtx)
 		defer func() {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cleanupCancel()
 			tracker.Cleanup(cleanupCtx)
-		}()
-		defer func() {
-			telemetryCtx, telemetryCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer telemetryCancel()
-			if stopErr := streamTelemetryRegistry.Stop(telemetryCtx); stopErr != nil {
-				slog.Error("stream telemetry shutdown error", "error", stopErr)
-			}
 		}()
 
 		var handler http.Handler
@@ -1388,12 +1412,14 @@ func main() {
 	var pluginInstallationStore *plugins.InstallationStore
 	var pluginRuntimeConfigStore *plugins.RuntimeConfigStore
 	var pluginHTTPProxy *plugins.HTTPProxy
+	var requestVirtualMetadataRefresh func(context.Context, string) error
 	pluginAutoUpdateDone := make(chan struct{})
 	var pluginAutoUpdater *plugins.AutoUpdateService
 	if deps.DB != nil {
 		pluginCacheDir := resolvePluginCacheDir()
 		repositoryStore := plugins.NewRepositoryStore(deps.DB)
 		installationStore := plugins.NewInstallationStore(deps.DB)
+		virtualRegistrar := catalog.NewVirtualMediaRegistrar(deps.DB)
 		runtimeConfigStore := plugins.NewRuntimeConfigStore(deps.DB, deps.SecretCipher)
 		catalogService := plugins.NewCatalogService(repositoryStore, plugins.CatalogServiceOptions{
 			SiloAPIVersion: plugins.DefaultSiloAPIVersion,
@@ -1447,6 +1473,24 @@ func main() {
 			EventPublisher:  eventsHub,
 			LibraryLister:   pluginhost.NewLibraryLister(libDataSource),
 			CatalogPresence: catalogPresence,
+			VirtualCatalog: virtualCatalogHostAdapter{
+				registrar: pluginhost.VirtualCatalogRegistrarFunc(
+					func(ctx context.Context, installationID int, req catalog.VirtualMedia) (*catalog.VirtualMediaResult, error) {
+						result, err := virtualRegistrar.UpsertVirtualMedia(ctx, installationID, req)
+						if err != nil {
+							return nil, err
+						}
+						sections.InvalidateResolvedListCache()
+						if requestVirtualMetadataRefresh != nil {
+							if err := requestVirtualMetadataRefresh(ctx, result.MediaID); err != nil {
+								slog.WarnContext(ctx, "failed to queue virtual media metadata refresh", "component", "plugin-host", "content_id", result.MediaID, "error", err)
+							}
+						}
+						return result, nil
+					},
+				),
+				reconciler: virtualRegistrar,
+			},
 			InstalledPlugins: pluginhost.InstalledPluginListerFunc(
 				func(ctx context.Context) ([]pluginhost.InstalledPluginRecord, error) {
 					installations, err := installationStore.List(ctx)
@@ -1716,6 +1760,9 @@ func main() {
 			personRepo,
 			deps.FileRepo, skippedRootRepo, staleIDRepo, rootClaimRepo,
 		)
+		requestVirtualMetadataRefresh = func(ctx context.Context, contentID string) error {
+			return metadataService.RequestStaleMetadataRefresh(ctx, metadata.RefreshTargetItem, contentID)
+		}
 		// Drop the resolved-chain cache whenever a plugin is installed, enabled,
 		// disabled, updated, or uninstalled. The installation-enabled check is
 		// served from the plugins service's in-memory cache (invalidated on the
@@ -1992,7 +2039,7 @@ func main() {
 			userStoreProvider = pgstore.NewPostgresProvider(deps.DB)
 			slog.Info("user store initialized", "backend", "postgres")
 		}
-		defer userStoreProvider.Close()
+		defer func() { _ = userStoreProvider.Close() }()
 	}
 
 	var policySystem *policy.System
@@ -2256,12 +2303,20 @@ func main() {
 	})
 	// The config watcher covers the Redis-less poll/RequestReload path, so
 	// admin UI edits apply without a restart on single-node deployments too.
-	configWatcher.OnChange(func(_, _ *config.Config) {
-		// Re-read under the same resolver reload lock as direct/event callbacks.
-		// The watcher snapshot may predate a committed administrator write.
-		if loadErr := ipResolver.ReloadTrustedCIDRs(context.Background(), settingsRepo); loadErr != nil {
-			slog.WarnContext(context.Background(), "clientip config reload failed", "component", "app", "error", loadErr)
+	configWatcher.OnChange(func(old, updated *config.Config) {
+		if old != nil && old.ClientIP.TrustedProxies == updated.ClientIP.TrustedProxies {
+			return
 		}
+		raw := updated.ClientIP.TrustedProxies
+		if raw == "" {
+			raw = clientip.DefaultTrustedProxies
+		}
+		cidrs, parseErr := clientip.ParseCIDRs(raw)
+		if parseErr != nil {
+			slog.WarnContext(context.Background(), "clientip config reload failed", "component", "app", "error", parseErr)
+			return
+		}
+		ipResolver.UpdateTrustedCIDRs(cidrs)
 	})
 
 	// Step 6b: Create rate limiter.
@@ -2389,7 +2444,23 @@ func main() {
 		collItemRepo := catalog.NewItemRepository(deps.DB)
 		libraryItemRepo := catalog.NewLibraryItemRepository(deps.DB)
 		collectionService := catalog.NewLibraryCollectionService(collectionRepo, collItemRepo, libraryItemRepo, nil)
+		if deps.PluginService != nil {
+			collectionService.VirtualVariants = func(ctx context.Context, virtualURI, mediaType string) ([]catalog.VirtualPlaybackVariant, error) {
+				got, err := deps.PluginService.ConfiguredVirtualVariants(ctx, virtualURI, mediaType)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]catalog.VirtualPlaybackVariant, 0, len(got))
+				for _, v := range got {
+					out = append(out, catalog.VirtualPlaybackVariant{VirtualURI: v.VirtualURI, Label: v.Label, Resolution: v.Resolution, CodecVideo: v.CodecVideo, CodecAudio: v.CodecAudio, HDR: v.HDR, OwnerInstallationID: v.OwnerInstallationID})
+				}
+				return out, nil
+			}
+		}
 		collectionService.TMDBCollections = api.NewTMDBCollectionFetcher(cfg.TMDBAPIKey)
+		discoverAdapter := api.NewTMDBDiscoverAdapter(cfg.TMDBAPIKey)
+		collectionService.TMDBDiscovers = discoverAdapter
+		collectionService.TMDBDigitalReleases = discoverAdapter
 		deps.CollectionService = collectionService
 		collectionSyncScheduler = catalog.NewCollectionSyncScheduler(collectionRepo, collectionService, slog.Default())
 
@@ -2546,6 +2617,10 @@ func main() {
 		if refreshWorker != nil && metadataService != nil {
 			taskMgr.Register(tasks.NewRefreshMetadataTask(refreshWorker, metadataService))
 		}
+		if itemRepo != nil {
+			taskMgr.Register(tasks.NewReconcileVirtualEpisodesTask(itemRepo))
+			taskMgr.Register(tasks.NewCleanupLegacyCollectionClaimsTask(itemRepo))
+		}
 		if metadataImageCacheProcessor != nil {
 			cacheImagesTask := tasks.NewCacheMetadataImagesTask(metadataImageCacheProcessor)
 			// Artwork cached under an older variant ladder is missing the rungs
@@ -2607,6 +2682,7 @@ func main() {
 		)
 		requestReconcileSvc.SetRequesterIdentityResolver(plugins.RequesterIdentityFromLookup(plugins.NewPgUserIdentityLookup(deps.DB)))
 		api.AttachRequestRouter(requestReconcileSvc, pluginService)
+		requestReconcileSvc.SetCatalogChangeNotifier(sections.InvalidateResolvedListCache)
 		requestReconcileSvc.SetGroupPolicyProvider(accessGroupStore)
 		if userStoreProvider != nil {
 			userRepo := auth.NewUserRepository(deps.DB)
@@ -2742,8 +2818,6 @@ func main() {
 			SessionSyncer:  deps.SessionSyncer,
 		}
 		absH := audiobooksService.BuildABSHandler(absHDeps)
-		// Must precede Mount: Mount is what registers the observed handlers.
-		absH.SetStreamTelemetry(streamTelemetryRegistry)
 		deps.ABSHandler = absH
 	}
 	_ = audiobooksService
@@ -2968,6 +3042,13 @@ func main() {
 		slog.Info("background workers started")
 	}
 
+	// Proxy nodes never run ffmpeg locally, so there is nothing to validate.
+	// Everywhere else the inventory runs detached: a cold multi-device walk
+	// can take minutes and must never delay serving traffic.
+	if mode != "proxy" {
+		go logToneMapStartupSummary(cfg)
+	}
+
 	// Step 10: Create and start the HTTP server.
 	srv := &http.Server{
 		Addr:         cfg.Server.Listen,
@@ -2996,6 +3077,109 @@ func main() {
 			// transcode node that restarts can rebuild a jellycompat session.
 			RecipeNodeStore: noderecipe.NewStore(apiRedisClient, 0),
 			SessionSyncer:   deps.SessionSyncer,
+		}
+		if pluginService != nil {
+			virtualRelay := remotestream.NewRelay()
+			compatDeps.RemoteStreamRelay = virtualRelay
+			go func() {
+				<-appCtx.Done()
+				closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := virtualRelay.Close(closeCtx); err != nil {
+					slog.Warn("close jellycompat virtual stream relay", "error", err)
+				}
+			}()
+
+			compatDeps.VirtualMediaResolver = jellycompat.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
+				return pluginService.ResolveVirtualPlaybackForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
+			})
+			compatDeps.VirtualMediaRefreshResolver = jellycompat.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
+				return pluginService.RefreshVirtualPlaybackForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
+			})
+			compatDeps.VirtualMediaDetailedResolver = jellycompat.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (jellycompat.ResolvedVirtualMedia, error) {
+				res, err := pluginService.ResolveVirtualPlaybackDetailedForInstallation(ctx, path, userID, profileID, ownerInstallationID, true, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+				if err != nil {
+					return jellycompat.ResolvedVirtualMedia{}, err
+				}
+				return jellycompat.ResolvedVirtualMedia{
+					URL:            res.URL,
+					URI:            res.URI,
+					CandidateID:    res.CandidateID,
+					RequestHeaders: res.RequestHeaders,
+					ExpiresAt:      res.ExpiresAt,
+				}, nil
+			})
+			compatDeps.VirtualPlaybackStreamLister = jellycompat.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]jellycompat.VirtualPlaybackStream, error) {
+				streams, err := pluginService.ListVirtualPlaybackStreamsForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
+				for _, stream := range streams {
+					out = append(out, jellycompat.VirtualPlaybackStream{
+						URI:                 stream.URI,
+						Label:               stream.Label,
+						Resolution:          stream.Resolution,
+						CodecVideo:          stream.CodecVideo,
+						CodecAudio:          stream.CodecAudio,
+						HDR:                 stream.HDR,
+						Container:           stream.Container,
+						FileSize:            stream.FileSize,
+						Bitrate:             stream.Bitrate,
+						AudioLanguages:      stream.AudioLanguages,
+						SubtitleLanguages:   stream.SubtitleLanguages,
+						OwnerInstallationID: stream.OwnerInstallationID,
+					})
+				}
+				return out, nil
+			})
+			compatDeps.AllowInsecureVirtual = func(installationID int) bool {
+				return pluginService.InstallationAllowsInsecure(context.Background(), installationID)
+			}
+			ffprobePath := scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)
+			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
+			compatVirtualSourceProberWithHeaders := func(ctx context.Context, sourceURL string, file *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
+				return virtualProbeCache.Probe(ctx, sourceURL, file, func(probeCtx context.Context, probeURL string, probeFile *models.MediaFile) (*models.MediaFile, error) {
+					var relayURL string
+					var cleanup func()
+					var err error
+					if pluginService.InstallationAllowsInsecure(context.Background(), probeFile.VirtualOwnerInstallationID) {
+						relayURL, cleanup, err = virtualRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
+					} else {
+						relayURL, cleanup, err = virtualRelay.RegisterWithHeaders(probeCtx, probeURL, headers)
+					}
+					if err != nil {
+						return probeFile, err
+					}
+					defer cleanup()
+					return scanner.ProbeVirtualSource(probeCtx, ffprobePath, cfg.Playback.FFmpegPath, relayURL, probeFile, func(dvCtx context.Context, input string) bool {
+						return playback.DVRPUStrippable(dvCtx, cfg.Playback.FFmpegPath, input)
+					})
+				})
+			}
+			compatDeps.VirtualSourceProberWithHeaders = compatVirtualSourceProberWithHeaders
+			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
+				return compatVirtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
+			}
+			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error {
+				if deps.DB == nil {
+					return nil
+				}
+				vStr := string(videoTracks)
+				if vStr == "" || vStr == "null" {
+					vStr = "[]"
+				}
+				aStr := string(audioTracks)
+				if aStr == "" || aStr == "null" {
+					aStr = "[]"
+				}
+				sStr := string(subtitleTracks)
+				if sStr == "" || sStr == "null" {
+					sStr = "[]"
+				}
+				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath)
+				return err
+			}
 		}
 
 		// Wire direct dependencies when DB is available.
@@ -3065,6 +3249,9 @@ func main() {
 
 			if deps.FileRepo != nil {
 				compatDeps.FileResolver = deps.FileRepo
+				compatDeps.VirtualCandidateFileLookup = func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
+					return deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+				}
 			}
 
 			compatDeps.SubtitleRepo = subtitles.NewPgRepository(deps.DB, deps.SecretCipher)
@@ -3133,7 +3320,7 @@ func main() {
 
 	// Run non-critical startup work in the background so it doesn't delay the
 	// HTTP listener from accepting connections. Steps run sequentially and stop
-	// early if the app context is cancelled (shutdown).
+	// early if the app context is canceled (shutdown).
 	if len(backgroundInit) > 0 {
 		go func() {
 			start := time.Now()
@@ -3882,6 +4069,24 @@ func mapFolderTypeToMediaType(t string) string {
 	default:
 		return "mixed"
 	}
+}
+
+type virtualCatalogHostAdapter struct {
+	registrar  pluginhost.VirtualCatalogRegistrar
+	reconciler interface {
+		ReconcileVirtualMedia(context.Context, int, string, []string, []int) (catalog.VirtualReconcileResult, error)
+	}
+}
+
+func (a virtualCatalogHostAdapter) UpsertVirtualMedia(ctx context.Context, installationID int, req catalog.VirtualMedia) (*catalog.VirtualMediaResult, error) {
+	return a.registrar.UpsertVirtualMedia(ctx, installationID, req)
+}
+
+func (a virtualCatalogHostAdapter) ReconcileVirtualMedia(ctx context.Context, installationID int, source string, keepIDs []string, libraryIDs []int) (catalog.VirtualReconcileResult, error) {
+	if a.reconciler == nil {
+		return catalog.VirtualReconcileResult{}, errors.New("virtual catalog reconciler is not configured")
+	}
+	return a.reconciler.ReconcileVirtualMedia(ctx, installationID, source, keepIDs, libraryIDs)
 }
 
 type scopeResolver interface {

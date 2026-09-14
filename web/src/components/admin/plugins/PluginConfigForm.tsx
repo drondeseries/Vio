@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   ConnectionCheckResponse,
@@ -9,10 +9,12 @@ import type {
 import { ConnectionCheckAction } from "@/components/admin/ConnectionCheckAction";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import { usePluginInstallationConfigOptions } from "@/hooks/queries/admin/plugins";
 
 import { adminFormForConfigSchema, humanizeConfigKey } from "./configSchemaAdminForm";
 import { SchemaForm } from "./SchemaForm";
-import { buildSchemaValues } from "./schemaFormUtils";
+import { buildSchemaValues, parseFieldTypes } from "./schemaFormUtils";
+import type { SchemaOption } from "./schemaFormUtils";
 
 type PluginConfigValue = Record<string, unknown>;
 
@@ -22,6 +24,8 @@ type Props = {
   schema: PluginConfigSchema;
   value?: PluginConfigValue;
   configuredSecrets?: string[];
+  /** Installation ID used to load dynamic SELECT options from the plugin. */
+  installationId?: number;
   onSave: (key: string, value: PluginConfigValue, clearSecrets: string[]) => void;
   onTest?: (
     key: string,
@@ -42,6 +46,9 @@ function defaultValueForField(field: PluginAdminFormField): string | boolean {
     }
     if (typeof field.default_value === "string") {
       return field.default_value;
+    }
+    if (Array.isArray(field.default_value) || typeof field.default_value === "object") {
+      return JSON.stringify(field.default_value, null, 2);
     }
   }
   if (field.control === "SWITCH") {
@@ -64,6 +71,9 @@ function valueForField(
   if (typeof raw === "string") {
     return raw;
   }
+  if (Array.isArray(raw) || (raw !== null && typeof raw === "object")) {
+    return JSON.stringify(raw, null, 2);
+  }
   return defaultValueForField(field);
 }
 
@@ -71,6 +81,7 @@ export function PluginConfigForm({
   schema,
   value,
   configuredSecrets = [],
+  installationId,
   onSave,
   onTest,
   isSaving = false,
@@ -79,6 +90,7 @@ export function PluginConfigForm({
   const inferredDescriptor = useMemo(() => adminFormForConfigSchema(schema), [schema]);
   const fields = inferredDescriptor?.fields ?? EMPTY_FIELDS;
   const supported = inferredDescriptor != null;
+  const fieldTypes = useMemo(() => parseFieldTypes(schema.json_schema), [schema.json_schema]);
 
   const descriptor = useMemo<PluginAdminForm>(() => {
     const base = inferredDescriptor ?? { fields };
@@ -97,7 +109,33 @@ export function PluginConfigForm({
     Object.fromEntries(fields.map((field) => [field.key, valueForField(field, value)])),
   );
   const [testResult, setTestResult] = useState<ConnectionCheckResponse | null>(null);
+  const [profilePreview, setProfilePreview] = useState<string | null>(null);
   const [clearSecrets, setClearSecrets] = useState<Set<string>>(new Set());
+
+  // Dynamic SELECT options: loaded once on mount (and when installationId changes)
+  // from the plugin's request_router.v1 ListConfigOptions gRPC method.
+  const [dynamicOptions, setDynamicOptions] = useState<Record<string, SchemaOption[]>>({});
+  const [optionsLoading, setOptionsLoading] = useState(false);
+  const loadOptions = usePluginInstallationConfigOptions();
+  const hasDynamicFields = useMemo(() => fields.some((f) => f.dynamic_options), [fields]);
+  const loadOptionsRef = useRef(loadOptions);
+  loadOptionsRef.current = loadOptions;
+
+  useEffect(() => {
+    if (!installationId || !hasDynamicFields) return;
+    setOptionsLoading(true);
+    loadOptionsRef.current
+      .mutateAsync({ installationId })
+      .then((loaded) => {
+        setDynamicOptions(loaded ?? {});
+      })
+      .catch(() => {
+        // Silently swallow — fields degrade to empty dropdowns.
+      })
+      .finally(() => setOptionsLoading(false));
+    // Re-run only when the installation changes, not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [installationId, hasDynamicFields]);
 
   useEffect(() => {
     setValues(Object.fromEntries(fields.map((field) => [field.key, valueForField(field, value)])));
@@ -106,6 +144,7 @@ export function PluginConfigForm({
 
   function handleChange(next: PluginConfigValue) {
     setTestResult(null);
+    setProfilePreview(null);
     setValues(next);
     setClearSecrets((current) => {
       const updated = new Set(current);
@@ -126,7 +165,11 @@ export function PluginConfigForm({
 
     try {
       setTestResult(
-        await onTest(schema.key, buildSchemaValues(descriptor, values), Array.from(clearSecrets)),
+        await onTest(
+          schema.key,
+          buildSchemaValues(descriptor, values, fieldTypes),
+          Array.from(clearSecrets),
+        ),
       );
     } catch (error) {
       setTestResult({
@@ -161,7 +204,66 @@ export function PluginConfigForm({
         values={values}
         onChange={handleChange}
         idPrefix={schema.key}
+        dynamicOptions={dynamicOptions}
+        optionsLoading={optionsLoading}
       />
+
+      {fields.some((field) => field.key === "quality_profiles") ? (
+        <div className="space-y-2 rounded-md border border-dashed p-2.5">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              const raw = values.quality_profiles;
+              try {
+                // Empty input: JSON.parse("") throws the raw browser
+                // "Unexpected end of JSON input" — say what it means instead.
+                if (typeof raw === "string" && raw.trim() === "") {
+                  throw new Error("No profiles entered. Paste a JSON array of profiles first.");
+                }
+                const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+                if (!Array.isArray(parsed)) throw new Error("Profiles must be a JSON array.");
+                const seen = new Set<string>();
+                const labels = parsed.map((profile, index) => {
+                  if (
+                    !profile ||
+                    typeof profile !== "object" ||
+                    typeof profile.label !== "string" ||
+                    !profile.label.trim()
+                  ) {
+                    throw new Error(`Profile ${index + 1} must have a label.`);
+                  }
+                  const typed = profile as Record<string, unknown>;
+                  const label = profile.label.trim();
+                  const key = label.toLowerCase();
+                  if (seen.has(key)) throw new Error(`Duplicate profile label: ${label}.`);
+                  seen.add(key);
+                  for (const regexKey of ["include_regex", "exclude_regex"]) {
+                    const regex = typed[regexKey];
+                    if (regex !== undefined && typeof regex !== "string") {
+                      throw new Error(`${regexKey} in profile ${label} must be a string.`);
+                    }
+                  }
+                  return label;
+                });
+                setProfilePreview(
+                  `Valid JSON structure: ${labels.join(", ")}. Save or test the connection to validate Go/RE2 expressions.`,
+                );
+              } catch (error) {
+                setProfilePreview(
+                  error instanceof Error ? error.message : "Invalid profiles JSON.",
+                );
+              }
+            }}
+          >
+            Validate profiles
+          </Button>
+          {profilePreview ? (
+            <p className="text-muted-foreground text-xs">{profilePreview}</p>
+          ) : null}
+        </div>
+      ) : null}
 
       {configuredSecrets.length > 0 ? (
         <div className="space-y-2 rounded-md border border-dashed p-2.5">
@@ -212,7 +314,11 @@ export function PluginConfigForm({
           variant="outline"
           disabled={isSaving || isTesting}
           onClick={() =>
-            onSave(schema.key, buildSchemaValues(descriptor, values), Array.from(clearSecrets))
+            onSave(
+              schema.key,
+              buildSchemaValues(descriptor, values, fieldTypes),
+              Array.from(clearSecrets),
+            )
           }
         >
           {schema.admin_form?.submit_label || "Save config"}

@@ -177,13 +177,13 @@ func TestNormalizeMangaStatus(t *testing.T) {
 		"RELEASING":        "Ongoing",
 		"FINISHED":         "Completed",
 		"NOT_YET_RELEASED": "Upcoming",
-		"CANCELLED":        "Cancelled",
+		"CANCELED":         "Canceled",
 		"HIATUS":           "Hiatus",
 		// MangaDex / lowercase
 		"ongoing":   "Ongoing",
 		"completed": "Completed",
 		"hiatus":    "Hiatus",
-		"cancelled": "Cancelled",
+		"canceled":  "Canceled",
 		// SDK Continuing/Ended + spacing/casing variants
 		"Continuing":  "Ongoing",
 		"Ended":       "Completed",

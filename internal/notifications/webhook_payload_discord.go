@@ -14,6 +14,8 @@ const (
 	discordColorWatchlist        = 3066993
 	discordColorContinueWatching = 15844367
 	discordColorNextUp           = 15158332
+	// discordColorRating is a gold accent for rating.set embeds (0xFFD700).
+	discordColorRating = 16766720
 )
 
 // Discord embed limits (enforced by the builder).
@@ -133,6 +135,8 @@ func discordEmbedAuthorLine(deliveryType string) string {
 		return "Your request was approved on Silo"
 	case DeliveryTypeRequestDeclined:
 		return "Your request was declined on Silo"
+	case DeliveryTypeRatingSet:
+		return "New rating on Silo"
 	default:
 		return genericNotificationTitle
 	}
@@ -156,6 +160,35 @@ func discordEmbedFooterText(contentRating string, test bool) string {
 // season/episode code lives in the title, so no dedicated fields repeat it.
 func buildDiscordEmbed(row DeliveryRow, test bool) discordEmbed {
 	flags := parseReasonFlags(row.ReasonFlags)
+
+	// rating.set gets a dedicated embed: the rating value lives in the reason
+	// flags (catalog ratings are an unrelated crowd score), and the rated
+	// item's id rides in a field since there is no catalog join to pull a
+	// title from.
+	if row.Type == DeliveryTypeRatingSet {
+		ratingFlags := parseRatingFlags(row.ReasonFlags)
+		itemID := ""
+		if row.EpisodeID != nil {
+			itemID = *row.EpisodeID
+		} else if row.SeriesID != nil {
+			itemID = *row.SeriesID
+		}
+		embed := discordEmbed{
+			Title:       "Rating set",
+			Description: fmt.Sprintf("Rated %d/5", ratingFlags.Rating),
+			Color:       discordColorRating,
+			Author:      &discordEmbedAuthor{Name: discordEmbedAuthorLine(row.Type)},
+			Footer:      &discordEmbedFooter{Text: discordEmbedFooterText(row.ContentRating, test)},
+			Fields: []discordEmbedField{
+				{Name: "Item", Value: itemID, Inline: true},
+			},
+		}
+		if !row.CreatedAt.IsZero() {
+			embed.Timestamp = row.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		enforceDiscordTotalLimit(&embed)
+		return embed
+	}
 
 	// Titles assembled from catalog metadata virtually never approach the
 	// limit, but Discord hard-rejects oversized embeds, so clip as a last
@@ -251,6 +284,8 @@ func discordEmbedTitle(row DeliveryRow) string {
 		return "Media request"
 	case DeliveryTypeEpisodeAvailable:
 		// Falls out of the switch into the episode title assembly below.
+	case DeliveryTypeRatingSet:
+		return "Rating set"
 	default:
 		return genericNotificationTitle
 	}

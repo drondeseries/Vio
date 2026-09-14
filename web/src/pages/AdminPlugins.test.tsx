@@ -491,7 +491,7 @@ describe("AdminPlugins", () => {
     expect(
       within(dialog).getByText("Configure bindings, credentials, and runtime settings."),
     ).toBeInTheDocument();
-    expect(within(dialog).getByText(installation.plugin_id)).toBeInTheDocument();
+    expect(within(dialog).getByText(installation.presentation!.display_name)).toBeInTheDocument();
   });
 
   it("ignores a ?configure deep link for a plugin that is not installed", async () => {

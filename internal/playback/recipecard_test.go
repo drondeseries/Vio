@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
@@ -113,36 +112,29 @@ func TestRecipeCardRoundTripOpts(t *testing.T) {
 	}
 }
 
-func TestRecipeCardOriginalStartedAtRoundTripAndReconstruct(t *testing.T) {
-	started := time.Date(2026, 8, 16, 12, 34, 56, 987654321, time.UTC)
-	card := NewRecipeCard(42, "profile-1", 77, "", TranscodeOpts{SessionID: "started", InputPath: "/media/movie.mkv"})
-	card.OriginalStartedAt = started
-	encoded, err := json.Marshal(card)
-	if err != nil {
-		t.Fatal(err)
+func TestRecipeCardUsesCanonicalInputForReconstruction(t *testing.T) {
+	card := NewRecipeCard(42, "profile-1", 77, "", TranscodeOpts{
+		SessionID:                        "virtual-session",
+		InputPath:                        "http://127.0.0.1:45701/source/expired/stream",
+		CanonicalInputPath:               "virtual://movie/tt1234567?result=stable",
+		VirtualSourceOwnerInstallationID: 19,
+	})
+
+	if card.InputPath != "virtual://movie/tt1234567?result=stable" {
+		t.Fatalf("recipe InputPath = %q, want canonical virtual source", card.InputPath)
 	}
-	var stored RecipeCard
-	if err := json.Unmarshal(encoded, &stored); err != nil {
-		t.Fatal(err)
-	}
-	if !stored.OriginalStartedAt.Equal(started) {
-		t.Fatalf("stored-card round trip = %s, want %s", stored.OriginalStartedAt, started)
+	if card.VirtualSourceOwnerInstallationID != 19 {
+		t.Fatalf("recipe virtual owner = %d, want 19", card.VirtualSourceOwnerInstallationID)
 	}
 
 	claims := card.ToClaims()
-	if claims.OriginalStartedAtUnixNano != started.UnixNano() {
-		t.Fatalf("ostn = %d, want %d", claims.OriginalStartedAtUnixNano, started.UnixNano())
+	decoded := RecipeCardFromClaims(&claims)
+	if decoded.InputPath != card.InputPath || decoded.VirtualSourceOwnerInstallationID != card.VirtualSourceOwnerInstallationID {
+		t.Fatalf("claims lost virtual source identity: got=%+v want=%+v", decoded, card)
 	}
-	back := RecipeCardFromClaims(&claims)
-	if !back.OriginalStartedAt.Equal(started) {
-		t.Fatalf("claim round trip = %s, want %s", back.OriginalStartedAt, started)
-	}
-
-	tm := NewTranscodeManager()
-	tm.Sessions = NewSessionManager(0, 0)
-	session := tm.ReconstructSession(t.Context(), "started", 42, back)
-	if session == nil || !session.StartedAt.Equal(started) {
-		t.Fatalf("reconstructed StartedAt = %v, want %s", session, started)
+	opts := decoded.TranscodeOpts("/tmp/transcode", "/usr/bin/ffmpeg", nil)
+	if opts.InputPath != card.InputPath || opts.CanonicalInputPath != card.InputPath {
+		t.Fatalf("reconstructed opts input = %q/%q, want %q", opts.InputPath, opts.CanonicalInputPath, card.InputPath)
 	}
 }
 

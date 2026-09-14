@@ -11,7 +11,10 @@ type AudioTrackSignature struct {
 	Codec         string `json:"codec,omitempty"`
 	Layout        string `json:"layout,omitempty"`
 	Channels      int    `json:"channels,omitempty"`
-	Default       bool   `json:"default"`
+	// Languages is the sorted, canonicalized MULTi language list (["de","en"])
+	// so signatures compare as multisets regardless of container ordering.
+	Languages []string `json:"languages,omitempty"`
+	Default   bool     `json:"default"`
 }
 
 // IsZero reports whether the signature carries no identifying information.
@@ -23,6 +26,7 @@ func (s *AudioTrackSignature) IsZero() bool {
 			s.Codec == "" &&
 			s.Layout == "" &&
 			s.Channels == 0 &&
+			len(s.Languages) == 0 &&
 			!s.Default)
 }
 

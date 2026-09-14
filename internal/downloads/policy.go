@@ -469,8 +469,7 @@ func downloadActionDenyError(reasonCode string) error {
 }
 
 func hasCapabilities(caps playback.ClientCapabilities) bool {
-	return caps.VideoEvidence != "" || len(caps.VideoDecode) > 0 ||
-		len(caps.CodecsVideo) > 0 || len(caps.CodecsAudio) > 0 ||
+	return len(caps.CodecsVideo) > 0 || len(caps.CodecsAudio) > 0 ||
 		len(caps.AudioPassthroughCodecs) > 0 || len(caps.Containers) > 0 ||
 		caps.MaxResolution != "" || caps.HDR
 }

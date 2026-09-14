@@ -154,16 +154,16 @@ func (h *AdminJobsHandler) HandleCancel(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if job.JobType != adminjob.JobTypeLibraryRefresh {
-		writeError(w, http.StatusConflict, "not_cancellable", "Only library metadata refresh jobs can be cancelled")
+		writeError(w, http.StatusConflict, "not_cancellable", "Only library metadata refresh jobs can be canceled")
 		return
 	}
 
 	switch job.Status {
 	case adminjob.StatusQueued:
-		cancelled, cancelErr := h.repo.CancelQueued(
+		canceled, cancelErr := h.repo.CancelQueued(
 			r.Context(),
 			id,
-			"Library metadata refresh cancelled",
+			"Library metadata refresh canceled",
 			time.Now().UTC().Add(7*24*time.Hour),
 		)
 		if cancelErr != nil {
@@ -196,10 +196,10 @@ func (h *AdminJobsHandler) HandleCancel(w http.ResponseWriter, r *http.Request) 
 				r.Context(),
 				h.RealtimeHub.EventsHub(),
 				string(notifications.TypeJobCancelled),
-				cancelled,
+				canceled,
 			)
 		}
-		writeJSON(w, http.StatusOK, adminJobToResponse(r, cancelled, h.store))
+		writeJSON(w, http.StatusOK, adminJobToResponse(r, canceled, h.store))
 	case adminjob.StatusRunning:
 		h.requestRunningCancellation(w, r, job)
 	default:

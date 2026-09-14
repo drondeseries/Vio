@@ -92,7 +92,7 @@ func ListLibraryPlaybackPreferences(db *sql.DB, profileID string) ([]LibraryPlay
 	if err != nil {
 		return nil, fmt.Errorf("listing library playback preferences for profile %q: %w", profileID, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	prefs := make([]LibraryPlaybackPreference, 0)
 	for rows.Next() {

@@ -8,6 +8,15 @@ const (
 	QuirkFireTVDV8HDR10PlusV3       = "android.fire_tv.dv8_hdr10plus_sei_v1"
 	QuirkFirefoxMatroskaAACTimingV3 = "web.firefox.matroska_aac_timestamps_v1"
 	legacyAndroidMedia3HLSBuildV3   = "15"
+
+	// QuirkAppleAVPlayerMKVContainerV3 corrects a container capability
+	// mis-advertisement present in Silo Apple clients: they advertise "mkv" as a
+	// supported container, but AVPlayer cannot play raw Matroska streams over HTTP
+	// progressive. Stripping "mkv" from the effective container list causes the
+	// planner to fall through to a remux route (fMP4 or HLS), which AVPlayer can
+	// play. The correction is detected via the "apple_execution_plan_v1" validated
+	// claim that all Silo AVPlayer clients include in their original_http delivery.
+	QuirkAppleAVPlayerMKVContainerV3 = "apple.avplayer.mkv_container_correction_v1"
 )
 
 func high10DecodeOverrideV3(source SourceDescriptorV3, request StartRequestV3) (*AppliedQuirkV3, bool) {
@@ -147,4 +156,67 @@ func isAmazonFireTVV3(request StartRequestV3) bool {
 func isHigh10ProfileV3(profile string) bool {
 	normalized := strings.NewReplacer(" ", "", "-", "", "_", "").Replace(strings.ToLower(profile))
 	return normalized == "high10" || normalized == "high10intra"
+}
+
+// appleAVPlayerMKVContainerFallback detects the known capability
+// mis-advertisement in Silo Apple clients where "mkv" is listed as a supported
+// container even though AVPlayer cannot play raw Matroska over HTTP progressive.
+// When it fires, the caller must strip "mkv" from the effective container list so
+// the planner selects a remux route instead. The quirk is recorded on the plan for
+// observability and client-side diagnostics.
+//
+// Detection uses the "apple_execution_plan_v1" validated claim in the client's
+// original_http delivery capability, which every Silo AVPlayer build includes and
+// no other platform includes.
+func appleAVPlayerMKVContainerFallback(source SourceDescriptorV3, request StartRequestV3) (*AppliedQuirkV3, bool) {
+	if !isAppleAVPlayerClientV3(request) {
+		return nil, false
+	}
+	if !strings.EqualFold(strings.TrimSpace(source.Container), "mkv") &&
+		!strings.EqualFold(strings.TrimSpace(source.Container), "matroska") {
+		return nil, false
+	}
+	if !containsFoldV3(request.Capabilities.Containers, "mkv") &&
+		!containsFoldV3(request.Capabilities.Containers, "matroska") {
+		return nil, false // already not claiming mkv; nothing to correct
+	}
+	quirk := AppliedQuirkV3{
+		ID:               QuirkAppleAVPlayerMKVContainerV3,
+		RegistryRevision: DeviceQuirkRegistryRevisionV3,
+		Action:           "container_claim_correction",
+		Reason:           "AVPlayer cannot play raw Matroska over HTTP progressive; mkv/matroska removed from effective container list to select a remux route.",
+	}
+	return &quirk, true
+}
+
+// isAppleAVPlayerClientV3 reports whether the request originates from a Silo
+// AVPlayer-based client (Apple TV, iPhone, iPad, Mac). The signal is the
+// "apple_execution_plan_v1" validated claim that every Silo Apple build includes
+// in its original_http delivery capability advertisement.
+func isAppleAVPlayerClientV3(request StartRequestV3) bool {
+	delivery, ok := request.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	if !ok || !delivery.Enabled {
+		return false
+	}
+	return containsFoldV3(delivery.ValidatedClaims, "apple_execution_plan_v1")
+}
+
+// filterContainersV3 returns a new slice with all entries matching remove
+// removed (case-insensitive, ignoring surrounding whitespace).
+func filterContainersV3(containers []string, remove ...string) []string {
+	result := make([]string, 0, len(containers))
+	for _, c := range containers {
+		trimmed := strings.TrimSpace(c)
+		excluded := false
+		for _, r := range remove {
+			if strings.EqualFold(trimmed, r) {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			result = append(result, c)
+		}
+	}
+	return result
 }

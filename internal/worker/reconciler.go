@@ -223,7 +223,6 @@ func (r *Reconciler) ReconcileNodeSessions(ctx context.Context, reportingNode st
 				target_resolution   = EXCLUDED.target_resolution,
 				target_video_codec  = EXCLUDED.target_video_codec,
 				target_audio_codec  = EXCLUDED.target_audio_codec,
-				target_audio_channels = EXCLUDED.target_audio_channels,
 				target_bitrate_kbps = EXCLUDED.target_bitrate_kbps,
 				transcode_hw_accel  = EXCLUDED.transcode_hw_accel,
 				tone_map_mode       = EXCLUDED.tone_map_mode,
@@ -329,7 +328,6 @@ func loadNodeSessionsSnapshot(ctx context.Context, tx pgx.Tx, reportingNode stri
 			COALESCE(target_resolution, ''),
 			COALESCE(target_video_codec, ''),
 			COALESCE(target_audio_codec, ''),
-			COALESCE(target_audio_channels, 0),
 			COALESCE(target_bitrate_kbps, 0),
 			COALESCE(transcode_hw_accel, ''),
 			COALESCE(tone_map_mode, ''),
@@ -379,7 +377,6 @@ func loadNodeSessionsSnapshot(ctx context.Context, tx pgx.Tx, reportingNode stri
 			&s.TargetResolution,
 			&s.TargetVideoCodec,
 			&s.TargetAudioCodec,
-			&s.TargetAudioChannels,
 			&s.TargetBitrateKbps,
 			&s.TranscodeHWAccel,
 			&s.ToneMapMode,
@@ -448,7 +445,6 @@ func sessionSnapshotsEqual(left, right []SessionSync) bool {
 			left[i].TargetResolution != right[i].TargetResolution ||
 			left[i].TargetVideoCodec != right[i].TargetVideoCodec ||
 			left[i].TargetAudioCodec != right[i].TargetAudioCodec ||
-			left[i].TargetAudioChannels != right[i].TargetAudioChannels ||
 			left[i].TargetBitrateKbps != right[i].TargetBitrateKbps ||
 			left[i].TranscodeHWAccel != right[i].TranscodeHWAccel ||
 			left[i].ToneMapMode != right[i].ToneMapMode ||

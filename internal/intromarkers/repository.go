@@ -57,6 +57,8 @@ const baseCandidateSelect = `
 	JOIN media_folders folders ON folders.id = mf.media_folder_id
 	JOIN episodes e ON e.content_id = mf.episode_id
 	WHERE mf.episode_id IS NOT NULL
+	  AND mf.file_path NOT LIKE 'virtual://%'
+	  AND (mf.container IS NULL OR mf.container <> 'virtual')
 	  AND COALESCE(e.season_id, '') <> ''
 	  AND folders.enabled = true
 	  AND folders.intro_detection_enabled = true
@@ -289,7 +291,7 @@ func (r *Repository) PatchIntroMarker(ctx context.Context, patch IntroMarkerPatc
 	if err != nil {
 		return false, fmt.Errorf("begin intro marker patch transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var row markerRow
 	if err := tx.QueryRow(ctx, `

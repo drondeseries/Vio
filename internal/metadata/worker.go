@@ -141,7 +141,7 @@ func (w *MatchWorker) SetRealtimeHub(hub *notifications.Hub) {
 	w.realtimeHub = hub
 }
 
-// Run starts the match worker loop. It blocks until ctx is cancelled.
+// Run starts the match worker loop. It blocks until ctx is canceled.
 func (w *MatchWorker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
@@ -438,6 +438,7 @@ func matchIdentityKey(title string, year int) string {
 	return title + "\x00" + strconv.Itoa(year)
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func compactUniquePaths(paths []string) []string {
 	if len(paths) == 0 {
 		return nil
@@ -692,7 +693,10 @@ func (w *MatchWorker) processFiles(ctx context.Context, files []*models.MediaFil
 			if ctx.Err() != nil {
 				return false
 			}
-			contentID := key.(string)
+			contentID, ok := key.(string)
+			if !ok {
+				return true
+			}
 			if err := w.service.ensureSeriesEpisodeLinks(ctx, contentID); err != nil {
 				slog.WarnContext(ctx, "metadata: deferred series episode link failed", "component", "metadata",
 					"content_id", contentID, "error", err)
@@ -1427,7 +1431,9 @@ func (w *MatchWorker) folderEnabled(ctx context.Context, folderID int, cache *sy
 
 	if cache != nil {
 		if cached, ok := cache.Load(folderID); ok {
-			return cached.(bool)
+			if enabled, valid := cached.(bool); valid {
+				return enabled
+			}
 		}
 	}
 

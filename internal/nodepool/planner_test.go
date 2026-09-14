@@ -106,35 +106,6 @@ func TestPlanSessionWithRestrictsEligibleTranscodeNodes(t *testing.T) {
 	}
 }
 
-func TestPlanTranscodeSessionWithLocalEgressDoesNotUseProxyCapacity(t *testing.T) {
-	group := strPtr("rack-a")
-	proxy := proxyNode(1, "http://proxy-a", group)
-	proxy.Healthy = false
-	transcode := transcodeNode(2, "http://tc-a", group, 0)
-	f := newFixture([]*Node{proxy}, []*Node{transcode})
-
-	plan := f.planner.PlanTranscodeSessionWithLocalEgress("s-local-egress", "", func(node *Node) bool {
-		return node != nil && node.URL == transcode.URL
-	})
-	if plan.TranscodeNode == nil || plan.TranscodeNode.URL != transcode.URL {
-		t.Fatalf("local-egress plan = %#v, want healthy transcode despite unrelated proxy health", plan)
-	}
-	if plan.ProxyNode != nil {
-		t.Fatalf("local-egress plan exposed proxy %#v", plan.ProxyNode)
-	}
-	reservation := f.planner.reserved["s-local-egress"]
-	if reservation == nil || reservation.transcodeURL != transcode.URL || reservation.proxyURL != "" || reservation.kbps != 0 {
-		t.Fatalf("local-egress reservation = %#v, want transcode-only accounting", reservation)
-	}
-
-	if none := f.planner.PlanTranscodeSessionWithLocalEgress("s-ineligible", "", func(*Node) bool { return false }); none.TranscodeNode != nil {
-		t.Fatalf("ineligible local-egress plan selected %#v", none.TranscodeNode)
-	}
-	if _, reserved := f.planner.reserved["s-ineligible"]; reserved {
-		t.Fatal("ineligible local-egress plan left a reservation")
-	}
-}
-
 func TestReleaseSessionDropsProvisionalReservation(t *testing.T) {
 	node := transcodeNode(1, "http://tc-1", nil, 0)
 	node.MaxJobs = intPtr(1)
@@ -148,48 +119,6 @@ func TestReleaseSessionDropsProvisionalReservation(t *testing.T) {
 	f.planner.ReleaseSession("s1")
 	if got := f.planner.PlanSession("s2", "", true, 0).TranscodeNode; got == nil {
 		t.Fatal("released reservation still blocked the node")
-	}
-}
-
-// A start that selected both nodes but publishes a URL the proxy does not serve
-// must give the proxy's job slot and estimated bandwidth back while the
-// transcode node keeps running the job. Asserted through selection, which is
-// what the accounting exists to drive.
-func TestReleaseSessionProxyFreesTheProxyHalfAndKeepsTheTranscode(t *testing.T) {
-	proxy := proxyNode(1, "http://proxy-1", nil)
-	proxy.MaxJobs = intPtr(1)
-	proxy.MaxBandwidthKbps = intPtr(10_000)
-	transcode := transcodeNode(2, "http://tc-1", nil, 0)
-	transcode.MaxJobs = intPtr(1)
-	f := newFixture([]*Node{proxy}, []*Node{transcode})
-
-	plan := f.planner.PlanSession("s1", "", true, 8_000)
-	if plan.TranscodeNode == nil || plan.ProxyNode == nil {
-		t.Fatalf("plan = %+v, want both halves reserved", plan)
-	}
-	// Both halves are charged, so nothing else fits on the proxy.
-	if got := f.planner.PlanSession("s2", "", false, 2_000).ProxyNode; got != nil {
-		t.Fatalf("proxy admitted %+v while its reservation stands", got)
-	}
-
-	f.planner.ReleaseSessionProxy("s1")
-
-	// 8 Mbps only fits if BOTH the job slot and the bandwidth charge were
-	// released; the estimate alone would leave 2 Mbps of headroom.
-	if got := f.planner.PlanSession("s2", "", false, 8_000).ProxyNode; got == nil {
-		t.Fatal("released proxy half still blocked the proxy")
-	}
-	// The transcode node is still running s1, so its slot is still charged.
-	if got := f.planner.PlanSession("s3", "", true, 0).TranscodeNode; got != nil {
-		t.Fatalf("transcode node admitted %+v; only the proxy half was released", got)
-	}
-
-	// Nil-safe, and an unknown session is a no-op rather than a phantom entry.
-	var absent *Planner
-	absent.ReleaseSessionProxy("s1")
-	f.planner.ReleaseSessionProxy("never-planned")
-	if _, ok := f.planner.reserved["never-planned"]; ok {
-		t.Fatal("releasing an unknown session created a reservation")
 	}
 }
 

@@ -3,6 +3,7 @@ package recommendations
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -114,7 +115,7 @@ func (r *Repo) withHNSWCandidateScan(ctx context.Context, candidateLimit int, fn
 	if err != nil {
 		return fmt.Errorf("begin hnsw candidate scan tx: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	_, err = tx.Exec(ctx, `
 		SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true),
@@ -195,7 +196,7 @@ func (r *Repo) GetEmbeddingLock(ctx context.Context) (*EmbeddingLock, error) {
 	var raw string
 	err := r.pool.QueryRow(ctx, `SELECT value FROM server_settings WHERE key = $1`, embeddingLockSettingKey).Scan(&raw)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get embedding lock: %w", err)
@@ -235,7 +236,7 @@ func (r *Repo) GetEmbedding(ctx context.Context, itemID string) ([]float32, erro
 		itemID,
 	).Scan(&v)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get embedding for item %s: %w", itemID, err)
@@ -700,7 +701,7 @@ func (r *Repo) GetTasteProfileMeta(ctx context.Context, userID int, profileID st
 		userID, profileID,
 	).Scan(&countsJSON, &maxContentRating, &updatedAt)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get taste profile meta for user %d profile %s: %w", userID, profileID, err)
@@ -726,7 +727,7 @@ func (r *Repo) GetTasteProfile(ctx context.Context, userID int, profileID string
 		userID, profileID,
 	).Scan(&v)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get taste profile for user %d profile %s: %w", userID, profileID, err)
@@ -828,7 +829,7 @@ func (r *Repo) GetRecommendationCache(ctx context.Context, userID int, profileID
 		  AND  expires_at     > NOW()
 	`, userID, profileID, recType, sourceItemID).Scan(&itemsJSON)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get recommendation cache: %w", err)
@@ -892,7 +893,7 @@ func (r *Repo) UpsertTasteClusters(ctx context.Context, userID int, profileID st
 	if err != nil {
 		return fmt.Errorf("begin tx for taste clusters: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	_, err = tx.Exec(ctx,
 		`DELETE FROM user_taste_clusters WHERE user_id = $1 AND profile_id = $2`,
@@ -964,7 +965,7 @@ func (r *Repo) UpsertCowatchPairs(ctx context.Context, pairs []CowatchPair) erro
 	if err != nil {
 		return fmt.Errorf("begin tx for cowatch: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	for _, p := range pairs {
 		_, err := tx.Exec(ctx, `
@@ -1592,7 +1593,6 @@ func (r *Repo) FilterAccessibleItemIDs(ctx context.Context, itemIDs []string, fi
 		}
 		conditions = append(conditions, fmt.Sprintf("mi.content_rating = ANY($%d)", argIdx))
 		args = append(args, allowedRatings)
-		argIdx++
 	}
 
 	rows, err := r.pool.Query(ctx, fmt.Sprintf(`

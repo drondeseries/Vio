@@ -64,7 +64,7 @@ func TestRouterCompressesJSONResponses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gzip reader: %v", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatalf("read compressed body: %v", err)

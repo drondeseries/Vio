@@ -90,7 +90,8 @@ func (s *Scanner) FinalizeVariantsByPathPrefix(
 		}
 
 		hints := naming.ParseVariantHints(file.FilePath, folder.Type)
-		if file.EditionSource == "import" && file.EditionKey != "" {
+		importOverride := file.EditionSource == "import" && file.EditionKey != ""
+		if importOverride {
 			hints = &naming.VariantHints{
 				EditionRaw:            file.EditionRaw,
 				EditionKey:            file.EditionKey,
@@ -102,6 +103,8 @@ func (s *Scanner) FinalizeVariantsByPathPrefix(
 				MultiEpisodeStart:     file.MultiEpisodeStart,
 				MultiEpisodeEnd:       file.MultiEpisodeEnd,
 			}
+			hints.ReleaseName = file.ReleaseName
+			hints.ReleaseGroup = file.ReleaseGroup
 		}
 		if hints == nil {
 			hints = &naming.VariantHints{}
@@ -130,6 +133,18 @@ func (s *Scanner) FinalizeVariantsByPathPrefix(
 		updated.PresentationPartTotal = partTotal
 		updated.MultiEpisodeStart = hints.MultiEpisodeStart
 		updated.MultiEpisodeEnd = hints.MultiEpisodeEnd
+		// Release name/group come from the filename itself. The import override
+		// pins only the edition fields, so re-parse a fresh hints value for the
+		// release fields to keep the override struct untouched.
+		if importOverride {
+			if releaseHints := naming.ParseVariantHints(file.FilePath, folder.Type); releaseHints != nil {
+				updated.ReleaseName = releaseHints.ReleaseName
+				updated.ReleaseGroup = releaseHints.ReleaseGroup
+			}
+		} else {
+			updated.ReleaseName = hints.ReleaseName
+			updated.ReleaseGroup = hints.ReleaseGroup
+		}
 		if _, err := s.fileRepo.Upsert(ctx, updated); err != nil {
 			return fmt.Errorf("finalizing variant metadata for %s: %w", file.FilePath, err)
 		}
@@ -213,7 +228,9 @@ func variantMetadataChanged(file *models.MediaFile, hints *naming.VariantHints, 
 		file.PresentationPartIndex != hints.PresentationPartIndex ||
 		file.PresentationPartTotal != partTotal ||
 		file.MultiEpisodeStart != hints.MultiEpisodeStart ||
-		file.MultiEpisodeEnd != hints.MultiEpisodeEnd {
+		file.MultiEpisodeEnd != hints.MultiEpisodeEnd ||
+		file.ReleaseName != hints.ReleaseName ||
+		file.ReleaseGroup != hints.ReleaseGroup {
 		return true
 	}
 	switch {

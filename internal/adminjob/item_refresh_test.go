@@ -488,14 +488,17 @@ func (r *itemRefreshTestSkippedRootRepo) DeleteMissingInScope(_ context.Context,
 	return nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type itemRefreshTestSeasonRepo struct {
 	season *models.Season
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (r *itemRefreshTestSeasonRepo) GetByID(_ context.Context, _ string) (*models.Season, error) {
 	return nil, errors.New("not implemented")
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (r *itemRefreshTestSeasonRepo) GetBySeriesAndNumber(_ context.Context, seriesID string, seasonNum int) (*models.Season, error) {
 	if r.season != nil && r.season.SeriesID == seriesID && r.season.SeasonNumber == seasonNum {
 		return r.season, nil

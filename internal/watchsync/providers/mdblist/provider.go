@@ -606,7 +606,7 @@ func (p *Provider) doOnce(ctx context.Context, method, path, target string, payl
 	if err != nil {
 		return -1, fmt.Errorf("send mdblist request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 			fmt.Errorf("mdblist request %s %s rate limited: status 429", method, path)

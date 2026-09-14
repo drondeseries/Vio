@@ -183,3 +183,171 @@ func quirkRequestV3() StartRequestV3 {
 	req.ClientPlaybackContext.Device = DeviceContextV3{Platform: "android", Manufacturer: "Amazon", Model: "AFTKRT", PlatformDetails: map[string]string{"sdk_int": "30"}}
 	return req
 }
+
+// appleAVPlayerRequestV3 returns a StartRequestV3 that mimics what a Silo Apple
+// client (Apple TV, build 29) sends. The original_http delivery's validated_claims
+// list includes "apple_execution_plan_v1", which is the server's signal that the
+// client is using AVPlayer.
+func appleAVPlayerRequestV3() StartRequestV3 {
+	req := validStartRequestV3()
+	req.ClientFeatures = append(req.ClientFeatures, FeatureDeviceQuirksV3)
+	req.ClientPlaybackContext.Device = DeviceContextV3{Platform: "tvos"}
+	req.ClientPlaybackContext.FormFactor = "tv"
+	// Mirror the real Apple TV delivery advertisement: enabled, validated claim
+	// present. Containers list includes mkv as the Apple TV app currently sends.
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = DeliveryCapabilityV3{
+		Enabled:           true,
+		SupportedOnDevice: true,
+		ValidatedClaims:   []string{"apple_execution_plan_v1", "authenticated_stream_headers", "client_subtitle_overlay"},
+		VideoCodecs:       []string{"h264", "hevc"},
+		AudioDecodeCodecs: []string{"aac", "ac3", "eac3", "dts", "truehd", "flac"},
+		Containers:        []string{"mp4", "mov", "m4v", "mkv", "matroska", "ts", "m4a"},
+		Features:          []string{},
+	}
+	req.Capabilities.Containers = []string{"mp4", "mov", "m4v", "mkv", "matroska", "webm", "ts"}
+	req.Capabilities.CodecsVideo = []string{"h264", "hevc"}
+	req.Capabilities.CodecsAudio = []string{"aac", "ac3", "eac3", "dts", "truehd", "flac"}
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{
+		{Codec: "hevc", Profiles: []string{"main", "main 10"}, Levels: []int{153}, BitDepths: []int{8, 10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true, DecoderName: "VideoToolbox"},
+		{Codec: "h264", Profiles: []string{"baseline", "main", "high"}, Levels: []int{51}, BitDepths: []int{8}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 120_000, Hardware: true, DecoderName: "VideoToolbox"},
+	}
+	req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+	return req
+}
+
+func TestAppleAVPlayerMKVContainerFallbackForcesRemux(t *testing.T) {
+	// Apple TV claiming mkv in containers + HEVC HDR10 MKV source → must remux,
+	// not direct-play. This matches the real bug: AVPlayer cannot play raw MKV.
+	file := &models.MediaFile{
+		ID: 5614291, FilePath: "virtual://movie/tt32357218", Container: "mkv",
+		CodecVideo: "hevc", CodecAudio: "eac3",
+		Resolution: "2160p", Bitrate: 72_000, AudioChannels: 6,
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", Profile: "Main 10", Level: 153, Width: 3840, Height: 2160,
+			FrameRate: "24000/1001", Bitrate: 72_000, BitDepth: 10,
+			VideoRange: "HDR", VideoRangeType: "HDR10",
+		}},
+		AudioTracks: []models.AudioTrack{{Codec: "eac3", Channels: 6, Layout: "5.1"}},
+	}
+	req := appleAVPlayerRequestV3()
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file,
+		AudioTrackIndex: 0,
+		Settings:        PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+		Registry:        testTransformationRegistryV3(),
+	})
+
+	if result.Plan == nil {
+		t.Fatal("expected a plan, got terminal")
+	}
+	if result.Plan.Delivery == DeliveryOriginalHTTPV3 {
+		t.Errorf("Apple TV MKV source must not be direct-played (delivery=%s)", result.Plan.Delivery)
+	}
+	if result.PlayMethod == PlayDirect {
+		t.Errorf("Apple TV MKV source must not use direct play method (method=%s)", result.PlayMethod)
+	}
+	found := false
+	for _, q := range result.Plan.AppliedQuirks {
+		if q.ID == QuirkAppleAVPlayerMKVContainerV3 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected quirk %s in applied quirks, got %v", QuirkAppleAVPlayerMKVContainerV3, result.Plan.AppliedQuirks)
+	}
+}
+
+func TestAppleAVPlayerMP4SourceUnaffectedByMKVQuirk(t *testing.T) {
+	// Apple TV with an MP4 source: the MKV quirk must NOT fire, and direct play
+	// must be selected as normal.
+	file := &models.MediaFile{
+		ID: 1234, FilePath: "virtual://movie/tt0000001", Container: "mp4",
+		CodecVideo: "hevc", CodecAudio: "aac",
+		Resolution: "1080p", Bitrate: 20_000, AudioChannels: 2,
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", Profile: "Main 10", Level: 120, Width: 1920, Height: 1080,
+			FrameRate: "24", Bitrate: 20_000, BitDepth: 8,
+			VideoRange: "SDR", VideoRangeType: "SDR",
+		}},
+		AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Layout: "stereo"}},
+	}
+	req := appleAVPlayerRequestV3()
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file,
+		AudioTrackIndex: 0,
+		Settings:        PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: false},
+		Registry:        testTransformationRegistryV3(),
+	})
+
+	if result.Plan == nil {
+		t.Fatal("expected a plan, got terminal")
+	}
+	if result.Plan.Delivery != DeliveryOriginalHTTPV3 {
+		t.Errorf("MP4 source on Apple TV must direct-play (delivery=%s)", result.Plan.Delivery)
+	}
+	for _, q := range result.Plan.AppliedQuirks {
+		if q.ID == QuirkAppleAVPlayerMKVContainerV3 {
+			t.Errorf("MKV quirk must not fire for MP4 source, but found it in applied quirks")
+		}
+	}
+}
+
+func TestNonAppleClientMKVSourceUnaffectedByMKVQuirk(t *testing.T) {
+	// Android client with MKV source: must be direct-played as before; MKV quirk
+	// must not interfere.
+	file := &models.MediaFile{
+		ID: 42, FilePath: "/media/movie.mkv", Container: "mkv",
+		CodecVideo: "hevc", CodecAudio: "aac",
+		Resolution: "1080p", Bitrate: 15_000, AudioChannels: 2,
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", Profile: "Main 10", Level: 120, Width: 1920, Height: 1080,
+			FrameRate: "24", Bitrate: 15_000, BitDepth: 8,
+			VideoRange: "SDR", VideoRangeType: "SDR",
+		}},
+		AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Layout: "stereo"}},
+	}
+	req := validStartRequestV3()
+	req.Capabilities.Containers = []string{"mkv", "mp4"}
+	req.Capabilities.CodecsVideo = []string{"hevc", "h264"}
+	req.Capabilities.CodecsAudio = []string{"aac"}
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{
+		{Codec: "hevc", Profiles: []string{"main", "main 10"}, Levels: []int{120}, BitDepths: []int{8, 10}, MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 30_000, Hardware: true},
+	}
+	// No apple_execution_plan_v1 in original_http validated claims.
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file,
+		AudioTrackIndex: 0,
+		Settings:        PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: false},
+		Registry:        testTransformationRegistryV3(),
+	})
+
+	if result.Plan == nil {
+		t.Fatal("expected a plan, got terminal")
+	}
+	if result.Plan.Delivery != DeliveryOriginalHTTPV3 {
+		t.Errorf("Android client MKV source must still direct-play (delivery=%s)", result.Plan.Delivery)
+	}
+	for _, q := range result.Plan.AppliedQuirks {
+		if q.ID == QuirkAppleAVPlayerMKVContainerV3 {
+			t.Errorf("MKV quirk must not fire for non-Apple client")
+		}
+	}
+}
+
+func TestAppleAVPlayerMKVQuirkNotFiredWhenMKVNotClaimed(t *testing.T) {
+	// Apple TV client that does NOT include mkv in its container list (e.g. a
+	// future build that has removed the mis-advertisement): quirk must not fire.
+	req := appleAVPlayerRequestV3()
+	// Remove mkv and matroska from the capabilities (already-fixed future client build).
+	req.Capabilities.Containers = []string{"mp4", "mov", "m4v", "ts"}
+	delivery := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	delivery.Containers = []string{"mp4", "mov", "m4v", "ts"}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = delivery
+
+	if _, fired := appleAVPlayerMKVContainerFallback(SourceDescriptorV3{Container: "mkv"}, req); fired {
+		t.Error("quirk must not fire when mkv is not in the claimed container list")
+	}
+}

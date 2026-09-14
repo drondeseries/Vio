@@ -114,7 +114,7 @@ func (h *DiagnosticsHandler) HandleAdminDownloadReport(w http.ResponseWriter, r 
 		writeDiagnosticsAdminError(w, err)
 		return
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	h.auditDownload(r, report.ID)
 	w.Header().Set("Content-Type", diagnostics.ReportDownloadContentType)

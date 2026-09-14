@@ -251,7 +251,17 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 		audioOK = true
 		audioClaims.Reason = "no_audio_track"
 	}
-	containerOK := containsFoldV3(input.Request.Capabilities.Containers, source.Container)
+	// Apple AVPlayer clients (tvOS, iOS, macOS) advertise "mkv" in their
+	// container list but AVPlayer cannot play raw Matroska over HTTP progressive.
+	// Detect and correct this before containerOK is evaluated so the planner
+	// selects a remux route instead of returning an unplayable direct stream.
+	// The quirk is recorded on base below, after base is initialized.
+	mkvQuirk, mkvQuirkFired := appleAVPlayerMKVContainerFallback(source, input.Request)
+	effectiveContainers := input.Request.Capabilities.Containers
+	if mkvQuirkFired {
+		effectiveContainers = filterContainersV3(effectiveContainers, "mkv", "matroska")
+	}
+	containerOK := containsFoldV3(effectiveContainers, source.Container)
 	hlsDeliveryOK := deliveryAvailableV3(input.Request, DeliveryClassHLSV3)
 	// DV strip eligibility is split by delivery because progressive proxy nodes
 	// and HLS transcode nodes are different executor pools. Keep each verdict
@@ -315,13 +325,21 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 		DegradationWarnings:    []DegradationWarningV3{},
 		RequestedMediaFileID:   input.RequestedFile.ID,
 		EffectiveMediaFileID:   file.ID,
+		EffectiveVirtualURI:    effectiveVirtualURIV3(input),
 		Source:                 source,
 		SubtitleFidelityPolicy: subtitlePolicyNameV3(input.Request.SubtitleFidelityPreference),
 		Timeline:               TimelineV3{SourceStartSeconds: floatOrZeroV3(input.Request.StartPosition), PlayerStartSeconds: floatOrZeroV3(input.Request.StartPosition), CanSeekAnywhere: true, SeekRestoration: "player_position"},
 	}
 	base.AvailableQualities = availableQualitiesV3(input, source)
 	base.Subtitle.Inventory = BuildSubtitleInventoryV3(file, input.AdditionalSubtitles)
+	// Authoritative per-track audio inventory of the effective source; clients
+	// should prefer it over item metadata, which can be stale after a version
+	// fallback rehydrates a different candidate under the same catalog row.
+	base.AudioTracks = file.AudioTracks
 	base.Claims.Audio.Passthrough = passthrough
+	if mkvQuirkFired {
+		appendAppliedQuirkV3(&base, *mkvQuirk, "")
+	}
 	if source.DynamicRange == DynamicRangeHDRUnknownV3 && (rangeOK || clientManagedRange) {
 		base.DegradationWarnings = append(base.DegradationWarnings, DegradationWarningV3{
 			Code:    "hdr_range_assumed_hdr10",
@@ -337,7 +355,7 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 		})
 	}
 	if !routeVideoMetadataCompleteV3(source) {
-		return terminalPlannerResultV3("source_metadata_incomplete", "The source is missing video metadata required for a validated playback route.", true)
+		return terminalPlannerResultV3WithDetail("source_metadata_incomplete", "The source is missing video metadata required for a validated playback route.", routeVideoMetadataGapsDetailV3(source), true)
 	}
 	if !videoOK && videoEvidenceInsufficient {
 		// The client's flat codec lists claim this stream, but its evidence
@@ -767,7 +785,11 @@ func planAudioOnlyV3(input PlannerInputV3, file *models.MediaFile, source Source
 		Claims:          ValidationClaimsV3{Audio: audioClaims},
 		// Audio-only routes bypass every subtitle gate, so the inventory is
 		// empty rather than a list of tracks no route on this plan can deliver.
-		Subtitle:               SubtitleDecisionV3{Mode: SubtitleOffV3, Inventory: []SubtitleInventoryItemV3{}},
+		Subtitle: SubtitleDecisionV3{Mode: SubtitleOffV3, Inventory: []SubtitleInventoryItemV3{}},
+		// The audio inventory is the effective source's probed tracks, exactly
+		// as on video plans: clients render the audio menu from it rather than
+		// from item metadata that can be stale after a version fallback.
+		AudioTracks:            file.AudioTracks,
 		Transformations:        []TransformationV3{},
 		AppliedQuirks:          []AppliedQuirkV3{},
 		RuntimeCorrections:     []string{},
@@ -775,6 +797,7 @@ func planAudioOnlyV3(input PlannerInputV3, file *models.MediaFile, source Source
 		DegradationWarnings:    []DegradationWarningV3{},
 		RequestedMediaFileID:   input.RequestedFile.ID,
 		EffectiveMediaFileID:   file.ID,
+		EffectiveVirtualURI:    effectiveVirtualURIV3(input),
 		Source:                 source,
 		SubtitleFidelityPolicy: subtitlePolicyNameV3(request.SubtitleFidelityPreference),
 		Timeline:               TimelineV3{SourceStartSeconds: floatOrZeroV3(request.StartPosition), PlayerStartSeconds: floatOrZeroV3(request.StartPosition), CanSeekAnywhere: true, SeekRestoration: "player_position"},
@@ -1445,6 +1468,19 @@ func audioSelectionUsesContainerDefaultV3(file *models.MediaFile, audioIndex int
 	return audioIndex == defaultIndex
 }
 
+// effectiveVirtualURIV3 exposes the substituted virtual candidate URI on the
+// plan. A neutral catalog row (virtual://movie/ttNNNN with no result=) is
+// replaced by a probed candidate during planning; the plan's effective file ID
+// already points at that candidate, but clients that key their version menu on
+// the requested row need the URI too so a first play adopts the working
+// version. It returns "" when the effective file is not a virtual candidate.
+func effectiveVirtualURIV3(input PlannerInputV3) string {
+	if input.EffectiveFile != nil && strings.HasPrefix(input.EffectiveFile.FilePath, "virtual://") {
+		return input.EffectiveFile.FilePath
+	}
+	return ""
+}
+
 func finalizePlanIdentityV3(plan *PlanV3, attemptID string, outputContextID string) {
 	plan.PlanID = DeterministicPlanIDV3(attemptID, plan.RequestedMediaFileID, plan.EffectiveMediaFileID, *plan)
 	plan.PlanAttemptKey = PlanAttemptKeyV3(*plan, outputContextID, nil)
@@ -1465,6 +1501,13 @@ func planAttemptedV3(plan PlanV3, outputContextID string, attempted []string) bo
 func terminalPlannerResultV3(reason, message string, retryable bool) PlannerResultV3 {
 	return PlannerResultV3{Terminal: &TerminalV3{Reason: reason, Message: message, Retryable: retryable}, SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1}
 }
+
+// terminalPlannerResultV3WithDetail is terminalPlannerResultV3 with a
+// diagnostic detail line naming the probe fields that blocked the route.
+func terminalPlannerResultV3WithDetail(reason, message, detail string, retryable bool) PlannerResultV3 {
+	return PlannerResultV3{Terminal: &TerminalV3{Reason: reason, Message: message, Retryable: retryable, Detail: detail}, SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1}
+}
+
 func subtitlePolicyNameV3(f SubtitleFidelityV3) string {
 	if f == SubtitleFidelityPreserveV3 {
 		return "require_authored_fidelity"

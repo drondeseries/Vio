@@ -138,4 +138,36 @@ describe("adminFormForConfigSchema", () => {
       { key: "advanced", secret: true },
     ]);
   });
+
+  it("infers TEXT control instead of PASSWORD for URL properties even when writeOnly is true", () => {
+    const form = adminFormForConfigSchema(
+      schema({
+        json_schema: JSON.stringify({
+          type: "object",
+          properties: {
+            manifest_url: {
+              type: "string",
+              format: "uri",
+              writeOnly: true,
+            },
+            api_token: {
+              type: "string",
+              format: "password",
+            },
+          },
+        }),
+      }),
+    );
+
+    expect(form).not.toBeNull();
+    const manifestField = form?.fields.find((f) => f.key === "manifest_url");
+    expect(manifestField).toBeDefined();
+    expect(manifestField?.control).toBe("TEXT");
+    expect(manifestField?.secret).toBe(false);
+
+    const tokenField = form?.fields.find((f) => f.key === "api_token");
+    expect(tokenField).toBeDefined();
+    expect(tokenField?.control).toBe("PASSWORD");
+    expect(tokenField?.secret).toBe(true);
+  });
 });

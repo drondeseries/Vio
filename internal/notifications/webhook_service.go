@@ -48,6 +48,7 @@ type WebhookInput struct {
 	NotifyContinueWatching *bool
 	NotifyNextUp           *bool
 	NotifyRequests         *bool
+	NotifyRatings          *bool
 }
 
 // validateChannelName limits destination names to 64 characters; invalid is the caller's sentinel to wrap.
@@ -164,6 +165,7 @@ func (s *WebhookService) Create(ctx context.Context, userID int, profileID strin
 		NotifyContinueWatching: boolOrDefault(input.NotifyContinueWatching, true),
 		NotifyNextUp:           boolOrDefault(input.NotifyNextUp, true),
 		NotifyRequests:         boolOrDefault(input.NotifyRequests, true),
+		NotifyRatings:          boolOrDefault(input.NotifyRatings, false),
 	}
 	hook.URLCiphertext, err = s.cipher.Encrypt(rawURL, webhookURLAAD(hook.ID))
 	if err != nil {
@@ -208,6 +210,9 @@ func (s *WebhookService) Update(ctx context.Context, profileID, id string, input
 
 	if err := s.applyWebhookInput(ctx, hook, input); err != nil {
 		return nil, err
+	}
+	if input.NotifyRatings != nil {
+		hook.NotifyRatings = *input.NotifyRatings
 	}
 
 	if err := s.repo.Update(ctx, *hook); err != nil {

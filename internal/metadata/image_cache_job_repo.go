@@ -631,7 +631,7 @@ func (r *ImageCacheJobRepository) MarkFailed(ctx context.Context, id int64, atte
 }
 
 // RequeueClaimed returns claimed-but-unprocessed jobs to the queue without
-// burning a retry attempt. Used when a run is cancelled before its workers
+// burning a retry attempt. Used when a run is canceled before its workers
 // start, so the jobs do not sit locked until the lease expires.
 func (r *ImageCacheJobRepository) RequeueClaimed(ctx context.Context, ids []int64, workerID string) error {
 	if r == nil || r.pool == nil || len(ids) == 0 {

@@ -890,7 +890,7 @@ func (h *LibraryHandler) markScanCancelled(scanID string) {
 		return
 	}
 	now := time.Now().UTC()
-	run.Status = "cancelled"
+	run.Status = "canceled"
 	run.CompletedAt = &now
 	h.ScanRegistry.MarkTerminal(run)
 	h.publishScanEvent(context.Background(), "scan.cancelled", run)
@@ -1037,6 +1037,7 @@ func boolPtr(v bool) *bool {
 	return &v
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (h *LibraryHandler) publishCatalogStatsInvalidation(eventType, payload string) {
 	if h.EventBus == nil {
 		return
@@ -1067,11 +1068,11 @@ type libraryMetadataMatchQueueStatusResponse struct {
 type libraryMetadataMatchQueueActionResponse struct {
 	Status           string                                  `json:"status"`
 	LibraryID        int                                     `json:"library_id"`
-	MovieCancelled   int                                     `json:"movie_cancelled,omitempty"`
-	SeriesCancelled  int                                     `json:"series_cancelled,omitempty"`
-	RawFileCancelled int                                     `json:"raw_file_cancelled,omitempty"`
+	MovieCancelled   int                                     `json:"movie_canceled,omitempty"`
+	SeriesCancelled  int                                     `json:"series_canceled,omitempty"`
+	RawFileCancelled int                                     `json:"raw_file_canceled,omitempty"`
 	RawFileRetried   int                                     `json:"raw_file_retried,omitempty"`
-	TotalCancelled   int                                     `json:"total_cancelled,omitempty"`
+	TotalCancelled   int                                     `json:"total_canceled,omitempty"`
 	Queue            libraryMetadataMatchQueueStatusResponse `json:"queue"`
 }
 
@@ -1392,7 +1393,7 @@ func (h *LibraryHandler) HandleUploadPoster(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "bad_request", "Missing poster file")
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Validate content type before reading the bytes, as v1 always has.
 	ct := header.Header.Get("Content-Type")

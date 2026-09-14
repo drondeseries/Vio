@@ -32,6 +32,8 @@ func NewLibraryItemRepository(pool *pgxpool.Pool) *LibraryItemRepository {
 const libraryItemColumns = `content_id, media_folder_id, first_seen_at`
 
 // scanLibraryItem scans a single row into a *models.MediaItemLibrary.
+//
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func scanLibraryItem(row pgx.Row) (*models.MediaItemLibrary, error) {
 	var lib models.MediaItemLibrary
 	err := row.Scan(
@@ -464,7 +466,7 @@ func (r *LibraryItemRepository) ReconcileFolderMembership(ctx context.Context, f
 			FROM media_files mf
 			WHERE mf.media_folder_id = mil.media_folder_id
 			  AND mf.content_id = mil.content_id
-			  AND mf.missing_since IS NULL
+			  AND (mf.missing_since IS NULL OR mf.container = 'virtual')
 		  )
 		  AND NOT EXISTS (
 			SELECT 1

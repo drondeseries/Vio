@@ -238,7 +238,7 @@ func (s *CatalogService) fetchRepositoryIndex(ctx context.Context, repositoryURL
 	if err != nil {
 		return nil, fmt.Errorf("fetch repository index %q: %w", repositoryURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetch repository index %q: unexpected status %d", repositoryURL, resp.StatusCode)
@@ -430,7 +430,7 @@ func (s *CatalogService) fetchChecksumForBinary(ctx context.Context, checksumsUR
 	if err != nil {
 		return "", fmt.Errorf("fetch checksums file %q: %w", checksumsURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("fetch checksums file %q: unexpected status %d", checksumsURL, resp.StatusCode)

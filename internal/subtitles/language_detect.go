@@ -32,7 +32,7 @@ type LanguageDetection struct {
 
 var (
 	subtitleTimestampLine = regexp.MustCompile(`^\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}`)
-	assDialoguePrefix     = regexp.MustCompile(`(?i)^dialogue:\s*\d`)
+	assDialoguePrefix     = regexp.MustCompile(`(?i)^dialog:\s*\d`)
 	metadataLanguageLine  = regexp.MustCompile(`(?i)^(?:language|lang)\s*:\s*(.+)$`)
 	vttLanguageLine       = regexp.MustCompile(`(?i)language\s*:\s*([^;]+)`)
 )
@@ -101,7 +101,7 @@ var subDLLanguageCodes = map[string]string{
 }
 
 // DetectSubtitleLanguage resolves a subtitle language from filename, embedded
-// metadata, or dialogue text.
+// metadata, or dialog text.
 func DetectSubtitleLanguage(filename string, format SubtitleFormat, data []byte) LanguageDetection {
 	if language, ok := languageFromFilename(filename); ok {
 		return LanguageDetection{Language: language, Source: LanguageSourceFilename}

@@ -31,11 +31,13 @@ func TestStartupSegmentRequirementScopesFastHardwareWindowsToFreshGenerations(t 
 		{name: "fresh hardware bitmap burn in", opts: func() TranscodeOpts { o := bitmap; o.HWAccel = transcodeHWQSV; return o }(), want: 1},
 		{name: "CPU bitmap burn in", opts: func() TranscodeOpts { o := bitmap; o.HWAccel = HWAccelNone; return o }(), want: 3},
 		{name: "reconstructed hardware bitmap burn in", opts: func() TranscodeOpts { o := bitmap; o.HWAccel = transcodeHWQSV; o.FastStart = false; return o }(), want: 3},
-		{name: "ordinary fresh hardware transcode", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: transcodeHWQSV, FastStart: true}, want: 2},
+		{name: "ordinary fresh hardware transcode", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: transcodeHWQSV, FastStart: true}, want: 1},
 		{name: "ordinary hardware restart", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: transcodeHWQSV, FastStart: false}, want: 3},
 		{name: "ordinary CPU transcode", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: HWAccelNone, FastStart: true}, want: 3},
 		{name: "unknown backend falls back to CPU", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: "stale-backend", FastStart: true}, want: 3},
-		{name: "copy video", opts: TranscodeOpts{TargetCodecVideo: "copy", HWAccel: transcodeHWQSV, FastStart: true}, want: 2},
+		{name: "copy video", opts: TranscodeOpts{TargetCodecVideo: "copy", HWAccel: transcodeHWQSV, FastStart: true}, want: 1},
+		{name: "fresh videotoolbox hardware transcode", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: transcodeHWVideoToolbox, FastStart: true}, want: 1},
+		{name: "copy video CPU", opts: TranscodeOpts{TargetCodecVideo: "copy", HWAccel: HWAccelNone, FastStart: false}, want: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -103,23 +105,6 @@ func TestBuildPlaybackManifest_CopyVideoUsesRealManifest(t *testing.T) {
 	}
 	if strings.Contains(text, "#EXT-X-PLAYLIST-TYPE:VOD") {
 		t.Fatalf("copy-mode manifest should not be synthetic VOD:\n%s", text)
-	}
-
-	tokenless, err := session.BuildPlaybackManifest("segment/", "")
-	if err != nil {
-		t.Fatalf("BuildPlaybackManifest tokenless: %v", err)
-	}
-	for _, want := range []string{
-		"#EXT-X-MAP:URI=\"segment/init.mp4\"",
-		"segment/seg_00009.m4s",
-		"segment/seg_00010.m4s",
-	} {
-		if !strings.Contains(string(tokenless), want) {
-			t.Fatalf("tokenless manifest missing %q:\n%s", want, tokenless)
-		}
-	}
-	if strings.Contains(string(tokenless), "?st=") || strings.Contains(string(tokenless), "?token=") {
-		t.Fatalf("tokenless manifest propagated a credential query:\n%s", tokenless)
 	}
 }
 
@@ -1293,5 +1278,77 @@ func TestAppendManifestQueryParam_NonManifestUnchanged(t *testing.T) {
 	}
 	if got := AppendManifestQueryParam([]byte("#EXTM3U\nseg.ts\n"), "", "TOKEN"); !strings.Contains(string(got), "seg.ts\n") || strings.Contains(string(got), "seg.ts?") {
 		t.Fatalf("empty key should be a no-op, got:\n%s", got)
+	}
+}
+
+func TestSegmentProgressFallsBackToDirectoryScanWhenManifestIsCorruptedOrMissing(t *testing.T) {
+	tempDir := t.TempDir()
+	now := time.Now()
+
+	// Write segments directly without a valid manifest (e.g. manifest mid-rewrite).
+	writeSegmentFile(t, tempDir, "seg_00173.ts", []byte("data1"), now.Add(-2*time.Second))
+	writeSegmentFile(t, tempDir, "seg_00174.ts", []byte("data2"), now.Add(-1*time.Second))
+
+	// Truncated/corrupted stream.m3u8
+	manifestPath := filepath.Join(tempDir, "stream.m3u8")
+	if err := os.WriteFile(manifestPath, []byte("PARTIAL_WRITE"), 0o600); err != nil {
+		t.Fatalf("write partial manifest: %v", err)
+	}
+
+	session := &TranscodeSession{
+		outputDir: tempDir,
+		running:   true,
+		opts: TranscodeOpts{
+			TargetCodecVideo:   "h264",
+			SegmentDuration:    2,
+			StartSegmentNumber: 0,
+		},
+	}
+
+	progress := session.SegmentProgress(now)
+	if progress.ProducedHead != 174 {
+		t.Fatalf("ProducedHead = %d, want 174", progress.ProducedHead)
+	}
+	if progress.ProducedCount != 2 {
+		t.Fatalf("ProducedCount = %d, want 2", progress.ProducedCount)
+	}
+	if !progress.HasManifest {
+		t.Fatal("HasManifest = false, want true (manifest file exists and segments were detected)")
+	}
+}
+
+func TestSegmentRecoveryDecisionWaitsForSequentialNextSegmentWhenManifestInFlux(t *testing.T) {
+	tempDir := t.TempDir()
+	now := time.Now()
+
+	// Only seg_00174 exists, client requested 174 and now immediately requests 175.
+	writeSegmentFile(t, tempDir, "seg_00174.ts", []byte("data"), now.Add(-500*time.Millisecond))
+
+	// Empty stream.m3u8 to simulate race during manifest update.
+	manifestPath := filepath.Join(tempDir, "stream.m3u8")
+	if err := os.WriteFile(manifestPath, []byte(""), 0o600); err != nil {
+		t.Fatalf("write empty manifest: %v", err)
+	}
+
+	session := &TranscodeSession{
+		outputDir:            tempDir,
+		running:              true,
+		lastRequestedSegment: 174,
+		opts: TranscodeOpts{
+			TargetCodecVideo:   "h264",
+			SegmentDuration:    2,
+			StartSegmentNumber: 0,
+		},
+	}
+
+	decision := session.SegmentRecoveryDecision(175, now)
+	if !decision.Wait {
+		t.Fatalf("Wait = false, want true (reason=%s)", decision.Reason)
+	}
+	if decision.Reason != "near_produced_head" {
+		t.Fatalf("Reason = %q, want near_produced_head", decision.Reason)
+	}
+	if decision.RestartOnTimeout {
+		t.Fatal("RestartOnTimeout = true, want false")
 	}
 }

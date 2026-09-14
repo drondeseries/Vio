@@ -28,16 +28,16 @@ func HandleSocket(w http.ResponseWriter, r *http.Request) {
 		slog.ErrorContext(r.Context(), "websocket upgrade failed", "component", "jellycompat", "error", err)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	slog.InfoContext(r.Context(), "websocket connected", "component", "jellycompat",
 		"remote_addr", r.RemoteAddr,
 		"device_id", r.URL.Query().Get("deviceId"),
 	)
 
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
 
@@ -57,7 +57,7 @@ func HandleSocket(w http.ResponseWriter, r *http.Request) {
 
 		switch msg.MessageType {
 		case "KeepAlive":
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		default:
 			slog.DebugContext(r.Context(), "websocket message ignored", "component", "jellycompat", "type", msg.MessageType)
 		}

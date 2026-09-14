@@ -73,7 +73,8 @@ type Claims struct {
 	// OriginalStartedAtUnixNano is decoded directly into int64 by golang-jwt,
 	// preserving nanosecond precision. A future map[string]any decode path must
 	// not pass this through float64, which cannot represent this magnitude exactly.
-	OriginalStartedAtUnixNano int64 `json:"ostn,omitempty"`
+	OriginalStartedAtUnixNano        int64 `json:"ostn,omitempty"`
+	VirtualSourceOwnerInstallationID int   `json:"vowner,omitempty"`
 	// DownloadArtifactID is an opaque transcode-node artifact handle. For
 	// download tokens TranscodeNode is its authenticated origin; MediaPath stays
 	// empty so node-local filesystem paths never leave the owning node.

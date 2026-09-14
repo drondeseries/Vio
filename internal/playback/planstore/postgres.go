@@ -103,6 +103,13 @@ func (s *Postgres) SaveAttempt(ctx context.Context, record playback.AttemptRecor
 		record.PlaybackAttemptID, record.SessionID); err != nil {
 		return err
 	}
+	// The requested media file ID is a historical identity, not a live
+	// reference: a virtual candidate rotation can delete the requested file row
+	// between the client's request and the attempt persist while the effective
+	// file survives. The requested_media_file_id FK was dropped so the raw
+	// requested ID is persisted verbatim; the effective FK still guards the
+	// live file. The replan path and the idempotency check rely on the raw
+	// requested identity surviving the persist.
 	result, err := tx.Exec(ctx, `
 		INSERT INTO playback_v3_attempts (
 			playback_attempt_id, session_id, user_id, profile_id,

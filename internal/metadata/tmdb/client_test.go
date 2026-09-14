@@ -1008,10 +1008,10 @@ func TestGetCertificationCallerStopsWaitingOnCancel(t *testing.T) {
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("cancelled caller error = %v, want context.Canceled", err)
+			t.Fatalf("canceled caller error = %v, want context.Canceled", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("cancelled caller still blocked on the shared fetch")
+		t.Fatal("canceled caller still blocked on the shared fetch")
 	}
 
 	// The detached fetch is still completable for a fresh caller.
@@ -1061,7 +1061,7 @@ func TestGetCertificationSurvivesFirstCallerCancellation(t *testing.T) {
 	close(release)
 
 	if err := <-secondErr; err != nil {
-		t.Fatalf("second caller failed after first caller cancelled: %v", err)
+		t.Fatalf("second caller failed after first caller canceled: %v", err)
 	}
 	if cert := <-secondCert; cert != "TV-PG" {
 		t.Fatalf("second caller cert = %q, want TV-PG", cert)
@@ -1136,5 +1136,211 @@ func TestGetCertificationSingleflightsConcurrentCallers(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("upstream calls = %d, want 1 (singleflight)", got)
+	}
+}
+
+func TestHasDigitalOrPhysicalRelease(t *testing.T) {
+	now := time.Now().UTC()
+	pastDate := now.AddDate(0, -1, 0).Format("2006-01-02")
+	futureDate := now.AddDate(0, 2, 0).Format("2006-01-02")
+
+	// Type 4 (Digital) in the past -> released
+	rdDigital := &releaseDatesResponse{
+		Results: []releaseDatesCountryEntry{
+			{
+				ISO3166: "US",
+				ReleaseDates: []releaseDateEntry{
+					{Type: 4, ReleaseDate: pastDate},
+				},
+			},
+		},
+	}
+	if !HasDigitalOrPhysicalRelease(rdDigital) {
+		t.Fatal("digital release in past must report true")
+	}
+
+	// Type 5 (Physical) in the past -> released
+	rdPhysical := &releaseDatesResponse{
+		Results: []releaseDatesCountryEntry{
+			{
+				ISO3166: "US",
+				ReleaseDates: []releaseDateEntry{
+					{Type: 5, ReleaseDate: pastDate},
+				},
+			},
+		},
+	}
+	if !HasDigitalOrPhysicalRelease(rdPhysical) {
+		t.Fatal("physical release in past must report true")
+	}
+
+	// Type 3 (Theatrical) only with no note -> false
+	rdTheatrical := &releaseDatesResponse{
+		Results: []releaseDatesCountryEntry{
+			{
+				ISO3166: "US",
+				ReleaseDates: []releaseDateEntry{
+					{Type: 3, ReleaseDate: pastDate},
+				},
+			},
+		},
+	}
+	if HasDigitalOrPhysicalRelease(rdTheatrical) {
+		t.Fatal("theatrical only without streaming note must report false")
+	}
+
+	// Type 4 in future -> false
+	rdDigitalFuture := &releaseDatesResponse{
+		Results: []releaseDatesCountryEntry{
+			{
+				ISO3166: "US",
+				ReleaseDates: []releaseDateEntry{
+					{Type: 4, ReleaseDate: futureDate},
+				},
+			},
+		},
+	}
+	if HasDigitalOrPhysicalRelease(rdDigitalFuture) {
+		t.Fatal("future digital release must report false")
+	}
+
+	// Type 3 with streaming note "Netflix" in the past -> released
+	rdStreamingNote := &releaseDatesResponse{
+		Results: []releaseDatesCountryEntry{
+			{
+				ISO3166: "US",
+				ReleaseDates: []releaseDateEntry{
+					{Type: 3, ReleaseDate: pastDate, Note: "Netflix"},
+				},
+			},
+		},
+	}
+	if !HasDigitalOrPhysicalRelease(rdStreamingNote) {
+		t.Fatal("streaming note in past must report true")
+	}
+
+	// Type 3 with streaming note "Max" or "HBO Max" -> released
+	for _, note := range []string{"Max", "HBO Max"} {
+		rd := &releaseDatesResponse{
+			Results: []releaseDatesCountryEntry{
+				{
+					ISO3166: "US",
+					ReleaseDates: []releaseDateEntry{
+						{Type: 3, ReleaseDate: pastDate, Note: note},
+					},
+				},
+			},
+		}
+		if !HasDigitalOrPhysicalRelease(rd) {
+			t.Fatalf("streaming note %q in past must report true", note)
+		}
+	}
+
+	// Theatrical presentation format notes (IMAX, Cinemax) must NEVER be treated as digital streaming releases
+	for _, note := range []string{"IMAX", "IMAX 3D", "Cinemax"} {
+		rd := &releaseDatesResponse{
+			Results: []releaseDatesCountryEntry{
+				{
+					ISO3166: "US",
+					ReleaseDates: []releaseDateEntry{
+						{Type: 3, ReleaseDate: pastDate, Note: note},
+					},
+				},
+			},
+		}
+		if HasDigitalOrPhysicalRelease(rd) {
+			t.Fatalf("theatrical note %q in past must NOT report true as a digital release", note)
+		}
+	}
+}
+
+func TestHasDigitalReleaseStreamingFallback(t *testing.T) {
+	pastDate := time.Now().UTC().AddDate(0, -1, 0).Format("2006-01-02")
+	futureDate := time.Now().UTC().AddDate(0, 2, 0).Format("2006-01-02")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/movie/1284041/release_dates":
+			// Streaming original (e.g. "The Last House") has only theatrical/premiere in release_dates
+			_, _ = w.Write([]byte(`{"results":[{"iso_3166_1":"US","release_dates":[{"type":3,"release_date":"` + pastDate + `"}]}]}`))
+		case "/movie/1284041":
+			// Movie detail shows Netflix production company and past release date
+			_, _ = w.Write([]byte(`{
+				"id": 1284041,
+				"title": "The Last House",
+				"release_date": "` + pastDate + `",
+				"status": "Released",
+				"production_companies": [{"id": 178464, "name": "Netflix"}]
+			}`))
+		case "/movie/1284042/release_dates":
+			_, _ = w.Write([]byte(`{"results":[{"iso_3166_1":"US","release_dates":[{"type":3,"release_date":"` + pastDate + `"}]}]}`))
+		case "/movie/1284042":
+			// Movie detail without Netflix company, but with Netflix homepage
+			_, _ = w.Write([]byte(`{
+				"id": 1284042,
+				"title": "The Last House (Homepage Variant)",
+				"release_date": "` + pastDate + `",
+				"status": "Released",
+				"homepage": "https://www.netflix.com/title/1284042",
+				"production_companies": [{"id": 999, "name": "Chernin Entertainment"}]
+			}`))
+		case "/movie/999999/release_dates":
+			// Unreleased theatrical movie (e.g. "Fuze")
+			_, _ = w.Write([]byte(`{"results":[{"iso_3166_1":"US","release_dates":[{"type":1,"release_date":"` + pastDate + `"}]}]}`))
+		case "/movie/999999":
+			_, _ = w.Write([]byte(`{
+				"id": 999999,
+				"title": "Fuze",
+				"release_date": "` + futureDate + `",
+				"status": "Post Production",
+				"production_companies": [{"id": 1, "name": "Anton"}]
+			}`))
+		case "/movie/888888/release_dates":
+			// Empty release dates -> fail open
+			_, _ = w.Write([]byte(`{"results":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", 1000)
+	client.SetBaseURL(server.URL)
+
+	// Streaming original with Netflix production company is recognized as released
+	rel, err := client.HasDigitalRelease(context.Background(), 1284041)
+	if err != nil {
+		t.Fatalf("HasDigitalRelease returned error: %v", err)
+	}
+	if !rel {
+		t.Fatal("streaming original with Netflix production company must be recognized as released")
+	}
+
+	// Streaming original with Netflix homepage (and non-streaming production company) is recognized as released
+	relHome, err := client.HasDigitalRelease(context.Background(), 1284042)
+	if err != nil {
+		t.Fatalf("HasDigitalRelease returned error for homepage variant: %v", err)
+	}
+	if !relHome {
+		t.Fatal("streaming original with Netflix homepage must be recognized as released")
+	}
+
+	// Theatrical unreleased title is recognized as NOT digitally released
+	relFuze, err := client.HasDigitalRelease(context.Background(), 999999)
+	if err != nil {
+		t.Fatalf("HasDigitalRelease returned error: %v", err)
+	}
+	if relFuze {
+		t.Fatal("theatrical unreleased title must not be recognized as released")
+	}
+
+	// Empty release dates fail open
+	relEmpty, err := client.HasDigitalRelease(context.Background(), 888888)
+	if err != nil {
+		t.Fatalf("HasDigitalRelease returned error: %v", err)
+	}
+	if !relEmpty {
+		t.Fatal("empty release dates must fail open (return true)")
 	}
 }

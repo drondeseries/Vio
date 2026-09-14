@@ -26,7 +26,9 @@ import {
   Scissors,
   RotateCcw,
   Tags,
+  Trash2,
 } from "lucide-react";
+import { useDeleteMediaItem } from "@/hooks/queries/items";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
 import {
@@ -119,6 +121,8 @@ export interface ActionBarProps {
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
   onSelectVersion?: (version: FileVersion) => void;
+  /** Fired when a version picker popover opens or closes (open=true on open). */
+  onVersionPickerOpenChange?: (open: boolean) => void;
   onDownload?: () => void;
   onSearchSubtitles?: () => void;
   rating?: number | null;
@@ -126,6 +130,9 @@ export interface ActionBarProps {
   qualityPreference?: string | null;
   audioSelectionMode?: "auto" | "explicit";
   explicitAudioTrackIndex?: number | null;
+  /** True when the play target version was explicitly chosen by the viewer;
+   * the server must not silently substitute another version. */
+  explicitFileSelection?: boolean;
   onSelectAudioTrack?: (trackIndex: number) => void;
   onResetAudioSelection?: () => void;
   prePlaySubtitleMode?: "auto" | "off" | "explicit";
@@ -171,12 +178,14 @@ export default function ActionBar({
   playbackVariants,
   selectedVersion,
   onSelectVersion,
+  onVersionPickerOpenChange,
   onDownload,
   onSearchSubtitles,
   rating,
   onRatingChange,
   audioSelectionMode = "auto",
   explicitAudioTrackIndex = null,
+  explicitFileSelection = false,
   onSelectAudioTrack,
   onResetAudioSelection,
   prePlaySubtitleMode = "auto",
@@ -206,6 +215,7 @@ export default function ActionBar({
   const [refreshDialogOpen, setRefreshDialogOpen] = useState(false);
   const [addToCollectionOpen, setAddToCollectionOpen] = useState(false);
   const [markerEditorOpen, setMarkerEditorOpen] = useState(false);
+  const deleteMediaItem = useDeleteMediaItem();
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
@@ -232,6 +242,7 @@ export default function ActionBar({
       libraryId?: number;
       restart?: boolean;
       returnHref?: string;
+      forceRelink?: boolean;
     }) => ({
       ...base,
       audioTrackIndex:
@@ -243,8 +254,15 @@ export default function ActionBar({
       prePlaySubtitleMode,
       prePlaySubtitleSelection:
         prePlaySubtitleMode === "explicit" ? explicitSubtitleSelection : null,
+      explicitFileSelection,
     }),
-    [audioSelectionMode, explicitAudioTrackIndex, explicitSubtitleSelection, prePlaySubtitleMode],
+    [
+      audioSelectionMode,
+      explicitAudioTrackIndex,
+      explicitSubtitleSelection,
+      explicitFileSelection,
+      prePlaySubtitleMode,
+    ],
   );
   const startPlaybackFromHref = useCallback(
     (href: string, restartOverride?: boolean) => {
@@ -461,6 +479,7 @@ export default function ActionBar({
           fileId: selectedVersion.file_id,
           restart,
           returnHref: currentHref,
+          forceRelink: selectedVersion.available === false ? true : undefined,
         }),
       );
     },
@@ -693,6 +712,29 @@ export default function ActionBar({
                       Split Versions
                     </DetailOverflowMenuItem>
                   )}
+                  {isAdmin && contentId && (
+                    <DetailOverflowMenuItem
+                      closeMenu={closeOverflowMenu}
+                      className="text-red-500 hover:bg-red-500/10 hover:text-red-400 focus:bg-red-500/10 focus:text-red-400"
+                      disabled={deleteMediaItem.isPending}
+                      onAction={() => {
+                        if (
+                          window.confirm(
+                            "Delete this show/movie? Home and library will update immediately.",
+                          )
+                        ) {
+                          deleteMediaItem.mutate(contentId, {
+                            onSuccess: () => {
+                              navigate("/");
+                            },
+                          });
+                        }
+                      }}
+                    >
+                      <Trash2 className="size-4 text-red-500" />
+                      Delete Show / Movie
+                    </DetailOverflowMenuItem>
+                  )}
                 </>
               )}
             </div>,
@@ -759,6 +801,7 @@ export default function ActionBar({
               playbackVariants={playbackVariants}
               selectedVersion={selectedVersion}
               onSelectVersion={onSelectVersion}
+              onOpenChange={onVersionPickerOpenChange}
             />
           )}
           {selectedVersion && (selectedVersion.audio_tracks?.length ?? 0) > 0 && (

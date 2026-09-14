@@ -93,6 +93,18 @@ export async function fetchCatalogSeasonDetail(
   return { season: seasonFromV2(season) };
 }
 
+export async function prefetchVirtualPlayback(
+  fileIds: number[],
+  options?: RequestInit,
+): Promise<void> {
+  await api<void>("/playback/prefetch", {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(options?.headers ?? {}) },
+    body: JSON.stringify({ file_ids: fileIds.slice(0, 2) }),
+  });
+}
+
 export async function fetchCatalogSeasonEpisodes(
   seriesId: string,
   seasonNum: number,
@@ -112,6 +124,11 @@ export function useCatalogItemDetail(id: string | undefined, libraryId?: number)
     queryKey: catalogKeys.itemDetail(id!, libraryId),
     queryFn: ({ signal }) => fetchCatalogItemDetail(id!, libraryId, { signal }),
     enabled: !!id,
+    // Detail pages are remounted on navigation (e.g. detail -> player -> back).
+    // A short freshness window reuses the cached payload instead of refetching
+    // identical data, while mutations still invalidate immediately and a
+    // server-side change is picked up within half a minute.
+    staleTime: 30_000,
   });
 }
 

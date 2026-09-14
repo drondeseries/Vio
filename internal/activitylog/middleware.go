@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -14,7 +13,6 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/Silo-Server/silo-server/internal/clientip"
-	"github.com/Silo-Server/silo-server/internal/httpstream"
 )
 
 // excludedPrefixes are paths that should not be logged. The admin log
@@ -214,13 +212,6 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 		w.wroteHeader = true
 	}
 	return w.ResponseWriter.Write(b)
-}
-
-func (w *statusWriter) ReadFrom(src io.Reader) (int64, error) {
-	if !w.wroteHeader {
-		w.status, w.wroteHeader = http.StatusOK, true
-	}
-	return httpstream.ForwardReadFrom(w.ResponseWriter, w, src, 0, nil)
 }
 
 // Hijack implements http.Hijacker, required for WebSocket upgrades.

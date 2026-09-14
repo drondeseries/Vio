@@ -22,6 +22,7 @@ import {
 import {
   cancelItemDetailQueries,
   invalidateMediaSurfaceQueries,
+  isTerminalItemDetailNotFound,
   scheduleMediaSurfaceInvalidation,
   updateCatalogItemDetail,
 } from "./mediaSurfaceRefresh";
@@ -49,7 +50,11 @@ export function useWatchDetail(id: string | undefined, fileId?: number, libraryI
     queryKey: itemKeys.watchDetail(id!, fileId, libraryId),
     queryFn: () => fetchWatchDetail(id!, fileId, libraryId),
     enabled: !!id,
-    staleTime: 0,
+    // Player navigation remounts this query (detail -> player -> back). A short
+    // freshness window lets the inventory poll, chapter refresh, and realtime
+    // reconcile reach share one payload instead of each issuing its own
+    // `staleTime: 0` fetch; explicit invalidations still force a refetch.
+    staleTime: 30_000,
   });
 }
 
@@ -528,7 +533,10 @@ export function useApplyItemImage() {
           queryKey: ["catalog", "items", item.content_id, "detail"],
         }),
         queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", item.content_id] }),
-        queryClient.invalidateQueries({ queryKey: catalogKeys.all }),
+        queryClient.invalidateQueries({
+          queryKey: catalogKeys.all,
+          predicate: (query) => !isTerminalItemDetailNotFound(query),
+        }),
         queryClient.invalidateQueries({ queryKey: sectionKeys.all }),
       ]);
 
@@ -600,6 +608,29 @@ export function useMetadataTranslationJobs(contentId: string, enabled: boolean) 
     refetchInterval: (query) => {
       const jobs = query.state.data?.jobs ?? [];
       return jobs.some((j) => j.status === "pending" || j.status === "running") ? 1500 : false;
+    },
+  });
+}
+
+export function useDeleteMediaItem() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (contentId: string) =>
+      api<{ success: boolean; content_id: string; message: string }>(
+        `/admin/items/${itemPathID(contentId)}`,
+        { method: "DELETE" },
+      ),
+    onSuccess: (result) => {
+      toast.success(result.message || "Item deleted");
+      void queryClient.invalidateQueries({ queryKey: sectionKeys.all });
+      void queryClient.invalidateQueries({
+        queryKey: catalogKeys.all,
+        predicate: (query) => !isTerminalItemDetailNotFound(query),
+      });
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Failed to delete item");
     },
   });
 }

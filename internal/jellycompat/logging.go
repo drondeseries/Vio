@@ -16,8 +16,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-
-	"github.com/Silo-Server/silo-server/internal/httpstream"
 )
 
 type loggingResponseWriter struct {
@@ -35,13 +33,6 @@ func (w *loggingResponseWriter) Write(b []byte) (int, error) {
 		w.status = http.StatusOK
 	}
 	return w.ResponseWriter.Write(b)
-}
-
-func (w *loggingResponseWriter) ReadFrom(src io.Reader) (int64, error) {
-	if w.status == 0 {
-		w.status = http.StatusOK
-	}
-	return httpstream.ForwardReadFrom(w.ResponseWriter, w, src, 0, nil)
 }
 
 func (w *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -150,27 +141,6 @@ func (w *debugResponseWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
-func (w *debugResponseWriter) ReadFrom(src io.Reader) (int64, error) {
-	ct := strings.TrimSpace(w.Header().Get("Content-Type"))
-	if !w.detected && ct == "" {
-		return io.Copy(httpstream.WriterOnly(w), src)
-	}
-	if !w.detected {
-		w.contentType = ct
-		w.skipBody = !isTextualContentType(ct)
-		w.detected = true
-	}
-	if !w.skipBody {
-		return io.Copy(httpstream.WriterOnly(w), src)
-	}
-	if w.status == 0 {
-		w.status = http.StatusOK
-	}
-	return httpstream.ForwardReadFrom(w.ResponseWriter, w, src, httpstream.ReadFromChunkDefault, func(n int64, _ error) {
-		w.totalBytes += int(n)
-	})
-}
-
 func (w *debugResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return hj.Hijack()
@@ -222,34 +192,34 @@ func newDebugLogMiddleware(logFile io.Writer, userAgentFilter string) func(http.
 			mu.Lock()
 			defer mu.Unlock()
 
-			fmt.Fprintf(logFile, "=== %s %s %s [%s] %dms ===\n",
+			_, _ = fmt.Fprintf(logFile, "=== %s %s %s [%s] %dms ===\n",
 				start.Format("2006/01/02 15:04:05"),
 				r.Method,
 				r.URL.String(),
 				reqID,
 				elapsed.Milliseconds(),
 			)
-			fmt.Fprintf(logFile, "Remote: %s  User-Agent: %s\n", r.RemoteAddr, r.UserAgent())
-			fmt.Fprintf(logFile, "Status: %d\n", status)
+			_, _ = fmt.Fprintf(logFile, "Remote: %s  User-Agent: %s\n", r.RemoteAddr, r.UserAgent())
+			_, _ = fmt.Fprintf(logFile, "Status: %d\n", status)
 
 			if len(reqBody) > 0 {
-				fmt.Fprintf(logFile, "Request Body (%d bytes):\n", len(reqBody))
+				_, _ = fmt.Fprintf(logFile, "Request Body (%d bytes):\n", len(reqBody))
 				writeIndentedJSON(logFile, reqBody)
 			}
 
 			switch {
 			case dw.body.Len() > 0:
-				fmt.Fprintf(logFile, "Response (content-type=%s, %d bytes):\n", displayContentType(dw.contentType), dw.totalBytes)
+				_, _ = fmt.Fprintf(logFile, "Response (content-type=%s, %d bytes):\n", displayContentType(dw.contentType), dw.totalBytes)
 				if dw.captured >= debugMaxBodyCapture {
-					fmt.Fprintf(logFile, "[truncated at %d bytes]\n", debugMaxBodyCapture)
+					_, _ = fmt.Fprintf(logFile, "[truncated at %d bytes]\n", debugMaxBodyCapture)
 				}
 				writeIndentedJSON(logFile, dw.body.Bytes())
 			case dw.skipBody && dw.totalBytes > 0:
-				fmt.Fprintf(logFile, "Response: [binary content-type=%s bytes=%d]\n", displayContentType(dw.contentType), dw.totalBytes)
+				_, _ = fmt.Fprintf(logFile, "Response: [binary content-type=%s bytes=%d]\n", displayContentType(dw.contentType), dw.totalBytes)
 			default:
-				fmt.Fprintln(logFile, "Response: (empty)")
+				_, _ = fmt.Fprintln(logFile, "Response: (empty)")
 			}
-			fmt.Fprintln(logFile)
+			_, _ = fmt.Fprintln(logFile)
 		})
 	}
 }
@@ -261,15 +231,15 @@ func writeIndentedJSON(w io.Writer, b []byte) {
 	var buf bytes.Buffer
 	if json.Indent(&buf, b, "", "  ") == nil {
 		buf.WriteByte('\n')
-		w.Write(buf.Bytes())
+		_, _ = w.Write(buf.Bytes())
 		return
 	}
 	if utf8.Valid(b) {
-		w.Write(b)
-		fmt.Fprintln(w)
+		_, _ = w.Write(b)
+		_, _ = fmt.Fprintln(w)
 		return
 	}
-	fmt.Fprintf(w, "[non-UTF-8 payload, %d bytes omitted]\n", len(b))
+	_, _ = fmt.Fprintf(w, "[non-UTF-8 payload, %d bytes omitted]\n", len(b))
 }
 
 // isTextualContentType reports whether a captured body with Content-Type ct is

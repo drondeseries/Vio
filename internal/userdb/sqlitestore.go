@@ -25,6 +25,7 @@ func NewSQLiteUserStore(db *sql.DB) *SQLiteUserStore {
 // Compile-time interface check.
 var _ userstore.UserStore = (*SQLiteUserStore)(nil)
 var _ userstore.DeviceRegistry = (*SQLiteUserStore)(nil)
+var _ userstore.DeviceProfileRegistry = (*SQLiteUserStore)(nil)
 var _ userstore.WatchedBatchWriter = (*SQLiteUserStore)(nil)
 
 // --- Profiles ---
@@ -376,6 +377,20 @@ func (s *SQLiteUserStore) RegisterDevice(_ context.Context, entry userstore.Devi
 
 func (s *SQLiteUserStore) ListDevices(_ context.Context) ([]userstore.DeviceEntry, error) {
 	return ListDevices(s.db)
+}
+
+// --- Device capability profiles ---
+
+func (s *SQLiteUserStore) GetDeviceProfile(_ context.Context, profileID, deviceID string) (*userstore.DeviceCapabilityProfile, error) {
+	return GetDeviceProfile(s.db, profileID, deviceID)
+}
+
+func (s *SQLiteUserStore) PutDeviceProfile(_ context.Context, profile userstore.DeviceCapabilityProfile) error {
+	return PutDeviceProfile(s.db, profile)
+}
+
+func (s *SQLiteUserStore) ForgetDeviceProfile(_ context.Context, profileID, deviceID string) error {
+	return ForgetDeviceProfile(s.db, profileID, deviceID)
 }
 
 func (s *SQLiteUserStore) DeviceExists(_ context.Context, profileID, deviceID string) (bool, error) {

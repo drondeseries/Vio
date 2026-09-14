@@ -768,7 +768,7 @@ func (s *MetadataService) itemLibrariesAgreeOnLanguage(ctx context.Context, cont
 func parseProcessFolderID(raw string) int {
 	folderID := 0
 	if raw != "" {
-		fmt.Sscanf(raw, "%d", &folderID)
+		_, _ = fmt.Sscanf(raw, "%d", &folderID)
 	}
 	return folderID
 }
@@ -2423,13 +2423,13 @@ func (s *MetadataService) mergeAndPersist(
 			slog.WarnContext(ctx, "metadata: batch find/create people failed", "component", "metadata", "error", err)
 		} else {
 			for i := range item.People {
-				item.People[i].Person.ID = personIDs[i]
+				item.People[i].ID = personIDs[i]
 			}
 		}
 		// Filter out entries where FindOrCreate failed (Person.ID stayed 0).
 		valid := item.People[:0]
 		for _, p := range item.People {
-			if p.Person.ID != 0 {
+			if p.ID != 0 {
 				valid = append(valid, p)
 			}
 		}
@@ -2463,7 +2463,7 @@ func (s *MetadataService) mergeAndPersist(
 	// this point; it uses the matched-only upsert as a secondary confirmation.
 	if req.Mode == ModeInitialMatch && req.FolderID != "" {
 		folderID := 0
-		fmt.Sscanf(req.FolderID, "%d", &folderID)
+		_, _ = fmt.Sscanf(req.FolderID, "%d", &folderID)
 		if err := s.upsertLibraryMembershipIfMatched(ctx, contentID, folderID); err != nil {
 			s.logLibraryMembershipError("ensuring matched library membership", contentID, folderID, err)
 		}
@@ -5160,6 +5160,14 @@ func (s *MetadataService) persistSeasonsAndEpisodes(
 		slog.WarnContext(ctx, "metadata: failed to ensure series episode links", "component", "metadata",
 			"series_id", seriesID, "error", err)
 	}
+	if materializer, ok := s.itemRepo.(interface {
+		MaterializeVirtualPlaybackEpisodes(context.Context, string) error
+	}); ok {
+		if err := materializer.MaterializeVirtualPlaybackEpisodes(ctx, seriesID); err != nil {
+			slog.WarnContext(ctx, "metadata: failed to materialize released virtual episodes",
+				"component", "metadata", "series_id", seriesID, "error", err)
+		}
+	}
 	s.refreshSeriesEpisodeMetadataState(ctx, seriesID, time.Now())
 }
 
@@ -5271,6 +5279,7 @@ func (s *MetadataService) synthesizeFallbackSeriesStructure(ctx context.Context,
 	return nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *MetadataService) linkSeriesFilesToEpisodes(ctx context.Context, seriesID string) {
 	if err := s.linkSeriesFilesToEpisodesWithOptions(ctx, seriesID, false); err == nil {
 		s.refreshSeriesEpisodeMetadataState(ctx, seriesID, time.Now())
@@ -6460,6 +6469,7 @@ func (s *MetadataService) confirmedOwnershipItem(ctx context.Context, contentID 
 	return item, true
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *MetadataService) rebindSkeletonByProviderIDs(
 	ctx context.Context,
 	skeletonContentID string,
@@ -6474,6 +6484,7 @@ func (s *MetadataService) rebindSkeletonByProviderIDs(
 	return s.rebindSkeletonByProviderIDsLocked(ctx, skeletonContentID, providerIDs, itemType)
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *MetadataService) rebindSkeletonByProviderIDsLocked(
 	ctx context.Context,
 	skeletonContentID string,
@@ -6564,6 +6575,7 @@ func (s *MetadataService) recoverProviderIDConflict(
 	return s.rebindItemByProviderIDsLocked(ctx, sourceContentID, providerIDs, itemType, allowMatchedSource)
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *MetadataService) rebindSkeletonToExistingItem(ctx context.Context, fromContentID, toContentID string) error {
 	return s.rebindItemToExistingItem(ctx, fromContentID, toContentID, false)
 }

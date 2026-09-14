@@ -14,7 +14,6 @@ import { useAccessGroups } from "@/hooks/queries/admin/accessGroups";
 import {
   PolicyAccessFields,
   PolicyLimitFields,
-  effectiveAccessGroupID,
   policyCreateFields,
   policyInheritHints,
   policyStateFromUser,
@@ -668,10 +667,8 @@ function UserForm({
   // new account lands on the default group — except an admin, which the server
   // deliberately leaves ungrouped (auth.Repository.CreateUser).
   const defaultGroupID = accessGroups.find((group) => group.is_default)?.id ?? null;
-  const inheritGroupID = effectiveAccessGroupID(role, user ? user.access_group_id : defaultGroupID);
-  const inheritHints =
-    policyInheritHints(inheritGroupID, accessGroups) ??
-    (role === "admin" ? undefined : user?.effective_policy);
+  const inheritGroupID = user ? user.access_group_id : role === "admin" ? null : defaultGroupID;
+  const inheritHints = policyInheritHints(inheritGroupID, accessGroups) ?? user?.effective_policy;
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();

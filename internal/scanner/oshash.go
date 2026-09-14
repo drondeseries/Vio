@@ -12,6 +12,7 @@ const (
 	// oshashMinFileSize is the minimum file size required for OSHash (2 * blockSize).
 	oshashMinFileSize = oshashBlockSize * 2
 	// oshashUint64Count is the number of uint64 values in one block.
+	//nolint:unused // Retained for compatibility with dormant integration paths.
 	oshashUint64Count = oshashBlockSize / 8
 )
 
@@ -31,7 +32,7 @@ func ComputeOSHash(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("oshash: open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {

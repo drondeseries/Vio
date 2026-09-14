@@ -132,6 +132,8 @@ describe("AdminCollections helpers", () => {
         updated_at: "",
       }),
     ).toEqual({
+      collectionId: "",
+      sourceKind: "preset",
       preset: "popular",
       mediaType: "movie",
       timeWindow: "day",

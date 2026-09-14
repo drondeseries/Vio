@@ -26,7 +26,7 @@ type genericWebhookBody struct {
 	ProfileID  string                 `json:"profile_id"`
 	LibraryID  *int                   `json:"library_id,omitempty"`
 	Type       string                 `json:"type"`
-	Reasons    ReasonFlags            `json:"reason_flags"`
+	Reasons    *ReasonFlags           `json:"reason_flags,omitempty"`
 	Series     *genericWebhookSeries  `json:"series,omitempty"`
 	Episode    *genericWebhookEpisode `json:"episode,omitempty"`
 	// Request is present for request.* deliveries. For request.fulfilled the
@@ -34,6 +34,8 @@ type genericWebhookBody struct {
 	// matched item); approved/declined have no catalog item yet, so the
 	// request's own title rides here.
 	Request *genericWebhookRequest `json:"request,omitempty"`
+	// Rating is present for rating.set deliveries.
+	Rating *genericWebhookRating `json:"rating,omitempty"`
 }
 
 type genericWebhookSeries struct {
@@ -57,6 +59,12 @@ type genericWebhookRequest struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// genericWebhookRating carries the rating payload for rating.set deliveries.
+type genericWebhookRating struct {
+	Rating int    `json:"rating"`
+	ItemID string `json:"item_id"`
+}
+
 // BuildGenericWebhookPayload renders a delivery as canonical Silo JSON. Pure
 // function.
 func BuildGenericWebhookPayload(row DeliveryRow, webhookID string, test bool) ([]byte, error) {
@@ -74,7 +82,14 @@ func BuildGenericWebhookPayload(row DeliveryRow, webhookID string, test bool) ([
 		ProfileID:  row.ProfileID,
 		LibraryID:  row.LibraryID,
 		Type:       row.Type,
-		Reasons:    parseReasonFlags(row.ReasonFlags),
+	}
+	// C4: reason_flags carries reason booleans (favorite, watchlist,
+	// continue_watching, next_up) that only apply to episode.available
+	// deliveries. rating.set decodes into all-false booleans, so omit the
+	// field for it; the rating itself rides in the rating block.
+	if row.Type != DeliveryTypeRatingSet {
+		flags := parseReasonFlags(row.ReasonFlags)
+		body.Reasons = &flags
 	}
 	if row.SeriesID != nil {
 		body.Series = &genericWebhookSeries{ID: *row.SeriesID, Title: row.SeriesTitle}
@@ -98,6 +113,18 @@ func BuildGenericWebhookPayload(row DeliveryRow, webhookID string, test bool) ([
 			Year:      flags.Year,
 			Reason:    flags.Reason,
 		}
+	case DeliveryTypeRatingSet:
+		flags := parseRatingFlags(row.ReasonFlags)
+		// item_id is the rated content itself: the episode for episode
+		// ratings (so receivers can resolve/download the exact episode),
+		// otherwise the movie/series content_id.
+		itemID := ""
+		if row.EpisodeID != nil {
+			itemID = *row.EpisodeID
+		} else if row.SeriesID != nil {
+			itemID = *row.SeriesID
+		}
+		body.Rating = &genericWebhookRating{Rating: flags.Rating, ItemID: itemID}
 	}
 	return json.Marshal(body)
 }

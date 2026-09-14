@@ -19,7 +19,6 @@ import (
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/downloads"
-	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
@@ -99,16 +98,23 @@ const (
 
 // downloadRequest represents the JSON body for POST /downloads.
 type downloadRequest struct {
-	ContentID string `json:"content_id"`
-	EpisodeID string `json:"episode_id,omitempty"`
-	FileID    int    `json:"file_id,omitempty"`
-	Quality   string `json:"quality,omitempty"`       // original (default) | 20mbps | 10mbps | 5mbps | 2mbps | 1mbps
-	Series    bool   `json:"series,omitempty"`        // if true, downloads all episodes
-	Season    *int   `json:"season_number,omitempty"` // with series=true, downloads only this season (0 = Specials)
-	// Caps is the device decode capability (original fallback / transcode
-	// target). The playback type is decoded directly: its JSON contract is the
-	// download `caps` contract, and a mirror struct here could only drift.
-	Caps *playback.ClientCapabilities `json:"caps,omitempty"`
+	ContentID string        `json:"content_id"`
+	EpisodeID string        `json:"episode_id,omitempty"`
+	FileID    int           `json:"file_id,omitempty"`
+	Quality   string        `json:"quality,omitempty"`       // original (default) | 20mbps | 10mbps | 5mbps | 2mbps | 1mbps
+	Series    bool          `json:"series,omitempty"`        // if true, downloads all episodes
+	Season    *int          `json:"season_number,omitempty"` // with series=true, downloads only this season (0 = Specials)
+	Caps      *downloadCaps `json:"caps,omitempty"`          // device decode capability (original fallback / transcode target)
+}
+
+// downloadCaps mirrors playback.ClientCapabilities for the request body.
+type downloadCaps struct {
+	CodecsVideo            []string `json:"codecs_video,omitempty"`
+	CodecsAudio            []string `json:"codecs_audio,omitempty"`
+	AudioPassthroughCodecs []string `json:"audio_passthrough_codecs,omitempty"`
+	Containers             []string `json:"containers,omitempty"`
+	MaxResolution          string   `json:"max_resolution,omitempty"`
+	HDR                    bool     `json:"hdr,omitempty"`
 }
 
 // patchDownloadRequest is the JSON body for PATCH /downloads/{id}.
@@ -268,10 +274,13 @@ func (h *DownloadHandler) HandleCreateDownload(w http.ResponseWriter, r *http.Re
 		DevicePlatform: devicePlatform,
 	}
 	if req.Caps != nil {
-		createReq.Caps = *req.Caps
-		if err := createReq.Caps.NormalizeAndValidateVideoDecode(); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-			return
+		createReq.Caps = playback.ClientCapabilities{
+			CodecsVideo:            req.Caps.CodecsVideo,
+			CodecsAudio:            req.Caps.CodecsAudio,
+			AudioPassthroughCodecs: req.Caps.AudioPassthroughCodecs,
+			Containers:             req.Caps.Containers,
+			MaxResolution:          req.Caps.MaxResolution,
+			HDR:                    req.Caps.HDR,
 		}
 	}
 
@@ -506,14 +515,7 @@ func (h *DownloadHandler) handleDirectDownload(w http.ResponseWriter, r *http.Re
 			return
 		}
 	}
-	serveCtx := downloads.WithServeAuthorized(r.Context(), func(target downloads.FileTarget) {
-		attachTransfer(r.Context(), userID, apimw.GetProfileID(r.Context()), target.MediaFileID)
-	})
-	// A multi-gigabyte original outlives the API server's absolute WriteTimeout,
-	// exactly as on /downloads/{id}/file above; roll the deadline with progress
-	// instead of truncating the body at 120 s.
-	sw := httpstream.NewRollingDeadlineWriter(w)
-	if err := h.svc.ServeDirect(serveCtx, sw, r, userID, fileID, r.URL.Query().Get("format"), filter); err != nil {
+	if err := h.svc.ServeDirect(r.Context(), w, r, userID, fileID, r.URL.Query().Get("format"), filter); err != nil {
 		h.writeDownloadError(w, err)
 		return
 	}
@@ -528,17 +530,7 @@ func (h *DownloadHandler) redirectDirectDownload(ctx context.Context, w http.Res
 	if err != nil {
 		return false, err
 	}
-	// The profile has to travel with the redirect. Hardcoding "" here recorded
-	// the telemetry transfer, the proxy's own attach (from the token claim) and
-	// the node session against no profile at all, so proxy-served traffic went
-	// missing from per-profile attribution while the same file served locally
-	// was attributed correctly.
-	profileID := apimw.GetProfileID(ctx)
-	handled, err := h.redirectToProxy(w, r, secret, target, userID, profileID)
-	if handled {
-		attachTransfer(ctx, userID, profileID, target.MediaFileID)
-	}
-	return handled, err
+	return h.redirectToProxy(w, r, secret, target, userID, "")
 }
 
 func (h *DownloadHandler) redirectManagedDownload(ctx context.Context, w http.ResponseWriter, r *http.Request, userID int, profileID, deviceID, downloadID string, filter catalog.AccessFilter) (bool, error) {
@@ -550,11 +542,7 @@ func (h *DownloadHandler) redirectManagedDownload(ctx context.Context, w http.Re
 	if err != nil {
 		return false, err
 	}
-	handled, err := h.redirectToProxy(w, r, secret, target, userID, profileID)
-	if handled {
-		attachTransfer(ctx, userID, profileID, target.MediaFileID)
-	}
-	return handled, err
+	return h.redirectToProxy(w, r, secret, target, userID, profileID)
 }
 
 func (h *DownloadHandler) proxyTarget() (downloadFileResolver, string, bool) {
@@ -785,10 +773,7 @@ func (h *DownloadHandler) HandleSubtitle(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	ref := chi.URLParam(r, "ref")
-	serveCtx := downloads.WithServeAuthorized(r.Context(), func(target downloads.FileTarget) {
-		attachTransfer(r.Context(), userID, profileID, target.MediaFileID)
-	})
-	if err := h.svc.ServeSubtitle(serveCtx, w, r, userID, profileID, deviceID, id, ref, requestAccessFilter(r)); err != nil {
+	if err := h.svc.ServeSubtitle(r.Context(), w, r, userID, profileID, deviceID, id, ref, requestAccessFilter(r)); err != nil {
 		h.writeAssetError(w, "subtitle", id, err)
 		return
 	}

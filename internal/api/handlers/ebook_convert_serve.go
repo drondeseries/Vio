@@ -78,7 +78,7 @@ func (h *EbookReaderHandler) serveEbook(w http.ResponseWriter, r *http.Request, 
 			}
 			return nil
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			// Caller went away / request cancelled — not a conversion verdict.
+			// Caller went away / request canceled — not a conversion verdict.
 			return err
 		default:
 			// DRM, corrupt, oversize, timed out, unavailable: fall back to the raw
@@ -149,7 +149,7 @@ func serveConvertedEpub(w http.ResponseWriter, r *http.Request, file *models.Med
 	if err != nil {
 		return fmt.Errorf("opening converted epub: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	stat, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("stat converted epub: %w", err)

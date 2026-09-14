@@ -3,6 +3,8 @@ package playback
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,19 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
+
+func TestIsHardwareTranscodeRecognizesAutoAndQSV(t *testing.T) {
+	for _, hw := range []string{"qsv", "vaapi", "nvenc", "auto", "QSV", "Auto"} {
+		if !IsHardwareTranscode(hw) {
+			t.Errorf("IsHardwareTranscode(%q) = false, want true", hw)
+		}
+	}
+	for _, hw := range []string{"none", "", "cpu", "soft"} {
+		if IsHardwareTranscode(hw) {
+			t.Errorf("IsHardwareTranscode(%q) = true, want false", hw)
+		}
+	}
+}
 
 func TestForwardRestartPreservesConfiguredBackBuffer(t *testing.T) {
 	truePath, err := exec.LookPath("true")
@@ -353,5 +368,122 @@ func TestRestartWaiterReceivesInFlightOutcome(t *testing.T) {
 	session.mu.Unlock()
 	if restartCount != 0 {
 		t.Errorf("restartCount = %d, want 0 (waiter must not perform a restart)", restartCount)
+	}
+}
+
+// TestRestartSeekTarget_CopyForwardJumpRequiresBoundedEnvelope pins the guard
+// around the copy-mode forward-jump fallback: it only fabricates a seek target
+// when the media duration is known and the requested segment lands inside that
+// envelope at or after the generation's first segment. Unknown-duration,
+// past-the-end, and before-start targets must stay unresolved so the caller
+// keeps its retryable-miss behavior.
+func TestRestartSeekTarget_CopyForwardJumpRequiresBoundedEnvelope(t *testing.T) {
+	base := func() *TranscodeSession {
+		return &TranscodeSession{
+			outputDir: t.TempDir(),
+			opts: TranscodeOpts{
+				SeekSeconds:            18.261,
+				StreamOriginSeconds:    18,
+				CopySeekAnchorResolved: true,
+				TargetCodecVideo:       "copy",
+				SegmentDuration:        2,
+				StartSegmentNumber:     9,
+				TotalDuration:          120,
+			},
+		}
+	}
+
+	unknown := base()
+	unknown.opts.TotalDuration = 0
+	if got, ok, err := unknown.RestartSeekTarget(40); err != nil || ok || got != 0 {
+		t.Fatalf("unknown-duration target = (%v, %v, %v), want (0, false, nil)", got, ok, err)
+	}
+
+	beyond := base()
+	beyond.opts.TotalDuration = 60
+	if got, ok, err := beyond.RestartSeekTarget(40); err != nil || ok || got != 0 {
+		t.Fatalf("past-envelope target = (%v, %v, %v), want (0, false, nil)", got, ok, err)
+	}
+
+	before := base()
+	if got, ok, err := before.RestartSeekTarget(5); err != nil || ok || got != 0 {
+		t.Fatalf("before-start target = (%v, %v, %v), want (0, false, nil)", got, ok, err)
+	}
+
+	inEnvelope := base()
+	got, ok, err := inEnvelope.RestartSeekTarget(40)
+	if err != nil || !ok {
+		t.Fatalf("bounded target = (%v, %v, %v), want (80, true, nil)", got, ok, err)
+	}
+	// base 18 + (40-9)*2 = 80.
+	if math.Abs(got-80) > 0.0001 {
+		t.Fatalf("bounded target = %.6f, want 80", got)
+	}
+}
+
+// TestRestartSeekTarget_CopyForwardJumpScalesByManifestAverage pins the
+// forward-jump estimate against the manifest's real segment timing. hls_time is
+// only a lower bound: keyframe-aligned copy fragments run longer, so a long
+// jump computed from the nominal duration lands early and serves content ahead
+// of the timeline. With five produced fragments averaging 2.5s the estimate
+// must use that average; with a single fragment it falls back to nominal 2s.
+func TestRestartSeekTarget_CopyForwardJumpScalesByManifestAverage(t *testing.T) {
+	baseOpts := TranscodeOpts{
+		SeekSeconds:            18.261,
+		StreamOriginSeconds:    18,
+		CopySeekAnchorResolved: true,
+		TargetCodecVideo:       "copy",
+		SegmentDuration:        2,
+		StartSegmentNumber:     9,
+		TotalDuration:          1000,
+	}
+	writeManifest := func(t *testing.T, dir, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "stream.m3u8"), []byte(body), 0o644); err != nil {
+			t.Fatalf("write manifest: %v", err)
+		}
+	}
+	writeProducedSegments := func(t *testing.T, dir string, numbers ...int) {
+		t.Helper()
+		for _, number := range numbers {
+			name := filepath.Join(dir, segmentFilename(number, baseOpts))
+			if err := os.WriteFile(name, []byte("segment"), 0o644); err != nil {
+				t.Fatalf("write segment %d: %v", number, err)
+			}
+		}
+	}
+
+	fiveDir := t.TempDir()
+	fiveSegments := "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:3\n#EXT-X-MEDIA-SEQUENCE:9\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+	for i := 0; i < 5; i++ {
+		fiveSegments += fmt.Sprintf("#EXTINF:2.500000,\nseg_%05d.m4s\n", 9+i)
+	}
+	writeManifest(t, fiveDir, fiveSegments)
+	writeProducedSegments(t, fiveDir, 9, 10, 11, 12, 13)
+
+	averaged := &TranscodeSession{outputDir: fiveDir, opts: baseOpts}
+	got, ok, err := averaged.RestartSeekTarget(109)
+	if err != nil || !ok {
+		t.Fatalf("averaged RestartSeekTarget = (%v, %v, %v), want (268, true, nil)", got, ok, err)
+	}
+	// base 18 + (109-9)*2.5 = 268; the nominal 2s would give 218.
+	if math.Abs(got-268) > 0.0001 {
+		t.Fatalf("averaged forward jump = %.6f, want 268 (manifest average 2.5s)", got)
+	}
+
+	// A manifest entry with no produced file is not a real timing: with only one
+	// produced segment the estimate must fall back to the nominal duration.
+	singleDir := t.TempDir()
+	writeManifest(t, singleDir, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:3\n#EXT-X-MEDIA-SEQUENCE:9\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.500000,\nseg_00009.m4s\n")
+	writeProducedSegments(t, singleDir, 9)
+
+	nominal := &TranscodeSession{outputDir: singleDir, opts: baseOpts}
+	got, ok, err = nominal.RestartSeekTarget(109)
+	if err != nil || !ok {
+		t.Fatalf("nominal RestartSeekTarget = (%v, %v, %v), want (218, true, nil)", got, ok, err)
+	}
+	// base 18 + (109-9)*2 = 218 when fewer than two produced timings exist.
+	if math.Abs(got-218) > 0.0001 {
+		t.Fatalf("nominal forward jump = %.6f, want 218 (nominal 2s)", got)
 	}
 }

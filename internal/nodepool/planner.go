@@ -451,31 +451,6 @@ func (p *Planner) ReleaseSession(sessionID string) {
 	p.mu.Unlock()
 }
 
-// ReleaseSessionProxy drops only the proxy half of a session's reservation,
-// leaving its transcode node charged. A start that selected both nodes but ends
-// up publishing a URL the proxy does not serve (its egress grant could not be
-// written, or the attempt fell back to the API-relayed manifest) would otherwise
-// keep charging that proxy's job slot and estimated bandwidth for a stream no
-// byte will cross it — enough grant-store failures and a healthy proxy looks
-// saturated. The transcode node is still running the job, so its half stands.
-func (p *Planner) ReleaseSessionProxy(sessionID string) {
-	if p == nil {
-		return
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	res, ok := p.reserved[sessionID]
-	if !ok {
-		return
-	}
-	res.proxyURL = ""
-	res.kbps = 0
-	if res.transcodeURL == "" {
-		// Nothing left to bridge; drop the entry rather than wait out its age.
-		delete(p.reserved, sessionID)
-	}
-}
-
 // ReserveTranscodeWork selects the least-loaded healthy transcode node while
 // sharing the same health-bridging reservation accounting as playback. Unlike
 // a playback session it does not require a proxy partner: the completed file

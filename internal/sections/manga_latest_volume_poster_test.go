@@ -60,3 +60,19 @@ func TestRecentlyReleasedQueryUsesLatestMangaVolumePoster(t *testing.T) {
 	}, nil, nil, catalog.AccessFilter{})
 	assertMangaPosterOverride(t, "recently-released", query)
 }
+
+func TestRecentlyReleasedQueryExcludesUnreleasedFutureTitles(t *testing.T) {
+	t.Parallel()
+
+	query, _ := buildRecentlyReleasedQuery(ResolvedSection{
+		ItemLimit: 12,
+		Config:    json.RawMessage(`{}`),
+	}, nil, nil, catalog.AccessFilter{})
+
+	if !strings.Contains(query, "mi.release_date <= CURRENT_DATE") {
+		t.Fatalf("recently-released query missing release_date condition:\n%s", query)
+	}
+	if !strings.Contains(query, "mi.year <= EXTRACT(YEAR FROM CURRENT_DATE)") {
+		t.Fatalf("recently-released query missing year condition:\n%s", query)
+	}
+}

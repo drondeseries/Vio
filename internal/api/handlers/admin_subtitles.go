@@ -223,7 +223,7 @@ func defaultProviderFactory(cfg *subtitles.ProviderConfig) (subtitles.Provider, 
 	switch cfg.ProviderName {
 	case "opensubtitles":
 		if cfg.Username == "" || cfg.Password == "" {
-			return nil, fmt.Errorf("Username and password are required")
+			return nil, fmt.Errorf("username and password are required")
 		}
 		return opensubtitles.New(opensubtitles.Config{
 			Username: cfg.Username,
@@ -240,7 +240,7 @@ func defaultProviderFactory(cfg *subtitles.ProviderConfig) (subtitles.Provider, 
 		}
 		return subsource.New(subsource.Config{APIKey: cfg.APIKey}), nil
 	default:
-		return nil, fmt.Errorf("Unknown provider: %s", cfg.ProviderName)
+		return nil, fmt.Errorf("unknown provider: %s", cfg.ProviderName)
 	}
 }
 

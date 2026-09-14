@@ -63,11 +63,58 @@ func TestCanonical(t *testing.T) {
 		{"english", "english"},
 		{"klingon", "klingon"},
 		{"  Ja  ", "ja"},
+		// "und"/"mul" are preserved verbatim, never remapped to English.
+		{"und", "und"},
+		{"mul", "mul"},
+		{"UND", "und"},
+		{"undetermined", "und"},
+		{"multiple", "mul"},
 	}
 	for _, tc := range cases {
 		got := Canonical(tc.in)
 		if got != tc.want {
 			t.Errorf("Canonical(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestParseLanguages(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"English / French / Spanish", []string{"en", "fr", "es"}},
+		{"Eng/Fra/Deu", []string{"en", "fr", "de"}},
+		{"AC3 5.1 English+French+Spanish", []string{"en", "fr", "es"}},
+		{"English", []string{"en"}},
+		{"SyncUP", nil},
+		{"Audio Commentary", nil},
+		{"DTS 5.1", nil},
+		{"", nil},
+		{"   ", nil},
+		// Uppercase 2-letter codes are unambiguous.
+		{"EN/FR", []string{"en", "fr"}},
+		// Lowercase 2-letter tokens are rejected to avoid English-word
+		// false positives ("it", "no", "hi").
+		{"it/no", nil},
+		// Junk alone yields nil even when it looks code-like.
+		{"7.1", nil},
+		{"German DTS-HD 5.1", []string{"de"}},
+	}
+	for _, tc := range cases {
+		got := ParseLanguages(tc.in)
+		if (got == nil) != (tc.want == nil) {
+			t.Errorf("ParseLanguages(%q) nil mismatch: got %v, want %v", tc.in, got, tc.want)
+			continue
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("ParseLanguages(%q) = %v, want %v", tc.in, got, tc.want)
+			continue
+		}
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Errorf("ParseLanguages(%q)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
+			}
 		}
 	}
 }

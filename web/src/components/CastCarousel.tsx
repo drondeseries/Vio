@@ -50,7 +50,7 @@ function CastCarousel({ cast, limit = 20, fullBleed = false }: CastCarouselProps
       <div
         ref={emblaRef}
         className={cn(
-          "embla__viewport -mt-1 overflow-hidden pt-1",
+          "embla__viewport overflow-hidden",
           fullBleed && "pr-4 sm:pr-6 lg:pr-10 xl:pr-12",
         )}
       >

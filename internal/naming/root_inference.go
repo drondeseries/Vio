@@ -275,10 +275,8 @@ func extractPathEvidence(filePath string, libraryType string) RootAssignment {
 	parentTitle, parentYear, parentTrusted := parseInferFolderTitleYear(parentBase)
 	fileStem := parseInferMovieStem(nameNoExt, parentTitle, parentYear)
 	hasMovieEvidence := detectInferMovieFolderEvidence(parentBase, nameNoExt, hasSeasonStructure)
-	strongMovieContradiction := false
-	if !hasSeasonStructure && parentTrusted && fileStem.Title != "" && !inferTitlesCoherent(parentTitle, fileStem.Title) {
-		strongMovieContradiction = true
-	}
+	strongMovieContradiction := !hasSeasonStructure && parentTrusted && fileStem.Title != "" && !inferTitlesCoherent(parentTitle, fileStem.Title)
+
 	if !hasSeasonStructure && parentTrusted && hasEpisodePattern {
 		strongMovieContradiction = true
 	}
@@ -302,7 +300,7 @@ func extractPathEvidence(filePath string, libraryType string) RootAssignment {
 		}
 	}
 
-	rootPath := parentDir
+	var rootPath string
 	if inferredType == "series" {
 		rootPath = deriveInferSeriesRootPath(cleanFilePath, dirParts)
 	} else {

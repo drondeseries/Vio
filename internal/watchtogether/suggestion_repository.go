@@ -127,7 +127,7 @@ func (r *SuggestionRepository) AddVote(ctx context.Context, suggestionID string,
 	if err != nil {
 		return fmt.Errorf("begin add vote tx: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	tag, err := tx.Exec(ctx,
 		`INSERT INTO watch_together_votes (suggestion_id, voter_profile_id, created_at)
@@ -162,7 +162,7 @@ func (r *SuggestionRepository) RemoveVote(ctx context.Context, suggestionID stri
 	if err != nil {
 		return fmt.Errorf("begin remove vote tx: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	tag, err := tx.Exec(ctx,
 		`DELETE FROM watch_together_votes WHERE suggestion_id = $1 AND voter_profile_id = $2`,

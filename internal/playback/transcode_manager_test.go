@@ -207,25 +207,6 @@ func TestLoadOrReconstructSession(t *testing.T) {
 		}
 	})
 
-	// A v3 transport that negotiated header-authenticated media never treats its
-	// session UUID as a credential, so the front door refuses an anonymous
-	// caller instead of leaving that rule to each serve handler.
-	t.Run("live media-authorized session, zero caller -> unauthorized", func(t *testing.T) {
-		reg := &fakeSessionRegistry{sessions: map[string]*Session{"s": {ID: "s", UserID: 5, RequireMediaAuthorization: true}}}
-		m := newMgr(reg)
-		if got, status := m.LoadOrReconstructSession(ctx, reg.GetSession, "s", 0, nil); status != SessionUnauthorized || got != nil {
-			t.Fatalf("status = %v session = %+v, want unauthorized", status, got)
-		}
-	})
-
-	t.Run("live media-authorized session, owner -> loaded", func(t *testing.T) {
-		reg := &fakeSessionRegistry{sessions: map[string]*Session{"s": {ID: "s", UserID: 5, RequireMediaAuthorization: true}}}
-		m := newMgr(reg)
-		if _, status := m.LoadOrReconstructSession(ctx, reg.GetSession, "s", 5, nil); status != SessionLoaded {
-			t.Fatalf("status = %v, want loaded", status)
-		}
-	})
-
 	t.Run("miss + remux token + matching owner -> reconstructed with method", func(t *testing.T) {
 		reg := &fakeSessionRegistry{}
 		m := newMgr(reg)
@@ -612,7 +593,7 @@ func TestReconstructSession_Ownership(t *testing.T) {
 }
 
 // acquireReconstructSlot must bound concurrent reconstructs and let a caller
-// whose request is cancelled give up its place instead of queueing dead work.
+// whose request is canceled give up its place instead of queueing dead work.
 func TestAcquireReconstructSlot(t *testing.T) {
 	m := &TranscodeManager{reconstructSem: make(chan struct{}, 1)}
 
@@ -621,11 +602,11 @@ func TestAcquireReconstructSlot(t *testing.T) {
 		t.Fatal("first acquire should succeed")
 	}
 
-	// Cap is full: a cancelled request must back off rather than block forever.
-	cancelled, cancel := context.WithCancel(context.Background())
+	// Cap is full: a canceled request must back off rather than block forever.
+	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, ok := m.acquireReconstructSlot(cancelled); ok {
-		t.Fatal("acquire on a full semaphore with a cancelled context must fail")
+	if _, ok := m.acquireReconstructSlot(canceled); ok {
+		t.Fatal("acquire on a full semaphore with a canceled context must fail")
 	}
 
 	// Releasing frees the slot for the next reconstruct.

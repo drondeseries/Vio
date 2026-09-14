@@ -1,6 +1,7 @@
 import { QueryClient } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ItemDetail } from "@/api/types";
+import { ApiClientError } from "@/api/client";
 import {
   catalogKeys,
   favoriteKeys,
@@ -110,6 +111,66 @@ describe("invalidateMediaSurfaceQueries", () => {
     expect(
       queryClient.getQueryState(libraryCollectionKeys.items(7, "favorites"))?.isInvalidated,
     ).toBe(true);
+  });
+
+  it("does not invalidate a catalog detail query already in a terminal 404 state", async () => {
+    const queryClient = new QueryClient();
+    const missingKey = catalogKeys.itemDetail("movie-tmdb-1319522");
+
+    const query = queryClient.getQueryCache().build(queryClient, { queryKey: missingKey });
+    query.setState({
+      status: "error",
+      error: new ApiClientError(404, "not_found", "Not Found"),
+    });
+
+    await invalidateMediaSurfaceQueries(queryClient);
+
+    expect(queryClient.getQueryState(missingKey)?.isInvalidated).toBe(false);
+  });
+
+  it("does not invalidate an itemKeys.detail query already in a terminal 404 state", async () => {
+    const queryClient = new QueryClient();
+    const missingKey = itemKeys.detail("movie-tmdb-1319522");
+
+    const query = queryClient.getQueryCache().build(queryClient, { queryKey: missingKey });
+    query.setState({
+      status: "error",
+      error: new ApiClientError(404, "not_found", "Not Found"),
+    });
+
+    await invalidateMediaSurfaceQueries(queryClient);
+
+    expect(queryClient.getQueryState(missingKey)?.isInvalidated).toBe(false);
+  });
+
+  it("still invalidates a catalog detail query that failed for a transient reason", async () => {
+    const queryClient = new QueryClient();
+    const flakyKey = catalogKeys.itemDetail("movie-tmdb-1319522");
+
+    const query = queryClient.getQueryCache().build(queryClient, { queryKey: flakyKey });
+    query.setState({
+      status: "error",
+      error: new ApiClientError(500, "internal_error", "Internal Server Error"),
+    });
+
+    await invalidateMediaSurfaceQueries(queryClient);
+
+    expect(queryClient.getQueryState(flakyKey)?.isInvalidated).toBe(true);
+  });
+
+  it("still invalidates an itemKeys.detail query that failed for a transient reason", async () => {
+    const queryClient = new QueryClient();
+    const flakyKey = itemKeys.detail("movie-tmdb-1319522");
+
+    const query = queryClient.getQueryCache().build(queryClient, { queryKey: flakyKey });
+    query.setState({
+      status: "error",
+      error: new ApiClientError(500, "internal_error", "Internal Server Error"),
+    });
+
+    await invalidateMediaSurfaceQueries(queryClient);
+
+    expect(queryClient.getQueryState(flakyKey)?.isInvalidated).toBe(true);
   });
 
   it("marks the active catalog detail query stale for the mutated item", async () => {

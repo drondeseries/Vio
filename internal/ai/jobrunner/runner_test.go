@@ -91,7 +91,7 @@ func TestSharedSemaphoreBoundsAcrossRunners(t *testing.T) {
 	}
 }
 
-// Cancelling a job that is queued behind the semaphore aborts it without
+// Canceling a job that is queued behind the semaphore aborts it without
 // running it, via the onAbort callback.
 func TestCancelWhileQueuedCallsOnAbort(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -125,7 +125,7 @@ func TestCancelWhileQueuedCallsOnAbort(t *testing.T) {
 		t.Fatal("onAbort never ran")
 	}
 	if ran.Load() {
-		t.Fatal("cancelled queued job still ran")
+		t.Fatal("canceled queued job still ran")
 	}
 }
 
@@ -136,7 +136,7 @@ func TestCancelUnknownJobReturnsFalse(t *testing.T) {
 	}
 }
 
-// The run context is cancelled by Cancel(id) so an in-flight job can stop.
+// The run context is canceled by Cancel(id) so an in-flight job can stop.
 func TestCancelRunningJobCancelsContext(t *testing.T) {
 	r := New(context.Background(), NewSemaphore(1), &fakeStore{}, "test", nil)
 	started := make(chan struct{})

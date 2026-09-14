@@ -130,7 +130,7 @@ func (i *Installer) downloadArchive(ctx context.Context, archiveURL string) ([]b
 	if err != nil {
 		return nil, fmt.Errorf("download archive %q: %w", archiveURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download archive %q: unexpected status %d", archiveURL, resp.StatusCode)
@@ -183,7 +183,7 @@ func (i *Installer) downloadBinary(
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("download binary %q: %w", req.BinaryURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, "", fmt.Errorf("download binary %q: unexpected status %d", req.BinaryURL, resp.StatusCode)
@@ -252,6 +252,8 @@ func (i *Installer) replaceBinary(
 		return nil, err
 	}
 
+	manifest.Checksum = checksum
+
 	manifestBytes, err := protojson.Marshal(manifest)
 	if err != nil {
 		return nil, fmt.Errorf("serialize plugin manifest: %w", err)
@@ -301,11 +303,12 @@ func (i *Installer) replaceBinary(
 	enabled := existing.Enabled
 	availableVersion := ""
 	if err := i.installations.Update(ctx, existing.ID, UpdateInstallationInput{
-		Version:          &version,
-		InstallPath:      &binaryPath,
-		Enabled:          &enabled,
-		AvailableVersion: &availableVersion,
-		Capabilities:     capabilities,
+		Version:            &version,
+		InstallPath:        &binaryPath,
+		Enabled:            &enabled,
+		AvailableVersion:   &availableVersion,
+		Capabilities:       capabilities,
+		RemoveVirtualMedia: false,
 	}); err != nil {
 		return nil, fmt.Errorf("update replacement plugin installation: %w", err)
 	}
@@ -382,11 +385,12 @@ func (i *Installer) replaceArchive(
 	enabled := existing.Enabled
 	availableVersion := ""
 	if err := i.installations.Update(ctx, existing.ID, UpdateInstallationInput{
-		Version:          &version,
-		InstallPath:      &binaryPath,
-		Enabled:          &enabled,
-		AvailableVersion: &availableVersion,
-		Capabilities:     capabilities,
+		Version:            &version,
+		InstallPath:        &binaryPath,
+		Enabled:            &enabled,
+		AvailableVersion:   &availableVersion,
+		Capabilities:       capabilities,
+		RemoveVirtualMedia: false,
 	}); err != nil {
 		return nil, fmt.Errorf("update replacement plugin installation: %w", err)
 	}
@@ -412,6 +416,13 @@ func (i *Installer) replaceArchive(
 }
 
 func (i *Installer) installBinary(ctx context.Context, binaryData []byte, checksum string, manifest *pluginv1.PluginManifest, repositoryID *int) (*InstallResult, error) {
+	// Use the checksum we computed from the downloaded binary data rather
+	// than the value the binary's self-reported manifest declares.  A
+	// plugin binary that was post-processed after compilation (strip, upx,
+	// signing) often reports a stale checksum that does not match the
+	// bytes Silo actually holds.
+	manifest.Checksum = checksum
+
 	manifestBytes, err := protojson.Marshal(manifest)
 	if err != nil {
 		return nil, fmt.Errorf("serialize plugin manifest: %w", err)
@@ -471,7 +482,7 @@ func (i *Installer) installBinary(ctx context.Context, binaryData []byte, checks
 
 	if err := i.installations.SaveArchive(ctx, installation.ID, manifestBytes, checksum, archiveBytes); err != nil {
 		if deleteErr := i.installations.Delete(ctx, installation.ID); deleteErr != nil {
-			return nil, fmt.Errorf("persist plugin archive: %w (cleanup failed: %v)", err, deleteErr)
+			return nil, fmt.Errorf("persist plugin archive: %w (cleanup failed: %w)", err, deleteErr)
 		}
 		return nil, fmt.Errorf("persist plugin archive: %w", err)
 	}
@@ -481,7 +492,7 @@ func (i *Installer) installBinary(ctx context.Context, binaryData []byte, checks
 		Enabled: &enabled,
 	}); err != nil {
 		if deleteErr := i.installations.Delete(ctx, installation.ID); deleteErr != nil {
-			return nil, fmt.Errorf("enable plugin installation: %w (cleanup failed: %v)", err, deleteErr)
+			return nil, fmt.Errorf("enable plugin installation: %w (cleanup failed: %w)", err, deleteErr)
 		}
 		return nil, fmt.Errorf("enable plugin installation: %w", err)
 	}
@@ -545,14 +556,14 @@ func (i *Installer) installArchive(ctx context.Context, data []byte, repositoryI
 
 	if err := i.installations.SaveArchive(ctx, installation.ID, manifestBytes, manifest.GetChecksum(), data); err != nil {
 		if deleteErr := i.installations.Delete(ctx, installation.ID); deleteErr != nil {
-			return nil, fmt.Errorf("persist plugin archive: %w (cleanup failed: %v)", err, deleteErr)
+			return nil, fmt.Errorf("persist plugin archive: %w (cleanup failed: %w)", err, deleteErr)
 		}
 		return nil, fmt.Errorf("persist plugin archive: %w", err)
 	}
 
 	if err := extractArchiveFiles(reader, installDir); err != nil {
 		if deleteErr := i.installations.Delete(ctx, installation.ID); deleteErr != nil {
-			return nil, fmt.Errorf("extract plugin archive: %w (cleanup failed: %v)", err, deleteErr)
+			return nil, fmt.Errorf("extract plugin archive: %w (cleanup failed: %w)", err, deleteErr)
 		}
 		return nil, err
 	}
@@ -562,7 +573,7 @@ func (i *Installer) installArchive(ctx context.Context, data []byte, repositoryI
 		Enabled: &enabled,
 	}); err != nil {
 		if deleteErr := i.installations.Delete(ctx, installation.ID); deleteErr != nil {
-			return nil, fmt.Errorf("enable plugin installation: %w (cleanup failed: %v)", err, deleteErr)
+			return nil, fmt.Errorf("enable plugin installation: %w (cleanup failed: %w)", err, deleteErr)
 		}
 		return nil, fmt.Errorf("enable plugin installation: %w", err)
 	}
@@ -594,7 +605,7 @@ func loadManifestFromBinary(ctx context.Context, binaryData []byte) (*pluginv1.P
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir for binary manifest: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	tmpBinary := filepath.Join(tmpDir, "plugin")
 	if err := os.WriteFile(tmpBinary, binaryData, 0755); err != nil {
@@ -657,7 +668,7 @@ func readZipFile(file *zip.File) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open plugin archive entry %q: %w", file.Name, err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	data, err := io.ReadAll(reader)
 	if err != nil {

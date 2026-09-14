@@ -87,7 +87,7 @@ func (r testProviderIDRepo) FindContentIDByProviderIDs(_ context.Context, provid
 
 func TestRecordPlaybackStopAddsMovieIdentity(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	service := NewService(testStoreProvider{store: store}).WithStableIdentityResolver(NewStableIdentityResolver(
 		testItemRepo{items: map[string]*models.MediaItem{
@@ -136,7 +136,7 @@ func TestRecordPlaybackStopAddsMovieIdentity(t *testing.T) {
 
 func TestManualMarkWatchedAddsEpisodeIdentity(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	episode := &models.Episode{
 		ContentID:     "episode-1",
@@ -191,7 +191,7 @@ func TestManualMarkWatchedAddsEpisodeIdentity(t *testing.T) {
 
 func TestManualMarkWatchedPreservesVisibleWatchedAt(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	watchedAt := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 	service := NewService(testStoreProvider{store: store})
@@ -220,7 +220,7 @@ func TestManualMarkWatchedPreservesVisibleWatchedAt(t *testing.T) {
 
 func TestIdentityLookupFailureDoesNotBlockHistory(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	service := NewService(testStoreProvider{store: store}).WithStableIdentityResolver(NewStableIdentityResolver(
 		testItemRepo{items: map[string]*models.MediaItem{
@@ -328,7 +328,7 @@ func TestStableIdentityResolverResolvesSeasonZeroSpecial(t *testing.T) {
 
 func TestManualMarkUnwatchedSuppressesImportedHistoryButReturnsManualHistory(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := store.CreateProfile(context.Background(), userstore.Profile{ID: "profile-1", Name: "Profile"}); err != nil {
 		t.Fatalf("CreateProfile: %v", err)
@@ -420,7 +420,7 @@ func TestManualMarkUnwatchedSuppressesImportedHistoryButReturnsManualHistory(t *
 
 func TestManualMarkUnwatchedReturnsOneOutboundEntryPerTarget(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	createWatchstateProfile(t, store)
 
 	for _, entry := range []userstore.WatchHistoryEntry{
@@ -471,7 +471,7 @@ func TestManualMarkUnwatchedReturnsOneOutboundEntryPerTarget(t *testing.T) {
 
 func TestManualMarkWatchedAfterHiddenWatermarkIsVisible(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	createWatchstateProfile(t, store)
 
 	hiddenBefore := time.Now().UTC().Add(time.Second).Format(time.RFC3339)
@@ -522,7 +522,7 @@ func TestManualMarkWatchedAfterHiddenWatermarkIsVisible(t *testing.T) {
 
 func TestImportedWatchIfNewerDoesNotOverwriteNewerResume(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	createWatchstateProfile(t, store)
 	if err := store.SetProgressAt(
 		context.Background(),
@@ -567,7 +567,7 @@ func TestImportedWatchIfNewerDoesNotOverwriteNewerResume(t *testing.T) {
 
 func TestImportedWatchIfNewerCompletesOlderResume(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	createWatchstateProfile(t, store)
 	if err := store.SetProgressAt(
 		context.Background(),
@@ -612,7 +612,7 @@ func TestImportedWatchIfNewerCompletesOlderResume(t *testing.T) {
 
 func TestImportedWatchIfNewerSuppressesHiddenOlderWatch(t *testing.T) {
 	store, db := newTestUserStore(t)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	createWatchstateProfile(t, store)
 
 	hiddenBefore := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
@@ -665,7 +665,7 @@ func newTestUserStore(t *testing.T) (userstore.UserStore, *sql.DB) {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	if err := userdb.InitSchema(db); err != nil {
-		db.Close()
+		_ = db.Close()
 		t.Fatalf("InitSchema: %v", err)
 	}
 	return userdb.NewSQLiteUserStore(db), db

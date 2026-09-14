@@ -14,7 +14,7 @@ func TestGetProgressWithCompletedHistoryCarriesHistoryTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := userdb.InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

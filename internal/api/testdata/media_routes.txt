@@ -786,6 +786,7 @@ POST /api/v1/admin/collections/import/tmdb	non-media
 POST /api/v1/admin/collections/import/trakt	non-media
 PUT /api/v1/admin/collections/order	non-media
 POST /api/v1/admin/collections/preview	non-media
+POST /api/v1/admin/collections/purge-virtual	non-media
 GET /api/v1/admin/collections/template-bundles	non-media
 POST /api/v1/admin/collections/template-bundles/{bundleID}/apply	non-media
 POST /api/v1/admin/collections/template-bundles/{bundleID}/apply-job	non-media
@@ -796,6 +797,7 @@ DELETE /api/v1/admin/collections/{id}/image	non-media
 PUT /api/v1/admin/collections/{id}/items/order	non-media
 DELETE /api/v1/admin/collections/{id}/items/{item_id}	non-media
 PUT /api/v1/admin/collections/{id}/items/{item_id}	non-media
+POST /api/v1/admin/collections/{id}/materialize/{item_id}	non-media
 POST /api/v1/admin/collections/{id}/sync	non-media
 GET /api/v1/admin/dashboard/capabilities	non-media
 DELETE /api/v1/admin/dashboard/layout	non-media
@@ -837,6 +839,7 @@ POST /api/v1/admin/invite-codes/	non-media
 DELETE /api/v1/admin/invite-codes/{id}	non-media
 PUT /api/v1/admin/invite-codes/{id}	non-media
 POST /api/v1/admin/invite-codes/{id}/top-up	non-media
+DELETE /api/v1/admin/items/{id}	non-media
 GET /api/v1/admin/items/{id}/files	non-media
 POST /api/v1/admin/items/{id}/merge	non-media
 PATCH /api/v1/admin/items/{id}/metadata	non-media
@@ -916,7 +919,6 @@ GET /api/v1/admin/stats/downloads	non-media
 GET /api/v1/admin/stats/playback-activity	non-media
 GET /api/v1/admin/stats/timeseries	non-media
 GET /api/v1/admin/stats/top-activity	non-media
-GET /api/v1/admin/stream-telemetry/parity	non-media
 GET /api/v1/admin/subtitle-providers/	non-media
 PUT /api/v1/admin/subtitle-providers/{provider}/	non-media
 POST /api/v1/admin/subtitle-providers/{provider}/test	non-media
@@ -977,6 +979,7 @@ POST /api/v1/catalog/query	non-media
 GET /api/v1/catalog/series/{id}/seasons	non-media
 GET /api/v1/catalog/series/{id}/seasons/{num}	non-media
 GET /api/v1/catalog/series/{id}/seasons/{num}/episodes	non-media
+POST /api/v1/catalog/versions/check	non-media
 GET /api/v1/compat/connect-info	non-media
 POST /api/v1/diagnostics/reports	non-media
 POST /api/v1/diagnostics/reports/uploads/	non-media
@@ -1071,6 +1074,7 @@ GET /api/v1/markers/items/{id}	non-media
 PUT /api/v1/markers/items/{id}	non-media
 GET /api/v1/metadata/ai/status	non-media
 GET /api/v1/playback/capability	non-media
+POST /api/v1/playback/prefetch	non-media
 POST /api/v1/playback/route-events	non-media
 GET /api/v1/playback/sessions/{session_id}/control/ws	non-media
 POST /api/v1/playback/start	non-media
@@ -1124,6 +1128,7 @@ HEAD /api/v1/stream/{session_id}	media	playback	viewer_egress	true	true
 GET /api/v1/stream/{session_id}/subtitles/{track}	media	playback	viewer_egress	true	true
 HEAD /api/v1/stream/{session_id}/subtitles/{track}	media	playback	viewer_egress	true	true
 GET /api/v1/stream/{session_id}/subtitles/{track}/fonts	media	playback	viewer_egress	true	true
+GET /api/v1/subtitles/ai/status	non-media
 GET /api/v1/subtitles/providers/status	non-media
 GET /api/v1/theme/admin-css	non-media
 GET /api/v1/theme/catalog	non-media

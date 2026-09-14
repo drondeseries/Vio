@@ -69,7 +69,7 @@ func CheckNode(ctx context.Context, n *Node) (healthy bool, activeJobs, egressKb
 	if err != nil {
 		return false, 0, 0, "", nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return false, 0, 0, "", nil

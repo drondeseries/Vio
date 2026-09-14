@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -641,7 +642,7 @@ func (s *PostgresUserStore) GetProgress(ctx context.Context, profileID, mediaIte
 		s.userID, profileID, mediaItemID,
 	)
 	wp, err := scanWatchProgress(row)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {

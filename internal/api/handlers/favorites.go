@@ -86,24 +86,29 @@ func (h *PersonalDataHandler) SetLocalListEventDispatcher(dispatcher LocalListEv
 
 // --- Response types ---
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type favoriteResponse struct {
 	MediaItemID string `json:"media_item_id"`
 	AddedAt     string `json:"added_at"`
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type favoriteListResponse struct {
 	Favorites []favoriteResponse `json:"favorites"`
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type watchlistEntryResponse struct {
 	MediaItemID string `json:"media_item_id"`
 	AddedAt     string `json:"added_at"`
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type watchlistListResponse struct {
 	Watchlist []watchlistEntryResponse `json:"watchlist"`
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type historyEntryResponse struct {
 	ID              string  `json:"id"`
 	MediaItemID     string  `json:"media_item_id"`
@@ -112,6 +117,7 @@ type historyEntryResponse struct {
 	Completed       bool    `json:"completed"`
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type historyListResponse struct {
 	History []historyEntryResponse `json:"history"`
 }

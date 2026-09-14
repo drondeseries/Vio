@@ -53,6 +53,26 @@ func MimeFromExtension(name string) string {
 	}
 }
 
+// MimeFromContainer maps probed container names when a source identity has no
+// filename extension (for example a provider-neutral virtual URI).
+func MimeFromContainer(container string) string {
+	normalized := strings.ToLower(strings.TrimSpace(strings.Split(container, ",")[0]))
+	switch normalized {
+	case "mp4", "mov", "m4v", "m4a":
+		return "video/mp4"
+	case "matroska", "mkv":
+		return "video/x-matroska"
+	case "webm":
+		return "video/webm"
+	case "mpegts", "mpeg-ts", "ts":
+		return "video/mp2t"
+	case "avi":
+		return "video/x-msvideo"
+	default:
+		return "application/octet-stream"
+	}
+}
+
 // ServeDirectPlay serves a media file with HTTP byte-range support.
 // Uses http.ServeContent for proper range handling, which supports
 // Range requests, conditional requests (including If-Match, If-Range, and
@@ -71,7 +91,7 @@ func ServeDirectPlay(w http.ResponseWriter, r *http.Request, filePath string) er
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	stat, err := f.Stat()
 	if err != nil {

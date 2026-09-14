@@ -221,7 +221,7 @@ func (c *Client) doWithRetry(ctx context.Context, httpClient *http.Client, label
 		}
 
 		respBody, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if readErr != nil {
 			// A truncated/failed read could otherwise be misparsed as a valid
 			// (empty) response; treat it as a retryable transport error.
@@ -317,7 +317,7 @@ func Truncate(s string, maxLen int) string {
 	return s
 }
 
-// sleepCtx waits for d or until ctx is cancelled.
+// sleepCtx waits for d or until ctx is canceled.
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	select {
 	case <-ctx.Done():

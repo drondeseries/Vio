@@ -496,6 +496,7 @@ function ConfigureDialog({
   const testConfig = useTestPluginConfig();
   const saveAuthBinding = useSavePluginAuthBinding();
   const saveTaskBinding = useSavePluginTaskBinding();
+  const presentation = installation.presentation;
   const capabilities = installation.capabilities ?? [];
   const globalConfigs = installation.global_configs ?? [];
   const globalConfigSchema = installation.global_config_schema ?? [];
@@ -517,7 +518,7 @@ function ConfigureDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Blocks className="h-5 w-5" />
-            {installation.plugin_id}
+            {pluginDisplayName(installation.plugin_id, presentation)}
             <Badge variant="secondary" className="font-mono text-[11px]">
               {installation.version}
             </Badge>
@@ -543,6 +544,7 @@ function ConfigureDialog({
                     <PluginConfigForm
                       key={schema.key}
                       schema={schema}
+                      installationId={installation.id}
                       value={globalConfigs.find((entry) => entry.key === schema.key)?.value}
                       configuredSecrets={
                         globalConfigs.find((entry) => entry.key === schema.key)?.configured_secrets

@@ -138,6 +138,10 @@ func (r SourceRevision) ValidatePath(path string) error {
 	if r.MediaFileID <= 0 {
 		return ErrSourceRevisionChanged
 	}
+	lower := strings.ToLower(strings.TrimSpace(path))
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "virtual://") {
+		return nil
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

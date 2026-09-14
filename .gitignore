@@ -67,8 +67,8 @@ docs/superpowers/
 /.claude/
 # Skills may carry per-developer state next to their instructions (the global
 # *.local.md rule above covers notes; these cover tokens and run state).
-**/.secrets
-**/.state
+**/.secrets/
+**/.state/
 .cursor/
 .superpowers/
 .codex/
@@ -90,3 +90,4 @@ docker-compose.local.yml
 output/
 /settingsgen
 /playbackfixtures
+.opencode/

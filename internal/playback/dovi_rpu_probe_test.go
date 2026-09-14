@@ -75,7 +75,7 @@ func TestProbeKeyRefusesAnUnreadableFile(t *testing.T) {
 	}
 }
 
-// A nil probe must not change behaviour: most Profile 7 sources need the strip,
+// A nil probe must not change behavior: most Profile 7 sources need the strip,
 // so "no probe configured" has to mean "strip", not "never strip".
 func TestNilProbeKeepsStripping(t *testing.T) {
 	var probe *DVRPUProbe
@@ -91,7 +91,7 @@ func TestProbeRefusesAnEmptyPath(t *testing.T) {
 	}
 }
 
-// Anything that stops the probe from reaching a conclusion — a cancelled
+// Anything that stops the probe from reaching a conclusion — a canceled
 // request, a cold mount that outruns the timeout, an ffmpeg that will not
 // start — must leave the strip on and leave the cache empty. Caching it would
 // disable the strip for that file for every later viewer, which is the
@@ -115,7 +115,7 @@ func TestInconclusiveProbeIsNeitherFatalNorCached(t *testing.T) {
 // The leader probes on behalf of every follower queued behind it, so its own
 // client giving up must not abandon the run: the verdict is still reached and
 // still cached for the next start. While the probe rode the caller's context,
-// one client disconnecting turned the answer its neighbours were waiting on
+// one client disconnecting turned the answer its neighbors were waiting on
 // into an inconclusive fail-open and hung them on the very source it had been
 // about to reject.
 func TestProbeSurvivesTheLeaderLeaving(t *testing.T) {
@@ -126,7 +126,7 @@ func TestProbeSurvivesTheLeaderLeaving(t *testing.T) {
 	cancel()
 
 	if probe.CanStrip(ctx, bin, path) {
-		t.Fatal("a cancelled caller abandoned the probe and fell back to stripping")
+		t.Fatal("a canceled caller abandoned the probe and fell back to stripping")
 	}
 	if runs := countRuns(t, runLog); runs != 1 {
 		t.Fatalf("the probe ran %d times, want 1", runs)
@@ -226,7 +226,7 @@ func TestConcurrentProbesShareOneRun(t *testing.T) {
 	}
 }
 
-// A follower whose own request is cancelled must not block on the leader.
+// A follower whose own request is canceled must not block on the leader.
 func TestFollowerLeavesWhenItsRequestIsCancelled(t *testing.T) {
 	path := writeProbeFile(t, "not really a movie")
 	probe := NewDVRPUProbe()
@@ -243,10 +243,10 @@ func TestFollowerLeavesWhenItsRequestIsCancelled(t *testing.T) {
 	select {
 	case strippable := <-done:
 		if !strippable {
-			t.Fatal("a cancelled follower reported a verdict it never waited for")
+			t.Fatal("a canceled follower reported a verdict it never waited for")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("a cancelled follower blocked on the leader's probe")
+		t.Fatal("a canceled follower blocked on the leader's probe")
 	}
 }
 

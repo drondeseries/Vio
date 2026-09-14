@@ -37,6 +37,7 @@ type pluginClient interface {
 	EventConsumer(capabilityID string) (*pluginhost.EventConsumerClient, error)
 	AuthProvider(capabilityID string) (*pluginhost.AuthProviderClient, error)
 	HTTPRoutes(capabilityID string) (*pluginhost.HTTPRoutesClient, error)
+	VirtualStreamProvider(capabilityID string) (*pluginhost.VirtualStreamProviderClient, error)
 	WatchSyncProvider(capabilityID string) (*pluginhost.WatchSyncProviderClient, error)
 }
 
@@ -95,7 +96,64 @@ type Service struct {
 	// lifecycle mutation is never written back into a freshly-cleared cache.
 	installationCacheMu  sync.RWMutex
 	installationCache    map[int]*Installation
+	capabilityCache      map[int][]*Capability
 	installationCacheGen uint64
+	virtualStreamsMu     sync.Mutex
+	virtualStreamsCache  map[string]virtualStreamsCacheEntry
+	virtualProfilesMu    sync.Mutex
+	virtualProfilesCache map[string]virtualProfilesCacheEntry
+	virtualVariantsMu    sync.Mutex
+	virtualVariantsCache map[string]virtualVariantsCacheEntry
+
+	// resolvedURLsMu guards a short-lived memo of provider URLs resolved
+	// during playback start. The same virtual URI is resolved once for probing
+	// and again when the transport opens; this memo bridges that gap so the
+	// provider is not contacted twice per playback start. Entries are fresh for
+	// resolvedURLMemoTTL and may be served stale for a further
+	// resolvedURLMemoStaleGrace while a background refresh replaces them, so a
+	// playback start that races a URL rotation is not forced into a synchronous
+	// provider fetch.
+	resolvedURLsMu        sync.Mutex
+	resolvedURLs          map[string]resolvedURLEntry
+	resolvedURLsNextSweep time.Time
+	// resolvedURLsGeneration fences background refreshes across Clear. A
+	// detached refresh that resolves after the cache was flushed carries the
+	// generation it started in, and storeResolvedStreamDepth drops a result
+	// from a superseded generation instead of recreating obsolete URLs and
+	// headers. Guarded by resolvedURLsMu.
+	resolvedURLsGeneration uint64
+	// afterResolvedURLRefresh is a test seam invoked when refreshResolvedURL
+	// returns, so a test can wait for a detached refresh to complete. Nil
+	// outside tests.
+	afterResolvedURLRefresh func()
+}
+
+// resolvedURLEntry is a single memoized provider URL. resolvedAt keeps the
+// entry hot only within a single playback start window. cancel stops the
+// background refresh goroutine when the entry is superseded or evicted.
+type resolvedURLEntry struct {
+	url            string
+	uri            string
+	candidateID    string
+	requestHeaders map[string]string
+	resolvedAt     time.Time
+	expiresAt      time.Time
+	cancel         context.CancelFunc
+	// refreshes counts background warm-refresh cycles this entry has served.
+	// Chains are capped so a memo only stays warm for an active playback
+	// startup window instead of living for the lifetime of the process.
+	refreshes int
+	// refreshFailed records a definitive provider failure on the last
+	// background refresh (error or empty URL). A stale entry with this set is
+	// dropped instead of served: extending it would pin a URL the provider has
+	// already refused to renew.
+	refreshFailed bool
+	// refreshInFlight marks a background refresh kicked by a stale lookup so
+	// concurrent callers join it instead of stampeding the provider.
+	refreshInFlight bool
+	// generation is the resolvedURLsGeneration the entry was stored under. A
+	// refresh started for an older generation must not overwrite a newer entry.
+	generation uint64
 }
 
 // SetEventDispatcher wires the EventDispatcher into the Service. The
@@ -153,6 +211,7 @@ func NewService(
 		repositories:  repositories,
 		installations: installations,
 		configs:       configs,
+		resolvedURLs:  make(map[string]resolvedURLEntry),
 		catalog:       catalog,
 		installer:     installer,
 		archiveCache:  NewArchiveCache(installations),
@@ -697,6 +756,18 @@ func (s *Service) HTTPRoutesClient(
 	return client.HTTPRoutes(capabilityID)
 }
 
+func (s *Service) VirtualStreamProviderClient(
+	ctx context.Context,
+	installationID int,
+	capabilityID string,
+) (*pluginhost.VirtualStreamProviderClient, error) {
+	client, err := s.ensureClient(ctx, installationID)
+	if err != nil {
+		return nil, err
+	}
+	return client.VirtualStreamProvider(capabilityID)
+}
+
 func (s *Service) RouteDescriptors(ctx context.Context, installationID int) ([]*pluginv1.HttpRouteDescriptor, error) {
 	manifest, err := s.manifestForInstallation(ctx, installationID, true)
 	if err != nil {
@@ -752,7 +823,11 @@ func (s *Service) ensureClient(ctx context.Context, installationID int) (pluginC
 	if err != nil {
 		return nil, err
 	}
-	return v.(pluginClient), nil
+	client, ok := v.(pluginClient)
+	if !ok {
+		return nil, fmt.Errorf("unexpected plugin client result %T", v)
+	}
+	return client, nil
 }
 
 func (s *Service) doEnsureClient(ctx context.Context, installationID int) (pluginClient, error) {
@@ -880,6 +955,34 @@ func (s *Service) cachedInstallation(ctx context.Context, installationID int) (*
 	return installation, nil
 }
 
+// cachedCapabilities returns the capabilities for installationID from the in-memory
+// cache, loading them from the store on a miss.
+func (s *Service) cachedCapabilities(ctx context.Context, installationID int) ([]*Capability, error) {
+	s.installationCacheMu.RLock()
+	cached, ok := s.capabilityCache[installationID]
+	gen := s.installationCacheGen
+	s.installationCacheMu.RUnlock()
+	if ok {
+		return cached, nil
+	}
+
+	capabilities, err := s.installations.ListCapabilities(ctx, installationID)
+	if err != nil {
+		return nil, err
+	}
+
+	s.installationCacheMu.Lock()
+	if s.installationCacheGen == gen {
+		if s.capabilityCache == nil {
+			s.capabilityCache = make(map[int][]*Capability)
+		}
+		s.capabilityCache[installationID] = capabilities
+	}
+	s.installationCacheMu.Unlock()
+
+	return capabilities, nil
+}
+
 // invalidateInstallationCache clears the in-memory installation cache. It is
 // registered as a lifecycle hook (see NewService) so OnLifecycleChange evicts
 // stale rows after every install / enable / disable / update / uninstall.
@@ -889,8 +992,10 @@ func (s *Service) invalidateInstallationCache() {
 	}
 	s.installationCacheMu.Lock()
 	s.installationCache = nil
+	s.capabilityCache = nil
 	s.installationCacheGen++
 	s.installationCacheMu.Unlock()
+	s.Clear()
 }
 
 // IsInstallationEnabled reports whether the given plugin installation is

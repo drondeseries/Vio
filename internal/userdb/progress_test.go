@@ -14,7 +14,7 @@ func TestWatchHistoryIdentityRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -70,7 +70,7 @@ func TestAddHistoryIfMissingKeepsExistingSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -121,7 +121,7 @@ func TestListCompletedHistoryAppliesScopedFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -182,7 +182,7 @@ func TestListCompletedHistoryItemsAppliesScopedFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -308,7 +308,7 @@ func TestMarkProgressBatch_CompactsDirtyInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -362,7 +362,7 @@ func TestClearProgressBatch_ClearsPartiallyWatchedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestClearProgressBatch_CompactsDirtyInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -450,7 +450,7 @@ func TestUpdateProgressBackwardSeekPersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

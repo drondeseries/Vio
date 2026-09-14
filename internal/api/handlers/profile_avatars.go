@@ -237,7 +237,7 @@ func (h *ProfileHandler) HandleUploadAvatar(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "bad_request", "Missing avatar file")
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	view, err := h.UploadAvatar(r.Context(), ProfileAvatarUpload{
 		UserID: userID, ProfileID: profileID, ContentType: header.Header.Get("Content-Type"), File: file,

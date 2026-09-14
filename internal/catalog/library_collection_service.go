@@ -9,7 +9,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/collage"
@@ -24,6 +27,9 @@ type TMDBCollectionEntry struct {
 	Title     string
 	IMDbID    string
 	TVDBID    int
+	// ReleaseDate is the TMDB primary_release_date (movies) or first_air_date
+	// (TV) in "YYYY-MM-DD" format. An empty string means the date is unknown.
+	ReleaseDate string
 }
 
 // TraktCollectionEntry is a lightweight Trakt discovery result used by collection sync.
@@ -80,6 +86,99 @@ type TMDBDiscoverFetcher interface {
 	Discover(ctx context.Context, mediaType string, params TMDBDiscoverParams, limit int) ([]TMDBCollectionEntry, error)
 }
 
+// TMDBDigitalReleaseChecker reports whether a TMDB movie has had any Digital,
+// Physical, or TV release. Implementations must fail open: only a definitive
+// false (theatrical-only on record) may gate an entry out.
+type TMDBDigitalReleaseChecker interface {
+	HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error)
+}
+
+// theatricalReleaseGate memoizes digital-release lookups for one sync run so
+// overlapping entries cost a single TMDB call per title.
+type theatricalReleaseGate struct {
+	checker TMDBDigitalReleaseChecker
+	lookup  func(ctx context.Context, tmdbID int) bool
+	memo    map[int]bool
+}
+
+func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker) *theatricalReleaseGate {
+	gate := &theatricalReleaseGate{checker: checker, memo: map[int]bool{}}
+	gate.lookup = func(ctx context.Context, tmdbID int) bool {
+		if cached, ok := gate.memo[tmdbID]; ok {
+			return cached
+		}
+		digital := true // fail open: TMDB outage must not stall a sync
+		if gate.checker != nil {
+			baseCtx := ctx
+			if baseCtx == nil {
+				baseCtx = context.Background()
+			}
+			checkCtx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
+			released, err := gate.checker.HasDigitalRelease(checkCtx, tmdbID)
+			cancel()
+			if err == nil {
+				digital = released
+			}
+		}
+		gate.memo[tmdbID] = digital
+		return digital
+	}
+	return gate
+}
+
+// isPastTheatricalWindow reports whether a movie's release year or release date
+// definitively places it beyond any plausible theatrical exclusivity window (e.g.
+// older than 180 days or from a prior year), allowing us to skip remote TMDB
+// digital-release queries.
+func isPastTheatricalWindow(year int, releaseDate string) bool {
+	now := time.Now().UTC()
+	currentYear := now.Year()
+
+	rd := strings.TrimSpace(releaseDate)
+	if len(rd) >= 10 {
+		rd = rd[:10]
+	}
+	if rd != "" {
+		if t, err := time.Parse("2006-01-02", rd); err == nil {
+			if now.Sub(t) > 180*24*time.Hour {
+				return true
+			}
+			return false
+		}
+		if len(rd) == 4 && year == 0 {
+			if y, err := strconv.Atoi(rd); err == nil {
+				year = y
+			}
+		}
+	}
+
+	if year > 0 && year < currentYear-1 {
+		return true
+	}
+	if year > 0 && year < currentYear && now.Month() > time.June {
+		return true
+	}
+	return false
+}
+
+// skipTheatricalMovie reports whether a movie entry must be skipped because it
+// is still theatrical-only. Movies without a TMDB ID cannot be checked and
+// fall through to the caller's existing date gates. Backlog and catalog titles
+// whose theatrical window has long closed bypass TMDB calls entirely.
+func (g *theatricalReleaseGate) skipTheatricalMovie(ctx context.Context, tmdbID int, title string, year int, releaseDate string) bool {
+	if g == nil || g.checker == nil || tmdbID <= 0 {
+		return false
+	}
+	if isPastTheatricalWindow(year, releaseDate) {
+		return false
+	}
+	if g.lookup(ctx, tmdbID) {
+		return false
+	}
+	slog.DebugContext(ctx, "Collection sync: skipping theatrical-only movie", "component", "catalog", "title", title, "tmdb_id", tmdbID)
+	return true
+}
+
 // TraktCollectionFetcher abstracts the Trakt discovery API.
 type TraktCollectionFetcher interface {
 	GetCollectionPreset(ctx context.Context, preset, mediaType string, limit int, accessToken string) ([]TraktCollectionEntry, error)
@@ -108,6 +207,12 @@ var ErrLibraryCollectionSyncUnsupported = errors.New("smart collections cannot b
 // request for one lands here; it is a caller mistake, not a server fault.
 var ErrLibraryCollectionSyncModeUnsupported = errors.New("unsupported collection sync mode")
 
+const (
+	virtualMetadataRefreshWorkers = 4
+	virtualMetadataRefreshQueue   = 256
+	virtualMetadataRefreshTimeout = 2 * time.Minute
+)
+
 type LibraryCollectionService struct {
 	collections  *LibraryCollectionRepository
 	items        *ItemRepository
@@ -125,6 +230,12 @@ type LibraryCollectionService struct {
 	// `tmdb_discover` source mode (genre matrices, decade filters, etc.).
 	TMDBDiscovers TMDBDiscoverFetcher
 
+	// TMDBDigitalReleases is nil when theatrical gating is not configured.
+	// When set, synced collections skip movies that are still
+	// theatrical-only (no Digital/Physical/TV release on TMDB yet) instead of
+	// materializing unplayable placeholders.
+	TMDBDigitalReleases TMDBDigitalReleaseChecker
+
 	// TraktCollections is nil when Trakt collection discovery is not configured.
 	TraktCollections TraktCollectionFetcher
 
@@ -133,6 +244,137 @@ type LibraryCollectionService struct {
 
 	// CollageGen is nil when S3/image processing is not configured.
 	CollageGen CollageGenerator
+	// VirtualVariants returns configured provider-neutral profile placeholders.
+	// It must not contact an upstream streaming provider.
+	VirtualVariants func(context.Context, string, string) ([]VirtualPlaybackVariant, error)
+	// RefreshVirtualItem is invoked after a collection-only item is materialized
+	// so metadata is enriched immediately instead of waiting for the six-hour
+	// refresh-debt task.
+	RefreshVirtualItem func(context.Context, string) error
+
+	virtualRefreshOnce  sync.Once
+	virtualRefreshQueue chan string
+}
+
+type collectionVirtualCreationTracker struct {
+	items map[string]preparedCollectionItem
+	err   error
+}
+
+type preparedCollectionItem struct {
+	item     *models.MediaItem
+	variants []VirtualPlaybackVariant
+}
+
+type collectionVirtualCreationTrackerKey struct{}
+type collectionVirtualVariantCacheKey struct{}
+
+type collectionVirtualVariantCache struct {
+	mu      sync.Mutex
+	entries map[string][]VirtualPlaybackVariant
+}
+
+func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, collection *models.LibraryCollection, matched []LibraryCollectionItemInput) error {
+	tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker)
+	if tracker == nil {
+		return errors.New("collection sync preparation is missing")
+	}
+	if tracker.err != nil {
+		return tracker.err
+	}
+	prepared := make(map[string]preparedCollectionItem, len(matched))
+	if sourceEnablesVirtualPlayback(collection.SourceConfig) {
+		ids := make([]string, 0, len(matched))
+		for _, member := range matched {
+			ids = append(ids, member.MediaItemID)
+		}
+		rows, err := s.collections.pool.Query(ctx, `
+			SELECT DISTINCT mf.content_id FROM media_files mf
+			WHERE mf.content_id = ANY($1::text[])
+			  AND mf.container IS DISTINCT FROM 'virtual'
+			  AND mf.file_path NOT LIKE 'virtual://%'`, ids)
+		if err != nil {
+			return err
+		}
+		physical := make(map[string]bool)
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			physical[id] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, member := range matched {
+			if physical[member.MediaItemID] {
+				// Retained physical members still need ownership reconciliation
+				// against current target libraries. Defer to post-acceptance repair.
+				continue
+			}
+			candidate, ok := tracker.items[member.MediaItemID]
+			if !ok {
+				item, err := s.items.GetByID(ctx, member.MediaItemID)
+				if err != nil {
+					return err
+				}
+				if _, err := s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, item, VirtualMaterializeOptions{}); err != nil {
+					return err
+				}
+				candidate = tracker.items[member.MediaItemID]
+			}
+			prepared[member.MediaItemID] = candidate
+		}
+	}
+	if err := s.collections.AcceptPreparedItems(ctx, collection, matched, prepared, s.items); err != nil {
+		return err
+	}
+	for id := range prepared {
+		s.queueVirtualMetadataRefresh(id)
+	}
+	return nil
+}
+
+func (s *LibraryCollectionService) configuredVirtualVariants(ctx context.Context, virtualURI, mediaType string) ([]VirtualPlaybackVariant, error) {
+	if s == nil || s.VirtualVariants == nil {
+		return nil, nil
+	}
+	cache, _ := ctx.Value(collectionVirtualVariantCacheKey{}).(*collectionVirtualVariantCache)
+	if cache == nil {
+		return s.VirtualVariants(ctx, virtualURI, mediaType)
+	}
+	cache.mu.Lock()
+	template, ok := cache.entries[mediaType]
+	cache.mu.Unlock()
+	if !ok {
+		variants, err := s.VirtualVariants(ctx, virtualURI, mediaType)
+		if err != nil {
+			return nil, err
+		}
+		cache.mu.Lock()
+		cache.entries[mediaType] = append([]VirtualPlaybackVariant(nil), variants...)
+		cache.mu.Unlock()
+		return variants, nil
+	}
+	target, err := url.Parse(virtualURI)
+	if err != nil || target.Scheme != "virtual" {
+		return nil, fmt.Errorf("invalid virtual playback URI %q", virtualURI)
+	}
+	variants := make([]VirtualPlaybackVariant, 0, len(template))
+	for _, variant := range template {
+		parsed, parseErr := url.Parse(variant.VirtualURI)
+		if parseErr != nil || parsed.Scheme != "virtual" {
+			return nil, fmt.Errorf("invalid cached virtual profile URI %q", variant.VirtualURI)
+		}
+		rebased := *target
+		rebased.RawQuery = parsed.RawQuery
+		variant.VirtualURI = rebased.String()
+		variants = append(variants, variant)
+	}
+	return variants, nil
 }
 
 func NewLibraryCollectionService(
@@ -161,16 +403,17 @@ type SyncCollectionOptions struct {
 }
 
 type libraryCollectionSourceConfig struct {
-	Mode       string              `json:"mode"`
-	Provider   string              `json:"provider,omitempty"`
-	Preset     string              `json:"preset,omitempty"`
-	URL        string              `json:"url,omitempty"`
-	ListURL    string              `json:"list_url,omitempty"`
-	MediaType  string              `json:"media_type,omitempty"`
-	TimeWindow string              `json:"time_window,omitempty"`
-	ProfileID  string              `json:"profile_id,omitempty"`
-	Limit      *int                `json:"limit,omitempty"`
-	Builders   *CollectionBuilders `json:"builders,omitempty"`
+	Mode            string              `json:"mode"`
+	Provider        string              `json:"provider,omitempty"`
+	Preset          string              `json:"preset,omitempty"`
+	URL             string              `json:"url,omitempty"`
+	ListURL         string              `json:"list_url,omitempty"`
+	MediaType       string              `json:"media_type,omitempty"`
+	TimeWindow      string              `json:"time_window,omitempty"`
+	ProfileID       string              `json:"profile_id,omitempty"`
+	Limit           *int                `json:"limit,omitempty"`
+	VirtualPlayback bool                `json:"virtual_playback,omitempty"`
+	Builders        *CollectionBuilders `json:"builders,omitempty"`
 	// CollectionID is the TMDB collection ID for the `tmdb_collection` mode.
 	// Stored as a plain int (not *int) so zero round-trips as "unset" via the
 	// omitempty tag — the sync path treats 0 as a placeholder sentinel.
@@ -209,6 +452,220 @@ type mdblistEntry struct {
 	MediaType   string `json:"mediatype"`
 	Title       string `json:"title"`
 	ReleaseYear int    `json:"release_year"`
+	Released    string `json:"released"`
+}
+
+func SourceEnablesVirtualPlayback(raw json.RawMessage) bool {
+	return sourceEnablesVirtualPlayback(raw)
+}
+
+func sourceEnablesVirtualPlayback(raw json.RawMessage) bool {
+	var cfg struct {
+		VirtualPlayback bool `json:"virtual_playback"`
+	}
+	return json.Unmarshal(raw, &cfg) == nil && cfg.VirtualPlayback
+}
+
+func virtualPlaybackIdentityAvailable(mediaType, imdbID string, tmdbID, tvdbID int) bool {
+	itemType := "movie"
+	if mediaType == "show" || mediaType == "tv" || mediaType == "series" {
+		itemType = "series"
+	}
+	item := &models.MediaItem{
+		Type:   itemType,
+		ImdbID: strings.TrimSpace(imdbID),
+	}
+	if tmdbID > 0 {
+		item.TmdbID = strconv.Itoa(tmdbID)
+	}
+	if tvdbID > 0 {
+		item.TvdbID = strconv.Itoa(tvdbID)
+	}
+	_, err := virtualPlaybackItemURI(item)
+	return err == nil
+}
+
+func (s *LibraryCollectionService) queueVirtualMetadataRefresh(contentID string) {
+	contentID = strings.TrimSpace(contentID)
+	if s == nil || s.RefreshVirtualItem == nil || contentID == "" {
+		return
+	}
+	s.virtualRefreshOnce.Do(func() {
+		s.virtualRefreshQueue = make(chan string, virtualMetadataRefreshQueue)
+		for range virtualMetadataRefreshWorkers {
+			go func() {
+				for queuedID := range s.virtualRefreshQueue {
+					ctx, cancel := context.WithTimeout(context.Background(), virtualMetadataRefreshTimeout)
+					if err := s.RefreshVirtualItem(ctx, queuedID); err != nil {
+						slog.WarnContext(ctx, "collection virtual metadata refresh failed",
+							"component", "catalog", "content_id", queuedID, "error", err)
+					} else if strings.HasPrefix(queuedID, "series-") && s.items != nil {
+						if err := s.items.MaterializeVirtualPlaybackEpisodes(ctx, queuedID); err != nil {
+							slog.WarnContext(ctx, "failed to materialize virtual episodes after refresh",
+								"component", "catalog", "content_id", queuedID, "error", err)
+						}
+					}
+					cancel()
+				}
+			}()
+		}
+	})
+	select {
+	case s.virtualRefreshQueue <- contentID:
+	default:
+		// Materialization inserted durable metadata_refresh_debt in the same
+		// transaction, so saturation delays enrichment without losing it.
+		slog.Warn("collection virtual metadata refresh queue is full",
+			"component", "catalog", "content_id", contentID)
+	}
+}
+
+func (s *LibraryCollectionService) materializeVirtualPlayback(ctx context.Context, collection *models.LibraryCollection, item *models.MediaItem) error {
+	_, err := s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, item, VirtualMaterializeOptions{RequireMembership: false})
+	return err
+}
+
+// EnsureCollectionItemMaterialized ensures that a collection item has its virtual
+// base files, released episodes (for series), and collection claims established
+// atomically, requiring pre-existing collection membership.
+func (s *LibraryCollectionService) EnsureCollectionItemMaterialized(ctx context.Context, collection *models.LibraryCollection, item *models.MediaItem) (*MaterializeResult, error) {
+	return s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, item, VirtualMaterializeOptions{RequireMembership: true})
+}
+
+// EnsureCollectionItemMaterializedWithOptions ensures that a collection item has its virtual
+// base files, released episodes (for series), and collection claims established
+// atomically with configurable membership requirements.
+func (s *LibraryCollectionService) EnsureCollectionItemMaterializedWithOptions(
+	ctx context.Context,
+	collection *models.LibraryCollection,
+	item *models.MediaItem,
+	opts VirtualMaterializeOptions,
+) (*MaterializeResult, error) {
+	if s == nil {
+		return nil, errors.New("library collection service is not configured")
+	}
+	if collection == nil || item == nil {
+		return nil, errors.New("collection and item are required")
+	}
+	if item.Type != "movie" && item.Type != "series" {
+		return nil, fmt.Errorf("item type %q is not eligible for virtual materialization", item.Type)
+	}
+	if !sourceEnablesVirtualPlayback(collection.SourceConfig) {
+		return nil, ErrVirtualPlaybackDisabled
+	}
+
+	libraryIDs := collection.LibraryIDs
+	if len(libraryIDs) == 0 && collection.LibraryID > 0 {
+		libraryIDs = []int{collection.LibraryID}
+	}
+	if len(libraryIDs) == 0 {
+		return nil, errors.New("collection has no target libraries configured")
+	}
+
+	tracker, _ := ctx.Value(collectionVirtualCreationTrackerKey{}).(*collectionVirtualCreationTracker)
+	var variants []VirtualPlaybackVariant
+	if s.VirtualVariants != nil {
+		uri, err := virtualPlaybackItemURI(item)
+		if err != nil {
+			return nil, err
+		}
+		variants, err = s.configuredVirtualVariants(ctx, uri, item.Type)
+		if err != nil {
+			err = fmt.Errorf("%w: getting virtual profile variants: %w", ErrProviderUnavailable, err)
+			if tracker != nil {
+				tracker.err = err
+			}
+			return nil, err
+		}
+	}
+	if len(variants) == 0 {
+		if tracker != nil {
+			tracker.err = ErrProviderUnavailable
+		}
+		return nil, ErrProviderUnavailable
+	}
+	if tracker != nil {
+		if tracker.items == nil {
+			tracker.items = make(map[string]preparedCollectionItem)
+		}
+		copyItem := *item
+		tracker.items[item.ContentID] = preparedCollectionItem{item: &copyItem, variants: variants}
+		return &MaterializeResult{ContentID: item.ContentID, MediaType: item.Type}, nil
+	}
+
+	if s.items == nil {
+		return nil, errors.New("library collection service items repository is not configured")
+	}
+
+	opts.sourceConfig = collection.SourceConfig
+	res, err := s.items.EnsureVirtualCollectionItemMaterializedWithOptions(ctx, collection.ID, item, libraryIDs, variants, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	s.queueVirtualMetadataRefresh(item.ContentID)
+	return res, nil
+}
+
+// RepairVirtualPlaybackItem materializes a collection member that has catalog
+// metadata but no provider-owned virtual media_files. It shares normal sync's
+// profile/owner selection, then creates released episode placeholders for a
+// series. It never resolves a provider URL, so it is safe to use as an admin
+// recovery operation when provider configuration was unavailable during sync.
+func (s *LibraryCollectionService) RepairVirtualPlaybackItem(ctx context.Context, collection *models.LibraryCollection, item *models.MediaItem) (*MaterializeResult, error) {
+	return s.EnsureCollectionItemMaterialized(ctx, collection, item)
+}
+
+// ReconcileMissingCollectionVirtualItems discovers collection items that have no
+// local files and no virtual base files, and ensures they are materialized.
+// Recoverable errors on individual items are logged and aggregated without aborting the batch.
+func (s *LibraryCollectionService) ReconcileMissingCollectionVirtualItems(ctx context.Context, collection *models.LibraryCollection) (int, error) {
+	if s == nil || s.items == nil || collection == nil {
+		return 0, nil
+	}
+	if !sourceEnablesVirtualPlayback(collection.SourceConfig) {
+		return 0, nil
+	}
+	missingItems, err := s.items.FindCollectionItemsMissingVirtualBase(ctx, collection.ID, 50)
+	if err != nil {
+		return 0, fmt.Errorf("finding collection items missing virtual base: %w", err)
+	}
+	if len(missingItems) == 0 {
+		return 0, nil
+	}
+	repairedCount := 0
+	var batchErrors error
+	for _, item := range missingItems {
+		// Record reconciliation progress independently of virtual ownership freshness.
+		if s.collections != nil {
+			_ = s.collections.TouchCollectionItem(ctx, collection.ID, item.ContentID)
+		}
+		if s.items != nil {
+			_ = s.items.TouchVirtualItemAttempt(ctx, item.ContentID)
+		}
+		if _, err := s.EnsureCollectionItemMaterialized(ctx, collection, item); err != nil {
+			if errors.Is(err, ErrCollectionItemNotMember) {
+				// Benign concurrent modification: item was removed from collection while batch was processing
+				continue
+			}
+			slog.WarnContext(ctx, "failed to materialize missing collection virtual item during routine reconciliation",
+				"component", "catalog", "collection_id", collection.ID, "content_id", item.ContentID, "error", err)
+			batchErrors = errors.Join(batchErrors, fmt.Errorf("%s: %w", item.ContentID, err))
+			continue
+		}
+		repairedCount++
+	}
+	return repairedCount, batchErrors
+}
+
+// CleanupLegacyUnscopedCollectionClaims executes a bounded cleanup of legacy unscoped
+// collection claims that have no surviving membership evidence or that have been superseded
+// by scoped claims.
+func (s *LibraryCollectionService) CleanupLegacyUnscopedCollectionClaims(ctx context.Context, limit int) (int64, error) {
+	if s == nil || s.items == nil {
+		return 0, nil
+	}
+	return s.items.CleanupLegacyUnscopedCollectionClaims(ctx, limit)
 }
 
 func (s *LibraryCollectionService) SyncCollection(ctx context.Context, collectionID string) (*models.LibraryCollectionSyncRun, error) {
@@ -223,30 +680,43 @@ func (s *LibraryCollectionService) SyncCollectionWithOptions(ctx context.Context
 	if IsLiveQueryType(collection.CollectionType) {
 		return nil, ErrLibraryCollectionSyncUnsupported
 	}
+	reconciliationCtx := ctx
+	tracker := &collectionVirtualCreationTracker{}
+	ctx = context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, tracker)
+	ctx = context.WithValue(ctx, collectionVirtualVariantCacheKey{}, &collectionVirtualVariantCache{
+		entries: make(map[string][]VirtualPlaybackVariant, 2),
+	})
 
 	var source libraryCollectionSourceConfig
 	if err := json.Unmarshal(collection.SourceConfig, &source); err != nil {
 		return nil, fmt.Errorf("parsing collection source config: %w", err)
 	}
 
+	var run *models.LibraryCollectionSyncRun
 	switch source.Mode {
 	case "smart":
 		return nil, ErrLibraryCollectionSyncUnsupported
 	case "mdblist_json":
-		return s.syncMDBListCollection(ctx, collection, collectionutil.MDBListURLCandidates(source.URL, collection.SourceURL), source.Limit, opts)
+		run, err = s.syncMDBListCollection(ctx, collection, collectionutil.MDBListURLCandidates(source.URL, collection.SourceURL), source.Limit, opts)
 	case "tmdb_preset":
-		return s.syncTMDBPresetCollection(ctx, collection, source, opts)
+		run, err = s.syncTMDBPresetCollection(ctx, collection, source, opts)
 	case "tmdb_collection":
-		return s.syncTMDBFranchiseCollection(ctx, collection, source, opts)
+		run, err = s.syncTMDBFranchiseCollection(ctx, collection, source, opts)
 	case "tmdb_discover":
-		return s.syncTMDBDiscoverCollection(ctx, collection, source, opts)
+		run, err = s.syncTMDBDiscoverCollection(ctx, collection, source, opts)
 	case "trakt_preset":
-		return s.syncTraktPresetCollection(ctx, collection, source, opts)
+		run, err = s.syncTraktPresetCollection(ctx, collection, source, opts)
 	case "trakt_list":
-		return s.syncTraktListCollection(ctx, collection, source, opts)
+		run, err = s.syncTraktListCollection(ctx, collection, source, opts)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrLibraryCollectionSyncModeUnsupported, source.Mode)
 	}
+	if err == nil {
+		if _, reconcileErr := s.ReconcileMissingCollectionVirtualItems(reconciliationCtx, collection); reconcileErr != nil {
+			return run, fmt.Errorf("reconciling collection virtual items: %w", reconcileErr)
+		}
+	}
+	return run, err
 }
 
 func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, collection *models.LibraryCollection, listURLs []string, limit *int, opts SyncCollectionOptions) (*models.LibraryCollectionSyncRun, error) {
@@ -305,6 +775,131 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 		return nil, err
 	}
 
+	warnings := make([]string, 0)
+	preparedVirtual := make(map[string]struct{})
+
+	if sourceEnablesVirtualPlayback(collection.SourceConfig) {
+		// MDBList fetches beyond the configured item limit to compensate for
+		// duplicates and local misses. Do not materialize that entire lookahead
+		// set: rows beyond the final collection limit would be left as orphaned
+		// library items even though they can never become collection members.
+		materializeEntries := entries
+		if limit != nil && *limit > 0 && len(materializeEntries) > *limit {
+			materializeEntries = materializeEntries[:*limit]
+		}
+		theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
+		preCandidateSet := make(map[string]struct{})
+		for _, entry := range materializeEntries {
+			itemType := mdbListEntryItemType(entry)
+			lookup := movieLookup
+			if itemType == "series" {
+				lookup = seriesLookup
+			}
+			for _, c := range pickCandidatesByPriority(lookup, entry, itemType) {
+				preCandidateSet[c] = struct{}{}
+			}
+		}
+		preMembers := map[string]bool{}
+		if len(preCandidateSet) > 0 && s.libraryItems != nil {
+			preIDs := make([]string, 0, len(preCandidateSet))
+			for id := range preCandidateSet {
+				preIDs = append(preIDs, id)
+			}
+			var preErr error
+			preMembers, preErr = s.libraryItems.GetItemsInFolders(ctx, preIDs, collection.LibraryIDs)
+			if preErr != nil {
+				return nil, preErr
+			}
+		}
+		for _, entry := range materializeEntries {
+			if isUnreleasedYearOrDate(entry.ReleaseYear, entry.Released) {
+				slog.DebugContext(ctx, "MDBList sync: skipping unreleased entry", "component", "catalog", "title", entry.Title, "year", entry.ReleaseYear)
+				continue
+			}
+			tvdbID := 0
+			if entry.TVDBID != nil {
+				tvdbID = *entry.TVDBID
+			}
+			if !virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, tvdbID) {
+				continue
+			}
+			itemType := mdbListEntryItemType(entry)
+			lookup := movieLookup
+			if itemType == "series" {
+				lookup = seriesLookup
+			}
+			if candidates := pickCandidatesByPriority(lookup, entry, itemType); len(candidates) > 0 {
+				// An existing library-resident match wins; the second pass
+				// accepts it and post-acceptance repair heals it if needed.
+				// Only stage a new virtual candidate when no candidate is
+				// already resident in a target library.
+				resident := false
+				for _, c := range candidates {
+					if preMembers[c] {
+						resident = true
+						break
+					}
+				}
+				if resident {
+					continue
+				}
+				if s.items != nil {
+					if existingItem, getErr := s.items.GetByID(ctx, candidates[0]); getErr != nil {
+						warnings = append(warnings, fmt.Sprintf("checking existing virtual item %q: %v", candidates[0], getErr))
+					} else if _, matErr := s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, existingItem, VirtualMaterializeOptions{RequireMembership: false}); matErr != nil {
+						warnings = append(warnings, fmt.Sprintf("repairing existing virtual item %q: %v", candidates[0], matErr))
+					} else {
+						preparedVirtual[candidates[0]] = struct{}{}
+					}
+				}
+				continue
+			}
+			if itemType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, entry.ReleaseYear, entry.Released) {
+				slog.InfoContext(ctx, "MDBList sync: skipping theatrical-only movie", "component", "catalog", "title", entry.Title, "tmdb_id", entry.ID)
+				continue
+			}
+			item := &models.MediaItem{
+				Type: itemType, Title: entry.Title,
+				SortTitle: entry.Title, Year: entry.ReleaseYear, ImdbID: entry.IMDbID,
+				TmdbID: fmt.Sprintf("%d", entry.ID), Status: "matched",
+			}
+			if entry.ID <= 0 {
+				item.TmdbID = ""
+			}
+			if tvdbID > 0 {
+				item.TvdbID = strconv.Itoa(tvdbID)
+			}
+			contentID, err := virtualPlaybackContentID(item)
+			if err != nil {
+				return nil, fmt.Errorf("building canonical virtual media id: %w", err)
+			}
+			item.ContentID = contentID
+			if err := s.materializeVirtualPlayback(ctx, collection, item); err != nil {
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("materializing virtual item %q: %w", entry.Title, err)
+				}
+				slog.WarnContext(ctx, "failed to materialize virtual playback item for collection entry",
+					"component", "catalog",
+					"collection_id", collection.ID,
+					"title", entry.Title,
+					"error", err,
+				)
+				warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, err))
+				continue
+			}
+			preparedVirtual[item.ContentID] = struct{}{}
+			if item.ImdbID != "" {
+				lookup.ByIMDb[item.ImdbID] = contentID
+			}
+			if item.TmdbID != "" {
+				lookup.ByTMDB[item.TmdbID] = contentID
+			}
+			if item.TvdbID != "" {
+				lookup.ByTVDB[item.TvdbID] = contentID
+			}
+		}
+	}
+
 	// First pass: collect ALL candidate content_ids per entry in priority
 	// order. The legacy resolveMDBListEntry walked every external-ID hit and
 	// returned the first library-resident match, so we must keep the full
@@ -319,7 +914,6 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 	candidateIDs := make([]string, 0, len(entries))
 	candidateSet := make(map[string]struct{}, len(entries))
 	matchedItems := make([]LibraryCollectionItemInput, 0, len(entries))
-	warnings := make([]string, 0)
 
 	for index, entry := range entries {
 		itemType := mdbListEntryItemType(entry)
@@ -376,6 +970,14 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 			}
 		}
 		if chosen == "" {
+			for _, candidate := range r.candidates {
+				if _, prepared := preparedVirtual[candidate]; prepared {
+					chosen = candidate
+					break
+				}
+			}
+		}
+		if chosen == "" {
 			warnings = append(warnings, fmt.Sprintf("No match in libraries %v for %s", collection.LibraryIDs, entry.Title))
 			continue
 		}
@@ -390,7 +992,7 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 		}
 	}
 
-	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
+	if err := s.acceptCollectionItems(ctx, collection, matchedItems); err != nil {
 		return nil, err
 	}
 
@@ -481,12 +1083,43 @@ func (s *LibraryCollectionService) syncTMDBPresetCollection(ctx context.Context,
 	duplicateCount := 0
 	scannedEntries := 0
 	limitReached := false
+	theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
 
 	for i, entry := range results {
 		scannedEntries = i + 1
+		if tmdbEntryIsUnreleased(entry) {
+			slog.DebugContext(ctx, "TMDB preset sync: skipping unreleased entry", "component", "catalog",
+				"rank", i+1, "title", entry.Title, "release_date", entry.ReleaseDate)
+			unmatchedCount++
+			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (release: %s)", entry.Title, entry.ReleaseDate))
+			continue
+		}
+		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, 0, entry.ReleaseDate) {
+			unmatchedCount++
+			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
+			continue
+		}
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item == nil {
+			if cfg.VirtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID) {
+				var vErr error
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
+				if vErr != nil {
+					if ctx.Err() != nil {
+						return nil, vErr
+					}
+					slog.WarnContext(ctx, "failed to materialize virtual item for collection entry",
+						"component", "catalog",
+						"collection_id", collection.ID,
+						"title", entry.Title,
+						"error", vErr,
+					)
+					warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, vErr))
+				}
+			}
 		}
 		if item == nil {
 			slog.DebugContext(ctx, "TMDB preset sync: no match", "component", "catalog",
@@ -548,7 +1181,7 @@ func (s *LibraryCollectionService) syncTMDBPresetCollection(ctx context.Context,
 		"total", len(results),
 	)
 
-	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
+	if err := s.acceptCollectionItems(ctx, collection, matchedItems); err != nil {
 		return nil, err
 	}
 
@@ -645,12 +1278,43 @@ func (s *LibraryCollectionService) syncTMDBFranchiseCollection(ctx context.Conte
 	duplicateCount := 0
 	scannedEntries := 0
 	limitReached := false
+	theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
 
 	for i, entry := range results {
 		scannedEntries = i + 1
+		if tmdbEntryIsUnreleased(entry) {
+			slog.DebugContext(ctx, "TMDB franchise sync: skipping unreleased entry", "component", "catalog",
+				"rank", i+1, "title", entry.Title, "release_date", entry.ReleaseDate)
+			unmatchedCount++
+			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (release: %s)", entry.Title, entry.ReleaseDate))
+			continue
+		}
+		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, 0, entry.ReleaseDate) {
+			unmatchedCount++
+			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
+			continue
+		}
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item == nil {
+			if cfg.VirtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID) {
+				var vErr error
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
+				if vErr != nil {
+					if ctx.Err() != nil {
+						return nil, vErr
+					}
+					slog.WarnContext(ctx, "failed to materialize virtual item for collection entry",
+						"component", "catalog",
+						"collection_id", collection.ID,
+						"title", entry.Title,
+						"error", vErr,
+					)
+					warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, vErr))
+				}
+			}
 		}
 		if item == nil {
 			slog.DebugContext(ctx, "TMDB franchise sync: no match", "component", "catalog",
@@ -703,7 +1367,7 @@ func (s *LibraryCollectionService) syncTMDBFranchiseCollection(ctx context.Conte
 		"total", len(results),
 	)
 
-	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
+	if err := s.acceptCollectionItems(ctx, collection, matchedItems); err != nil {
 		return nil, err
 	}
 
@@ -820,12 +1484,43 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 	duplicateCount := 0
 	scannedEntries := 0
 	limitReached := false
+	theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
 
 	for i, entry := range results {
 		scannedEntries = i + 1
+		if tmdbEntryIsUnreleased(entry) {
+			slog.DebugContext(ctx, "TMDB discover sync: skipping unreleased entry", "component", "catalog",
+				"rank", i+1, "title", entry.Title, "release_date", entry.ReleaseDate)
+			unmatchedCount++
+			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (release: %s)", entry.Title, entry.ReleaseDate))
+			continue
+		}
+		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, 0, entry.ReleaseDate) {
+			unmatchedCount++
+			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
+			continue
+		}
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item == nil {
+			if cfg.VirtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID) {
+				var vErr error
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
+				if vErr != nil {
+					if ctx.Err() != nil {
+						return nil, vErr
+					}
+					slog.WarnContext(ctx, "failed to materialize virtual item for collection entry",
+						"component", "catalog",
+						"collection_id", collection.ID,
+						"title", entry.Title,
+						"error", vErr,
+					)
+					warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, vErr))
+				}
+			}
 		}
 		if item == nil {
 			slog.DebugContext(ctx, "TMDB discover sync: no match", "component", "catalog",
@@ -874,7 +1569,7 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 		"total", len(results),
 	)
 
-	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
+	if err := s.acceptCollectionItems(ctx, collection, matchedItems); err != nil {
 		return nil, err
 	}
 
@@ -922,7 +1617,7 @@ func (s *LibraryCollectionService) syncTraktPresetCollection(ctx context.Context
 	startedAt := syncTimestamp()
 
 	if s.TraktCollections == nil {
-		return nil, fmt.Errorf("Trakt preset sync requires configured Trakt access")
+		return nil, fmt.Errorf("Trakt preset sync requires configured Trakt access") //nolint:staticcheck // Trakt is a proper product name.
 	}
 
 	preset := strings.TrimSpace(cfg.Preset)
@@ -975,7 +1670,7 @@ func (s *LibraryCollectionService) syncTraktPresetCollection(ctx context.Context
 		"count", len(results),
 	)
 
-	return s.completeTraktEntrySync(ctx, collection, results, cfg.Limit, startedAt, opts)
+	return s.completeTraktEntrySync(ctx, collection, results, cfg.Limit, cfg.VirtualPlayback, startedAt, opts)
 }
 
 // syncTraktListCollection populates a collection from a user-authored Trakt
@@ -986,7 +1681,7 @@ func (s *LibraryCollectionService) syncTraktListCollection(ctx context.Context, 
 	startedAt := syncTimestamp()
 
 	if s.TraktCollections == nil {
-		return nil, fmt.Errorf("Trakt list sync requires configured Trakt access")
+		return nil, fmt.Errorf("Trakt list sync requires configured Trakt access") //nolint:staticcheck // Trakt is a proper product name.
 	}
 	listURL := strings.TrimSpace(cfg.ListURL)
 	if listURL == "" {
@@ -1013,7 +1708,7 @@ func (s *LibraryCollectionService) syncTraktListCollection(ctx context.Context, 
 		"count", len(results),
 	)
 
-	return s.completeTraktEntrySync(ctx, collection, results, cfg.Limit, startedAt, opts)
+	return s.completeTraktEntrySync(ctx, collection, results, cfg.Limit, cfg.VirtualPlayback, startedAt, opts)
 }
 
 // ParseTraktListURL extracts the user and list slug from a trakt.tv list URL
@@ -1022,10 +1717,10 @@ func (s *LibraryCollectionService) syncTraktListCollection(ctx context.Context, 
 func ParseTraktListURL(raw string) (user, list string, err error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return "", "", fmt.Errorf("Trakt list sync: url is required")
+		return "", "", fmt.Errorf("Trakt list sync: url is required") //nolint:staticcheck // Trakt is a proper product name.
 	}
 	badFormat := func() (string, string, error) {
-		return "", "", fmt.Errorf("Trakt list sync: expected a URL like https://trakt.tv/users/{user}/lists/{list}, got %q", raw)
+		return "", "", fmt.Errorf("Trakt list sync: expected a URL like https://trakt.tv/users/{user}/lists/{list}, got %q", raw) //nolint:staticcheck // Trakt is a proper product name.
 	}
 	isURL := strings.Contains(trimmed, "://") || strings.Contains(strings.ToLower(trimmed), "trakt.tv")
 	if isURL {
@@ -1035,7 +1730,7 @@ func ParseTraktListURL(raw string) (user, list string, err error) {
 		}
 		parsed, parseErr := url.Parse(normalized)
 		if parseErr != nil {
-			return "", "", fmt.Errorf("Trakt list sync: invalid url %q", raw)
+			return "", "", fmt.Errorf("Trakt list sync: invalid url %q", raw) //nolint:staticcheck // Trakt is a proper product name.
 		}
 		host := strings.ToLower(parsed.Hostname())
 		if host != "trakt.tv" && host != "www.trakt.tv" {
@@ -1063,7 +1758,7 @@ func ParseTraktListURL(raw string) (user, list string, err error) {
 // completeTraktEntrySync matches fetched Trakt entries against the
 // collection's libraries and records the sync run. Shared by the preset and
 // user-list sources.
-func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, collection *models.LibraryCollection, results []TraktCollectionEntry, limit *int, startedAt time.Time, opts SyncCollectionOptions) (*models.LibraryCollectionSyncRun, error) {
+func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, collection *models.LibraryCollection, results []TraktCollectionEntry, limit *int, virtualPlayback bool, startedAt time.Time, opts SyncCollectionOptions) (*models.LibraryCollectionSyncRun, error) {
 	matchedItems := make([]LibraryCollectionItemInput, 0, len(results))
 	seenContentIDs := make(map[string]int, len(results))
 	warnings := make([]string, 0)
@@ -1071,12 +1766,41 @@ func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, c
 	duplicateCount := 0
 	scannedEntries := 0
 	limitReached := false
+	theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
 
 	for i, entry := range results {
 		scannedEntries = i + 1
+		if isUnreleasedYearOrDate(entry.Year, "") {
+			slog.DebugContext(ctx, "Trakt sync: skipping unreleased entry", "component", "catalog", "title", entry.Title, "year", entry.Year)
+			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (year: %d)", entry.Title, entry.Year))
+			continue
+		}
+		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.TMDBID, entry.Title, entry.Year, "") {
+			unmatchedCount++
+			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
+			continue
+		}
 		item, err := s.resolveTraktEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item == nil {
+			if virtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.TMDBID, entry.TVDBID) {
+				var vErr error
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, entry.Year, entry.IMDbID, entry.TMDBID, entry.TVDBID)
+				if vErr != nil {
+					if ctx.Err() != nil {
+						return nil, vErr
+					}
+					slog.WarnContext(ctx, "failed to materialize virtual item for collection entry",
+						"component", "catalog",
+						"collection_id", collection.ID,
+						"title", entry.Title,
+						"error", vErr,
+					)
+					warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, vErr))
+				}
+			}
 		}
 		if item == nil {
 			unmatchedCount++
@@ -1110,7 +1834,7 @@ func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, c
 		}
 	}
 
-	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
+	if err := s.acceptCollectionItems(ctx, collection, matchedItems); err != nil {
 		return nil, err
 	}
 
@@ -1166,6 +1890,30 @@ func (s *LibraryCollectionService) recordFailedCollectionSync(ctx context.Contex
 		StartedAt:    startedAt,
 		CompletedAt:  syncTimestamp(),
 	})
+}
+
+func (s *LibraryCollectionService) createVirtualCollectionItem(ctx context.Context, collection *models.LibraryCollection, mediaType, title string, year int, imdbID string, tmdbID, tvdbID int) (*models.MediaItem, error) {
+	itemType := "movie"
+	if mediaType == "show" || mediaType == "tv" || mediaType == "series" {
+		itemType = "series"
+	}
+	item := &models.MediaItem{Type: itemType, Title: title, SortTitle: title, Year: year, ImdbID: strings.TrimSpace(imdbID), Status: "matched"}
+	if tmdbID > 0 {
+		item.TmdbID = fmt.Sprintf("%d", tmdbID)
+	}
+	if tvdbID > 0 {
+		item.TvdbID = fmt.Sprintf("%d", tvdbID)
+	}
+	contentID, err := virtualPlaybackContentID(item)
+	if err != nil {
+		return nil, fmt.Errorf("building canonical virtual media ID for %q: %w", title, err)
+	}
+	item.ContentID = contentID
+	_, err = s.EnsureCollectionItemMaterializedWithOptions(ctx, collection, item, VirtualMaterializeOptions{RequireMembership: false})
+	if err != nil {
+		return nil, fmt.Errorf("materializing virtual item %q: %w", title, err)
+	}
+	return item, nil
 }
 
 // resolveTMDBEntry finds a media item in the library matching a TMDB preset entry.
@@ -1284,7 +2032,7 @@ func (s *LibraryCollectionService) fetchMDBListEntries(ctx context.Context, list
 	if err != nil {
 		return nil, fmt.Errorf("fetching mdblist list: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return nil, fmt.Errorf("mdblist request failed with status %d", res.StatusCode)
@@ -1345,6 +2093,7 @@ func pickCandidatesByPriority(lookup *ExternalIDLookup, entry mdblistEntry, item
 	return candidates
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func slugifyCollectionTitle(title string) string {
 	title = strings.ToLower(strings.TrimSpace(title))
 	title = strings.ReplaceAll(title, "'", "")
@@ -1394,4 +2143,111 @@ func (s *LibraryCollectionService) maybeGenerateCollage(ctx context.Context, col
 
 func syncTimestamp() time.Time {
 	return time.Now().UTC().Truncate(time.Microsecond)
+}
+
+var (
+	bracketYearRegex  = regexp.MustCompile(`[([{](19\d\d|20\d\d)[)\]}]`)
+	trailingYearRegex = regexp.MustCompile(`(?:\s+-\s*|\s+)(19\d\d|20\d\d)\s*$`)
+)
+
+func extractTitleYear(title string) int {
+	if m := bracketYearRegex.FindStringSubmatch(title); len(m) > 1 {
+		if y, err := strconv.Atoi(m[1]); err == nil {
+			return y
+		}
+	}
+	if m := trailingYearRegex.FindStringSubmatch(title); len(m) > 1 {
+		if y, err := strconv.Atoi(m[1]); err == nil {
+			return y
+		}
+	}
+	return 0
+}
+
+// tmdbEntryIsUnreleased reports whether a TMDB collection entry should be
+// excluded from collection sync because it has not yet been released. Both
+// movies and TV series are gated: for movies this is the primary_release_date,
+// for TV it is the first_air_date. An empty or unparseable ReleaseDate is
+// treated as unreleased to avoid surfacing placeholder entries that have no
+// confirmed air/release date.
+//
+// When a title includes an explicit future or current release year (e.g. from
+// its title "Fuze (2026)") that postdates a past festival premiere date (e.g.
+// TIFF/Sundance), the entry is gated as unreleased so festival screenings do
+// not bypass release gating.
+func tmdbEntryIsUnreleased(entry TMDBCollectionEntry) bool {
+	rd := strings.TrimSpace(entry.ReleaseDate)
+	if len(rd) >= 10 {
+		rd = rd[:10]
+	}
+	if rd == "" {
+		return true // no release/air date known yet
+	}
+	t, err := time.Parse("2006-01-02", rd)
+	if err != nil {
+		if len(rd) == 4 {
+			if y, yerr := strconv.Atoi(rd); yerr == nil {
+				return y >= time.Now().UTC().Year()
+			}
+		}
+		// Malformed date — treat as unreleased.
+		return true
+	}
+	now := time.Now().UTC().Truncate(24 * time.Hour)
+	if t.After(now) {
+		return true
+	}
+
+	// Check if the title indicates a future or current theatrical release year
+	// that postdates this premiere date (e.g. TIFF/Sundance festival premiere
+	// in a prior year, or theatrical release later this year/next year).
+	if titleYear := extractTitleYear(entry.Title); titleYear > 0 {
+		if titleYear > now.Year() || (titleYear >= now.Year() && titleYear > t.Year()) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isUnreleasedYearOrDate reports whether a release year or release date is in
+// the future relative to the server clock. A release date that cannot be
+// parsed falls back to the release year comparison when one is available.
+// If a movie has a release year indicating a current or future theatrical
+// release that postdates a past festival premiere date (e.g. TIFF/Sundance),
+// it is treated as unreleased so early festival screenings do not bypass
+// release gating.
+func isUnreleasedYearOrDate(year int, releaseDate string) bool {
+	now := time.Now().UTC().Truncate(24 * time.Hour)
+	currentYear := now.Year()
+
+	if year > currentYear {
+		return true
+	}
+
+	rd := strings.TrimSpace(releaseDate)
+	if len(rd) >= 10 {
+		rd = rd[:10]
+	}
+	if rd != "" {
+		if t, err := time.Parse("2006-01-02", rd); err == nil {
+			if t.After(now) {
+				return true
+			}
+			// Future theatrical movie with past festival premiere date (e.g. TIFF/Sundance):
+			// If the movie's release year is current or future, but the recorded date was from
+			// a prior year, it was an early festival premiere and has not had its general release.
+			if year >= currentYear && year > t.Year() {
+				return true
+			}
+			return false
+		}
+		if len(rd) == 4 {
+			if y, err := strconv.Atoi(rd); err == nil {
+				return y > currentYear
+			}
+		}
+	}
+
+	return year > currentYear
 }

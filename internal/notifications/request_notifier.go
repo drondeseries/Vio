@@ -25,6 +25,11 @@ const (
 	// DeliveryTypeRequestDeclined notifies the requesting profile that an
 	// admin declined their request.
 	DeliveryTypeRequestDeclined = "request.declined"
+	// DeliveryTypeRatingSet is the operational notice posted when a profile
+	// rates an item (PUT /ratings/{item_id}). It carries the rated item's
+	// identifiers so outbound receivers (e.g. a translation pipeline) can
+	// resolve and act on the media.
+	DeliveryTypeRatingSet = "rating.set"
 )
 
 // RequestFlags is the decoded reason_flags shape for request.* deliveries.

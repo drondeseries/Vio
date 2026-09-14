@@ -191,6 +191,7 @@ func TestPlaybackProbeEnsurerRefetchesBeforeRepairingStaleCaller(t *testing.T) {
 		Resolution:     "1080p",
 		Container:      "mkv",
 		Duration:       7_200,
+		Bitrate:        1_000,
 		VideoTracks:    []models.VideoTrack{{Codec: "hevc", ColorRange: "tv"}},
 		AudioTracks:    []models.AudioTrack{{Codec: "aac"}},
 		Chapters:       []models.MediaChapter{},

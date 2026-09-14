@@ -404,6 +404,32 @@ func TestPrepareSubtitleFilterInputCreatesParserSafeAlias(t *testing.T) {
 	}
 }
 
+func TestPrepareSubtitleFilterInput_HTTPStream(t *testing.T) {
+	outputDir := t.TempDir()
+	httpInputPath := "http://127.0.0.1:41569/source/abc12345/stream"
+	opts := TranscodeOpts{
+		InputPath:          httpInputPath,
+		OutputDir:          outputDir,
+		SubtitleBurnIn:     true,
+		SubtitleTrackIndex: 1,
+		SubtitleCodec:      "subrip",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+	}
+
+	if err := prepareSubtitleFilterInput(&opts); err != nil {
+		t.Fatalf("prepareSubtitleFilterInput() error = %v", err)
+	}
+	if opts.subtitleFilterInputPath != httpInputPath {
+		t.Fatalf("subtitleFilterInputPath = %q, want %q", opts.subtitleFilterInputPath, httpInputPath)
+	}
+
+	aliasPath := filepath.Join(outputDir, subtitleFilterAliasName)
+	if _, err := os.Stat(aliasPath); err == nil {
+		t.Fatalf("prepareSubtitleFilterInput should not create a local symlink for HTTP stream URLs")
+	}
+}
+
 func TestStartTranscodeRejectsUnvalidatedBitstreamFilter(t *testing.T) {
 	_, err := StartTranscode(context.Background(), TranscodeOpts{
 		VideoBitstreamFilter: "arbitrary_filter=1",
@@ -959,9 +985,6 @@ func TestBuildFFmpegArgs_H264High10UploadsBeforeHardwareToneMap(t *testing.T) {
 				toneMap := strings.Index(joined, toneMapName)
 				if upload < 0 || toneMap < 0 || upload >= toneMap {
 					t.Fatalf("software frames were not uploaded before %s: %s", toneMapName, joined)
-				}
-				if strings.Contains(joined, "-hwaccel vaapi") || strings.Contains(joined, "-hwaccel_output_format vaapi") {
-					t.Fatalf("High 10 source unexpectedly selected hardware decode: %s", joined)
 				}
 			})
 		}

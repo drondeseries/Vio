@@ -56,6 +56,10 @@ type deviceResponse struct {
 	// It is the one number a device list needs: everything else about a device
 	// is either its identity or its last-seen time.
 	ChangedCount int `json:"changed_count"`
+	// CapabilityFingerprint and CapabilitySource are present only when this
+	// device has reported a capability profile (or an admin seeded one).
+	CapabilityFingerprint string `json:"capability_fingerprint,omitempty"`
+	CapabilitySource      string `json:"capability_source,omitempty"`
 }
 
 type deviceListResponse struct {
@@ -133,6 +137,28 @@ func (h *DeviceHandler) HandleListDevices(w http.ResponseWriter, r *http.Request
 			IsCurrentDevice: device.DeviceID == currentDeviceID,
 			ChangedCount:    counts[deviceKey{profileID: device.ProfileID, deviceID: device.DeviceID}],
 		})
+	}
+
+	// Attach each device's capability fingerprint/source so clients and the
+	// admin UI can tell whether a device has reported a codec profile.
+	if profiles, ok := store.(userstore.DeviceProfileRegistry); ok {
+		profileByDevice := map[string]*userstore.DeviceCapabilityProfile{}
+		for _, device := range devices {
+			if !household && device.ProfileID != profileID {
+				continue
+			}
+			p, err := profiles.GetDeviceProfile(r.Context(), device.ProfileID, device.DeviceID)
+			if err != nil || p == nil {
+				continue
+			}
+			profileByDevice[device.DeviceID] = p
+		}
+		for i := range resp.Devices {
+			if p := profileByDevice[resp.Devices[i].DeviceID]; p != nil {
+				resp.Devices[i].CapabilityFingerprint = p.Fingerprint
+				resp.Devices[i].CapabilitySource = p.Source
+			}
+		}
 	}
 
 	// ListDevices already orders by last_seen_at; keep that and make the tie
@@ -242,6 +268,16 @@ func (h *DeviceHandler) removeDevice(w http.ResponseWriter, r *http.Request, for
 		if err := registry.ForgetDevice(r.Context(), profileID, deviceID); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to forget device")
 			return
+		}
+	}
+	// Forgetting a device also drops its capability profile; clearing settings
+	// (forget=false) keeps it so the device keeps ranking for direct-play.
+	if forget {
+		if profiles, ok := store.(userstore.DeviceProfileRegistry); ok {
+			if err := profiles.ForgetDeviceProfile(r.Context(), profileID, deviceID); err != nil {
+				slog.WarnContext(r.Context(), "forget device profile failed", "component", "api",
+					"profile_id", profileID, "device_id", deviceID, "error", err)
+			}
 		}
 	}
 

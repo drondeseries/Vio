@@ -91,6 +91,27 @@ interface SubtitleFontBundleItem {
   data: string;
 }
 
+/**
+ * Normalizes a font bundle URL for cache keying. The N embedded ASS tracks of
+ * one file share one font payload, but the server URLs differ only by
+ * `embedded_stream_index`; without stripping that parameter each track would
+ * get its own cache entry for identical bytes (and the prefetch of one track
+ * would not warm the selection of another). The fetch URL itself is unchanged.
+ */
+export function fontBundleCacheKey(url: string): string {
+  // Parse with a base so relative URLs (the common case for API calls)
+  // work; fall back to the raw URL for truly unparseable inputs.
+  let parsed: URL;
+  try {
+    parsed = new URL(url, "http://silo.local");
+  } catch {
+    return url;
+  }
+  parsed.searchParams.delete("embedded_stream_index");
+  const qs = parsed.searchParams.toString();
+  return qs ? `${parsed.pathname}?${qs}` : parsed.pathname;
+}
+
 export function loadSubtitleFallbackFontData(font: SubtitleFallbackFont): Promise<Uint8Array[]> {
   const cached = fontDataCache.get(font.family);
   if (cached) return cached;
@@ -111,11 +132,16 @@ export function loadSubtitleFallbackFontData(font: SubtitleFallbackFont): Promis
   return promise;
 }
 
-export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promise<Uint8Array[]> {
-  const cached = fontBundleCache.get(url);
+export function loadSubtitleFontBundle(
+  url: string,
+  signal?: AbortSignal,
+  onSourceChanged?: () => void,
+): Promise<Uint8Array[]> {
+  const cacheKey = fontBundleCacheKey(url);
+  const cached = fontBundleCache.get(cacheKey);
   if (cached) {
-    fontBundleCache.delete(url);
-    fontBundleCache.set(url, cached);
+    fontBundleCache.delete(cacheKey);
+    fontBundleCache.set(cacheKey, cached);
     return cached.promise;
   }
 
@@ -126,6 +152,14 @@ export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promi
   const promise = fetch(url, { signal })
     .then(async (response) => {
       if (!response.ok) {
+        if (response.status === 409) {
+          // Virtual release rotation made the font URL stale; signal the
+          // player to refresh the subtitle inventory. The text fetcher
+          // usually fires first, but the font prefetch at plan adoption
+          // can hit this before any text fetch.
+          onSourceChanged?.();
+          return [];
+        }
         throw new Error(`HTTP ${response.status}`);
       }
       return (await response.json()) as { items: SubtitleFontBundleItem[] };
@@ -134,7 +168,7 @@ export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promi
     .then((fonts) => {
       entry.bytes = totalByteLength(fonts);
       if (entry.bytes > MAX_FONT_BUNDLE_CACHE_BYTES) {
-        fontBundleCache.delete(url);
+        fontBundleCache.delete(cacheKey);
       } else {
         evictFontBundleCache();
       }
@@ -143,11 +177,11 @@ export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promi
 
   // Do not poison the cache with transient network errors or aborted requests.
   const cachedPromise = promise.catch((err) => {
-    fontBundleCache.delete(url);
+    fontBundleCache.delete(cacheKey);
     throw err;
   });
   entry.promise = cachedPromise;
-  fontBundleCache.set(url, entry);
+  fontBundleCache.set(cacheKey, entry);
   evictFontBundleCache();
   return cachedPromise;
 }

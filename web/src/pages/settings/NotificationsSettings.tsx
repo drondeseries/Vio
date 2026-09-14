@@ -94,11 +94,13 @@ const REASON_FIELDS = [
   { key: "notify_next_up", label: "Next Up" },
 ] as const;
 
-// Webhooks additionally carry the request.fulfilled toggle; it is not an
-// episode reason, so the profile preferences section keeps REASON_FIELDS.
+// Webhooks additionally carry the request.fulfilled and rating.set toggles;
+// they are not episode reasons, so the profile preferences section keeps
+// REASON_FIELDS.
 const WEBHOOK_NOTIFY_FIELDS = [
   ...REASON_FIELDS,
   { key: "notify_requests", label: "Requests" },
+  { key: "notify_ratings", label: "Ratings" },
 ] as const;
 
 type WebhookNotifyKey = (typeof WEBHOOK_NOTIFY_FIELDS)[number]["key"];
@@ -732,6 +734,7 @@ function WebhookFormDialog({
     notify_continue_watching: webhook?.notify_continue_watching ?? true,
     notify_next_up: webhook?.notify_next_up ?? true,
     notify_requests: webhook?.notify_requests ?? true,
+    notify_ratings: webhook?.notify_ratings ?? false,
   });
   const pending = create.isPending || update.isPending;
   const editing = webhook != null;

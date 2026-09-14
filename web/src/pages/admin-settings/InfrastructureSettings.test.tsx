@@ -46,6 +46,22 @@ vi.mock("@/hooks/queries/admin/settings", () => ({
   useUpdateServerSettings: () => ({ mutateAsync: updateSettingsMock, isPending: false }),
 }));
 
+vi.mock("@/hooks/queries/admin/collections", () => ({
+  usePurgeVirtualPlaybackItems: () => ({
+    isPending: false,
+    variables: undefined,
+    mutate: vi.fn(),
+  }),
+}));
+
+vi.mock("@/hooks/queries/admin/libraries", () => ({
+  useAdminLibraries: () => ({ data: undefined, isLoading: false }),
+}));
+
+vi.mock("@/hooks/queries/admin/plugins", () => ({
+  useAdminPluginInstallations: () => ({ data: undefined, isLoading: false }),
+}));
+
 useCheckAdminSettingsConnectionMock.mockReturnValue({ isPending: false, mutateAsync: vi.fn() });
 
 type FormOverrides = Partial<Record<string, unknown>>;

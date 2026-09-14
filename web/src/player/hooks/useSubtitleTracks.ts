@@ -3,6 +3,7 @@ import { parseVTT, type ParsedCue } from "../utils/parseVTT";
 import type { PlayerSubtitleInfo } from "../types";
 import { isASSCodec, isBitmapCodec } from "../utils/subtitleCodecs";
 import { toMediaTime } from "../utils/mediaTimeline";
+import { isSubtitleSourceChanged } from "../utils/subtitleSourceChanged";
 
 // Explicitly bound each subtitle fetch to this many source-time seconds.
 const WINDOW_DURATION = 600;
@@ -20,7 +21,9 @@ const SEEK_BACKOFF = 2;
 // a chunk. Extraction streams cues progressively, so a healthy-but-slow
 // ffmpeg keeps resetting the clock; only a genuinely hung one trips it.
 // Without this, one hung fetch blocks every future window for the session.
-const FETCH_STALL_TIMEOUT_MS = 30_000;
+// 60s matches the server relay's first-byte budget (30s) plus headroom for
+// a slow-but-progressing Usenet/altmount extraction.
+const FETCH_STALL_TIMEOUT_MS = 60_000;
 // Wait this long after a failed window fetch before retrying, so a
 // persistently failing extraction doesn't turn timeupdate into a fetch storm.
 const FETCH_RETRY_BACKOFF_MS = 5_000;
@@ -132,10 +135,17 @@ export function useSubtitleTracks(
   // fetched before the first media metadata arrives.
   streamGeneration = 0,
   onLoadState?: (state: "idle" | "loading" | "ready" | "error") => void,
+  // Fired when the server answers a window fetch with `subtitle_source_changed`
+  // (409): a virtual release rotated under this plan, so every URL for the
+  // active track is stale. The caller must refresh the plan's subtitle
+  // inventory; retrying the same URL can never succeed.
+  onSourceChanged?: () => void,
 ): string[] {
   const [activeCueTexts, setActiveCueTexts] = useState<string[]>([]);
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
+  const onSourceChangedRef = useRef(onSourceChanged);
+  onSourceChangedRef.current = onSourceChanged;
 
   // Latest stream origin, readable from stable callbacks (maybeFetch) without
   // retriggering the main effect.
@@ -242,6 +252,10 @@ export function useSubtitleTracks(
     // a short backoff before retrying the uncovered range.
     let lastFetchFailureAt = 0;
     let retryDelay = 0;
+    // Set when a window fetch answers 409 subtitle_source_changed: the source
+    // rotated under this plan and the URL is stale, so the failure branch must
+    // not schedule a backoff retry of a URL that can never succeed.
+    let sourceChangedSignaled = false;
 
     function handleCueChange() {
       const active = track.activeCues;
@@ -319,44 +333,53 @@ export function useSubtitleTracks(
         armStallTimer();
         const resp = await fetch(url, { signal: controller.signal });
         if (!resp.ok || !resp.body) {
-          console.error(`[useSubtitleTracks] Failed to fetch ${url}: ${resp.status}`);
-          return;
-        }
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
-
-        // Split on the last complete cue boundary (blank line) and parse
-        // the safe prefix, keep the rest. The WebVTT muxer emits cues
-        // terminated by "\n\n".
-        while (!cancelled) {
-          armStallTimer();
-          const { value, done } = await reader.read();
-          if (cancelled || controller.signal.aborted || inflight !== controller) return;
-          if (done) break;
-          buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-          const split = buf.lastIndexOf("\n\n");
-          if (split < 0) continue;
-          const safe = buf.slice(0, split);
-          buf = buf.slice(split + 2);
-          const cues = parseVTT(safe);
-          if (cues.length > 0) {
-            addParsedCues(cues);
-            onLoadStateRef.current?.("ready");
+          if (await isSubtitleSourceChanged(resp)) {
+            sourceChangedSignaled = true;
+            onSourceChangedRef.current?.();
+          } else {
+            // Non-ok responses (including 404/415) fall through to the finally
+            // block, which schedules a bounded exponential-backoff retry. A
+            // silent return here would let every timeupdate re-trigger the
+            // fetch and storm the server.
+            console.error(`[useSubtitleTracks] Failed to fetch ${url}: ${resp.status}`);
           }
-        }
+        } else {
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
 
-        // Flush any tail the muxer didn't terminate with a blank line.
-        buf += decoder.decode();
-        if (buf.trim()) {
-          const cues = parseVTT(buf);
-          if (cues.length > 0) {
-            addParsedCues(cues);
-            onLoadStateRef.current?.("ready");
+          // Split on the last complete cue boundary (blank line) and parse
+          // the safe prefix, keep the rest. The WebVTT muxer emits cues
+          // terminated by "\n\n".
+          while (!cancelled) {
+            armStallTimer();
+            const { value, done } = await reader.read();
+            if (cancelled || controller.signal.aborted || inflight !== controller) return;
+            if (done) break;
+            buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+            const split = buf.lastIndexOf("\n\n");
+            if (split < 0) continue;
+            const safe = buf.slice(0, split);
+            buf = buf.slice(split + 2);
+            const cues = parseVTT(safe);
+            if (cues.length > 0) {
+              addParsedCues(cues);
+              onLoadStateRef.current?.("ready");
+            }
           }
-        }
 
-        succeeded = true;
+          // Flush any tail the muxer didn't terminate with a blank line.
+          buf += decoder.decode();
+          if (buf.trim()) {
+            const cues = parseVTT(buf);
+            if (cues.length > 0) {
+              addParsedCues(cues);
+              onLoadStateRef.current?.("ready");
+            }
+          }
+
+          succeeded = true;
+        }
       } catch (err) {
         if ((err as Error).name !== "AbortError") {
           console.error("[useSubtitleTracks] Stream error:", err);
@@ -388,14 +411,19 @@ export function useSubtitleTracks(
           }
         } else if (!succeeded && !superseded && !cancelled) {
           // Genuine failure (error, stall, or non-ok response) rather than a
-          // seek superseding this fetch — back off before retrying.
-          lastFetchFailureAt = Date.now();
-          onLoadStateRef.current?.("error");
-          retryDelay = Math.min(
-            retryDelay ? retryDelay * 2 : FETCH_RETRY_BACKOFF_MS,
-            FETCH_RETRY_MAX_BACKOFF_MS,
-          );
-          retryTimer = setTimeout(maybeFetch, retryDelay);
+          // seek superseding this fetch — back off before retrying. A signaled
+          // source change is not a retryable failure: the replan will re-mint
+          // the URL, so no backoff is scheduled here. Guarded inline rather
+          // than with a `return` — this block runs inside a finally.
+          if (!sourceChangedSignaled) {
+            lastFetchFailureAt = Date.now();
+            onLoadStateRef.current?.("error");
+            retryDelay = Math.min(
+              retryDelay ? retryDelay * 2 : FETCH_RETRY_BACKOFF_MS,
+              FETCH_RETRY_MAX_BACKOFF_MS,
+            );
+            retryTimer = setTimeout(maybeFetch, retryDelay);
+          }
         }
       }
     }
@@ -410,6 +438,7 @@ export function useSubtitleTracks(
     //   - playback is nearing windowEnd and we haven't hit EOF → queue
     //     the next window, overlapping slightly with the previous
     function maybeFetch() {
+      if (sourceChangedSignaled) return; // stale URL; waiting for replan
       if (cancelled) return;
       // Until the element has media loaded, currentTime reads 0 rather than
       // the position playback will actually start at (resume target, or a

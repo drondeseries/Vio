@@ -134,10 +134,10 @@ func (p DeviceProfile) codecProfileCompatibilityWithValues(
 
 func codecProfileTarget(profile CodecProfile) string {
 	typ := normalizeConditionToken(profile.Type)
-	switch {
-	case typ == "videoaudio" || typ == "audio":
+	switch typ {
+	case "videoaudio", "audio":
 		return "audio"
-	case typ == "" || typ == "video":
+	case "", "video":
 		return "video"
 	default:
 		return ""

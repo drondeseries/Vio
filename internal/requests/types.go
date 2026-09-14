@@ -29,7 +29,7 @@ type Outcome string
 const (
 	OutcomeActive    Outcome = "active"
 	OutcomeDeclined  Outcome = "declined"
-	OutcomeCancelled Outcome = "cancelled"
+	OutcomeCancelled Outcome = "canceled"
 	OutcomeFailed    Outcome = "failed"
 )
 

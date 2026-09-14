@@ -7,6 +7,7 @@ import {
   compactAudioMeta,
   formatLanguageName,
 } from "@/pages/ItemDetail/components/versionFormatUtils";
+import { dedupeAudioTracks } from "../utils/trackDedupe";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
 
 interface AudioTrackMenuProps {
@@ -39,7 +40,9 @@ interface TrackDescriptor {
 
 function describeTrack(track: PlayerAudioTrack, index: number): TrackDescriptor {
   const title = audioTitle(track) || `Track ${index + 1}`;
-  const language = formatLanguageName(track.language ?? "");
+  const language = track.languages?.length
+    ? track.languages.map(formatLanguageName).filter(Boolean).join("/")
+    : formatLanguageName(track.language ?? "");
   const metaParts = [
     language && language.toLowerCase() !== title.toLowerCase() ? language : "",
     compactAudioMeta(track),
@@ -133,18 +136,21 @@ export function AudioTrackMenu({
 
   if (tracks.length === 0) return null;
 
-  const disabled = tracks.length <= 1;
+  // Probed inventories can repeat the same stream at several container
+  // indexes; the menu shows one row per distinct descriptor. The retained
+  // entry keeps its original inventory position so selection still names the
+  // track the server has at that slot.
+  const dedupedTracks = dedupeAudioTracks(tracks);
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
       {!hideTrigger && (
         <button
           type="button"
-          className={`player-utility-btn ${disabled ? "cursor-default opacity-40" : ""}`}
-          onClick={disabled ? undefined : () => setOpen((v) => !v)}
+          className="player-utility-btn"
+          onClick={() => setOpen((v) => !v)}
           aria-label="Audio tracks"
           aria-expanded={open}
-          aria-disabled={disabled}
           aria-haspopup="menu"
         >
           <AudioLines className="h-[18px] w-[18px]" />
@@ -160,7 +166,7 @@ export function AudioTrackMenu({
           <div className="px-3 py-1.5 text-xs font-medium tracking-wide text-white/50 uppercase">
             Audio
           </div>
-          {tracks.map((track, index) => {
+          {dedupedTracks.map(({ track, index }) => {
             const descriptor = describeTrack(track, index);
             const isActive = index === activeIndex;
             return (

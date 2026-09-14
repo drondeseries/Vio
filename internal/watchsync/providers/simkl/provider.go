@@ -239,7 +239,7 @@ func (p *Provider) FetchProgressBatch(ctx context.Context, cfg watchsync.ServerC
 	animeChanged := !shouldSkipSimklBucket(animePrevious, activities.Anime.Playback)
 	if showsChanged || animeChanged {
 		dateFrom := ""
-		if !(showsChanged && showsPrevious == "") && !(animeChanged && animePrevious == "") {
+		if (!showsChanged || showsPrevious != "") && (!animeChanged || animePrevious != "") {
 			dateFrom = oldestCursor(showsPrevious, animePrevious)
 		}
 		payload, err := p.fetchPlayback(ctx, cfg, conn, "/sync/playback/episodes", dateFrom)
@@ -480,7 +480,7 @@ func (p *Provider) do(ctx context.Context, method string, path string, cfg watch
 	if err != nil {
 		return fmt.Errorf("send simkl request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusConflict {
 		return simklConflictError{method: method, path: path}
 	}
@@ -972,6 +972,7 @@ func buildHistoryRequest(plays []watchsync.LocalPlay, includeWatchedAt bool) sim
 	return request
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func buildHistoryPayload(plays []watchsync.LocalPlay, includeWatchedAt bool) simklHistoryPayload {
 	return buildHistoryRequest(plays, includeWatchedAt).Payload
 }

@@ -210,7 +210,7 @@ func (h *DiagnosticsHandler) IngestMultipart(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		return diagnostics.IngestResult{}, h.diagnosticsMultipartFailure(r.Context(), userID, err)
 	}
-	defer bundlePart.Close()
+	defer func() { _ = bundlePart.Close() }()
 
 	result, err := h.service.Ingest(
 		r.Context(),

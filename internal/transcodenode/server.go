@@ -439,6 +439,15 @@ func (s *Server) restartSegmentLocked(
 }
 
 // NewServer creates a new transcode server.
+func playbackHWAccel(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "qsv", "vaapi", "nvenc", "cuda", "videotoolbox", "amf":
+		return true
+	default:
+		return false
+	}
+}
+
 func NewServer(watcher *nodeconfig.Watcher, tracker *nodesessions.Tracker) *Server {
 	var trackerImpl sessionTracker
 	if tracker != nil {
@@ -1190,7 +1199,7 @@ func (s *Server) trackDownloadPrepare(ctx context.Context, info nodesessions.Ses
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	snapshot := s.metrics.Snapshot().RedactPaths()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(HealthResponse{
+	_ = json.NewEncoder(w).Encode(HealthResponse{
 		Status:           "ok",
 		ActiveJobs:       s.activeJobs.Load(),
 		CapabilitiesHash: s.storedCapabilityHash(),
@@ -1320,7 +1329,7 @@ func (s *Server) handleHWCapabilities(w http.ResponseWriter, r *http.Request) {
 	// starts advertising this hash immediately rather than at the next tick.
 	s.storeCapabilityHash(info.CapabilityHash)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
+	_ = json.NewEncoder(w).Encode(info)
 }
 
 // capabilitySnapshotInterval is how often the node recomputes its capability
@@ -1595,6 +1604,13 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	// spawn or validation failure must leave a healthy live session intact.
 	session, err := playback.StartTranscode(r.Context(), opts)
+	if err != nil && playbackHWAccel(opts.HWAccel) && softwareFallbackAllowed(cfg.Playback.SoftwareFallback) {
+		slog.WarnContext(r.Context(), "hardware transcode start failed; falling back to software",
+			"component", "transcodenode", "hw_accel", opts.HWAccel, "error", err)
+		swOpts := opts
+		swOpts.HWAccel = "none"
+		session, err = playback.StartTranscode(r.Context(), swOpts)
+	}
 	if err != nil {
 		unlock()
 		slog.ErrorContext(r.Context(), "start transcode", "component", "transcodenode", "error", err, "session", req.SessionID, "playback_session_id", req.SessionID)
@@ -1689,7 +1705,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(TranscodeStartResponse{
+	_ = json.NewEncoder(w).Encode(TranscodeStartResponse{
 		SessionID:             req.SessionID,
 		Status:                "started",
 		HWAccel:               effectiveHWAccel,
@@ -1698,6 +1714,10 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		CopyFMP4RecipeVersion: req.CopyFMP4RecipeVersion,
 		ThrottleSeconds:       req.ThrottleSeconds,
 	})
+}
+
+func softwareFallbackAllowed(value string) bool {
+	return !strings.EqualFold(strings.TrimSpace(value), "gpu_only")
 }
 
 func (s *Server) requireApprovedInputPath(w http.ResponseWriter, r *http.Request, path string) bool {

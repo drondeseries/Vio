@@ -415,6 +415,9 @@ type attemptKeyInput struct {
 
 func (f attemptKeyInput) plan() playback.PlanV3 {
 	width, height, bitrate := f.Width, f.Height, f.BitrateKbps
+	// AudioTracks is deliberately omitted: the attempt-key preimage must not
+	// depend on the inventory, exactly like the subtitle inventory. The key
+	// identifies the route, not the menu the route happens to publish.
 	return playback.PlanV3{
 		PlanID:   f.PlanID,
 		Delivery: f.Delivery,
@@ -875,7 +878,7 @@ func makePlannerScenarioWithAudioIndex(name, category string, request playback.S
 	}
 	return playback.PlannerScenarioV3{
 		Name: name, Category: category, Request: request,
-		Source:        playback.SourceDescriptorFromFileV3(file, audioTrackIndex),
+		Source:        playback.SourceDescriptorFromFileV3(file, 0),
 		AttemptedKeys: append([]string(nil), attempted...), Expected: expected,
 	}
 }

@@ -3,12 +3,16 @@ package pluginhost
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"golang.org/x/time/rate"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/events"
 )
 
@@ -82,6 +86,22 @@ func (f GlobalConfigSetterFunc) SetGlobalConfigEntry(ctx context.Context, instal
 	return f(ctx, installationID, key, value)
 }
 
+// VirtualCatalogRegistrar performs host-owned transactional registration of
+// virtual media submitted by an installed plugin.
+type VirtualCatalogRegistrar interface {
+	UpsertVirtualMedia(context.Context, int, catalog.VirtualMedia) (*catalog.VirtualMediaResult, error)
+}
+
+type VirtualCatalogReconciler interface {
+	ReconcileVirtualMedia(context.Context, int, string, []string, []int) (catalog.VirtualReconcileResult, error)
+}
+
+type VirtualCatalogRegistrarFunc func(context.Context, int, catalog.VirtualMedia) (*catalog.VirtualMediaResult, error)
+
+func (f VirtualCatalogRegistrarFunc) UpsertVirtualMedia(ctx context.Context, installationID int, req catalog.VirtualMedia) (*catalog.VirtualMediaResult, error) {
+	return f(ctx, installationID, req)
+}
+
 // DefaultPublishEventRatePerSec is the default maximum number of events a
 // plugin may publish per second. It also serves as the burst size so a plugin
 // can fire a short burst at a higher rate before being throttled.
@@ -100,6 +120,7 @@ type RuntimeHostServer struct {
 
 	installedPlugins InstalledPluginLister
 	configSetter     GlobalConfigSetter
+	virtualCatalog   VirtualCatalogRegistrar
 	installationID   int
 }
 
@@ -147,14 +168,154 @@ func NewRuntimeHostServerWithServices(
 	catalog CatalogPresenceLookup,
 	installedPlugins InstalledPluginLister,
 	configSetter GlobalConfigSetter,
+	virtualCatalog VirtualCatalogRegistrar,
 	pluginID string,
 	installationID int,
 ) *RuntimeHostServer {
 	s := NewRuntimeHostServerWithCatalog(publisher, libs, catalog, pluginID)
 	s.installedPlugins = installedPlugins
 	s.configSetter = configSetter
+	s.virtualCatalog = virtualCatalog
 	s.installationID = installationID
 	return s
+}
+
+func (s *RuntimeHostServer) UpsertVirtualMedia(ctx context.Context, req *pluginv1.UpsertVirtualMediaRequest) (*pluginv1.UpsertVirtualMediaResponse, error) {
+	if s.virtualCatalog == nil {
+		return nil, fmt.Errorf("server: virtual catalog is not configured")
+	}
+	if s.installationID <= 0 {
+		return nil, fmt.Errorf("server: plugin installation is not bound")
+	}
+
+	variants := make([]catalog.VirtualMediaVariant, 0, len(req.GetVariants()))
+	for _, v := range req.GetVariants() {
+		variants = append(variants, catalog.VirtualMediaVariant{
+			VirtualURI:     v.GetVirtualUri(),
+			Label:          v.GetLabel(),
+			Resolution:     v.GetResolution(),
+			CodecVideo:     v.GetCodecVideo(),
+			CodecAudio:     v.GetCodecAudio(),
+			HDR:            v.GetHdr(),
+			Bitrate:        int(v.GetBitrate()),
+			RuntimeMinutes: int(v.GetRuntimeMinutes()),
+			FileSize:       v.GetFileSize(), Container: v.GetContainer(), SourceType: v.GetSourceType(),
+			AudioLanguages: v.GetAudioLanguages(), SubtitleLanguages: v.GetSubtitleLanguages(), Availability: v.GetAvailability(),
+		})
+	}
+
+	episodes := make([]catalog.VirtualEpisode, 0, len(req.GetEpisodes()))
+	for _, episode := range req.GetEpisodes() {
+		var airDate time.Time
+		if episode.GetAirDateUnix() > 0 {
+			airDate = time.Unix(episode.GetAirDateUnix(), 0).UTC()
+		}
+		epVariants := make([]catalog.VirtualMediaVariant, 0, len(episode.GetVariants()))
+		for _, v := range episode.GetVariants() {
+			epVariants = append(epVariants, catalog.VirtualMediaVariant{
+				VirtualURI:     v.GetVirtualUri(),
+				Label:          v.GetLabel(),
+				Resolution:     v.GetResolution(),
+				CodecVideo:     v.GetCodecVideo(),
+				CodecAudio:     v.GetCodecAudio(),
+				HDR:            v.GetHdr(),
+				Bitrate:        int(v.GetBitrate()),
+				RuntimeMinutes: int(v.GetRuntimeMinutes()),
+				FileSize:       v.GetFileSize(), Container: v.GetContainer(), SourceType: v.GetSourceType(),
+				AudioLanguages: v.GetAudioLanguages(), SubtitleLanguages: v.GetSubtitleLanguages(), Availability: v.GetAvailability(),
+			})
+		}
+		// Carry first-variant metadata to the episode so non-variant
+		// upsertVirtualFileWithMeta stores audio/subtitle languages.
+		var epResolution, epCodecVideo, epCodecAudio, epHDR, epContainer, epSourceType string
+		var epBitrate int
+		var epFileSize int64
+		var epAudioLangs, epSubLangs []string
+		if len(epVariants) > 0 {
+			epResolution = epVariants[0].Resolution
+			epCodecVideo = epVariants[0].CodecVideo
+			epCodecAudio = epVariants[0].CodecAudio
+			epHDR = epVariants[0].HDR
+			epBitrate = epVariants[0].Bitrate
+			epFileSize = epVariants[0].FileSize
+			epContainer = epVariants[0].Container
+			epSourceType = epVariants[0].SourceType
+			epAudioLangs = epVariants[0].AudioLanguages
+			epSubLangs = epVariants[0].SubtitleLanguages
+		}
+		episodes = append(episodes, catalog.VirtualEpisode{
+			SeasonNumber: int(episode.GetSeasonNumber()), EpisodeNumber: int(episode.GetEpisodeNumber()),
+			Title: episode.GetTitle(), Overview: episode.GetOverview(), AirDate: airDate,
+			RuntimeMinutes: int(episode.GetRuntimeMinutes()), StillPath: episode.GetStillPath(), VirtualURI: episode.GetVirtualUri(),
+			Variants:   epVariants,
+			Resolution: epResolution, CodecVideo: epCodecVideo, CodecAudio: epCodecAudio,
+			HDR: epHDR, Bitrate: epBitrate, FileSize: epFileSize,
+			Container: epContainer, SourceType: epSourceType,
+			AudioLanguages: epAudioLangs, SubtitleLanguages: epSubLangs,
+		})
+	}
+
+	// Carry top-level stream metadata from the first variant when the request
+	// carries no dedicated top-level fields — this lets the catalog store
+	// resolution, codecs, audio/subtitle languages so the watch detail and
+	// player UI show track options without waiting for a playback probe.
+	var topResolution, topCodecVideo, topCodecAudio, topHDR, topContainer, topSourceType string
+	var topBitrate int
+	var topFileSize int64
+	var topAudioLangs, topSubLangs []string
+	if len(variants) > 0 {
+		topResolution = variants[0].Resolution
+		topCodecVideo = variants[0].CodecVideo
+		topCodecAudio = variants[0].CodecAudio
+		topHDR = variants[0].HDR
+		topBitrate = variants[0].Bitrate
+		topFileSize = variants[0].FileSize
+		topContainer = variants[0].Container
+		topSourceType = variants[0].SourceType
+		topAudioLangs = variants[0].AudioLanguages
+		topSubLangs = variants[0].SubtitleLanguages
+	}
+	vm := catalog.VirtualMedia{
+		LibraryID: req.GetLibraryId(), MediaType: req.GetMediaType(), Title: req.GetTitle(), Year: int(req.GetYear()),
+		IMDbID: req.GetImdbId(), TMDBID: req.GetTmdbId(), TVDBID: req.GetTvdbId(), Overview: req.GetOverview(),
+		Genres: req.GetGenres(), PosterPath: req.GetPosterPath(), BackdropPath: req.GetBackdropPath(),
+		VirtualURI: req.GetVirtualUri(), RuntimeMinutes: int(req.GetRuntimeMinutes()), Episodes: episodes,
+		Variants: variants, Source: req.GetSourceKey(),
+		Resolution: topResolution, CodecVideo: topCodecVideo, CodecAudio: topCodecAudio,
+		HDR: topHDR, Bitrate: topBitrate, FileSize: topFileSize,
+		Container: topContainer, SourceType: topSourceType,
+		AudioLanguages: topAudioLangs, SubtitleLanguages: topSubLangs,
+	}
+
+	result, err := s.virtualCatalog.UpsertVirtualMedia(ctx, s.installationID, vm)
+	if err != nil {
+		return nil, err
+	}
+	return &pluginv1.UpsertVirtualMediaResponse{MediaId: result.MediaID, LibraryId: result.LibraryID, EpisodesUpserted: int32(result.EpisodesUpserted)}, nil
+}
+
+func (s *RuntimeHostServer) ReconcileVirtualMedia(ctx context.Context, req *pluginv1.ReconcileVirtualMediaRequest) (*pluginv1.ReconcileVirtualMediaResponse, error) {
+	reconciler, ok := s.virtualCatalog.(VirtualCatalogReconciler)
+	if !ok {
+		return nil, errors.New("server: virtual catalog is not configured")
+	}
+	sourceKey := strings.TrimSpace(req.GetSourceKey())
+	if sourceKey == "" {
+		return nil, errors.New("source_key is required")
+	}
+	libraryIDs := make([]int, 0, len(req.GetLibraryIds()))
+	for _, value := range req.GetLibraryIds() {
+		id, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid library_id %q", value)
+		}
+		libraryIDs = append(libraryIDs, id)
+	}
+	result, err := reconciler.ReconcileVirtualMedia(ctx, s.installationID, sourceKey, req.GetKeepMediaIds(), libraryIDs)
+	if err != nil {
+		return nil, err
+	}
+	return &pluginv1.ReconcileVirtualMediaResponse{ItemsRemoved: int32(result.ItemsRemoved), FilesRemoved: int32(result.FilesRemoved)}, nil
 }
 
 // PublishEvent auto-prefixes the plugin's event name with "plugin.<plugin_id>."

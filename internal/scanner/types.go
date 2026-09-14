@@ -89,17 +89,26 @@ type VideoTrackInfo struct {
 
 // AudioTrackInfo describes a probed audio track.
 type AudioTrackInfo struct {
+	// Index is the container stream ordinal (ffmpeg's `0:a:N`), preserved so
+	// the selected track can be mapped to the real stream even when the
+	// probed/synthesized track list order differs from the container order
+	// (common for MULTi releases and virtual sources).
+	Index         int
 	Title         string
 	EmbeddedTitle string
 	Language      string
-	Codec         string
-	Profile       string
-	Layout        string
-	Channels      int
-	Bitrate       int
-	SampleRate    int
-	BitDepth      int
-	Default       bool
+	// Languages is the full advertised language list for MULTI/DUAL tracks
+	// ("English / French"), parsed from the track title when the container
+	// language tag is absent, undetermined, or multiple.
+	Languages  []string
+	Codec      string
+	Profile    string
+	Layout     string
+	Channels   int
+	Bitrate    int
+	SampleRate int
+	BitDepth   int
+	Default    bool
 }
 
 // SubtitleTrackInfo describes an embedded subtitle track from probing.

@@ -94,7 +94,8 @@ func ValidateSourceWithRunner(ctx context.Context, request SourcePreflightReques
 		request.FFprobePath = ffprobeForFFmpeg(request.FFmpegPath)
 	}
 
-	preflightCtx, cancel := context.WithTimeout(ctx, SourcePreflightTimeout(request.DurationSeconds))
+	budget := sourcePreflightBudget(request.DurationSeconds, request.InputPath)
+	preflightCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	key, cacheable := sourcePreflightKey(preflightCtx, request, run)
 	if err := preflightCtx.Err(); err != nil {
@@ -110,7 +111,8 @@ func ValidateSourceWithRunner(ctx context.Context, request SourcePreflightReques
 			if ok {
 				return entry, nil
 			}
-			sharedCtx, sharedCancel := context.WithTimeout(context.Background(), sourcePreflightExecutionTimeout(request.DurationSeconds))
+			execBudget := sourcePreflightBudget(request.DurationSeconds, request.InputPath)
+			sharedCtx, sharedCancel := context.WithTimeout(context.Background(), execBudget)
 			defer sharedCancel()
 			preflightErr := runSourcePreflight(sharedCtx, request, run)
 			if err := sharedCtx.Err(); err != nil {
@@ -199,6 +201,41 @@ func SourcePreflightTimeout(durationSeconds float64) time.Duration {
 func sourcePreflightExecutionTimeout(durationSeconds float64) time.Duration {
 	commandCount := 3 * len(sourcePreflightPositions(durationSeconds))
 	return time.Duration(commandCount)*probeCommandTimeout + sourcePreflightTimeoutSlack
+}
+
+// sourcePreflightBudget widens the wall-clock allowance for remote and virtual
+// inputs, whose per-command latency is dominated by network reads instead of
+// local decode.
+func sourcePreflightBudget(durationSeconds float64, inputPath string) time.Duration {
+	if !sourcePreflightInputIsRemote(inputPath) {
+		return SourcePreflightTimeout(durationSeconds)
+	}
+	commandCount := 3 * len(sourcePreflightPositions(durationSeconds))
+	return time.Duration(commandCount)*remoteProbeCommandTimeout + sourcePreflightTimeoutSlack
+}
+
+// sourcePreflightInputIsRemote reports whether preflight commands must read
+// their input over HTTP or from a virtual plugin stream.
+func sourcePreflightInputIsRemote(inputPath string) bool {
+	lower := strings.ToLower(strings.TrimSpace(inputPath))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "virtual://")
+}
+
+// sourcePreflightCommandTimeout bounds a single preflight command; remote and
+// virtual inputs get a wider window than local files.
+func sourcePreflightCommandTimeout(inputPath string) time.Duration {
+	if sourcePreflightInputIsRemote(inputPath) {
+		return remoteProbeCommandTimeout
+	}
+	return probeCommandTimeout
+}
+
+// runSourcePreflightBounded runs one preflight command with an input-aware
+// timeout on top of the caller's context.
+func runSourcePreflightBounded(ctx context.Context, run CommandRunner, inputPath string, name string, args ...string) ([]byte, error) {
+	commandCtx, cancel := context.WithTimeout(ctx, sourcePreflightCommandTimeout(inputPath))
+	defer cancel()
+	return run(commandCtx, name, args...)
 }
 
 // cachedPreflightError reconstructs the stored negative verdict without
@@ -342,7 +379,7 @@ func runSourcePreflight(ctx context.Context, request SourcePreflightRequest, run
 			return err
 		}
 		if !frameMatchesSourceKind(frame, request.Kind) {
-			return fmt.Errorf("%w: decoded frame metadata does not match %s fallback", ErrSourcePreflightRejected, request.Kind)
+			return fmt.Errorf("%w: decoded frame metadata does not match %s fallback (range=%q, primaries=%q, transfer=%q, space=%q)", ErrSourcePreflightRejected, request.Kind, frame.ColorRange, frame.ColorPrimaries, frame.ColorTransfer, frame.ColorSpace)
 		}
 		file, err := os.CreateTemp("", "silo-tonemap-preflight-*.mkv")
 		if err != nil {
@@ -354,7 +391,7 @@ func runSourcePreflight(ctx context.Context, request SourcePreflightRequest, run
 			return fmt.Errorf("%w: close tone-map preflight output: %w", ErrSourcePreflightUnavailable, err)
 		}
 		args := sourceConversionPreflightArgs(request, position, outputPath)
-		if output, err := runBounded(ctx, run, request.FFmpegPath, args...); err != nil {
+		if output, err := runSourcePreflightBounded(ctx, run, request.InputPath, request.FFmpegPath, args...); err != nil {
 			_ = os.Remove(outputPath)
 			return fmt.Errorf("%w: tone-map source conversion failed: %w (%s)", ErrSourcePreflightUnavailable, err, boundedCommandFailure(err, output))
 		}
@@ -407,7 +444,7 @@ func inspectSourceFrame(ctx context.Context, request SourcePreflightRequest, pos
 		"-show_entries", "frame=color_range,color_space,color_transfer,color_primaries",
 		"-of", "json", request.InputPath,
 	}
-	output, err := runBounded(ctx, run, request.FFprobePath, args...)
+	output, err := runSourcePreflightBounded(ctx, run, request.InputPath, request.FFprobePath, args...)
 	if err != nil {
 		return preflightFrame{}, fmt.Errorf("%w: inspect tone-map source frame: %w (%s)", ErrSourcePreflightUnavailable, err, boundedCommandFailure(err, output))
 	}
@@ -420,14 +457,15 @@ func inspectSourceFrame(ctx context.Context, request SourcePreflightRequest, pos
 	return payload.Frames[0], nil
 }
 
-// frameMatchesSourceKind requires complete decoded-frame metadata compatible
-// with the frozen base-signal classification.
+// frameMatchesSourceKind requires decoded-frame metadata compatible with the
+// frozen base-signal classification; remote and virtual sources may omit
+// individual fields, so completeness is not demanded here.
 func frameMatchesSourceKind(frame preflightFrame, kind SourceKind) bool {
-	complete, compatible := sourceMetadataCompatibility(kind, SourceMetadata{
+	_, compatible := sourceMetadataCompatibility(kind, SourceMetadata{
 		ColorRange: frame.ColorRange, ColorPrimaries: frame.ColorPrimaries,
 		ColorTransfer: frame.ColorTransfer, ColorSpace: frame.ColorSpace,
 	})
-	return complete && compatible
+	return compatible
 }
 
 // sourceConversionPreflightArgs builds a one-frame FFmpeg conversion that uses

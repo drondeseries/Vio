@@ -40,6 +40,7 @@ func ObserveRoot(filePath string, libraryType string) (RootObservation, bool) {
 	return observationFromAssignment(assignment), true
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func collectRootObservations(filePaths []string, libraryType string) []RootObservation {
 	return inferRootAssignments(filePaths, libraryType, 0, nil).Observations
 }

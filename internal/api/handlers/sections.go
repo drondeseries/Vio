@@ -1512,6 +1512,7 @@ func (h *SectionHandler) listSectionItemUserStates(ctx context.Context, items []
 	return states
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (h *SectionHandler) sectionPresignURL(r *http.Request, path string, variant string) string {
 	if h.DetailSvc != nil {
 		return h.DetailSvc.PresignURL(r.Context(), path, variant)

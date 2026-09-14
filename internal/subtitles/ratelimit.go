@@ -40,7 +40,7 @@ func (rl *RateLimiter) Allow() bool {
 	return true
 }
 
-// Wait blocks until a request is allowed or context is cancelled.
+// Wait blocks until a request is allowed or context is canceled.
 func (rl *RateLimiter) Wait(ctx context.Context) error {
 	for {
 		if rl.Allow() {

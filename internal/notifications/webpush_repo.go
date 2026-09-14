@@ -237,7 +237,7 @@ func (r *WebPushRepository) EnqueueAttempts(ctx context.Context, tx pgx.Tx, atte
 			sb.WriteString(", ")
 		}
 		base := len(args)
-		sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4, base+5))
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4, base+5)
 		args = append(args, attempt.ID, attempt.NotificationDeliveryID, attempt.TargetID, 0, WebhookOutcomePending)
 	}
 	sb.WriteString(" ON CONFLICT DO NOTHING")

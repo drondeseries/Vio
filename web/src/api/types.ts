@@ -882,9 +882,15 @@ export interface FileVersion {
   file_size: number;
   duration: number;
   bitrate: number;
+  /** Liveness for virtual versions. Absent means available/unknown; false
+   *  means the version is currently unavailable (e.g. the provider no longer
+   *  serves it). Populated by the catalog versions/check endpoint. */
+  available?: boolean;
   added_at?: string;
   edition_raw?: string;
   edition_key?: string;
+  release_name?: string;
+  release_group?: string;
   presentation_kind?: string;
   presentation_group_key?: string;
   presentation_part_index?: number;
@@ -901,6 +907,16 @@ export interface FileVersion {
   credits?: TimeRange | null;
   recap?: TimeRange | null;
   preview?: TimeRange | null;
+}
+
+// Batched liveness check for virtual versions (POST /catalog/versions/check).
+export interface VersionLivenessResult {
+  file_id: number;
+  available: boolean;
+}
+
+export interface VersionLivenessResponse {
+  results: VersionLivenessResult[];
 }
 
 export interface PlaybackVariantPart {
@@ -963,6 +979,7 @@ export interface VersionAudioTrack {
   title?: string;
   embedded_title?: string;
   language?: string;
+  languages?: string[];
   codec?: string;
   profile?: string;
   layout?: string;
@@ -1621,6 +1638,7 @@ export interface ImportMDBListCollectionRequest {
   description?: string;
   url: string;
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;
@@ -1654,6 +1672,7 @@ export interface ImportTMDBCollectionRequest {
   time_window?: "day" | "week";
   media_type: "movie" | "tv" | "all";
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;
@@ -1683,6 +1702,7 @@ export interface ImportTraktCollectionRequest {
   profile_id?: string;
   list_url?: string;
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;
@@ -2495,10 +2515,6 @@ export interface AdminSession {
   target_resolution?: string;
   target_video_codec?: string;
   target_audio_codec?: string;
-  /** Channel count the transcode actually encodes. Absent when the reporting
-   * node did not know it — render the target codec with no channel layout
-   * rather than falling back to `source_audio_channels`. */
-  target_audio_channels?: number | null;
   target_bitrate_kbps: number | null;
   transcode_hw_accel?: string;
   tone_map_mode?: string;
@@ -2811,6 +2827,7 @@ export interface NotificationWebhook {
   notify_continue_watching: boolean;
   notify_next_up: boolean;
   notify_requests: boolean;
+  notify_ratings: boolean;
   consecutive_failures: number;
   disabled_reason: string | null;
   last_success_at: string | null;
@@ -2831,6 +2848,7 @@ export interface NotificationWebhookInput {
   notify_continue_watching?: boolean;
   notify_next_up?: boolean;
   notify_requests?: boolean;
+  notify_ratings?: boolean;
 }
 
 export interface NotificationWebhookTestResult {
@@ -3064,6 +3082,10 @@ export interface UserDevice {
   is_current_device: boolean;
   /** How many settings this (profile, device) pair overrides. */
   changed_count: number;
+  /** Present when this device has reported (or been seeded with) a capability profile. */
+  capability_fingerprint?: string;
+  /** client | admin | seed — how the capability profile was recorded. */
+  capability_source?: string;
 }
 
 export interface UserDeviceListResponse {

@@ -22,12 +22,17 @@ func TestPlaybackSessionMissingResponsesUseStableErrorCode(t *testing.T) {
 	streamHandler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{})
 
 	tests := []struct {
-		name    string
-		request func() *http.Request
-		handle  func(http.ResponseWriter, *http.Request)
+		name       string
+		request    func() *http.Request
+		handle     func(http.ResponseWriter, *http.Request)
+		wantStatus int // defaults to 404 with the stable error code
 	}{
 		{
 			name: "progress",
+			// Progress for a session that no longer exists is a benign no-op:
+			// version switches delete the old session while a 10s progress tick
+			// is in flight, and answering 404 would just flood the console.
+			wantStatus: http.StatusNoContent,
 			request: func() *http.Request {
 				return playbackTestRequest(
 					http.MethodPost,
@@ -134,6 +139,12 @@ func TestPlaybackSessionMissingResponsesUseStableErrorCode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			tt.handle(rr, tt.request())
+			if tt.wantStatus != 0 && tt.wantStatus != http.StatusNotFound {
+				if rr.Code != tt.wantStatus {
+					t.Fatalf("status = %d, want %d; body = %s", rr.Code, tt.wantStatus, rr.Body.String())
+				}
+				return
+			}
 			assertPlaybackSessionMissingResponse(t, rr)
 		})
 	}

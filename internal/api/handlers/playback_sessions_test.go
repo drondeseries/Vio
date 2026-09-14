@@ -439,7 +439,7 @@ func TestPlaybackClientInfoFromRequestClampsHeaders(t *testing.T) {
 	req.Header.Set("X-Silo-Client-Build", strings.Repeat("b", 100))
 	req.Header.Set("X-Silo-Client-Channel", strings.Repeat("c", 100))
 
-	got := playback.ClientInfoFromRequest(req)
+	got := playbackClientInfoFromRequest(req)
 
 	for _, tc := range []struct {
 		field string
@@ -468,7 +468,7 @@ func TestNormalizeClientMetadataCountsRunes(t *testing.T) {
 	// counts it, well past it as bytes.
 	req.Header.Set("X-Silo-Client-Channel", strings.Repeat("δ", 40))
 
-	got := playback.ClientInfoFromRequest(req)
+	got := playbackClientInfoFromRequest(req)
 
 	if runes := utf8.RuneCountInString(got.Channel); runes != 32 {
 		t.Errorf("Channel runes = %d, want the 32-character bound", runes)

@@ -1076,40 +1076,6 @@ For Apple TV 4K or modern HDR-capable devices, the client may advertise `4k` and
 `hdr: true`; older phones/tablets should stay conservative. These caps affect
 only server-side compatibility decisions and bitrate transcode targets.
 
-A client with real decoder facts can send `video_evidence` and `video_decode`
-alongside the flat lists. Note what that changes: detailed entries supersede the
-coarse `max_resolution` ceiling, so a conservative `"max_resolution": "1080p"`
-no longer bounds anything once `video_decode` describes a decoder that reaches
-higher. If a hard 1080p cap is the intent, bound the entries themselves
-(`max_width: 1920`, `max_height: 1080`, and the matching frame-rate and bitrate
-limits) rather than relying on `max_resolution`.
-
-```json
-{
-  "caps": {
-    "client_features": ["software_video_decode_v1"],
-    "video_evidence": "platform_attested",
-    "codecs_video": ["h264", "hevc"],
-    "codecs_audio": ["aac", "ac3", "eac3"],
-    "audio_passthrough_codecs": ["ac3", "eac3"],
-    "containers": ["mp4", "mov", "m4v"],
-    "max_resolution": "1080p",
-    "hdr": false,
-    "video_decode": [
-      {
-        "codec": "hevc",
-        "bit_depths": [8, 10],
-        "max_width": 1920,
-        "max_height": 1080,
-        "max_frame_rate": 60,
-        "max_bitrate_kbps": 40000,
-        "hardware": true
-      }
-    ]
-  }
-}
-```
-
 ### 10.5 Download orchestration
 
 For a single movie or episode:

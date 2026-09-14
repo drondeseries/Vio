@@ -1359,7 +1359,7 @@ func TestCancelOwnerCanWithdrawPendingRequest(t *testing.T) {
 		t.Fatalf("Cancel returned error: %v", err)
 	}
 	if req.Outcome != OutcomeCancelled {
-		t.Fatalf("Outcome = %q, want cancelled", req.Outcome)
+		t.Fatalf("Outcome = %q, want canceled", req.Outcome)
 	}
 }
 

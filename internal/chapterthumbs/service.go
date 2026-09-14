@@ -616,6 +616,9 @@ func (s *Service) extractFrame(
 	seekSeconds float64,
 	hdrPolicy string,
 ) ([]byte, string, error) {
+	if file != nil && (strings.HasPrefix(strings.ToLower(file.FilePath), "virtual://") || strings.EqualFold(file.Container, "virtual")) {
+		return nil, "virtual_unsupported", wrapReason("virtual_unsupported", fmt.Errorf("chapter thumbnail extraction is not supported for virtual media"))
+	}
 	if s.extractFrameFunc != nil {
 		return s.extractFrameFunc(ctx, file, seekSeconds, hdrPolicy)
 	}

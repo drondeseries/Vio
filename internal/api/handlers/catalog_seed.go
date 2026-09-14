@@ -306,9 +306,11 @@ func writeCatalogSeedError(w http.ResponseWriter, status int, code, message stri
 const defaultLocalImportDir = "/catalog-seeds"
 
 var (
-	errCatalogSeedImportSourceUnavailable = errors.New("Catalog imports from S3 require the private internal S3 bucket")
-	errCatalogSeedImportInvalidLocalPath  = errors.New("Local path must point to an existing .json.gz file")
-	errCatalogSeedImportInvalidRemoteURL  = errors.New("Remote URL must point to an http(s) .json.gz file")
+	errCatalogSeedImportSourceRequired    = errors.New("provide exactly one source: local_path, export_job_id, artifact_key, or remote_url")
+	errCatalogSeedImportSourceConflict    = errors.New("provide only one catalog seed source")
+	errCatalogSeedImportSourceUnavailable = errors.New("catalog imports from S3 require the private internal S3 bucket")
+	errCatalogSeedImportInvalidLocalPath  = errors.New("local path must point to an existing .json.gz file")
+	errCatalogSeedImportInvalidRemoteURL  = errors.New("remote URL must point to an http(s) .json.gz file")
 )
 
 func (h *CatalogSeedHandler) SetLocalImportDir(dir string) {
@@ -383,7 +385,7 @@ func readImportDataFromRemoteURL(ctx context.Context, remoteURL string) ([]byte,
 	if err != nil {
 		return nil, fmt.Errorf("downloading remote catalog seed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("downloading remote catalog seed: unexpected status %d", resp.StatusCode)
@@ -415,7 +417,7 @@ func parseCatalogImportOptions(r *http.Request) (catalogseed.ImportOptions, erro
 	var rewrites []catalogseed.PathRewrite
 	if raw := r.FormValue("path_rewrites"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &rewrites); err != nil {
-			return catalogseed.ImportOptions{}, errors.New("Invalid path_rewrites")
+			return catalogseed.ImportOptions{}, errors.New("invalid path_rewrites")
 		}
 	}
 

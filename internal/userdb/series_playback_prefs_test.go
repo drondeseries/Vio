@@ -12,7 +12,7 @@ func TestSeriesPlaybackPreferenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("init schema: %v", err)

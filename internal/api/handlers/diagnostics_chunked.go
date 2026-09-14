@@ -364,7 +364,7 @@ func (h *DiagnosticsHandler) PutDiagnosticChunk(w http.ResponseWriter, r *http.R
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, diagnostics.UploadChunkBytes+1)
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	session, err := h.chunkSessions.manager.PutChunk(r.Context(), uploadID, chunkIndex, r.Body, r.ContentLength)
 	if err != nil {
@@ -460,7 +460,7 @@ func (h *DiagnosticsHandler) CompleteDiagnosticChunks(ctx context.Context, userI
 	if err != nil {
 		return diagnostics.IngestResult{}, &DiagnosticsUploadFailure{Status: http.StatusInternalServerError, Code: diagnosticsInternalCode, Message: diagnosticsUploadFailedMessage}
 	}
-	defer bundle.Close()
+	defer func() { _ = bundle.Close() }()
 
 	result, err := h.service.Ingest(ctx, userID, profileID, owner.manifest, io.Reader(bundle))
 	if err != nil {

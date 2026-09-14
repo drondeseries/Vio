@@ -16,8 +16,19 @@ type RecipeHandler struct{}
 // GET /api/sections/recipes
 func (h *RecipeHandler) HandleList(w http.ResponseWriter, _ *http.Request) {
 	groups := map[string][]recipes.RecipeDefinition{}
-	for _, cat := range h.Recipes() {
-		groups[cat.Category] = cat.Recipes
+	for _, rec := range recipes.List() {
+		def := rec.Definition()
+		if def.Hidden {
+			continue
+		}
+		// Guarantee Presets serializes as `[]` rather than `null` so the UI can
+		// iterate without a guard. Recipes that take no preset (e.g. custom_filter)
+		// still need a present-but-empty array.
+		if def.Presets == nil {
+			def.Presets = []recipes.GalleryPreset{}
+		}
+		key := string(def.Category)
+		groups[key] = append(groups[key], def)
 	}
 	resp := map[string]any{"categories": groups}
 	writeJSON(w, http.StatusOK, resp)

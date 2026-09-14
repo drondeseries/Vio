@@ -319,6 +319,58 @@ func TestGetItemVersionsKeepsChapterImagesAndEmptyFiles(t *testing.T) {
 	}
 }
 
+func TestGetItemVersionsAvailableSignal(t *testing.T) {
+	f := newVersionsFixture(t)
+	// Local files: available when missing_since is nil, unavailable when set.
+	local := f.files.files[f.ids["movie"]][0]
+	local.MissingSince = nil
+	local.FailedAt = nil
+	missing := f.files.files[f.ids["movie"]][1]
+	missing.MissingSince = new(time.Now())
+	missing.FailedAt = nil
+	// Virtual candidates: available when failed_at is nil, unavailable when
+	// stamped; missing_since never applies to them.
+	virtualLive := f.files.files[f.ids["episode"]][0]
+	virtualLive.FilePath = "virtual://movie/tt1?result=live"
+	virtualLive.FailedAt = nil
+	virtualLive.MissingSince = new(time.Now())
+	virtualDead := f.files.files[f.ids["episode"]][1]
+	virtualDead.FilePath = "virtual://movie/tt1?result=dead"
+	virtualDead.FailedAt = new(time.Now())
+	virtualDead.MissingSince = nil
+
+	versions, err := f.svc.GetItemVersions(t.Context(), f.ids["movie"], AccessFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 2 {
+		t.Fatalf("want 2 movie versions, got %d", len(versions))
+	}
+	if versions[0].Available != nil {
+		t.Fatalf("present local file must omit available (available/unknown): %+v", versions[0])
+	}
+	if versions[1].Available == nil || *versions[1].Available {
+		t.Fatalf("missing local file must report available=false: %+v", versions[1])
+	}
+
+	epVersions, err := f.svc.GetItemVersions(t.Context(), f.ids["episode"], AccessFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(epVersions) != 2 {
+		t.Fatalf("want 2 episode versions, got %d", len(epVersions))
+	}
+	if epVersions[0].Available != nil {
+		t.Fatalf("live virtual candidate must omit available (available/unknown): %+v", epVersions[0])
+	}
+	if epVersions[1].Available == nil || *epVersions[1].Available {
+		t.Fatalf("dead virtual candidate must report available=false: %+v", epVersions[1])
+	}
+	if epVersions[0].Failed || !epVersions[1].Failed {
+		t.Fatalf("virtual failed flag mismatch: %+v / %+v", epVersions[0], epVersions[1])
+	}
+}
+
 func BenchmarkGetItemVersions(b *testing.B) {
 	f := newVersionsFixture(b)
 	for _, kind := range []string{"movie", "audiobook", "episode"} {

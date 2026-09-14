@@ -46,6 +46,24 @@ func langMatchRank(candidate, preferred string) int {
 	return 2
 }
 
+// trackHasLanguage reports whether the track carries the preferred language,
+// either as its primary code or anywhere in its MULTi language list.
+func trackHasLanguage(track models.AudioTrack, preferred string) bool {
+	if langMatch(track.Language, preferred) {
+		return true
+	}
+	if preferred == "" || len(track.Languages) == 0 {
+		return false
+	}
+	canonical := lang.Canonical(preferred)
+	for _, code := range track.Languages {
+		if lang.Canonical(code) == canonical {
+			return true
+		}
+	}
+	return false
+}
+
 // SelectAudioTrack determines which audio track to use based on preferences.
 //
 // Priority:
@@ -75,7 +93,7 @@ func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPr
 		// scanner now preserves regional subtags, so any compatible match keeps
 		// the index rather than falling through to a different track.
 		if seriesPref.AudioTrackIndex >= 0 && seriesPref.AudioTrackIndex < len(tracks) {
-			if langMatch(tracks[seriesPref.AudioTrackIndex].Language, seriesPref.AudioLanguage) {
+			if trackHasLanguage(tracks[seriesPref.AudioTrackIndex], seriesPref.AudioLanguage) {
 				return seriesPref.AudioTrackIndex
 			}
 		}
@@ -112,6 +130,14 @@ func bestLanguageTrack(tracks []models.AudioTrack, preferred string) int {
 		if rank := langMatchRank(track.Language, preferred); rank >= 0 && rank < bestRank {
 			best, bestRank = i, rank
 		}
+		for _, code := range track.Languages {
+			if rank := langMatchRank(code, preferred); rank >= 0 && rank < bestRank {
+				best, bestRank = i, rank
+			}
+		}
+		if bestRank == 0 {
+			break
+		}
 	}
 	return best
 }
@@ -137,11 +163,59 @@ func MatchAudioTrackAcrossVersions(
 	}
 
 	selected := requestedTracks[requestedIndex]
-	return SelectAudioTrack(effectiveTracks, "", &AudioTrackPreference{
-		AudioTrackIndex: requestedIndex,
-		AudioLanguage:   selected.Language,
-		TrackSignature:  AudioTrackSignatureFromTrack(selected),
-	})
+	signature := AudioTrackSignatureFromTrack(selected)
+	// A signature match is language-independent and authoritative: the same
+	// track on another encode keeps its identity even if the language list is
+	// ordered differently.
+	if idx := findExactAudioTrack(effectiveTracks, signature); idx >= 0 {
+		return idx
+	}
+	// A MULTi/undetermined track's primary Language is "mul"/"und" and matches
+	// nothing; it carries several concrete languages instead. Try every
+	// language the requested track carries, in order, before falling back to
+	// the effective file's default. Reducing to a single code (the old
+	// Languages[0] behavior) degraded to default whenever that one language was
+	// absent even though a later one was present.
+	for _, code := range crossVersionAudioLanguages(selected) {
+		candidate := SelectAudioTrack(effectiveTracks, "", &AudioTrackPreference{
+			AudioTrackIndex: requestedIndex,
+			AudioLanguage:   code,
+			TrackSignature:  signature,
+		})
+		if trackHasLanguage(effectiveTracks[candidate], code) {
+			return candidate
+		}
+	}
+	// No carried language resolved on the target; keep the previous
+	// default/first-track fallback.
+	return SelectAudioTrack(effectiveTracks, "", nil)
+}
+
+// crossVersionAudioLanguages returns the concrete languages a track carries,
+// primary code first, then its MULTi language list, deduplicated by canonical
+// form. The "und"/"mul" sentinels are placeholders and are skipped.
+func crossVersionAudioLanguages(track models.AudioTrack) []string {
+	codes := make([]string, 0, len(track.Languages)+1)
+	primary := track.Language
+	if primary != "" && primary != "und" && primary != "mul" {
+		codes = append(codes, primary)
+	}
+	for _, code := range track.Languages {
+		if code == "" {
+			continue
+		}
+		duplicate := false
+		for _, existing := range codes {
+			if langMatch(existing, code) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			codes = append(codes, code)
+		}
+	}
+	return codes
 }
 
 // BrowserSupportsAudioCodec returns true if the given audio codec can be

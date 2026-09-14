@@ -40,18 +40,18 @@ func trackInoFor(contentID string, fileIdx int) string {
 // and a ?token= query-param fallback (the iOS streaming variant uses ?token=
 // because AVPlayer doesn't add Authorization on its own subrequests).
 //
-// "ino" in real ABS is the file's filesystem inode. We synthesise an
+// "ino" in real ABS is the file's filesystem inode. We synthesize an
 // MD5-derived inode-shaped string per trackInoFor — the same value emitted by
 // handlePlayStart. To reverse: call GetMediaFiles for the item, then find the
 // file whose index matches the ino. As a fallback we also accept a bare
 // 0-based integer index.
 //
-// Behaviour:
+// Behavior:
 //   - Validate ABS bearer token (bearerAuth middleware has already done this).
 //   - Look up the requested file in silo's media_files table.
 //   - Serve the bytes directly with Range-request support via playback.ServeDirectPlay.
 //   - Set Content-Disposition: attachment on /download paths to encourage
-//     browser save-to-disk / mobile offline-save behaviour.
+//     browser save-to-disk / mobile offline-save behavior.
 func (h *Handler) handleFileStream(w http.ResponseWriter, r *http.Request) {
 	a, ok := absAuthFrom(r)
 	if !ok || a.UserID == "" {
@@ -100,9 +100,6 @@ func (h *Handler) handleFileStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mediaFile := files[fileIdx]
-	// §4.2b: a bare file stream has a user but no stable playback session, so it
-	// is a Transfer, never cap-relevant and never subject to per-session rules.
-	attachABSTransfer(r.Context(), a.UserID, a.ProfileID, mediaFile.ID)
 
 	// /download variant: hint the client to save rather than stream.
 	if strings.HasSuffix(r.URL.Path, "/download") {
@@ -144,7 +141,7 @@ func (h *Handler) handleFileStream(w http.ResponseWriter, r *http.Request) {
 //  4. Stream via playback.ServeDirectPlay (handles Range + HEAD).
 //
 // Mounted OUTSIDE bearerAuth: the client sends no Authorization header on
-// this endpoint, and the session ID alone authorises access.
+// this endpoint, and the session ID alone authorizes access.
 func (h *Handler) handlePublicTrack(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "sid")
 	idxStr := chi.URLParam(r, "idx")
@@ -194,9 +191,6 @@ func (h *Handler) handlePublicTrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mediaFile := files[idx-1]
-	// The session id IS the capability on this route, and it is also the
-	// canonical session key. Everything above this point is authorization.
-	attachABSSession(r.Context(), sid, sess.UserID, sess.ProfileID, mediaFile.ID, sess.StartedAt)
 
 	ext := strings.ToLower(filepath.Ext(mediaFile.FilePath))
 	if ct := audioContentType(ext); ct != "" {

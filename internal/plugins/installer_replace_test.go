@@ -81,6 +81,9 @@ func TestInstallerReplaceBinaryPreservesInstallationID(t *testing.T) {
 	if result.Installation.ID != 15 {
 		t.Fatalf("result installation id = %d, want 15", result.Installation.ID)
 	}
+	if store.updateInputs[0].RemoveVirtualMedia {
+		t.Fatal("upgrade must NOT request virtual media cleanup (ownership preserved)")
+	}
 	if result.Installation.Version != "0.0.19" {
 		t.Fatalf("result installation version = %q, want 0.0.19", result.Installation.Version)
 	}
@@ -112,6 +115,39 @@ func TestInstallerReplaceBinaryPreservesInstallationID(t *testing.T) {
 	}
 	if len(update.Capabilities) != 1 || update.Capabilities[0].ID != "metadb" {
 		t.Fatalf("update capabilities = %#v, want metadata_provider.v1/metadb", update.Capabilities)
+	}
+}
+
+func TestInstallerReplaceArchiveRequestsVirtualMediaCleanup(t *testing.T) {
+	ctx := context.Background()
+	oldDir := t.TempDir()
+	oldPath := filepath.Join(oldDir, "plugin")
+	if err := os.WriteFile(oldPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("WriteFile(%q) returned error: %v", oldPath, err)
+	}
+
+	archivePath := filepath.Join(t.TempDir(), "silo-metadb.zip")
+	manifest := testPluginManifest(t, "silo.metadb", "0.0.20")
+	writePluginArchive(t, archivePath, manifest)
+	archiveData, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) returned error: %v", archivePath, err)
+	}
+
+	store := newRecordingInstallationStore()
+	installer := NewInstaller(store, InstallerOptions{BaseDir: t.TempDir()})
+	if _, err := installer.replaceArchive(ctx, &Installation{
+		ID:          16,
+		PluginID:    "silo.metadb",
+		Version:     "0.0.19",
+		InstallPath: oldPath,
+		Enabled:     true,
+	}, archiveData, nil); err != nil {
+		t.Fatalf("replaceArchive() returned error: %v", err)
+	}
+
+	if len(store.updateInputs) != 1 || store.updateInputs[0].RemoveVirtualMedia {
+		t.Fatalf("archive replacement update = %#v, want NO virtual media cleanup on upgrade (ownership preserved)", store.updateInputs)
 	}
 }
 

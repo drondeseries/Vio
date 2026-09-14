@@ -26,7 +26,7 @@ const webhookColumns = `
 	id, user_id, profile_id, name, type, url_ciphertext, url_host,
 	signing_secret_ciphertext, enabled,
 	notify_favorites, notify_watchlist, notify_continue_watching, notify_next_up,
-	notify_requests,
+	notify_requests, notify_ratings,
 	consecutive_failures, disabled_reason,
 	last_success_at, last_failure_at, last_failure_status, last_failure_message,
 	created_at, updated_at, revision`
@@ -37,7 +37,7 @@ func scanWebhook(row pgx.Row) (*Webhook, error) {
 		&hook.ID, &hook.UserID, &hook.ProfileID, &hook.Name, &hook.Type,
 		&hook.URLCiphertext, &hook.URLHost, &hook.SigningSecretCiphertext, &hook.Enabled,
 		&hook.NotifyFavorites, &hook.NotifyWatchlist, &hook.NotifyContinueWatching, &hook.NotifyNextUp,
-		&hook.NotifyRequests,
+		&hook.NotifyRequests, &hook.NotifyRatings,
 		&hook.ConsecutiveFailures, &hook.DisabledReason,
 		&hook.LastSuccessAt, &hook.LastFailureAt, &hook.LastFailureStatus, &hook.LastFailureMessage,
 		&hook.CreatedAt, &hook.UpdatedAt, &hook.Revision,
@@ -59,6 +59,27 @@ func scanWebhooks(rows pgx.Rows) ([]Webhook, error) {
 		hooks = append(hooks, *hook)
 	}
 	return hooks, rows.Err()
+}
+
+// HasRatingSubscribers reports whether the profile has at least one enabled
+// webhook with notify_ratings set. Used by the rating notifier's cheap
+// pre-check so a rating on a profile with no rating-enabled webhook never
+// creates a delivery row at all (C2/C8). Errors from the query surface as
+// false so the caller's best-effort path still degrades to dispatching.
+func (r *WebhookRepository) HasRatingSubscribers(ctx context.Context, profileID string) (bool, error) {
+	var has bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM notification_webhooks
+			WHERE profile_id = $1 AND enabled AND notify_ratings
+			LIMIT 1
+		)`,
+		profileID,
+	).Scan(&has)
+	if err != nil {
+		return false, fmt.Errorf("check rating webhook subscribers: %w", err)
+	}
+	return has, nil
 }
 
 // ListByProfile returns all of a profile's webhooks for the listing endpoint.
@@ -167,12 +188,12 @@ func (r *WebhookRepository) InsertWithLimit(ctx context.Context, hook Webhook, m
 			(id, user_id, profile_id, name, type, url_ciphertext, url_host,
 			 signing_secret_ciphertext, enabled,
 			 notify_favorites, notify_watchlist, notify_continue_watching, notify_next_up,
-			 notify_requests)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			 notify_requests, notify_ratings)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 		hook.ID, hook.UserID, hook.ProfileID, hook.Name, hook.Type,
 		hook.URLCiphertext, hook.URLHost, hook.SigningSecretCiphertext, hook.Enabled,
 		hook.NotifyFavorites, hook.NotifyWatchlist, hook.NotifyContinueWatching, hook.NotifyNextUp,
-		hook.NotifyRequests); err != nil {
+		hook.NotifyRequests, hook.NotifyRatings); err != nil {
 		if isWebhookNameViolation(err) {
 			return ErrWebhookNameTaken
 		}
@@ -193,14 +214,14 @@ func (r *WebhookRepository) Update(ctx context.Context, hook Webhook) error {
 			signing_secret_ciphertext = $6, enabled = $7,
 			notify_favorites = $8, notify_watchlist = $9,
 			notify_continue_watching = $10, notify_next_up = $11,
-			notify_requests = $12,
-			consecutive_failures = $13, disabled_reason = $14,
+			notify_requests = $12, notify_ratings = $13,
+			consecutive_failures = $14, disabled_reason = $15,
 			updated_at = now()
 		WHERE id = $1`,
 		hook.ID, hook.Name, hook.Type, hook.URLCiphertext, hook.URLHost,
 		hook.SigningSecretCiphertext, hook.Enabled,
 		hook.NotifyFavorites, hook.NotifyWatchlist, hook.NotifyContinueWatching, hook.NotifyNextUp,
-		hook.NotifyRequests,
+		hook.NotifyRequests, hook.NotifyRatings,
 		hook.ConsecutiveFailures, hook.DisabledReason)
 	if err != nil {
 		if isWebhookNameViolation(err) {
@@ -307,7 +328,7 @@ func (r *WebhookRepository) EnqueueAttempts(ctx context.Context, tx pgx.Tx, atte
 			sb.WriteString(", ")
 		}
 		base := len(args)
-		sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4, base+5))
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4, base+5)
 		args = append(args, attempt.ID, attempt.NotificationDeliveryID, attempt.TargetID, 0, WebhookOutcomePending)
 	}
 	sb.WriteString(" ON CONFLICT DO NOTHING")

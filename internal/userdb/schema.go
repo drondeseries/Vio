@@ -236,6 +236,22 @@ CREATE TABLE IF NOT EXISTS user_devices (
 CREATE INDEX IF NOT EXISTS user_devices_profile_recency_idx ON user_devices (profile_id, last_seen_at DESC, device_id);
 CREATE INDEX IF NOT EXISTS user_devices_household_recency_idx ON user_devices (last_seen_at DESC, profile_id, device_id);
 
+CREATE TABLE IF NOT EXISTS user_device_profiles (
+    profile_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    codecs_video TEXT NOT NULL DEFAULT '',
+    codecs_audio TEXT NOT NULL DEFAULT '',
+    containers TEXT NOT NULL DEFAULT '',
+    max_resolution TEXT NOT NULL DEFAULT '',
+    hdr INTEGER NOT NULL DEFAULT 0,
+    dolby_vision INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'client',
+    capability_fingerprint TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    last_reported_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, device_id)
+);
+
 CREATE TABLE IF NOT EXISTS downloads (
     id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL,
@@ -526,6 +542,9 @@ func InitSchema(db *sql.DB) error {
 		return err
 	}
 	if err := ensureDeviceSettingsProfileColumn(db); err != nil {
+		return err
+	}
+	if err := ensureDeviceCapabilityDolbyVisionColumn(db); err != nil {
 		return err
 	}
 	if err := ensureAutoSkipRecapPreviewColumns(db); err != nil {
@@ -926,6 +945,26 @@ func ensureDeviceSettingsProfileColumn(db *sql.DB) error {
 	}
 
 	return tx.Commit()
+}
+
+func ensureDeviceCapabilityDolbyVisionColumn(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		"user_device_profiles",
+		"dolby_vision",
+	).Scan(&count); err != nil {
+		return fmt.Errorf("checking user_device_profiles.dolby_vision column: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	if _, err := db.Exec(
+		"ALTER TABLE user_device_profiles ADD COLUMN dolby_vision INTEGER NOT NULL DEFAULT 0",
+	); err != nil {
+		return fmt.Errorf("adding user_device_profiles.dolby_vision column: %w", err)
+	}
+	return nil
 }
 
 func backfillUserDevices(db *sql.DB) error {

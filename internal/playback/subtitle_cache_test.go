@@ -42,7 +42,7 @@ func TestServeExtractTextCacheVariants(t *testing.T) {
 	}
 	// Both current variants must survive another variant's commit.
 	for _, format := range []string{"ass", "vtt"} {
-		f, _, ok := c.lookup(source, 0, format)
+		f, _, ok := c.lookup(source, "", 0, format)
 		if !ok {
 			t.Fatalf("missing %s variant", format)
 		}
@@ -60,9 +60,150 @@ func TestServeExtractTextWindowDoesNotPoisonFullTrack(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if f, _, ok := c.lookup(source, 0, "vtt"); ok {
+	if f, _, ok := c.lookup(source, "", 0, "vtt"); ok {
 		_ = f.Close()
 		t.Fatal("window was cached as a complete track")
+	}
+}
+
+// A windowed text request against a committed full-track entry must extract
+// from the small cached artifact even when background warms are disabled
+// (virtual relay sources set DisableBackgroundWarm, but an already-populated
+// entry must still be served instead of re-demuxing the multi-GB source).
+// Disabling the warm must also suppress any detached warm.
+func TestServeExtractTextWindowedUsesCachedTrackWithWarmDisabled(t *testing.T) {
+	c, source := newTestCache(t)
+
+	// Populate the full-track VTT entry through the real fill path.
+	full := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", TrackIndex: 0}
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), full, func(_ context.Context, opts StreamExtractOpts) error {
+		_, err := io.WriteString(opts.Writer, "FULL TRACK")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cachedPath := textEntryPath(t, c, source, 0, "vtt")
+	if _, err := os.Stat(cachedPath); err != nil {
+		t.Fatalf("full-track entry not committed: %v", err)
+	}
+
+	var (
+		mu                     sync.Mutex
+		got                    StreamExtractOpts
+		windowCalls, warmCalls int
+	)
+	windowed := StreamExtractOpts{
+		InputPath:             source,
+		SourceCodec:           "subrip",
+		TrackIndex:            0,
+		SeekSeconds:           600,
+		DurationSeconds:       600,
+		DisableBackgroundWarm: true,
+	}
+	rec = httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), windowed, func(_ context.Context, opts StreamExtractOpts) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
+			warmCalls++
+			return nil
+		}
+		windowCalls++
+		got = opts
+		_, err := io.WriteString(opts.Writer, "WINDOW SLICE")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if windowCalls != 1 || warmCalls != 0 {
+		t.Fatalf("extract calls: window=%d warm=%d, want window=1 warm=0", windowCalls, warmCalls)
+	}
+	if rec.Body.String() != "WINDOW SLICE" {
+		t.Fatalf("windowed body = %q", rec.Body.String())
+	}
+	if got.InputPath != cachedPath {
+		t.Fatalf("windowed extract input = %q, want cached entry %q", got.InputPath, cachedPath)
+	}
+	if got.InputIsExtractedText != "vtt" {
+		t.Fatalf("windowed extract InputIsExtractedText = %q, want %q", got.InputIsExtractedText, "vtt")
+	}
+	if got.SeekSeconds != 600 || got.DurationSeconds != 600 {
+		t.Fatalf("window parameters not preserved: %+v", got)
+	}
+}
+
+// A windowed text miss with background warms enabled must trigger exactly one
+// detached full-track warm no matter how many windowed requests arrive while
+// it runs, and once the warm commits the next windowed request extracts from
+// the cached artifact. Mirrors the SUP warm flow in
+// TestServeSUPExtractWindowedMissWarmsOnce.
+func TestServeExtractTextWindowedMissWarmsOnce(t *testing.T) {
+	c, source := newTestCache(t)
+
+	var (
+		mu          sync.Mutex
+		warmOpts    []StreamExtractOpts
+		windowOpts  []StreamExtractOpts
+		warmRelease = make(chan struct{})
+	)
+	extract := func(_ context.Context, opts StreamExtractOpts) error {
+		if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 && opts.InputIsExtractedText == "" {
+			mu.Lock()
+			warmOpts = append(warmOpts, opts)
+			mu.Unlock()
+			<-warmRelease
+			_, err := opts.Writer.Write([]byte("FULL TRACK"))
+			return err
+		}
+		mu.Lock()
+		windowOpts = append(windowOpts, opts)
+		mu.Unlock()
+		_, err := opts.Writer.Write([]byte("WINDOW SLICE"))
+		return err
+	}
+
+	windowed := StreamExtractOpts{InputPath: source, SourceCodec: "subrip", SeekSeconds: 100, DurationSeconds: 3600}
+	for i := 0; i < 4; i++ {
+		rec := httptest.NewRecorder()
+		if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), windowed, extract); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Body.String() != "WINDOW SLICE" {
+			t.Fatalf("windowed body = %q", rec.Body.String())
+		}
+	}
+	close(warmRelease)
+	waitForTextCacheEntry(t, c, source, 0, "vtt")
+
+	mu.Lock()
+	if len(warmOpts) != 1 {
+		t.Fatalf("warm extracts = %d, want exactly 1", len(warmOpts))
+	}
+	warm := warmOpts[0]
+	if warm.InputPath != source || warm.SeekSeconds != 0 || warm.DurationSeconds != 0 || warm.AllowWindow || warm.InputIsExtractedText != "" {
+		t.Fatalf("warm must be a full-track extract of the original file: %+v", warm)
+	}
+	if len(windowOpts) != 4 {
+		t.Fatalf("windowed extracts = %d, want 4", len(windowOpts))
+	}
+	for _, wo := range windowOpts {
+		if wo.InputPath != source || wo.InputIsExtractedText != "" {
+			t.Fatalf("pre-warm windowed extract must read the original file: %+v", wo)
+		}
+	}
+	mu.Unlock()
+
+	// Warm committed → the next windowed request reads the cached artifact.
+	rec := httptest.NewRecorder()
+	if err := c.ServeExtract(rec, httptest.NewRequest(http.MethodGet, "/subtitle", nil), windowed, extract); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	last := windowOpts[len(windowOpts)-1]
+	mu.Unlock()
+	if last.InputPath != textEntryPath(t, c, source, 0, "vtt") || last.InputIsExtractedText != "vtt" {
+		t.Fatalf("post-warm windowed extract must read the cached artifact: %+v", last)
 	}
 }
 
@@ -104,7 +245,7 @@ func TestServeExtractTextConcurrentViewerDoesNotWaitForFill(t *testing.T) {
 		t.Fatalf("body = %q", rec.Body.String())
 	}
 	// The second viewer must not publish or discard the first viewer's fill.
-	if f, _, ok := c.lookup(source, 0, "vtt"); ok {
+	if f, _, ok := c.lookup(source, "", 0, "vtt"); ok {
 		_ = f.Close()
 		t.Fatal("concurrent viewer published another viewer's fill")
 	}
@@ -112,7 +253,7 @@ func TestServeExtractTextConcurrentViewerDoesNotWaitForFill(t *testing.T) {
 
 func TestServeExtractTextCancelledViewerDoesNotDiscardFill(t *testing.T) {
 	c, source := newTestCache(t)
-	fill := c.beginFill(source, 0, "vtt")
+	fill := c.beginFill(source, "", 0, "vtt")
 	if fill == nil {
 		t.Fatal("failed to reserve fill")
 	}
@@ -132,7 +273,7 @@ func TestServeExtractTextCancelledViewerDoesNotDiscardFill(t *testing.T) {
 	if err := fill.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	f, _, ok := c.lookup(source, 0, "vtt")
+	f, _, ok := c.lookup(source, "", 0, "vtt")
 	if !ok {
 		t.Fatal("canceled viewer discarded the active fill")
 	}
@@ -173,7 +314,7 @@ func TestServeExtractOutlivesServerWriteTimeout(t *testing.T) {
 			if err != nil || string(body) != "complete subtitle track" {
 				t.Fatalf("body=%q error=%v", body, err)
 			}
-			f, _, ok := c.lookup(source, 0, map[string]string{"subrip": "vtt", "ass": "ass", "hdmv_pgs_subtitle": "sup"}[codec])
+			f, _, ok := c.lookup(source, "", 0, map[string]string{"subrip": "vtt", "ass": "ass", "hdmv_pgs_subtitle": "sup"}[codec])
 			if !ok {
 				t.Fatal("completed extraction not cached")
 			}
@@ -198,7 +339,7 @@ func TestServeExtractTextFailedFillRetries(t *testing.T) {
 		if (err != nil) != fail {
 			t.Fatalf("fail=%v extract error=%v", fail, err)
 		}
-		f, _, ok := c.lookup(source, 0, "vtt")
+		f, _, ok := c.lookup(source, "", 0, "vtt")
 		if ok {
 			_ = f.Close()
 		}
@@ -272,12 +413,39 @@ func waitForCacheEntry(t *testing.T, c *SubtitleCache, source string, track int)
 
 func readAllAndClose(t *testing.T, f *os.File) string {
 	t.Helper()
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	data, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// textEntryPath computes the committed cache-entry path for source+track in
+// the given text format (e.g. "vtt", "ass").
+func textEntryPath(t *testing.T, c *SubtitleCache, source string, track int, format string) string {
+	t.Helper()
+	src, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(c.dir(), subtitleCacheFormatKey(source, track, src.ModTime(), src.Size(), format))
+}
+
+// waitForTextCacheEntry polls until the cache holds a committed entry for
+// source+track in the given text format, like waitForCacheEntry but for
+// non-SUP artifacts.
+func waitForTextCacheEntry(t *testing.T, c *SubtitleCache, source string, track int, format string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if f, _, ok := c.lookup(source, "", track, format); ok {
+			_ = f.Close()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("cache entry for track %d format %q never appeared", track, format)
 }
 
 func TestSubtitleCacheMissThenHit(t *testing.T) {
@@ -775,6 +943,35 @@ func TestServeSUPExtractWindowedMissWarmsOnce(t *testing.T) {
 	mu.Unlock()
 	if last.InputPath != entryPath(t, c, source, 0) || !last.InputIsExtractedSup {
 		t.Fatalf("post-warm windowed extract must read the cached track: %+v", last)
+	}
+}
+
+func TestServeSUPExtractWindowedRemoteInputSkipsDetachedWarm(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := windowedSupOpts(source, 0, 100, 3600)
+	opts.CacheIdentity = "virtual://movie/tt123?profile=1080p"
+	opts.DisableBackgroundWarm = true
+
+	var warmCalls, windowCalls int
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil)
+	err := c.ServeSUPExtract(recorder, request, opts, func(_ context.Context, extractOpts StreamExtractOpts) error {
+		if extractOpts.AllowWindow {
+			windowCalls++
+			_, writeErr := extractOpts.Writer.Write([]byte("WINDOW"))
+			return writeErr
+		}
+		warmCalls++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if windowCalls != 1 || warmCalls != 0 {
+		t.Fatalf("extract calls: window=%d warm=%d, want window=1 warm=0", windowCalls, warmCalls)
+	}
+	if recorder.Body.String() != "WINDOW" {
+		t.Fatalf("windowed body = %q", recorder.Body.String())
 	}
 }
 

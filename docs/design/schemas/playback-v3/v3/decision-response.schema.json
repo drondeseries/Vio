@@ -122,6 +122,55 @@
       },
       "additionalProperties": true
     },
+    "audio_track": {
+      "type": "object",
+      "description": "One probed audio stream of the effective source, mirroring the catalog's file-version audio_tracks shape. `index` is the absolute container stream index as ffprobe reported it (video is typically stream 0, the first audio stream 1, subtitles interleaved between them) — not the track's position in the audio_tracks array, and not the audio-only FFmpeg ordinal `0:a:N` (first audio = 0). Example: in a video-first file the first audio has absolute index 1 but FFmpeg audio ordinal 0.",
+      "properties": {
+        "index": {
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        },
+        "embedded_title": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        },
+        "languages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "codec": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "layout": {
+          "type": "string"
+        },
+        "channels": {
+          "type": "integer"
+        },
+        "bitrate": {
+          "type": "integer"
+        },
+        "sample_rate": {
+          "type": "integer"
+        },
+        "bit_depth": {
+          "type": "integer"
+        },
+        "default": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
     "transformation": {
       "type": "object",
       "required": [
@@ -240,6 +289,13 @@
         },
         "subtitle": {
           "$ref": "#/$defs/subtitle_decision"
+        },
+        "audio_tracks": {
+          "type": "array",
+          "description": "Authoritative per-track audio inventory of the effective source, mirroring the subtitle inventory. Clients should prefer it over item metadata, which can be stale after a version fallback. Shape matches the catalog's file-version audio_tracks.",
+          "items": {
+            "$ref": "#/$defs/audio_track"
+          }
         },
         "transformations": {
           "type": "array",

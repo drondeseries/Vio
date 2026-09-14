@@ -44,10 +44,12 @@ func (s stubItemAccessChecker) EnsureAccessible(context.Context, string, catalog
 	return s.err
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type stubEpisodeLookup struct {
 	episode *models.Episode
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s stubEpisodeLookup) GetByID(context.Context, string) (*models.Episode, error) {
 	return s.episode, nil
 }

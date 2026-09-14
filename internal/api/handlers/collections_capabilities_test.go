@@ -22,8 +22,8 @@ func TestCollectionCapabilitiesAdvertiseSortSupport(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if !got.CollectionDefaultSort || !got.CollectionSortPreferences || !got.EffectiveCollectionSort {
-		t.Fatalf("sort capabilities not fully advertised: %+v", got)
+	if !got.CollectionDefaultSort || !got.CollectionSortPreferences || !got.EffectiveCollectionSort || !got.AdminItemMaterialize {
+		t.Fatalf("collection capabilities not fully advertised: %+v", got)
 	}
 
 	// Every advertised kind must actually be accepted, or a client that trusts

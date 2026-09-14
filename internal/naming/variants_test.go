@@ -97,3 +97,54 @@ func TestStripComparisonSafeEditionSuffix_DoesNotAlterDistinctGreyTitle(t *testi
 		t.Fatalf("StripComparisonSafeEditionSuffix() = %q, want %q", got, want)
 	}
 }
+
+func TestParseVariantHints_ReleaseNameAndGroup(t *testing.T) {
+	hints := ParseVariantHints(
+		"/movies/Mission.Impossible.2023.2160p.Multi-AltMount.mkv",
+		"movies",
+	)
+	if hints == nil {
+		t.Fatal("expected hints")
+	}
+	if got, want := hints.ReleaseName, "Mission.Impossible.2023.2160p.Multi-AltMount"; got != want {
+		t.Fatalf("ReleaseName = %q, want %q", got, want)
+	}
+	if got, want := hints.ReleaseGroup, "AltMount"; got != want {
+		t.Fatalf("ReleaseGroup = %q, want %q", got, want)
+	}
+}
+
+func TestParseVariantHints_NoReleaseGroupWithoutTrailingGroupTag(t *testing.T) {
+	hints := ParseVariantHints(
+		"/movies/Movie.2023.1080p.mkv",
+		"movies",
+	)
+	if hints == nil {
+		t.Fatal("expected hints")
+	}
+	if got, want := hints.ReleaseName, "Movie.2023.1080p"; got != want {
+		t.Fatalf("ReleaseName = %q, want %q", got, want)
+	}
+	if got, want := hints.ReleaseGroup, ""; got != want {
+		t.Fatalf("ReleaseGroup = %q, want %q", got, want)
+	}
+}
+
+func TestParseVariantHints_MultiEpisodeCarriesReleaseFields(t *testing.T) {
+	hints := ParseVariantHints(
+		"/tv/Show/Season 1/Show.S01E01-E02.1080p.WEB-DL.x264-GROUP.mkv",
+		"series",
+	)
+	if hints == nil {
+		t.Fatal("expected hints")
+	}
+	if got, want := hints.PresentationKind, "multi_episode"; got != want {
+		t.Fatalf("PresentationKind = %q, want %q", got, want)
+	}
+	if got, want := hints.ReleaseName, "Show.S01E01-E02.1080p.WEB-DL.x264-GROUP"; got != want {
+		t.Fatalf("ReleaseName = %q, want %q", got, want)
+	}
+	if got, want := hints.ReleaseGroup, "GROUP"; got != want {
+		t.Fatalf("ReleaseGroup = %q, want %q", got, want)
+	}
+}

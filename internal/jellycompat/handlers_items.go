@@ -3150,6 +3150,7 @@ func urlValuesFromItemsQuery(query itemsQuery) url.Values {
 	return buildBrowseParams(query)
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func progressMap(entries []upstreamProgress) map[string]*upstreamProgress {
 	result := make(map[string]*upstreamProgress, len(entries))
 	for i := range entries {
@@ -3271,6 +3272,7 @@ func (h *ItemsHandler) rememberSeasonImages(seasons []upstreamSeason, seriesID s
 	}
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (h *ItemsHandler) rememberEpisodeImages(episodes []upstreamEpisode) {
 	if h.images == nil {
 		return

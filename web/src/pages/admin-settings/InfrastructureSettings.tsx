@@ -17,6 +17,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { usePurgeVirtualPlaybackItems } from "@/hooks/queries/admin/collections";
+import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
+import { useAdminPluginInstallations } from "@/hooks/queries/admin/plugins";
 import { useCheckAdminSettingsConnection } from "@/hooks/queries/admin/settings";
 import { useRestartKeys, type RestartKeyMatcher } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
@@ -722,6 +725,120 @@ function LogsGroup({ form, restartKeys }: { form: SettingsForm; restartKeys: Res
   );
 }
 
+/**
+ * Danger-zone maintenance for the zero-storage virtual library rows: remove
+ * virtual media files and any orphaned catalog items they reference, scoped by
+ * library or plugin installation. Everything here is destructive, so the flow
+ * always offers a dry-run preview first and a confirm on the real purge.
+ */
+function VirtualLibraryGroup() {
+  const purgeVirtual = usePurgeVirtualPlaybackItems();
+  const { data: librariesData } = useAdminLibraries();
+  const { data: pluginInstallations } = useAdminPluginInstallations();
+  const [libraryID, setLibraryID] = useState("all");
+  const [installationID, setInstallationID] = useState("all");
+
+  const libraryOptions = useMemo(() => {
+    const opts: { value: string; label: string }[] = [{ value: "all", label: "All Libraries" }];
+    if (librariesData) {
+      for (const lib of librariesData) {
+        opts.push({ value: String(lib.id), label: `${lib.name} (ID: ${lib.id})` });
+      }
+    }
+    return opts;
+  }, [librariesData]);
+
+  const pluginOptions = useMemo(() => {
+    const opts: { value: string; label: string }[] = [{ value: "all", label: "All Plugins" }];
+    if (pluginInstallations) {
+      for (const plugin of pluginInstallations) {
+        opts.push({
+          value: String(plugin.id),
+          label: `${plugin.plugin_id} v${plugin.version} (ID: ${plugin.id})`,
+        });
+      }
+    }
+    return opts;
+  }, [pluginInstallations]);
+
+  const scope = () => {
+    const libraryId = Number.parseInt(libraryID, 10);
+    const installationId = Number.parseInt(installationID, 10);
+    return {
+      libraryId: libraryId > 0 ? libraryId : undefined,
+      installationId: installationId > 0 ? installationId : undefined,
+    };
+  };
+
+  return (
+    <FieldGroup label="Virtual Library">
+      <div className="flex flex-col justify-between gap-4 py-3 sm:flex-row sm:items-center">
+        <div className="space-y-1">
+          <span className="text-sm font-medium">Purge Virtual Library</span>
+          <p className="text-muted-foreground text-xs">
+            Remove all zero-storage virtual files and their orphaned catalog items.
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={purgeVirtual.isPending}
+            onClick={() => purgeVirtual.mutate({ dryRun: true, ...scope() })}
+          >
+            {purgeVirtual.isPending && purgeVirtual.variables?.dryRun
+              ? "Previewing..."
+              : "Preview Purge"}
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            disabled={purgeVirtual.isPending}
+            onClick={() => {
+              const { libraryId, installationId } = scope();
+              const scoped =
+                libraryId || installationId ? "the selected scope" : "all virtual items";
+              if (
+                window.confirm(
+                  `Purge all zero-storage virtual library items for ${scoped}? This cannot be undone.`,
+                )
+              ) {
+                purgeVirtual.mutate({
+                  dryRun: false,
+                  libraryId,
+                  installationId,
+                });
+              }
+            }}
+          >
+            {purgeVirtual.isPending && !purgeVirtual.variables?.dryRun
+              ? "Purging..."
+              : "Purge Virtual Items"}
+          </Button>
+        </div>
+      </div>
+      <div className="grid gap-3 pt-2 pb-1 md:grid-cols-2">
+        <SettingField
+          label="Library Scope"
+          type="select"
+          options={libraryOptions}
+          value={libraryID}
+          onChange={setLibraryID}
+        />
+        <SettingField
+          label="Plugin Installation Scope"
+          type="select"
+          options={pluginOptions}
+          value={installationID}
+          onChange={setInstallationID}
+        />
+      </div>
+    </FieldGroup>
+  );
+}
+
 export default function InfrastructureSettings() {
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
   const restartKeys = useRestartKeys();
@@ -822,6 +939,10 @@ export default function InfrastructureSettings() {
         />
         <DatabaseGroup form={form} restartKeys={restartKeys} />
         <LogsGroup form={form} restartKeys={restartKeys} />
+      </div>
+
+      <div className="flex-1 space-y-5">
+        <VirtualLibraryGroup />
       </div>
 
       <SaveBar

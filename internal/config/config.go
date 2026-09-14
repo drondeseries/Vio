@@ -163,6 +163,7 @@ type PlaybackConfig struct {
 	TranscodeDir            string `yaml:"transcode_dir"`
 	SegmentRetentionSeconds int    `yaml:"segment_retention_seconds"`
 	HWAccel                 string `yaml:"hw_accel"`
+	SoftwareFallback        string `yaml:"software_fallback"`
 	// HWDevice is the GPU render device for hardware transcodes. A single
 	// path pins every GPU workload to that device; a comma-separated list
 	// (e.g. "/dev/dri/renderD128,/dev/dri/renderD129") balances workloads
@@ -181,6 +182,7 @@ type PlaybackConfig struct {
 	ChapterThumbnailNodeCapacity int                   `yaml:"chapter_thumbnail_node_capacity"`
 	TranscodeEnabled             bool                  `yaml:"transcode_enabled"`
 	Routing                      PlaybackRoutingPolicy `yaml:"-"`
+	MaxVirtualFailoverAttempts   int                   `yaml:"max_virtual_failover_attempts"`
 }
 
 // RedisConfig holds Redis connection settings.
@@ -505,6 +507,7 @@ func setDefaults() *configRaw {
 			TranscodeDir:                 DefaultTranscodeDir,
 			SegmentRetentionSeconds:      600,
 			HWAccel:                      "auto",
+			SoftwareFallback:             "allow",
 			ChapterThumbnailWorkers:      1,
 			ChapterThumbnailExecution:    "local",
 			ChapterThumbnailNodeCapacity: 1,

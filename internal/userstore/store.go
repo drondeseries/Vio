@@ -296,6 +296,21 @@ type UserStore interface {
 	DeleteExpiredSettingMutations(ctx context.Context, before time.Time) (int64, error)
 }
 
+// DeviceProfileRegistry stores the normalized per-device capability profile
+// used to rank virtual playback candidates for direct-play. It is additive to
+// DeviceRegistry; a store may implement either or both.
+type DeviceProfileRegistry interface {
+	// GetDeviceProfile returns the stored capability profile for one
+	// (profile, device), or nil when none has been reported.
+	GetDeviceProfile(ctx context.Context, profileID, deviceID string) (*DeviceCapabilityProfile, error)
+	// PutDeviceProfile upserts the capability profile for one (profile, device),
+	// recording the reported source. A fingerprint equal to the stored one
+	// leaves updated_at untouched so redundant reports do not churn the row.
+	PutDeviceProfile(ctx context.Context, profile DeviceCapabilityProfile) error
+	// ForgetDeviceProfile removes one (profile, device) capability profile.
+	ForgetDeviceProfile(ctx context.Context, profileID, deviceID string) error
+}
+
 // DeviceRegistry is implemented by stores that track observed devices even
 // when they do not currently have any device-scoped overrides.
 type DeviceRegistry interface {

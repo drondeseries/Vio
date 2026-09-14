@@ -20,7 +20,7 @@ func ListHomeDismissals(db *sql.DB, profileID, surface string) ([]HomeItemDismis
 	if err != nil {
 		return nil, fmt.Errorf("listing home dismissals: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var dismissals []HomeItemDismissal
 	for rows.Next() {

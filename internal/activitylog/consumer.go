@@ -3,6 +3,7 @@ package activitylog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -48,7 +49,7 @@ func NewConsumer(pool *pgxpool.Pool, redisClient *redis.Client, streamHub *logst
 	}
 }
 
-// RunRedis starts the Redis consumer loop. Blocks until ctx is cancelled.
+// RunRedis starts the Redis consumer loop. Blocks until ctx is canceled.
 func (c *Consumer) RunRedis(ctx context.Context) {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
@@ -85,7 +86,7 @@ func (c *Consumer) drainRedis(ctx context.Context) {
 func (c *Consumer) popRedisBatch(ctx context.Context) ([]LogEntry, error) {
 	result, err := popBatchScript.Run(ctx, c.redis, []string{redisKey}, c.batchSize).StringSlice()
 	if err != nil {
-		if err == redis.Nil {
+		if errors.Is(err, redis.Nil) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("pop batch script: %w", err)
@@ -118,7 +119,7 @@ func (c *Consumer) insertBatchWithRetry(ctx context.Context, entries []LogEntry)
 	return lastErr
 }
 
-// RunMemory starts the in-memory consumer loop. Blocks until ctx is cancelled
+// RunMemory starts the in-memory consumer loop. Blocks until ctx is canceled
 // or the channel is closed.
 func (c *Consumer) RunMemory(ctx context.Context, ch <-chan LogEntry) {
 	ticker := time.NewTicker(c.interval)

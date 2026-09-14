@@ -187,6 +187,11 @@ func mustJSON(t *testing.T, v any) []byte {
 	return data
 }
 
+// A virtual candidate rotation can delete the requested media file row between
+// the client's request and the attempt persist while the effective file
+// survives. The requested_media_file_id FK was dropped so the raw requested
+// identity is persisted verbatim; the replan path and the idempotency check
+// depend on that raw ID surviving the persist.
 func TestPostgresPlanStore(t *testing.T) {
 	f := newPlanstoreFixture(t)
 	store := NewPostgres(f.pool)
@@ -289,6 +294,41 @@ func TestPostgresPlanStore(t *testing.T) {
 		f.expireAttempt(t, attemptID)
 		if err := store.SaveAttempt(ctx, record); err != nil {
 			t.Fatalf("SaveAttempt after expiry should reclaim the attempt-ID: %v", err)
+		}
+	})
+
+	// A virtual candidate rotation can delete the requested media file row
+	// between the client's request and the attempt persist while the effective
+	// file survives. SaveAttempt must persist the raw requested ID verbatim
+	// (the FK was dropped) so the replan path and the idempotency check can
+	// still recognize the original request identity.
+	t.Run("SaveAttemptRequestedFileDeletedPreservesRawRequestedID", func(t *testing.T) {
+		sessionID := uuid.NewString()
+		attemptID := "att-rotated-" + sessionID
+		record := f.attemptRecord(sessionID, attemptID, "digest-rotated")
+		record.RequestedMediaFileID = 999999 // deleted by candidate rotation
+		record.EffectiveMediaFileID = f.altFileID
+		record.CurrentPlan.RequestedMediaFileID = 999999
+		record.CurrentPlan.EffectiveMediaFileID = f.altFileID
+		record.NormalizedRequest.FileID = 999999
+
+		if err := store.SaveAttempt(ctx, record); err != nil {
+			t.Fatalf("SaveAttempt with deleted requested file: %v", err)
+		}
+		got, err := store.GetAttemptByPlaybackAttemptID(ctx, attemptID)
+		if err != nil {
+			t.Fatalf("GetAttemptByPlaybackAttemptID: %v", err)
+		}
+		if got.RequestedMediaFileID != 999999 {
+			t.Fatalf("persisted requested file = %d, want raw requested 999999", got.RequestedMediaFileID)
+		}
+		if got.EffectiveMediaFileID != f.altFileID {
+			t.Fatalf("persisted effective file = %d, want %d", got.EffectiveMediaFileID, f.altFileID)
+		}
+		// The idempotency check compares the stored requested ID against the
+		// client's original file_id; a replay with the original ID must match.
+		if got.RequestedMediaFileID != record.NormalizedRequest.FileID {
+			t.Fatalf("replay lookup mismatch: stored requested %d != normalized request file_id %d", got.RequestedMediaFileID, record.NormalizedRequest.FileID)
 		}
 	})
 

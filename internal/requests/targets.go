@@ -123,7 +123,7 @@ func (r *Repository) UpdateTargetStatus(ctx context.Context, targetID int64, sta
 	if err != nil {
 		return nil, fmt.Errorf("begin target update: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var requestID string
 	if err := tx.QueryRow(ctx, `
@@ -187,6 +187,6 @@ func (r *Repository) recomputeAggregate(ctx context.Context, exec requestExecuto
 	if err != nil {
 		return nil, fmt.Errorf("recompute aggregate: %w", err)
 	}
-	_ = r.recordEvent(ctx, exec, requestID, "status_"+string(status), actor, string(req.ExternalStatus))
+	_ = r.recordEvent(ctx, exec, requestID, "status_"+string(status), actor, req.ExternalStatus)
 	return req, nil
 }

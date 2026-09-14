@@ -236,7 +236,6 @@ func buildListNextUpQuery(q NextUpQuery, limit int, cursor *nextUpWalkCursor) (s
 	if q.DateCutoff != nil {
 		dateCutoffFilter = fmt.Sprintf(" AND uwp.updated_at >= $%d", argIdx)
 		args = append(args, *q.DateCutoff)
-		argIdx++
 	}
 
 	// seedSeen is projected alongside the seed's picked series, which the global

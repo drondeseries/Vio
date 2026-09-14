@@ -102,9 +102,6 @@ func (reg *Registry) createDownloads(ctx context.Context, cursors *Cursors, in *
 	}
 	if body.Caps != nil {
 		req.Caps = *body.Caps
-		if err := req.Caps.NormalizeAndValidateVideoDecode(); err != nil {
-			return nil, NewProblem(TypeMalformedRequest, err.Error())
-		}
 	}
 	if len(body.ExpectedEntries) > 100 {
 		return nil, NewProblem(TypeMalformedRequest, "At most 100 episode revision guards are allowed.")

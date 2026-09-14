@@ -8,8 +8,10 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type fakeCatalogWorkSummaryProvider struct{}
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (fakeCatalogWorkSummaryProvider) GetSummaryForContentID(ctx context.Context, contentID string, filter catalog.AccessFilter) (*catalog.WorkSummary, error) {
 	if contentID != "ebook-1" && contentID != "audio-1" {
 		return nil, nil

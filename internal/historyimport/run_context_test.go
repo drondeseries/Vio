@@ -20,7 +20,7 @@ func TestNewRunContext_HasNoDeadline(t *testing.T) {
 func TestNewRunContext_UsesBackgroundWhenParentNil(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := newRunContext(nil)
+	ctx, cancel := newRunContext(nil) //nolint:staticcheck // This test verifies the function's documented nil-parent fallback.
 	defer cancel()
 
 	if err := ctx.Err(); err != nil {

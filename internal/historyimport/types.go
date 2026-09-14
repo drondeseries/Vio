@@ -17,7 +17,7 @@ const (
 	RunStatusRunning   = "running"
 	RunStatusCompleted = "completed"
 	RunStatusFailed    = "failed"
-	RunStatusCancelled = "cancelled"
+	RunStatusCancelled = "canceled"
 
 	KindMovie   = "movie"
 	KindSeries  = "series"

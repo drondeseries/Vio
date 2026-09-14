@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { formatPageCount, formatLanguageName, extractSourceHint } from "./versionFormatUtils";
+import {
+  audioLanguageSummary,
+  formatLanguageName,
+  formatPageCount,
+  extractSourceHint,
+  isVirtualFileVersion,
+  subtitleLanguageSummary,
+} from "./versionFormatUtils";
 
 describe("formatPageCount", () => {
   it("formats singular and plural ebook page counts", () => {
@@ -77,5 +84,73 @@ describe("extractSourceHint", () => {
   it("returns null when no source hint matches", () => {
     expect(extractSourceHint("Movie.2160p.mkv")).toBeNull();
     expect(extractSourceHint("random-file-name.mp4")).toBeNull();
+  });
+});
+
+describe("audioLanguageSummary", () => {
+  it("joins resolved language names", () => {
+    expect(audioLanguageSummary([{ language: "eng" }, { language: "fra" }])).toBe("English/French");
+  });
+
+  it("joins the languages array when present", () => {
+    expect(audioLanguageSummary([{ languages: ["en", "fr", "es"] }])).toBe(
+      "English/French/Spanish",
+    );
+    expect(audioLanguageSummary([{ languages: ["en", "fr", "es"] }, { language: "deu" }])).toBe(
+      "English/French/Spanish/German",
+    );
+  });
+
+  it("falls back to the single language tag when languages is absent", () => {
+    expect(audioLanguageSummary([{ language: "eng" }])).toBe("English");
+    expect(audioLanguageSummary([{}])).toBeNull();
+  });
+
+  it("renders release markers like MULTI and DUAL as-is", () => {
+    expect(audioLanguageSummary([{ language: "MULTI" }, { language: "fra" }])).toBe("Multi/French");
+  });
+
+  it("deduplicates the same language", () => {
+    expect(
+      audioLanguageSummary([{ language: "eng" }, { language: "en" }, { language: "English" }]),
+    ).toBe("English");
+  });
+
+  it("returns null for missing or placeholder languages", () => {
+    expect(audioLanguageSummary(undefined)).toBeNull();
+    expect(audioLanguageSummary([])).toBeNull();
+    expect(audioLanguageSummary([{ language: "" }, { language: "und" }])).toBeNull();
+  });
+});
+
+describe("subtitleLanguageSummary", () => {
+  it("joins subtitle languages", () => {
+    expect(subtitleLanguageSummary([{ language: "eng" }, { language: "spa" }])).toBe(
+      "English/Spanish",
+    );
+  });
+
+  it("returns null for empty track list", () => {
+    expect(subtitleLanguageSummary([])).toBeNull();
+    expect(subtitleLanguageSummary(undefined)).toBeNull();
+  });
+});
+
+describe("isVirtualFileVersion", () => {
+  it("detects virtual container", () => {
+    expect(isVirtualFileVersion({ container: "virtual", file_path: "virtual://movie/tt1" })).toBe(
+      true,
+    );
+  });
+
+  it("detects virtual file path", () => {
+    expect(
+      isVirtualFileVersion({ container: "mkv", file_path: "virtual://series/tt1/1/1?result=abc" }),
+    ).toBe(true);
+  });
+
+  it("is false for local files", () => {
+    expect(isVirtualFileVersion({ container: "mkv", file_path: "/media/Movie.mkv" })).toBe(false);
+    expect(isVirtualFileVersion({})).toBe(false);
   });
 });

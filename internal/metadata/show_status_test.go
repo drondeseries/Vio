@@ -16,7 +16,7 @@ func TestNormalizeShowStatus(t *testing.T) {
 		// TMDB spellings
 		{"Returning Series", "returning"},
 		{"Ended", "ended"},
-		{"Canceled", "cancelled"},
+		{"Canceled", "canceled"},
 		{"In Production", "in_production"},
 		{"Pilot", "in_production"},
 		{"Planned", "upcoming"},
@@ -26,7 +26,7 @@ func TestNormalizeShowStatus(t *testing.T) {
 		// Already-canonical values are stable
 		{"returning", "returning"},
 		{"ended", "ended"},
-		{"cancelled", "cancelled"},
+		{"canceled", "canceled"},
 		{"in_production", "in_production"},
 		{"upcoming", "upcoming"},
 		// Unknown values pass through lowercased instead of being dropped

@@ -36,7 +36,9 @@ export function adminFormForConfigSchema(schema: PluginConfigSchema): PluginAdmi
         if (!propertyType || !["string", "number", "integer", "boolean"].includes(propertyType)) {
           return null;
         }
-        const secret = property.writeOnly === true || property.format === "password";
+        const isUrl =
+          property.format === "uri" || property.format === "url" || key.endsWith("_url");
+        const secret = !isUrl && (property.writeOnly === true || property.format === "password");
         const control =
           propertyType === "boolean"
             ? "SWITCH"

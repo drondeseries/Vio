@@ -128,6 +128,10 @@ func (h *EbookReaderHandler) HandleReadFile(w http.ResponseWriter, r *http.Reque
 		h.writeReadError(w, err)
 		return
 	}
+	if file == nil || file.ContentID != contentID || !isEbookFile(file) {
+		writeError(w, http.StatusNotFound, "not_found", "Ebook file not found")
+		return
+	}
 
 	if err := h.ServeReaderFile(w, r, file); err != nil {
 		if errors.Is(err, catalog.ErrItemNotFound) {
@@ -547,7 +551,7 @@ func serveEbookInline(w http.ResponseWriter, r *http.Request, file *models.Media
 		}
 		return fmt.Errorf("opening ebook file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	stat, err := f.Stat()
 	if err != nil {

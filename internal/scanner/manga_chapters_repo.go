@@ -38,6 +38,8 @@ func upsertMangaChapter(ctx context.Context, pool *pgxpool.Pool, chapterID, seri
 // listMangaChapters returns the chapter_content_id values for all chapters
 // belonging to the given series, ordered by chapter_index (NULLs last) then
 // by content ID for a stable secondary sort.
+//
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func listMangaChapters(ctx context.Context, pool *pgxpool.Pool, seriesID string) ([]string, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT chapter_content_id

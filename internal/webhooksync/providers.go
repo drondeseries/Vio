@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -296,7 +297,7 @@ func decodeEmbyMultipart(body []byte, boundary string, payload *embyWebhookPaylo
 	var fallback []byte
 	for {
 		part, err := reader.NextPart()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -541,7 +542,7 @@ func isEmbyFavoriteRemovedEvent(eventName string) bool {
 }
 
 func containsEmbyFavoriteToken(eventName string) bool {
-	return strings.Contains(eventName, "favorite") || strings.Contains(eventName, "favourite")
+	return strings.Contains(eventName, "favorite") || strings.Contains(eventName, "favourite") //nolint:misspell // Emby's British-spelling variant.
 }
 
 func actionAllowsSeries(action string) bool {

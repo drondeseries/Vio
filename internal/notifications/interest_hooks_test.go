@@ -580,23 +580,83 @@ func TestInterestTrackingStoreConditionalCapabilities(t *testing.T) {
 	}
 }
 
-func TestInterestTrackingOptionalCapabilityResolution(t *testing.T) {
-	inner := &struct {
-		userstore.UserStore
-		userstore.OnboardingProgressStore
-	}{}
-	provider := WrapUserStoreProvider(preferenceTransactionTestProvider{store: inner}, &System{})
-	wrapped, err := provider.ForUser(t.Context(), 1)
+// allCapabilitiesFakeStore advertises every optional capability ForUser
+// switches on, so the test below exercises the widest wrapper combination.
+type allCapabilitiesFakeStore struct {
+	userstore.UserStore
+	profile *userstore.DeviceCapabilityProfile
+}
+
+func (s *allCapabilitiesFakeStore) RegisterDevice(context.Context, userstore.DeviceEntry) error {
+	return nil
+}
+
+func (s *allCapabilitiesFakeStore) ListDevices(context.Context) ([]userstore.DeviceEntry, error) {
+	return nil, nil
+}
+
+func (s *allCapabilitiesFakeStore) DeviceExists(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
+func (s *allCapabilitiesFakeStore) ForgetDevice(context.Context, string, string) error {
+	return nil
+}
+
+func (s *allCapabilitiesFakeStore) SeriesEpisodeWatchCounts(context.Context, string, []string) (map[string]userstore.SeriesWatchCounts, error) {
+	return map[string]userstore.SeriesWatchCounts{}, nil
+}
+
+func (s *allCapabilitiesFakeStore) SeriesCompletion(context.Context, string, []string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+
+func (s *allCapabilitiesFakeStore) SeasonCompletion(context.Context, string, []string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+
+func (s *allCapabilitiesFakeStore) GetDeviceProfile(_ context.Context, profileID, deviceID string) (*userstore.DeviceCapabilityProfile, error) {
+	if s.profile == nil || s.profile.ProfileID != profileID || s.profile.DeviceID != deviceID {
+		return nil, nil
+	}
+	return s.profile, nil
+}
+
+func (s *allCapabilitiesFakeStore) PutDeviceProfile(context.Context, userstore.DeviceCapabilityProfile) error {
+	return nil
+}
+
+func (s *allCapabilitiesFakeStore) ForgetDeviceProfile(context.Context, string, string) error {
+	return nil
+}
+
+// TestInterestTrackingStoreKeepsDeviceProfilesCallable pins the regression
+// that broke all virtual playback starts: the devices+rollup+completion
+// wrapper embedded a nil DeviceProfileRegistry, so the type assertion in
+// DeviceCapabilitiesFor succeeded and the subsequent GetDeviceProfile call
+// panicked. Asserting the interface is not enough — the capability must
+// remain callable through the wrapper.
+func TestInterestTrackingStoreKeepsDeviceProfilesCallable(t *testing.T) {
+	inner := &allCapabilitiesFakeStore{
+		profile: &userstore.DeviceCapabilityProfile{ProfileID: "p1", DeviceID: "d1"},
+	}
+	provider := WrapUserStoreProvider(
+		preferenceTransactionTestProvider{store: inner},
+		&System{},
+	)
+	wrapped, err := provider.ForUser(context.Background(), 1)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ForUser: %v", err)
 	}
-	if _, ok := wrapped.(userstore.OnboardingProgressStore); !ok {
-		t.Fatal("lost underlying onboarding capability")
+	registry, ok := wrapped.(userstore.DeviceProfileRegistry)
+	if !ok {
+		t.Fatal("interest-tracking wrapper dropped DeviceProfileRegistry")
 	}
-	if _, ok := wrapped.(userstore.WatchedBatchWriter); !ok {
-		t.Fatal("decorator dropped the notification mutation hooks")
+	got, err := registry.GetDeviceProfile(context.Background(), "p1", "d1")
+	if err != nil {
+		t.Fatalf("GetDeviceProfile: %v", err)
 	}
-	if _, ok := wrapped.(userstore.SeriesEpisodeRollupStore); ok {
-		t.Fatal("decorator invented backend support")
+	if got == nil || got.DeviceID != "d1" {
+		t.Fatalf("GetDeviceProfile = %+v, want the stored profile", got)
 	}
 }

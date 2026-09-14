@@ -12,7 +12,7 @@ func TestAudioPreference_TrackSignatureRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -52,7 +52,7 @@ func TestSubtitlePreference_TrackSignatureRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := InitSchema(db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

@@ -1,5 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import type { HomeSectionItemsResponse, ItemDetail } from "@/api/types";
+import { ApiClientError } from "@/api/client";
 import {
   adminKeys,
   catalogKeys,
@@ -191,8 +192,31 @@ export async function invalidateMediaSurfaceQueries(
   // that predates the mutation satisfy the invalidation and land in the cache
   // as fresh.
   await queryClient.invalidateQueries({
-    predicate: (query) => shouldInvalidateMediaSurfaceQuery(query.queryKey, options),
+    predicate: (query) => {
+      // A 404 for an item detail is terminal: the item has no catalog row (a
+      // virtual-library listing or a stale link), so re-fetching it on every
+      // catalog invalidation sweep just hammers an endpoint that cannot
+      // succeed. Skip it — the error state already tells the UI the item is
+      // gone, and a fresh mount with a valid id re-issues the query.
+      if (isTerminalItemDetailNotFound(query)) return false;
+      return shouldInvalidateMediaSurfaceQuery(query.queryKey, options);
+    },
   });
+}
+
+export function isTerminalItemDetailNotFound(query: {
+  queryKey: readonly unknown[];
+  state?: { status?: string; error?: unknown };
+}): boolean {
+  if (query.state?.status !== "error") return false;
+  const error = query.state.error;
+  if (!(error instanceof ApiClientError) || error.status !== 404) return false;
+  const key = query.queryKey;
+  return (
+    Array.isArray(key) &&
+    ((key[0] === "catalog" && key[1] === "items" && key[3] === "detail") ||
+      (key[0] === "items" && key[1] === "detail"))
+  );
 }
 
 export function scheduleMediaSurfaceInvalidation(

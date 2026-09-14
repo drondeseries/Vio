@@ -549,7 +549,7 @@ func checkRedisConnection(ctx context.Context, cfg *config.Config) connectionChe
 	if client == nil {
 		return connectionCheckResponse{Success: false, Message: "Redis URL is required."}
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

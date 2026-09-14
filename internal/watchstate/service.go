@@ -557,6 +557,7 @@ func buildMarkPlayedBatchSQL() (string, []any) {
            OR user_watch_progress.updated_at < EXCLUDED.updated_at`, nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *Service) addImportedHistoryIfMissing(
 	ctx context.Context,
 	store userstore.UserStore,

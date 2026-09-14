@@ -38,6 +38,9 @@ func (e *ChromaprintExtractor) Preflight(ctx context.Context) error {
 }
 
 func (e *ChromaprintExtractor) Extract(ctx context.Context, candidate Candidate) (Fingerprint, bool, error) {
+	if candidate.FilePath == "" || strings.HasPrefix(strings.ToLower(candidate.FilePath), "virtual://") {
+		return Fingerprint{}, false, nil
+	}
 	windowStart := 0.0
 	windowEnd := analysisWindowEnd(candidate.DurationSeconds, e.config)
 	if windowEnd <= windowStart {

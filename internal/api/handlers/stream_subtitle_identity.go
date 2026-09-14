@@ -49,6 +49,17 @@ func subtitleRouteIndex(file *models.MediaFile, index int, query url.Values) (in
 			}
 		}
 		if match < 0 {
+			// Virtual sources plan against provider-declared placeholder
+			// tracks (Index 0, no codec) and then inherit the real probed
+			// tracks at stream time, whose container indices differ. The
+			// combined ordinal is the stable identity across that transition,
+			// so fall back to it rather than 404ing the pinned URL. Local
+			// files keep strict matching: a pin that no longer resolves means
+			// the inventory changed and serving a different track would be
+			// wrong.
+			if isVirtualPlaybackFile(file) {
+				return index, nil
+			}
 			return 0, errSubtitleIdentityUnavailable
 		}
 		return match, nil

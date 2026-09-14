@@ -2,6 +2,64 @@ import type { VersionAudioTrack, VersionSubtitleTrack, VersionVideoTrack } from 
 import { englishLanguageName, getLanguageName } from "@/lib/languageNames";
 import { formatBitrate, formatChannels, formatSampleRate } from "@/lib/mediaFormat";
 
+/** Languages that carry no real identity and are skipped in summaries. */
+const LANGUAGE_PLACEHOLDERS = new Set(["und", "unknown", "unk", ""]);
+
+/**
+ * Collects deduplicated, human-readable language labels from a version's
+ * tracks. Release markers like MULTI/DUAL and ISO/BCP 47 codes both resolve
+ * through formatLanguageName, so a virtual candidate advertising
+ * ["MULTI", "FR", "eng"] summarizes to "Multi/French/English".
+ */
+export function collectLanguageLabels(
+  languages: ReadonlyArray<string | undefined | null>,
+): string[] {
+  const seen = new Set<string>();
+  const labels: string[] = [];
+  for (const value of languages ?? []) {
+    const language = value?.trim();
+    if (!language || LANGUAGE_PLACEHOLDERS.has(language.toLowerCase())) continue;
+    const label = formatLanguageName(language);
+    // Deduplicate on the resolved display label: "eng", "en", and "English"
+    // all render as "English", while distinct regions keep their qualifiers.
+    const identity = label.toLowerCase();
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    labels.push(label);
+  }
+  return labels;
+}
+
+/** Compact, deduplicated audio language list ("Multi/French") or null. */
+export function audioLanguageSummary(tracks: VersionAudioTrack[] | undefined): string | null {
+  const languages = tracks?.flatMap((track) =>
+    track.languages?.length ? track.languages : [track.language],
+  );
+  const labels = collectLanguageLabels(languages ?? []);
+  return labels.length > 0 ? labels.join("/") : null;
+}
+
+/** Compact, deduplicated subtitle language list ("English/French") or null. */
+export function subtitleLanguageSummary(tracks: VersionSubtitleTrack[] | undefined): string | null {
+  const labels = collectLanguageLabels(tracks?.map((track) => track.language) ?? []);
+  return labels.length > 0 ? labels.join("/") : null;
+}
+
+/** True for zero-storage catalog entries backed by a virtual:// provider URI. */
+export function isVirtualFileVersion(version: { container?: string; file_path?: string }): boolean {
+  return (
+    version.container === "virtual" ||
+    Boolean(version.file_path?.toLowerCase().startsWith("virtual://"))
+  );
+}
+
+/** Turns a release-style name ("Movie.2023.2160p.Remux-GRP") into a readable
+ *  line ("Movie 2023 2160p Remux GRP"). */
+export function prettifyReleaseName(releaseName?: string): string {
+  if (!releaseName) return "";
+  return releaseName.replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
 export function formatPageCount(pages?: number): string {
   if (!pages || pages <= 0) return "";
   return `${pages.toLocaleString()} ${pages === 1 ? "page" : "pages"}`;

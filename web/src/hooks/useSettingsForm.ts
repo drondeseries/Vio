@@ -153,7 +153,7 @@ export function useSettingsForm({ keys }: UseSettingsFormOptions) {
   );
 
   const save = useCallback(async () => {
-    if (dirty.size === 0) return;
+    if (dirty.size === 0 || !settings) return;
     const submittedKeys = Array.from(dirty);
     const values = Object.fromEntries(submittedKeys.map((key) => [key, localValues[key] ?? ""]));
     const submittedVersions = new Map(

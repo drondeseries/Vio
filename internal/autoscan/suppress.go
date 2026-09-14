@@ -28,9 +28,9 @@ func (s *redisSuppressor) ShouldScan(ctx context.Context, key string, ttl time.D
 		return true, nil // no suppression configured -> always scan
 	}
 	redisKey := "autoscan:scanned:" + key
-	ok, err := s.client.SetNX(ctx, redisKey, "1", ttl).Result()
+	ok, err := s.client.SetNX(ctx, redisKey, "1", ttl).Result() //nolint:staticcheck // This go-redis version has no Set NX option API.
 	if err != nil {
-		return true, nil // fail open: a Redis hiccup should not block scanning
+		return true, nil //nolint:nilerr // Suppression intentionally fails open on Redis errors.
 	}
 	return ok, nil
 }
