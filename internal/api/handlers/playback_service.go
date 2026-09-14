@@ -473,9 +473,16 @@ func (h *PlaybackHandler) finalizeStopV2(ctx context.Context, store playback.Pro
 		return receipt
 	}
 	if !claimed {
+		// Another caller holds the lease. Wait for it to finish, or for its
+		// lease to lapse and take over, bounded by the request context. The
+		// receipt is re-read each round so the lease judged is the one the
+		// store holds now, not the one read before the winner claimed.
 		for {
-			if replay, _, err := store.StopAttempt(ctx, sessionID, receipt.StopID, nil); err == nil && replay.Finalized {
-				return replay
+			if replay, _, err := store.StopAttempt(ctx, sessionID, receipt.StopID, nil); err == nil {
+				if replay.Finalized {
+					return replay
+				}
+				receipt = replay
 			}
 			if !receipt.FinalizingUntil.IsZero() && !time.Now().Before(receipt.FinalizingUntil) {
 				claimed, err = store.ClaimStopFinalization(ctx, sessionID, time.Now().Add(stopFinalizationLease))

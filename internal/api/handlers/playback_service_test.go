@@ -629,7 +629,9 @@ func TestReplayedProgressRedoesPersistence(t *testing.T) {
 }
 
 // TestStopFinalizationRunsOnce: two replays of an unfinalized stop must
-// produce one history writer run, not one per replay.
+// produce one history writer run, not one per replay. A replay that loses
+// the claim waits for the holder, bounded by its request context, and takes
+// over only once the holder's lease has lapsed.
 func TestStopFinalizationRunsOnce(t *testing.T) {
 	f := newPlaybackServiceFixture(t)
 	store := f.handler.PlanStoreV3.(playback.ProgressStoreV3)
@@ -637,8 +639,9 @@ func TestStopFinalizationRunsOnce(t *testing.T) {
 	if _, _, err := store.StopAttempt(context.Background(), f.session.ID, stopID, nil); err != nil {
 		t.Fatal(err)
 	}
-	// Hold the claim as a dead replica would, then replay: the replay must not
-	// finalize while the lease is live, and must report the stored receipt.
+	// Hold the claim as a dead replica would, then replay under a bounded
+	// request: the replay must not finalize while the lease is live, and
+	// must report the stored receipt when its context ends.
 	if won, err := store.ClaimStopFinalization(context.Background(), f.session.ID, time.Now().Add(time.Minute)); err != nil || !won {
 		t.Fatalf("seed claim: %v %v", won, err)
 	}
@@ -647,14 +650,17 @@ func TestStopFinalizationRunsOnce(t *testing.T) {
 	// a deadline, the loop would block for the full lease duration, re-claim
 	// after expiry, and finalize — violating the expectation that a replay
 	// that loses the claim must not tear the session down.
-	shortCtx, shortCancel := context.WithTimeout(f.ctx, 500*time.Millisecond)
-	defer shortCancel()
-	view, err := f.handler.StopPlaybackV2(shortCtx, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
+	bounded, cancel := context.WithTimeout(f.ctx, 200*time.Millisecond)
+	defer cancel()
+	view, err := f.handler.StopPlaybackV2(bounded, f.caller, f.session.ID, PlaybackStopCommand{StopID: uuid.NewString()})
 	if err != nil || view.Outcome != PlaybackOutcomeReplayed || view.StopID != stopID {
 		t.Fatalf("view = %+v, %v", view, err)
 	}
 	if _, err := f.manager.GetSession(f.session.ID); err != nil {
 		t.Fatalf("a replay that lost the claim must not tear the session down: %v", err)
+	}
+	if replay, _, _ := store.StopAttempt(context.Background(), f.session.ID, uuid.NewString(), nil); replay.Finalized {
+		t.Fatalf("a replay that lost the claim finalized the receipt: %+v", replay)
 	}
 	// Once the lease lapses the next replay finishes the job exactly once.
 	// Rewrite the stored receipt with an already-expired lease, as time would.
