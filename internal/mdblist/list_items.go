@@ -23,6 +23,11 @@ var ErrUnauthorized = errors.New("mdblist rejected apikey")
 // ErrListNotFound reports that the requested user/list does not exist (404).
 var ErrListNotFound = errors.New("mdblist list not found")
 
+// ErrEmptyItemsWithTotal reports a list whose pagination.total is positive but
+// whose movie/show buckets are empty. MDBList's slug-based items endpoint
+// returns this for many lists; it must never be treated as "empty list".
+var ErrEmptyItemsWithTotal = errors.New("mdblist items response reported items but returned none")
+
 // ListItem is one movie or show in an authenticated list-items page. The
 // authenticated API uses different field names than the public /json feed
 // (tvdb_id / release_date), so the catalog maps these separately.
@@ -59,6 +64,14 @@ type listItemsResponse struct {
 	Pagination listPagination `json:"pagination"`
 }
 
+// listMeta is one entry from GET /lists/{user}/{slug}, a JSON array. Only the
+// fields needed to match the requested list and recover its numeric id.
+type listMeta struct {
+	ID       int    `json:"id"`
+	UserName string `json:"user_name"`
+	Slug     string `json:"slug"`
+}
+
 // listItem is a single API item. tvdb_id and release_date differ from the
 // public /json feed's tvdbid and (absent) release date field.
 type listItem struct {
@@ -72,11 +85,66 @@ type listItem struct {
 	Rank        int    `json:"rank"`
 }
 
+// ResolveListID maps a user/slug pair to MDBList's numeric list id via
+// GET /lists/{user}/{slug}. That endpoint returns an array of list objects;
+// the entry whose user_name and slug match the request wins. A single-entry
+// response with no exact match is accepted (the endpoint is addressable by the
+// requested pair), but an ambiguous multi-entry response errors rather than
+// guessing.
+func (c *Client) ResolveListID(ctx context.Context, user, slug string) (int, error) {
+	user = strings.TrimSpace(user)
+	slug = strings.TrimSpace(slug)
+	if user == "" || slug == "" {
+		return 0, fmt.Errorf("mdblist list user and slug are required")
+	}
+	if !c.Configured() {
+		return 0, ErrNotConfigured
+	}
+
+	q := url.Values{}
+	q.Set("apikey", c.currentAPIKey())
+	u := c.baseURL + "/lists/" + url.PathEscape(user) + "/" + url.PathEscape(slug) + "?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, fmt.Errorf("creating mdblist request: %w", err)
+	}
+	res, err := c.http.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("calling mdblist: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if err := checkResponse(res); err != nil {
+		return 0, err
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	if err != nil {
+		return 0, fmt.Errorf("reading mdblist response: %w", err)
+	}
+	var metas []listMeta
+	if err := json.Unmarshal(body, &metas); err != nil {
+		return 0, fmt.Errorf("parsing mdblist response: %w", err)
+	}
+	for _, meta := range metas {
+		if strings.EqualFold(meta.UserName, user) && strings.EqualFold(meta.Slug, slug) && meta.ID > 0 {
+			return meta.ID, nil
+		}
+	}
+	if len(metas) == 1 && metas[0].ID > 0 {
+		// The endpoint is addressable by this user/slug; a single result is
+		// the list, even if the upstream casing/aliases differ.
+		return metas[0].ID, nil
+	}
+	return 0, fmt.Errorf("mdblist could not resolve list %s/%s to a unique id (%d matches)", user, slug, len(metas))
+}
+
 // ListItems fetches a user's list through the authenticated, cursor-paginated
-// items endpoint. maxItems > 0 bounds the result (and stops pagination early);
-// otherwise the hard MaxExplicitItemLimit cap applies. movies and shows are
-// separate buckets, so this merges them by ascending rank (stable) to
-// reproduce the public /json single-array rank order. seasons/episodes are
+// items endpoint. It first resolves the numeric list id (MDBList's slug-based
+// items endpoint silently returns zero items for many lists), then pages
+// /lists/{id}/items. maxItems > 0 bounds the result (and stops pagination
+// early); otherwise the hard MaxExplicitItemLimit cap applies. movies and
+// shows are separate buckets, so this merges them by ascending rank (stable)
+// to reproduce the public /json single-array rank order. seasons/episodes are
 // ignored.
 func (c *Client) ListItems(ctx context.Context, user, list string, maxItems int) ([]ListItem, error) {
 	user = strings.TrimSpace(user)
@@ -88,12 +156,18 @@ func (c *Client) ListItems(ctx context.Context, user, list string, maxItems int)
 		return nil, ErrNotConfigured
 	}
 
+	listID, err := c.ResolveListID(ctx, user, list)
+	if err != nil {
+		return nil, err
+	}
+
 	hardCap := maxItems
 	if hardCap <= 0 {
 		hardCap = collectionutil.MaxExplicitItemLimit
 	}
 
 	var movies, shows []listItem
+	total := 0
 	seenCursors := map[string]struct{}{}
 	cursor := ""
 	for page := 0; ; page++ {
@@ -103,12 +177,15 @@ func (c *Client) ListItems(ctx context.Context, user, list string, maxItems int)
 		if cursor != "" {
 			q.Set("cursor", cursor)
 		}
-		resp, err := c.fetchListItemsPage(ctx, user, list, q)
+		resp, err := c.fetchListItemsPage(ctx, listID, q)
 		if err != nil {
 			return nil, err
 		}
 		movies = append(movies, resp.Movies...)
 		shows = append(shows, resp.Shows...)
+		if resp.Pagination.Total > 0 {
+			total = resp.Pagination.Total
+		}
 
 		if len(movies)+len(shows) >= hardCap {
 			break
@@ -140,6 +217,11 @@ func (c *Client) ListItems(ctx context.Context, user, list string, maxItems int)
 	if len(items) > hardCap {
 		items = items[:hardCap]
 	}
+	if len(items) == 0 && total > 0 {
+		// Never let an empty bucket silently wipe a collection the API says is
+		// non-empty. Callers fall back to the public /json feed.
+		return nil, fmt.Errorf("%w: list %s/%s (id %d) reports total=%d", ErrEmptyItemsWithTotal, user, list, listID, total)
+	}
 	return items, nil
 }
 
@@ -156,8 +238,8 @@ func (it listItem) toListItem() ListItem {
 	}
 }
 
-func (c *Client) fetchListItemsPage(ctx context.Context, user, list string, q url.Values) (*listItemsResponse, error) {
-	u := c.baseURL + "/lists/" + url.PathEscape(user) + "/" + url.PathEscape(list) + "/items?" + q.Encode()
+func (c *Client) fetchListItemsPage(ctx context.Context, listID int, q url.Values) (*listItemsResponse, error) {
+	u := c.baseURL + "/lists/" + strconv.Itoa(listID) + "/items?" + q.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating mdblist request: %w", err)
@@ -168,19 +250,9 @@ func (c *Client) fetchListItemsPage(ctx context.Context, user, list string, q ur
 	}
 	defer func() { _ = res.Body.Close() }()
 
-	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("%w (status %d): %s", ErrUnauthorized, res.StatusCode, readSnippet(res.Body))
+	if err := checkResponse(res); err != nil {
+		return nil, err
 	}
-	if res.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("%w (status %d): %s", ErrListNotFound, res.StatusCode, readSnippet(res.Body))
-	}
-	if res.StatusCode == http.StatusTooManyRequests {
-		return nil, fmt.Errorf("mdblist rate limit exceeded")
-	}
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("mdblist request failed with status %d: %s", res.StatusCode, readSnippet(res.Body))
-	}
-
 	body, err := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	if err != nil {
 		return nil, fmt.Errorf("reading mdblist response: %w", err)
@@ -190,6 +262,22 @@ func (c *Client) fetchListItemsPage(ctx context.Context, user, list string, q ur
 		return nil, fmt.Errorf("parsing mdblist response: %w", err)
 	}
 	return &resp, nil
+}
+
+// checkResponse maps non-2xx statuses onto the package's typed errors. It only
+// reads a bounded snippet of the body.
+func checkResponse(res *http.Response) error {
+	switch {
+	case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("%w (status %d): %s", ErrUnauthorized, res.StatusCode, readSnippet(res.Body))
+	case res.StatusCode == http.StatusNotFound:
+		return fmt.Errorf("%w (status %d): %s", ErrListNotFound, res.StatusCode, readSnippet(res.Body))
+	case res.StatusCode == http.StatusTooManyRequests:
+		return fmt.Errorf("mdblist rate limit exceeded")
+	case res.StatusCode < 200 || res.StatusCode >= 300:
+		return fmt.Errorf("mdblist request failed with status %d: %s", res.StatusCode, readSnippet(res.Body))
+	}
+	return nil
 }
 
 // readSnippet returns a bounded, non-secret fragment of an error body for

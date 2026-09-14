@@ -2564,7 +2564,12 @@ func (s *LibraryCollectionService) fetchMDBListEntries(ctx context.Context, list
 // fetcher that reports ErrNotConfigured (no key — including a key cleared by
 // the config watcher after startup) does fall back, because that is the
 // documented no-key path.
+//
+// ErrEmptyItemsWithTotal is also treated as a fallback: the API reported items
+// but returned none, and an empty result would wipe a non-empty collection.
+// The public /json feed is the source of truth in that case.
 func (s *LibraryCollectionService) fetchMDBListEntriesWithAPI(ctx context.Context, listURLs []string, limit *int) ([]mdblistEntry, error) {
+	fallback := false
 	if s.MDBListAPI != nil {
 		for _, listURL := range listURLs {
 			user, list, ok := collectionutil.ParseMDBListListURL(listURL)
@@ -2576,13 +2581,26 @@ func (s *LibraryCollectionService) fetchMDBListEntriesWithAPI(ctx context.Contex
 				maxItems = collectionutil.MaxExplicitItemLimit
 			}
 			items, err := s.MDBListAPI.ListItems(ctx, user, list, maxItems)
-			if err != nil {
-				if errors.Is(err, mdblist.ErrNotConfigured) {
-					break // no key: use the public /json fallback
-				}
+			switch {
+			case err == nil:
+				return apiListItemsToEntries(items), nil
+			case errors.Is(err, mdblist.ErrNotConfigured):
+				// No key (including one cleared at runtime): use /json.
+				fallback = true
+			case errors.Is(err, mdblist.ErrEmptyItemsWithTotal):
+				slog.WarnContext(ctx, "MDBList API returned no items for a non-empty list; falling back to the public JSON feed",
+					"component", "catalog",
+					"user", user,
+					"list", list,
+					"error", err,
+				)
+				fallback = true
+			default:
 				return nil, fmt.Errorf("fetching mdblist list %s/%s: %w", user, list, err)
 			}
-			return apiListItemsToEntries(items), nil
+			if fallback {
+				break
+			}
 		}
 	}
 	return collectionutil.FetchMDBListWithFallback(listURLs, func(listURL string) ([]mdblistEntry, error) {

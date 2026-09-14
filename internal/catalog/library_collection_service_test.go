@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -451,6 +452,34 @@ func TestFetchMDBListEntriesFallsBackWhenAPIReportsNotConfigured(t *testing.T) {
 	}
 	if httpHits != 1 || len(entries) != 1 || entries[0].Title != "Fallback" {
 		t.Fatalf("httpHits=%d entries=%+v, want the /json fallback", httpHits, entries)
+	}
+}
+
+func TestFetchMDBListEntriesFallsBackOnEmptyItemsWithTotal(t *testing.T) {
+	httpHits := 0
+	svc := &LibraryCollectionService{
+		MDBListAPI: &fakeMDBListAPI{err: fmt.Errorf("%w: total=300", mdblist.ErrEmptyItemsWithTotal)},
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			httpHits++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`[{"id":3082,"title":"Netflix Shows","mediatype":"tv","release_year":2020}]`)),
+				Header:     make(http.Header),
+			}, nil
+		})},
+	}
+	entries, err := svc.fetchMDBListEntriesWithAPI(context.Background(), []string{"https://mdblist.com/lists/garycrawfordgc/netflix-shows/json"}, nil)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if httpHits != 1 {
+		t.Fatalf("public /json path used %d times, want 1", httpHits)
+	}
+	if len(entries) != 1 || entries[0].ID != 3082 || entries[0].Title != "Netflix Shows" {
+		t.Fatalf("entries = %+v, want the non-empty /json fallback", entries)
+	}
+	if !svc.MDBListAPI.(*fakeMDBListAPI).called {
+		t.Fatal("API fetcher was not attempted before falling back")
 	}
 }
 

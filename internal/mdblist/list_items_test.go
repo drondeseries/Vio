@@ -11,28 +11,49 @@ import (
 	"testing"
 )
 
-// listItemsServer returns an httptest server that serves canned pages keyed by
-// cursor ("" for the first page) and records the query params of each request.
-func listItemsServer(t *testing.T, pages map[string]string) (*httptest.Server, *[]url.Values, *[]string) {
+// metaOne is a single-list metadata response for GET /lists/{user}/{slug}.
+func metaOne(user, slug string, id int) string {
+	return fmt.Sprintf(`[{"id":%d,"user_name":%q,"slug":%q,"items":10}]`, id, user, slug)
+}
+
+// listItemsServer serves the two-call sequence: GET /lists/{user}/{slug}
+// returns metaBody, and GET /lists/{id}/items returns pages keyed by cursor
+// ("" for the first page). It records every request's query and path.
+func listItemsServer(t *testing.T, metaBody string, pages map[string]string) (*httptest.Server, *[]url.Values, *[]string) {
 	t.Helper()
 	var queries []url.Values
 	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		queries = append(queries, r.URL.Query())
 		paths = append(paths, r.URL.Path)
-		page, ok := pages[r.URL.Query().Get("cursor")]
-		if !ok {
-			w.WriteHeader(http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/items") {
+			page, ok := pages[r.URL.Query().Get("cursor")]
+			if !ok {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(page))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(page))
+		_, _ = w.Write([]byte(metaBody))
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &queries, &paths
 }
 
-func TestListItemsTraversesCursorsAndSendsKey(t *testing.T) {
+// itemPaths returns only the /items request paths.
+func itemPaths(paths []string) []string {
+	var out []string
+	for _, p := range paths {
+		if strings.HasSuffix(p, "/items") {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func TestListItemsResolvesIDThenPagesByID(t *testing.T) {
 	pages := map[string]string{
 		"": `{
 			"movies":[{"id":100,"mediatype":"movie","imdb_id":"tt100","title":"Movie A","release_year":2001,"release_date":"2001-01-01","rank":1000}],
@@ -45,7 +66,7 @@ func TestListItemsTraversesCursorsAndSendsKey(t *testing.T) {
 			"pagination":{"limit":1000,"offset":1,"total":2,"has_more":false,"next_cursor":""}
 		}`,
 	}
-	srv, queries, paths := listItemsServer(t, pages)
+	srv, queries, paths := listItemsServer(t, metaOne("alice", "watchlist", 2194), pages)
 
 	c := NewClient("secret-key", srv.Client())
 	c.baseURL = srv.URL
@@ -57,25 +78,41 @@ func TestListItemsTraversesCursorsAndSendsKey(t *testing.T) {
 	if len(items) != 2 {
 		t.Fatalf("items = %d, want 2", len(items))
 	}
-	if len(*queries) != 2 {
-		t.Fatalf("requests = %d, want 2", len(*queries))
+	// Call sequence: metadata by slug first, then items by numeric id.
+	if (*paths)[0] != "/lists/alice/watchlist" {
+		t.Fatalf("first path = %q, want /lists/alice/watchlist", (*paths)[0])
 	}
-	for i, q := range *queries {
+	ips := itemPaths(*paths)
+	if len(ips) != 2 {
+		t.Fatalf("item requests = %d, want 2", len(ips))
+	}
+	for _, p := range ips {
+		if p != "/lists/2194/items" {
+			t.Fatalf("items path = %q, want /lists/2194/items (by numeric id)", p)
+		}
+	}
+	// The metadata request carries the key but no limit/cursor.
+	if (*queries)[0].Get("apikey") != "secret-key" {
+		t.Fatalf("metadata apikey = %q, want secret-key", (*queries)[0].Get("apikey"))
+	}
+	if (*queries)[0].Get("limit") != "" {
+		t.Fatalf("metadata limit = %q, want empty", (*queries)[0].Get("limit"))
+	}
+	// Item pages: limit, cursor, and key.
+	for i, q := range (*queries)[1:] {
 		if q.Get("apikey") != "secret-key" {
-			t.Fatalf("request %d apikey = %q, want secret-key", i, q.Get("apikey"))
+			t.Fatalf("item request %d apikey = %q, want secret-key", i, q.Get("apikey"))
 		}
 		if q.Get("limit") != "1000" {
-			t.Fatalf("request %d limit = %q, want 1000", i, q.Get("limit"))
+			t.Fatalf("item request %d limit = %q, want 1000", i, q.Get("limit"))
 		}
 	}
-	if (*queries)[0].Get("cursor") != "" {
-		t.Fatalf("first request sent cursor %q, want empty", (*queries)[0].Get("cursor"))
+	itemQueries := (*queries)[1:]
+	if itemQueries[0].Get("cursor") != "" {
+		t.Fatalf("first item request sent cursor %q, want empty", itemQueries[0].Get("cursor"))
 	}
-	if (*queries)[1].Get("cursor") != "c1" {
-		t.Fatalf("second request cursor = %q, want c1", (*queries)[1].Get("cursor"))
-	}
-	if (*paths)[0] != "/lists/alice/watchlist/items" {
-		t.Fatalf("path = %q, want /lists/alice/watchlist/items", (*paths)[0])
+	if itemQueries[1].Get("cursor") != "c1" {
+		t.Fatalf("second item request cursor = %q, want c1", itemQueries[1].Get("cursor"))
 	}
 	// Fields map from the API names (tvdb_id/release_date).
 	if items[0].TMDBID != 100 || items[0].ReleaseDate != "2001-01-01" || items[0].Rank != 1000 {
@@ -83,6 +120,82 @@ func TestListItemsTraversesCursorsAndSendsKey(t *testing.T) {
 	}
 	if items[1].MediaType != "show" || items[1].TVDBID == nil || *items[1].TVDBID != 200 || items[1].ReleaseDate != "2002-02-02" {
 		t.Fatalf("show item = %+v", items[1])
+	}
+}
+
+func TestResolveListIDSelectsMatchingEntry(t *testing.T) {
+	meta := `[
+		{"id":1,"user_name":"someone","slug":"other"},
+		{"id":3082,"user_name":"garycrawfordgc","slug":"netflix-shows"},
+		{"id":3,"user_name":"garycrawfordgc","slug":"netflix-movies"}
+	]`
+	srv, _, paths := listItemsServer(t, meta, nil)
+	c := NewClient("k", srv.Client())
+	c.baseURL = srv.URL
+
+	id, err := c.ResolveListID(context.Background(), "garycrawfordgc", "netflix-shows")
+	if err != nil {
+		t.Fatalf("ResolveListID: %v", err)
+	}
+	if id != 3082 {
+		t.Fatalf("id = %d, want 3082", id)
+	}
+	if (*paths)[0] != "/lists/garycrawfordgc/netflix-shows" {
+		t.Fatalf("path = %q", (*paths)[0])
+	}
+}
+
+func TestResolveListIDSingleEntryFallback(t *testing.T) {
+	// A one-entry response is accepted even if upstream casing differs.
+	meta := `[{"id":42,"user_name":"Alice","slug":"Watchlist"}]`
+	srv, _, _ := listItemsServer(t, meta, nil)
+	c := NewClient("k", srv.Client())
+	c.baseURL = srv.URL
+
+	id, err := c.ResolveListID(context.Background(), "alice", "watchlist")
+	if err != nil {
+		t.Fatalf("ResolveListID: %v", err)
+	}
+	if id != 42 {
+		t.Fatalf("id = %d, want 42", id)
+	}
+}
+
+func TestResolveListIDMismatchErrors(t *testing.T) {
+	meta := `[
+		{"id":1,"user_name":"someone","slug":"other"},
+		{"id":2,"user_name":"someone","slug":"another"}
+	]`
+	srv, _, _ := listItemsServer(t, meta, nil)
+	c := NewClient("k", srv.Client())
+	c.baseURL = srv.URL
+
+	if _, err := c.ResolveListID(context.Background(), "alice", "watchlist"); err == nil {
+		t.Fatal("expected an ambiguity error, got nil")
+	}
+}
+
+func TestResolveListIDTypedErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		wantErr error
+	}{
+		{"unauthorized", http.StatusUnauthorized, ErrUnauthorized},
+		{"not found", http.StatusNotFound, ErrListNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"error":"x"}`))
+			}))
+			defer srv.Close()
+			c := NewClient("k", srv.Client())
+			c.baseURL = srv.URL
+			if _, err := c.ResolveListID(context.Background(), "u", "l"); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -99,7 +212,7 @@ func TestListItemsMergesMoviesAndShowsByRank(t *testing.T) {
 		],
 		"pagination":{"limit":1000,"offset":0,"total":5,"has_more":false}
 	}`
-	srv, _, _ := listItemsServer(t, map[string]string{"": page})
+	srv, _, _ := listItemsServer(t, metaOne("u", "l", 77), map[string]string{"": page})
 
 	c := NewClient("k", srv.Client())
 	c.baseURL = srv.URL
@@ -126,7 +239,7 @@ func TestListItemsStableForZeroRanks(t *testing.T) {
 		"shows":[{"id":3,"mediatype":"show","title":"S1","rank":0}],
 		"pagination":{"limit":1000,"offset":0,"total":3,"has_more":false}
 	}`
-	srv, _, _ := listItemsServer(t, map[string]string{"": page})
+	srv, _, _ := listItemsServer(t, metaOne("u", "l", 7), map[string]string{"": page})
 	c := NewClient("k", srv.Client())
 	c.baseURL = srv.URL
 
@@ -150,7 +263,7 @@ func TestListItemsIgnoresSeasonsAndEpisodes(t *testing.T) {
 		"episodes":[{"id":901,"mediatype":"episode","title":"Episode","rank":600}],
 		"pagination":{"limit":1000,"offset":0,"total":2,"has_more":false}
 	}`
-	srv, _, _ := listItemsServer(t, map[string]string{"": page})
+	srv, _, _ := listItemsServer(t, metaOne("u", "l", 5), map[string]string{"": page})
 	c := NewClient("k", srv.Client())
 	c.baseURL = srv.URL
 
@@ -169,9 +282,14 @@ func TestListItemsIgnoresSeasonsAndEpisodes(t *testing.T) {
 }
 
 func TestListItemsStopsEarlyAtMaxItems(t *testing.T) {
-	var requests int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requests++
+	var itemRequests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !strings.HasSuffix(r.URL.Path, "/items") {
+			_, _ = w.Write([]byte(metaOne("u", "l", 9)))
+			return
+		}
+		itemRequests++
 		_, _ = w.Write([]byte(`{
 			"movies":[{"id":1,"rank":1000},{"id":2,"rank":2000},{"id":3,"rank":3000},{"id":4,"rank":4000}],
 			"shows":[],
@@ -187,8 +305,8 @@ func TestListItemsStopsEarlyAtMaxItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListItems: %v", err)
 	}
-	if requests != 1 {
-		t.Fatalf("requests = %d, want 1 (stop after first page exceeds maxItems)", requests)
+	if itemRequests != 1 {
+		t.Fatalf("item requests = %d, want 1 (stop after first page exceeds maxItems)", itemRequests)
 	}
 	if len(items) != 2 {
 		t.Fatalf("items = %d, want 2", len(items))
@@ -203,7 +321,7 @@ func TestListItemsTrimsToMaxItemsAfterMerge(t *testing.T) {
 		"shows":[{"id":10,"rank":2000},{"id":11,"rank":3000},{"id":12,"rank":4000}],
 		"pagination":{"limit":1000,"offset":0,"total":4,"has_more":false}
 	}`
-	srv, _, _ := listItemsServer(t, map[string]string{"": page})
+	srv, _, _ := listItemsServer(t, metaOne("u", "l", 11), map[string]string{"": page})
 	c := NewClient("k", srv.Client())
 	c.baseURL = srv.URL
 
@@ -213,6 +331,35 @@ func TestListItemsTrimsToMaxItemsAfterMerge(t *testing.T) {
 	}
 	if len(items) != 2 || items[0].TMDBID != 1 || items[1].TMDBID != 10 {
 		t.Fatalf("items = %+v, want [1,10]", items)
+	}
+}
+
+func TestListItemsEmptyItemsWithTotalErrors(t *testing.T) {
+	// MDBList's slug endpoint returns this shape for many non-empty lists: the
+	// buckets are empty while total is positive. It must not read as "empty".
+	page := `{"movies":[],"shows":[],"pagination":{"offset":0,"limit":1000,"total":300,"has_more":false}}`
+	srv, _, _ := listItemsServer(t, metaOne("garycrawfordgc", "netflix-shows", 3082), map[string]string{"": page})
+	c := NewClient("k", srv.Client())
+	c.baseURL = srv.URL
+
+	_, err := c.ListItems(context.Background(), "garycrawfordgc", "netflix-shows", 0)
+	if !errors.Is(err, ErrEmptyItemsWithTotal) {
+		t.Fatalf("err = %v, want ErrEmptyItemsWithTotal", err)
+	}
+}
+
+func TestListItemsGenuinelyEmptyReturnsEmpty(t *testing.T) {
+	page := `{"movies":[],"shows":[],"pagination":{"offset":0,"limit":1000,"total":0,"has_more":false}}`
+	srv, _, _ := listItemsServer(t, metaOne("u", "empty", 3), map[string]string{"": page})
+	c := NewClient("k", srv.Client())
+	c.baseURL = srv.URL
+
+	items, err := c.ListItems(context.Background(), "u", "empty", 0)
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("items = %+v, want empty", items)
 	}
 }
 
@@ -231,7 +378,7 @@ func TestListItemsNonAdvancingCursorGuard(t *testing.T) {
 	}
 	for name, page := range cases {
 		t.Run(name, func(t *testing.T) {
-			srv, queries, _ := listItemsServer(t, map[string]string{"": page, "same": page})
+			srv, _, paths := listItemsServer(t, metaOne("u", "l", 1), map[string]string{"": page, "same": page})
 			c := NewClient("k", srv.Client())
 			c.baseURL = srv.URL
 
@@ -239,8 +386,8 @@ func TestListItemsNonAdvancingCursorGuard(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected non-advancing cursor error, got nil")
 			}
-			if len(*queries) > 2 {
-				t.Fatalf("guard did not stop pagination: %d requests", len(*queries))
+			if len(itemPaths(*paths)) > 2 {
+				t.Fatalf("guard did not stop pagination: %d item requests", len(itemPaths(*paths)))
 			}
 		})
 	}
@@ -258,7 +405,7 @@ func TestListItemsRepeatedCursorGuard(t *testing.T) {
 		"shows":[],
 		"pagination":{"has_more":true,"next_cursor":"c1"}
 	}`
-	srv, _, _ := listItemsServer(t, map[string]string{"": first, "c1": second})
+	srv, _, _ := listItemsServer(t, metaOne("u", "l", 2), map[string]string{"": first, "c1": second})
 	c := NewClient("k", srv.Client())
 	c.baseURL = srv.URL
 
@@ -282,6 +429,8 @@ func TestListItemsTypedErrors(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			// The metadata call fails first, so the typed error comes from
+			// ResolveListID.
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(tc.body))
@@ -344,10 +493,15 @@ func TestListItemsRespectsContextCancellation(t *testing.T) {
 }
 
 func TestListItemsEscapesUserAndListPathSegments(t *testing.T) {
-	var requestURI string
+	var requestURIs []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestURI = r.RequestURI
-		_, _ = w.Write([]byte(`{"movies":[],"shows":[],"pagination":{"has_more":false}}`))
+		requestURIs = append(requestURIs, r.RequestURI)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/items") {
+			_, _ = w.Write([]byte(`{"movies":[{"id":1,"rank":1000}],"shows":[],"pagination":{"total":1,"has_more":false}}`))
+			return
+		}
+		_, _ = w.Write([]byte(metaOne("a b", "c/d", 55)))
 	}))
 	defer srv.Close()
 	c := NewClient("k", srv.Client())
@@ -355,8 +509,11 @@ func TestListItemsEscapesUserAndListPathSegments(t *testing.T) {
 	if _, err := c.ListItems(context.Background(), "a b", "c/d", 0); err != nil {
 		t.Fatalf("ListItems: %v", err)
 	}
-	if !strings.HasPrefix(requestURI, "/lists/a%20b/c%2Fd/items?") {
-		t.Fatalf("request URI = %q, want escaped path segments", requestURI)
+	if !strings.HasPrefix(requestURIs[0], "/lists/a%20b/c%2Fd?") {
+		t.Fatalf("metadata URI = %q, want escaped path segments", requestURIs[0])
+	}
+	if !strings.HasPrefix(requestURIs[1], "/lists/55/items?") {
+		t.Fatalf("items URI = %q, want /lists/55/items", requestURIs[1])
 	}
 }
 
