@@ -795,7 +795,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			resolutionAssumed := transient.Resolution == ""
 			if resolutionAssumed {
-				transient.Resolution = "1080p"
+				transient.Resolution = transcodeResolution1080p
 			}
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
@@ -845,7 +845,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			resolutionAssumed := transient.Resolution == ""
 			if resolutionAssumed {
-				transient.Resolution = "1080p"
+				transient.Resolution = transcodeResolution1080p
 			}
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
@@ -867,7 +867,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			resolutionAssumed := transient.Resolution == ""
 			if resolutionAssumed {
-				transient.Resolution = "1080p"
+				transient.Resolution = transcodeResolution1080p
 			}
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {

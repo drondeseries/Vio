@@ -696,14 +696,6 @@ func hlsVideoSampleEntryV3(source SourceDescriptorV3, request StartRequestV3, dv
 	return VideoSampleEntryHVC1
 }
 
-func isDynamicStreamSourceV3(file *models.MediaFile) bool {
-	if file == nil {
-		return false
-	}
-	path := strings.ToLower(file.FilePath)
-	return strings.HasSuffix(path, ".strm") || strings.EqualFold(file.Container, "strm") || strings.HasPrefix(path, "aiostreams://") || strings.HasPrefix(path, "virtual://")
-}
-
 // availableQualitiesV3 publishes the server ladder rungs a client could
 // request for this source through a quality_change replan. The source rung is
 // always present; transcode rungs are listed below the source resolution class,

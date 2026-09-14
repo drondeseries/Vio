@@ -205,12 +205,6 @@ func isPGTransient(err error) bool {
 		strings.Contains(msg, "55P03") || strings.Contains(lower, "lock timeout")
 }
 
-// isPGDeadlock is kept for existing callers; it reports the deadlock subset
-// of isPGTransient.
-func isPGDeadlock(err error) bool {
-	return isPGTransient(err) && (strings.Contains(err.Error(), "40P01") || strings.Contains(strings.ToLower(err.Error()), "deadlock detected"))
-}
-
 // VirtualPurgeOptions filters an administrative virtual-item purge. Zero
 // values mean "no filter".
 type VirtualPurgeOptions struct {
