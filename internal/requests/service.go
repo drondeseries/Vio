@@ -1797,6 +1797,12 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 	if s.catalogChanged != nil {
 		s.catalogChanged()
 	}
+	// Fulfill is allowed to create virtual catalog rows before returning. Flush
+	// shared home-section membership now so Recently Added reflects the change
+	// on the user's next request instead of serving its five-minute warm entry.
+	if s.catalogChanged != nil {
+		s.catalogChanged()
+	}
 	if len(targets) == 0 {
 		if msg == "" {
 			msg = "fulfillment backend created no targets"

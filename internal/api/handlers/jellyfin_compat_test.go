@@ -410,12 +410,19 @@ func TestStartAdminJellyfinCompatWebSeamReportsRunningOperation(t *testing.T) {
 	if settings.values["jellyfin_compat.web_enabled"] != "false" {
 		t.Fatalf("web_enabled = %q", settings.values["jellyfin_compat.web_enabled"])
 	}
-	// While the removal runs, another removal reports it and an install conflicts with it.
-	if op := jellycompat.CurrentWebOperation(root); op != nil && op.State == jellycompat.WebComponentOperationRunning {
-		again, err := handler.StartAdminJellyfinCompatWebRemove(ctx)
-		if !errors.Is(err, jellycompat.ErrWebComponentOperationActive) || again.Operation == nil || again.Operation.Kind != jellycompat.WebComponentOperationRemove {
-			t.Fatalf("repeat remove: %+v %v", again.Operation, err)
-		}
+	// While the removal runs, another removal reports it. Removing an empty
+	// root is quick, so the first operation may already have finished, in
+	// which case the second one starts in its place; the conflict itself is
+	// pinned by the jellycompat package tests.
+	again, err := handler.StartAdminJellyfinCompatWebRemove(ctx)
+	if err != nil && !errors.Is(err, jellycompat.ErrWebComponentOperationActive) {
+		t.Fatalf("repeat remove: %+v %v", again.Operation, err)
+	}
+	if again.Operation == nil || again.Operation.Kind != jellycompat.WebComponentOperationRemove {
+		t.Fatalf("repeat remove: %+v %v", again.Operation, err)
+	}
+	if errors.Is(err, jellycompat.ErrWebComponentOperationActive) && again.Operation.ID != status.Operation.ID {
+		t.Fatalf("repeat remove reported %q, want the running %q", again.Operation.ID, status.Operation.ID)
 	}
 	waitForWebOperation(t, root)
 	// An install pinned to an unsafe version is refused before any operation starts.

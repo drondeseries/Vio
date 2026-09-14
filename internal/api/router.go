@@ -1301,7 +1301,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET file_path=$1, updated_at=now() WHERE id=$2`, newFilePath, fileID)
 				return err
 			}
-			playbackHandler.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error {
+			playbackHandler.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error {
 				vStr := string(videoTracks)
 				if vStr == "" || vStr == "null" {
 					vStr = "[]"
@@ -1314,7 +1314,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				if sStr == "" || sStr == "null" {
 					sStr = "[]"
 				}
-				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath)
+				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath, stampProbe)
 				return err
 			}
 		}
@@ -1354,6 +1354,14 @@ func newChiRouter(deps Dependencies) chi.Router {
 			playbackHandler.VirtualPlaybackSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
 				return virtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
 			}
+		}
+		playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
+			return deps.PluginHTTPProxy.ResolveVirtualMedia(ctx, virtualURI)
+		})
+		if streamHandler != nil {
+			streamHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
+				return deps.PluginHTTPProxy.ResolveVirtualMedia(ctx, virtualURI)
+			})
 		}
 		if deps.DB != nil {
 			playbackHandler.PlanStoreV3 = planstore.NewPostgres(deps.DB)
@@ -1867,10 +1875,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 
 	var subtitleAIHandler *handlers.SubtitleAIHandler
 	if subtitleManager != nil && subtitleRepo != nil && deps.FileRepo != nil && deps.DB != nil && deps.Config != nil {
-		aiCfg, disabledGateway := effectiveSubtitleAIConfig(deps.Config)
-		if disabledGateway != "" {
-			warnChatOnlyGateway(disabledGateway)
-		}
+		aiCfg := effectiveSubtitleAIConfig(deps.Config)
 		var aiNotifier subtitleai.Notifier
 		if subtitleAINotifier != nil {
 			aiNotifier = subtitleAINotifier
@@ -1893,18 +1898,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 		)
 		aiService.Recover()
 		if deps.OnConfigChange != nil {
-			deps.OnConfigChange(func(old, updated *config.Config) {
-				newCfg, newDisabled := effectiveSubtitleAIConfig(updated)
+			deps.OnConfigChange(func(_, updated *config.Config) {
+				newCfg := effectiveSubtitleAIConfig(updated)
 				aiService.UpdateConfig(newCfg)
 				aiTranslator.SetBatching(updated.SubtitleAI.BatchSize, updated.SubtitleAI.ContextNeighbors)
 				aiTranscriber.SetExtraction(updated.Playback.FFmpegPath, updated.SubtitleAI.ASRChunkSeconds)
-				// Warn only when the gateway-disable condition newly appears,
-				// not on every unrelated settings change.
-				if newDisabled != "" && old != nil {
-					if _, oldDisabled := effectiveSubtitleAIConfig(old); oldDisabled == "" {
-						warnChatOnlyGateway(newDisabled)
-					}
-				}
 			})
 		}
 		subtitleAIHandler = handlers.NewSubtitleAIHandler(aiService)
@@ -4919,28 +4917,12 @@ func llmConfigFromServer(cfg *config.Config) llm.Config {
 	}
 }
 
-// effectiveSubtitleAIConfig derives the subtitle AI service config from the
-// server config. A chat-only gateway (e.g. OpenRouter) cannot produce
-// timestamped transcriptions, so transcription is disabled rather than
-// letting every job fail; the settings API rejects such values for the ASR
-// URL, but the chat base URL legitimately may be one — this catches the
-// blank-ASR-URL fallback case. The second return is the offending endpoint
-// when that guard fired, empty otherwise.
-func effectiveSubtitleAIConfig(cfg *config.Config) (subtitleai.Config, string) {
-	transcribeEnabled := cfg.SubtitleAI.TranscribeEnabled
-	effectiveASRBase := cfg.AI.ASRBaseURL
-	if effectiveASRBase == "" {
-		effectiveASRBase = cfg.AI.BaseURL
-	}
-	disabledGateway := ""
-	if transcribeEnabled && llm.IsChatOnlyGateway(effectiveASRBase) {
-		transcribeEnabled = false
-		disabledGateway = effectiveASRBase
-	}
+// effectiveSubtitleAIConfig derives the subtitle AI service config from the server config.
+func effectiveSubtitleAIConfig(cfg *config.Config) subtitleai.Config {
 	return subtitleai.Config{
 		Configured:            cfg.AI.BaseURL != "",
 		TranslateEnabled:      cfg.SubtitleAI.Enabled,
-		TranscribeEnabled:     transcribeEnabled,
+		TranscribeEnabled:     cfg.SubtitleAI.TranscribeEnabled,
 		ChatModel:             cfg.AI.ChatModel,
 		ASRModel:              cfg.AI.ASRModel,
 		BatchSize:             cfg.SubtitleAI.BatchSize,
@@ -4948,12 +4930,7 @@ func effectiveSubtitleAIConfig(cfg *config.Config) (subtitleai.Config, string) {
 		LiveASRChunkSeconds:   cfg.SubtitleAI.LiveASRChunkSeconds,
 		TranscribeQuotaJobs:   cfg.SubtitleAI.TranscribeQuotaJobs,
 		TranscribeQuotaPeriod: cfg.SubtitleAI.TranscribeQuotaPeriod,
-	}, disabledGateway
-}
-
-func warnChatOnlyGateway(endpoint string) {
-	slog.Warn("subtitle transcription disabled: the effective transcription endpoint is a chat-only gateway; "+
-		"set a Whisper-compatible Transcription base URL in AI Services", "endpoint", endpoint)
+	}
 }
 
 type scopeEntitlementResolver struct {

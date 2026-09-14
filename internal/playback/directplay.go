@@ -78,7 +78,6 @@ func MimeFromContainer(container string) string {
 // Range requests, conditional requests (including If-Match, If-Range, and
 // If-None-Match), and Content-Type detection.
 func ServeDirectPlay(w http.ResponseWriter, r *http.Request, filePath string) error {
-	// Media bodies routinely take longer than the server's absolute
 	// WriteTimeout; roll the write deadline with progress instead.
 	streamWriter := httpstream.NewRollingDeadlineWriter(w)
 	w = streamWriter

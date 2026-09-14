@@ -910,6 +910,12 @@ func (r *LibraryCollectionRepository) ReplaceItems(ctx context.Context, collecti
 		return fmt.Errorf("beginning collection item replacement: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Shared purge barrier: allows concurrent writers but excludes them
+	// during the purge sweep. Taken first so both sides order the shared
+	// lock before any row lock.
+	if err := requestlock.LockPurgeBarrierShared(ctx, tx); err != nil {
+		return fmt.Errorf("lock purge barrier: %w", err)
+	}
 
 	// Serialize replacements for one collection and retain the previous
 	// membership inside this transaction. Cleanup must be based only on rows

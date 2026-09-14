@@ -24,6 +24,11 @@ var s3Bytes = promauto.NewCounterVec(prometheus.CounterOpts{Name: "silo_s3_body_
 var s3BodyErrors = promauto.NewCounterVec(prometheus.CounterOpts{Name: "silo_s3_body_errors_total", Help: "S3 HTTP body read errors excluding EOF."}, []string{s3RoleLabel, "direction"})
 var s3ConnectionWait = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "silo_s3_connection_wait_seconds", Help: "S3 HTTP connection acquisition including dial and TLS setup.", Buckets: []float64{.001, .01, .05, .1, .5, 1, 5, 30}}, []string{s3RoleLabel, "reused"})
 
+// Count TCP dial completions independently of connection acquisitions: a
+// background dial may finish after a redirect, retry, or canceled request.
+// ConnectDone does not establish TLS completion or whether HTTP used the socket.
+var s3Dials = promauto.NewCounterVec(prometheus.CounterOpts{Name: "silo_s3_dials_total", Help: "S3 TCP dial attempts completed successfully, including background and parallel address attempts. Does not imply TLS completion or HTTP use."}, []string{s3RoleLabel})
+
 func s3Operation(op string) string {
 	switch op {
 	case "GetObject", "PutObject", "HeadObject", "HeadBucket", "DeleteObject", "DeleteObjects", "ListObjectsV2", "PutBucketCors", "PutObjectAcl", "CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload", "AbortMultipartUpload":
@@ -89,6 +94,11 @@ func (c observedHTTPClient) Do(req *http.Request) (*http.Response, error) {
 				reused = "true"
 			}
 			s3ConnectionWait.WithLabelValues(c.role, reused).Observe(time.Since(began).Seconds())
+		},
+		ConnectDone: func(network, addr string, err error) {
+			if err == nil {
+				s3Dials.WithLabelValues(c.role).Inc()
+			}
 		},
 	}
 	copy := req.Clone(httptrace.WithClientTrace(req.Context(), ct))

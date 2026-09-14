@@ -3179,7 +3179,7 @@ func main() {
 			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
 				return compatVirtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
 			}
-			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error {
+			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error {
 				if deps.DB == nil {
 					return nil
 				}
@@ -3195,7 +3195,7 @@ func main() {
 				if sStr == "" || sStr == "null" {
 					sStr = "[]"
 				}
-				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath)
+				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath, stampProbe)
 				return err
 			}
 		}

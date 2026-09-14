@@ -416,13 +416,14 @@ const (
 )
 
 type resolvedVirtualPlaybackSource struct {
-	URL            string
-	URI            string
-	OwnerID        int
-	File           *models.MediaFile
-	ProbeSucceeded bool
-	Provenance     ProbeProvenance
-	AppliedRemux   bool
+	URL               string
+	URI               string
+	OwnerID           int
+	File              *models.MediaFile
+	ProbeSucceeded    bool
+	Provenance        ProbeProvenance
+	AppliedRemux      bool
+	ResolutionAssumed bool
 }
 
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
@@ -785,6 +786,17 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		)
 		if allowDefer {
 			h.pinVirtualSticky(stickyKey, cand.URI)
+			// Resolution precedence: stored evidence wins; otherwise adopt
+			// the candidate's declared label; only when both are absent is
+			// the 1080p baseline assumed. Only the last case marks
+			// ResolutionAssumed, so a declared 2160p is never clobbered.
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
+			resolutionAssumed := transient.Resolution == ""
+			if resolutionAssumed {
+				transient.Resolution = transcodeResolution1080p
+			}
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
@@ -797,7 +809,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					// back to the candidate-declared metadata instead of paying
 					// it again on this replan.
 					return &resolvedVirtualPlaybackSource{
-						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared,
+						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 					}, nil
 				}
 				targetID := file.ID
@@ -820,28 +832,50 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}()
 			}
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, AppliedRemux: appliedRemux,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
 			}, nil
 		}
 		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
+			// Resolution precedence: stored evidence wins; otherwise adopt
+			// the candidate's declared label; only when both are absent is
+			// the 1080p baseline assumed. Only the last case marks
+			// ResolutionAssumed, so a declared 2160p is never clobbered.
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
+			resolutionAssumed := transient.Resolution == ""
+			if resolutionAssumed {
+				transient.Resolution = transcodeResolution1080p
+			}
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, AppliedRemux: appliedRemux,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
 			}, nil
 		}
 		probeKey := virtualProbeFailureKey(cand.URI, oid)
 		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
+			// Resolution precedence: stored evidence wins; otherwise adopt
+			// the candidate's declared label; only when both are absent is
+			// the 1080p baseline assumed. Only the last case marks
+			// ResolutionAssumed, so a declared 2160p is never clobbered.
+			if transient.Resolution == "" {
+				transient.Resolution = cand.Resolution
+			}
+			resolutionAssumed := transient.Resolution == ""
+			if resolutionAssumed {
+				transient.Resolution = transcodeResolution1080p
+			}
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, AppliedRemux: appliedRemux,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
 			}, nil
 		}
 		if virtualProbeFailures.recent(probeKey) {
@@ -907,7 +941,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			attemptErr = errors.Join(attemptErr, err)
 			continue
 		}
-		if result.Provenance == ProbeProvenanceVerified || (!result.AppliedRemux && h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
+		if result.Provenance == ProbeProvenanceVerified || (!result.AppliedRemux && !result.ResolutionAssumed && h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
 			// Content ground truth: a probed duration wildly different from the
 			// catalog runtime means the provider handed us mislabeled content.
 			// Skip persisting its metadata onto this content's rows and rotate.
@@ -940,7 +974,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if result.File != nil && result.File.ID > 0 {
 				targetID = result.File.ID
 			}
-			h.persistVirtualMetadataBounded(r.Context(), targetID, result.File.FilePath, result.File)
+			h.persistVirtualMetadataBounded(r.Context(), targetID, result.File.FilePath, result.File, result.Provenance == ProbeProvenanceVerified)
 			// The filtered candidate list is already cached device-neutrally
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
@@ -954,15 +988,22 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 	}
 	if firstResolved != nil {
-		if len(candidates) > 0 {
-			mergeVirtualCandidateTracks(firstResolved.File, candidates[0])
+		// Re-merge against the candidate that actually produced this result,
+		// not candidates[0]: after failover the usable source may come from
+		// a later candidate, and merging the wrong candidate contaminates
+		// tracks with another release's metadata.
+		for _, candidate := range candidates {
+			if firstResolved.URI != "" && candidate.URI == firstResolved.URI {
+				mergeVirtualCandidateTracks(firstResolved.File, candidate)
+				break
+			}
 		}
 		if firstResolved.Provenance == ProbeProvenanceVerified {
 			targetID := file.ID
 			if firstResolved.File != nil && firstResolved.File.ID > 0 {
 				targetID = firstResolved.File.ID
 			}
-			h.persistVirtualMetadataBounded(r.Context(), targetID, firstResolved.File.FilePath, firstResolved.File)
+			h.persistVirtualMetadataBounded(r.Context(), targetID, firstResolved.File.FilePath, firstResolved.File, true)
 		}
 		return *firstResolved, nil
 	}
@@ -1071,7 +1112,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 		probed.Duration = probeTransient.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	h.persistVirtualMetadataBounded(bgCtx, targetID, probeCand.URI, probed)
+	h.persistVirtualMetadataBounded(bgCtx, targetID, probeCand.URI, probed, true)
 }
 
 // revalidateVirtualCandidateBackground resolves the provider URL for a
@@ -1152,9 +1193,9 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 // probe gate can recognize the row as really probed and stop re-probing it on
 // every start. virtual_collection rows keep their existing stamp: that source
 // is owned by the collection registration path, not playback.
-const VirtualFileMetadataUpdateSQL = `UPDATE media_files SET video_tracks=$1::jsonb, audio_tracks=$2::jsonb, subtitle_tracks=$3::jsonb, resolution=NULLIF($4,''), codec_video=NULLIF($5,''), codec_audio=NULLIF($6,''), container=NULLIF($7,''), hdr=$8, bitrate=NULLIF($9,0), duration=CASE WHEN $10 > 0 THEN $10 ELSE duration END, audio_channels=COALESCE((SELECT (elem->>'channels')::int FROM jsonb_array_elements(CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END) elem LIMIT 1), audio_channels), probe_source=CASE WHEN media_files.probe_source='virtual_collection' THEN media_files.probe_source ELSE 'virtual' END, probe_updated_at=CASE WHEN media_files.probe_source='virtual_collection' THEN media_files.probe_updated_at ELSE now() END, updated_at=now() WHERE id=$11 AND (NULLIF($12, '') IS NULL OR file_path=$12)`
+const VirtualFileMetadataUpdateSQL = `UPDATE media_files SET video_tracks=$1::jsonb, audio_tracks=$2::jsonb, subtitle_tracks=$3::jsonb, resolution=NULLIF($4,''), codec_video=NULLIF($5,''), codec_audio=NULLIF($6,''), container=NULLIF($7,''), hdr=$8, bitrate=NULLIF($9,0), duration=CASE WHEN $10 > 0 THEN $10 ELSE duration END, audio_channels=COALESCE((SELECT (elem->>'channels')::int FROM jsonb_array_elements(CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END) elem LIMIT 1), audio_channels), probe_source=CASE WHEN media_files.probe_source='virtual_collection' OR NOT $13::boolean THEN media_files.probe_source ELSE 'virtual' END, probe_updated_at=CASE WHEN media_files.probe_source='virtual_collection' OR NOT $13::boolean THEN media_files.probe_updated_at ELSE now() END, updated_at=now() WHERE id=$11 AND (NULLIF($12, '') IS NULL OR file_path=$12) AND ($13::boolean OR media_files.probe_updated_at IS NULL)`
 
-func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, targetID int, expectedFilePath string, file *models.MediaFile) {
+func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, targetID int, expectedFilePath string, file *models.MediaFile, stampProbe bool) {
 	if h == nil || h.VirtualFileMetadataSaver == nil || file == nil || targetID <= 0 {
 		return
 	}
@@ -1165,7 +1206,7 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, tar
 	go func() {
 		persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer persistCancel()
-		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, expectedFilePath, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration); err != nil {
+		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, expectedFilePath, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration, stampProbe); err != nil {
 			slog.ErrorContext(persistCtx, "virtual metadata persist failed", "component", "api", "file_id", targetID, "error", err)
 		}
 	}()
@@ -1234,7 +1275,7 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 			// tracks (wrong audio languages, phantom subtitle tracks) while the
 			// stream serves the substitute's real ones.
 			if resolved.File != nil && resolved.Provenance == ProbeProvenanceVerified {
-				h.persistVirtualMetadataBounded(ctx, file.ID, stream.URI, resolved.File)
+				h.persistVirtualMetadataBounded(ctx, file.ID, stream.URI, resolved.File, true)
 			}
 			return resolved
 		}
@@ -1795,22 +1836,28 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	}
 
 	// Fill empty top-level fields that ffprobe may miss on remote streams.
+	// A trackless, resolution-less file keeps CodecVideo/CodecAudio/Container
+	// empty so the evidence gates below report it incomplete: without a
+	// resolution the planner cannot pick a route, and claiming synthesized
+	// evidence would only hide the missing metadata that still blocks
+	// planning. The caller-supplied baselines (declaredFallback fixes up
+	// transient.Resolution first) flow through because a non-empty candidate
+	// label lands in probed.Resolution on the line below.
 	if probed.Resolution == "" {
 		probed.Resolution = candidate.Resolution
 	}
-	if probed.CodecVideo == "" {
-		probed.CodecVideo = candidate.CodecVideo
-	}
-	if probed.CodecAudio == "" {
-		probed.CodecAudio = candidate.CodecAudio
-	}
+	// Top-level codec derivation defers to the track-evidence-first blocks
+	// below (lines ~1883+, ~1903+): existing tracks win over candidate blobs,
+	// and the final CodecVideo/CodecAudio assignment happens there exactly
+	// once so merge stays idempotent.
+	hasResolution := probed.Resolution != ""
 	if !probed.HDR && candidate.HDR != "" {
 		probed.HDR = true
 	}
 	if probed.Container == "" || strings.EqualFold(probed.Container, "virtual") {
 		if candidate.Container != "" && !strings.EqualFold(candidate.Container, "virtual") {
 			probed.Container = candidate.Container
-		} else {
+		} else if hasResolution {
 			probed.Container = "mkv"
 		}
 	}
@@ -1827,12 +1874,17 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		probed.Bitrate = virtualBitrateFallback(probed.Resolution)
 	}
 
-	// Ensure probed.CodecAudio is resolved before inferring channels so 5.1/7.1 codecs
-	// are not prematurely downgraded to 2-channel stereo.
+	// Codec precedence: existing top-level wins; if empty, use first track
+	// codec; then candidate; then resolution-gated default. The top-level
+	// scalar is preserved when non-empty because it may reflect a probed
+	// value that is more authoritative than the first track in the slice.
+	if probed.CodecAudio == "" && len(probed.AudioTracks) > 0 && probed.AudioTracks[0].Codec != "" {
+		probed.CodecAudio = probed.AudioTracks[0].Codec
+	}
 	if probed.CodecAudio == "" {
 		probed.CodecAudio = candidate.CodecAudio
 	}
-	if probed.CodecAudio == "" {
+	if probed.CodecAudio == "" && hasResolution {
 		probed.CodecAudio = "aac"
 	}
 	channels := inferChannelsFromCodec(probed.CodecAudio)
@@ -1843,21 +1895,27 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		probed.AudioChannels = channels
 	}
 
-	// Create a basic video track when ffprobe didn't detect any.
+	// Create a basic video track when ffprobe didn't detect any. Codec
+	// precedence: existing top-level > first track > candidate > h264 default
+	// (only when resolution is present, to avoid false claims on
+	// resolution-less incomplete metadata).
 	videoCodec := probed.CodecVideo
+	if videoCodec == "" && len(probed.VideoTracks) > 0 && probed.VideoTracks[0].Codec != "" {
+		videoCodec = probed.VideoTracks[0].Codec
+	}
 	if videoCodec == "" {
 		videoCodec = candidate.CodecVideo
 	}
-	if videoCodec == "" {
+	if videoCodec == "" && probed.Resolution != "" {
 		videoCodec = "h264"
 	}
-	if probed.CodecVideo == "" {
+	if probed.CodecVideo == "" && videoCodec != "" {
 		probed.CodecVideo = videoCodec
 	}
 	isDV, dvProfile := virtualDVMetadata(candidate.HDR)
 	isHDR := probed.HDR || candidate.HDR != ""
 	defaultProfile, defaultLevel, defaultBitDepth := defaultVirtualVideoProfileAndLevel(videoCodec, isHDR, isDV, probed.Resolution)
-	if len(probed.VideoTracks) == 0 {
+	if len(probed.VideoTracks) == 0 && probed.Resolution != "" {
 		videoRange := "SDR"
 		videoRangeType := "SDR"
 		if isDV {
@@ -1954,14 +2012,15 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		}
 	}
 
-	// Synthesize audio/subtitle tracks from the provider-declared languages
-	// when the probe left the inventory empty. ffprobe may not always detect
-	// language tags on remote streams (especially HLS and DASH), so candidate
-	// languages fill the gap so the player can display track choices before
-	// and during playback. Existing probed tracks are never overwritten.
+	// Synthesize audio tracks from the provider-declared languages when the
+	// probe left the inventory empty. A file with no resolution and no tracks
+	// cannot produce a routable plan, so language synthesis is gated on the
+	// caller supplying a resolution (declared, backfilled, or probed) — via
+	// the baseline or a real candidate value. Video track synthesis below
+	// follows the same gate so both inventories stay consistent.
 	mergeVirtualCandidateLanguages(probed, candidate)
 
-	if len(probed.AudioTracks) == 0 {
+	if len(probed.AudioTracks) == 0 && probed.Resolution != "" {
 		probed.AudioTracks = []models.AudioTrack{{
 			Codec:    probed.CodecAudio,
 			Channels: channels,
