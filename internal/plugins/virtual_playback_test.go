@@ -1552,3 +1552,37 @@ func TestConfiguredVirtualVariantsIsolatesLeaderCancellation(t *testing.T) {
 		t.Fatalf("follower got unexpected variants: %#v", fRes.variants)
 	}
 }
+
+func TestStreamsFromVirtualResult_NumericResolution(t *testing.T) {
+	numeric := &pluginv1.VirtualStreamCandidate{
+		CandidateId: "test-candidate",
+		VideoCodec:  "h264",
+		AudioCodec:  "aac",
+		Resolution:  &pluginv1.VirtualStreamResolution{Width: 1920, Height: 1080},
+	}
+	streams := streamsFromVirtualResult("virtual://movie/tt123", &pluginv1.VirtualStreamResult{
+		Candidates: []*pluginv1.VirtualStreamCandidate{numeric},
+	}, 1)
+	if len(streams) != 1 {
+		t.Fatalf("streams = %d, want 1", len(streams))
+	}
+	if streams[0].Resolution != "1920x1080" {
+		t.Fatalf("Resolution = %q, want %q", streams[0].Resolution, "1920x1080")
+	}
+
+	labeled := &pluginv1.VirtualStreamCandidate{
+		CandidateId: "test-candidate-labeled",
+		VideoCodec:  "h264",
+		AudioCodec:  "aac",
+		Resolution:  &pluginv1.VirtualStreamResolution{Label: "1080p", Width: 1920, Height: 1080},
+	}
+	streams = streamsFromVirtualResult("virtual://movie/tt123", &pluginv1.VirtualStreamResult{
+		Candidates: []*pluginv1.VirtualStreamCandidate{labeled},
+	}, 1)
+	if len(streams) != 1 {
+		t.Fatalf("streams = %d, want 1", len(streams))
+	}
+	if streams[0].Resolution != "1080p" {
+		t.Fatalf("Resolution = %q, want %q", streams[0].Resolution, "1080p")
+	}
+}

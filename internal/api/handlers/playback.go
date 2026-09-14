@@ -2415,6 +2415,13 @@ func transcodeResolutionHeight(resolution string) (int, bool) {
 	case transcodeResolution328p:
 		return 328, true
 	default:
+		if left, right, ok := strings.Cut(strings.TrimSpace(resolution), "x"); ok {
+			if w, err := strconv.Atoi(strings.TrimSpace(left)); err == nil && w > 0 && w <= 32768 {
+				if h, err := strconv.Atoi(strings.TrimSpace(right)); err == nil && h > 0 && h <= 32768 {
+					return h, true
+				}
+			}
+		}
 		return 0, false
 	}
 }

@@ -1284,7 +1284,7 @@ func streamsFromVirtualResult(virtualPath string, result *pluginv1.VirtualStream
 			exp = candidate.GetExpiresAt().AsTime()
 		}
 		resolution := candidate.GetResolution().GetLabel()
-		if resolution == "" {
+		if strings.TrimSpace(resolution) == "" {
 			w, h := candidate.GetResolution().GetWidth(), candidate.GetResolution().GetHeight()
 			if w > 0 && h > 0 {
 				resolution = fmt.Sprintf("%dx%d", w, h)

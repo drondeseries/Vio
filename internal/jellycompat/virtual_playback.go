@@ -765,6 +765,13 @@ func compatResolutionWidth(label string) int {
 	case "480p":
 		return 720
 	default:
+		if left, right, ok := strings.Cut(strings.TrimSpace(label), "x"); ok {
+			if w, err := strconv.Atoi(strings.TrimSpace(left)); err == nil && w > 0 && w <= 32768 {
+				if h, err := strconv.Atoi(strings.TrimSpace(right)); err == nil && h > 0 && h <= 32768 {
+					return w
+				}
+			}
+		}
 		return 0
 	}
 }
@@ -781,6 +788,13 @@ func compatResolutionHeight(label string) int {
 	case "480p":
 		return 480
 	default:
+		if left, right, ok := strings.Cut(strings.TrimSpace(label), "x"); ok {
+			if w, err := strconv.Atoi(strings.TrimSpace(left)); err == nil && w > 0 && w <= 32768 {
+				if h, err := strconv.Atoi(strings.TrimSpace(right)); err == nil && h > 0 && h <= 32768 {
+					return h
+				}
+			}
+		}
 		return 0
 	}
 }
