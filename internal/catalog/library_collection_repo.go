@@ -910,12 +910,11 @@ func (r *LibraryCollectionRepository) ReplaceItems(ctx context.Context, collecti
 		return fmt.Errorf("beginning collection item replacement: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// Shared lock with the virtual purge sweep (see
-	// purgeVirtualPlaybackItemsOnce): the claim rebuild below inserts
-	// claims+files for the same content the purge deletes. Taken first so
-	// both sides order the shared lock before any row lock.
-	if err := requestlock.LockVirtual(ctx, tx, "virtual-purge"); err != nil {
-		return fmt.Errorf("lock virtual purge: %w", err)
+	// Shared purge barrier: allows concurrent writers but excludes them
+	// during the purge sweep. Taken first so both sides order the shared
+	// lock before any row lock.
+	if err := requestlock.LockPurgeBarrierShared(ctx, tx); err != nil {
+		return fmt.Errorf("lock purge barrier: %w", err)
 	}
 
 	// Serialize replacements for one collection and retain the previous

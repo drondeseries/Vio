@@ -212,13 +212,12 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 		return nil, fmt.Errorf("begin virtual media transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// Shared lock with the virtual purge sweep (see
-	// purgeVirtualPlaybackItemsOnce): registration inserts claims+files
-	// for the same content the purge deletes. Taken before the content
-	// and installation locks below so both sides order the shared lock
-	// first and the AB-BA cycle cannot form.
-	if err := requestlock.LockVirtual(ctx, tx, "virtual-purge"); err != nil {
-		return nil, fmt.Errorf("lock virtual purge: %w", err)
+	// Shared purge barrier: allows concurrent writers but excludes them
+	// during the purge sweep. Taken before the content and installation
+	// locks below so both sides order the shared lock first and the
+	// AB-BA cycle cannot form.
+	if err := requestlock.LockPurgeBarrierShared(ctx, tx); err != nil {
+		return nil, fmt.Errorf("lock purge barrier: %w", err)
 	}
 	// Exclusive content lock first (see lockReleaseContentTx): registration
 	// that owns item metadata can insert or change scalar aliases, so it is

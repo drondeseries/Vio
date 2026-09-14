@@ -256,12 +256,12 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Serialize against concurrent virtual reconcile writers: the purge
-	// deletes media_files rows (firing the episode_catalog_entries trigger)
-	// while reconcile inserts claims+files for the same content. A shared
-	// advisory lock removes the AB-BA cycle instead of relying on retries.
-	if err := requestlock.LockVirtual(ctx, tx, "virtual-purge"); err != nil {
-		return result, fmt.Errorf("lock virtual purge: %w", err)
+	// Exclusive purge barrier: writers hold this shared so concurrent
+	// upserts, registrations, and materializations proceed in parallel.
+	// The purge takes exclusive to block all of them while it deletes
+	// media_files (firing the episode_catalog_entries trigger).
+	if err := requestlock.LockPurgeBarrierExclusive(ctx, tx); err != nil {
+		return result, fmt.Errorf("lock purge barrier: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -1404,13 +1404,12 @@ func (r *ItemRepository) Upsert(ctx context.Context, item *models.MediaItem) err
 		return fmt.Errorf("begin media item upsert tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// Shared lock with the virtual purge sweep (see
-	// purgeVirtualPlaybackItemsOnce): the metadata refresh path calls
-	// Upsert for the same content the purge DELETEs from media_files.
-	// DELETE fires the episode_catalog_entries trigger which INSERTs into
-	// the same index the upsert path touches, forming an AB-BA cycle.
-	if err := requestlock.LockVirtual(ctx, tx, "virtual-purge"); err != nil {
-		return fmt.Errorf("lock virtual purge: %w", err)
+	// Shared purge barrier: allows concurrent writers but excludes them
+	// during the purge sweep. Protects against the AB-BA cycle where
+	// DELETE fires the episode_catalog_entries trigger while this
+	// transaction INSERTs into the same index.
+	if err := requestlock.LockPurgeBarrierShared(ctx, tx); err != nil {
+		return fmt.Errorf("lock purge barrier: %w", err)
 	}
 
 	if err := r.upsert(ctx, tx, item); err != nil {
@@ -1974,12 +1973,11 @@ func (r *ItemRepository) EnsureVirtualCollectionItemMaterializedWithOptions(
 		return nil, fmt.Errorf("begin virtual item transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// Shared lock with the virtual purge sweep (see
-	// purgeVirtualPlaybackItemsOnce): materialization inserts claims+files
-	// for the same content the purge deletes. Taken before the per-item
-	// content lock below so both sides order the shared lock first.
-	if err := requestlock.LockVirtual(ctx, tx, "virtual-purge"); err != nil {
-		return nil, fmt.Errorf("lock virtual purge: %w", err)
+	// Shared purge barrier: allows concurrent writers but excludes them
+	// during the purge sweep. Taken before the per-item content lock so
+	// both sides order the shared lock first.
+	if err := requestlock.LockPurgeBarrierShared(ctx, tx); err != nil {
+		return nil, fmt.Errorf("lock purge barrier: %w", err)
 	}
 	opts.RequireMembership = true
 	result, err := r.ensureVirtualCollectionItemMaterializedTx(ctx, tx, collectionID, item, targetLibraryIDs, variants, opts)
