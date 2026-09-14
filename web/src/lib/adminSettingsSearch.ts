@@ -337,13 +337,17 @@ export const ADMIN_SETTINGS_GROUPS: AdminSettingsSearchGroup[] = [
       {
         id: "providers",
         label: "Subtitles & Metadata",
-        description: "Subtitle provider accounts, the MDBList metadata key, and marker providers.",
+        description:
+          "Subtitle provider accounts, the MDBList metadata key, RemuxDB stream metadata, and marker providers.",
         groups: ["Subtitle providers", "Metadata providers", "Marker providers"],
         keywords: [
           "opensubtitles",
           "subdl",
           "subsource",
           "mdblist",
+          "remuxdb",
+          "remux",
+          "stream metadata",
           "subtitles",
           "captions",
           "api key",
@@ -366,6 +370,9 @@ export const ADMIN_SETTINGS_GROUPS: AdminSettingsSearchGroup[] = [
           "API key",
           "Metadata providers",
           "MDBList",
+          "RemuxDB",
+          "Base URL",
+          "API token",
           "Marker providers",
           "TheIntroDB",
           "Use for online marker lookup",

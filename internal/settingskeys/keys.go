@@ -9,7 +9,7 @@
 package settingskeys
 
 // Revision is the manifest revision these bindings were generated from.
-const Revision = 8
+const Revision = 9
 
 // Setting keys, one constant per definition.
 const (
@@ -85,6 +85,14 @@ const (
 	PlayerSubtitleSyncMs = "player.subtitle_sync_ms"
 	// Video sizing
 	PlayerVideoGravity = "player.video_gravity"
+	// RemuxDB base URL
+	RemuxdbBaseUrl = "remuxdb.base_url"
+	// RemuxDB stream metadata
+	RemuxdbEnabled = "remuxdb.enabled"
+	// Contribute to RemuxDB
+	RemuxdbSubmitEnabled = "remuxdb.submit_enabled"
+	// RemuxDB API token
+	RemuxdbToken = "remuxdb.token"
 	// Search scope
 	SearchMediaScope = "search.media_scope"
 	// Match device caption settings
@@ -160,6 +168,10 @@ var Remote = []string{
 	PlayerSleepTimerDefaultMinutes,
 	PlayerSubtitleSyncMs,
 	PlayerVideoGravity,
+	RemuxdbBaseUrl,
+	RemuxdbEnabled,
+	RemuxdbSubmitEnabled,
+	RemuxdbToken,
 	SearchMediaScope,
 	UiCardOverlays,
 	UiCardOverlaysEnabled,

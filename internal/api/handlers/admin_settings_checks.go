@@ -21,6 +21,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/recommendations/embeddings"
+	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 )
 
@@ -161,6 +162,8 @@ func runAdminSettingsConnectionCheck(ctx context.Context, kind string, cfg *conf
 		response = checkMeilisearchConnection(ctx, effectiveSettings)
 	case "mdblist":
 		response = checkMDBListConnection(ctx, cfg)
+	case "remuxdb":
+		response = checkRemuxDBConnection(ctx, effectiveSettings)
 	default:
 		return connectionCheckResponse{}, ErrAdminSettingsCheckKind
 	}
@@ -178,6 +181,39 @@ func checkMDBListConnection(ctx context.Context, cfg *config.Config) connectionC
 		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("MDBList connection check failed: %v", err)}
 	}
 	return connectionCheckResponse{Success: true, Message: "MDBList API key verified."}
+}
+
+func checkRemuxDBConnection(ctx context.Context, settings map[string]string) connectionCheckResponse {
+	baseURL := strings.TrimSpace(settings[remuxdb.SettingBaseURL])
+	if baseURL == "" {
+		baseURL = remuxdb.DefaultBaseURL
+	}
+	token := strings.TrimSpace(settings[remuxdb.SettingToken])
+	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/public/stats", nil)
+	if err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB URL is invalid: %v", err)}
+	}
+	req.Header.Set("x-client-id", "silo-server")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB connection check failed: %v", err)}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB returned status %d.", resp.StatusCode)}
+	}
+	var stats struct {
+		TotalMediainfo int64 `json:"total_mediainfo"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB returned an unexpected response: %v", err)}
+	}
+	return connectionCheckResponse{Success: true, Message: fmt.Sprintf("RemuxDB verified (%d mediainfo records).", stats.TotalMediainfo)}
 }
 
 func aiClientConfig(cfg *config.Config) llm.Config {
@@ -323,6 +359,9 @@ func (h *AdminHandler) effectiveSettingsForConnectionCheck(
 			return nil, err
 		}
 	}
+	// Capture the persisted RemuxDB authority before the draft's dirty keys
+	// overwrite it so a changed endpoint cannot receive the stored token.
+	storedRemuxBaseURL := merged[remuxdb.SettingBaseURL]
 	for _, key := range req.DirtyKeys {
 		merged[key] = req.Values[key]
 	}
@@ -333,8 +372,27 @@ func (h *AdminHandler) effectiveSettingsForConnectionCheck(
 		}
 		protectAIConnectionCheckSecrets(kind, req, storedAIConfig, draftAIConfig, merged)
 	}
+	if kind == "remuxdb" {
+		protectRemuxDBConnectionCheckSecrets(storedRemuxBaseURL, req, merged)
+	}
 
 	return merged, nil
+}
+
+// protectRemuxDBConnectionCheckSecrets withholds the stored RemuxDB token when
+// the draft points the connection check at a different authority and the
+// request did not explicitly supply a replacement token.
+func protectRemuxDBConnectionCheckSecrets(
+	storedBaseURL string,
+	req adminSettingsConnectionCheckRequest,
+	settings map[string]string,
+) {
+	if endpointAuthority(storedBaseURL) == endpointAuthority(settings[remuxdb.SettingBaseURL]) {
+		return
+	}
+	if !hasExplicitDraftSecret(req, remuxdb.SettingToken) {
+		settings[remuxdb.SettingToken] = ""
+	}
 }
 
 func protectAIConnectionCheckSecrets(

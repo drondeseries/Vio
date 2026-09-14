@@ -64,6 +64,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
+	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 	"github.com/Silo-Server/silo-server/internal/scanner"
@@ -1176,6 +1177,17 @@ func newChiRouter(deps Dependencies) chi.Router {
 						return files[0], nil
 					}
 					return nil, errors.New("media file not found for content")
+				}
+				playbackHandler.RemuxDBConfig = func(ctx context.Context) remuxdb.Config {
+					cfg, err := remuxdb.LoadConfig(ctx, settingsRepo)
+					if err != nil {
+						slog.WarnContext(ctx, "load remuxdb config; using defaults", "component", "api", "error", err)
+						return remuxdb.DefaultConfig()
+					}
+					return cfg
+				}
+				if deps.DB != nil {
+					playbackHandler.RemuxDBStore = remuxdb.NewStore(deps.DB)
 				}
 			}
 			streamHandler = handlers.NewStreamHandler(deps.SessionMgr, deps.FileRepo)
