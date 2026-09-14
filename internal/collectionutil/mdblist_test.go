@@ -3,6 +3,7 @@ package collectionutil
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"reflect"
 	"testing"
 	"time"
@@ -163,6 +164,35 @@ func TestCanonicalMDBListURLRejectsPrivateHosts(t *testing.T) {
 	}
 	if got != "https://mdblist.com/lists/example-user/watchlist/json" {
 		t.Fatalf("CanonicalMDBListURL = %q", got)
+	}
+}
+
+func TestParseMDBListListURLReturnsUnescapedSegments(t *testing.T) {
+	t.Parallel()
+
+	// F10: the returned segments must be raw slugs so callers escape exactly
+	// once. %2F/%25 must not come back percent-encoded.
+	user, list, ok := ParseMDBListListURL("https://mdblist.com/lists/some%2Fuser/my%25list/json")
+	if !ok {
+		t.Fatal("ParseMDBListListURL rejected an escaped URL")
+	}
+	if user != "some/user" || list != "my%list" {
+		t.Fatalf("segments = (%q, %q), want (some/user, my%%list)", user, list)
+	}
+}
+
+func TestParseMDBListListURLEscapesExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	user, list, ok := ParseMDBListListURL("https://mdblist.com/lists/some%2Fuser/my%25list/json")
+	if !ok {
+		t.Fatal("ParseMDBListListURL rejected an escaped URL")
+	}
+	if got := url.PathEscape(user); got != "some%2Fuser" {
+		t.Fatalf("re-escaping user = %q, want some%%2Fuser (single escape)", got)
+	}
+	if got := url.PathEscape(list); got != "my%25list" {
+		t.Fatalf("re-escaping list = %q, want my%%25list (single escape)", got)
 	}
 }
 

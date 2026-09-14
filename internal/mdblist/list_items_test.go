@@ -145,20 +145,39 @@ func TestResolveListIDSelectsMatchingEntry(t *testing.T) {
 	}
 }
 
-func TestResolveListIDSingleEntryFallback(t *testing.T) {
-	// A one-entry response is accepted even if upstream casing differs.
-	meta := `[{"id":42,"user_name":"Alice","slug":"Watchlist"}]`
-	srv, _, _ := listItemsServer(t, meta, nil)
-	c := NewClient("k", srv.Client())
-	c.baseURL = srv.URL
+func TestResolveListIDSingleEntryPartialMatch(t *testing.T) {
+	// F5: a single entry is accepted only when at least one component matches.
+	t.Run("slug matches", func(t *testing.T) {
+		meta := `[{"id":42,"user_name":"Alice","slug":"watchlist"}]`
+		srv, _, _ := listItemsServer(t, meta, nil)
+		c := NewClient("k", srv.Client())
+		c.baseURL = srv.URL
+		id, err := c.ResolveListID(context.Background(), "alice", "watchlist")
+		if err != nil || id != 42 {
+			t.Fatalf("ResolveListID = %d, %v; want 42, nil (case-insensitive match)", id, err)
+		}
+	})
 
-	id, err := c.ResolveListID(context.Background(), "alice", "watchlist")
-	if err != nil {
-		t.Fatalf("ResolveListID: %v", err)
-	}
-	if id != 42 {
-		t.Fatalf("id = %d, want 42", id)
-	}
+	t.Run("wholly unrelated single entry rejected", func(t *testing.T) {
+		meta := `[{"id":99,"user_name":"someone-else","slug":"different-list"}]`
+		srv, _, _ := listItemsServer(t, meta, nil)
+		c := NewClient("k", srv.Client())
+		c.baseURL = srv.URL
+		if _, err := c.ResolveListID(context.Background(), "alice", "watchlist"); err == nil {
+			t.Fatal("a wholly unrelated single entry must not resolve")
+		}
+	})
+
+	t.Run("only user matches accepted", func(t *testing.T) {
+		meta := `[{"id":7,"user_name":"alice","slug":"renamed"}]`
+		srv, _, _ := listItemsServer(t, meta, nil)
+		c := NewClient("k", srv.Client())
+		c.baseURL = srv.URL
+		id, err := c.ResolveListID(context.Background(), "alice", "watchlist")
+		if err != nil || id != 7 {
+			t.Fatalf("ResolveListID = %d, %v; want 7, nil (user matches)", id, err)
+		}
+	})
 }
 
 func TestResolveListIDMismatchErrors(t *testing.T) {
@@ -348,18 +367,84 @@ func TestListItemsEmptyItemsWithTotalErrors(t *testing.T) {
 	}
 }
 
-func TestListItemsGenuinelyEmptyReturnsEmpty(t *testing.T) {
+func TestListItemsEmptyWithoutTotalErrors(t *testing.T) {
+	// F1: an empty 200 with total absent/0 must still be a sentinel, never
+	// (nil, nil) — otherwise the catalog would wipe membership.
+	cases := map[string]string{
+		"total zero":    `{"movies":[],"shows":[],"pagination":{"offset":0,"limit":1000,"total":0,"has_more":false}}`,
+		"total omitted": `{"movies":[],"shows":[],"pagination":{"has_more":false}}`,
+	}
+	for name, page := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv, _, _ := listItemsServer(t, metaOne("u", "l", 1), map[string]string{"": page})
+			c := NewClient("k", srv.Client())
+			c.baseURL = srv.URL
+			items, err := c.ListItems(context.Background(), "u", "l", 0)
+			if !errors.Is(err, ErrEmptyItemsWithTotal) {
+				t.Fatalf("err = %v, want ErrEmptyItemsWithTotal", err)
+			}
+			if items != nil {
+				t.Fatalf("items = %+v, want nil", items)
+			}
+		})
+	}
+}
+
+func TestListItemsShortPageBelowTotalErrors(t *testing.T) {
+	// F2: pagination ends with fewer items than total, beyond the cap.
+	page := `{"movies":[{"id":1,"rank":1000},{"id":2,"rank":2000}],"shows":[],"pagination":{"total":5,"has_more":false}}`
+	srv, _, _ := listItemsServer(t, metaOne("u", "l", 2), map[string]string{"": page})
+	c := NewClient("k", srv.Client())
+	c.baseURL = srv.URL
+
+	_, err := c.ListItems(context.Background(), "u", "l", 0)
+	if !errors.Is(err, ErrIncompleteItems) {
+		t.Fatalf("err = %v, want ErrIncompleteItems", err)
+	}
+}
+
+func TestListItemsMaxItemsCapIsNotIncomplete(t *testing.T) {
+	// F2: the intentional maxItems cap must NOT be flagged incomplete.
+	page := `{"movies":[{"id":1,"rank":1000},{"id":2,"rank":2000},{"id":3,"rank":3000}],"shows":[],"pagination":{"total":100,"has_more":true,"next_cursor":"c1"}}`
+	srv, _, _ := listItemsServer(t, metaOne("u", "l", 2), map[string]string{"": page})
+	c := NewClient("k", srv.Client())
+	c.baseURL = srv.URL
+
+	items, err := c.ListItems(context.Background(), "u", "l", 2)
+	if err != nil {
+		t.Fatalf("ListItems: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2", len(items))
+	}
+}
+
+func TestListItemsGenuinelyEmptyErrorsNotSilent(t *testing.T) {
+	// A genuinely empty list still yields the sentinel; the catalog falls back
+	// to /json, and only an empty /json result may empty the collection.
 	page := `{"movies":[],"shows":[],"pagination":{"offset":0,"limit":1000,"total":0,"has_more":false}}`
 	srv, _, _ := listItemsServer(t, metaOne("u", "empty", 3), map[string]string{"": page})
 	c := NewClient("k", srv.Client())
 	c.baseURL = srv.URL
 
-	items, err := c.ListItems(context.Background(), "u", "empty", 0)
+	if _, err := c.ListItems(context.Background(), "u", "empty", 0); !errors.Is(err, ErrEmptyItemsWithTotal) {
+		t.Fatalf("err = %v, want ErrEmptyItemsWithTotal (catalog then checks /json)", err)
+	}
+}
+
+func TestListItemsCompletePageBelowCap(t *testing.T) {
+	// A complete result equal to total at the cap is fine.
+	page := `{"movies":[{"id":1,"rank":1000},{"id":2,"rank":2000}],"shows":[],"pagination":{"total":2,"has_more":false}}`
+	srv, _, _ := listItemsServer(t, metaOne("u", "l", 2), map[string]string{"": page})
+	c := NewClient("k", srv.Client())
+	c.baseURL = srv.URL
+
+	items, err := c.ListItems(context.Background(), "u", "l", 10)
 	if err != nil {
 		t.Fatalf("ListItems: %v", err)
 	}
-	if len(items) != 0 {
-		t.Fatalf("items = %+v, want empty", items)
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2", len(items))
 	}
 }
 
@@ -426,6 +511,7 @@ func TestListItemsTypedErrors(t *testing.T) {
 		{"unauthorized", http.StatusUnauthorized, `{"error":"Invalid API key"}`, ErrUnauthorized, "Invalid API key"},
 		{"forbidden", http.StatusForbidden, `{"error":"nope"}`, ErrUnauthorized, ""},
 		{"not found", http.StatusNotFound, `{"error":"List Not found"}`, ErrListNotFound, "List Not found"},
+		{"rate limited", http.StatusTooManyRequests, `{"error":"Too many requests"}`, ErrRateLimit, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

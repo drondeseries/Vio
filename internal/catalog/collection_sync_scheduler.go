@@ -86,7 +86,8 @@ func NewCollectionSyncScheduler(
 // RunOnce queries for due collections and syncs them with bounded concurrency.
 // It returns a JSON summary suitable for task result data. onProgress, when
 // non-nil, receives one snapshot when the due set is known and one after each
-// collection finishes; it is never called simultaneously.
+// collection finishes. Snapshots are emitted outside the accounting mutex, so
+// callers must tolerate concurrent (unordered) delivery.
 func (s *CollectionSyncScheduler) RunOnce(ctx context.Context, onProgress func(CollectionSyncProgress)) (json.RawMessage, error) {
 	due, err := s.repo.ListDueForSync(ctx)
 	if err != nil {
@@ -143,8 +144,9 @@ func (s *CollectionSyncScheduler) syncOne(ctx context.Context, collection *model
 		)
 		mu.Lock()
 		result.Skipped++
-		s.reportProgressLocked(result, collection, onProgress)
+		snapshot := progressSnapshot(result, collection)
 		mu.Unlock()
+		reportProgress(onProgress, snapshot)
 		return
 	}
 	defer s.inFlight.Delete(collection.ID)
@@ -173,6 +175,15 @@ func (s *CollectionSyncScheduler) syncOne(ctx context.Context, collection *model
 		}
 	}
 
+	snapshot := s.accountResult(ctx, collection, syncErr, timeout, startedAt, completedAt, mu, result)
+	// The callback runs after accounting releases mu so a slow observer cannot
+	// serialize other collections' counter updates.
+	reportProgress(onProgress, snapshot)
+}
+
+// accountResult updates the result counters and logs the outcome under mu,
+// returning the progress snapshot for the caller to emit after unlocking.
+func (s *CollectionSyncScheduler) accountResult(ctx context.Context, collection *models.LibraryCollection, syncErr error, timeout time.Duration, startedAt, completedAt time.Time, mu *sync.Mutex, result *CollectionSyncResult) CollectionSyncProgress {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -202,22 +213,26 @@ func (s *CollectionSyncScheduler) syncOne(ctx context.Context, collection *model
 			"duration", completedAt.Sub(startedAt).Round(time.Millisecond),
 		)
 	}
-
-	s.reportProgressLocked(result, collection, onProgress)
+	return progressSnapshot(result, collection)
 }
 
-// reportProgressLocked emits a progress snapshot. Callers must hold the
-// result mutex so completed counts and callback delivery stay serialized.
-func (s *CollectionSyncScheduler) reportProgressLocked(result *CollectionSyncResult, collection *models.LibraryCollection, onProgress func(CollectionSyncProgress)) {
-	if onProgress == nil {
-		return
-	}
-	onProgress(CollectionSyncProgress{
+// progressSnapshot builds the progress snapshot for a finished collection.
+// Callers must hold result's mutex; the returned value is emitted after the
+// lock is released.
+func progressSnapshot(result *CollectionSyncResult, collection *models.LibraryCollection) CollectionSyncProgress {
+	return CollectionSyncProgress{
 		Due:          result.Due,
 		Completed:    result.Synced + result.Failed + result.Skipped,
 		CurrentID:    collection.ID,
 		CurrentTitle: collection.Title,
-	})
+	}
+}
+
+// reportProgress delivers a snapshot to the optional observer.
+func reportProgress(onProgress func(CollectionSyncProgress), snapshot CollectionSyncProgress) {
+	if onProgress != nil {
+		onProgress(snapshot)
+	}
 }
 
 // IsInFlight returns true if the given collection is currently being synced

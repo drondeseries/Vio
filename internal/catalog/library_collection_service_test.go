@@ -483,6 +483,64 @@ func TestFetchMDBListEntriesFallsBackOnEmptyItemsWithTotal(t *testing.T) {
 	}
 }
 
+func TestFetchMDBListEntriesFallbackMatrix(t *testing.T) {
+	// Sentinel errors the API path must defer to /json for. Each must still
+	// attempt the API first, then return the non-empty feed.
+	fallbackErrs := map[string]error{
+		"empty items":      mdblist.ErrEmptyItemsWithTotal,
+		"incomplete items": mdblist.ErrIncompleteItems,
+		"list not found":   mdblist.ErrListNotFound,
+		"rate limited":     mdblist.ErrRateLimit,
+		"not configured":   mdblist.ErrNotConfigured,
+	}
+	for name, sentinel := range fallbackErrs {
+		t.Run(name, func(t *testing.T) {
+			httpHits := 0
+			svc := &LibraryCollectionService{
+				MDBListAPI: &fakeMDBListAPI{err: fmt.Errorf("wrapped: %w", sentinel)},
+				httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					httpHits++
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(`[{"id":1,"title":"Fallback","mediatype":"movie","release_year":2000}]`)),
+						Header:     make(http.Header),
+					}, nil
+				})},
+			}
+			entries, err := svc.fetchMDBListEntriesWithAPI(context.Background(), []string{"https://mdblist.com/lists/alice/horror/json"}, nil)
+			if err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			if !svc.MDBListAPI.(*fakeMDBListAPI).called {
+				t.Fatal("API fetcher was not attempted")
+			}
+			if httpHits != 1 || len(entries) != 1 || entries[0].Title != "Fallback" {
+				t.Fatalf("httpHits=%d entries=%+v, want the /json fallback", httpHits, entries)
+			}
+		})
+	}
+}
+
+func TestFetchMDBListEntriesSurfacesUnauthorizedWithoutFallback(t *testing.T) {
+	// A bad/expired key must stay visible: ErrUnauthorized (and generic errors)
+	// must not silently degrade to the unauthenticated feed.
+	httpHits := 0
+	svc := &LibraryCollectionService{
+		MDBListAPI: &fakeMDBListAPI{err: mdblist.ErrUnauthorized},
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			httpHits++
+			return nil, errors.New("must not fall back on a rejected key")
+		})},
+	}
+	_, err := svc.fetchMDBListEntriesWithAPI(context.Background(), []string{"https://mdblist.com/lists/alice/horror/json"}, nil)
+	if !errors.Is(err, mdblist.ErrUnauthorized) {
+		t.Fatalf("err = %v, want ErrUnauthorized surfaced", err)
+	}
+	if httpHits != 0 {
+		t.Fatalf("public /json path used %d times after an auth failure", httpHits)
+	}
+}
+
 func TestFetchMDBListEntriesSurfacesAPIErrorWithoutFallback(t *testing.T) {
 	httpHits := 0
 	apiErr := errors.New("invalid api key")

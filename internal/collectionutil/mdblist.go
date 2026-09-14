@@ -103,15 +103,26 @@ func ParseMDBListListURL(raw string) (user, list string, ok bool) {
 	if port := parsed.Port(); port != "" && port != "80" && port != "443" {
 		return "", "", false
 	}
+	// Split the escaped path so an encoded %2F inside a slug is not treated as
+	// a separator, then unescape each segment so callers receive raw slugs and
+	// escape exactly once. Using EscapedPath directly would return encoded
+	// segments that callers re-escape into double-encoding.
 	path := strings.TrimSuffix(parsed.EscapedPath(), "/")
 	path = strings.TrimSuffix(path, "/json")
 	path = strings.TrimSuffix(path, "/")
-	parts := strings.Split(path, "/")
+	rawParts := strings.Split(path, "/")
 	// ["", "lists", user, list]
-	if len(parts) != 4 || parts[0] != "" || parts[1] != "lists" {
+	if len(rawParts) != 4 || rawParts[0] != "" || rawParts[1] != "lists" {
 		return "", "", false
 	}
-	user, list = parts[2], parts[3]
+	user, err = url.PathUnescape(rawParts[2])
+	if err != nil {
+		return "", "", false
+	}
+	list, err = url.PathUnescape(rawParts[3])
+	if err != nil {
+		return "", "", false
+	}
 	if user == "" || list == "" {
 		return "", "", false
 	}

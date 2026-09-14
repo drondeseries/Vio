@@ -1164,6 +1164,20 @@ func (s *LibraryCollectionService) SyncCollectionWithOptions(ctx context.Context
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrLibraryCollectionSyncModeUnsupported, source.Mode)
 	}
+	if err != nil && run == nil && ctx.Err() != nil {
+		// A context deadline/cancellation (e.g. the scheduler's per-collection
+		// timeout) must leave a durable failed run so last_sync_status shows the
+		// failure. Only when no run was recorded already (run != nil), to avoid
+		// duplicate history rows. The insert uses a detached context because the
+		// triggering context is already done.
+		if _, recordErr := s.recordFailedCollectionSync(context.WithoutCancel(reconciliationCtx), collection.ID, syncTimestamp(), fmt.Sprintf("sync context ended: %v", err)); recordErr != nil {
+			slog.ErrorContext(reconciliationCtx, "recording failed collection sync run after context end",
+				"component", "catalog",
+				"collection_id", collection.ID,
+				"error", recordErr,
+			)
+		}
+	}
 	if err == nil {
 		if _, reconcileErr := s.ReconcileMissingCollectionVirtualItems(reconciliationCtx, collection); reconcileErr != nil {
 			return run, fmt.Errorf("reconciling collection virtual items: %w", reconcileErr)
@@ -2557,17 +2571,18 @@ func (s *LibraryCollectionService) fetchMDBListEntries(ctx context.Context, list
 // paginated MDBList API when the fetcher is wired and the URL parses to a
 // user/slug pair; otherwise it falls back to the public /json single GET.
 //
-// It deliberately does not fall back on an API error once a key is in play: a
-// bad or expired key must be visible rather than silently masked by the
-// unauthenticated feed. The scheduler's per-collection deadline plus
-// next_sync_at advance bound the blast radius of a persistent failure. A
-// fetcher that reports ErrNotConfigured (no key — including a key cleared by
-// the config watcher after startup) does fall back, because that is the
-// documented no-key path.
+// It deliberately does not fall back on every API error once a key is in play:
+// a bad or expired key (ErrUnauthorized) must be visible rather than silently
+// masked by the unauthenticated feed. The scheduler's per-collection deadline
+// plus next_sync_at advance bound the blast radius of a persistent failure.
 //
-// ErrEmptyItemsWithTotal is also treated as a fallback: the API reported items
-// but returned none, and an empty result would wipe a non-empty collection.
-// The public /json feed is the source of truth in that case.
+// These are treated as fallback conditions because /json is the authoritative
+// source and the API path cannot safely produce a membership decision:
+//   - ErrNotConfigured: no key (including a key cleared by the config watcher).
+//   - ErrEmptyItemsWithTotal / ErrIncompleteItems: the API returned fewer items
+//     than it says exist; blindly accepting would wipe or shrink membership.
+//   - ErrListNotFound / ErrRateLimit: temporary or protocol-level problems the
+//     public feed can still serve.
 func (s *LibraryCollectionService) fetchMDBListEntriesWithAPI(ctx context.Context, listURLs []string, limit *int) ([]mdblistEntry, error) {
 	fallback := false
 	if s.MDBListAPI != nil {
@@ -2584,11 +2599,8 @@ func (s *LibraryCollectionService) fetchMDBListEntriesWithAPI(ctx context.Contex
 			switch {
 			case err == nil:
 				return apiListItemsToEntries(items), nil
-			case errors.Is(err, mdblist.ErrNotConfigured):
-				// No key (including one cleared at runtime): use /json.
-				fallback = true
-			case errors.Is(err, mdblist.ErrEmptyItemsWithTotal):
-				slog.WarnContext(ctx, "MDBList API returned no items for a non-empty list; falling back to the public JSON feed",
+			case isMDBListFallbackError(err):
+				slog.WarnContext(ctx, "MDBList API fetch inconclusive; falling back to the public JSON feed",
 					"component", "catalog",
 					"user", user,
 					"list", list,
@@ -2606,6 +2618,24 @@ func (s *LibraryCollectionService) fetchMDBListEntriesWithAPI(ctx context.Contex
 	return collectionutil.FetchMDBListWithFallback(listURLs, func(listURL string) ([]mdblistEntry, error) {
 		return s.fetchMDBListEntries(ctx, listURL)
 	})
+}
+
+// isMDBListFallbackError reports errors that should defer to the public /json
+// feed instead of failing the sync. ErrUnauthorized and generic/parse errors
+// are intentionally absent so a bad key stays visible.
+func isMDBListFallbackError(err error) bool {
+	for _, sentinel := range []error{
+		mdblist.ErrNotConfigured,
+		mdblist.ErrEmptyItemsWithTotal,
+		mdblist.ErrIncompleteItems,
+		mdblist.ErrListNotFound,
+		mdblist.ErrRateLimit,
+	} {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
 }
 
 // apiListItemsToEntries maps authenticated API items onto the public-feed

@@ -155,12 +155,19 @@ func TestCollectionSyncSchedulerProgressSequence(t *testing.T) {
 	}}
 	s := newTestScheduler(repo, syncer)
 
-	// The scheduler serializes callbacks (one snapshot per finished collection,
-	// delivered while holding the result mutex), so a plain append is safe and
-	// -race validates that contract.
-	var snapshots []CollectionSyncProgress
+	// Callbacks are delivered outside the accounting mutex (F6), so a slow
+	// observer cannot serialize counters; delivery order across concurrently
+	// finishing collections is therefore not guaranteed. The callback is still
+	// invoked from distinct goroutines, so guard the collector with its own
+	// mutex.
+	var (
+		snapMu    sync.Mutex
+		snapshots []CollectionSyncProgress
+	)
 	data, err := s.RunOnce(context.Background(), func(p CollectionSyncProgress) {
+		snapMu.Lock()
 		snapshots = append(snapshots, p)
+		snapMu.Unlock()
 	})
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -173,30 +180,49 @@ func TestCollectionSyncSchedulerProgressSequence(t *testing.T) {
 		t.Fatalf("result = %+v, want synced=3", result)
 	}
 
+	snapMu.Lock()
+	defer snapMu.Unlock()
 	if len(snapshots) != 4 {
 		t.Fatalf("snapshots = %d, want initial + one per collection", len(snapshots))
 	}
-	if snapshots[0].Due != 3 || snapshots[0].Completed != 0 {
-		t.Fatalf("initial snapshot = %+v, want due=3 completed=0", snapshots[0])
+	// Exactly one initial snapshot.
+	initial := 0
+	for _, snap := range snapshots {
+		if snap.Completed == 0 {
+			initial++
+			if snap.Due != 3 {
+				t.Fatalf("initial snapshot = %+v, want due=3 completed=0", snap)
+			}
+		}
 	}
-	// Every collection after the initial snapshot must appear exactly once,
-	// with a strictly increasing completed count and its own title.
+	if initial != 1 {
+		t.Fatalf("initial snapshots = %d, want exactly 1", initial)
+	}
+	// Every finished collection appears exactly once, and the completed counts
+	// cover 1..3 exactly.
 	seen := map[string]bool{}
-	for i, snap := range snapshots[1:] {
-		if snap.Completed != i+1 {
-			t.Fatalf("snapshot %d completed = %d, want %d", i+1, snap.Completed, i+1)
+	counts := map[int]int{}
+	for _, snap := range snapshots {
+		if snap.Completed == 0 {
+			continue
 		}
 		if snap.CurrentTitle == "" || snap.CurrentID == "" {
-			t.Fatalf("snapshot %d missing collection identity: %+v", i+1, snap)
+			t.Fatalf("snapshot missing collection identity: %+v", snap)
 		}
 		if seen[snap.CurrentID] {
 			t.Fatalf("collection %q reported twice", snap.CurrentID)
 		}
 		seen[snap.CurrentID] = true
+		counts[snap.Completed]++
+	}
+	for n := 1; n <= 3; n++ {
+		if counts[n] != 1 {
+			t.Fatalf("completed=%d observed %d times, want exactly once", n, counts[n])
+		}
 	}
 	for _, want := range []string{"Alpha", "Bravo", "Charlie"} {
-		if !containsTitle(snapshots[1:], want) {
-			t.Fatalf("missing progress title %q in %+v", want, snapshots[1:])
+		if !containsTitle(snapshots, want) {
+			t.Fatalf("missing progress title %q in %+v", want, snapshots)
 		}
 	}
 }
@@ -208,6 +234,36 @@ func containsTitle(snapshots []CollectionSyncProgress, title string) bool {
 		}
 	}
 	return false
+}
+
+func TestCollectionSyncSchedulerProgressCallbackOutsideLock(t *testing.T) {
+	// F6: the callback must run after accounting releases the result mutex, so
+	// a callback that takes the same mutex cannot deadlock.
+	repo := &fakeCollectionSyncRepo{due: []*models.LibraryCollection{scheduledCollection("a", "Alpha")}}
+	syncer := &fakeCollectionSyncer{fn: func(context.Context, string) (*models.LibraryCollectionSyncRun, error) {
+		return &models.LibraryCollectionSyncRun{}, nil
+	}}
+	s := newTestScheduler(repo, syncer)
+
+	mu := &sync.Mutex{}
+	result := &CollectionSyncResult{Due: 1}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.syncOne(context.Background(), repo.due[0], mu, result, func(CollectionSyncProgress) {
+			// If the callback ran under mu, this would deadlock.
+			mu.Lock()
+			mu.Unlock()
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("syncOne did not finish; the callback likely ran while holding the mutex")
+	}
+	if result.Synced != 1 {
+		t.Fatalf("result = %+v, want synced=1", result)
+	}
 }
 
 func TestCollectionSyncSchedulerNilProgressCallbackIsSafe(t *testing.T) {

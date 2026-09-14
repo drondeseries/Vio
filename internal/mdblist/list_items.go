@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -23,10 +24,22 @@ var ErrUnauthorized = errors.New("mdblist rejected apikey")
 // ErrListNotFound reports that the requested user/list does not exist (404).
 var ErrListNotFound = errors.New("mdblist list not found")
 
-// ErrEmptyItemsWithTotal reports a list whose pagination.total is positive but
-// whose movie/show buckets are empty. MDBList's slug-based items endpoint
-// returns this for many lists; it must never be treated as "empty list".
-var ErrEmptyItemsWithTotal = errors.New("mdblist items response reported items but returned none")
+// ErrRateLimit reports an HTTP 429 from MDBList.
+var ErrRateLimit = errors.New("mdblist rate limit exceeded")
+
+// ErrEmptyItemsWithTotal reports an items response whose movie/show buckets are
+// empty. MDBList returns this for many lists (notably via its slug-based items
+// endpoint), so an empty response must never be accepted as "the list is now
+// empty": that would wipe collection membership. The catalog falls back to the
+// public /json feed, and only a genuinely empty /json result may empty a
+// collection.
+var ErrEmptyItemsWithTotal = errors.New("mdblist items response was empty")
+
+// ErrIncompleteItems reports that pagination ended with fewer items than the
+// announced total, beyond what the requested cap explains. A truncated or
+// dropped bucket must not silently replace full collection membership; the
+// catalog falls back to the public /json feed.
+var ErrIncompleteItems = errors.New("mdblist items response was incomplete")
 
 // ListItem is one movie or show in an authenticated list-items page. The
 // authenticated API uses different field names than the public /json feed
@@ -73,7 +86,8 @@ type listMeta struct {
 }
 
 // listItem is a single API item. tvdb_id and release_date differ from the
-// public /json feed's tvdbid and (absent) release date field.
+// public /json feed's tvdbid and (absent) release date field. Item ID equals
+// the item's ids.tmdb and the public feed's "id": it is the TMDB id.
 type listItem struct {
 	ID          int    `json:"id"`
 	MediaType   string `json:"mediatype"`
@@ -87,10 +101,10 @@ type listItem struct {
 
 // ResolveListID maps a user/slug pair to MDBList's numeric list id via
 // GET /lists/{user}/{slug}. That endpoint returns an array of list objects;
-// the entry whose user_name and slug match the request wins. A single-entry
-// response with no exact match is accepted (the endpoint is addressable by the
-// requested pair), but an ambiguous multi-entry response errors rather than
-// guessing.
+// the entry whose user_name and slug both match (case-insensitive) wins. A
+// single-entry response is accepted only when at least one of user_name/slug
+// also matches, so a wholly unrelated list is never imported; an ambiguous
+// multi-entry response errors rather than guessing.
 func (c *Client) ResolveListID(ctx context.Context, user, slug string) (int, error) {
 	user = strings.TrimSpace(user)
 	slug = strings.TrimSpace(slug)
@@ -131,9 +145,13 @@ func (c *Client) ResolveListID(ctx context.Context, user, slug string) (int, err
 		}
 	}
 	if len(metas) == 1 && metas[0].ID > 0 {
-		// The endpoint is addressable by this user/slug; a single result is
-		// the list, even if the upstream casing/aliases differ.
-		return metas[0].ID, nil
+		// A single result is only the requested list if at least one component
+		// matches; a wholly unrelated single entry is a resolution failure, not
+		// permission to import a different list.
+		meta := metas[0]
+		if strings.EqualFold(meta.UserName, user) || strings.EqualFold(meta.Slug, slug) {
+			return meta.ID, nil
+		}
 	}
 	return 0, fmt.Errorf("mdblist could not resolve list %s/%s to a unique id (%d matches)", user, slug, len(metas))
 }
@@ -146,6 +164,10 @@ func (c *Client) ResolveListID(ctx context.Context, user, slug string) (int, err
 // shows are separate buckets, so this merges them by ascending rank (stable)
 // to reproduce the public /json single-array rank order. seasons/episodes are
 // ignored.
+//
+// It refuses to return an empty or short result that would silently shrink a
+// collection: ErrEmptyItemsWithTotal for empty buckets, ErrIncompleteItems
+// when pagination ends below min(total, cap). Callers fall back to /json.
 func (c *Client) ListItems(ctx context.Context, user, list string, maxItems int) ([]ListItem, error) {
 	user = strings.TrimSpace(user)
 	list = strings.TrimSpace(list)
@@ -217,10 +239,25 @@ func (c *Client) ListItems(ctx context.Context, user, list string, maxItems int)
 	if len(items) > hardCap {
 		items = items[:hardCap]
 	}
-	if len(items) == 0 && total > 0 {
-		// Never let an empty bucket silently wipe a collection the API says is
-		// non-empty. Callers fall back to the public /json feed.
-		return nil, fmt.Errorf("%w: list %s/%s (id %d) reports total=%d", ErrEmptyItemsWithTotal, user, list, listID, total)
+	if len(items) == 0 {
+		// An empty 200 must never be accepted as "the list is now empty": the
+		// catalog would delete all membership. It falls back to /json, and only
+		// a genuinely empty /json result may empty the collection.
+		return nil, fmt.Errorf("%w: list %s/%s (id %d) total=%d", ErrEmptyItemsWithTotal, user, list, listID, total)
+	}
+	// A short page (has_more=false but fewer items than announced) or a dropped
+	// bucket would silently shrink membership. The intentional maxItems cap is
+	// not a shortfall: min(total, hardCap) is exactly what the cap allows.
+	if total > 0 && len(items) < min(total, hardCap) {
+		slog.Warn("mdblist items response incomplete",
+			"list_id", listID,
+			"user", user,
+			"list", list,
+			"delivered", len(items),
+			"total", total,
+			"cap", hardCap,
+		)
+		return nil, fmt.Errorf("%w: list %s/%s (id %d) delivered %d of total %d", ErrIncompleteItems, user, list, listID, len(items), total)
 	}
 	return items, nil
 }
@@ -273,7 +310,7 @@ func checkResponse(res *http.Response) error {
 	case res.StatusCode == http.StatusNotFound:
 		return fmt.Errorf("%w (status %d): %s", ErrListNotFound, res.StatusCode, readSnippet(res.Body))
 	case res.StatusCode == http.StatusTooManyRequests:
-		return fmt.Errorf("mdblist rate limit exceeded")
+		return fmt.Errorf("%w (status %d): %s", ErrRateLimit, res.StatusCode, readSnippet(res.Body))
 	case res.StatusCode < 200 || res.StatusCode >= 300:
 		return fmt.Errorf("mdblist request failed with status %d: %s", res.StatusCode, readSnippet(res.Body))
 	}
