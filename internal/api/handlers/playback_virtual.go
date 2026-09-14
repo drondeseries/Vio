@@ -789,6 +789,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
 			}
+			// Case B: no candidate resolution and RemuxDB disabled. Same
+			// 1080p baseline synthesis as declaredFallback so the immediate
+			// plan has complete metadata while the background probe persists
+			// the verified evidence.
+			if transient.Resolution == "" {
+				transient.Resolution = "1080p"
+				mergeVirtualCandidateTracks(&transient, cand)
+			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
 				probeKey := virtualProbeFailureKey(cand.URI, oid)
@@ -828,6 +836,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
 			}
+			if transient.Resolution == "" {
+				transient.Resolution = "1080p"
+				mergeVirtualCandidateTracks(&transient, cand)
+			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, AppliedRemux: appliedRemux,
@@ -838,6 +850,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
+			}
+			if transient.Resolution == "" {
+				transient.Resolution = "1080p"
+				mergeVirtualCandidateTracks(&transient, cand)
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
@@ -1795,13 +1811,21 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	}
 
 	// Fill empty top-level fields that ffprobe may miss on remote streams.
+	// A trackless, resolution-less file keeps CodecVideo/CodecAudio/Container
+	// empty so the evidence gates below report it incomplete: without a
+	// resolution the planner cannot pick a route, and claiming synthesized
+	// evidence would only hide the missing metadata that still blocks
+	// planning. The caller-supplied baselines (declaredFallback fixes up
+	// transient.Resolution first) flow through because a non-empty candidate
+	// label lands in probed.Resolution on the line below.
 	if probed.Resolution == "" {
 		probed.Resolution = candidate.Resolution
 	}
-	if probed.CodecVideo == "" {
+	hasResolution := probed.Resolution != ""
+	if probed.CodecVideo == "" && (hasResolution || candidate.CodecVideo != "") {
 		probed.CodecVideo = candidate.CodecVideo
 	}
-	if probed.CodecAudio == "" {
+	if probed.CodecAudio == "" && (hasResolution || candidate.CodecAudio != "") {
 		probed.CodecAudio = candidate.CodecAudio
 	}
 	if !probed.HDR && candidate.HDR != "" {
@@ -1810,7 +1834,7 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	if probed.Container == "" || strings.EqualFold(probed.Container, "virtual") {
 		if candidate.Container != "" && !strings.EqualFold(candidate.Container, "virtual") {
 			probed.Container = candidate.Container
-		} else {
+		} else if hasResolution {
 			probed.Container = "mkv"
 		}
 	}
@@ -1832,7 +1856,7 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	if probed.CodecAudio == "" {
 		probed.CodecAudio = candidate.CodecAudio
 	}
-	if probed.CodecAudio == "" {
+	if probed.CodecAudio == "" && len(probed.AudioTracks) > 0 {
 		probed.CodecAudio = "aac"
 	}
 	channels := inferChannelsFromCodec(probed.CodecAudio)
@@ -1843,21 +1867,25 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		probed.AudioChannels = channels
 	}
 
-	// Create a basic video track when ffprobe didn't detect any.
+	// Create a basic video track when ffprobe didn't detect any. A trackless
+	// resolution-less file keeps CodecVideo and Container empty so the evidence
+	// gates below report it incomplete: without a resolution the planner
+	// cannot pick a route, and claiming synthesized evidence would only hide
+	// the missing metadata that still blocks planning.
 	videoCodec := probed.CodecVideo
 	if videoCodec == "" {
 		videoCodec = candidate.CodecVideo
 	}
-	if videoCodec == "" {
+	if videoCodec == "" && len(probed.VideoTracks) > 0 {
 		videoCodec = "h264"
 	}
-	if probed.CodecVideo == "" {
+	if probed.CodecVideo == "" && videoCodec != "" {
 		probed.CodecVideo = videoCodec
 	}
 	isDV, dvProfile := virtualDVMetadata(candidate.HDR)
 	isHDR := probed.HDR || candidate.HDR != ""
 	defaultProfile, defaultLevel, defaultBitDepth := defaultVirtualVideoProfileAndLevel(videoCodec, isHDR, isDV, probed.Resolution)
-	if len(probed.VideoTracks) == 0 {
+	if len(probed.VideoTracks) == 0 && probed.Resolution != "" {
 		videoRange := "SDR"
 		videoRangeType := "SDR"
 		if isDV {
@@ -1954,19 +1982,23 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		}
 	}
 
-	// Synthesize audio/subtitle tracks from the provider-declared languages
-	// when the probe left the inventory empty. ffprobe may not always detect
-	// language tags on remote streams (especially HLS and DASH), so candidate
-	// languages fill the gap so the player can display track choices before
-	// and during playback. Existing probed tracks are never overwritten.
+	// Synthesize audio tracks from the provider-declared languages when the
+	// probe left the inventory empty. A file with no resolution and no tracks
+	// cannot produce a routable plan, so language synthesis is gated on the
+	// caller supplying a resolution (declared, backfilled, or probed) — via
+	// the baseline or a real candidate value. Video track synthesis below
+	// follows the same gate so both inventories stay consistent.
 	mergeVirtualCandidateLanguages(probed, candidate)
 
-	if len(probed.AudioTracks) == 0 {
+	if len(probed.AudioTracks) == 0 && probed.Resolution != "" {
 		probed.AudioTracks = []models.AudioTrack{{
 			Codec:    probed.CodecAudio,
 			Channels: channels,
 			Default:  true,
 		}}
+	}
+	if len(probed.AudioTracks) > 0 && probed.CodecAudio == "" {
+		probed.CodecAudio = probed.AudioTracks[0].Codec
 	}
 
 	// Fill audio channels and codec on existing tracks that lack them.

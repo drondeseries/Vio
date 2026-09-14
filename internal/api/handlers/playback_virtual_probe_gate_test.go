@@ -221,6 +221,123 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 	}
 }
 
+// A resolution-less stored row whose lister returns a resolution-less
+// candidate and whose RemuxDB gate is closed must still synthesize the 1080p
+// baseline through the candidate-merge gate: the immediate plan keeps the
+// synthesized tracks and defers the real probe to the background.
+func TestResolveResolutionlessMergesIntoBaseline(t *testing.T) {
+	uri := "virtual://movie/tt-merge-baseline?result=cand-1"
+	stored := &models.MediaFile{
+		ID:                         303,
+		ContentID:                  "movie-1",
+		FilePath:                   uri,
+		Container:                  "mkv",
+		CodecVideo:                 "h264",
+		VirtualOwnerInstallationID: 5,
+	}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-merge", URI: uri, CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+		}}, nil
+	})
+	probeStarted := make(chan struct{})
+	var probeCalls int32
+	h := virtualProbeGateCandidateHandler(stored, lister,
+		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			atomic.AddInt32(&probeCalls, 1)
+			close(probeStarted)
+			<-time.After(50 * time.Millisecond)
+			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24"}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
+			return f, nil
+		}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := *stored
+	resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.Provenance != ProbeProvenancePending {
+		t.Fatalf("provenance=%q, want pending deferred probe", resolved.Provenance)
+	}
+	if resolved.File == nil || resolved.File.Resolution != "1080p" {
+		t.Fatalf("resolution=%v, want 1080p baseline", resolved.File)
+	}
+	if !completeVirtualVideoEvidenceV3(resolved.File) ||
+		!completeVirtualAudioEvidenceV3(resolved.File) ||
+		!completeVirtualContainerEvidenceV3(resolved.File) {
+		t.Fatalf("baseline must carry complete evidence: %#v", resolved.File)
+	}
+
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("real probe was not launched in the background")
+	}
+	if probeCalls := atomic.LoadInt32(&probeCalls); probeCalls != 1 {
+		t.Fatalf("prober called %d times, want 1 background probe", probeCalls)
+	}
+}
+
+// A resolution-less merge gate must not erase candidate-declared tracks: the
+// probe failure damper path degrades to the same 1080p baseline. The first
+// call consumes the probe budget; the second replan skips the prober via the
+// damper but keeps the complete baseline evidence.
+func TestResolveVirtualProbeFailureBaselineForResolutionless(t *testing.T) {
+	uri := "virtual://movie/tt-negative-cache-baseline?result=cand-1"
+	key := virtualProbeFailureKey(uri, 5)
+	virtualProbeFailures.clear(key)
+	t.Cleanup(func() { virtualProbeFailures.clear(key) })
+
+	stored := &models.MediaFile{
+		ID:                         302,
+		ContentID:                  "movie-1",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-baseline", URI: uri, CodecAudio: "aac", Container: "mkv",
+		}}, nil
+	})
+	probeCalls := 0
+	h := virtualProbeGateCandidateHandler(stored, lister,
+		func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+			probeCalls++
+			return nil, errors.New("probe failed")
+		}, nil)
+
+	for call := 0; call < 2; call++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		file := *stored
+		resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", false, nil, "", "", 0, false)
+		if err != nil {
+			t.Fatalf("call %d: resolveVirtualPlaybackSource error: %v", call, err)
+		}
+		if resolved.Provenance != ProbeProvenanceFailed {
+			t.Fatalf("call %d: provenance=%q, want failed declared fallback", call, resolved.Provenance)
+		}
+		if resolved.File == nil || resolved.File.Resolution != "1080p" {
+			t.Fatalf("call %d: resolution=%v, want 1080p baseline", call, resolved.File)
+		}
+		if !completeVirtualVideoEvidenceV3(resolved.File) {
+			t.Fatalf("call %d: baseline must carry complete video evidence: %#v", call, resolved.File)
+		}
+		if !completeVirtualAudioEvidenceV3(resolved.File) {
+			t.Fatalf("call %d: baseline must carry complete audio evidence: %#v", call, resolved.File)
+		}
+		if !completeVirtualContainerEvidenceV3(resolved.File) {
+			t.Fatalf("call %d: baseline must carry complete container evidence: %#v", call, resolved.File)
+		}
+	}
+	if probeCalls != 1 {
+		t.Fatalf("prober called %d times across two replans, want 1 after the failure damper engages", probeCalls)
+	}
+}
+
 // A failed probe consumed the whole probe budget; the next replan must not pay
 // it again for the same candidate. The second call skips the prober and falls
 // back to the candidate-declared metadata.
