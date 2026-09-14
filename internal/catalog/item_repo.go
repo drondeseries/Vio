@@ -1404,6 +1404,14 @@ func (r *ItemRepository) Upsert(ctx context.Context, item *models.MediaItem) err
 		return fmt.Errorf("begin media item upsert tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Shared lock with the virtual purge sweep (see
+	// purgeVirtualPlaybackItemsOnce): the metadata refresh path calls
+	// Upsert for the same content the purge DELETEs from media_files.
+	// DELETE fires the episode_catalog_entries trigger which INSERTs into
+	// the same index the upsert path touches, forming an AB-BA cycle.
+	if err := requestlock.LockVirtual(ctx, tx, "virtual-purge"); err != nil {
+		return fmt.Errorf("lock virtual purge: %w", err)
+	}
 
 	if err := r.upsert(ctx, tx, item); err != nil {
 		return err
