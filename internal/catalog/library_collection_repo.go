@@ -836,11 +836,24 @@ func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, s
 	}
 	lockIDs = append(lockIDs, desiredIDs...)
 	slices.Sort(lockIDs)
-	for _, id := range slices.Compact(lockIDs) {
+	lockIDs = slices.Compact(lockIDs)
+	// Content locks first (see lockReleaseContentTx): alias writers take
+	// these exclusively, so alias sets observed below cannot change under us.
+	for _, id := range lockIDs {
+		if err := lockReleaseContentTx(ctx, tx, id, false); err != nil {
+			return err
+		}
+	}
+	for _, id := range lockIDs {
 		if err := requestlock.LockItem(ctx, tx, id); err != nil {
 			return err
 		}
 	}
+	// Phase 1: materialize every member with debt writes deferred, so no
+	// new release identity is acquired after the first debt write (see
+	// lockReleaseContentTx ordering). Phase 2 below emits all debt rows
+	// in deterministic order.
+	var debtContentIDs []string
 	for _, id := range slices.Sorted(slices.Values(desiredIDs)) {
 		candidate, ok := prepared[id]
 		if !ok || !sourceEnablesVirtualPlayback(snapshot.SourceConfig) {
@@ -849,8 +862,14 @@ func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, s
 		if candidate.item == nil || candidate.item.ContentID != id {
 			return errors.New("invalid prepared collection item")
 		}
-		if _, err := items.ensureVirtualCollectionItemMaterializedTx(ctx, tx, snapshot.ID, candidate.item, libraries, candidate.variants, VirtualMaterializeOptions{accepting: true}); err != nil {
+		if _, err := items.ensureVirtualCollectionItemMaterializedTx(ctx, tx, snapshot.ID, candidate.item, libraries, candidate.variants, VirtualMaterializeOptions{accepting: true, releaseSnapshot: candidate.releaseSnapshot, preparedExplicitly: true, deferDebtWrite: true}); err != nil {
 			return err
+		}
+		debtContentIDs = append(debtContentIDs, id)
+	}
+	for _, id := range debtContentIDs {
+		if err := queueVirtualItemRefreshDebtTx(ctx, tx, id); err != nil {
+			return fmt.Errorf("queueing accepted item metadata refresh: %w", err)
 		}
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM library_collection_items WHERE collection_id=$1`, snapshot.ID); err != nil {

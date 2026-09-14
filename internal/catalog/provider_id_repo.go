@@ -83,6 +83,13 @@ func (r *ProviderIDRepository) AttachTMDBID(ctx context.Context, contentID, item
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// Exclusive content lock first (see lockReleaseContentTx): release
+	// readers hold it shared, so this attach serializes fully before or
+	// after their alias-set observations.
+	if err := lockReleaseContentTx(ctx, tx, contentID, true); err != nil {
+		return fmt.Errorf("lock release content for tmdb attach: %w", err)
+	}
+
 	tmdbText := strconv.Itoa(tmdbID)
 	var existingType, existingTMDBID string
 	if err := tx.QueryRow(ctx, `
@@ -369,6 +376,7 @@ func (r *ProviderIDRepository) ReplaceByContentID(ctx context.Context, contentID
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// ReplaceByContentIDTx takes the exclusive content lock first thing.
 	var itemType string
 	if err := tx.QueryRow(ctx, `SELECT type FROM media_items WHERE content_id = $1`, contentID).Scan(&itemType); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -401,6 +409,14 @@ func (r *ProviderIDRepository) ReplaceByContentIDTx(
 	itemType = strings.TrimSpace(itemType)
 	if itemType == "" {
 		return fmt.Errorf("item_type is required")
+	}
+	// Callers running inside their own transaction take this exclusive lock
+	// here; like all content locks it must precede item-row and identity
+	// locks in the global order (see lockReleaseContentTx). Release readers
+	// never evaluate audiobook/ebook content, so enrichment pipelines
+	// sharing this helper cannot contend with them.
+	if err := lockReleaseContentTx(ctx, tx, contentID, true); err != nil {
+		return fmt.Errorf("lock release content for provider id replace: %w", err)
 	}
 	entries := normalizeDurableProviderIDs(providerIDs)
 

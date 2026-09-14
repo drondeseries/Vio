@@ -100,7 +100,9 @@ type Settings struct {
 }
 
 type FeatureStatus struct {
-	RequestsEnabled bool `json:"requests_enabled"`
+	ReleaseDateOverrides bool `json:"release_date_overrides"`
+	NeedsReleaseMetadata bool `json:"needs_release_metadata"`
+	RequestsEnabled      bool `json:"requests_enabled"`
 	// RatingRestrictionsEnforced advertises that discovery/search results are
 	// filtered by the profile's max content rating and that over-ceiling
 	// detail (404) and create (403) requests are rejected. Additive v1

@@ -2,14 +2,29 @@ package catalog
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+type releasedMovieChecker struct{}
+
+func (releasedMovieChecker) HasDigitalRelease(context.Context, int) (bool, error) {
+	return true, nil
+}
+
+func newReleasedVirtualMediaRegistrar(pool *pgxpool.Pool) *VirtualMediaRegistrar {
+	reg := NewVirtualMediaRegistrar(pool)
+	reg.TMDBDigitalReleases = releasedMovieChecker{}
+	return reg
+}
 
 func newVirtualMediaTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
@@ -62,10 +77,119 @@ func newVirtualMediaTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// waitForBlockedAdvisoryLock polls pg_locks until another backend holds an
+// ungranted advisory lock (optionally matching a specific lockKey), proving a
+// concurrent writer actually queued behind held locks rather than running sequentially.
+// It captures the intended writer database and lock key, excludes the
+// test's own PID, and logs the observed advisory lock holders on timeout
+// so a mismatch (wrong key, wrong backend, no queuing) is diagnosable
+// instead of a bare timeout.
+func waitForBlockedAdvisoryLock(t *testing.T, pool *pgxpool.Pool, lockKey string, timeout time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	var self int
+	var dbName string
+	if err := pool.QueryRow(ctx, "SELECT pg_backend_pid(), current_database()").Scan(&self, &dbName); err != nil {
+		t.Fatal(err)
+	}
+	var wantHash int64
+	if lockKey != "" {
+		if err := pool.QueryRow(ctx, `SELECT hashtextextended($1, 0)`, lockKey).Scan(&wantHash); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var blocked int
+		var err error
+		if lockKey != "" {
+			err = pool.QueryRow(ctx, `
+				SELECT count(*) FROM pg_locks
+				WHERE locktype='advisory' AND NOT granted AND pid <> $1
+				  AND ((classid::bigint << 32) | (objid::bigint & 4294967295)) = hashtextextended($2, 0)`, self, lockKey).Scan(&blocked)
+		} else {
+			err = pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted AND pid <> $1`, self).Scan(&blocked)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if blocked > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	rows, qerr := pool.Query(ctx, `
+		SELECT l.pid, l.granted,
+		       ((l.classid::bigint << 32) | (l.objid::bigint & 4294967295)),
+		       COALESCE(a.datname, ''), COALESCE(a.query, ''), COALESCE(a.wait_event_type, ''), COALESCE(a.wait_event, '')
+		FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+		WHERE l.locktype='advisory' AND l.pid <> $1
+		ORDER BY l.pid`, self)
+	if qerr != nil {
+		t.Fatalf("concurrent writer never queued behind the held release locks (db=%q lockKey=%q wantHash=%d self=%d): could not dump pg_locks: %v", dbName, lockKey, wantHash, self, qerr)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pid int
+		var granted bool
+		var keyHash int64
+		var datname, query, waitType, waitEvent string
+		if err := rows.Scan(&pid, &granted, &keyHash, &datname, &query, &waitType, &waitEvent); err != nil {
+			t.Logf("pg_locks dump scan failed: %v", err)
+			break
+		}
+		t.Logf("advisory lock: pid=%d granted=%v keyHash=%d datname=%q query=%q wait=%s/%s (want lockKey=%q wantHash=%d self=%d db=%q)", pid, granted, keyHash, datname, query, waitType, waitEvent, lockKey, wantHash, self, dbName)
+	}
+	t.Fatalf("concurrent writer never queued behind the held release locks (db=%q lockKey=%q wantHash=%d self=%d)", dbName, lockKey, wantHash, self)
+}
+
+var testReleaseSuffixCounter atomic.Uint64
+
+// uniqueReleaseSuffix returns per-run digits for provider identities written
+// to append-only tables (override history, metadata queue, provider IDs, and
+// content-keyed claims). Canonical numeric schemes accept the result. The
+// scheme combines the process ID with an atomic counter so concurrent tests
+// and processes get deterministic, collision-free suffixes without
+// timestamp-based collisions.
+func uniqueReleaseSuffix(t *testing.T) string {
+	t.Helper()
+	c := testReleaseSuffixCounter.Add(1)
+	return fmt.Sprintf("%02d%05d", os.Getpid()%100, c%100000)
+}
+
+func TestPresenceRequiresFileInMatchingEnabledLibrary(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(998,'Disabled','movies',false),(999,'Enabled','movies',true);
+		INSERT INTO media_items(content_id,type,title,tmdb_id) VALUES('movie-tmdb-1','movie','Presence','1');
+		INSERT INTO media_item_libraries(content_id,media_folder_id) VALUES('movie-tmdb-1',998),('movie-tmdb-1',999);
+		INSERT INTO media_item_provider_ids(content_id,provider,provider_id,item_type) VALUES('movie-tmdb-1','imdb','tt1','movie');
+		INSERT INTO media_files(content_id,media_folder_id,file_path,container) VALUES('movie-tmdb-1',998,'/test/presence.mkv','mkv')`); err != nil {
+		t.Fatal(err)
+	}
+	repo := NewItemRepository(pool)
+	for _, candidate := range []ExternalIDLookupCandidate{{TMDBID: "1"}, {TMDBID: "2", IMDbID: "tt1"}} {
+		rows, err := repo.LookupExternalIDs(ctx, "movie", []ExternalIDLookupCandidate{candidate})
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("disabled file counted as enabled presence: rows=%+v err=%v", rows, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE media_files SET media_folder_id=999 WHERE content_id='movie-tmdb-1'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range []ExternalIDLookupCandidate{{TMDBID: "1"}, {TMDBID: "2", IMDbID: "tt1"}} {
+		rows, err := repo.LookupExternalIDs(ctx, "movie", []ExternalIDLookupCandidate{candidate})
+		if err != nil || len(rows) != 1 || rows[0].LibraryID != "999" {
+			t.Fatalf("enabled file not found: rows=%+v err=%v", rows, err)
+		}
+	}
+}
+
 func TestVirtualMediaVariantsUpsert(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)
 	ctx := context.Background()
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 
 	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtual','mixed',true)"); err != nil {
 		t.Fatalf("seed virtual media folder: %v", err)
@@ -73,6 +197,7 @@ func TestVirtualMediaVariantsUpsert(t *testing.T) {
 
 	in := VirtualMedia{
 		LibraryID: "999", MediaType: "movie", Title: "Test Movie", IMDbID: "tt100", TMDBID: "1", Source: "provider-a",
+		Year:           2020,
 		RuntimeMinutes: 120,
 		Variants: []VirtualMediaVariant{
 			{VirtualURI: "virtual://movie/tt100?profile=1080p", Resolution: "1080p", CodecVideo: "h264", RuntimeMinutes: 120},
@@ -96,6 +221,7 @@ func TestVirtualMediaVariantsUpsert(t *testing.T) {
 	// Test variant with supplied container and file size
 	inWithSupplied := VirtualMedia{
 		LibraryID: "999", MediaType: "movie", Title: "Custom Variant Movie", IMDbID: "tt200", TMDBID: "2", Source: "provider-a",
+		Year:           2020,
 		RuntimeMinutes: 120,
 		Variants: []VirtualMediaVariant{
 			{VirtualURI: "virtual://movie/tt200?profile=1080p", Resolution: "1080p", CodecVideo: "h264", Container: "mkv", FileSize: 104857600},
@@ -143,7 +269,7 @@ func TestVirtualMediaVariantsUpsert(t *testing.T) {
 		LibraryID: "999", MediaType: "series", Title: "Test Series", IMDbID: "tt300", TMDBID: "3", Source: "provider-a",
 		Episodes: []VirtualEpisode{
 			{
-				SeasonNumber: 1, EpisodeNumber: 1, Title: "Ep 1",
+				SeasonNumber: 1, EpisodeNumber: 1, Title: "Ep 1", AirDate: time.Now().Add(-time.Hour),
 				Variants: []VirtualMediaVariant{
 					{VirtualURI: "virtual://series/tt300/1/1?profile=1080p", Resolution: "1080p"},
 					{VirtualURI: "virtual://series/tt300/1/1?profile=720p", Resolution: "720p"},
@@ -182,7 +308,7 @@ func TestVirtualMediaUpsertAndReconcileShareSourceLock(t *testing.T) {
 		VALUES(973,'Source Lock','movies',true)`); err != nil {
 		t.Fatalf("seed folder: %v", err)
 	}
-	registrar := NewVirtualMediaRegistrar(pool)
+	registrar := newReleasedVirtualMediaRegistrar(pool)
 	input := VirtualMedia{
 		LibraryID: "973", MediaType: "movie", Title: "Source Lock",
 		IMDbID: "tt208", TMDBID: "208", Source: "source-lock",
@@ -253,7 +379,7 @@ func TestVirtualMediaUpsertAndReconcileShareSourceLock(t *testing.T) {
 func TestVirtualMediaUpsertPreservesLocalItemAndAddsIndependentVirtualSource(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)
 	ctx := context.Background()
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 
 	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(997,'LocalAndVirtual','movies',true)"); err != nil {
 		t.Fatalf("seed folder: %v", err)
@@ -273,6 +399,7 @@ func TestVirtualMediaUpsertPreservesLocalItemAndAddsIndependentVirtualSource(t *
 	_, err := reg.UpsertVirtualMedia(ctx, 11, VirtualMedia{
 		LibraryID: "997", MediaType: "movie", Title: "Plugin Must Not Replace This",
 		IMDbID: "tt10", TMDBID: "10", Source: "provider-a",
+		Year:       2020,
 		VirtualURI: "virtual://movie/tt10",
 	})
 	if err != nil {
@@ -343,7 +470,7 @@ func TestVirtualMediaUpsertPreservesLocalItemAndAddsIndependentVirtualSource(t *
 func TestVirtualMediaSourcesDoNotOverwriteEachOtherAndReconcileIndependently(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)
 	ctx := context.Background()
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(996,'MultiProvider','movies',true)"); err != nil {
 		t.Fatalf("seed folder: %v", err)
 	}
@@ -351,6 +478,7 @@ func TestVirtualMediaSourcesDoNotOverwriteEachOtherAndReconcileIndependently(t *
 	first := VirtualMedia{
 		LibraryID: "996", MediaType: "movie", Title: "Provider A Title",
 		IMDbID: "tt20", TMDBID: "20", Source: "provider-a",
+		Year:       2020,
 		VirtualURI: "virtual://movie/tt20?result=a",
 	}
 	result, err := reg.UpsertVirtualMedia(ctx, 11, first)
@@ -418,7 +546,7 @@ func TestVirtualMediaSourcesDoNotOverwriteEachOtherAndReconcileIndependently(t *
 func TestReplaceCollectionItemsPreservesOtherVirtualSourceClaims(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)
 	ctx := context.Background()
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO media_folders(id,name,type,enabled)
@@ -428,6 +556,7 @@ func TestReplaceCollectionItemsPreservesOtherVirtualSourceClaims(t *testing.T) {
 	result, err := reg.UpsertVirtualMedia(ctx, 11, VirtualMedia{
 		LibraryID: "994", MediaType: "movie", Title: "Shared source",
 		IMDbID: "tt40", TMDBID: "40", Source: "request",
+		Year:       2020,
 		VirtualURI: "virtual://movie/tt40",
 	})
 	if err != nil {
@@ -473,7 +602,7 @@ func TestReplaceCollectionItemsPreservesOtherVirtualSourceClaims(t *testing.T) {
 func TestCleanupRequestVirtualMediaPreservesOtherPluginClaim(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)
 	ctx := context.Background()
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO media_folders(id,name,type,enabled)
 		VALUES(993,'RequestClaims','movies',true)`); err != nil {
@@ -482,6 +611,7 @@ func TestCleanupRequestVirtualMediaPreservesOtherPluginClaim(t *testing.T) {
 	requestMedia := VirtualMedia{
 		LibraryID: "993", MediaType: "movie", Title: "Claim cleanup",
 		IMDbID: "tt50", TMDBID: "50", Source: "request:movie:tt50",
+		Year:       2020,
 		VirtualURI: "virtual://movie/tt50?result=request",
 	}
 	result, err := reg.UpsertVirtualMedia(ctx, 11, requestMedia)
@@ -557,9 +687,10 @@ func seedSharedCollectionAndRequestVirtualFile(t *testing.T, pool *pgxpool.Pool)
 	}}); err != nil {
 		t.Fatalf("claim collection virtual item: %v", err)
 	}
-	if _, err := NewVirtualMediaRegistrar(pool).UpsertVirtualMedia(ctx, 11, VirtualMedia{
+	if _, err := newReleasedVirtualMediaRegistrar(pool).UpsertVirtualMedia(ctx, 11, VirtualMedia{
 		LibraryID: "989", MediaType: "movie", Title: "Shared Claims",
 		IMDbID: "tt90", TMDBID: "90", Source: "request:movie:tt90",
+		Year:       2020,
 		VirtualURI: "virtual://movie/tt90",
 	}); err != nil {
 		t.Fatalf("add shared request claim: %v", err)
@@ -884,13 +1015,14 @@ func TestReleasedEpisodeReconciliationSkipsFutureEpisodes(t *testing.T) {
 func TestVirtualMediaUpsertRemovesStaleVariantsWithinSourceClaim(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)
 	ctx := context.Background()
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(995,'VariantReconcile','movies',true)"); err != nil {
 		t.Fatalf("seed folder: %v", err)
 	}
 	input := VirtualMedia{
 		LibraryID: "995", MediaType: "movie", Title: "Variant Reconcile",
 		IMDbID: "tt30", TMDBID: "30", Source: "provider-a",
+		Year: 2020,
 		Variants: []VirtualMediaVariant{
 			{VirtualURI: "virtual://movie/tt30?result=a"},
 			{VirtualURI: "virtual://movie/tt30?result=b"},
@@ -936,10 +1068,11 @@ func TestVirtualMediaUpsertPreservesLocalSeriesEpisodeMetadata(t *testing.T) {
 		t.Fatalf("seed local series: %v", err)
 	}
 
-	_, err := NewVirtualMediaRegistrar(pool).UpsertVirtualMedia(ctx, 11, VirtualMedia{
+	_, err := newReleasedVirtualMediaRegistrar(pool).UpsertVirtualMedia(ctx, 11, VirtualMedia{
 		LibraryID: "984", MediaType: "series", Title: "Plugin Series", TVDBID: "200",
 		Source: "provider-a", Episodes: []VirtualEpisode{{
 			SeasonNumber: 1, EpisodeNumber: 1, Title: "Plugin Episode",
+			AirDate:  time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
 			Overview: "Plugin overview", VirtualURI: "virtual://series/tvdb/200/1/1",
 		}},
 	})
@@ -970,7 +1103,7 @@ func TestVirtualMetadataOwnershipPromotesSurvivingSource(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(983,'OwnerFailover','movies',true)`); err != nil {
 		t.Fatalf("seed folder: %v", err)
 	}
-	reg := NewVirtualMediaRegistrar(pool)
+	reg := newReleasedVirtualMediaRegistrar(pool)
 	first := VirtualMedia{
 		LibraryID: "983", MediaType: "movie", Title: "Primary", IMDbID: "tt201", TMDBID: "201",
 		Source: "provider-a", VirtualURI: "virtual://movie/tt201?result=a",
@@ -1327,9 +1460,10 @@ func TestPurgeVirtualPlaybackItemsRemovesOwnerZeroClaimsFromLocalItem(t *testing
 		VALUES('movie-tmdb-209',972,'/media/owner-zero-local.mkv',1024,'mkv')`); err != nil {
 		t.Fatalf("seed local item: %v", err)
 	}
-	if _, err := NewVirtualMediaRegistrar(pool).Upsert(ctx, VirtualMedia{
+	if _, err := newReleasedVirtualMediaRegistrar(pool).Upsert(ctx, VirtualMedia{
 		LibraryID: "972", MediaType: "movie", Title: "Owner Zero Purge",
 		IMDbID: "tt209", TMDBID: "209", Source: "generic-source",
+		Year:       2020,
 		VirtualURI: "virtual://movie/tt209",
 	}); err != nil {
 		t.Fatalf("add generic virtual source: %v", err)
@@ -1438,7 +1572,7 @@ func TestRemoveVirtualMediaInstallationCleansLegacyOwnerRowsAndPreservesSharedCl
 		t.Fatalf("seed shared legacy uninstall rows: %v", err)
 	}
 
-	result, err := NewVirtualMediaRegistrar(pool).RemoveInstallationVirtualMedia(ctx, 11)
+	result, err := newReleasedVirtualMediaRegistrar(pool).RemoveInstallationVirtualMedia(ctx, 11)
 	if err != nil {
 		t.Fatalf("remove installation virtual media: %v", err)
 	}
@@ -1660,5 +1794,721 @@ func TestPurgeVirtualPlaybackItemsRemovesSeriesAndOrphanedItems(t *testing.T) {
 	}
 	if seriesCount != 0 || epFileCount != 0 || libCount != 0 {
 		t.Fatalf("after purge: seriesCount=%d epFileCount=%d libCount=%d, want 0/0/0", seriesCount, epFileCount, libCount)
+	}
+}
+
+func TestVirtualMediaUpcomingEpisodesPreserveMetadataWithoutPlayableFiles(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	reg := newReleasedVirtualMediaRegistrar(pool)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtual','mixed',true)"); err != nil {
+		t.Fatalf("seed virtual media folder: %v", err)
+	}
+
+	now := time.Now()
+	series := VirtualMedia{
+		LibraryID: "999", MediaType: "series", Title: "Upcoming Test Series", IMDbID: "tt400", TMDBID: "4", Source: "provider-b",
+		Episodes: []VirtualEpisode{
+			{
+				SeasonNumber: 1, EpisodeNumber: 1, Title: "Aired Episode", AirDate: now.Add(-24 * time.Hour),
+				VirtualURI: "virtual://series/tt400/1/1?profile=1080p",
+			},
+			{
+				SeasonNumber: 1, EpisodeNumber: 2, Title: "Future Episode (Blank URI)", AirDate: now.Add(24 * time.Hour),
+				VirtualURI: "",
+			},
+			{
+				SeasonNumber: 1, EpisodeNumber: 3, Title: "Undated Episode (Blank URI)",
+				VirtualURI: "",
+			},
+		},
+	}
+
+	res, err := reg.UpsertVirtualMedia(ctx, 11, series)
+	if err != nil {
+		t.Fatalf("upsert series failed: %v", err)
+	}
+	if res.EpisodesUpserted != 1 {
+		t.Fatalf("expected 1 playable episode upserted, got %d", res.EpisodesUpserted)
+	}
+
+	var episodeRowCount, mediaFileCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM episodes WHERE series_id=$1", res.MediaID).Scan(&episodeRowCount); err != nil {
+		t.Fatalf("count episodes: %v", err)
+	}
+	if episodeRowCount != 3 {
+		t.Fatalf("expected all 3 episodes in catalog metadata, got %d", episodeRowCount)
+	}
+
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1", res.MediaID).Scan(&mediaFileCount); err != nil {
+		t.Fatalf("count media files: %v", err)
+	}
+	if mediaFileCount != 1 {
+		t.Fatalf("expected only 1 playable media file for aired episode, got %d", mediaFileCount)
+	}
+
+	var playedEpisodeID string
+	if err := pool.QueryRow(ctx, "SELECT episode_id FROM media_files WHERE content_id=$1", res.MediaID).Scan(&playedEpisodeID); err != nil {
+		t.Fatalf("query media file episode_id: %v", err)
+	}
+	if !strings.HasSuffix(playedEpisodeID, "-1-1") {
+		t.Fatalf("expected media file to belong to S01E01, got %q", playedEpisodeID)
+	}
+
+	// Now postpone Episode 1 into the future as well
+	series.Episodes[0].AirDate = now.Add(48 * time.Hour)
+	resPostponed, err := reg.UpsertVirtualMedia(ctx, 11, series)
+	if err != nil {
+		t.Fatalf("upsert postponed series failed: %v", err)
+	}
+	if resPostponed.EpisodesUpserted != 0 {
+		t.Fatalf("expected 0 playable episodes after postponement, got %d", resPostponed.EpisodesUpserted)
+	}
+
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM episodes WHERE series_id=$1", res.MediaID).Scan(&episodeRowCount); err != nil {
+		t.Fatalf("count episodes after postponement: %v", err)
+	}
+	if episodeRowCount != 3 {
+		t.Fatalf("metadata must still be preserved for 3 episodes, got %d", episodeRowCount)
+	}
+
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1", res.MediaID).Scan(&mediaFileCount); err != nil {
+		t.Fatalf("count media files after postponement: %v", err)
+	}
+	if mediaFileCount != 0 {
+		t.Fatalf("expected 0 playable media files after postponement, got %d", mediaFileCount)
+	}
+}
+
+func TestUpsertVirtualMedia_FutureAndUndatedMoviesPreserveMetadataWithoutPlayableFiles(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	reg := newReleasedVirtualMediaRegistrar(pool)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(999,'TestVirtual','mixed',true)"); err != nil {
+		t.Fatalf("seed virtual media folder: %v", err)
+	}
+	nowYear := time.Now().UTC().Year()
+
+	// 1. Future movie
+	futureMovie := VirtualMedia{
+		LibraryID:      "999",
+		MediaType:      "movie",
+		Title:          "Future Movie 2099",
+		Year:           nowYear + 5,
+		IMDbID:         "tt8888001",
+		Overview:       "A movie from the future",
+		VirtualURI:     "virtual://movie/tt8888001",
+		RuntimeMinutes: 120,
+	}
+
+	resFuture, err := reg.UpsertVirtualMedia(ctx, 11, futureMovie)
+	if err != nil {
+		t.Fatalf("upsert future movie failed: %v", err)
+	}
+
+	var futureItemCount, futureFileCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_items WHERE content_id=$1", resFuture.MediaID).Scan(&futureItemCount); err != nil || futureItemCount != 1 {
+		t.Fatalf("expected future movie metadata in media_items, count=%d, err=%v", futureItemCount, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1", resFuture.MediaID).Scan(&futureFileCount); err != nil || futureFileCount != 0 {
+		t.Fatalf("expected 0 media_files for future movie, got %d, err=%v", futureFileCount, err)
+	}
+
+	// 2. Undated movie (Year: 0)
+	undatedMovie := VirtualMedia{
+		LibraryID:      "999",
+		MediaType:      "movie",
+		Title:          "Undated Movie",
+		Year:           0,
+		IMDbID:         "tt8888002",
+		Overview:       "A movie with no year",
+		VirtualURI:     "virtual://movie/tt8888002",
+		RuntimeMinutes: 90,
+	}
+	if _, err := reg.UpsertVirtualMedia(ctx, 11, undatedMovie); err == nil {
+		t.Fatal("missing release identity must defer registration")
+	}
+
+	// 3. Current year movie without verified digital release fails closed (0 media_files)
+	currentYearMovie := VirtualMedia{
+		LibraryID:      "999",
+		MediaType:      "movie",
+		Title:          "Current Year Unverified",
+		Year:           nowYear,
+		IMDbID:         "tt8888004",
+		Overview:       "A current-year movie without release checker",
+		VirtualURI:     "virtual://movie/tt8888004",
+		RuntimeMinutes: 110,
+	}
+	if _, err := reg.UpsertVirtualMedia(ctx, 11, currentYearMovie); err == nil {
+		t.Fatal("unverified current movie must defer registration")
+	}
+
+	// 4. Current year movie WITH verified digital release creates 1 media_file
+	regWithChecker := newReleasedVirtualMediaRegistrar(pool)
+	regWithChecker.TMDBDigitalReleases = &fakeDigitalReleaseChecker{released: map[int]bool{777: true}}
+	currentYearVerifiedMovie := VirtualMedia{
+		LibraryID:      "999",
+		MediaType:      "movie",
+		Title:          "Current Year Verified",
+		Year:           nowYear,
+		TMDBID:         "777",
+		IMDbID:         "tt8888005",
+		Overview:       "A current-year movie with verified digital release",
+		VirtualURI:     "virtual://movie/tt8888005",
+		RuntimeMinutes: 115,
+	}
+	resCurrentVerified, err := regWithChecker.UpsertVirtualMedia(ctx, 11, currentYearVerifiedMovie)
+	if err != nil {
+		t.Fatalf("upsert current verified movie failed: %v", err)
+	}
+	var currentVerifiedFileCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1", resCurrentVerified.MediaID).Scan(&currentVerifiedFileCount); err != nil || currentVerifiedFileCount != 1 {
+		t.Fatalf("expected 1 media_file for verified current year movie, got %d, err=%v", currentVerifiedFileCount, err)
+	}
+
+	// 5. Released movie then postponed
+	releasedMovie := VirtualMedia{
+		LibraryID:      "999",
+		MediaType:      "movie",
+		Title:          "Postponed Movie",
+		Year:           nowYear - 1,
+		IMDbID:         "tt8888003",
+		TMDBID:         "8888003",
+		Overview:       "A movie that gets postponed",
+		VirtualURI:     "virtual://movie/tt8888003",
+		RuntimeMinutes: 100,
+	}
+
+	resReleased, err := reg.UpsertVirtualMedia(ctx, 11, releasedMovie)
+	if err != nil {
+		t.Fatalf("upsert released movie failed: %v", err)
+	}
+
+	var releasedFileCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1", resReleased.MediaID).Scan(&releasedFileCount); err != nil || releasedFileCount != 1 {
+		t.Fatalf("expected 1 media_file for released movie, got %d, err=%v", releasedFileCount, err)
+	}
+
+	reg.TMDBDigitalReleases = &fakeDigitalReleaseChecker{err: context.DeadlineExceeded}
+	if _, err := reg.UpsertVirtualMedia(ctx, 11, releasedMovie); err == nil {
+		t.Fatal("lookup outage must defer registration")
+	}
+	var retainedClaims int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM virtual_media_file_source_claims WHERE content_id=$1", resReleased.MediaID).Scan(&retainedClaims); err != nil || retainedClaims != 1 {
+		t.Fatalf("outage removed file claims: count=%d err=%v", retainedClaims, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1", resReleased.MediaID).Scan(&releasedFileCount); err != nil || releasedFileCount != 1 {
+		t.Fatalf("outage removed existing file: count=%d err=%v", releasedFileCount, err)
+	}
+	reg.TMDBDigitalReleases = releasedMovieChecker{}
+
+	// Now update to future year
+	releasedMovie.Year = nowYear + 2
+	resPostponed, err := reg.UpsertVirtualMedia(ctx, 11, releasedMovie)
+	if err != nil {
+		t.Fatalf("upsert postponed movie failed: %v", err)
+	}
+
+	var postponedFileCount, postponedItemCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1", resPostponed.MediaID).Scan(&postponedFileCount); err != nil || postponedFileCount != 0 {
+		t.Fatalf("expected 0 media_files after movie postponement, got %d, err=%v", postponedFileCount, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_items WHERE content_id=$1", resPostponed.MediaID).Scan(&postponedItemCount); err != nil || postponedItemCount != 1 {
+		t.Fatalf("expected metadata preserved after movie postponement, got %d, err=%v", postponedItemCount, err)
+	}
+}
+
+func TestVirtualMovieRegistrationHonorsStoredAliasOverride(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	sfx := uniqueReleaseSuffix(t)
+	tmdbID := "4242" + sfx
+	imdbID := "tt424242" + sfx[:6]
+	reg := newReleasedVirtualMediaRegistrar(pool)
+	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(996,'AliasOverride','movies',true)"); err != nil {
+		t.Fatalf("seed virtual media folder: %v", err)
+	}
+
+	// Register with both IDs so the catalog row carries a known IMDb alias.
+	first := VirtualMedia{
+		LibraryID: "996", MediaType: "movie", Title: "Alias Movie", Year: 2020,
+		TMDBID: tmdbID, IMDbID: imdbID, Source: "provider-a",
+		Variants: []VirtualMediaVariant{
+			{VirtualURI: "virtual://movie/" + tmdbID + "?profile=1080p", Resolution: "1080p"},
+		},
+	}
+	res, err := reg.UpsertVirtualMedia(ctx, 11, first)
+	if err != nil {
+		t.Fatalf("initial upsert failed: %v", err)
+	}
+	var files int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1 AND container='virtual'", res.MediaID).Scan(&files); err != nil || files != 1 {
+		t.Fatalf("expected 1 file after initial upsert, got %d, err=%v", files, err)
+	}
+
+	// Record a future override against the IMDb alias directly.
+	if _, err := pool.Exec(ctx, `INSERT INTO verified_release_override_history
+		(media_type,provider,provider_id,season_number,episode_number,revision,action,release_at,evidence_note,actor_account_id)
+		VALUES('movie','imdb','`+imdbID+`',0,0,1,'set','2099-01-01T00:00:00Z','verified future',1)`); err != nil {
+		t.Fatalf("seed future IMDb override: %v", err)
+	}
+
+	// Retry registration with the TMDB identity only, omitting the known
+	// IMDb alias. The merged identity set must still observe the override
+	// and withdraw the files instead of replaying the pin.
+	retry := VirtualMedia{
+		LibraryID: "996", MediaType: "movie", Title: "Alias Movie", Year: 2020,
+		TMDBID: tmdbID, Source: "provider-a",
+		Variants: []VirtualMediaVariant{
+			{VirtualURI: "virtual://movie/" + tmdbID + "?profile=1080p", Resolution: "1080p"},
+		},
+	}
+	if _, err := reg.UpsertVirtualMedia(ctx, 11, retry); err != nil {
+		t.Fatalf("alias-omitting upsert failed: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1 AND container='virtual'", res.MediaID).Scan(&files); err != nil || files != 0 {
+		t.Fatalf("expected 0 files while the alias override blocks, got %d, err=%v", files, err)
+	}
+	var reason string
+	if err := pool.QueryRow(ctx, `SELECT reason FROM release_metadata_queue WHERE media_type='movie' AND provider='imdb' AND provider_id='`+imdbID+`'`).Scan(&reason); err != nil {
+		t.Fatalf("blocked alias missing from metadata queue: %v", err)
+	}
+	if reason != "no_home_release" {
+		t.Fatalf("queue reason = %q, want no_home_release", reason)
+	}
+}
+
+func TestCollectionEpisodeMaterializationObservesCommittedOverride(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(975,'OverrideEpisodes','series',true);
+		INSERT INTO library_collections(id,library_id,slug,title,collection_type)
+		VALUES('override-episodes',975,'override-episodes','Override Episodes','manual');
+		INSERT INTO library_collection_libraries(collection_id,library_id)
+		VALUES('override-episodes',975)`); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
+	repo := NewItemRepository(pool)
+	tvdbID := "206" + uniqueReleaseSuffix(t)
+	seriesID := "series-tvdb-" + tvdbID
+	baseURI := "virtual://series/tvdb/" + tvdbID
+	episodePath := baseURI + "/1/1"
+	if _, err := repo.MaterializeVirtualPlaybackItemWithVariants(ctx, &models.MediaItem{
+		ContentID: seriesID, Type: "series", Title: "Override Series", SortTitle: "Override Series",
+		TvdbID: tvdbID, Status: "matched",
+	}, []int{975}, []VirtualPlaybackVariant{{VirtualURI: baseURI, OwnerInstallationID: 11}}); err != nil {
+		t.Fatalf("materialize series: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO seasons(content_id,series_id,season_number,title)
+		VALUES('season-tvdb-206-1',$1,1,'Season 1')
+		ON CONFLICT (content_id) DO NOTHING`, seriesID); err != nil {
+		t.Fatalf("seed season: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO episodes(content_id,series_id,season_id,season_number,episode_number,title,air_date)
+		VALUES('episode-tvdb-206-1-1',$1,'season-tvdb-206-1',1,1,'Blocked',CURRENT_DATE)
+		ON CONFLICT (content_id) DO UPDATE SET air_date=EXCLUDED.air_date`, seriesID); err != nil {
+		t.Fatalf("seed episode: %v", err)
+	}
+	// A future verified override committed before materialization must win
+	// over the aired date: no playable file may be created.
+	if _, err := pool.Exec(ctx, `INSERT INTO verified_release_override_history
+		(media_type,provider,provider_id,season_number,episode_number,revision,action,release_at,evidence_note,actor_account_id)
+		VALUES('episode','tvdb','`+tvdbID+`',1,1,1,'set','2099-01-01T00:00:00Z','verified future',1)`); err != nil {
+		t.Fatalf("seed future episode override: %v", err)
+	}
+	if err := repo.MaterializeVirtualPlaybackEpisodes(ctx, seriesID); err != nil {
+		t.Fatalf("materialize blocked episode: %v", err)
+	}
+	var files int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path='`+episodePath+`'`, seriesID).Scan(&files); err != nil || files != 0 {
+		t.Fatalf("blocked episode materialized %d files, err=%v", files, err)
+	}
+}
+
+func TestVirtualEpisodeRegistrationDefersToFutureOverrideOverLocalFiles(t *testing.T) {
+	tvdbID := "207" + uniqueReleaseSuffix(t)
+	seriesID := "series-tvdb-" + tvdbID
+	episodePath := "virtual://series/tvdb/" + tvdbID + "/1/1"
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(974,'OverridePrecedence','series',true);
+		INSERT INTO media_items(content_id,type,title,tvdb_id,status)
+		VALUES('`+seriesID+`','series','Precedence Series','`+tvdbID+`','matched');
+		INSERT INTO seasons(content_id,series_id,season_number,title,metadata_source)
+		VALUES('local-season-207-1','`+seriesID+`',1,'Season 1','local');
+		INSERT INTO episodes(content_id,series_id,season_id,season_number,episode_number,title,metadata_source)
+		VALUES('local-episode-207-1-1','`+seriesID+`','local-season-207-1',1,1,'Local Ep','local');
+		INSERT INTO media_files(content_id,episode_id,media_folder_id,file_path,file_size,container)
+		VALUES('`+seriesID+`','local-episode-207-1-1',974,'/media/prec-s01e01.mkv',1024,'mkv');
+		INSERT INTO verified_release_override_history
+		(media_type,provider,provider_id,season_number,episode_number,revision,action,release_at,evidence_note,actor_account_id)
+		VALUES('episode','tvdb','`+tvdbID+`',1,1,1,'set','2099-01-01T00:00:00Z','verified future',1)`); err != nil {
+		t.Fatalf("seed local series with future override: %v", err)
+	}
+	_, err := newReleasedVirtualMediaRegistrar(pool).UpsertVirtualMedia(ctx, 11, VirtualMedia{
+		LibraryID: "974", MediaType: "series", Title: "Precedence Series", TVDBID: tvdbID,
+		Source: "provider-a", Episodes: []VirtualEpisode{{
+			SeasonNumber: 1, EpisodeNumber: 1, Title: "Ep 1",
+			AirDate:    time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+			VirtualURI: episodePath,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("registration with blocking override failed: %v", err)
+	}
+	var virtualFiles, physicalFiles int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER(WHERE file_path='`+episodePath+`'),
+		       count(*) FILTER(WHERE file_path='/media/prec-s01e01.mkv')
+		FROM media_files WHERE content_id='`+seriesID+`'`).Scan(&virtualFiles, &physicalFiles); err != nil {
+		t.Fatal(err)
+	}
+	if virtualFiles != 0 {
+		t.Fatal("future override must block new virtual files even for locally proven episodes")
+	}
+	if physicalFiles != 1 {
+		t.Fatal("blocking an override must never remove the existing physical file")
+	}
+}
+
+func TestVirtualMovieRegistrationUsesStoredPastOverrideWithoutProvider(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	sfx := uniqueReleaseSuffix(t)
+	tmdbID := "4243" + sfx
+	imdbID := "tt424243" + sfx[:6]
+	movieID := "movie-tmdb-" + tmdbID
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(973,'PastAliasPermit','movies',true);
+		INSERT INTO media_items(content_id,type,title,tmdb_id,imdb_id,status)
+		VALUES('`+movieID+`','movie','Past Alias','`+tmdbID+`','`+imdbID+`','matched');
+		INSERT INTO verified_release_override_history
+		(media_type,provider,provider_id,season_number,episode_number,revision,action,release_at,evidence_note,actor_account_id)
+		VALUES('movie','imdb','`+imdbID+`',0,0,1,'set','2020-01-01T00:00:00Z','verified past',1)`); err != nil {
+		t.Fatalf("seed stored alias with past override: %v", err)
+	}
+	reg := newReleasedVirtualMediaRegistrar(pool)
+	reg.TMDBDigitalReleases = &fakeDigitalReleaseChecker{err: errors.New("tmdb down")}
+	// TMDB-only registration omits the known IMDb alias while the provider
+	// is unreachable. The stored past override must permit regardless.
+	res, err := reg.UpsertVirtualMedia(ctx, 11, VirtualMedia{
+		LibraryID: "973", MediaType: "movie", Title: "Past Alias", Year: 2020,
+		TMDBID: tmdbID, Source: "provider-a",
+		Variants: []VirtualMediaVariant{
+			{VirtualURI: "virtual://movie/" + tmdbID + "?profile=1080p", Resolution: "1080p"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("stored past override must permit without provider evidence: %v", err)
+	}
+	var files int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM media_files WHERE content_id=$1 AND container='virtual'", res.MediaID).Scan(&files); err != nil || files != 1 {
+		t.Fatalf("expected 1 file via stored past override, got %d, err=%v", files, err)
+	}
+}
+
+func TestCollectionEpisodeMaterializationIgnoresConcurrentlyAddedEpisodes(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(971,'Newcomer','series',true);
+		INSERT INTO library_collections(id,library_id,slug,title,collection_type)
+		VALUES('newcomer',971,'newcomer','Newcomer','manual');
+		INSERT INTO library_collection_libraries(collection_id,library_id)
+		VALUES('newcomer',971)`); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
+	repo := NewItemRepository(pool)
+	tvdbID := "208" + uniqueReleaseSuffix(t)
+	seriesID := "series-tvdb-" + tvdbID
+	baseURI := "virtual://series/tvdb/" + tvdbID
+	if _, err := repo.MaterializeVirtualPlaybackItemWithVariants(ctx, &models.MediaItem{
+		ContentID: seriesID, Type: "series", Title: "Newcomer", SortTitle: "Newcomer",
+		TvdbID: tvdbID, Status: "matched",
+	}, []int{971}, []VirtualPlaybackVariant{{VirtualURI: baseURI, OwnerInstallationID: 11}}); err != nil {
+		t.Fatalf("materialize series: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO seasons(content_id,series_id,season_number,title)
+		VALUES('season-tvdb-208-1',$1,1,'Season 1')
+		ON CONFLICT (content_id) DO NOTHING`, seriesID); err != nil {
+		t.Fatalf("seed newcomer season: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO virtual_media_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata)
+		VALUES(11,'collection',$1,971,false)`, seriesID); err != nil {
+		t.Fatalf("seed newcomer source claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO virtual_media_file_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,file_path)
+		VALUES(11,'collection',$1,971,'`+baseURI+`')`, seriesID); err != nil {
+		t.Fatalf("seed newcomer file claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO episodes(content_id,series_id,season_id,season_number,episode_number,title,air_date)
+		VALUES('episode-tvdb-208-1-1',$1,'season-tvdb-208-1',1,1,'First',CURRENT_DATE)
+		ON CONFLICT (content_id) DO NOTHING`, seriesID); err != nil {
+		t.Fatalf("seed first episode: %v", err)
+	}
+	// After locks are held, a second episode becomes eligible on a separate
+	// connection. It must wait for its own run, not join this one unlocked.
+	inserted := false
+	materializeVirtualEpisodesEvalHook = func() {
+		if inserted {
+			return
+		}
+		inserted = true
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO episodes(content_id,series_id,season_id,season_number,episode_number,title,air_date)
+			VALUES('episode-tvdb-208-1-2',$1,'season-tvdb-208-1',1,2,'Second',CURRENT_DATE)`, seriesID); err != nil {
+			t.Errorf("insert concurrent episode: %v", err)
+		}
+	}
+	defer func() { materializeVirtualEpisodesEvalHook = nil }()
+	if err := repo.MaterializeVirtualPlaybackEpisodes(ctx, seriesID); err != nil {
+		t.Fatalf("materialize with concurrent episode: %v", err)
+	}
+	var first, second int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER(WHERE file_path='`+baseURI+`/1/1'),
+		       count(*) FILTER(WHERE file_path='`+baseURI+`/1/2')
+		FROM media_files WHERE content_id=$1`, seriesID).Scan(&first, &second); err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 || second != 0 {
+		t.Fatalf("locked run created first=%d second=%d, want 1/0", first, second)
+	}
+	if err := repo.MaterializeVirtualPlaybackEpisodes(ctx, seriesID); err != nil {
+		t.Fatalf("follow-up materialization failed: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path='`+baseURI+`/1/2'`, seriesID).Scan(&second); err != nil || second != 1 {
+		t.Fatalf("follow-up run created second=%d, err=%v", second, err)
+	}
+}
+
+func TestEpisodeMaterializationSerializesWithConcurrentOverrideWrite(t *testing.T) {
+	runTag := uniqueReleaseSuffix(t)
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(970,'Serialize','series',true);
+		INSERT INTO library_collections(id,library_id,slug,title,collection_type)
+		VALUES('serialize',970,'serialize','Serialize','manual');
+		INSERT INTO library_collection_libraries(collection_id,library_id)
+		VALUES('serialize',970);
+		INSERT INTO users(username,role,enabled) VALUES('override-serialize-`+runTag+`','admin',true)`); err != nil {
+		t.Fatalf("seed collection and admin: %v", err)
+	}
+	var actor int
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE username='override-serialize-' || $1`, runTag).Scan(&actor); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, actor) })
+	repo := NewItemRepository(pool)
+	tvdbID := "209" + runTag
+	seriesID := "series-tvdb-" + tvdbID
+	baseURI := "virtual://series/tvdb/" + tvdbID
+	episodePath := baseURI + "/1/1"
+	if _, err := repo.MaterializeVirtualPlaybackItemWithVariants(ctx, &models.MediaItem{
+		ContentID: seriesID, Type: "series", Title: "Serialize", SortTitle: "Serialize",
+		TvdbID: tvdbID, Status: "matched",
+	}, []int{970}, []VirtualPlaybackVariant{{VirtualURI: baseURI, OwnerInstallationID: 11}}); err != nil {
+		t.Fatalf("materialize series: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO seasons(content_id,series_id,season_number,title)
+		VALUES('season-tvdb-209-1',$1,1,'Season 1')
+		ON CONFLICT (content_id) DO NOTHING`, seriesID); err != nil {
+		t.Fatalf("seed serialize season: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO episodes(content_id,series_id,season_id,season_number,episode_number,title,air_date)
+		VALUES('episode-tvdb-209-1-1',$1,'season-tvdb-209-1',1,1,'First',CURRENT_DATE)
+		ON CONFLICT (content_id) DO NOTHING`, seriesID); err != nil {
+		t.Fatalf("seed serialize episode: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO virtual_media_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata)
+		VALUES(11,'collection',$1,970,false)`, seriesID); err != nil {
+		t.Fatalf("seed serialize source claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO virtual_media_file_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,file_path)
+		VALUES(11,'collection',$1,970,'`+baseURI+`')`, seriesID); err != nil {
+		t.Fatalf("seed serialize file claim: %v", err)
+	}
+	// Hold materialization inside its release locks while an administrator
+	// commits a future override for the same episode. Exactly one order
+	// wins; neither side may deadlock and the loser must observe the winner.
+	reached := make(chan struct{})
+	releaseHook := make(chan struct{})
+	hooked := false
+	materializeVirtualEpisodesEvalHook = func() {
+		if hooked {
+			return
+		}
+		hooked = true
+		close(reached)
+		<-releaseHook
+	}
+	defer func() { materializeVirtualEpisodesEvalHook = nil }()
+	matErr := make(chan error, 1)
+	go func() { matErr <- repo.MaterializeVirtualPlaybackEpisodes(context.Background(), seriesID) }()
+	select {
+	case <-reached:
+	case <-time.After(60 * time.Second):
+		t.Fatal("materialization never reached its release locks")
+	}
+	mutErr := make(chan error, 1)
+	go func() {
+		_, err := NewReleaseOverrideRepository(pool).Mutate(context.Background(), actor, ReleaseOverrideMutation{
+			ReleaseIdentity: ReleaseIdentity{MediaType: "episode", Provider: "tvdb", ProviderID: tvdbID, SeasonNumber: 1, EpisodeNumber: 1},
+			ReleaseAt:       "2099-01-01",
+			EvidenceNote:    "verified future",
+		}, false)
+		mutErr <- err
+	}()
+	// Prove the writer actually queued behind the held release locks
+	// before releasing materialization: otherwise the test could pass
+	// with effectively sequential execution.
+	overrideLockKey := ReleaseIdentity{MediaType: "episode", Provider: "tvdb", ProviderID: tvdbID, SeasonNumber: 1, EpisodeNumber: 1}.lockKey()
+	waitForBlockedAdvisoryLock(t, pool, overrideLockKey, 30*time.Second)
+	// Let materialization commit first: its decision predates the override.
+	close(releaseHook)
+	select {
+	case err := <-matErr:
+		if err != nil {
+			t.Fatalf("materialization failed during concurrent override: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("materialization deadlocked with the override write")
+	}
+	select {
+	case err := <-mutErr:
+		if err != nil {
+			t.Fatalf("override write failed after materialization: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("override write deadlocked with materialization")
+	}
+	var files int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path=$2`, seriesID, episodePath).Scan(&files); err != nil || files != 1 {
+		t.Fatalf("pre-override decision must stand: files=%d err=%v", files, err)
+	}
+	// A follow-up run observes the committed override and withdraws the file.
+	if err := repo.MaterializeVirtualPlaybackEpisodes(ctx, seriesID); err != nil {
+		t.Fatalf("follow-up materialization failed: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path=$2`, seriesID, episodePath).Scan(&files); err != nil || files != 0 {
+		t.Fatalf("committed future override must withdraw the file: files=%d err=%v", files, err)
+	}
+}
+
+func TestReconciliationDiscoversUndatedLocalEpisode(t *testing.T) {
+	tvdbID := "210" + uniqueReleaseSuffix(t)
+	seriesID := "series-tvdb-" + tvdbID
+	baseURI := "virtual://series/tvdb/" + tvdbID
+	episodePath := baseURI + "/1/1"
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(969,'LocalUndated','series',true);
+		INSERT INTO library_collections(id,library_id,slug,title,collection_type)
+		VALUES('local-undated',969,'local-undated','Local Undated','manual');
+		INSERT INTO library_collection_libraries(collection_id,library_id)
+		VALUES('local-undated',969)`); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
+	repo := NewItemRepository(pool)
+	if _, err := repo.MaterializeVirtualPlaybackItemWithVariants(ctx, &models.MediaItem{
+		ContentID: seriesID, Type: "series", Title: "Local Undated", SortTitle: "Local Undated",
+		TvdbID: tvdbID, Status: "matched",
+	}, []int{969}, []VirtualPlaybackVariant{{VirtualURI: baseURI, OwnerInstallationID: 11}}); err != nil {
+		t.Fatalf("materialize series: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO library_collection_items(collection_id,media_item_id,position)
+		VALUES('local-undated',$1,0)`, seriesID); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO seasons(content_id,series_id,season_number,title)
+		VALUES('season-tvdb-210-1',$1,1,'Season 1')
+		ON CONFLICT (content_id) DO NOTHING`, seriesID); err != nil {
+		t.Fatalf("seed undated season: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO episodes(content_id,series_id,season_id,season_number,episode_number,title,metadata_source)
+		VALUES('episode-tvdb-210-1-1',$1,'season-tvdb-210-1',1,1,'Undated Local','local')`, seriesID); err != nil {
+		t.Fatalf("seed undated local episode: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO virtual_media_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata)
+		VALUES(11,'collection',$1,969,false)`, seriesID); err != nil {
+		t.Fatalf("seed undated source claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO virtual_media_file_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,file_path)
+		VALUES(11,'collection',$1,969,'`+baseURI+`')`, seriesID); err != nil {
+		t.Fatalf("seed undated file claim: %v", err)
+	}
+	// Discovery, materialization, and cleanup must agree: the undated local
+	// episode is found, materialized once, and never treated as stale.
+	if n, err := repo.ReconcileReleasedCollectionVirtualEpisodes(ctx, 10); err != nil || n < 1 {
+		t.Fatalf("reconciliation found n=%d err=%v", n, err)
+	}
+	var files int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path=$2`, seriesID, episodePath).Scan(&files); err != nil || files != 1 {
+		t.Fatalf("undated local episode files=%d err=%v", files, err)
+	}
+	if _, err := repo.ReconcileReleasedCollectionVirtualEpisodes(ctx, 10); err != nil {
+		t.Fatalf("second reconciliation failed: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path=$2`, seriesID, episodePath).Scan(&files); err != nil || files != 1 {
+		t.Fatalf("second run left files=%d err=%v", files, err)
+	}
+}
+
+func TestVirtualMovieRegistrationPermitsPossessedMovieWithoutProvider(t *testing.T) {
+	sfx := uniqueReleaseSuffix(t)
+	tmdbID := "4250" + sfx
+	movieID := "movie-tmdb-" + tmdbID
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled) VALUES(968,'PossessedMovie','movies',true);
+		INSERT INTO media_items(content_id,type,title,tmdb_id,status)
+		VALUES('`+movieID+`','movie','Possessed','`+tmdbID+`','matched');
+		INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container)
+		VALUES('`+movieID+`',968,'/local/possessed.mkv',1024,'mkv')`); err != nil {
+		t.Fatalf("seed possessed movie: %v", err)
+	}
+	reg := newReleasedVirtualMediaRegistrar(pool)
+	reg.TMDBDigitalReleases = &fakeDigitalReleaseChecker{err: errors.New("tmdb down")}
+	res, err := reg.UpsertVirtualMedia(ctx, 11, VirtualMedia{
+		LibraryID: "968", MediaType: "movie", Title: "Possessed", Year: 2020,
+		TMDBID: tmdbID, Source: "provider-a",
+		Variants: []VirtualMediaVariant{
+			{VirtualURI: "virtual://movie/" + tmdbID + "?profile=1080p", Resolution: "1080p"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("possession must permit without provider evidence: %v", err)
+	}
+	var virtualFiles, physicalFiles int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER(WHERE container='virtual'),
+		       count(*) FILTER(WHERE file_path='/local/possessed.mkv')
+		FROM media_files WHERE content_id=$1`, res.MediaID).Scan(&virtualFiles, &physicalFiles); err != nil {
+		t.Fatal(err)
+	}
+	if virtualFiles != 1 || physicalFiles != 1 {
+		t.Fatalf("virtual=%d physical=%d, want coexistence 1/1", virtualFiles, physicalFiles)
 	}
 }

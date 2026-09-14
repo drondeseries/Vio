@@ -2115,7 +2115,7 @@ func (s *Service) retireStalledTargets(ctx context.Context, req Request, live []
 	var updated *Request
 	retired := false
 	for _, t := range live {
-		if t.Status != StatusQueued || t.UpdatedAt.After(cutoff) {
+		if t.Status != StatusQueued || t.UpdatedAt.After(cutoff) || strings.EqualFold(strings.TrimSpace(t.ExternalStatus), "monitored") {
 			continue
 		}
 		next, err := s.store.UpdateTargetStatus(ctx, t.ID, StatusCompleted, "", ExternalStatusPresenceConfirmed, "", Viewer{})

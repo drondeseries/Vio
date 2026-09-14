@@ -257,6 +257,9 @@ func TestItemRepo_GetByExternalIDs_NilSliceStillBindsArg(t *testing.T) {
 
 func TestLookupExternalIDsSQLChecksProviderTableAndDirectColumns(t *testing.T) {
 	sql := lookupExternalIDsSQL()
+	if strings.Count(sql, "mf_playable.media_folder_id = mil.media_folder_id") != 2 {
+		t.Fatal("both direct and provider matches must require a playable file in the matched enabled library")
+	}
 
 	for _, want := range []string{
 		"FROM requested r",
@@ -270,6 +273,8 @@ func TestLookupExternalIDsSQLChecksProviderTableAndDirectColumns(t *testing.T) {
 		"mi.imdb_id <> '' AND mi.imdb_id = r.provider_id",
 		"JOIN media_folders mf ON mf.id = mil.media_folder_id",
 		"mf.enabled = true",
+		"FROM media_files mf_playable",
+		"mf_playable.missing_since IS NULL",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("lookupExternalIDsSQL missing %q:\n%s", want, sql)

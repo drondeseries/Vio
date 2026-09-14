@@ -35,6 +35,110 @@ operation:
 - Capability documents carry the common `state`, `allowed`, and `revision` members
   and support `If-None-Match`.
 
+## Verified release dates and release metadata
+
+`GET /api/v1/requests/status` advertises `release_date_overrides` and
+`needs_release_metadata` when host storage is wired. These capabilities do not
+grant access: the following routes require a server administrator account.
+
+| Route | Result |
+|---|---|
+| `GET /api/v1/admin/release-overrides` | `200 {"entries": [...]}`; latest revision by default, or descending audit history. |
+| `PUT /api/v1/admin/release-overrides` | Set or change a verified release instant; `200` with the recorded entry. |
+| `DELETE /api/v1/admin/release-overrides` | Append a clear revision; `200` with the recorded entry. |
+| `GET /api/v1/admin/needs-release-metadata` | `200 {"entries": [...]}`; observed blocked identities. |
+| `POST /api/v1/admin/needs-release-metadata/retry` | `202 {"catalog_items_queued": N}`. |
+
+An identity consists of `media_type` (`movie` or `episode`), `provider`,
+`provider_id`, `season_number`, and `episode_number`. Movies support `tmdb` and
+`imdb`, with both ordinals zero. Episodes additionally support `tvdb`; their
+provider ID identifies the **series**, and both ordinals must be 1–100000.
+Specials are not supported by these virtual release gates. Numeric provider IDs
+are canonical positive decimal strings of at most 20 digits; IMDb IDs are `tt`
+followed by 1–16 digits. Overrides are global, not library- or profile-scoped,
+and need no existing catalog item.
+
+GET takes identity fields as query parameters, optional `before_revision`
+(exclusive, zero means latest), and `limit` (1–100, default 1). No history returns
+an empty array and means revision zero. Each entry contains the identity plus
+`revision` (integer), `action` (`set`, `change`, or `clear`), `release_at`
+(UTC RFC3339 or null), `evidence_note`, `actor_account_id`, and `recorded_at`.
+History is append-only and survives account deletion.
+
+PUT and DELETE take a JSON body with the identity, `expected_revision`, and a
+nonblank `evidence_note` of at most 4096 UTF-8 bytes. PUT also requires
+`release_at`, either `YYYY-MM-DD` (midnight UTC) or RFC3339 with an offset.
+Instants are normalized to UTC microseconds. DELETE must omit `release_at` or
+send an empty string. The actor comes from authentication, never the body.
+Unknown fields and extra JSON values are rejected; bodies are capped at 16 KiB.
+
+Use revision zero for the first write. A stale revision, or clearing an identity
+without an active override, returns `409 revision_conflict`; reload before
+retrying. Invalid input returns `400 bad_request`, non-admin access returns
+`403 forbidden`, and unavailable storage returns `503 unavailable`. The
+repository rechecks that the actor is an enabled administrator during reads and
+writes, including after a role change.
+
+A verified future instant blocks virtual materialization even when provider
+metadata says released. A past instant permits it. Clear restores provider
+policy without replacing provider dates. If known aliases have conflicting
+active overrides, the latest release instant wins. With no active override,
+local possession (local metadata or physical files) also permits, since
+legacy rows often lack provider dates. Movie preparation captures
+revisions and checks them again under database locks before accepting virtual
+files; concurrent edits require preparation to retry. Network provider lookups
+run before write transactions. Physical files are not removed by release gates.
+This is a materialization policy, not immediate revocation of existing playback.
+See `docs/architecture/release-gating.md` for the full eligibility and lock protocol.
+
+The metadata queue lists identity fields plus `reason`, `observed_at`, and
+nullable `retry_requested_at`, ordered by observation time then identity. GET
+accepts `limit` (1–100, default 50) and nonnegative `offset`. Reasons are
+`missing_date`, `future_date`, `provider_unavailable`, and `no_home_release`;
+not every producer currently emits every reason. Retry accepts only an identity
+in a JSON body (maximum 4096 bytes), marks its retry request, and schedules
+metadata refresh debt for matching catalog items. A missing queue entry returns
+`400 bad_request`. Zero queued items is valid before catalog creation; this
+endpoint does not yet dispatch plugin-owned retries. Override writes also
+schedule matching catalog metadata refresh debt. Successful registrar release
+checks remove queue entries; retries do not imply release approval.
+
+### Read-only plugin contract
+
+The host registers `/silo.plugin.v1.ReleaseOverrides/Lookup` on the installation's
+runtime broker, not the public HTTP API. The process connection uses automatic
+mutual TLS. The installation identity is host-bound; requests cannot select an
+actor or installation. No write RPC exists, and audit notes/account IDs are not
+returned.
+
+Both RPC messages use `google.protobuf.Struct`. Request:
+
+```json
+{"identities":[{"media_type":"episode","provider":"tmdb","provider_id":"42","season_number":1,"episode_number":2}]}
+```
+
+Response entries correspond to request order, including duplicates and misses:
+
+```json
+{"entries":[{"release_at":null,"revision":"0"}]}
+```
+
+`revision` is a decimal string to preserve int64 precision. A null date with
+revision zero means no history; a null date with a positive revision means
+cleared. Active dates are UTC RFC3339 strings. Lookup accepts 1–100 identities
+and at most 64 KiB of serialized JSON. Errors are `InvalidArgument` for invalid
+input, `PermissionDenied` for an unbound installation, and `Unavailable` for
+missing storage or lookup failure. Older hosts return `Unimplemented`.
+The SDK exposes `runtimehost.Client.LookupReleaseOverrides(ctx, ids)` with typed
+identities and results. Plugins must distinguish lookup failure from absence,
+and must not use a failed lookup to bypass host release policy.
+
+The additive broker RPC avoids requiring regenerated protobuf symbols in the
+host's currently pinned SDK. The SDK helper still needs a published release
+before downstream plugins can pin it. Plugin adoption and queue retry dispatch,
+web UI, Apple and Android client controls remain follow-up work. Jellyfin has no
+admin override endpoint; it sees the shared catalog materialization results.
+
 ## Branding assets
 
 Uploadable images white-label the server: the sidebar wordmark, the square

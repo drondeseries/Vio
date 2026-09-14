@@ -828,6 +828,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			requestSvc.SetLifecycleNotifier(lifecycle)
 		}
 		requestHandler = handlers.NewRequestsHandler(requestSvc)
+		requestHandler.ReleaseOverrides = catalog.NewReleaseOverrideRepository(deps.DB)
 
 		// Onboarding tour manifest: gates consult live state at request time
 		// so admin toggles apply without a restart. The watch-together gate
@@ -4404,6 +4405,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 							}
 
 							if requestHandler != nil {
+								r.Get("/needs-release-metadata", requestHandler.HandleNeedsReleaseMetadata)
+								r.Post("/needs-release-metadata/retry", requestHandler.HandleNeedsReleaseMetadata)
+								r.Get("/release-overrides", requestHandler.HandleReleaseOverrides)
+								r.Put("/release-overrides", requestHandler.HandleReleaseOverrides)
+								r.Delete("/release-overrides", requestHandler.HandleReleaseOverrides)
 								r.Get("/requests", requestHandler.HandleAdminList)
 								r.Post("/requests/{id}/approve", requestHandler.HandleApprove)
 								r.Post("/requests/{id}/decline", requestHandler.HandleDecline)
@@ -4784,6 +4790,10 @@ func NewTMDBDiscoverAdapter(apiKey string) *TMDBDiscoverAdapter {
 // HasDigitalRelease implements catalog.TMDBDigitalReleaseChecker: a movie is
 // digitally released once TMDB records any Digital, Physical, or TV release
 // date in the past. Titles with no release-date data fail open (released).
+func (a *TMDBDiscoverAdapter) EpisodeReleaseDates(ctx context.Context, seriesID, season int) (map[int]time.Time, error) {
+	return a.client.EpisodeReleaseDates(ctx, seriesID, season)
+}
+
 func (a *TMDBDiscoverAdapter) HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error) {
 	return a.client.HasDigitalRelease(ctx, tmdbID)
 }

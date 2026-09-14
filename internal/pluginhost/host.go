@@ -130,6 +130,7 @@ func (h *Host) Start(ctx context.Context, req StartRequest) (*Client, error) {
 	process := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig: HandshakeConfig(),
 		GRPCDialOptions: []grpc.DialOption{grpc.WithChainUnaryInterceptor(observePluginRPC)},
+		AutoMTLS:        true,
 		AllowedProtocols: []plugin.Protocol{
 			plugin.ProtocolGRPC,
 		},
@@ -371,6 +372,8 @@ func (h *Host) bindRuntimeHost(ctx context.Context, sdkClient *sdkruntime.Client
 			installationID,
 		)
 		pluginv1.RegisterRuntimeHostServer(s, srv)
+		reader, _ := h.virtualCatalog.(releaseOverrideReader)
+		registerReleaseOverrideRPC(s, reader, installationID)
 		return s
 	})
 

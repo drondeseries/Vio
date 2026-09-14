@@ -5,7 +5,39 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func TestVirtualMovieReleaseFailurePrecedesDatabaseAccess(t *testing.T) {
+	for _, year := range []int{0, 2000, time.Now().UTC().Year()} {
+		for _, tc := range []struct {
+			name    string
+			id      string
+			checker TMDBDigitalReleaseChecker
+		}{
+			{"missing checker", "1", nil},
+			{"bad identity", "invalid", &fakeDigitalReleaseChecker{}},
+			{"outage", "1", &fakeDigitalReleaseChecker{err: errors.New("offline")}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				reg := NewVirtualMediaRegistrar(&pgxpool.Pool{})
+				reg.TMDBDigitalReleases = tc.checker
+				reg.ReleaseOverrides = nil
+				in := validVirtualMovie()
+				in.Year, in.TMDBID = year, tc.id
+				want := ErrProviderUnavailable
+				if tc.id == "invalid" {
+					want = ErrInvalidVirtualMedia
+				}
+				if _, err := reg.UpsertVirtualMedia(context.Background(), 11, in); !errors.Is(err, want) {
+					t.Fatalf("year %d: expected failure before transaction or locks, got %v", year, err)
+				}
+			})
+		}
+	}
+}
 
 func validVirtualMovie() VirtualMedia {
 	return VirtualMedia{

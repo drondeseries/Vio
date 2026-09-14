@@ -178,6 +178,14 @@ func TestHandleMaterializeAdminCollectionItem_ValidationAndErrors(t *testing.T) 
 	}
 }
 
+// releasedDigitalReleaseChecker reports every movie as home-released so
+// handler tests exercise routing and storage behavior past release gating.
+type releasedDigitalReleaseChecker struct{}
+
+func (releasedDigitalReleaseChecker) HasDigitalRelease(context.Context, int) (bool, error) {
+	return true, nil
+}
+
 func TestHandleMaterializeAdminCollectionItem_SuccessAndIdempotency(t *testing.T) {
 	pool := materializeTestPool(t)
 	ctx := context.Background()
@@ -185,6 +193,7 @@ func TestHandleMaterializeAdminCollectionItem_SuccessAndIdempotency(t *testing.T
 	itemRepo := catalog.NewItemRepository(pool)
 	collRepo := catalog.NewLibraryCollectionRepository(pool)
 	service := catalog.NewLibraryCollectionService(collRepo, itemRepo, nil, nil)
+	service.TMDBDigitalReleases = releasedDigitalReleaseChecker{}
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]catalog.VirtualPlaybackVariant, error) {
 		return []catalog.VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
@@ -273,6 +282,7 @@ func TestHandleMaterializeAdminCollectionItem_ProviderFailureAndIncompatibleLibr
 	itemRepo := catalog.NewItemRepository(pool)
 	collRepo := catalog.NewLibraryCollectionRepository(pool)
 	service := catalog.NewLibraryCollectionService(collRepo, itemRepo, nil, nil)
+	service.TMDBDigitalReleases = releasedDigitalReleaseChecker{}
 	// Provider outage returns error
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]catalog.VirtualPlaybackVariant, error) {
 		return nil, errors.New("upstream provider connection timed out")
@@ -443,6 +453,7 @@ func TestHandleMaterializeAdminCollectionItem_RoutedAuthorization(t *testing.T) 
 	itemRepo := catalog.NewItemRepository(pool)
 	collRepo := catalog.NewLibraryCollectionRepository(pool)
 	service := catalog.NewLibraryCollectionService(collRepo, itemRepo, nil, nil)
+	service.TMDBDigitalReleases = releasedDigitalReleaseChecker{}
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]catalog.VirtualPlaybackVariant, error) {
 		return []catalog.VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
@@ -577,6 +588,7 @@ func TestHandleRemoveAdminCollectionItem_Routed(t *testing.T) {
 	itemRepo := catalog.NewItemRepository(pool)
 	collRepo := catalog.NewLibraryCollectionRepository(pool)
 	service := catalog.NewLibraryCollectionService(collRepo, itemRepo, nil, nil)
+	service.TMDBDigitalReleases = releasedDigitalReleaseChecker{}
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]catalog.VirtualPlaybackVariant, error) {
 		return []catalog.VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
