@@ -135,6 +135,12 @@ func (s *SQLiteUserStore) ListNextUpStatePage(ctx context.Context, profileID str
 	return ListNextUpStatePage(ctx, s.db, profileID, cursor, limit)
 }
 
+// ListNextUpStateForItems exposes exact item-scoped Next Up state through the
+// optional userstore.NextUpStateStore capability.
+func (s *SQLiteUserStore) ListNextUpStateForItems(ctx context.Context, profileID string, mediaItemIDs []string) ([]userstore.NextUpStateEntry, error) {
+	return ListNextUpStateForItems(ctx, s.db, profileID, mediaItemIDs)
+}
+
 func (s *SQLiteUserStore) AddHistory(_ context.Context, entry userstore.WatchHistoryEntry) error {
 	return AddHistory(s.db, entry)
 }

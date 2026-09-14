@@ -112,7 +112,10 @@ func (a nextUpAnchor) newerThan(b nextUpAnchor) bool {
 // capability and resolves the returned media item ids against Postgres catalog
 // metadata. Anchors and the per-series successor are decided in Go after
 // paging; the store's pages are keyset-bounded and the walk stops as soon as it
-// has enough correctly ordered results or the state is exhausted.
+// has enough correctly ordered results or the state is exhausted. Before
+// returning, the resolver reads exact item-scoped state for the candidate
+// series (ListNextUpStateForItems) so the result does not depend on how far the
+// walk happened to get; see nextUpResolver.
 //
 // A store that does not implement userstore.NextUpStateStore is a hard error:
 // there is no fallback that joins catalog SQL against user-state tables.
@@ -147,7 +150,7 @@ func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]Nex
 	}
 
 	if q.EnableResumable {
-		resumable, rErr := r.listResumableEpisodes(ctx, q, store, anchors)
+		resumable, rErr := r.listResumableEpisodes(ctx, q, store, stateStore, anchors)
 		if rErr != nil {
 			return nil, rErr
 		}
@@ -184,6 +187,13 @@ func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]Nex
 //     anchor. This replaces the old fixed 960-series ceiling: ineligible series
 //     (no successor, suppressed by newer in-progress, hidden, or outside the
 //     cutoff) never consume the budget, so an older eligible series is reached.
+//
+// The prefix of state the walk accumulates is not enough to decide a returned
+// series' successor: an out-of-order watch can leave a post-anchor episode's
+// state row below the stop threshold, so the walk never sees it. Once the walk
+// could stop (or is exhausted) the resolver fetches exact item-scoped state for
+// the candidate series, keeping the returned rows exact while the walk stays
+// bounded. See nextUpResolver.
 func (r *NextUpRepository) listNextUpGlobal(
 	ctx context.Context,
 	q NextUpQuery,
@@ -191,8 +201,12 @@ func (r *NextUpRepository) listNextUpGlobal(
 	limit int,
 ) ([]NextUpResult, map[string]nextUpAnchor, error) {
 	anchors := make(map[string]nextUpAnchor)
-	inProgressMax := make(map[string]time.Time)
-	stateIDs := make(map[string]struct{})
+	resolver := &nextUpResolver{
+		repo:       r,
+		q:          q,
+		stateStore: stateStore,
+		cache:      make(map[string]nextUpCandidateResolution),
+	}
 
 	var cursor *userstore.NextUpStateCursor
 	for {
@@ -205,20 +219,25 @@ func (r *NextUpRepository) listNextUpGlobal(
 			return nil, nil, err
 		}
 
-		if err := r.accumulateNextUpState(ctx, q, page, anchors, inProgressMax, stateIDs); err != nil {
+		if err := r.accumulateNextUpAnchors(ctx, q, page, anchors); err != nil {
 			return nil, nil, err
 		}
 
-		results, err := r.resolveNextUpResults(ctx, q, anchors, inProgressMax, stateIDs, limit)
-		if err != nil {
-			return nil, nil, err
-		}
-
+		exhausted := page.Exhausted || page.Next == nil || len(page.Entries) == 0
 		cutoffReached := nextUpPageReachedCutoff(q, page)
-		if page.Exhausted || cutoffReached {
-			return results, anchors, nil
+
+		// Exact resolution is the expensive part and only matters once the walk
+		// could stop: with fewer anchors than the limit it cannot fill a page,
+		// so hold off unless the walk is done.
+		var results []NextUpResult
+		if exhausted || cutoffReached || len(anchors) >= limit {
+			results, err = resolver.resolve(ctx, anchors, limit)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
-		if len(page.Entries) == 0 || page.Next == nil {
+
+		if exhausted || cutoffReached {
 			return results, anchors, nil
 		}
 		if len(results) >= limit && nextUpPageBelowThreshold(page, results[limit-1].CompletedAt) {
@@ -229,17 +248,14 @@ func (r *NextUpRepository) listNextUpGlobal(
 	}
 }
 
-// accumulateNextUpState folds one state page into the per-series anchor,
-// in-progress, and any-state accumulators. Entries older than the date cutoff
-// stop contributing anchors and in-progress timestamps, but still contribute
-// their state ids so the successor exclusion covers the whole resolved page.
-func (r *NextUpRepository) accumulateNextUpState(
+// accumulateNextUpAnchors folds one state page into the per-series anchor map.
+// Entries older than the date cutoff stop contributing anchors; the exact
+// resolver owns per-series in-progress and successor state from here.
+func (r *NextUpRepository) accumulateNextUpAnchors(
 	ctx context.Context,
 	q NextUpQuery,
 	page userstore.NextUpStatePage,
 	anchors map[string]nextUpAnchor,
-	inProgressMax map[string]time.Time,
-	stateIDs map[string]struct{},
 ) error {
 	if len(page.Entries) == 0 {
 		return nil
@@ -255,26 +271,16 @@ func (r *NextUpRepository) accumulateNextUpState(
 		if q.DateCutoff != nil && entry.UpdatedAt.Before(*q.DateCutoff) {
 			cutoffReached = true
 		}
+		if cutoffReached || !entry.Completed {
+			continue
+		}
 		meta, ok := resolved[entry.MediaItemID]
 		if !ok {
 			continue
 		}
-		stateIDs[entry.MediaItemID] = struct{}{}
-		if cutoffReached {
-			continue
-		}
-
 		candidate := nextUpAnchor{nextUpEpisode: meta, UpdatedAt: entry.UpdatedAt}
-		if entry.Completed {
-			if current, ok := anchors[meta.SeriesID]; !ok || candidate.newerThan(current) {
-				anchors[meta.SeriesID] = candidate
-			}
-			continue
-		}
-		if entry.Position > 0 {
-			if current, ok := inProgressMax[meta.SeriesID]; !ok || entry.UpdatedAt.After(current) {
-				inProgressMax[meta.SeriesID] = entry.UpdatedAt
-			}
+		if current, ok := anchors[meta.SeriesID]; !ok || candidate.newerThan(current) {
+			anchors[meta.SeriesID] = candidate
 		}
 	}
 	return nil
@@ -373,33 +379,46 @@ func (r *NextUpRepository) listNextUpForSeries(
 	return []NextUpResult{nextUpResult(anchor, successor)}, anchors, nil
 }
 
-// resolveNextUpResults applies in-progress suppression, orders the surviving
-// series by anchor (updated_at DESC, series_id), resolves each successor in one
-// batched catalog query, and trims to the limit.
-func (r *NextUpRepository) resolveNextUpResults(
-	ctx context.Context,
-	q NextUpQuery,
-	anchors map[string]nextUpAnchor,
-	inProgressMax map[string]time.Time,
-	stateIDs map[string]struct{},
-	limit int,
-) ([]NextUpResult, error) {
+// nextUpResolveBatchSize bounds how many unresolved candidate series one exact
+// resolution round trip covers. The catalog and store reads are batched, so a
+// larger batch is fewer round trips; a smaller batch avoids fetching state for
+// candidates an early stop would never return.
+const nextUpResolveBatchSize = 32
+
+// nextUpCandidateResolution is the exact per-series state the resolver needs to
+// decide a candidate: whether a successor exists and the newest in-progress
+// timestamp. It is cached across page iterations, so a candidate is resolved at
+// most once per ListNextUp call.
+type nextUpCandidateResolution struct {
+	successor     nextUpEpisode
+	hasSuccessor  bool
+	inProgressMax time.Time
+}
+
+// nextUpResolver resolves candidate series against exact item-scoped state.
+//
+// The page walk only sees a prefix of the profile's state, newest first. A
+// post-anchor episode watched out of order can hold an older state row the walk
+// never reached, so successor exclusion and the in-progress gate read exact
+// state for the candidate series' own episodes instead of trusting the prefix.
+// Candidates the walk has not reached cannot be returned, so the walk can still
+// stop early.
+type nextUpResolver struct {
+	repo       *NextUpRepository
+	q          NextUpQuery
+	stateStore userstore.NextUpStateStore
+	cache      map[string]nextUpCandidateResolution
+}
+
+// resolve returns up to limit results for the candidate anchors in
+// (updated_at DESC, series_id) order. It resolves cache-miss candidates in
+// batches and stops resolving once the limit is filled, so an early-stopped
+// walk never pays for candidates it will not return.
+func (res *nextUpResolver) resolve(ctx context.Context, anchors map[string]nextUpAnchor, limit int) ([]NextUpResult, error) {
 	candidates := make([]nextUpAnchor, 0, len(anchors))
 	for _, anchor := range anchors {
-		// When resumable items are disabled, a series with in-progress activity
-		// newer than its newest completion is mid-watch; surfacing the episode
-		// after the completion would skip past the user's position.
-		if !q.EnableResumable {
-			if newer, ok := inProgressMax[anchor.SeriesID]; ok && newer.After(anchor.UpdatedAt) {
-				continue
-			}
-		}
 		candidates = append(candidates, anchor)
 	}
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-
 	sort.Slice(candidates, func(i, j int) bool {
 		if !candidates[i].UpdatedAt.Equal(candidates[j].UpdatedAt) {
 			return candidates[i].UpdatedAt.After(candidates[j].UpdatedAt)
@@ -407,23 +426,93 @@ func (r *NextUpRepository) resolveNextUpResults(
 		return candidates[i].SeriesID < candidates[j].SeriesID
 	})
 
-	successors, err := r.lookupNextUpSuccessors(ctx, candidates, stateIDs)
+	results := make([]NextUpResult, 0, limit)
+	for i := 0; i < len(candidates) && len(results) < limit; {
+		end := i + nextUpResolveBatchSize
+		if end > len(candidates) {
+			end = len(candidates)
+		}
+
+		unresolved := make([]nextUpAnchor, 0, end-i)
+		for _, candidate := range candidates[i:end] {
+			if _, ok := res.cache[candidate.SeriesID]; !ok {
+				unresolved = append(unresolved, candidate)
+			}
+		}
+		if len(unresolved) > 0 {
+			if err := res.resolveBatch(ctx, unresolved); err != nil {
+				return nil, err
+			}
+		}
+
+		for ; i < end && len(results) < limit; i++ {
+			candidate := candidates[i]
+			resolution := res.cache[candidate.SeriesID]
+			// When resumable items are disabled, a series with in-progress
+			// activity newer than its newest completion is mid-watch; surfacing
+			// the episode after the completion would skip past the position.
+			if !res.q.EnableResumable && !resolution.inProgressMax.IsZero() && resolution.inProgressMax.After(candidate.UpdatedAt) {
+				continue
+			}
+			if !resolution.hasSuccessor {
+				continue
+			}
+			results = append(results, nextUpResult(candidate, resolution.successor))
+		}
+	}
+	return results, nil
+}
+
+// resolveBatch fetches exact state for the given candidate series in one
+// catalog query and one store query, then resolves their successors in one
+// more catalog query.
+func (res *nextUpResolver) resolveBatch(ctx context.Context, candidates []nextUpAnchor) error {
+	episodeToSeries, err := res.repo.nextUpPostAnchorEpisodes(ctx, candidates)
 	if err != nil {
-		return nil, err
+		return err
+	}
+	episodeIDs := make([]string, 0, len(episodeToSeries))
+	for episodeID := range episodeToSeries {
+		episodeIDs = append(episodeIDs, episodeID)
 	}
 
-	results := make([]NextUpResult, 0, len(candidates))
-	for _, anchor := range candidates {
-		successor, ok := successors[anchor.SeriesID]
+	entries, err := res.stateStore.ListNextUpStateForItems(ctx, res.q.ProfileID, episodeIDs)
+	if err != nil {
+		return err
+	}
+
+	stateIDs := make(map[string]struct{}, len(entries))
+	inProgressMax := make(map[string]time.Time)
+	for _, entry := range entries {
+		seriesID, ok := episodeToSeries[entry.MediaItemID]
 		if !ok {
 			continue
 		}
-		results = append(results, nextUpResult(anchor, successor))
+		stateIDs[entry.MediaItemID] = struct{}{}
+		if !entry.Completed && entry.Position > 0 {
+			if current, ok := inProgressMax[seriesID]; !ok || entry.UpdatedAt.After(current) {
+				inProgressMax[seriesID] = entry.UpdatedAt
+			}
+		}
 	}
-	if limit > 0 && len(results) > limit {
-		results = results[:limit]
+
+	successors, err := res.repo.lookupNextUpSuccessors(ctx, candidates, stateIDs)
+	if err != nil {
+		return err
 	}
-	return results, nil
+
+	for _, candidate := range candidates {
+		resolution := nextUpCandidateResolution{}
+		if at, ok := inProgressMax[candidate.SeriesID]; ok {
+			resolution.inProgressMax = at
+		}
+		if successor, ok := successors[candidate.SeriesID]; ok {
+			resolution.successor = successor
+			resolution.hasSuccessor = true
+		}
+		res.cache[candidate.SeriesID] = resolution
+	}
+	return nil
 }
 
 // nextUpResult builds the response row for an anchor/successor pair.
@@ -512,6 +601,89 @@ func (r *NextUpRepository) resolveNextUpEpisodes(ctx context.Context, contentIDs
 		return nil, fmt.Errorf("iterating next-up episodes: %w", err)
 	}
 	return resolved, nil
+}
+
+// nextUpPostAnchorEpisodesQuery resolves, for each candidate anchor, the
+// content ids of every episode after it. The resolver asks the user store for
+// exact state on exactly those episodes, so a post-anchor watch is excluded no
+// matter how far down the recency-ordered page walk it sits.
+const nextUpPostAnchorEpisodesQuery = `
+	SELECT e.content_id, e.series_id
+	FROM unnest($1::text[], $2::int[], $3::int[]) AS anchor(series_id, season_number, episode_number)
+	JOIN episodes e
+	  ON e.series_id = anchor.series_id
+	 AND (e.season_number, e.episode_number) > (anchor.season_number, anchor.episode_number)`
+
+// nextUpPostAnchorEpisodes returns episode content id -> parent series id for
+// every episode after each candidate's anchor. The caller feeds the ids to the
+// user store's exact state lookup.
+func (r *NextUpRepository) nextUpPostAnchorEpisodes(ctx context.Context, candidates []nextUpAnchor) (map[string]string, error) {
+	episodeToSeries := make(map[string]string, len(candidates))
+	if len(candidates) == 0 {
+		return episodeToSeries, nil
+	}
+
+	seriesIDs := make([]string, len(candidates))
+	seasons := make([]int, len(candidates))
+	episodes := make([]int, len(candidates))
+	for i, candidate := range candidates {
+		seriesIDs[i] = candidate.SeriesID
+		seasons[i] = candidate.SeasonNumber
+		episodes[i] = candidate.EpisodeNumber
+	}
+
+	rows, err := r.pool.Query(ctx, nextUpPostAnchorEpisodesQuery, seriesIDs, seasons, episodes)
+	if err != nil {
+		return nil, fmt.Errorf("resolving next-up post-anchor episodes: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var contentID, seriesID string
+		if err := rows.Scan(&contentID, &seriesID); err != nil {
+			return nil, fmt.Errorf("scanning next-up post-anchor episode: %w", err)
+		}
+		episodeToSeries[contentID] = seriesID
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating next-up post-anchor episodes: %w", err)
+	}
+	return episodeToSeries, nil
+}
+
+// nextUpSeriesEpisodesQuery resolves every episode content id for the given
+// series. The resumable gate needs a whole-series view: a completion anywhere
+// in the series disqualifies it from the resumable branch.
+const nextUpSeriesEpisodesQuery = `
+	SELECT e.content_id, e.series_id
+	FROM episodes e
+	WHERE e.series_id = ANY($1::text[])`
+
+// nextUpSeriesEpisodes returns episode content id -> parent series id for every
+// episode of the given series.
+func (r *NextUpRepository) nextUpSeriesEpisodes(ctx context.Context, seriesIDs []string) (map[string]string, error) {
+	episodeToSeries := make(map[string]string)
+	if len(seriesIDs) == 0 {
+		return episodeToSeries, nil
+	}
+
+	rows, err := r.pool.Query(ctx, nextUpSeriesEpisodesQuery, seriesIDs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving next-up series episodes: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var contentID, seriesID string
+		if err := rows.Scan(&contentID, &seriesID); err != nil {
+			return nil, fmt.Errorf("scanning next-up series episode: %w", err)
+		}
+		episodeToSeries[contentID] = seriesID
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating next-up series episodes: %w", err)
+	}
+	return episodeToSeries, nil
 }
 
 // nextUpSuccessorQuery resolves, for every candidate anchor, the first episode
@@ -604,6 +776,7 @@ func (r *NextUpRepository) listResumableEpisodes(
 	ctx context.Context,
 	q NextUpQuery,
 	store userstore.UserStore,
+	stateStore userstore.NextUpStateStore,
 	completedSeries map[string]nextUpAnchor,
 ) ([]NextUpResult, error) {
 	if store == nil {
@@ -661,15 +834,36 @@ func (r *NextUpRepository) listResumableEpisodes(
 	}
 	sort.Strings(seriesIDs)
 
+	// The completed-series gate is global by design: any completion in the
+	// series routes it through the completed-next path instead of this branch.
+	// The anchor map only holds completions the (possibly early-stopped) walk
+	// saw, so fill the rest from exact item-scoped state; otherwise a series
+	// whose only completion is older than the stop would be mis-gated into
+	// "resumable" even though it has history.
+	completed := make(map[string]bool, len(seriesIDs))
+	if q.SeriesID == "" {
+		unresolved := make([]string, 0, len(seriesIDs))
+		for _, seriesID := range seriesIDs {
+			if _, ok := completedSeries[seriesID]; ok {
+				completed[seriesID] = true
+				continue
+			}
+			unresolved = append(unresolved, seriesID)
+		}
+		if len(unresolved) > 0 {
+			if err := r.markResumableSeriesCompletions(ctx, q, stateStore, unresolved, completed); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	results := make([]NextUpResult, 0, len(seriesIDs))
 	for _, seriesID := range seriesIDs {
 		if q.SeriesID != "" && seriesID != q.SeriesID {
 			continue
 		}
-		if q.SeriesID == "" {
-			if _, completed := completedSeries[seriesID]; completed {
-				continue
-			}
+		if q.SeriesID == "" && completed[seriesID] {
+			continue
 		}
 		episode := newest[seriesID]
 		results = append(results, NextUpResult{
@@ -683,4 +877,39 @@ func (r *NextUpRepository) listResumableEpisodes(
 		})
 	}
 	return results, nil
+}
+
+// markResumableSeriesCompletions adds every series that has any completion to
+// out. It resolves the series' whole episode set, then reads exact item-scoped
+// state, so a completion below the anchor walk's stop still disqualifies the
+// series from the resumable branch.
+func (r *NextUpRepository) markResumableSeriesCompletions(
+	ctx context.Context,
+	q NextUpQuery,
+	stateStore userstore.NextUpStateStore,
+	seriesIDs []string,
+	out map[string]bool,
+) error {
+	episodeToSeries, err := r.nextUpSeriesEpisodes(ctx, seriesIDs)
+	if err != nil {
+		return err
+	}
+	episodeIDs := make([]string, 0, len(episodeToSeries))
+	for episodeID := range episodeToSeries {
+		episodeIDs = append(episodeIDs, episodeID)
+	}
+
+	entries, err := stateStore.ListNextUpStateForItems(ctx, q.ProfileID, episodeIDs)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.Completed {
+			continue
+		}
+		if seriesID, ok := episodeToSeries[entry.MediaItemID]; ok {
+			out[seriesID] = true
+		}
+	}
+	return nil
 }

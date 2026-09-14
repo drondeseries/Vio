@@ -34,6 +34,16 @@ func (f *fakeNextUpStateStore) ListNextUpStatePage(ctx context.Context, _ string
 	return page, nil
 }
 
+func (f *fakeNextUpStateStore) ListNextUpStateForItems(ctx context.Context, _ string, _ []string) ([]userstore.NextUpStateEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	return nil, nil
+}
+
 // stateProvider returns one fixed store for every user id.
 type stateProvider struct {
 	store userstore.UserStore

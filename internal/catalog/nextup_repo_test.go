@@ -786,6 +786,116 @@ func TestNextUp_ResumableMergePriority(t *testing.T) {
 	})
 }
 
+// --- Exact post-anchor state (out-of-order watch) --------------------------
+
+func TestNextUp_OutOfOrderWatchExcludesPostAnchorEpisode(t *testing.T) {
+	// A returned series' successor must exclude every post-anchor episode with
+	// any state, even when that state row is older than the page walk's stop
+	// threshold. Watch e4 first, then e2: e2 is the newest anchor, but e4's
+	// state row sits below the stop and the prefix walk never reaches it. e3 is
+	// unavailable, so trusting the prefix picks e4; exact state picks e5.
+	runNextUpBackends(t, func(t *testing.T, pool *pgxpool.Pool, provider userstore.UserStoreProvider) {
+		f := newNextUpFixture(t, pool, provider)
+		seriesID := f.prefix + "-series"
+		seedNextUpSeries(t, f.ctx, pool, seriesID, "Out Of Order")
+
+		e1, e2, e3, e4, e5 := seriesID+"-e1", seriesID+"-e2", seriesID+"-e3", seriesID+"-e4", seriesID+"-e5"
+		seedNextUpEpisodes(t, f.ctx, pool, []string{e1, e2, e3, e4, e5}, repeatString(seriesID, 5), []int{1, 2, 3, 4, 5})
+		seedNextUpFiles(t, f.ctx, pool, f.folderID, []string{e4, e5})
+
+		otherA := f.prefix + "-other-a"
+		otherB := f.prefix + "-other-b"
+		seedNextUpSeries(t, f.ctx, pool, otherA, "Other A")
+		seedNextUpSeries(t, f.ctx, pool, otherB, "Other B")
+		seedNextUpEpisodes(t, f.ctx, pool,
+			[]string{otherA + "-e1", otherA + "-e2", otherB + "-e1", otherB + "-e2"},
+			[]string{otherA, otherA, otherB, otherB}, []int{1, 2, 1, 2})
+		seedNextUpFiles(t, f.ctx, pool, f.folderID, []string{otherA + "-e2", otherB + "-e2"})
+
+		newest := time.Now().UTC().Truncate(time.Microsecond)
+		// Page order (updated_at DESC) with a one-entry page: e2, otherA,
+		// otherB, e4. The walk stops at otherA's page, before e4.
+		f.seedProgress(t, e2, 0, true, newest)
+		f.seedProgress(t, otherA+"-e1", 0, true, newest.Add(-time.Minute))
+		f.seedProgress(t, otherB+"-e1", 0, true, newest.Add(-2*time.Minute))
+		f.seedProgress(t, e4, 0, true, newest.Add(-3*time.Minute))
+
+		repo := f.repo(t)
+		repo.statePageSize = 1
+		results, err := repo.ListNextUp(f.ctx, NextUpQuery{UserID: f.userID, ProfileID: f.profileID, Limit: 1})
+		if err != nil {
+			t.Fatalf("ListNextUp: %v", err)
+		}
+		assertNextUpOrderedIDs(t, results, e5)
+	})
+}
+
+// --- Resumable gate uses exact completions ---------------------------------
+
+func TestNextUp_ResumableGateSeesCompletionBelowStop(t *testing.T) {
+	// A series with an old completion plus live in-progress must not surface as
+	// resumable just because the early-stopped walk never saw its completion.
+	// The gate has to read exact state; a genuinely completion-free series with
+	// in-progress activity must still surface.
+	runNextUpBackends(t, func(t *testing.T, pool *pgxpool.Pool, provider userstore.UserStoreProvider) {
+		f := newNextUpFixture(t, pool, provider)
+
+		seriesP1 := f.prefix + "-p1"
+		seriesP2 := f.prefix + "-p2"
+		seedNextUpSeries(t, f.ctx, pool, seriesP1, "P1")
+		seedNextUpSeries(t, f.ctx, pool, seriesP2, "P2")
+		seedNextUpEpisodes(t, f.ctx, pool,
+			[]string{seriesP1 + "-e1", seriesP1 + "-e2", seriesP2 + "-e1", seriesP2 + "-e2"},
+			[]string{seriesP1, seriesP1, seriesP2, seriesP2}, []int{1, 2, 1, 2})
+		seedNextUpFiles(t, f.ctx, pool, f.folderID, []string{seriesP1 + "-e2", seriesP2 + "-e2"})
+
+		// Gated series: e1 completed long ago, e2 in progress now.
+		gated := f.prefix + "-gated"
+		seedNextUpSeries(t, f.ctx, pool, gated, "Gated")
+		seedNextUpEpisodes(t, f.ctx, pool, []string{gated + "-e1", gated + "-e2"}, repeatString(gated, 2), []int{1, 2})
+
+		// Genuinely resumable series: in progress, no completion at all.
+		openSeries := f.prefix + "-open"
+		seedNextUpSeries(t, f.ctx, pool, openSeries, "Open")
+		seedNextUpEpisodes(t, f.ctx, pool, []string{openSeries + "-e1"}, []string{openSeries}, []int{1})
+
+		newest := time.Now().UTC().Truncate(time.Microsecond)
+		f.seedProgress(t, gated+"-e2", 30, false, newest)
+		f.seedProgress(t, seriesP1+"-e1", 0, true, newest.Add(-time.Minute))
+		f.seedProgress(t, seriesP2+"-e1", 0, true, newest.Add(-2*time.Minute))
+		f.seedProgress(t, openSeries+"-e1", 20, false, newest.Add(-3*time.Minute))
+		// The gated series' only completion is below the stop threshold.
+		f.seedProgress(t, gated+"-e1", 0, true, newest.Add(-4*time.Minute))
+
+		repo := f.repo(t)
+		repo.statePageSize = 1
+		resumable, err := repo.ListNextUp(f.ctx, NextUpQuery{
+			UserID: f.userID, ProfileID: f.profileID, Limit: 1, EnableResumable: true,
+		})
+		if err != nil {
+			t.Fatalf("ListNextUp(resumable): %v", err)
+		}
+		byContent := nextUpResultByContentID(resumable)
+		if _, ok := byContent[gated+"-e2"]; ok {
+			t.Fatalf("gated series surfaced as resumable despite a completion: %+v", resumable)
+		}
+		if _, ok := byContent[openSeries+"-e1"]; !ok {
+			t.Fatalf("completion-free in-progress series missing: %+v", resumable)
+		}
+
+		// With resumable disabled the in-progress episode must not surface.
+		completedOnly, err := repo.ListNextUp(f.ctx, NextUpQuery{
+			UserID: f.userID, ProfileID: f.profileID, Limit: 1,
+		})
+		if err != nil {
+			t.Fatalf("ListNextUp(completed): %v", err)
+		}
+		if _, ok := nextUpResultByContentID(completedOnly)[gated+"-e2"]; ok {
+			t.Fatalf("in-progress surfaced with resumable disabled: %+v", completedOnly)
+		}
+	})
+}
+
 // --- Limits and ordering ---------------------------------------------------
 
 func TestNextUp_MultiSeriesLimit(t *testing.T) {

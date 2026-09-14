@@ -20,13 +20,7 @@ type PostgresUserStore struct {
 var _ userstore.UserStore = (*PostgresUserStore)(nil)
 var _ userstore.DeviceRegistry = (*PostgresUserStore)(nil)
 var _ userstore.WatchedBatchWriter = (*PostgresUserStore)(nil)
-var _ userstore.PostgresAnchorStore = (*PostgresUserStore)(nil)
 var _ userstore.NextUpStateStore = (*PostgresUserStore)(nil)
-
-// NextUpAnchorsBackedByPostgres reports that this store's progress rows are the
-// shared Postgres tables the catalog already queries, so Next Up can join
-// user_watch_progress directly instead of round-tripping store snapshots.
-func (s *PostgresUserStore) NextUpAnchorsBackedByPostgres() bool { return true }
 
 // newStore creates a PostgresUserStore scoped to a user.
 func newStore(pool *pgxpool.Pool, userID int) *PostgresUserStore {

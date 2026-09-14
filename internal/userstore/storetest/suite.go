@@ -210,6 +210,7 @@ func RunNextUpState(t *testing.T, newStore func(t *testing.T) userstore.UserStor
 	t.Run("ProfileIsolation", func(t *testing.T) { testNextUpStateProfileIsolation(t, newStore) })
 	t.Run("Cancellation", func(t *testing.T) { testNextUpStateCancellation(t, newStore) })
 	t.Run("InvalidLimit", func(t *testing.T) { testNextUpStateInvalidLimit(t, newStore) })
+	t.Run("StateForItems", func(t *testing.T) { testNextUpStateForItems(t, newStore) })
 }
 
 func nextUpStateStore(t *testing.T, store userstore.UserStore) userstore.NextUpStateStore {
@@ -510,6 +511,94 @@ func testNextUpStateInvalidLimit(t *testing.T, newStore func(t *testing.T) users
 		if _, err := nextUp.ListNextUpStatePage(ctx, "p1", nil, limit); !errors.Is(err, userstore.ErrNextUpStateInvalidLimit) {
 			t.Fatalf("limit %d error = %v, want ErrNextUpStateInvalidLimit", limit, err)
 		}
+	}
+}
+
+func testNextUpStateForItems(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	ctx := context.Background()
+	store := newStore(t)
+	for _, id := range []string{"p1", "p2"} {
+		if err := store.CreateProfile(ctx, userstore.Profile{ID: id, Name: id}); err != nil {
+			t.Fatalf("CreateProfile(%s): %v", id, err)
+		}
+	}
+	nextUp := nextUpStateStore(t, store)
+
+	base := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	seedNextUpEntry(t, store, "p1", "completed", 0, true, base)
+	seedNextUpEntry(t, store, "p1", "in-progress", 60, false, base.Add(time.Minute))
+	seedNextUpEntry(t, store, "p1", "idle", 0, false, base.Add(2*time.Minute))
+	seedNextUpEntry(t, store, "p1", "unrequested", 60, false, base.Add(3*time.Minute))
+	seedNextUpEntry(t, store, "p2", "sibling", 60, false, base)
+
+	// Empty input returns an empty result without querying.
+	empty, err := nextUp.ListNextUpStateForItems(ctx, "p1", nil)
+	if err != nil {
+		t.Fatalf("ListNextUpStateForItems(empty): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("ListNextUpStateForItems(empty) = %+v, want none", empty)
+	}
+
+	// Multiple ids return completed and in-progress rows, skip idle rows, and
+	// never return an id that was not requested (no wide profile scan).
+	entries, err := nextUp.ListNextUpStateForItems(ctx, "p1", []string{"completed", "in-progress", "idle"})
+	if err != nil {
+		t.Fatalf("ListNextUpStateForItems: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %+v, want completed and in-progress only", entries)
+	}
+	byID := make(map[string]userstore.NextUpStateEntry, len(entries))
+	for _, entry := range entries {
+		byID[entry.MediaItemID] = entry
+	}
+	if entry, ok := byID["completed"]; !ok || !entry.Completed {
+		t.Fatalf("completed row missing or wrong: %+v", entries)
+	}
+	if entry, ok := byID["in-progress"]; !ok || entry.Completed || entry.Position != 60 {
+		t.Fatalf("in-progress row missing or wrong: %+v", entries)
+	}
+	if _, ok := byID["idle"]; ok {
+		t.Fatalf("idle row (completed=false, position=0) returned: %+v", entries)
+	}
+	if _, ok := byID["unrequested"]; ok {
+		t.Fatalf("unrequested row returned: %+v", entries)
+	}
+
+	// Profile scope: another profile's row for the same id is not returned.
+	p2, err := nextUp.ListNextUpStateForItems(ctx, "p2", []string{"completed", "sibling"})
+	if err != nil {
+		t.Fatalf("ListNextUpStateForItems(p2): %v", err)
+	}
+	if len(p2) != 1 || p2[0].MediaItemID != "sibling" {
+		t.Fatalf("p2 entries = %+v, want [sibling]", p2)
+	}
+
+	seeder, ok := store.(NextUpStateHiddenSeeder)
+	if !ok {
+		t.Fatalf("store %T does not implement the Next Up hidden-history test seeder", store)
+	}
+	// The hidden boundary is inclusive, and a sibling profile's watermark for
+	// the same id must not hide this profile's row.
+	if err := seeder.SeedHiddenHistoryItem(ctx, "p1", "completed", base); err != nil {
+		t.Fatalf("seed hidden (equal): %v", err)
+	}
+	if err := seeder.SeedHiddenHistoryItem(ctx, "p2", "in-progress", base.Add(time.Hour)); err != nil {
+		t.Fatalf("seed cross-profile hidden: %v", err)
+	}
+	entries, err = nextUp.ListNextUpStateForItems(ctx, "p1", []string{"completed", "in-progress"})
+	if err != nil {
+		t.Fatalf("ListNextUpStateForItems(hidden): %v", err)
+	}
+	if len(entries) != 1 || entries[0].MediaItemID != "in-progress" {
+		t.Fatalf("entries after hidden = %+v, want [in-progress]", entries)
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := nextUp.ListNextUpStateForItems(canceled, "p1", []string{"in-progress"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled ListNextUpStateForItems error = %v, want context.Canceled", err)
 	}
 }
 

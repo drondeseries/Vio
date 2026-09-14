@@ -375,6 +375,67 @@ func (s *PostgresUserStore) ListNextUpStatePage(ctx context.Context, profileID s
 	return userstore.NextUpStatePageFromEntries(entries, limit), nil
 }
 
+// ListNextUpStateForItems returns the exact Next Up state rows for the given
+// media item ids, scoped to this store's account and the profile. See
+// userstore.NextUpStateStore for the full contract.
+//
+// Unlike ListNextUpStatePage there is no keyset and no sort: the caller already
+// chose the items, and order is unspecified. Empty input short-circuits before
+// touching the pool.
+//
+// Indexes: user_watch_progress_pkey (user_id, profile_id, media_item_id) serves
+// the id equality list, and the user_history_hidden_items_pkey
+// (user_id, profile_id, media_item_id) serves the hidden NOT EXISTS probe.
+func (s *PostgresUserStore) ListNextUpStateForItems(ctx context.Context, profileID string, mediaItemIDs []string) ([]userstore.NextUpStateEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(mediaItemIDs) == 0 {
+		return nil, nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT uwp.media_item_id, uwp.completed, uwp.position_seconds, uwp.updated_at
+		FROM user_watch_progress uwp
+		WHERE uwp.user_id = $1
+		  AND uwp.profile_id = $2
+		  AND uwp.media_item_id = ANY($3::text[])
+		  AND (uwp.completed = TRUE OR uwp.position_seconds > 0)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM user_history_hidden_items hhi
+			WHERE hhi.user_id = uwp.user_id
+			  AND hhi.profile_id = uwp.profile_id
+			  AND hhi.media_item_id = uwp.media_item_id
+			  AND hhi.hidden_before >= uwp.updated_at
+		  )`, s.userID, profileID, mediaItemIDs)
+	if err != nil {
+		return nil, fmt.Errorf("listing next up state for items: %w", err)
+	}
+	defer rows.Close()
+
+	entries := make([]userstore.NextUpStateEntry, 0, len(mediaItemIDs))
+	for rows.Next() {
+		var entry userstore.NextUpStateEntry
+		var updatedAt time.Time
+		if err := rows.Scan(&entry.MediaItemID, &entry.Completed, &entry.Position, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scanning next up state item row: %w", err)
+		}
+		entry.UpdatedAt = updatedAt.UTC()
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating next up state item rows: %w", err)
+	}
+	// A cancellation that lands after the last row was scanned must surface as
+	// the context error, never as a short result the caller would treat as exact.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	return entries, nil
+}
+
 func (s *PostgresUserStore) MarkWatched(ctx context.Context, profileID, mediaItemID string, duration float64) error {
 	if duration < 0 {
 		duration = 0

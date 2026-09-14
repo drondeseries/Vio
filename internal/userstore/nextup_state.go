@@ -64,6 +64,20 @@ type NextUpStatePage struct {
 // page. limit <= 0 is rejected with ErrNextUpStateInvalidLimit.
 type NextUpStateStore interface {
 	ListNextUpStatePage(ctx context.Context, profileID string, cursor *NextUpStateCursor, limit int) (NextUpStatePage, error)
+
+	// ListNextUpStateForItems returns every state row (completed or in-progress)
+	// for the given content ids, in the store's account/profile scope, excluding
+	// hidden activity (hidden_before >= updated_at, inclusive). Order is
+	// unspecified.
+	//
+	// It is the exact counterpart to ListNextUpStatePage. A caller that has
+	// already resolved which catalog items matter uses it instead of depending
+	// on how far a recency-ordered page walk happened to get: the page walk can
+	// stop early, but a state row older than the stop is still state.
+	//
+	// Empty mediaItemIDs returns an empty result without querying; cancellation
+	// returns the context error.
+	ListNextUpStateForItems(ctx context.Context, profileID string, mediaItemIDs []string) ([]NextUpStateEntry, error)
 }
 
 // NextUpStatePageFromEntries builds a page from the rows an implementation read

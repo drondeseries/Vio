@@ -316,6 +316,22 @@ func TestPostgresNextUpStateAccountIsolation(t *testing.T) {
 		t.Fatalf("storeB entries = %+v, want [item-b]", pageB.Entries)
 	}
 
+	// The exact item-scoped reader holds the same account boundary as the page.
+	itemsA, err := storeA.ListNextUpStateForItems(ctx, profileID, []string{"item-a", "item-b"})
+	if err != nil {
+		t.Fatalf("storeA items: %v", err)
+	}
+	if len(itemsA) != 1 || itemsA[0].MediaItemID != "item-a" {
+		t.Fatalf("storeA items = %+v, want [item-a]", itemsA)
+	}
+	itemsB, err := storeB.ListNextUpStateForItems(ctx, profileID, []string{"item-a", "item-b"})
+	if err != nil {
+		t.Fatalf("storeB items: %v", err)
+	}
+	if len(itemsB) != 1 || itemsB[0].MediaItemID != "item-b" {
+		t.Fatalf("storeB items = %+v, want [item-b]", itemsB)
+	}
+
 	// A watermark written by account B, even for account A's media item id,
 	// must not hide account A's row.
 	if err := storeB.SeedHiddenHistoryItem(ctx, profileID, "item-a", base.Add(time.Hour)); err != nil {
@@ -327,6 +343,13 @@ func TestPostgresNextUpStateAccountIsolation(t *testing.T) {
 	}
 	if len(pageA.Entries) != 1 || pageA.Entries[0].MediaItemID != "item-a" {
 		t.Fatalf("storeA entries after cross-account watermark = %+v, want [item-a]", pageA.Entries)
+	}
+	itemsA, err = storeA.ListNextUpStateForItems(ctx, profileID, []string{"item-a"})
+	if err != nil {
+		t.Fatalf("storeA items after cross-account watermark: %v", err)
+	}
+	if len(itemsA) != 1 || itemsA[0].MediaItemID != "item-a" {
+		t.Fatalf("storeA items after cross-account watermark = %+v, want [item-a]", itemsA)
 	}
 }
 
