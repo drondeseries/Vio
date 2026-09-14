@@ -338,6 +338,158 @@ func TestResolveVirtualProbeFailureBaselineForResolutionless(t *testing.T) {
 	}
 }
 
+// Merge idempotency: calling mergeVirtualCandidateTracks once vs twice with
+// the same inputs must produce identical results. The baseline fix previously
+// created empty-codec tracks on the first merge and filled them on the second.
+func TestMergeVirtualCandidateTracksIdempotency(t *testing.T) {
+	candidate := VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+		AudioLanguages: []string{"eng"},
+	}
+	// Single merge.
+	once := &models.MediaFile{}
+	mergeVirtualCandidateTracks(once, candidate)
+	onceTracks := once.VideoTracks
+	onceAudio := once.AudioTracks
+
+	// Double merge: second call must not change anything.
+	twice := &models.MediaFile{}
+	mergeVirtualCandidateTracks(twice, candidate)
+	mergeVirtualCandidateTracks(twice, candidate)
+
+	if twice.CodecVideo != once.CodecVideo {
+		t.Errorf("CodecVideo single=%q double=%q", once.CodecVideo, twice.CodecVideo)
+	}
+	if twice.CodecAudio != once.CodecAudio {
+		t.Errorf("CodecAudio single=%q double=%q", once.CodecAudio, twice.CodecAudio)
+	}
+	if twice.Container != once.Container {
+		t.Errorf("Container single=%q double=%q", once.Container, twice.Container)
+	}
+	if twice.Resolution != once.Resolution {
+		t.Errorf("Resolution single=%q double=%q", once.Resolution, twice.Resolution)
+	}
+	if len(twice.VideoTracks) != len(onceTracks) {
+		t.Fatalf("VideoTracks single=%d double=%d", len(onceTracks), len(twice.VideoTracks))
+	}
+	for i := range onceTracks {
+		if twice.VideoTracks[i].Codec != onceTracks[i].Codec {
+			t.Errorf("VideoTracks[%d].Codec single=%q double=%q", i, onceTracks[i].Codec, twice.VideoTracks[i].Codec)
+		}
+	}
+	if len(twice.AudioTracks) != len(onceAudio) {
+		t.Fatalf("AudioTracks single=%d double=%d", len(onceAudio), len(twice.AudioTracks))
+	}
+}
+
+// Fully empty metadata (no resolution, no codecs, no container) must not
+// synthesize tracks or codecs when resolution is absent. The merge should
+// leave the file evidence-incomplete so the planner produces a terminal.
+func TestMergeVirtualCandidateTracksEmptyMetadataStaysIncomplete(t *testing.T) {
+	file := &models.MediaFile{}
+	candidate := VirtualPlaybackStream{}
+
+	mergeVirtualCandidateTracks(file, candidate)
+
+	if file.Resolution != "" {
+		t.Errorf("Resolution = %q, want empty", file.Resolution)
+	}
+	if file.CodecVideo != "" {
+		t.Errorf("CodecVideo = %q, want empty", file.CodecVideo)
+	}
+	if file.CodecAudio != "" {
+		t.Errorf("CodecAudio = %q, want empty", file.CodecAudio)
+	}
+	if file.Container != "" {
+		t.Errorf("Container = %q, want empty", file.Container)
+	}
+	if len(file.VideoTracks) != 0 {
+		t.Errorf("VideoTracks = %d, want 0", len(file.VideoTracks))
+	}
+	if len(file.AudioTracks) != 0 {
+		t.Errorf("AudioTracks = %d, want 0", len(file.AudioTracks))
+	}
+	if completeVirtualVideoEvidenceV3(file) || completeVirtualAudioEvidenceV3(file) || completeVirtualContainerEvidenceV3(file) {
+		t.Error("empty metadata must not produce complete evidence")
+	}
+}
+
+// ResolutionAssumed flag is set only at baseline fallback sites, not on
+// verified probe paths.
+func TestResolutionAssumedFlagOnlyOnBaseline(t *testing.T) {
+	uri := "virtual://movie/tt-resassumed-verify?result=cand-1"
+	stored := &models.MediaFile{
+		ID:                         304,
+		ContentID:                  "movie-1",
+		FilePath:                   uri,
+		Container:                  "mkv",
+		CodecVideo:                 "h264",
+		Resolution:                 "1080p",
+		ProbeUpdatedAt:             timePtr(time.Now().Add(-time.Hour)),
+		VirtualOwnerInstallationID: 5,
+		VideoTracks:                []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24"}},
+		AudioTracks:                []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}},
+	}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-ok", URI: uri, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+		}}, nil
+	})
+	h := virtualProbeGateCandidateHandler(stored, lister, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := *stored
+	resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.ResolutionAssumed {
+		t.Error("verified fast-path must not set ResolutionAssumed")
+	}
+}
+
+// No-prober fallback with assumed resolution must not persist the fabricated
+// metadata as probed evidence.
+func TestNoProberBaselineDoesNotPersistAssumedMetadata(t *testing.T) {
+	uri := "virtual://movie/tt-noprober-persist?result=cand-1"
+	stored := &models.MediaFile{
+		ID:                         305,
+		ContentID:                  "movie-1",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-np", URI: uri, CodecAudio: "aac", Container: "mkv",
+		}}, nil
+	})
+	var persisted bool
+	saver := func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int) error {
+		persisted = true
+		return nil
+	}
+	h := virtualProbeGateCandidateHandler(stored, lister, nil, saver)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := *stored
+	resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", false, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if !resolved.ResolutionAssumed {
+		t.Error("no-prober baseline must set ResolutionAssumed")
+	}
+	if resolved.File == nil || resolved.File.Resolution != "1080p" {
+		t.Fatalf("resolution=%v, want 1080p baseline", resolved.File)
+	}
+	if persisted {
+		t.Error("no-prober baseline must not trigger metadata persistence")
+	}
+}
+
+func timePtr(t time.Time) *time.Time { return &t }
+
 // A failed probe consumed the whole probe budget; the next replan must not pay
 // it again for the same candidate. The second call skips the prober and falls
 // back to the candidate-declared metadata.

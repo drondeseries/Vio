@@ -1684,7 +1684,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	userID := apimw.GetUserID(r.Context())
 	deviceID := deviceMetadataFromRequest(r).DeviceID
 	requestDigests := newPlaybackStartRequestDigestsV3(body, deviceID)
-	resolvedWasUnverified := false
+	resolutionWasAssumed := false
 	if existing, lookupErr := h.PlanStoreV3.GetAttemptByPlaybackAttemptID(r.Context(), req.PlaybackAttemptID); lookupErr == nil {
 		if existing.UserID != userID || existing.ProfileID != profileID || existing.RequestedMediaFileID != req.FileID ||
 			!requestDigests.matches(existing.RequestDigest) {
@@ -1751,7 +1751,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		requestedFile.VirtualOwnerInstallationID = resolved.OwnerID
 		// Do NOT mutate req.FileID here: the original caller-supplied file ID
 		// must survive into the attempt record for idempotent replay.
-		resolvedWasUnverified = resolved.Provenance != ProbeProvenanceVerified
+		resolutionWasAssumed = resolved.ResolutionAssumed
 	} else {
 		requestedFile = h.ensurePlaybackProbe(r.Context(), requestedFile)
 	}
@@ -1984,7 +1984,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	result = escalated
 	timings.mark("remux_escalation")
 	appendStartWarningsV3(&result, warnings)
-	if resolvedWasUnverified && result.Terminal == nil {
+	if resolutionWasAssumed && result.Terminal == nil {
 		result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.DegradationWarningV3{
 			Code:    "resolution_assumed_1080p",
 			Message: "Source resolution could not be verified on first touch; playback uses a baseline quality until probe evidence lands.",
