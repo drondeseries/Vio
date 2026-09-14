@@ -62,6 +62,10 @@ type aiSettingsCheckClient interface {
 	Transcribe(ctx context.Context, req llm.TranscribeRequest) (*llm.Transcription, error)
 }
 
+// adminSettingsCheckFailureMessage is the shared fallback when a settings
+// connection check fails without a specific diagnostic.
+const adminSettingsCheckFailureMessage = "Connection check failed. Verify the submitted settings and provider availability."
+
 type redisSettingsCheckAdapter struct {
 	client *redis.Client
 }
@@ -283,7 +287,7 @@ func checkAITranscriptionConnection(ctx context.Context, cfg *config.Config) con
 	if err != nil {
 		message := transcriptionCheckFailureMessage(err)
 		if message == "" {
-			message = "Connection check failed. Verify the submitted settings and provider availability."
+			message = adminSettingsCheckFailureMessage
 		}
 		// Both the legacy handler and native service consume this result.
 		// Never put provider-controlled error text in the response.

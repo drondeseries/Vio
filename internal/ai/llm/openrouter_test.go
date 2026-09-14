@@ -29,7 +29,7 @@ func TestTranscribeOpenRouter(t *testing.T) {
 				if err := req.ParseMultipartForm(1 << 20); err != nil {
 					t.Fatal(err)
 				}
-				defer req.MultipartForm.RemoveAll()
+				defer func() { _ = req.MultipartForm.RemoveAll() }()
 				for key, want := range map[string]string{"model": cfg.ASRModel, "response_format": "verbose_json", "temperature": "0", "language": "en"} {
 					if got := req.FormValue(key); got != want {
 						t.Errorf("%s = %q, want %q", key, got, want)
@@ -45,7 +45,7 @@ func TestTranscribeOpenRouter(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer file.Close()
+				defer func() { _ = file.Close() }()
 				audio, err := io.ReadAll(file)
 				if err != nil || string(audio) != "RIFFtest" || header.Filename != "test.wav" {
 					t.Fatalf("multipart audio = %q, filename = %q, error = %v", audio, header.Filename, err)

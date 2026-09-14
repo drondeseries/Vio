@@ -57,4 +57,7 @@ var sharedDeliveryHTTPClient = &http.Client{Transport: sharedHTTPClientValue.Tra
 
 func sharedHTTPClient() *http.Client { return sharedHTTPClientValue }
 
-func sharedTransport() *http.Transport { return sharedHTTPClientValue.Transport.(*http.Transport) }
+func sharedTransport() *http.Transport {
+	transport, _ := sharedHTTPClientValue.Transport.(*http.Transport)
+	return transport
+}

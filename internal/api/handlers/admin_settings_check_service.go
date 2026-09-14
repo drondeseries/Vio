@@ -43,7 +43,7 @@ func (h *AdminHandler) CheckAdminSettingsConnection(ctx context.Context, kind st
 	if !result.Success {
 		result.Message = result.safeMessage
 		if result.Message == "" {
-			result.Message = "Connection check failed. Verify the submitted settings and provider availability."
+			result.Message = adminSettingsCheckFailureMessage
 		}
 	}
 	return AdminSettingsCheckResult{Success: result.Success, Message: result.Message}, nil
