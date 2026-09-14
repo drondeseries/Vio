@@ -143,7 +143,6 @@ type PlaybackChapterThumbnailQueuer interface {
 	QueuePriorityFileAtPosition(ctx context.Context, fileID int, targetSeconds float64)
 }
 
-<<<<<<< Updated upstream
 // ResolvedVirtualMedia represents a resolved virtual stream with provider details,
 // temporary URL, candidate identity, and proxy request headers.
 type ResolvedVirtualMedia struct {
@@ -200,12 +199,6 @@ type VirtualFileMetadataSaver func(ctx context.Context, fileID int, expectedFile
 // stream enters playback without embedded or external subtitle tracks.
 type SubtitleSearchTrigger func(ctx context.Context, contentID, imdbID, title string, year, season, episode, fileID int, languages []string)
 
-=======
-type VirtualMediaResolver interface {
-	ResolveVirtualMedia(ctx context.Context, virtualURI string) (string, error)
-}
-
->>>>>>> Stashed changes
 // PlaybackOriginalLanguageLookup fetches the original language for a content item.
 type PlaybackOriginalLanguageLookup interface {
 	GetOriginalLanguage(ctx context.Context, contentID string) (string, error)
@@ -261,7 +254,6 @@ type VirtualEpisodeFileLookup func(ctx context.Context, episodeID string) (*mode
 
 // PlaybackHandler handles playback session HTTP endpoints.
 type PlaybackHandler struct {
-<<<<<<< Updated upstream
 	sessionMgr                  SessionManagerInterface
 	fileResolver                FilePathResolver // optional; enables stream_url in responses
 	VirtualPlaybackResolver     VirtualPlaybackResolver
@@ -362,43 +354,6 @@ type PlaybackHandler struct {
 	RemuxDBStore                           *remuxdb.Store
 	remuxSubmitOnce                        sync.Once
 	remuxSubmitCh                          chan remuxSubmitTask
-=======
-	sessionMgr              SessionManagerInterface
-	fileResolver            FilePathResolver            // optional; enables stream_url in responses
-	StoreProvider           userstore.UserStoreProvider // optional; enables progress/history persistence
-	WatchScrobbler          PlaybackWatchScrobbler
-	StableIdentityResolver  *watchstate.StableIdentityResolver
-	CompletionObserver      watchstate.CompletionObserver // optional; auto-removes watched items from the watchlist
-	profileStaler           ProfileStaler
-	profileRefreshRequester ProfileRefreshRequester
-	AdminStore              PlaybackAdminStore    // optional; enables admin playback history/live session cleanup
-	SessionSyncer           PlaybackSessionSyncer // optional; enables immediate session sync to shared admin view
-	EventsHub               *evt.Hub
-	MissingMarker           MissingFileMarker
-	NodePlanner             nodepool.SessionPlanner   // optional; enables proxy/transcode node selection
-	JWTSecret               string                    // needed for signing stream tokens
-	ItemAccess              PlaybackItemAccessChecker // optional; enables file authorization checks
-	EpisodeLookup           PlaybackEpisodeLookup     // optional; resolves episode files to their series
-	ExtraLookup             PlaybackExtraLookup       // optional; resolves extras files to their parent item
-	OriginalLangLookup      PlaybackOriginalLanguageLookup
-	SettingsRepo            PlaybackSettingsReader     // optional; reads server settings (e.g., allow_4k_transcode)
-	FileVersionFetcher      PlaybackFileVersionFetcher // optional; queries sibling file versions for 4K guard
-	ProbeEnsurer            PlaybackProbeEnsurer       // optional; repairs missing probe metadata on demand
-	ChapterThumbnailQueuer  PlaybackChapterThumbnailQueuer
-	VirtualMediaResolver    VirtualMediaResolver
-	IntroAnalyzer           IntroEpisodeAnalyzer
-	IntroRepository         PlaybackIntroEligibilityChecker
-	MarkerRegistry          *markers.Registry
-	MarkerResolver          markers.ExternalIDResolver
-	MarkerUpserter          PlaybackMarkerUpserter
-	MarkerUpdateNotifier    PlaybackMarkerUpdateNotifier
-	MarkerLazyContext       context.Context
-	MarkerLazyInFlight      sync.Map
-	SubtitleRepo            subtitles.Repository // optional; enables downloaded subtitles in playback
-	RealtimeHub             *playback.RealtimeHub
-	CommandTracker          *playback.CommandTracker
-	CommandDispatcher       *playback.CommandDispatcher
->>>>>>> Stashed changes
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through

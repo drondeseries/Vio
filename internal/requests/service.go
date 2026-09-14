@@ -69,10 +69,7 @@ type Service struct {
 	notifier          FulfillmentNotifier
 	lifecycle         LifecycleNotifier
 	catalogChanged    func()
-<<<<<<< Updated upstream
 	cleanupVirtual    func(context.Context, Request) error
-=======
->>>>>>> Stashed changes
 	Now               func() time.Time
 }
 
@@ -106,15 +103,12 @@ func (s *Service) SetRouterProvider(p RequestRouterProvider) { s.router = p }
 // router may have registered media directly in the catalog during Fulfill.
 func (s *Service) SetCatalogChangeNotifier(notify func()) { s.catalogChanged = notify }
 
-<<<<<<< Updated upstream
 // SetVirtualMediaCleanup installs the host catalog cleanup hook used when a
 // pending request is canceled. The hook must preserve physical files.
 func (s *Service) SetVirtualMediaCleanup(cleanup func(context.Context, Request) error) {
 	s.cleanupVirtual = cleanup
 }
 
-=======
->>>>>>> Stashed changes
 func (s *Service) SetEntitlementResolver(r EntitlementResolver) { s.entitlements = r }
 
 func (s *Service) SetGroupPolicyProvider(p access.GroupPolicyProvider) { s.groupProvider = p }

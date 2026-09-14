@@ -1055,13 +1055,8 @@ function IntegrationEditor({
     patchForm({
       installation_id: String(entry.installationID),
       capability_id: entry.capability.id,
-<<<<<<< Updated upstream
       base_url: defaults?.baseURL ?? "",
       api_key_ref: defaults?.apiKey ?? "",
-=======
-      base_url: "",
-      api_key_ref: "",
->>>>>>> Stashed changes
       has_api_key: false,
     });
     onConfigChange({});
@@ -1185,11 +1180,7 @@ function IntegrationEditor({
             placeholder="Connection name"
           />
         </Field>
-<<<<<<< Updated upstream
         <Field label="API key or setting key" error={fieldErrors.api_key_ref}>
-=======
-        <Field label="API key or setting key (optional)">
->>>>>>> Stashed changes
           <Input
             aria-invalid={Boolean(fieldErrors.api_key_ref)}
             value={form.api_key_ref}
@@ -1199,11 +1190,7 @@ function IntegrationEditor({
         </Field>
       </div>
 
-<<<<<<< Updated upstream
       <Field label="Base URL" error={fieldErrors.base_url}>
-=======
-      <Field label="Base URL (optional)">
->>>>>>> Stashed changes
         <Input
           aria-invalid={Boolean(fieldErrors.base_url)}
           value={form.base_url}
