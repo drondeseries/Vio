@@ -1874,10 +1874,10 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		probed.Bitrate = virtualBitrateFallback(probed.Resolution)
 	}
 
-	// Ensure probed.CodecAudio is resolved before inferring channels so 5.1/7.1 codecs
-	// are not prematurely downgraded to 2-channel stereo. Derive from existing
-	// track evidence first, then the candidate, so the result is idempotent
-	// regardless of invocation count.
+	// Codec precedence: existing top-level wins; if empty, use first track
+	// codec; then candidate; then resolution-gated default. The top-level
+	// scalar is preserved when non-empty because it may reflect a probed
+	// value that is more authoritative than the first track in the slice.
 	if probed.CodecAudio == "" && len(probed.AudioTracks) > 0 && probed.AudioTracks[0].Codec != "" {
 		probed.CodecAudio = probed.AudioTracks[0].Codec
 	}
@@ -1895,9 +1895,10 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		probed.AudioChannels = channels
 	}
 
-	// Create a basic video track when ffprobe didn't detect any. Derive the
-	// codec from existing track evidence first, then the candidate, then the
-	// h264 default so the result is idempotent regardless of invocation count.
+	// Create a basic video track when ffprobe didn't detect any. Codec
+	// precedence: existing top-level > first track > candidate > h264 default
+	// (only when resolution is present, to avoid false claims on
+	// resolution-less incomplete metadata).
 	videoCodec := probed.CodecVideo
 	if videoCodec == "" && len(probed.VideoTracks) > 0 && probed.VideoTracks[0].Codec != "" {
 		videoCodec = probed.VideoTracks[0].Codec

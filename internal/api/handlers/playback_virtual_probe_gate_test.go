@@ -1374,3 +1374,136 @@ func TestDeclaredNoProberCandidateResolutionPersists(t *testing.T) {
 		t.Fatalf("saver called %d times, want 1 for declared metadata", got)
 	}
 }
+
+// Table-driven test for mergeVirtualCandidateTracks codec precedence:
+// existing top-level wins; if empty, first track; then candidate; then default.
+func TestMergeVirtualCandidateTracksCodecPrecedence(t *testing.T) {
+	tests := []struct {
+		name           string
+		topLevelVideo  string // initial CodecVideo
+		topLevelAudio  string // initial CodecAudio
+		trackVideo     string // first video track codec (empty = no track)
+		trackAudio     string // first audio track codec (empty = no track)
+		candVideo      string
+		candAudio      string
+		resolution     string
+		wantVideo      string
+		wantAudio      string
+		wantTrackCount int // expected len(VideoTracks) after merge
+	}{
+		{
+			name:           "existing top-level wins over contradictory track and candidate",
+			topLevelVideo:  "hevc",
+			topLevelAudio:  "eac3",
+			trackVideo:     "h264",
+			trackAudio:     "aac",
+			candVideo:      "av1",
+			candAudio:      "opus",
+			resolution:     "2160p",
+			wantVideo:      "hevc",
+			wantAudio:      "eac3",
+			wantTrackCount: 1, // existing track preserved, no synthesized track
+		},
+		{
+			name:           "empty top-level uses first track, ignores candidate",
+			topLevelVideo:  "",
+			topLevelAudio:  "",
+			trackVideo:     "hevc",
+			trackAudio:     "eac3",
+			candVideo:      "h264",
+			candAudio:      "aac",
+			resolution:     "2160p",
+			wantVideo:      "hevc",
+			wantAudio:      "eac3",
+			wantTrackCount: 1,
+		},
+		{
+			name:           "empty top-level and track uses candidate",
+			topLevelVideo:  "",
+			topLevelAudio:  "",
+			trackVideo:     "",
+			trackAudio:     "",
+			candVideo:      "h264",
+			candAudio:      "aac",
+			resolution:     "1080p",
+			wantVideo:      "h264",
+			wantAudio:      "aac",
+			wantTrackCount: 1, // synthesized video track
+		},
+		{
+			name:           "empty everything with resolution defaults",
+			topLevelVideo:  "",
+			topLevelAudio:  "",
+			trackVideo:     "",
+			trackAudio:     "",
+			candVideo:      "",
+			candAudio:      "",
+			resolution:     "1080p",
+			wantVideo:      "h264",
+			wantAudio:      "aac",
+			wantTrackCount: 1,
+		},
+		{
+			name:           "empty everything without resolution stays empty",
+			topLevelVideo:  "",
+			topLevelAudio:  "",
+			trackVideo:     "",
+			trackAudio:     "",
+			candVideo:      "",
+			candAudio:      "",
+			resolution:     "",
+			wantVideo:      "",
+			wantAudio:      "",
+			wantTrackCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := &models.MediaFile{Resolution: tt.resolution}
+			if tt.topLevelVideo != "" {
+				file.CodecVideo = tt.topLevelVideo
+			}
+			if tt.topLevelAudio != "" {
+				file.CodecAudio = tt.topLevelAudio
+			}
+			if tt.trackVideo != "" {
+				file.VideoTracks = []models.VideoTrack{{Codec: tt.trackVideo}}
+			}
+			if tt.trackAudio != "" {
+				file.AudioTracks = []models.AudioTrack{{Codec: tt.trackAudio}}
+			}
+
+			candidate := VirtualPlaybackStream{
+				Resolution: tt.resolution,
+				CodecVideo: tt.candVideo,
+				CodecAudio: tt.candAudio,
+				Container:  "mkv",
+			}
+
+			mergeVirtualCandidateTracks(file, candidate)
+
+			if file.CodecVideo != tt.wantVideo {
+				t.Errorf("CodecVideo = %q, want %q", file.CodecVideo, tt.wantVideo)
+			}
+			if file.CodecAudio != tt.wantAudio {
+				t.Errorf("CodecAudio = %q, want %q", file.CodecAudio, tt.wantAudio)
+			}
+			if len(file.VideoTracks) != tt.wantTrackCount {
+				t.Errorf("VideoTracks = %d, want %d", len(file.VideoTracks), tt.wantTrackCount)
+			}
+
+			// Idempotency: merge again, result must not change
+			mergeVirtualCandidateTracks(file, candidate)
+			if file.CodecVideo != tt.wantVideo {
+				t.Errorf("after second merge: CodecVideo = %q, want %q", file.CodecVideo, tt.wantVideo)
+			}
+			if file.CodecAudio != tt.wantAudio {
+				t.Errorf("after second merge: CodecAudio = %q, want %q", file.CodecAudio, tt.wantAudio)
+			}
+			if len(file.VideoTracks) != tt.wantTrackCount {
+				t.Errorf("after second merge: VideoTracks = %d, want %d", len(file.VideoTracks), tt.wantTrackCount)
+			}
+		})
+	}
+}
