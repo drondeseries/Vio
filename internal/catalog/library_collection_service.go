@@ -17,6 +17,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/collage"
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
+	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -91,6 +92,12 @@ type TMDBDiscoverFetcher interface {
 
 type TMDBDigitalReleaseChecker interface {
 	HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error)
+}
+
+// MDBListAPIFetcher fetches a user's list through MDBList's authenticated,
+// cursor-paginated items endpoint. It is satisfied by *mdblist.Client.
+type MDBListAPIFetcher interface {
+	ListItems(ctx context.Context, user, list string, maxItems int) ([]mdblist.ListItem, error)
 }
 
 // theatricalReleaseGate memoizes digital-release lookups for one sync run so
@@ -560,6 +567,11 @@ type LibraryCollectionService struct {
 
 	// TraktTokenResolver is required for Trakt recommended collections.
 	TraktTokenResolver TraktAccessTokenResolver
+
+	// MDBListAPI is the authenticated, cursor-paginated MDBList list-items
+	// client. Nil (no api_key configured) falls back to the public /json
+	// single-GET fetch.
+	MDBListAPI MDBListAPIFetcher
 
 	// CollageGen is nil when S3/image processing is not configured.
 	CollageGen CollageGenerator
@@ -1166,9 +1178,7 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 	if len(listURLs) == 0 {
 		return nil, fmt.Errorf("mdblist sync: url is required")
 	}
-	entries, err := collectionutil.FetchMDBListWithFallback(listURLs, func(listURL string) ([]mdblistEntry, error) {
-		return s.fetchMDBListEntries(ctx, listURL)
-	})
+	entries, err := s.fetchMDBListEntriesWithAPI(ctx, listURLs, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -2541,6 +2551,69 @@ func (s *LibraryCollectionService) fetchMDBListEntries(ctx context.Context, list
 		return nil, fmt.Errorf("parsing mdblist response: %w", err)
 	}
 	return entries, nil
+}
+
+// fetchMDBListEntriesWithAPI fetches a list through the authenticated,
+// paginated MDBList API when the fetcher is wired and the URL parses to a
+// user/slug pair; otherwise it falls back to the public /json single GET.
+//
+// It deliberately does not fall back on an API error once a key is in play: a
+// bad or expired key must be visible rather than silently masked by the
+// unauthenticated feed. The scheduler's per-collection deadline plus
+// next_sync_at advance bound the blast radius of a persistent failure. A
+// fetcher that reports ErrNotConfigured (no key — including a key cleared by
+// the config watcher after startup) does fall back, because that is the
+// documented no-key path.
+func (s *LibraryCollectionService) fetchMDBListEntriesWithAPI(ctx context.Context, listURLs []string, limit *int) ([]mdblistEntry, error) {
+	if s.MDBListAPI != nil {
+		for _, listURL := range listURLs {
+			user, list, ok := collectionutil.ParseMDBListListURL(listURL)
+			if !ok {
+				continue
+			}
+			maxItems := collectionutil.SourceFetchLimit(limit)
+			if maxItems <= 0 {
+				maxItems = collectionutil.MaxExplicitItemLimit
+			}
+			items, err := s.MDBListAPI.ListItems(ctx, user, list, maxItems)
+			if err != nil {
+				if errors.Is(err, mdblist.ErrNotConfigured) {
+					break // no key: use the public /json fallback
+				}
+				return nil, fmt.Errorf("fetching mdblist list %s/%s: %w", user, list, err)
+			}
+			return apiListItemsToEntries(items), nil
+		}
+	}
+	return collectionutil.FetchMDBListWithFallback(listURLs, func(listURL string) ([]mdblistEntry, error) {
+		return s.fetchMDBListEntries(ctx, listURL)
+	})
+}
+
+// apiListItemsToEntries maps authenticated API items onto the public-feed
+// entry shape. The API's release_date fills Released so the future/ theatrical
+// window keeps working; media_type stays as returned ("show" etc.) for
+// mdbListEntryItemType to normalize.
+func apiListItemsToEntries(items []mdblist.ListItem) []mdblistEntry {
+	entries := make([]mdblistEntry, 0, len(items))
+	for _, item := range items {
+		var tvdbID *int
+		if item.TVDBID != nil {
+			id := *item.TVDBID
+			tvdbID = &id
+		}
+		entries = append(entries, mdblistEntry{
+			ID:          item.TMDBID,
+			Rank:        item.Rank,
+			TVDBID:      tvdbID,
+			IMDbID:      item.IMDbID,
+			MediaType:   item.MediaType,
+			Title:       item.Title,
+			ReleaseYear: item.ReleaseYear,
+			Released:    item.ReleaseDate,
+		})
+	}
+	return entries
 }
 
 // mdbListEntryItemType normalizes an MDBList entry's media_type field to the

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
+	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -352,6 +354,149 @@ func TestTraktCandidatesByPriority_ShowUsesTVDBBeforeTMDB(t *testing.T) {
 		if candidates[i] != want[i] {
 			t.Fatalf("candidates = %v, want %v", candidates, want)
 		}
+	}
+}
+
+// fakeMDBListAPI records calls and returns canned ListItems, standing in for
+// *mdblist.Client so tests can prove which fetch path ran without a network.
+type fakeMDBListAPI struct {
+	items  []mdblist.ListItem
+	err    error
+	users  []string
+	lists  []string
+	maxes  []int
+	called bool
+}
+
+func (f *fakeMDBListAPI) ListItems(_ context.Context, user, list string, maxItems int) ([]mdblist.ListItem, error) {
+	f.called = true
+	f.users = append(f.users, user)
+	f.lists = append(f.lists, list)
+	f.maxes = append(f.maxes, maxItems)
+	return f.items, f.err
+}
+
+func TestFetchMDBListEntriesUsesAPIFetcherWhenSet(t *testing.T) {
+	httpHits := 0
+	svc := &LibraryCollectionService{
+		MDBListAPI: &fakeMDBListAPI{items: []mdblist.ListItem{{
+			TMDBID: 603, IMDbID: "tt0133093", MediaType: "movie",
+			Title: "The Matrix", ReleaseYear: 1999, ReleaseDate: "1999-03-31", Rank: 1000,
+		}}},
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			httpHits++
+			return nil, errors.New("the public /json path must not run when the API fetcher is set")
+		})},
+	}
+	limit := 5
+	entries, err := svc.fetchMDBListEntriesWithAPI(context.Background(), []string{"https://mdblist.com/lists/alice/horror/json"}, &limit)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if httpHits != 0 {
+		t.Fatalf("public /json path was used %d times", httpHits)
+	}
+	api := svc.MDBListAPI.(*fakeMDBListAPI)
+	if !api.called || api.users[0] != "alice" || api.lists[0] != "horror" {
+		t.Fatalf("API calls = %+v, want alice/horror", api)
+	}
+	if api.maxes[0] != collectionutil.SourceFetchLimit(&limit) {
+		t.Fatalf("maxItems = %d, want SourceFetchLimit(%d)=%d", api.maxes[0], limit, collectionutil.SourceFetchLimit(&limit))
+	}
+	if len(entries) != 1 || entries[0].ID != 603 || entries[0].Released != "1999-03-31" || entries[0].Rank != 1000 {
+		t.Fatalf("mapped entries = %+v", entries)
+	}
+}
+
+func TestFetchMDBListEntriesFallsBackToJSONWhenAPINil(t *testing.T) {
+	httpHits := 0
+	svc := &LibraryCollectionService{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			httpHits++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`[{"id":603,"title":"The Matrix","mediatype":"movie","release_year":1999}]`)),
+				Header:     make(http.Header),
+			}, nil
+		})},
+	}
+	entries, err := svc.fetchMDBListEntriesWithAPI(context.Background(), []string{"https://mdblist.com/lists/alice/horror/json"}, nil)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if httpHits != 1 {
+		t.Fatalf("public /json path used %d times, want 1", httpHits)
+	}
+	if len(entries) != 1 || entries[0].ID != 603 || entries[0].Title != "The Matrix" {
+		t.Fatalf("entries = %+v", entries)
+	}
+}
+
+func TestFetchMDBListEntriesFallsBackWhenAPIReportsNotConfigured(t *testing.T) {
+	httpHits := 0
+	svc := &LibraryCollectionService{
+		MDBListAPI: &fakeMDBListAPI{err: mdblist.ErrNotConfigured},
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			httpHits++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`[{"id":1,"title":"Fallback","mediatype":"movie","release_year":2000}]`)),
+				Header:     make(http.Header),
+			}, nil
+		})},
+	}
+	entries, err := svc.fetchMDBListEntriesWithAPI(context.Background(), []string{"https://mdblist.com/lists/alice/horror/json"}, nil)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if httpHits != 1 || len(entries) != 1 || entries[0].Title != "Fallback" {
+		t.Fatalf("httpHits=%d entries=%+v, want the /json fallback", httpHits, entries)
+	}
+}
+
+func TestFetchMDBListEntriesSurfacesAPIErrorWithoutFallback(t *testing.T) {
+	httpHits := 0
+	apiErr := errors.New("invalid api key")
+	svc := &LibraryCollectionService{
+		MDBListAPI: &fakeMDBListAPI{err: apiErr},
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			httpHits++
+			return nil, errors.New("must not fall back on an API error")
+		})},
+	}
+	_, err := svc.fetchMDBListEntriesWithAPI(context.Background(), []string{"https://mdblist.com/lists/alice/horror/json"}, nil)
+	if !errors.Is(err, apiErr) {
+		t.Fatalf("err = %v, want the API error surfaced", err)
+	}
+	if httpHits != 0 {
+		t.Fatalf("public /json path was used %d times after an API error", httpHits)
+	}
+}
+
+func TestAPIMappedReleaseDateDrivesFutureGate(t *testing.T) {
+	// A show is exempt from the movie release window; use a movie to prove the
+	// API's release_date populates Released so isFutureDate sees a future date.
+	future := time.Now().UTC().AddDate(1, 0, 0).Format("2006-01-02")
+	entries := apiListItemsToEntries([]mdblist.ListItem{{
+		TMDBID: 999, MediaType: "movie", Title: "Upcoming", ReleaseYear: time.Now().Year() + 1, ReleaseDate: future,
+	}})
+	if len(entries) != 1 || entries[0].Released != future {
+		t.Fatalf("entries = %+v, want Released=%q", entries, future)
+	}
+	if !isFutureDate(entries[0].ReleaseYear, entries[0].Released) {
+		t.Fatalf("isFutureDate(%d, %q) = false, want true", entries[0].ReleaseYear, entries[0].Released)
+	}
+}
+
+func TestAPIMappedTVDBPointerIsCopiedNotAliased(t *testing.T) {
+	tvdb := 305089
+	entries := apiListItemsToEntries([]mdblist.ListItem{{TMDBID: 65942, TVDBID: &tvdb, MediaType: "show"}})
+	if entries[0].TVDBID == nil || *entries[0].TVDBID != 305089 {
+		t.Fatalf("TVDBID = %v, want 305089", entries[0].TVDBID)
+	}
+	tvdb = 1
+	if *entries[0].TVDBID != 305089 {
+		t.Fatal("entry TVDBID aliases the source pointer")
 	}
 }
 

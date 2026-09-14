@@ -166,6 +166,59 @@ func TestCanonicalMDBListURLRejectsPrivateHosts(t *testing.T) {
 	}
 }
 
+func TestParseMDBListListURL(t *testing.T) {
+	t.Parallel()
+
+	accepted := []struct {
+		raw  string
+		user string
+		list string
+	}{
+		{"https://mdblist.com/lists/alice/horror", "alice", "horror"},
+		{"https://mdblist.com/lists/alice/horror/json", "alice", "horror"},
+		{"https://mdblist.com/lists/alice/horror/", "alice", "horror"},
+		{"http://www.mdblist.com/lists/bob/my-list/json", "bob", "my-list"},
+		{"https://mdblist.com:443/lists/carol/top_100/json", "carol", "top_100"},
+		{"  https://mdblist.com/lists/dave/sci-fi  ", "dave", "sci-fi"},
+		{"https://mdblist.com/lists/12345/horror", "12345", "horror"},
+	}
+	for _, tc := range accepted {
+		user, list, ok := ParseMDBListListURL(tc.raw)
+		if !ok {
+			t.Errorf("ParseMDBListListURL(%q) rejected, want accept", tc.raw)
+			continue
+		}
+		if user != tc.user || list != tc.list {
+			t.Errorf("ParseMDBListListURL(%q) = (%q, %q), want (%q, %q)", tc.raw, user, list, tc.user, tc.list)
+		}
+	}
+
+	rejected := []string{
+		"",
+		"https://mdblist.com/",
+		"https://mdblist.com/lists/alice",
+		"https://mdblist.com/lists/alice/horror/extra",
+		"https://mdblist.com/lists/alice/horror/extra/json",
+		"https://mdblist.com/lists/alice/12345", // numeric list id, not a slug
+		"https://mdblist.com/lists/alice/12345/json",
+		"https://evil.example/lists/alice/horror",
+		"https://mdblist.com.evil.example/lists/alice/horror",
+		"ftp://mdblist.com/lists/alice/horror",
+		"https://mdblist.com:8080/lists/alice/horror",
+		"https://mdblist.com@127.0.0.1/lists/alice/horror",
+		"https://mdblist.com/lists//horror",
+		"https://mdblist.com/lists/alice/",
+		"https://mdblist.com/lists/alice/horror?x=1",
+		"https://mdblist.com/lists/alice/horror#frag",
+		"https://mdblist.com/admin/alice/horror",
+	}
+	for _, raw := range rejected {
+		if _, _, ok := ParseMDBListListURL(raw); ok {
+			t.Errorf("ParseMDBListListURL(%q) accepted, want reject", raw)
+		}
+	}
+}
+
 func TestMDBListHTTPClientRejectsPrivateRedirect(t *testing.T) {
 	t.Parallel()
 
