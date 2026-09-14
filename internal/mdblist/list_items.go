@@ -249,7 +249,7 @@ func (c *Client) ListItems(ctx context.Context, user, list string, maxItems int)
 	// bucket would silently shrink membership. The intentional maxItems cap is
 	// not a shortfall: min(total, hardCap) is exactly what the cap allows.
 	if total > 0 && len(items) < min(total, hardCap) {
-		slog.Warn("mdblist items response incomplete",
+		slog.WarnContext(ctx, "mdblist items response incomplete",
 			"list_id", listID,
 			"user", user,
 			"list", list,
