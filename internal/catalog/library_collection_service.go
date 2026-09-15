@@ -613,6 +613,8 @@ func (s *LibraryCollectionService) acceptCollectionItems(ctx context.Context, co
 		}
 	}
 	if err := s.collections.AcceptPreparedItems(ctx, collection, matched, prepared, s.items); err != nil {
+		slog.WarnContext(ctx, "collection sync accept failed", "component", "catalog",
+			"collection_id", collection.ID, "error", err)
 		return err
 	}
 	for id := range prepared {

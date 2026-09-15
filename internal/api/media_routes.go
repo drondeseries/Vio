@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 )
@@ -45,7 +46,7 @@ func nativeCapture(pattern string) func(*http.Request) streamtelemetry.CaptureSe
 		viewerIP := streamtelemetry.ViewerIP(r)
 		return streamtelemetry.CaptureSet{
 			Method: r.Method, Pattern: pattern, ViewerIP: viewerIP,
-			DeviceID:  r.Header.Get("X-Silo-Device-ID"),
+			DeviceID:  httpheader.GetDeviceID(r.Header),
 			Client:    streamtelemetry.ClientVariant{Name: client.Name, Version: client.Version, Build: client.Build, Channel: client.Channel},
 			UserAgent: client.UserAgent, ReceivedAt: time.Now(),
 		}

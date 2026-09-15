@@ -812,10 +812,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
 					}, nil
 				}
-				targetID := file.ID
-				if transient.ID > 0 {
-					targetID = transient.ID
-				}
 				probeTransient := cloneVirtualProbeTransient(transient)
 				// Zero the duration so the background probe measures the
 				// empirical duration instead of inheriting the catalog value.
@@ -828,7 +824,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					// WithoutCancel context.
 					bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(r.Context()), virtualProbeBudget)
 					defer bgCancel()
-					h.probeVirtualSourceAndPersist(bgCtx, stickyKey, targetID, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+					h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 				}()
 			}
 			return &resolvedVirtualPlaybackSource{
@@ -926,7 +922,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			return *result, nil
 		}
-		if err != nil || (!result.ProbeSucceeded && candidate.URI == pinnedURI) {
+		if err != nil || result.Provenance == ProbeProvenanceFailed {
 			if candidate.URI == pinnedURI && h != nil {
 				// The pinned source stopped working; release it so the next
 				// start re-ranks candidates instead of retrying a dead URI.
@@ -935,11 +931,25 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if firstResolved == nil && result != nil {
 				firstResolved = result
 			}
-			slog.WarnContext(r.Context(), "virtual playback candidate failed",
-				"component", "api", "candidate_uri", candidate.URI, "candidate_index", i,
-				"file_id", file.ID, "content_id", file.ContentID, "error", err)
+			if err != nil {
+				slog.WarnContext(r.Context(), "virtual playback candidate failed",
+					"component", "api", "candidate_uri", candidate.URI, "candidate_index", i,
+					"file_id", file.ID, "content_id", file.ContentID, "error", err)
+			}
 			attemptErr = errors.Join(attemptErr, err)
 			continue
+		}
+		// A deferred or declared result is already usable: return it now. The
+		// original loop kept scanning trailing candidates for a verified
+		// sibling, but every extra iteration pays a full provider resolve RPC
+		// (a plugin round-trip, seconds each) whose work the loop then throws
+		// away — the final return is this same first usable source anyway.
+		// Deferred results already fired their background probe; declared
+		// results (no prober) cannot be upgraded by trying siblings. Only a
+		// hard-failed synchronous probe (ProbeProvenanceFailed above) keeps
+		// shopping via firstResolved below.
+		if result.Provenance == ProbeProvenancePending || result.Provenance == ProbeProvenanceDeclared {
+			return *result, nil
 		}
 		if result.Provenance == ProbeProvenanceVerified || (!result.AppliedRemux && !result.ResolutionAssumed && h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
 			// Content ground truth: a probed duration wildly different from the
@@ -970,11 +980,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// Persist probed audio/subtitle tracks back to the DB so
 			// the watch detail and player UI show track options on
 			// subsequent views without re-probing.
-			targetID := file.ID
-			if result.File != nil && result.File.ID > 0 {
-				targetID = result.File.ID
-			}
-			h.persistVirtualMetadataBounded(r.Context(), targetID, result.File.FilePath, result.File, result.Provenance == ProbeProvenanceVerified)
+			h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, result.Provenance == ProbeProvenanceVerified)
 			// The filtered candidate list is already cached device-neutrally
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
@@ -999,11 +1005,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 		}
 		if firstResolved.Provenance == ProbeProvenanceVerified {
-			targetID := file.ID
-			if firstResolved.File != nil && firstResolved.File.ID > 0 {
-				targetID = firstResolved.File.ID
-			}
-			h.persistVirtualMetadataBounded(r.Context(), targetID, firstResolved.File.FilePath, firstResolved.File, true)
+			h.persistVirtualProbeEvidence(r.Context(), file, firstResolved.File.FilePath, firstResolved.File, true)
 		}
 		return *firstResolved, nil
 	}
@@ -1071,14 +1073,16 @@ func (h *PlaybackHandler) virtualExpectedRuntimeMinutes(ctx context.Context, fil
 }
 
 // probeVirtualSourceAndPersist probes an already-resolved provider URL and
-// persists the probed inventory to targetID. It is the shared tail of the
-// deferred start-path probe and the optimistic-start revalidation. bgCtx
-// bounds the whole probe; the runtime-plausibility guard and the probe-failure
-// damper are applied here so both callers behave identically.
+// persists the probed inventory back to the catalog row the client requested,
+// so the next start of that row reuses the evidence instead of re-probing. It
+// is the shared tail of the deferred start-path probe and the optimistic-start
+// revalidation. bgCtx bounds the whole probe; the runtime-plausibility guard
+// and the probe-failure damper are applied here so both callers behave
+// identically.
 func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	bgCtx context.Context,
 	stickyKey string,
-	targetID int,
+	catalogFile *models.MediaFile,
 	probeURL string,
 	probeTransient models.MediaFile,
 	probeCand VirtualPlaybackStream,
@@ -1098,7 +1102,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
 		virtualProbeFailures.mark(probeKey)
 		slog.WarnContext(bgCtx, "background virtual probe rejected: probed duration implausible",
-			"component", "api", "candidate_uri", probeCand.URI, "file_id", targetID,
+			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID,
 			"probed_duration_seconds", probed.Duration, "expected_runtime_minutes", expectedRuntimeMinutes)
 		h.unpinVirtualSticky(stickyKey, probeCand.URI)
 		return
@@ -1112,7 +1116,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 		probed.Duration = probeTransient.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	h.persistVirtualMetadataBounded(bgCtx, targetID, probeCand.URI, probed, true)
+	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true)
 }
 
 // revalidateVirtualCandidateBackground resolves the provider URL for a
@@ -1180,20 +1184,21 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 		}
 		if dbFile != nil && dbFile.ID > 0 {
 			probeTransient = cloneVirtualProbeTransient(*dbFile)
-			targetID = dbFile.ID
 		}
 		probeTransient.FilePath = cand.URI
 		probeTransient.VirtualOwnerInstallationID = oid
-		h.probeVirtualSourceAndPersist(bgCtx, stickyKey, targetID, streamURL, probeTransient, cand, h.virtualExpectedRuntimeMinutes(bgCtx, file), oid)
+		h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, cand, h.virtualExpectedRuntimeMinutes(bgCtx, file), oid)
 	}()
 }
 
 // VirtualFileMetadataUpdateSQL persists a probed virtual inventory back to
 // media_files. It also stamps probe_source/probe_updated_at so the playback
 // probe gate can recognize the row as really probed and stop re-probing it on
-// every start. virtual_collection rows keep their existing stamp: that source
-// is owned by the collection registration path, not playback.
-const VirtualFileMetadataUpdateSQL = `UPDATE media_files SET video_tracks=$1::jsonb, audio_tracks=$2::jsonb, subtitle_tracks=$3::jsonb, resolution=NULLIF($4,''), codec_video=NULLIF($5,''), codec_audio=NULLIF($6,''), container=NULLIF($7,''), hdr=$8, bitrate=NULLIF($9,0), duration=CASE WHEN $10 > 0 THEN $10 ELSE duration END, audio_channels=COALESCE((SELECT (elem->>'channels')::int FROM jsonb_array_elements(CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END) elem LIMIT 1), audio_channels), probe_source=CASE WHEN media_files.probe_source='virtual_collection' OR NOT $13::boolean THEN media_files.probe_source ELSE 'virtual' END, probe_updated_at=CASE WHEN media_files.probe_source='virtual_collection' OR NOT $13::boolean THEN media_files.probe_updated_at ELSE now() END, updated_at=now() WHERE id=$11 AND (NULLIF($12, '') IS NULL OR file_path=$12) AND ($13::boolean OR media_files.probe_updated_at IS NULL)`
+// every start. probe_source stays 'virtual_collection' on collection-owned
+// rows so the collection materializer keeps recognizing them; a real playback
+// probe (stampProbe=true) still stamps probe_updated_at so collection rows
+// converge to probed evidence instead of re-probing on every start.
+const VirtualFileMetadataUpdateSQL = `UPDATE media_files SET video_tracks=$1::jsonb, audio_tracks=$2::jsonb, subtitle_tracks=$3::jsonb, resolution=NULLIF($4,''), codec_video=NULLIF($5,''), codec_audio=NULLIF($6,''), container=NULLIF($7,''), hdr=$8, bitrate=NULLIF($9,0), duration=CASE WHEN $10 > 0 THEN $10 ELSE duration END, audio_channels=COALESCE((SELECT (elem->>'channels')::int FROM jsonb_array_elements(CASE WHEN jsonb_typeof($2::jsonb) = 'array' THEN $2::jsonb ELSE '[]'::jsonb END) elem LIMIT 1), audio_channels), probe_source=CASE WHEN media_files.probe_source='virtual_collection' OR NOT $13::boolean THEN media_files.probe_source ELSE 'virtual' END, probe_updated_at=CASE WHEN NOT $13::boolean THEN media_files.probe_updated_at ELSE now() END, updated_at=now() WHERE id=$11 AND (NULLIF($12, '') IS NULL OR file_path=$12) AND ($13::boolean OR media_files.probe_updated_at IS NULL)`
 
 func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, targetID int, expectedFilePath string, file *models.MediaFile, stampProbe bool) {
 	if h == nil || h.VirtualFileMetadataSaver == nil || file == nil || targetID <= 0 {
@@ -1210,6 +1215,35 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, tar
 			slog.ErrorContext(persistCtx, "virtual metadata persist failed", "component", "api", "file_id", targetID, "error", err)
 		}
 	}()
+}
+
+// persistVirtualProbeEvidence writes probed track inventory and the probe stamp
+// back to the catalog row for the virtual content the client requested, so the
+// next start of that row can reuse the persisted evidence instead of
+// re-listing and re-probing.
+//
+// The probed candidate carries a resolved ?result= URI while the catalog row
+// usually stores the neutral URI, so the metadata update's file_path guard
+// would miss the row. Non-collection rows adopt the resolved URI onto the row
+// first (mirroring the stale-fallback path) so the guard matches and the row
+// owns the pinned candidate on the next start. Collection-owned rows are never
+// rewritten: the collection sync reconciles their file_path against its
+// desired set and would delete an adopted path as stale. They are stamped in
+// place under their neutral path instead, which is still enough for the
+// repeat-play gates (cache/pin + probe stamp + complete evidence) to fire.
+func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) {
+	if h == nil || h.VirtualFileMetadataSaver == nil || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
+		return
+	}
+	expectedPath := catalogFile.FilePath
+	if resolvedPath != "" && resolvedPath != catalogFile.FilePath && catalogFile.ProbeSource != "virtual_collection" && h.VirtualFileUpdater != nil {
+		if updateErr := h.VirtualFileUpdater(ctx, catalogFile.ID, resolvedPath); updateErr != nil {
+			slog.ErrorContext(ctx, "virtual probe evidence: adopt result URI failed", "component", "api", "file_id", catalogFile.ID, "new_path", resolvedPath, "error", updateErr)
+		} else {
+			expectedPath = resolvedPath
+		}
+	}
+	h.persistVirtualMetadataBounded(ctx, catalogFile.ID, expectedPath, probed, stampProbe)
 }
 
 // fallbackResolveStaleVirtualSource re-lists the provider's current candidates

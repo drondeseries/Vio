@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -854,6 +855,7 @@ func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, s
 	// lockReleaseContentTx ordering). Phase 2 below emits all debt rows
 	// in deterministic order.
 	var debtContentIDs []string
+	skipped := make(map[string]string, 0)
 	for _, id := range slices.Sorted(slices.Values(desiredIDs)) {
 		candidate, ok := prepared[id]
 		if !ok || !sourceEnablesVirtualPlayback(snapshot.SourceConfig) {
@@ -863,9 +865,36 @@ func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, s
 			return errors.New("invalid prepared collection item")
 		}
 		if _, err := items.ensureVirtualCollectionItemMaterializedTx(ctx, tx, snapshot.ID, candidate.item, libraries, candidate.variants, VirtualMaterializeOptions{accepting: true, releaseSnapshot: candidate.releaseSnapshot, preparedExplicitly: true, deferDebtWrite: true}); err != nil {
+			if errors.Is(err, ErrIncompatibleLibrary) {
+				// A member whose media type has no compatible target library
+				// (e.g. a series in a collection bound only to a movies
+				// library) is skipped for this run rather than failing the
+				// whole accept: every other member still lands, and the
+				// warning travels in the sync run record.
+				skipped[id] = err.Error()
+				continue
+			}
 			return err
 		}
 		debtContentIDs = append(debtContentIDs, id)
+	}
+	if len(skipped) > 0 {
+		filtered := desiredIDs[:0]
+		for _, id := range desiredIDs {
+			if _, ok := skipped[id]; !ok {
+				filtered = append(filtered, id)
+			}
+		}
+		desiredIDs = filtered
+		filteredMembers := members[:0]
+		for _, member := range members {
+			if _, ok := skipped[member.MediaItemID]; !ok {
+				filteredMembers = append(filteredMembers, member)
+			}
+		}
+		members = filteredMembers
+		slog.WarnContext(ctx, "collection sync: skipped members with no compatible target library",
+			"component", "catalog", "collection_id", snapshot.ID, "skipped", skipped)
 	}
 	for _, id := range debtContentIDs {
 		if err := queueVirtualItemRefreshDebtTx(ctx, tx, id); err != nil {

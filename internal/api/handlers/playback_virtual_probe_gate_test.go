@@ -200,8 +200,11 @@ func TestResolveSkipsProbeForAlreadyProbedVirtualRow(t *testing.T) {
 
 // The probe gate can only converge if persisting a probe also stamps the row:
 // without probe_updated_at a row that was just probed still looks unprobed on
-// the next start and re-probes forever. virtual_collection rows keep their
-// collection-owned stamp.
+// the next start and re-probes forever. probe_source stays 'virtual_collection'
+// on collection-owned rows so the collection materializer keeps recognizing
+// them, but a real playback probe stamps probe_updated_at on any row —
+// including collection rows — so they converge to probed evidence instead of
+// re-probing on every start.
 func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 	sql := VirtualFileMetadataUpdateSQL
 	if !strings.Contains(sql, "probe_updated_at") {
@@ -210,8 +213,8 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 	if !strings.Contains(sql, "probe_source=CASE WHEN media_files.probe_source='virtual_collection'") {
 		t.Fatalf("metadata update does not preserve virtual_collection probe_source: %s", sql)
 	}
-	if !strings.Contains(sql, "probe_updated_at=CASE WHEN media_files.probe_source='virtual_collection'") {
-		t.Fatalf("metadata update does not preserve virtual_collection probe_updated_at: %s", sql)
+	if !strings.Contains(sql, "probe_updated_at=CASE WHEN NOT $13::boolean THEN media_files.probe_updated_at ELSE now() END") {
+		t.Fatalf("metadata update does not stamp probe_updated_at on any real probe: %s", sql)
 	}
 	if !strings.Contains(sql, "ELSE 'virtual' END") {
 		t.Fatalf("metadata update does not default probe_source to virtual: %s", sql)
