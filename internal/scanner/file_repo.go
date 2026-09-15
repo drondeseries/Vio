@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,6 +35,10 @@ var (
 // FileRepository provides CRUD operations for the media_files table.
 type FileRepository struct {
 	pool *pgxpool.Pool
+}
+
+type fileQueryer interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 type RawMatchBacklogMode string
@@ -912,6 +917,70 @@ func (r *FileRepository) LoadCopySafetyVerdict(ctx context.Context, id int, size
 }
 
 func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*models.MediaFile, error) {
+	return r.upsertWithQueryer(ctx, r.pool, mf)
+}
+
+// UpsertTx inserts or updates a media file inside the caller's transaction.
+// Audiobook folder scans use this to commit the item and all of its parts as
+// one unit instead of leaving half-indexed books when one file write fails.
+func (r *FileRepository) UpsertTx(ctx context.Context, tx pgx.Tx, mf models.MediaFile) (*models.MediaFile, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("media file upsert: nil transaction")
+	}
+	return r.upsertWithQueryer(ctx, tx, mf)
+}
+
+// UpsertBatchTx queues media-file upserts on one transaction and sends them as
+// a single PostgreSQL batch. This keeps multipart audiobook reconciliation
+// atomic while reducing one client/server round trip per part.
+func (r *FileRepository) UpsertBatchTx(ctx context.Context, tx pgx.Tx, files []models.MediaFile) error {
+	if tx == nil {
+		return fmt.Errorf("media file batch upsert: nil transaction")
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for i := range files {
+		capture := &fileUpsertCapture{}
+		if _, err := r.upsertWithQueryer(ctx, capture, files[i]); err != nil {
+			return err
+		}
+		query := capture.query
+		if idx := strings.Index(query, "RETURNING "); idx >= 0 {
+			query = query[:idx]
+		}
+		batch.Queue(query, capture.args...)
+	}
+	results := tx.SendBatch(ctx, batch)
+	defer results.Close()
+	for range files {
+		if _, err := results.Exec(); err != nil {
+			return fmt.Errorf("media file batch upsert: %w", err)
+		}
+	}
+	return nil
+}
+
+// fileUpsertCapture lets UpsertBatchTx reuse the canonical upsert SQL and
+// argument normalization without duplicating its large column list.
+type fileUpsertCapture struct {
+	query string
+	args  []any
+}
+
+func (c *fileUpsertCapture) QueryRow(_ context.Context, query string, args ...any) pgx.Row {
+	c.query = query
+	c.args = append([]any(nil), args...)
+	return c
+}
+
+func (c *fileUpsertCapture) Scan(...any) error { return nil }
+
+func (r *FileRepository) upsertWithQueryer(ctx context.Context, queryer fileQueryer, mf models.MediaFile) (*models.MediaFile, error) {
+	if queryer == nil {
+		return nil, fmt.Errorf("media file upsert: nil queryer")
+	}
 	subtitleTracksJSON, err := serializeJSONB(mf.SubtitleTracks)
 	if err != nil {
 		return nil, fmt.Errorf("marshaling subtitle_tracks: %w", err)
@@ -1048,7 +1117,7 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		updated_at = NOW()
 	RETURNING ` + fileColumns
 
-	row := r.pool.QueryRow(ctx, query,
+	row := queryer.QueryRow(ctx, query,
 		contentID,
 		episodeID,
 		extraID,
@@ -1106,6 +1175,9 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		nilIfEmpty(scanbatch.RunID(ctx)),
 		virtualOwnerInstallationValue(mf),
 	)
+	if _, ok := queryer.(*fileUpsertCapture); ok {
+		return nil, nil
+	}
 
 	return scanMediaFile(row)
 }
@@ -3608,7 +3680,8 @@ func (r *FileRepository) ListByObservedRootPath(ctx context.Context, folderID in
 }
 
 // GetByContentID returns all media files linked to the given content ID,
-// ordered by resolution (highest first), excluding files that are missing.
+// excluding files that are missing. This preserves the long-standing id order
+// used by the general catalog and playback paths.
 func (r *FileRepository) GetByContentID(ctx context.Context, contentID string) ([]*models.MediaFile, error) {
 	query := `SELECT ` + fileColumns + ` FROM media_files
 		WHERE content_id = $1 AND missing_since IS NULL
@@ -3620,6 +3693,54 @@ func (r *FileRepository) GetByContentID(ctx context.Context, contentID string) (
 	defer rows.Close()
 
 	return scanMediaFiles(rows)
+}
+
+// GetByContentIDPresentation is the audiobook presentation ordering variant.
+// Multipart books use the scanner-assigned part index. Rows that predate the
+// column have no index and SQL cannot apply naturalPathLess to them, so those
+// legacy rows are re-sorted in Go after the query; part10.m4b must follow
+// part2.m4b for them too. Keeping this separate avoids changing ordering
+// assumptions in movie and series playback.
+func (r *FileRepository) GetByContentIDPresentation(ctx context.Context, contentID string) ([]*models.MediaFile, error) {
+	query := `SELECT ` + fileColumns + ` FROM media_files
+		WHERE content_id = $1 AND missing_since IS NULL
+		ORDER BY COALESCE(presentation_part_index, 2147483647), file_path ASC, id ASC`
+	rows, err := r.pool.Query(ctx, query, contentID)
+	if err != nil {
+		return nil, fmt.Errorf("querying presentation files by content_id: %w", err)
+	}
+	defer rows.Close()
+	files, err := scanMediaFiles(rows)
+	if err != nil {
+		return nil, err
+	}
+	sortPresentationFiles(files)
+	return files, nil
+}
+
+// sortPresentationFiles orders multipart rows for one content ID: indexed rows
+// by part index, then legacy rows without one by natural file path. The SQL
+// ordering already places the null-index group last, so this only fixes the
+// intra-group lexical order (part10 before part2) that SQL cannot express.
+func sortPresentationFiles(files []*models.MediaFile) {
+	sort.SliceStable(files, func(i, j int) bool {
+		a, b := files[i], files[j]
+		if a == nil || b == nil {
+			return b == nil && a != nil
+		}
+		aIndexed := a.PresentationPartIndex > 0
+		bIndexed := b.PresentationPartIndex > 0
+		switch {
+		case aIndexed && bIndexed:
+			return a.PresentationPartIndex < b.PresentationPartIndex
+		case aIndexed != bIndexed:
+			return aIndexed
+		}
+		if a.FilePath != b.FilePath {
+			return naturalPathLess(a.FilePath, b.FilePath)
+		}
+		return a.ID < b.ID
+	})
 }
 
 // FirstDurationsByContentIDs returns the probed duration (seconds) of the

@@ -2669,6 +2669,13 @@ func main() {
 				brandingReconciler,
 				identity,
 			))
+			// The reconcile above repairs catalog rows whose objects went
+			// missing. This sweeps the other direction: objects no row
+			// references. Only the sweep can reclaim a revision whose GC
+			// candidate was never enqueued, which nothing else ever reads back.
+			if sweeper := metadata.NewArtworkStorageSweeper(deps.DB, deps.S3Public); sweeper != nil {
+				taskMgr.Register(tasks.NewSweepArtworkStorageTask(sweeper, settingsRepo, identity))
+			}
 		}
 		if pluginAutoUpdater != nil {
 			taskMgr.Register(tasks.NewCheckPluginUpdatesTask(pluginAutoUpdater))
