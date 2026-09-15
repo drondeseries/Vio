@@ -45,7 +45,7 @@ func TestDownloadSubscriptionReads(t *testing.T) {
 	deps.DownloadSubscriptions = svc
 	h := newTestHandler(t, deps)
 	viewer := with(bearer(memberToken), "X-Profile-Id", "p-owner")
-	device := with(viewer, "X-Silo-Device-Id", "device-one")
+	device := with(viewer, "X-Vio-Device-Id", "device-one")
 	path := Prefix + "/downloads/subscriptions"
 	rec := do(t, h, "GET", path+"/monitor", "", device)
 	if rec.Code != 200 || rec.Header().Get("ETag") == "" {
@@ -71,7 +71,7 @@ func TestDownloadSubscriptionReads(t *testing.T) {
 	if rec.Code != 200 || svc.after == nil || svc.after.ID != row.ID || !svc.after.CreatedAt.Equal(row.CreatedAt) {
 		t.Fatalf("%d %+v", rec.Code, svc)
 	}
-	rec = do(t, h, "GET", path+"?cursor="+page.Page.NextCursor, "", with(viewer, "X-Silo-Device-Id", "other"))
+	rec = do(t, h, "GET", path+"?cursor="+page.Page.NextCursor, "", with(viewer, "X-Vio-Device-Id", "other"))
 	if rec.Code != 400 {
 		t.Fatalf("foreign cursor: %d", rec.Code)
 	}

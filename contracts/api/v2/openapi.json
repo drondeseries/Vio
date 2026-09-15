@@ -31083,6 +31083,9 @@
             "format": "int64",
             "type": "integer"
           },
+          "carried_audio_track_id": {
+            "type": "string"
+          },
           "client_capabilities": {
             "$ref": "#/components/schemas/ClientCodecCapabilitiesV3"
           },
@@ -31102,6 +31105,16 @@
             ],
             "minLength": 1,
             "type": "string"
+          },
+          "file_selection": {
+            "enum": [
+              "auto",
+              "explicit"
+            ],
+            "type": "string"
+          },
+          "force_relink": {
+            "type": "boolean"
           },
           "installation_id": {
             "description": "Opaque identifier",
@@ -77441,7 +77454,7 @@
           "204": {
             "description": "No Content",
             "headers": {
-              "X-Silo-Restart-Required": {
+              "X-Vio-Restart-Required": {
                 "schema": {
                   "description": "Always true: bindings load at server start",
                   "type": "string"
@@ -90583,7 +90596,7 @@
             },
             "description": "Conflict",
             "headers": {
-              "X-Silo-Latest-Sequence": {
+              "X-Vio-Latest-Sequence": {
                 "description": "On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts.",
                 "schema": {
                   "type": "string"
@@ -90805,7 +90818,7 @@
             },
             "description": "Conflict",
             "headers": {
-              "X-Silo-Latest-Sequence": {
+              "X-Vio-Latest-Sequence": {
                 "description": "On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts.",
                 "schema": {
                   "type": "string"
@@ -91027,7 +91040,7 @@
             },
             "description": "Conflict",
             "headers": {
-              "X-Silo-Latest-Sequence": {
+              "X-Vio-Latest-Sequence": {
                 "description": "On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts.",
                 "schema": {
                   "type": "string"
@@ -91249,7 +91262,7 @@
             },
             "description": "Conflict",
             "headers": {
-              "X-Silo-Latest-Sequence": {
+              "X-Vio-Latest-Sequence": {
                 "description": "On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts.",
                 "schema": {
                   "type": "string"
@@ -116457,7 +116470,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -120257,7 +120270,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -120426,7 +120439,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -120434,7 +120447,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "maxLength": 120,
               "type": "string"
@@ -120442,7 +120455,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "maxLength": 40,
               "type": "string"
@@ -120684,7 +120697,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -120857,7 +120870,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -121035,7 +121048,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -121045,7 +121058,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "maxLength": 256,
               "type": "string"
@@ -121053,7 +121066,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -121258,7 +121271,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -121509,7 +121522,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -121693,7 +121706,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -121882,7 +121895,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -122127,7 +122140,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -122280,7 +122293,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -122479,7 +122492,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -122686,7 +122699,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -123170,7 +123183,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -123596,7 +123609,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -124132,7 +124145,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "maxLength": 128,
               "type": "string"
@@ -124626,7 +124639,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -124794,7 +124807,7 @@
           },
           {
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "maxLength": 128,
@@ -126076,7 +126089,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -126193,7 +126206,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -126238,7 +126251,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -126313,7 +126326,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -126365,7 +126378,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -126553,7 +126566,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -126598,7 +126611,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -126643,7 +126656,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -126718,7 +126731,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -126770,7 +126783,7 @@
                   "type": "string"
                 }
               },
-              "X-Silo-Ebook-Conversion": {
+              "X-Vio-Ebook-Conversion": {
                 "schema": {
                   "type": "string"
                 }
@@ -158183,7 +158196,7 @@
           {
             "description": "The client's stable device identifier",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "description": "The client's stable device identifier",
@@ -158197,7 +158210,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -158210,7 +158223,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -158359,7 +158372,7 @@
           {
             "description": "The client's stable device identifier",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "required": true,
             "schema": {
               "description": "The client's stable device identifier",
@@ -158373,7 +158386,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -158386,7 +158399,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -159227,7 +159240,7 @@
           {
             "description": "The client's stable device identifier; absent resolves the profile-wide value",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; absent resolves the profile-wide value",
               "examples": [
@@ -159240,7 +159253,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -159253,7 +159266,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -159508,7 +159521,7 @@
           {
             "description": "The client family a profile_client value belongs to",
             "in": "header",
-            "name": "X-Silo-Client-Family",
+            "name": "X-Vio-Client-Family",
             "schema": {
               "description": "The client family a profile_client value belongs to",
               "enum": [
@@ -159527,7 +159540,7 @@
           {
             "description": "The client's stable device identifier; the profile_device scope stores against it when device_id is absent",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; the profile_device scope stores against it when device_id is absent",
               "examples": [
@@ -159540,7 +159553,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -159553,7 +159566,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -159799,7 +159812,7 @@
           {
             "description": "The client family whose profile_client values take part; required when a requested key has that scope",
             "in": "header",
-            "name": "X-Silo-Client-Family",
+            "name": "X-Vio-Client-Family",
             "schema": {
               "description": "The client family whose profile_client values take part; required when a requested key has that scope",
               "enum": [
@@ -159818,7 +159831,7 @@
           {
             "description": "The client's stable device identifier; its profile_device values take part",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; its profile_device values take part",
               "examples": [
@@ -159831,7 +159844,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -159844,7 +159857,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -159998,7 +160011,7 @@
           {
             "description": "The client family whose profile_client values take part; required when a requested key has that scope",
             "in": "header",
-            "name": "X-Silo-Client-Family",
+            "name": "X-Vio-Client-Family",
             "schema": {
               "description": "The client family whose profile_client values take part; required when a requested key has that scope",
               "enum": [
@@ -160017,7 +160030,7 @@
           {
             "description": "The client's stable device identifier; its profile_device values take part",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; its profile_device values take part",
               "examples": [
@@ -160030,7 +160043,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -160043,7 +160056,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -160528,7 +160541,7 @@
           {
             "description": "The client family a profile_client value belongs to",
             "in": "header",
-            "name": "X-Silo-Client-Family",
+            "name": "X-Vio-Client-Family",
             "schema": {
               "description": "The client family a profile_client value belongs to",
               "enum": [
@@ -160547,7 +160560,7 @@
           {
             "description": "The client's stable device identifier; the profile_device scope stores against it when device_id is absent",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; the profile_device scope stores against it when device_id is absent",
               "examples": [
@@ -160560,7 +160573,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -160573,7 +160586,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -160815,7 +160828,7 @@
           {
             "description": "The client family a profile_client value belongs to",
             "in": "header",
-            "name": "X-Silo-Client-Family",
+            "name": "X-Vio-Client-Family",
             "schema": {
               "description": "The client family a profile_client value belongs to",
               "enum": [
@@ -160834,7 +160847,7 @@
           {
             "description": "The client's stable device identifier; the profile_device scope stores against it when device_id is absent",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; the profile_device scope stores against it when device_id is absent",
               "examples": [
@@ -160847,7 +160860,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -160860,7 +160873,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -161107,7 +161120,7 @@
           {
             "description": "The client family a profile_client value belongs to",
             "in": "header",
-            "name": "X-Silo-Client-Family",
+            "name": "X-Vio-Client-Family",
             "schema": {
               "description": "The client family a profile_client value belongs to",
               "enum": [
@@ -161126,7 +161139,7 @@
           {
             "description": "The client's stable device identifier; the profile_device scope stores against it when device_id is absent",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The client's stable device identifier; the profile_device scope stores against it when device_id is absent",
               "examples": [
@@ -161139,7 +161152,7 @@
           {
             "description": "Optional display name recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Name",
+            "name": "X-Vio-Device-Name",
             "schema": {
               "description": "Optional display name recorded on the device registry",
               "examples": [
@@ -161152,7 +161165,7 @@
           {
             "description": "Optional platform recorded on the device registry",
             "in": "header",
-            "name": "X-Silo-Device-Platform",
+            "name": "X-Vio-Device-Platform",
             "schema": {
               "description": "Optional platform recorded on the device registry",
               "examples": [
@@ -172296,7 +172309,7 @@
           {
             "description": "The stable device identifier used to resolve playback preferences",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The stable device identifier used to resolve playback preferences",
               "examples": [
@@ -176568,7 +176581,7 @@
           {
             "description": "Opaque incarnation/timeline from the completed response; private to Silo hops.",
             "in": "header",
-            "name": "X-Silo-Transcode-Segment-Generation",
+            "name": "X-Vio-Transcode-Segment-Generation",
             "required": true,
             "schema": {
               "type": "string"
@@ -176687,7 +176700,7 @@
             },
             "description": "Unprocessable Entity",
             "headers": {
-              "X-Silo-Tone-Map-Execution-Error": {
+              "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Bounded tone-map refusal code when available; not present on all failures.",
                 "schema": {
                   "type": "string"
@@ -176715,7 +176728,7 @@
             },
             "description": "Service Unavailable",
             "headers": {
-              "X-Silo-Tone-Map-Execution-Error": {
+              "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Bounded tone-map refusal code when available; not present on all failures.",
                 "schema": {
                   "type": "string"
@@ -177349,7 +177362,7 @@
             },
             "description": "Unprocessable Entity",
             "headers": {
-              "X-Silo-Tone-Map-Execution-Error": {
+              "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Existing tone-map refusal code when available.",
                 "schema": {
                   "type": "string"
@@ -177377,7 +177390,7 @@
             },
             "description": "Service Unavailable",
             "headers": {
-              "X-Silo-Tone-Map-Execution-Error": {
+              "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Existing tone-map refusal code when available.",
                 "schema": {
                   "type": "string"
@@ -179535,7 +179548,7 @@
           {
             "description": "Signed recipe reference for node-side validation and deny-marker lookup; not a native user access token.",
             "in": "header",
-            "name": "X-Silo-Stream-Token",
+            "name": "X-Vio-Stream-Token",
             "required": true,
             "schema": {
               "type": "string"
@@ -179661,7 +179674,7 @@
           {
             "description": "Signed recipe reference for node-side validation and deny-marker lookup; not a native user access token.",
             "in": "header",
-            "name": "X-Silo-Stream-Token",
+            "name": "X-Vio-Stream-Token",
             "required": true,
             "schema": {
               "type": "string"
@@ -179722,7 +179735,7 @@
           {
             "description": "Signed recipe reference for node-side validation and deny-marker lookup; not a native user access token.",
             "in": "header",
-            "name": "X-Silo-Stream-Token",
+            "name": "X-Vio-Stream-Token",
             "schema": {
               "type": "string"
             }
@@ -179793,7 +179806,7 @@
             },
             "description": "Unprocessable Entity",
             "headers": {
-              "X-Silo-Tone-Map-Execution-Error": {
+              "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Existing tone-map refusal code when available.",
                 "schema": {
                   "type": "string"
@@ -179811,7 +179824,7 @@
             },
             "description": "Service Unavailable",
             "headers": {
-              "X-Silo-Tone-Map-Execution-Error": {
+              "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Existing tone-map refusal code when available.",
                 "schema": {
                   "type": "string"
@@ -179834,7 +179847,7 @@
           {
             "description": "Signed recipe reference for node-side validation and deny-marker lookup; not a native user access token.",
             "in": "header",
-            "name": "X-Silo-Stream-Token",
+            "name": "X-Vio-Stream-Token",
             "schema": {
               "type": "string"
             }
@@ -179850,7 +179863,7 @@
           {
             "description": "Value1 defers completion accounting to downstream acknowledgment and returns private generation metadata.",
             "in": "header",
-            "name": "X-Silo-Transcode-Proxy",
+            "name": "X-Vio-Transcode-Proxy",
             "schema": {
               "type": "string"
             }
@@ -179917,7 +179930,7 @@
             },
             "description": "Leased segment bytes with standard conditions/ranges",
             "headers": {
-              "X-Silo-Transcode-Segment-Generation": {
+              "X-Vio-Transcode-Segment-Generation": {
                 "description": "Private generation only for marked proxy hops; never client-facing.",
                 "schema": {
                   "type": "string"
@@ -179937,7 +179950,7 @@
             },
             "description": "Leased segment bytes with standard conditions/ranges",
             "headers": {
-              "X-Silo-Transcode-Segment-Generation": {
+              "X-Vio-Transcode-Segment-Generation": {
                 "description": "Private generation only for marked proxy hops; never client-facing.",
                 "schema": {
                   "type": "string"
@@ -180001,7 +180014,7 @@
             },
             "description": "Unprocessable Entity",
             "headers": {
-              "X-Silo-Tone-Map-Execution-Error": {
+              "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Existing tone-map refusal code when available.",
                 "schema": {
                   "type": "string"
@@ -180029,7 +180042,7 @@
             },
             "description": "Service Unavailable",
             "headers": {
-              "X-Silo-Tone-Map-Execution-Error": {
+              "X-Vio-Tone-Map-Execution-Error": {
                 "description": "Existing tone-map refusal code when available.",
                 "schema": {
                   "type": "string"

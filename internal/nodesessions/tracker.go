@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	keyPrefix  = "silo:sessions:"
+	keyPrefix  = "vio:sessions:"
 	sessionTTL = 60 * time.Second
 	refreshInt = 30 * time.Second
 )

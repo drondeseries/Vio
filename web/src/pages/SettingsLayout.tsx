@@ -315,7 +315,7 @@ const NAV_SECTIONS: NavSection[] = [
         path: "connect-apps",
         label: "Connect Apps",
         icon: Cast,
-        description: "Sign-in details for Silo and Jellyfin-compatible apps.",
+        description: "Sign-in details for Vio and Jellyfin-compatible apps.",
         keywords: [
           "jellyfin",
           "infuse",
@@ -330,7 +330,7 @@ const NAV_SECTIONS: NavSection[] = [
           "pin",
         ],
         settings: settingIndex(
-          "Silo app or website",
+          "Vio app or website",
           "Jellyfin-compatible app",
           "Server",
           "Username",
@@ -383,7 +383,7 @@ const NAV_SECTIONS: NavSection[] = [
         path: "history-import",
         label: "History Import",
         icon: Clock,
-        description: "Bring an existing Emby watch history into Silo.",
+        description: "Bring an existing Emby watch history into Vio.",
         keywords: ["emby", "watched history", "import", "mapping", "sync"],
         settings: settingIndex(
           "New import",
@@ -614,7 +614,7 @@ export default function SettingsLayout() {
               <div className="min-w-0 space-y-3">
                 <h1 className="page-title text-[clamp(2rem,4vw,3rem)]">Settings</h1>
                 <p className="page-subtitle text-sm sm:text-base">
-                  Make Silo work the way you like.
+                  Make Vio work the way you like.
                 </p>
               </div>
               <SettingsSearchInput

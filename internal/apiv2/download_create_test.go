@@ -41,7 +41,7 @@ func TestDownloadCreateTransport(t *testing.T) {
 	deps.DownloadCreation = svc
 	h := newTestHandler(t, deps)
 	viewer := with(bearer(memberToken), "X-Profile-Id", "p-owner")
-	device := with(viewer, "X-Silo-Device-Id", "device-one")
+	device := with(viewer, "X-Vio-Device-Id", "device-one")
 	path := Prefix + "/downloads"
 	rec := do(t, h, "POST", path, `{"content_id":"movie","media_file_id":"42","expected_revision":0}`, device)
 	if rec.Code != 202 || svc.user != 1 || svc.req.ProfileID != "p-owner" || svc.req.DeviceID != "device-one" || svc.req.FileID != 42 || svc.req.ExpectedRevision == nil || *svc.req.ExpectedRevision != 0 || !svc.req.StrictIdentity {
@@ -104,7 +104,7 @@ func TestDownloadCreateRejectsEmptyBatchGuardsOnSingle(t *testing.T) {
 	deps.DownloadCreation = svc
 	h := newTestHandler(t, deps)
 	viewer := with(bearer(memberToken), "X-Profile-Id", "p-owner")
-	device := with(viewer, "X-Silo-Device-Id", "device-one")
+	device := with(viewer, "X-Vio-Device-Id", "device-one")
 	for _, tc := range []struct {
 		name, body string
 		managed    bool

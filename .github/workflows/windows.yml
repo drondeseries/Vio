@@ -1,0 +1,156 @@
+name: Native Windows Server
+
+on:
+  # Manual-only while the Windows packaging path is being proven out, mirroring
+  # the macOS workflow until the binary is exercised regularly.
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOPRIVATE: github.com/Silo-Server/*
+  GONOSUMDB: github.com/Silo-Server/*
+  GOWORK: off
+  # The main binary binds libvips (github.com/h2non/bimg) and sqlite
+  # (github.com/mattn/go-sqlite3) through cgo, so the Windows build needs the
+  # mingw gcc on windows-latest rather than silently falling back to a
+  # pure-Go build that would fail at link time.
+  CGO_ENABLED: 1
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows amd64
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    # git-bash ships on windows-latest, so the bash idioms below (mktemp,
+    # grep, date, sha256sum) stay identical to the macOS workflow.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # Mirrors `brew install vips ffmpeg` on macOS: the vips dev files must
+      # be visible to cgo through pkg-config, and ffmpeg ships the runtime
+      # encoders. A fresh shell per step picks up the PATH entries choco
+      # registers, so verification lives in the next step.
+      - name: Install native dependencies
+        run: choco install -y vips ffmpeg pkgconfiglite --no-progress
+
+      - name: Verify native dependencies
+        run: |
+          gcc --version
+          pkg-config --modversion vips-cpp || {
+            echo "::error::vips-cpp is not visible to pkg-config; the cgo build against libvips will fail."
+            pkg-config --list-all 2>&1 | grep -i vips || echo "no vips entry in pkg-config --list-all"
+            echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+            ls '/c/Program Files' | grep -i vips || true
+            exit 1
+          }
+          vips --version
+          ffmpeg -hide_banner -version
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend assets
+        working-directory: web
+        run: pnpm run build
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Validate SDK resolves from the module graph
+        run: |
+          sdk_module_json="$(mktemp)"
+          go list -m -json github.com/Silo-Server/silo-plugin-sdk > "$sdk_module_json"
+          if grep -q '"Replace":' "$sdk_module_json"; then
+            echo "silo-plugin-sdk resolved through a module replacement."
+            cat "$sdk_module_json"
+            exit 1
+          fi
+          if grep -q '"Main": true' "$sdk_module_json"; then
+            echo "silo-plugin-sdk resolved from the local workspace instead of go.mod."
+            cat "$sdk_module_json"
+            exit 1
+          fi
+
+      - name: Test Go on Windows
+        run: go test ./...
+
+      - name: Build native server archive
+        id: build
+        env:
+          BUILDINFO_PKG: github.com/Silo-Server/silo-server/internal/buildinfo
+        run: |
+          built_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          archive="vio-windows-amd64-${GITHUB_SHA::8}.zip"
+          package_dir="dist/vio-windows-amd64"
+          mkdir -p "$package_dir"
+
+          go build -trimpath \
+            -ldflags "-X ${BUILDINFO_PKG}.revisionOverride=${GITHUB_SHA} -X ${BUILDINFO_PKG}.dirtyOverride=false -X ${BUILDINFO_PKG}.builtAtOverride=${built_at}" \
+            -o "$package_dir/vio.exe" ./cmd/silo/
+
+          cp LICENSE "$package_dir/LICENSE"
+          go version -m "$package_dir/vio.exe" > "$package_dir/build-info.txt"
+          # No otool equivalent on Windows; build-info.txt carries the module
+          # hashes instead of a linked-libraries.txt. Compress-Archive is used
+          # over zip/7z because it is always present on windows-latest.
+          powershell.exe -NoProfile -NonInteractive -Command "Compress-Archive -Path dist/vio-windows-amd64 -DestinationPath dist/$archive -Force"
+          (cd dist && sha256sum "$archive" > "$archive.sha256")
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Verify native runtime
+        env:
+          ARCHIVE: ${{ steps.build.outputs.archive }}
+        run: |
+          test -f dist/vio-windows-amd64/vio.exe
+          dist/vio-windows-amd64/vio.exe -h >/dev/null
+          grep -aFq "$GITHUB_SHA" dist/vio-windows-amd64/vio.exe
+          (cd dist && sha256sum -c "$ARCHIVE.sha256")
+
+          # Informational only: windows-latest runners have no GPU, so
+          # DirectX/NVENC encoders are not expected — never fail on these.
+          echo '--- ffmpeg hwaccels (informational only) ---'
+          ffmpeg -hide_banner -hwaccels 2>&1 || true
+          echo '--- ffmpeg h264/hevc/av1 encoders (informational only) ---'
+          ffmpeg -hide_banner -encoders 2>&1 | grep -i -E 'h264|hevc|av1' || true
+
+      - name: Upload native server
+        uses: actions/upload-artifact@v4
+        with:
+          name: vio-windows-amd64-${{ github.sha }}
+          path: |
+            dist/${{ steps.build.outputs.archive }}
+            dist/${{ steps.build.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14

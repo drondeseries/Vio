@@ -17,7 +17,7 @@ import (
 const (
 	webhookRequestTimeout = 10 * time.Second
 	webhookMaxRedirects   = 3
-	webhookUserAgent      = "Silo-Webhook/1.0"
+	webhookUserAgent      = "Vio-Webhook/1.0"
 )
 
 // webhookSendResult is the structured outcome of one webhook POST.

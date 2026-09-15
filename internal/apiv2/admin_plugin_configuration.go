@@ -54,7 +54,7 @@ type AdminPluginAuthBindingInput struct {
 	Body    AdminPluginAuthBindingWrite
 }
 type AdminPluginAuthBindingOutput struct {
-	RestartRequired string `header:"X-Silo-Restart-Required" doc:"Always true: bindings load at server start"`
+	RestartRequired string `header:"X-Vio-Restart-Required" doc:"Always true: bindings load at server start"`
 }
 
 // AdminPluginTaskBindingWrite is the whole-row task binding assignment.
@@ -73,7 +73,7 @@ type AdminPluginTaskBindingResult struct {
 }
 type AdminPluginTaskBindingOutput struct{ Body AdminPluginTaskBindingResult }
 
-// restartRequiredHeaderValue is the fixed X-Silo-Restart-Required value:
+// restartRequiredHeaderValue is the fixed X-Vio-Restart-Required value:
 // bindings load at server start, so every successful write requires one.
 const restartRequiredHeaderValue = "true"
 

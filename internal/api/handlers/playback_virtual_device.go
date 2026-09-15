@@ -48,10 +48,10 @@ func (h *PlaybackHandler) rankVirtualCandidatesForDevice(r *http.Request, stream
 }
 
 // requestDeviceID returns the durable device ID the web/app clients send on
-// every request (X-Silo-Device-Id). Empty means "no device identity": ranking
-// then falls back to provider order.
+// every request (X-Vio-Device-Id, legacy X-Silo-Device-Id accepted). Empty
+// means "no device identity": ranking then falls back to provider order.
 func requestDeviceID(r *http.Request) string {
-	return clampHeaderValue(r.Header.Get(deviceIDHeader), 128)
+	return clampHeaderValue(headerValue(r.Header, deviceIDHeader, legacyDeviceIDHeader), 128)
 }
 
 // providerDeviceCapabilitySource implements plugins.DeviceCapabilityProfileSource

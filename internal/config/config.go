@@ -418,7 +418,7 @@ const downloadArtifactDirSettingKey = "download.artifact_dir"
 
 // DefaultTranscodeDir is the fallback playback.transcode_dir; download
 // artifacts default to a sibling directory (see EffectiveDownloadArtifactDir).
-const DefaultTranscodeDir = "/tmp/silo-transcode"
+const DefaultTranscodeDir = "/tmp/vio-transcode"
 
 // EffectiveDownloadArtifactDir resolves the shared prepared-download artifact
 // root. Keeping this path rule in config lets API and transcode-node processes
@@ -434,12 +434,12 @@ func EffectiveDownloadArtifactDir(artifactDir, transcodeDir string) string {
 	// "/srv/transcode", which would nest the artifact root INSIDE the transcode
 	// dir — where the orphaned-transcode sweep deletes non-active
 	// subdirectories, i.e. it would delete prepared downloads.
-	return filepath.Join(filepath.Dir(filepath.Clean(transcodeDir)), "silo-download-artifacts")
+	return filepath.Join(filepath.Dir(filepath.Clean(transcodeDir)), "vio-download-artifacts")
 }
 
 const DefaultJellyfinCompatEmulatedServerVersion = "10.12.0"
 const DefaultJellyfinWebVersion = "10.11.6"
-const DefaultJellyfinWebInstallDir = "/var/lib/silo/compat/jellyfin-web"
+const DefaultJellyfinWebInstallDir = "/var/lib/vio/compat/jellyfin-web"
 const DefaultJellyfinWebDir = DefaultJellyfinWebInstallDir + "/current"
 
 // parseDuration parses a duration string that supports Go's time.ParseDuration
@@ -527,7 +527,7 @@ func setDefaults() *configRaw {
 			PublicURL:             "http://127.0.0.1:8097",
 			EmulatedServerVersion: DefaultJellyfinCompatEmulatedServerVersion,
 			ServerID:              defaultJellyfinCompatServerID,
-			ServerName:            "Silo",
+			ServerName:            "Vio",
 			WebEnabled:            true,
 			WebVersion:            DefaultJellyfinWebVersion,
 			WebDir:                DefaultJellyfinWebDir,

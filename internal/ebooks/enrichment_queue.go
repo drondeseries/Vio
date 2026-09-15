@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/envutil"
 )
 
 const (
@@ -20,11 +20,13 @@ const (
 	skippedRetryHorizon      = 15 * time.Minute
 	claimCandidateWindow     = maxEnrichWorkers
 	defaultRateLimitCooldown = 15 * time.Minute
-	rateLimitCooldownEnv     = "SILO_EBOOK_RATE_LIMIT_COOLDOWN"
+	rateLimitCooldownEnv     = "VIO_EBOOK_RATE_LIMIT_COOLDOWN"
+	// rateLimitCooldownEnvLegacy is the pre-rebrand fallback.
+	rateLimitCooldownEnvLegacy = "SILO_EBOOK_RATE_LIMIT_COOLDOWN"
 )
 
 func rateLimitCooldownFloor() time.Duration {
-	if v := os.Getenv(rateLimitCooldownEnv); v != "" {
+	if v := envutil.GetenvFirst(rateLimitCooldownEnv, rateLimitCooldownEnvLegacy); v != "" {
 		if parsed, err := time.ParseDuration(v); err == nil && parsed > 0 {
 			return parsed
 		}

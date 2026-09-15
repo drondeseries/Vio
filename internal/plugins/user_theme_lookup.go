@@ -10,7 +10,7 @@ import (
 )
 
 // PgUserThemeLookup resolves the user's effective UI theme so the plugin proxy
-// can stamp X-Silo-Theme on every plugin request.
+// can stamp X-Vio-Theme on every plugin request.
 //
 // The theme is the canonical profile-scoped ui.theme setting in
 // user_setting_values — the row the settings contract's typed API writes. The

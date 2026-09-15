@@ -19,7 +19,7 @@ import (
 const (
 	PushPlatformApple      = "apple"
 	PushPlatformAndroid    = "android"
-	PushProviderSiloRelay  = "silo_relay"
+	PushProviderSiloRelay  = "vio_relay"
 	PushModeOff            = "off"
 	PushModeInAppOnly      = "in_app_only"
 	PushModePrivatePush    = "private_push"

@@ -3,7 +3,7 @@
 #
 # Vite serves the UI at http://localhost:${PORT:-8090} and proxies API
 # requests to the Air-reloaded Go backend on the compose network.
-name: silo-dev
+name: vio-dev
 
 services:
   postgres:
@@ -17,7 +17,7 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - silo-dev-postgres:/var/lib/postgresql
+      - vio-dev-postgres:/var/lib/postgresql
     command: ["postgres", "-c", "listen_addresses=*"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-silo}"]
@@ -31,14 +31,14 @@ services:
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
-      - silo-dev-redis:/data
+      - vio-dev-redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  silo:
+  vio:
     build:
       context: .
       dockerfile_inline: |
@@ -84,8 +84,8 @@ services:
         tmp_dir = "tmp"
 
         [build]
-          cmd = "go build -o ./tmp/silo ./cmd/silo/"
-          bin = "./tmp/silo"
+          cmd = "go build -o ./tmp/vio ./cmd/silo/"
+          bin = "./tmp/vio"
           args_bin = []
           include_ext = ["go", "sql", "json"]
           include_dir = ["cmd", "internal", "migrations"]
@@ -109,7 +109,8 @@ services:
       PORT: "8080"
       DATABASE_URL: postgres://${POSTGRES_USER:-silo}:${POSTGRES_PASSWORD:-silo}@postgres:5432/${POSTGRES_DB:-silo}?sslmode=disable
       REDIS_URL: redis://redis:6379
-      SILO_PLUGIN_CACHE_DIR: /var/lib/silo/plugins
+      VIO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
+      SILO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
       POSTGRES_TUNE: "off"
     ports:
       - "${BACKEND_PORT:-18080}:8080"
@@ -117,13 +118,13 @@ services:
       - "${ABS_PORT:-13378}:13378"
     volumes:
       - .:/app
-      - silo-dev-air-tmp:/app/tmp
-      - silo-dev-go-build:/root/.cache/go-build
-      - silo-dev-go-mod:/go/pkg/mod
-      - silo-dev-plugins:/var/lib/silo/plugins
-      - silo-dev-compat:/var/lib/silo/compat
-      - silo-dev-transcode:/tmp/silo-transcode
-      - ${MEDIA_ROOT:-/tmp/silo-dev-media}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
+      - vio-dev-air-tmp:/app/tmp
+      - vio-dev-go-build:/root/.cache/go-build
+      - vio-dev-go-mod:/go/pkg/mod
+      - vio-dev-plugins:/var/lib/vio/plugins
+      - vio-dev-compat:/var/lib/vio/compat
+      - vio-dev-transcode:/tmp/vio-transcode
+      - ${MEDIA_ROOT:-/tmp/vio-dev-media}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -152,7 +153,7 @@ services:
     working_dir: /app/web
     command: sh -c "pnpm install --frozen-lockfile --store-dir /pnpm/store && pnpm run dev -- --host 0.0.0.0"
     environment:
-      VITE_API_PROXY_TARGET: http://silo:8080
+      VITE_API_PROXY_TARGET: http://vio:8080
       VITE_HMR_CLIENT_PORT: "${PORT:-8090}"
       PNPM_STORE_DIR: /pnpm/store
       CI: "true"
@@ -160,20 +161,20 @@ services:
       - "${PORT:-8090}:5173"
     volumes:
       - .:/app
-      - silo-dev-web-node-modules:/app/web/node_modules
-      - silo-dev-pnpm-store:/pnpm/store
+      - vio-dev-web-node-modules:/app/web/node_modules
+      - vio-dev-pnpm-store:/pnpm/store
     depends_on:
-      silo:
+      vio:
         condition: service_healthy
 
 volumes:
-  silo-dev-air-tmp:
-  silo-dev-compat:
-  silo-dev-go-build:
-  silo-dev-go-mod:
-  silo-dev-plugins:
-  silo-dev-pnpm-store:
-  silo-dev-postgres:
-  silo-dev-redis:
-  silo-dev-transcode:
-  silo-dev-web-node-modules:
+  vio-dev-air-tmp:
+  vio-dev-compat:
+  vio-dev-go-build:
+  vio-dev-go-mod:
+  vio-dev-plugins:
+  vio-dev-pnpm-store:
+  vio-dev-postgres:
+  vio-dev-redis:
+  vio-dev-transcode:
+  vio-dev-web-node-modules:

@@ -1074,7 +1074,7 @@ func buildScrobblePayload(event watchsync.ScrobbleEvent) map[string]any {
 	}
 	payload := map[string]any{
 		"progress":    progress,
-		"app_version": "Silo",
+		"app_version": "Vio",
 		"app_date":    time.Now().UTC().Format("2006-01-02"),
 	}
 	switch event.Kind {

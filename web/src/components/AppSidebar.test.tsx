@@ -137,7 +137,7 @@ vi.mock("@/hooks/useViewTransition", () => ({
 
 vi.mock("@/hooks/useServerBranding", () => ({
   useServerBranding: () => ({
-    serverName: "Silo",
+    serverName: "Vio",
   }),
 }));
 
@@ -150,7 +150,7 @@ vi.mock("@/hooks/useTheme", () => ({
     resetPreviewTheme: vi.fn(),
   }),
   isKeyboardFocus: () => false,
-  // SiloBrand reads the appearance through the optional hook; null keeps it on
+  // VioBrand reads the appearance through the optional hook; null keeps it on
   // the dark built-in assets, matching the sidebar's own surface.
   useOptionalTheme: () => null,
 }));
@@ -206,11 +206,11 @@ describe("AppSidebar", () => {
     expect(markup).toContain(`>${SEARCH_SHORTCUT_LABEL}</kbd>`);
   });
 
-  it("renders the Silo brand mark instead of the old play glyph", () => {
+  it("renders the Vio brand mark instead of the old play glyph", () => {
     const markup = renderSidebar("/");
 
     expect(markup).toContain('src="/silo-wordmark-sidebar.png"');
-    expect(markup).toContain('alt="Silo"');
+    expect(markup).toContain('alt="Vio"');
     expect(markup).not.toContain("▶");
   });
 

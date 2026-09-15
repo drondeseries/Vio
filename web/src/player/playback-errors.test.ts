@@ -62,7 +62,7 @@ describe("describePlanTerminal", () => {
     ).toEqual({
       title: "That subtitle track can't be used",
       message:
-        "Silo couldn't prepare the selected subtitles for this device. Try a different track.",
+        "Vio couldn't prepare the selected subtitles for this device. Try a different track.",
       reason: "subtitle_codec_unsupported",
       retryable: false,
     });
@@ -89,7 +89,7 @@ describe("describePlanTerminal", () => {
     ).toEqual({
       title: "No playable version found",
       message:
-        "Silo couldn't find a way to play this file on this device. Try another version if one is available.",
+        "Vio couldn't find a way to play this file on this device. Try another version if one is available.",
       reason: "no_alternate_version",
       retryable: false,
     });
@@ -105,7 +105,7 @@ describe("describePlanTerminal", () => {
     ).toEqual({
       title: "No playable version found",
       message:
-        "Silo couldn't find a way to play this file on this device. Try another version if one is available.",
+        "Vio couldn't find a way to play this file on this device. Try another version if one is available.",
       reason: "adaptation_exhausted",
       retryable: false,
     });
@@ -191,7 +191,7 @@ describe("describePlanTerminal", () => {
       describePlanTerminal({ reason: "some_future_reason", message: "", retryable: false }),
     ).toEqual({
       title: "Playback unavailable",
-      message: "Silo could not start playback.",
+      message: "Vio could not start playback.",
       reason: "some_future_reason",
       retryable: false,
     });

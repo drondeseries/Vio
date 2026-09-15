@@ -29,7 +29,7 @@ import { parseSubtitleAppearance, type SubtitleAppearance } from "@/lib/subtitle
 import { cn } from "@/lib/utils";
 
 /**
- * "Your devices" — see and change how Silo behaves on each device you watch on.
+ * "Your devices" — see and change how Vio behaves on each device you watch on.
  *
  * Two things make this screen different from the admin device console. Every
  * device is editable from wherever you are, because the settings API accepts an
@@ -409,7 +409,7 @@ function DeviceDetail({
           <div>
             <p className="text-sm font-semibold">Couldn&apos;t check settings compatibility</p>
             <p className="text-muted-foreground mt-1 text-[13px] leading-relaxed">
-              Device controls stay unavailable until Silo confirms which settings this server
+              Device controls stay unavailable until Vio confirms which settings this server
               supports.
             </p>
           </div>
@@ -490,7 +490,7 @@ function DeviceDetail({
       {forSomeoneElse ? (
         <Callout tone="muted" icon={<ShieldCheck className="h-4 w-4" />}>
           <strong className="text-foreground font-semibold">What you can&apos;t see here.</strong>{" "}
-          This page shows how Silo is set up on each device — not what anyone watched. Viewing
+          This page shows how Vio is set up on each device — not what anyone watched. Viewing
           history stays private to each profile.
         </Callout>
       ) : null}

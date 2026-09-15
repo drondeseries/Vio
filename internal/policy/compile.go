@@ -79,7 +79,7 @@ func CompileCheck(ctx context.Context, domain, source string) error {
 		return compileErrorMessage("policy source is empty")
 	}
 
-	expectedPackage := "silo_custom." + domain
+	expectedPackage := "vio_custom." + domain
 	if actualPackage := modulePackageName(candidate); actualPackage != expectedPackage {
 		location := candidate.Package.Location
 		return compileErrorAt(

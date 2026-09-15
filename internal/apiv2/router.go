@@ -450,7 +450,7 @@ func humaConfig() huma.Config {
 	return huma.Config{
 		OpenAPI: &huma.OpenAPI{
 			OpenAPI: "3.1.0",
-			Info:    &huma.Info{Title: "Silo API", Version: fmt.Sprintf("%d", APIMajor)},
+			Info:    &huma.Info{Title: "Vio API", Version: fmt.Sprintf("%d", APIMajor)},
 			Components: &huma.Components{
 				Schemas: huma.NewMapRegistry("#/components/schemas/", nativeSchemaName),
 				SecuritySchemes: map[string]*huma.SecurityScheme{

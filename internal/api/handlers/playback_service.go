@@ -206,10 +206,10 @@ func playbackCallerRequest(ctx context.Context, caller PlaybackCaller) *http.Req
 	headers.Set(deviceNameHeader, caller.DeviceName)
 	headers.Set(devicePlatformHeader, caller.Platform)
 	headers.Set("User-Agent", caller.UserAgent)
-	headers.Set("X-Silo-Client", caller.ClientName)
-	headers.Set("X-Silo-Client-Version", caller.ClientVersion)
-	headers.Set("X-Silo-Client-Build", caller.ClientBuild)
-	headers.Set("X-Silo-Client-Channel", caller.ClientChannel)
+	headers.Set("X-Vio-Client", caller.ClientName)
+	headers.Set("X-Vio-Client-Version", caller.ClientVersion)
+	headers.Set("X-Vio-Client-Build", caller.ClientBuild)
+	headers.Set("X-Vio-Client-Channel", caller.ClientChannel)
 	return (&http.Request{Header: headers, RemoteAddr: caller.RemoteAddr, URL: &url.URL{}}).WithContext(ctx)
 }
 

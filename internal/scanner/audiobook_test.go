@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -322,6 +324,15 @@ func TestParseAudiobookFolderMultiFile(t *testing.T) {
 	}
 }
 
+func TestAudiobookPartPathsUseNaturalOrdering(t *testing.T) {
+	paths := []string{"/book/part10.m4b", "/book/part2.m4b", "/book/part1.m4b", "/book/Part3.m4b"}
+	sort.SliceStable(paths, func(i, j int) bool { return naturalPathLess(paths[i], paths[j]) })
+	want := []string{"/book/part1.m4b", "/book/part2.m4b", "/book/Part3.m4b", "/book/part10.m4b"}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("natural audiobook part order = %v, want %v", paths, want)
+	}
+}
+
 func TestApplyAudiobookFilesystemFallbacksUsesFolderNameWhenTagsAreBlank(t *testing.T) {
 	book := &parsedAudiobook{}
 	book.applyFilesystemFallbacks(
@@ -404,7 +415,39 @@ func TestScanAudiobookFolderReturnsCanceledContext(t *testing.T) {
 	}
 }
 
-func TestSplitAudiobookReconcileRootsExcludesIncompleteWalks(t *testing.T) {
+func TestCollectAudiobookRootScansKeepsSiblingFoldersWhenRootHasLooseAudio(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "loose.m4b"), []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(root, "Sibling Book")
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibling, "part1.m4b"), []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	scans, err := collectAudiobookRootScans(context.Background(), 1, []string{root})
+	if err != nil {
+		t.Fatalf("collectAudiobookRootScans: %v", err)
+	}
+	if len(scans) != 1 {
+		t.Fatalf("got %d root scans, want 1", len(scans))
+	}
+	got := make(map[string]bool, len(scans[0].candidates))
+	for _, candidate := range scans[0].candidates {
+		got[candidate] = true
+	}
+	if !got[root] {
+		t.Fatalf("candidates = %#v, want root candidate %q", scans[0].candidates, root)
+	}
+	if !got[sibling] {
+		t.Fatalf("candidates = %#v, want sibling candidate %q", scans[0].candidates, sibling)
+	}
+}
+
+func TestSplitAudiobookReconcileRootsProtectsOnlyFailedPaths(t *testing.T) {
 	scans := []audiobookRootScan{
 		{
 			root: "/library/clean",
@@ -420,26 +463,31 @@ func TestSplitAudiobookReconcileRootsExcludesIncompleteWalks(t *testing.T) {
 			seenPaths: map[string]bool{
 				"/library/partial/found-book/track.mp3": true,
 			},
-			walkFailures: 1,
+			walkFailures: []string{"/library/partial/unreadable"},
 		},
 		{
 			root:    "/library/missing",
 			rootErr: os.ErrNotExist,
 		},
+		{
+			root:         "/library/unreadable",
+			walkFailures: []string{"/library/unreadable"},
+		},
 	}
 
-	roots, seen, sawFiles := splitAudiobookReconcileRoots(scans)
-	if !sawFiles {
-		t.Fatal("sawFiles = false, want true from clean root")
-	}
-	if len(roots) != 1 || roots[0] != "/library/clean" {
-		t.Fatalf("roots = %#v, want only clean root", roots)
+	roots, seen, protected := splitAudiobookReconcileRoots(scans)
+	if !reflect.DeepEqual(roots, []string{"/library/clean", "/library/partial"}) {
+		t.Fatalf("roots = %#v, want clean and partial roots", roots)
 	}
 	if !seen["/library/clean/book/track.mp3"] {
 		t.Fatalf("seen missing clean-root track: %#v", seen)
 	}
-	if seen["/library/partial/found-book/track.mp3"] {
-		t.Fatalf("seen includes partial-walk root track: %#v", seen)
+	if !seen["/library/partial/found-book/track.mp3"] {
+		t.Fatalf("seen missing readable partial-root track: %#v", seen)
+	}
+	wantProtected := []string{"/library/partial/unreadable", "/library/missing", "/library/unreadable"}
+	if !reflect.DeepEqual(protected, wantProtected) {
+		t.Fatalf("protected = %#v, want %#v", protected, wantProtected)
 	}
 }
 

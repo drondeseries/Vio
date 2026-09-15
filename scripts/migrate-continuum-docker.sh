@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Preflight and optional cutover helper for Docker installs migrating from
-# Continuum to Silo.
+# Continuum to Vio.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,7 +17,8 @@ CONTINUUM_COMPOSE_FILE="${CONTINUUM_COMPOSE_FILE:-}"
 CONTINUUM_ENV_FILE="${CONTINUUM_ENV_FILE:-}"
 CONTINUUM_PROJECT="${CONTINUUM_PROJECT:-continuum}"
 CONTINUUM_DATA_ROOT="${CONTINUUM_DATA_ROOT:-/opt/continuum}"
-SILO_DATA_ROOT="${SILO_DATA_ROOT:-/opt/silo}"
+VIO_DATA_ROOT="${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}"
+SILO_DATA_ROOT="${SILO_DATA_ROOT:-/opt/vio}"
 BACKUP_DIR="${BACKUP_DIR:-${CONTINUUM_DATA_ROOT}/db-backups}"
 
 usage() {
@@ -30,24 +31,24 @@ Usage:
 Modes:
   check    Read-only preflight. Prints detected containers, paths, env, and risks.
   migrate  Backs up the DB, stops the old Continuum stack, moves bind-mounted
-           state from /opt/continuum to /opt/silo, starts Silo, and applies
+           state from /opt/continuum to /opt/vio, starts Vio, and applies
            narrow DB compatibility updates.
-  db-fix   Only applies DB compatibility updates to a running Silo compose stack.
+  db-fix   Only applies DB compatibility updates to a running Vio compose stack.
 
 Important environment overrides:
-  COMPOSE_FILE=/path/to/silo/docker-compose.yml
-  ENV_FILE=/path/to/silo/.env
+  COMPOSE_FILE=/path/to/vio/docker-compose.yml
+  ENV_FILE=/path/to/vio/.env
   CONTINUUM_COMPOSE_FILE=/path/to/old/docker-compose.yml
   CONTINUUM_ENV_FILE=/path/to/old/.env
   CONTINUUM_DATA_ROOT=/opt/continuum
-  SILO_DATA_ROOT=/opt/silo
+  VIO_DATA_ROOT=/opt/vio
   BACKUP_DIR=/opt/continuum/db-backups
 
 Flags:
   --apply               Required for modes that modify the host or database.
   --skip-db-dump        Do not run pg_dump before cutover.
-  --keep-old-data-root  Do not move CONTINUUM_DATA_ROOT to SILO_DATA_ROOT.
-  --no-compat-symlink   Do not leave CONTINUUM_DATA_ROOT as a symlink to Silo.
+  --keep-old-data-root  Do not move CONTINUUM_DATA_ROOT to VIO_DATA_ROOT.
+  --no-compat-symlink   Do not leave CONTINUUM_DATA_ROOT as a symlink to Vio.
   -h, --help            Show this help.
 USAGE
 }
@@ -182,7 +183,7 @@ require_docker_daemon() {
 	docker info >/dev/null 2>&1 || die "docker daemon is not reachable"
 }
 
-print_preflight() {
+	print_preflight() {
 	local postgres_user postgres_db media_root media_container_root image old_pg docker_ready
 
 	require_tools
@@ -190,7 +191,7 @@ print_preflight() {
 	postgres_db="$(env_value POSTGRES_DB continuum)"
 	media_root="$(env_value MEDIA_ROOT '')"
 	media_container_root="$(env_value MEDIA_CONTAINER_ROOT /mnt/media)"
-	image="$(env_value SILO_IMAGE 'ghcr.io/silo-server/silo-server:latest')"
+	image="$(env_value VIO_IMAGE "$(env_value SILO_IMAGE 'ghcr.io/drondeseries/vio-server:latest')")"
 	docker_ready="false"
 	if docker info >/dev/null 2>&1; then
 		docker_ready="true"
@@ -200,13 +201,13 @@ print_preflight() {
 		warn "docker daemon is not reachable; skipping live container and DB probes"
 	fi
 
-	log "Silo compose"
+	log "Vio compose"
 	printf 'compose file:        %s\n' "${COMPOSE_FILE}"
 	printf 'env file:            %s\n' "${ENV_FILE}"
 	printf 'image:               %s\n' "${image}"
 	printf 'media root:          %s\n' "${media_root:-<unset>}"
 	printf 'media container root: %s\n' "${media_container_root}"
-	printf 'silo data root:      %s\n' "${SILO_DATA_ROOT}"
+	printf 'vio data root:       %s\n' "${VIO_DATA_ROOT}"
 	printf 'postgres user/db:    %s / %s\n' "${postgres_user}" "${postgres_db}"
 	printf '\n'
 
@@ -218,7 +219,7 @@ print_preflight() {
 
 	log "Detected containers"
 	if [ "${docker_ready}" = "true" ]; then
-		docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | grep -E '(^NAMES|continuum|silo)' || true
+		docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | grep -E '(^NAMES|continuum|vio)' || true
 	else
 		printf '<skipped; docker daemon unavailable>\n'
 	fi
@@ -230,8 +231,8 @@ print_preflight() {
 	else
 		warn "old data root not found: ${CONTINUUM_DATA_ROOT}"
 	fi
-	if [ -e "${SILO_DATA_ROOT}" ]; then
-		printf 'found Silo data root: %s\n' "${SILO_DATA_ROOT}"
+	if [ -e "${VIO_DATA_ROOT}" ]; then
+		printf 'found Vio data root: %s\n' "${VIO_DATA_ROOT}"
 	fi
 	if [ -n "${media_root}" ] && [ ! -d "${media_root}" ]; then
 		warn "MEDIA_ROOT does not exist on this host: ${media_root}"
@@ -241,7 +242,7 @@ print_preflight() {
 	fi
 	printf '\n'
 
-	log "Silo compose validation"
+	log "Vio compose validation"
 	if [ -f "${COMPOSE_FILE}" ]; then
 		if compose config >/dev/null; then
 			printf 'compose config: ok\n'
@@ -287,7 +288,7 @@ dump_database() {
 
 	postgres_user="$(env_value POSTGRES_USER continuum)"
 	postgres_db="$(env_value POSTGRES_DB continuum)"
-	backup_file="${BACKUP_DIR}/continuum-before-silo-$(date -u +%Y%m%dT%H%M%SZ).dump"
+	backup_file="${BACKUP_DIR}/continuum-before-vio-$(date -u +%Y%m%dT%H%M%SZ).dump"
 
 	log "Creating PostgreSQL dump at ${backup_file}"
 	mkdir -p "${BACKUP_DIR}"
@@ -306,17 +307,17 @@ move_data_root() {
 		return
 	fi
 
-	if [ -e "${SILO_DATA_ROOT}" ] && [ ! -L "${SILO_DATA_ROOT}" ]; then
-		die "Silo data root already exists: ${SILO_DATA_ROOT}; move or merge it manually before running migrate"
+	if [ -e "${VIO_DATA_ROOT}" ] && [ ! -L "${VIO_DATA_ROOT}" ]; then
+		die "Vio data root already exists: ${VIO_DATA_ROOT}; move or merge it manually before running migrate"
 	fi
 
-	log "Moving ${CONTINUUM_DATA_ROOT} to ${SILO_DATA_ROOT}"
-	mkdir -p "$(dirname "${SILO_DATA_ROOT}")"
-	mv "${CONTINUUM_DATA_ROOT}" "${SILO_DATA_ROOT}"
+	log "Moving ${CONTINUUM_DATA_ROOT} to ${VIO_DATA_ROOT}"
+	mkdir -p "$(dirname "${VIO_DATA_ROOT}")"
+	mv "${CONTINUUM_DATA_ROOT}" "${VIO_DATA_ROOT}"
 
 	if [ "${NO_COMPAT_SYMLINK}" != "true" ]; then
-		ln -s "${SILO_DATA_ROOT}" "${CONTINUUM_DATA_ROOT}"
-		log "Left compatibility symlink ${CONTINUUM_DATA_ROOT} -> ${SILO_DATA_ROOT}"
+		ln -s "${VIO_DATA_ROOT}" "${CONTINUUM_DATA_ROOT}"
+		log "Left compatibility symlink ${CONTINUUM_DATA_ROOT} -> ${VIO_DATA_ROOT}"
 	fi
 }
 
@@ -339,13 +340,13 @@ apply_db_compatibility_updates() {
 	postgres_user="$(env_value POSTGRES_USER continuum)"
 	postgres_db="$(env_value POSTGRES_DB continuum)"
 
-	log "Applying Continuum-to-Silo DB compatibility updates"
+	log "Applying Continuum-to-Vio DB compatibility updates"
 	compose exec -T postgres psql -U "${postgres_user}" -d "${postgres_db}" -v ON_ERROR_STOP=1 <<'SQL'
 DO $$
 BEGIN
 	IF to_regclass('public.plugin_installations') IS NOT NULL THEN
 		UPDATE plugin_installations
-		SET install_path = replace(install_path, '/var/lib/continuum/plugins/', '/var/lib/silo/plugins/'),
+		SET install_path = replace(install_path, '/var/lib/continuum/plugins/', '/var/lib/vio/plugins/'),
 		    enabled = CASE WHEN plugin_id LIKE 'continuum.%' THEN false ELSE enabled END,
 		    updated_at = NOW()
 		WHERE install_path LIKE '/var/lib/continuum/plugins/%'
@@ -354,11 +355,15 @@ BEGIN
 
 	IF to_regclass('public.plugin_repositories') IS NOT NULL THEN
 		UPDATE plugin_repositories
-		SET display_name = replace(display_name, 'Continuum', 'Silo'),
+		SET display_name = replace(display_name, 'Continuum', 'Vio'),
 		    url = replace(url, 'https://raw.githubusercontent.com/ContinuumApp/continuum-plugins/', 'https://raw.githubusercontent.com/Silo-Server/silo-plugins/'),
 		    enabled = false,
 		    updated_at = NOW()
 		WHERE display_name LIKE '%Continuum%'
+		   OR url LIKE '%ContinuumApp/continuum-plugins/%'
+		   OR url LIKE '%Silo-Server/silo-plugins/%';
+	END IF;
+END $$;
 		   OR url LIKE '%ContinuumApp/continuum-plugins/%'
 		   OR url LIKE '%Silo-Server/silo-plugins/%';
 	END IF;
@@ -371,13 +376,13 @@ SQL
 	fi
 }
 
-wait_for_silo() {
+wait_for_vio() {
 	local port
 	port="$(env_value PORT 8090)"
 
 	# /api/v1/health and /api/v1/ready are retained operational probes; they keep
 	# these paths after the /api/v1 contract is retired.
-	log "Waiting for Silo readiness on localhost:${port}"
+	log "Waiting for Vio readiness on localhost:${port}"
 	for _ in $(seq 1 60); do
 		if curl -fsS "http://localhost:${port}/api/v1/ready" >/dev/null 2>&1; then
 			curl -fsS "http://localhost:${port}/api/v1/health" || true
@@ -388,7 +393,7 @@ wait_for_silo() {
 		fi
 		sleep 2
 	done
-	warn "Silo did not report ready within the wait window; inspect logs with docker compose logs silo"
+	warn "Vio did not report ready within the wait window; inspect logs with docker compose logs vio"
 }
 
 run_migration() {
@@ -400,7 +405,7 @@ run_migration() {
 	[ -f "${ENV_FILE}" ] || die "env file not found: ${ENV_FILE}; copy .env.example to .env and set MEDIA_ROOT plus old POSTGRES_* values first"
 
 	if [ "$(env_value POSTGRES_USER silo)" = "silo" ] || [ "$(env_value POSTGRES_DB silo)" = "silo" ]; then
-		warn "POSTGRES_USER/POSTGRES_DB are set to Silo defaults. If reusing a Continuum PostgreSQL data directory, set them to the old DB values before migrating."
+		warn "POSTGRES_USER/POSTGRES_DB are set to Vio defaults. If reusing a Continuum PostgreSQL data directory, set them to the old DB values before migrating."
 	fi
 
 	dump_database
@@ -408,14 +413,14 @@ run_migration() {
 	continuum_compose_down
 	move_data_root
 
-	log "Starting Silo stack"
+	log "Starting Vio stack"
 	compose up -d
 	wait_for_postgres
 	apply_db_compatibility_updates
-	wait_for_silo
+	wait_for_vio
 
 	log "Migration complete"
-	printf 'Old Continuum plugin installations were disabled if present. Install Silo-native plugin packages from the admin UI, then re-enable provider chains as needed.\n'
+	printf 'Old Continuum plugin installations were disabled if present. Install Vio-native plugin packages from the admin UI, then re-enable provider chains as needed.\n'
 }
 
 case "${MODE}" in

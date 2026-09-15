@@ -20,7 +20,7 @@ import (
 // AuthProvider is one way to sign in.
 type AuthProvider struct {
 	ID             string `json:"id" doc:"Provider id; the value login takes as provider" example:"local"`
-	DisplayName    string `json:"display_name" doc:"Label for the sign-in button" example:"Silo account"`
+	DisplayName    string `json:"display_name" doc:"Label for the sign-in button" example:"Vio account"`
 	Mode           string `json:"mode" doc:"How the provider authenticates: credentials (login) or oauth (the OAuth handshake)" example:"credentials"`
 	Default        bool   `json:"default" doc:"Whether this is the provider login uses when none is named" example:"true"`
 	IconURL        string `json:"icon_url,omitempty" doc:"Icon shown next to the button; absent when the provider ships none" example:"https://plugins.example.test/icon.svg"`
@@ -61,7 +61,7 @@ type RefreshSessionOutput struct {
 // LoginSession is one live login session of the caller's account.
 type LoginSession struct {
 	ID         ID      `json:"id" doc:"Session identifier; the value deleteSession takes" example:"6f1c2a1e-8d3b-4f0e-9a7c-2b5d8e1f3a4c"`
-	DeviceName string  `json:"device_name" doc:"User-Agent recorded at login; empty when none was sent" example:"Silo/1.0 (tvOS)"`
+	DeviceName string  `json:"device_name" doc:"User-Agent recorded at login; empty when none was sent" example:"Vio/1.0 (tvOS)"`
 	IPAddress  string  `json:"ip_address" doc:"Client address recorded at login; empty when unknown" example:"203.0.113.7"`
 	CreatedAt  Instant `json:"created_at" example:"2026-01-02T03:04:05.678Z"`
 	ExpiresAt  Instant `json:"expires_at" example:"2026-02-01T03:04:05.678Z"`

@@ -97,8 +97,12 @@ func NewSettingValuesHandler(
 	}
 }
 
-// mutationIDHeader carries the client's idempotency key.
-const mutationIDHeader = "X-Silo-Mutation-Id"
+// mutationIDHeader carries the client's idempotency key. Vio emits
+// X-Vio-Mutation-Id; legacy X-Silo-Mutation-Id accepted on ingest.
+const mutationIDHeader = "X-Vio-Mutation-Id"
+
+// legacyMutationIDHeader is the pre-rebrand spelling, ingest only.
+const legacyMutationIDHeader = "X-Silo-Mutation-Id"
 
 // fieldRevision is the response field carrying the contract revision. Clients
 // filter definitions, scopes and enum members against it, so every response

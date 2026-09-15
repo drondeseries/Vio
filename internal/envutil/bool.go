@@ -28,6 +28,19 @@ func Truthy(value string) bool {
 // Bool reports whether the named environment variable is set to a truthy value.
 func Bool(name string) bool { return Truthy(os.Getenv(name)) }
 
+// BoolNames reports whether any of the named environment variables is set to
+// a truthy value. Names are checked in order; the first truthy value wins so
+// callers pass the new VIO_* name first with the legacy SILO_* name as
+// fallback.
+func BoolNames(names ...string) bool {
+	for _, name := range names {
+		if Truthy(os.Getenv(name)) {
+			return true
+		}
+	}
+	return false
+}
+
 // BoolDefault reports whether the named environment variable is on, falling back
 // to def when the variable is unset or empty — whitespace-only counts as empty,
 // since a value that survives a shell only as spaces was never really supplied.
@@ -44,9 +57,31 @@ func BoolDefault(name string, def bool) bool {
 	return Truthy(os.Getenv(name))
 }
 
+// BoolDefaultNames is BoolDefault over several names: the first set name
+// wins, otherwise def. Pass the VIO_* name first, SILO_* second.
+func BoolDefaultNames(def bool, names ...string) bool {
+	for _, name := range names {
+		if IsSet(name) {
+			return Truthy(os.Getenv(name))
+		}
+	}
+	return def
+}
+
 // IsSet reports whether the named environment variable carries a non-empty value
 // once surrounding whitespace is trimmed. It answers "did the operator touch this
 // knob?", which a default-on flag has to ask separately from "is it on?" — an
 // unset knob and one explicitly set to false want different behaviour when
 // something else would otherwise derive the value.
 func IsSet(name string) bool { return strings.TrimSpace(os.Getenv(name)) != "" }
+
+// GetenvFirst returns the first non-empty (after trimming) value among the
+// named environment variables. Pass the VIO_* name first, SILO_* second.
+func GetenvFirst(names ...string) string {
+	for _, name := range names {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v
+		}
+	}
+	return ""
+}

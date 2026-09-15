@@ -88,7 +88,7 @@ export function PlaybackStep() {
   return (
     <StepFrame
       title="Playback"
-      lede="When a device can't play a file as-is, Silo converts it on the fly. A GPU makes that cheap; without one it runs on the CPU."
+      lede="When a device can't play a file as-is, Vio converts it on the fly. A GPU makes that cheap; without one it runs on the CPU."
       onSubmit={handleSubmit}
       busy={busy}
       onSkip={skip}
@@ -124,7 +124,7 @@ export function PlaybackStep() {
 
       <StepSection
         title="HDR tone mapping"
-        caption="Converts HDR video to SDR for screens that can't show HDR. Each path has to be allowed before Silo will use it."
+        caption="Converts HDR video to SDR for screens that can't show HDR. Each path has to be allowed before Vio will use it."
       >
         <SettingField
           label="On the GPU"

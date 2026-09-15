@@ -73,7 +73,7 @@ func TestDownloadManifestTransport(t *testing.T) {
 	deps.DownloadManifests = service
 	h := newTestHandler(t, deps)
 	viewer := with(bearer(memberToken), "X-Profile-Id", "p-owner")
-	device := with(viewer, "X-Silo-Device-Id", "device-one")
+	device := with(viewer, "X-Vio-Device-Id", "device-one")
 	path := Prefix + "/downloads/entry/manifest"
 	rec := do(t, h, "GET", path, "", device)
 	if rec.Code != 200 {
@@ -103,7 +103,7 @@ func TestDownloadManifestSkippedPageCursor(t *testing.T) {
 	deps := pilotDeps(nil, nil)
 	deps.DownloadManifests = service
 	h := newTestHandler(t, deps)
-	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Silo-Device-Id", "device-one")
+	viewer := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Vio-Device-Id", "device-one")
 	path := Prefix + "/downloads/batches/batch/manifests"
 	rec := do(t, h, "GET", path+"?limit=1", "", viewer)
 	var page DownloadManifestPage

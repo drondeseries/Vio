@@ -25,7 +25,7 @@ import (
 )
 
 // DownloadService is the interface that the download handler depends on. A
-// non-empty deviceID (from the X-Silo-Device-Id header) selects the managed
+// non-empty deviceID (from the X-Vio-Device-Id header) selects the managed
 // device-library lifecycle; empty is the ephemeral/account-level path.
 type DownloadService interface {
 	Capability(ctx context.Context, userID int) (downloads.Capability, error)
@@ -198,7 +198,7 @@ func toDownloadResponse(d *downloads.Download) downloadResponse {
 }
 
 // managedIdentity returns the (profileID, deviceID) the request is acting as.
-// deviceID comes ONLY from the X-Silo-Device-Id header (never the body/query);
+// deviceID comes ONLY from the X-Vio-Device-Id header (never the body/query);
 // profileID is resolved by the viewer-access middleware from X-Profile-Id.
 func managedIdentity(r *http.Request) (profileID, deviceID, deviceName, devicePlatform string) {
 	device := deviceMetadataFromRequest(r)
@@ -238,7 +238,7 @@ func (h *DownloadHandler) HandleCapability(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// HandleCreateDownload handles POST /downloads. The X-Silo-Device-Id header
+// HandleCreateDownload handles POST /downloads. The X-Vio-Device-Id header
 // (if present) makes this a managed device entry; otherwise it is ephemeral.
 func (h *DownloadHandler) HandleCreateDownload(w http.ResponseWriter, r *http.Request) {
 	userID := apimw.GetUserID(r.Context())
@@ -679,7 +679,7 @@ func (h *DownloadHandler) proxyCanServe(ctx context.Context, cacheKey, location 
 
 // requireManaged validates a managed (device-scoped) request: authentication, a
 // configured service, and the device + profile identity (device_id from the
-// X-Silo-Device-Id header only, never the body). On failure it writes the error
+// X-Vio-Device-Id header only, never the body). On failure it writes the error
 // response and returns ok=false. Shared by every managed-only endpoint — the
 // offline assets and the series-monitoring subscriptions.
 func (h *DownloadHandler) requireManaged(w http.ResponseWriter, r *http.Request) (userID int, profileID, deviceID, deviceName, devicePlatform string, ok bool) {
@@ -694,7 +694,7 @@ func (h *DownloadHandler) requireManaged(w http.ResponseWriter, r *http.Request)
 	}
 	profileID, deviceID, deviceName, devicePlatform = managedIdentity(r)
 	if deviceID == "" {
-		writeError(w, http.StatusBadRequest, "device_id_required", "X-Silo-Device-Id header is required")
+		writeError(w, http.StatusBadRequest, "device_id_required", "X-Vio-Device-Id header is required")
 		return
 	}
 	if profileID == "" {

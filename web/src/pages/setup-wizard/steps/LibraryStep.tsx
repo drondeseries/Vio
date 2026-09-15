@@ -109,7 +109,7 @@ export function LibraryStep() {
   return (
     <StepFrame
       title="Add your media"
-      lede="Point Silo at the folders your files live in. Each library holds one kind of media and scans on its own schedule."
+      lede="Point Vio at the folders your files live in. Each library holds one kind of media and scans on its own schedule."
       onContinue={() => markDone("library")}
       // An open editor holds edits Continue would not submit; the editor's
       // own Add / Save / Cancel closes it first.
@@ -197,7 +197,7 @@ export function LibraryStep() {
           if (!open) setPendingDelete(null);
         }}
         title={pendingDelete ? `Delete ${pendingDelete.name}?` : "Delete library?"}
-        description="Removes the library and everything Silo learned about it. Your files on disk are not touched."
+        description="Removes the library and everything Vio learned about it. Your files on disk are not touched."
         confirmLabel="Delete library"
         variant="destructive"
         onConfirm={confirmDelete}

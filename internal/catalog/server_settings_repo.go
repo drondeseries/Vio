@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const serverSettingsMutationLock = "silo:server_settings:mutation"
+const serverSettingsMutationLock = "vio:server_settings:mutation"
 
 // ServerSettingsRepo provides CRUD access to the server_settings table.
 type ServerSettingsRepo struct {

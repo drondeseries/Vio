@@ -21,7 +21,7 @@ import (
 // critical path: a lookup that fails or times out is treated as "not denied",
 // with a rate-limited warning, so an unreachable Redis never blocks serving.
 const (
-	streamDenyKeyPrefix = "silo:streamauth:"
+	streamDenyKeyPrefix = "vio:streamauth:"
 	streamDenyValue     = "deny"
 	// streamDenyCacheTTL bounds Redis load to one GET per session per window
 	// on each replica; it is also the longest a revocation can lag on a

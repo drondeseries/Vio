@@ -46,7 +46,7 @@ type legacyPlexSyncActorMapping struct {
 	ConnectionID     string    `json:"connection_id"`
 	PlexAccountID    int64     `json:"plex_account_id"`
 	PlexAccountTitle string    `json:"plex_account_title"`
-	SiloProfileID    string    `json:"silo_profile_id"`
+	SiloProfileID    string    `json:"vio_profile_id"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 }
@@ -84,7 +84,7 @@ type legacyUpdatePlexSyncActorsRequest struct {
 	Mappings []struct {
 		PlexAccountID    int64  `json:"plex_account_id"`
 		PlexAccountTitle string `json:"plex_account_title"`
-		SiloProfileID    string `json:"silo_profile_id"`
+		SiloProfileID    string `json:"vio_profile_id"`
 	} `json:"mappings"`
 }
 

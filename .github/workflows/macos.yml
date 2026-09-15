@@ -84,18 +84,18 @@ jobs:
           BUILDINFO_PKG: github.com/Silo-Server/silo-server/internal/buildinfo
         run: |
           built_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          archive="silo-darwin-arm64-${GITHUB_SHA::8}.tar.gz"
-          package_dir="dist/silo-darwin-arm64"
+          archive="vio-darwin-arm64-${GITHUB_SHA::8}.tar.gz"
+          package_dir="dist/vio-darwin-arm64"
           mkdir -p "$package_dir"
 
           go build -trimpath \
             -ldflags "-X ${BUILDINFO_PKG}.revisionOverride=${GITHUB_SHA} -X ${BUILDINFO_PKG}.dirtyOverride=false -X ${BUILDINFO_PKG}.builtAtOverride=${built_at}" \
-            -o "$package_dir/silo" ./cmd/silo/
+            -o "$package_dir/vio" ./cmd/silo/
 
           cp LICENSE "$package_dir/LICENSE"
-          go version -m "$package_dir/silo" > "$package_dir/build-info.txt"
-          otool -L "$package_dir/silo" > "$package_dir/linked-libraries.txt"
-          tar -czf "dist/$archive" -C dist silo-darwin-arm64
+          go version -m "$package_dir/vio" > "$package_dir/build-info.txt"
+          otool -L "$package_dir/vio" > "$package_dir/linked-libraries.txt"
+          tar -czf "dist/$archive" -C dist vio-darwin-arm64
           (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
@@ -103,9 +103,9 @@ jobs:
         env:
           ARCHIVE: ${{ steps.build.outputs.archive }}
         run: |
-          file dist/silo-darwin-arm64/silo | grep -q 'Mach-O 64-bit executable arm64'
-          dist/silo-darwin-arm64/silo -h >/dev/null
-          grep -aFq "$GITHUB_SHA" dist/silo-darwin-arm64/silo
+          file dist/vio-darwin-arm64/vio | grep -q 'Mach-O 64-bit executable arm64'
+          dist/vio-darwin-arm64/vio -h >/dev/null
+          grep -aFq "$GITHUB_SHA" dist/vio-darwin-arm64/vio
 
           ffmpeg -hide_banner -hwaccels > "$RUNNER_TEMP/ffmpeg-hwaccels.txt" 2>/dev/null
           grep -Fxq 'videotoolbox' "$RUNNER_TEMP/ffmpeg-hwaccels.txt"
@@ -120,7 +120,7 @@ jobs:
       - name: Upload native server
         uses: actions/upload-artifact@v4
         with:
-          name: silo-darwin-arm64-${{ github.sha }}
+          name: vio-darwin-arm64-${{ github.sha }}
           path: |
             dist/${{ steps.build.outputs.archive }}
             dist/${{ steps.build.outputs.archive }}.sha256

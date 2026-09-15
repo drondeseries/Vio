@@ -34,7 +34,7 @@ const megabytes = (bytes: number) => `${Math.round(bytes / MB)} MB`;
  * clients in `docs/admin-api.md`.
  *
  * `defaultUrl` is the bundled asset served while a slot is empty — the same
- * files `SiloBrand` and the favicon link fall back to. The login background has
+ * files `SiloBrand` (Vio defaults) and the favicon link fall back to. The login background has
  * none: the auth pages just keep their theme gradient.
  */
 export const BRANDING_ASSET_SPECS: Record<BrandingAssetKind, BrandingAssetSpec> = {

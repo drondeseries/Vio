@@ -246,7 +246,7 @@ func checkAIChatConnection(ctx context.Context, cfg *config.Config) connectionCh
 	defer cancel()
 	if _, err := client.Chat(checkCtx, []llm.Message{
 		{Role: "system", Content: "Return a JSON object with status set to ok."},
-		{Role: "user", Content: "Check this Silo text translation connection."},
+		{Role: "user", Content: "Check this Vio text translation connection."},
 	}, true); err != nil {
 		return connectionCheckResponse{
 			Success: false,

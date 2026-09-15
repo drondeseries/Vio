@@ -44,10 +44,16 @@ const (
 )
 
 const (
-	deviceIDHeader       = "X-Silo-Device-Id"
-	deviceNameHeader     = "X-Silo-Device-Name"
-	devicePlatformHeader = "X-Silo-Device-Platform"
-	clientFamilyHeader   = "X-Silo-Client-Family"
+	deviceIDHeader       = "X-Vio-Device-Id"
+	deviceNameHeader     = "X-Vio-Device-Name"
+	devicePlatformHeader = "X-Vio-Device-Platform"
+	clientFamilyHeader   = "X-Vio-Client-Family"
+	// legacyDeviceIDHeader etc. are the pre-rebrand spellings, accepted on
+	// ingest only and never emitted.
+	legacyDeviceIDHeader       = "X-Silo-Device-Id"
+	legacyDeviceNameHeader     = "X-Silo-Device-Name"
+	legacyDevicePlatformHeader = "X-Silo-Device-Platform"
+	legacyClientFamilyHeader   = "X-Silo-Client-Family"
 )
 
 // ServerSettingReader reads individual keys from the server_settings table.
@@ -528,9 +534,16 @@ func validateDeviceSettingTarget(cmd *DeviceSettingCommand) error {
 }
 
 // DeviceMetadataFromHeaders reads the device headers the v1 routes read, with
-// the same clamps.
+// the same clamps. The X-Vio-* spellings win; legacy X-Silo-* accepted.
 func DeviceMetadataFromHeaders(h http.Header) DeviceMetadata {
-	return NewDeviceMetadata(h.Get(deviceIDHeader), h.Get(deviceNameHeader), h.Get(devicePlatformHeader))
+	return NewDeviceMetadata(headerValue(h, deviceIDHeader, legacyDeviceIDHeader), headerValue(h, deviceNameHeader, legacyDeviceNameHeader), headerValue(h, devicePlatformHeader, legacyDevicePlatformHeader))
+}
+
+func headerValue(h http.Header, name, legacy string) string {
+	if v := h.Get(name); v != "" {
+		return v
+	}
+	return h.Get(legacy)
 }
 
 // NewDeviceMetadata applies the header clamps to already-read values.
