@@ -2667,7 +2667,7 @@ describe("usePlaybackSession plan audio inventory", () => {
     // A menu-data fill-in must not reload the stream.
     expect(result.current.planRevision).toBe(planRevision);
     expect(result.current.transportRevision).toBe(transportRevision);
-    expect(result.current.streamUrl).toBe("/api/v1/stream/session-1/master.m3u8?token=token");
+    expect(result.current.streamUrl).toBe("/api/v2/stream/session-1/master.m3u8?token=token");
     expect(
       fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/playback/start")),
     ).toHaveLength(1);
