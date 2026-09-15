@@ -4,11 +4,11 @@ import { useOptionalTheme } from "@/hooks/useTheme";
 import { THEMES } from "@/lib/themes";
 
 /** White-text wordmark, for dark surfaces. */
-const VIO_WORDMARK_SRC = "/silo-wordmark-sidebar.png";
+const VIO_WORDMARK_SRC = "/vio-wordmark-sidebar.png";
 /** Dark-text wordmark, for light surfaces. */
-const VIO_WORDMARK_LIGHT_SRC = "/silo-wordmark-sidebar-light.png";
+const VIO_WORDMARK_LIGHT_SRC = "/vio-wordmark-sidebar-light.png";
 /** The square mark reads on both appearances, so it has no variant. */
-const VIO_MARK_SRC = "/silo-icon-1024.png";
+const VIO_MARK_SRC = "/vio-icon-1024.png";
 
 export type SiloBrandVariant = "wordmark" | "mark";
 

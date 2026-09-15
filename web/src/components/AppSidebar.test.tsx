@@ -209,7 +209,7 @@ describe("AppSidebar", () => {
   it("renders the Vio brand mark instead of the old play glyph", () => {
     const markup = renderSidebar("/");
 
-    expect(markup).toContain('src="/silo-wordmark-sidebar.png"');
+    expect(markup).toContain('src="/vio-wordmark-sidebar.png"');
     expect(markup).toContain('alt="Vio"');
     expect(markup).not.toContain("▶");
   });
@@ -221,24 +221,24 @@ describe("AppSidebar", () => {
     const expanded = renderSidebar("/");
 
     for (const markup of [collapsed, expanded]) {
-      expect(markup).toContain('src="/silo-icon-1024.png"');
-      expect(markup).toContain('src="/silo-wordmark-sidebar.png"');
+      expect(markup).toContain('src="/vio-icon-1024.png"');
+      expect(markup).toContain('src="/vio-wordmark-sidebar.png"');
     }
     // Collapsed: the mark is the one showing, and the wordmark is out of the
     // accessibility tree so the two images never both name the sidebar.
     const collapsedDocument = parseMarkup(collapsed);
     const expandedDocument = parseMarkup(expanded);
     const collapsedWordmark = collapsedDocument
-      .querySelector('img[src="/silo-wordmark-sidebar.png"]')
+      .querySelector('img[src="/vio-wordmark-sidebar.png"]')
       ?.closest(".sidebar-fade");
     const collapsedMark = collapsedDocument
-      .querySelector('img[src="/silo-icon-1024.png"]')
+      .querySelector('img[src="/vio-icon-1024.png"]')
       ?.closest(".sidebar-fade");
     const expandedWordmark = expandedDocument
-      .querySelector('img[src="/silo-wordmark-sidebar.png"]')
+      .querySelector('img[src="/vio-wordmark-sidebar.png"]')
       ?.closest(".sidebar-fade");
     const expandedMark = expandedDocument
-      .querySelector('img[src="/silo-icon-1024.png"]')
+      .querySelector('img[src="/vio-icon-1024.png"]')
       ?.closest(".sidebar-fade");
 
     expect(collapsedWordmark?.getAttribute("aria-hidden")).toBe("true");

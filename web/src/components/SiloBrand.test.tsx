@@ -52,7 +52,7 @@ describe("SiloBrand", () => {
   });
 
   it("uses the white-text built-in wordmark on a dark theme", () => {
-    expect(renderBrandSrc("wordmark")).toBe("/silo-wordmark-sidebar.png");
+    expect(renderBrandSrc("wordmark")).toBe("/vio-wordmark-sidebar.png");
   });
 
   it("uses the custom wordmark on a dark theme", () => {
@@ -63,7 +63,7 @@ describe("SiloBrand", () => {
 
   it("uses the dark-text built-in wordmark on a light theme", () => {
     mockActiveTheme = "cinema-light";
-    expect(renderBrandSrc("wordmark")).toBe("/silo-wordmark-sidebar-light.png");
+    expect(renderBrandSrc("wordmark")).toBe("/vio-wordmark-sidebar-light.png");
   });
 
   it("falls back to the main custom wordmark on a light theme when no variant is set", () => {
@@ -91,7 +91,7 @@ describe("SiloBrand", () => {
 
   it("keeps the shared built-in mark on a light theme with no custom asset", () => {
     mockActiveTheme = "cinema-light";
-    expect(renderBrandSrc("mark")).toBe("/silo-icon-1024.png");
+    expect(renderBrandSrc("mark")).toBe("/vio-icon-1024.png");
   });
 
   it("prefers the light mark variant over the main custom mark on a light theme", () => {
@@ -113,7 +113,7 @@ describe("SiloBrand", () => {
 
   it("assumes a dark appearance outside ThemeProvider", () => {
     mockActiveTheme = null;
-    expect(renderBrandSrc("wordmark")).toBe("/silo-wordmark-sidebar.png");
-    expect(renderBrandSrc("mark")).toBe("/silo-icon-1024.png");
+    expect(renderBrandSrc("wordmark")).toBe("/vio-wordmark-sidebar.png");
+    expect(renderBrandSrc("mark")).toBe("/vio-icon-1024.png");
   });
 });

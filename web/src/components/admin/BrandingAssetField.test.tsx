@@ -24,7 +24,7 @@ describe("BrandingAssetField", () => {
     );
 
     const preview = screen.getByAltText("Logo (wordmark) preview");
-    expect(preview).toHaveAttribute("src", "/silo-wordmark-sidebar.png");
+    expect(preview).toHaveAttribute("src", "/vio-wordmark-sidebar.png");
     expect(preview.className).toContain("opacity-40");
     expect(screen.getByText("Default")).toBeInTheDocument();
     // Nothing to remove while the default is what is being served.
