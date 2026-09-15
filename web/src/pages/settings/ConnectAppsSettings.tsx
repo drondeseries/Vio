@@ -399,11 +399,7 @@ export default function ConnectAppsSettings() {
                 icon={Server}
                 kind={kind}
                 copyValue={
-                  isJellyfin
-                    ? compatURLIsLoopback
-                      ? undefined
-                      : (compatURL ?? undefined)
-                    : vioURL
+                  isJellyfin ? (compatURLIsLoopback ? undefined : (compatURL ?? undefined)) : vioURL
                 }
                 hint={
                   isJellyfin
