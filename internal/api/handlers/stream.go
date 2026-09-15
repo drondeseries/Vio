@@ -1038,12 +1038,18 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	setPlaybackSessionLogContext(r, sessionID)
-
-	session, err := h.sessionMgr.GetSession(sessionID)
-	if err != nil {
-		writePlaybackSessionNotFound(w)
+	if h.StreamDeny.Denied(r.Context(), sessionID) {
+		writePlaybackSessionEnded(w)
 		return
 	}
+
+	session, claims, err := h.loadSidecarSession(r.Context(), r.URL.Query().Get(streamTokenParam), sessionID, userID)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	attachPlaybackSession(r.Context(), session, claims)
+
 	if session.UserID != userID {
 		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
 		return
