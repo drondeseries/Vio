@@ -129,8 +129,10 @@ fire_start() {
   total=$(echo "$timing" | awk '{print $2}')
 
   local ttfb_ms total_ms outcome sid
-  ttfb_ms=$(python3 -c "print(f'{float('$ttfb')*1000:.0f}')" 2>/dev/null || echo "0")
-  total_ms=$(python3 -c "print(f'{float('$total')*1000:.0f}')" 2>/dev/null || echo "0")
+  # awk rather than a Python f-string: f'{float('...')}' needs Python 3.12+,
+  # and older hosts fail it silently, reporting every duration as 0 ms.
+  ttfb_ms=$(awk -v v="$ttfb" 'BEGIN{printf "%.0f", v*1000}' 2>/dev/null || echo "0")
+  total_ms=$(awk -v v="$total" 'BEGIN{printf "%.0f", v*1000}' 2>/dev/null || echo "0")
   outcome="error"
   sid=""
   reason=""
@@ -290,7 +292,7 @@ for i in "${!FILES[@]}"; do
       -o /dev/null \
       -w "%{time_starttransfer}" \
       -d "$body" 2>/dev/null || echo "0")
-    ttfb_ms=$(python3 -c "print(f'{float('$ttfb')*1000:.1f}')" 2>/dev/null || echo "0")
+    ttfb_ms=$(awk -v v="$ttfb" 'BEGIN{printf "%.1f", v*1000}' 2>/dev/null || echo "0")
     echo "$ttfb_ms" >> "$vals_file"
   done
 
