@@ -749,13 +749,13 @@ func TestHandleDownloadPreparePublishesToneMapReceiptAndStatusAttestation(t *tes
 	if headRecorder.Code != http.StatusOK {
 		t.Fatalf("HEAD status = %d, body = %s", headRecorder.Code, headRecorder.Body.String())
 	}
-	if got := headRecorder.Header().Get("X-Silo-Tone-Map-Recipe-Version"); got != want.ToneMapRecipeVersion {
+	if got := headRecorder.Header().Get("X-Vio-Tone-Map-Recipe-Version"); got != want.ToneMapRecipeVersion {
 		t.Fatalf("recipe header = %q, want %q", got, want.ToneMapRecipeVersion)
 	}
-	if got := headRecorder.Header().Get("X-Silo-Tone-Map-Mode"); got != string(want.ToneMapMode) {
+	if got := headRecorder.Header().Get("X-Vio-Tone-Map-Mode"); got != string(want.ToneMapMode) {
 		t.Fatalf("mode header = %q, want %q", got, want.ToneMapMode)
 	}
-	if got := headRecorder.Header().Get("X-Silo-Tone-Map-Source-Revision-Fingerprint"); got != want.ToneMapSourceRevisionFingerprint {
+	if got := headRecorder.Header().Get("X-Vio-Tone-Map-Source-Revision-Fingerprint"); got != want.ToneMapSourceRevisionFingerprint {
 		t.Fatalf("source revision header = %q, want %q", got, want.ToneMapSourceRevisionFingerprint)
 	}
 }

@@ -63,7 +63,7 @@ func TestLoadConfigValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("loadConfig: %v", err)
 		}
-		if cfg.port != 587 || cfg.security != securityStartTLS || cfg.fromName != "Silo" {
+		if cfg.port != 587 || cfg.security != securityStartTLS || cfg.fromName != "Vio" {
 			t.Fatalf("unexpected defaults: %+v", cfg)
 		}
 	})
