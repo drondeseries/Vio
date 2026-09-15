@@ -52,7 +52,7 @@ points you at Template Bundles to apply them.
 | --- | --- | --- |
 | `tmdb` | A TMDB API key in Settings (`tmdb.api_key`, encrypted, restart-required). | Yes — opens the standard confirmation drawer. |
 | `trakt` | A Trakt API app (`Client ID`/`Client Secret`) configured server-wide in Settings. Templates tagged "recommended" additionally need the chosen profile to have a Trakt account connected under **Settings → Watch Providers**. | Yes. |
-| `mdblist` | Nothing required to *use* a list — fetching a public MDBList `/json` URL is an unauthenticated request. An optional MDBList API key in Settings only powers in-app list *search/browse* while picking a URL. | Yes. |
+| `mdblist` | Nothing required to *use* a list: with no API key, syncing fetches the public MDBList `/json` URL unauthenticated. An MDBList API key in Settings additionally switches syncs (and in-app list *search/browse*) to MDBList's authenticated, cursor-paginated items endpoint. | Yes. |
 | `tmdb_discover` | Same TMDB API key as `tmdb` (same underlying client, hit via TMDB's `/discover` endpoint). | No — bundle-only; shows a read-only filter summary. |
 | `tmdb_collection` | Same TMDB API key as `tmdb` (hit via TMDB's `/collection/{id}` endpoint). | No — bundle-only; shows a read-only summary. |
 

@@ -17,9 +17,11 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/collage"
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
+	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 )
 
 // TMDBCollectionEntry is a lightweight TMDB preset result used by the collection sync.
@@ -92,6 +94,12 @@ type TMDBDigitalReleaseChecker interface {
 	HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error)
 }
 
+// MDBListAPIFetcher fetches a user's list through MDBList's authenticated,
+// cursor-paginated items endpoint. It is satisfied by *mdblist.Client.
+type MDBListAPIFetcher interface {
+	ListItems(ctx context.Context, user, list string, maxItems int) ([]mdblist.ListItem, error)
+}
+
 // theatricalReleaseGate memoizes digital-release lookups for one sync run so
 // overlapping entries cost a single TMDB call per title.
 type theatricalReleaseGate struct {
@@ -99,6 +107,8 @@ type theatricalReleaseGate struct {
 	lookup         func(ctx context.Context, tmdbID int) (bool, error)
 	lookupProvider func(ctx context.Context, tmdbID int) (bool, error)
 	memo           map[int]bool
+	memoMu         sync.Mutex
+	inflight       singleflight.Group
 	overrides      ReleaseOverrideLookup
 	// canonicalIDs unions source-entry IDs with a catalog-resident same
 	// movie's IDs. Nil outside collection sync; set by releaseGate.
@@ -120,9 +130,11 @@ func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker, overrides ...Re
 	}
 	// lookupProvider is provider evidence only: memoized TMDB digital-release
 	// answers with no override evaluation. Override decisions belong to the
-	// callers' validated snapshots.
+	// callers' validated snapshots. The memo is mutex-guarded and concurrent
+	// callers for the same id collapse into one TMDB call via singleflight so
+	// prefetch and the sequential pass cannot duplicate work.
 	lookupProvider := func(ctx context.Context, tmdbID int) (bool, error) {
-		if cached, ok := gate.memo[tmdbID]; ok {
+		if cached, ok := gate.memoValue(tmdbID); ok {
 			return cached, nil
 		}
 		if gate.checker == nil || tmdbID <= 0 {
@@ -131,14 +143,24 @@ func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker, overrides ...Re
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		digital, err := gate.checker.HasDigitalRelease(checkCtx, tmdbID)
+		value, err, _ := gate.inflight.Do(strconv.Itoa(tmdbID), func() (any, error) {
+			if cached, ok := gate.memoValue(tmdbID); ok {
+				return cached, nil
+			}
+			checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			digital, err := gate.checker.HasDigitalRelease(checkCtx, tmdbID)
+			if err != nil {
+				return false, fmt.Errorf("%w: movie home release lookup: %w", ErrProviderUnavailable, err)
+			}
+			gate.memoStore(tmdbID, digital)
+			return digital, nil
+		})
 		if err != nil {
-			return false, fmt.Errorf("%w: movie home release lookup: %w", ErrProviderUnavailable, err)
+			return false, err
 		}
-		gate.memo[tmdbID] = digital
-		return digital, nil
+		released, _ := value.(bool)
+		return released, nil
 	}
 	gate.lookupProvider = lookupProvider
 	// lookup preserves the historical override-aware behavior for direct
@@ -154,6 +176,71 @@ func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker, overrides ...Re
 		return lookupProvider(ctx, tmdbID)
 	}
 	return gate
+}
+
+// theatricalPrefetchWorkers bounds the concurrent TMDB release lookups issued
+// when warming the gate memo before a sequential materialize loop.
+const theatricalPrefetchWorkers = 6
+
+func (g *theatricalReleaseGate) memoValue(tmdbID int) (bool, bool) {
+	g.memoMu.Lock()
+	defer g.memoMu.Unlock()
+	value, ok := g.memo[tmdbID]
+	return value, ok
+}
+
+func (g *theatricalReleaseGate) memoStore(tmdbID int, released bool) {
+	g.memoMu.Lock()
+	g.memo[tmdbID] = released
+	g.memoMu.Unlock()
+}
+
+// prefetch warms the memo for tmdbIDs with a small bounded worker pool so a
+// batch of unmatched movies does not serialize N x 5s TMDB calls. Each lookup
+// keeps the 5s per-call bound and single-flight dedupe. Errors are swallowed:
+// the sequential gate callers fail open on inconclusive evidence and retry.
+func (g *theatricalReleaseGate) prefetch(ctx context.Context, tmdbIDs []int) {
+	if g == nil || len(tmdbIDs) == 0 || g.checker == nil {
+		// No provider to warm: the sequential gate fails open immediately, so
+		// spinning up workers would only churn.
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	workers := theatricalPrefetchWorkers
+	if len(tmdbIDs) < workers {
+		workers = len(tmdbIDs)
+	}
+	ids := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for id := range ids {
+				if ctx.Err() != nil {
+					return
+				}
+				// Fail open: the sequential pass re-evaluates this id and
+				// defers to the authoritative materialization decision.
+				if _, err := g.lookupProvider(ctx, id); err != nil {
+					continue
+				}
+			}
+		}()
+	}
+	for _, id := range tmdbIDs {
+		select {
+		case <-ctx.Done():
+			close(ids)
+			wg.Wait()
+			return
+		case ids <- id:
+		}
+	}
+	close(ids)
+	wg.Wait()
 }
 
 func isFutureDate(year int, releaseDate string) bool {
@@ -480,6 +567,11 @@ type LibraryCollectionService struct {
 
 	// TraktTokenResolver is required for Trakt recommended collections.
 	TraktTokenResolver TraktAccessTokenResolver
+
+	// MDBListAPI is the authenticated, cursor-paginated MDBList list-items
+	// client. Nil (no api_key configured) falls back to the public /json
+	// single-GET fetch.
+	MDBListAPI MDBListAPIFetcher
 
 	// CollageGen is nil when S3/image processing is not configured.
 	CollageGen CollageGenerator
@@ -1074,6 +1166,20 @@ func (s *LibraryCollectionService) SyncCollectionWithOptions(ctx context.Context
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrLibraryCollectionSyncModeUnsupported, source.Mode)
 	}
+	if err != nil && run == nil && ctx.Err() != nil {
+		// A context deadline/cancellation (e.g. the scheduler's per-collection
+		// timeout) must leave a durable failed run so last_sync_status shows the
+		// failure. Only when no run was recorded already (run != nil), to avoid
+		// duplicate history rows. The insert uses a detached context because the
+		// triggering context is already done.
+		if _, recordErr := s.recordFailedCollectionSync(context.WithoutCancel(reconciliationCtx), collection.ID, syncTimestamp(), fmt.Sprintf("sync context ended: %v", err)); recordErr != nil {
+			slog.ErrorContext(reconciliationCtx, "recording failed collection sync run after context end",
+				"component", "catalog",
+				"collection_id", collection.ID,
+				"error", recordErr,
+			)
+		}
+	}
 	if err == nil {
 		if _, reconcileErr := s.ReconcileMissingCollectionVirtualItems(reconciliationCtx, collection); reconcileErr != nil {
 			return run, fmt.Errorf("reconciling collection virtual items: %w", reconcileErr)
@@ -1088,9 +1194,7 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 	if len(listURLs) == 0 {
 		return nil, fmt.Errorf("mdblist sync: url is required")
 	}
-	entries, err := collectionutil.FetchMDBListWithFallback(listURLs, func(listURL string) ([]mdblistEntry, error) {
-		return s.fetchMDBListEntries(ctx, listURL)
-	})
+	entries, err := s.fetchMDBListEntriesWithAPI(ctx, listURLs, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1173,6 +1277,40 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 			if preErr != nil {
 				return nil, preErr
 			}
+		}
+		// The sequential loop below consults the theatrical gate only for
+		// movie entries that reach it: a TMDB id, a non-future release date
+		// (future entries short-circuit inside the gate without a lookup), no
+		// matching catalog candidate (a candidate takes the repair/continue
+		// path), and an available virtual identity. Prefetch exactly those ids
+		// so the loop's per-movie TMDB lookups become memo hits rather than N
+		// serial calls bounded at 5s each.
+		prefetchSet := map[int]struct{}{}
+		for _, entry := range materializeEntries {
+			if mdbListEntryItemType(entry) != "movie" || entry.ID <= 0 {
+				continue
+			}
+			if isFutureDate(entry.ReleaseYear, entry.Released) {
+				continue
+			}
+			tvdbID := 0
+			if entry.TVDBID != nil {
+				tvdbID = *entry.TVDBID
+			}
+			if !virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, tvdbID) {
+				continue
+			}
+			if len(pickCandidatesByPriority(movieLookup, entry, "movie")) > 0 {
+				continue
+			}
+			prefetchSet[entry.ID] = struct{}{}
+		}
+		if len(prefetchSet) > 0 {
+			prefetchIDs := make([]int, 0, len(prefetchSet))
+			for id := range prefetchSet {
+				prefetchIDs = append(prefetchIDs, id)
+			}
+			theatricalGate.prefetch(ctx, prefetchIDs)
 		}
 		for _, entry := range materializeEntries {
 			if mdbListEntryItemType(entry) != "movie" && isFutureDate(entry.ReleaseYear, entry.Released) {
@@ -2429,6 +2567,100 @@ func (s *LibraryCollectionService) fetchMDBListEntries(ctx context.Context, list
 		return nil, fmt.Errorf("parsing mdblist response: %w", err)
 	}
 	return entries, nil
+}
+
+// fetchMDBListEntriesWithAPI fetches a list through the authenticated,
+// paginated MDBList API when the fetcher is wired and the URL parses to a
+// user/slug pair; otherwise it falls back to the public /json single GET.
+//
+// It deliberately does not fall back on every API error once a key is in play:
+// a bad or expired key (ErrUnauthorized) must be visible rather than silently
+// masked by the unauthenticated feed. The scheduler's per-collection deadline
+// plus next_sync_at advance bound the blast radius of a persistent failure.
+//
+// These are treated as fallback conditions because /json is the authoritative
+// source and the API path cannot safely produce a membership decision:
+//   - ErrNotConfigured: no key (including a key cleared by the config watcher).
+//   - ErrEmptyItemsWithTotal / ErrIncompleteItems: the API returned fewer items
+//     than it says exist; blindly accepting would wipe or shrink membership.
+//   - ErrListNotFound / ErrRateLimit: temporary or protocol-level problems the
+//     public feed can still serve.
+func (s *LibraryCollectionService) fetchMDBListEntriesWithAPI(ctx context.Context, listURLs []string, limit *int) ([]mdblistEntry, error) {
+	if s.MDBListAPI != nil {
+	apiLoop:
+		for _, listURL := range listURLs {
+			user, list, ok := collectionutil.ParseMDBListListURL(listURL)
+			if !ok {
+				continue
+			}
+			maxItems := collectionutil.SourceFetchLimit(limit)
+			if maxItems <= 0 {
+				maxItems = collectionutil.MaxExplicitItemLimit
+			}
+			items, err := s.MDBListAPI.ListItems(ctx, user, list, maxItems)
+			switch {
+			case err == nil:
+				return apiListItemsToEntries(items), nil
+			case isMDBListFallbackError(err):
+				slog.WarnContext(ctx, "MDBList API fetch inconclusive; falling back to the public JSON feed",
+					"component", "catalog",
+					"user", user,
+					"list", list,
+					"error", err,
+				)
+				break apiLoop
+			default:
+				return nil, fmt.Errorf("fetching mdblist list %s/%s: %w", user, list, err)
+			}
+		}
+	}
+	return collectionutil.FetchMDBListWithFallback(listURLs, func(listURL string) ([]mdblistEntry, error) {
+		return s.fetchMDBListEntries(ctx, listURL)
+	})
+}
+
+// isMDBListFallbackError reports errors that should defer to the public /json
+// feed instead of failing the sync. ErrUnauthorized and generic/parse errors
+// are intentionally absent so a bad key stays visible.
+func isMDBListFallbackError(err error) bool {
+	for _, sentinel := range []error{
+		mdblist.ErrNotConfigured,
+		mdblist.ErrEmptyItemsWithTotal,
+		mdblist.ErrIncompleteItems,
+		mdblist.ErrListNotFound,
+		mdblist.ErrRateLimit,
+	} {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
+}
+
+// apiListItemsToEntries maps authenticated API items onto the public-feed
+// entry shape. The API's release_date fills Released so the future/ theatrical
+// window keeps working; media_type stays as returned ("show" etc.) for
+// mdbListEntryItemType to normalize.
+func apiListItemsToEntries(items []mdblist.ListItem) []mdblistEntry {
+	entries := make([]mdblistEntry, 0, len(items))
+	for _, item := range items {
+		var tvdbID *int
+		if item.TVDBID != nil {
+			id := *item.TVDBID
+			tvdbID = &id
+		}
+		entries = append(entries, mdblistEntry{
+			ID:          item.TMDBID,
+			Rank:        item.Rank,
+			TVDBID:      tvdbID,
+			IMDbID:      item.IMDbID,
+			MediaType:   item.MediaType,
+			Title:       item.Title,
+			ReleaseYear: item.ReleaseYear,
+			Released:    item.ReleaseDate,
+		})
+	}
+	return entries
 }
 
 // mdbListEntryItemType normalizes an MDBList entry's media_type field to the

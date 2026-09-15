@@ -2062,6 +2062,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 				provider: watchtrakt.NewProvider(nil, ""),
 			}
 		}
+		if libraryCollectionService.MDBListAPI == nil && deps.MDBListClient != nil {
+			libraryCollectionService.MDBListAPI = deps.MDBListClient
+		}
 		if deps.PluginService != nil {
 			libraryCollectionService.VirtualVariants = func(ctx context.Context, virtualURI, mediaType string) ([]catalog.VirtualPlaybackVariant, error) {
 				got, err := deps.PluginService.ConfiguredVirtualVariants(ctx, virtualURI, mediaType)
