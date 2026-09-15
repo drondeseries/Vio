@@ -10,7 +10,7 @@
   "consumer_method": "Client call sites were extracted by scripts/apiv2-ledger/extract_consumers.py from web/src (this repo) and the origin/main trees of silo-apple and silo-android at the commits pinned in source_trees (re-resolve a sibling site with git show <sha>:<file> in that repo, never against a moving branch): path literals and templates passed to HTTP/WebSocket calls, plus paths built by helper functions that return a template, templates rooted at the API base URL, Kotlin buildString/const val builders, and Swift let/static let path bindings, with interpolations normalized to a wildcard and matched against inventory paths by method (scripts/apiv2-ledger/match_consumers.py). scripts/apiv2-ledger/sweep_uncredited.py then greps the last two static segments of every inventory path across all three trees and every hit not within four lines of a credited site was resolved by hand. Server-internal and compat consumers are Go URL builders and callers in this repo. Sites marked match=manual were resolved by hand where the path is assembled from variables the scripts cannot follow. Call-site files are repository-root-relative for their repo (web: src/... under web/; apple: iosApp/...; android: shared/, android-shared/, androidApp/, androidTvApp/; server: this repository root). Absence of a first-party consumer is not proof of disuse.",
   "field_reference": "internal/contractledger validates this file against migration.schema.json and reconciles it against the route inventory: listener, namespace, method, path, registration_index, handler, handler_kind, source_file, route_group, middleware_chain, auth_class, auth_traits, conditional, conditions, delegates_to (inventory empty string is null here), request_kind, response_media_kind, streams, and upgrades_websocket are copied from the inventory row and must match it, except that dynamic_plugin_proxy rows record both media kinds as dynamic_proxy; profile_required and admin_required are derived from auth_traits. Every other field is curated by hand and preserved when scripts/apiv2-ledger/build_ledger.py merges a regenerated inventory into this file.",
   "totals": {
-    "entries": 773
+    "entries": 785
   },
   "entries": [
     {
@@ -3548,7 +3548,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 346,
+          "line": 347,
           "types": [],
           "match": "mechanical"
         }
@@ -3857,7 +3857,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 108,
+          "line": 109,
           "types": [],
           "match": "mechanical"
         }
@@ -3919,7 +3919,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 389,
+          "line": 390,
           "types": [],
           "match": "mechanical"
         }
@@ -3981,7 +3981,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 425,
+          "line": 426,
           "types": [],
           "match": "mechanical"
         }
@@ -4043,7 +4043,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 461,
+          "line": 462,
           "types": [],
           "match": "mechanical"
         }
@@ -4193,6 +4193,68 @@
     {
       "listener": "api",
       "namespace": "api_v1",
+      "method": "POST",
+      "path": "/api/v1/admin/collections/purge-virtual",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.LibraryCollectionHandler).PurgeVirtualPlaybackItems",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/admin/collections",
+      "middleware_chain": 9,
+      "auth_class": "acting_admin",
+      "auth_traits": [
+        "acting_admin",
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": true,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil",
+        "libraryCollectionHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "unknown",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "web"
+      ],
+      "consumer_call_sites": [
+        {
+          "repo": "web",
+          "file": "src/hooks/queries/admin/collections.ts",
+          "line": 493,
+          "types": [
+            "{ success: boolean; files_deleted: number; items_deleted: number; message: string }"
+          ],
+          "match": "mechanical"
+        }
+      ],
+      "section": "admin-collections",
+      "release_flow": "other_admin",
+      "tier": 2,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "Inventory media kind is heuristic and unresolved for this row; confirm in the section PR. Conditionally registered: authMiddleware != nil; adminHandler != nil; libraryCollectionHandler != nil. v2 registers the operation unconditionally and reports capability state instead."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
       "method": "GET",
       "path": "/api/v1/admin/collections/template-bundles",
       "registration_index": 0,
@@ -4230,7 +4292,7 @@
         {
           "repo": "web",
           "file": "src/lib/collectionTemplates.ts",
-          "line": 190,
+          "line": 192,
           "types": [],
           "match": "mechanical"
         }
@@ -4290,7 +4352,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 135,
+          "line": 136,
           "types": [],
           "match": "mechanical"
         }
@@ -4352,7 +4414,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 180,
+          "line": 181,
           "types": [],
           "match": "mechanical"
         }
@@ -4414,7 +4476,7 @@
         {
           "repo": "web",
           "file": "src/lib/collectionTemplates.ts",
-          "line": 184,
+          "line": 186,
           "types": [],
           "match": "mechanical"
         }
@@ -4474,14 +4536,14 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 275,
+          "line": 276,
           "types": [],
           "match": "mechanical"
         },
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 302,
+          "line": 303,
           "types": [],
           "match": "mechanical"
         }
@@ -4544,7 +4606,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 252,
+          "line": 253,
           "types": [],
           "match": "mechanical"
         }
@@ -4669,7 +4731,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 435,
+          "line": 436,
           "types": [],
           "match": "mechanical"
         }
@@ -4732,7 +4794,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 257,
+          "line": 258,
           "types": [],
           "match": "mechanical"
         }
@@ -4801,7 +4863,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 234,
+          "line": 235,
           "types": [],
           "match": "mechanical"
         }
@@ -4822,6 +4884,58 @@
       "notes": "Administrator collection v2 operation uses shared services and typed string IDs. Bundled web consumes v2; legacy routes remain available. No existing Apple or Android administrator collection consumer was found. Jellyfin has no administrator editing surface.",
       "retry_safety": "non_retryable",
       "retry_safety_note": "No durable request identity is provided. Delayed replay can repeat side effects or overwrite a later action; clients must not retry automatically."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "POST",
+      "path": "/api/v1/admin/collections/{id}/materialize/{item_id}",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.LibraryCollectionHandler).HandleMaterializeAdminCollectionItem",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/admin/collections",
+      "middleware_chain": 9,
+      "auth_class": "acting_admin",
+      "auth_traits": [
+        "acting_admin",
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": true,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil",
+        "libraryCollectionHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "unknown",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "unused"
+      ],
+      "consumer_call_sites": [],
+      "section": "admin-collections",
+      "release_flow": "other_admin",
+      "tier": 2,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "No first-party or internal consumer found. Absence from first-party clients is not proof of disuse: third-party clients exist, and removal needs an affirmative product decision. Inventory media kind is heuristic and unresolved for this row; confirm in the section PR. Conditionally registered: authMiddleware != nil; adminHandler != nil; libraryCollectionHandler != nil. v2 registers the operation unconditionally and reports capability state instead."
     },
     {
       "listener": "api",
@@ -4863,7 +4977,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 359,
+          "line": 360,
           "types": [],
           "match": "mechanical"
         }
@@ -7394,6 +7508,67 @@
     {
       "listener": "api",
       "namespace": "api_v1",
+      "method": "DELETE",
+      "path": "/api/v1/admin/items/{id}",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.ItemsHandler).HandleDelete",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/admin",
+      "middleware_chain": 8,
+      "auth_class": "permission_gated",
+      "auth_traits": [
+        "authenticated",
+        "demo_guarded",
+        "metadata_curation",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": false,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "unknown",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "web"
+      ],
+      "consumer_call_sites": [
+        {
+          "repo": "web",
+          "file": "src/hooks/queries/items.ts",
+          "line": 625,
+          "types": [
+            "{ success: boolean; content_id: string; message: string }"
+          ],
+          "match": "mechanical"
+        }
+      ],
+      "section": "admin-catalog",
+      "release_flow": "other_admin",
+      "tier": 2,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "Inventory media kind is heuristic and unresolved for this row; confirm in the section PR. Conditionally registered: authMiddleware != nil; adminHandler != nil. v2 registers the operation unconditionally and reports capability state instead."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
       "method": "GET",
       "path": "/api/v1/admin/items/{id}/files",
       "registration_index": 0,
@@ -7613,7 +7788,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 394,
+          "line": 404,
           "types": [],
           "match": "mechanical"
         }
@@ -7675,7 +7850,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 354,
+          "line": 364,
           "types": [],
           "match": "mechanical"
         }
@@ -7790,7 +7965,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 271,
+          "line": 281,
           "types": [],
           "match": "mechanical"
         }
@@ -7852,7 +8027,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 573,
+          "line": 586,
           "types": [],
           "match": "mechanical"
         }
@@ -7914,7 +8089,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 598,
+          "line": 611,
           "types": [],
           "match": "mechanical"
         }
@@ -8028,7 +8203,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 210,
+          "line": 220,
           "types": [],
           "match": "mechanical"
         }
@@ -8143,7 +8318,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 97,
+          "line": 107,
           "types": [],
           "match": "mechanical"
         }
@@ -8266,7 +8441,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 383,
+          "line": 384,
           "types": [],
           "match": "mechanical"
         }
@@ -8328,7 +8503,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 363,
+          "line": 364,
           "types": [],
           "match": "mechanical"
         }
@@ -8387,7 +8562,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 457,
+          "line": 458,
           "types": [],
           "match": "mechanical"
         }
@@ -8448,7 +8623,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 461,
+          "line": 462,
           "types": [],
           "match": "mechanical"
         }
@@ -8509,7 +8684,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 457,
+          "line": 458,
           "types": [],
           "match": "mechanical"
         }
@@ -9699,6 +9874,110 @@
       "notes": "Typed acting-admin marker provider administration with shared frozen-v1 services; independently reviewed and ratified. Partial config retains omitted/null fields; validation remains synchronous200 valid/stats or valid=false with sanitized error. Existing web migrated; no native/Jellyfin admin callers.",
       "retry_safety": "non_retryable",
       "retry_safety_note": "Partial config performs full-row persistence and validation invokes a provider; no durable replay receipt. Web disables mutation and authentication retries."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "GET",
+      "path": "/api/v1/admin/needs-release-metadata",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.RequestsHandler).HandleNeedsReleaseMetadata",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/admin",
+      "middleware_chain": 9,
+      "auth_class": "acting_admin",
+      "auth_traits": [
+        "acting_admin",
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": true,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil",
+        "requestHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "json",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "unused"
+      ],
+      "consumer_call_sites": [],
+      "section": "admin-requests",
+      "release_flow": "other_admin",
+      "tier": 2,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "No first-party or internal consumer found. Absence from first-party clients is not proof of disuse: third-party clients exist, and removal needs an affirmative product decision. Conditionally registered: authMiddleware != nil; adminHandler != nil; requestHandler != nil. v2 registers the operation unconditionally and reports capability state instead."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "POST",
+      "path": "/api/v1/admin/needs-release-metadata/retry",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.RequestsHandler).HandleNeedsReleaseMetadata",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/admin",
+      "middleware_chain": 9,
+      "auth_class": "acting_admin",
+      "auth_traits": [
+        "acting_admin",
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": true,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil",
+        "requestHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "json",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "unused"
+      ],
+      "consumer_call_sites": [],
+      "section": "admin-requests",
+      "release_flow": "other_admin",
+      "tier": 2,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "No first-party or internal consumer found. Absence from first-party clients is not proof of disuse: third-party clients exist, and removal needs an affirmative product decision. Conditionally registered: authMiddleware != nil; adminHandler != nil; requestHandler != nil. v2 registers the operation unconditionally and reports capability state instead."
     },
     {
       "listener": "api",
@@ -11164,7 +11443,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 116,
+          "line": 117,
           "types": [],
           "match": "mechanical"
         }
@@ -11224,7 +11503,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 274,
+          "line": 275,
           "types": [],
           "match": "mechanical"
         }
@@ -11284,7 +11563,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 300,
+          "line": 301,
           "types": [],
           "match": "mechanical"
         }
@@ -11347,7 +11626,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 142,
+          "line": 143,
           "types": [],
           "match": "mechanical"
         }
@@ -11407,7 +11686,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 533,
+          "line": 534,
           "types": [],
           "match": "mechanical"
         }
@@ -11469,7 +11748,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 744,
+          "line": 745,
           "types": [],
           "match": "mechanical"
         }
@@ -11531,7 +11810,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 659,
+          "line": 660,
           "types": [],
           "match": "mechanical"
         }
@@ -11593,7 +11872,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 912,
+          "line": 913,
           "types": [],
           "match": "mechanical"
         }
@@ -11655,7 +11934,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 833,
+          "line": 834,
           "types": [],
           "match": "mechanical"
         }
@@ -11676,6 +11955,58 @@
       "notes": "Conditionally registered: authMiddleware != nil; adminHandler != nil; deps.PluginService != nil && deps.PluginUserConfig != nil. v2 registers the operation unconditionally and reports capability state instead. Typed entry write through the shared handler seam; manifest validation 422, unknown 404, builtin 409, 204 on success. Pending independent review.",
       "retry_safety": "natural_idempotent",
       "retry_safety_note": "Whole-entry assignment after manifest validation; the service merges preserved secrets and compare-and-swaps on updated_at, so a repeat converges on one stored entry; each accepted write issues an idempotent plugin stop."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "POST",
+      "path": "/api/v1/admin/plugins/installations/{id}/config-options",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.PluginHandler).HandleListInstallationConfigOptions",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/admin/plugins",
+      "middleware_chain": 9,
+      "auth_class": "acting_admin",
+      "auth_traits": [
+        "acting_admin",
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": true,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil",
+        "deps.PluginService != nil && deps.PluginUserConfig != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "unknown",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "unused"
+      ],
+      "consumer_call_sites": [],
+      "section": "admin-plugins",
+      "release_flow": "other_admin",
+      "tier": 2,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "No first-party or internal consumer found. Absence from first-party clients is not proof of disuse: third-party clients exist, and removal needs an affirmative product decision. Inventory media kind is heuristic and unresolved for this row; confirm in the section PR. Conditionally registered: authMiddleware != nil; adminHandler != nil; deps.PluginService != nil && deps.PluginUserConfig != nil. v2 registers the operation unconditionally and reports capability state instead."
     },
     {
       "listener": "api",
@@ -11717,7 +12048,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 881,
+          "line": 882,
           "types": [],
           "match": "mechanical"
         }
@@ -11779,7 +12110,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 973,
+          "line": 974,
           "types": [],
           "match": "mechanical"
         }
@@ -11841,7 +12172,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 701,
+          "line": 702,
           "types": [],
           "match": "mechanical"
         }
@@ -11903,7 +12234,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 192,
+          "line": 193,
           "types": [],
           "match": "mechanical"
         }
@@ -11963,7 +12294,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 353,
+          "line": 354,
           "types": [],
           "match": "mechanical"
         }
@@ -12025,7 +12356,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 463,
+          "line": 464,
           "types": [],
           "match": "mechanical"
         }
@@ -12087,7 +12418,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 411,
+          "line": 412,
           "types": [],
           "match": "mechanical"
         }
@@ -13737,6 +14068,162 @@
     {
       "listener": "api",
       "namespace": "api_v1",
+      "method": "DELETE",
+      "path": "/api/v1/admin/release-overrides",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.RequestsHandler).HandleReleaseOverrides",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/admin",
+      "middleware_chain": 9,
+      "auth_class": "acting_admin",
+      "auth_traits": [
+        "acting_admin",
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": true,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil",
+        "requestHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "json",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "unused"
+      ],
+      "consumer_call_sites": [],
+      "section": "admin-requests",
+      "release_flow": "other_admin",
+      "tier": 2,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "No first-party or internal consumer found. Absence from first-party clients is not proof of disuse: third-party clients exist, and removal needs an affirmative product decision. Conditionally registered: authMiddleware != nil; adminHandler != nil; requestHandler != nil. v2 registers the operation unconditionally and reports capability state instead."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "GET",
+      "path": "/api/v1/admin/release-overrides",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.RequestsHandler).HandleReleaseOverrides",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/admin",
+      "middleware_chain": 9,
+      "auth_class": "acting_admin",
+      "auth_traits": [
+        "acting_admin",
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": true,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil",
+        "requestHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "json",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "unused"
+      ],
+      "consumer_call_sites": [],
+      "section": "admin-requests",
+      "release_flow": "other_admin",
+      "tier": 2,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "No first-party or internal consumer found. Absence from first-party clients is not proof of disuse: third-party clients exist, and removal needs an affirmative product decision. Conditionally registered: authMiddleware != nil; adminHandler != nil; requestHandler != nil. v2 registers the operation unconditionally and reports capability state instead."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "PUT",
+      "path": "/api/v1/admin/release-overrides",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.RequestsHandler).HandleReleaseOverrides",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/admin",
+      "middleware_chain": 9,
+      "auth_class": "acting_admin",
+      "auth_traits": [
+        "acting_admin",
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": true,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil",
+        "requestHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "json",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "unused"
+      ],
+      "consumer_call_sites": [],
+      "section": "admin-requests",
+      "release_flow": "other_admin",
+      "tier": 2,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "No first-party or internal consumer found. Absence from first-party clients is not proof of disuse: third-party clients exist, and removal needs an affirmative product decision. Conditionally registered: authMiddleware != nil; adminHandler != nil; requestHandler != nil. v2 registers the operation unconditionally and reports capability state instead."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
       "method": "GET",
       "path": "/api/v1/admin/request-integrations",
       "registration_index": 0,
@@ -15189,7 +15676,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 116,
+          "line": 117,
           "types": [],
           "match": "mechanical"
         }
@@ -15359,7 +15846,7 @@
         {
           "repo": "web",
           "file": "src/api/v2/adminPlaybackCommands.ts",
-          "line": 119,
+          "line": 166,
           "types": [],
           "match": "mechanical"
         }
@@ -15421,7 +15908,7 @@
         {
           "repo": "web",
           "file": "src/api/v2/adminPlaybackCommands.ts",
-          "line": 99,
+          "line": 146,
           "types": [],
           "match": "mechanical"
         },
@@ -15492,7 +15979,7 @@
         {
           "repo": "web",
           "file": "src/api/v2/adminPlaybackCommands.ts",
-          "line": 105,
+          "line": 152,
           "types": [],
           "match": "mechanical"
         },
@@ -15563,7 +16050,7 @@
         {
           "repo": "web",
           "file": "src/api/v2/adminPlaybackCommands.ts",
-          "line": 111,
+          "line": 158,
           "types": [],
           "match": "mechanical"
         },
@@ -15634,7 +16121,7 @@
         {
           "repo": "web",
           "file": "src/api/v2/adminPlaybackCommands.ts",
-          "line": 159,
+          "line": 213,
           "types": [],
           "match": "mechanical"
         },
@@ -15755,7 +16242,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 133,
+          "line": 134,
           "types": [],
           "match": "mechanical"
         }
@@ -15817,7 +16304,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 334,
+          "line": 335,
           "types": [],
           "match": "mechanical"
         }
@@ -16103,7 +16590,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 326,
+          "line": 327,
           "types": [],
           "match": "mechanical"
         }
@@ -16162,7 +16649,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 535,
+          "line": 536,
           "types": [],
           "match": "mechanical"
         }
@@ -16221,7 +16708,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/settings.ts",
-          "line": 239,
+          "line": 240,
           "types": [],
           "match": "mechanical"
         }
@@ -16543,57 +17030,6 @@
       "listener": "api",
       "namespace": "api_v1",
       "method": "GET",
-      "path": "/api/v1/admin/stream-telemetry/parity",
-      "registration_index": 0,
-      "handler": "(*internal/api/handlers.StreamTelemetryParityHandler).HandleGetStreamTelemetryParity",
-      "handler_kind": "method",
-      "source_file": "internal/api/router.go",
-      "route_group": "/api/v1/admin",
-      "middleware_chain": 9,
-      "auth_class": "acting_admin",
-      "auth_traits": [
-        "acting_admin",
-        "authenticated",
-        "demo_guarded",
-        "rate_limited",
-        "viewer_access"
-      ],
-      "profile_required": false,
-      "admin_required": true,
-      "conditional": true,
-      "conditions": [
-        "authMiddleware != nil",
-        "adminHandler != nil"
-      ],
-      "delegates_to": null,
-      "request_kind": "none",
-      "response_media_kind": "json",
-      "streams": false,
-      "upgrades_websocket": false,
-      "capability_endpoint": null,
-      "consumers": [
-        "unused"
-      ],
-      "consumer_call_sites": [],
-      "section": "admin-observability",
-      "release_flow": "core_admin",
-      "tier": 1,
-      "disposition": "ported",
-      "disposition_rule": "default_ported",
-      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
-      "owner": null,
-      "review_state": "ratified",
-      "v2": {
-        "method": "GET",
-        "path": "/api/v2/admin/stream-telemetry/parity",
-        "operation_id": "getAdminStreamTelemetryParity"
-      },
-      "notes": "No first-party or internal consumer found. Absence from first-party clients is not proof of disuse: third-party clients exist, and removal needs an affirmative product decision. Conditionally registered: authMiddleware != nil; adminHandler != nil. v2 registers the operation unconditionally and reports capability state instead."
-    },
-    {
-      "listener": "api",
-      "namespace": "api_v1",
-      "method": "GET",
       "path": "/api/v1/admin/subtitle-providers/",
       "registration_index": 0,
       "handler": "(*internal/api/handlers.AdminSubtitleHandler).HandleListProviders",
@@ -16753,7 +17189,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/subtitles.ts",
-          "line": 88,
+          "line": 89,
           "types": [],
           "match": "mechanical"
         }
@@ -17061,7 +17497,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/system.ts",
-          "line": 57,
+          "line": 66,
           "types": [],
           "match": "mechanical"
         }
@@ -17120,7 +17556,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/system.ts",
-          "line": 105,
+          "line": 114,
           "types": [],
           "match": "mechanical"
         }
@@ -17179,7 +17615,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/system.ts",
-          "line": 80,
+          "line": 89,
           "types": [],
           "match": "mechanical"
         }
@@ -17548,7 +17984,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 784,
+          "line": 785,
           "types": [],
           "match": "mechanical"
         },
@@ -19756,7 +20192,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 313,
+          "line": 318,
           "types": [],
           "match": "mechanical"
         }
@@ -19821,7 +20257,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 469,
+          "line": 490,
           "types": [],
           "match": "mechanical"
         }
@@ -19888,7 +20324,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 469,
+          "line": 490,
           "types": [],
           "match": "mechanical"
         }
@@ -19972,7 +20408,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 324,
+          "line": 339,
           "types": [],
           "match": "mechanical"
         }
@@ -20057,7 +20493,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 386,
+          "line": 407,
           "types": [],
           "match": "mechanical"
         },
@@ -20328,7 +20764,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 363,
+          "line": 381,
           "types": [],
           "match": "mechanical"
         }
@@ -20551,7 +20987,14 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 362,
+          "line": 328,
+          "types": [],
+          "match": "mechanical"
+        },
+        {
+          "repo": "web",
+          "file": "src/hooks/useAuth.tsx",
+          "line": 380,
           "types": [],
           "match": "mechanical"
         }
@@ -20604,7 +21047,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 479,
+          "line": 500,
           "types": [],
           "match": "mechanical"
         }
@@ -20661,7 +21104,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 479,
+          "line": 500,
           "types": [],
           "match": "mechanical"
         }
@@ -20725,7 +21168,7 @@
         {
           "repo": "web",
           "file": "src/pages/Signup.tsx",
-          "line": 33,
+          "line": 34,
           "types": [],
           "match": "mechanical"
         }
@@ -20778,7 +21221,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 489,
+          "line": 519,
           "types": [],
           "match": "mechanical"
         }
@@ -20835,7 +21278,7 @@
         {
           "repo": "web",
           "file": "src/hooks/useAuth.tsx",
-          "line": 489,
+          "line": 519,
           "types": [],
           "match": "mechanical"
         }
@@ -21471,7 +21914,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/catalogRead.ts",
-          "line": 37,
+          "line": 38,
           "types": [],
           "match": "mechanical"
         }
@@ -21540,7 +21983,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/catalogRead.ts",
-          "line": 61,
+          "line": 62,
           "types": [],
           "match": "mechanical"
         }
@@ -21599,7 +22042,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/catalogRead.ts",
-          "line": 130,
+          "line": 148,
           "types": [],
           "match": "mechanical"
         }
@@ -21668,7 +22111,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/catalogRead.ts",
-          "line": 49,
+          "line": 50,
           "types": [],
           "match": "mechanical"
         }
@@ -21817,7 +22260,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/catalogRead.ts",
-          "line": 74,
+          "line": 75,
           "types": [],
           "match": "mechanical"
         }
@@ -21876,7 +22319,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/catalogRead.ts",
-          "line": 88,
+          "line": 89,
           "types": [],
           "match": "mechanical"
         }
@@ -21945,7 +22388,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/catalogRead.ts",
-          "line": 102,
+          "line": 115,
           "types": [],
           "match": "mechanical"
         }
@@ -21964,6 +22407,69 @@
         "operation_id": "listSeasonEpisodes"
       },
       "notes": "Section catalog-items (profile_scoped). {episodes:[...]} became an {items} collection; a non-integer or negative num is 422."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "POST",
+      "path": "/api/v1/catalog/versions/check",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.CatalogResourceHandler).HandleCheckVersions",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1",
+      "middleware_chain": 5,
+      "auth_class": "profile_scoped",
+      "auth_traits": [
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": false,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "itemsHandler != nil",
+        "catalogResourceHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "json",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "web"
+      ],
+      "consumer_call_sites": [
+        {
+          "repo": "web",
+          "file": "src/hooks/queries/versionLiveness.ts",
+          "line": 18,
+          "types": [
+            "VersionLivenessResponse"
+          ],
+          "match": "mechanical"
+        }
+      ],
+      "section": "catalog-items",
+      "release_flow": "browse_search",
+      "tier": 1,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "Conditionally registered: authMiddleware != nil; itemsHandler != nil; catalogResourceHandler != nil. v2 registers the operation unconditionally and reports capability state instead.",
+      "retry_safety": "natural_idempotent",
+      "retry_safety_note": "A batched availability probe: repeating it re-resolves the same files and converges on the current provider verdict; there is no durable side effect to duplicate."
     },
     {
       "listener": "api",
@@ -22014,7 +22520,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 39,
+          "line": 40,
           "types": [],
           "match": "mechanical"
         }
@@ -22083,7 +22589,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 139,
+          "line": 140,
           "types": [],
           "match": "mechanical"
         }
@@ -22154,7 +22660,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 76,
+          "line": 77,
           "types": [],
           "match": "mechanical"
         }
@@ -22223,7 +22729,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 347,
+          "line": 348,
           "types": [],
           "match": "mechanical"
         }
@@ -22294,7 +22800,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 399,
+          "line": 400,
           "types": [],
           "match": "mechanical"
         }
@@ -22366,7 +22872,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 381,
+          "line": 382,
           "types": [],
           "match": "mechanical"
         }
@@ -22438,7 +22944,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 362,
+          "line": 363,
           "types": [],
           "match": "mechanical"
         }
@@ -22816,7 +23322,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 296,
+          "line": 297,
           "types": [],
           "match": "mechanical"
         }
@@ -22949,7 +23455,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 92,
+          "line": 93,
           "types": [],
           "match": "mechanical"
         }
@@ -23061,7 +23567,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 527,
+          "line": 528,
           "types": [],
           "match": "mechanical"
         }
@@ -23192,7 +23698,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 193,
+          "line": 194,
           "types": [],
           "match": "mechanical"
         }
@@ -23273,7 +23779,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 170,
+          "line": 171,
           "types": [],
           "match": "mechanical"
         }
@@ -23335,7 +23841,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 462,
+          "line": 463,
           "types": [],
           "match": "mechanical"
         }
@@ -23396,7 +23902,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 107,
+          "line": 108,
           "types": [],
           "match": "mechanical"
         }
@@ -23465,7 +23971,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 435,
+          "line": 436,
           "types": [],
           "match": "mechanical"
         }
@@ -23537,7 +24043,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 257,
+          "line": 258,
           "types": [],
           "match": "mechanical"
         }
@@ -23615,7 +24121,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 230,
+          "line": 231,
           "types": [],
           "match": "mechanical"
         }
@@ -23933,6 +24439,67 @@
       "notes": "Independently reviewed ordinary port. Profile-scoped settings devices; household reads and named-profile mutations retain primary-profile/PIN or admin authority. Other accounts and missing devices return404 after operation authorization. Bounded keyset listing uses full-precision recency with profile/device ties and logical override counts. Cleanup atomically clears both settings generations and optionally the registry, with postcommit canonical-key invalidation. Forgetting does not revoke login sessions. Both mutation retry classifications remain non_retryable because retries can remove intervening settings. Web device hooks use v2; native clients have no callers for these three operations.",
       "retry_safety": "non_retryable",
       "retry_safety_note": "Stale retry hazard: a setting write re-registers the same profile/device identity after forgetting it; a delayed retry deletes the new settings and registration. The auth-devices section must bind forgetting to a registration generation before clients may retry."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "PUT",
+      "path": "/api/v1/devices/{device_id}/capabilities",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.DeviceHandler).HandlePutDeviceCapabilities",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/devices",
+      "middleware_chain": 6,
+      "auth_class": "profile_scoped",
+      "auth_traits": [
+        "authenticated",
+        "demo_guarded",
+        "profile_required",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": true,
+      "admin_required": false,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "deviceHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "json",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "web"
+      ],
+      "consumer_call_sites": [
+        {
+          "repo": "web",
+          "file": "src/lib/deviceCapabilities.ts",
+          "line": 99,
+          "types": [],
+          "match": "mechanical"
+        }
+      ],
+      "section": "auth-devices",
+      "release_flow": "settings",
+      "tier": 1,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "Conditionally registered: authMiddleware != nil; deviceHandler != nil. v2 registers the operation unconditionally and reports capability state instead.",
+      "retry_safety": "natural_idempotent",
+      "retry_safety_note": "Storing a capability profile converges: the same device republishing the same payload overwrites the identical row and returns the stored fingerprint."
     },
     {
       "listener": "api",
@@ -33346,6 +33913,67 @@
       "listener": "api",
       "namespace": "api_v1",
       "method": "POST",
+      "path": "/api/v1/playback/prefetch",
+      "registration_index": 0,
+      "handler": "(*internal/api/handlers.PlaybackHandler).HandlePrefetchVirtualPlayback",
+      "handler_kind": "method",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/playback",
+      "middleware_chain": 6,
+      "auth_class": "profile_scoped",
+      "auth_traits": [
+        "authenticated",
+        "demo_guarded",
+        "profile_required",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": true,
+      "admin_required": false,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
+        "playbackHandler != nil"
+      ],
+      "delegates_to": null,
+      "request_kind": "json",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": "GET /api/v1/playback/capability",
+      "consumers": [
+        "web"
+      ],
+      "consumer_call_sites": [
+        {
+          "repo": "web",
+          "file": "src/hooks/queries/catalogRead.ts",
+          "line": 101,
+          "types": [],
+          "match": "mechanical"
+        }
+      ],
+      "section": "playback-control",
+      "release_flow": "playback_lifecycle",
+      "tier": 1,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "proposed",
+      "v2": {
+        "method": null,
+        "path": null,
+        "operation_id": null
+      },
+      "notes": "Conditionally registered: authMiddleware != nil; playbackHandler != nil. v2 registers the operation unconditionally and reports capability state instead.",
+      "retry_safety": "non_retryable",
+      "retry_safety_note": "Prefetch warms a resolver cache and answers 202 Accepted; the response carries no durable result a client can reconcile, so a lost response is simply not repeated. Convergence happens through the next playback start."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "POST",
       "path": "/api/v1/playback/route-events",
       "registration_index": 0,
       "handler": "(*internal/api/handlers.PlaybackHandler).HandlePlaybackRouteEventV3",
@@ -34458,7 +35086,6 @@
       "upgrades_websocket": false,
       "capability_endpoint": null,
       "consumers": [
-        "compat",
         "external_unknown",
         "internal",
         "web"
@@ -35196,7 +35823,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/profiles.ts",
-          "line": 100,
+          "line": 101,
           "types": [],
           "match": "mechanical"
         }
@@ -35254,7 +35881,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/profiles.ts",
-          "line": 108,
+          "line": 109,
           "types": [],
           "match": "mechanical"
         }
@@ -35314,7 +35941,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/profiles.ts",
-          "line": 122,
+          "line": 123,
           "types": [],
           "match": "mechanical"
         }
@@ -35372,7 +35999,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/profiles.ts",
-          "line": 250,
+          "line": 261,
           "types": [],
           "match": "mechanical"
         }
@@ -35461,7 +36088,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/profiles.ts",
-          "line": 169,
+          "line": 180,
           "types": [],
           "match": "mechanical"
         }
@@ -35521,7 +36148,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/profiles.ts",
-          "line": 214,
+          "line": 225,
           "types": [],
           "match": "mechanical"
         }
@@ -35581,7 +36208,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/profiles.ts",
-          "line": 116,
+          "line": 117,
           "types": [],
           "match": "mechanical"
         }
@@ -35641,7 +36268,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/profiles.ts",
-          "line": 112,
+          "line": 113,
           "types": [],
           "match": "mechanical"
         }
@@ -37862,7 +38489,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/useRequests.ts",
-          "line": 80,
+          "line": 82,
           "types": [],
           "match": "mechanical"
         }
@@ -37984,7 +38611,8 @@
       "upgrades_websocket": false,
       "capability_endpoint": null,
       "consumers": [
-        "android"
+        "android",
+        "web"
       ],
       "consumer_call_sites": [
         {
@@ -37993,6 +38621,15 @@
           "line": 149,
           "types": [
             "ApiResult<MediaRequest>"
+          ],
+          "match": "mechanical"
+        },
+        {
+          "repo": "web",
+          "file": "src/hooks/queries/useRequests.ts",
+          "line": 269,
+          "types": [
+            "MediaRequest"
           ],
           "match": "mechanical"
         }
@@ -38349,7 +38986,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/settingValues.ts",
-          "line": 457,
+          "line": 469,
           "types": [],
           "match": "mechanical"
         }
@@ -38478,7 +39115,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/settingValues.ts",
-          "line": 457,
+          "line": 469,
           "types": [],
           "match": "mechanical"
         }
@@ -39334,7 +39971,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/settingValues.ts",
-          "line": 198,
+          "line": 204,
           "types": [],
           "match": "mechanical"
         }
@@ -39458,7 +40095,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/settingValues.ts",
-          "line": 351,
+          "line": 357,
           "types": [],
           "match": "mechanical"
         }
@@ -39546,7 +40183,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/settingValues.ts",
-          "line": 378,
+          "line": 384,
           "types": [],
           "match": "mechanical"
         },
@@ -39695,7 +40332,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/settingValues.ts",
-          "line": 305,
+          "line": 311,
           "types": [],
           "match": "mechanical"
         },
@@ -40842,6 +41479,66 @@
       "conditional": true,
       "conditions": [
         "authMiddleware != nil",
+        "!(subtitleSearchHandler != nil)"
+      ],
+      "delegates_to": null,
+      "request_kind": "none",
+      "response_media_kind": "json",
+      "streams": false,
+      "upgrades_websocket": false,
+      "capability_endpoint": null,
+      "consumers": [
+        "android"
+      ],
+      "consumer_call_sites": [
+        {
+          "repo": "android",
+          "file": "shared/src/commonMain/kotlin/org/siloserver/silo/network/api/SubtitlesApi.kt",
+          "line": 84,
+          "types": [
+            "ApiResult<SubtitleAiStatus>"
+          ],
+          "match": "mechanical"
+        }
+      ],
+      "section": "playback-subtitles",
+      "release_flow": "browse_search",
+      "tier": 1,
+      "disposition": "ported",
+      "disposition_rule": "default_ported",
+      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
+      "owner": null,
+      "review_state": "ratified",
+      "v2": {
+        "method": "GET",
+        "path": "/api/v2/subtitles/ai/status",
+        "operation_id": "getSubtitleAIStatus"
+      },
+      "notes": "Typed v2 capability always registered. Missing subtitle services return disabled 200 with explicit booleans and empty provider list; optional profile still resolves viewer access. Shared v1/v2 capability methods preserve bridge responses. Web AI probe migrated; native adoption and independent review pending. See docs/subtitles-api.md."
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "GET",
+      "path": "/api/v1/subtitles/ai/status",
+      "registration_index": 1,
+      "handler": "internal/api/handlers.WriteSubtitleAIDisabledStatus",
+      "handler_kind": "func",
+      "source_file": "internal/api/router.go",
+      "route_group": "/api/v1/subtitles",
+      "middleware_chain": 5,
+      "auth_class": "profile_scoped",
+      "auth_traits": [
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "profile_required": false,
+      "admin_required": false,
+      "conditional": true,
+      "conditions": [
+        "authMiddleware != nil",
         "subtitleSearchHandler != nil",
         "!(subtitleAIHandler != nil)"
       ],
@@ -40885,7 +41582,7 @@
       "namespace": "api_v1",
       "method": "GET",
       "path": "/api/v1/subtitles/ai/status",
-      "registration_index": 1,
+      "registration_index": 2,
       "handler": "(*internal/api/handlers.SubtitleAIHandler).HandleStatus",
       "handler_kind": "method",
       "source_file": "internal/api/router.go",
@@ -40933,13 +41630,13 @@
       "disposition_rule": "default_ported",
       "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
       "owner": null,
-      "review_state": "ratified",
+      "review_state": "proposed",
       "v2": {
-        "method": "GET",
-        "path": "/api/v2/subtitles/ai/status",
-        "operation_id": "getSubtitleAIStatus"
+        "method": null,
+        "path": null,
+        "operation_id": null
       },
-      "notes": "Typed v2 capability always registered. Missing subtitle services return disabled 200 with explicit booleans and empty provider list; optional profile still resolves viewer access. Shared v1/v2 capability methods preserve bridge responses. Web AI probe migrated; native adoption and independent review pending. See docs/subtitles-api.md."
+      "notes": "No first-party or internal consumer found. Absence from first-party clients is not proof of disuse: third-party clients exist, and removal needs an affirmative product decision. Conditionally registered: authMiddleware != nil; subtitleSearchHandler != nil; subtitleAIHandler != nil. v2 registers the operation unconditionally and reports capability state instead. One of several registrations of this method+path with different middleware/conditions; see registration_index and conditions."
     },
     {
       "listener": "api",
@@ -43485,7 +44182,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 36,
+          "line": 42,
           "types": [],
           "match": "mechanical"
         }
@@ -43562,7 +44259,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 306,
+          "line": 316,
           "types": [],
           "match": "mechanical"
         }
@@ -43641,7 +44338,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/items.ts",
-          "line": 305,
+          "line": 315,
           "types": [],
           "match": "mechanical"
         }
@@ -44893,7 +45590,7 @@
         {
           "repo": "web",
           "file": "src/api/v2/adminPlaybackCommands.ts",
-          "line": 137,
+          "line": 191,
           "types": [],
           "match": "mechanical"
         },
@@ -44956,21 +45653,21 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 64,
+          "line": 65,
           "types": [],
           "match": "mechanical"
         },
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/collections.ts",
-          "line": 211,
+          "line": 212,
           "types": [],
           "match": "mechanical"
         },
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/plugins.ts",
-          "line": 280,
+          "line": 281,
           "types": [],
           "match": "mechanical"
         },
@@ -44984,7 +45681,7 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/admin/system.ts",
-          "line": 73,
+          "line": 82,
           "types": [],
           "match": "mechanical"
         },
@@ -44998,14 +45695,14 @@
         {
           "repo": "web",
           "file": "src/hooks/queries/collections.ts",
-          "line": 107,
+          "line": 108,
           "types": [],
           "match": "mechanical"
         },
         {
           "repo": "web",
           "file": "src/hooks/queries/useRequests.ts",
-          "line": 385,
+          "line": 409,
           "types": [],
           "match": "mechanical"
         },
