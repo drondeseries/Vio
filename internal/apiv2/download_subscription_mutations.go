@@ -23,9 +23,9 @@ type DownloadSubscriptionCreateBody struct {
 	MaxStorageBytes int64  `json:"max_storage_bytes" minimum:"0"`
 }
 type DownloadSubscriptionCreateInput struct {
-	DeviceID       string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
-	DeviceName     string `header:"X-Silo-Device-Name" maxLength:"256"`
-	DevicePlatform string `header:"X-Silo-Device-Platform" maxLength:"128"`
+	DeviceID       string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceName     string `header:"X-Vio-Device-Name" maxLength:"256"`
+	DevicePlatform string `header:"X-Vio-Device-Platform" maxLength:"128"`
 	Body           DownloadSubscriptionCreateBody
 }
 type DownloadSubscriptionPatchBody struct {
@@ -37,14 +37,14 @@ type DownloadSubscriptionPatchBody struct {
 }
 type DownloadSubscriptionPatchInput struct {
 	ID          string `path:"id" minLength:"1"`
-	DeviceID    string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceID    string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
 	IfMatch     string `header:"If-Match"`
 	IfNoneMatch string `header:"If-None-Match"`
 	Body        DownloadSubscriptionPatchBody
 }
 type DownloadSubscriptionDeleteInput struct {
 	ID          string `path:"id" minLength:"1"`
-	DeviceID    string `header:"X-Silo-Device-Id" required:"true" minLength:"1" maxLength:"128"`
+	DeviceID    string `header:"X-Vio-Device-Id" required:"true" minLength:"1" maxLength:"128"`
 	IfMatch     string `header:"If-Match"`
 	IfNoneMatch string `header:"If-None-Match"`
 }

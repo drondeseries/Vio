@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/idgen"
 	"github.com/Silo-Server/silo-server/internal/imageutil"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -34,7 +35,7 @@ type filesystemMediaItemReader interface {
 }
 
 func ebookScanWorkers() int {
-	if v := os.Getenv("SILO_EBOOK_SCAN_WORKERS"); v != "" {
+	if v := envutil.GetenvFirst("VIO_EBOOK_SCAN_WORKERS", "SILO_EBOOK_SCAN_WORKERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}

@@ -15,6 +15,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
 )
 
@@ -83,7 +84,7 @@ type httpProxyService interface {
 }
 
 // UserThemeLookup resolves the active UI theme for a silo user. The
-// proxy uses it to inject X-Silo-Theme on every plugin request so
+// proxy uses it to inject X-Vio-Theme on every plugin request so
 // plugin SPAs can paint in the user's theme on first byte without relying
 // on the URL ?theme= parameter (which is fragile under refresh, direct
 // links, and cross-tab sharing). Theme is a profile-scoped setting under the
@@ -108,7 +109,7 @@ func NewHTTPProxy(service httpProxyService, installations taskInstallationStore)
 }
 
 // WithUserThemeLookup attaches a theme resolver. When set, ServeRoute injects
-// X-Silo-Theme on the upstream plugin request for authenticated users.
+// X-Vio-Theme on the upstream plugin request for authenticated users.
 // Pass nil to disable.
 func (p *HTTPProxy) WithUserThemeLookup(t UserThemeLookup) *HTTPProxy {
 	p.themes = t
@@ -116,8 +117,8 @@ func (p *HTTPProxy) WithUserThemeLookup(t UserThemeLookup) *HTTPProxy {
 }
 
 // WithUserIdentityLookup attaches a username/profile-name resolver. When set,
-// ServeRoute injects X-Silo-User-Name, X-Silo-Profile-Name, and
-// X-Silo-Profile-Primary headers so plugins can render "user#profile"
+// ServeRoute injects X-Vio-User-Name, X-Vio-Profile-Name, and
+// X-Vio-Profile-Primary headers so plugins can render "user#profile"
 // strings without reaching back into browser localStorage.
 func (p *HTTPProxy) WithUserIdentityLookup(l UserIdentityLookup) *HTTPProxy {
 	p.identity = l
@@ -197,11 +198,11 @@ func (p *HTTPProxy) ServeRoute(w http.ResponseWriter, r *http.Request, installat
 	body, _ := io.ReadAll(r.Body)
 	headers := forwardedRequestHeaders(r.Header)
 	if _, _, userID, contextProfileID := pluginAccessUserFromContext(r.Context()); userID > 0 {
-		headers["X-Silo-User-Id"] = strconv.Itoa(userID)
+		headers[httpheader.PluginUserID] = strconv.Itoa(userID)
 		if admin {
-			headers["X-Silo-User-Role"] = "admin"
+			headers[httpheader.PluginUserRole] = "admin"
 		} else {
-			headers["X-Silo-User-Role"] = "user"
+			headers[httpheader.PluginUserRole] = "user"
 		}
 		// Full-page plugin navigation cannot attach X-Profile-Id. The launch
 		// cookie carries the validated active profile in that case; direct
@@ -212,19 +213,19 @@ func (p *HTTPProxy) ServeRoute(w http.ResponseWriter, r *http.Request, installat
 		}
 		if p.themes != nil {
 			if theme, err := p.themes.LookupUITheme(r.Context(), userID, profileID); err == nil && theme != "" {
-				headers["X-Silo-Theme"] = theme
+				headers[httpheader.PluginTheme] = theme
 			}
 		}
 		if p.identity != nil {
 			if ident, err := p.identity.LookupIdentity(r.Context(), userID, profileID); err == nil {
 				if ident.Username != "" {
-					headers["X-Silo-User-Name"] = ident.Username
+					headers[httpheader.PluginUserName] = ident.Username
 				}
 				if ident.ProfileName != "" {
-					headers["X-Silo-Profile-Name"] = ident.ProfileName
+					headers[httpheader.PluginProfileName] = ident.ProfileName
 				}
 				if ident.ProfileIsPrimary {
-					headers["X-Silo-Profile-Primary"] = "true"
+					headers[httpheader.PluginProfilePrime] = "true"
 				}
 			}
 		}

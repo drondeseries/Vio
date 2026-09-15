@@ -180,7 +180,7 @@ func (h *SettingValuesHandler) sessionIdentity(
 		family := settingscontract.ClientFamily(strings.TrimSpace(req.ClientFamily))
 		if !family.Valid() {
 			return userstore.SettingIdentity{}, fieldError(settingFieldClientFamily,
-				"X-Silo-Client-Family header must be one of tv, mobile, tablet, desktop or web")
+				"X-Vio-Client-Family header must be one of tv, mobile, tablet, desktop or web")
 		}
 		identity.ClientFamily = family
 	}
@@ -197,7 +197,7 @@ func (h *SettingValuesHandler) sessionIdentity(
 		}
 		if identity.DeviceID == "" {
 			return userstore.SettingIdentity{}, fieldError(settingFieldDeviceHeader,
-				"X-Silo-Device-Id header is required for a device override")
+				"X-Vio-Device-Id header is required for a device override")
 		}
 		if named != "" {
 			if err := h.deviceBelongs(ctx, store, identity.ProfileID, named); err != nil {
@@ -333,7 +333,7 @@ func (h *SettingValuesHandler) libraryExists(ctx context.Context, libraryID int)
 // An absent header deliberately drops the profile_client layer so pre-revision
 // 5 callers keep resolving broader fallbacks; explicit profile_client reads and
 // writes still require the header in sessionIdentity. The server never
-// guesses this identity from X-Silo-Device-Platform: that header is free-form
+// guesses this identity from X-Vio-Device-Platform: that header is free-form
 // display metadata, while client_family is a closed storage key shared by like
 // clients.
 func (h *SettingValuesHandler) clientFamilyFor(
@@ -354,7 +354,7 @@ func (h *SettingValuesHandler) clientFamilyFor(
 	family := settingscontract.ClientFamily(value)
 	if !family.Valid() {
 		return "", false, fieldError(settingFieldClientFamily,
-			"X-Silo-Client-Family header must be one of tv, mobile, tablet, desktop or web")
+			"X-Vio-Client-Family header must be one of tv, mobile, tablet, desktop or web")
 	}
 	return family, eligible, nil
 }
@@ -816,7 +816,7 @@ func (h *SettingValuesHandler) resolveEffective(
 			if def, ok := h.contract.Lookup(key); ok &&
 				def.AllowsScope(settingscontract.ScopeProfileDevice) {
 				return nil, fieldError(settingFieldDeviceHeader,
-					"X-Silo-Device-Id header is required to resolve "+key)
+					"X-Vio-Device-Id header is required to resolve "+key)
 			}
 		}
 	}
@@ -860,7 +860,7 @@ func (h *SettingValuesHandler) resolveEffectiveContexts(
 	if deviceID == "" {
 		for _, key := range keys {
 			if def, exists := h.contract.Lookup(key); exists && def.AllowsScope(settingscontract.ScopeProfileDevice) {
-				return nil, fieldError(settingFieldDeviceHeader, "X-Silo-Device-Id header is required to resolve "+key)
+				return nil, fieldError(settingFieldDeviceHeader, "X-Vio-Device-Id header is required to resolve "+key)
 			}
 		}
 	}

@@ -91,7 +91,7 @@ function QualitySetting() {
     <>
       <SettingRow
         label="Preferred quality"
-        description="The resolution your profile should request when playback begins. Auto lets Silo pick based on your connection."
+        description="The resolution your profile should request when playback begins. Auto lets Vio pick based on your connection."
         control={(id) => (
           <Select
             value={resolution}
@@ -118,7 +118,7 @@ function QualitySetting() {
 
       <SettingRow
         label="Maximum bitrate"
-        description="Cap how much bandwidth playback may use. No limit means Silo picks for the chosen resolution."
+        description="Cap how much bandwidth playback may use. No limit means Vio picks for the chosen resolution."
         control={(id) => (
           <Select
             value={bitrateValue === "" ? NO_BITRATE_LIMIT : bitrateValue}
@@ -280,7 +280,7 @@ export default function PlaybackSettings() {
         <div className="space-y-3">
           <h2 className="text-2xl font-semibold tracking-tight sm:text-3xl">Playback</h2>
           <p className="text-muted-foreground max-w-2xl text-sm leading-relaxed">
-            Choose the defaults Silo should use when playback starts.
+            Choose the defaults Vio should use when playback starts.
           </p>
         </div>
       </div>
@@ -357,7 +357,7 @@ export default function PlaybackSettings() {
           // whose position would be a guess the user could act on.
           <SettingRow
             label="Skip intros"
-            description="Available once Silo has checked what this server supports."
+            description="Available once Vio has checked what this server supports."
             control={(id) => (
               <Select disabled>
                 <SelectTrigger id={id} className="w-full sm:w-[220px]">
@@ -376,7 +376,7 @@ export default function PlaybackSettings() {
         ) : (
           <SettingRow
             label="Auto-skip intros"
-            description="Jump past intros automatically when Silo can detect them."
+            description="Jump past intros automatically when Vio can detect them."
             control={(id) => (
               <Switch
                 id={id}
@@ -407,7 +407,7 @@ export default function PlaybackSettings() {
 
         <SettingRow
           label="Auto-skip recaps"
-          description="Skip 'previously on…' recaps automatically when Silo can detect them."
+          description="Skip 'previously on…' recaps automatically when Vio can detect them."
           control={(id) => (
             <Switch
               id={id}

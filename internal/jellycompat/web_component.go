@@ -261,7 +261,7 @@ func listRemoteWebVersions(ctx context.Context, sourceURL string) ([]string, err
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "silo-jellyfin-web-installer")
+	req.Header.Set("User-Agent", "vio-jellyfin-web-installer")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -919,7 +919,7 @@ func ensureWebInstallerPrerequisites() error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("%w: install %s on the Silo host or container", ErrWebInstallerUnavailable, strings.Join(missing, ", "))
+		return fmt.Errorf("%w: install %s on the Vio host or container", ErrWebInstallerUnavailable, strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -1501,7 +1501,7 @@ Build: %s
 Modified: %t
 Checksum: %s
 
-This component is separate from Silo's AGPL-licensed server code. It is installed only
+This component is separate from Vio's AGPL-licensed server code. It is installed only
 when an administrator explicitly requests Jellyfin-compatible web UI assets.
 `, metadata.SourceURL, metadata.Tag, metadata.CommitSHA, metadata.License, metadata.BuildCommand, metadata.Modified, metadata.Checksum)
 	return os.WriteFile(filepath.Join(dir, webSourceFile), []byte(body), 0o644)

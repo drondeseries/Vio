@@ -118,7 +118,7 @@ export function FeaturesStep() {
           type="toggle"
           description={
             <>
-              Delivers to the iOS and Android apps through Silo's open-source relay. On by default.{" "}
+              Delivers to the iOS and Android apps through Vio's open-source relay. On by default.{" "}
               <button
                 type="button"
                 className="text-foreground underline underline-offset-2"

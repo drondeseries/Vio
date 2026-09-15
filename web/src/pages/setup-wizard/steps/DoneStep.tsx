@@ -63,11 +63,11 @@ export function DoneStep() {
   return (
     <div className="setup-step">
       <header className="setup-step-header">
-        <h1 className="setup-step-title">Silo is ready</h1>
+        <h1 className="setup-step-title">Vio is ready</h1>
         <p className="setup-step-lede">
           {libraries.length > 0
             ? "Your libraries are scanning in the background. Start browsing, or head to the admin area to keep going."
-            : "Add a library from the admin area when you're ready and Silo will start scanning."}
+            : "Add a library from the admin area when you're ready and Vio will start scanning."}
         </p>
       </header>
 
@@ -101,7 +101,7 @@ export function DoneStep() {
 
       <div className="setup-actions">
         <Button onClick={() => void completeSetup("/")} disabled={finishing} className="min-w-40">
-          {finishing ? "Starting…" : "Start using Silo"}
+          {finishing ? "Starting…" : "Start using Vio"}
           <ChevronRight className="ml-1 size-4" />
         </Button>
         <Button

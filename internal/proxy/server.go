@@ -1127,7 +1127,7 @@ func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, cl
 	// of 404ing (the integrated server already does this from the same token). The
 	// node re-verifies the token independently before trusting it.
 	if forwardToken != "" {
-		req.Header.Set("X-Silo-Stream-Token", forwardToken)
+		req.Header.Set("X-Vio-Stream-Token", forwardToken)
 	}
 
 	resp, err := telemetry.DoTrustedNode(s.httpClient, req, "stream")

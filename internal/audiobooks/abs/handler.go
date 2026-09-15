@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -718,7 +719,7 @@ func (h *Handler) broadcast(event string, payload any) {
 // absBaseURL returns the server address prefix ABS clients should use to
 // resolve response-embedded URLs.
 //
-//   - Host-proxied (X-Silo-User-Id header present): returns the plugin-content
+//   - Host-proxied (X-Vio-User-Id header present): returns the plugin-content
 //     path "<scheme>://<host>/api/v2/plugin-content/plugins/<installID>".
 //   - Standalone listener: returns "<scheme>://<host>" — origin only.
 //
@@ -736,7 +737,7 @@ func (h *Handler) absBaseURL(r *http.Request) string {
 	if host == "" {
 		host = r.Host
 	}
-	if r.Header.Get("X-Silo-User-Id") != "" {
+	if httpheader.Get(r.Header, httpheader.PluginUserID, httpheader.LegacyPluginUserID) != "" {
 		return scheme + "://" + host + "/api/v2/plugin-content/plugins/" + h.deps.InstallID()
 	}
 	return scheme + "://" + host

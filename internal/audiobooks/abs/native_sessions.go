@@ -187,6 +187,7 @@ func absPlaybackClientInfoFromRequest(r *http.Request) playback.ClientInfo {
 		return playback.ClientInfo{Name: "Audiobookshelf"}
 	}
 	name := firstHeaderValue(r,
+		"X-Vio-Client",
 		"X-Silo-Client",
 		"X-Client-Name",
 		"X-Device-Name",
@@ -198,6 +199,7 @@ func absPlaybackClientInfoFromRequest(r *http.Request) playback.ClientInfo {
 	return playback.ClientInfo{
 		Name: name,
 		Version: firstHeaderValue(r,
+			"X-Vio-Client-Version",
 			"X-Silo-Client-Version",
 			"X-Client-Version",
 			"X-Emby-Client-Version",

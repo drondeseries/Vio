@@ -115,7 +115,7 @@ func NewClient(cfg BucketConfig) *Client {
 	// URL signing is local work, so it must not appear as a storage call.
 	presignClient := s3.NewPresignClient(s3Client, s3.WithPresignClientFromClientOptions(func(o *s3.Options) {
 		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-			_, _ = stack.Initialize.Remove("SiloObserve")
+			_, _ = stack.Initialize.Remove("VioObserve")
 			return nil
 		})
 	}))

@@ -15,14 +15,14 @@ export function ConnectStep() {
   // The snapshot always carries the effective value, so the default (on) is
   // never read as blank.
   const jellyfinEnabled = form.getValue("jellyfin_compat.enabled") === "true";
-  useStepSummary("connect", jellyfinEnabled ? "Jellyfin apps" : "Silo apps only");
+  useStepSummary("connect", jellyfinEnabled ? "Jellyfin apps" : "Vio apps only");
 
   if (form.isPending) return <StepSkeleton rows={2} />;
 
   return (
     <StepFrame
       title="Connect apps"
-      lede="Silo's own apps for iOS, Android, and TV work out of the box. It can also answer to apps built for Jellyfin."
+      lede="Vio's own apps for iOS, Android, and TV work out of the box. It can also answer to apps built for Jellyfin."
       onSubmit={handleSubmit}
       busy={busy}
       onSkip={skip}
@@ -30,7 +30,7 @@ export function ConnectStep() {
     >
       <StepSection
         title="Jellyfin-compatible apps"
-        caption="Infuse, Findroid, VidHub, Swiftfin, and others sign in and play through Silo's compatibility API."
+        caption="Infuse, Findroid, VidHub, Swiftfin, and others sign in and play through Vio's compatibility API."
       >
         <SettingField
           label="Answer Jellyfin apps"

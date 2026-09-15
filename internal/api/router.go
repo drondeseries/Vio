@@ -1,4 +1,4 @@
-// Package api provides the HTTP router and middleware setup for Silo.
+// Package api provides the HTTP router and middleware setup for Vio.
 package api
 
 import (
@@ -3049,7 +3049,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 
 		// Autoscan webhook intake: public — Sonarr/Radarr POST here without a
-		// Silo session; the URL's bearer token authenticates the delivery and
+		// Vio session; the URL's bearer token authenticates the delivery and
 		// maps it to its Autoscan source. Rate limited per-IP (plus the
 		// "autoscan_webhook" per-endpoint limit) since it is unauthenticated.
 		if autoscanHandler != nil {
@@ -3076,7 +3076,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			r.Get("/notifications/discord/link/callback", discordNotificationsHandler.HandleLinkCallback)
 
 			// Tokenized email links: public — clicked from mail clients on
-			// devices without a Silo session; the single-use token (verify)
+			// devices without a Vio session; the single-use token (verify)
 			// or per-profile capability token (unsubscribe) authenticates the
 			// request. Static paths coexist with the authenticated
 			// /notifications subrouter below, same as the Discord callback.

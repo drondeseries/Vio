@@ -2,18 +2,18 @@ package plugins
 
 const (
 	DefaultRepositoryURL  = "https://raw.githubusercontent.com/Silo-Server/silo-plugins/main/manifest.json"
-	DefaultRepositoryName = "Silo maintained"
+	DefaultRepositoryName = "Vio maintained"
 
 	ApprovedCommunityRepositoryURL  = "https://raw.githubusercontent.com/Silo-Community/silo-plugins/main/manifest.json"
 	ApprovedCommunityRepositoryName = "Approved community"
 	ForkVirtualRepositoryURL        = "https://raw.githubusercontent.com/drondeseries/silo-virtual-library/main/catalog.json"
-	ForkVirtualRepositoryName       = "Silo Virtual Library"
+	ForkVirtualRepositoryName       = "Vio Virtual Library"
 
 	OfficialRepositoryManagedKey          = "official"
 	ApprovedCommunityRepositoryManagedKey = "approved-community"
 	ForkVirtualRepositoryManagedKey       = "fork-virtual-library"
 
-	RepositorySourceSilo              = "silo"
+	RepositorySourceSilo              = "vio"
 	RepositorySourceApprovedCommunity = "approved_community"
 	RepositorySourceExternal          = "external"
 

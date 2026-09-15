@@ -312,7 +312,7 @@ func sampleDeliveryRow(profileID string) DeliveryRow {
 			ReasonFlags: []byte(`{"favorite":true,"watchlist":false,"continue_watching":false,"next_up":false}`),
 			CreatedAt:   time.Now(),
 		},
-		SeriesTitle:   "Silo Test Series",
+		SeriesTitle:   "Vio Test Series",
 		EpisodeTitle:  "This is a test notification",
 		SeasonNumber:  &seasonNumber,
 		EpisodeNumber: &episodeNumber,

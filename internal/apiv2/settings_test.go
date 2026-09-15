@@ -86,7 +86,7 @@ func TestGetOverlayConfig(t *testing.T) {
 func TestSubtitleAppearanceDeviceOverrideRoundTrip(t *testing.T) {
 	deps := pilotDeps(nil, nil)
 	h := newTestHandler(t, deps)
-	device := with(with(settingsOwner(), "X-Silo-Device-Id", "iphone-1"), "X-Silo-Device-Name", "Living room")
+	device := with(with(settingsOwner(), "X-Vio-Device-Id", "iphone-1"), "X-Vio-Device-Name", "Living room")
 
 	// Before any override: the profile-wide value applies and the device
 	// members are absent.
@@ -120,7 +120,7 @@ func TestSubtitleAppearanceDeviceOverrideRoundTrip(t *testing.T) {
 		t.Errorf("device_platform emitted without a value: %s", rec.Body.String())
 	}
 	// Another device on the same profile sees no override.
-	rec = do(t, h, http.MethodGet, "/api/v2/settings/subtitle-appearance/effective", "", with(settingsOwner(), "X-Silo-Device-Id", "tv-1"))
+	rec = do(t, h, http.MethodGet, "/api/v2/settings/subtitle-appearance/effective", "", with(settingsOwner(), "X-Vio-Device-Id", "tv-1"))
 	if rec.Code != 200 || bytes.Contains(rec.Body.Bytes(), []byte(`"has_device_override":true`)) {
 		t.Fatalf("override leaked to another device: %d %s", rec.Code, rec.Body.String())
 	}
@@ -137,15 +137,15 @@ func TestSubtitleAppearanceDeviceOverrideRoundTrip(t *testing.T) {
 
 func TestSubtitleAppearanceDeviceOverrideValidation(t *testing.T) {
 	h := newTestHandler(t, pilotDeps(nil, nil))
-	device := with(settingsOwner(), "X-Silo-Device-Id", "iphone-1")
+	device := with(settingsOwner(), "X-Vio-Device-Id", "iphone-1")
 
 	// The device header is a declared required parameter.
 	p := requireProblem(t, do(t, h, http.MethodPut, "/api/v2/settings/device/subtitle-appearance", `{"value":"{}"}`, settingsOwner()), TypeValidationFailed)
-	if len(p.Errors) != 1 || p.Errors[0].Location != "header.X-Silo-Device-Id" || p.Errors[0].Code != codeRequired {
+	if len(p.Errors) != 1 || p.Errors[0].Location != "header.X-Vio-Device-Id" || p.Errors[0].Code != codeRequired {
 		t.Fatalf("errors = %+v", p.Errors)
 	}
 	p = requireProblem(t, do(t, h, http.MethodDelete, "/api/v2/settings/device/subtitle-appearance", "", settingsOwner()), TypeValidationFailed)
-	if len(p.Errors) != 1 || p.Errors[0].Location != "header.X-Silo-Device-Id" {
+	if len(p.Errors) != 1 || p.Errors[0].Location != "header.X-Vio-Device-Id" {
 		t.Fatalf("errors = %+v", p.Errors)
 	}
 	// A value that is not JSON is the seam's decision, rendered at body.value.
@@ -168,19 +168,19 @@ func TestSubtitleAppearanceDenied(t *testing.T) {
 	h := newTestHandler(t, pilotDeps(nil, nil))
 	// Profile scoped: the header is required, and a locked profile asks for
 	// the PIN.
-	p := requireProblem(t, do(t, h, http.MethodGet, "/api/v2/settings/subtitle-appearance/effective", "", with(bearer(memberToken), "X-Silo-Device-Id", "iphone-1")), TypeValidationFailed)
+	p := requireProblem(t, do(t, h, http.MethodGet, "/api/v2/settings/subtitle-appearance/effective", "", with(bearer(memberToken), "X-Vio-Device-Id", "iphone-1")), TypeValidationFailed)
 	if len(p.Errors) != 1 || p.Errors[0].Location != "header.x-profile-id" {
 		t.Fatalf("errors = %+v", p.Errors)
 	}
-	locked := with(with(bearer(memberToken), "X-Profile-Id", "p-locked"), "X-Silo-Device-Id", "iphone-1")
+	locked := with(with(bearer(memberToken), "X-Profile-Id", "p-locked"), "X-Vio-Device-Id", "iphone-1")
 	requireProblem(t, do(t, h, http.MethodPut, "/api/v2/settings/device/subtitle-appearance", `{"value":"{}"}`, locked), TypeProfileVerificationRequired)
 	requireProblem(t, do(t, h, http.MethodDelete, "/api/v2/settings/device/subtitle-appearance", "", locked), TypeProfileVerificationRequired)
 	// Demo mode refuses the mutations to non-admins, never the read.
 	demo := pilotDeps(nil, nil)
 	demo.DemoSettings = fakeSettings{demo: true}
 	dh := newTestHandler(t, demo)
-	requireProblem(t, do(t, dh, http.MethodPut, "/api/v2/settings/device/subtitle-appearance", `{"value":"{}"}`, with(settingsOwner(), "X-Silo-Device-Id", "iphone-1")), TypePermissionDenied)
-	if rec := do(t, dh, http.MethodGet, "/api/v2/settings/subtitle-appearance/effective", "", with(settingsOwner(), "X-Silo-Device-Id", "iphone-1")); rec.Code != 200 {
+	requireProblem(t, do(t, dh, http.MethodPut, "/api/v2/settings/device/subtitle-appearance", `{"value":"{}"}`, with(settingsOwner(), "X-Vio-Device-Id", "iphone-1")), TypePermissionDenied)
+	if rec := do(t, dh, http.MethodGet, "/api/v2/settings/subtitle-appearance/effective", "", with(settingsOwner(), "X-Vio-Device-Id", "iphone-1")); rec.Code != 200 {
 		t.Fatalf("demo mode blocked a read: %d %s", rec.Code, rec.Body.String())
 	}
 	// A store failure is an internal error with no detail.
@@ -345,7 +345,7 @@ func TestSettingValueScopes(t *testing.T) {
 		t.Fatalf("account: %d %s", rec.Code, rec.Body.String())
 	}
 	// profile_device stores against the declared device header, or a named device.
-	rec = do(t, h, http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile_device", `{"value":"x"}`, with(settingsOwner(), "X-Silo-Device-Id", "iphone-1"))
+	rec = do(t, h, http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile_device", `{"value":"x"}`, with(settingsOwner(), "X-Vio-Device-Id", "iphone-1"))
 	if rec.Code != 200 || !bytes.Contains(rec.Body.Bytes(), []byte(`"device_id":"iphone-1"`)) {
 		t.Fatalf("device: %d %s", rec.Code, rec.Body.String())
 	}
@@ -355,7 +355,7 @@ func TestSettingValueScopes(t *testing.T) {
 		t.Fatalf("library: %d %s", rec.Code, rec.Body.String())
 	}
 	// profile_client takes the family from the header.
-	rec = do(t, h, http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile_client", `{"value":"x"}`, with(settingsOwner(), "X-Silo-Client-Family", "tv"))
+	rec = do(t, h, http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile_client", `{"value":"x"}`, with(settingsOwner(), "X-Vio-Client-Family", "tv"))
 	if rec.Code != 200 || !bytes.Contains(rec.Body.Bytes(), []byte(`"client_family":"tv"`)) {
 		t.Fatalf("client: %d %s", rec.Code, rec.Body.String())
 	}
@@ -373,7 +373,7 @@ func TestSettingValueValidation(t *testing.T) {
 		{"unknown key is 422, not 404", http.MethodGet, "/api/v2/settings/values/no.such?scope=profile", "", settingsOwner(), locationPathKey, codeInvalid},
 		{"device header missing", http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile_device", `{"value":"x"}`, settingsOwner(), "header." + deviceIDHeader, codeInvalid},
 		{"client family missing", http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile_client", `{"value":"x"}`, settingsOwner(), "header." + clientFamilyHeader, codeInvalid},
-		{"client family enum", http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile_client", `{"value":"x"}`, with(settingsOwner(), "X-Silo-Client-Family", "toaster"), "header.X-Silo-Client-Family", codeInvalidEnum},
+		{"client family enum", http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile_client", `{"value":"x"}`, with(settingsOwner(), "X-Vio-Client-Family", "toaster"), "header.X-Vio-Client-Family", codeInvalidEnum},
 		{"library id", http.MethodGet, "/api/v2/settings/values/ui.theme?scope=profile_library&library_id=9", "", settingsOwner(), locationQueryLibraryID, codeInvalid},
 		{"value required", http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile", `{}`, settingsOwner(), locationBodyValue, codeRequired},
 		{"unknown member", http.MethodPut, "/api/v2/settings/values/ui.theme?scope=profile", `{"value":"x","mutation_id":"1"}`, settingsOwner(), "body.mutation_id", codeUnknownField},

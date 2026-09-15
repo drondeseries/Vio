@@ -77,7 +77,7 @@ func NormalizePushRelayURL(raw, developmentOrigin string) (string, error) {
 		allowed[override] = true
 	}
 	if !allowed[value] {
-		return "", errors.New("relay_url is not an allowed Silo relay origin")
+		return "", errors.New("relay_url is not an allowed Vio relay origin")
 	}
 	return value, nil
 }

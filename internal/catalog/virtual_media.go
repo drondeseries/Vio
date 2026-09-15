@@ -1045,7 +1045,7 @@ func (r *VirtualMediaRegistrar) RemoveInstallationVirtualMedia(ctx context.Conte
 }
 
 func lockVirtualMediaSource(ctx context.Context, tx pgx.Tx, installationID int, source string) error {
-	lockKey := fmt.Sprintf("silo:virtual-media-source:%d:%s", installationID, source)
+	lockKey := fmt.Sprintf("vio:virtual-media-source:%d:%s", installationID, source)
 	if err := requestlock.LockVirtual(ctx, tx, lockKey); err != nil {
 		return fmt.Errorf("lock virtual media source: %w", err)
 	}
@@ -1053,7 +1053,7 @@ func lockVirtualMediaSource(ctx context.Context, tx pgx.Tx, installationID int, 
 }
 
 func lockVirtualMediaInstallation(ctx context.Context, tx pgx.Tx, installationID int) error {
-	lockKey := fmt.Sprintf("silo:virtual-media-installation:%d", installationID)
+	lockKey := fmt.Sprintf("vio:virtual-media-installation:%d", installationID)
 	if err := requestlock.LockVirtual(ctx, tx, lockKey); err != nil {
 		return fmt.Errorf("lock virtual media installation: %w", err)
 	}

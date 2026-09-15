@@ -623,7 +623,7 @@ func writeDecodeProbeFixture() (string, func(), error) {
 	if err != nil {
 		return "", func() {}, err
 	}
-	file, err := os.CreateTemp("", "silo-tonemap-probe-*.hevc")
+	file, err := os.CreateTemp("", "vio-tonemap-probe-*.hevc")
 	if err != nil {
 		return "", func() {}, err
 	}

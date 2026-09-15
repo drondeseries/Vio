@@ -295,7 +295,7 @@ func (s *Service) ProcessWebhookBounded(ctx context.Context, secret string, r *h
 		result.ProfileID = profileID
 	} else {
 		result.Outcome = OutcomeSkipped
-		result.Summary = "Skipped because external user is not linked to a Silo profile"
+		result.Summary = "Skipped because external user is not linked to a Vio profile"
 		return result, nil
 	}
 	profileID := result.ProfileID
@@ -307,7 +307,7 @@ func (s *Service) ProcessWebhookBounded(ctx context.Context, secret string, r *h
 	}
 	if match == nil {
 		result.Outcome = OutcomeUnmatched
-		result.Summary = "Received webhook event but found no matching Silo item"
+		result.Summary = "Received webhook event but found no matching Vio item"
 		return result, nil
 	}
 	result.MatchedMediaItemID = match.MediaItemID

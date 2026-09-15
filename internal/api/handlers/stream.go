@@ -1262,7 +1262,7 @@ func writeFontBundleResponse(w http.ResponseWriter, bundle []byte) {
 // still in flight. The web client treats either this header or a no-store
 // Cache-Control as pending: it must not persist the empty body as a definitive
 // font-less result and instead re-fetches for the completed bundle.
-const fontBundlePendingHeader = "X-Silo-Font-Bundle-Pending"
+const fontBundlePendingHeader = "X-Vio-Font-Bundle-Pending"
 
 // writePendingFontBundleResponse writes a valid empty bundle for an extraction
 // that is still running. Unlike a definitive font-less file, it is marked

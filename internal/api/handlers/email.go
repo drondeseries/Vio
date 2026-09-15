@@ -71,13 +71,13 @@ func (h *EmailHandler) sendTestEmail(ctx context.Context, to string) (int64, err
 	started := time.Now()
 	err := h.sender.Send(ctx, silomail.Message{
 		To:      []string{to},
-		Subject: "Silo test email",
-		TextBody: "This is a test email from your Silo server.\n\n" +
+		Subject: "Vio test email",
+		TextBody: "This is a test email from your Vio server.\n\n" +
 			"If you received it, outbound email is configured correctly.",
 		HTMLBody: silomail.RenderLayout(silomail.LayoutOptions{
-			Preheader: "Outbound email from your Silo server is configured correctly.",
+			Preheader: "Outbound email from your Vio server is configured correctly.",
 			Title:     "Outbound email is working",
-			BodyHTML: silomail.EmailParagraph("This is a test email from your Silo server.") +
+			BodyHTML: silomail.EmailParagraph("This is a test email from your Vio server.") +
 				silomail.EmailParagraph("If you're reading it, the SMTP settings are correct and "+
 					"notification emails will look like this one."),
 		}),

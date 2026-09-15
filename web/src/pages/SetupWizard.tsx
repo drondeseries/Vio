@@ -69,7 +69,7 @@ function WizardContent() {
           <div className="setup-brand">
             <SiloBrand variant="mark" className="size-9" />
             <span>
-              <span className="setup-brand-name">Silo</span>
+              <span className="setup-brand-name">Vio</span>
               <span className="setup-brand-sub">First-run setup</span>
             </span>
           </div>

@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -61,7 +61,7 @@ func mangaContentType() string {
 
 func mangaEnrichWorkers() int {
 	n := defaultEnrichWorkers
-	if v := os.Getenv("SILO_MANGA_ENRICH_WORKERS"); v != "" {
+	if v := envutil.GetenvFirst("VIO_MANGA_ENRICH_WORKERS", "SILO_MANGA_ENRICH_WORKERS"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 			n = parsed
 		}
@@ -73,7 +73,7 @@ func mangaEnrichWorkers() int {
 }
 
 func mangaEnrichBatchSize() int {
-	if v := os.Getenv("SILO_MANGA_ENRICH_BATCH"); v != "" {
+	if v := envutil.GetenvFirst("VIO_MANGA_ENRICH_BATCH", "SILO_MANGA_ENRICH_BATCH"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 			return parsed
 		}

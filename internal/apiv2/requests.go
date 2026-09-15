@@ -31,7 +31,7 @@ type RequestMediaState struct {
 // RequestMediaResult is one discovery or search card.
 type RequestMediaResult struct {
 	MediaType        string            `json:"media_type" doc:"movie or series" example:"movie"`
-	TMDBID           int               `json:"tmdb_id" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
+	TMDBID           int               `json:"tmdb_id" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
 	Title            string            `json:"title" example:"Heat"`
 	Year             int               `json:"year,omitempty" example:"1995"`
 	Overview         string            `json:"overview,omitempty"`
@@ -56,9 +56,9 @@ type RequestMediaCastMember struct {
 // RequestMediaDetail is the full detail document of one piece of media.
 type RequestMediaDetail struct {
 	MediaType           string                   `json:"media_type" doc:"movie or series" example:"movie"`
-	TMDBID              int                      `json:"tmdb_id" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
+	TMDBID              int                      `json:"tmdb_id" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
 	IMDbID              string                   `json:"imdb_id,omitempty" example:"tt0113277"`
-	TVDBID              *int                     `json:"tvdb_id,omitempty" doc:"TVDB identifier (external, not a Silo ID)"`
+	TVDBID              *int                     `json:"tvdb_id,omitempty" doc:"TVDB identifier (external, not a Vio ID)"`
 	Title               string                   `json:"title" example:"Heat"`
 	OriginalTitle       string                   `json:"original_title,omitempty"`
 	Tagline             string                   `json:"tagline,omitempty"`
@@ -117,7 +117,7 @@ type DiscoverSectionCollection struct {
 
 // DiscoverBrand is a studio, network, or genre card.
 type DiscoverBrand struct {
-	TMDBID          int     `json:"tmdb_id,omitempty" doc:"TMDB identifier (external, not a Silo ID)" example:"420"`
+	TMDBID          int     `json:"tmdb_id,omitempty" doc:"TMDB identifier (external, not a Vio ID)" example:"420"`
 	Slug            string  `json:"slug" example:"marvel-studios"`
 	DisplayName     string  `json:"display_name" example:"Marvel Studios"`
 	LogoURL         *string `json:"logo_url,omitempty" nullable:"true"`
@@ -167,8 +167,8 @@ type MediaRequest struct {
 	ID                   ID              `json:"id" example:"1834729"`
 	Provider             string          `json:"provider" example:"tmdb"`
 	MediaType            string          `json:"media_type" doc:"movie or series" example:"movie"`
-	TMDBID               int             `json:"tmdb_id" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
-	TVDBID               *int            `json:"tvdb_id,omitempty" doc:"TVDB identifier (external, not a Silo ID)"`
+	TMDBID               int             `json:"tmdb_id" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
+	TVDBID               *int            `json:"tvdb_id,omitempty" doc:"TVDB identifier (external, not a Vio ID)"`
 	IMDbID               string          `json:"imdb_id,omitempty" example:"tt0113277"`
 	Title                string          `json:"title" example:"Heat"`
 	Year                 *int            `json:"year,omitempty" example:"1995"`
@@ -206,8 +206,8 @@ type MediaRequestCollection struct {
 // it on a discovery or search card.
 type MediaRequestCreate struct {
 	MediaType    string `json:"media_type" enum:"movie,series" example:"movie"`
-	TMDBID       int    `json:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
-	TVDBID       *int   `json:"tvdb_id,omitempty" minimum:"1" doc:"TVDB identifier (external, not a Silo ID)"`
+	TMDBID       int    `json:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
+	TVDBID       *int   `json:"tvdb_id,omitempty" minimum:"1" doc:"TVDB identifier (external, not a Vio ID)"`
 	IMDbID       string `json:"imdb_id,omitempty" example:"tt0113277"`
 	Title        string `json:"title" minLength:"1" example:"Heat"`
 	Year         *int   `json:"year,omitempty" example:"1995"`
@@ -255,7 +255,7 @@ type RequestMediaPageOutput struct {
 // RequestMediaDetailInput names one piece of media.
 type RequestMediaDetailInput struct {
 	MediaType string `path:"media_type" enum:"movie,series" doc:"The media type" example:"movie"`
-	TMDBID    int    `path:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Silo ID)" example:"949"`
+	TMDBID    int    `path:"tmdb_id" minimum:"1" doc:"TMDB identifier (external, not a Vio ID)" example:"949"`
 }
 
 // RequestMediaDetailOutput is the getRequestMediaDetail response.

@@ -14,7 +14,7 @@ import (
 
 const RoomSocketTicketTTL = 30 * time.Second
 const RoomSocketMaxLifetime = 5 * time.Minute
-const roomSocketTicketPrefix = "silo:watch-together:v2:ticket:"
+const roomSocketTicketPrefix = "vio:watch-together:v2:ticket:"
 
 var ErrRoomSocketCredential = errors.New("invalid or unavailable room socket credential")
 

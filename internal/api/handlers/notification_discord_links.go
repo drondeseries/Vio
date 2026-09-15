@@ -75,7 +75,7 @@ func (h *DiscordLinkHandler) beginLink(ctx context.Context, userID int, callback
 	}
 	publicURL := h.currentPublicURL()
 	if publicURL == "" {
-		return "", apiError(409, "no_public_url", "Linking requires the Silo public URL to be configured")
+		return "", apiError(409, "no_public_url", "Linking requires the Vio public URL to be configured")
 	}
 	stateBytes := make([]byte, 32)
 	if _, err := rand.Read(stateBytes); err != nil {

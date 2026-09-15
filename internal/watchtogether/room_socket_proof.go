@@ -6,7 +6,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-const RoomSocketProtocol = "silo.room.v2"
+const RoomSocketProtocol = "vio.room.v2"
 
 // ValidateSocketProof requires the server's current signing algorithm and a
 // signed expiry, without changing frozen v1 room-token validation.

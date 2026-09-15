@@ -62,7 +62,7 @@ func TestSubscriptionMutationTransport(t *testing.T) {
 	deps.DownloadSubscriptionMutations = svc
 	h := newTestHandler(t, deps)
 	viewer := with(bearer(memberToken), "X-Profile-Id", "p-owner")
-	device := with(viewer, "X-Silo-Device-Id", "device-one")
+	device := with(viewer, "X-Vio-Device-Id", "device-one")
 	path := Prefix + "/downloads/subscriptions"
 	rec := do(t, h, "POST", path, `{"series_id":"series","mode":"specific_seasons","season_numbers":[0],"delete_watched":false,"max_storage_bytes":0}`, device)
 	if rec.Code != 200 || rec.Header().Get("ETag") == "" || svc.user != 1 || svc.request.ProfileID != "p-owner" || svc.request.DeviceID != "device-one" || svc.request.SeasonNumbers[0] != 0 {

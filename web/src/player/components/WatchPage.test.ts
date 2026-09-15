@@ -444,7 +444,7 @@ describe("WatchPage virtual version substitution notice", () => {
   const genericNotice =
     "Playing a different version than selected — the requested version isn't playable on this device.";
   const labeledNotice =
-    "The selected version wasn't available, so Silo is playing 1080p H264 instead.";
+    "The selected version wasn't available, so Vio is playing 1080p H264 instead.";
   const virtualRow: PlayerFileVersion = {
     ...version,
     file_id: 100,

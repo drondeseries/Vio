@@ -19,14 +19,14 @@ func MediaKey(mediaType string, tmdbID int, tvdbID, imdbID string) (string, bool
 		return "", false
 	}
 	if tmdbID > 0 {
-		return fmt.Sprintf("silo:request-media:%s:tmdb:%d", mediaType, tmdbID), true
+		return fmt.Sprintf("vio:request-media:%s:tmdb:%d", mediaType, tmdbID), true
 	}
 	if parsedTVDBID, err := strconv.Atoi(strings.TrimSpace(tvdbID)); err == nil && parsedTVDBID > 0 {
-		return fmt.Sprintf("silo:request-media:%s:tvdb:%d", mediaType, parsedTVDBID), true
+		return fmt.Sprintf("vio:request-media:%s:tvdb:%d", mediaType, parsedTVDBID), true
 	}
 	imdbID = strings.ToLower(strings.TrimSpace(imdbID))
 	if imdbID != "" {
-		return fmt.Sprintf("silo:request-media:%s:imdb:%s", mediaType, imdbID), true
+		return fmt.Sprintf("vio:request-media:%s:imdb:%s", mediaType, imdbID), true
 	}
 	return "", false
 }

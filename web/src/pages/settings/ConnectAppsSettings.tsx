@@ -29,7 +29,7 @@ import {
   isLoopbackURL,
   jellyfinUsernameIssue,
   JELLYFIN_APP_EXAMPLES,
-  SILO_APP_EXAMPLES,
+  VIO_APP_EXAMPLES,
 } from "./connectApps";
 
 type AppKind = "silo" | "jellyfin";
@@ -114,12 +114,12 @@ function ScopeBanner({ kind }: { kind: AppKind }) {
       )}
       <div className="min-w-0 space-y-0.5">
         <p className="text-sm font-medium">
-          {isJellyfin ? "For Jellyfin-compatible apps only" : "For Silo's own apps"}
+          {isJellyfin ? "For Jellyfin-compatible apps only" : "For Vio's own apps"}
         </p>
         <p className="text-muted-foreground text-xs leading-relaxed">
-          {isJellyfin ? JELLYFIN_APP_EXAMPLES : SILO_APP_EXAMPLES}.{" "}
+          {isJellyfin ? JELLYFIN_APP_EXAMPLES : VIO_APP_EXAMPLES}.{" "}
           {isJellyfin
-            ? "These credentials will not work on a Silo sign-in screen."
+            ? "These credentials will not work on a Vio sign-in screen."
             : "Don't add a # to either field here."}
         </p>
       </div>
@@ -193,7 +193,7 @@ function TroubleshootingPanel({
     },
     {
       q: "Your account password itself contains a #",
-      a: "Type it in full and append #PIN anyway. Silo splits at the last # only.",
+      a: "Type it in full and append #PIN anyway. Vio splits at the last # only.",
     },
     {
       q: "Two profiles share a name",
@@ -202,7 +202,7 @@ function TroubleshootingPanel({
     ...(compatURL
       ? [
           {
-            q: "You used the Silo app's address",
+            q: "You used the Vio app's address",
             a: `The compatibility API is a separate address: ${compatURL}`,
           },
         ]
@@ -272,7 +272,7 @@ export default function ConnectAppsSettings() {
   }, [activeProfile?.id, profiles, selectedProfileID]);
 
   const accountUsername = user?.username ?? "";
-  const siloURL = typeof window === "undefined" ? "" : window.location.origin;
+  const vioURL = typeof window === "undefined" ? "" : window.location.origin;
   const compatEnabled = connectInfo?.jellyfin.enabled ?? false;
   const compatPendingRestart = connectInfo?.jellyfin.pending_restart ?? false;
   const compatURL = connectInfo?.jellyfin.public_url?.trim() || null;
@@ -311,7 +311,7 @@ export default function ConnectAppsSettings() {
       >
         {(
           [
-            { id: "silo", label: "Silo app or website", icon: MonitorSmartphone },
+            { id: "silo", label: "Vio app or website", icon: MonitorSmartphone },
             { id: "jellyfin", label: "Jellyfin-compatible app", icon: Cast },
           ] as const
         ).map((option) => {
@@ -365,8 +365,8 @@ export default function ConnectAppsSettings() {
           <div className="border-border rounded-md border border-dashed px-3.5 py-4">
             <p className="text-sm font-medium">This account can't sign in to a Jellyfin app</p>
             <p className="text-muted-foreground mt-1 text-sm leading-relaxed">
-              It signs in through an external provider rather than a Silo password, and the
-              compatibility API only accepts Silo passwords. Use a Silo app, or ask an administrator
+              It signs in through an external provider rather than a Vio password, and the
+              compatibility API only accepts Vio passwords. Use a Vio app, or ask an administrator
               about an account with password sign-in.
             </p>
           </div>
@@ -403,7 +403,7 @@ export default function ConnectAppsSettings() {
                     ? compatURLIsLoopback
                       ? undefined
                       : (compatURL ?? undefined)
-                    : siloURL
+                    : vioURL
                 }
                 hint={
                   isJellyfin
@@ -426,7 +426,7 @@ export default function ConnectAppsSettings() {
                     </span>
                   )
                 ) : (
-                  <code className="font-mono">{siloURL}</code>
+                  <code className="font-mono">{vioURL}</code>
                 )}
               </FieldRow>
 
@@ -478,7 +478,7 @@ export default function ConnectAppsSettings() {
                 <X className="text-info mt-0.5 h-3.5 w-3.5 shrink-0" />
                 <span>
                   Jellyfin apps offer only two boxes and never prompt for a profile, so the profile
-                  name and PIN are appended here. This format is rejected on a Silo sign-in screen.
+                  name and PIN are appended here. This format is rejected on a Vio sign-in screen.
                 </span>
               </p>
             ) : (

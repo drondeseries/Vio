@@ -18,7 +18,7 @@ import (
 
 // WatchDetailInput is the getWatchState request.
 type WatchDetailInput struct {
-	DeviceID  string `header:"X-Silo-Device-Id" maxLength:"128" doc:"The stable device identifier used to resolve playback preferences" example:"tv-1"`
+	DeviceID  string `header:"X-Vio-Device-Id" maxLength:"128" doc:"The stable device identifier used to resolve playback preferences" example:"tv-1"`
 	ID        ID     `path:"id" doc:"A movie, episode, audiobook or ebook; a series is not directly playable" example:"movie:heat-1995"`
 	FileID    ID     `query:"file_id" doc:"Prefer this file when the item has several versions" example:"42"`
 	LibraryID ID     `query:"library_id" doc:"Present the item as a member of this library" example:"1"`

@@ -34,7 +34,7 @@ func ProtocolStreaming() []workerprotocol.Operation {
 		headerParameter   = "header"
 		sessionParameter  = "session_id"
 		textMedia         = "text/plain"
-		streamToken       = "X-Silo-Stream-Token"
+		streamToken       = "X-Vio-Stream-Token"
 		binaryFormat      = "binary"
 	)
 	mounts := []struct {

@@ -55,7 +55,7 @@ export function ServerStep() {
         <SettingField
           label="Server name"
           description="Shown on the sign-in page and in the apps."
-          hint="Silo"
+          hint="Vio"
           value={serverName}
           onChange={(v) => form.setValue("branding.server_name", v)}
         />
@@ -77,7 +77,7 @@ export function ServerStep() {
             description={
               proxiesManaged
                 ? "Set by SILO_TRUSTED_PROXIES in the environment."
-                : "Silo reads the real client address from these proxy ranges. Leave blank to trust private networks only."
+                : "Vio reads the real client address from these proxy ranges. Leave blank to trust private networks only."
             }
             hint="172.16.0.0/12, 203.0.113.7/32"
             value={form.getValue("clientip.trusted_proxies")}

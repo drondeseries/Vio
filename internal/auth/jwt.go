@@ -45,7 +45,7 @@ const (
 	TokenTypeApplePushDisplay = "apple_push_display"
 )
 
-const PluginAccessCookieName = "silo_plugin_access"
+const PluginAccessCookieName = "vio_plugin_access"
 
 // JWTService handles JWT token generation and validation using HMAC-SHA256.
 // The expiry durations are atomics so they can be hot-reloaded from admin

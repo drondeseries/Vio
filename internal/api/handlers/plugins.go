@@ -961,7 +961,7 @@ func (h *PluginHandler) HandlePutAuthBinding(w http.ResponseWriter, r *http.Requ
 	}
 
 	h.restartStatus.MarkRequired("plugin_auth_binding")
-	w.Header().Set("X-Silo-Restart-Required", "true")
+	w.Header().Set("X-Vio-Restart-Required", "true")
 	w.WriteHeader(http.StatusNoContent)
 }
 

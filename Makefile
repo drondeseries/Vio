@@ -33,7 +33,7 @@ frontend:
 
 # Build the Go binary (depends on frontend)
 build: frontend
-	go build -ldflags "$(GO_LDFLAGS)" -o silo ./cmd/silo/
+	go build -ldflags "$(GO_LDFLAGS)" -o vio ./cmd/silo/
 
 # Run frontend dev server (proxies API to localhost:8080)
 dev-frontend:
@@ -407,7 +407,7 @@ migrate-continuum-check:
 
 # Clean build artifacts
 clean:
-	rm -rf web/dist web/node_modules silo
+	rm -rf web/dist web/node_modules vio
 
 # Include developer-specific targets (gitignored, optional).
 # In Git worktrees, fall back to the main checkout's Makefile.local so custom

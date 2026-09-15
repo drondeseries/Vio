@@ -34,7 +34,7 @@ func (h *SettingValuesHandler) identityRequestFrom(r *http.Request, key string) 
 		ProfileID:       query.Get("profile_id"),
 		DeviceID:        query.Get("device_id"),
 		Device:          deviceMetadataFromRequest(r),
-		ClientFamily:    r.Header.Get(clientFamilyHeader),
+		ClientFamily:    headerValue(r.Header, clientFamilyHeader, legacyClientFamilyHeader),
 		LibraryID:       query.Get("library_id"),
 		SeriesID:        query.Get("series_id"),
 		VerifyProfile: func(profileID string) error {
@@ -149,14 +149,14 @@ func (h *SettingValuesHandler) setValueAt(
 		return
 	}
 
-	mutationID := strings.TrimSpace(r.Header.Get(mutationIDHeader))
+	mutationID := strings.TrimSpace(headerValue(r.Header, mutationIDHeader, legacyMutationIDHeader))
 	result, err := h.writeSettingValue(r.Context(), store, eventUserID, identity, body.Value, mutationID, deviceMetadataFromRequest(r))
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
 	if result.replay {
-		w.Header().Set("X-Silo-Idempotent-Replay", "true")
+		w.Header().Set("X-Vio-Idempotent-Replay", "true")
 	}
 	if result.raw != nil {
 		writeRawJSON(w, http.StatusOK, result.raw)
@@ -186,7 +186,7 @@ func (h *SettingValuesHandler) HandleSetNavigationShortcut(w http.ResponseWriter
 		return
 	}
 
-	mutationID := strings.TrimSpace(r.Header.Get(mutationIDHeader))
+	mutationID := strings.TrimSpace(headerValue(r.Header, mutationIDHeader, legacyMutationIDHeader))
 	result, err := h.setNavigationShortcut(r.Context(), store, apimw.GetUserID(r.Context()),
 		apimw.GetProfileID(r.Context()), body.Item, body.Present, mutationID)
 	if err != nil {
@@ -194,7 +194,7 @@ func (h *SettingValuesHandler) HandleSetNavigationShortcut(w http.ResponseWriter
 		return
 	}
 	if result.replay {
-		w.Header().Set("X-Silo-Idempotent-Replay", "true")
+		w.Header().Set("X-Vio-Idempotent-Replay", "true")
 	}
 	if result.raw != nil {
 		writeRawJSON(w, http.StatusOK, result.raw)
@@ -245,7 +245,7 @@ func (h *SettingValuesHandler) effectiveQueryFrom(r *http.Request, keys []string
 		ProfileID:       query.Get("profile_id"),
 		DeviceID:        query.Get("device_id"),
 		Device:          deviceMetadataFromRequest(r),
-		ClientFamily:    r.Header.Get(clientFamilyHeader),
+		ClientFamily:    headerValue(r.Header, clientFamilyHeader, legacyClientFamilyHeader),
 		LibraryIDs:      parseIntCSV(query.Get("library_ids")),
 		SeriesIDs:       splitCSV(query.Get("series_ids")),
 		VerifyProfile: func(profileID string) error {

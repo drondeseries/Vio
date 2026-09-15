@@ -25,8 +25,8 @@ func demoDownloadDeps(demo bool) Dependencies {
 // PATCH — which v1's guard never listed — keeps working for everyone.
 func TestDownloadDemoRestrictions(t *testing.T) {
 	h := newTestHandler(t, demoDownloadDeps(true))
-	member := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Silo-Device-Id", "device-one")
-	admin := with(with(bearer(adminToken), "X-Profile-Id", "p-primary"), "X-Silo-Device-Id", "device-one")
+	member := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Vio-Device-Id", "device-one")
+	admin := with(with(bearer(adminToken), "X-Profile-Id", "p-primary"), "X-Vio-Device-Id", "device-one")
 	create := `{"content_id":"movie","media_file_id":"42","expected_revision":0}`
 
 	for _, tc := range []struct {

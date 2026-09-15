@@ -36,9 +36,9 @@ type DownloadCreateBody struct {
 	ExpectedEntries    map[string]DownloadEntryExpectation `json:"expected_entries,omitempty" doc:"At most 100 episode ID to exact registry ID/revision guards. Existing rows without a guard retain current bytes, status and batch."`
 }
 type DownloadCreateInput struct {
-	DeviceID       string `header:"X-Silo-Device-Id" maxLength:"128"`
-	DeviceName     string `header:"X-Silo-Device-Name" maxLength:"120"`
-	DevicePlatform string `header:"X-Silo-Device-Platform" maxLength:"40"`
+	DeviceID       string `header:"X-Vio-Device-Id" maxLength:"128"`
+	DeviceName     string `header:"X-Vio-Device-Name" maxLength:"120"`
+	DevicePlatform string `header:"X-Vio-Device-Platform" maxLength:"40"`
 	Limit          int    `query:"limit" default:"50" minimum:"1" maximum:"100"`
 	Cursor         string `query:"cursor"`
 	Body           DownloadCreateBody

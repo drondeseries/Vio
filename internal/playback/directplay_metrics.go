@@ -10,23 +10,23 @@ import (
 
 var (
 	directStreamActive = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "silo_direct_stream_active",
+		Name: "vio_direct_stream_active",
 		Help: "Number of original-file direct streams currently being served.",
 	})
 	directStreamEnds = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "silo_direct_stream_ends_total",
+		Name: "vio_direct_stream_ends_total",
 		Help: "Number of original-file direct streams by terminal outcome.",
 	}, []string{"outcome"})
 	directStreamRangeResumes = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "silo_direct_stream_range_resumes_total",
+		Name: "vio_direct_stream_range_resumes_total",
 		Help: "Number of successful original-file byte-range resumes after byte zero.",
 	})
 	directStreamInvalidRanges = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "silo_direct_stream_invalid_range_total",
+		Name: "vio_direct_stream_invalid_range_total",
 		Help: "Number of original-file direct stream requests rejected with HTTP 416.",
 	})
 	directStreamBytesSent = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "silo_direct_stream_bytes_sent_total",
+		Name: "vio_direct_stream_bytes_sent_total",
 		Help: "Number of original-file direct stream response body bytes sent.",
 	})
 )

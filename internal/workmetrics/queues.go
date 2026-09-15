@@ -29,12 +29,12 @@ var queueQueries = []struct{ name, sql string }{
 	{"web_push_delivery", `SELECT 'queued', count(*), min(attempted_at) FROM web_push_delivery_attempts WHERE outcome IN ('pending','retrying')`},
 	{"native_push_delivery", `SELECT 'queued', count(*), min(created_at) FROM push_delivery_attempts WHERE outcome IN ('pending','retrying')`},
 }
-var queueDepthDesc = prometheus.NewDesc("silo_queue_items", "Shared durable queue items; aggregate replicas with max, not sum. Queued includes delayed retries.", []string{labelQueue, "state"}, nil)
-var queueOldestDesc = prometheus.NewDesc("silo_queue_oldest_requested_timestamp_seconds", "Oldest request timestamp by shared queue state; absent when empty or unavailable.", []string{labelQueue, "state"}, nil)
-var queueSampleDesc = prometheus.NewDesc("silo_queue_sample_timestamp_seconds", "Last successful shared queue sample. Samples older than 90 seconds are omitted.", []string{labelQueue}, nil)
-var queueAvailableDesc = prometheus.NewDesc("silo_queue_sample_available", "Whether the last queue query succeeded and its sample is fresh.", []string{labelQueue}, nil)
-var queueErrorsDesc = prometheus.NewDesc("silo_queue_sample_errors_total", "Background queue query failures; no raw error strings are exported.", []string{labelQueue}, nil)
-var queueDurationDesc = prometheus.NewDesc("silo_queue_sample_duration_seconds", "Wall time of the last background queue query including pool wait.", []string{labelQueue}, nil)
+var queueDepthDesc = prometheus.NewDesc("vio_queue_items", "Shared durable queue items; aggregate replicas with max, not sum. Queued includes delayed retries.", []string{labelQueue, "state"}, nil)
+var queueOldestDesc = prometheus.NewDesc("vio_queue_oldest_requested_timestamp_seconds", "Oldest request timestamp by shared queue state; absent when empty or unavailable.", []string{labelQueue, "state"}, nil)
+var queueSampleDesc = prometheus.NewDesc("vio_queue_sample_timestamp_seconds", "Last successful shared queue sample. Samples older than 90 seconds are omitted.", []string{labelQueue}, nil)
+var queueAvailableDesc = prometheus.NewDesc("vio_queue_sample_available", "Whether the last queue query succeeded and its sample is fresh.", []string{labelQueue}, nil)
+var queueErrorsDesc = prometheus.NewDesc("vio_queue_sample_errors_total", "Background queue query failures; no raw error strings are exported.", []string{labelQueue}, nil)
+var queueDurationDesc = prometheus.NewDesc("vio_queue_sample_duration_seconds", "Wall time of the last background queue query including pool wait.", []string{labelQueue}, nil)
 
 type queueState struct {
 	count  float64
