@@ -104,6 +104,23 @@ interface SubtitleFontBundleItem {
 }
 
 /**
+ * Decodes a font-bundle payload. The v2 fonts endpoint answers with the shared
+ * collection envelope (`{"items": [...]}`), while the bridge API's font route
+ * serves the historical bare array; both shapes carry the same items.
+ */
+function decodeFontBundleItems(payload: unknown): SubtitleFontBundleItem[] {
+  if (Array.isArray(payload)) return payload as SubtitleFontBundleItem[];
+  if (
+    typeof payload === "object" &&
+    payload !== null &&
+    Array.isArray((payload as { items?: unknown }).items)
+  ) {
+    return (payload as { items: SubtitleFontBundleItem[] }).items;
+  }
+  throw new TypeError("font bundle payload is not a recognized collection shape");
+}
+
+/**
  * The response header the server sets on an in-flight font bundle. A definitive
  * font-less file stays cacheable and does not carry it. Pending bundles are also
  * served with `Cache-Control: no-store`; either signal marks the response.
@@ -197,7 +214,7 @@ export function loadSubtitleFontBundleResult(
         throw new Error(`HTTP ${response.status}`);
       }
       const pending = isPendingFontBundleResponse(response);
-      const items = (await response.json()) as SubtitleFontBundleItem[];
+      const items = decodeFontBundleItems(await response.json());
       return { fonts: items.map((item) => base64ToBytes(item.data)), pending };
     })
     .then((result) => {

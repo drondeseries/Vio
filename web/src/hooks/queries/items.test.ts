@@ -407,8 +407,8 @@ describe("item query helpers", () => {
 
 describe("useWatchDetail caching", () => {
   beforeEach(() => {
-    mocks.api.mockReset();
-    mocks.api.mockResolvedValue({});
+    mocks.v2.mockReset();
+    mocks.v2.mockResolvedValue({ content_id: "movie-1", versions: [], subtitles: [] });
   });
 
   function wrapperFor(client: QueryClient) {
@@ -418,12 +418,12 @@ describe("useWatchDetail caching", () => {
 
   it("reuses cached watch detail when remounting within the stale window", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    mocks.api.mockResolvedValue({ content_id: "movie-1", versions: [] });
+    mocks.v2.mockResolvedValue({ content_id: "movie-1", versions: [], subtitles: [] });
     const wrapper = wrapperFor(client);
 
     const first = renderHook(() => useWatchDetail("movie-1", 7, 1), { wrapper });
     await waitFor(() => expect(first.result.current.isSuccess).toBe(true));
-    expect(mocks.api).toHaveBeenCalledTimes(1);
+    expect(mocks.v2).toHaveBeenCalledTimes(1);
 
     // Navigating detail -> player -> back remounts the query. A cache entry
     // inside the 30s stale window must be reused instead of refetched.
@@ -431,13 +431,13 @@ describe("useWatchDetail caching", () => {
     const second = renderHook(() => useWatchDetail("movie-1", 7, 1), { wrapper });
     await waitFor(() => expect(second.result.current.isSuccess).toBe(true));
 
-    expect(mocks.api).toHaveBeenCalledTimes(1);
+    expect(mocks.v2).toHaveBeenCalledTimes(1);
   });
 
   it("dedupes concurrent watch detail fetches onto one network request", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     let resolveApi: (value: unknown) => void = () => {};
-    mocks.api.mockImplementation(
+    mocks.v2.mockImplementation(
       () =>
         new Promise((resolve) => {
           resolveApi = resolve;
@@ -454,10 +454,10 @@ describe("useWatchDetail caching", () => {
     const first = client.fetchQuery(options);
     const second = client.fetchQuery(options);
 
-    await vi.waitFor(() => expect(mocks.api).toHaveBeenCalledTimes(1));
-    resolveApi({ content_id: "movie-1", versions: [] });
+    await vi.waitFor(() => expect(mocks.v2).toHaveBeenCalledTimes(1));
+    resolveApi({ content_id: "movie-1", versions: [], subtitles: [] });
     await Promise.all([first, second]);
 
-    expect(mocks.api).toHaveBeenCalledTimes(1);
+    expect(mocks.v2).toHaveBeenCalledTimes(1);
   });
 });
