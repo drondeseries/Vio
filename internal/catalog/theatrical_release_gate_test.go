@@ -31,13 +31,12 @@ func (f *fakeDigitalReleaseChecker) HasDigitalRelease(_ context.Context, tmdbID 
 // tests. It records every distinct id and can block until the test releases
 // it, so cancellation can be observed while work is in flight.
 type recordingReleaseChecker struct {
-	mu        sync.Mutex
-	calls     map[int]int
-	released  map[int]bool
-	err       error
-	gate      chan struct{}
-	started   chan int
-	startOnce sync.Once
+	mu       sync.Mutex
+	calls    map[int]int
+	released map[int]bool
+	err      error
+	gate     chan struct{}
+	started  chan int
 }
 
 func (c *recordingReleaseChecker) HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error) {

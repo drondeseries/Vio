@@ -2584,8 +2584,8 @@ func (s *LibraryCollectionService) fetchMDBListEntries(ctx context.Context, list
 //   - ErrListNotFound / ErrRateLimit: temporary or protocol-level problems the
 //     public feed can still serve.
 func (s *LibraryCollectionService) fetchMDBListEntriesWithAPI(ctx context.Context, listURLs []string, limit *int) ([]mdblistEntry, error) {
-	fallback := false
 	if s.MDBListAPI != nil {
+	apiLoop:
 		for _, listURL := range listURLs {
 			user, list, ok := collectionutil.ParseMDBListListURL(listURL)
 			if !ok {
@@ -2606,12 +2606,9 @@ func (s *LibraryCollectionService) fetchMDBListEntriesWithAPI(ctx context.Contex
 					"list", list,
 					"error", err,
 				)
-				fallback = true
+				break apiLoop
 			default:
 				return nil, fmt.Errorf("fetching mdblist list %s/%s: %w", user, list, err)
-			}
-			if fallback {
-				break
 			}
 		}
 	}

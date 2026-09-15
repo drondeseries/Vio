@@ -251,8 +251,11 @@ func TestCollectionSyncSchedulerProgressCallbackOutsideLock(t *testing.T) {
 	go func() {
 		defer close(done)
 		s.syncOne(context.Background(), repo.due[0], mu, result, func(CollectionSyncProgress) {
-			// If the callback ran under mu, this would deadlock.
-			mu.Lock()
+			// If the callback ran under mu, TryLock fails and this panics
+			// instead of deadlocking the whole test.
+			if !mu.TryLock() {
+				panic("progress callback ran while holding the result mutex")
+			}
 			mu.Unlock()
 		})
 	}()
