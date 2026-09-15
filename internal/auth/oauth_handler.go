@@ -151,7 +151,7 @@ func (h *OAuthHandler) CallbackURL(prefix string, installID int) string {
 // and the v2 handshake both call it; a failure is an *OAuthHandshakeError.
 func (h *OAuthHandler) Init(ctx context.Context, installID int, next, redirectURI string) (string, error) {
 	if h.currentHostBaseURL() == "" {
-		return "", &OAuthHandshakeError{Status: http.StatusConflict, Message: "Silo public URL is not configured"}
+		return "", &OAuthHandshakeError{Status: http.StatusConflict, Message: "Vio public URL is not configured"}
 	}
 	next = normalizeOAuthNext(next)
 

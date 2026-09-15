@@ -1,4 +1,4 @@
-// Package api provides the HTTP router and middleware setup for Silo.
+// Package api provides the HTTP router and middleware setup for Vio.
 package api
 
 import (
@@ -1296,26 +1296,31 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed(ctx, fileID, expectedFilePath, nil)
 			}
-			playbackHandler.VirtualFileUpdater = func(ctx context.Context, fileID int, newFilePath string) error {
-				_, _ = deps.DB.Exec(ctx, `DELETE FROM media_files WHERE file_path=$1 AND id != $2 AND virtual_owner_installation_id IS NOT NULL`, newFilePath, fileID)
-				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET file_path=$1, updated_at=now() WHERE id=$2`, newFilePath, fileID)
-				return err
-			}
-			playbackHandler.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error {
-				vStr := string(videoTracks)
+			playbackHandler.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+				if deps.DB == nil {
+					return 0, nil
+				}
+				vStr := string(args.VideoTracks)
 				if vStr == "" || vStr == "null" {
 					vStr = "[]"
 				}
-				aStr := string(audioTracks)
+				aStr := string(args.AudioTracks)
 				if aStr == "" || aStr == "null" {
 					aStr = "[]"
 				}
-				sStr := string(subtitleTracks)
+				sStr := string(args.SubtitleTracks)
 				if sStr == "" || sStr == "null" {
 					sStr = "[]"
 				}
-				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath, stampProbe)
-				return err
+				tag, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL,
+					vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
+					args.FileID, args.ExpectedFilePath, args.StampProbe,
+					args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, args.AdoptPath,
+				)
+				if err != nil {
+					return 0, err
+				}
+				return tag.RowsAffected(), nil
 			}
 		}
 		if deps.Config != nil {
@@ -1603,15 +1608,19 @@ func newChiRouter(deps Dependencies) chi.Router {
 
 		if deps.DB != nil && deps.FileRepo != nil && viewerResolver != nil && deps.Config != nil && detailSvc != nil {
 			roomTokenService := watchtogether.NewRoomTokenService(deps.Config.Auth.JWTSecret, 24*time.Hour)
+			watchTogetherService := watchtogether.NewService(
+				watchtogether.NewRepository(deps.DB),
+				deps.SessionMgr,
+				deps.FileRepo,
+				watchtogether.NewCatalogSelectionResolver(detailSvc),
+				watchtogether.NewSuggestionRepository(deps.DB),
+				watchtogether.NewProfileNameResolver(deps.UserStoreProvider),
+			)
+			if err := watchTogetherService.SetClusterEventBus(deps.EventBus); err != nil {
+				slog.Warn("watch together cluster synchronization unavailable", "error", err)
+			}
 			watchTogetherHandler = handlers.NewWatchTogetherHandler(
-				watchtogether.NewService(
-					watchtogether.NewRepository(deps.DB),
-					deps.SessionMgr,
-					deps.FileRepo,
-					watchtogether.NewCatalogSelectionResolver(detailSvc),
-					watchtogether.NewSuggestionRepository(deps.DB),
-					watchtogether.NewProfileNameResolver(deps.UserStoreProvider),
-				),
+				watchTogetherService,
 				viewerResolver,
 				roomTokenService,
 			)
@@ -3052,7 +3061,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 
 		// Autoscan webhook intake: public — Sonarr/Radarr POST here without a
-		// Silo session; the URL's bearer token authenticates the delivery and
+		// Vio session; the URL's bearer token authenticates the delivery and
 		// maps it to its Autoscan source. Rate limited per-IP (plus the
 		// "autoscan_webhook" per-endpoint limit) since it is unauthenticated.
 		if autoscanHandler != nil {
@@ -3079,7 +3088,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			r.Get("/notifications/discord/link/callback", discordNotificationsHandler.HandleLinkCallback)
 
 			// Tokenized email links: public — clicked from mail clients on
-			// devices without a Silo session; the single-use token (verify)
+			// devices without a Vio session; the single-use token (verify)
 			// or per-profile capability token (unsubscribe) authenticates the
 			// request. Static paths coexist with the authenticated
 			// /notifications subrouter below, same as the Discord callback.

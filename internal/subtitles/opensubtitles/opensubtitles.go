@@ -21,7 +21,7 @@ import (
 const (
 	defaultBaseURL   = "https://api.opensubtitles.com/api/v1"
 	defaultAPIKey    = "Hsn0IpAAGNFVIbAvK0gtJqCi8lAYuugT"
-	defaultUserAgent = "Silo v1.0"
+	defaultUserAgent = "Vio v1.0"
 )
 
 // Config holds the configuration for the OpenSubtitles provider.
@@ -77,6 +77,14 @@ func (p *Provider) TestConnection(ctx context.Context) error {
 func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]subtitles.SubtitleResult, error) {
 	if err := p.limiter.Wait(ctx); err != nil {
 		return nil, err
+	}
+	// OpenSubtitles permits anonymous searches, but configured credentials must
+	// be checked here so the admin connection test cannot report bogus login
+	// details as healthy.
+	if p.username != "" || p.password != "" {
+		if _, err := p.ensureToken(ctx); err != nil {
+			return nil, fmt.Errorf("opensubtitles: credential validation failed: %w", err)
+		}
 	}
 
 	params := url.Values{}

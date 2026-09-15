@@ -360,12 +360,12 @@ type PlaybackSession struct {
 	IsPaused                 bool    `json:"is_paused" example:"false"`
 	HasPlaybackControl       bool    `json:"has_playback_control" doc:"Whether the serving node accepts remote control of this session" example:"true"`
 	ClientIP                 string  `json:"client_ip" doc:"Empty when unknown" example:"192.0.2.10"`
-	ClientName               string  `json:"client_name" doc:"Empty when unknown" example:"Silo for Apple TV"`
+	ClientName               string  `json:"client_name" doc:"Empty when unknown" example:"Vio for Apple TV"`
 	ClientVersion            string  `json:"client_version" doc:"Empty when unknown" example:"1.4.0"`
 	ClientBuild              string  `json:"client_build" doc:"Empty when unknown" example:"1400"`
 	ClientChannel            string  `json:"client_channel" doc:"Empty when unknown" example:"release"`
-	ClientLabel              string  `json:"client_label" doc:"Display label derived from the client name and version; empty when unknown" example:"Silo for Apple TV 1.4"`
-	ClientLabelFull          string  `json:"client_label_full" doc:"Display label with the exact build; empty when unknown" example:"Silo for Apple TV 1.4.0 (1400)"`
+	ClientLabel              string  `json:"client_label" doc:"Display label derived from the client name and version; empty when unknown" example:"Vio for Apple TV 1.4"`
+	ClientLabelFull          string  `json:"client_label_full" doc:"Display label with the exact build; empty when unknown" example:"Vio for Apple TV 1.4.0 (1400)"`
 	ClientUserAgent          string  `json:"client_user_agent" doc:"Empty when unknown" example:""`
 	AudioTrackIndex          int     `json:"audio_track_index" example:"0"`
 	TranscodeAudio           bool    `json:"transcode_audio" example:"false"`

@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -21,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -62,7 +62,7 @@ func ebookContentType() string {
 
 func ebookEnrichWorkers() int {
 	n := defaultEnrichWorkers
-	if v := os.Getenv("SILO_EBOOK_ENRICH_WORKERS"); v != "" {
+	if v := envutil.GetenvFirst("VIO_EBOOK_ENRICH_WORKERS", "SILO_EBOOK_ENRICH_WORKERS"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 			n = parsed
 		}
@@ -1089,8 +1089,8 @@ func collectEbookMetadata(ctx context.Context, item enrichmentItemRow, providers
 		admittedResult := *result
 		admittedResult.ProviderIDs = identity.ProviderIDs
 		result = &admittedResult
-		accumulator.HasMetadata = true
 		mergeEnrichmentProviderIDs(accumulator, result)
+		accumulator.HasMetadata = true
 		metadata.MergeMetadata(result, accumulator, nil, metadata.MergeFillEmpty)
 
 		slog.DebugContext(ctx, "ebook enrichment: metadata received", "component", "ebooks",
@@ -1526,6 +1526,9 @@ func buildEbookMetadataRequest(providerIDs map[string]string, language string) m
 	}
 }
 
+// mergeEnrichmentProviderIDs keeps the ebook-specific provider allowlist while
+// accumulating IDs for subsequent provider calls. Generic media types can use
+// metadata.MergeMetadata directly; ebooks intentionally exclude ASIN aliases.
 func mergeEnrichmentProviderIDs(dst *metadata.MetadataResult, src *metadata.MetadataResult) {
 	if src == nil || len(src.ProviderIDs) == 0 {
 		return

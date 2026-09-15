@@ -28,11 +28,11 @@ const (
 	ArtifactDirectoryName = "download-artifacts"
 	RelayReadIdleTimeout  = 2 * time.Minute
 
-	resultToneMapRecipeVersionHeader             = "X-Silo-Tone-Map-Recipe-Version"
-	resultToneMapModeHeader                      = "X-Silo-Tone-Map-Mode"
-	resultToneMapSourceRevisionFingerprintHeader = "X-Silo-Tone-Map-Source-Revision-Fingerprint"
-	resultExecutionFingerprintHeader             = "X-Silo-Download-Execution-Fingerprint"
-	resultArtifactSizeHeader                     = "X-Silo-Download-Artifact-Size"
+	resultToneMapRecipeVersionHeader             = "X-Vio-Tone-Map-Recipe-Version"
+	resultToneMapModeHeader                      = "X-Vio-Tone-Map-Mode"
+	resultToneMapSourceRevisionFingerprintHeader = "X-Vio-Tone-Map-Source-Revision-Fingerprint"
+	resultExecutionFingerprintHeader             = "X-Vio-Download-Execution-Fingerprint"
+	resultArtifactSizeHeader                     = "X-Vio-Download-Artifact-Size"
 	maxResultAttestationHeaderBytes              = 1024
 )
 

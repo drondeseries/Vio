@@ -123,7 +123,7 @@ type Dependencies struct {
 	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
 	VirtualSourceProber            VirtualSourceProber
 	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
-	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	VirtualFileSaver               VirtualFileSaver
 	VirtualCandidateFileLookup     VirtualCandidateFileLookup
 	RemoteStreamRelay              RemoteStreamRelay
 	// AllowInsecureVirtual reports whether a plugin installation has explicitly

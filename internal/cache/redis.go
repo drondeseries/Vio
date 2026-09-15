@@ -17,22 +17,22 @@ import (
 const (
 	// ChannelCatalog is the pub/sub channel for catalog events (scan_complete,
 	// metadata_updated).
-	ChannelCatalog = "silo:catalog"
+	ChannelCatalog = "vio:catalog"
 
 	// ChannelAdmin is the pub/sub channel for admin events (user_disabled,
 	// user_deleted, settings_changed).
-	ChannelAdmin = "silo:admin"
+	ChannelAdmin = "vio:admin"
 
 	// ChannelPlayback is the pub/sub channel reserved for future playback
 	// events.
-	ChannelPlayback = "silo:playback"
+	ChannelPlayback = "vio:playback"
 
 	// ChannelLogs is the pub/sub channel for persisted operational/audit log
 	// entries that should be fanned out to admin WebSocket subscribers.
-	ChannelLogs = "silo:logs"
+	ChannelLogs = "vio:logs"
 
 	// ChannelEvents is the pub/sub channel for passive websocket events.
-	ChannelEvents = "silo:events"
+	ChannelEvents = "vio:events"
 )
 
 // ---------------------------------------------------------------------------

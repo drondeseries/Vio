@@ -8,11 +8,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/telemetry"
 
 	"github.com/Silo-Server/silo-server/internal/secret"
@@ -155,7 +155,7 @@ func newPushSender(devices *PushDeviceRepository, deliveries *DeliveryRepository
 		settings:            settings,
 		client:              client,
 		logger:              slog.Default().With("component", "notifications.apple_push"),
-		developmentRelayURL: os.Getenv("SILO_PUSH_RELAY_DEVELOPMENT_URL"),
+		developmentRelayURL: envutil.GetenvFirst("VIO_PUSH_RELAY_DEVELOPMENT_URL", "SILO_PUSH_RELAY_DEVELOPMENT_URL"),
 		now:                 time.Now,
 	}
 }
@@ -368,7 +368,7 @@ func (s *pushSender) sendWithCapability(ctx context.Context, attempt PushDeliver
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Silo-Push/1.0")
+	req.Header.Set("User-Agent", "Vio-Push/1.0")
 	// One logical delivery attempt keeps the same key across every transport
 	// retry. The relay can then distinguish a safe retry from a new delivery and
 	// refuse to resend an ambiguous APNs outcome.

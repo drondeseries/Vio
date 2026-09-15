@@ -126,12 +126,13 @@ type VirtualSourceProberWithHeaders func(context.Context, string, *models.MediaF
 // persist probe metadata against the row it actually belongs to.
 type VirtualCandidateFileLookup func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error)
 
-// VirtualFileMetadataSaver persists a probed virtual inventory back to the
-// catalog row, mirroring internal/api/handlers.VirtualFileMetadataSaver.
-// jellycompat cannot import internal/api/handlers (that package imports
-// jellycompat), so cmd/silo binds this to handlers.VirtualFileMetadataUpdateSQL
-// and the UPDATE execution there.
-type VirtualFileMetadataSaver func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error
+// VirtualFileSaver persists a probed virtual inventory back to the catalog
+// row, mirroring the native VirtualFileSaver contract. jellycompat cannot
+// import internal/api/handlers (that package imports jellycompat), so both
+// sides share models.VirtualFilePersistArgs and cmd/silo binds this to
+// handlers.VirtualFileMetadataUpdateSQL with the same 18-arg execution as
+// the native wiring.
+type VirtualFileSaver func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error)
 
 // RemoteStreamRelay is the credential-hiding, SSRF-protected transport shared
 // by direct delivery and FFmpeg inputs.
@@ -397,31 +398,65 @@ func (h *PlaybackHandler) probeVirtualSourceWithHeaders(ctx context.Context, sou
 
 // persistCompatVirtualMetadata stamps a successfully probed virtual inventory
 // back to the catalog row in the background, mirroring the native
-// persistVirtualMetadataBounded pattern. It stamps probe_updated_at through the
+// persistVirtualProbeEvidence pattern. It stamps probe_updated_at through the
 // bound SQL so the next play takes the fast candidate-merge path.
 //
 // The probed transient carries the neutral row's ID but the concrete
-// candidate's file_path, and the bound UPDATE fences on both id and file_path.
-// Persisting those two directly would match zero rows, so the concrete
-// candidate row is resolved first and the save targets it; when no such row
-// exists the neutral row's own id and path are used so the stamp at least lands
-// on the row that exists.
+// candidate's file_path. The concrete candidate row is resolved first and a
+// value snapshot of that row is taken *before* spawning the background
+// goroutine, so the CAS fence binds to pre-probe state — not to a lookup
+// performed after the probe, and never to a pointer captured across the
+// goroutine boundary.
 func (h *PlaybackHandler) persistCompatVirtualMetadata(ctx context.Context, file *models.MediaFile, neutral *models.MediaFile, candidateURI string) {
-	if h == nil || h.VirtualFileMetadataSaver == nil || file == nil || file.ID <= 0 {
+	if h == nil || h.VirtualFileSaver == nil || file == nil || file.ID <= 0 {
 		return
 	}
+	// Snapshot evidence bytes by value now — the caller's `file` pointer is
+	// not touched after this point.
 	videoJSON := marshalCompatTracks(file.VideoTracks)
 	audioJSON := marshalCompatTracks(file.AudioTracks)
 	subJSON := marshalCompatTracks(file.SubtitleTracks)
-	res, vCodec, aCodec, container, hdr, bitrate, duration := file.Resolution, file.CodecVideo, file.CodecAudio, file.Container, file.HDR, file.Bitrate, file.Duration
-	go func() {
+	args := models.VirtualFilePersistArgs{
+		VideoTracks:    videoJSON,
+		AudioTracks:    audioJSON,
+		SubtitleTracks: subJSON,
+		Resolution:     file.Resolution,
+		CodecVideo:     file.CodecVideo,
+		CodecAudio:     file.CodecAudio,
+		Container:      file.Container,
+		HDR:            file.HDR,
+		Bitrate:        file.Bitrate,
+		Duration:       file.Duration,
+		StampProbe:     true,
+	}
+	// Synchronously resolve the target row and snapshot its generation
+	// *before* leaving this goroutine: the CAS fence needs the pre-probe
+	// snapshot, and the background save must not dereference `file` or
+	// `neutral` after spawn.
+	resolveCtx, resolveCancel := context.WithTimeout(ctx, 3*time.Second)
+	target := h.compatVirtualPersistSnapshot(resolveCtx, file, neutral, candidateURI)
+	resolveCancel()
+	if target.FileID <= 0 {
+		return
+	}
+	args.FileID = target.FileID
+	args.ExpectedFilePath = target.ExpectedFilePath
+	args.UpdatedAt = target.UpdatedAt
+	args.ProbeUpdatedAt = target.ProbeUpdatedAt
+	args.OwnerID = target.OwnerID
+	args.LibraryID = target.LibraryID
+	go func(save models.VirtualFilePersistArgs) {
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		targetID, expectedFilePath := h.compatVirtualPersistTarget(persistCtx, file, neutral, candidateURI)
-		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, expectedFilePath, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration, true); err != nil {
-			slog.ErrorContext(persistCtx, "compat virtual metadata persist failed", "component", "jellycompat", "file_id", targetID, "error", err)
+		rows, err := h.VirtualFileSaver(persistCtx, save)
+		if err != nil {
+			slog.ErrorContext(persistCtx, "compat virtual metadata persist failed", "component", "jellycompat", "file_id", save.FileID, "error", err)
+			return
 		}
-	}()
+		if rows == 0 {
+			slog.DebugContext(persistCtx, "compat virtual metadata persist skipped: stale snapshot", "component", "jellycompat", "file_id", save.FileID)
+		}
+	}(args)
 }
 
 // compatVirtualPersistTarget returns the row id and file_path fence the probe
@@ -430,22 +465,54 @@ func (h *PlaybackHandler) persistCompatVirtualMetadata(ctx context.Context, file
 // falls back to the neutral row's own id and path, which always satisfies the
 // bound UPDATE's id+file_path fence.
 func (h *PlaybackHandler) compatVirtualPersistTarget(ctx context.Context, probed, neutral *models.MediaFile, candidateURI string) (int, string) {
+	snap := h.compatVirtualPersistSnapshot(ctx, probed, neutral, candidateURI)
+	return snap.FileID, snap.ExpectedFilePath
+}
+
+// compatVirtualPersistSnapshot resolves the target row and snapshots its CAS
+// generation in one call, so the background save binds to pre-probe state.
+func (h *PlaybackHandler) compatVirtualPersistSnapshot(ctx context.Context, probed, neutral *models.MediaFile, candidateURI string) models.VirtualFilePersistArgs {
+	var out models.VirtualFilePersistArgs
 	if probed == nil {
-		return 0, ""
+		return out
 	}
 	if neutral == nil {
-		return probed.ID, probed.FilePath
+		out.FileID = probed.ID
+		out.ExpectedFilePath = probed.FilePath
+		out.UpdatedAt = probed.UpdatedAt
+		out.ProbeUpdatedAt = probed.ProbeUpdatedAt
+		out.OwnerID = probed.VirtualOwnerInstallationID
+		out.LibraryID = probed.MediaFolderID
+		return out
 	}
 	if h.VirtualCandidateFileLookup == nil {
-		return neutral.ID, neutral.FilePath
+		out.FileID = neutral.ID
+		out.ExpectedFilePath = neutral.FilePath
+		out.UpdatedAt = neutral.UpdatedAt
+		out.ProbeUpdatedAt = neutral.ProbeUpdatedAt
+		out.OwnerID = neutral.VirtualOwnerInstallationID
+		out.LibraryID = neutral.MediaFolderID
+		return out
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	candidate, err := h.VirtualCandidateFileLookup(lookupCtx, compatVirtualNeutralURI(candidateURI), neutral.ContentID, neutral.EpisodeID, neutral.VirtualOwnerInstallationID)
 	if err != nil || candidate == nil || candidate.ID <= 0 {
-		return neutral.ID, neutral.FilePath
+		out.FileID = neutral.ID
+		out.ExpectedFilePath = neutral.FilePath
+		out.UpdatedAt = neutral.UpdatedAt
+		out.ProbeUpdatedAt = neutral.ProbeUpdatedAt
+		out.OwnerID = neutral.VirtualOwnerInstallationID
+		out.LibraryID = neutral.MediaFolderID
+		return out
 	}
-	return candidate.ID, candidate.FilePath
+	out.FileID = candidate.ID
+	out.ExpectedFilePath = candidate.FilePath
+	out.UpdatedAt = candidate.UpdatedAt
+	out.ProbeUpdatedAt = candidate.ProbeUpdatedAt
+	out.OwnerID = candidate.VirtualOwnerInstallationID
+	out.LibraryID = candidate.MediaFolderID
+	return out
 }
 
 // marshalCompatTracks renders track slices as JSON arrays, never a bare null,

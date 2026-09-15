@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/notifications"
 )
 
@@ -28,7 +28,7 @@ func NewAdminApplePushHandler(system *notifications.System, settings ServerSetti
 		system:              system,
 		settings:            settings,
 		client:              &http.Client{Timeout: 10 * time.Second},
-		developmentRelayURL: os.Getenv("SILO_PUSH_RELAY_DEVELOPMENT_URL"),
+		developmentRelayURL: envutil.GetenvFirst("VIO_PUSH_RELAY_DEVELOPMENT_URL", "SILO_PUSH_RELAY_DEVELOPMENT_URL"),
 	}
 }
 

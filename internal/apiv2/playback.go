@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -57,6 +58,9 @@ type PlaybackStartBody struct {
 	ProgressPersistence        playback.ProgressPersistenceV3     `json:"progress_persistence,omitempty" enum:"server,client"`
 	AudioTrackID               string                             `json:"audio_track_id,omitempty"`
 	AudioTrackIndex            *int                               `json:"audio_track_index,omitempty" nullable:"false"`
+	CarriedAudioTrackID        string                             `json:"carried_audio_track_id,omitempty"`
+	FileSelection              playback.FileSelectionV3           `json:"file_selection,omitempty" enum:"auto,explicit"`
+	ForceRelink                bool                               `json:"force_relink,omitempty"`
 	SubtitleTrackID            string                             `json:"subtitle_track_id,omitempty"`
 	SubtitleTrackIndex         *int                               `json:"subtitle_track_index,omitempty" nullable:"false"`
 	Metered                    bool                               `json:"metered"`
@@ -304,13 +308,16 @@ func registerPlayback(reg *Registry) {
 	Register(reg, op(http.MethodPost, "/start", opStartPlayback), func(ctx context.Context, in *PlaybackStartInput) (*PlaybackStartOutput, error) {
 		caller, p := reg.playbackCaller(ctx, in.PlaybackRequestHeaders, in.Body.InstallationID)
 		if p != nil {
+			slog.WarnContext(ctx, "playback start rejected", "phase", "caller", "error", p.Title)
 			return nil, p
 		}
 		fileID, p := in.Body.FileID.positive("body.file_id")
 		if p != nil {
+			slog.WarnContext(ctx, "playback start rejected", "phase", "file_id", "error", "invalid file_id")
 			return nil, p
 		}
 		if string(in.Body.ProfileID) != caller.ProfileID {
+			slog.WarnContext(ctx, "playback start rejected", "phase", "profile", "error", "profile mismatch")
 			return nil, validationProblem("body.profile_id", "invalid", "Profile must match the authenticated viewer.")
 		}
 		request := in.Body.domain(fileID)
@@ -323,6 +330,7 @@ func registerPlayback(reg *Registry) {
 			return nil, validationProblem("body", "invalid", "Invalid playback request.")
 		}
 		if _, err := validationRequest.NormalizeAndValidate(); err != nil {
+			slog.WarnContext(ctx, "playback start rejected", "phase", "validation", "error", err.Error())
 			return nil, validationProblem("body", "invalid", err.Error())
 		}
 		response, err := reg.deps.Playback.StartPlaybackV2(ctx, caller, request)
@@ -453,7 +461,7 @@ func playbackMutation(view handlers.PlaybackMutationView, err error) (*PlaybackM
 	return &PlaybackMutationOutput{Body: body}, nil
 }
 func (in PlaybackStartBody) domain(fileID int) playback.StartRequestV3 {
-	return playback.StartRequestV3{ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, FileID: fileID, ProfileID: string(in.ProfileID), PlaybackAttemptID: in.PlaybackAttemptID, QualityPreference: in.QualityPreference, SubtitleFidelityPreference: in.SubtitleFidelityPreference, StartPosition: in.StartPosition, ProgressPersistence: in.ProgressPersistence, AudioTrackID: in.AudioTrackID, AudioTrackIndex: in.AudioTrackIndex, SubtitleTrackID: in.SubtitleTrackID, SubtitleTrackIndex: in.SubtitleTrackIndex, Metered: in.Metered, BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthCapKbps: in.BandwidthCapKbps, Capabilities: in.Capabilities, ClientPlaybackContext: in.ClientPlaybackContext}
+	return playback.StartRequestV3{ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, FileID: fileID, ProfileID: string(in.ProfileID), PlaybackAttemptID: in.PlaybackAttemptID, QualityPreference: in.QualityPreference, SubtitleFidelityPreference: in.SubtitleFidelityPreference, StartPosition: in.StartPosition, ProgressPersistence: in.ProgressPersistence, AudioTrackID: in.AudioTrackID, AudioTrackIndex: in.AudioTrackIndex, CarriedAudioTrackID: in.CarriedAudioTrackID, FileSelection: in.FileSelection, ForceRelink: in.ForceRelink, SubtitleTrackID: in.SubtitleTrackID, SubtitleTrackIndex: in.SubtitleTrackIndex, Metered: in.Metered, BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthCapKbps: in.BandwidthCapKbps, Capabilities: in.Capabilities, ClientPlaybackContext: in.ClientPlaybackContext}
 }
 func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 	out := PlaybackDecision{ProtocolVersion: in.ProtocolVersion, ServerFeatures: in.ServerFeatures, Outcome: in.Outcome, SessionID: in.SessionID, Terminal: in.Terminal}

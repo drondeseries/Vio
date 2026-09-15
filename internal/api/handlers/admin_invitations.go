@@ -204,7 +204,7 @@ func writeInvitationSendError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "role_not_allowed", "You may not grant this role")
 	case errors.Is(err, invitations.ErrNoLinkBase):
 		writeError(w, http.StatusConflict, "no_link_base",
-			"Configure the Silo public URL so invitation links can be built")
+			"Configure the Vio public URL so invitation links can be built")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to send invitation")
 	}

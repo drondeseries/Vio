@@ -17,6 +17,7 @@ import (
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/telemetry"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -62,14 +63,14 @@ const (
 	metricClientWeb     = "web"
 	metricClientApple   = "apple"
 	metricClientAndroid = "android"
-	// maxClientNameLen and maxClientVersionLen clamp the X-Silo-Client and
-	// X-Silo-Client-Version values before they reach a label or a log line.
+	// maxClientNameLen and maxClientVersionLen clamp the X-Vio-Client and
+	// X-Vio-Client-Version values before they reach a label or a log line.
 	maxClientNameLen    = 64
 	maxClientVersionLen = 32
 )
 
 var (
-	requestInFlight = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "silo_apiv2_in_flight", Help: "Active native API v2 operations, including response streaming."}, []string{labelOperationID})
+	requestInFlight = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "vio_apiv2_in_flight", Help: "Active native API v2 operations, including response streaming."}, []string{labelOperationID})
 	requestsTotal   = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "streamapp_apiv2_requests_total",
 		Help: "Native API v2 requests by operation, status class, problem type, credential class and client.",
@@ -256,8 +257,8 @@ func statusClass(status int) string {
 // to a printable bounded string. The values are opaque: trimmed, length
 // limited, control characters dropped, never parsed or validated.
 func clientIdentity(r *http.Request) (name, version string) {
-	return clampLabel(r.Header.Get("X-Silo-Client"), maxClientNameLen),
-		clampLabel(r.Header.Get("X-Silo-Client-Version"), maxClientVersionLen)
+	return clampLabel(httpheader.Get(r.Header, httpheader.Client, httpheader.LegacyClient), maxClientNameLen),
+		clampLabel(httpheader.Get(r.Header, httpheader.ClientVersion, httpheader.LegacyClientVersion), maxClientVersionLen)
 }
 
 func clampLabel(v string, limit int) string {

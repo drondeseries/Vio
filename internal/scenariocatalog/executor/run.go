@@ -20,6 +20,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/contracts/api/v2/scenarios"
 	"github.com/Silo-Server/silo-server/internal/apiv2"
+	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/scenariocatalog"
 )
 
@@ -771,9 +772,9 @@ func syntheticFile(spec string) ([]byte, error) {
 }
 
 // WriteReport renders results as JSON for CI artifacts when
-// SILO_SCENARIO_REPORT names a file.
+// VIO_SCENARIO_REPORT names a file (legacy SILO_SCENARIO_REPORT honored).
 func WriteReport(results []Result) error {
-	path := os.Getenv("SILO_SCENARIO_REPORT")
+	path := envutil.GetenvFirst("VIO_SCENARIO_REPORT", "SILO_SCENARIO_REPORT")
 	if path == "" {
 		return nil
 	}

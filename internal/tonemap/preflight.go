@@ -381,7 +381,7 @@ func runSourcePreflight(ctx context.Context, request SourcePreflightRequest, run
 		if !frameMatchesSourceKind(frame, request.Kind) {
 			return fmt.Errorf("%w: decoded frame metadata does not match %s fallback (range=%q, primaries=%q, transfer=%q, space=%q)", ErrSourcePreflightRejected, request.Kind, frame.ColorRange, frame.ColorPrimaries, frame.ColorTransfer, frame.ColorSpace)
 		}
-		file, err := os.CreateTemp("", "silo-tonemap-preflight-*.mkv")
+		file, err := os.CreateTemp("", "vio-tonemap-preflight-*.mkv")
 		if err != nil {
 			return fmt.Errorf("%w: create tone-map preflight output: %w", ErrSourcePreflightUnavailable, err)
 		}

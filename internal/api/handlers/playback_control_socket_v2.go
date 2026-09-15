@@ -49,7 +49,7 @@ const PlaybackControlSocketProtocol = "silo.playback-control.v2"
 const (
 	playbackControlTicketTTL      = 30 * time.Second
 	playbackControlMaxLifetime    = 4 * time.Hour
-	playbackControlTicketRedisKey = "silo:playback:v2:control-ticket:"
+	playbackControlTicketRedisKey = "vio:playback:v2:control-ticket:"
 	playbackControlCheckInterval  = 15 * time.Second
 	playbackControlTicketBytes    = 32
 	playbackControlTicketLength   = 43

@@ -237,7 +237,7 @@ func (e *jellyfinHTTPError) Error() string {
 }
 
 func jellyfinAuthorizationHeader() string {
-	return `MediaBrowser Client="watch-importer", Device="Silo", DeviceId="silo-history-import", Version="1.0.0"`
+	return `MediaBrowser Client="watch-importer", Device="Vio", DeviceId="vio-history-import", Version="1.0.0"`
 }
 
 func jellyfinAuthorizationHeaderWithToken(token string) string {

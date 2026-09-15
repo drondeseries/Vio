@@ -343,7 +343,7 @@ func (c *Cacher) uploadVariants(ctx context.Context, bucket string, result *imag
 
 func variantRevision(result *imageutil.VariantResult) string {
 	h := sha256.New()
-	_, _ = io.WriteString(h, "silo-artwork-v1\x00")
+	_, _ = io.WriteString(h, "vio-artwork-v1\x00")
 	_, _ = io.WriteString(h, result.Ext)
 	_, _ = h.Write([]byte{0})
 	variants := append([]imageutil.Variant(nil), result.Variants...)

@@ -35,7 +35,7 @@ func TestSubscriptionSyncTransport(t *testing.T) {
 	deps := pilotDeps(nil, nil)
 	deps.DownloadSubscriptionSync = svc
 	h := newTestHandler(t, deps)
-	device := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Silo-Device-Id", "device-one")
+	device := with(with(bearer(memberToken), "X-Profile-Id", "p-owner"), "X-Vio-Device-Id", "device-one")
 	body, _ := json.Marshal(map[string]string{"subscription_id": "monitor", "etag": downloadSubscriptionOf(row).ETag})
 	path := Prefix + "/downloads/subscriptions/sync"
 	rec := do(t, h, "POST", path+"?limit=1", string(body), device)

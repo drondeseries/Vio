@@ -631,7 +631,7 @@ export function WatchPage({
               {session.errorTitle ?? "Playback unavailable"}
             </p>
             <p className="text-sm text-white/60">
-              {session.error ?? "Silo could not start playback."}
+              {session.error ?? "Vio could not start playback."}
             </p>
           </div>
           <div className="flex flex-col items-center gap-2">
@@ -718,7 +718,7 @@ export function WatchPage({
     ? buildEffectiveVersionLabel(effectiveVersionRow)
     : null;
   const substitutionCopy = effectiveVersionLabel
-    ? `The selected version wasn't available, so Silo is playing ${effectiveVersionLabel} instead.`
+    ? `The selected version wasn't available, so Vio is playing ${effectiveVersionLabel} instead.`
     : "Playing a different version than selected — the requested version isn't playable on this device.";
   const versionSwapNotice =
     versionWasSubstituted && !explicitFileSelection && !versionSwapNoticeDismissed ? (

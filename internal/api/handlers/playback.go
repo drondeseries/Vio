@@ -23,6 +23,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/config"
 	evt "github.com/Silo-Server/silo-server/internal/events"
+	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -186,14 +187,13 @@ func (f VirtualMediaDetailedResolverFunc) ResolveVirtualMediaDetailed(ctx contex
 type VirtualPlaybackSourceProber func(context.Context, string, *models.MediaFile) (*models.MediaFile, error)
 type VirtualPlaybackSourceProberWithHeaders func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error)
 
-// VirtualFileUpdateFunc persists a media file path update after a stale
-// virtual result= candidate is replaced by a working substitute during
-// fallback resolution.
-type VirtualFileUpdateFunc func(ctx context.Context, fileID int, newFilePath string) error
+// VirtualFileSaver atomically persists probed virtual inventory and optionally
+// adopts a new file_path in a single CAS-fenced UPDATE. Returns the number of
+// rows updated (0 means the snapshot was stale — a newer write landed first).
+type VirtualFileSaver func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error)
 
-// VirtualFileMetadataSaver persists probed track inventory, duration, and codec/container
-// facts so subsequent v3 plans can use complete evidence without re-probing.
-type VirtualFileMetadataSaver func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error
+// VirtualPlaybackSourceProber resolves a virtual provider URL and probes the
+// stream metadata.
 
 // SubtitleSearchTrigger fires a background subtitle search when a virtual
 // stream enters playback without embedded or external subtitle tracks.
@@ -345,8 +345,7 @@ type PlaybackHandler struct {
 	VirtualPlaybackSourceProber            VirtualPlaybackSourceProber
 	VirtualPlaybackSourceProberWithHeaders VirtualPlaybackSourceProberWithHeaders
 	BestResultCache                        *VirtualBestResultCache
-	VirtualFileUpdater                     VirtualFileUpdateFunc
-	VirtualFileMetadataSaver               VirtualFileMetadataSaver
+	VirtualFileSaver                       VirtualFileSaver
 	VirtualSubtitleSearcher                SubtitleSearchTrigger
 	SubtitleSearchInFlight                 *sync.Map
 	DeviceCapabilitySource                 *providerDeviceCapabilitySource
@@ -1573,10 +1572,10 @@ func playbackClientInfoFromRequest(r *http.Request) playback.ClientInfo {
 	// reach both despite the published bound. Values stay opaque — trimmed and
 	// length-clamped, never parsed or validated against an enum.
 	return playback.ClientInfo{
-		Name:      r.Header.Get("X-Silo-Client"),
-		Version:   r.Header.Get("X-Silo-Client-Version"),
-		Build:     r.Header.Get("X-Silo-Client-Build"),
-		Channel:   r.Header.Get("X-Silo-Client-Channel"),
+		Name:      httpheader.GetClientInfo(r.Header).Name,
+		Version:   httpheader.GetClientInfo(r.Header).Version,
+		Build:     httpheader.GetClientInfo(r.Header).Build,
+		Channel:   httpheader.GetClientInfo(r.Header).Channel,
 		UserAgent: r.UserAgent(),
 	}.Normalized()
 }
@@ -1800,7 +1799,7 @@ func alignedSeekSeconds(seekSeconds float64, segmentDuration int, targetVideoCod
 // Errors: 404 (playback_session_not_found / not_found) when the session is
 // missing or cannot be reconstructed, 503 (unavailable) while the transcode is
 // temporarily unavailable, and — for tone-map execution failures — 422
-// (unsupported) with an X-Silo-Tone-Map-Execution-Error header of
+// (unsupported) with an X-Vio-Tone-Map-Execution-Error header of
 // source_revision_changed or source_preflight_rejected. The 422 responses are
 // additive to the existing 404 and 503 cases; the Jellyfin-compatible 415
 // mapping is a separate surface and unchanged.
@@ -1920,7 +1919,7 @@ func writePlaybackToneMapExecutionError(w http.ResponseWriter, err error) bool {
 // missing or cannot be reconstructed, or the segment does not exist; 503
 // (unavailable) while the transcode is temporarily unavailable; and — for
 // tone-map execution failures — 422 (unsupported) with an
-// X-Silo-Tone-Map-Execution-Error header of source_revision_changed or
+// X-Vio-Tone-Map-Execution-Error header of source_revision_changed or
 // source_preflight_rejected. The 422 responses are additive to the existing
 // 404 and 503 cases; the Jellyfin-compatible 415 mapping is a separate surface
 // and unchanged.
@@ -2193,7 +2192,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 		transcodeproxy.PrepareRequest(req, r)
 	}
 	// Best-effort forward of the stream token as a header so the node's
-	// reconstruct path (X-Silo-Stream-Token) can rebuild after a self-restart.
+	// reconstruct path (X-Vio-Stream-Token) can rebuild after a self-restart.
 	// Verify at the API boundary and confirm it belongs to this session; an
 	// invalid or missing token never blocks the live proxy. validToken is kept so
 	// the same verified token can be re-injected into the node's manifest segment
@@ -2202,7 +2201,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 	if stToken != "" && h.JWTSecret != "" {
 		claims, verifyErr := streamtoken.Verify(stToken, h.JWTSecret)
 		if verifyErr == nil && claims.SessionID == sessionID {
-			req.Header.Set("X-Silo-Stream-Token", stToken)
+			req.Header.Set("X-Vio-Stream-Token", stToken)
 			validToken = stToken
 		} else if verifyErr != nil {
 			slog.WarnContext(r.Context(), "stream token not forwarded to transcode node", "component", "api", "error", verifyErr, "playback_session_id", sessionID)

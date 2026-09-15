@@ -2,11 +2,11 @@ package metadata
 
 import (
 	"math"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/Silo-Server/silo-server/internal/envutil"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -297,7 +297,7 @@ func (want preparedWantedTitle) score(candidate, c string) float64 {
 // the calibrated minTitleScore. Out-of-range values are ignored rather than
 // obeyed, since a typo'd 0 would accept everything and a typo'd 5 nothing.
 func matchThreshold() float64 {
-	raw := strings.TrimSpace(os.Getenv("SILO_METADATA_MATCH_MIN_SCORE"))
+	raw := strings.TrimSpace(envutil.GetenvFirst("VIO_METADATA_MATCH_MIN_SCORE", "SILO_METADATA_MATCH_MIN_SCORE"))
 	if raw == "" {
 		return minTitleScore
 	}

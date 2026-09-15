@@ -50,7 +50,7 @@ func TestDeviceSettingsWire(t *testing.T) {
 	deps.DeviceSettings = f
 	h := newTestHandler(t, deps)
 	headers := viewerHeaders()
-	headers["X-Silo-Device-Id"] = "d-1"
+	headers["X-Vio-Device-Id"] = "d-1"
 	rec := do(t, h, http.MethodGet, "/api/v2/devices?limit=1", "", headers)
 	if rec.Code != 200 {
 		t.Fatal(rec.Body.String())

@@ -1,4 +1,4 @@
-// Package middleware provides HTTP middleware for the Silo API,
+// Package middleware provides HTTP middleware for the Vio API,
 // including authentication and authorization.
 package middleware
 

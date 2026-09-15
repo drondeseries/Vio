@@ -329,7 +329,7 @@ type PlaybackHandler struct {
 	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
 	VirtualSourceProber            VirtualSourceProber
 	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
-	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	VirtualFileSaver               VirtualFileSaver
 	VirtualCandidateFileLookup     VirtualCandidateFileLookup
 	RemoteStreamRelay              RemoteStreamRelay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
@@ -1081,7 +1081,7 @@ func NewPlaybackHandler(
 	fileResolver FilePathResolver,
 	storeProvider userstore.UserStoreProvider,
 ) *PlaybackHandler {
-	transcodeDir := filepath.Join(os.TempDir(), "silo-transcode")
+	transcodeDir := filepath.Join(os.TempDir(), "vio-transcode")
 	ffmpegPath := ""
 	hwAccel := ""
 	segmentRetentionSeconds := 600

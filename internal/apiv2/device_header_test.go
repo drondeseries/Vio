@@ -28,7 +28,7 @@ func TestDeviceHeaderGuardRefusesRepeatedAndMalformedValues(t *testing.T) {
 		r.Header.Set("Authorization", "Bearer "+memberToken)
 		r.Header.Set("X-Profile-Id", "p-owner")
 		for _, line := range lines {
-			r.Header.Add("X-Silo-Device-Id", line)
+			r.Header.Add("X-Vio-Device-Id", line)
 		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)
@@ -84,8 +84,8 @@ func TestDeviceHeaderGuardCoversEveryOperation(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
 		r.Header.Set("Authorization", "Bearer "+memberToken)
 		r.Header.Set("X-Profile-Id", "p-owner")
-		r.Header.Add("X-Silo-Device-Id", "one")
-		r.Header.Add("X-Silo-Device-Id", "two")
+		r.Header.Add("X-Vio-Device-Id", "one")
+		r.Header.Add("X-Vio-Device-Id", "two")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)
 		requireProblem(t, rec, TypeValidationFailed)

@@ -1717,6 +1717,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if err != nil {
 		return playback.DecisionResponseV3{}, playbackFileOperationError(err)
 	}
+	timings.mark("file_load")
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve and
 	// probe them through the virtual provider before the generic probe repair
 	// path, which only understands local/HTTP media files.
@@ -1827,8 +1828,39 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		if err != nil {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load saved playback progress")
 		}
+		// Multipart audiobook files share one item progress row, while the
+		// planner starts a single file-local timeline. When the stored resume
+		// point is item-absolute, select the corresponding part and translate
+		// it to that part's local clock. Explicit client positions remain
+		// unchanged.
+		if req.StartPosition != nil && effectiveFile.PresentationPartTotal > 1 {
+			target, local, resolveErr := h.multipartResumeFileV3(r.Context(), effectiveFile, *req.StartPosition, requestAccessFilter(r))
+			if resolveErr != nil {
+				// An item-absolute position cannot be projected onto this
+				// file's part-local clock without the complete ordered part
+				// list. Applying it to the requested part would seek that part
+				// far past its end, so start from the beginning instead.
+				slog.DebugContext(r.Context(), "protocol v3 multipart resume mapping unavailable", "component", "api", "file_id", effectiveFile.ID, "error", resolveErr)
+				req.StartPosition = nil
+			} else if target != nil {
+				effectiveFile = h.ensurePlaybackProbe(r.Context(), target)
+				audioIndex = remapAudioIndexV3(requestedFile, effectiveFile, audioIndex)
+				if err := preflightPlaybackFile(r.Context(), effectiveFile, h.MissingMarker, h.EventsHub); err != nil {
+					return playback.DecisionResponseV3{}, playbackPreflightOperationError(err)
+				}
+				req.StartPosition = &local
+			} else {
+				req.StartPosition = nil
+			}
+		}
 	}
 	timings.mark("resume")
+	// If resume selected a specific presentation part, alternate playback must
+	// stay on that same part. Sibling parts are not interchangeable versions.
+	alternateBase := requestedFile
+	if effectiveFile.PresentationPartTotal > 1 && effectiveFile.PresentationPartIndex > 0 {
+		alternateBase = effectiveFile
+	}
 	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
 		Request: req, RequestedFile: requestedFile, EffectiveFile: effectiveFile,
 		AudioTrackIndex: audioIndex, Settings: settings,
@@ -1837,7 +1869,12 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	})
 	timings.mark("planning")
 	if terminalAllowsAlternateFileV3(result.Terminal) && shouldTryAlternateFileV3(req.QualityPreference) && req.FileSelection != playback.FileSelectionExplicitV3 {
-		if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile); alternateErr == nil {
+		if alternates, alternateErr := h.findAlternateFiles(r.Context(), alternateBase); alternateErr == nil {
+			if alternateBase != requestedFile {
+				alternates = slices.DeleteFunc(alternates, func(candidate *models.MediaFile) bool {
+					return candidate == nil || candidate.PresentationPartIndex != alternateBase.PresentationPartIndex
+				})
+			}
 			baseReq := req
 			baseAudioIndex := audioIndex
 			var firstFailureResult playback.PlannerResultV3
@@ -1865,7 +1902,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 					continue
 				}
 				candidateReq := baseReq
-				candidateAudioIndex := remapAudioIndexV3(requestedFile, candidateFile, baseAudioIndex)
+				candidateAudioIndex := remapAudioIndexV3(alternateBase, candidateFile, baseAudioIndex)
 				var candidateResult playback.PlannerResultV3
 				var candidateToneMapErr error
 				if err := h.remapSubtitleSelectionV3(r.Context(), requestedFile, candidateFile, &candidateReq); err != nil {
@@ -3655,6 +3692,81 @@ func sessionOwnsResumeTimelineV3(file *models.MediaFile) bool {
 	return file == nil || file.PresentationPartTotal <= 1
 }
 
+// multipartResumeFileV3 maps an item-absolute resume position to the part
+// whose local timeline should be planned. It only returns a mapping when all
+// ordered parts have positive durations; guessing across incomplete metadata
+// would seek to the wrong file, so callers retain the existing safe fallback.
+func (h *PlaybackHandler) multipartResumeFileV3(ctx context.Context, file *models.MediaFile, absolute float64, access catalog.AccessFilter) (*models.MediaFile, float64, error) {
+	if h == nil || h.FileVersionFetcher == nil || file == nil || file.PresentationPartTotal <= 1 || absolute <= 0 {
+		return nil, 0, nil
+	}
+	parts, err := h.FileVersionFetcher.GetByContentID(ctx, file.ContentID)
+	if err != nil {
+		return nil, 0, err
+	}
+	// The requested file has already passed requestAccessFilter. Keep the
+	// resume timeline inside that same media folder; a content ID may be shared
+	// by copies in several libraries, and an unscoped part lookup could move
+	// playback onto a folder the viewer cannot access.
+	parts = slices.DeleteFunc(parts, func(part *models.MediaFile) bool {
+		return part == nil || part.MediaFolderID != file.MediaFolderID || !catalog.FileAllowedByAccess(part, access)
+	})
+	if len(parts) != file.PresentationPartTotal {
+		return nil, 0, fmt.Errorf("multipart sequence incomplete")
+	}
+	for _, part := range parts {
+		if part.PresentationGroupKey != file.PresentationGroupKey || part.PresentationPartTotal != file.PresentationPartTotal || part.PresentationPartIndex < 1 || part.PresentationPartIndex > file.PresentationPartTotal {
+			return nil, 0, fmt.Errorf("multipart sequence inconsistent")
+		}
+	}
+	parts = slices.Clone(parts)
+	slices.SortStableFunc(parts, func(a, b *models.MediaFile) int {
+		if a == nil && b == nil {
+			return 0
+		}
+		if a == nil {
+			return 1
+		}
+		if b == nil {
+			return -1
+		}
+		if a.PresentationPartIndex != b.PresentationPartIndex {
+			return a.PresentationPartIndex - b.PresentationPartIndex
+		}
+		if a.ID < b.ID {
+			return -1
+		}
+		if a.ID > b.ID {
+			return 1
+		}
+		return 0
+	})
+	for i, part := range parts {
+		if part.PresentationPartIndex != i+1 {
+			return nil, 0, fmt.Errorf("multipart sequence has missing part")
+		}
+	}
+	var offset float64
+	for _, part := range parts {
+		if part == nil || part.Duration <= 0 {
+			return nil, 0, fmt.Errorf("part duration unavailable")
+		}
+		end := offset + float64(part.Duration)
+		if absolute < end || part == parts[len(parts)-1] {
+			local := absolute - offset
+			if local < 0 {
+				local = 0
+			}
+			if local > float64(part.Duration) {
+				local = float64(part.Duration)
+			}
+			return part, local, nil
+		}
+		offset = end
+	}
+	return nil, 0, nil
+}
+
 // preferredAudioTrackIndexV3 answers what an omitted audio track means: the
 // language this profile has settled on for this series, this library, this
 // device, or generally — the same resolution the catalog performs when it
@@ -3724,11 +3836,11 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 // chosen for zero and then seeked to 40 minutes is a different route.
 //
 // A client that wants to start over sends an explicit `start_position: 0`; only
-// omission asks the server for its resume policy. Parts of a multipart item are
-// skipped for the same reason their progress is not persisted: they share one
-// resume point with the whole item, so a part-local seek to it is meaningless.
+// omission asks the server for its resume policy. Multipart progress is stored
+// as one item-level position and is translated to a part-local seek only when
+// the complete ordered part timeline is available.
 func (h *PlaybackHandler) resumePositionV3(ctx context.Context, userID int, profileID string, file *models.MediaFile) (*float64, error) {
-	if h.StoreProvider == nil || !sessionOwnsResumeTimelineV3(file) {
+	if h.StoreProvider == nil {
 		return nil, nil
 	}
 	targetID := playbackProgressTarget(file)

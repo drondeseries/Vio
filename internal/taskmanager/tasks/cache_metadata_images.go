@@ -294,7 +294,7 @@ func (t *CacheMetadataImagesTask) runLadderBackfill(
 ) {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
-		hostname = "silo"
+		hostname = "vio"
 	}
 	workerID := fmt.Sprintf("%s:ladder:%s", hostname, uuid.NewString())
 	progress.Report(0, "Regenerating cached artwork for the current image size ladder")
@@ -348,7 +348,7 @@ type metadataImageRunFunc func(context.Context, string, int, int, time.Duration,
 func executeMetadataImages(ctx context.Context, progress taskmanager.ProgressReporter, backfill bool, run metadataImageRunFunc) error {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
-		hostname = "silo"
+		hostname = "vio"
 	}
 	mode := "drain"
 	maxRuntime := cacheMetadataImagesMaxRuntime

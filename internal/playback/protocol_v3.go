@@ -519,7 +519,7 @@ type ClientPlaybackContextV3 struct {
 	FormFactor      string `json:"form_factor"`
 	AppVersion      string `json:"app_version"`
 	// AppBuild and AppChannel are the request-body fallback for the
-	// X-Silo-Client-Build / X-Silo-Client-Channel headers. Both are opaque
+	// X-Vio-Client-Build / X-Vio-Client-Channel headers. Both are opaque
 	// strings the server stores verbatim.
 	AppBuild   string                          `json:"app_build,omitempty"`
 	AppChannel string                          `json:"app_channel,omitempty"`
@@ -1341,7 +1341,7 @@ func normalizeCapabilitiesV3(c *ClientCodecCapabilitiesV3, ctx *ClientPlaybackCo
 	normalizeVideoCapabilitiesV3(c)
 	// Version, build, and channel are diagnostic labels, so an over-long value is
 	// worth clamping and never worth refusing playback over. The header route
-	// (X-Silo-Client-Version / -Build / -Channel) clamps with the same helper; rejecting
+	// (X-Vio-Client-Version / -Build / -Channel) clamps with the same helper; rejecting
 	// here would mean the same string plays from a header and 400s from the
 	// body.
 	ctx.AppVersion = normalizeClientMetadataValue(ctx.AppVersion, 64)

@@ -8,7 +8,7 @@ import type { ThemeId } from "@/lib/themes";
 
 import { SiloBrand, type SiloBrandVariant } from "./SiloBrand";
 
-// The theme context is optional for SiloBrand, so the mock models the two
+// The theme context is optional for VioBrand defaults, so the mock models the two
 // shapes that matter: a provider is present, or the component renders outside
 // one (login chrome, other component tests).
 let mockActiveTheme: ThemeId | null = null;
@@ -18,7 +18,7 @@ vi.mock("@/hooks/useTheme", () => ({
 }));
 
 const BRANDING_DEFAULTS: BrandingContextValue = {
-  serverName: "Silo",
+  serverName: "Vio",
   loginSubtitle: "Sign in with an existing account.",
   accentColor: null,
   defaultTheme: null,

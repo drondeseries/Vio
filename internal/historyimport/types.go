@@ -30,7 +30,7 @@ const (
 	maxStoredWarnings      = 20
 	maxUnmatchedSamples    = 10
 	maxUnmatchedLogSamples = 40
-	connectApplicationName = "Silo/1.0.0"
+	connectApplicationName = "Vio/1.0.0"
 )
 
 // Source is an admin-configured external media server used as an import source.
@@ -282,17 +282,17 @@ type ExternalUser struct {
 	Restricted bool   `json:"restricted,omitempty"`
 }
 
-// UserMapping persists the link from one external server user to a Silo user + profile.
+// UserMapping persists the link from one external server user to a Vio user + profile.
 type UserMapping struct {
 	Revision         int64      `json:"-"`
 	ID               int        `json:"id"`
 	SourceID         int        `json:"source_id"`
 	ExternalUserID   string     `json:"external_user_id"`
 	ExternalUserName string     `json:"external_user_name"`
-	SiloUserID       int        `json:"silo_user_id"`
-	SiloProfileID    string     `json:"silo_profile_id"`
-	SiloUsername     string     `json:"silo_username,omitempty"`
-	SiloProfileName  string     `json:"silo_profile_name,omitempty"`
+	SiloUserID       int        `json:"vio_user_id"`
+	SiloProfileID    string     `json:"vio_profile_id"`
+	SiloUsername     string     `json:"vio_username,omitempty"`
+	SiloProfileName  string     `json:"vio_profile_name,omitempty"`
 	LastImportedAt   *time.Time `json:"last_imported_at,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
@@ -302,13 +302,13 @@ type CreateMappingInput struct {
 	SourceID         int    `json:"source_id"`
 	ExternalUserID   string `json:"external_user_id"`
 	ExternalUserName string `json:"external_user_name"`
-	SiloUserID       int    `json:"silo_user_id"`
-	SiloProfileID    string `json:"silo_profile_id"`
+	SiloUserID       int    `json:"vio_user_id"`
+	SiloProfileID    string `json:"vio_profile_id"`
 }
 
 type UpdateMappingInput struct {
-	SiloUserID    *int    `json:"silo_user_id,omitempty"`
-	SiloProfileID *string `json:"silo_profile_id,omitempty"`
+	SiloUserID    *int    `json:"vio_user_id,omitempty"`
+	SiloProfileID *string `json:"vio_profile_id,omitempty"`
 }
 
 type SetAdminTokenInput struct {

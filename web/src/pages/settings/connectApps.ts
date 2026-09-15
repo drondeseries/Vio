@@ -1,6 +1,6 @@
 import type { Profile } from "@/api/types";
 
-export const SILO_APP_EXAMPLES = "Silo for iPhone, Apple TV, Android, Android TV, and this website";
+export const VIO_APP_EXAMPLES = "Vio for iPhone, Apple TV, Android, Android TV, and this website";
 
 export const JELLYFIN_APP_EXAMPLES = "Infuse, Swiftfin, JellyCon, Findroid, Jellyfin Media Player";
 

@@ -43,7 +43,7 @@ func compatRoute(method, pattern string, class streamtelemetry.Class, capRelevan
 
 // compatCapture records the §2.2 request-time set for a Jellyfin client.
 //
-// Identity comes from the MediaBrowser authorization header, not X-Silo-Client*:
+// Identity comes from the MediaBrowser authorization header, not X-Vio-Client*:
 // Jellyfin clients never send silo's own headers, and firstMediaBrowserAuthorizationValue
 // is the parser the negotiation path already uses for DeviceId
 // (handlers_playback.go:764), so telemetry reads the same value the play session

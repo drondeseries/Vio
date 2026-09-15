@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -238,6 +239,13 @@ func fromHumaError(requestID string, status int, msg string, errs []error, bodyL
 			Code:     validationCode(detail.Message),
 			Detail:   validationDetail(detail.Message),
 		})
+	}
+	if status == http.StatusUnprocessableEntity && len(p.Errors) > 0 {
+		var codes []string
+		for _, e := range p.Errors {
+			codes = append(codes, e.Code)
+		}
+		slog.Warn("validation_failed", "request_id", requestID, "error_count", len(p.Errors), "codes", codes)
 	}
 	return p
 }

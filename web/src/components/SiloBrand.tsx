@@ -4,11 +4,11 @@ import { useOptionalTheme } from "@/hooks/useTheme";
 import { THEMES } from "@/lib/themes";
 
 /** White-text wordmark, for dark surfaces. */
-const SILO_WORDMARK_SRC = "/silo-wordmark-sidebar.png";
+const VIO_WORDMARK_SRC = "/silo-wordmark-sidebar.png";
 /** Dark-text wordmark, for light surfaces. */
-const SILO_WORDMARK_LIGHT_SRC = "/silo-wordmark-sidebar-light.png";
+const VIO_WORDMARK_LIGHT_SRC = "/silo-wordmark-sidebar-light.png";
 /** The square mark reads on both appearances, so it has no variant. */
-const SILO_MARK_SRC = "/silo-icon-1024.png";
+const VIO_MARK_SRC = "/silo-icon-1024.png";
 
 export type SiloBrandVariant = "wordmark" | "mark";
 
@@ -31,10 +31,10 @@ export function SiloBrand({ className, imageClassName, variant = "wordmark" }: S
   // admin who uploaded only one presumably wants it everywhere), then the
   // bundled default for the appearance.
   const src = isMark
-    ? ((isLight ? (markLightUrl ?? markUrl) : markUrl) ?? SILO_MARK_SRC)
+    ? ((isLight ? (markLightUrl ?? markUrl) : markUrl) ?? VIO_MARK_SRC)
     : isLight
-      ? (wordmarkLightUrl ?? wordmarkUrl ?? SILO_WORDMARK_LIGHT_SRC)
-      : (wordmarkUrl ?? SILO_WORDMARK_SRC);
+      ? (wordmarkLightUrl ?? wordmarkUrl ?? VIO_WORDMARK_LIGHT_SRC)
+      : (wordmarkUrl ?? VIO_WORDMARK_SRC);
 
   return (
     <span className={cn("block shrink-0", !isMark && "overflow-hidden", className)}>

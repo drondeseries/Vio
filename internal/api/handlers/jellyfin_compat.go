@@ -131,7 +131,7 @@ func jellyfinCompatSettingUpdates(req AdminJellyfinCompatSettingsPatch, settings
 		}
 		managedPath := jellycompat.ManagedWebInstallPath(root)
 		if raw := strings.TrimSpace(*req.WebDir); raw != "" && filepath.Clean(raw) != filepath.Clean(managedPath) {
-			return nil, apiError(400, "bad_request", "Jellyfin Web active directory is managed by Silo and cannot point at an arbitrary path")
+			return nil, apiError(400, "bad_request", "Jellyfin Web active directory is managed by Vio and cannot point at an arbitrary path")
 		}
 		updates["jellyfin_compat.web_dir"] = managedPath
 	}

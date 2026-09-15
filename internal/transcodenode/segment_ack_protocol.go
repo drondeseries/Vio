@@ -24,7 +24,7 @@ func ProtocolSegmentAcknowledgement() workerprotocol.Operation {
 	parameters := []*huma.Param{
 		{Name: sessionParameter, In: pathParameter, Required: true, Schema: &huma.Schema{Type: huma.TypeString}, Description: "Existing transport session."},
 		{Name: segmentName, In: pathParameter, Required: true, Schema: &huma.Schema{Type: huma.TypeString}, Description: "Media segment filename parsed by playback.ParseSegmentNumber."},
-		{Name: transcodeproxy.GenerationHeader, In: headerParameter, Required: true, Schema: &huma.Schema{Type: huma.TypeString}, Description: "Opaque incarnation/timeline from the completed response; private to Silo hops."},
+		{Name: transcodeproxy.GenerationHeader, In: headerParameter, Required: true, Schema: &huma.Schema{Type: huma.TypeString}, Description: "Opaque incarnation/timeline from the completed response; private to Vio hops."},
 	}
 	responses := map[string]*huma.Response{"204": {Description: "Acknowledged or ignored stale timeline; no body."}}
 	for _, status := range []int{400, 401, 404, 503} {

@@ -6,11 +6,11 @@
 //   - offline: no database pool that can connect, so only the routes that
 //     register without one exist. Public discovery, health, and readiness
 //     failure cases run here in plain CI.
-//   - live: a real Postgres named by SILO_SCENARIO_DATABASE_URL, migrated and
+//   - live: a real Postgres named by VIO_SCENARIO_DATABASE_URL (legacy SILO_SCENARIO_DATABASE_URL honored), migrated and
 //     seeded with a deterministic synthetic household. Everything else runs
 //     here and is skipped when the variable is unset.
 //
-// SILO_SCENARIO_DATABASE_URL is deliberately not SILO_TEST_DATABASE_URL: the
+// VIO_SCENARIO_DATABASE_URL is deliberately not VIO_TEST_DATABASE_URL: the
 // executor TRUNCATEs users, access groups, invite codes, and invitations on
 // every reseed (restoring only the migration-seeded default group), which
 // would break the other DB-gated packages sharing the test database (and two
@@ -34,7 +34,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http/httptest"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -52,6 +51,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/contractledger"
 	"github.com/Silo-Server/silo-server/internal/database"
+	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/policy"
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
@@ -65,7 +65,10 @@ import (
 // DatabaseEnv names the environment variable that points the executor at
 // its own scratch database. See the package documentation for why it is not
 // SILO_TEST_DATABASE_URL.
-const DatabaseEnv = "SILO_SCENARIO_DATABASE_URL"
+const DatabaseEnv = "VIO_SCENARIO_DATABASE_URL"
+
+// DatabaseEnvLegacy is the pre-rebrand scenario database env name.
+const DatabaseEnvLegacy = "SILO_SCENARIO_DATABASE_URL"
 
 // fixtureProviderID names the executor's second login provider.
 const fixtureProviderID = "fixture-directory"
@@ -92,7 +95,7 @@ const (
 const (
 	jwtSecret     = "scenario-catalog-fixture-jwt-secret-0000000000000000"
 	masterKey     = "scenario-catalog-fixture-master-key-000000000000000"
-	serverName    = "Silo Fixture"
+	serverName    = "Vio Fixture"
 	serverID      = "00000000-0000-4000-8000-0000000000f1"
 	publicURL     = "https://silo.example.test"
 	adminUsername = "fixture-admin"
@@ -210,7 +213,7 @@ func (e *Env) OfflineHas(method, pattern string) bool {
 }
 
 // New builds the environment. Database wiring happens only when
-// SILO_SCENARIO_DATABASE_URL is set; the offline router always exists.
+// VIO_SCENARIO_DATABASE_URL (or legacy SILO_SCENARIO_DATABASE_URL) is set; the offline router always exists.
 func New(t testing.TB) *Env {
 	t.Helper()
 	ctx := context.Background()
@@ -256,7 +259,7 @@ func New(t testing.TB) *Env {
 			apiv2.OfflineRoutesPath, e.offlineRoutes.Wiring, got)
 	}
 
-	dsn := os.Getenv(DatabaseEnv)
+	dsn := envutil.GetenvFirst(DatabaseEnv, DatabaseEnvLegacy)
 	if dsn == "" {
 		return e
 	}

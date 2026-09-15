@@ -10,7 +10,7 @@ services:
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - ${SILO_DATA_ROOT:-/opt/silo}/postgres:/var/lib/postgresql
+      - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/postgres:/var/lib/postgresql
     command: ["postgres", "-c", "listen_addresses=*"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-silo}"]
@@ -24,7 +24,7 @@ services:
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
-      - ${SILO_DATA_ROOT:-/opt/silo}/redis:/data
+      - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -49,10 +49,10 @@ services:
     ports:
       - "${MEILISEARCH_HOST:-127.0.0.1}:${MEILISEARCH_PORT:-7700}:7700"
     volumes:
-      - ${SILO_DATA_ROOT:-/opt/silo}/meilisearch:/meili_data
+      - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/meilisearch:/meili_data
 
-  silo:
-    image: ${SILO_IMAGE:-ghcr.io/silo-server/silo-server:latest}
+  vio:
+    image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/drondeseries/vio-server:latest}}
     restart: unless-stopped
     environment:
       MODE: integrated
@@ -67,7 +67,8 @@ services:
       SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env — generate one with openssl rand -base64 48}
       DATABASE_URL: postgres://${POSTGRES_USER:-silo}:${POSTGRES_PASSWORD:-silo}@postgres:5432/${POSTGRES_DB:-silo}?sslmode=disable
       REDIS_URL: redis://redis:6379
-      SILO_PLUGIN_CACHE_DIR: /var/lib/silo/plugins
+      VIO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
+      SILO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
       POSTGRES_TUNE: ${POSTGRES_TUNE:-auto}
     ports:
       - "${PORT:-8090}:8080"
@@ -75,10 +76,10 @@ services:
       - "${ABS_PORT:-13378}:13378"
     volumes:
       - ${MEDIA_ROOT:?Set MEDIA_ROOT in .env to the host media path}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
-      - ${SILO_DATA_ROOT:-/opt/silo}/plugins:/var/lib/silo/plugins
-      - ${SILO_DATA_ROOT:-/opt/silo}/compat:/var/lib/silo/compat
-      - ${SILO_DATA_ROOT:-/opt/silo}/transcode:/tmp/silo-transcode
-      - ${SILO_DATA_ROOT:-/opt/silo}/catalog-seeds:/catalog-seeds:ro
+      - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/plugins:/var/lib/vio/plugins
+      - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/compat:/var/lib/vio/compat
+      - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/transcode:/tmp/vio-transcode
+      - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/catalog-seeds:/catalog-seeds:ro
       # Only load-bearing when the Docker host is itself an LXC container, where
       # these three files describe the physical machine and the LXC's own cap
       # sits on a cgroup this container cannot see. lxcfs virtualizes them to the
@@ -100,8 +101,8 @@ services:
         required: false
   # Optional distributed-mode example. Most single-host installs should
   # just use the integrated service above.
-  # silo-proxy:
-  #   image: ${SILO_IMAGE:-ghcr.io/silo-server/silo-server:latest}
+  # vio-proxy:
+  #   image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/drondeseries/vio-server:latest}}
   #   restart: unless-stopped
   #   profiles: [proxy]
   #   environment:
@@ -132,8 +133,8 @@ services:
 
   # Optional distributed-mode example. Most single-host installs should
   # just use the integrated service above.
-  # silo-transcode:
-  #   image: ${SILO_IMAGE:-ghcr.io/silo-server/silo-server:latest}
+  # vio-transcode:
+  #   image: ${VIO_IMAGE:-${SILO_IMAGE:-ghcr.io/drondeseries/vio-server:latest}}
   #   restart: unless-stopped
   #   profiles: [transcode]
   #   environment:
@@ -142,14 +143,15 @@ services:
   #     SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env — generate one with openssl rand -base64 48}
   #     DATABASE_URL: postgres://${POSTGRES_USER:-silo}:${POSTGRES_PASSWORD:-silo}@postgres:5432/${POSTGRES_DB:-silo}?sslmode=disable
   #     REDIS_URL: redis://redis:6379
-  #     SILO_PLUGIN_CACHE_DIR: /var/lib/silo/plugins
+  #     VIO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
+  #     SILO_PLUGIN_CACHE_DIR: /var/lib/vio/plugins
   #     PORT: "8080"
   #   ports:
   #     - "${TRANSCODE_PORT:-8082}:8080"
   #   volumes:
   #     - ${MEDIA_ROOT:?Set MEDIA_ROOT in .env to the host media path}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
-  #     - ${SILO_DATA_ROOT:-/opt/silo}/plugins:/var/lib/silo/plugins
-  #     - ${SILO_DATA_ROOT:-/opt/silo}/transcode:/tmp/silo-transcode
+  #     - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/plugins:/var/lib/vio/plugins
+  #     - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/transcode:/tmp/vio-transcode
   #     # See the note on the integrated service above: a node reports its own
   #     # CPU, load, and memory rather than the physical machine's only with
   #     # these mounted, and the Nodes page reads exactly what the node reports.

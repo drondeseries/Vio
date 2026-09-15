@@ -330,7 +330,7 @@ const maxSyntheticManifestSegments = 50_000
 // simpler legacy form; below this byte threshold the saving is immaterial.
 const minManifestQuerySubstitutionSavings = 64 * 1024
 
-const manifestQueryVariable = "silo_query"
+const manifestQueryVariable = "vio_query"
 
 // remountStartOffsetSeconds is a positive, effectively-zero HLS start offset.
 // Media3 suppresses live-edge position projection for EVENT playlists only

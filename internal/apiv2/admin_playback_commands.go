@@ -90,7 +90,7 @@ const (
 	// LatestSequenceHeader carries the session's latest applied sequence on
 	// a stale 409, so a client whose allocation runs behind another
 	// administrator's (or its own earlier clock) can allocate above it.
-	LatestSequenceHeader = "X-Silo-Latest-Sequence"
+	LatestSequenceHeader = "X-Vio-Latest-Sequence"
 )
 
 // latestSequenceResponseHeaders documents LatestSequenceHeader on the 409

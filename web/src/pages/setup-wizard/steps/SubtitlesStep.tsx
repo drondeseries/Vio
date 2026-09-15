@@ -363,7 +363,7 @@ export function SubtitlesStep() {
   return (
     <StepFrame
       title="Subtitle sources"
-      lede="When a file has no subtitles in the language someone wants, Silo can fetch them. Each source needs its own free account or API key."
+      lede="When a file has no subtitles in the language someone wants, Vio can fetch them. Each source needs its own free account or API key."
       onSubmit={handleSubmit}
       busy={submitting}
       onSkip={() => markDone("subtitles")}

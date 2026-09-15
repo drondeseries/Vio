@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     go build \
     -ldflags "-X github.com/Silo-Server/silo-server/internal/buildinfo.revisionOverride=${BUILD_REVISION} -X github.com/Silo-Server/silo-server/internal/buildinfo.dirtyOverride=${BUILD_DIRTY} -X github.com/Silo-Server/silo-server/internal/buildinfo.buildNumberOverride=${BUILD_NUMBER} -X github.com/Silo-Server/silo-server/internal/buildinfo.builtAtOverride=${BUILD_DATE}" \
-    -o /silo ./cmd/silo/
+    -o /vio ./cmd/silo/
 
 # Stage 3: Runtime
 FROM debian:trixie-slim
@@ -82,13 +82,13 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
       cd / && \
       rm -rf "${runtime_dir}" /var/lib/apt/lists/*; \
     fi
-RUN mkdir -p /tmp/silo-transcode /var/lib/silo/compat/jellyfin-web
+RUN mkdir -p /tmp/vio-transcode /var/lib/vio/compat/jellyfin-web
 COPY --from=frontend /usr/local/bin/node /usr/local/bin/node
 COPY --from=frontend /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
-COPY --from=build /silo /usr/local/bin/silo
+COPY --from=build /vio /usr/local/bin/vio
 EXPOSE 8080 8096 13378
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:${PORT:-8080}/api/v1/health || exit 1
-ENTRYPOINT ["silo"]
+ENTRYPOINT ["vio"]

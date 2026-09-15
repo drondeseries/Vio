@@ -109,8 +109,8 @@ export function PolicyVendorViewer() {
   return (
     <div className="space-y-5">
       <p className="text-muted-foreground max-w-prose text-sm">
-        These rules ship with each Silo release and always apply — upgrading Silo updates them
-        without touching your overrides. Summaries below; the Rego source under each card is the
+        These rules ship with each Vio release and always apply — upgrading Vio updates them without
+        touching your overrides. Summaries below; the Rego source under each card is the
         authoritative version.
       </p>
 

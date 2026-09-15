@@ -588,17 +588,16 @@ func TestFallbackResolveStaleVirtualSourcePersistsSubstituteMetadata(t *testing.
 			transient.SubtitleTracks = []models.SubtitleTrack{{Language: "eng", Codec: "subrip"}}
 			return transient, nil
 		},
-		VirtualFileUpdater: func(ctx context.Context, fileID int, newFilePath string) error {
-			updatedPath = newFilePath
-			return nil
-		},
-		VirtualFileMetadataSaver: func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error {
-			savedFileID = fileID
-			savedPath = expectedFilePath
-			savedAudio = append([]byte(nil), audioTracks...)
-			savedSubs = append([]byte(nil), subtitleTracks...)
+		VirtualFileSaver: func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+			if args.AdoptPath != "" {
+				updatedPath = args.AdoptPath
+			}
+			savedFileID = args.FileID
+			savedPath = args.ExpectedFilePath
+			savedAudio = append([]byte(nil), args.AudioTracks...)
+			savedSubs = append([]byte(nil), args.SubtitleTracks...)
 			saved <- struct{}{}
-			return nil
+			return 1, nil
 		},
 	}
 
