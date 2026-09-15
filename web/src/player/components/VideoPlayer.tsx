@@ -701,23 +701,23 @@ export function VideoPlayer({
   // Any stream restart (transcode restart on seek, quality/audio switch,
   // turning off bitmap burn-in) reloads the <video> element, which can orphan
   // a programmatic TextTrack — cuechange stops firing and the last cue
-  // freezes on screen. Bump a generation on every settled stream change so
-  // useSubtitleTracks rebuilds its track against the new element; the rebuild
-  // carries loaded cues and window coverage over, so it costs no refetch.
-  // Keyed on the transport revision, not the plan revision: a text-sidecar
-  // replan reuses the element and must not rebuild the track.
+  // freezes on screen. Bump a generation every time the element settles on a
+  // source so useSubtitleTracks rebuilds its track against the new element;
+  // the rebuild carries loaded cues and window coverage over, so it costs no
+  // refetch. Keyed on `loadedmetadata` rather than the transport revision: a
+  // text-sidecar replan reuses the element, fires no new metadata event, and
+  // must not rebuild, while a stream restart (including initial startup, when
+  // HLS clears native cue lists on attach) always reloads the element first.
   const [subtitleStreamGeneration, setSubtitleStreamGeneration] = useState(0);
-  const lastSubtitleTransportRevisionRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!isPlayerReady) return;
-    const changed =
-      lastSubtitleTransportRevisionRef.current !== null &&
-      lastSubtitleTransportRevisionRef.current !== effectiveTransportRevision;
-    lastSubtitleTransportRevisionRef.current = effectiveTransportRevision;
-    if (changed) {
-      setSubtitleStreamGeneration((generation) => generation + 1);
-    }
-  }, [effectiveTransportRevision, isPlayerReady]);
+    const video = videoRef.current;
+    if (!video || !isPlayerReady) return;
+    // The URL is available before HLS attaches and clears native cue lists.
+    // Rebuild only once the actual source has loaded, including first startup.
+    const handleLoadedMetadata = () => setSubtitleStreamGeneration((generation) => generation + 1);
+    video.addEventListener("loadedmetadata", handleLoadedMetadata);
+    return () => video.removeEventListener("loadedmetadata", handleLoadedMetadata);
+  }, [isPlayerReady, planRevision]);
 
   // The effective subtitle source identity. A virtual release that rotates to a
   // new concrete candidate changes this; a plan that only re-mints subtitle
