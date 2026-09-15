@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // ErrMDBListURL is returned when a caller-supplied list URL is not an
@@ -78,14 +79,91 @@ func ValidateMDBListURL(raw string) error {
 	return nil
 }
 
+// ParseMDBListListURL extracts the user and list slug from a canonical MDBList
+// list URL of the exact shape
+// http(s)://mdblist.com|www.mdblist.com/lists/{user}/{list}[/json].
+// It rejects anything else — numeric-only list ids, extra path segments,
+// missing parts, query strings, or fragments — so callers never hand the
+// authenticated API path an ambiguous identifier.
+func ParseMDBListListURL(raw string) (user, list string, ok bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", "", false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", "", false
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", "", false
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if _, allowed := allowedMDBListHosts[host]; !allowed {
+		return "", "", false
+	}
+	if port := parsed.Port(); port != "" && port != "80" && port != "443" {
+		return "", "", false
+	}
+	// Split the escaped path so an encoded %2F inside a slug is not treated as
+	// a separator, then unescape each segment so callers receive raw slugs and
+	// escape exactly once. Using EscapedPath directly would return encoded
+	// segments that callers re-escape into double-encoding.
+	path := strings.TrimSuffix(parsed.EscapedPath(), "/")
+	path = strings.TrimSuffix(path, "/json")
+	path = strings.TrimSuffix(path, "/")
+	rawParts := strings.Split(path, "/")
+	// ["", "lists", user, list]
+	if len(rawParts) != 4 || rawParts[0] != "" || rawParts[1] != "lists" {
+		return "", "", false
+	}
+	user, err = url.PathUnescape(rawParts[2])
+	if err != nil {
+		return "", "", false
+	}
+	list, err = url.PathUnescape(rawParts[3])
+	if err != nil {
+		return "", "", false
+	}
+	if user == "" || list == "" {
+		return "", "", false
+	}
+	if strings.ContainsAny(user, " \t") || strings.ContainsAny(list, " \t") {
+		return "", "", false
+	}
+	// A numeric-only list segment is an internal list id, not a slug; reject
+	// it so the authenticated path never guesses at an ambiguous identifier.
+	if isAllDigits(list) {
+		return "", "", false
+	}
+	return user, list, true
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // MDBListHTTPClient returns a clone of base whose redirects are re-checked
 // against ValidateMDBListURL so an mdblist.com 3xx cannot bounce the fetch
 // onto loopback or RFC1918. A nil base uses http.DefaultClient.
+//
+// The clone gets a default 30s timeout when the base has none, so a stalled
+// MDBList socket cannot hang a collection sync forever. An explicit non-zero
+// base timeout is preserved. http.DefaultClient itself is never mutated.
 func MDBListHTTPClient(base *http.Client) *http.Client {
 	if base == nil {
 		base = http.DefaultClient
 	}
 	clone := *base
+	if clone.Timeout == 0 {
+		clone.Timeout = 30 * time.Second
+	}
 	parentRedirect := base.CheckRedirect
 	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if req == nil || req.URL == nil {

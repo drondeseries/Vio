@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/requestlock"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -128,7 +129,7 @@ func TestCollectionSchedulerRepairsAcceptedVirtualMember(t *testing.T) {
 	}
 	scheduler := NewCollectionSyncScheduler(collections, service, slog.New(slog.DiscardHandler))
 	for attempt := range 2 {
-		data, err := scheduler.RunOnce(ctx)
+		data, err := scheduler.RunOnce(ctx, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2907,6 +2908,162 @@ func TestVirtualCollection_MDBListPrefersInLibraryCandidate(t *testing.T) {
 	}
 	if variantsCalled {
 		t.Fatal("provider variants were resolved for a resident local match")
+	}
+}
+
+// TestVirtualCollection_MDBListFetchFailurePreservesMembership proves a fetch
+// error leaves existing collection membership untouched and records a failed
+// sync run (F9).
+func TestVirtualCollection_MDBListFetchFailurePreservesMembership(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(3005,'Fetch Fail','movies',true)`); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	const colID = "col-mdblist-fetchfail"
+	const existingID = "movie-existing-3005"
+	cfg, _ := json.Marshal(map[string]any{"mode": "mdblist_json", "url": "https://mdblist.com/lists/testuser/testlist", "virtual_playback": true})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+		VALUES($1,$1,'Fetch Fail Col','mdblist',3005,$2)`, colID, cfg); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO library_collection_libraries(collection_id,library_id) VALUES($1,3005)`, colID); err != nil {
+		t.Fatalf("seed collection library: %v", err)
+	}
+	itemRepo := NewItemRepository(pool)
+	if err := itemRepo.Upsert(ctx, &models.MediaItem{ContentID: existingID, Type: "movie", Title: "Existing", SortTitle: "Existing", TmdbID: "3005", Status: "matched"}); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO library_collection_items(collection_id,media_item_id,position) VALUES($1,$2,0)`, colID, existingID); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+
+	stub := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("mdblist source unavailable")
+	})}
+	service := NewLibraryCollectionService(NewLibraryCollectionRepository(pool), itemRepo, NewLibraryItemRepository(pool), stub)
+
+	if _, err := service.SyncCollection(ctx, colID); err == nil {
+		t.Fatal("expected a fetch error")
+	}
+	var members int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM library_collection_items WHERE collection_id=$1 AND media_item_id=$2`, colID, existingID).Scan(&members); err != nil {
+		t.Fatalf("inspect membership: %v", err)
+	}
+	if members != 1 {
+		t.Fatalf("membership = %d, want 1 (fetch error must not clear membership)", members)
+	}
+}
+
+// TestVirtualCollection_MDBListEmptyAPIFallsBackWithoutWipe proves the API
+// empty-response sentinel falls back to /json and preserves membership (F1/F2
+// + F9). The API fetcher returns the sentinel; the /json stub serves the
+// pre-existing member so membership is re-accepted rather than cleared.
+func TestVirtualCollection_MDBListEmptyAPIFallsBackWithoutWipe(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(3006,'Empty API','movies',true)`); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	const colID = "col-mdblist-emptyapi"
+	const existingID = "movie-existing-3006"
+	cfg, _ := json.Marshal(map[string]any{"mode": "mdblist_json", "url": "https://mdblist.com/lists/testuser/testlist", "limit": 10, "virtual_playback": true})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+		VALUES($1,$1,'Empty API Col','mdblist',3006,$2)`, colID, cfg); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO library_collection_libraries(collection_id,library_id) VALUES($1,3006)`, colID); err != nil {
+		t.Fatalf("seed collection library: %v", err)
+	}
+	itemRepo := NewItemRepository(pool)
+	if err := itemRepo.Upsert(ctx, &models.MediaItem{ContentID: existingID, Type: "movie", Title: "Existing", SortTitle: "Existing", TmdbID: "3006", ImdbID: "tt3006006", Status: "matched"}); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	// A resident physical member so the sync accepts it without needing
+	// release evidence (mirrors the in-library-candidate test).
+	if _, err := pool.Exec(ctx, `INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container) VALUES($1,3006,'/movies/existing-3006.mkv',1024,NULL)`, existingID); err != nil {
+		t.Fatalf("seed local file: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_item_libraries(content_id,media_folder_id) VALUES($1,3006)`, existingID); err != nil {
+		t.Fatalf("seed local link: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO library_collection_items(collection_id,media_item_id,position) VALUES($1,$2,0)`, colID, existingID); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+
+	body := `[{"id":3006,"rank":1,"imdb_id":"tt3006006","mediatype":"movie","title":"Existing","release_year":2024,"released":"2024-05-01"}]`
+	stub := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	service := NewLibraryCollectionService(NewLibraryCollectionRepository(pool), itemRepo, NewLibraryItemRepository(pool), stub)
+	// The API fetcher reports the empty/incomplete sentinel; the service must
+	// fall back to the /json stub instead of accepting zero items.
+	service.MDBListAPI = &fakeMDBListAPI{err: fmt.Errorf("%w: total=1", mdblist.ErrEmptyItemsWithTotal)}
+
+	run, err := service.SyncCollection(ctx, colID)
+	if err != nil {
+		t.Fatalf("sync collection: %v", err)
+	}
+	if run.Status != "success" {
+		t.Fatalf("run status = %q, want success via /json fallback", run.Status)
+	}
+	var members int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM library_collection_items WHERE collection_id=$1 AND media_item_id=$2`, colID, existingID).Scan(&members); err != nil {
+		t.Fatalf("inspect membership: %v", err)
+	}
+	if members != 1 {
+		t.Fatalf("membership = %d, want 1 (empty API must not wipe the collection)", members)
+	}
+	if !service.MDBListAPI.(*fakeMDBListAPI).called {
+		t.Fatal("API fetcher was not attempted before falling back")
+	}
+}
+
+// TestVirtualCollection_ContextEndRecordsFailedRun proves F4: a sync that ends
+// because its context is done still persists a failed sync run, so
+// last_sync_status reflects the failure.
+func TestVirtualCollection_ContextEndRecordsFailedRun(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(3007,'Context End','movies',true)`); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	const colID = "col-mdblist-contextend"
+	cfg, _ := json.Marshal(map[string]any{"mode": "mdblist_json", "url": "https://mdblist.com/lists/testuser/testlist", "virtual_playback": true})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+		VALUES($1,$1,'Context End Col','mdblist',3007,$2)`, colID, cfg); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO library_collection_libraries(collection_id,library_id) VALUES($1,3007)`, colID); err != nil {
+		t.Fatalf("seed collection library: %v", err)
+	}
+
+	syncCtx, cancel := context.WithCancel(ctx)
+	stub := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		// Simulate a deadline arriving mid-fetch: the context ends, then the
+		// fetch returns an error.
+		cancel()
+		return nil, context.DeadlineExceeded
+	})}
+	service := NewLibraryCollectionService(NewLibraryCollectionRepository(pool), NewItemRepository(pool), NewLibraryItemRepository(pool), stub)
+
+	if _, err := service.SyncCollection(syncCtx, colID); err == nil {
+		t.Fatal("expected a fetch error")
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `
+		SELECT status FROM library_collection_sync_runs
+		WHERE collection_id=$1 ORDER BY created_at DESC LIMIT 1`, colID).Scan(&status); err != nil {
+		t.Fatalf("expected a durable failed run row: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("run status = %q, want failed", status)
 	}
 }
 

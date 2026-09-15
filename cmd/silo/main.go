@@ -2467,6 +2467,16 @@ func main() {
 		discoverAdapter := api.NewTMDBDiscoverAdapter(cfg.TMDBAPIKey)
 		collectionService.TMDBDiscovers = discoverAdapter
 		collectionService.TMDBDigitalReleases = discoverAdapter
+		// The shared MDBList client powers authenticated list discovery and,
+		// when a key is configured, authenticated collection syncs. It is
+		// created unconditionally so admin syncs honor the key even when the
+		// user store (and its discovery endpoints) is absent.
+		deps.MDBListClient = mdblist.NewClient(cfg.MDBListAPIKey, nil)
+		collectionService.MDBListAPI = deps.MDBListClient
+		mdblistForReload := deps.MDBListClient
+		configWatcher.OnChange(func(_, updated *config.Config) {
+			mdblistForReload.SetAPIKey(updated.MDBListAPIKey)
+		})
 		if virtualRegistrar != nil {
 			virtualRegistrar.TMDBDigitalReleases = discoverAdapter
 			virtualRegistrar.EpisodeReleaseDates = discoverAdapter
@@ -2495,11 +2505,6 @@ func main() {
 			userCollectionScheduler = usercollections.NewScheduler(deps.DB, userSync, slog.Default())
 			deps.UserCollectionSync = userSync
 			deps.UserCollectionScheduler = userCollectionScheduler
-			deps.MDBListClient = mdblist.NewClient(cfg.MDBListAPIKey, nil)
-			mdblistForReload := deps.MDBListClient
-			configWatcher.OnChange(func(_, updated *config.Config) {
-				mdblistForReload.SetAPIKey(updated.MDBListAPIKey)
-			})
 		}
 	}
 

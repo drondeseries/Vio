@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -24,6 +25,58 @@ func (f *fakeDigitalReleaseChecker) HasDigitalRelease(_ context.Context, tmdbID 
 		return false, f.err
 	}
 	return f.released[tmdbID], nil
+}
+
+// recordingReleaseChecker is a race-safe checker for prefetch concurrency
+// tests. It records every distinct id and can block until the test releases
+// it, so cancellation can be observed while work is in flight.
+type recordingReleaseChecker struct {
+	mu       sync.Mutex
+	calls    map[int]int
+	released map[int]bool
+	err      error
+	gate     chan struct{}
+	started  chan int
+}
+
+func (c *recordingReleaseChecker) HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error) {
+	c.mu.Lock()
+	if c.calls == nil {
+		c.calls = map[int]int{}
+	}
+	c.calls[tmdbID]++
+	c.mu.Unlock()
+	if c.started != nil {
+		select {
+		case c.started <- tmdbID:
+		default:
+		}
+	}
+	if c.gate != nil {
+		select {
+		case <-c.gate:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	if c.err != nil {
+		return false, c.err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.released[tmdbID], nil
+}
+
+func (c *recordingReleaseChecker) callCount(tmdbID int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls[tmdbID]
+}
+
+func (c *recordingReleaseChecker) distinctIDs() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.calls)
 }
 
 func TestTheatricalReleaseGateSkipsTheatricalOnlyMovies(t *testing.T) {
@@ -381,5 +434,130 @@ func TestTheatricalReleaseGateNilContextDoesNotPanic(t *testing.T) {
 	//nolint:staticcheck // documents the resolver's explicit nil-context tolerance
 	if gate.skipTheatricalMovie(nil, 300, "", "Nil Context", 0, "") {
 		t.Fatal("expected released movie to not be skipped with nil context")
+	}
+}
+
+func TestTheatricalGatePrefetchWarmsEachDistinctID(t *testing.T) {
+	checker := &recordingReleaseChecker{released: map[int]bool{101: true, 102: false, 103: true}}
+	gate := newTheatricalReleaseGate(checker)
+	ids := []int{101, 102, 103}
+
+	gate.prefetch(context.Background(), ids)
+
+	if got := checker.distinctIDs(); got != 3 {
+		t.Fatalf("checker distinct ids = %d, want 3", got)
+	}
+	for _, id := range ids {
+		if got := checker.callCount(id); got != 1 {
+			t.Fatalf("checker calls for %d = %d, want 1", id, got)
+		}
+		// The sequential pass must observe the warmed memo without a new call.
+		if _, err := gate.lookupProvider(context.Background(), id); err != nil {
+			t.Fatalf("lookupProvider(%d) after prefetch: %v", id, err)
+		}
+		if got := checker.callCount(id); got != 1 {
+			t.Fatalf("checker calls for %d after memo hit = %d, want 1", id, got)
+		}
+	}
+}
+
+func TestTheatricalGatePrefetchDeduplicatesDuplicateIDs(t *testing.T) {
+	checker := &recordingReleaseChecker{released: map[int]bool{200: true}}
+	gate := newTheatricalReleaseGate(checker)
+
+	gate.prefetch(context.Background(), []int{200, 200, 200})
+
+	if got := checker.distinctIDs(); got != 1 {
+		t.Fatalf("checker distinct ids = %d, want 1", got)
+	}
+	if got := checker.callCount(200); got != 1 {
+		t.Fatalf("checker calls for 200 = %d, want 1 (deduped and memoized)", got)
+	}
+}
+
+func TestTheatricalGatePrefetchFailsOpenOnCheckerError(t *testing.T) {
+	checker := &recordingReleaseChecker{err: errors.New("tmdb down")}
+	gate := newTheatricalReleaseGate(checker)
+
+	// Prefetch itself must never panic or block on a failing provider.
+	gate.prefetch(context.Background(), []int{300, 301})
+
+	// A provider error is not cached as "unreleased": the sequential gate
+	// defers (not gated) rather than rejecting the entry.
+	if gate.skipTheatricalMovie(context.Background(), 300, "", "Outage", 2000, "") {
+		t.Fatal("prefetch error must fail open, not gate the movie")
+	}
+	entryCalls := checker.callCount(300)
+	if entryCalls < 2 {
+		t.Fatalf("checker calls for 300 = %d, want a retry after the swallowed prefetch error", entryCalls)
+	}
+}
+
+func TestTheatricalGatePrefetchStopsOnCancellation(t *testing.T) {
+	release := make(chan struct{})
+	checker := &recordingReleaseChecker{released: map[int]bool{}, gate: release, started: make(chan int, 1)}
+	gate := newTheatricalReleaseGate(checker)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ids := []int{400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411}
+	done := make(chan struct{})
+	go func() {
+		gate.prefetch(ctx, ids)
+		close(done)
+	}()
+
+	// Wait until at least one worker is inside the checker, then cancel.
+	select {
+	case <-checker.started:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("prefetch never issued a lookup")
+	}
+	cancel()
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("prefetch did not return promptly after cancellation")
+	}
+	if got := checker.distinctIDs(); got >= len(ids) {
+		t.Fatalf("prefetch queried %d/%d ids after early cancellation, want fewer", got, len(ids))
+	}
+}
+
+func TestTheatricalGatePrefetchWithoutCheckerIsNoop(t *testing.T) {
+	gate := newTheatricalReleaseGate(nil)
+	// Must return immediately and not spin up workers against a nil checker.
+	gate.prefetch(context.Background(), []int{1, 2, 3})
+}
+
+func TestTheatricalGateMemoConcurrentPrefetchAndLookup(t *testing.T) {
+	checker := &recordingReleaseChecker{released: map[int]bool{500: true, 501: false, 502: true}}
+	gate := newTheatricalReleaseGate(checker)
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gate.prefetch(context.Background(), []int{500, 501, 502, 503, 504, 505})
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, id := range []int{500, 501, 502} {
+				if _, err := gate.lookupProvider(context.Background(), id); err != nil {
+					t.Errorf("lookupProvider(%d): %v", id, err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, id := range []int{500, 501, 502, 503, 504, 505} {
+		if got := checker.callCount(id); got != 1 {
+			t.Fatalf("checker calls for %d = %d, want 1 (memo + singleflight)", id, got)
+		}
 	}
 }

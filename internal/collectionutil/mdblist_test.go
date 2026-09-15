@@ -3,8 +3,10 @@ package collectionutil
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestNormalizeMDBListURL(t *testing.T) {
@@ -165,6 +167,88 @@ func TestCanonicalMDBListURLRejectsPrivateHosts(t *testing.T) {
 	}
 }
 
+func TestParseMDBListListURLReturnsUnescapedSegments(t *testing.T) {
+	t.Parallel()
+
+	// F10: the returned segments must be raw slugs so callers escape exactly
+	// once. %2F/%25 must not come back percent-encoded.
+	user, list, ok := ParseMDBListListURL("https://mdblist.com/lists/some%2Fuser/my%25list/json")
+	if !ok {
+		t.Fatal("ParseMDBListListURL rejected an escaped URL")
+	}
+	if user != "some/user" || list != "my%list" {
+		t.Fatalf("segments = (%q, %q), want (some/user, my%%list)", user, list)
+	}
+}
+
+func TestParseMDBListListURLEscapesExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	user, list, ok := ParseMDBListListURL("https://mdblist.com/lists/some%2Fuser/my%25list/json")
+	if !ok {
+		t.Fatal("ParseMDBListListURL rejected an escaped URL")
+	}
+	if got := url.PathEscape(user); got != "some%2Fuser" {
+		t.Fatalf("re-escaping user = %q, want some%%2Fuser (single escape)", got)
+	}
+	if got := url.PathEscape(list); got != "my%25list" {
+		t.Fatalf("re-escaping list = %q, want my%%25list (single escape)", got)
+	}
+}
+
+func TestParseMDBListListURL(t *testing.T) {
+	t.Parallel()
+
+	accepted := []struct {
+		raw  string
+		user string
+		list string
+	}{
+		{"https://mdblist.com/lists/alice/horror", "alice", "horror"},
+		{"https://mdblist.com/lists/alice/horror/json", "alice", "horror"},
+		{"https://mdblist.com/lists/alice/horror/", "alice", "horror"},
+		{"http://www.mdblist.com/lists/bob/my-list/json", "bob", "my-list"},
+		{"https://mdblist.com:443/lists/carol/top_100/json", "carol", "top_100"},
+		{"  https://mdblist.com/lists/dave/sci-fi  ", "dave", "sci-fi"},
+		{"https://mdblist.com/lists/12345/horror", "12345", "horror"},
+	}
+	for _, tc := range accepted {
+		user, list, ok := ParseMDBListListURL(tc.raw)
+		if !ok {
+			t.Errorf("ParseMDBListListURL(%q) rejected, want accept", tc.raw)
+			continue
+		}
+		if user != tc.user || list != tc.list {
+			t.Errorf("ParseMDBListListURL(%q) = (%q, %q), want (%q, %q)", tc.raw, user, list, tc.user, tc.list)
+		}
+	}
+
+	rejected := []string{
+		"",
+		"https://mdblist.com/",
+		"https://mdblist.com/lists/alice",
+		"https://mdblist.com/lists/alice/horror/extra",
+		"https://mdblist.com/lists/alice/horror/extra/json",
+		"https://mdblist.com/lists/alice/12345", // numeric list id, not a slug
+		"https://mdblist.com/lists/alice/12345/json",
+		"https://evil.example/lists/alice/horror",
+		"https://mdblist.com.evil.example/lists/alice/horror",
+		"ftp://mdblist.com/lists/alice/horror",
+		"https://mdblist.com:8080/lists/alice/horror",
+		"https://mdblist.com@127.0.0.1/lists/alice/horror",
+		"https://mdblist.com/lists//horror",
+		"https://mdblist.com/lists/alice/",
+		"https://mdblist.com/lists/alice/horror?x=1",
+		"https://mdblist.com/lists/alice/horror#frag",
+		"https://mdblist.com/admin/alice/horror",
+	}
+	for _, raw := range rejected {
+		if _, _, ok := ParseMDBListListURL(raw); ok {
+			t.Errorf("ParseMDBListListURL(%q) accepted, want reject", raw)
+		}
+	}
+}
+
 func TestMDBListHTTPClientRejectsPrivateRedirect(t *testing.T) {
 	t.Parallel()
 
@@ -175,5 +259,40 @@ func TestMDBListHTTPClientRejectsPrivateRedirect(t *testing.T) {
 	}
 	if err := client.CheckRedirect(req, []*http.Request{req}); !errors.Is(err, ErrMDBListURL) {
 		t.Fatalf("CheckRedirect = %v, want ErrMDBListURL", err)
+	}
+}
+
+func TestMDBListHTTPClientAppliesDefaultTimeout(t *testing.T) {
+	t.Parallel()
+
+	base := &http.Client{}
+	client := MDBListHTTPClient(base)
+	if client.Timeout != 30*time.Second {
+		t.Fatalf("clone timeout = %v, want 30s default", client.Timeout)
+	}
+	if base.Timeout != 0 {
+		t.Fatalf("base client mutated: timeout = %v, want 0", base.Timeout)
+	}
+}
+
+func TestMDBListHTTPClientPreservesExplicitTimeout(t *testing.T) {
+	t.Parallel()
+
+	base := &http.Client{Timeout: 7 * time.Second}
+	client := MDBListHTTPClient(base)
+	if client.Timeout != 7*time.Second {
+		t.Fatalf("clone timeout = %v, want explicit 7s preserved", client.Timeout)
+	}
+}
+
+func TestMDBListHTTPClientNilBaseGetsDefaultTimeout(t *testing.T) {
+	t.Parallel()
+
+	client := MDBListHTTPClient(nil)
+	if client.Timeout != 30*time.Second {
+		t.Fatalf("nil-base clone timeout = %v, want 30s default", client.Timeout)
+	}
+	if http.DefaultClient.Timeout != 0 {
+		t.Fatalf("http.DefaultClient mutated: timeout = %v", http.DefaultClient.Timeout)
 	}
 }
