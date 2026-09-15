@@ -23,7 +23,9 @@ SERVER="${SILO_SERVER:-http://localhost:8090}"
 API_KEY="${SILO_API_KEY:-sa_5782222a48a27bed071273614ea47e5d9f4d3692239e910811582f5913de1ee7}"
 SAMPLE_SIZE="${SAMPLE_SIZE:-0}"
 SEED="${SEED:-42}"
-PROFILE_ID="06ddc31a-4694-4fa8-946c-a661f2099baf"
+PROFILE_ID="${PROFILE_ID:-06ddc31a-4694-4fa8-946c-a661f2099baf}"
+MOVIE_LIBRARY_ID="${MOVIE_LIBRARY_ID:-31}"
+SERIES_LIBRARY_ID="${SERIES_LIBRARY_ID:-32}"
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
@@ -165,7 +167,7 @@ while IFS= read -r line; do
     FILES+=("$fid"); TITLES+=("$title"); TYPES+=("movie")
     echo "  movie:     $title → file_id=$fid"
   fi
-done < <(curl_json "$SERVER/api/v1/catalog?library_id=31&limit=500&type=movie" 2>/dev/null \
+done < <(curl_json "$SERVER/api/v1/catalog?library_id=$MOVIE_LIBRARY_ID&limit=500&type=movie" 2>/dev/null \
   | python3 -c "import sys,json; [print(f\"{i['content_id']}|{i['title']}\") for i in json.load(sys.stdin).get('items',[])]" 2>/dev/null)
 
 while IFS= read -r line; do
@@ -177,7 +179,7 @@ while IFS= read -r line; do
     FILES+=("$fid"); TITLES+=("$title"); TYPES+=("episode")
     echo "  episode:   $title → file_id=$fid"
   fi
-done < <(curl_json "$SERVER/api/v1/catalog?library_id=32&limit=500&type=episode" 2>/dev/null \
+done < <(curl_json "$SERVER/api/v1/catalog?library_id=$SERIES_LIBRARY_ID&limit=500&type=episode" 2>/dev/null \
   | python3 -c "import sys,json; [print(f\"{i['content_id']}|{i['title']}\") for i in json.load(sys.stdin).get('items',[])]" 2>/dev/null)
 
 NFILES=${#FILES[@]}
