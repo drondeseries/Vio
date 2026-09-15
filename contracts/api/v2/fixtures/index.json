@@ -4262,7 +4262,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         },
         "body": "{\"content_id\":\"series\",\"series\":true,\"season_number\":0,\"batch_id\":\"intent\"}"
       },
@@ -4284,7 +4284,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         },
         "body": "{\"content_id\":\"movie\",\"media_file_id\":\"42\",\"expected_revision\":0}"
       },
@@ -4306,7 +4306,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         }
       },
       "expected_status": 204,
@@ -4325,7 +4325,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         }
       },
       "expected_status": 200,
@@ -4346,7 +4346,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         }
       },
       "expected_status": 200,
@@ -4367,7 +4367,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         },
         "body": "{\"status\":\"completed\",\"updated_at\":\"2026-01-02T03:04:05.000Z\",\"revision\":1}"
       },
@@ -4389,7 +4389,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         }
       },
       "expected_status": 200,
@@ -4411,7 +4411,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         },
         "body": "{\"series_id\":\"series\",\"mode\":\"all\",\"delete_watched\":false,\"max_storage_bytes\":0}"
       },
@@ -4435,7 +4435,7 @@
           "Authorization": "Bearer tok-member",
           "If-Match": "\"7b39536ecc52eb9d09f0198d1fea5167e3267c15597aa4b6c62c138d5642a715\"",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         }
       },
       "expected_status": 204,
@@ -4455,7 +4455,7 @@
           "Authorization": "Bearer tok-member",
           "If-Match": "\"5c9ccf00919cd0d69b57d9600d87615c24ab8945ae94956412d8ba3ca0631e84\"",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         },
         "body": "{\"active\":true}"
       },
@@ -4478,7 +4478,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         },
         "body": "{\"etag\":\"\\\"5c9ccf00919cd0d69b57d9600d87615c24ab8945ae94956412d8ba3ca0631e84\\\"\",\"subscription_id\":\"monitor\"}"
       },
@@ -4500,7 +4500,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         }
       },
       "expected_status": 200,
@@ -4521,7 +4521,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "device-one"
+          "X-Vio-Device-Id": "device-one"
         }
       },
       "expected_status": 200,
@@ -5463,7 +5463,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          "X-Vio-Device-Id": "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
         }
       },
       "expected_status": 422,
@@ -5485,7 +5485,7 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "iphone-1"
+          "X-Vio-Device-Id": "iphone-1"
         }
       },
       "expected_status": 200,
@@ -12560,8 +12560,8 @@
         "headers": {
           "Authorization": "Bearer tok-member",
           "X-Profile-Id": "p-owner",
-          "X-Silo-Device-Id": "iphone-1",
-          "X-Silo-Device-Name": "Living room"
+          "X-Vio-Device-Id": "iphone-1",
+          "X-Vio-Device-Name": "Living room"
         },
         "body": "{\"value\":\"{\\\"fontSize\\\":\\\"xxlarge\\\"}\"}"
       },

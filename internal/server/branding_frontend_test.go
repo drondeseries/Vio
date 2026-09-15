@@ -39,7 +39,7 @@ func withBranding(t *testing.T, settings fakeSettings) {
 	prevFS, prevBranding := WebDistFS, Branding
 	WebDistFS = fstest.MapFS{
 		"index.html": &fstest.MapFile{Data: []byte(
-			`<!doctype html><head><title>Silo</title>` +
+			`<!doctype html><head><title>Vio</title>` +
 				`<link rel="icon" href="/favicon.ico" sizes="any" /></head><body></body>`)},
 		"favicon.ico": &fstest.MapFile{Data: []byte("STATIC_ICO")},
 	}

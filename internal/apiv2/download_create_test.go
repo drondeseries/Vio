@@ -75,12 +75,20 @@ func TestDownloadCreateTransport(t *testing.T) {
 	if rec.Code != 400 {
 		t.Fatalf("scope %d", rec.Code)
 	}
-	for _, body := range []string{`{"content_id":"movie","expected_revision":1}`, `{"content_id":"movie","expected_revision":0,"expected_download_id":"old"}`, `{"content_id":"series","series":true,"batch_id":"intent","expected_entries":{"episode":{"revision":1}}}`, `{"content_id":"movie"}`, `{"content_id":"movie","media_file_id":"042","expected_revision":0}`, `{"content_id":"movie","expected_revision":0,"season_number":0}`, `{"content_id":"series","series":true}`, `{"content_id":"movie","expected_revision":0,"caps":{"video_evidence":"typo","codecs_video":[],"codecs_audio":[],"containers":[],"max_resolution":"1080p","hdr":false}}`} {
+	for _, body := range []string{`{"content_id":"movie","expected_revision":1}`, `{"content_id":"movie","expected_revision":0,"expected_download_id":"old"}`, `{"content_id":"series","series":true,"batch_id":"intent","expected_entries":{"episode":{"revision":1}}}`, `{"content_id":"movie"}`, `{"content_id":"movie","media_file_id":"042","expected_revision":0}`, `{"content_id":"movie","expected_revision":0,"season_number":0}`, `{"content_id":"series","series":true}`} {
 		before := svc.calls
 		rec = do(t, h, "POST", path, body, device)
 		if rec.Code != 400 || svc.calls != before {
 			t.Fatalf("invalid %s: %d %s", body, rec.Code, rec.Body.String())
 		}
+	}
+	// A caps object carrying a property the v2 schema does not define is a schema
+	// violation, so it is refused with 422 before the handler runs — unlike the
+	// handler-level 400s above.
+	beforeSchema := svc.calls
+	rec = do(t, h, "POST", path, `{"content_id":"movie","expected_revision":0,"caps":{"video_evidence":"typo","codecs_video":[],"codecs_audio":[],"containers":[],"max_resolution":"1080p","hdr":false}}`, device)
+	if rec.Code != 422 || svc.calls != beforeSchema {
+		t.Fatalf("caps unknown property: %d %s", rec.Code, rec.Body.String())
 	}
 	rec = do(t, h, "POST", path, `{"content_id":"movie"}`, viewer)
 	if rec.Code != 202 || svc.req.DeviceID != "" {

@@ -24,6 +24,7 @@ DELETE /api/v1/admin/invite-codes/{id}
 DELETE /api/v1/admin/items/{id}
 DELETE /api/v1/admin/literary-works/{work_id}/items/{content_id}
 DELETE /api/v1/admin/notifications/push/relay
+DELETE /api/v1/admin/release-overrides
 DELETE /api/v1/admin/request-integrations/{id}
 DELETE /api/v1/admin/sections/{id}
 DELETE /api/v1/admin/subtitles/{id}/
@@ -66,9 +67,11 @@ GET /api/v1/admin/jobs/
 GET /api/v1/admin/jobs/{id}
 GET /api/v1/admin/libraries/{libraryID}/collection-groups/
 GET /api/v1/admin/literary-works/items/{content_id}/candidates
+GET /api/v1/admin/needs-release-metadata
 GET /api/v1/admin/playback-history
 GET /api/v1/admin/playback-routing/capabilities
 GET /api/v1/admin/rate-limits/config
+GET /api/v1/admin/release-overrides
 GET /api/v1/admin/request-integrations
 GET /api/v1/admin/request-settings
 GET /api/v1/admin/request-users/{user_id}/limit
@@ -247,6 +250,7 @@ POST /api/v1/admin/libraries/{libraryID}/collection-groups/
 POST /api/v1/admin/literary-works/link
 POST /api/v1/admin/literary-works/matches/confirm
 POST /api/v1/admin/literary-works/matches/ignore
+POST /api/v1/admin/needs-release-metadata/retry
 POST /api/v1/admin/notifications/push/relay/register
 POST /api/v1/admin/request-integrations
 POST /api/v1/admin/request-integrations/{id}/options
@@ -312,6 +316,7 @@ PUT /api/v1/admin/history-imports/sources/{id}/token
 PUT /api/v1/admin/invite-codes/{id}
 PUT /api/v1/admin/libraries/{libraryID}/collection-groups/reorder
 PUT /api/v1/admin/rate-limits/config
+PUT /api/v1/admin/release-overrides
 PUT /api/v1/admin/request-integrations/{id}
 PUT /api/v1/admin/request-settings
 PUT /api/v1/admin/request-users/{user_id}/limit

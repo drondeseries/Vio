@@ -11641,17 +11641,17 @@ export interface components {
        * @description Opaque identifier
        * @example 1
        */
-      silo_profile_id: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      silo_user_id: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
       source_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      vio_profile_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      vio_user_id: string;
     };
     AdminHistoryImportMappingCreateInputBody: {
       external_user_id: string;
@@ -11660,29 +11660,29 @@ export interface components {
        * @description Opaque identifier
        * @example 1
        */
-      silo_profile_id: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      silo_user_id: string;
-      /**
-       * @description Opaque identifier
-       * @example 1
-       */
       source_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      vio_profile_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      vio_user_id: string;
     };
     AdminHistoryImportMappingUpdateInputBody: {
       /**
        * @description Opaque identifier
        * @example 1
        */
-      silo_profile_id?: string;
+      vio_profile_id?: string;
       /**
        * @description Opaque identifier
        * @example 1
        */
-      silo_user_id?: string;
+      vio_user_id?: string;
     };
     AdminHistoryImportPlexLoginInputBody: {
       password: string;
@@ -15285,7 +15285,7 @@ export interface components {
       default: boolean;
       /**
        * @description Label for the sign-in button
-       * @example Silo account
+       * @example Vio account
        */
       display_name: string;
       /**
@@ -17074,7 +17074,7 @@ export interface components {
       slug: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Silo ID)
+       * @description TMDB identifier (external, not a Vio ID)
        * @example 420
        */
       tmdb_id?: number;
@@ -19259,7 +19259,7 @@ export interface components {
       created_at: string;
       /**
        * @description User-Agent recorded at login; empty when none was sent
-       * @example Silo/1.0 (tvOS)
+       * @example Vio/1.0 (tvOS)
        */
       device_name: string;
       /**
@@ -19602,13 +19602,13 @@ export interface components {
       title: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Silo ID)
+       * @description TMDB identifier (external, not a Vio ID)
        * @example 949
        */
       tmdb_id: number;
       /**
        * Format: int64
-       * @description TVDB identifier (external, not a Silo ID)
+       * @description TVDB identifier (external, not a Vio ID)
        */
       tvdb_id?: number;
       /**
@@ -19646,13 +19646,13 @@ export interface components {
       title: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Silo ID)
+       * @description TMDB identifier (external, not a Vio ID)
        * @example 949
        */
       tmdb_id: number;
       /**
        * Format: int64
-       * @description TVDB identifier (external, not a Silo ID)
+       * @description TVDB identifier (external, not a Vio ID)
        */
       tvdb_id?: number;
       /**
@@ -21092,17 +21092,17 @@ export interface components {
       client_ip: string;
       /**
        * @description Display label derived from the client name and version; empty when unknown
-       * @example Silo for Apple TV 1.4
+       * @example Vio for Apple TV 1.4
        */
       client_label: string;
       /**
        * @description Display label with the exact build; empty when unknown
-       * @example Silo for Apple TV 1.4.0 (1400)
+       * @example Vio for Apple TV 1.4.0 (1400)
        */
       client_label_full: string;
       /**
        * @description Empty when unknown
-       * @example Silo for Apple TV
+       * @example Vio for Apple TV
        */
       client_name: string;
       /**
@@ -21435,6 +21435,7 @@ export interface components {
       bandwidth_cap_kbps?: number;
       /** Format: int64 */
       bandwidth_estimate_kbps?: number;
+      carried_audio_track_id?: string;
       client_capabilities: components["schemas"]["ClientCodecCapabilitiesV3"];
       client_features: string[];
       client_playback_context: components["schemas"]["ClientPlaybackContextV3"];
@@ -21443,6 +21444,9 @@ export interface components {
        * @example 1
        */
       file_id: string;
+      /** @enum {string} */
+      file_selection?: "auto" | "explicit";
+      force_relink?: boolean;
       /**
        * @description Opaque identifier
        * @example 1
@@ -22633,13 +22637,13 @@ export interface components {
       title: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Silo ID)
+       * @description TMDB identifier (external, not a Vio ID)
        * @example 949
        */
       tmdb_id: number;
       /**
        * Format: int64
-       * @description TVDB identifier (external, not a Silo ID)
+       * @description TVDB identifier (external, not a Vio ID)
        */
       tvdb_id?: number;
       /** Format: double */
@@ -22707,7 +22711,7 @@ export interface components {
       title: string;
       /**
        * Format: int64
-       * @description TMDB identifier (external, not a Silo ID)
+       * @description TMDB identifier (external, not a Vio ID)
        * @example 949
        */
       tmdb_id: number;
@@ -25591,15 +25595,15 @@ export interface components {
        */
       last_seen_at: string;
       /**
-       * @description Opaque identifier
-       * @example 1
-       */
-      silo_profile_id?: string;
-      /**
        * Format: date-time
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       updated_at: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      vio_profile_id?: string;
     };
     WebhookMappingsInputBody: {
       mappings: components["schemas"]["WebhookMappingUpdate"][];
@@ -25612,7 +25616,7 @@ export interface components {
     WebhookMappingUpdate: {
       external_user_id: string;
       external_user_name: string;
-      silo_profile_id: string | null;
+      vio_profile_id: string | null;
     };
     WebhookReceiverCapabilitiesOutputBody: {
       /** @description Whether the current principal may use the capability */
@@ -50183,7 +50187,7 @@ export interface operations {
       /** @description No Content */
       204: {
         headers: {
-          "X-Silo-Restart-Required"?: string;
+          "X-Vio-Restart-Required"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -58839,7 +58843,7 @@ export interface operations {
       409: {
         headers: {
           /** @description On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts. */
-          "X-Silo-Latest-Sequence"?: string;
+          "X-Vio-Latest-Sequence"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -58998,7 +59002,7 @@ export interface operations {
       409: {
         headers: {
           /** @description On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts. */
-          "X-Silo-Latest-Sequence"?: string;
+          "X-Vio-Latest-Sequence"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -59157,7 +59161,7 @@ export interface operations {
       409: {
         headers: {
           /** @description On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts. */
-          "X-Silo-Latest-Sequence"?: string;
+          "X-Vio-Latest-Sequence"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -59316,7 +59320,7 @@ export interface operations {
       409: {
         headers: {
           /** @description On a stale refusal, the session's latest applied sequence as a decimal integer; allocate a new command above it. Absent on other conflicts. */
-          "X-Silo-Latest-Sequence"?: string;
+          "X-Vio-Latest-Sequence"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -76630,7 +76634,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -78911,7 +78915,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path?: never;
       cookie?: never;
@@ -79021,9 +79025,9 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
-        "X-Silo-Device-Name"?: string;
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Id"?: string;
+        "X-Vio-Device-Name"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -79179,7 +79183,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -79286,7 +79290,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path: {
         id: string;
@@ -79435,7 +79439,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path: {
         id: string;
@@ -79559,7 +79563,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -79752,7 +79756,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -79935,7 +79939,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -80145,7 +80149,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         id: string;
@@ -80337,7 +80341,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path: {
         id: string;
@@ -80464,7 +80468,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path: {
         id: string;
@@ -80591,7 +80595,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path: {
         batch_id: string;
@@ -80703,7 +80707,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path?: never;
       cookie?: never;
@@ -80811,9 +80815,9 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
-        "X-Silo-Device-Name"?: string;
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Id": string;
+        "X-Vio-Device-Name"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -80953,7 +80957,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path: {
         id: string;
@@ -81068,7 +81072,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path: {
         id: string;
@@ -81199,7 +81203,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path: {
         id: string;
@@ -81365,7 +81369,7 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
       };
       path?: never;
       cookie?: never;
@@ -82104,7 +82108,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -82130,7 +82134,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -82156,7 +82160,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -82198,7 +82202,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -82213,7 +82217,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -82291,7 +82295,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -82306,7 +82310,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -82321,7 +82325,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -82363,7 +82367,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content?: never;
@@ -82378,7 +82382,7 @@ export interface operations {
           "Content-Range"?: string;
           ETag?: string;
           "Last-Modified"?: string;
-          "X-Silo-Ebook-Conversion"?: string;
+          "X-Vio-Ebook-Conversion"?: string;
           [name: string]: unknown;
         };
         content: {
@@ -101301,7 +101305,7 @@ export interface operations {
       path: {
         /** @description The media type */
         media_type: "movie" | "series";
-        /** @description TMDB identifier (external, not a Silo ID) */
+        /** @description TMDB identifier (external, not a Vio ID) */
         tmdb_id: number;
       };
       cookie?: never;
@@ -103627,11 +103631,11 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client's stable device identifier */
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -103770,11 +103774,11 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client's stable device identifier */
-        "X-Silo-Device-Id": string;
+        "X-Vio-Device-Id": string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -104342,11 +104346,11 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client's stable device identifier; absent resolves the profile-wide value */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -104473,13 +104477,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family a profile_client value belongs to */
-        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; the profile_device scope stores against it when device_id is absent */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -104604,13 +104608,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family a profile_client value belongs to */
-        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; the profile_device scope stores against it when device_id is absent */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path: {
         /** @description The setting key, as defined in the settings contract */
@@ -104738,13 +104742,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family a profile_client value belongs to */
-        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; the profile_device scope stores against it when device_id is absent */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path: {
         /** @description The setting key, as defined in the settings contract */
@@ -104903,13 +104907,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family a profile_client value belongs to */
-        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; the profile_device scope stores against it when device_id is absent */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path: {
         /** @description The setting key, as defined in the settings contract */
@@ -105029,13 +105033,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family whose profile_client values take part; required when a requested key has that scope */
-        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; its profile_device values take part */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -105143,13 +105147,13 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The client family whose profile_client values take part; required when a requested key has that scope */
-        "X-Silo-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
+        "X-Vio-Client-Family"?: "tv" | "mobile" | "tablet" | "desktop" | "web";
         /** @description The client's stable device identifier; its profile_device values take part */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
         /** @description Optional display name recorded on the device registry */
-        "X-Silo-Device-Name"?: string;
+        "X-Vio-Device-Name"?: string;
         /** @description Optional platform recorded on the device registry */
-        "X-Silo-Device-Platform"?: string;
+        "X-Vio-Device-Platform"?: string;
       };
       path?: never;
       cookie?: never;
@@ -112900,7 +112904,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve playback preferences */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description A movie, episode, audiobook or ebook; a series is not directly playable */

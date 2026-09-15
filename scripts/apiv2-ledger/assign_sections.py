@@ -47,6 +47,7 @@ ADMIN = {
     "tasks": "admin-tasks", "jobs": "admin-tasks", "nodes": "admin-nodes",
     "recommendations": "admin-recommendations",
     "subtitles": "admin-subtitles", "subtitle-providers": "admin-subtitles",
+    "needs-release-metadata": "admin-requests", "release-overrides": "admin-requests",
 }
 
 # /api/v1/<a> -> section

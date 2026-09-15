@@ -401,6 +401,8 @@ for r in rows:
         # The extractor does not know where a path constant is declared; that
         # annotation is curated on the site and survives a refresh by location.
         literal_line = prior_by_loc.get((c['repo'], c['file'], c['line']), {}).get('path_literal_line')
+        if literal_line is None:
+            literal_line = c.get('path_literal_line')
         if literal_line is not None:
             site["path_literal_line"] = literal_line
         site["types"] = sorted(set(t for t in c['types'] if t))

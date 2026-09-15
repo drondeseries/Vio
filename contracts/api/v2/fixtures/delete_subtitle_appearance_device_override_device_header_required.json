@@ -6,7 +6,7 @@
   "instance": "urn:silo:request:0000000000000000000000b5",
   "errors": [
     {
-      "location": "header.X-Silo-Device-Id",
+      "location": "header.X-Vio-Device-Id",
       "code": "required",
       "detail": "required header parameter is missing"
     }

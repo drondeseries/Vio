@@ -6,7 +6,7 @@
   "instance": "urn:silo:request:0000000000000000000000b3",
   "errors": [
     {
-      "location": "header.X-Silo-Device-Id",
+      "location": "header.X-Vio-Device-Id",
       "code": "out_of_range",
       "detail": "expected length <= 128"
     }

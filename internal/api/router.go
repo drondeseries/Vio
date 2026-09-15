@@ -3686,8 +3686,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 					r.Route("/ebooks", func(r chi.Router) {
 						r.Use(apimw.RequireProfile)
 						r.Get("/capability", ebookReaderHandler.HandleConversionCapability)
-						r.Get("/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile)
-						r.Head("/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile)
+						// The page/file delivery carries stream telemetry like
+						// the other media egress routes.
+						r.Get("/{content_id}/files/{file_id}/read", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/ebooks/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile))
+						r.Head("/{content_id}/files/{file_id}/read", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/ebooks/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile))
 						r.Get("/{content_id}/progress", ebookReaderHandler.HandleGetProgress)
 						r.Put("/{content_id}/progress", ebookReaderHandler.HandleSaveProgress)
 						r.Get("/{content_id}/reader-config", ebookReaderHandler.HandleGetConfig)
@@ -3808,9 +3810,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 						r.Get("/capability", playbackHandler.HandlePlaybackCapabilityV3)
 						// HLS transcode delivery — no profile auth needed;
 						// session ID (UUID) serves as the access token, same
-						// pattern as /stream/{session_id}.
-						r.Get("/transcode/{session_id}/master.m3u8", playbackHandler.HandleGetTranscodeManifest)
-						r.Get("/transcode/{session_id}/segment/{name}", playbackHandler.HandleGetTranscodeSegment)
+						// pattern as /stream/{session_id}. Both delivery
+						// routes carry stream telemetry like the /stream and
+						// download media routes below.
+						r.Get("/transcode/{session_id}/master.m3u8", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/playback/transcode/{session_id}/master.m3u8", playbackHandler.HandleGetTranscodeManifest))
+						r.Get("/transcode/{session_id}/segment/{name}", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/playback/transcode/{session_id}/segment/{name}", playbackHandler.HandleGetTranscodeSegment))
 
 						// Playback realtime control socket — needs auth but not profile.
 						r.Get("/sessions/{session_id}/control/ws", playbackHandler.HandleSessionWebSocket)
@@ -3849,13 +3853,16 @@ func newChiRouter(deps Dependencies) chi.Router {
 					})
 				}
 
-				// Stream routes.
+				// Stream routes. The observeNative wrapper enrolls each route
+				// in stream telemetry; media_routes.go declares these
+				// method+pattern pairs, so dropping the wrapper would strand
+				// the declaration.
 				if streamHandler != nil {
-					r.Get("/stream/{session_id}", streamHandler.HandleStream)
-					r.Head("/stream/{session_id}", streamHandler.HandleStream)
-					r.Get("/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle)
-					r.Head("/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle)
-					r.Get("/stream/{session_id}/subtitles/{track}/fonts", streamHandler.HandleSubtitleFonts)
+					r.Get("/stream/{session_id}", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/stream/{session_id}", streamHandler.HandleStream))
+					r.Head("/stream/{session_id}", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/stream/{session_id}", streamHandler.HandleStream))
+					r.Get("/stream/{session_id}/subtitles/{track}", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle))
+					r.Head("/stream/{session_id}/subtitles/{track}", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle))
+					r.Get("/stream/{session_id}/subtitles/{track}/fonts", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/stream/{session_id}/subtitles/{track}/fonts", streamHandler.HandleSubtitleFonts))
 				}
 
 				// Download routes.
@@ -3878,19 +3885,20 @@ func newChiRouter(deps Dependencies) chi.Router {
 					r.Delete("/{id}", downloadHandler.HandleDeleteDownload)
 					// GET+HEAD: background download stacks probe with HEAD
 					// before issuing ranged GETs; http.ServeContent handles
-					// HEAD natively.
-					r.Get("/{id}/file", downloadHandler.HandleDownloadFile)
-					r.Head("/{id}/file", downloadHandler.HandleDownloadFile)
-					r.Get("/{id}/file-proxy", downloadHandler.HandleDownloadFileViaProxy)
-					r.Head("/{id}/file-proxy", downloadHandler.HandleDownloadFileViaProxy)
+					// HEAD natively. All file/asset deliveries below carry
+					// stream telemetry.
+					r.Get("/{id}/file", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/downloads/{id}/file", downloadHandler.HandleDownloadFile))
+					r.Head("/{id}/file", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/downloads/{id}/file", downloadHandler.HandleDownloadFile))
+					r.Get("/{id}/file-proxy", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/downloads/{id}/file-proxy", downloadHandler.HandleDownloadFileViaProxy))
+					r.Head("/{id}/file-proxy", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/downloads/{id}/file-proxy", downloadHandler.HandleDownloadFileViaProxy))
 					r.Get("/{id}/manifest", downloadHandler.HandleManifest)
 					r.Get("/{id}/artwork/{kind}", downloadHandler.HandleArtwork)
-					r.Get("/{id}/subtitles/{ref}", downloadHandler.HandleSubtitle)
+					r.Get("/{id}/subtitles/{ref}", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/downloads/{id}/subtitles/{ref}", downloadHandler.HandleSubtitle))
 				})
-				r.Get("/direct-download", downloadHandler.HandleDirectDownload)
-				r.Head("/direct-download", downloadHandler.HandleDirectDownload)
-				r.Get("/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxy)
-				r.Head("/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxy)
+				r.Get("/direct-download", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/direct-download", downloadHandler.HandleDirectDownload))
+				r.Head("/direct-download", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/direct-download", downloadHandler.HandleDirectDownload))
+				r.Get("/direct-download-proxy", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxy))
+				r.Head("/direct-download-proxy", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxy))
 
 				// Recipe gallery catalog (no profile required — purely static metadata).
 				recipeHandler := &handlers.RecipeHandler{}
