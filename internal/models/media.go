@@ -797,3 +797,36 @@ func (f *MediaFile) VideoCopySafetyUnknown() bool {
 	}
 	return codec == "h264" || codec == "avc" || codec == "avc1"
 }
+
+// VirtualFilePersistArgs carries the full persistence payload for a virtual
+// probe result. The SQL update is CAS-fenced on the caller's snapshot to
+// prevent stale or out-of-order probes from overwriting newer evidence.
+// Defined here (not in the handler packages) so both the native and
+// Jellyfin-compat persistence paths share one contract without an import
+// cycle.
+type VirtualFilePersistArgs struct {
+	FileID           int
+	ExpectedFilePath string // CAS: what file_path should be in the DB right now
+	VideoTracks      []byte
+	AudioTracks      []byte
+	SubtitleTracks   []byte
+	Resolution       string
+	CodecVideo       string
+	CodecAudio       string
+	Container        string
+	HDR              bool
+	Bitrate          int
+	Duration         int
+	StampProbe       bool
+	// CAS fence fields — caller snapshots these from the catalog row
+	// *before* resolution/probing so a stale background result cannot
+	// overwrite evidence committed since the snapshot was taken.
+	UpdatedAt      time.Time
+	ProbeUpdatedAt *time.Time
+	OwnerID        int
+	LibraryID      int
+	// AdoptPath: if non-empty, atomically adopt this file_path (unless
+	// probe_source is 'virtual_collection'). Empty string retains the
+	// current path.
+	AdoptPath string
+}

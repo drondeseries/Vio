@@ -893,8 +893,13 @@ func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, s
 			}
 		}
 		members = filteredMembers
+		var skippedIDs []string
+		for id := range skipped {
+			skippedIDs = append(skippedIDs, id)
+		}
+		slices.Sort(skippedIDs)
 		slog.WarnContext(ctx, "collection sync: skipped members with no compatible target library",
-			"component", "catalog", "collection_id", snapshot.ID, "skipped", skipped)
+			"component", "catalog", "collection_id", snapshot.ID, "skipped_count", len(skippedIDs), "skipped_ids", skippedIDs)
 	}
 	for _, id := range debtContentIDs {
 		if err := queueVirtualItemRefreshDebtTx(ctx, tx, id); err != nil {

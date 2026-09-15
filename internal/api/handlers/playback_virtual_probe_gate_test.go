@@ -18,7 +18,7 @@ import (
 // resolveVirtualPlaybackSource down the candidate-declared upgrade path: a
 // listed candidate that declares codecs/resolution/container, a stored row
 // seeded by VirtualFileLookup, and a stub prober/saver.
-func virtualProbeGateCandidateHandler(stored *models.MediaFile, lister VirtualPlaybackStreamLister, prober VirtualPlaybackSourceProber, saver VirtualFileMetadataSaver) *PlaybackHandler {
+func virtualProbeGateCandidateHandler(stored *models.MediaFile, lister VirtualPlaybackStreamLister, prober VirtualPlaybackSourceProber, saver VirtualFileSaver) *PlaybackHandler {
 	return &PlaybackHandler{
 		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
 			return "http://127.0.0.1:8080/stream?path=" + path, nil
@@ -28,7 +28,7 @@ func virtualProbeGateCandidateHandler(stored *models.MediaFile, lister VirtualPl
 			return stored, nil
 		},
 		VirtualPlaybackSourceProber: prober,
-		VirtualFileMetadataSaver:    saver,
+		VirtualFileSaver:            saver,
 	}
 }
 
@@ -86,12 +86,12 @@ func TestResolveProbesUnprobedVirtualRowDespiteCandidateDeclarations(t *testing.
 			f.Container = "mkv"
 			return f, nil
 		},
-		func(_ context.Context, _ int, _ string, videoTracks, audioTracks, subtitleTracks []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
-			savedVideo = videoTracks
-			savedAudio = audioTracks
-			savedSubs = subtitleTracks
+		func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+			savedVideo = args.VideoTracks
+			savedAudio = args.AudioTracks
+			savedSubs = args.SubtitleTracks
 			close(saverDone)
-			return nil
+			return 1, nil
 		})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
@@ -210,27 +210,31 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 	if !strings.Contains(sql, "probe_updated_at") {
 		t.Fatalf("metadata update does not stamp probe_updated_at: %s", sql)
 	}
-	if !strings.Contains(sql, "probe_source=CASE WHEN media_files.probe_source='virtual_collection'") {
+	if !strings.Contains(sql, "WHEN probe_source = 'virtual_collection' THEN probe_source") {
 		t.Fatalf("metadata update does not preserve virtual_collection probe_source: %s", sql)
 	}
-	if !strings.Contains(sql, "probe_updated_at=CASE WHEN NOT $13::boolean THEN media_files.probe_updated_at ELSE now() END") {
+	if !strings.Contains(sql, "ELSE GREATEST(clock_timestamp(), probe_updated_at") {
 		t.Fatalf("metadata update does not stamp probe_updated_at on any real probe: %s", sql)
 	}
-	if !strings.Contains(sql, "ELSE 'virtual' END") {
+	if !strings.Contains(sql, "ELSE 'virtual'") {
 		t.Fatalf("metadata update does not default probe_source to virtual: %s", sql)
-	}
-	if !strings.Contains(sql, "ELSE now() END") {
-		t.Fatalf("metadata update does not stamp probe_updated_at with now(): %s", sql)
 	}
 	// Declared (unprobed) persists must not stamp the row as probed: the
 	// stamp is gated on the $13 stampProbe flag.
-	if !strings.Contains(sql, "OR NOT $13::boolean") {
+	if !strings.Contains(sql, "WHEN NOT $13::boolean THEN probe_source") {
 		t.Fatalf("metadata update does not gate probe stamp on stampProbe flag: %s", sql)
 	}
-	// A delayed declared write must not overwrite a verified row that was
-	// stamped after the declared read.
-	if !strings.Contains(sql, "($13::boolean OR media_files.probe_updated_at IS NULL)") {
-		t.Fatalf("metadata update does not guard declared writes against verified rows: %s", sql)
+	// A stale background probe must not overwrite evidence committed since
+	// its snapshot: the CAS fence binds the row to the caller's snapshot.
+	if !strings.Contains(sql, "AND updated_at     = $14") {
+		t.Fatalf("metadata update does not fence on updated_at snapshot: %s", sql)
+	}
+	if !strings.Contains(sql, "AND probe_updated_at IS NOT DISTINCT FROM $15::timestamptz") {
+		t.Fatalf("metadata update does not fence on probe_updated_at snapshot: %s", sql)
+	}
+	// Path adoption must be refused on collection-owned rows.
+	if !strings.Contains(sql, "WHEN $18 != '' AND probe_source != 'virtual_collection' THEN $18") {
+		t.Fatalf("metadata update does not guard path adoption: %s", sql)
 	}
 }
 
@@ -478,9 +482,9 @@ func TestNoProberBaselineDoesNotPersistAssumedMetadata(t *testing.T) {
 		}}, nil
 	})
 	var persisted bool
-	saver := func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
+	saver := func(_ context.Context, _ models.VirtualFilePersistArgs) (int64, error) {
 		persisted = true
-		return nil
+		return 1, nil
 	}
 	h := virtualProbeGateCandidateHandler(stored, lister, nil, saver)
 
@@ -921,9 +925,9 @@ func TestResolveVirtualOptimisticStartWithinDeliveryGrace(t *testing.T) {
 			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
 			return f, nil
 		},
-		VirtualFileMetadataSaver: func(_ context.Context, _ int, expectedFilePath string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
-			saverDone <- expectedFilePath
-			return nil
+		VirtualFileSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+			saverDone <- args.ExpectedFilePath
+			return 1, nil
 		},
 	}
 
@@ -1346,13 +1350,13 @@ func TestDeclaredNoProberCandidateResolutionPersists(t *testing.T) {
 	})
 	var saverCalls int32
 	saverDone := make(chan struct{}, 1)
-	saver := func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
+	saver := func(_ context.Context, _ models.VirtualFilePersistArgs) (int64, error) {
 		atomic.AddInt32(&saverCalls, 1)
 		select {
 		case saverDone <- struct{}{}:
 		default:
 		}
-		return nil
+		return 1, nil
 	}
 	h := virtualProbeGateCandidateHandler(stored, lister, nil, saver)
 

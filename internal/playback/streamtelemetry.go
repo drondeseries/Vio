@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
 )
@@ -52,10 +51,10 @@ func ClientInfoFromRequest(r *http.Request) ClientInfo {
 	// reach both despite the published bound. Values stay opaque — trimmed and
 	// length-clamped, never parsed or validated against an enum.
 	return ClientInfo{
-		Name:      httpheader.GetClientInfo(r.Header).Name,
-		Version:   httpheader.GetClientInfo(r.Header).Version,
-		Build:     httpheader.GetClientInfo(r.Header).Build,
-		Channel:   httpheader.GetClientInfo(r.Header).Channel,
+		Name:      r.Header.Get("X-Silo-Client"),
+		Version:   r.Header.Get("X-Silo-Client-Version"),
+		Build:     r.Header.Get("X-Silo-Client-Build"),
+		Channel:   r.Header.Get("X-Silo-Client-Channel"),
 		UserAgent: r.UserAgent(),
 	}.Normalized()
 }

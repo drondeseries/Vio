@@ -308,16 +308,16 @@ func registerPlayback(reg *Registry) {
 	Register(reg, op(http.MethodPost, "/start", opStartPlayback), func(ctx context.Context, in *PlaybackStartInput) (*PlaybackStartOutput, error) {
 		caller, p := reg.playbackCaller(ctx, in.PlaybackRequestHeaders, in.Body.InstallationID)
 		if p != nil {
-			slog.WarnContext(ctx, "playback start rejected", "phase", "caller", "error", p.Title, "body", string(in.Body.InstallationID))
+			slog.WarnContext(ctx, "playback start rejected", "phase", "caller", "error", p.Title)
 			return nil, p
 		}
 		fileID, p := in.Body.FileID.positive("body.file_id")
 		if p != nil {
-			slog.WarnContext(ctx, "playback start rejected", "phase", "file_id", "error", "invalid file_id", "body", string(in.Body.FileID))
+			slog.WarnContext(ctx, "playback start rejected", "phase", "file_id", "error", "invalid file_id")
 			return nil, p
 		}
 		if string(in.Body.ProfileID) != caller.ProfileID {
-			slog.WarnContext(ctx, "playback start rejected", "phase", "profile", "error", "profile mismatch", "body_profile", string(in.Body.ProfileID), "caller_profile", caller.ProfileID)
+			slog.WarnContext(ctx, "playback start rejected", "phase", "profile", "error", "profile mismatch")
 			return nil, validationProblem("body.profile_id", "invalid", "Profile must match the authenticated viewer.")
 		}
 		request := in.Body.domain(fileID)

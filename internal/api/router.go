@@ -1296,26 +1296,31 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed(ctx, fileID, expectedFilePath, nil)
 			}
-			playbackHandler.VirtualFileUpdater = func(ctx context.Context, fileID int, newFilePath string) error {
-				_, _ = deps.DB.Exec(ctx, `DELETE FROM media_files WHERE file_path=$1 AND id != $2 AND virtual_owner_installation_id IS NOT NULL`, newFilePath, fileID)
-				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET file_path=$1, updated_at=now() WHERE id=$2`, newFilePath, fileID)
-				return err
-			}
-			playbackHandler.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error {
-				vStr := string(videoTracks)
+			playbackHandler.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+				if deps.DB == nil {
+					return 0, nil
+				}
+				vStr := string(args.VideoTracks)
 				if vStr == "" || vStr == "null" {
 					vStr = "[]"
 				}
-				aStr := string(audioTracks)
+				aStr := string(args.AudioTracks)
 				if aStr == "" || aStr == "null" {
 					aStr = "[]"
 				}
-				sStr := string(subtitleTracks)
+				sStr := string(args.SubtitleTracks)
 				if sStr == "" || sStr == "null" {
 					sStr = "[]"
 				}
-				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath, stampProbe)
-				return err
+				tag, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL,
+					vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
+					args.FileID, args.ExpectedFilePath, args.StampProbe,
+					args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, args.AdoptPath,
+				)
+				if err != nil {
+					return 0, err
+				}
+				return tag.RowsAffected(), nil
 			}
 		}
 		if deps.Config != nil {

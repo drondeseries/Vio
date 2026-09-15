@@ -3,7 +3,6 @@ package transcodenode
 import (
 	"net/http"
 
-	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
 )
@@ -17,7 +16,7 @@ func (s *Server) canonicalSessionID(r *http.Request, transportID string) (string
 	if r == nil || s.watcher == nil {
 		return fallback, nil
 	}
-	tokenStr := httpheader.GetStreamToken(r.Header)
+	tokenStr := r.Header.Get("X-Silo-Stream-Token")
 	cfg := s.watcher.Config()
 	if tokenStr == "" || cfg == nil {
 		return fallback, nil

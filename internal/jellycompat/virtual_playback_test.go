@@ -1344,13 +1344,13 @@ func TestResolveAndProbeVirtualSourceProbesUnprobedRowAndPersists(t *testing.T) 
 			probed.SubtitleTracks = []models.SubtitleTrack{{Codec: "srt", Language: "eng"}}
 			return &probed, nil
 		},
-		VirtualFileMetadataSaver: func(_ context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
-			savedID = fileID
-			savedPath = expectedFilePath
-			savedVideo = string(videoTracks)
-			savedAudio = string(audioTracks)
+		VirtualFileSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+			savedID = args.FileID
+			savedPath = args.ExpectedFilePath
+			savedVideo = string(args.VideoTracks)
+			savedAudio = string(args.AudioTracks)
 			close(saverDone)
-			return nil
+			return 1, nil
 		},
 		// No concrete candidate row: the save must fall back to the neutral
 		// row's own id and file_path so the id+file_path fence still matches.
@@ -1436,11 +1436,11 @@ func TestResolveAndProbeVirtualSourcePersistsToCandidateRow(t *testing.T) {
 			lookupOwner = ownerInstallationID
 			return candidateRow, nil
 		},
-		VirtualFileMetadataSaver: func(_ context.Context, fileID int, expectedFilePath string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
-			savedID = fileID
-			savedPath = expectedFilePath
+		VirtualFileSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+			savedID = args.FileID
+			savedPath = args.ExpectedFilePath
 			close(saverDone)
-			return nil
+			return 1, nil
 		},
 	}
 
@@ -1537,9 +1537,9 @@ func TestResolveAndProbeVirtualSourceFallsBackOnProbeError(t *testing.T) {
 		VirtualSourceProber: func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
 			return nil, errors.New("probe timed out")
 		},
-		VirtualFileMetadataSaver: func(context.Context, int, string, []byte, []byte, []byte, string, string, string, string, bool, int, int, bool) error {
+		VirtualFileSaver: func(context.Context, models.VirtualFilePersistArgs) (int64, error) {
 			saverCalls++
-			return nil
+			return 1, nil
 		},
 	}
 

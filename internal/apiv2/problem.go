@@ -241,7 +241,11 @@ func fromHumaError(requestID string, status int, msg string, errs []error, bodyL
 		})
 	}
 	if status == http.StatusUnprocessableEntity && len(p.Errors) > 0 {
-		slog.Warn("validation_failed", "request_id", requestID, "errors", p.Errors)
+		var codes []string
+		for _, e := range p.Errors {
+			codes = append(codes, e.Code)
+		}
+		slog.Warn("validation_failed", "request_id", requestID, "error_count", len(p.Errors), "codes", codes)
 	}
 	return p
 }

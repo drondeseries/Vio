@@ -115,15 +115,19 @@ func TestPersistVirtualMetadataBoundedForwardsExpectedPath(t *testing.T) {
 	var gotID int
 	var gotPath string
 	h := &PlaybackHandler{
-		VirtualFileMetadataSaver: func(_ context.Context, fileID int, expectedFilePath string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
-			gotID = fileID
-			gotPath = expectedFilePath
+		VirtualFileSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+			gotID = args.FileID
+			gotPath = args.ExpectedFilePath
 			done <- struct{}{}
-			return nil
+			return 1, nil
 		},
 	}
 	file := &models.MediaFile{ID: 42, FilePath: "virtual://movie/1?result=cand-1"}
-	h.persistVirtualMetadataBounded(context.Background(), 42, file.FilePath, file, true)
+	snap := snapshotVirtualRow(file)
+	_, err := h.persistVirtualMetadataBounded(context.Background(), snap, file.FilePath, file, true)
+	if err != nil {
+		t.Fatalf("persistVirtualMetadataBounded failed: %v", err)
+	}
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):

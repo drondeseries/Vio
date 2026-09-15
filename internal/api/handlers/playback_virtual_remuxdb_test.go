@@ -379,9 +379,9 @@ func TestRemuxDBEvidenceNeverPersistedWhenProberNil(t *testing.T) {
 				{URI: "virtual://movie/tt0000001?result=a", FileSize: 28980000000, Resolution: "1080p", CodecVideo: "h264"},
 			}, nil
 		}),
-		VirtualFileMetadataSaver: func(_ context.Context, _ int, _ string, _, _, _ []byte, _, _, _, _ string, _ bool, _ int, _ int, _ bool) error {
+		VirtualFileSaver: func(_ context.Context, _ models.VirtualFilePersistArgs) (int64, error) {
 			persisted = true
-			return nil
+			return 1, nil
 		},
 		VirtualPlaybackSourceProber:            nil,
 		VirtualPlaybackSourceProberWithHeaders: nil,

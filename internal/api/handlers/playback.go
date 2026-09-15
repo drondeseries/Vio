@@ -186,14 +186,13 @@ func (f VirtualMediaDetailedResolverFunc) ResolveVirtualMediaDetailed(ctx contex
 type VirtualPlaybackSourceProber func(context.Context, string, *models.MediaFile) (*models.MediaFile, error)
 type VirtualPlaybackSourceProberWithHeaders func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error)
 
-// VirtualFileUpdateFunc persists a media file path update after a stale
-// virtual result= candidate is replaced by a working substitute during
-// fallback resolution.
-type VirtualFileUpdateFunc func(ctx context.Context, fileID int, newFilePath string) error
+// VirtualFileSaver atomically persists probed virtual inventory and optionally
+// adopts a new file_path in a single CAS-fenced UPDATE. Returns the number of
+// rows updated (0 means the snapshot was stale — a newer write landed first).
+type VirtualFileSaver func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error)
 
-// VirtualFileMetadataSaver persists probed track inventory, duration, and codec/container
-// facts so subsequent v3 plans can use complete evidence without re-probing.
-type VirtualFileMetadataSaver func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error
+// VirtualPlaybackSourceProber resolves a virtual provider URL and probes the
+// stream metadata.
 
 // SubtitleSearchTrigger fires a background subtitle search when a virtual
 // stream enters playback without embedded or external subtitle tracks.
@@ -345,8 +344,7 @@ type PlaybackHandler struct {
 	VirtualPlaybackSourceProber            VirtualPlaybackSourceProber
 	VirtualPlaybackSourceProberWithHeaders VirtualPlaybackSourceProberWithHeaders
 	BestResultCache                        *VirtualBestResultCache
-	VirtualFileUpdater                     VirtualFileUpdateFunc
-	VirtualFileMetadataSaver               VirtualFileMetadataSaver
+	VirtualFileSaver                       VirtualFileSaver
 	VirtualSubtitleSearcher                SubtitleSearchTrigger
 	SubtitleSearchInFlight                 *sync.Map
 	DeviceCapabilitySource                 *providerDeviceCapabilitySource

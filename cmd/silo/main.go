@@ -3174,24 +3174,31 @@ func main() {
 			compatDeps.VirtualSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
 				return compatVirtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
 			}
-			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int, stampProbe bool) error {
+			compatDeps.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
 				if deps.DB == nil {
-					return nil
+					return 0, nil
 				}
-				vStr := string(videoTracks)
+				vStr := string(args.VideoTracks)
 				if vStr == "" || vStr == "null" {
 					vStr = "[]"
 				}
-				aStr := string(audioTracks)
+				aStr := string(args.AudioTracks)
 				if aStr == "" || aStr == "null" {
 					aStr = "[]"
 				}
-				sStr := string(subtitleTracks)
+				sStr := string(args.SubtitleTracks)
 				if sStr == "" || sStr == "null" {
 					sStr = "[]"
 				}
-				_, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL, vStr, aStr, sStr, resolution, codecVideo, codecAudio, container, hdr, bitrate, duration, fileID, expectedFilePath, stampProbe)
-				return err
+				tag, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL,
+					vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
+					args.FileID, args.ExpectedFilePath, args.StampProbe,
+					args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, args.AdoptPath,
+				)
+				if err != nil {
+					return 0, err
+				}
+				return tag.RowsAffected(), nil
 			}
 		}
 

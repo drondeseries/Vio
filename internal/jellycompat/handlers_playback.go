@@ -329,7 +329,7 @@ type PlaybackHandler struct {
 	VirtualPlaybackStreamLister    VirtualPlaybackStreamLister
 	VirtualSourceProber            VirtualSourceProber
 	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
-	VirtualFileMetadataSaver       VirtualFileMetadataSaver
+	VirtualFileSaver               VirtualFileSaver
 	VirtualCandidateFileLookup     VirtualCandidateFileLookup
 	RemoteStreamRelay              RemoteStreamRelay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
