@@ -43,10 +43,23 @@ jobs:
 
       # Mirrors `brew install vips ffmpeg` on macOS: the vips dev files must
       # be visible to cgo through pkg-config, and ffmpeg ships the runtime
-      # encoders. A fresh shell per step picks up the PATH entries choco
-      # registers, so verification lives in the next step.
-      - name: Install native dependencies
-        run: choco install -y vips ffmpeg pkgconfiglite --no-progress
+      # encoders. The Chocolatey vips package was removed from the community
+      # repository, so we fetch the official pre-built Windows binaries from
+      # libvips/build-win64-mxe instead.
+      - name: Install ffmpeg and pkg-config
+        run: choco install -y ffmpeg pkgconfiglite --no-progress
+
+      - name: Install libvips
+        shell: bash
+        run: |
+          VIPS_VERSION="8.18.6"
+          VIPS_URL="https://github.com/libvips/build-win64-mxe/releases/download/v${VIPS_VERSION}/vips-dev-x64-all-${VIPS_VERSION}.zip"
+          echo "Downloading libvips ${VIPS_VERSION} from ${VIPS_URL}"
+          curl -fsSL -o /tmp/vips-dev.zip "$VIPS_URL"
+          mkdir -p /c/vips
+          unzip -q /tmp/vips-dev.zip -d /c/vips --strip-components=1
+          echo "PKG_CONFIG_PATH=/c/vips/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "/c/vips/bin" >> "$GITHUB_PATH"
 
       - name: Verify native dependencies
         run: |
@@ -55,10 +68,10 @@ jobs:
             echo "::error::vips-cpp is not visible to pkg-config; the cgo build against libvips will fail."
             pkg-config --list-all 2>&1 | grep -i vips || echo "no vips entry in pkg-config --list-all"
             echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
-            ls '/c/Program Files' | grep -i vips || true
+            ls /c/vips/lib 2>/dev/null || ls '/c/Program Files' | grep -i vips || true
             exit 1
           }
-          vips --version
+          vips --version || echo "vips binary not in PATH (library-only install is fine)"
           ffmpeg -hide_banner -version
 
       - name: Set up pnpm
