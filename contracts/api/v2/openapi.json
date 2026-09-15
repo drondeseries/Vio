@@ -4974,23 +4974,23 @@
             "minLength": 1,
             "type": "string"
           },
-          "silo_profile_id": {
-            "description": "Opaque identifier",
-            "examples": [
-              "1"
-            ],
-            "minLength": 1,
-            "type": "string"
-          },
-          "silo_user_id": {
-            "description": "Opaque identifier",
-            "examples": [
-              "1"
-            ],
-            "minLength": 1,
-            "type": "string"
-          },
           "source_id": {
+            "description": "Opaque identifier",
+            "examples": [
+              "1"
+            ],
+            "minLength": 1,
+            "type": "string"
+          },
+          "vio_profile_id": {
+            "description": "Opaque identifier",
+            "examples": [
+              "1"
+            ],
+            "minLength": 1,
+            "type": "string"
+          },
+          "vio_user_id": {
             "description": "Opaque identifier",
             "examples": [
               "1"
@@ -5004,8 +5004,8 @@
           "source_id",
           "external_user_id",
           "external_user_name",
-          "silo_user_id",
-          "silo_profile_id"
+          "vio_user_id",
+          "vio_profile_id"
         ],
         "type": "object"
       },
@@ -5019,15 +5019,7 @@
           "external_user_name": {
             "type": "string"
           },
-          "silo_profile_id": {
-            "description": "Opaque identifier",
-            "examples": [
-              "1"
-            ],
-            "minLength": 1,
-            "type": "string"
-          },
-          "silo_user_id": {
+          "source_id": {
             "description": "Opaque identifier",
             "examples": [
               "1"
@@ -5036,7 +5028,15 @@
             "pattern": "^[1-9][0-9]*$",
             "type": "string"
           },
-          "source_id": {
+          "vio_profile_id": {
+            "description": "Opaque identifier",
+            "examples": [
+              "1"
+            ],
+            "minLength": 1,
+            "type": "string"
+          },
+          "vio_user_id": {
             "description": "Opaque identifier",
             "examples": [
               "1"
@@ -5050,15 +5050,15 @@
           "source_id",
           "external_user_id",
           "external_user_name",
-          "silo_user_id",
-          "silo_profile_id"
+          "vio_user_id",
+          "vio_profile_id"
         ],
         "type": "object"
       },
       "AdminHistoryImportMappingUpdateInputBody": {
         "additionalProperties": false,
         "properties": {
-          "silo_profile_id": {
+          "vio_profile_id": {
             "description": "Opaque identifier",
             "examples": [
               "1"
@@ -5066,7 +5066,7 @@
             "minLength": 1,
             "type": "string"
           },
-          "silo_user_id": {
+          "vio_user_id": {
             "description": "Opaque identifier",
             "examples": [
               "1"
@@ -15460,7 +15460,7 @@
           "display_name": {
             "description": "Label for the sign-in button",
             "examples": [
-              "Silo account"
+              "Vio account"
             ],
             "type": "string"
           },
@@ -20305,7 +20305,7 @@
             "type": "string"
           },
           "tmdb_id": {
-            "description": "TMDB identifier (external, not a Silo ID)",
+            "description": "TMDB identifier (external, not a Vio ID)",
             "examples": [
               420
             ],
@@ -25698,7 +25698,7 @@
           "device_name": {
             "description": "User-Agent recorded at login; empty when none was sent",
             "examples": [
-              "Silo/1.0 (tvOS)"
+              "Vio/1.0 (tvOS)"
             ],
             "type": "string"
           },
@@ -26455,7 +26455,7 @@
             "type": "string"
           },
           "tmdb_id": {
-            "description": "TMDB identifier (external, not a Silo ID)",
+            "description": "TMDB identifier (external, not a Vio ID)",
             "examples": [
               949
             ],
@@ -26463,7 +26463,7 @@
             "type": "integer"
           },
           "tvdb_id": {
-            "description": "TVDB identifier (external, not a Silo ID)",
+            "description": "TVDB identifier (external, not a Vio ID)",
             "format": "int64",
             "type": "integer"
           },
@@ -26558,7 +26558,7 @@
             "type": "string"
           },
           "tmdb_id": {
-            "description": "TMDB identifier (external, not a Silo ID)",
+            "description": "TMDB identifier (external, not a Vio ID)",
             "examples": [
               949
             ],
@@ -26567,7 +26567,7 @@
             "type": "integer"
           },
           "tvdb_id": {
-            "description": "TVDB identifier (external, not a Silo ID)",
+            "description": "TVDB identifier (external, not a Vio ID)",
             "format": "int64",
             "minimum": 1,
             "type": "integer"
@@ -30421,21 +30421,21 @@
           "client_label": {
             "description": "Display label derived from the client name and version; empty when unknown",
             "examples": [
-              "Silo for Apple TV 1.4"
+              "Vio for Apple TV 1.4"
             ],
             "type": "string"
           },
           "client_label_full": {
             "description": "Display label with the exact build; empty when unknown",
             "examples": [
-              "Silo for Apple TV 1.4.0 (1400)"
+              "Vio for Apple TV 1.4.0 (1400)"
             ],
             "type": "string"
           },
           "client_name": {
             "description": "Empty when unknown",
             "examples": [
-              "Silo for Apple TV"
+              "Vio for Apple TV"
             ],
             "type": "string"
           },
@@ -33913,7 +33913,7 @@
             "type": "string"
           },
           "tmdb_id": {
-            "description": "TMDB identifier (external, not a Silo ID)",
+            "description": "TMDB identifier (external, not a Vio ID)",
             "examples": [
               949
             ],
@@ -33921,7 +33921,7 @@
             "type": "integer"
           },
           "tvdb_id": {
-            "description": "TVDB identifier (external, not a Silo ID)",
+            "description": "TVDB identifier (external, not a Vio ID)",
             "format": "int64",
             "type": "integer"
           },
@@ -34055,7 +34055,7 @@
             "type": "string"
           },
           "tmdb_id": {
-            "description": "TMDB identifier (external, not a Silo ID)",
+            "description": "TMDB identifier (external, not a Vio ID)",
             "examples": [
               949
             ],
@@ -41266,19 +41266,19 @@
             "patternDescription": "a non-zero RFC 3339 instant",
             "type": "string"
           },
-          "silo_profile_id": {
-            "description": "Opaque identifier",
-            "examples": [
-              "1"
-            ],
-            "minLength": 1,
-            "type": "string"
-          },
           "updated_at": {
             "description": "RFC 3339 instant in UTC with millisecond precision",
             "format": "date-time",
             "pattern": "^(?:[1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[2-9])-",
             "patternDescription": "a non-zero RFC 3339 instant",
+            "type": "string"
+          },
+          "vio_profile_id": {
+            "description": "Opaque identifier",
+            "examples": [
+              "1"
+            ],
+            "minLength": 1,
             "type": "string"
           }
         },
@@ -41305,7 +41305,7 @@
             "maxLength": 1024,
             "type": "string"
           },
-          "silo_profile_id": {
+          "vio_profile_id": {
             "type": [
               "string",
               "null"
@@ -41315,7 +41315,7 @@
         "required": [
           "external_user_id",
           "external_user_name",
-          "silo_profile_id"
+          "vio_profile_id"
         ],
         "type": "object"
       },
@@ -41408,7 +41408,7 @@
     }
   },
   "info": {
-    "title": "Silo API",
+    "title": "Vio API",
     "version": "2"
   },
   "openapi": "3.1.0",
@@ -103773,7 +103773,7 @@
             "headers": {
               "Set-Cookie": {
                 "schema": {
-                  "description": "silo_plugin_access on the v2 plugin-content parent path: five minutes, HttpOnly, SameSite=Lax, Secure on HTTPS",
+                  "description": "vio_plugin_access on the v2 plugin-content parent path: five minutes, HttpOnly, SameSite=Lax, Secure on HTTPS",
                   "type": "string"
                 }
               }
@@ -139705,7 +139705,7 @@
         ],
         "x-silo-class": "public",
         "x-silo-raw-protocol": "redirect",
-        "x-silo-raw-reason": "Discord redirects browsers without Silo login headers; the stored one-time state authenticates the account-link callback.",
+        "x-silo-raw-reason": "Discord redirects browsers without Vio login headers; the stored one-time state authenticates the account-link callback.",
         "x-silo-service-backed": true
       }
     },
@@ -140833,7 +140833,7 @@
         ],
         "x-silo-class": "public",
         "x-silo-raw-protocol": "html-callback",
-        "x-silo-raw-reason": "Mail clients follow tokenized links without a Silo session; RFC 8058 clients POST form data and consume HTML.",
+        "x-silo-raw-reason": "Mail clients follow tokenized links without a Vio session; RFC 8058 clients POST form data and consume HTML.",
         "x-silo-service-backed": true
       },
       "post": {
@@ -140950,7 +140950,7 @@
         ],
         "x-silo-class": "public",
         "x-silo-raw-protocol": "html-callback",
-        "x-silo-raw-reason": "Mail clients follow tokenized links without a Silo session; RFC 8058 clients POST form data and consume HTML.",
+        "x-silo-raw-reason": "Mail clients follow tokenized links without a Vio session; RFC 8058 clients POST form data and consume HTML.",
         "x-silo-retry-safety": "non_retryable",
         "x-silo-service-backed": true
       }
@@ -141098,7 +141098,7 @@
         ],
         "x-silo-class": "public",
         "x-silo-raw-protocol": "html-callback",
-        "x-silo-raw-reason": "Mail clients follow tokenized links without a Silo session; RFC 8058 clients POST form data and consume HTML.",
+        "x-silo-raw-reason": "Mail clients follow tokenized links without a Vio session; RFC 8058 clients POST form data and consume HTML.",
         "x-silo-service-backed": true
       }
     },
@@ -154361,12 +154361,12 @@
             }
           },
           {
-            "description": "TMDB identifier (external, not a Silo ID)",
+            "description": "TMDB identifier (external, not a Vio ID)",
             "in": "path",
             "name": "tmdb_id",
             "required": true,
             "schema": {
-              "description": "TMDB identifier (external, not a Silo ID)",
+              "description": "TMDB identifier (external, not a Vio ID)",
               "examples": [
                 949
               ],
@@ -176579,7 +176579,7 @@
             }
           },
           {
-            "description": "Opaque incarnation/timeline from the completed response; private to Silo hops.",
+            "description": "Opaque incarnation/timeline from the completed response; private to Vio hops.",
             "in": "header",
             "name": "X-Vio-Transcode-Segment-Generation",
             "required": true,

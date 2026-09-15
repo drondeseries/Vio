@@ -38,7 +38,7 @@
     {
       "id": "api",
       "entrypoint": "internal/api.NewRouter",
-      "description": "Main Silo API listener: the /api/v1 namespace and the routes mounted beside it.",
+      "description": "Main Vio API listener: the /api/v1 namespace and the routes mounted beside it.",
       "route_count": 714
     },
     {
