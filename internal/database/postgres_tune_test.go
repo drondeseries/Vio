@@ -22,6 +22,7 @@ func TestRecommendPostgresOLTPSettings(t *testing.T) {
 
 	expected := map[string]string{
 		"max_connections":                  "100",
+		"max_locks_per_transaction":        "256",
 		"shared_buffers":                   "4GB",
 		"effective_cache_size":             "12GB",
 		"maintenance_work_mem":             "1GB",

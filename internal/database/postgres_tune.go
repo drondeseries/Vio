@@ -36,6 +36,7 @@ const (
 
 var managedPostgresTuneSettings = []string{
 	"max_connections",
+	"max_locks_per_transaction",
 	"shared_buffers",
 	"effective_cache_size",
 	"maintenance_work_mem",
@@ -197,7 +198,7 @@ func RecommendPostgresOLTPSettings(opts PostgresTuneOptions, postgresMajorVersio
 		connections = 100
 	}
 
-	settings := make([]PostgresTuneSetting, 0, 24)
+	settings := make([]PostgresTuneSetting, 0, 25)
 	sharedBuffers := memoryBudgetKB / 4
 	effectiveCacheSize := (memoryBudgetKB * 3) / 4
 	maintenanceWorkMem := memoryBudgetKB / 16
@@ -207,6 +208,12 @@ func RecommendPostgresOLTPSettings(opts PostgresTuneOptions, postgresMajorVersio
 
 	settings = append(settings,
 		PostgresTuneSetting{Name: "max_connections", Value: strconv.Itoa(connections)},
+		// Postmaster-scope: locks per transaction. Collection sync acceptance
+		// takes transaction-scoped advisory locks proportional to the virtual
+		// membership it touches; the default 64 is too low for large
+		// collections. Reported with RequiresRestart because pg_settings
+		// classifies it postmaster-scope.
+		PostgresTuneSetting{Name: "max_locks_per_transaction", Value: "256"},
 		PostgresTuneSetting{Name: "shared_buffers", Value: formatPostgresTuneKB(sharedBuffers)},
 		PostgresTuneSetting{Name: "effective_cache_size", Value: formatPostgresTuneKB(effectiveCacheSize)},
 		PostgresTuneSetting{Name: "maintenance_work_mem", Value: formatPostgresTuneKB(maintenanceWorkMem)},
