@@ -1278,15 +1278,15 @@ func ExecVirtualFileMetadataUpdate(ctx context.Context, db VirtualFileMetadataDB
 		return 0, nil
 	}
 	vStr := string(args.VideoTracks)
-	if vStr == "" || vStr == "null" {
+	if vStr == "" || vStr == jsonNullLiteral {
 		vStr = "[]"
 	}
 	aStr := string(args.AudioTracks)
-	if aStr == "" || aStr == "null" {
+	if aStr == "" || aStr == jsonNullLiteral {
 		aStr = "[]"
 	}
 	sStr := string(args.SubtitleTracks)
-	if sStr == "" || sStr == "null" {
+	if sStr == "" || sStr == jsonNullLiteral {
 		sStr = "[]"
 	}
 	exec := func(adoptPath string) (int64, error) {
