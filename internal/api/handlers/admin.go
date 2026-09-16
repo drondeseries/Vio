@@ -25,6 +25,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/adminjob"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/artworkstore"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/cache"
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -134,6 +135,7 @@ type AdminHandler struct {
 	DownloadsStatsSource         AdminDownloadsStatsSource
 	RedisClient                  *redis.Client // health reporting only; nil means this deployment runs without Redis
 	Config                       *config.Config
+	ArtworkBackend               string // resolved artwork backend for the settings status; empty when unopened
 	EventBus                     cache.EventBus
 	EventsHub                    *evt.Hub
 	SettingsRepo                 ServerSettingsStore
@@ -156,13 +158,6 @@ type AdminHandler struct {
 	// would be pure waste. Nil when the handler was built without the
 	// constructor (tests): the counts are then simply uncached.
 	logLevelCounts *cache.TTLCache[adminLogLevelCounts]
-	// PublicStorageConfigured reports whether the public object-storage client
-	// is active in this process — the same condition that gates branding asset
-	// uploads (branding.Service.HasStorage) and the metadata image cacher, both
-	// of which are only wired when the public S3 client exists. A nil func
-	// means "not configured". See publicBucketConfigured for the full rule,
-	// which also accepts a bucket that is saved but not live yet.
-	PublicStorageConfigured func() bool
 }
 
 // NewAdminHandler creates a new AdminHandler backed by the given
@@ -1547,6 +1542,78 @@ var sensitiveSettingKeys = catalog.SensitiveSettingKeys
 // server_settings store but is not part of the administrator settings API.
 var machineManagedSettingKeys = map[string]bool{
 	config.ArtworkStorageReconcileCheckpointKey: true,
+	config.ArtworkStorageSweepCheckpointKey:     true,
+	artworkstore.IdentitySettingKey:             true,
+}
+
+// Setting keys that decide where artwork lives. The s3 keys are the canonical
+// names; the effective settings map already applies the operational aliases.
+const (
+	artworkStorageBackendKey = "artwork.storage_backend"
+	artworkLocalPathKey      = "artwork.local_path"
+	s3PublicEndpointKey      = "s3.public_endpoint"
+	s3PublicBucketKey        = "s3.public_bucket"
+	s3PublicKeyPrefixKey     = "s3.public_key_prefix"
+	s3OperationalBucketKey   = "s3.operational_bucket"
+)
+
+// artworkStorageLocked reports whether the artwork storage location can still
+// change. The first artwork write records the store identity; after that the
+// catalog's keys live in exactly one place and there is no migrator, so every
+// setting that selects that place is read-only.
+func artworkStorageLocked(stored map[string]string) bool {
+	return strings.TrimSpace(stored[artworkstore.IdentitySettingKey]) != ""
+}
+
+var errArtworkStorageLocked = &APIError{
+	Status:  http.StatusConflict,
+	Code:    "artwork_storage_locked",
+	Message: "artwork storage cannot change once artwork has been stored; the catalog's artwork keys belong to the recorded storage",
+}
+
+// artworkIdentityInputs names the effective settings that decide where
+// artwork lives: the resolved backend and, for that backend, the fields the
+// store folds into its identity. The s3 keys are the canonical names; the
+// effective map already applies the legacy operational aliases.
+func artworkIdentityInputs(effective map[string]string) (backend string, inputs map[string]string) {
+	backend = strings.ToLower(strings.TrimSpace(effective[artworkStorageBackendKey]))
+	if backend == "" || backend == config.ArtworkBackendAuto {
+		backend = artworkstore.BackendLocal
+		if strings.TrimSpace(effective[s3PublicBucketKey]) != "" {
+			backend = artworkstore.BackendS3
+		}
+	}
+	inputs = map[string]string{}
+	switch backend {
+	case artworkstore.BackendS3:
+		for _, key := range []string{s3PublicEndpointKey, s3PublicBucketKey, s3PublicKeyPrefixKey} {
+			inputs[key] = strings.TrimSpace(effective[key])
+		}
+	default:
+		inputs[artworkLocalPathKey] = strings.TrimSpace(effective[artworkLocalPathKey])
+	}
+	return backend, inputs
+}
+
+// rejectArtworkIdentityChange refuses a write that would move artwork storage
+// after it has been recorded: a backend other than the recorded one, or a
+// different value for any setting that backend's identity is built from.
+// Writes that leave the location as it is, including re-saving the same
+// values or adding a bucket an explicit local backend ignores, are allowed so
+// a settings form that includes the keys can still submit.
+func rejectArtworkIdentityChange(recorded string, before, after map[string]string) error {
+	recordedBackend, _, _ := strings.Cut(strings.TrimSpace(recorded), "|")
+	_, beforeInputs := artworkIdentityInputs(before)
+	afterBackend, afterInputs := artworkIdentityInputs(after)
+	if afterBackend != recordedBackend {
+		return errArtworkStorageLocked
+	}
+	for key, value := range beforeInputs {
+		if afterInputs[key] != value {
+			return errArtworkStorageLocked
+		}
+	}
+	return nil
 }
 
 func redactAdminSettings(values map[string]string) {
@@ -2012,102 +2079,7 @@ type updateSettingsResponse struct {
 	RestartRequiredKeys []string          `json:"restart_required_keys,omitempty"`
 }
 
-// settingMetadataCacheImages copies provider artwork into the public bucket, so
-// it cannot be turned on without one. settingPublicBucketLegacy is the
-// pre-rename alias config.db_loader still falls back to.
-const (
-	settingMetadataCacheImages = "metadata.cache_images"
-	settingPublicBucket        = "s3.public_bucket"
-	settingPublicBucketLegacy  = "s3.operational_bucket"
-)
-
-// errCodeStorageUnavailable is the API error code for a setting that needs
-// object storage this deployment has not configured.
 const errCodeStorageUnavailable = "storage_unavailable"
-
-// errPublicStorageUnavailable is returned when a write would leave
-// metadata.cache_images enabled with no public bucket anywhere: the image cacher
-// is wired off the public S3 client, so caching could never start.
-var errPublicStorageUnavailable = errors.New(
-	"S3 image caching requires a configured public storage bucket: metadata.cache_images cannot be " +
-		"enabled while s3.public_bucket is empty (Infrastructure \u2192 Public storage)")
-
-// publicBucketConfigured reports whether a public object-storage bucket exists
-// from the server's point of view. A bucket that is only saved counts: an admin
-// editing an inactive-but-saved deployment is one restart away. Only the live
-// client proves caching starts immediately, so the UI still badges the pending
-// restart — but the API must not block a legitimate save.
-//
-// This is the single-key endpoint's view: it writes one setting against
-// whatever is already stored. The batch endpoint uses
-// prospectivePublicBucketConfigured instead, because a bucket written or
-// cleared by the same request has not reached the store yet.
-func (h *AdminHandler) publicBucketConfigured(ctx context.Context) bool {
-	if h == nil {
-		return false
-	}
-	if h.PublicStorageConfigured != nil && h.PublicStorageConfigured() {
-		return true
-	}
-	for _, key := range []string{settingPublicBucket, settingPublicBucketLegacy} {
-		if h.BootstrapSensitiveConfigured[key] &&
-			strings.TrimSpace(h.BootstrapSensitiveValues[key]) != "" {
-			return true
-		}
-		if h.SettingsRepo == nil {
-			continue
-		}
-		if stored, err := h.SettingsRepo.Get(ctx, key); err == nil && strings.TrimSpace(stored) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// prospectivePublicBucketConfigured reports whether the settings a batch is
-// about to persist still describe a public bucket. effective is the stored
-// state overlaid with the batch and the environment and run through
-// config.EffectiveAdminSettings, so the legacy s3.operational_bucket fallback
-// LoadFromDB applies is already folded into settingPublicBucket; changed is the
-// batch itself.
-//
-// A bucket key the batch does not mention leaves the live public client as
-// evidence, because the bucket may come from a source the settings store cannot
-// see. An explicitly empty bucket in the batch is a clear, not an absence: the
-// live client only reflects what this process booted with, so it cannot vouch
-// for storage the saved settings no longer describe.
-func (h *AdminHandler) prospectivePublicBucketConfigured(effective, changed map[string]string) bool {
-	if h == nil {
-		return false
-	}
-	if strings.TrimSpace(effective[settingPublicBucket]) != "" {
-		return true
-	}
-	for _, key := range []string{settingPublicBucket, settingPublicBucketLegacy} {
-		if _, cleared := changed[key]; cleared {
-			return false
-		}
-	}
-	return h.PublicStorageConfigured != nil && h.PublicStorageConfigured()
-}
-
-// validateProspectiveImageCaching rejects a batch whose final state leaves image
-// caching enabled with nowhere to write. Both directions matter: enabling
-// caching while clearing the bucket in the same request, and clearing the bucket
-// while stored settings already have caching on. Either way the image cacher
-// cannot start after the next restart.
-func (h *AdminHandler) validateProspectiveImageCaching(effective, changed map[string]string) error {
-	// ParseBool matches config.LoadFromDB, which reads the stored value the same
-	// way; anything it rejects is not a deployment running with caching on.
-	enabled, _ := strconv.ParseBool(strings.TrimSpace(effective[settingMetadataCacheImages]))
-	if !enabled {
-		return nil
-	}
-	if h.prospectivePublicBucketConfigured(effective, changed) {
-		return nil
-	}
-	return errPublicStorageUnavailable
-}
 
 func (h *AdminHandler) normalizeBatchSetting(
 	ctx context.Context,
@@ -2198,6 +2170,7 @@ var adminSettingDependencyGroups = [][]string{
 	{config.PlaybackRoutingRemuxExecutionSettingKey, config.PlaybackRoutingRemuxEgressSettingKey},
 	{config.PlaybackRoutingVideoTranscodeExecutionSettingKey, config.PlaybackRoutingVideoTranscodeEgressSettingKey},
 	{"s3.public_endpoint", "s3.public_bucket"},
+	{artworkStorageBackendKey, s3PublicEndpointKey, s3PublicBucketKey},
 	{"s3.public_access_key", "s3.public_secret_key"},
 	{"s3.private_endpoint", "s3.private_bucket"},
 	{"s3.private_access_key", "s3.private_secret_key"},
@@ -2425,17 +2398,18 @@ func (h *AdminHandler) UpdateAdminSettings(ctx context.Context, values map[strin
 			for key, value := range normalized {
 				prospective[key] = value
 			}
+			if artworkStorageLocked(stored) {
+				if err := rejectArtworkIdentityChange(stored[artworkstore.IdentitySettingKey], h.effectiveAdminSettings(stored), h.effectiveAdminSettings(prospective)); err != nil {
+					preconditionErr = err
+					return nil, err
+				}
+			}
 			activeProspective := h.activeAdminSettings(prospective)
 			before := h.effectiveAdminSettings(stored)
 			after = h.effectiveAdminSettings(prospective)
 			// Cross-field checks run against the complete prospective state, so a
 			// value the batch clears is gone even when the store still has it and
 			// the current process is still running on it.
-			if err := h.validateProspectiveImageCaching(after, normalized); err != nil {
-				validationErr = err
-				validationCode = errCodeStorageUnavailable
-				return nil, err
-			}
 			validationSnapshot := adminSettingsValidationSnapshot(activeProspective, normalized)
 			if err := validateProspectiveAdminSettings(validationSnapshot, h.RedisBootstrapAvailable); err != nil {
 				validationErr = err
@@ -2612,10 +2586,6 @@ func (h *AdminHandler) UpdateAdminSetting(ctx context.Context, key, value string
 			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "policy.editor_enabled must be true or false"}
 		}
 		req.Value = strconv.FormatBool(enabled)
-	case settingMetadataCacheImages:
-		if req.Value == "true" && !h.publicBucketConfigured(ctx) {
-			return AdminSettingUpdateResult{}, &APIError{Status: http.StatusBadRequest, Code: errCodeStorageUnavailable, Message: errPublicStorageUnavailable.Error()}
-		}
 	case diagnostics.KeyUploadsEnabled:
 		enabled, err := strconv.ParseBool(strings.TrimSpace(req.Value))
 		if err != nil {
@@ -2786,6 +2756,12 @@ func (h *AdminHandler) UpdateAdminSetting(ctx context.Context, key, value string
 
 			prospective := maps.Clone(stored)
 			prospective[key] = req.Value
+			if artworkStorageLocked(stored) {
+				if err := rejectArtworkIdentityChange(stored[artworkstore.IdentitySettingKey], h.effectiveAdminSettings(stored), h.effectiveAdminSettings(prospective)); err != nil {
+					preconditionErr = err
+					return nil, err
+				}
+			}
 			if isPlaybackRoutingPairSetting(key) {
 				changed := map[string]string{key: req.Value}
 				validationSnapshot := adminSettingsValidationSnapshot(h.activeAdminSettings(prospective), changed)
@@ -2810,16 +2786,13 @@ func (h *AdminHandler) UpdateAdminSetting(ctx context.Context, key, value string
 					return nil, err
 				}
 			}
-			// Image caching's bucket is the other durable prerequisite: clearing
-			// it here while metadata.cache_images is stored on would leave the
-			// cacher unable to start after restart. Disable caching first.
-			if key == settingPublicBucket || key == settingPublicBucketLegacy {
-				if err := h.validateProspectiveImageCaching(
-					h.effectiveAdminSettings(prospective),
-					map[string]string{key: req.Value},
-				); err != nil {
+			// The artwork backend is the other durable prerequisite: an explicit
+			// S3 backend without a public bucket cannot open after restart, whether
+			// this write selects the backend or clears the bucket under it.
+			if key == artworkStorageBackendKey || key == s3PublicBucketKey || key == s3OperationalBucketKey {
+				if err := config.ValidateArtworkStorageSettings(h.effectiveAdminSettings(prospective)); err != nil {
 					validationErr = err
-					validationCode = errCodeStorageUnavailable
+					validationCode = "invalid_settings"
 					return nil, err
 				}
 			}

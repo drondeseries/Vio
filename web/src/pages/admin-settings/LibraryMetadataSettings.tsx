@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { AlertTriangle, ArrowRight } from "lucide-react";
+import { ArrowRight, RotateCcw } from "lucide-react";
 import { Link } from "react-router";
 
 import type { ConnectionCheckResponse } from "@/api/types";
@@ -7,8 +7,8 @@ import { ConnectionCheckAction } from "@/components/admin/ConnectionCheckAction"
 import { AdvancedSection } from "@/components/settings/AdvancedSection";
 import { SecretField } from "@/components/settings/SecretField";
 import { SettingsPageHeader } from "@/components/settings/SettingsPageHeader";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useBranding } from "@/hooks/useBranding";
 import {
   useCatalogSearchStatus,
   useCheckAdminSettingsConnection,
@@ -20,10 +20,16 @@ import { MarkerTasksCard } from "./MarkerTasksCard";
 import { SaveBar } from "./SaveBar";
 import { SearchStatusPanel } from "./SearchStatusPanel";
 import { SettingField, SettingFieldStatus } from "./SettingField";
+import { WORKER_SETTING_DEFAULTS, hasWorkerOverrides } from "./settingsWorkerDefaults";
 
 const ARTWORK_KEYS = ["metadata.cache_images"];
 
-const SCANNER_KEYS = ["scanner.workers", "matcher.workers", "matcher.batch_size"];
+const SCANNER_KEYS = [
+  "scanner.workers",
+  "matcher.workers",
+  "matcher.batch_size",
+  "metadata.image_workers",
+];
 
 const MARKER_KEYS = ["markers.mode", "markers.lazy_playback"];
 
@@ -51,30 +57,24 @@ const KEYS = [...ARTWORK_KEYS, ...SCANNER_KEYS, ...MARKER_KEYS, ...SEARCH_KEYS];
 
 export default function LibraryMetadataSettings() {
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
-  const branding = useBranding();
   const restartKeys = useRestartKeys();
   const checkConnection = useCheckAdminSettingsConnection();
   const [connectionResult, setConnectionResult] = useState<ConnectionCheckResponse | null>(null);
-
-  // Artwork storage writes provider images into the public bucket, so the
-  // server rejects enabling it when no bucket is configured at all.
-  // `storage_available` is the process-level truth (branding uses the same
-  // flag for asset uploads); s3.public_bucket only says a bucket was saved,
-  // which is enough for the server to accept the save — the two together
-  // separate "restart pending" from "never configured". s3.public_bucket is
-  // not staged here, but getValue falls back to the full settings response.
-  const publicBucketSaved = Boolean(form.getValue("s3.public_bucket"));
-  const artworkStorageOn = form.getValue("metadata.cache_images") === "true";
-  // Never trap an admin with it on: turning it off stays available even when
-  // the bucket went away.
-  const artworkStorageLocked =
-    !branding.storageAvailable && !publicBucketSaved && !artworkStorageOn;
 
   const provider = form.getValue("catalog.search.provider") || "postgres";
   const meiliEnabled = provider === "meilisearch";
   const { data: searchStatus } = useCatalogSearchStatus(meiliEnabled);
   const anyDirty = (keys: string[]) => keys.some((key) => form.isDirty(key));
   const allRestart = (keys: string[]) => keys.every((key) => restartKeys.has(key));
+  // Restoring stages every worker value at once; the save bar still confirms
+  // it. The button is only offered while something differs from the default,
+  // so an untouched group never shows a control that would do nothing.
+  const workerOverrides = hasWorkerOverrides(form.getValue);
+  function restoreWorkerDefaults() {
+    for (const [key, fallback] of Object.entries(WORKER_SETTING_DEFAULTS)) {
+      if (form.getValue(key) !== fallback) form.setValue(key, fallback);
+    }
+  }
   // Staged Meilisearch edits stay reachable after switching the provider back,
   // so the save bar can never count a change the admin cannot see.
   const showMeili = meiliEnabled || anyDirty(MEILI_KEYS);
@@ -120,42 +120,38 @@ export default function LibraryMetadataSettings() {
       <div className="flex-1 space-y-5">
         <FieldGroup
           label="Artwork"
-          description="Posters and backdrops from metadata providers, copied into the public bucket and served from there."
+          description="Posters and backdrops from metadata providers, copied into your artwork storage."
           restartAll={allRestart(ARTWORK_KEYS)}
         >
-          {!branding.storageAvailable && (
-            <div className="mt-3 flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
-              <p className="text-muted-foreground text-[13px] leading-relaxed">
-                {publicBucketSaved ? (
-                  <>Restart the server for artwork storage to start.</>
-                ) : (
-                  <>
-                    Artwork storage needs a public S3 bucket, set in{" "}
-                    <Link
-                      to="/admin/settings/infrastructure"
-                      className="text-foreground font-medium underline-offset-2 hover:underline"
-                    >
-                      Storage &amp; Database
-                    </Link>{" "}
-                    settings.
-                  </>
-                )}
-              </p>
-            </div>
-          )}
           <SettingField
-            label="Store artwork in your bucket"
+            label="Keep provider artwork"
             type="toggle"
             description="When off, clients load artwork straight from the providers."
             value={form.getValue("metadata.cache_images")}
             onChange={(value) => form.setValue("metadata.cache_images", value)}
-            disabled={artworkStorageLocked}
             restartRequired={restartKeys.has("metadata.cache_images")}
           />
         </FieldGroup>
 
-        <FieldGroup label="Scanning" restartAll={allRestart(SCANNER_KEYS)}>
+        <FieldGroup
+          label="Scanning"
+          restartAll={allRestart(SCANNER_KEYS)}
+          dirty={anyDirty(SCANNER_KEYS)}
+          actions={
+            workerOverrides ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                className="text-muted-foreground hover:text-foreground"
+                onClick={restoreWorkerDefaults}
+              >
+                <RotateCcw aria-hidden="true" />
+                Restore defaults
+              </Button>
+            ) : undefined
+          }
+        >
           <AdvancedSection
             id="library.scanning"
             count={SCANNER_KEYS.length}
@@ -168,6 +164,14 @@ export default function LibraryMetadataSettings() {
               value={form.getValue("scanner.workers")}
               onChange={(value) => form.setValue("scanner.workers", value)}
               restartRequired={restartKeys.has("scanner.workers")}
+            />
+            <SettingField
+              label="Image encoding workers"
+              type="number"
+              description="How many artwork images Silo encodes at once. 0 uses one per CPU core."
+              value={form.getValue("metadata.image_workers")}
+              onChange={(value) => form.setValue("metadata.image_workers", value)}
+              restartRequired={restartKeys.has("metadata.image_workers")}
             />
             <SettingField
               label="Matcher workers"

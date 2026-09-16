@@ -71,8 +71,8 @@ func (p *PlexAdminProvider) Fetch(ctx context.Context) ([]Record, []string, erro
 // endpoint. Only movies and episodes are looked up: the matcher rejects every other
 // kind, so fetching metadata for music tracks or clips would be wasted requests.
 // Rating keys are fetched once each, in batches, because one item can appear many
-// times in the raw history. Individual failures stay best-effort so exact title/year
-// matching can still run; only context cancellation aborts the sweep.
+// times in the raw history. Individual failures stay best-effort so other records
+// can still import; only context cancellation aborts the sweep.
 func (p *PlexAdminProvider) fetchItemMetadata(
 	ctx context.Context,
 	items []PlexHistoryItem,
@@ -81,21 +81,21 @@ func (p *PlexAdminProvider) fetchItemMetadata(
 ) (map[string]*PlexItem, error) {
 	// A rating key is resolved when any of its history entries already carries usable
 	// ids (Plex is inconsistent about including Guid on history rows for one item).
-	kinds := make(map[string]string)
+	eligible := make(map[string]struct{})
 	resolved := make(map[string]struct{})
 	for _, item := range items {
 		if item.RatingKey == "" || (item.Type != KindMovie && item.Type != KindEpisode) {
 			continue
 		}
-		kinds[item.RatingKey] = item.Type
-		if hasMatchablePlexGuidForKind(item.Guid, item.Type) || hasMatchableSeriesFallback(item, seriesMeta) {
+		eligible[item.RatingKey] = struct{}{}
+		if hasMatchablePlexGuid(item.Guid) || hasMatchableSeriesFallback(item, seriesMeta) {
 			resolved[item.RatingKey] = struct{}{}
 		}
 	}
-	seen := make(map[string]struct{}, len(kinds))
+	seen := make(map[string]struct{}, len(eligible))
 	var pending []string
 	for _, item := range items {
-		if _, ok := kinds[item.RatingKey]; !ok {
+		if _, ok := eligible[item.RatingKey]; !ok {
 			continue
 		}
 		if _, ok := resolved[item.RatingKey]; ok {
@@ -159,7 +159,7 @@ func (p *PlexAdminProvider) fetchItemMetadata(
 	unresolved := 0
 	for _, key := range pending {
 		meta, ok := result[key]
-		if !ok || !hasMatchablePlexGuidForKind(meta.Guid, kinds[key]) {
+		if !ok || !hasMatchablePlexGuid(meta.Guid) {
 			unresolved++
 		}
 	}
@@ -171,7 +171,7 @@ func (p *PlexAdminProvider) fetchItemMetadata(
 }
 
 func enrichPlexHistoryItem(item PlexHistoryItem, meta *PlexItem) PlexHistoryItem {
-	item.Guid, item.Year = applyPlexMetadataFallback(item.Guid, item.Year, item.Type, meta)
+	item.Guid, item.Year = applyPlexMetadataFallback(item.Guid, item.Year, meta)
 	return item
 }
 
@@ -180,7 +180,7 @@ func hasMatchableSeriesFallback(item PlexHistoryItem, seriesMeta map[string]*Ple
 		return false
 	}
 	series := seriesMeta[item.GrandparentRatingKey]
-	return series != nil && hasMatchablePlexGuidForKind(series.Guid, KindSeries)
+	return series != nil && hasMatchablePlexGuid(series.Guid)
 }
 
 // fetchSeriesMetadata fetches metadata for all unique series referenced by episode items.

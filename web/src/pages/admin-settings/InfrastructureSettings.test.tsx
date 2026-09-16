@@ -27,11 +27,11 @@ vi.mock("@/hooks/useSettingsForm", async (importOriginal) => {
   };
 });
 
-// Mirrors the server registry's restart prefixes: every s3/redis/database/
+// Mirrors the server registry's restart prefixes: every artwork/s3/redis/database/
 // userdb key restarts; nothing else on this page does. Tests that need a
 // different registry override the mock.
 const restartKeysMock = vi.fn(() => ({
-  has: (key: string) => /^(s3|redis|database|userdb)\./.test(key),
+  has: (key: string) => /^(artwork|s3|redis|database|userdb)\./.test(key),
 }));
 
 vi.mock("@/hooks/useRestartKeys", () => ({
@@ -44,6 +44,7 @@ vi.mock("@/hooks/queries/admin/settings", () => ({
   useAdminServerSettings: () => ({ data: serverSettings.current, isLoading: false }),
   useAdminSensitiveStatus: () => ({ data: sensitiveStatus.current, isError: false }),
   useUpdateServerSettings: () => ({ mutateAsync: updateSettingsMock, isPending: false }),
+  useAdminServerStatus: () => ({ data: serverStatus.current }),
 }));
 
 vi.mock("@/hooks/queries/admin/collections", () => ({
@@ -62,6 +63,12 @@ vi.mock("@/hooks/queries/admin/plugins", () => ({
   useAdminPluginInstallations: () => ({ data: undefined, isLoading: false }),
 }));
 
+const serverStatus: {
+  current: { artwork_storage?: { backend?: string; locked: boolean } } | undefined;
+} = {
+  current: undefined,
+};
+
 useCheckAdminSettingsConnectionMock.mockReturnValue({ isPending: false, mutateAsync: vi.fn() });
 
 type FormOverrides = Partial<Record<string, unknown>>;
@@ -70,6 +77,7 @@ function mockForm(overrides: FormOverrides = {}) {
   const form = {
     isLoading: false,
     getValue: (key: string) => (key === "s3.public_url_auth" ? "presigned" : ""),
+    getPersistedValue: () => "",
     setValue: vi.fn(),
     resetValue: vi.fn(),
     dirtyCount: 0,
@@ -97,9 +105,35 @@ describe("InfrastructureSettings", () => {
 
     const markup = renderToStaticMarkup(<InfrastructureSettings />);
 
-    for (const heading of ["Redis", "Public storage", "Private storage", "Database", "Logs"]) {
+    for (const heading of [
+      "Artwork storage",
+      "Redis",
+      "Public storage",
+      "Private storage",
+      "Database",
+      "Logs",
+    ]) {
       expect(markup).toContain(heading);
     }
+  });
+
+  it("keeps the backend editable until artwork has been stored", () => {
+    serverStatus.current = { artwork_storage: { backend: "local", locked: false } };
+    mockForm();
+    render(<InfrastructureSettings />);
+    expect(screen.getByRole("combobox", { name: "Backend" })).toBeEnabled();
+    expect(screen.queryByText(/Locked to/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Local artwork path")).toBeEnabled();
+  });
+
+  it("locks the backend once artwork has been stored", () => {
+    serverStatus.current = { artwork_storage: { backend: "s3", locked: true } };
+    mockForm({ getValue: (key: string) => (key === "artwork.storage_backend" ? "s3" : "") });
+    render(<InfrastructureSettings />);
+    expect(screen.getByRole("combobox", { name: "Backend" })).toBeDisabled();
+    expect(screen.getByText(/Locked to S3/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Local artwork path")).toBeDisabled();
+    serverStatus.current = undefined;
   });
 
   it("renders the page header on its own, with no description or status strip", () => {
@@ -127,9 +161,9 @@ describe("InfrastructureSettings", () => {
     expect(
       screen.queryByText("Changes on this page apply after a restart."),
     ).not.toBeInTheDocument();
-    // Redis, both storage buckets, and Database each say it once; their
+    // Artwork, Redis, both storage buckets, and Database each say it once; their
     // fields drop the per-field chips.
-    expect(screen.getAllByText(/Changes apply after a restart/)).toHaveLength(4);
+    expect(screen.getAllByText(/Changes apply after a restart/)).toHaveLength(5);
     expect(screen.queryAllByLabelText("Takes effect after a server restart")).toHaveLength(0);
     const logsGroup = within(screen.getByRole("group", { name: "Logs" }));
     expect(logsGroup.queryByText(/Changes apply after a restart/)).not.toBeInTheDocument();
@@ -187,8 +221,7 @@ describe("InfrastructureSettings", () => {
     expect(keys).toEqual(
       expect.arrayContaining(["s3.public_bucket", "s3.private_bucket", OPSLOG_BUCKET_POLICIES_KEY]),
     );
-    // Artwork storage lives on Library & Metadata, beside the rest of the
-    // metadata behavior; this page only owns the buckets it writes into.
+    // Provider caching remains on Library & Metadata. This page selects storage.
     expect(keys).not.toContain("metadata.cache_images");
     // The disabled Litestream storage tab is gone; its keys keep working through the API.
     expect(keys.filter((key) => key.startsWith("s3.user_db_"))).toEqual([]);
@@ -248,13 +281,26 @@ describe("InfrastructureSettings", () => {
     expect(markup).toContain("Advanced · 2 settings");
   });
 
-  it("warns about the artwork cache when a public storage identity field is edited", () => {
+  it("warns that the first artwork write locks a public storage identity field", () => {
+    serverStatus.current = { artwork_storage: { backend: "local", locked: false } };
     mockForm({ isDirty: (key: string) => key === "s3.public_bucket", dirtyCount: 1 });
 
     const markup = renderToStaticMarkup(<InfrastructureSettings />);
 
     expect(markup).toContain("Storage location change");
-    expect(markup).toContain("will not change artwork cache records");
+    expect(markup).toContain("records this location and locks it");
+    serverStatus.current = undefined;
+  });
+
+  it("explains the rejection when a locked S3 identity field is edited", () => {
+    serverStatus.current = { artwork_storage: { backend: "s3", locked: true } };
+    mockForm({ isDirty: (key: string) => key === "s3.public_bucket", dirtyCount: 1 });
+
+    const markup = renderToStaticMarkup(<InfrastructureSettings />);
+
+    expect(markup).toContain("Storage location change");
+    expect(markup).toContain("the server will reject a change");
+    serverStatus.current = undefined;
   });
 
   it("keeps a saved credential when its input is emptied", async () => {

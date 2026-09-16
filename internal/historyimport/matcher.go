@@ -7,9 +7,10 @@ import (
 	"time"
 )
 
+const missingProviderIDsReason = "missing tmdb_id, imdb_id, or tvdb_id"
+
 type matcherRepository interface {
 	MatchMediaByExternalID(ctx context.Context, kind, column, value string) ([]mediaLookupRow, error)
-	MatchMediaByTitleYear(ctx context.Context, kind, title string, year int) ([]mediaLookupRow, error)
 	MatchEpisodeByExternalID(ctx context.Context, column, value string) ([]mediaLookupRow, error)
 	MatchEpisodeBySeriesExternalID(ctx context.Context, column, value string, seasonNumber, episodeNumber int) ([]mediaLookupRow, error)
 	MatchEpisodeBySeries(ctx context.Context, seriesID string, seasonNumber, episodeNumber int) (*Match, error)
@@ -86,7 +87,7 @@ func (m *Matcher) MatchLeaves(ctx context.Context, record Record) ([]Match, stri
 }
 
 func (m *Matcher) matchMovie(ctx context.Context, record Record) (*Match, string, error) {
-	match, reason, err := m.matchMedia(ctx, KindMovie, record.TMDBID, record.IMDbID, "", record.Title, record.Year, false)
+	match, reason, err := m.matchMedia(ctx, KindMovie, record.TMDBID, record.IMDbID, record.TVDBID, false)
 	if err != nil {
 		return nil, "", err
 	}
@@ -94,7 +95,7 @@ func (m *Matcher) matchMovie(ctx context.Context, record Record) (*Match, string
 }
 
 func (m *Matcher) matchSeries(ctx context.Context, record Record) (*Match, string, error) {
-	match, reason, err := m.matchMedia(ctx, KindSeries, record.TMDBID, record.IMDbID, record.TVDBID, record.Title, record.Year, record.PreferTMDB)
+	match, reason, err := m.matchMedia(ctx, KindSeries, record.TMDBID, record.IMDbID, record.TVDBID, record.PreferTMDB)
 	if err != nil {
 		return nil, "", err
 	}
@@ -204,8 +205,8 @@ func (m *Matcher) matchEpisode(ctx context.Context, record Record) (*Match, stri
 	return match, "", nil
 }
 
-func (m *Matcher) matchMedia(ctx context.Context, kind, tmdbID, imdbID, tvdbID, title string, year int, preferTMDB bool) (*Match, string, error) {
-	attempts := make([]string, 0, 4)
+func (m *Matcher) matchMedia(ctx context.Context, kind, tmdbID, imdbID, tvdbID string, preferTMDB bool) (*Match, string, error) {
+	attempts := make([]string, 0, 3)
 	candidates := []struct {
 		column string
 		value  string
@@ -213,6 +214,7 @@ func (m *Matcher) matchMedia(ctx context.Context, kind, tmdbID, imdbID, tvdbID, 
 	}{
 		{column: "tmdb_id", value: tmdbID, label: "tmdb_id"},
 		{column: "imdb_id", value: imdbID, label: "imdb_id"},
+		{column: "tvdb_id", value: tvdbID, label: "tvdb_id"},
 	}
 	if kind == KindSeries {
 		candidates = []struct {
@@ -251,35 +253,8 @@ func (m *Matcher) matchMedia(ctx context.Context, kind, tmdbID, imdbID, tvdbID, 
 		attempts = append(attempts, fmt.Sprintf("no %s match for %q", candidate.label, candidate.value))
 	}
 
-	if title == "" {
-		if len(attempts) == 0 {
-			return nil, "missing identifiers and title", nil
-		}
-		return nil, strings.Join(attempts, "; "), nil
+	if len(attempts) == 0 {
+		return nil, missingProviderIDsReason, nil
 	}
-
-	rows, err := m.repo.MatchMediaByTitleYear(ctx, kind, title, year)
-	if err != nil {
-		return nil, "", err
-	}
-	if len(rows) == 1 {
-		return &Match{
-			MediaItemID: rows[0].ContentID,
-			Kind:        kind,
-			Title:       rows[0].Title,
-			Year:        rows[0].Year,
-		}, "", nil
-	}
-	if len(rows) > 1 {
-		return nil, fmt.Sprintf("ambiguous exact title/year match for %s (%d rows)", describeTitleYear(title, year), len(rows)), nil
-	}
-	attempts = append(attempts, fmt.Sprintf("no exact title/year match for %s", describeTitleYear(title, year)))
 	return nil, strings.Join(attempts, "; "), nil
-}
-
-func describeTitleYear(title string, year int) string {
-	if year > 0 {
-		return fmt.Sprintf("%q (%d)", title, year)
-	}
-	return fmt.Sprintf("%q", title)
 }

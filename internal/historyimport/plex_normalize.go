@@ -136,24 +136,21 @@ func ParsePlexGuids(guids PlexGuids, imdbID, tmdbID, tvdbID *string) {
 	}
 }
 
-func hasMatchablePlexGuidForKind(guids PlexGuids, kind string) bool {
+func hasMatchablePlexGuid(guids PlexGuids) bool {
 	var imdbID, tmdbID, tvdbID string
 	ParsePlexGuids(guids, &imdbID, &tmdbID, &tvdbID)
-	if kind == KindMovie {
-		return imdbID != "" || tmdbID != ""
-	}
 	return imdbID != "" || tmdbID != "" || tvdbID != ""
 }
 
 // applyPlexMetadataFallback fills provider ids and year that a listing omitted from a
 // full metadata record. Ids are only overlaid when the listing carries none the matcher
-// can use for kind, and only the providers still missing are added, so ids Plex did
+// can use, and only the providers still missing are added, so ids Plex did
 // return on the listing always win.
-func applyPlexMetadataFallback(guid PlexGuids, year int, kind string, meta *PlexItem) (PlexGuids, int) {
+func applyPlexMetadataFallback(guid PlexGuids, year int, meta *PlexItem) (PlexGuids, int) {
 	if meta == nil {
 		return guid, year
 	}
-	if !hasMatchablePlexGuidForKind(guid, kind) && hasMatchablePlexGuidForKind(meta.Guid, kind) {
+	if !hasMatchablePlexGuid(guid) && hasMatchablePlexGuid(meta.Guid) {
 		guid = overlayMissingPlexGuids(guid, meta.Guid)
 	}
 	if year == 0 {
@@ -182,10 +179,10 @@ func overlayMissingPlexGuids(existing, metadata PlexGuids) PlexGuids {
 }
 
 // plexUnresolvedIDsWarning is the shared wording for a best-effort id sweep that left
-// some items on title/year matching. firstErr, when set, names the first upstream
+// some items without a matchable identity. firstErr, when set, names the first upstream
 // failure so a systematic cause (auth, wrong URL) is visible in the run summary.
 func plexUnresolvedIDsWarning(scope, noun string, unresolved, attempted int, firstErr error) string {
-	msg := fmt.Sprintf("%s: could not resolve external ids for %d of %d %s; those fall back to exact title/year matching",
+	msg := fmt.Sprintf("%s: could not resolve external ids for %d of %d %s; those items will remain unmatched",
 		scope, unresolved, attempted, noun)
 	if firstErr != nil {
 		msg += fmt.Sprintf(" (first error: %v)", firstErr)

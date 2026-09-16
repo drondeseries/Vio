@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -301,7 +302,23 @@ func (s *System) discordPosterURL(ctx context.Context, posterPath, posterSourceP
 	if mode != DiscordPostersServer || s.images == nil || posterPath == "" {
 		return ""
 	}
-	return s.images.PresignImageURL(ctx, posterPath, "poster", "")
+	return s.absoluteArtworkURL(ctx, s.images.PresignImageURL(ctx, posterPath, "poster", ""))
+}
+
+// absoluteArtworkURL makes a resolved artwork URL usable outside this server.
+// S3 delivery already presigns absolute URLs; local artwork storage signs
+// root-relative /api/v2/artwork paths that only a client of this server can
+// follow, so they are anchored to server.public_url. Without a public URL the
+// embed carries no image rather than a link Discord cannot fetch.
+func (s *System) absoluteArtworkURL(ctx context.Context, url string) string {
+	if url == "" || !strings.HasPrefix(url, "/") {
+		return url
+	}
+	base := s.emailLinkBase(ctx)
+	if base == "" {
+		return ""
+	}
+	return base + url
 }
 
 // PayloadForRow converts a row to its wire shape, attaching a presigned

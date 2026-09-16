@@ -20,7 +20,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { usePurgeVirtualPlaybackItems } from "@/hooks/queries/admin/collections";
 import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
 import { useAdminPluginInstallations } from "@/hooks/queries/admin/plugins";
-import { useCheckAdminSettingsConnection } from "@/hooks/queries/admin/settings";
+import {
+  useAdminServerStatus,
+  useCheckAdminSettingsConnection,
+} from "@/hooks/queries/admin/settings";
 import { useRestartKeys, type RestartKeyMatcher } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 
@@ -70,9 +73,9 @@ const PUBLIC_S3_KEYS = [
   "s3.public_token_ttl",
 ];
 
-// Changing any of these moves where cached artwork objects live. Silo detects
-// that change after restart but requires an explicit manual reconcile so an
-// incomplete bucket migration cannot rewrite the artwork catalog.
+// Changing any of these moves where cached artwork objects live. Once artwork
+// has been stored in S3 the server rejects the write (artwork_storage_locked);
+// before that it warns, because a later scan will record whatever is saved.
 const PUBLIC_S3_IDENTITY_KEYS = ["s3.public_endpoint", "s3.public_bucket", "s3.public_key_prefix"];
 
 const PRIVATE_S3_KEYS = [
@@ -98,7 +101,15 @@ const LOG_ADVANCED_KEYS = [
 
 const LOG_KEYS = [...LOG_ESSENTIAL_KEYS, ...LOG_ADVANCED_KEYS];
 
-const KEYS = [...REDIS_KEYS, ...DATABASE_KEYS, ...PUBLIC_S3_KEYS, ...PRIVATE_S3_KEYS, ...LOG_KEYS];
+const KEYS = [
+  "artwork.storage_backend",
+  "artwork.local_path",
+  ...REDIS_KEYS,
+  ...DATABASE_KEYS,
+  ...PUBLIC_S3_KEYS,
+  ...PRIVATE_S3_KEYS,
+  ...LOG_KEYS,
+];
 
 function countDirty(form: SettingsForm, keys: string[]): number {
   return keys.filter((key) => form.isDirty(key)).length;
@@ -229,6 +240,7 @@ function S3Group({
   label,
   description,
   checkKind,
+  artworkLockedBackend,
 }: {
   form: SettingsForm;
   restartKeys: RestartKeyMatcher;
@@ -237,6 +249,7 @@ function S3Group({
   label: string;
   description: string;
   checkKind: "s3_public" | "s3_private";
+  artworkLockedBackend?: string;
 }) {
   const checkConnection = useCheckAdminSettingsConnection();
   const [connectionResult, setConnectionResult] = useState<ConnectionCheckResponse | null>(null);
@@ -299,15 +312,19 @@ function S3Group({
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
           <div className="text-[13px] leading-relaxed">
             <p className="font-medium text-amber-500">Storage location change</p>
-            <p className="text-muted-foreground mt-1">
-              Artwork is cached in this bucket. Silo will not change artwork cache records
-              automatically after restart. Copy or migrate the existing bucket objects first, then
-              manually run Reconcile Artwork Cache only if you intend every missing record to be
-              reset or cleared. Re-downloading those reset provider images is a separate, manual
-              Backfill Metadata Images action; normal scheduled caching only processes artwork
-              queued by new or changed metadata. Uploaded images (custom posters, collection
-              artwork, branding) cannot be re-downloaded.
-            </p>
+            {artworkLockedBackend === "s3" ? (
+              <p className="text-muted-foreground mt-1">
+                Artwork is stored in this bucket, so the server will reject a change to the
+                endpoint, bucket, or key prefix. To move artwork, copy the objects to the new
+                location and follow the manual migration steps in the artwork storage documentation.
+              </p>
+            ) : (
+              <p className="text-muted-foreground mt-1">
+                The first artwork write records this location and locks it. Uploaded images (custom
+                posters, collection artwork, branding) cannot be re-downloaded, so choose the bucket
+                before scanning.
+              </p>
+            )}
           </div>
         </div>
       )}
@@ -842,6 +859,8 @@ function VirtualLibraryGroup() {
 export default function InfrastructureSettings() {
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
   const restartKeys = useRestartKeys();
+  const artworkStorage = useAdminServerStatus().data?.artwork_storage;
+  const artworkLocked = artworkStorage?.locked === true;
   const [saveInProgress, setSaveInProgress] = useState(false);
   const saveInProgressRef = useRef(false);
 
@@ -918,6 +937,39 @@ export default function InfrastructureSettings() {
       <SettingsPageHeader title="Storage & Database" className="mb-8" />
 
       <div className="flex-1 space-y-5">
+        <FieldGroup label="Artwork storage" restartAll={restartKeys.has("artwork.storage_backend")}>
+          <SettingField
+            label="Backend"
+            type="select"
+            value={form.getValue("artwork.storage_backend") || "auto"}
+            onChange={(value) => form.setValue("artwork.storage_backend", value)}
+            options={[
+              { value: "auto", label: "Automatic" },
+              { value: "local", label: "Local disk" },
+              { value: "s3", label: "S3" },
+            ]}
+            disabled={artworkLocked}
+            description={
+              artworkLocked
+                ? `Locked to ${artworkStorage?.backend === "s3" ? "S3" : "local disk"}: artwork has been stored here and cannot be moved between backends.`
+                : undefined
+            }
+            restartRequired={restartKeys.has("artwork.storage_backend")}
+          />
+          <SettingField
+            label="Local artwork path"
+            hint="/var/lib/silo/artwork"
+            value={form.getValue("artwork.local_path")}
+            onChange={(value) => form.setValue("artwork.local_path", value)}
+            disabled={artworkLocked}
+            description={
+              artworkLocked
+                ? "Locked: artwork has been stored here. Mount a volume at this path in Docker."
+                : "Absolute path on the server. Mount a volume here in Docker."
+            }
+            restartRequired={restartKeys.has("artwork.local_path")}
+          />
+        </FieldGroup>
         <RedisGroup form={form} restartKeys={restartKeys} secrets={secrets} />
         <S3Group
           form={form}
@@ -927,6 +979,7 @@ export default function InfrastructureSettings() {
           label="Public storage"
           description="Files clients download directly: cached artwork, uploaded posters, and branding images."
           checkKind="s3_public"
+          artworkLockedBackend={artworkLocked ? artworkStorage?.backend : undefined}
         />
         <S3Group
           form={form}

@@ -77,6 +77,7 @@ services:
     volumes:
       - ${MEDIA_ROOT:?Set MEDIA_ROOT in .env to the host media path}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
       - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/plugins:/var/lib/vio/plugins
+      - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/artwork:/var/lib/vio/artwork
       - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/compat:/var/lib/vio/compat
       - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/transcode:/tmp/vio-transcode
       - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/catalog-seeds:/catalog-seeds:ro
@@ -151,6 +152,7 @@ services:
   #   volumes:
   #     - ${MEDIA_ROOT:?Set MEDIA_ROOT in .env to the host media path}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
   #     - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/plugins:/var/lib/vio/plugins
+  #     - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/artwork:/var/lib/vio/artwork
   #     - ${VIO_DATA_ROOT:-${SILO_DATA_ROOT:-/opt/vio}}/transcode:/tmp/vio-transcode
   #     # See the note on the integrated service above: a node reports its own
   #     # CPU, load, and memory rather than the physical machine's only with

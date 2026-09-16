@@ -100,21 +100,15 @@ func TestPlexAdminProviderTreatsPlexOnlyGuidAsUnresolved(t *testing.T) {
 	}
 }
 
-func TestPlexAdminProviderTreatsMovieTVDBGuidAsUnresolved(t *testing.T) {
+func TestPlexAdminProviderAcceptsMovieTVDBGuid(t *testing.T) {
 	t.Parallel()
 
-	metadataCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/status/sessions/history/all":
 			_, _ = fmt.Fprint(w, `{"MediaContainer":{"totalSize":1,"Metadata":[
 				{"ratingKey":"9","type":"movie","title":"Diuna","year":2021,"Guid":[{"id":"tvdb://12345"}]}
-			]}}`)
-		case "/library/metadata/9":
-			metadataCalls++
-			_, _ = fmt.Fprint(w, `{"MediaContainer":{"Metadata":[
-				{"ratingKey":"9","type":"movie","Guid":[{"id":"tmdb://438631"}]}
 			]}}`)
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
@@ -129,9 +123,8 @@ func TestPlexAdminProviderTreatsMovieTVDBGuidAsUnresolved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	if len(warnings) != 0 || metadataCalls != 1 || len(records) != 1 ||
-		records[0].TMDBID != "438631" || records[0].TVDBID != "12345" {
-		t.Fatalf("records = %+v, warnings = %v, metadata calls = %d", records, warnings, metadataCalls)
+	if len(warnings) != 0 || len(records) != 1 || records[0].TVDBID != "12345" {
+		t.Fatalf("records = %+v, warnings = %v", records, warnings)
 	}
 }
 
@@ -211,7 +204,7 @@ func TestPlexAdminProviderSkipsMetadataForStableProviderGuid(t *testing.T) {
 	}
 }
 
-func TestPlexAdminProviderMetadataFailureFallsBackToTitleYear(t *testing.T) {
+func TestPlexAdminProviderMetadataFailureLeavesItemUnmatched(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -249,7 +242,7 @@ func TestPlexAdminProviderMetadataFailureFallsBackToTitleYear(t *testing.T) {
 				t.Fatalf("Fetch: %v", err)
 			}
 			if len(records) != 1 || records[0].Title != "Arrival" || records[0].Year != 2016 {
-				t.Fatalf("records = %+v, want title/year fallback record", records)
+				t.Fatalf("records = %+v, want unresolved source record", records)
 			}
 			if len(warnings) != 1 || !strings.Contains(warnings[0], "1 of 1 unique items") {
 				t.Fatalf("warnings = %v, want one aggregated unresolved warning", warnings)
@@ -258,12 +251,9 @@ func TestPlexAdminProviderMetadataFailureFallsBackToTitleYear(t *testing.T) {
 				t.Fatalf("warnings = %v, want the first upstream error named", warnings)
 			}
 
-			repo := &matcherRepoStub{mediaByTitleYear: map[string][]mediaLookupRow{
-				"movie:Arrival:2016": {{ContentID: "movie-arrival", Title: "Arrival", Year: 2016}},
-			}}
-			match, reason, err := NewMatcher(repo).Match(context.Background(), records[0])
-			if err != nil || reason != "" || match == nil || match.MediaItemID != "movie-arrival" {
-				t.Fatalf("fallback match = %+v, reason = %q, err = %v", match, reason, err)
+			match, reason, err := NewMatcher(&matcherRepoStub{}).Match(context.Background(), records[0])
+			if err != nil || match != nil || reason != missingProviderIDsReason {
+				t.Fatalf("match = %+v, reason = %q, err = %v", match, reason, err)
 			}
 		})
 	}
@@ -480,7 +470,7 @@ func TestPlexAdminProviderRetriesFailedBatchPerKey(t *testing.T) {
 		byKey[record.ExternalID] = record
 	}
 	if byKey["1"].TMDBID != "1" || byKey["2"].TMDBID != "" || byKey["2"].Title != "Deleted" {
-		t.Fatalf("records = %+v, want key 1 enriched and key 2 on title/year fallback", records)
+		t.Fatalf("records = %+v, want key 1 enriched and key 2 unresolved", records)
 	}
 }
 
@@ -526,7 +516,7 @@ func TestPlexAdminProviderDoesNotRetrySystematicBatchFailurePerKey(t *testing.T)
 		t.Fatalf("metadata calls = %d, want %d batch requests and no per-key retries", metadataCalls, wantBatchCalls)
 	}
 	if len(records) != movieCount {
-		t.Fatalf("records = %d, want all %d title/year fallback records", len(records), movieCount)
+		t.Fatalf("records = %d, want all %d unresolved source records", len(records), movieCount)
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], fmt.Sprintf("%d of %d unique items", movieCount, movieCount)) {
 		t.Fatalf("warnings = %v, want one aggregated warning for all unresolved items", warnings)

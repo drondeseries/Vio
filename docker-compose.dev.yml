@@ -122,6 +122,7 @@ services:
       - vio-dev-go-build:/root/.cache/go-build
       - vio-dev-go-mod:/go/pkg/mod
       - vio-dev-plugins:/var/lib/vio/plugins
+      - vio-dev-artwork:/var/lib/vio/artwork
       - vio-dev-compat:/var/lib/vio/compat
       - vio-dev-transcode:/tmp/vio-transcode
       - ${MEDIA_ROOT:-/tmp/vio-dev-media}:${MEDIA_CONTAINER_ROOT:-/mnt/media}:ro
@@ -169,6 +170,7 @@ services:
 
 volumes:
   vio-dev-air-tmp:
+  vio-dev-artwork:
   vio-dev-compat:
   vio-dev-go-build:
   vio-dev-go-mod:

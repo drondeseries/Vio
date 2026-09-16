@@ -11,6 +11,11 @@ Construction does not start recovery or dispatch. Production installs the stable
 identity resolver and run observers, then calls `StartBackgroundWork`; activation
 is idempotent. Configuration must finish before any persisted run can execute.
 
+Movies and series match the local catalog only through TMDB, IMDb, or TVDB identifiers.
+Episodes match through their own identifier or through a series identifier plus season and
+episode number. Records without one of these identities remain unmatched; title and year do not
+establish media identity. Watch provider sync and webhook sync use the same matching rule.
+
 A node reserves local capacity before atomically claiming a queued row. Claims use
 `FOR UPDATE SKIP LOCKED` and an incremented generation. Heartbeat, progress, and
 terminal writes require the running status and exact generation. New personal runs

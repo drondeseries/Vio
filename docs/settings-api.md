@@ -950,3 +950,34 @@ Content-Type: application/json
 
 The five accepted `client_family` values are also returned by the capability
 endpoint so admin tooling does not need to invent them.
+
+### Artwork storage settings
+
+The server admin settings include `artwork.storage_backend` (`auto`, `local`, or
+`s3`) and `artwork.local_path` (an absolute filesystem path, defaulting to
+`/var/lib/silo/artwork`). Artwork storage settings take effect after a server
+restart.
+
+The artwork location can only be chosen before any artwork is stored. The
+first artwork write records the storage identity, and from then on a write that
+would move artwork is rejected with `409` and the problem code
+`artwork_storage_locked`: a change of `artwork.storage_backend`, of
+`artwork.local_path` for a local store, or of `s3.public_endpoint`,
+`s3.public_bucket`, or `s3.public_key_prefix` for an S3 store. Adding a public
+bucket while an `auto` backend is recorded as local is also rejected, since it
+would change what `auto` resolves to. Re-saving the current values is accepted.
+`GET /api/v2/admin/server/status` reports `artwork_storage.locked` so a settings
+form can disable the control. Selecting `s3` without a configured
+`s3.public_bucket`, or clearing the bucket while `s3` is selected, is rejected
+as `invalid_settings`.
+
+`metadata.image_workers` sizes the pool that downloads and encodes provider
+artwork, in parallel encodes. `0`, the default, runs one encode per CPU core.
+Each encode is single-threaded in libvips, so the pool is the only source of
+parallelism; a lower value keeps a shared household server responsive during a
+first scan, a higher one finishes the backlog sooner. The value is capped by the
+process memory limit at one worker per 512 MiB and applies to the next run
+without a restart.
+
+`metadata.cache_images` defaults to `true` on fresh installations. It no longer
+requires a public S3 bucket because local artwork storage is available.

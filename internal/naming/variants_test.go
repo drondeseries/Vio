@@ -148,3 +148,35 @@ func TestParseVariantHints_MultiEpisodeCarriesReleaseFields(t *testing.T) {
 		t.Fatalf("ReleaseGroup = %q, want %q", got, want)
 	}
 }
+
+func TestParseVariantHints_FourDigitMultiEpisodeRange(t *testing.T) {
+	hints := ParseVariantHints(
+		"/tv/One Piece/Season 23/One Piece S23E1162-E1163 - Wano Country.mkv",
+		"series",
+	)
+	if hints == nil {
+		t.Fatal("expected hints")
+	}
+	if got, want := hints.PresentationKind, "multi_episode"; got != want {
+		t.Fatalf("PresentationKind = %q, want %q", got, want)
+	}
+	if got, want := hints.EpisodeStart, 1162; got != want {
+		t.Fatalf("EpisodeStart = %d, want %d", got, want)
+	}
+	if got, want := hints.EpisodeEnd, 1163; got != want {
+		t.Fatalf("EpisodeEnd = %d, want %d", got, want)
+	}
+}= hints.ReleaseName, "Show.S01E01-E02.1080p.WEB-DL.x264-GROUP"; got != want {
+		t.Fatalf("ReleaseName = %q, want %q", got, want)
+	}
+	if got, want := hints.ReleaseGroup, "GROUP"; got != want {
+		t.Fatalf("ReleaseGroup = %q, want %q", got, want)
+=======
+	if got, want := hints.MultiEpisodeStart, 1162; got != want {
+		t.Fatalf("MultiEpisodeStart = %d, want %d", got, want)
+	}
+	if got, want := hints.MultiEpisodeEnd, 1163; got != want {
+		t.Fatalf("MultiEpisodeEnd = %d, want %d", got, want)
+>>>>>>> upstream/main
+	}
+}

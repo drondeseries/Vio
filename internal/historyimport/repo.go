@@ -1005,35 +1005,6 @@ func (r *Repository) MatchMediaByExternalID(ctx context.Context, kind, column, v
 	return matches, nil
 }
 
-func (r *Repository) MatchMediaByTitleYear(ctx context.Context, kind, title string, year int) ([]mediaLookupRow, error) {
-	if title == "" {
-		return nil, nil
-	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT content_id, title, COALESCE(year, 0)
-		FROM media_items
-		WHERE type = $1 AND status = 'matched' AND title = $2 AND ($3 = 0 OR COALESCE(year, 0) = $3)
-		ORDER BY content_id ASC`,
-		kind, title, year,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("matching media by title/year: %w", err)
-	}
-	defer rows.Close()
-	var matches []mediaLookupRow
-	for rows.Next() {
-		var row mediaLookupRow
-		if err := rows.Scan(&row.ContentID, &row.Title, &row.Year); err != nil {
-			return nil, fmt.Errorf("scanning title/year match: %w", err)
-		}
-		matches = append(matches, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating title/year matches: %w", err)
-	}
-	return matches, nil
-}
-
 func (r *Repository) MatchEpisodeByExternalID(ctx context.Context, column, value string) ([]mediaLookupRow, error) {
 	if value == "" {
 		return nil, nil

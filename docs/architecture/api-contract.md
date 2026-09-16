@@ -1115,9 +1115,14 @@ tombstone. The retained contract is:
   Jellyfin-compat server name and id and are omitted (not null) when unconfigured. It inspects no
   dependency and answers identically with the database unreachable.
 - **API `GET /api/v1/ready`** (readiness): `200 {"status":"ok"}` when Postgres answers a ping and
-  either no S3 client is configured or its `HeadBucket` succeeds; otherwise `503` with
-  `{"status":"error","postgres":<bool>,"s3":<bool>}`. The per-dependency booleans appear only on
-  failure; an unconfigured S3 reports `true`. `Content-Type: application/json` on both branches.
+  every configured storage probe succeeds; `503` with
+  `{"status":"error","postgres":false,"s3":<bool>,"artwork":<bool>}` when Postgres does not
+  answer; `200` with `{"status":"degraded","postgres":true,"s3":<bool>,"artwork":<bool>}` when
+  Postgres answers but the S3 `HeadBucket` or the artwork storage probe fails. The per-dependency
+  booleans appear only outside the `ok` answer; an unconfigured dependency reports `true`.
+  `Content-Type: application/json` on every branch. Revision (2026-09-15, with local artwork
+  storage): storage outages no longer remove a node from rotation, because the API keeps
+  answering and artwork routes fail on their own; `degraded` is additive to the frozen shape.
 - **Proxy / transcode-node `GET /api/v1/health`**: `200 application/json`
   `{"status":"ok","active_jobs":n,"capabilities_hash":…,"system":…,"gpu":…}` (proxy also
   `egress_kbps`); read from already-published snapshots, never a probe, path-redacted because the
