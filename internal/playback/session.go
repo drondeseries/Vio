@@ -583,14 +583,23 @@ func (m *SessionManager) StartSessionWithFilesContext(
 			RequiresVideoTranscode:  method == PlayTranscode,
 			RequiresAudioTranscode:  transcodeAudio,
 		})
+		fallbackInline := false
 		if err != nil {
-			// Fail closed, but make an engine outage distinguishable from a
-			// genuine concurrency-limit denial in the logs.
-			slog.WarnContext(ctx, "playback admission decider error; denying session", "component", "playback",
-				"user_id", userID, "method", method, "error", err)
-			return nil, admissionDenyError("")
-		}
-		if !decision.Allowed {
+			// An eval timeout is not a decision: degrade to the inline
+			// stream/transcode caps rather than denying a viewer whose content
+			// access was already authorized upstream. Every other decider error
+			// stays fail-closed, and makes an engine outage distinguishable
+			// from a genuine concurrency-limit denial in the logs.
+			if errors.Is(err, ErrAdmissionDeciderTimeout) {
+				fallbackInline = true
+				slog.WarnContext(ctx, "playback admission policy timed out; falling back to inline limits", "component", "playback",
+					"user_id", userID, "method", method, "error", err)
+			} else {
+				slog.WarnContext(ctx, "playback admission decider error; denying session", "component", "playback",
+					"user_id", userID, "method", method, "error", err)
+				return nil, admissionDenyError("")
+			}
+		} else if !decision.Allowed {
 			return nil, admissionDenyError(decision.ReasonCode)
 		}
 
@@ -598,6 +607,12 @@ func (m *SessionManager) StartSessionWithFilesContext(
 		if activeStreams != m.activeCountLocked(userID) || activeTranscodes != m.transcodeCountLocked(userID) {
 			m.mu.Unlock()
 			continue
+		}
+		if fallbackInline {
+			if err := m.inlineAdmissionErrorLocked(userID, method, transcodeAudio, limits); err != nil {
+				m.mu.Unlock()
+				return nil, err
+			}
 		}
 		s := newSession(ctx, userID, profileID, effectiveFileID, requestedFileID, method, transcodeAudio)
 		m.sessions[s.ID] = s
@@ -870,6 +885,27 @@ func (m *SessionManager) CheckReplacementAllowed(ctx context.Context, sessionID 
 		if err := transcodingDisabledError(method == PlayTranscode, transcodeAudio, limits); err != nil {
 			return err
 		}
+		if decider != nil {
+			decision, err := decider(ctx, AdmissionRequest{UserID: userID, Limits: limits, CurrentActiveStreams: otherStreams, CurrentActiveTranscodes: otherTranscodes, RequestedMethod: method, RequiresVideoTranscode: method == PlayTranscode, RequiresAudioTranscode: transcodeAudio})
+			if err != nil {
+				// An eval timeout is not a decision: fall through to the inline
+				// replacement branch below, exactly as when no decider is
+				// installed. Every other decider error stays fail-closed, and
+				// makes an engine outage distinguishable from a genuine
+				// concurrency-limit denial in the logs.
+				if errors.Is(err, ErrAdmissionDeciderTimeout) {
+					slog.WarnContext(ctx, "playback replacement admission policy timed out; falling back to inline limits", "component", "playback",
+						"user_id", userID, "session", sessionID, "method", method, "error", err)
+					decider = nil
+				} else {
+					slog.WarnContext(ctx, "playback replacement admission decider error; denying replacement", "component", "playback",
+						"user_id", userID, "session", sessionID, "method", method, "error", err)
+					return ErrPlaybackNotAllowed
+				}
+			} else if !decision.Allowed {
+				return admissionDenyError(decision.ReasonCode)
+			}
+		}
 		if decider == nil {
 			m.mu.Lock()
 			stillCurrent, stillExists := m.sessions[sessionID]
@@ -885,17 +921,6 @@ func (m *SessionManager) CheckReplacementAllowed(ctx context.Context, sessionID 
 			stillCurrent.replacementPlayMethod = method
 			m.mu.Unlock()
 			return nil
-		}
-		decision, err := decider(ctx, AdmissionRequest{UserID: userID, Limits: limits, CurrentActiveStreams: otherStreams, CurrentActiveTranscodes: otherTranscodes, RequestedMethod: method, RequiresVideoTranscode: method == PlayTranscode, RequiresAudioTranscode: transcodeAudio})
-		if err != nil {
-			// Fail closed, but make an engine outage distinguishable from a
-			// genuine concurrency-limit denial in the logs.
-			slog.WarnContext(ctx, "playback replacement admission decider error; denying replacement", "component", "playback",
-				"user_id", userID, "session", sessionID, "method", method, "error", err)
-			return ErrPlaybackNotAllowed
-		}
-		if !decision.Allowed {
-			return admissionDenyError(decision.ReasonCode)
 		}
 		m.mu.Lock()
 		stillCurrent, stillExists := m.sessions[sessionID]

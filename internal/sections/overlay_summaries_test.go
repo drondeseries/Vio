@@ -49,7 +49,7 @@ func overlayTestPool(t testing.TB) (*pgxpool.Pool, *overlayQueryTrace) {
 		_, err := conn.Exec(ctx, `CREATE TEMP TABLE media_files (
    id integer PRIMARY KEY, content_id text, episode_id text, media_folder_id integer NOT NULL DEFAULT 1,
    file_path text NOT NULL DEFAULT '', resolution text, codec_audio text,
-   audio_tracks jsonb, hdr boolean NOT NULL DEFAULT false, video_tracks jsonb,
+   audio_tracks jsonb, hdr boolean, video_tracks jsonb,
    codec_video text, audio_channels integer, container text,
    subtitle_tracks jsonb, external_subtitles jsonb, edition_key text, missing_since timestamptz
   );
@@ -183,6 +183,33 @@ func TestOverlaySummariesReadCommittedChanges(t *testing.T) {
 			t.Fatal(err)
 		}
 		check(step.want)
+	}
+}
+
+// TestOverlaySummariesToleratesNullableColumns mirrors the production schema,
+// where media_files.content_id and media_files.hdr are nullable (the scanner
+// clears content_id on unmatched files). A file matched by episode_id can
+// therefore carry a NULL content_id, and probe rows may carry a NULL hdr. The
+// loader must map both to the model's zero values instead of failing to scan.
+func TestOverlaySummariesToleratesNullableColumns(t *testing.T) {
+	pool, _ := overlayTestPool(t)
+	_, err := pool.Exec(t.Context(), `INSERT INTO media_files
+   (id, content_id, episode_id, media_folder_id, resolution, hdr, video_tracks)
+   VALUES (1, 'movie-null-hdr', NULL, 1, '1080p', NULL, '[]'::jsonb),
+          (2, NULL, 'episode-null-content', 1, '720p', false, '[]'::jsonb)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := (&Fetcher{pool: pool}).ListOverlaySummaries(
+		t.Context(), []string{"movie-null-hdr", "episode-null-content"}, catalog.AccessFilter{})
+	if err != nil {
+		t.Fatalf("ListOverlaySummaries: %v", err)
+	}
+	if summary := got["movie-null-hdr"]; summary == nil || summary.Resolution != "1080p" || summary.HDR != "" {
+		t.Fatalf("NULL hdr: got %+v, want 1080p with no HDR badge", summary)
+	}
+	if summary := got["episode-null-content"]; summary == nil || summary.Resolution != "720p" {
+		t.Fatalf("NULL content_id: got %+v, want a 720p summary", summary)
 	}
 }
 

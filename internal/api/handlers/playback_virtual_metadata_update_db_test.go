@@ -172,3 +172,94 @@ func TestVirtualFileMetadataUpdateSkipsAdoptionWhenSiblingOwnsPath(t *testing.T)
 		t.Fatal("probe_updated_at was not stamped despite skipped adoption")
 	}
 }
+
+// A row that has never been stamped (probe_source IS NULL) must adopt its
+// resolved path: the adoption guard uses IS DISTINCT FROM so NULL behaves like
+// any other non-collection source. With a plain `probe_source != ...` the guard
+// evaluated to NULL and the row silently kept its old path.
+func TestVirtualFileMetadataUpdateAdoptsPathForNullProbeSource(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	ctx := context.Background()
+	const folderID, ownerID = 994313, 7003
+	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
+
+	adoptPath := "virtual://movie/tt-db-null-source"
+	candidatePath := adoptPath + "?result=cand-a"
+	var candidateID int
+	var updatedAt time.Time
+	var probeUpdatedAt *time.Time
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id)
+		VALUES('movie-db-null-source', $1, $2, 'virtual', $3)
+		RETURNING id, updated_at, probe_updated_at`, folderID, candidatePath, ownerID,
+	).Scan(&candidateID, &updatedAt, &probeUpdatedAt); err != nil {
+		t.Fatalf("insert candidate row: %v", err)
+	}
+
+	runVirtualMetadataUpdate(t, pool, candidateID, candidatePath, adoptPath, ownerID, folderID, updatedAt, probeUpdatedAt)
+
+	var path, resolution, probeSource string
+	var stampedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT file_path, resolution, COALESCE(probe_source, ''), probe_updated_at FROM media_files WHERE id = $1`, candidateID).Scan(&path, &resolution, &probeSource, &stampedAt); err != nil {
+		t.Fatalf("read candidate row: %v", err)
+	}
+	if path != adoptPath {
+		t.Fatalf("file_path = %q, want adopted %q", path, adoptPath)
+	}
+	if resolution != "2160p" {
+		t.Fatalf("resolution = %q, want 2160p evidence persisted", resolution)
+	}
+	if probeSource != "virtual" {
+		t.Fatalf("probe_source = %q, want virtual after a real probe", probeSource)
+	}
+	if stampedAt == nil {
+		t.Fatal("probe_updated_at was not stamped")
+	}
+}
+
+// A NULL-probe_source row still honors the sibling guard: when another row in
+// the same library and virtual owner already owns the resolved path, the update
+// must skip adoption rather than let the unique index reject the write and drop
+// the evidence.
+func TestVirtualFileMetadataUpdateSkipsAdoptionForNullProbeSourceSiblingOwner(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	ctx := context.Background()
+	const folderID, ownerID = 994314, 7004
+	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
+
+	adoptPath := "virtual://movie/tt-db-null-source-guard"
+	candidatePath := adoptPath + "?result=cand-a"
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id)
+		VALUES('movie-db-null-source-guard', $1, $2, 'virtual', $3)`, folderID, adoptPath, ownerID); err != nil {
+		t.Fatalf("insert sibling row: %v", err)
+	}
+
+	var candidateID int
+	var updatedAt time.Time
+	var probeUpdatedAt *time.Time
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id)
+		VALUES('movie-db-null-source-guard', $1, $2, 'virtual', $3)
+		RETURNING id, updated_at, probe_updated_at`, folderID, candidatePath, ownerID,
+	).Scan(&candidateID, &updatedAt, &probeUpdatedAt); err != nil {
+		t.Fatalf("insert candidate row: %v", err)
+	}
+
+	runVirtualMetadataUpdate(t, pool, candidateID, candidatePath, adoptPath, ownerID, folderID, updatedAt, probeUpdatedAt)
+
+	var path, resolution string
+	var stampedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT file_path, resolution, probe_updated_at FROM media_files WHERE id = $1`, candidateID).Scan(&path, &resolution, &stampedAt); err != nil {
+		t.Fatalf("read candidate row: %v", err)
+	}
+	if path != candidatePath {
+		t.Fatalf("file_path = %q, want unchanged candidate %q (sibling owns %q)", path, candidatePath, adoptPath)
+	}
+	if resolution != "2160p" {
+		t.Fatalf("resolution = %q, want 2160p evidence persisted despite skipped adoption", resolution)
+	}
+	if stampedAt == nil {
+		t.Fatal("probe_updated_at was not stamped despite skipped adoption")
+	}
+}

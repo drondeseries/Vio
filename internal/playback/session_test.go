@@ -450,6 +450,69 @@ func TestSessionManager_AdmissionDeciderErrorDenies(t *testing.T) {
 	}
 }
 
+func TestSessionManager_AdmissionDeciderTimeoutFallsBackToInlineLimits(t *testing.T) {
+	timeoutDecider := func(context.Context, playback.AdmissionRequest) (playback.AdmissionDecision, error) {
+		return playback.AdmissionDecision{}, playback.ErrAdmissionDeciderTimeout
+	}
+
+	// With cap headroom the inline checks admit the session; the eval timeout
+	// is not a denial.
+	headroom := playback.NewSessionManager(0, 0)
+	headroom.SetAdmissionDecider(timeoutDecider)
+	if _, err := headroom.StartSession(1, "profile-1", 100, playback.PlayDirect, false); err != nil {
+		t.Fatalf("StartSession with timeout and headroom = %v, want nil", err)
+	}
+
+	// At the inline max-streams cap the fallback still denies.
+	capped := playback.NewSessionManager(0, 0)
+	capped.SetAdmissionDecider(timeoutDecider)
+	capped.SetLimitProvider(func(context.Context, int) (playback.SessionLimits, error) {
+		return playback.SessionLimits{MaxStreams: 1}, nil
+	})
+	if _, err := capped.StartSession(1, "profile-1", 100, playback.PlayDirect, false); err != nil {
+		t.Fatalf("StartSession (first, within cap) = %v, want nil", err)
+	}
+	if _, err := capped.StartSession(1, "profile-1", 101, playback.PlayDirect, false); !errors.Is(err, playback.ErrTooManyStreams) {
+		t.Fatalf("StartSession (second, at cap) = %v, want ErrTooManyStreams", err)
+	}
+}
+
+func TestSessionManager_ReplacementAdmissionDeciderTimeoutFallsBackToInline(t *testing.T) {
+	timeoutDecider := func(context.Context, playback.AdmissionRequest) (playback.AdmissionDecision, error) {
+		return playback.AdmissionDecision{}, playback.ErrAdmissionDeciderTimeout
+	}
+
+	// A free transcode slot: the inline replacement branch admits the change
+	// and reserves the slot, exactly as when no decider is installed. The held
+	// reservation is observable as a transcode that no longer fits.
+	free := playback.NewSessionManager(10, 1)
+	free.SetAdmissionDecider(timeoutDecider)
+	direct, err := free.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession(direct): %v", err)
+	}
+	if err := free.CheckReplacementAllowed(context.Background(), direct.ID, playback.PlayTranscode, false); err != nil {
+		t.Fatalf("CheckReplacementAllowed with timeout and free slot = %v, want nil", err)
+	}
+	if _, err := free.StartSession(1, "profile-1", 200, playback.PlayTranscode, false); !errors.Is(err, playback.ErrTooManyTranscodes) {
+		t.Fatalf("StartSession(transcode) after timeout replacement = %v, want ErrTooManyTranscodes (slot reserved)", err)
+	}
+
+	// At the inline max-transcode cap the fallback still denies.
+	capped := playback.NewSessionManager(10, 1)
+	capped.SetAdmissionDecider(timeoutDecider)
+	if _, err := capped.StartSession(1, "profile-1", 300, playback.PlayTranscode, false); err != nil {
+		t.Fatalf("StartSession(seed transcode): %v", err)
+	}
+	cappedDirect, err := capped.StartSession(1, "profile-1", 301, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession(seed direct): %v", err)
+	}
+	if err := capped.CheckReplacementAllowed(context.Background(), cappedDirect.ID, playback.PlayTranscode, false); !errors.Is(err, playback.ErrTooManyTranscodes) {
+		t.Fatalf("CheckReplacementAllowed at cap with timeout = %v, want ErrTooManyTranscodes", err)
+	}
+}
+
 func TestSessionManager_AdmissionReasonCodesMapToSentinelErrors(t *testing.T) {
 	cases := []struct {
 		name       string

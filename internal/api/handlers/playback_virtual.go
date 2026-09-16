@@ -24,6 +24,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/text/language"
 )
 
@@ -1201,7 +1202,9 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 // Path adoption is skipped when a sibling row (same virtual owner and library)
 // already owns the target path. Adopting it anyway would violate the
 // media_files_virtual_file_owner_key unique index and drop the probe evidence;
-// the row keeps its current path while the metadata and stamp still apply.
+// the row keeps its current path while the metadata and stamp still apply. The
+// probe_source guard is IS DISTINCT FROM so a row whose probe_source is NULL
+// (never stamped) adopts its resolved path like any other non-collection row.
 const VirtualFileMetadataUpdateSQL = `
 UPDATE media_files SET
   video_tracks     = $1::jsonb,
@@ -1222,7 +1225,7 @@ UPDATE media_files SET
     audio_channels
   ),
   file_path        = CASE
-    WHEN $18 != '' AND probe_source != 'virtual_collection'
+    WHEN $18 != '' AND probe_source IS DISTINCT FROM 'virtual_collection'
          AND NOT EXISTS (
            SELECT 1 FROM media_files sibling
            WHERE sibling.id <> media_files.id
@@ -1251,6 +1254,64 @@ WHERE id = $11
   AND virtual_owner_installation_id IS NOT DISTINCT FROM $16
   AND media_folder_id IS NOT DISTINCT FROM $17
 `
+
+// VirtualFileMetadataDB is the minimal database surface the shared virtual
+// metadata update needs. Both the native router wiring and the jellycompat
+// wiring pass a *pgxpool.Pool, which satisfies this interface.
+type VirtualFileMetadataDB interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+// ExecVirtualFileMetadataUpdate executes VirtualFileMetadataUpdateSQL and owns
+// the adoption-race retry shared by the native and jellycompat savers.
+//
+// The SQL's sibling guard keeps adoption from colliding with an existing owner
+// of the target path, but two concurrent probes can both pass it and one still
+// loses the unique-index race (media_files_virtual_file_owner_key). When that
+// happens with a non-empty AdoptPath, retry exactly once with AdoptPath cleared
+// so the probe evidence lands on the row's current path instead of being
+// dropped. The retry keys on SQLSTATE 23505 rather than the constraint name,
+// and a second failure is returned unchanged. A nil db is a no-op so callers
+// that run without a database stay safe.
+func ExecVirtualFileMetadataUpdate(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs) (int64, error) {
+	if db == nil {
+		return 0, nil
+	}
+	vStr := string(args.VideoTracks)
+	if vStr == "" || vStr == jsonNullLiteral {
+		vStr = "[]"
+	}
+	aStr := string(args.AudioTracks)
+	if aStr == "" || aStr == jsonNullLiteral {
+		aStr = "[]"
+	}
+	sStr := string(args.SubtitleTracks)
+	if sStr == "" || sStr == jsonNullLiteral {
+		sStr = "[]"
+	}
+	exec := func(adoptPath string) (int64, error) {
+		tag, err := db.Exec(ctx, VirtualFileMetadataUpdateSQL,
+			vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
+			args.FileID, args.ExpectedFilePath, args.StampProbe,
+			args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
+		)
+		if err != nil {
+			return 0, err
+		}
+		return tag.RowsAffected(), nil
+	}
+	rows, err := exec(args.AdoptPath)
+	if err == nil {
+		return rows, nil
+	}
+	var pgErr *pgconn.PgError
+	if args.AdoptPath == "" || !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		return 0, err
+	}
+	slog.WarnContext(ctx, "virtual probe evidence persist adoption raced an existing path owner; retrying without adoption",
+		"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath, "error", err)
+	return exec("")
+}
 
 // virtualSnapshot captures a catalog row's identity and generation before
 // resolution/probing so the CAS fence can detect stale writes.

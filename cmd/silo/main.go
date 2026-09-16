@@ -3190,27 +3190,7 @@ func main() {
 				if deps.DB == nil {
 					return 0, nil
 				}
-				vStr := string(args.VideoTracks)
-				if vStr == "" || vStr == "null" {
-					vStr = "[]"
-				}
-				aStr := string(args.AudioTracks)
-				if aStr == "" || aStr == "null" {
-					aStr = "[]"
-				}
-				sStr := string(args.SubtitleTracks)
-				if sStr == "" || sStr == "null" {
-					sStr = "[]"
-				}
-				tag, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL,
-					vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
-					args.FileID, args.ExpectedFilePath, args.StampProbe,
-					args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, args.AdoptPath,
-				)
-				if err != nil {
-					return 0, err
-				}
-				return tag.RowsAffected(), nil
+				return handlers.ExecVirtualFileMetadataUpdate(ctx, deps.DB, args)
 			}
 		}
 
