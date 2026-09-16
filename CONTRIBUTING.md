@@ -14,8 +14,7 @@ external contributors alike.
 > to a pull request.
 
 Silo is pre-1.0 and moves quickly. Coordinating first avoids duplicate work,
-conflicts with changes already in flight, and proposals outside scope. Read
-[Project non-goals](docs/non-goals.md) and the relevant
+conflicts with changes already in flight, and proposals outside scope. Read the relevant
 `docs/architecture/` material before proposing a capability.
 
 Durable architecture and contracts live under `docs/architecture/`.
