@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -1318,7 +1319,26 @@ func newChiRouter(deps Dependencies) chi.Router {
 					args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, args.AdoptPath,
 				)
 				if err != nil {
-					return 0, err
+					// The SQL's sibling guard keeps adoption from colliding with an
+					// existing owner of the target path, but two concurrent probes
+					// can both pass it and one still loses the unique-index race
+					// (media_files_virtual_file_owner_key). Retry once without
+					// adopting so the probe evidence is persisted on the row's
+					// current path instead of being dropped.
+					var pgErr *pgconn.PgError
+					if args.AdoptPath == "" || !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+						return 0, err
+					}
+					slog.WarnContext(ctx, "virtual probe evidence persist adoption raced an existing path owner; retrying without adoption",
+						"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath, "error", err)
+					tag, err = deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL,
+						vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
+						args.FileID, args.ExpectedFilePath, args.StampProbe,
+						args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, "",
+					)
+					if err != nil {
+						return 0, err
+					}
 				}
 				return tag.RowsAffected(), nil
 			}

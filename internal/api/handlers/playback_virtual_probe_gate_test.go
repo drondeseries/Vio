@@ -233,8 +233,23 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 		t.Fatalf("metadata update does not fence on probe_updated_at snapshot: %s", sql)
 	}
 	// Path adoption must be refused on collection-owned rows.
-	if !strings.Contains(sql, "WHEN $18 != '' AND probe_source != 'virtual_collection' THEN $18") {
+	if !strings.Contains(sql, "WHEN $18 != '' AND probe_source != 'virtual_collection'") {
 		t.Fatalf("metadata update does not guard path adoption: %s", sql)
+	}
+	// Adoption must also be refused when a sibling row (same virtual owner and
+	// library) already owns the target path: adopting it anyway violates
+	// media_files_virtual_file_owner_key and drops the probe evidence.
+	if !strings.Contains(sql, "NOT EXISTS (") ||
+		!strings.Contains(sql, "FROM media_files sibling") ||
+		!strings.Contains(sql, "sibling.id <> media_files.id") ||
+		!strings.Contains(sql, "sibling.file_path = $18") ||
+		!strings.Contains(sql, "sibling.virtual_owner_installation_id IS NOT DISTINCT FROM $16") ||
+		!strings.Contains(sql, "sibling.media_folder_id IS NOT DISTINCT FROM $17") {
+		t.Fatalf("metadata update does not guard path adoption against an existing sibling owner: %s", sql)
+	}
+	// The metadata update must still adopt the path when no sibling owns it.
+	if !strings.Contains(sql, "THEN $18\n    ELSE file_path\n  END,") {
+		t.Fatalf("metadata update does not adopt $18 when no sibling owns it: %s", sql)
 	}
 }
 

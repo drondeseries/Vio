@@ -1197,6 +1197,11 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 // rows so the collection materializer keeps recognizing them; a real playback
 // probe (stampProbe=true) still stamps probe_updated_at so collection rows
 // converge to probed evidence instead of re-probing on every start.
+//
+// Path adoption is skipped when a sibling row (same virtual owner and library)
+// already owns the target path. Adopting it anyway would violate the
+// media_files_virtual_file_owner_key unique index and drop the probe evidence;
+// the row keeps its current path while the metadata and stamp still apply.
 const VirtualFileMetadataUpdateSQL = `
 UPDATE media_files SET
   video_tracks     = $1::jsonb,
@@ -1217,7 +1222,15 @@ UPDATE media_files SET
     audio_channels
   ),
   file_path        = CASE
-    WHEN $18 != '' AND probe_source != 'virtual_collection' THEN $18
+    WHEN $18 != '' AND probe_source != 'virtual_collection'
+         AND NOT EXISTS (
+           SELECT 1 FROM media_files sibling
+           WHERE sibling.id <> media_files.id
+             AND sibling.file_path = $18
+             AND sibling.virtual_owner_installation_id IS NOT DISTINCT FROM $16
+             AND sibling.media_folder_id IS NOT DISTINCT FROM $17
+         )
+    THEN $18
     ELSE file_path
   END,
   probe_source     = CASE
