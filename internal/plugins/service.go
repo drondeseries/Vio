@@ -274,7 +274,7 @@ func catalogEntryPreferredForDiscovery(candidate, current CatalogEntry) bool {
 
 func repositorySourcePrecedence(sourceKind string) int {
 	switch sourceKind {
-	case RepositorySourceSilo:
+	case RepositorySourceSilo, "silo":
 		return 0
 	case RepositorySourceApprovedCommunity:
 		return 1

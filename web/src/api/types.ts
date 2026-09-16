@@ -3571,7 +3571,7 @@ export interface PluginRepository {
   url: string;
   display_name: string;
   enabled: boolean;
-  source_kind: "silo" | "approved_community" | "external";
+  source_kind: "silo" | "vio" | "approved_community" | "external";
   managed: boolean;
   last_fetched_at?: string | null;
   created_at?: string;
@@ -3597,7 +3597,7 @@ export interface PluginCatalogEntry {
   plugin_id: string;
   version: string;
   archive_url: string;
-  source_kind: "silo" | "approved_community" | "external";
+  source_kind: "silo" | "vio" | "approved_community" | "external";
   repository_name: string;
   repo_url?: string;
   presentation?: PluginPresentation;
@@ -3627,7 +3627,7 @@ export interface PluginInstallation {
   task_bindings: PluginTaskBinding[];
   update_policy: string;
   available_version?: string | null;
-  source_kind: "silo" | "approved_community" | "external";
+  source_kind: "silo" | "vio" | "approved_community" | "external";
   repository_name?: string;
   repo_url?: string;
   presentation?: PluginPresentation;
