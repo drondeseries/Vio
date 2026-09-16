@@ -3132,6 +3132,7 @@ func main() {
 					CandidateID:    res.CandidateID,
 					RequestHeaders: res.RequestHeaders,
 					ExpiresAt:      res.ExpiresAt,
+					OwnerID:        res.OwnerID,
 				}, nil
 			})
 			compatDeps.VirtualPlaybackStreamLister = jellycompat.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]jellycompat.VirtualPlaybackStream, error) {

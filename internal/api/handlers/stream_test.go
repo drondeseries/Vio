@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -182,6 +184,51 @@ func TestHandleStreamRecoveryStampsHealthyFirstDelivery(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("recovery marker calls = %d, want 1", calls)
+	}
+}
+
+func TestHandleStreamVirtualResolveFailureLogsCause(t *testing.T) {
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-virtual-unresolvable",
+		FilePath:                   "virtual://movie/movie-unresolvable?result=dead",
+		VirtualOwnerInstallationID: 0,
+	}
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	cause := errors.New("virtual playback provider returned an unsafe stream URL: remote stream URL targets a non-public address")
+	h := NewStreamHandler(manager, testPlaybackFileResolver{file: file})
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+		return ResolvedVirtualMedia{}, cause
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil).WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+	rec := httptest.NewRecorder()
+	h.HandleStream(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body = %s", rec.Code, rec.Body.String())
+	}
+	logged := logs.String()
+	for _, want := range []string{
+		`"session":"` + session.ID + `"`,
+		`"owner_installation_id":0`,
+		`"virtual_uri":"` + file.FilePath + `"`,
+		"non-public address",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("502 log missing %q in:\n%s", want, logged)
+		}
 	}
 }
 

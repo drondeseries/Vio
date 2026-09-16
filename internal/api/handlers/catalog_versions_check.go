@@ -173,13 +173,7 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 // requested candidate: either the returned CandidateID is the requested
 // result= value, or the returned URI carries it. Substituted candidates are
 // never treated as recovery evidence for the requested pin.
-func resolvedIdentityMatches(resolved struct {
-	URL            string
-	URI            string
-	CandidateID    string
-	RequestHeaders map[string]string
-	ExpiresAt      time.Time
-}, requestedCandidateID string) bool {
+func resolvedIdentityMatches(resolved ResolvedVirtualMedia, requestedCandidateID string) bool {
 	if resolved.CandidateID == requestedCandidateID {
 		return true
 	}
