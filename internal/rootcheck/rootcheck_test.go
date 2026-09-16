@@ -46,7 +46,8 @@ func TestProbeVirtualRoots(t *testing.T) {
 	}
 }
 
-func TestProbeMissingPath(t *testing.T) {	t.Parallel()
+func TestProbeMissingPath(t *testing.T) {
+	t.Parallel()
 
 	res := Probe(filepath.Join(t.TempDir(), "does-not-exist"))
 	if res.Reachable {
