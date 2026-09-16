@@ -228,6 +228,12 @@ func (f VirtualMediaDetailedResolverFunc) ResolveVirtualMediaDetailed(ctx contex
 type VirtualPlaybackSourceProber func(context.Context, string, *models.MediaFile) (*models.MediaFile, error)
 type VirtualPlaybackSourceProberWithHeaders func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error)
 
+// VirtualProbeCacheLookup returns a completed probe from the virtual probe
+// cache without starting one. A nil result means no completed probe is
+// available. It lets the probe-failure damper recover evidence from a probe
+// that outlived the caller's wait instead of leaving the row unprobed.
+type VirtualProbeCacheLookup func(sourceURL string, file *models.MediaFile) *models.MediaFile
+
 // VirtualFileSaver atomically persists probed virtual inventory and optionally
 // adopts a new file_path in a single CAS-fenced UPDATE. Returns the number of
 // rows updated (0 means the snapshot was stale — a newer write landed first).
@@ -385,11 +391,12 @@ type PlaybackHandler struct {
 	AllowInsecureVirtual                   func(installationID int) bool
 	VirtualPlaybackSourceProber            VirtualPlaybackSourceProber
 	VirtualPlaybackSourceProberWithHeaders VirtualPlaybackSourceProberWithHeaders
+	VirtualProbeCacheLookup                VirtualProbeCacheLookup
 	BestResultCache                        *VirtualBestResultCache
 	VirtualFileSaver                       VirtualFileSaver
 	VirtualSubtitleSearcher                SubtitleSearchTrigger
 	SubtitleSearchInFlight                 *sync.Map
-	DeviceCapabilitySource                 *providerDeviceCapabilitySource
+	DeviceCapabilitySource                 DeviceCapabilityProfileSource
 	RemuxDBConfig                          func(ctx context.Context) remuxdb.Config
 	RemuxDBStore                           *remuxdb.Store
 	remuxSubmitOnce                        sync.Once

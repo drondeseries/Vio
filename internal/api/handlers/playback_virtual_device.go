@@ -12,6 +12,13 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+// DeviceCapabilityProfileSource resolves the persisted device capabilities used
+// for candidate ranking. It is an interface so tests can inject a deterministic
+// profile; production wires providerDeviceCapabilitySource.
+type DeviceCapabilityProfileSource interface {
+	DeviceCapabilitiesFor(ctx context.Context, profileID, deviceID string) (plugins.DeviceCapabilities, bool)
+}
+
 func (h *PlaybackHandler) requestDeviceCapabilities(r *http.Request) (plugins.DeviceCapabilities, bool) {
 	if h == nil || h.DeviceCapabilitySource == nil || r == nil {
 		return plugins.DeviceCapabilities{}, false

@@ -49,13 +49,26 @@ const (
 	// cache.
 	virtualProbeFailureTTL    = 5 * time.Minute
 	virtualProbeFailureMaxTTL = 60 * time.Minute
+	// virtualProbeFailureRepeatThreshold is the number of consecutive failures
+	// for one candidate before an unpin is allowed. A single transient failure
+	// (outer budget fired, provider RPC timeout) leaves the candidate's health
+	// unknown; only a repeat is treated as evidence it should stop steering
+	// starts.
+	virtualProbeFailureRepeatThreshold = 2
 )
 
-// virtualProbeFailureMark records the most recent failure for one candidate
-// and the backoff window derived from the number of consecutive failures.
+// virtualBackgroundProbeBudget bounds a background probe. Production uses the
+// scanner's shared probe timeout so the inner probe and the caller that waits
+// for it cannot drift; it is a var so tests can shrink the wait.
+var virtualBackgroundProbeBudget = scanner.VirtualProbeTimeout
+
+// virtualProbeFailureMark records the most recent failure for one candidate,
+// the backoff window derived from the number of consecutive failures, and the
+// running failure count that gates unpinning.
 type virtualProbeFailureMark struct {
 	ttl       time.Duration
 	expiresAt time.Time
+	failures  int
 }
 
 // virtualProbeFailureCache remembers the last failed probe per candidate so a
@@ -112,13 +125,42 @@ func (c *virtualProbeFailureCache) mark(key string) {
 		}
 	}
 	ttl := virtualProbeFailureTTL
+	failures := 1
 	if prev, ok := c.marks[key]; ok {
+		failures = prev.failures + 1
 		ttl = prev.ttl * 2
 		if ttl > virtualProbeFailureMaxTTL {
 			ttl = virtualProbeFailureMaxTTL
 		}
 	}
-	c.marks[key] = virtualProbeFailureMark{ttl: ttl, expiresAt: now.Add(ttl)}
+	c.marks[key] = virtualProbeFailureMark{ttl: ttl, expiresAt: now.Add(ttl), failures: failures}
+}
+
+// count returns the number of consecutive failures recorded for key, or 0 when
+// no live marker exists. An expired marker is dropped on read, matching recent.
+func (c *virtualProbeFailureCache) count(key string) int {
+	if c == nil || key == "" {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	mark, ok := c.marks[key]
+	if !ok {
+		return 0
+	}
+	if !c.clock().Before(mark.expiresAt) {
+		delete(c.marks, key)
+		return 0
+	}
+	return mark.failures
+}
+
+// virtualProbeVerdictUnknown reports whether an error leaves the candidate's
+// health unknown rather than condemning it: the caller's outer budget fired or
+// the request was canceled while the probe was still running under its own
+// timeout. The probe may yet complete in the cache, so this must not unpin.
+func virtualProbeVerdictUnknown(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 func (c *virtualProbeFailureCache) clear(key string) {
@@ -812,25 +854,30 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
 				probeKey := virtualProbeFailureKey(cand.URI, oid)
-				if virtualProbeFailures.recent(probeKey) {
-					// A fresh failure already consumed the probe budget; fall
-					// back to the candidate-declared metadata instead of paying
-					// it again on this replan.
-					return &resolvedVirtualPlaybackSource{
-						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
-					}, nil
-				}
 				probeTransient := cloneVirtualProbeTransient(transient)
 				// Zero the duration so the background probe measures the
 				// empirical duration instead of inheriting the catalog value.
 				probeTransient.Duration = 0
+				if virtualProbeFailures.recent(probeKey) {
+					// A fresh failure already consumed the probe budget. The
+					// inner probe may still have completed and landed in the
+					// cache, so try a cache-only recovery before falling back
+					// to declared metadata; otherwise the row stays unprobed
+					// until the damper lapses.
+					h.recoverVirtualProbeFromCache(r.Context(), file, streamURL, probeTransient, cand, oid)
+					return &resolvedVirtualPlaybackSource{
+						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
+					}, nil
+				}
 				probeCand := cand
 				expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
 				go func() {
 					// The start path may outlive the request (the client can
 					// disconnect while the probe completes), so it keeps a
-					// WithoutCancel context.
-					bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(r.Context()), virtualProbeBudget)
+					// WithoutCancel context. The goroutine starts after the
+					// synchronous provider resolve returned, so the fetch time
+					// does not consume this budget.
+					bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(r.Context()), virtualBackgroundProbeBudget)
 					defer bgCancel()
 					h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 				}()
@@ -883,8 +930,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}, nil
 		}
 		if virtualProbeFailures.recent(probeKey) {
-			// A recent probe failure already consumed the probe budget; use
-			// the candidate-declared metadata instead of paying it again.
+			// A recent probe failure already consumed the probe budget. A
+			// completed inner probe may still be cached; recover it before
+			// settling for the candidate-declared metadata.
+			syncProbeFile := cloneVirtualProbeTransient(transient)
+			syncProbeFile.Duration = 0
+			h.recoverVirtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid)
 			return declaredFallback()
 		}
 		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
@@ -1097,13 +1148,21 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	ownerInstallationID int,
 ) {
 	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
-	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualProbeBudget)
+	probeCtx, probeCancel := context.WithTimeout(bgCtx, virtualBackgroundProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 	probeCancel()
 	if probeErr != nil || probed == nil {
 		virtualProbeFailures.mark(probeKey)
 		slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
-		h.unpinVirtualSticky(stickyKey, probeCand.URI)
+		// A context error (outer budget fired, request canceled) means the
+		// verdict is unknown: the inner probe keeps its own timeout and may
+		// still complete and land in the cache. A candidate-specific rejection
+		// is definitive; every other error must repeat before the pin is
+		// released, so one slow provider cannot steer later starts.
+		if errors.Is(probeErr, scanner.ErrVirtualProbeNoTracks) ||
+			virtualProbeFailures.count(probeKey) >= virtualProbeFailureRepeatThreshold {
+			h.unpinVirtualSticky(stickyKey, probeCand.URI)
+		}
 		return
 	}
 	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
@@ -1124,6 +1183,41 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
 	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true)
+}
+
+// recoverVirtualProbeFromCache attempts a cache-only probe for a candidate the
+// failure damper would otherwise skip. A transient outer timeout can leave the
+// inner probe running under its own scanner.VirtualProbeTimeout; when it
+// completes it lands in the probe cache, so the completed evidence is available
+// without paying the provider round-trip again. Recovering it persists the
+// evidence and clears the damper, so a transient timeout does not starve the
+// row until the backoff lapses. It reports whether cached evidence was used.
+func (h *PlaybackHandler) recoverVirtualProbeFromCache(
+	ctx context.Context,
+	catalogFile *models.MediaFile,
+	sourceURL string,
+	probeFile models.MediaFile,
+	probeCand VirtualPlaybackStream,
+	ownerInstallationID int,
+) bool {
+	if h == nil || h.VirtualProbeCacheLookup == nil || catalogFile == nil {
+		return false
+	}
+	probed := h.VirtualProbeCacheLookup(sourceURL, &probeFile)
+	if probed == nil {
+		return false
+	}
+	virtualProbeFailures.clear(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
+	if probeFile.ID > 0 {
+		probed.ID = probeFile.ID
+		probed.MediaFolderID = probeFile.MediaFolderID
+	}
+	if probeFile.Duration > 0 && probed.Duration <= 0 {
+		probed.Duration = probeFile.Duration
+	}
+	mergeVirtualCandidateTracks(probed, probeCand)
+	h.persistVirtualProbeEvidence(ctx, catalogFile, probeCand.URI, probed, true)
+	return true
 }
 
 // revalidateVirtualCandidateBackground resolves the provider URL for a
@@ -1172,12 +1266,15 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 			return
 		}
 		if resolveErr != nil {
-			virtualProbeFailures.mark(virtualProbeFailureKey(cand.URI, oid))
+			resolveKey := virtualProbeFailureKey(cand.URI, oid)
+			virtualProbeFailures.mark(resolveKey)
 			slog.WarnContext(bgCtx, "optimistic virtual revalidation resolve failed", "component", "api", "candidate_uri", cand.URI, "error", resolveErr)
-			h.unpinVirtualSticky(stickyKey, cand.URI)
-			return
-		}
-		if virtualProbeFailures.recent(virtualProbeFailureKey(cand.URI, oid)) {
+			// A transient RPC timeout leaves the candidate's health unknown;
+			// only a repeat (or a concrete provider rejection) releases it.
+			if !virtualProbeVerdictUnknown(resolveErr) ||
+				virtualProbeFailures.count(resolveKey) >= virtualProbeFailureRepeatThreshold {
+				h.unpinVirtualSticky(stickyKey, cand.URI)
+			}
 			return
 		}
 
@@ -1194,6 +1291,12 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 		}
 		probeTransient.FilePath = cand.URI
 		probeTransient.VirtualOwnerInstallationID = oid
+		if virtualProbeFailures.recent(virtualProbeFailureKey(cand.URI, oid)) {
+			// The damper would skip the probe, but a completed inner probe may
+			// already be cached. Recover it so the row is not left unprobed.
+			h.recoverVirtualProbeFromCache(bgCtx, file, streamURL, probeTransient, cand, oid)
+			return
+		}
 		h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, cand, h.virtualExpectedRuntimeMinutes(bgCtx, file), oid)
 	}()
 }
