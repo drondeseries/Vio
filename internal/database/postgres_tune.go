@@ -34,9 +34,14 @@ const (
 	sizeTB = 1024 * sizeGB
 )
 
+// postgresSettingMaxLocksPerTransaction is the Postgres
+// max_locks_per_transaction setting name. Named because the managed-tune
+// list and the recommendation set both reference it.
+const postgresSettingMaxLocksPerTransaction = "max_locks_per_transaction"
+
 var managedPostgresTuneSettings = []string{
 	"max_connections",
-	"max_locks_per_transaction",
+	postgresSettingMaxLocksPerTransaction,
 	"shared_buffers",
 	"effective_cache_size",
 	"maintenance_work_mem",
@@ -213,7 +218,7 @@ func RecommendPostgresOLTPSettings(opts PostgresTuneOptions, postgresMajorVersio
 		// membership it touches; the default 64 is too low for large
 		// collections. Reported with RequiresRestart because pg_settings
 		// classifies it postmaster-scope.
-		PostgresTuneSetting{Name: "max_locks_per_transaction", Value: "256"},
+		PostgresTuneSetting{Name: postgresSettingMaxLocksPerTransaction, Value: "256"},
 		PostgresTuneSetting{Name: "shared_buffers", Value: formatPostgresTuneKB(sharedBuffers)},
 		PostgresTuneSetting{Name: "effective_cache_size", Value: formatPostgresTuneKB(effectiveCacheSize)},
 		PostgresTuneSetting{Name: "maintenance_work_mem", Value: formatPostgresTuneKB(maintenanceWorkMem)},

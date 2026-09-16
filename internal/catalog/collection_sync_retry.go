@@ -24,15 +24,25 @@ var (
 	collectionSyncRetryMaxBackoff  = 2 * time.Second
 )
 
+// PostgreSQL SQLSTATE codes that can surface from an advisory-lock-exhausted
+// accept and are safe to retry. Named because the same codes appear across
+// the catalog's error handling.
+const (
+	pgSQLStateOutOfSharedMemory    = "53200" // lock table exhausted
+	pgSQLStateLockNotAvailable     = "55P03"
+	pgSQLStateDeadlock             = "40P01"
+	pgSQLStateSerializationFailure = "40001"
+)
+
 // retryableCollectionSyncCodes are the SQLSTATEs that can surface from an
 // advisory-lock-exhausted accept and are safe to retry: out of shared memory
 // (53200), lock not available (55P03), deadlock (40P01), and serialization
 // failure (40001).
 var retryableCollectionSyncCodes = map[string]struct{}{
-	"53200": {},
-	"55P03": {},
-	"40P01": {},
-	"40001": {},
+	pgSQLStateOutOfSharedMemory:    {},
+	pgSQLStateLockNotAvailable:     {},
+	pgSQLStateDeadlock:             {},
+	pgSQLStateSerializationFailure: {},
 }
 
 // isRetryableCollectionSyncError reports whether a failed collection sync may

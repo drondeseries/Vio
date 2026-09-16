@@ -533,6 +533,14 @@ var ErrLibraryCollectionSyncUnsupported = errors.New("smart collections cannot b
 // request for one lands here; it is a caller mistake, not a server fault.
 var ErrLibraryCollectionSyncModeUnsupported = errors.New("unsupported collection sync mode")
 
+// Library collection source modes (the `mode` field of the stored source
+// config). Only the modes that appear in a sync dispatch decision are named;
+// the rest of the switch below stays on literals.
+const (
+	libraryCollectionSourceModeSmart       = "smart"
+	libraryCollectionSourceModeMDBListJSON = "mdblist_json"
+)
+
 const (
 	virtualMetadataRefreshWorkers = 4
 	virtualMetadataRefreshQueue   = 256
@@ -1149,9 +1157,9 @@ func (s *LibraryCollectionService) SyncCollectionWithOptions(ctx context.Context
 
 	syncOnce := func() (*models.LibraryCollectionSyncRun, error) {
 		switch source.Mode {
-		case "smart":
+		case libraryCollectionSourceModeSmart:
 			return nil, ErrLibraryCollectionSyncUnsupported
-		case "mdblist_json":
+		case libraryCollectionSourceModeMDBListJSON:
 			return s.syncMDBListCollection(ctx, collection, collectionutil.MDBListURLCandidates(source.URL, collection.SourceURL), source.Limit, opts)
 		case "tmdb_preset":
 			return s.syncTMDBPresetCollection(ctx, collection, source, opts)
