@@ -55,7 +55,7 @@ export function useAdminPluginInstallations() {
   });
 }
 
-const PLUGIN_SOURCE_KINDS = new Set(["silo", "approved_community", "external"]);
+const PLUGIN_SOURCE_KINDS = new Set(["silo", "vio", "approved_community", "external"]);
 const PLUGIN_PAGE_LIMIT = 100;
 const PLUGIN_PAGE_CAP = 100;
 
@@ -202,6 +202,7 @@ export function useAdminPluginRepositories() {
             throw new Error("Invalid repository identifier in response.");
           if (
             row.source_kind !== "silo" &&
+            row.source_kind !== "vio" &&
             row.source_kind !== "approved_community" &&
             row.source_kind !== "external"
           )

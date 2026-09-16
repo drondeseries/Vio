@@ -157,7 +157,7 @@ type AdminPluginCatalogEntry struct {
 	PluginID           string                    `json:"plugin_id"`
 	Version            string                    `json:"version"`
 	ArchiveURL         string                    `json:"archive_url"`
-	SourceKind         string                    `json:"source_kind" enum:"silo,approved_community,external"`
+	SourceKind         string                    `json:"source_kind" enum:"silo,vio,approved_community,external"`
 	RepositoryName     string                    `json:"repository_name"`
 	RepoURL            string                    `json:"repo_url,omitempty"`
 	Presentation       *AdminPluginPresentation  `json:"presentation,omitempty"`
@@ -181,7 +181,7 @@ type AdminPluginInstallation struct {
 	Kind               string                    `json:"kind"`
 	UpdatePolicy       string                    `json:"update_policy"`
 	AvailableVersion   string                    `json:"available_version,omitempty"`
-	SourceKind         string                    `json:"source_kind" enum:"silo,approved_community,external"`
+	SourceKind         string                    `json:"source_kind" enum:"silo,vio,approved_community,external"`
 	RepositoryName     string                    `json:"repository_name,omitempty"`
 	RepoURL            string                    `json:"repo_url,omitempty"`
 	Presentation       *AdminPluginPresentation  `json:"presentation,omitempty"`

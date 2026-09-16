@@ -1279,7 +1279,20 @@ func normalizeLibraryPaths(paths []string) ([]string, error) {
 		if path == "" {
 			return nil, fieldError("paths", "Library paths must not be blank")
 		}
-		normalized[i] = filepath.Clean(path)
+		normalized[i] = normalizeLibraryPath(path)
 	}
 	return normalized, nil
+}
+
+// normalizeLibraryPath trims whitespace and cleans filesystem paths.
+// Virtual roots (virtual:/...) have no filesystem presence, and
+// filepath.Clean would collapse the scheme's double slash (virtual://x
+// becomes virtual:/x), breaking the prefix checks in rootcheck and the
+// scanner. Leave them untouched beyond trimming.
+func normalizeLibraryPath(path string) string {
+	path = strings.TrimSpace(path)
+	if strings.HasPrefix(strings.ToLower(path), "virtual:") {
+		return path
+	}
+	return filepath.Clean(path)
 }

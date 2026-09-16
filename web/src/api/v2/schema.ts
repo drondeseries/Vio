@@ -13115,7 +13115,7 @@ export interface components {
       repository_name: string;
       routes: components["schemas"]["PluginRoute"][];
       /** @enum {string} */
-      source_kind: "silo" | "approved_community" | "external";
+      source_kind: "silo" | "vio" | "approved_community" | "external";
       user_config_schema: components["schemas"]["AdminPluginConfigSchema"][];
       version: string;
     };
@@ -13252,7 +13252,7 @@ export interface components {
       repository_name?: string;
       routes: components["schemas"]["PluginRoute"][];
       /** @enum {string} */
-      source_kind: "silo" | "approved_community" | "external";
+      source_kind: "silo" | "vio" | "approved_community" | "external";
       task_bindings: components["schemas"]["AdminPluginTaskBinding"][];
       update_policy: string;
       /**

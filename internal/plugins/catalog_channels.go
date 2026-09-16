@@ -6,17 +6,14 @@ const (
 
 	ApprovedCommunityRepositoryURL  = "https://raw.githubusercontent.com/Silo-Community/silo-plugins/main/manifest.json"
 	ApprovedCommunityRepositoryName = "Approved community"
-	ForkVirtualRepositoryURL        = "https://raw.githubusercontent.com/drondeseries/silo-virtual-library/main/catalog.json"
+	ForkVirtualRepositoryURL        = "https://raw.githubusercontent.com/drondeseries/vio-virtual-library/main/catalog.json"
 	ForkVirtualRepositoryName       = "Vio Virtual Library"
 
 	OfficialRepositoryManagedKey          = "official"
 	ApprovedCommunityRepositoryManagedKey = "approved-community"
 	ForkVirtualRepositoryManagedKey       = "fork-virtual-library"
 
-	// The persisted source kind. It is a stored value with a database check
-	// constraint (20260709191109) and an API enum, both of which name 'silo',
-	// so the rebrand's product name does not apply here.
-	RepositorySourceSilo              = "silo"
+	RepositorySourceSilo              = "vio"
 	RepositorySourceApprovedCommunity = "approved_community"
 	RepositorySourceExternal          = "external"
 

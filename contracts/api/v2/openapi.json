@@ -9121,6 +9121,7 @@
           "source_kind": {
             "enum": [
               "silo",
+              "vio",
               "approved_community",
               "external"
             ],
@@ -9622,6 +9623,7 @@
           "source_kind": {
             "enum": [
               "silo",
+              "vio",
               "approved_community",
               "external"
             ],

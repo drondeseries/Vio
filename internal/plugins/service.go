@@ -274,7 +274,7 @@ func catalogEntryPreferredForDiscovery(candidate, current CatalogEntry) bool {
 
 func repositorySourcePrecedence(sourceKind string) int {
 	switch sourceKind {
-	case RepositorySourceSilo:
+	case RepositorySourceSilo, "silo":
 		return 0
 	case RepositorySourceApprovedCommunity:
 		return 1
@@ -317,7 +317,31 @@ func (s *Service) InstallLocal(ctx context.Context, req InstallArchiveRequest) (
 }
 
 func (s *Service) InstallRemote(ctx context.Context, req InstallArchiveRequest) (*InstallResult, error) {
-	result, err := s.installer.InstallRemote(ctx, req)
+	if req.ArchiveURL == "" {
+		return nil, fmt.Errorf("archive url is required")
+	}
+	data, err := s.installer.downloadArchive(ctx, req.ArchiveURL)
+	if err != nil {
+		return nil, err
+	}
+	_, _, manifest, err := openPluginArchive(data)
+	if err != nil {
+		return nil, err
+	}
+
+	existing, err := s.existingInstallationByPluginID(ctx, manifest.GetPluginId())
+	if err != nil {
+		return nil, err
+	}
+	var result *InstallResult
+	if existing == nil {
+		result, err = s.installer.installArchive(ctx, data, req.RepositoryID)
+	} else {
+		if err = s.stopInstallationIfRunning(existing); err != nil {
+			return nil, err
+		}
+		result, err = s.installer.replaceArchive(ctx, existing, data, req.RepositoryID)
+	}
 	if err != nil {
 		return nil, err
 	}
