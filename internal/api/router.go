@@ -1226,6 +1226,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 					CandidateID:    res.CandidateID,
 					RequestHeaders: res.RequestHeaders,
 					ExpiresAt:      res.ExpiresAt,
+					OwnerID:        res.OwnerID,
 				}, nil
 			})
 		}

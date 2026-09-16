@@ -300,6 +300,12 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 		res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
 	}
 	if err != nil {
+		slog.WarnContext(ctx, "virtual stream resolve failed",
+			"component", "api",
+			"owner_installation_id", ownerInstallationID,
+			"virtual_uri", virtualURI,
+			"error", logredact.SanitizeURLError(err),
+		)
 		return res, nil, fmt.Errorf("resolve virtual input: %w", err)
 	}
 	if h.RemoteStreamRelay == nil {
@@ -307,12 +313,19 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	}
 	var relayURL string
 	var cleanup func()
-	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(ownerInstallationID) {
+	effectiveOwner := effectiveVirtualOwner(res.OwnerID, ownerInstallationID)
+	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(effectiveOwner) {
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterInsecureWithHeaders(ctx, res.URL, res.RequestHeaders)
 	} else {
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterWithHeaders(ctx, res.URL, res.RequestHeaders)
 	}
 	if err != nil {
+		slog.WarnContext(ctx, "virtual stream relay registration failed",
+			"component", "api",
+			"owner_installation_id", effectiveOwner,
+			"virtual_uri", virtualURI,
+			"error", logredact.SanitizeURLError(err),
+		)
 		return ResolvedVirtualMedia{}, nil, err
 	}
 	res.URL = relayURL

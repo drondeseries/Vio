@@ -681,6 +681,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				if res.CandidateID != "" {
 					cand.ID = res.CandidateID
 				}
+				// The provider that answered is the runtime owner for a
+				// legacy file row whose stored owner is 0. Adopt it so the
+				// transient file, the session, and every downstream recipe
+				// carry the effective owner instead of 0.
+				if res.OwnerID > 0 {
+					oid = res.OwnerID
+				}
 			} else {
 				resolveErr = err
 			}

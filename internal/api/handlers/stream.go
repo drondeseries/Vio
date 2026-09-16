@@ -252,7 +252,8 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	}
 	var relayURL string
 	var cleanup func()
-	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(file.VirtualOwnerInstallationID) {
+	ownerID := effectiveVirtualOwner(resolved.OwnerID, file.VirtualOwnerInstallationID)
+	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(ownerID) {
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterInsecureWithHeaders(ctx, resolved.URL, resolved.RequestHeaders)
 	} else {
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterWithHeaders(ctx, resolved.URL, resolved.RequestHeaders)
@@ -393,6 +394,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if resolveErr != nil {
+			logVirtualStreamFailure(r.Context(), sessionID, file, resolveErr)
 			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
 			return
 		}
@@ -420,6 +422,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				err = fmt.Errorf("unsupported virtual stream scheme %q", targetURL.Scheme)
 			}
 			if err != nil {
+				logVirtualStreamFailure(r.Context(), sessionID, file, err)
 				h.handleTransportStartFailure(r.Context(), session, file, err)
 				writeError(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
 				return
@@ -430,6 +433,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			host := targetURL.Hostname()
 			if host != "127.0.0.1" && host != "::1" && host != "[::1]" {
 				err := fmt.Errorf("virtual direct-play proxy target %q is not the local relay", targetURL.Host)
+				logVirtualStreamFailure(r.Context(), sessionID, file, err)
 				h.handleTransportStartFailure(r.Context(), session, file, err)
 				writeError(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
 				return
@@ -497,6 +501,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				if lastProxyErr != nil {
 					h.handleTransportStartFailure(r.Context(), session, file, lastProxyErr)
 					if streamWriter.StatusCode() == 0 {
+						logVirtualStreamFailure(r.Context(), sessionID, file, lastProxyErr)
 						writeError(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
 					}
 				}
@@ -1135,6 +1140,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			var resolved ResolvedVirtualMedia
 			resolved, releaseInput, err = h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 			if err != nil {
+				logVirtualStreamFailure(r.Context(), session.ID, file, err)
 				writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
 				return
 			}
@@ -1174,6 +1180,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		if virtualFontSource && hasVirtualMediaResolver(h) {
 			resolved, cleanup, resolveErr := h.resolveVirtualInputURI(extractCtx, file, session.UserID, session.ProfileID, false)
 			if resolveErr != nil {
+				logVirtualStreamFailure(extractCtx, session.ID, file, resolveErr)
 				return nil, fmt.Errorf("%w: %w", errVirtualFontResolve, resolveErr)
 			}
 			inputPath = resolved.URL
@@ -1189,6 +1196,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	})
 	if err != nil {
 		if errors.Is(err, errVirtualFontResolve) {
+			logVirtualStreamFailure(r.Context(), session.ID, file, err)
 			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
 			return
 		}
@@ -1691,6 +1699,7 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 			defer cancel()
 			resolved, resolvedCleanup, err := h.resolveVirtualInputURI(resolveCtx, file, session.UserID, session.ProfileID, false)
 			if err != nil {
+				logVirtualStreamFailure(resolveCtx, session.ID, file, err)
 				return fmt.Errorf("resolve virtual input for subtitle warm: %w", err)
 			}
 			cleanup = resolvedCleanup

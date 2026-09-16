@@ -3011,7 +3011,7 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *p
 		card.DVProfile = file.PrimaryDVProfile()
 		card.AudioOnly = file.IsAudioOnly()
 		if isVirtualPlaybackFile(file) {
-			card.VirtualSourceOwnerInstallationID = file.VirtualOwnerInstallationID
+			card.VirtualSourceOwnerInstallationID = effectiveVirtualOwner(file.VirtualOwnerInstallationID, routeSession.VirtualSourceOwnerInstallationID)
 		}
 		if err := h.putRequiredNodeRecipeV3(r.Context(), transportID, card); err != nil {
 			h.deleteNodeRecipeV3(r.Context(), transportID)
@@ -3987,7 +3987,7 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 	opts := playback.TranscodeOpts{
 		InputPath:                        file.FilePath,
 		MediaFileID:                      file.ID,
-		VirtualSourceOwnerInstallationID: file.VirtualOwnerInstallationID,
+		VirtualSourceOwnerInstallationID: effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID),
 		OutputDir:                        outputDir,
 		OutputSubdir:                     outputSubdir,
 		SessionID:                        session.ID,
@@ -4118,7 +4118,7 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 	cardOpts := ts.Opts()
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), "virtual://") {
 		cardOpts.CanonicalInputPath = file.FilePath
-		cardOpts.VirtualSourceOwnerInstallationID = file.VirtualOwnerInstallationID
+		cardOpts.VirtualSourceOwnerInstallationID = effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
 	}
 	url := fmt.Sprintf("/playback/transcode/%s/master.m3u8", session.ID)
 	if !mode.headerAuth {
@@ -4327,7 +4327,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	// recipe so a node/central restart resolves the same release.
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), "virtual://") {
 		card.InputPath = file.FilePath
-		card.VirtualSourceOwnerInstallationID = file.VirtualOwnerInstallationID
+		card.VirtualSourceOwnerInstallationID = effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
 	}
 	card.OriginalStartedAt = session.StartedAt
 	url := fmt.Sprintf("/playback/transcode/%s/master.m3u8", session.ID)
@@ -4581,7 +4581,7 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 	if isVirtualPlaybackFile(file) && strings.HasPrefix(file.FilePath, "virtual://") {
 		state.VirtualSourceURI = file.FilePath
 		state.VirtualSourceSet = true
-		state.VirtualSourceOwnerInstallationID = file.VirtualOwnerInstallationID
+		state.VirtualSourceOwnerInstallationID = effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
 		state.VirtualSubtitleTracks = file.SubtitleTracks
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
 		state.VirtualSubtitleEvidenceSet = true
