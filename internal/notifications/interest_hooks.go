@@ -233,6 +233,7 @@ var _ userstore.SettingMutationTransactioner = (*interestTrackingStoreWithProfil
 var _ userstore.WatchedBatchWriter = (*interestTrackingStore)(nil)
 var _ userstore.VisibleHistoryAdder = (*interestTrackingStore)(nil)
 var _ userstore.HistoryVisibilityStore = (*interestTrackingStore)(nil)
+var _ userstore.NextUpStateStore = (*interestTrackingStore)(nil)
 var _ userstore.WatchedBatchWriter = (*interestTrackingStoreWithDevices)(nil)
 var _ userstore.VisibleHistoryAdder = (*interestTrackingStoreWithDevices)(nil)
 var _ userstore.HistoryVisibilityStore = (*interestTrackingStoreWithDevices)(nil)
@@ -558,6 +559,28 @@ func (s *interestTrackingStore) VisibleHistoryTimestamps(ctx context.Context, pr
 		return userstore.VisibleHistoryTimestamps(ctx, s.UserStore, profileID, mediaItemIDs, at)
 	}
 	return visibility.VisibleHistoryTimestamps(ctx, profileID, mediaItemIDs, at)
+}
+
+// ListNextUpStatePage forwards the Next Up state page walk. The catalog's Next
+// Up repository type-asserts NextUpStateStore and treats a store without the
+// capability as a hard error, so a missing forward breaks Next Up sections in
+// production rather than degrading to a fallback.
+func (s *interestTrackingStore) ListNextUpStatePage(ctx context.Context, profileID string, cursor *userstore.NextUpStateCursor, limit int) (userstore.NextUpStatePage, error) {
+	state, ok := s.UserStore.(userstore.NextUpStateStore)
+	if !ok {
+		return userstore.NextUpStatePage{}, errors.New("wrapped user store does not implement userstore.NextUpStateStore")
+	}
+	return state.ListNextUpStatePage(ctx, profileID, cursor, limit)
+}
+
+// ListNextUpStateForItems forwards the by-item Next Up state read; see
+// ListNextUpStatePage.
+func (s *interestTrackingStore) ListNextUpStateForItems(ctx context.Context, profileID string, mediaItemIDs []string) ([]userstore.NextUpStateEntry, error) {
+	state, ok := s.UserStore.(userstore.NextUpStateStore)
+	if !ok {
+		return nil, errors.New("wrapped user store does not implement userstore.NextUpStateStore")
+	}
+	return state.ListNextUpStateForItems(ctx, profileID, mediaItemIDs)
 }
 
 func (s *interestTrackingStore) DeleteHistoryBySource(ctx context.Context, profileID string, mediaItemIDs []string, source userstore.WatchHistorySource) error {

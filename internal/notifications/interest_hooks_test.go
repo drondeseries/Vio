@@ -7,6 +7,7 @@ import (
 	"errors"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -585,6 +586,15 @@ func TestInterestTrackingStoreConditionalCapabilities(t *testing.T) {
 type allCapabilitiesFakeStore struct {
 	userstore.UserStore
 	profile *userstore.DeviceCapabilityProfile
+
+	nextUpPageProfile string
+	nextUpPageCursor  *userstore.NextUpStateCursor
+	nextUpPageLimit   int
+	nextUpPageResult  userstore.NextUpStatePage
+
+	nextUpItemsProfile string
+	nextUpItemsIDs     []string
+	nextUpItemsResult  []userstore.NextUpStateEntry
 }
 
 func (s *allCapabilitiesFakeStore) RegisterDevice(context.Context, userstore.DeviceEntry) error {
@@ -613,6 +623,27 @@ func (s *allCapabilitiesFakeStore) SeriesCompletion(context.Context, string, []s
 
 func (s *allCapabilitiesFakeStore) SeasonCompletion(context.Context, string, []string) (map[string]bool, error) {
 	return map[string]bool{}, nil
+}
+
+func (s *allCapabilitiesFakeStore) ListNextUpStatePage(_ context.Context, profileID string, cursor *userstore.NextUpStateCursor, limit int) (userstore.NextUpStatePage, error) {
+	s.nextUpPageProfile = profileID
+	s.nextUpPageCursor = cursor
+	s.nextUpPageLimit = limit
+	return s.nextUpPageResult, nil
+}
+
+func (s *allCapabilitiesFakeStore) ListNextUpStateForItems(_ context.Context, profileID string, mediaItemIDs []string) ([]userstore.NextUpStateEntry, error) {
+	s.nextUpItemsProfile = profileID
+	s.nextUpItemsIDs = mediaItemIDs
+	return s.nextUpItemsResult, nil
+}
+
+func (s *allCapabilitiesFakeStore) ListDeviceSettingsPage(context.Context, userstore.DevicePageOptions) ([]userstore.DeviceSettingsEntry, error) {
+	return nil, nil
+}
+
+func (s *allCapabilitiesFakeStore) RemoveDeviceSettings(context.Context, string, string, bool) ([]string, error) {
+	return nil, nil
 }
 
 func (s *allCapabilitiesFakeStore) GetDeviceProfile(_ context.Context, profileID, deviceID string) (*userstore.DeviceCapabilityProfile, error) {
@@ -658,5 +689,94 @@ func TestInterestTrackingStoreKeepsDeviceProfilesCallable(t *testing.T) {
 	}
 	if got == nil || got.DeviceID != "d1" {
 		t.Fatalf("GetDeviceProfile = %+v, want the stored profile", got)
+	}
+}
+
+// TestInterestTrackingStoreForwardsNextUpStateCapability pins the production
+// regression: the catalog's Next Up repository type-asserts
+// userstore.NextUpStateStore and hard-errors when the decorator does not forward
+// it, which broke every Next Up section. The fake advertises the same
+// capabilities as the Postgres backend plus device settings, so ForUser builds
+// the widest production chain (the completion chain wrapped by the
+// device-settings anonymous struct) and the test proves the capability survives
+// the whole chain transitively.
+func TestInterestTrackingStoreForwardsNextUpStateCapability(t *testing.T) {
+	ctx := t.Context()
+	inner := &allCapabilitiesFakeStore{
+		profile: &userstore.DeviceCapabilityProfile{ProfileID: "p1", DeviceID: "d1"},
+		nextUpPageResult: userstore.NextUpStatePage{
+			Entries:   []userstore.NextUpStateEntry{{MediaItemID: "m1", Position: 42}},
+			Exhausted: true,
+		},
+		nextUpItemsResult: []userstore.NextUpStateEntry{{MediaItemID: "m1", Position: 42}},
+	}
+	provider := WrapUserStoreProvider(preferenceTransactionTestProvider{store: inner}, &System{})
+	wrapped, err := provider.ForUser(ctx, 1)
+	if err != nil {
+		t.Fatalf("ForUser: %v", err)
+	}
+
+	// Assert the exact production wrapper shape so the test cannot pass on a
+	// narrower chain than the one the deployment builds.
+	if _, ok := wrapped.(*struct {
+		*interestTrackingStoreWithDevicesRollupAndCompletion
+		userstore.DeviceSettingsStore
+	}); !ok {
+		t.Fatalf("wrapped store %T is not the production devices+rollup+completion+settings decorator", wrapped)
+	}
+
+	state, ok := wrapped.(userstore.NextUpStateStore)
+	if !ok {
+		t.Fatal("interest-tracking wrapper dropped userstore.NextUpStateStore; Next Up sections fail in production")
+	}
+
+	cursor := &userstore.NextUpStateCursor{
+		UpdatedAt:   time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC),
+		MediaItemID: "cursor-1",
+	}
+	page, err := state.ListNextUpStatePage(ctx, "profile-1", cursor, 25)
+	if err != nil {
+		t.Fatalf("ListNextUpStatePage: %v", err)
+	}
+	if inner.nextUpPageProfile != "profile-1" || inner.nextUpPageLimit != 25 || inner.nextUpPageCursor != cursor {
+		t.Fatalf("ListNextUpStatePage arguments changed: profile=%q limit=%d cursor=%+v",
+			inner.nextUpPageProfile, inner.nextUpPageLimit, inner.nextUpPageCursor)
+	}
+	if len(page.Entries) != 1 || page.Entries[0].MediaItemID != "m1" || !page.Exhausted {
+		t.Fatalf("ListNextUpStatePage result = %+v, want the fake backend's page", page)
+	}
+
+	entries, err := state.ListNextUpStateForItems(ctx, "profile-1", []string{"m1", "m2"})
+	if err != nil {
+		t.Fatalf("ListNextUpStateForItems: %v", err)
+	}
+	if inner.nextUpItemsProfile != "profile-1" || !slices.Equal(inner.nextUpItemsIDs, []string{"m1", "m2"}) {
+		t.Fatalf("ListNextUpStateForItems arguments changed: profile=%q ids=%v",
+			inner.nextUpItemsProfile, inner.nextUpItemsIDs)
+	}
+	if len(entries) != 1 || entries[0].MediaItemID != "m1" {
+		t.Fatalf("ListNextUpStateForItems result = %+v, want the fake backend's entries", entries)
+	}
+}
+
+// TestInterestTrackingStoreNextUpStateNoCapability asserts that a backing store
+// without the capability yields a clear error naming it rather than a silently
+// empty page that callers would read as exhausted.
+func TestInterestTrackingStoreNextUpStateNoCapability(t *testing.T) {
+	inner := &struct{ userstore.UserStore }{}
+	provider := WrapUserStoreProvider(preferenceTransactionTestProvider{store: inner}, &System{})
+	wrapped, err := provider.ForUser(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("ForUser: %v", err)
+	}
+	state, ok := wrapped.(userstore.NextUpStateStore)
+	if !ok {
+		t.Fatal("interest-tracking wrapper does not forward NextUpStateStore at all")
+	}
+	if _, err := state.ListNextUpStatePage(t.Context(), "p1", nil, 10); err == nil || !strings.Contains(err.Error(), "NextUpStateStore") {
+		t.Fatalf("ListNextUpStatePage error = %v, want an error naming NextUpStateStore", err)
+	}
+	if _, err := state.ListNextUpStateForItems(t.Context(), "p1", []string{"m1"}); err == nil || !strings.Contains(err.Error(), "NextUpStateStore") {
+		t.Fatalf("ListNextUpStateForItems error = %v, want an error naming NextUpStateStore", err)
 	}
 }
