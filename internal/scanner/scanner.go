@@ -1485,8 +1485,7 @@ func probeUnreachableRoots(ctx context.Context, folderID int, roots []string) []
 }
 
 func isVirtualRootPath(root string) bool {
-	raw := strings.TrimSpace(strings.ToLower(root))
-	return raw == "virtual" || strings.HasPrefix(raw, "virtual://")
+	return rootcheck.IsVirtualRootPath(root)
 }
 
 func logUnreachableRoot(ctx context.Context, folderID int, root string, probe rootcheck.Result) {

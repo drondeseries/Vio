@@ -53,9 +53,21 @@ type Result struct {
 // should never be probed as directories or walked by the scanner.
 const VirtualRootPrefix = "virtual://"
 
+// virtualRootPrefixLegacy is the single-slash form (virtual:/x) that older
+// writes produced when filepath.Clean collapsed the scheme's double slash.
+// Accept it for backward compatibility; new writes use VirtualRootPrefix.
+const virtualRootPrefixLegacy = "virtual:/"
+
+// IsVirtualRootPath reports whether path is a virtual library root in either
+// slash form. Case-insensitive; surrounding whitespace is ignored.
+func IsVirtualRootPath(path string) bool {
+	raw := strings.TrimSpace(strings.ToLower(path))
+	return raw == "virtual" || strings.HasPrefix(raw, VirtualRootPrefix) || strings.HasPrefix(raw, virtualRootPrefixLegacy)
+}
+
 // Probe checks that path exists, is a directory, and can be listed.
 func Probe(path string) Result {
-	if strings.HasPrefix(path, VirtualRootPrefix) {
+	if IsVirtualRootPath(path) {
 		return Result{Reachable: true, Empty: true}
 	}
 	res := Result{Reachable: true}

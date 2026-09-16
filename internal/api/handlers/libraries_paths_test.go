@@ -30,3 +30,17 @@ func TestNormalizeLibraryPaths(t *testing.T) {
 		t.Fatal("mutated caller paths")
 	}
 }
+
+func TestNormalizeLibraryPathsPreservesVirtualScheme(t *testing.T) {
+	// filepath.Clean collapses virtual://x to virtual:/x, breaking the
+	// prefix checks in rootcheck and the scanner. Virtual roots must pass
+	// through untouched beyond whitespace trimming.
+	paths := []string{" virtual://movies ", "virtual://series", "VIRTUAL://media"}
+	got, err := normalizeLibraryPaths(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"virtual://movies", "virtual://series", "VIRTUAL://media"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("paths = %q, want %q", got, want)
+	}
+}
