@@ -232,8 +232,10 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 	if !strings.Contains(sql, "AND probe_updated_at IS NOT DISTINCT FROM $15::timestamptz") {
 		t.Fatalf("metadata update does not fence on probe_updated_at snapshot: %s", sql)
 	}
-	// Path adoption must be refused on collection-owned rows.
-	if !strings.Contains(sql, "WHEN $18 != '' AND probe_source != 'virtual_collection'") {
+	// Path adoption must be refused on collection-owned rows. IS DISTINCT FROM
+	// makes rows with a NULL probe_source (never stamped) adopt like any other
+	// non-collection source instead of the guard evaluating to NULL.
+	if !strings.Contains(sql, "WHEN $18 != '' AND probe_source IS DISTINCT FROM 'virtual_collection'") {
 		t.Fatalf("metadata update does not guard path adoption: %s", sql)
 	}
 	// Adoption must also be refused when a sibling row (same virtual owner and
