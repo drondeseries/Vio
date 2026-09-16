@@ -13,7 +13,10 @@ const (
 	ApprovedCommunityRepositoryManagedKey = "approved-community"
 	ForkVirtualRepositoryManagedKey       = "fork-virtual-library"
 
-	RepositorySourceSilo              = "vio"
+	// The persisted source kind. It is a stored value with a database check
+	// constraint (20260709191109) and an API enum, both of which name 'silo',
+	// so the rebrand's product name does not apply here.
+	RepositorySourceSilo              = "silo"
 	RepositorySourceApprovedCommunity = "approved_community"
 	RepositorySourceExternal          = "external"
 
