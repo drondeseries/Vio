@@ -13,10 +13,14 @@ var (
 	// without a recognized concurrency-limit code (e.g. an admin custom
 	// override, or a failed policy evaluation) must not masquerade as one.
 	ErrPlaybackNotAllowed = errors.New("playback not allowed by policy")
-	ErrFileNotFound       = errors.New("media file not found")
-	ErrTranscodeFailed    = errors.New("transcode process failed")
-	ErrSegmentNotFound    = errors.New("segment not found")
-	ErrManifestNotReady   = errors.New("manifest not ready")
+	// ErrAdmissionDeciderTimeout reports the policy engine exceeded its eval
+	// budget, which is not a decision. Playback admission may degrade to the
+	// inline stream/transcode caps; a generic decider error must still deny.
+	ErrAdmissionDeciderTimeout = errors.New("admission decider timed out")
+	ErrFileNotFound            = errors.New("media file not found")
+	ErrTranscodeFailed         = errors.New("transcode process failed")
+	ErrSegmentNotFound         = errors.New("segment not found")
+	ErrManifestNotReady        = errors.New("manifest not ready")
 	// ErrToneMapSourceValidationUnavailable reports that the executor could not
 	// freshly probe the source metadata needed to validate a tone-map recipe.
 	// The failure is transient: callers may retry after the source or probe
