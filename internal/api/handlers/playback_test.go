@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1697,7 +1698,7 @@ func TestFindAlternateFilesMultipleCandidates(t *testing.T) {
 		},
 	}
 
-	alternates, err := handler.findAlternateFiles(context.Background(), source)
+	alternates, err := handler.findAlternateFiles(context.Background(), source, alternateOrdering{})
 	if err != nil {
 		t.Fatalf("findAlternateFiles: %v", err)
 	}
@@ -1708,5 +1709,118 @@ func TestFindAlternateFilesMultipleCandidates(t *testing.T) {
 	// Expected order: 3 (1080p SDR), 4 (720p SDR - wait: 2 is 1080p HDR, SDR preferred so 3, 4, 2)
 	if alternates[0].ID != 3 {
 		t.Errorf("alternates[0].ID = %d, want 3 (1080p SDR)", alternates[0].ID)
+	}
+}
+
+// alternateOrderingTestHandler builds one source and four siblings: a 4K HDR
+// version, a 1080p HDR version, a 1080p SDR version, and a 720p SDR version.
+func alternateOrderingTestHandler() (*PlaybackHandler, *models.MediaFile) {
+	source := &models.MediaFile{ID: 1, ContentID: "movie-order", Resolution: "2160p", HDR: true}
+	handler := &PlaybackHandler{
+		FileVersionFetcher: testPlaybackFileVersionFetcher{
+			byContent: map[string][]*models.MediaFile{
+				"movie-order": {
+					source,
+					{ID: 2, ContentID: "movie-order", Resolution: "2160p", HDR: true, Bitrate: 40_000_000},
+					{ID: 3, ContentID: "movie-order", Resolution: "1080p", HDR: true, Bitrate: 10_000_000},
+					{ID: 4, ContentID: "movie-order", Resolution: "1080p", HDR: false, Bitrate: 8_000_000},
+					{ID: 5, ContentID: "movie-order", Resolution: "720p", HDR: false, Bitrate: 3_000_000},
+				},
+			},
+		},
+	}
+	return handler, source
+}
+
+func alternateFileIDs(files []*models.MediaFile) []int {
+	ids := make([]int, len(files))
+	for i, f := range files {
+		ids[i] = f.ID
+	}
+	return ids
+}
+
+func TestAlternateOrderingForClient(t *testing.T) {
+	cases := []struct {
+		name    string
+		maxRes  string
+		hdr     bool
+		want4K  bool
+		wantHDR bool
+	}{
+		{name: "absent capability is conservative", maxRes: "", want4K: false, wantHDR: false},
+		{name: "1080p ceiling stays conservative", maxRes: "1080p", want4K: false, wantHDR: false},
+		{name: "2160p ceiling prefers 4K", maxRes: "2160p", want4K: true, wantHDR: false},
+		{name: "4k alias normalizes to 2160p", maxRes: "4k", want4K: true, wantHDR: false},
+		{name: "uhd alias normalizes to 2160p", maxRes: "uhd", want4K: true, wantHDR: false},
+		{name: "2160p plus HDR prefers both", maxRes: "2160p", hdr: true, want4K: true, wantHDR: true},
+		{name: "1080p plus HDR keeps resolution conservative", maxRes: "1080p", hdr: true, want4K: false, wantHDR: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := alternateOrderingForClient(playback.ClientCodecCapabilitiesV3{MaxResolution: tc.maxRes, HDR: tc.hdr})
+			if got.Prefer4K != tc.want4K || got.PreferHDR != tc.wantHDR {
+				t.Fatalf("alternateOrderingForClient(%q, hdr=%v) = %+v, want Prefer4K=%v PreferHDR=%v", tc.maxRes, tc.hdr, got, tc.want4K, tc.wantHDR)
+			}
+		})
+	}
+}
+
+func TestFindAlternateFilesOrders4KFirstFor4KClient(t *testing.T) {
+	handler, source := alternateOrderingTestHandler()
+	order := alternateOrderingForClient(playback.ClientCodecCapabilitiesV3{MaxResolution: "2160p"})
+	alternates, err := handler.findAlternateFiles(context.Background(), source, order)
+	if err != nil {
+		t.Fatalf("findAlternateFiles: %v", err)
+	}
+	// 4K first, then non-4K with the existing SDR-before-HDR tiebreak.
+	if got := alternateFileIDs(alternates); !slices.Equal(got, []int{2, 4, 5, 3}) {
+		t.Fatalf("4K-capable order = %v, want [2 4 5 3]", got)
+	}
+}
+
+func TestFindAlternateFilesKeepsNon4KFirstFor1080pClient(t *testing.T) {
+	handler, source := alternateOrderingTestHandler()
+	order := alternateOrderingForClient(playback.ClientCodecCapabilitiesV3{MaxResolution: "1080p"})
+	alternates, err := handler.findAlternateFiles(context.Background(), source, order)
+	if err != nil {
+		t.Fatalf("findAlternateFiles: %v", err)
+	}
+	// A device capped at 1080p keeps today's non-4K-first order: SDR 1080p,
+	// SDR 720p, HDR 1080p, then the 4K sibling.
+	if got := alternateFileIDs(alternates); !slices.Equal(got, []int{4, 5, 3, 2}) {
+		t.Fatalf("1080p-capable order = %v, want [4 5 3 2]", got)
+	}
+}
+
+func TestFindAlternateFilesOrdersHDRFirstForHDRClient(t *testing.T) {
+	handler, source := alternateOrderingTestHandler()
+	order := alternateOrderingForClient(playback.ClientCodecCapabilitiesV3{MaxResolution: "2160p", HDR: true})
+	alternates, err := handler.findAlternateFiles(context.Background(), source, order)
+	if err != nil {
+		t.Fatalf("findAlternateFiles: %v", err)
+	}
+	// HDR is a secondary key within the 4K tier: 4K HDR first, then non-4K
+	// HDR before non-4K SDR, then resolution/bitrate.
+	if got := alternateFileIDs(alternates); !slices.Equal(got, []int{2, 3, 4, 5}) {
+		t.Fatalf("HDR-capable order = %v, want [2 3 4 5]", got)
+	}
+}
+
+func TestFindAlternateFilesDefaultOrderPreservesLegacy(t *testing.T) {
+	handler, source := alternateOrderingTestHandler()
+	// The zero ordering is what a device with no declared capability produces,
+	// and what the singular findAlternateFile path uses.
+	alternates, err := handler.findAlternateFiles(context.Background(), source, alternateOrdering{})
+	if err != nil {
+		t.Fatalf("findAlternateFiles: %v", err)
+	}
+	if got := alternateFileIDs(alternates); !slices.Equal(got, []int{4, 5, 3, 2}) {
+		t.Fatalf("default order = %v, want the legacy non-4K/SDR-first [4 5 3 2]", got)
+	}
+
+	absent := alternateOrderingForClient(playback.ClientCodecCapabilitiesV3{})
+	if absent != (alternateOrdering{}) {
+		t.Fatalf("absent capability = %+v, want the conservative zero ordering", absent)
 	}
 }
