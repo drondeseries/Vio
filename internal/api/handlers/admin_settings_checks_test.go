@@ -2089,3 +2089,38 @@ func TestAITranscriptionConnectionRequiresTimestampedSpeech(t *testing.T) {
 		})
 	}
 }
+
+func TestVirtualLibraryConnectionCheck(t *testing.T) {
+	t.Run("missing manifest url", func(t *testing.T) {
+		res := checkVirtualLibraryConnection(t.Context(), map[string]string{})
+		if res.Success {
+			t.Fatalf("expected failure for missing manifest url, got %+v", res)
+		}
+		if res.Message != "Manifest URL is required." {
+			t.Fatalf("unexpected message: %s", res.Message)
+		}
+	})
+
+	t.Run("valid manifest url", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/manifest.json") {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"org.test","name":"Test","version":"1.0.0","resources":["stream"],"types":["movie","series"]}`))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer srv.Close()
+
+		res := checkVirtualLibraryConnection(t.Context(), map[string]string{
+			"virtual_library.manifest_url":        srv.URL + "/manifest.json",
+			"virtual_library.allow_insecure_http": "true",
+		})
+		if !res.Success {
+			t.Fatalf("expected success, got %+v", res)
+		}
+		if res.Message != "Streaming provider manifest verified successfully." {
+			t.Fatalf("unexpected message: %s", res.Message)
+		}
+	})
+}

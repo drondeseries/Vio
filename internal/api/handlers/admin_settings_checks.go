@@ -23,6 +23,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/recommendations/embeddings"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/s3client"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 type adminSettingsConnectionCheckRequest struct {
@@ -170,6 +171,8 @@ func runAdminSettingsConnectionCheck(ctx context.Context, kind string, cfg *conf
 		response = checkMDBListConnection(ctx, cfg)
 	case "remuxdb":
 		response = checkRemuxDBConnection(ctx, effectiveSettings)
+	case "virtual_library":
+		response = checkVirtualLibraryConnection(ctx, effectiveSettings)
 	default:
 		return connectionCheckResponse{}, ErrAdminSettingsCheckKind
 	}
@@ -220,6 +223,27 @@ func checkRemuxDBConnection(ctx context.Context, settings map[string]string) con
 		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB returned an unexpected response: %v", err)}
 	}
 	return connectionCheckResponse{Success: true, Message: fmt.Sprintf("RemuxDB verified (%d mediainfo records).", stats.TotalMediainfo)}
+}
+
+func checkVirtualLibraryConnection(ctx context.Context, settings map[string]string) connectionCheckResponse {
+	manifestURL := strings.TrimSpace(settings["virtual_library.manifest_url"])
+	if manifestURL == "" {
+		return connectionCheckResponse{Success: false, Message: "Manifest URL is required."}
+	}
+	allowInsecure := strings.EqualFold(strings.TrimSpace(settings["virtual_library.allow_insecure_http"]), "true")
+	tmdbKey := strings.TrimSpace(settings["virtual_library.tmdb_api_key"])
+
+	r := resolver.New(resolver.Config{
+		ManifestURL:   manifestURL,
+		AllowInsecure: allowInsecure,
+		TMDBAPIKey:    tmdbKey,
+	})
+	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := r.ValidateConnection(checkCtx); err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("Streaming provider connection failed: %v", err)}
+	}
+	return connectionCheckResponse{Success: true, Message: "Streaming provider manifest verified successfully."}
 }
 
 func aiClientConfig(cfg *config.Config) llm.Config {

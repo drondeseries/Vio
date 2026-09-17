@@ -1,5 +1,12 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { Loader2, Sparkles } from "lucide-react";
 
+import {
+  ConnectionCheckAction,
+  useConnectionCheck,
+} from "@/components/admin/ConnectionCheckAction";
+import { Button } from "@/components/ui/button";
+import { useAdminLibraries, useCreateLibrary } from "@/hooks/queries/admin/libraries";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { SettingField } from "@/pages/admin-settings/SettingField";
 
@@ -19,10 +26,82 @@ const STREAMING_KEYS = [
 export function StreamingStep() {
   const form = useSettingsForm({ keys: useMemo(() => STREAMING_KEYS, []) });
   const { handleSubmit, busy, skip } = useStepSubmit("streaming", form, "Failed to save");
+  const { data: libraries } = useAdminLibraries();
+  const createLibrary = useCreateLibrary();
+  const [creatingLibs, setCreatingLibs] = useState(false);
+
+  const providerCheck = useConnectionCheck("virtual_library", form, STREAMING_KEYS);
 
   const enabled = form.getValue("virtual_library.enabled") === "true";
   const manifestUrl = form.getValue("virtual_library.manifest_url");
   useStepSummary("streaming", enabled && manifestUrl ? "Stremio provider set" : "Skipped");
+
+  const movieOptions = useMemo(() => {
+    if (!libraries || libraries.length === 0) return [];
+    return libraries
+      .filter((l) => l.type === "movies" || l.type === "mixed")
+      .map((l) => ({ value: String(l.id), label: `${l.name} (ID: ${l.id})` }));
+  }, [libraries]);
+
+  const seriesOptions = useMemo(() => {
+    if (!libraries || libraries.length === 0) return [];
+    return libraries
+      .filter((l) => l.type === "series" || l.type === "mixed")
+      .map((l) => ({ value: String(l.id), label: `${l.name} (ID: ${l.id})` }));
+  }, [libraries]);
+
+  const currentMovieID = form.getValue("virtual_library.movie_library_id");
+  const movieSelectOptions = useMemo(() => {
+    const opts = [...movieOptions];
+    if (currentMovieID && !opts.some((o) => o.value === currentMovieID)) {
+      opts.unshift({ value: currentMovieID, label: `Library #${currentMovieID}` });
+    }
+    return opts;
+  }, [movieOptions, currentMovieID]);
+
+  const currentSeriesID = form.getValue("virtual_library.series_library_id");
+  const seriesSelectOptions = useMemo(() => {
+    const opts = [...seriesOptions];
+    if (currentSeriesID && !opts.some((o) => o.value === currentSeriesID)) {
+      opts.unshift({ value: currentSeriesID, label: `Library #${currentSeriesID}` });
+    }
+    return opts;
+  }, [seriesOptions, currentSeriesID]);
+
+  const handleCreateVirtualLibraries = async () => {
+    setCreatingLibs(true);
+    try {
+      const hasMovies = libraries?.some(
+        (l) =>
+          (l.type === "movies" || l.type === "mixed") &&
+          l.paths.some((p) => p.startsWith("virtual://")),
+      );
+      const hasSeries = libraries?.some(
+        (l) =>
+          (l.type === "series" || l.type === "mixed") &&
+          l.paths.some((p) => p.startsWith("virtual://")),
+      );
+
+      if (!hasMovies) {
+        const mov = await createLibrary.mutateAsync({
+          name: "Virtual Movies",
+          type: "movies",
+          paths: ["virtual://movies"],
+        });
+        form.setValue("virtual_library.movie_library_id", String(mov.id));
+      }
+      if (!hasSeries) {
+        const ser = await createLibrary.mutateAsync({
+          name: "Virtual Series",
+          type: "series",
+          paths: ["virtual://series"],
+        });
+        form.setValue("virtual_library.series_library_id", String(ser.id));
+      }
+    } finally {
+      setCreatingLibs(false);
+    }
+  };
 
   if (form.isPending) return <StepSkeleton rows={4} />;
 
@@ -33,7 +112,7 @@ export function StreamingStep() {
       onSubmit={handleSubmit}
       busy={busy}
       onSkip={skip}
-      footnote="Create virtual://movies and virtual://series libraries under Libraries, then point the provider at them. Details live in Admin › Settings › Streaming."
+      footnote="Virtual libraries hold zero-storage titles streamed on demand. Details live in Admin › Settings › Streaming."
     >
       <StepSection
         title="Stremio provider"
@@ -56,20 +135,59 @@ export function StreamingStep() {
               value={manifestUrl}
               onChange={(v) => form.setValue("virtual_library.manifest_url", v)}
             />
+            <ConnectionCheckAction
+              onClick={providerCheck.run}
+              result={providerCheck.result}
+              isPending={providerCheck.isPending}
+              disabled={!form.getValue("virtual_library.manifest_url")}
+            />
             <SettingField
-              label="Movies library ID"
-              type="number"
+              label="Movies library"
+              settingKey="virtual_library.movie_library_id"
+              type={movieSelectOptions.length > 0 ? "select" : "number"}
+              options={movieSelectOptions.length > 0 ? movieSelectOptions : undefined}
               description="Virtual movies library (virtual://movies) that holds provider titles."
               value={form.getValue("virtual_library.movie_library_id")}
               onChange={(v) => form.setValue("virtual_library.movie_library_id", v)}
             />
             <SettingField
-              label="Series library ID"
-              type="number"
+              label="Series library"
+              settingKey="virtual_library.series_library_id"
+              type={seriesSelectOptions.length > 0 ? "select" : "number"}
+              options={seriesSelectOptions.length > 0 ? seriesSelectOptions : undefined}
               description="Virtual series library (virtual://series) that holds provider episodes."
               value={form.getValue("virtual_library.series_library_id")}
               onChange={(v) => form.setValue("virtual_library.series_library_id", v)}
             />
+            <div className="border-border/60 flex flex-col gap-2 border-b pt-1 pb-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-xs font-medium">Auto-create zero-storage libraries</p>
+                <p className="text-muted-foreground text-xs">
+                  Quickly create Virtual Movies (virtual://movies) and Virtual Series
+                  (virtual://series).
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={creatingLibs || createLibrary.isPending}
+                onClick={handleCreateVirtualLibraries}
+                className="shrink-0"
+              >
+                {creatingLibs || createLibrary.isPending ? (
+                  <>
+                    <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    Creating...
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                    Create Virtual Libraries
+                  </>
+                )}
+              </Button>
+            </div>
             <SettingField
               label="TMDB API key"
               type="password"

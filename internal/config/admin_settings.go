@@ -121,6 +121,12 @@ var adminSettingDefaults = map[string]string{
 	"virtual_library.fallback_to_any_stream":      "false",
 	"virtual_library.quality_profiles":            "",
 	"virtual_library.custom_formats":              "",
+	"virtual_library.indexer_rss_url":             "",
+	"virtual_library.indexer_api_key":             "",
+	"virtual_library.indexer_rss_check_minutes":   "15",
+	"virtual_library.altmount_url":                "",
+	"virtual_library.altmount_api_key":            "",
+	"virtual_library.altmount_check_minutes":      "15",
 
 	"playback.ffmpeg_path":                           "",
 	playbackTranscodeDirSettingKey:                   DefaultTranscodeDir,
@@ -421,12 +427,14 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 50)
 	case "virtual_library.movie_library_id", "virtual_library.series_library_id":
 		return normalizeAdminInt(key, value, 1, 1000000)
-	case "virtual_library.cache_ttl_minutes":
+	case "virtual_library.cache_ttl_minutes", "virtual_library.indexer_rss_check_minutes", "virtual_library.altmount_check_minutes":
 		return normalizeAdminInt(key, value, 1, 10080)
 	case "virtual_library.schedule_refresh_minutes":
 		return normalizeAdminInt(key, value, 30, 10080)
 	case "virtual_library.manifest_url", "virtual_library.tmdb_api_key",
-		"virtual_library.monitor_file":
+		"virtual_library.monitor_file", "virtual_library.indexer_rss_url",
+		"virtual_library.indexer_api_key", "virtual_library.altmount_url",
+		"virtual_library.altmount_api_key":
 		if len(value) > 4096 {
 			return "", fmt.Errorf("%s exceeds 4096 bytes", key)
 		}

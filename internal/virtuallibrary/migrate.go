@@ -110,6 +110,12 @@ var streamingToCore = []struct {
 	{"custom_format_preset", "virtual_library.custom_format_preset", "string"},
 	{"fallback_to_any_stream", "virtual_library.fallback_to_any_stream", "bool"},
 	{"single_stream_with_failover", "virtual_library.single_stream_with_failover", "bool"},
+	{"indexer_rss_url", "virtual_library.indexer_rss_url", "string"},
+	{"indexer_api_key", "virtual_library.indexer_api_key", "string"},
+	{"indexer_rss_check_minutes", "virtual_library.indexer_rss_check_minutes", "int"},
+	{"altmount_url", "virtual_library.altmount_url", "string"},
+	{"altmount_api_key", "virtual_library.altmount_api_key", "string"},
+	{"altmount_check_minutes", "virtual_library.altmount_check_minutes", "int"},
 }
 
 // MigrateFromPlugin copies the retired plugin's `streaming` config group

@@ -66,6 +66,12 @@ type Config struct {
 	ScheduleRefreshMinutes int
 	MonitorFile            string
 	Quality                quality.QualityConfig
+	IndexerRSSURL          string
+	IndexerAPIKey          string
+	IndexerCheckMinutes    int
+	AltmountURL            string
+	AltmountAPIKey         string
+	AltmountCheckMinutes   int
 }
 
 // ConfigFromSettings builds a Config from a settings map (e.g. from
@@ -110,6 +116,12 @@ func ConfigFromSettings(m map[string]string) Config {
 		ScheduleRefreshMinutes: intOr(m, "virtual_library.schedule_refresh_minutes", 360),
 		MonitorFile:            stringOr(m, "virtual_library.monitor_file", ".vio-virtual-library-monitored.json"),
 		Quality:                qc,
+		IndexerRSSURL:          m["virtual_library.indexer_rss_url"],
+		IndexerAPIKey:          m["virtual_library.indexer_api_key"],
+		IndexerCheckMinutes:    intOr(m, "virtual_library.indexer_rss_check_minutes", 15),
+		AltmountURL:            m["virtual_library.altmount_url"],
+		AltmountAPIKey:         m["virtual_library.altmount_api_key"],
+		AltmountCheckMinutes:   intOr(m, "virtual_library.altmount_check_minutes", 15),
 	}
 }
 
@@ -191,6 +203,16 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 		Quality:    cfg.Quality,
 	}); err != nil {
 		logger.Warn("virtual library monitor state unavailable; starting with empty state", "error", err)
+	}
+	if cfg.IndexerRSSURL != "" {
+		if err := m.ConfigureProwlarr(cfg.IndexerRSSURL, cfg.IndexerAPIKey, cfg.IndexerCheckMinutes, ".vio-virtual-library-prowlarr-index.json"); err != nil {
+			logger.Warn("virtual library prowlarr configuration error", "error", err)
+		}
+	}
+	if cfg.AltmountURL != "" {
+		if err := m.ConfigureAltmount(cfg.AltmountURL, cfg.AltmountAPIKey, cfg.AltmountCheckMinutes, ".vio-virtual-library-altmount-state.json"); err != nil {
+			logger.Warn("virtual library altmount configuration error", "error", err)
+		}
 	}
 	if registrar != nil {
 		m.SetRegistrar(&catalogMonitorRegistrar{registrar: registrar})
