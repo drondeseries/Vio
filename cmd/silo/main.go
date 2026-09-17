@@ -2880,7 +2880,7 @@ func main() {
 			),
 		)
 		requestReconcileSvc.SetRequesterIdentityResolver(plugins.RequesterIdentityFromLookup(plugins.NewPgUserIdentityLookup(deps.DB)))
-		api.AttachRequestRouter(requestReconcileSvc, pluginService)
+		api.AttachRequestRouter(requestReconcileSvc, pluginService, vlSvc)
 		requestReconcileSvc.SetCatalogChangeNotifier(sections.InvalidateResolvedListCache)
 		requestReconcileSvc.SetGroupPolicyProvider(accessGroupStore)
 		if userStoreProvider != nil {

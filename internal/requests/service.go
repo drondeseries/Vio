@@ -68,9 +68,10 @@ type Service struct {
 	requesterIdentity RequesterIdentityResolver
 	notifier          FulfillmentNotifier
 	lifecycle         LifecycleNotifier
-	catalogChanged    func()
-	cleanupVirtual    func(context.Context, Request) error
-	Now               func() time.Time
+	catalogChanged          func()
+	cleanupVirtual          func(context.Context, Request) error
+	hasDefaultVirtualRouter func() bool
+	Now                     func() time.Time
 }
 
 type DiscoverySection struct {
@@ -98,6 +99,8 @@ func NewService(store Store, tmdbClient TMDBClient, presence PresenceResolver) *
 }
 
 func (s *Service) SetRouterProvider(p RequestRouterProvider) { s.router = p }
+
+func (s *Service) SetDefaultVirtualRouter(enabled func() bool) { s.hasDefaultVirtualRouter = enabled }
 
 // SetCatalogChangeNotifier installs the cache/event hook used when a request
 // router may have registered media directly in the catalog during Fulfill.
@@ -428,6 +431,15 @@ func (s *Service) resolveRouterConnections(ctx context.Context, fc *fulfillConte
 			installationID, capabilityID, chosen = *in.InstallationID, in.CapabilityID, true
 		}
 		conns = append(conns, ResolvedRouterConnection{ID: in.ID, BaseURL: in.BaseURL, APIKey: apiKey, Config: in.PluginConfig})
+	}
+	if len(conns) == 0 && s.hasDefaultVirtualRouter != nil && s.hasDefaultVirtualRouter() {
+		conns = []ResolvedRouterConnection{{
+			ID:      "core-virtual-library",
+			BaseURL: "virtual://streaming",
+			APIKey:  "core-managed",
+			Config:  map[string]any{},
+		}}
+		return conns, 0, "virtual-library-requests", nil
 	}
 	return conns, installationID, capabilityID, nil
 }
@@ -1703,6 +1715,9 @@ func (s *Service) integrationConfigured(ctx context.Context, mediaType MediaType
 			strings.TrimSpace(in.BaseURL) != "" && strings.TrimSpace(in.APIKeyRef) != "" {
 			return true, nil
 		}
+	}
+	if s.hasDefaultVirtualRouter != nil && s.hasDefaultVirtualRouter() {
+		return true, nil
 	}
 	return false, nil
 }

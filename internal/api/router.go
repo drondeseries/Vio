@@ -832,7 +832,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			tmdb.NewClient(tmdbAPIKey, 40),
 			mediarequests.NewCatalogPresence(itemRepo, providerIDRepo),
 		)
-		AttachRequestRouter(requestSvc, deps.PluginService)
+		AttachRequestRouter(requestSvc, deps.PluginService, deps.VirtualLibraryService)
 		requestSvc.SetCatalogChangeNotifier(sections.InvalidateResolvedListCache)
 		requestSvc.SetVirtualMediaCleanup(func(ctx context.Context, req mediarequests.Request) error {
 			tvdbID := ""

@@ -216,6 +216,7 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 	}
 	if registrar != nil {
 		m.SetRegistrar(&catalogMonitorRegistrar{registrar: registrar})
+		m.SetHost(&catalogRegistrarAdapter{registrar: registrar})
 	}
 	return &Service{Resolver: r, Monitor: m, cfg: cfg, logger: logger}
 }
@@ -267,9 +268,32 @@ func (s *Service) CheckRemote(ctx context.Context) error {
 	return s.Resolver.ValidateConnection(timeoutCtx)
 }
 
-// catalogRegistrarAdapter is the future bridge from
-// catalog.VirtualMediaRegistrar to the monitor's HostRegistrar interface.
-// It is intentionally unreferenced until Phase 3 wires ListLibraries.
+// catalogRegistrarAdapter bridges catalog.VirtualMediaRegistrar to the monitor's HostRegistrar interface.
 type catalogRegistrarAdapter struct {
 	registrar *catalog.VirtualMediaRegistrar
+}
+
+func (c *catalogRegistrarAdapter) ListLibraries(ctx context.Context, _ string) ([]*monitor.Library, error) {
+	if c == nil || c.registrar == nil || c.registrar.Pool() == nil {
+		return nil, nil
+	}
+	rows, err := c.registrar.Pool().Query(ctx, "SELECT id, name, type FROM media_folders WHERE enabled = true ORDER BY id ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*monitor.Library
+	for rows.Next() {
+		var id int
+		var name, typ string
+		if err := rows.Scan(&id, &name, &typ); err != nil {
+			return nil, err
+		}
+		out = append(out, &monitor.Library{
+			ID:        strconv.Itoa(id),
+			Name:      name,
+			MediaType: typ,
+		})
+	}
+	return out, rows.Err()
 }

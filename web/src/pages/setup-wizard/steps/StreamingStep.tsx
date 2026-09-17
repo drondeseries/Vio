@@ -190,7 +190,6 @@ export function StreamingStep() {
             </div>
             <SettingField
               label="TMDB API key"
-              type="password"
               description="Optional: resolves TMDB IDs to provider IDs for broader coverage."
               value={form.getValue("virtual_library.tmdb_api_key")}
               onChange={(v) => form.setValue("virtual_library.tmdb_api_key", v)}

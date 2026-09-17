@@ -642,12 +642,41 @@ type RequestRouterInstallation = {
   capability: PluginCapability;
 };
 
+const CORE_VIRTUAL_ROUTER_INSTALLATION: RequestRouterInstallation = {
+  installationID: 0,
+  pluginID: "core",
+  capability: {
+    type: REQUEST_ROUTER_CAPABILITY,
+    id: "virtual-library-requests",
+    display_name: "Virtual Library (Core Streaming)",
+    description:
+      "Registers home-released media immediately and queues upcoming media for monitoring.",
+    metadata: {
+      connection_defaults: {
+        base_url: "virtual://streaming",
+        api_key: "core-managed",
+      },
+    },
+    config_schema: [
+      {
+        key: "connection",
+        title: "Connection",
+        required: false,
+        json_schema: '{"type":"object","properties":{}}',
+        admin_form: {
+          fields: [],
+        },
+      },
+    ],
+  },
+};
+
 // requestRouterInstallations flattens installed plugins to one entry per
 // request_router.v1 capability so the form can offer an installation selector.
 function requestRouterInstallations(
   installations: PluginInstallation[],
 ): RequestRouterInstallation[] {
-  const out: RequestRouterInstallation[] = [];
+  const out: RequestRouterInstallation[] = [CORE_VIRTUAL_ROUTER_INSTALLATION];
   for (const installation of installations) {
     for (const capability of installation.capabilities ?? []) {
       if (
@@ -713,7 +742,10 @@ function integrationToForm(integration?: RequestIntegration): IntegrationFormSta
     base_url: integration?.base_url ?? "",
     api_key_ref: "",
     has_api_key: integration?.has_api_key ?? false,
-    installation_id: integration?.installation_id ? String(integration.installation_id) : "",
+    installation_id:
+      integration?.installation_id !== undefined && integration?.installation_id !== null
+        ? String(integration.installation_id)
+        : "",
     capability_id: integration?.capability_id ?? "",
   };
 }
@@ -1016,7 +1048,10 @@ function IntegrationEditor({
   }, [form.installation_id, soleInstallationID]);
 
   const selectedInstallationID = Number(form.installation_id);
-  const hasInstallation = Number.isInteger(selectedInstallationID) && selectedInstallationID > 0;
+  const hasInstallation =
+    Number.isInteger(selectedInstallationID) &&
+    selectedInstallationID >= 0 &&
+    form.installation_id.trim() !== "";
   // Match on both installation and capability sub-id so a multi-capability
   // installation resolves the exact backend; fall back to installation-only for
   // connections whose capability_id isn't set yet (adopts that installation's
