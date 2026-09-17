@@ -2,8 +2,6 @@
   <img src="assets/icon.png" alt="Vio logo" width="112" height="112">
 </p>
 
-<h1 align="center">Vio</h1>
-
 <p align="center">
   A self-hosted media server for films, series, audiobooks, ebooks, podcasts, and manga.
 </p>
