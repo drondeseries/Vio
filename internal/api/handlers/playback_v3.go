@@ -1869,7 +1869,8 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	})
 	timings.mark("planning")
 	if terminalAllowsAlternateFileV3(result.Terminal) && shouldTryAlternateFileV3(req.QualityPreference) && req.FileSelection != playback.FileSelectionExplicitV3 {
-		if alternates, alternateErr := h.findAlternateFiles(r.Context(), alternateBase); alternateErr == nil {
+		alternateOrder := alternateOrderingForClient(req.Capabilities)
+		if alternates, alternateErr := h.findAlternateFiles(r.Context(), alternateBase, alternateOrder); alternateErr == nil {
 			if alternateBase != requestedFile {
 				alternates = slices.DeleteFunc(alternates, func(candidate *models.MediaFile) bool {
 					return candidate == nil || candidate.PresentationPartIndex != alternateBase.PresentationPartIndex
@@ -2039,7 +2040,8 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	timings.mark("session_transport_commit")
 	if statusErr != nil {
 		if statusErr.reason == "transcode_start_failed" && isVirtualPlaybackFile(requestedFile) {
-			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile); alternateErr == nil && len(alternates) > 0 {
+			alternateOrder := alternateOrderingForClient(req.Capabilities)
+			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder); alternateErr == nil && len(alternates) > 0 {
 				for _, altCandidate := range alternates {
 					alternate, err := h.prepareVirtualAlternateFileV3(r, altCandidate, profileID)
 					if err != nil || alternate == nil {
@@ -2065,7 +2067,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 						})
 						clampPlannerTargetResolution(&alternateResult, alternate)
 						if alternateResult.Terminal == nil {
-							slog.WarnContext(r.Context(), "virtual playback transport failed; retrying compatible alternate", "component", "playback", "requested_file_id", requestedFile.ID, "alternate_file_id", alternate.ID, "error", statusErr.cause)
+							slog.WarnContext(r.Context(), "virtual playback transport failed; retrying compatible alternate", "component", "playback", "requested_file_id", requestedFile.ID, "alternate_file_id", alternate.ID, "alternate_order_4k_first", alternateOrder.Prefer4K, "error", statusErr.cause)
 							if alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r, userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateResult, clientInfo); alternateStatusErr == nil {
 								return alternateResponse, nil
 							}
@@ -5895,7 +5897,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	transportPrepared := false
 
 	if virtualRehydrationFailed {
-		alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile)
+		alternateOrder := alternateOrderingForClient(req.Capabilities)
+		alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder)
 		if alternateErr != nil {
 			virtualRehydrationErr = errors.Join(virtualRehydrationErr, alternateErr)
 		}
@@ -6105,7 +6108,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 		if terminalAllowsAlternateFileV3(result.Terminal) && (replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
 			(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3)) {
-			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile); alternateErr == nil {
+			alternateOrder := alternateOrderingForClient(req.Capabilities)
+			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder); alternateErr == nil {
 				baseStart := start
 				baseEffectiveFile := effectiveFile
 				var firstFailureEval *candidateEvaluationV3

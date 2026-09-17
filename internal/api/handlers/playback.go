@@ -2322,18 +2322,44 @@ func (h *PlaybackHandler) maybeStartThrottler(ctx context.Context, session *play
 // encoding.
 // Within each class it prefers SDR, then resolution, then bitrate.
 func (h *PlaybackHandler) findAlternateFile(ctx context.Context, source *models.MediaFile) (*models.MediaFile, error) {
-	candidates, err := h.findAlternateFiles(ctx, source)
+	candidates, err := h.findAlternateFiles(ctx, source, alternateOrdering{})
 	if err != nil || len(candidates) == 0 {
 		return nil, err
 	}
 	return candidates[0], nil
 }
 
+// alternateOrdering expresses the client's ceiling for version fallback
+// ordering. The zero value is the conservative default: prefer non-4K and SDR
+// siblings regardless of what the client can decode.
+type alternateOrdering struct {
+	Prefer4K  bool
+	PreferHDR bool
+}
+
+// alternateOrderingForClient derives the version-fallback ordering from the
+// client's declared capabilities. Prefer4K requires a normalized max
+// resolution of 2160p or higher; PreferHDR requires a declared HDR capability.
+// An absent or unknown ceiling yields the zero value, so a device whose limits
+// are unknown keeps the conservative non-4K/SDR-first order.
+//
+// HDR is a secondary key: it orders within the 4K preference tier (after the
+// 4K-ness comparison, before resolution/bitrate), not before it.
+func alternateOrderingForClient(caps playback.ClientCodecCapabilitiesV3) alternateOrdering {
+	normalized, _ := playback.NormalizeQualityV3(caps.MaxResolution)
+	return alternateOrdering{
+		Prefer4K:  resolutionRank(normalized) >= resolutionRank(transcodeResolution2160p),
+		PreferHDR: caps.HDR,
+	}
+}
+
 // findAlternateFiles returns every compatible edition/version candidate in
 // fallback order. Callers that plan candidates must keep trying after a
 // terminal: a lower-resolution candidate can still fail while a later 4K
-// candidate direct-plays or remuxes without forbidden video encoding.
-func (h *PlaybackHandler) findAlternateFiles(ctx context.Context, source *models.MediaFile) ([]*models.MediaFile, error) {
+// candidate direct-plays or remuxes without forbidden video encoding. The
+// ordering prefers the client's declared ceiling when it is known, and the
+// conservative non-4K/SDR-first order otherwise.
+func (h *PlaybackHandler) findAlternateFiles(ctx context.Context, source *models.MediaFile, order alternateOrdering) ([]*models.MediaFile, error) {
 	if h.FileVersionFetcher == nil {
 		return nil, fmt.Errorf("file version fetcher not configured")
 	}
@@ -2372,19 +2398,27 @@ func (h *PlaybackHandler) findAlternateFiles(ctx context.Context, source *models
 		return nil, nil
 	}
 
-	// Prefer non-4K before 4K so a lower-resolution sibling is tried first.
-	// Keep 4K siblings at the end: when no non-4K sibling exists, the planner
-	// may still direct-play or remux one because the policy only forbids video
-	// encoding.
+	// Group by 4K-ness, then by HDR, then resolution, then bitrate. The
+	// preference flags only reverse a group's direction: with the zero value
+	// this is the historical non-4K/SDR-first order, which keeps a
+	// lower-resolution sibling ahead of a 4K one that may hit the
+	// disabled-4K-transcode terminal. A 4K-capable client gets 4K first, and a
+	// failing 4K start still falls through to every later sibling because the
+	// retry loop iterates the whole list and commits the first that starts.
 	sort.Slice(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
 		a4K := playback.Is4KMediaFileV3(a)
 		b4K := playback.Is4KMediaFileV3(b)
 		if a4K != b4K {
+			if order.Prefer4K {
+				return a4K
+			}
 			return !a4K
 		}
-		// Prefer SDR over HDR (SDR = !HDR, so !HDR < HDR means SDR first).
 		if a.HDR != b.HDR {
+			if order.PreferHDR {
+				return a.HDR
+			}
 			return !a.HDR
 		}
 		aRes := resolutionRank(a.Resolution)
