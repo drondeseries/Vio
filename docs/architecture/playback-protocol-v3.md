@@ -755,6 +755,30 @@ carries the signed stream token `st` on its media URLs — never on subtitle or
 font-bundle routes. It is an opaque transport credential rather than a playback
 parameter, and it is outside the table above.
 
+### 4.3 Projecting the plan's media URL
+
+`stream.url` is deliberately version-agnostic: the plan names the route without
+an API version prefix, for example `/stream/{session_id}?st=...` or
+`/playback/transcode/{session_id}/master.m3u8`. The literal path is not a media
+route. Outside `/api/`, the installation root serves the SPA handler, so an
+unprefixed path returns the HTML app shell, not bytes. A client must project the
+path onto the API namespace it speaks: prefix it with its API root to form
+`/api/v1/stream/{session_id}` or `/api/v2/stream/{session_id}`, preserving the
+path suffix and query string exactly. Subtitle artifact and font-bundle URLs are
+projected the same way.
+
+The projected request still needs an account credential: the
+`Authorization: Bearer <access token>` header, or the `?token=<access token>`
+query parameter for native media elements that cannot set headers. The `st`
+parameter, when the plan included it, travels with the URL and reconstructs the
+session after a server restart; it is not the account credential. `X-Profile-Id`
+is optional on media routes. Absolute proxy-origin URLs (§4.1) are already fully
+qualified and are fetched as returned.
+
+`web/src/player/stream-url.ts` (`buildPlayerStreamUrl`) is the reference
+implementation: it rewrites `^(?:/api/v1)?/(stream/|playback/transcode/)` to
+`/api/v2/$1` and appends the access token as `token`.
+
 ---
 
 ## 5. The timeline model

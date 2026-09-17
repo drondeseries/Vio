@@ -184,6 +184,12 @@ type ResolvedVirtualStream struct {
 	CandidateID    string
 	RequestHeaders map[string]string
 	ExpiresAt      time.Time
+	// OwnerID is the plugin installation that actually served the candidate.
+	// It is the runtime inheritance for a virtual file row whose stored owner
+	// is 0: the catalog treats owner 0 as "inherit from the parent item", and
+	// the provider that answers is that owner. Callers use it to make the
+	// allow_insecure_http decision for the provider that served the stream.
+	OwnerID int
 }
 
 // ResolveVirtualPlayback is the compatibility entry point for callers that do
@@ -274,9 +280,25 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 	if err != nil {
 		return ResolvedVirtualStream{}, err
 	}
-	result, _, err := s.resolveVirtualStreamResult(ctx, request, selection, routing)
+	result, providerInstallationID, err := s.resolveVirtualStreamResult(ctx, request, selection, routing)
 	if err != nil {
 		return ResolvedVirtualStream{}, err
+	}
+	// The provider that answered can differ from the caller's file owner:
+	// owner 0 (legacy rows) resolves through any enabled provider. Re-derive
+	// the insecure decision for the provider that actually served the
+	// candidate so this deployment's LAN/private provider URLs are validated
+	// with the opt-in the owning installation opted into, not the strict
+	// validator that a 0 owner forces.
+	ownerID := providerInstallationID
+	if ownerID <= 0 {
+		ownerID = routing.OwnerInstallationID
+	}
+	if providerInstallationID > 0 && !routing.AllowInsecure {
+		// Only ever widen the opt-in with the serving provider's own config;
+		// an explicit caller opt-in (already computed for the owner) is never
+		// downgraded by a provider whose config cannot be read.
+		routing.AllowInsecure = s.InstallationAllowsInsecure(ctx, providerInstallationID)
 	}
 	candidatesToTry := result.GetCandidates()
 	if selection.resultID != "" || selection.profile != "" {
@@ -315,6 +337,7 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 			CandidateID:    candID,
 			RequestHeaders: cloneHeaderMap(candidate.GetRequestHeaders()),
 			ExpiresAt:      exp,
+			OwnerID:        ownerID,
 		}
 		s.storeResolvedStreamContext(ctx, virtualPath, userID, profileID, routing.OwnerInstallationID, stream)
 		return stream, nil
@@ -350,6 +373,7 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 				CandidateID:    candID,
 				RequestHeaders: cloneHeaderMap(candidate.GetRequestHeaders()),
 				ExpiresAt:      exp,
+				OwnerID:        ownerID,
 			}
 			s.storeResolvedStreamContext(ctx, virtualPath, userID, profileID, routing.OwnerInstallationID, stream)
 			return stream, nil
@@ -1790,6 +1814,7 @@ func resolvedStreamFromEntry(entry resolvedURLEntry) ResolvedVirtualStream {
 		CandidateID:    entry.candidateID,
 		RequestHeaders: cloneHeaderMap(entry.requestHeaders),
 		ExpiresAt:      entry.expiresAt,
+		OwnerID:        entry.ownerID,
 	}
 }
 
@@ -1983,6 +2008,7 @@ func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profi
 			uri:            stream.URI,
 			candidateID:    stream.CandidateID,
 			requestHeaders: cloneHeaderMap(stream.RequestHeaders),
+			ownerID:        stream.OwnerID,
 			resolvedAt:     now,
 			expiresAt:      stream.ExpiresAt,
 			generation:     generation,
@@ -1994,6 +2020,7 @@ func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profi
 		uri:            stream.URI,
 		candidateID:    stream.CandidateID,
 		requestHeaders: cloneHeaderMap(stream.RequestHeaders),
+		ownerID:        stream.OwnerID,
 		resolvedAt:     now,
 		expiresAt:      stream.ExpiresAt,
 		cancel:         bgCancel,

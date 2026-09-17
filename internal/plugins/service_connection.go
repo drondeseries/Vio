@@ -20,6 +20,11 @@ var (
 	ErrConnectionTestFailed      = errors.New("plugin connection test failed")
 )
 
+// connectionProbeMediaType is the content type every plugin connection probe
+// asks about. The probes are configuration checks, so one representative type
+// is enough: a provider that answers nothing for a movie is not usable.
+const connectionProbeMediaType = "movie"
+
 type ConnectionTestError struct {
 	Message string
 	Cause   error
@@ -68,13 +73,42 @@ var runPluginConnectionCheck = func(
 		return nil
 	}
 
+	if capabilityType == virtualStreamProviderCapabilityType {
+		virtualClient, err := client.VirtualStreamProvider(capabilityID)
+		if err != nil {
+			return &ConnectionTestError{
+				Message: fmt.Sprintf("Failed to initialize the virtual stream provider: %v", err),
+				Cause:   err,
+			}
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		response, err := virtualClient.ListVirtualStreamProfiles(probeCtx, &pluginv1.ListVirtualStreamProfilesRequest{
+			CapabilityId: capabilityID,
+			MediaType:    connectionProbeMediaType,
+		})
+		if err != nil {
+			return &ConnectionTestError{
+				Message: fmt.Sprintf("Connection check failed: %v", err),
+				Cause:   err,
+			}
+		}
+		if response == nil {
+			return &ConnectionTestError{
+				Message: "Connection check returned an empty response",
+				Cause:   ErrConnectionTestFailed,
+			}
+		}
+		return nil
+	}
+
 	capability := metadataProviderConnectionCheckCapability(manifest, capabilityID)
-	if !metadataProviderSupportsConnectionProbe(capability, "movie") {
+	if !metadataProviderSupportsConnectionProbe(capability, connectionProbeMediaType) {
 		slog.DebugContext(ctx,
 			"skipping metadata provider connection check for unsupported probe type", "component", "plugins",
 			"plugin_id", manifest.GetPluginId(),
 			"capability_id", capabilityID,
-			"item_type", "movie",
+			"item_type", connectionProbeMediaType,
 		)
 		return nil
 	}
@@ -92,7 +126,7 @@ var runPluginConnectionCheck = func(
 
 	if _, err := metadataClient.Search(probeCtx, &pluginv1.SearchMetadataRequest{
 		Query:    "The Matrix",
-		ItemType: "movie",
+		ItemType: connectionProbeMediaType,
 		Year:     1999,
 		Language: "en",
 	}); err != nil {
@@ -108,6 +142,11 @@ var runPluginConnectionCheck = func(
 func connectionCheckCapabilityID(manifest *pluginv1.PluginManifest) (string, string, error) {
 	for _, capability := range manifest.GetCapabilities() {
 		if capability.GetType() == "request_router.v1" {
+			return capability.GetType(), capability.GetId(), nil
+		}
+	}
+	for _, capability := range manifest.GetCapabilities() {
+		if capability.GetType() == virtualStreamProviderCapabilityType {
 			return capability.GetType(), capability.GetId(), nil
 		}
 	}

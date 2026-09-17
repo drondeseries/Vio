@@ -390,6 +390,48 @@ func TestVirtualPlaybackResolvesPrivateHostWithInsecureOptIn(t *testing.T) {
 	}
 }
 
+func TestResolveVirtualPlaybackDetailedInheritsProviderOwnerForInsecure(t *testing.T) {
+	private := "http://127.0.0.1/lan/stream.mp4"
+	providePrivate := func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+		return virtualResponse(virtualCandidate("lan", private)), nil
+	}
+	enableInsecure := func(service *Service) {
+		service.configs = &fakeServiceConfigStore{configsByInstallation: map[int][]*RuntimeConfig{
+			101: {{InstallationID: 101, Key: "streaming", Value: map[string]any{"allow_insecure_http": true}}},
+		}}
+	}
+
+	t.Run("provider owner authorizes private host for ownerless caller", func(t *testing.T) {
+		service, _ := newVirtualPlaybackTestService(t, providePrivate)
+		enableInsecure(service)
+		// The caller models a legacy media_files row: file owner 0. The
+		// provider that answers (101) opted into allow_insecure_http, so the
+		// resolver must derive the insecure decision from the provider owner
+		// instead of failing closed on the caller's 0.
+		resolved, err := service.ResolveVirtualPlaybackDetailedWithRouting(
+			context.Background(), "virtual://movie/tt1234", 0, "", VirtualPlaybackRouting{AllowFallback: true}, false, nil, "",
+		)
+		if err != nil {
+			t.Fatalf("private host rejected despite provider allow_insecure_http: %v", err)
+		}
+		if resolved.OwnerID != 101 {
+			t.Fatalf("resolved OwnerID = %d, want 101", resolved.OwnerID)
+		}
+		if resolved.URL != private {
+			t.Fatalf("resolved URL = %q, want %q", resolved.URL, private)
+		}
+	})
+
+	t.Run("provider without opt-in stays strict", func(t *testing.T) {
+		service, _ := newVirtualPlaybackTestService(t, providePrivate)
+		if _, err := service.ResolveVirtualPlaybackDetailedWithRouting(
+			context.Background(), "virtual://movie/tt1234", 0, "", VirtualPlaybackRouting{AllowFallback: true}, false, nil, "",
+		); err == nil {
+			t.Fatal("private host accepted without allow_insecure_http")
+		}
+	})
+}
+
 func TestVirtualPlaybackDefersDNSUntilCandidateResolution(t *testing.T) {
 	service, _ := newVirtualPlaybackTestService(t,
 		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {

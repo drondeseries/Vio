@@ -49,6 +49,11 @@ type ResolvedVirtualMedia struct {
 	CandidateID    string
 	RequestHeaders map[string]string
 	ExpiresAt      time.Time
+	// OwnerID is the plugin installation that served the candidate, stamped by
+	// the provider resolver. It is the runtime inheritance for a virtual file
+	// whose stored owner is 0 and takes precedence over the file owner for the
+	// allow_insecure_http decision.
+	OwnerID int
 }
 
 // VirtualMediaResolver resolves a provider-neutral virtual URI to a temporary
@@ -82,6 +87,19 @@ type VirtualMediaDetailedResolverFunc func(ctx context.Context, virtualURI strin
 
 func (f VirtualMediaDetailedResolverFunc) ResolveVirtualMediaDetailed(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
 	return f(ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+}
+
+// effectiveVirtualOwner prefers the provider-resolved owner over the stored
+// file owner so a legacy file owner of 0 cannot mask the installation that
+// actually served the candidate.
+func effectiveVirtualOwner(resolvedOwner, fileOwner int) int {
+	if resolvedOwner > 0 {
+		return resolvedOwner
+	}
+	if fileOwner > 0 {
+		return fileOwner
+	}
+	return 0
 }
 
 // VirtualPlaybackStream is the provider-neutral portion of a current provider
@@ -1091,7 +1109,7 @@ func (h *PlaybackHandler) registerVirtualInputForIdentity(ctx context.Context, u
 	if h.RemoteStreamRelay == nil {
 		return "", nil, errors.New("remote stream relay is not configured")
 	}
-	insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(source.VirtualSourceOwnerInstallationID)
+	insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(effectiveVirtualOwner(resolved.OwnerID, source.VirtualSourceOwnerInstallationID))
 	relayURL, cleanup, err := registerRemoteStreamInputWithHeaders(ctx, h.RemoteStreamRelay, resolved.URL, resolved.RequestHeaders, insecure)
 	if err != nil {
 		return "", nil, err
@@ -1133,7 +1151,7 @@ func (h *PlaybackHandler) serveVirtualDirect(w http.ResponseWriter, r *http.Requ
 // proxy, or through the insecure proxy when the owning plugin installation has
 // explicitly enabled allow_insecure_http for private/local hosts.
 func (h *PlaybackHandler) proxyVirtualStream(w http.ResponseWriter, r *http.Request, source PlaybackMediaSource, resolved ResolvedVirtualMedia) error {
-	insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(source.VirtualSourceOwnerInstallationID)
+	insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(effectiveVirtualOwner(resolved.OwnerID, source.VirtualSourceOwnerInstallationID))
 	if hp, ok := h.RemoteStreamRelay.(headerRemoteStreamProxy); ok {
 		if insecure {
 			return hp.ProxyInsecureWithHeaders(w, r, resolved.URL, resolved.RequestHeaders)

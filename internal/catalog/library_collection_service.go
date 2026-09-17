@@ -533,6 +533,14 @@ var ErrLibraryCollectionSyncUnsupported = errors.New("smart collections cannot b
 // request for one lands here; it is a caller mistake, not a server fault.
 var ErrLibraryCollectionSyncModeUnsupported = errors.New("unsupported collection sync mode")
 
+// Library collection source modes (the `mode` field of the stored source
+// config). Only the modes that appear in a sync dispatch decision are named;
+// the rest of the switch below stays on literals.
+const (
+	libraryCollectionSourceModeSmart       = "smart"
+	libraryCollectionSourceModeMDBListJSON = "mdblist_json"
+)
+
 const (
 	virtualMetadataRefreshWorkers = 4
 	virtualMetadataRefreshQueue   = 256
@@ -1147,33 +1155,41 @@ func (s *LibraryCollectionService) SyncCollectionWithOptions(ctx context.Context
 		return nil, fmt.Errorf("parsing collection source config: %w", err)
 	}
 
-	var run *models.LibraryCollectionSyncRun
-	switch source.Mode {
-	case "smart":
-		return nil, ErrLibraryCollectionSyncUnsupported
-	case "mdblist_json":
-		run, err = s.syncMDBListCollection(ctx, collection, collectionutil.MDBListURLCandidates(source.URL, collection.SourceURL), source.Limit, opts)
-	case "tmdb_preset":
-		run, err = s.syncTMDBPresetCollection(ctx, collection, source, opts)
-	case "tmdb_collection":
-		run, err = s.syncTMDBFranchiseCollection(ctx, collection, source, opts)
-	case "tmdb_discover":
-		run, err = s.syncTMDBDiscoverCollection(ctx, collection, source, opts)
-	case "trakt_preset":
-		run, err = s.syncTraktPresetCollection(ctx, collection, source, opts)
-	case "trakt_list":
-		run, err = s.syncTraktListCollection(ctx, collection, source, opts)
-	default:
-		return nil, fmt.Errorf("%w: %s", ErrLibraryCollectionSyncModeUnsupported, source.Mode)
+	syncOnce := func() (*models.LibraryCollectionSyncRun, error) {
+		switch source.Mode {
+		case libraryCollectionSourceModeSmart:
+			return nil, ErrLibraryCollectionSyncUnsupported
+		case libraryCollectionSourceModeMDBListJSON:
+			return s.syncMDBListCollection(ctx, collection, collectionutil.MDBListURLCandidates(source.URL, collection.SourceURL), source.Limit, opts)
+		case "tmdb_preset":
+			return s.syncTMDBPresetCollection(ctx, collection, source, opts)
+		case "tmdb_collection":
+			return s.syncTMDBFranchiseCollection(ctx, collection, source, opts)
+		case "tmdb_discover":
+			return s.syncTMDBDiscoverCollection(ctx, collection, source, opts)
+		case "trakt_preset":
+			return s.syncTraktPresetCollection(ctx, collection, source, opts)
+		case "trakt_list":
+			return s.syncTraktListCollection(ctx, collection, source, opts)
+		default:
+			return nil, fmt.Errorf("%w: %s", ErrLibraryCollectionSyncModeUnsupported, source.Mode)
+		}
 	}
-	if err != nil && run == nil && ctx.Err() != nil {
-		// A context deadline/cancellation (e.g. the scheduler's per-collection
-		// timeout) must leave a durable failed run so last_sync_status shows the
-		// failure. Only when no run was recorded already (run != nil), to avoid
-		// duplicate history rows. The insert uses a detached context because the
-		// triggering context is already done.
-		if _, recordErr := s.recordFailedCollectionSync(context.WithoutCancel(reconciliationCtx), collection.ID, syncTimestamp(), fmt.Sprintf("sync context ended: %v", err)); recordErr != nil {
-			slog.ErrorContext(reconciliationCtx, "recording failed collection sync run after context end",
+	run, err := retryCollectionSync(ctx, syncOnce)
+	if err != nil && run == nil {
+		// Any source path that returns before RecordSyncRun — an accept
+		// failure, a provider error, or an exhausted retry — must still leave
+		// a durable failed run so last_sync_status cannot keep reporting
+		// success. Skipped when a run was already recorded (run != nil) to
+		// avoid duplicate history rows. The insert uses a detached context
+		// because the triggering context may already be done (e.g. the
+		// scheduler's per-collection timeout).
+		message := fmt.Sprintf("sync failed: %v", err)
+		if ctx.Err() != nil {
+			message = fmt.Sprintf("sync context ended: %v", err)
+		}
+		if _, recordErr := s.recordFailedCollectionSync(context.WithoutCancel(reconciliationCtx), collection.ID, syncTimestamp(), message); recordErr != nil {
+			slog.ErrorContext(reconciliationCtx, "recording failed collection sync run",
 				"component", "catalog",
 				"collection_id", collection.ID,
 				"error", recordErr,

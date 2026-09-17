@@ -104,6 +104,7 @@ const AdminUsers = lazy(() => import("@/pages/AdminUsers"));
 const AdminRequests = lazy(() => import("@/pages/AdminRequests"));
 const AdminDevices = lazy(() => import("@/pages/AdminDevices"));
 const AdminLibraries = lazy(() => import("@/pages/AdminLibraries"));
+const AdminVirtualLibrary = lazy(() => import("@/pages/AdminVirtualLibrary"));
 const AdminSettingsLayout = lazy(() => import("@/pages/admin-settings/AdminSettingsLayout"));
 const AdminNodes = lazy(() => import("@/pages/AdminNodes"));
 const AdminSections = lazy(() => import("@/pages/AdminSections"));
@@ -520,6 +521,7 @@ function AppRoutes() {
                   <Route path="logs" element={<AdminLogs />} />
                   <Route path="diagnostics" element={<AdminDiagnostics />} />
                   <Route path="libraries" element={<AdminLibraries />} />
+                  <Route path="virtual-library" element={<AdminVirtualLibrary />} />
                   <Route path="maintenance" element={<AdminMaintenance />} />
                   <Route path="collections" element={<AdminCollections />} />
                   <Route path="collections/new" element={<AdminCollectionEditor />} />

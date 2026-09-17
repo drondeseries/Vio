@@ -560,6 +560,7 @@ func registerAll(reg *Registry) {
 	registerLibraryViews(reg)
 	registerPersonalCollections(reg)
 	registerAdminCollections(reg)
+	registerAdminVirtualItems(reg)
 	registerAdminSections(reg)
 	registerAdminPolicy(reg)
 	registerAdminTasks(reg)

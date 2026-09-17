@@ -170,4 +170,65 @@ describe("adminFormForConfigSchema", () => {
     expect(tokenField?.control).toBe("PASSWORD");
     expect(tokenField?.secret).toBe(true);
   });
+
+  it("infers a SELECT library picker from the silo-library formats", () => {
+    const form = adminFormForConfigSchema(
+      schema({
+        json_schema: JSON.stringify({
+          type: "object",
+          properties: {
+            library_id: { type: "string", format: "silo-library" },
+            movie_library_id: { type: "string", format: "silo-library-movie" },
+            tv_library_id: { type: "string", format: "silo-library-tv" },
+          },
+          required: ["movie_library_id"],
+        }),
+      }),
+    );
+
+    expect(
+      form?.fields.map(({ key, control, library_picker, required }) => ({
+        key,
+        control,
+        library_picker,
+        required,
+      })),
+    ).toEqual([
+      { key: "library_id", control: "SELECT", library_picker: "any", required: false },
+      { key: "movie_library_id", control: "SELECT", library_picker: "movie", required: true },
+      { key: "tv_library_id", control: "SELECT", library_picker: "tv", required: false },
+    ]);
+  });
+
+  it("leaves every other format on the existing control inference", () => {
+    const form = adminFormForConfigSchema(
+      schema({
+        json_schema: JSON.stringify({
+          type: "object",
+          properties: {
+            base_url: { type: "string", format: "uri" },
+            api_token: { type: "string", format: "password" },
+            library_index: { type: "string", format: "silo-library-index" },
+            verify_tls: { type: "boolean" },
+            port: { type: "integer" },
+          },
+        }),
+      }),
+    );
+
+    expect(
+      form?.fields.map(({ key, control, library_picker, secret }) => ({
+        key,
+        control,
+        library_picker,
+        secret,
+      })),
+    ).toEqual([
+      { key: "base_url", control: "TEXT", library_picker: undefined, secret: false },
+      { key: "api_token", control: "PASSWORD", library_picker: undefined, secret: true },
+      { key: "library_index", control: "TEXT", library_picker: undefined, secret: false },
+      { key: "verify_tls", control: "SWITCH", library_picker: undefined, secret: false },
+      { key: "port", control: "NUMBER", library_picker: undefined, secret: false },
+    ]);
+  });
 });

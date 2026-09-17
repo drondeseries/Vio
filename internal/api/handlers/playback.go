@@ -25,6 +25,7 @@ import (
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/httpheader"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
@@ -152,6 +153,46 @@ type ResolvedVirtualMedia struct {
 	CandidateID    string
 	RequestHeaders map[string]string
 	ExpiresAt      time.Time
+	// OwnerID is the plugin installation that served the candidate, stamped
+	// by the provider resolver. It is the runtime inheritance for a virtual
+	// file whose stored owner is 0 and takes precedence over the file owner
+	// when deciding whether allow_insecure_http applies.
+	OwnerID int
+}
+
+// effectiveVirtualOwner returns the first positive installation owner from the
+// candidates, or 0 when none is known. Order matters: a provider-resolved
+// owner is authoritative and can never be masked by a 0 file owner. A file row
+// with owner 0 inherits the parent item's virtual_owner_installation_id in the
+// catalog (internal/catalog/item_repo.go), and the resolver surfaces that
+// inherited owner as ResolvedVirtualMedia.OwnerID, so callers never re-read
+// media_items themselves. A legacy row with no resolved and no stored owner
+// yields 0, which keeps the strict SSRF validator.
+func effectiveVirtualOwner(owners ...int) int {
+	for _, owner := range owners {
+		if owner > 0 {
+			return owner
+		}
+	}
+	return 0
+}
+
+// logVirtualStreamFailure records the sanitized cause behind a virtual-stream
+// 502. A provider URL can be embedded in a wrapped *url.Error, so the cause is
+// passed through logredact; only the provider-neutral virtual URI, the file,
+// the session, and the owner installation are logged directly.
+func logVirtualStreamFailure(ctx context.Context, sessionID string, file *models.MediaFile, err error) {
+	if err == nil || file == nil {
+		return
+	}
+	slog.WarnContext(ctx, "virtual stream transport failed",
+		"component", "api",
+		"session", sessionID,
+		"file_id", file.ID,
+		"owner_installation_id", file.VirtualOwnerInstallationID,
+		"virtual_uri", file.FilePath,
+		"error", logredact.SanitizeURLError(err),
+	)
 }
 
 type VirtualMediaResolver interface {
@@ -186,6 +227,12 @@ func (f VirtualMediaDetailedResolverFunc) ResolveVirtualMediaDetailed(ctx contex
 
 type VirtualPlaybackSourceProber func(context.Context, string, *models.MediaFile) (*models.MediaFile, error)
 type VirtualPlaybackSourceProberWithHeaders func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error)
+
+// VirtualProbeCacheLookup returns a completed probe from the virtual probe
+// cache without starting one. A nil result means no completed probe is
+// available. It lets the probe-failure damper recover evidence from a probe
+// that outlived the caller's wait instead of leaving the row unprobed.
+type VirtualProbeCacheLookup func(sourceURL string, file *models.MediaFile) *models.MediaFile
 
 // VirtualFileSaver atomically persists probed virtual inventory and optionally
 // adopts a new file_path in a single CAS-fenced UPDATE. Returns the number of
@@ -344,11 +391,12 @@ type PlaybackHandler struct {
 	AllowInsecureVirtual                   func(installationID int) bool
 	VirtualPlaybackSourceProber            VirtualPlaybackSourceProber
 	VirtualPlaybackSourceProberWithHeaders VirtualPlaybackSourceProberWithHeaders
+	VirtualProbeCacheLookup                VirtualProbeCacheLookup
 	BestResultCache                        *VirtualBestResultCache
 	VirtualFileSaver                       VirtualFileSaver
 	VirtualSubtitleSearcher                SubtitleSearchTrigger
 	SubtitleSearchInFlight                 *sync.Map
-	DeviceCapabilitySource                 *providerDeviceCapabilitySource
+	DeviceCapabilitySource                 DeviceCapabilityProfileSource
 	RemuxDBConfig                          func(ctx context.Context) remuxdb.Config
 	RemuxDBStore                           *remuxdb.Store
 	remuxSubmitOnce                        sync.Once

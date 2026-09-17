@@ -136,9 +136,13 @@ type resolvedURLEntry struct {
 	uri            string
 	candidateID    string
 	requestHeaders map[string]string
-	resolvedAt     time.Time
-	expiresAt      time.Time
-	cancel         context.CancelFunc
+	// ownerID is the plugin installation that served the candidate. It must
+	// survive memoization so a second resolve in the same startup window still
+	// reports the owner that governs the insecure-http decision.
+	ownerID    int
+	resolvedAt time.Time
+	expiresAt  time.Time
+	cancel     context.CancelFunc
 	// refreshes counts background warm-refresh cycles this entry has served.
 	// Chains are capped so a memo only stays warm for an active playback
 	// startup window instead of living for the lifetime of the process.

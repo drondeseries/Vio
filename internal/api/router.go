@@ -1335,6 +1335,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 						CandidateID:    res.CandidateID,
 						RequestHeaders: res.RequestHeaders,
 						ExpiresAt:      res.ExpiresAt,
+						OwnerID:        res.OwnerID,
 					}, nil
 				}
 				if ownerInstallationID > 0 {
@@ -1436,27 +1437,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				if deps.DB == nil {
 					return 0, nil
 				}
-				vStr := string(args.VideoTracks)
-				if vStr == "" || vStr == "null" {
-					vStr = "[]"
-				}
-				aStr := string(args.AudioTracks)
-				if aStr == "" || aStr == "null" {
-					aStr = "[]"
-				}
-				sStr := string(args.SubtitleTracks)
-				if sStr == "" || sStr == "null" {
-					sStr = "[]"
-				}
-				tag, err := deps.DB.Exec(ctx, handlers.VirtualFileMetadataUpdateSQL,
-					vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
-					args.FileID, args.ExpectedFilePath, args.StampProbe,
-					args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, args.AdoptPath,
-				)
-				if err != nil {
-					return 0, err
-				}
-				return tag.RowsAffected(), nil
+				return handlers.ExecVirtualFileMetadataUpdate(ctx, deps.DB, args)
 			}
 		}
 		if deps.Config != nil {
@@ -1500,6 +1481,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 			playbackHandler.VirtualPlaybackSourceProberWithHeaders = virtualSourceProberWithHeaders
 			playbackHandler.VirtualPlaybackSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
 				return virtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
+			}
+			// Cache-only recovery for the probe-failure damper: a probe that
+			// outlived its caller's wait may have completed and landed here.
+			playbackHandler.VirtualProbeCacheLookup = func(sourceURL string, file *models.MediaFile) *models.MediaFile {
+				return virtualProbeCache.Lookup(sourceURL, file)
 			}
 		}
 		if deps.VirtualLibraryService != nil {
@@ -2943,6 +2929,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 	if libraryCollectionHandler != nil {
 		v2deps.LibraryCollections = libraryCollectionHandler
 		v2deps.AdminCollections = libraryCollectionHandler
+		v2deps.AdminVirtualItems = libraryCollectionHandler
 	}
 	if libraryCollectionGroupHandler != nil {
 		v2deps.AdminCollectionGroups = libraryCollectionGroupHandler

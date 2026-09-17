@@ -784,6 +784,12 @@ func (r *LibraryCollectionRepository) Delete(ctx context.Context, id string) err
 
 var ErrCollectionSyncConfigurationChanged = errors.New("collection configuration changed during sync preparation")
 
+// acceptPreparedItemsPostLockHook, when non-nil, runs after AcceptPreparedItems
+// has acquired its advisory locks and before it materializes or mutates
+// membership. It is nil in production; tests use it to inspect the
+// transaction's advisory-lock footprint while the transaction is paused.
+var acceptPreparedItemsPostLockHook func()
+
 func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, snapshot *models.LibraryCollection, members []LibraryCollectionItemInput, prepared map[string]preparedCollectionItem, items *ItemRepository) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -823,7 +829,19 @@ func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, s
 	if err := captureCollectionVirtualItems(ctx, tx, sourceKey); err != nil {
 		return err
 	}
-	rows, err = tx.Query(ctx, `SELECT content_id FROM affected_collection_virtual_items UNION SELECT media_item_id FROM library_collection_items WHERE collection_id=$1`, snapshot.ID)
+	desiredIDs := make([]string, 0, len(members))
+	for _, member := range members {
+		desiredIDs = append(desiredIDs, member.MediaItemID)
+	}
+	// Scope the advisory-lock set to the items this transaction actually
+	// reads or writes: the captured previous virtual items and the prepared
+	// members. Membership changes are already serialized by the collection
+	// row lock taken above, which ReplaceItems and RemoveItem also take before
+	// any item lock, so current and desired non-virtual members need no
+	// per-item advisory lock. Locking the whole membership here consumes
+	// roughly three transaction-scoped lock-table entries per member and can
+	// exhaust max_locks_per_transaction on a large collection re-sync.
+	rows, err = tx.Query(ctx, `SELECT content_id FROM affected_collection_virtual_items`)
 	if err != nil {
 		return err
 	}
@@ -831,24 +849,27 @@ func (r *LibraryCollectionRepository) AcceptPreparedItems(ctx context.Context, s
 	if err != nil {
 		return err
 	}
-	desiredIDs := make([]string, 0, len(members))
-	for _, member := range members {
-		desiredIDs = append(desiredIDs, member.MediaItemID)
+	for id := range prepared {
+		lockIDs = append(lockIDs, id)
 	}
-	lockIDs = append(lockIDs, desiredIDs...)
-	slices.Sort(lockIDs)
-	lockIDs = slices.Compact(lockIDs)
-	// Content locks first (see lockReleaseContentTx): alias writers take
-	// these exclusively, so alias sets observed below cannot change under us.
-	for _, id := range lockIDs {
-		if err := lockReleaseContentTx(ctx, tx, id, false); err != nil {
-			return err
+	if len(lockIDs) > 0 {
+		slices.Sort(lockIDs)
+		lockIDs = slices.Compact(lockIDs)
+		// Content locks first (see lockReleaseContentTx): alias writers take
+		// these exclusively, so alias sets observed below cannot change under us.
+		for _, id := range lockIDs {
+			if err := lockReleaseContentTx(ctx, tx, id, false); err != nil {
+				return err
+			}
+		}
+		for _, id := range lockIDs {
+			if err := requestlock.LockItem(ctx, tx, id); err != nil {
+				return err
+			}
 		}
 	}
-	for _, id := range lockIDs {
-		if err := requestlock.LockItem(ctx, tx, id); err != nil {
-			return err
-		}
+	if acceptPreparedItemsPostLockHook != nil {
+		acceptPreparedItemsPostLockHook()
 	}
 	// Phase 1: materialize every member with debt writes deferred, so no
 	// new release identity is acquired after the first debt write (see

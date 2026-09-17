@@ -1135,6 +1135,7 @@ func NewPlaybackHandler(
 		var resolved string
 		var headers map[string]string
 		var err error
+		effectiveOwner := ownerInstallationID
 		if h.VirtualMediaDetailedResolver != nil {
 			res, dErr := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(ctx, canonicalPath, ownerInstallationID, userID, profileID, false, nil, "")
 			if dErr != nil {
@@ -1142,13 +1143,14 @@ func NewPlaybackHandler(
 			}
 			resolved = res.URL
 			headers = res.RequestHeaders
+			effectiveOwner = effectiveVirtualOwner(res.OwnerID, ownerInstallationID)
 		} else {
 			resolved, err = h.VirtualMediaResolver.ResolveVirtualMedia(ctx, canonicalPath, ownerInstallationID, userID, profileID)
 			if err != nil {
 				return "", nil, err
 			}
 		}
-		insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(ownerInstallationID)
+		insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(effectiveOwner)
 		relayURL, cleanup, err := registerRemoteStreamInputWithHeaders(ctx, h.RemoteStreamRelay, resolved, headers, insecure)
 		if err != nil {
 			return "", nil, err

@@ -75,8 +75,8 @@ func (f *Fetcher) ListOverlaySummaries(ctx context.Context, contentIDs []string,
 			-- the earliest file in the slice and that slice arrived in this order.
 			ORDER BY group_key, resolution_rank DESC, range_rank DESC, content_id ASC, episode_id ASC, id ASC
 		)
-		SELECT winners.group_key, mf.content_id, mf.episode_id, mf.file_path, mf.resolution, mf.codec_audio,
-			mf.audio_tracks, mf.hdr, mf.video_tracks, mf.codec_video, mf.audio_channels, mf.container,
+		SELECT winners.group_key, COALESCE(mf.content_id, ''), mf.episode_id, mf.file_path, mf.resolution, mf.codec_audio,
+			mf.audio_tracks, COALESCE(mf.hdr, false), mf.video_tracks, mf.codec_video, mf.audio_channels, mf.container,
 			mf.subtitle_tracks, mf.external_subtitles, mf.edition_key
 		FROM winners
 		JOIN media_files mf ON mf.id = winners.id

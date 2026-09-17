@@ -1,0 +1,240 @@
+package handlers
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/plugins"
+)
+
+// staticDeviceCapabilitySource injects a fixed decode profile so the ranking
+// path is exercised without a user store.
+type staticDeviceCapabilitySource struct {
+	caps plugins.DeviceCapabilities
+}
+
+func (s staticDeviceCapabilitySource) DeviceCapabilitiesFor(context.Context, string, string) (plugins.DeviceCapabilities, bool) {
+	return s.caps, true
+}
+
+// A background probe that ends because the caller's budget fired must not
+// release the active sticky pin: the verdict is unknown, and the inner probe
+// may still complete under its own shared timeout.
+func TestBackgroundProbeTransientTimeoutDoesNotUnpinActivePin(t *testing.T) {
+	uri := "virtual://series/tt-bg-timeout/3/5?result=cand-1"
+	key := virtualProbeFailureKey(uri, 5)
+	virtualProbeFailures.clear(key)
+	t.Cleanup(func() { virtualProbeFailures.clear(key) })
+
+	persisted := false
+	h := &PlaybackHandler{
+		VirtualPlaybackSourceProber: func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
+			return nil, context.DeadlineExceeded
+		},
+		VirtualFileSaver: func(context.Context, models.VirtualFilePersistArgs) (int64, error) {
+			persisted = true
+			return 1, nil
+		},
+	}
+	stickyKey := "sticky-transient-timeout"
+	h.pinVirtualSticky(stickyKey, uri)
+	file := &models.MediaFile{ID: 501, ContentID: "series-tt", EpisodeID: "ep-1", FilePath: uri, VirtualOwnerInstallationID: 5}
+	cand := VirtualPlaybackStream{ID: "cand-1", URI: uri}
+
+	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, 45, 5)
+
+	if got := h.peekVirtualSticky(stickyKey); got != uri {
+		t.Fatalf("transient timeout released the active pin: got %q, want %q", got, uri)
+	}
+	if got := virtualProbeFailures.count(key); got >= virtualProbeFailureRepeatThreshold {
+		t.Fatalf("transient timeout counted %d failures, want fewer than %d", got, virtualProbeFailureRepeatThreshold)
+	}
+	if persisted {
+		t.Fatal("a transient timeout must not persist evidence")
+	}
+}
+
+// A context error is not a definitive candidate failure: one occurrence leaves
+// the pin in place and the count below the repeat threshold; a second
+// consecutive occurrence is what releases the pin.
+func TestBackgroundProbeContextErrorDoesNotMarkDefinitiveFailure(t *testing.T) {
+	uri := "virtual://series/tt-bg-context/3/5?result=cand-1"
+	key := virtualProbeFailureKey(uri, 5)
+	virtualProbeFailures.clear(key)
+	t.Cleanup(func() { virtualProbeFailures.clear(key) })
+
+	h := &PlaybackHandler{
+		VirtualPlaybackSourceProber: func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
+			return nil, context.Canceled
+		},
+	}
+	stickyKey := "sticky-context-cancel"
+	h.pinVirtualSticky(stickyKey, uri)
+	file := &models.MediaFile{ID: 502, ContentID: "series-tt", EpisodeID: "ep-1", FilePath: uri, VirtualOwnerInstallationID: 5}
+	cand := VirtualPlaybackStream{ID: "cand-1", URI: uri}
+
+	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, 0, 5)
+	if got := h.peekVirtualSticky(stickyKey); got != uri {
+		t.Fatalf("first context error released the pin: got %q, want %q", got, uri)
+	}
+	if got := virtualProbeFailures.count(key); got >= virtualProbeFailureRepeatThreshold {
+		t.Fatalf("first context error counted %d failures, want fewer than %d", got, virtualProbeFailureRepeatThreshold)
+	}
+
+	h.probeVirtualSourceAndPersist(context.Background(), stickyKey, file, "http://provider.example/stream", *file, cand, 0, 5)
+	if got := h.peekVirtualSticky(stickyKey); got != "" {
+		t.Fatalf("second consecutive context error kept the pin: %q", got)
+	}
+	if got := virtualProbeFailures.count(key); got < virtualProbeFailureRepeatThreshold {
+		t.Fatalf("second context error count = %d, want at least %d", got, virtualProbeFailureRepeatThreshold)
+	}
+}
+
+// The probe-failure damper is advisory only for probing. It must never feed
+// candidate ranking: a marked 4K candidate still outranks an SDR 1080p sibling
+// for a 4K/HDR-capable device.
+func TestProbeFailureMarkDoesNotChangeCandidateRanking(t *testing.T) {
+	uri4k := "virtual://movie/tt-rank?result=4k"
+	uri1080 := "virtual://movie/tt-rank?result=1080"
+	key := virtualProbeFailureKey(uri4k, 5)
+	virtualProbeFailures.clear(key)
+	t.Cleanup(func() { virtualProbeFailures.clear(key) })
+	virtualProbeFailures.mark(key)
+
+	h := &PlaybackHandler{DeviceCapabilitySource: staticDeviceCapabilitySource{caps: plugins.DeviceCapabilities{
+		CodecsVideo:   []string{"hevc"},
+		CodecsAudio:   []string{"eac3"},
+		Containers:    []string{"mkv"},
+		MaxResolution: "2160p",
+		HDR:           true,
+	}}}
+	streams := []VirtualPlaybackStream{
+		{ID: "4k", URI: uri4k, Resolution: "2160p", CodecVideo: "hevc", CodecAudio: "eac3", Container: "mkv", HDR: "HDR"},
+		{ID: "1080", URI: uri1080, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv"},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	ranked, _ := h.rankVirtualCandidatesForDevice(req, streams)
+	if len(ranked) != 2 || ranked[0].URI != uri4k {
+		t.Fatalf("probe-failure mark changed ranking: %#v", ranked)
+	}
+}
+
+// The provider fetch happens before the background goroutine starts, so its
+// duration must not consume the probe budget. The background budget is shrunk
+// here to keep the test fast; the resolver blocks longer than it, and the probe
+// still succeeds because the goroutine gets a fresh budget after the fetch.
+func TestBackgroundProbeBudgetIndependentOfProviderFetch(t *testing.T) {
+	old := virtualBackgroundProbeBudget
+	virtualBackgroundProbeBudget = 300 * time.Millisecond
+	t.Cleanup(func() { virtualBackgroundProbeBudget = old })
+
+	uri := "virtual://movie/tt-bg-fetch?result=cand-1"
+	stored := &models.MediaFile{
+		ID:                         401,
+		ContentID:                  "movie-1",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{ID: "cand-1", URI: uri, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv"}}, nil
+	})
+	saverDone := make(chan struct{}, 1)
+	h := virtualProbeGateCandidateHandler(stored, lister,
+		func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
+			return f, nil
+		},
+		func(_ context.Context, _ models.VirtualFilePersistArgs) (int64, error) {
+			saverDone <- struct{}{}
+			return 1, nil
+		})
+	// The provider fetch blocks for longer than the background budget. A naive
+	// implementation that created the probe context before resolving would
+	// leave the probe with no budget and no evidence would be persisted.
+	h.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		time.Sleep(2 * virtualBackgroundProbeBudget)
+		return "http://provider.example/stream?path=" + path, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := *stored
+	resolved, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.Provenance != ProbeProvenancePending {
+		t.Fatalf("provenance = %q, want pending deferred probe", resolved.Provenance)
+	}
+	select {
+	case <-saverDone:
+	case <-time.After(4 * time.Second):
+		t.Fatal("probe evidence was not persisted; the provider fetch consumed the probe budget")
+	}
+}
+
+// The background probe runs under its own budget, which must cover the shared
+// scanner probe timeout rather than the shorter interactive startup budget.
+// Asserting the deadline keeps the test fast while still proving a slow probe
+// (the incident's ~20s) is covered.
+func TestBackgroundProbeBudgetCoversSlowProbe(t *testing.T) {
+	uri := "virtual://movie/tt-bg-slow?result=cand-1"
+	key := virtualProbeFailureKey(uri, 5)
+	virtualProbeFailures.clear(key)
+	t.Cleanup(func() { virtualProbeFailures.clear(key) })
+
+	stored := &models.MediaFile{
+		ID:                         402,
+		ContentID:                  "movie-2",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{ID: "cand-1", URI: uri, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", Container: "mkv"}}, nil
+	})
+	deadlineCh := make(chan time.Duration, 1)
+	saverDone := make(chan struct{}, 1)
+	h := virtualProbeGateCandidateHandler(stored, lister,
+		func(ctx context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				deadlineCh <- 0
+				return f, context.DeadlineExceeded
+			}
+			deadlineCh <- time.Until(deadline)
+			f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+			f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "h264", "aac", "1080p", "mkv"
+			return f, nil
+		},
+		func(_ context.Context, _ models.VirtualFilePersistArgs) (int64, error) {
+			saverDone <- struct{}{}
+			return 1, nil
+		})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := *stored
+	if _, err := h.resolveVirtualPlaybackSource(req, &file, "profile-1", true, nil, "", "", 0, false); err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	select {
+	case <-saverDone:
+	case <-time.After(4 * time.Second):
+		t.Fatal("probe evidence was not persisted under the background budget")
+	}
+	remaining := <-deadlineCh
+	if remaining <= virtualProbeBudget {
+		t.Fatalf("background probe deadline %s did not exceed the interactive budget %s", remaining, virtualProbeBudget)
+	}
+	if virtualProbeFailures.recent(key) {
+		t.Fatal("a successful slow probe left a failure mark")
+	}
+}

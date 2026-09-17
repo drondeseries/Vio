@@ -468,6 +468,7 @@ export const adminKeys = {
     search !== undefined
       ? (["admin", "libraries", "unmatchedItems", search] as const)
       : (["admin", "libraries", "unmatchedItems"] as const),
+  virtualItems: (limit: number) => ["admin", "virtualItems", limit] as const,
   itemImages: (id: string) => ["admin", "items", id, "images"] as const,
   buildInfo: () => ["admin", "system", "buildInfo"] as const,
   hwAccel: () => ["admin", "system", "hwAccel"] as const,

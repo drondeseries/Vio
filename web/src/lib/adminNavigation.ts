@@ -101,6 +101,13 @@ export const ADMIN_NAV_SECTIONS: AdminNavGroup[] = [
         href: "/admin/libraries",
       },
       {
+        label: "Virtual Library",
+        description: "Release desk for zero-storage items registered by plugins.",
+        keywords: ["virtual", "zero-storage", "release desk", "queue", "streaming"],
+        icon: Radio,
+        href: "/admin/virtual-library",
+      },
+      {
         label: "Collections",
         description: "Curated and smart collection management.",
         keywords: ["collection groups", "templates", "smart collections"],

@@ -54,6 +54,38 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 			t.Fatal("expected private host to be rejected for an installation without the opt-in")
 		}
 	})
+
+	// A legacy file row reports owner 0, but the provider resolver knows which
+	// installation actually served the stream. The resolved owner must govern
+	// the insecure decision instead of the file's 0.
+	t.Run("resolved owner authorizes private host for ownerless file", func(t *testing.T) {
+		h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "http://altmount:8080/stremio/test/play", OwnerID: 8}, nil
+		})
+		h.AllowInsecureVirtual = func(installationID int) bool { return installationID == 8 }
+		res, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 0, 1, "profile", false, nil, "")
+		if err != nil {
+			t.Fatalf("expected resolved owner 8 to authorize the private host: %v", err)
+		}
+		defer cleanup()
+		if res.URL == "" {
+			t.Fatal("expected a relay URL")
+		}
+		if res.OwnerID != 8 {
+			t.Fatalf("resolved OwnerID = %d, want 8", res.OwnerID)
+		}
+	})
+
+	t.Run("unresolved owner keeps ownerless file strict", func(t *testing.T) {
+		h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "http://altmount:8080/stremio/test/play", OwnerID: 0}, nil
+		})
+		h.AllowInsecureVirtual = func(installationID int) bool { return installationID == 8 }
+		if _, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 0, 1, "profile", false, nil, ""); err == nil {
+			cleanup()
+			t.Fatal("expected private host to be rejected when no owner is resolved")
+		}
+	})
 }
 
 type fakePinFileResolver struct {

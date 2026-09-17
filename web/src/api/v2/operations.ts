@@ -222,6 +222,7 @@ export const v2Operations = {
   "GET /api/v2/admin/users/{id}/ips": "listAdminUserIPs",
   "GET /api/v2/admin/users/{id}/profiles": "listAdminUserProfiles",
   "GET /api/v2/admin/users/{id}/settings/values": "listAdminUserSettingValues",
+  "GET /api/v2/admin/virtual-items": "listAdminVirtualItems",
   "GET /api/v2/api-keys": "listPersonalAPIKeys",
   "GET /api/v2/api-keys/scopes": "getPersonalAPIKeyScopes",
   "GET /api/v2/artwork/{key}": "getArtwork",
