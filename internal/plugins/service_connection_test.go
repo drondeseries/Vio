@@ -10,6 +10,8 @@ import (
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/Silo-Server/silo-server/internal/pluginhost"
 )
 
 type fakeServiceConfigStore struct {
@@ -851,6 +853,190 @@ func TestServiceTestGlobalConfigUsesUniqueTemporaryInstallationIDs(t *testing.T)
 	}
 	if host.started[0].InstallationID == host.started[1].InstallationID {
 		t.Fatalf("temporary installation ids matched: %d", host.started[0].InstallationID)
+	}
+}
+
+func TestConnectionCheckCapabilityIDUsesVirtualStreamProvider(t *testing.T) {
+	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
+		Type: virtualStreamProviderCapabilityType,
+		Id:   "virtual-connection",
+	}}
+
+	capabilityType, capabilityID, err := connectionCheckCapabilityID(manifest)
+	if err != nil {
+		t.Fatalf("connectionCheckCapabilityID() error = %v", err)
+	}
+	if capabilityType != virtualStreamProviderCapabilityType {
+		t.Fatalf("capability type = %q, want %q", capabilityType, virtualStreamProviderCapabilityType)
+	}
+	if capabilityID != "virtual-connection" {
+		t.Fatalf("capability id = %q, want virtual-connection", capabilityID)
+	}
+}
+
+func TestConnectionCheckCapabilityIDPrefersRequestRouterOverVirtualStreamProvider(t *testing.T) {
+	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{
+		{
+			Type: virtualStreamProviderCapabilityType,
+			Id:   "virtual-connection",
+		},
+		{
+			Type: "request_router.v1",
+			Id:   "virtual-requests",
+		},
+	}
+
+	capabilityType, capabilityID, err := connectionCheckCapabilityID(manifest)
+	if err != nil {
+		t.Fatalf("connectionCheckCapabilityID() error = %v", err)
+	}
+	if capabilityType != "request_router.v1" {
+		t.Fatalf("capability type = %q, want request_router.v1", capabilityType)
+	}
+	if capabilityID != "virtual-requests" {
+		t.Fatalf("capability id = %q, want virtual-requests", capabilityID)
+	}
+}
+
+func TestConnectionCheckCapabilityIDPrefersVirtualStreamProviderOverMetadataProvider(t *testing.T) {
+	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{
+		{
+			Type: "metadata_provider.v1",
+			Id:   "metadata",
+		},
+		{
+			Type: virtualStreamProviderCapabilityType,
+			Id:   "virtual-connection",
+		},
+	}
+
+	capabilityType, capabilityID, err := connectionCheckCapabilityID(manifest)
+	if err != nil {
+		t.Fatalf("connectionCheckCapabilityID() error = %v", err)
+	}
+	if capabilityType != virtualStreamProviderCapabilityType {
+		t.Fatalf("capability type = %q, want %q", capabilityType, virtualStreamProviderCapabilityType)
+	}
+	if capabilityID != "virtual-connection" {
+		t.Fatalf("capability id = %q, want virtual-connection", capabilityID)
+	}
+}
+
+func TestConnectionCheckCapabilityIDReturnsUnsupportedWithoutSupportedCapability(t *testing.T) {
+	manifest := connectionTestManifest(t, "com.example.simple", "0.1.0")
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
+		Type: "scheduled_task.v1",
+		Id:   "refresh",
+	}}
+
+	_, _, err := connectionCheckCapabilityID(manifest)
+	if !errors.Is(err, ErrConnectionTestUnsupported) {
+		t.Fatalf("connectionCheckCapabilityID() error = %v, want ErrConnectionTestUnsupported", err)
+	}
+}
+
+func TestRunPluginConnectionCheckProbesVirtualStreamProvider(t *testing.T) {
+	var gotRequest *pluginv1.ListVirtualStreamProfilesRequest
+	grpcClient := &fakeVirtualStreamGRPCClient{
+		profilesFunc: func(
+			_ context.Context,
+			request *pluginv1.ListVirtualStreamProfilesRequest,
+		) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+			gotRequest = request
+			return &pluginv1.ListVirtualStreamProfilesResponse{
+				Profiles: []*pluginv1.VirtualStreamProfile{{Label: "1080p"}},
+			}, nil
+		},
+	}
+	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
+		Type: virtualStreamProviderCapabilityType,
+		Id:   "virtual-connection",
+	}}
+	client := &fakePluginClient{
+		manifest:            manifest,
+		virtualStreamClient: pluginhost.NewVirtualStreamProviderClientForTest(grpcClient, time.Second),
+	}
+
+	if err := runPluginConnectionCheck(context.Background(), client, manifest); err != nil {
+		t.Fatalf("runPluginConnectionCheck() error = %v", err)
+	}
+	if gotRequest == nil {
+		t.Fatal("ListVirtualStreamProfiles was not called")
+	}
+	if gotRequest.GetCapabilityId() != "virtual-connection" {
+		t.Fatalf("capability id = %q, want virtual-connection", gotRequest.GetCapabilityId())
+	}
+	if gotRequest.GetMediaType() != "movie" {
+		t.Fatalf("media type = %q, want movie", gotRequest.GetMediaType())
+	}
+	if client.metadataProviderCalls != 0 {
+		t.Fatalf("metadata provider calls = %d, want 0", client.metadataProviderCalls)
+	}
+}
+
+func TestRunPluginConnectionCheckVirtualStreamProviderProbeError(t *testing.T) {
+	probeErr := errors.New("upstream unavailable")
+	grpcClient := &fakeVirtualStreamGRPCClient{
+		profilesFunc: func(
+			context.Context,
+			*pluginv1.ListVirtualStreamProfilesRequest,
+		) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+			return nil, probeErr
+		},
+	}
+	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
+		Type: virtualStreamProviderCapabilityType,
+		Id:   "virtual-connection",
+	}}
+	client := &fakePluginClient{
+		manifest:            manifest,
+		virtualStreamClient: pluginhost.NewVirtualStreamProviderClientForTest(grpcClient, time.Second),
+	}
+
+	err := runPluginConnectionCheck(context.Background(), client, manifest)
+	var connectionErr *ConnectionTestError
+	if !errors.As(err, &connectionErr) {
+		t.Fatalf("runPluginConnectionCheck() error = %v, want ConnectionTestError", err)
+	}
+	if !errors.Is(connectionErr, probeErr) {
+		t.Fatalf("ConnectionTestError cause = %v, want %v", connectionErr.Cause, probeErr)
+	}
+	if errors.Is(connectionErr, ErrConnectionTestFailed) {
+		t.Fatalf("ConnectionTestError cause = ErrConnectionTestFailed, want probe error")
+	}
+}
+
+func TestRunPluginConnectionCheckVirtualStreamProviderEmptyResponse(t *testing.T) {
+	grpcClient := &fakeVirtualStreamGRPCClient{
+		profilesFunc: func(
+			context.Context,
+			*pluginv1.ListVirtualStreamProfilesRequest,
+		) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+			return nil, nil
+		},
+	}
+	manifest := connectionTestManifest(t, "com.example.virtual", "0.1.0")
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{
+		Type: virtualStreamProviderCapabilityType,
+		Id:   "virtual-connection",
+	}}
+	client := &fakePluginClient{
+		manifest:            manifest,
+		virtualStreamClient: pluginhost.NewVirtualStreamProviderClientForTest(grpcClient, time.Second),
+	}
+
+	err := runPluginConnectionCheck(context.Background(), client, manifest)
+	var connectionErr *ConnectionTestError
+	if !errors.As(err, &connectionErr) {
+		t.Fatalf("runPluginConnectionCheck() error = %v, want ConnectionTestError", err)
+	}
+	if !errors.Is(connectionErr, ErrConnectionTestFailed) {
+		t.Fatalf("ConnectionTestError cause = %v, want ErrConnectionTestFailed", connectionErr.Cause)
 	}
 }
 

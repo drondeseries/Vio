@@ -41,6 +41,26 @@ contains a compatible Stremio `manifest.json` URL, movie library ID, series libr
 optional TMDB credential, and a durable monitored-queue path. Database access
 is neither requested nor supported.
 
+### Choosing a library in the plugin config
+
+A plugin can declare a config property that should be chosen rather than typed
+by setting a host-known JSON Schema `format` on it:
+
+- `silo-library` — any enabled library.
+- `silo-library-movie` — an enabled movie-capable library (`movie`/`movies`,
+  plus `mixed`).
+- `silo-library-tv` — an enabled TV-capable library (`series`/`tv`/`show`/
+  `tvshows`, plus `mixed`).
+
+The admin draws that property as a dropdown of enabled libraries labelled
+`Name (ID)`, and the value written to the field is the library's numeric id as a
+string. This is how a virtual-library plugin lets an administrator pick its
+movie and series libraries by name instead of typing a database id. The marker
+applies only to fields the admin infers from `json_schema`; explicit
+`admin_form` fields cannot carry it. If a saved id no longer matches an enabled
+library, the form keeps it visible as `"<id> (not found)"` rather than dropping
+it.
+
 ## Updating from upstream
 
 The feature is intentionally isolated to an additive SDK RPC, the catalog

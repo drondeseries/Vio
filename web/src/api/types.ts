@@ -3512,6 +3512,14 @@ export interface PluginAdminFormField {
    * values render no action.
    */
   fill_from?: string;
+  /**
+   * Marks a field as a library picker. Set from the host-known JSON Schema
+   * `format` values `silo-library`, `silo-library-movie`, and `silo-library-tv`
+   * on a plugin config property; the admin chooses from Silo's enabled
+   * libraries by name. The value written to the field is the library's numeric
+   * id as a string. Only fields inferred from `json_schema` carry this marker.
+   */
+  library_picker?: "any" | "movie" | "tv";
 }
 
 export interface PluginCapability {

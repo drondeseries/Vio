@@ -216,6 +216,7 @@ type Dependencies struct {
 	AdminPolicy           AdminPolicyService
 	AdminCollections      AdminCollectionService
 	AdminCollectionGroups AdminCollectionGroupService
+	AdminVirtualItems     AdminVirtualItemsService
 	WebhookSync           WebhookSyncService
 	SubtitleProviders     SubtitleProviderStatusService
 	SubtitleAI            SubtitleAIStatusService

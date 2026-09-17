@@ -10,6 +10,16 @@ import { PluginConfigForm } from "./PluginConfigForm";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+// jsdom lacks the pointer-capture API Radix Select calls when opening.
+window.HTMLElement.prototype.hasPointerCapture ??= () => false;
+window.HTMLElement.prototype.scrollIntoView ??= () => {};
+
+vi.mock("@/hooks/queries/admin/libraries", () => ({
+  useAdminLibraries: () => ({
+    data: [{ id: 7, name: "Movies", type: "movie", enabled: true }],
+  }),
+}));
+
 function renderWithClient(ui: React.ReactElement) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -69,6 +79,32 @@ describe("PluginConfigForm secrets", () => {
 
     expect(screen.getByLabelText("Base URL")).toBeInTheDocument();
     expect(screen.getByLabelText("Api Key")).toHaveAttribute("type", "password");
+  });
+
+  it("renders an inferred library picker for a silo-library json_schema format", async () => {
+    renderWithClient(
+      <PluginConfigForm
+        schema={{
+          key: "virtual",
+          title: "Virtual Library",
+          json_schema: JSON.stringify({
+            type: "object",
+            properties: {
+              movie_library_id: {
+                type: "string",
+                title: "Movie library",
+                format: "silo-library-movie",
+              },
+            },
+          }),
+          required: true,
+        }}
+        onSave={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("combobox", { name: "Movie library" }));
+    expect(await screen.findByRole("option", { name: "Movies (7)" })).toBeInTheDocument();
   });
 
   it("shows redacted saved state and only clears through an explicit action", async () => {

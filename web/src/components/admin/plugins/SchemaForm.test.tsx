@@ -1,7 +1,67 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
-import type { PluginAdminForm } from "@/api/types";
+import userEvent from "@testing-library/user-event";
+import type { Library, PluginAdminForm } from "@/api/types";
 import { SchemaForm } from "./SchemaForm";
+
+// jsdom lacks the pointer-capture API Radix Select calls when opening.
+window.HTMLElement.prototype.hasPointerCapture ??= () => false;
+window.HTMLElement.prototype.scrollIntoView ??= () => {};
+
+const { librariesState, useAdminLibrariesCalls } = vi.hoisted(() => ({
+  librariesState: { current: [] as Library[] },
+  useAdminLibrariesCalls: [] as Array<{ enabled?: boolean } | undefined>,
+}));
+vi.mock("@/hooks/queries/admin/libraries", () => ({
+  useAdminLibraries: (options?: { enabled?: boolean }) => {
+    useAdminLibrariesCalls.push(options);
+    return { data: librariesState.current };
+  },
+}));
+
+function library(overrides: Partial<Library> & Pick<Library, "id" | "name" | "type">): Library {
+  return {
+    paths: [],
+    enabled: true,
+    metadata_language: "",
+    auto_translate_metadata: false,
+    chapter_thumbnails_enabled: false,
+    chapter_thumbnails_supported: false,
+    intro_detection_enabled: false,
+    trailer_kinds: [],
+    sort_order: 0,
+    last_scanned_at: null,
+    ...overrides,
+  };
+}
+
+const LIBRARIES: Library[] = [
+  library({ id: 1, name: "Movies", type: "movie" }),
+  library({ id: 3, name: "Shows", type: "series" }),
+  library({ id: 5, name: "Mixed", type: "mixed" }),
+  library({ id: 6, name: "Disabled movies", type: "movie", enabled: false }),
+];
+
+function libraryPickerDescriptor(picker: "any" | "movie" | "tv"): PluginAdminForm {
+  return {
+    fields: [
+      {
+        key: "library_id",
+        label: "Library",
+        control: "SELECT",
+        required: false,
+        secret: false,
+        multiline: false,
+        library_picker: picker,
+      },
+    ],
+  };
+}
+
+beforeEach(() => {
+  librariesState.current = [];
+  useAdminLibrariesCalls.length = 0;
+});
 
 const descriptor: PluginAdminForm = {
   fields: [
@@ -317,4 +377,66 @@ it("renders inputs with autocomplete and password-manager ignore attributes", ()
   const passwordInput = container.querySelector("#schema-api_key");
   expect(passwordInput?.getAttribute("autocomplete")).toBe("new-password");
   expect(passwordInput?.getAttribute("data-1p-ignore")).toBe("true");
+});
+
+describe("SchemaForm library picker", () => {
+  it("requests libraries only when the descriptor has a library picker", () => {
+    const { rerender } = render(
+      <SchemaForm descriptor={descriptor} values={{}} onChange={vi.fn()} />,
+    );
+    expect(useAdminLibrariesCalls[0]).toEqual({ enabled: false });
+
+    rerender(
+      <SchemaForm descriptor={libraryPickerDescriptor("any")} values={{}} onChange={vi.fn()} />,
+    );
+    expect(useAdminLibrariesCalls[useAdminLibrariesCalls.length - 1]).toEqual({ enabled: true });
+  });
+
+  it("shows the selected library by name and id", () => {
+    librariesState.current = LIBRARIES;
+    render(
+      <SchemaForm
+        descriptor={libraryPickerDescriptor("any")}
+        values={{ library_id: "3" }}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Shows (3)")).toBeTruthy();
+  });
+
+  it("lists only movie and mixed libraries for a movie picker", async () => {
+    librariesState.current = LIBRARIES;
+    render(
+      <SchemaForm descriptor={libraryPickerDescriptor("movie")} values={{}} onChange={vi.fn()} />,
+    );
+    await userEvent.click(screen.getByRole("combobox", { name: "Library" }));
+    expect(await screen.findByRole("option", { name: "Movies (1)" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Mixed (5)" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "Shows (3)" })).toBeNull();
+    expect(screen.queryByRole("option", { name: "Disabled movies (6)" })).toBeNull();
+  });
+
+  it("keeps a saved value with no matching library as a not-found option", () => {
+    librariesState.current = LIBRARIES;
+    render(
+      <SchemaForm
+        descriptor={libraryPickerDescriptor("movie")}
+        values={{ library_id: "99" }}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("99 (not found)")).toBeTruthy();
+  });
+
+  it("keeps a saved value while the library list is still empty", () => {
+    librariesState.current = [];
+    render(
+      <SchemaForm
+        descriptor={libraryPickerDescriptor("any")}
+        values={{ library_id: "3" }}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("3 (not found)")).toBeTruthy();
+  });
 });

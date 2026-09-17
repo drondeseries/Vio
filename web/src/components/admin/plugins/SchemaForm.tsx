@@ -4,7 +4,12 @@ import { Loader2 } from "lucide-react";
 
 import { Link } from "react-router";
 
-import type { PluginAdminForm, PluginAdminFormField, PluginAdminFormSection } from "@/api/types";
+import type {
+  Library,
+  PluginAdminForm,
+  PluginAdminFormField,
+  PluginAdminFormSection,
+} from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -18,7 +23,9 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
+import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
 
+import { libraryPickerOptions } from "./libraryPicker";
 import {
   effectiveValue,
   evaluateShowWhen,
@@ -43,14 +50,37 @@ type Props = {
   onValidityChange?: (valid: boolean) => void;
 };
 
+const EMPTY_LIBRARIES: Library[] = [];
+
 function optionsFor(
   field: PluginAdminFormField,
   dynamicOptions: Record<string, SchemaOption[]> | undefined,
+  libraries: readonly Library[],
 ): SchemaOption[] {
+  if (field.library_picker) {
+    return libraryPickerOptions(field.library_picker, libraries);
+  }
   if (field.dynamic_options) {
     return dynamicOptions?.[field.key] ?? field.options ?? [];
   }
   return field.options ?? [];
+}
+
+// A saved library id can outlive the library it names (deleted, renamed out of
+// scope, disabled) and the library list may not have loaded yet. Keep the
+// current value as its own option so the select never renders blank and the
+// operator sees exactly what a save would submit.
+function withCurrentLibraryOption(
+  field: PluginAdminFormField,
+  options: SchemaOption[],
+  values: Record<string, unknown>,
+): SchemaOption[] {
+  if (!field.library_picker) return options;
+  const current = effectiveValue(field, values);
+  if (current === undefined || current === null) return options;
+  const value = String(current);
+  if (value.trim() === "" || options.some((option) => option.value === value)) return options;
+  return [...options, { value, label: `${value} (not found)` }];
 }
 
 // A dynamic control is "pending" only when we're probing AND have nothing to
@@ -194,6 +224,14 @@ export function SchemaForm({
   idPrefix = "schema",
   onValidityChange,
 }: Props) {
+  // /api/v2/libraries is admin-gated and SchemaForm renders on user-facing
+  // pages too, so only ask for the library list when a picker needs it.
+  const hasLibraryPicker = useMemo(
+    () => descriptor.fields.some((field) => field.library_picker),
+    [descriptor.fields],
+  );
+  const libraries = useAdminLibraries({ enabled: hasLibraryPicker }).data ?? EMPTY_LIBRARIES;
+
   const byKey = useMemo(() => {
     const map = new Map<string, PluginAdminFormField>();
     for (const field of descriptor.fields) {
@@ -237,7 +275,11 @@ export function SchemaForm({
     const id = `${idPrefix}-${field.key}`;
 
     if (field.control === "SELECT") {
-      const options = optionsFor(field, dynamicOptions);
+      const options = withCurrentLibraryOption(
+        field,
+        optionsFor(field, dynamicOptions, libraries),
+        values,
+      );
       if (isPending(field, options, optionsLoading)) {
         return <SelectSkeleton />;
       }
@@ -261,7 +303,7 @@ export function SchemaForm({
     }
 
     if (field.control === "MULTI_SELECT") {
-      const options = optionsFor(field, dynamicOptions);
+      const options = optionsFor(field, dynamicOptions, libraries);
       if (isPending(field, options, optionsLoading)) {
         return <ChipsSkeleton />;
       }

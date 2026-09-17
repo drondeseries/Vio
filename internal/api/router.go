@@ -2768,6 +2768,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 	if libraryCollectionHandler != nil {
 		v2deps.LibraryCollections = libraryCollectionHandler
 		v2deps.AdminCollections = libraryCollectionHandler
+		v2deps.AdminVirtualItems = libraryCollectionHandler
 	}
 	if libraryCollectionGroupHandler != nil {
 		v2deps.AdminCollectionGroups = libraryCollectionGroupHandler
