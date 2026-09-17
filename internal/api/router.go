@@ -1340,6 +1340,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 			playbackHandler.VirtualPlaybackSourceProber = func(ctx context.Context, sourceURL string, file *models.MediaFile) (*models.MediaFile, error) {
 				return virtualSourceProberWithHeaders(ctx, sourceURL, file, nil)
 			}
+			// Cache-only recovery for the probe-failure damper: a probe that
+			// outlived its caller's wait may have completed and landed here.
+			playbackHandler.VirtualProbeCacheLookup = func(sourceURL string, file *models.MediaFile) *models.MediaFile {
+				return virtualProbeCache.Lookup(sourceURL, file)
+			}
 		}
 		playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
 			return deps.PluginHTTPProxy.ResolveVirtualMedia(ctx, virtualURI)

@@ -209,14 +209,16 @@ func (r copySafetyResult) matches(file *models.MediaFile) bool {
 	return sameFileModifiedAt(r.mtime, *file.FileModifiedAt)
 }
 
-// errVirtualProbeNoTracks reports that ffprobe exited successfully against a
+// ErrVirtualProbeNoTracks reports that ffprobe exited successfully against a
 // virtual source but described no audio and no video stream. Remote relays can
 // return a parseable but empty stream table when the analysis window is too
 // short; treating that as success stamps a never-probed row with ProbeSource and
 // a fresh ProbeUpdatedAt, so the row looks probed while carrying empty track
 // arrays. A real virtual source always carries at least one stream, so a
-// fully-empty result is inconclusive and must surface as a failure.
-var errVirtualProbeNoTracks = errors.New("virtual probe returned no audio or video streams")
+// fully-empty result is inconclusive and must surface as a failure. It is the
+// one probe error the playback handler can classify as a candidate-specific
+// rejection; every other probe error leaves the verdict unknown or repeated.
+var ErrVirtualProbeNoTracks = errors.New("virtual probe returned no audio or video streams")
 
 // ProbeVirtualSource probes a virtual (plugin-provided) stream for playback
 // metadata without letting the provider's signed URL replace the canonical
@@ -235,7 +237,7 @@ func ProbeVirtualSource(
 		return file, err
 	}
 	if probe == nil || (len(probe.AudioTracks) == 0 && len(probe.VideoTracks) == 0) {
-		return file, errVirtualProbeNoTracks
+		return file, ErrVirtualProbeNoTracks
 	}
 	updated := *file
 	applyProbeData(&updated, probe, "virtual")

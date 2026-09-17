@@ -49,8 +49,8 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"120"},"streams":[]}
 `)
 	file := &models.MediaFile{ID: 9, FilePath: "virtual://movie/tt9?result=empty"}
 	probed, err := ProbeVirtualSource(context.Background(), ffprobe, "", "http://127.0.0.1/source", file, nil)
-	if !errors.Is(err, errVirtualProbeNoTracks) {
-		t.Fatalf("ProbeVirtualSource error = %v, want errVirtualProbeNoTracks", err)
+	if !errors.Is(err, ErrVirtualProbeNoTracks) {
+		t.Fatalf("ProbeVirtualSource error = %v, want ErrVirtualProbeNoTracks", err)
 	}
 	if probed != file {
 		t.Fatal("ProbeVirtualSource must return the original file on a failed probe")

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -214,6 +215,99 @@ func TestVirtualFileMetadataUpdateAdoptsPathForNullProbeSource(t *testing.T) {
 	}
 	if stampedAt == nil {
 		t.Fatal("probe_updated_at was not stamped")
+	}
+}
+
+// A transient outer timeout leaves the inner probe running under its own
+// scanner timeout. Once that probe completes and lands in the cache, the
+// damper's cache-only recovery must still persist the evidence and stamp
+// probe_updated_at, so the row is not left unprobed until the backoff lapses.
+func TestVirtualMetadataUpdateRecoversEvidenceAfterTransientTimeout(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	ctx := context.Background()
+	const folderID, ownerID = 994315, 7005
+	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
+
+	candidatePath := "virtual://movie/tt-db-recover?result=cand-a"
+	failureKey := virtualProbeFailureKey(candidatePath, ownerID)
+	virtualProbeFailures.clear(failureKey)
+	t.Cleanup(func() { virtualProbeFailures.clear(failureKey) })
+
+	var candidateID int
+	var updatedAt time.Time
+	var probeUpdatedAt *time.Time
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id, probe_source)
+		VALUES('movie-db-recover', $1, $2, 'virtual', $3, 'virtual')
+		RETURNING id, updated_at, probe_updated_at`, folderID, candidatePath, ownerID,
+	).Scan(&candidateID, &updatedAt, &probeUpdatedAt); err != nil {
+		t.Fatalf("insert candidate row: %v", err)
+	}
+
+	var cacheLookups int
+	h := &PlaybackHandler{
+		VirtualPlaybackSourceProber: func(context.Context, string, *models.MediaFile) (*models.MediaFile, error) {
+			return nil, context.DeadlineExceeded
+		},
+		VirtualFileSaver: func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+			return ExecVirtualFileMetadataUpdate(ctx, pool, args)
+		},
+		VirtualProbeCacheLookup: func(_ string, file *models.MediaFile) *models.MediaFile {
+			cacheLookups++
+			return &models.MediaFile{
+				FilePath:                   file.FilePath,
+				VirtualOwnerInstallationID: file.VirtualOwnerInstallationID,
+				VideoTracks:                []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},
+				AudioTracks:                []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}},
+				Resolution:                 "2160p",
+				CodecVideo:                 "hevc",
+				CodecAudio:                 "eac3",
+				Container:                  "mkv",
+				Duration:                   5400,
+			}
+		},
+	}
+	stored := &models.MediaFile{
+		ID:                         candidateID,
+		ContentID:                  "movie-db-recover",
+		FilePath:                   candidatePath,
+		MediaFolderID:              folderID,
+		VirtualOwnerInstallationID: ownerID,
+		UpdatedAt:                  updatedAt,
+		ProbeUpdatedAt:             probeUpdatedAt,
+	}
+	cand := VirtualPlaybackStream{ID: "cand-a", URI: candidatePath}
+
+	// The transient timeout marks the damper but must not stamp the row.
+	h.probeVirtualSourceAndPersist(ctx, "sticky-recover", stored, "http://provider.example/stream", *stored, cand, 90, ownerID)
+	if got := virtualProbeFailures.count(failureKey); got == 0 {
+		t.Fatal("transient timeout did not mark the probe failure damper")
+	}
+
+	// The completed inner probe is now available; recovery persists it.
+	if !h.recoverVirtualProbeFromCache(ctx, stored, "http://provider.example/stream", *stored, cand, ownerID) {
+		t.Fatal("cache-only recovery did not use the completed probe")
+	}
+	if cacheLookups != 1 {
+		t.Fatalf("cache lookups = %d, want 1", cacheLookups)
+	}
+	if virtualProbeFailures.count(failureKey) != 0 {
+		t.Fatal("cache-only recovery did not clear the failure mark")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var stampedAt *time.Time
+		if err := pool.QueryRow(ctx, `SELECT probe_updated_at FROM media_files WHERE id = $1`, candidateID).Scan(&stampedAt); err != nil {
+			t.Fatalf("read candidate row: %v", err)
+		}
+		if stampedAt != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("probe_updated_at was not stamped after cache-only recovery")
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 

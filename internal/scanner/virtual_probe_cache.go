@@ -21,6 +21,14 @@ const (
 	defaultVirtualProbeCacheEntries = 256
 )
 
+// VirtualProbeTimeout bounds one playback-time probe. The cache runs the real
+// probe under this timeout and the playback handler uses it as its background
+// probe budget, so the two cannot drift: a caller that stops waiting before
+// this fires has not learned a verdict, while the probe itself keeps running to
+// completion. It covers the ffprobe and the nested copy-safety and Dolby Vision
+// scans in ProbeVirtualSource.
+const VirtualProbeTimeout = 60 * time.Second
+
 type virtualProbeCacheEntry struct {
 	file      *models.MediaFile
 	expiresAt time.Time
@@ -78,7 +86,7 @@ func (c *VirtualProbeCache) Probe(
 		if cached := c.load(key, time.Now()); cached != nil {
 			return cached, nil
 		}
-		probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+		probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), VirtualProbeTimeout)
 		defer probeCancel()
 		workerSnapshot := cloneVirtualProbeFile(inputSnapshot)
 		probed, err := probe(probeCtx, sourceURL, workerSnapshot)
@@ -101,6 +109,17 @@ func (c *VirtualProbeCache) Probe(
 		}
 		return cloneVirtualProbeFile(probed), nil
 	}
+}
+
+// Lookup returns a completed probe cached for this source without starting a
+// new one. It is the cache-only seam the playback handler uses to recover
+// evidence from a probe that outlived the caller's wait. A nil result means no
+// completed probe is available.
+func (c *VirtualProbeCache) Lookup(sourceURL string, file *models.MediaFile) *models.MediaFile {
+	if c == nil || file == nil {
+		return nil
+	}
+	return c.load(virtualProbeCacheKey(sourceURL, file), time.Now())
 }
 
 func (c *VirtualProbeCache) load(key string, now time.Time) *models.MediaFile {
