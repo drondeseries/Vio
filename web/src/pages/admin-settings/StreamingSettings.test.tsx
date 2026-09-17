@@ -26,7 +26,15 @@ vi.mock("@/hooks/queries/admin/libraries", () => ({
 }));
 
 vi.mock("@/components/admin/ConnectionCheckAction", () => ({
-  ConnectionCheckAction: ({ label = "Check Connection", onClick, disabled }: any) => (
+  ConnectionCheckAction: ({
+    label = "Check Connection",
+    onClick,
+    disabled,
+  }: {
+    label?: string;
+    onClick?: () => void;
+    disabled?: boolean;
+  }) => (
     <button type="button" onClick={onClick} disabled={disabled}>
       {label}
     </button>

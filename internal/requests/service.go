@@ -58,16 +58,16 @@ type RequesterIdentityResolver interface {
 }
 
 type Service struct {
-	store             Store
-	tmdb              TMDBClient
-	presence          PresenceResolver
-	router            RequestRouterProvider
-	entitlements      EntitlementResolver
-	groupProvider     access.GroupPolicyProvider
-	users             access.UserRepository
-	requesterIdentity RequesterIdentityResolver
-	notifier          FulfillmentNotifier
-	lifecycle         LifecycleNotifier
+	store                   Store
+	tmdb                    TMDBClient
+	presence                PresenceResolver
+	router                  RequestRouterProvider
+	entitlements            EntitlementResolver
+	groupProvider           access.GroupPolicyProvider
+	users                   access.UserRepository
+	requesterIdentity       RequesterIdentityResolver
+	notifier                FulfillmentNotifier
+	lifecycle               LifecycleNotifier
 	catalogChanged          func()
 	cleanupVirtual          func(context.Context, Request) error
 	hasDefaultVirtualRouter func() bool
