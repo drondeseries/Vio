@@ -131,6 +131,16 @@ func NewVirtualMediaRegistrar(pool *pgxpool.Pool) *VirtualMediaRegistrar {
 	return &VirtualMediaRegistrar{pool: pool, ReleaseOverrides: NewReleaseOverrideRepository(pool)}
 }
 
+// Pool exposes the registrar's database pool to core services that need to
+// coordinate work with the same database session without taking ownership of
+// the pool.
+func (r *VirtualMediaRegistrar) Pool() *pgxpool.Pool {
+	if r == nil {
+		return nil
+	}
+	return r.pool
+}
+
 func (r *VirtualMediaRegistrar) Upsert(ctx context.Context, in VirtualMedia) (*VirtualMediaResult, error) {
 	return r.UpsertVirtualMedia(ctx, 0, in)
 }
@@ -556,14 +566,15 @@ func syncVirtualFileSourceClaims(ctx context.Context, tx pgx.Tx, installationID 
 	return nil
 }
 
-// ReconcileVirtualMedia removes stale virtual media owned by one plugin source.
-// Physical files and collection-linked items are preserved.
+// ReconcileVirtualMedia removes stale virtual media owned by one source.
+// Physical files and collection-linked items are preserved. Core-owned media
+// uses installationID 0; plugin-owned media uses a positive installation ID.
 func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, installationID int, source string, keepIDs []string, libraryIDs []int) (VirtualReconcileResult, error) {
 	var result VirtualReconcileResult
 	if r == nil || r.pool == nil {
 		return result, errors.New("virtual catalog is unavailable")
 	}
-	if installationID <= 0 || source == "" {
+	if installationID < 0 || source == "" {
 		return result, errors.New("installation and source are required")
 	}
 	if err := validateVirtualText("source", source, maxVirtualSourceBytes, true, false); err != nil {
@@ -601,7 +612,7 @@ func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, insta
 			return result, fmt.Errorf("virtual reconciliation guard check: %w", err)
 		}
 		if existingCount > 0 {
-			return result, fmt.Errorf("virtual reconciliation refused: plugin sent empty keep list but %d existing claims exist for source %q — the plugin may have lost its monitored state", existingCount, source)
+			return result, fmt.Errorf("virtual reconciliation refused: empty keep list but %d existing claims exist for source %q — monitored state may be unavailable", existingCount, source)
 		}
 	}
 	if _, err := tx.Exec(ctx, `

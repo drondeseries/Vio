@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -1585,4 +1586,194 @@ func TestStreamsFromVirtualResult_NumericResolution(t *testing.T) {
 	if streams[0].Resolution != "1080p" {
 		t.Fatalf("Resolution = %q, want %q", streams[0].Resolution, "1080p")
 	}
+}
+
+// TestConfiguredVirtualVariantsParityFixtures pins the current plugin
+// ConfiguredVirtualVariants outputs as deterministic fixtures (Oracle Phase 1
+// scope freeze for retiring com.drondeseries.vio-virtual-library).
+//
+// The core Variants() cutover (Phase 4) must reproduce every pinned value:
+// profile order, labels, variant URIs, codecs, HDR, ownership, the
+// empty-profile sentinel, and the error paths. Do not rewrite these
+// expectations to fit new code; change them only with an explicit parity
+// update.
+func TestConfiguredVirtualVariantsParityFixtures(t *testing.T) {
+	newParityService := func(t *testing.T, profilesFunc func(context.Context, *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error)) *Service {
+		t.Helper()
+		manifest := testPluginManifest(t, "test.virtual", "1.0.0")
+		manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{Type: virtualStreamProviderCapabilityType, Id: testVirtualCapabilityID}}
+		installPath := writeInstalledPluginManifest(t, manifest)
+		store := newFakeServiceInstallationStore()
+		store.listCapabilities = []*Capability{{Type: virtualStreamProviderCapabilityType, ID: testVirtualCapabilityID}}
+		installation := &Installation{ID: 101, PluginID: "test.virtual", Version: "1.0.0", InstallPath: installPath, Enabled: true}
+		store.byID[101] = installation
+		store.byPluginID[installation.PluginID] = append(store.byPluginID[installation.PluginID], installation)
+		host := &fakeVirtualPluginHost{clients: map[int]pluginClient{
+			101: &fakePluginClient{
+				manifest: manifest,
+				virtualStreamClient: pluginhost.NewVirtualStreamProviderClientForTest(&fakeVirtualStreamGRPCClient{
+					profilesFunc: func(ctx context.Context, request *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+						if request.GetCapabilityId() != testVirtualCapabilityID || request.GetMediaType() != "movie" {
+							t.Errorf("profile request = %#v", request)
+						}
+						return profilesFunc(ctx, request)
+					},
+				}, time.Second),
+			},
+		}}
+		return &Service{installations: store, host: host}
+	}
+
+	t.Run("empty profiles sentinel carries owner and preserves URI", func(t *testing.T) {
+		service := newParityService(t, func(context.Context, *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+			return &pluginv1.ListVirtualStreamProfilesResponse{}, nil
+		})
+		const virtualPath = "virtual://movie/tt100"
+		variants, err := service.ConfiguredVirtualVariants(context.Background(), virtualPath, "movie")
+		if err != nil {
+			t.Fatalf("ConfiguredVirtualVariants: %v", err)
+		}
+		if len(variants) != 1 {
+			t.Fatalf("variants = %#v, want single sentinel", variants)
+		}
+		sentinel := variants[0]
+		if sentinel.VirtualURI != virtualPath {
+			t.Fatalf("sentinel URI = %q, want %q", sentinel.VirtualURI, virtualPath)
+		}
+		if sentinel.OwnerInstallationID != 101 {
+			t.Fatalf("sentinel owner = %d, want 101", sentinel.OwnerInstallationID)
+		}
+		if sentinel.Label != "" || sentinel.Resolution != "" || sentinel.CodecVideo != "" || sentinel.CodecAudio != "" || sentinel.HDR != "" {
+			t.Fatalf("sentinel carries profile fields: %#v", sentinel)
+		}
+	})
+
+	t.Run("profile order labels URIs codecs HDR ownership", func(t *testing.T) {
+		service := newParityService(t, func(context.Context, *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+			return &pluginv1.ListVirtualStreamProfilesResponse{Profiles: []*pluginv1.VirtualStreamProfile{
+				{Label: "1080p", Resolution: "1920x1080", VideoCodec: "h264", AudioCodec: "aac", HdrFormat: "SDR"},
+				{Label: "4K HDR", Resolution: "3840x2160", VideoCodec: "hevc", AudioCodec: "eac3", HdrFormat: "HDR10"},
+				{Label: "All", AllResults: true},
+			}}, nil
+		})
+		// A stale ?result= selection must be stripped from every variant URI.
+		variants, err := service.ConfiguredVirtualVariants(context.Background(), "virtual://movie/tt100?result=stale-candidate", "movie")
+		if err != nil {
+			t.Fatalf("ConfiguredVirtualVariants: %v", err)
+		}
+		want := []VirtualPlaybackVariant{
+			{VirtualURI: "virtual://movie/tt100?profile=1080p", Label: "1080p", Resolution: "1920x1080", CodecVideo: "h264", CodecAudio: "aac", HDR: "SDR", OwnerInstallationID: 101, VirtualProvenance: models.VirtualProvenancePlugin},
+			{VirtualURI: "virtual://movie/tt100?profile=4K+HDR", Label: "4K HDR", Resolution: "3840x2160", CodecVideo: "hevc", CodecAudio: "eac3", HDR: "HDR10", OwnerInstallationID: 101, VirtualProvenance: models.VirtualProvenancePlugin},
+			{VirtualURI: "virtual://movie/tt100?results=all", Label: "All", OwnerInstallationID: 101, VirtualProvenance: models.VirtualProvenancePlugin},
+		}
+		if len(variants) != len(want) {
+			t.Fatalf("variants = %#v, want %#v", variants, want)
+		}
+		for i := range want {
+			if variants[i] != want[i] {
+				t.Errorf("variants[%d] = %#v, want %#v", i, variants[i], want[i])
+			}
+		}
+	})
+
+	t.Run("invalid label and control chars rejected", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			profile *pluginv1.VirtualStreamProfile
+		}{
+			{"newline in label", &pluginv1.VirtualStreamProfile{Label: "bad\nlabel"}},
+			{"carriage return in label", &pluginv1.VirtualStreamProfile{Label: "bad\rlabel"}},
+			{"NUL in label", &pluginv1.VirtualStreamProfile{Label: "bad\x00label"}},
+			{"newline in resolution", &pluginv1.VirtualStreamProfile{Label: "ok", Resolution: "1080p\n"}},
+			{"NUL in video codec", &pluginv1.VirtualStreamProfile{Label: "ok", VideoCodec: "h\x00vc"}},
+			{"carriage return in audio codec", &pluginv1.VirtualStreamProfile{Label: "ok", AudioCodec: "aa\rc"}},
+			{"newline in HDR format", &pluginv1.VirtualStreamProfile{Label: "ok", HdrFormat: "HDR\n10"}},
+			{"overlong label", &pluginv1.VirtualStreamProfile{Label: strings.Repeat("x", maxVirtualLabelLen+1)}},
+			{"overlong resolution", &pluginv1.VirtualStreamProfile{Label: "ok", Resolution: strings.Repeat("x", maxVirtualLabelLen+1)}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				profile := tc.profile
+				service := newParityService(t, func(context.Context, *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+					return &pluginv1.ListVirtualStreamProfilesResponse{Profiles: []*pluginv1.VirtualStreamProfile{profile}}, nil
+				})
+				_, err := service.ConfiguredVirtualVariants(context.Background(), "virtual://movie/tt100", "movie")
+				if err == nil {
+					t.Fatalf("invalid profile was accepted: %#v", profile)
+				}
+				if !strings.Contains(err.Error(), "invalid field") {
+					t.Fatalf("error = %q, want invalid-field rejection", err)
+				}
+			})
+		}
+	})
+
+	t.Run("empty and whitespace labels rejected", func(t *testing.T) {
+		for _, label := range []string{"", "   "} {
+			service := newParityService(t, func(context.Context, *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+				return &pluginv1.ListVirtualStreamProfilesResponse{Profiles: []*pluginv1.VirtualStreamProfile{{Label: label}}}, nil
+			})
+			_, err := service.ConfiguredVirtualVariants(context.Background(), "virtual://movie/tt100", "movie")
+			if err == nil {
+				t.Fatalf("unlabeled profile %q was accepted", label)
+			}
+			if !strings.Contains(err.Error(), "unlabeled profile") {
+				t.Fatalf("error = %q, want unlabeled-profile rejection", err)
+			}
+		}
+	})
+
+	t.Run("nil profile rejected", func(t *testing.T) {
+		service := newParityService(t, func(context.Context, *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+			return &pluginv1.ListVirtualStreamProfilesResponse{Profiles: []*pluginv1.VirtualStreamProfile{nil}}, nil
+		})
+		_, err := service.ConfiguredVirtualVariants(context.Background(), "virtual://movie/tt100", "movie")
+		// The profiles-layer proto clone normalizes a nil element to an empty
+		// message, so variant mapping rejects it as unlabeled rather than
+		// empty. Pin the observed error either way a future core
+		// implementation must reproduce: nil input is rejected, never mapped.
+		if err == nil || !strings.Contains(err.Error(), "profile") {
+			t.Fatalf("nil profile err = %v, want profile rejection", err)
+		}
+		if got := err.Error(); !strings.Contains(got, "unlabeled profile") && !strings.Contains(got, "empty profile") {
+			t.Fatalf("nil profile err = %q, want unlabeled/empty-profile rejection", got)
+		}
+	})
+
+	t.Run("over-limit profile set rejected at profiles layer", func(t *testing.T) {
+		profiles := make([]*pluginv1.VirtualStreamProfile, maxVirtualPlaybackStreams+1)
+		for i := range profiles {
+			profiles[i] = &pluginv1.VirtualStreamProfile{Label: fmt.Sprintf("p%d", i)}
+		}
+		client := pluginhost.NewVirtualStreamProviderClientForTest(&fakeVirtualStreamGRPCClient{
+			profilesFunc: func(context.Context, *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+				return &pluginv1.ListVirtualStreamProfilesResponse{Profiles: profiles}, nil
+			},
+		}, time.Second)
+		service := &Service{}
+		_, err := service.configuredVirtualProfiles(context.Background(), 101, testVirtualCapabilityID, "movie", client)
+		if err == nil || !strings.Contains(err.Error(), "exceeded its limit") {
+			t.Fatalf("over-limit profile set err = %v, want limit rejection", err)
+		}
+	})
+
+	t.Run("over-limit installation is skipped by variants", func(t *testing.T) {
+		profiles := make([]*pluginv1.VirtualStreamProfile, maxVirtualPlaybackStreams+1)
+		for i := range profiles {
+			profiles[i] = &pluginv1.VirtualStreamProfile{Label: fmt.Sprintf("p%d", i)}
+		}
+		service := newParityService(t, func(context.Context, *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+			return &pluginv1.ListVirtualStreamProfilesResponse{Profiles: profiles}, nil
+		})
+		// configuredVirtualVariantsUncached continues past a failing
+		// installation, so a lone over-limit installation yields nil
+		// variants and a nil error rather than surfacing the rejection.
+		variants, err := service.ConfiguredVirtualVariants(context.Background(), "virtual://movie/tt100", "movie")
+		if err != nil {
+			t.Fatalf("ConfiguredVirtualVariants: %v", err)
+		}
+		if variants != nil {
+			t.Fatalf("variants = %#v, want nil when the only installation is skipped", variants)
+		}
+	})
 }

@@ -21,6 +21,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
 )
 
@@ -77,14 +78,22 @@ type VirtualPlaybackRouting struct {
 // VirtualPlaybackVariant is a provider-neutral profile placeholder returned
 // by a virtual playback plugin. It is safe to request during collection sync:
 // no upstream streaming provider is contacted until playback.
+//
+// Provenance is the explicit origin discriminator: "plugin" marks the plugin
+// path, "core" marks core-stamped variants (Phase 4), and "" means
+// legacy/unknown. The zero value stays fail-open on the legacy plugin path;
+// the NEW core SSRF dispatch fails closed on unknown/inconsistent provenance.
+// No DB column backs this in Phase 2 — struct-level only; the core Variants()
+// path (Phase 4) stamps Provenance:"core".
 type VirtualPlaybackVariant struct {
-	VirtualURI          string `json:"virtual_uri"`
-	Label               string `json:"label"`
-	Resolution          string `json:"resolution,omitempty"`
-	CodecVideo          string `json:"codec_video,omitempty"`
-	CodecAudio          string `json:"codec_audio,omitempty"`
-	HDR                 string `json:"hdr,omitempty"`
-	OwnerInstallationID int    `json:"-"`
+	VirtualURI          string                   `json:"virtual_uri"`
+	Label               string                   `json:"label"`
+	Resolution          string                   `json:"resolution,omitempty"`
+	CodecVideo          string                   `json:"codec_video,omitempty"`
+	CodecAudio          string                   `json:"codec_audio,omitempty"`
+	HDR                 string                   `json:"hdr,omitempty"`
+	OwnerInstallationID int                      `json:"-"`
+	VirtualProvenance   models.VirtualProvenance `json:"-"`
 }
 
 // VirtualPlaybackStream is a provider result exposed as a temporary, stable
@@ -1470,6 +1479,7 @@ func (s *Service) configuredVirtualVariantsUncached(ctx context.Context, virtual
 			return []VirtualPlaybackVariant{{
 				VirtualURI:          virtualPath,
 				OwnerInstallationID: installation.ID,
+				VirtualProvenance:   models.VirtualProvenancePlugin,
 			}}, nil
 		}
 		variants := make([]VirtualPlaybackVariant, 0, len(response.GetProfiles()))
@@ -1508,6 +1518,7 @@ func (s *Service) configuredVirtualVariantsUncached(ctx context.Context, virtual
 				Resolution: profile.GetResolution(), CodecVideo: profile.GetVideoCodec(),
 				CodecAudio: profile.GetAudioCodec(), HDR: profile.GetHdrFormat(),
 				OwnerInstallationID: installation.ID,
+				VirtualProvenance:   models.VirtualProvenancePlugin,
 			})
 		}
 		return variants, nil

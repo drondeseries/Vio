@@ -35,11 +35,13 @@ The resolver runs at playback time so signed upstream URLs are not persisted.
 
 ## Administrator setup
 
-The server administrator installs a Silo build containing this host contract,
-then installs a compatible virtual-library plugin. The plugin configuration
-contains a compatible Stremio `manifest.json` URL, movie library ID, series library ID, an
-optional TMDB credential, and a durable monitored-queue path. Database access
-is neither requested nor supported.
+In Vio, Stremio virtual streaming is built directly into core (`internal/virtuallibrary`),
+configured via `virtual_library.*` server settings (Admin › Settings › Streaming).
+
+The server administrator can also install external virtual-library plugins via the generic
+plugin runtime. The plugin configuration contains a compatible Stremio `manifest.json` URL,
+movie library ID, series library ID, an optional TMDB credential, and a durable
+monitored-queue path. Database access is neither requested nor supported.
 
 ## Updating from upstream
 

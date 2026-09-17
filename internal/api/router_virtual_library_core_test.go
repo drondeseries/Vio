@@ -1,0 +1,197 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/auth"
+	"github.com/Silo-Server/silo-server/internal/clientip"
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/secret"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
+)
+
+func newCoreTestProvider(t *testing.T) (*httptest.Server, *virtuallibrary.Service) {
+	t.Helper()
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/manifest.json" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"org.stremio.core","resources":["stream"],"types":["movie"]}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"streams":[{"name":"HD","url":"http://127.0.0.1:8080/stream.mkv"}]}`))
+	}))
+	t.Cleanup(mockServer.Close)
+
+	vlSvc := virtuallibrary.New(virtuallibrary.Config{
+		Enabled:           true,
+		ManifestURL:       mockServer.URL + "/manifest.json",
+		AllowInsecureHTTP: true,
+	}, nil, nil)
+	if vlSvc == nil {
+		t.Fatal("expected non-nil virtuallibrary.Service")
+	}
+	return mockServer, vlSvc
+}
+
+func newAuthorizedContext() context.Context {
+	ctx := context.Background()
+	ctx = apimw.SetClaims(ctx, &auth.Claims{UserID: 1, Role: "user", TokenType: auth.TokenTypeAccess})
+	return apimw.SetProfileID(ctx, "profile-1")
+}
+
+func TestRouterWiresVirtualLibraryService(t *testing.T) {
+	_, vlSvc := newCoreTestProvider(t)
+
+	deps := Dependencies{
+		Config:                &config.Config{},
+		VirtualLibraryService: vlSvc,
+	}
+
+	// router initialization must succeed without crashing or panicking
+	router := NewRouter(deps)
+	if router == nil {
+		t.Fatal("NewRouter returned nil")
+	}
+
+	// Verify the core service can resolve a virtual path directly
+	resolved, err := vlSvc.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	if err != nil {
+		t.Fatalf("core ResolveDetailed failed: %v", err)
+	}
+	if resolved.URL != "http://127.0.0.1:8080/stream.mkv" {
+		t.Fatalf("resolved URL = %q, want stream.mkv", resolved.URL)
+	}
+}
+
+// TestRouterWiresCorePlaybackWithoutPlugin exercises the real playback
+// wiring path (SessionMgr + FileRepo present, PluginService absent). This is
+// the configuration the retirement cutover produces: core owns owner<=0
+// virtual media with no plugin process running. Before the cutover, the
+// resolver wiring blocks required PluginService != nil, so this test locks
+// in that core-only boot wires playback without nil-dereference panics
+// (notably the SSRF dispatch, which must fail closed via the nil-safe
+// AllowInsecureForProvenance rather than panicking).
+func TestRouterWiresCorePlaybackWithoutPlugin(t *testing.T) {
+	_, vlSvc := newCoreTestProvider(t)
+
+	deps := Dependencies{
+		Config:                &config.Config{},
+		SessionMgr:            playback.NewSessionManager(1, 1),
+		FileRepo:              scanner.NewFileRepository(nil),
+		VirtualLibraryService: vlSvc,
+		// PluginService deliberately nil: core-only operation.
+	}
+
+	router := NewRouter(deps)
+	if router == nil {
+		t.Fatal("NewRouter returned nil for core-only deps")
+	}
+
+	// The service captured by the wired closures must serve owner<=0
+	// (core-owned) media end to end: variants for listing, streams for
+	// playback selection, detailed resolution for transport.
+	variants, err := vlSvc.Variants(context.Background(), "virtual://movie/tt100", "movie")
+	if err != nil {
+		t.Fatalf("core Variants failed: %v", err)
+	}
+	if len(variants) == 0 {
+		t.Fatal("expected at least one variant")
+	}
+	for _, v := range variants {
+		if v.OwnerInstallationID != 0 {
+			t.Fatalf("variant owner = %d, want 0 (core-owned)", v.OwnerInstallationID)
+		}
+	}
+
+	streams, err := vlSvc.ListStreams(context.Background(), "virtual://movie/tt100")
+	if err != nil {
+		t.Fatalf("core ListStreams failed: %v", err)
+	}
+	if len(streams) == 0 {
+		t.Fatal("expected at least one stream")
+	}
+
+	resolved, err := vlSvc.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	if err != nil {
+		t.Fatalf("core ResolveDetailed failed: %v", err)
+	}
+	if resolved.URL == "" {
+		t.Fatal("expected non-empty resolved URL")
+	}
+}
+
+// TestRouterStreamRouteMounted tests that playback routes are mounted on
+// the router and protected by authentication middleware.
+func TestRouterStreamRouteMounted(t *testing.T) {
+	_, vlSvc := newCoreTestProvider(t)
+
+	cfg, err := config.LoadFromDB(map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(t.Context(), "postgres://nobody:nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	cipher, err := secret.New(bytes.Repeat([]byte{0}, secret.MinMasterKeyLen))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionMgr := playback.NewSessionManager(1, 1)
+	deps := Dependencies{
+		Config:                cfg,
+		AppContext:            t.Context(),
+		DB:                    pool,
+		SecretCipher:          cipher,
+		ClientIPResolver:      clientip.NewResolver(nil),
+		SessionMgr:            sessionMgr,
+		FileRepo:              scanner.NewFileRepository(nil),
+		VirtualLibraryService: vlSvc,
+	}
+
+	router := NewRouter(deps)
+	if router == nil {
+		t.Fatal("NewRouter returned nil")
+	}
+
+	// Request to /api/v1/playback/start without auth returns 401 Unauthorized,
+	// proving the router mounts playback routes through authentication middleware.
+	reqStart := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	rrStart := httptest.NewRecorder()
+	router.ServeHTTP(rrStart, reqStart)
+	if rrStart.Code != http.StatusUnauthorized {
+		t.Fatalf("playback start status = %d, want 401; body = %s", rrStart.Code, rrStart.Body.String())
+	}
+}
+
+// TestRouterCoreOwnershipPolicy documents the unified dispatch contract the
+// router closures implement: core owns owner<=0, the plugin owns owner>0.
+// Plugin-owned rows without a plugin service are an explicit error, never a
+// silent core fallback or an empty success.
+func TestRouterCoreOwnershipPolicy(t *testing.T) {
+	_, vlSvc := newCoreTestProvider(t)
+
+	// Core serves unowned rows.
+	if _, err := vlSvc.Resolve(context.Background(), "virtual://movie/tt100"); err != nil {
+		t.Fatalf("core Resolve for unowned path failed: %v", err)
+	}
+
+	// A nil core service surfaces unavailability explicitly.
+	var nilSvc *virtuallibrary.Service
+	if _, err := nilSvc.Resolve(context.Background(), "virtual://movie/tt100"); err == nil {
+		t.Fatal("expected unavailable error from nil service")
+	}
+}

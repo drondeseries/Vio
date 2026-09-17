@@ -180,6 +180,13 @@ func (r *ItemRepository) ReconcileCollectionVirtualLibraryLinks(ctx context.Cont
 
 // VirtualPlaybackVariant describes a provider-neutral profile variant. The
 // URI is resolved lazily by a virtual playback plugin when playback starts.
+//
+// Provenance is the explicit origin discriminator: "core" marks variants
+// stamped by the in-tree core virtual library (Phase 4 Variants()), "plugin"
+// marks plugin-path variants, and "" means legacy/unknown (existing plugin
+// rows). The zero value stays fail-open on the legacy path; the NEW core SSRF
+// dispatch fails closed on unknown/inconsistent provenance. No DB column backs
+// this in Phase 2 — struct-level only.
 type VirtualPlaybackVariant struct {
 	VirtualURI          string
 	Label               string
@@ -188,6 +195,7 @@ type VirtualPlaybackVariant struct {
 	CodecAudio          string
 	HDR                 string
 	OwnerInstallationID int
+	VirtualProvenance   models.VirtualProvenance
 }
 
 // isPGTransient reports Postgres errors that are safe to retry: deadlocks

@@ -55,7 +55,7 @@ func compareVersions(a, b string) int {
 	return 0
 }
 
-var defaultPluginIDs = []string{"vio.tmdb", "vio.tvdb", "com.drondeseries.vio-virtual-library"}
+var defaultPluginIDs = []string{"vio.tmdb", "vio.tvdb"}
 
 type autoUpdateRepositoryStore interface {
 	List(ctx context.Context) ([]*Repository, error)

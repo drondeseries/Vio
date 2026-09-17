@@ -1,0 +1,1314 @@
+// Package resolver ports the Stremio manifest stream resolver from the
+// vio-virtual-library plugin (manifestStreamResolver in main.go, plus the
+// streamEndpointWithPolicy URL validation and ValidateConnection helper from
+// routing.go) into Vio core.
+//
+// Scope: manifest fetch over HTTP, the candidate cache (positive entries with
+// TTL, negative caching of empty answers, the fresh-serve floor, stale grace
+// with background refresh, singleflight fetch dedup), candidate dedup with the
+// maxVirtualCandidates cap, and connection validation. Deliberately NOT
+// ported: Configure() (replaced by Config + New), runtimeServer/gRPC,
+// TestConnection (monitor/prowlarr/altmount phases), and quality-profile
+// selection (Resolve/SelectCandidates/GetVariants live with the quality
+// package).
+package resolver
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"net"
+	"net/http"
+	"net/url"
+	"path"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
+)
+
+const (
+	virtualPathPrefix = "virtual://"
+
+	maxResponseBytes         = 4 << 20
+	maxCandidateCacheEntries = 256
+	maxCandidateCacheBytes   = 16 << 20
+	maxVirtualCandidates     = 50
+	maxManifestResponseBytes = 256 << 10
+
+	// defaultCacheTTL is the positive-entry TTL when Config.CacheTTL is unset.
+	// Bounds mirror the plugin (1 minute .. 10080 minutes / 7 days).
+	defaultCacheTTL = 10 * time.Minute
+	minCacheTTL     = 1 * time.Minute
+	maxCacheTTL     = 10080 * time.Minute
+
+	defaultHTTPTimeout = 45 * time.Second
+
+	defaultTVMazeBaseURL = "https://api.tvmaze.com"
+	defaultTMDBBaseURL   = "https://api.themoviedb.org/3"
+
+	// negativeCacheTTL bounds how long an empty provider answer is reused.
+	// Without it, a title the provider cannot serve re-paid a full 3-8s
+	// round-trip on every resolve — four times inside one playback start in
+	// production. Entries expire so newly added sources are noticed without
+	// operator action.
+	negativeCacheTTL = 2 * time.Minute
+	// freshServeFloor caps how aggressively forced lookups re-fetch. One
+	// playback start walks several candidate rounds; serving results younger
+	// than this floor even to GetCandidatesFresh keeps an entire attempt at
+	// one provider round-trip while bounding staleness well under the TTL.
+	freshServeFloor = 30 * time.Second
+	// candidateStaleGrace extends candidate-cache usefulness past its TTL:
+	// an expired-but-non-empty entry is served immediately while one
+	// background refresh repopulates it. Provider URLs are short-lived
+	// tokens whose actual lifetime is unknown to the plugin, so the grace is
+	// intentionally short — long enough to cover a typical playback start,
+	// short enough that expired credentials are not served for long.
+	candidateStaleGrace = 3 * time.Minute
+	// backgroundRefreshTimeout bounds the stale-grace background repopulation
+	// fetch so a hung provider cannot pile up goroutines.
+	backgroundRefreshTimeout = 15 * time.Second
+	// syncFetchTimeout bounds the singleflight blocking fetch used past stale
+	// grace; the provider client timeout is the tighter bound in practice.
+	syncFetchTimeout = 45 * time.Second
+
+	// altmountCachedBadge is the display badge AltMount's Stremio addon puts
+	// on imported, fresh releases; honored as a zero-config confirmed signal.
+	altmountCachedBadge = "⚡ cached"
+)
+
+// StreamCandidate, BehaviorHints, QualityConfig, QualityProfile and
+// CustomFormat are aliases of the stream and quality packages (see below).
+
+// StreamCandidate is a single playable source offered by the provider.
+// It aliases the stream package type so the resolver and stream parser share
+// one definition.
+type StreamCandidate = stream.StreamCandidate
+
+// CustomFormat is a regex-scored quality custom format (quality package owns it).
+type CustomFormat = quality.CustomFormat
+
+// QualityProfile is a named quality selection profile (quality package owns it).
+type QualityProfile = quality.QualityProfile
+
+// QualityConfig carries the quality selection configuration. The resolver
+// stores it for forward compatibility; profile-driven selection itself lives
+// with the quality package.
+type QualityConfig = quality.QualityConfig
+
+// Config is the plain resolver configuration. It replaces the plugin SDK
+// Configure() path: values are passed to New, never read from the SDK.
+type Config struct {
+	// ManifestURL is the provider manifest URL (must end in /manifest.json).
+	ManifestURL string
+	// AllowInsecure permits HTTP manifests, but only for private/local hosts
+	// (see streamEndpointWithPolicy).
+	AllowInsecure bool
+	// CacheTTL is the positive candidate-cache TTL (clamped to 1m..7d,
+	// default 10m).
+	CacheTTL time.Duration
+	// HTTPTimeout bounds provider round-trips (default 45s).
+	HTTPTimeout time.Duration
+	// TMDBAPIKey resolves tmdb: virtual IDs to IMDb provider IDs.
+	TMDBAPIKey string
+	// TVMazeBaseURL translates legacy tvdb: series IDs (default TVMaze API).
+	TVMazeBaseURL string
+	// TMDBBaseURL is the TMDB API base for external-ID lookups.
+	TMDBBaseURL string
+	// Quality is stored for forward compatibility with the quality port.
+	Quality QualityConfig
+}
+
+// CandidateClassifier marks provider candidates with the authoritative
+// completed/failed state of the configured source of truth. Implementations
+// must be safe to call concurrently with their own refresh.
+type CandidateClassifier interface {
+	ClassifyCandidates(candidates []StreamCandidate)
+}
+
+// ReleaseGate reports whether tracked release metadata considers the
+// requested movie or episode released. A nil gate disables the check.
+type ReleaseGate interface {
+	IsReleased(itemType string, imdbID string, season int, episode int) (bool, *time.Time)
+}
+
+// CandidateEnricher fills derived stream fields (resolution, codecs, sizes,
+// languages) on an ingested candidate. Defaults to the stream package parser.
+type CandidateEnricher func(*StreamCandidate)
+
+// DefaultEnricher wires the stream package parser as the candidate enricher.
+func DefaultEnricher(c *StreamCandidate) {
+	stream.ParseStreamDetails(c)
+}
+
+// Resolver fetches Stremio stream candidates from a manifest provider with a
+// bounded cache. Safe for concurrent use.
+type Resolver struct {
+	client *http.Client
+
+	mu          sync.RWMutex
+	config      Config
+	generation  uint64
+	enricher    CandidateEnricher
+	classifier  CandidateClassifier
+	releaseGate ReleaseGate
+	logger      *slog.Logger
+
+	cacheMu         sync.Mutex
+	cache           map[string]candidateCacheEntry
+	cacheGeneration uint64
+	cacheBytes      int64
+	refreshes       map[string]chan struct{}
+	syncFlights     map[string]chan struct{}
+}
+
+// New builds a Resolver from a plain Config, clamping the cache TTL into its
+// bounds and defaulting timeouts and metadata base URLs.
+func New(cfg Config) *Resolver {
+	return NewWithClient(cfg, nil)
+}
+
+// NewWithClient is New with an injectable HTTP client (nil selects a
+// restricted-redirect client with the configured timeout). It exists for
+// tests that stub the provider transport.
+func NewWithClient(cfg Config, client *http.Client) *Resolver {
+	if cfg.CacheTTL <= 0 {
+		cfg.CacheTTL = defaultCacheTTL
+	}
+	if cfg.CacheTTL < minCacheTTL {
+		cfg.CacheTTL = minCacheTTL
+	}
+	if cfg.CacheTTL > maxCacheTTL {
+		cfg.CacheTTL = maxCacheTTL
+	}
+	if cfg.TVMazeBaseURL == "" {
+		cfg.TVMazeBaseURL = defaultTVMazeBaseURL
+	}
+	if cfg.TMDBBaseURL == "" {
+		cfg.TMDBBaseURL = defaultTMDBBaseURL
+	}
+	timeout := cfg.HTTPTimeout
+	if timeout <= 0 {
+		timeout = defaultHTTPTimeout
+	}
+	if client == nil {
+		client = newRestrictedRedirectHTTPClient(timeout)
+	}
+	return &Resolver{
+		client: client,
+		config: cfg,
+	}
+}
+
+// SetCandidateClassifier installs the completed/failed classifier. It is safe
+// to call at any time: the classifier is typically a long-lived client whose
+// cache is refreshed out of band.
+func (r *Resolver) SetCandidateClassifier(classifier CandidateClassifier) {
+	r.mu.Lock()
+	r.classifier = classifier
+	r.mu.Unlock()
+}
+
+// SetReleaseGate installs the unreleased-media gate (nil disables it).
+func (r *Resolver) SetReleaseGate(gate ReleaseGate) {
+	r.mu.Lock()
+	r.releaseGate = gate
+	r.mu.Unlock()
+}
+
+// SetCandidateEnricher installs the derived-field enricher run at ingestion.
+func (r *Resolver) SetCandidateEnricher(enricher CandidateEnricher) {
+	r.mu.Lock()
+	r.enricher = enricher
+	r.mu.Unlock()
+}
+
+// SetLogger installs the logger (nil disables logging; provider URLs are
+// never logged).
+func (r *Resolver) SetLogger(logger *slog.Logger) {
+	r.mu.Lock()
+	r.logger = logger
+	r.mu.Unlock()
+}
+
+// unreleasedError reports that tracked release metadata places the requested
+// movie or episode in the future. It is never surfaced as a playable
+// candidate: the host selects candidates by rank without consulting
+// availability flags, so any placeholder source would be handed to the
+// player and fail at stream-open.
+type unreleasedError struct {
+	message string
+}
+
+func (e *unreleasedError) Error() string { return e.message }
+
+func newUnreleasedError(imdbID string, airDate *time.Time, itemType string) *unreleasedError {
+	formatted := "soon"
+	if airDate != nil && !airDate.IsZero() {
+		formatted = airDate.UTC().Format("2006-01-02 15:04 MST")
+	}
+	noun := "episode"
+	if strings.EqualFold(itemType, "movie") {
+		noun = "movie"
+	}
+	return &unreleasedError{message: fmt.Sprintf("This %s (%s) airs %s. Streams appear automatically once it is released.", noun, imdbID, formatted)}
+}
+
+type candidateCacheEntry struct {
+	candidates []StreamCandidate
+	expiresAt  time.Time
+	// fetchedAt records when the provider actually answered, distinct from
+	// lastAccess which moves on every serve. The forced-lookup floor is
+	// judged against fetchedAt so repeated resolves inside one playback
+	// start stay on one round-trip.
+	fetchedAt  time.Time
+	lastAccess time.Time
+	sizeBytes  int64
+}
+
+type stremioResponse struct {
+	Streams []StreamCandidate `json:"streams"`
+}
+
+type stremioManifest struct {
+	ID        string            `json:"id"`
+	Resources []json.RawMessage `json:"resources"`
+	Types     []string          `json:"types"`
+}
+
+func cloneCandidates(candidates []StreamCandidate) []StreamCandidate {
+	out := make([]StreamCandidate, len(candidates))
+	for i, c := range candidates {
+		out[i] = c
+		out[i].AudioLanguages = append([]string(nil), c.AudioLanguages...)
+		out[i].SubtitleLanguages = append([]string(nil), c.SubtitleLanguages...)
+		out[i].RequestHeaders = maps.Clone(c.RequestHeaders)
+		out[i].BehaviorHints.ProxyHeaders = maps.Clone(c.BehaviorHints.ProxyHeaders)
+	}
+	return out
+}
+
+// preferConfirmedCandidates applies the source-of-truth state to the ranked
+// candidate list: releases AltMount reports as failed are dropped, and
+// completed/imported releases are stably moved ahead of unconfirmed ones.
+// Order within each group is preserved, so the operator's quality ranking
+// still decides which confirmed release wins. Candidates reaching this point
+// already passed the profile and custom-format filters, so confirmation never
+// overrides an explicit reject.
+//
+// After classification the list is deduplicated: one torrent surfaces one
+// candidate per contained file, and those per-file variants share a release
+// identity. Collapsing them keeps the version list to one entry per playable
+// release; the confirmed variant wins its group when one exists.
+func (r *Resolver) preferConfirmedCandidates(candidates []StreamCandidate) []StreamCandidate {
+	if len(candidates) == 0 {
+		return candidates
+	}
+	// The AltMount Stremio addon marks releases it already imported with a
+	// "⚡ Cached" badge. That is a free, zero-config signal even when the
+	// AltMount API is not configured, so honor it before the classifier runs.
+	markAltmountBadgeCandidates(candidates)
+	r.mu.RLock()
+	classifier := r.classifier
+	r.mu.RUnlock()
+	if classifier != nil {
+		classifier.ClassifyCandidates(candidates)
+	}
+	candidates = dropFailedCandidates(candidates)
+	candidates = dedupeCandidates(candidates)
+	return stablePartitionCandidates(candidates)
+}
+
+// dropFailedCandidates removes releases the source of truth reports as dead
+// before deduplication, so a dead variant can never shadow a live duplicate of
+// the same release.
+func dropFailedCandidates(candidates []StreamCandidate) []StreamCandidate {
+	kept := candidates[:0]
+	for _, candidate := range candidates {
+		if candidate.SourceFailed {
+			continue
+		}
+		kept = append(kept, candidate)
+	}
+	return kept
+}
+
+// candidateDedupKey returns the stable identity shared by provider candidates
+// that describe the same playable release, in tiers from strongest to weakest.
+//
+// A stable external identity beats any name/size/profile heuristic: a non-empty
+// VideoHash identifies the actual video content, and a SourceGUID identifies
+// the indexed release the classifier matched. The maintainer's rule is that a
+// shared GUID is enough to call two candidates one release, so the GUID tier
+// deliberately ignores name, size, and quality profile differences — the same
+// release re-offered with a different file list is still one release.
+//
+// Only when neither identity is available does it fall back to the release
+// name plus exact file size. That tier collapses per-file torrent variants
+// (one candidate per contained file, offered under different result IDs) while
+// keeping genuinely distinct releases apart. An empty key means the candidate
+// carries too little identity to collapse and is always kept.
+func candidateDedupKey(candidate StreamCandidate) string {
+	// Tier 1a: provider-supplied content hash.
+	if hash := strings.ToLower(strings.TrimSpace(candidate.BehaviorHints.VideoHash)); hash != "" {
+		return "vidhash:" + hash
+	}
+	// Tier 1b: GUID of the indexed release the classifier tied us to.
+	if guid := strings.TrimSpace(candidate.SourceGUID); guid != "" {
+		return "guid:" + guid
+	}
+	// Tier 2: release name + exact size. The quality profile is deliberately
+	// not part of the key: per-file variants of one release can parse
+	// different resolution/codec/HDR metadata from their differing result
+	// ids, and upstream treats a shared release name and size as sufficient
+	// to call them one release.
+	releaseKey := candidateDedupName(candidate)
+	if releaseKey == "" {
+		return ""
+	}
+	// True duplicates report identical byte sizes; distinct releases differ.
+	// Unknown sizes collapse only with other unknown sizes of the same name.
+	sizeKey := "0"
+	if candidate.FileSize > 0 {
+		sizeKey = strconv.FormatInt(candidate.FileSize, 10)
+	}
+	return releaseKey + "\x00" + sizeKey
+}
+
+// candidateDedupName returns the release identity used for deduplication. It
+// prefers the provider's release-title line because behaviorHints.filename and
+// the URL name a single file inside a multi-file release: two files of one
+// torrent yield different filenames/result IDs and would otherwise escape the
+// name+size collapse. When only a per-file name is available, a trailing
+// numeric file index (the `<hash>-43` form) is stripped.
+func candidateDedupName(candidate StreamCandidate) string {
+	for _, value := range []string{
+		firstReleaseLine(candidate.Title),
+		firstReleaseLine(candidate.Name),
+	} {
+		if key := releaseNameKey(value); key != "" {
+			return key
+		}
+	}
+	for _, value := range []string{
+		candidate.BehaviorHints.Filename,
+		urlPathBase(candidate.URL),
+	} {
+		if key := releaseNameKey(trimPerFileIndex(value)); key != "" {
+			return key
+		}
+	}
+	return ""
+}
+
+// urlPathBase returns the last path segment of a stream URL, or "" when the
+// URL cannot be parsed.
+func urlPathBase(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	return path.Base(parsed.Path)
+}
+
+// trimPerFileIndex drops a trailing `-<digits>` result/file index such as the
+// `-43` AltMount appends to per-file result IDs and filenames.
+func trimPerFileIndex(name string) string {
+	if idx := strings.LastIndexByte(name, '-'); idx > 0 {
+		suffix := name[idx+1:]
+		for _, ext := range []string{".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".webm"} {
+			suffix = strings.TrimSuffix(suffix, ext)
+		}
+		if suffix != "" {
+			if _, err := strconv.Atoi(suffix); err == nil {
+				return name[:idx]
+			}
+		}
+	}
+	return name
+}
+
+// dedupeCandidates collapses candidates that share a release identity, keeping
+// the first-ranked variant of each group. When a group carries a confirmed
+// variant, that variant is the keeper regardless of rank: confirmation is
+// authoritative for the release, and the remaining variants differ only in
+// which file the provider selects server-side at stream time.
+func dedupeCandidates(candidates []StreamCandidate) []StreamCandidate {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	keeper := make(map[string]int, len(candidates))
+	keep := make([]bool, len(candidates))
+	for i, candidate := range candidates {
+		key := candidateDedupKey(candidate)
+		if key == "" {
+			keep[i] = true
+			continue
+		}
+		existing, seen := keeper[key]
+		if !seen {
+			keeper[key] = i
+			keep[i] = true
+			continue
+		}
+		if candidate.SourceConfirmed && !candidates[existing].SourceConfirmed {
+			keep[existing] = false
+			keeper[key] = i
+			keep[i] = true
+		}
+	}
+	kept := candidates[:0]
+	for i := range candidates {
+		if keep[i] {
+			kept = append(kept, candidates[i])
+		}
+	}
+	return kept
+}
+
+// stablePartitionCandidates drops known-dead candidates and stably moves
+// confirmed ones to the front, returning the possibly-shortened slice.
+func stablePartitionCandidates(candidates []StreamCandidate) []StreamCandidate {
+	kept := candidates[:0]
+	confirmed := 0
+	for _, candidate := range candidates {
+		if candidate.SourceFailed {
+			continue
+		}
+		if candidate.SourceConfirmed {
+			confirmed++
+		}
+		kept = append(kept, candidate)
+	}
+	candidates = kept
+	if confirmed == 0 || confirmed == len(candidates) {
+		return candidates
+	}
+	ordered := make([]StreamCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.SourceConfirmed {
+			ordered = append(ordered, candidate)
+		}
+	}
+	for _, candidate := range candidates {
+		if !candidate.SourceConfirmed {
+			ordered = append(ordered, candidate)
+		}
+	}
+	copy(candidates, ordered)
+	return candidates
+}
+
+// GetCandidates returns the ranked provider candidates for a virtual:// URI,
+// serving the bounded candidate cache when possible.
+func (r *Resolver) GetCandidates(ctx context.Context, virtualPath string) ([]StreamCandidate, string, string, error) {
+	return r.getCandidates(ctx, virtualPath, false, false)
+}
+
+// GetCandidatesFresh bypasses the bounded candidate cache for an explicit
+// user refresh/retry while retaining the normal cache behavior by default.
+func (r *Resolver) GetCandidatesFresh(ctx context.Context, virtualPath string) ([]StreamCandidate, string, string, error) {
+	return r.getCandidates(ctx, virtualPath, true, false)
+}
+
+// GetCandidatesFreshUnbounded re-lists candidates from the provider even when
+// the cache entry is younger than freshServeFloor. The floor exists so the
+// transport failover walk (which excludes failed candidate IDs) stays on one
+// provider round-trip per playback start; a genuine re-list — the host asking
+// for a fresh answer after the relay returned 502 — must not be served the
+// same dead candidates it is trying to escape.
+func (r *Resolver) GetCandidatesFreshUnbounded(ctx context.Context, virtualPath string) ([]StreamCandidate, string, string, error) {
+	return r.getCandidates(ctx, virtualPath, true, true)
+}
+
+func (r *Resolver) getCandidates(ctx context.Context, virtualPath string, forceRefresh bool, bypassFloor bool) ([]StreamCandidate, string, string, error) {
+	mediaType, mediaID, err := parseVirtualPath(virtualPath)
+	if err != nil {
+		return nil, mediaType, mediaID, err
+	}
+	r.mu.RLock()
+	config := r.config
+	generation := r.generation
+	releaseGate := r.releaseGate
+	r.mu.RUnlock()
+
+	if strings.Contains(virtualPath, "refresh=1") || strings.Contains(virtualPath, "force=1") {
+		forceRefresh = true
+	}
+	// strip query from mediaID
+	if idx := strings.Index(mediaID, "?"); idx != -1 {
+		mediaID = mediaID[:idx]
+	}
+	// Silo keeps TVDB-based catalog IDs for stable series identity, but the
+	// Stremio stream protocol expects IMDb video IDs (tt...:season:episode).
+	// Translate legacy TVDB virtual paths before contacting the provider.
+	if mediaType == "series" {
+		mediaID, err = r.normalizeSeriesProviderID(ctx, mediaID, config.TVMazeBaseURL)
+		if err != nil {
+			return nil, mediaType, mediaID, err
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(mediaID), "tmdb:") {
+		mediaID, err = r.normalizeTMDBProviderID(ctx, mediaType, mediaID, config.TMDBAPIKey, config.TMDBBaseURL)
+		if err != nil {
+			return nil, mediaType, mediaID, err
+		}
+	}
+
+	// Intercept unreleased media before contacting the streaming provider
+	if releaseGate != nil {
+		imdbID := mediaID
+		season := 0
+		episode := 0
+		if mediaType == "series" {
+			parts := strings.Split(mediaID, ":")
+			if len(parts) >= 3 {
+				imdbID = parts[0]
+				season, _ = strconv.Atoi(parts[1])
+				episode, _ = strconv.Atoi(parts[2])
+			} else if len(parts) == 1 {
+				imdbID = parts[0]
+			}
+		}
+		if released, airDate := releaseGate.IsReleased(mediaType, imdbID, season, episode); !released {
+			return nil, mediaType, mediaID, newUnreleasedError(imdbID, airDate, mediaType)
+		}
+	}
+	cacheKey := mediaType + "|" + mediaID
+
+	if forceRefresh && !bypassFloor {
+		// Forced lookups still serve very recent answers. One playback start
+		// walks several resolve rounds; re-fetching within a single attempt
+		// multiplies provider latency without producing new information, so
+		// entries younger than the floor are served as-is regardless of
+		// emptiness. Anything older takes the full fetch path below.
+		now := time.Now()
+		r.cacheMu.Lock()
+		entry, ok := r.cache[cacheKey]
+		if sameGeneration := r.cacheGeneration == generation; sameGeneration && ok && now.Before(entry.fetchedAt.Add(freshServeFloor)) {
+			candidates := cloneCandidates(entry.candidates)
+			entry.lastAccess = now
+			r.cache[cacheKey] = entry
+			r.cacheMu.Unlock()
+			return candidates, mediaType, mediaID, nil
+		}
+		r.cacheMu.Unlock()
+	}
+
+	// Cache tiers: fresh serve → stale-in-grace serve + one background
+	// refresh → singleflight blocking fetch past grace or on force_refresh.
+	if !forceRefresh {
+		now := time.Now()
+		r.cacheMu.Lock()
+		entry, ok := r.cache[cacheKey]
+		sameGeneration := r.cacheGeneration == generation
+		switch {
+		case sameGeneration && ok && now.Before(entry.expiresAt):
+			candidates := cloneCandidates(entry.candidates)
+			entry.lastAccess = now
+			r.cache[cacheKey] = entry
+			r.cacheMu.Unlock()
+			return candidates, mediaType, mediaID, nil
+		case sameGeneration && ok && len(entry.candidates) > 0 &&
+			!now.Before(entry.expiresAt) && now.Before(entry.expiresAt.Add(candidateStaleGrace)):
+			candidates := cloneCandidates(entry.candidates)
+			entry.lastAccess = now
+			r.cache[cacheKey] = entry
+			started := r.startRefreshLocked(cacheKey, generation, config, mediaType, mediaID)
+			r.cacheMu.Unlock()
+			if started {
+				r.debugLog("stale candidates served; background refresh started", cacheKey, len(candidates))
+			} else {
+				r.debugLog("stale candidates served; refresh already running", cacheKey, len(candidates))
+			}
+			return candidates, mediaType, mediaID, nil
+		}
+		r.cacheMu.Unlock()
+
+		// Past stale grace: deduplicate concurrent blocking fetches through
+		// the same keyed flight used for background refreshes. The first
+		// caller blocks on the provider; later callers receive its result.
+		// The wait respects context cancellation so a canceled caller does not
+		// block for the full provider timeout.
+		if wait := r.joinFlight(cacheKey, config, generation, mediaType, mediaID); wait != nil {
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				return nil, "", "", ctx.Err()
+			}
+			r.cacheMu.Lock()
+			fresh, stillOK := r.cache[cacheKey]
+			r.cacheMu.Unlock()
+			if stillOK {
+				now := time.Now()
+				withinGrace := !now.After(fresh.expiresAt.Add(candidateStaleGrace))
+				switch {
+				case len(fresh.candidates) > 0 && withinGrace:
+					// Positive results stay servable through the same stale
+					// grace the direct tiers use.
+					return cloneCandidates(fresh.candidates), mediaType, mediaID, nil
+				case len(fresh.candidates) == 0 && now.Before(fresh.expiresAt):
+					// Negative-cache hit: the flight already proved the title
+					// is unavailable, so waiting callers must not re-pay the
+					// round-trip. Negatives never outlive their own short TTL.
+					return cloneCandidates(fresh.candidates), mediaType, mediaID, nil
+				}
+			}
+			// Flight completed without a usable entry (expired, past grace,
+			// or absent); fall through to our own attempt.
+		}
+	}
+
+	candidates, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID)
+	if err == nil && len(candidates) == 0 {
+		// The provider flapped to an empty answer, but the store may have kept
+		// a positive entry that is still servable (fresh, or within stale
+		// grace). Serving it keeps playback alive; the empty answer is
+		// returned only once no positive entry is servable, which also
+		// preserves the escape-from-dead-candidates purpose of a forced
+		// re-list.
+		if cached, ok := r.servePositiveCachedCandidates(cacheKey, generation); ok {
+			r.debugLog("empty provider answer served; cached positive retained", cacheKey, len(cached))
+			return cached, mediaType, mediaID, nil
+		}
+	}
+	return candidates, mediaType, mediaID, err
+}
+
+// servePositiveCachedCandidates returns the key's non-empty cache entry when it
+// is still servable (fresh, or within candidateStaleGrace), and reports whether
+// one was found. It honors the cache generation check and refreshes lastAccess
+// the same way the direct read tiers do.
+func (r *Resolver) servePositiveCachedCandidates(cacheKey string, generation uint64) ([]StreamCandidate, bool) {
+	now := time.Now()
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.cacheGeneration != generation {
+		return nil, false
+	}
+	entry, ok := r.cache[cacheKey]
+	if !ok || len(entry.candidates) == 0 {
+		return nil, false
+	}
+	if !now.Before(entry.expiresAt.Add(candidateStaleGrace)) {
+		return nil, false
+	}
+	candidates := cloneCandidates(entry.candidates)
+	entry.lastAccess = now
+	r.cache[cacheKey] = entry
+	return candidates, true
+}
+
+// joinFlight registers this caller as a synchronous provider fetcher if no
+// other flight is active for the key. It returns a channel to wait on, or
+// nil if this caller should proceed directly (first-in wins). Callers must
+// NOT hold cacheMu.
+func (r *Resolver) joinFlight(cacheKey string, config Config, generation uint64, mediaType, mediaID string) <-chan struct{} {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.refreshes == nil {
+		r.refreshes = make(map[string]chan struct{})
+	}
+	if r.syncFlights == nil {
+		r.syncFlights = make(map[string]chan struct{})
+	}
+	if _, inflight := r.refreshes[cacheKey]; inflight {
+		ch, exists := r.syncFlights[cacheKey]
+		if !exists {
+			ch = make(chan struct{})
+			r.syncFlights[cacheKey] = ch
+		}
+		return ch
+	}
+	done := make(chan struct{})
+	r.refreshes[cacheKey] = done
+	r.syncFlights[cacheKey] = done
+	go func() {
+		defer func() {
+			r.cacheMu.Lock()
+			delete(r.refreshes, cacheKey)
+			delete(r.syncFlights, cacheKey)
+			r.cacheMu.Unlock()
+			close(done)
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), syncFetchTimeout)
+		defer cancel()
+		if _, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID); err != nil {
+			r.debugLog("synchronous candidate fetch failed", cacheKey, 0)
+			return
+		}
+		r.debugLog("synchronous candidate fetch complete", cacheKey, 0)
+	}()
+	return done
+}
+
+// startRefreshLocked launches exactly one background provider fetch per
+// cache key. Callers must hold cacheMu; the spawned goroutine replaces the
+// cache entry through the normal generation-checked path.
+func (r *Resolver) startRefreshLocked(cacheKey string, generation uint64, config Config, mediaType, mediaID string) bool {
+	if _, inflight := r.refreshes[cacheKey]; inflight {
+		return false
+	}
+	if r.refreshes == nil {
+		r.refreshes = make(map[string]chan struct{})
+	}
+	if r.syncFlights == nil {
+		r.syncFlights = make(map[string]chan struct{})
+	}
+	done := make(chan struct{})
+	r.refreshes[cacheKey] = done
+	r.syncFlights[cacheKey] = done
+	go func() {
+		defer func() {
+			r.cacheMu.Lock()
+			delete(r.refreshes, cacheKey)
+			delete(r.syncFlights, cacheKey)
+			r.cacheMu.Unlock()
+			close(done)
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), backgroundRefreshTimeout)
+		defer cancel()
+		if _, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID); err != nil {
+			r.debugLog("background candidate refresh failed", cacheKey, 0)
+			return
+		}
+		r.debugLog("background candidate refresh complete", cacheKey, 0)
+	}()
+	return true
+}
+
+// fetchProviderCandidates performs a synchronous streaming-provider lookup
+// and caches successful results. Provider URLs are never logged.
+func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, generation uint64, cacheKey, mediaType, mediaID string) ([]StreamCandidate, error) {
+	started := time.Now()
+	endpoint, err := streamEndpointWithPolicy(config.ManifestURL, mediaType, mediaID, config.AllowInsecure)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create streaming provider request: %w", err)
+	}
+	r.mu.RLock()
+	enricher := r.enricher
+	r.mu.RUnlock()
+	client := r.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, errors.New("request streaming provider failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("streaming provider returned status %d", resp.StatusCode)
+	}
+	var payload stremioResponse
+	if err := decodeBoundedJSON(resp.Body, maxResponseBytes, &payload); err != nil {
+		return nil, fmt.Errorf("decode streaming provider response: %w", err)
+	}
+	validCandidates := make([]StreamCandidate, 0, len(payload.Streams))
+	for i, stream := range payload.Streams {
+		parsed, parseErr := url.Parse(strings.TrimSpace(stream.URL))
+		if parseErr == nil && parsed.IsAbs() && (parsed.Scheme == "https" || parsed.Scheme == "http") {
+			// Some providers answer unavailable titles with a placeholder
+			// entry instead of an empty list. Persisting or ranking it makes
+			// every start pay a doomed probe and pollutes the catalog with
+			// ghost variants — drop it at ingestion.
+			if isProviderStubCandidate(stream) {
+				continue
+			}
+			stream.OriginalIndex = i
+			enrich := enricher
+			if enrich == nil {
+				enrich = DefaultEnricher
+			}
+			enrich(&stream)
+			validCandidates = append(validCandidates, stream)
+			if len(validCandidates) >= maxVirtualCandidates {
+				break
+			}
+		}
+	}
+	now := time.Now()
+	r.storeCandidateCache(cacheKey, validCandidates, now.Add(config.CacheTTL), now, generation)
+	r.mu.RLock()
+	logger := r.logger
+	r.mu.RUnlock()
+	if logger != nil {
+		logger.Info("provider candidates fetched",
+			"media_type", mediaType, "media_id", mediaID,
+			"count", len(validCandidates),
+			"duration_ms", time.Since(started).Milliseconds())
+	}
+	return validCandidates, nil
+}
+
+// isProviderStubCandidate reports whether a provider stream entry is the
+// conventional "nothing found" placeholder rather than a playable source.
+// Addons signal this via the entry's display text; the URL itself usually
+// still looks plausible, so it must be checked before ingestion.
+func isProviderStubCandidate(s StreamCandidate) bool {
+	hay := strings.ToLower(strings.Join([]string{s.Name, s.Title, s.Description}, " \n "))
+	for _, marker := range []string{
+		"no streams available",
+		"no streams found",
+		"nothing found",
+		"no results",
+	} {
+		if strings.Contains(hay, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Resolver) debugLog(msg, cacheKey string, count int) {
+	r.mu.RLock()
+	logger := r.logger
+	r.mu.RUnlock()
+	if logger == nil {
+		return
+	}
+	logger.Debug(msg, "cache_key", cacheKey, "count", count)
+}
+
+func candidateCacheSize(candidates []StreamCandidate) int64 {
+	var size int64
+	for _, candidate := range candidates {
+		size += 256
+		for _, value := range []string{
+			candidate.URL, candidate.Name, candidate.Title, candidate.Description,
+			candidate.Resolution, candidate.CodecVideo, candidate.CodecAudio,
+			candidate.HDR, candidate.SourceType, candidate.Container, candidate.BehaviorHints.VideoHash,
+		} {
+			size += int64(len(value))
+		}
+		for _, language := range candidate.AudioLanguages {
+			size += int64(len(language))
+		}
+		for _, language := range candidate.SubtitleLanguages {
+			size += int64(len(language))
+		}
+	}
+	return size
+}
+
+func (r *Resolver) storeCandidateCache(key string, candidates []StreamCandidate, expiresAt, now time.Time, generation uint64) {
+	size := int64(0)
+	if len(candidates) == 0 {
+		// Negative caching: an empty provider answer is stored briefly so
+		// repeated resolves of an unavailable title fail in microseconds
+		// instead of paying another 3-8s round-trip each. The short TTL keeps
+		// newly added sources discoverable without operator action.
+		expiresAt = now.Add(negativeCacheTTL)
+	} else {
+		size = candidateCacheSize(candidates)
+		if size > maxCandidateCacheBytes {
+			return
+		}
+	}
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.cacheGeneration != generation {
+		return
+	}
+	if len(candidates) == 0 {
+		// The upstream provider flaps between a full list and an empty/stub
+		// answer. Letting the empty answer replace a still-servable positive
+		// entry starves playback for the whole negative TTL, so keep the
+		// positive entry (and its lastAccess) until it leaves stale grace, and
+		// only then install the negative. No usable positive means the
+		// negative is installed as before.
+		if previous, exists := r.cache[key]; exists && len(previous.candidates) > 0 &&
+			now.Before(previous.expiresAt.Add(candidateStaleGrace)) {
+			return
+		}
+	}
+	if r.cache == nil {
+		r.cache = make(map[string]candidateCacheEntry)
+	}
+	if previous, exists := r.cache[key]; exists {
+		r.cacheBytes -= previous.sizeBytes
+		delete(r.cache, key)
+	}
+	for candidateKey, entry := range r.cache {
+		if !now.Before(entry.expiresAt) {
+			r.cacheBytes -= entry.sizeBytes
+			delete(r.cache, candidateKey)
+		}
+	}
+	for len(r.cache) >= maxCandidateCacheEntries || r.cacheBytes+size > maxCandidateCacheBytes {
+		oldestKey := ""
+		var oldest time.Time
+		for candidateKey, entry := range r.cache {
+			if oldestKey == "" || entry.lastAccess.Before(oldest) {
+				oldestKey, oldest = candidateKey, entry.lastAccess
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		r.cacheBytes -= r.cache[oldestKey].sizeBytes
+		delete(r.cache, oldestKey)
+	}
+	r.cache[key] = candidateCacheEntry{
+		candidates: cloneCandidates(candidates),
+		expiresAt:  expiresAt,
+		fetchedAt:  now,
+		lastAccess: now,
+		sizeBytes:  size,
+	}
+	r.cacheBytes += size
+}
+
+func (r *Resolver) normalizeTMDBProviderID(ctx context.Context, mediaType, mediaID, apiKey, baseURL string) (string, error) {
+	parts := strings.Split(mediaID, ":")
+	if len(parts) < 2 || !strings.EqualFold(parts[0], "tmdb") {
+		return mediaID, nil
+	}
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		return "", errors.New("TMDB ID requires a configured TMDB API token to resolve IMDb playback ID")
+	}
+	externals, err := fetchTMDBExternalIDs(ctx, mediaType, parts[1], key, baseURL)
+	if err != nil || strings.TrimSpace(externals.IMDbID) == "" {
+		return "", fmt.Errorf("TMDB ID %s has no IMDb playback ID", parts[1])
+	}
+	if len(parts) > 2 {
+		return externals.IMDbID + ":" + strings.Join(parts[2:], ":"), nil
+	}
+	return externals.IMDbID, nil
+}
+
+// ValidateConnection checks the manifest URL policy and fetches the provider
+// manifest, verifying it advertises the Stremio stream resource for movies or
+// series. It mirrors the provider phase of the plugin's TestConnection; the
+// Prowlarr/AltMount phases are host concerns and are not ported.
+func (r *Resolver) ValidateConnection(ctx context.Context) error {
+	r.mu.RLock()
+	manifestURL := r.config.ManifestURL
+	allowInsecure := r.config.AllowInsecure
+	r.mu.RUnlock()
+	if _, err := streamEndpointWithPolicy(manifestURL, "movie", "tt0000001", allowInsecure); err != nil {
+		return err
+	}
+	// Use a short-timeout clone of the provider client so validation can't
+	// exhaust the caller's deadline. Copy the transport (so mocks and
+	// redirect policies still work) but cap the round-trip at 5s.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+	if err != nil {
+		return fmt.Errorf("create manifest validation request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	var client *http.Client
+	if r.client != nil {
+		client = &http.Client{Timeout: 5 * time.Second, Transport: r.client.Transport, CheckRedirect: r.client.CheckRedirect}
+	} else {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.New("request streaming provider manifest failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("streaming provider manifest returned status %d", resp.StatusCode)
+	}
+	var manifest stremioManifest
+	if err := decodeBoundedJSON(resp.Body, maxManifestResponseBytes, &manifest); err != nil {
+		return fmt.Errorf("decode streaming provider manifest: %w", err)
+	}
+	return validateStremioManifest(manifest)
+}
+
+func validateStremioManifest(manifest stremioManifest) error {
+	if strings.TrimSpace(manifest.ID) == "" {
+		return errors.New("streaming provider manifest is missing id")
+	}
+	hasStreamResource := false
+	for _, raw := range manifest.Resources {
+		var name string
+		if err := json.Unmarshal(raw, &name); err != nil {
+			var descriptor struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(raw, &descriptor); err == nil {
+				name = descriptor.Name
+			}
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "stream") {
+			hasStreamResource = true
+			break
+		}
+	}
+	if !hasStreamResource {
+		return errors.New("streaming provider manifest does not advertise the stream resource")
+	}
+	for _, mediaType := range manifest.Types {
+		if strings.EqualFold(strings.TrimSpace(mediaType), "movie") || strings.EqualFold(strings.TrimSpace(mediaType), "series") {
+			return nil
+		}
+	}
+	return errors.New("streaming provider manifest does not advertise movie or series support")
+}
+
+func decodeBoundedJSON(body io.Reader, limit int64, destination any) error {
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > limit {
+		return fmt.Errorf("response exceeds %d bytes", limit)
+	}
+	return json.Unmarshal(data, destination)
+}
+
+func newProviderHTTPClient() *http.Client {
+	return newRestrictedRedirectHTTPClient(defaultHTTPTimeout)
+}
+
+// sameParentDomain reports whether host a and host b share at least two
+// rightmost domain labels (e.g. "v3-cinemeta.strem.io" and
+// "cinemeta-live.strem.io" both end with ".strem.io").
+func sameParentDomain(a, b string) bool {
+	aParts := strings.Split(strings.TrimSuffix(a, "."), ".")
+	bParts := strings.Split(strings.TrimSuffix(b, "."), ".")
+	if len(aParts) < 3 || len(bParts) < 3 {
+		return false
+	}
+	aLast := strings.ToLower(strings.Join(aParts[len(aParts)-2:], "."))
+	bLast := strings.ToLower(strings.Join(bParts[len(bParts)-2:], "."))
+	return aLast == bLast
+}
+
+func newRestrictedRedirectHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(request *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			if len(via) == 0 {
+				return nil
+			}
+			origin := via[0].URL
+			target := request.URL
+			if target.User != nil {
+				return errors.New("redirect with userinfo is not allowed")
+			}
+			if !strings.EqualFold(origin.Scheme, target.Scheme) {
+				return errors.New("cross-scheme redirects are not allowed")
+			}
+			if strings.EqualFold(origin.Host, target.Host) {
+				return nil
+			}
+			// Allow same-registered-domain redirects so well-known
+			// metadata providers redirect within their own domain.
+			if sameParentDomain(origin.Host, target.Host) {
+				return nil
+			}
+			return errors.New("cross-origin redirects are not allowed")
+		},
+	}
+}
+
+func (r *Resolver) normalizeSeriesProviderID(ctx context.Context, mediaID, baseURL string) (string, error) {
+	parts := strings.Split(mediaID, ":")
+	if len(parts) < 2 || !strings.EqualFold(parts[0], "tvdb") {
+		return mediaID, nil
+	}
+	tvdbID := strings.TrimSpace(parts[1])
+	if tvdbID == "" {
+		return "", errors.New("TVDB series ID is empty")
+	}
+	lookupURL := strings.TrimRight(baseURL, "/") + "/lookup/shows?thetvdb=" + url.QueryEscape(tvdbID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, lookupURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create TVDB series lookup: %w", err)
+	}
+	client := r.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("lookup TVDB series ID %s: %w", tvdbID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("TVMaze returned status %d for TVDB series ID %s", resp.StatusCode, tvdbID)
+	}
+	var payload struct {
+		Externals struct {
+			IMDb string `json:"imdb"`
+		} `json:"externals"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode TVDB series lookup: %w", err)
+	}
+	imdbID := strings.TrimSpace(payload.Externals.IMDb)
+	if imdbID == "" {
+		return "", fmt.Errorf("TVDB series ID %s has no IMDb ID for Stremio playback", tvdbID)
+	}
+	if len(parts) == 2 {
+		return imdbID, nil
+	}
+	return imdbID + ":" + strings.Join(parts[2:], ":"), nil
+}
+
+// prowlarrCleanPattern reduces a release name to a comparable identity:
+// lowercase, extension stripped, all non-alphanumerics removed. Two postings
+// of the same scene release normalize to the same key even when one uses dots
+// and the other spaces.
+var prowlarrCleanPattern = regexp.MustCompile(`[^a-z0-9]+`)
+
+// releaseNameKey reduces a release or provider filename to a comparable
+// identity: lowercase, extension stripped, all non-alphanumerics removed. Two
+// postings of the same scene release normalize to the same key even when one
+// uses dots and the other spaces.
+func releaseNameKey(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	if idx := strings.IndexAny(value, "?#"); idx != -1 {
+		value = value[:idx]
+	}
+	for _, ext := range []string{".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".webm"} {
+		value = strings.TrimSuffix(value, ext)
+	}
+	return prowlarrCleanPattern.ReplaceAllString(value, "")
+}
+
+// firstReleaseLine returns the first line of a provider display field.
+// AltMount-style providers put the release name on the first line of the
+// stream title (the remaining lines carry size and indexer badges), so only
+// the first line is considered for release identity.
+func firstReleaseLine(value string) string {
+	if idx := strings.IndexAny(value, "\r\n"); idx >= 0 {
+		return value[:idx]
+	}
+	return value
+}
+
+// markAltmountBadgeCandidates honors the completion badge AltMount's Stremio
+// addon already puts on imported, fresh releases. This needs no API
+// configuration and lets the resolver respect AltMount's cached-first ordering
+// instead of re-sorting it away.
+func markAltmountBadgeCandidates(candidates []StreamCandidate) {
+	for i := range candidates {
+		name := strings.ToLower(candidates[i].Name)
+		if strings.Contains(name, altmountCachedBadge) {
+			candidates[i].SourceConfirmed = true
+		}
+	}
+}
+
+func parseVirtualPath(virtualPath string) (string, string, error) {
+	if !strings.HasPrefix(virtualPath, virtualPathPrefix) {
+		return "", "", errors.New("path is not an virtual URI")
+	}
+	cleanPath := virtualPath
+	if idx := strings.Index(cleanPath, "?"); idx != -1 {
+		cleanPath = cleanPath[:idx]
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(cleanPath, virtualPathPrefix), "/"), "/")
+	if len(parts) < 2 {
+		return "", "", errors.New("virtual URI must contain a media type and identifier")
+	}
+	mediaType := strings.ToLower(parts[0])
+	if mediaType != "movie" && mediaType != "series" && mediaType != "anime" {
+		return "", "", fmt.Errorf("unsupported virtual media type %q", mediaType)
+	}
+	mediaID := strings.Join(parts[1:], ":")
+	if strings.ContainsAny(mediaID, "?#") || strings.Contains(mediaID, "..") {
+		return "", "", errors.New("virtual URI contains an invalid identifier")
+	}
+	return mediaType, mediaID, nil
+}
+
+func streamEndpoint(manifestURL, mediaType, mediaID string) (string, error) {
+	return streamEndpointWithPolicy(manifestURL, mediaType, mediaID, false)
+}
+
+func streamEndpointWithPolicy(manifestURL, mediaType, mediaID string, allowInsecure bool) (string, error) {
+	manifest, err := url.Parse(strings.TrimSpace(manifestURL))
+	if err != nil || manifest.Host == "" || (manifest.Scheme != "https" && manifest.Scheme != "http") || (manifest.Scheme != "https" && !allowInsecure) {
+		return "", errors.New("a valid streaming provider manifest URL is required (HTTPS, or HTTP with Allow local HTTP enabled for private/local hosts)")
+	}
+	if manifest.Scheme == "http" && !isPrivateHost(manifest.Hostname()) {
+		return "", errors.New("insecure HTTP is allowed only for private/local streaming provider hosts")
+	}
+	if !strings.HasSuffix(manifest.Path, "/manifest.json") {
+		return "", errors.New("streaming provider URL must end in /manifest.json")
+	}
+	manifest.Path = strings.TrimSuffix(manifest.Path, "/manifest.json") + "/stream/" + url.PathEscape(mediaType) + "/" + url.PathEscape(mediaID) + ".json"
+	manifest.RawQuery = ""
+	manifest.Fragment = ""
+	return manifest.String(), nil
+}
+
+func isPrivateHost(host string) bool {
+	host = strings.TrimSpace(strings.ToLower(host))
+	// Single-label names are normally Docker/Kubernetes service names (for
+	// example "virtual" or "altmount") and are not public DNS names.
+	if host == "localhost" || strings.HasSuffix(host, ".local") || !strings.Contains(host, ".") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	return false
+}
+
+// metadataHTTPClient serves the TMDB external-ID lookups (mirrors the shared
+// metadata client in the plugin's routing.go).
+var metadataHTTPClient = newRestrictedRedirectHTTPClient(20 * time.Second)
+
+type tmdbExternalIDs struct {
+	IMDbID string `json:"imdb_id"`
+	TVDBID int    `json:"tvdb_id"`
+}
+
+func fetchTMDBExternalIDs(ctx context.Context, mediaType, tmdbID, key, baseURL string) (tmdbExternalIDs, error) {
+	kind := "tv"
+	if mediaType == "movie" {
+		kind = "movie"
+	}
+	endpoint := strings.TrimRight(baseURL, "/") + "/" + kind + "/" + url.PathEscape(tmdbID) + "/external_ids"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if strings.Count(key, ".") == 2 {
+		req.Header.Set("Authorization", "Bearer "+key)
+	} else {
+		q := req.URL.Query()
+		q.Set("api_key", key)
+		req.URL.RawQuery = q.Encode()
+	}
+	resp, err := metadataHTTPClient.Do(req)
+	if err != nil {
+		return tmdbExternalIDs{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return tmdbExternalIDs{}, fmt.Errorf("TMDB external_ids HTTP %d", resp.StatusCode)
+	}
+	var out tmdbExternalIDs
+	if err = json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&out); err != nil {
+		return tmdbExternalIDs{}, err
+	}
+	return out, nil
+}

@@ -17,6 +17,7 @@ import { ServerStep } from "./setup-wizard/steps/ServerStep";
 import { PlaybackStep } from "./setup-wizard/steps/PlaybackStep";
 import { StorageStep } from "./setup-wizard/steps/StorageStep";
 import { LibraryStep } from "./setup-wizard/steps/LibraryStep";
+import { StreamingStep } from "./setup-wizard/steps/StreamingStep";
 import { SubtitlesStep } from "./setup-wizard/steps/SubtitlesStep";
 import { ConnectStep } from "./setup-wizard/steps/ConnectStep";
 import { FeaturesStep } from "./setup-wizard/steps/FeaturesStep";
@@ -34,6 +35,8 @@ function StepContent({ step }: { step: WizardStepId }) {
       return <StorageStep />;
     case "library":
       return <LibraryStep />;
+    case "streaming":
+      return <StreamingStep />;
     case "subtitles":
       return <SubtitlesStep />;
     case "connect":

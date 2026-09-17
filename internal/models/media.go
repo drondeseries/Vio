@@ -36,27 +36,47 @@ type MediaFolder struct {
 	SortOrder             int
 }
 
+// VirtualProvenance is the explicit origin discriminator for virtual media.
+// It answers "which subsystem owns this virtual row" without redefining
+// owner zero: zero still means local (see MediaFile.VirtualOwnerInstallationID),
+// and the legacy-0-vs-NULL ambiguity stays with VirtualOwnerInstallationSet.
+// The zero value ("") means legacy/unknown and follows the pre-existing plugin
+// path; only the NEW core dispatch fails closed on unknown/inconsistent
+// provenance. No DB column backs this in Phase 2 — struct-level only.
+type VirtualProvenance string
+
+const (
+	VirtualProvenanceLocal  VirtualProvenance = "local"
+	VirtualProvenanceCore   VirtualProvenance = "core"
+	VirtualProvenancePlugin VirtualProvenance = "plugin"
+)
+
 // MediaFile represents a row in the media_files table.
 type MediaFile struct {
-	ID                           int
-	ContentID                    string // Sonyflake ID (nullable until matched)
-	EpisodeID                    string // FK to episodes.content_id (nullable)
-	ExtraID                      string // FK to media_extras.content_id (nullable); set only for local extras files, which keep ContentID/EpisodeID empty
-	SeasonNumber                 int    // parsed from filename (nullable)
-	EpisodeNumber                int    // parsed from filename (nullable)
-	MediaFolderID                int
-	CanonicalRootPath            string
-	ObservedRootPath             string
-	ContentGroupKey              string
-	GroupKeyVersion              int
-	BaseTitle                    string
-	BaseYear                     int
-	BaseType                     string
-	IdentityConfidence           string
-	IdentityJSON                 []byte
-	FilePath                     string
-	VirtualOwnerInstallationID   int  // owner for zero-storage virtual files; zero for local files
-	VirtualOwnerInstallationSet  bool // distinguishes legacy virtual owner 0 from local NULL
+	ID                          int
+	ContentID                   string // Sonyflake ID (nullable until matched)
+	EpisodeID                   string // FK to episodes.content_id (nullable)
+	ExtraID                     string // FK to media_extras.content_id (nullable); set only for local extras files, which keep ContentID/EpisodeID empty
+	SeasonNumber                int    // parsed from filename (nullable)
+	EpisodeNumber               int    // parsed from filename (nullable)
+	MediaFolderID               int
+	CanonicalRootPath           string
+	ObservedRootPath            string
+	ContentGroupKey             string
+	GroupKeyVersion             int
+	BaseTitle                   string
+	BaseYear                    int
+	BaseType                    string
+	IdentityConfidence          string
+	IdentityJSON                []byte
+	FilePath                    string
+	VirtualOwnerInstallationID  int  // owner for zero-storage virtual files; zero for local files
+	VirtualOwnerInstallationSet bool // distinguishes legacy virtual owner 0 from local NULL
+	// VirtualProvenance is the explicit origin discriminator (core/plugin/
+	// local/""). In-memory only: rows loaded from storage carry "" until
+	// resolved by ResolvedVirtualProvenance(), which infers core provenance
+	// for virtual files with owner <= 0 across database reloads.
+	VirtualProvenance            VirtualProvenance
 	FileSize                     int64
 	FileModifiedAt               *time.Time
 	FileHash                     string // OSHash (16-char hex)
@@ -183,6 +203,31 @@ type OverlaySummary struct {
 	Edition       string `json:"edition,omitempty"`
 	MultiAudio    bool   `json:"multi_audio,omitempty"` // ≥2 distinct audio languages
 	MultiSub      bool   `json:"multi_sub,omitempty"`   // ≥1 subtitle track (embedded or external)
+}
+
+// ResolvedVirtualProvenance returns the effective VirtualProvenance for this
+// file, inferring it across database reloads when the in-memory field is
+// unset. If explicitly set, that value wins. Otherwise, if the file is virtual
+// (Container=="virtual" or FilePath starts with "virtual://"):
+//   - VirtualOwnerInstallationID <= 0 implies core provenance;
+//   - VirtualOwnerInstallationID > 0 implies plugin provenance.
+//
+// Non-virtual files return VirtualProvenanceLocal.
+func (f *MediaFile) ResolvedVirtualProvenance() VirtualProvenance {
+	if f == nil {
+		return ""
+	}
+	if f.VirtualProvenance != "" {
+		return f.VirtualProvenance
+	}
+	isVirtual := f.Container == "virtual" || strings.HasPrefix(strings.ToLower(f.FilePath), "virtual://")
+	if !isVirtual {
+		return VirtualProvenanceLocal
+	}
+	if f.VirtualOwnerInstallationID <= 0 {
+		return VirtualProvenanceCore
+	}
+	return VirtualProvenancePlugin
 }
 
 // PrimaryDVProfile returns the Dolby Vision profile of the first video

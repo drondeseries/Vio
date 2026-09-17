@@ -105,6 +105,23 @@ var adminSettingDefaults = map[string]string{
 	"markers.mode":                         "local",
 	"markers.lazy_playback":                "false",
 
+	"virtual_library.enabled":                     "true",
+	"virtual_library.manifest_url":                "",
+	"virtual_library.movie_library_id":            "1",
+	"virtual_library.series_library_id":           "2",
+	"virtual_library.tmdb_api_key":                "",
+	"virtual_library.allow_insecure_http":         "false",
+	"virtual_library.cache_ttl_minutes":           "10",
+	"virtual_library.schedule_refresh_minutes":    "360",
+	"virtual_library.monitor_file":                ".vio-virtual-library-monitored.json",
+	"virtual_library.enable_quality_profiles":     "false",
+	"virtual_library.quality_preset":              "custom",
+	"virtual_library.custom_format_preset":        "custom",
+	"virtual_library.single_stream_with_failover": "true",
+	"virtual_library.fallback_to_any_stream":      "false",
+	"virtual_library.quality_profiles":            "",
+	"virtual_library.custom_formats":              "",
+
 	"playback.ffmpeg_path":                           "",
 	playbackTranscodeDirSettingKey:                   DefaultTranscodeDir,
 	playbackSegmentRetentionSettingKey:               "600",
@@ -368,7 +385,11 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		"notifications.apple_push_delivery_enabled", "notifications.android_push_delivery_enabled",
 		"catalog.search.meilisearch.semantic_enabled", "catalog.search.meilisearch.binary_quantized",
 		"s3.public_path_style", "s3.private_path_style", "s3.user_db_path_style",
-		"remuxdb.enabled", "remuxdb.submit_enabled":
+		"remuxdb.enabled", "remuxdb.submit_enabled",
+		"virtual_library.enabled", "virtual_library.allow_insecure_http",
+		"virtual_library.enable_quality_profiles",
+		"virtual_library.single_stream_with_failover",
+		"virtual_library.fallback_to_any_stream":
 		return normalizeAdminBool(key, value)
 
 	case "artwork.storage_backend":
@@ -398,6 +419,31 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 99)
 	case "playback.max_virtual_failover_attempts":
 		return normalizeAdminInt(key, value, 1, 50)
+	case "virtual_library.movie_library_id", "virtual_library.series_library_id":
+		return normalizeAdminInt(key, value, 1, 1000000)
+	case "virtual_library.cache_ttl_minutes":
+		return normalizeAdminInt(key, value, 1, 10080)
+	case "virtual_library.schedule_refresh_minutes":
+		return normalizeAdminInt(key, value, 30, 10080)
+	case "virtual_library.manifest_url", "virtual_library.tmdb_api_key",
+		"virtual_library.monitor_file":
+		if len(value) > 4096 {
+			return "", fmt.Errorf("%s exceeds 4096 bytes", key)
+		}
+		return value, nil
+	case "virtual_library.quality_preset", "virtual_library.custom_format_preset":
+		if value == "" {
+			return "custom", nil
+		}
+		if len(value) > 64 {
+			return "", fmt.Errorf("%s exceeds 64 bytes", key)
+		}
+		return value, nil
+	case "virtual_library.quality_profiles", "virtual_library.custom_formats":
+		if len(value) > 65536 {
+			return "", fmt.Errorf("%s exceeds 65536 bytes", key)
+		}
+		return value, nil
 	case "transcode_throttle_seconds":
 		return normalizeAdminInt(key, value, 60, 86400)
 	case playbackSegmentRetentionSettingKey:

@@ -1,0 +1,430 @@
+package stream
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net/url"
+	"path"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+)
+
+var streamSizePattern = regexp.MustCompile(`(?i)\b\d+(?:\.\d+)?\s*(?:TB|GB|MB)\b`)
+var languagePattern = regexp.MustCompile(`(?i)\b(?:eng|en|fra|fre|fr|deu|ger|de|ita|es|spa|jpn|kor|zho|chi|por|rus|ara)\b`)
+var (
+	dolbyVisionPattern = regexp.MustCompile(`(?i)(?:\bdolby[ ._-]*vision\b|\bdv\b)`)
+	atmosPattern       = regexp.MustCompile(`(?i)\batmos\b`)
+	trueHDPattern      = regexp.MustCompile(`(?i)(?:\btrue[ ._-]*hd\b|\bthd\b)`)
+	dtsHDPattern       = regexp.MustCompile(`(?i)\bdts[ ._-]*hd\b`)
+	dtsPattern         = regexp.MustCompile(`(?i)\bdts\b`)
+	eac3Pattern        = regexp.MustCompile(`(?i)(?:\be[ ._-]*ac[ ._-]*3\b|\bdd\+)`)
+	ac3Pattern         = regexp.MustCompile(`(?i)(?:\bac[ ._-]*3\b|\bdd\b)`)
+	aacPattern         = regexp.MustCompile(`(?i)\baac\b`)
+)
+
+// subtitlePattern matches subtitle-track markers in release metadata: common
+// subtitle container extensions (.srt/.ass/.ssa/.sub/.vtt), the "subtitles"
+// word, and forced/HI qualifiers. It does not match audio-only tokens so the
+// same language code in the audio list does not bleed into subtitles.
+var subtitlePattern = regexp.MustCompile(`(?i)\b(?:srt|ass|ssa|sub|vtt|pgs|sup|subtitle[s]?|forced|hi)\b`)
+var subtitleLanguagePattern = regexp.MustCompile(`(?i)\b(?:eng|en|fra|fre|fr|deu|ger|de|ita|es|spa|jpn|kor|zho|chi|por|rus|ara)\b`)
+
+type StreamCandidate struct {
+	URL           string
+	Name          string
+	Description   string
+	Title         string
+	BehaviorHints struct {
+		VideoHash    string         `json:"videoHash"`
+		Filename     string         `json:"filename"`
+		BingeGroup   string         `json:"bingeGroup"`
+		NotWebReady  bool           `json:"notWebReady"`
+		ProxyHeaders map[string]any `json:"proxyHeaders"`
+	}
+
+	Resolution        string
+	CodecVideo        string
+	CodecAudio        string
+	HasAtmos          bool
+	HDR               string
+	SourceType        string
+	FileSize          int64
+	Container         string
+	AudioLanguages    []string
+	SubtitleLanguages []string
+	ExpiresAt         time.Time
+	RequestHeaders    map[string]string
+	QualityScore      int
+	OriginalIndex     int
+	// SourceConfirmed marks a candidate whose release the configured source of
+	// truth (AltMount's completed/imported state, or Prowlarr as a fallback)
+	// has already accepted. SourceFailed marks a release AltMount reports as
+	// failed. Both are provider-local derived state, never part of the Stremio
+	// payload, so a provider response cannot spoof them.
+	SourceConfirmed bool `json:"-"`
+	SourceFailed    bool `json:"-"`
+	// SourceGUID is the stable GUID of the indexed release the classifier tied
+	// this candidate to (Prowlarr exposes one per result). It is the dedup
+	// identity when the provider carries no content hash, so two variants of
+	// one release collapse even when their display names or sizes differ.
+	// Like the flags above it is provider-local derived state and never part
+	// of the Stremio payload.
+	SourceGUID string `json:"-"`
+}
+
+// ParseStreamDetails fills Resolution, CodecVideo, CodecAudio, HasAtmos, HDR,
+// SourceType, FileSize, Container, AudioLanguages, and SubtitleLanguages on
+// the candidate from its name/description/title/URL text.
+func ParseStreamDetails(s *StreamCandidate) {
+	parseStreamDetails(s)
+	ParseStreamMetadata(s)
+}
+
+func parseStreamDetails(s *StreamCandidate) {
+	metadataText := strings.ToLower(s.Name + " " + s.Description + " " + s.Title)
+	fullText := metadataText + " " + strings.ToLower(s.URL)
+
+	// Resolution
+	// Prefer explicit provider metadata. URL tokens can contain unrelated
+	// strings such as "4k" in an opaque identifier.
+	resolutionText := metadataText
+	if !hasResolutionMarker(resolutionText) {
+		resolutionText = fullText
+	}
+	if strings.Contains(resolutionText, "2160p") || strings.Contains(resolutionText, "4k") || strings.Contains(resolutionText, "uhd") {
+		s.Resolution = "2160p"
+	} else if strings.Contains(resolutionText, "1080p") || strings.Contains(resolutionText, "1080i") {
+		s.Resolution = "1080p"
+	} else if strings.Contains(resolutionText, "720p") {
+		s.Resolution = "720p"
+	} else if strings.Contains(resolutionText, "480p") || strings.Contains(resolutionText, "sd") {
+		s.Resolution = "480p"
+	} else if strings.Contains(resolutionText, "bluray") || strings.Contains(resolutionText, "bdrip") || strings.Contains(resolutionText, "brrip") || strings.Contains(resolutionText, "remux") {
+		s.Resolution = "1080p"
+	} else if strings.Contains(resolutionText, "dvdrip") || strings.Contains(resolutionText, "dvd") {
+		s.Resolution = "480p"
+	}
+
+	// Codec Video
+	if strings.Contains(fullText, "hevc") || strings.Contains(fullText, "h265") || strings.Contains(fullText, "x265") {
+		s.CodecVideo = "hevc"
+	} else if strings.Contains(fullText, "h264") || strings.Contains(fullText, "x264") || strings.Contains(fullText, "avc") {
+		s.CodecVideo = "h264"
+	} else if strings.Contains(fullText, "av1") {
+		s.CodecVideo = "av1"
+	}
+
+	// Codec Audio & Atmos
+	s.HasAtmos = atmosPattern.MatchString(fullText)
+	if trueHDPattern.MatchString(fullText) {
+		s.CodecAudio = "truehd"
+	} else if dtsHDPattern.MatchString(fullText) {
+		s.CodecAudio = "dts-hd"
+	} else if dtsPattern.MatchString(fullText) {
+		s.CodecAudio = "dts"
+	} else if eac3Pattern.MatchString(fullText) {
+		s.CodecAudio = "eac3"
+	} else if ac3Pattern.MatchString(fullText) {
+		s.CodecAudio = "ac3"
+	} else if aacPattern.MatchString(fullText) {
+		s.CodecAudio = "aac"
+	} else if s.HasAtmos {
+		s.CodecAudio = "eac3"
+	}
+
+	// HDR
+	if strings.Contains(fullText, "hdr10+") {
+		s.HDR = "hdr10+"
+	} else if strings.Contains(fullText, "hdr10") {
+		s.HDR = "hdr10"
+	} else if dolbyVisionPattern.MatchString(fullText) {
+		s.HDR = "dv"
+	} else if strings.Contains(fullText, "hdr") {
+		s.HDR = "hdr"
+	}
+
+	// Source Type
+	if strings.Contains(fullText, "remux") {
+		s.SourceType = "remux"
+	} else if strings.Contains(fullText, "web-dl") || strings.Contains(fullText, "webdl") || strings.Contains(fullText, "web") {
+		s.SourceType = "web-dl"
+	} else if strings.Contains(fullText, "bluray") || strings.Contains(fullText, "blu-ray") || strings.Contains(fullText, "bdrip") {
+		s.SourceType = "bluray"
+	} else if strings.Contains(fullText, "hdtv") {
+		s.SourceType = "hdtv"
+	}
+}
+
+func hasResolutionMarker(text string) bool {
+	return strings.Contains(text, "2160p") || strings.Contains(text, "4k") ||
+		strings.Contains(text, "1080p") || strings.Contains(text, "720p") ||
+		strings.Contains(text, "480p")
+}
+
+func streamSize(s StreamCandidate) string {
+	return streamSizePattern.FindString(s.Name + " " + s.Description + " " + s.Title)
+}
+
+// CandidateVariantID computes the stable 24-character hex candidate identity
+// from stable stream fields. It matches the algorithm used by the plugin and
+// ensures ?result= identifiers survive between plugin and core.
+func CandidateVariantID(candidate StreamCandidate) string {
+	urlIdentity := ""
+	if parsed, err := url.Parse(strings.TrimSpace(candidate.URL)); err == nil {
+		filename := strings.TrimSpace(candidate.BehaviorHints.Filename)
+		if filename == "" {
+			filename = path.Base(parsed.Path)
+		}
+		urlIdentity = strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host) + "/" + strings.ToLower(filename)
+	}
+	fingerprint := strings.Join([]string{
+		strings.TrimSpace(candidate.Name), strings.TrimSpace(candidate.Title),
+		strconv.FormatInt(candidate.FileSize, 10),
+		strings.TrimSpace(candidate.Resolution), strings.TrimSpace(candidate.CodecVideo),
+		strings.TrimSpace(candidate.CodecAudio), strings.TrimSpace(candidate.HDR),
+		strings.TrimSpace(candidate.SourceType), strings.TrimSpace(candidate.Container),
+		strings.Join(candidate.AudioLanguages, ","), strings.Join(candidate.SubtitleLanguages, ","),
+		strings.TrimSpace(candidate.BehaviorHints.VideoHash),
+		strings.TrimSpace(candidate.BehaviorHints.Filename),
+		strings.TrimSpace(candidate.BehaviorHints.BingeGroup),
+		urlIdentity,
+	}, "\x00")
+	digest := sha256.Sum256([]byte(fingerprint))
+	return hex.EncodeToString(digest[:12])
+}
+
+// CandidateDisplayName formats a clean display name for a stream candidate.
+func CandidateDisplayName(candidate StreamCandidate) string {
+	name := strings.TrimSpace(candidate.Name)
+	if name == "" {
+		name = strings.TrimSpace(candidate.Title)
+	}
+	if name == "" {
+		name = candidate.Resolution
+	}
+	if size := streamSize(candidate); size != "" && !strings.Contains(strings.ToLower(name), strings.ToLower(size)) {
+		name += " · " + size
+	}
+	clean := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, name)
+	return strings.TrimSpace(clean)
+}
+
+// ParseStreamMetadata fills FileSize, AudioLanguages, SubtitleLanguages,
+// Container, ExpiresAt, and RequestHeaders on the candidate.
+func ParseStreamMetadata(s *StreamCandidate) {
+	text := s.Name + " " + s.Description + " " + s.Title
+	if size := streamSizePattern.FindString(text); size != "" {
+		parts := strings.Fields(strings.ToUpper(size))
+		if len(parts) == 2 {
+			if value, err := strconv.ParseFloat(parts[0], 64); err == nil {
+				multiplier := float64(1)
+				switch parts[1] {
+				case "TB":
+					multiplier = 1e12
+				case "GB":
+					multiplier = 1e9
+				case "MB":
+					multiplier = 1e6
+				}
+				s.FileSize = int64(value * multiplier)
+			}
+		}
+	}
+	seen := map[string]bool{}
+	for _, match := range languagePattern.FindAllString(strings.ToLower(text), -1) {
+		match = strings.ToUpper(match)
+		if !seen[match] {
+			seen[match] = true
+			s.AudioLanguages = append(s.AudioLanguages, match)
+		}
+	}
+
+	// Subtitle languages: only parse when the release text actually carries a
+	// subtitle marker (an extension, the "subtitles" word, or a forced/HI
+	// qualifier). A bare language token that only appears in the audio context
+	// (e.g. "English DD5.1") must not be advertised as a subtitle track.
+	if subtitlePattern.MatchString(text) {
+		subSeen := map[string]bool{}
+		for _, match := range subtitleLanguagePattern.FindAllString(strings.ToLower(text), -1) {
+			match = strings.ToUpper(match)
+			if !subSeen[match] {
+				subSeen[match] = true
+				s.SubtitleLanguages = append(s.SubtitleLanguages, match)
+			}
+		}
+	}
+
+	// Container resolution: prefer behaviorHints.filename, then URL, then text
+	s.Container = inferContainer(s.BehaviorHints.Filename, s.URL, text)
+
+	// URL expiry extraction
+	s.ExpiresAt = parseURLExpiration(s.URL)
+
+	// Request headers extraction from behaviorHints.proxyHeaders
+	s.RequestHeaders = extractProxyRequestHeaders(s.BehaviorHints.ProxyHeaders)
+}
+
+func inferContainer(filename, streamURL, text string) string {
+	knownExts := []string{".mkv", ".mp4", ".webm", ".avi", ".mov", ".ts", ".m2ts", ".m4v"}
+	if filename != "" {
+		ext := strings.ToLower(path.Ext(filename))
+		for _, k := range knownExts {
+			if ext == k {
+				return strings.TrimPrefix(k, ".")
+			}
+		}
+	}
+	lowerURL := strings.ToLower(streamURL)
+	for _, ext := range knownExts {
+		if strings.Contains(lowerURL, ext) {
+			return strings.TrimPrefix(ext, ".")
+		}
+	}
+	lowerText := strings.ToLower(text)
+	for _, ext := range knownExts {
+		if strings.Contains(lowerText, ext) {
+			return strings.TrimPrefix(ext, ".")
+		}
+	}
+	return ""
+}
+
+func parseURLExpiration(rawURL string) time.Time {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed == nil {
+		return time.Time{}
+	}
+	q := parsed.Query()
+
+	// 1. AWS SigV4 signed URLs: X-Amz-Expires (duration in seconds) + X-Amz-Date
+	amzExpires := strings.TrimSpace(q.Get("X-Amz-Expires"))
+	if amzExpires == "" {
+		amzExpires = strings.TrimSpace(q.Get("x-amz-expires"))
+	}
+	if amzExpires != "" {
+		if durSec, err := strconv.ParseInt(amzExpires, 10, 64); err == nil && durSec > 0 {
+			amzDate := strings.TrimSpace(q.Get("X-Amz-Date"))
+			if amzDate == "" {
+				amzDate = strings.TrimSpace(q.Get("x-amz-date"))
+			}
+			if amzDate != "" {
+				var baseTime time.Time
+				if t, err := time.Parse("20060102T150405Z", amzDate); err == nil {
+					baseTime = t.UTC()
+				} else if t, err := time.Parse(time.RFC3339, amzDate); err == nil {
+					baseTime = t.UTC()
+				}
+				if !baseTime.IsZero() {
+					t := baseTime.Add(time.Duration(durSec) * time.Second)
+					if t.After(time.Now()) {
+						return t.Add(-15 * time.Second)
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Absolute Unix timestamp expiration params
+	for _, key := range []string{"expires", "expire", "exp", "Expires"} {
+		val := strings.TrimSpace(q.Get(key))
+		if val == "" {
+			continue
+		}
+		if sec, err := strconv.ParseInt(val, 10, 64); err == nil && sec > 0 {
+			if sec > 1000000000 { // unix timestamp
+				t := time.Unix(sec, 0).UTC()
+				if t.After(time.Now()) {
+					return t.Add(-15 * time.Second) // safety margin
+				}
+			}
+		}
+	}
+	return time.Time{}
+}
+
+func extractProxyRequestHeaders(proxyHeaders map[string]any) map[string]string {
+	if len(proxyHeaders) == 0 {
+		return nil
+	}
+	reqRaw, ok := proxyHeaders["request"]
+	if !ok {
+		reqRaw = proxyHeaders
+	}
+	reqMap, ok := reqRaw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string)
+	for k, v := range reqMap {
+		sVal, ok := v.(string)
+		if !ok || strings.TrimSpace(sVal) == "" {
+			continue
+		}
+		lowerK := strings.ToLower(strings.TrimSpace(k))
+		if lowerK == "referer" || lowerK == "origin" || lowerK == "user-agent" {
+			out[k] = strings.TrimSpace(sVal)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// ResolutionScore ranks a normalized resolution string for quality sorting.
+// Higher is better: 2160p=4, 1080p=3, 720p=2, 480p=1, unknown=0.
+func ResolutionScore(res string) int {
+	switch res {
+	case "2160p":
+		return 4
+	case "1080p":
+		return 3
+	case "720p":
+		return 2
+	case "480p":
+		return 1
+	}
+	return 0
+}
+
+// SourceScore ranks a source type string for quality sorting.
+// Higher is better: remux=4, bluray=3, web-dl=2, hdtv=1, unknown=0.
+func SourceScore(src string) int {
+	switch src {
+	case "remux":
+		return 4
+	case "bluray":
+		return 3
+	case "web-dl":
+		return 2
+	case "hdtv":
+		return 1
+	}
+	return 0
+}
+
+// NormalizeResolution canonicalizes a resolution label ("4k" -> "2160p").
+func NormalizeResolution(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "4k", "uhd", "2160":
+		return "2160p"
+	case "2k", "1440":
+		return "1440p"
+	case "1080":
+		return "1080p"
+	case "720":
+		return "720p"
+	case "480":
+		return "480p"
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}

@@ -4,6 +4,7 @@ package onboarding
 const (
 	StepIDWelcome         = "welcome"
 	StepIDPlaybackQuality = "playback-quality"
+	StepIDStreaming       = "streaming"
 	StepIDWatchTogether   = "watch-together"
 	StepIDRequests        = "requests"
 	StepIDRecommendations = "recommendations"
@@ -77,6 +78,15 @@ var tourSteps = []Step{
 		Route:        "/rooms/join",
 		ActionLabel:  "Open Watch Party",
 		gate:         gateWatchTogether,
+	},
+	{
+		ID:           StepIDStreaming,
+		Kind:         KindFeatureCard,
+		Title:        "Stream anything with Stremio",
+		Body:         "Vio streams straight from a Stremio addon provider — no files to manage. The admin pastes a provider manifest URL once, and the whole catalog appears as virtual libraries.",
+		Illustration: StepIDStreaming,
+		Route:        "/requests",
+		ActionLabel:  "Browse the catalog",
 	},
 	{
 		ID:           StepIDRequests,

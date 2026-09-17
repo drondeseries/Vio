@@ -23,6 +23,7 @@ export const WIZARD_STEP_LABELS: Record<WizardStepId, string> = {
   playback: "Playback",
   storage: "Storage",
   library: "Libraries",
+  streaming: "Streaming",
   subtitles: "Subtitles",
   connect: "Connect apps",
   features: "Features",

@@ -77,7 +77,7 @@ func TestHandleMaterializeAdminCollectionItem_ValidationAndErrors(t *testing.T) 
 	itemRepo := catalog.NewItemRepository(pool)
 	collRepo := catalog.NewLibraryCollectionRepository(pool)
 	service := catalog.NewLibraryCollectionService(collRepo, itemRepo, nil, nil)
-	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, 0, nil, nil)
+	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, nil)
 
 	// Seed test folder
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(9901,'Mat Folder','movies',true) ON CONFLICT (id) DO NOTHING`); err != nil {
@@ -197,7 +197,7 @@ func TestHandleMaterializeAdminCollectionItem_SuccessAndIdempotency(t *testing.T
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]catalog.VirtualPlaybackVariant, error) {
 		return []catalog.VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
-	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, 0, nil, nil)
+	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, nil)
 
 	// Seed test folder
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(9902,'Mat Folder 2','movies',true) ON CONFLICT (id) DO NOTHING`); err != nil {
@@ -287,7 +287,7 @@ func TestHandleMaterializeAdminCollectionItem_ProviderFailureAndIncompatibleLibr
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]catalog.VirtualPlaybackVariant, error) {
 		return nil, errors.New("upstream provider connection timed out")
 	}
-	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, 0, nil, nil)
+	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, nil)
 
 	// Seed test folder (series folder only!)
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(9903,'Series Only Folder','series',true) ON CONFLICT (id) DO NOTHING`); err != nil {
@@ -370,7 +370,7 @@ func TestHandleMaterializeAdminCollectionItem_SeriesWithEpisodes(t *testing.T) {
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]catalog.VirtualPlaybackVariant, error) {
 		return []catalog.VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
-	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, 0, nil, nil)
+	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, nil)
 
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(9904,'Series Folder 4','series',true) ON CONFLICT (id) DO NOTHING`); err != nil {
 		t.Fatalf("seed folder: %v", err)
@@ -457,7 +457,7 @@ func TestHandleMaterializeAdminCollectionItem_RoutedAuthorization(t *testing.T) 
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]catalog.VirtualPlaybackVariant, error) {
 		return []catalog.VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
-	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, 0, nil, nil)
+	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, nil)
 
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(9905,'Auth Folder','movies',true) ON CONFLICT (id) DO NOTHING`); err != nil {
 		t.Fatalf("seed folder: %v", err)
@@ -592,7 +592,7 @@ func TestHandleRemoveAdminCollectionItem_Routed(t *testing.T) {
 	service.VirtualVariants = func(_ context.Context, _, _ string) ([]catalog.VirtualPlaybackVariant, error) {
 		return []catalog.VirtualPlaybackVariant{{OwnerInstallationID: 11}}, nil
 	}
-	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, 0, nil, nil)
+	handler := NewLibraryCollectionHandler(collRepo, service, itemRepo, nil)
 
 	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES(9906,'Remove Item Folder','movies',true) ON CONFLICT (id) DO NOTHING`); err != nil {
 		t.Fatalf("seed folder: %v", err)

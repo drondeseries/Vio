@@ -118,6 +118,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userdb"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/userstore/pgstore"
+	virtuallibrary "github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/watchlist"
 	"github.com/Silo-Server/silo-server/internal/watchstate"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
@@ -1423,6 +1424,8 @@ func main() {
 	var pluginRuntimeConfigStore *plugins.RuntimeConfigStore
 	var pluginHTTPProxy *plugins.HTTPProxy
 	var virtualRegistrar *catalog.VirtualMediaRegistrar
+	var vlSvc *virtuallibrary.Service
+	vlActive := false
 	var requestVirtualMetadataRefresh func(context.Context, string) error
 	pluginAutoUpdateDone := make(chan struct{})
 	var pluginAutoUpdater *plugins.AutoUpdateService
@@ -2500,6 +2503,159 @@ func main() {
 			virtualRegistrar.TMDBDigitalReleases = discoverAdapter
 			virtualRegistrar.EpisodeReleaseDates = discoverAdapter
 		}
+		// Virtual library core service (retires
+		// com.drondeseries.vio-virtual-library). Boot order per Oracle:
+		// migrate -> validate -> activate. Migration never overwrites
+		// existing core settings; failure keeps the plugin installed and
+		// the core service unavailable (explicit, no silent fallback).
+		vlActive = false
+		vlSettings, vlErr := settingsRepo.GetAll(ctx)
+		if vlErr == nil {
+			migRes, migErr := virtuallibrary.MigrateFromPlugin(ctx,
+				virtuallibrary.InstallationListerFunc(func(ctx context.Context, pluginID string) ([]*virtuallibrary.PluginInstallation, error) {
+					if pluginInstallationStore == nil {
+						return nil, nil
+					}
+					rows, err := pluginInstallationStore.ListByPluginID(ctx, pluginID)
+					if err != nil {
+						return nil, err
+					}
+					out := make([]*virtuallibrary.PluginInstallation, 0, len(rows))
+					for _, r := range rows {
+						if r == nil {
+							continue
+						}
+						out = append(out, &virtuallibrary.PluginInstallation{ID: r.ID, PluginID: r.PluginID, Enabled: r.Enabled})
+					}
+					return out, nil
+				}),
+				virtuallibrary.PluginConfigReaderFunc(func(ctx context.Context, installationID int, key string) (map[string]any, error) {
+					if pluginRuntimeConfigStore == nil {
+						return nil, nil
+					}
+					rows, err := pluginRuntimeConfigStore.ListGlobalConfigs(ctx, installationID)
+					if err != nil {
+						return nil, err
+					}
+					for _, r := range rows {
+						if r != nil && r.Key == key {
+							return r.Value, nil
+						}
+					}
+					return nil, nil
+				}),
+				settingsRepo, slog.Default())
+			if migErr != nil {
+				slog.Warn("virtual library migration failed; core service unavailable, plugin retained",
+					"error", migErr)
+			} else {
+				rereadOK := true
+				if migRes.Ran {
+					fresh, freshErr := settingsRepo.GetAll(ctx)
+					if freshErr != nil {
+						slog.Warn("virtual library settings reread failed after migration; core service unavailable, plugin retained",
+							"error", freshErr)
+						vlErr = freshErr
+						vlActive = false
+						rereadOK = false
+					} else {
+						vlSettings = fresh
+					}
+				}
+				if !rereadOK {
+					vlSvc = nil
+				} else {
+					vlCfg := virtuallibrary.ConfigFromSettings(vlSettings)
+					vlSvc = virtuallibrary.New(vlCfg, virtualRegistrar, slog.Default())
+					if vlSvc == nil {
+						slog.Info("virtual library core service dormant (no manifest URL)")
+					} else if verr := vlSvc.Validate(ctx); verr != nil {
+						slog.Warn("virtual library core service misconfigured; unavailable",
+							"error", verr)
+						vlSvc = nil
+					} else {
+						vlActive = true
+						slog.Info("virtual library core service active",
+							"movie_library_id", vlCfg.MovieLibraryID,
+							"series_library_id", vlCfg.SeriesLibraryID,
+							"migrated", migRes.Migrated)
+						go func(svc *virtuallibrary.Service) {
+							probeCtx, cancel := context.WithTimeout(appCtx, 5*time.Second)
+							defer cancel()
+							if err := svc.CheckRemote(probeCtx); err != nil {
+								slog.Warn("virtual library provider initial remote probe failed (will retry on playback)", "error", err)
+							} else {
+								slog.Info("virtual library provider remote manifest verified")
+							}
+						}(vlSvc)
+					}
+				}
+			}
+		} else {
+			slog.Warn("virtual library: settings unavailable; core service dormant", "error", vlErr)
+		}
+		if vlActive && vlSvc != nil {
+			// Hard cutover: core Variants replaces the plugin closure.
+			// Plugin-owned catalog rows keep their owner IDs; new variants
+			// carry core provenance (OwnerInstallationID 0 + Provenance core)
+			// and the SSRF dispatch reads virtual_library.allow_insecure_http.
+			collectionService.VirtualVariants = vlSvc.VirtualVariants()
+			deps.VirtualLibraryService = vlSvc
+			deps.VirtualLibraryVariants = vlSvc.VirtualVariants()
+			// Monitor timer: Run is bounded work (see monitor/doc.go); the
+			// caller drives repetition with a per-pass deadline. Refresh
+			// interval from settings; shutdown via appCtx.
+			vlMonitor := vlSvc.Monitor
+			vlActiveCfg := virtuallibrary.ConfigFromSettings(vlSettings)
+			vlInterval := time.Duration(vlActiveCfg.ScheduleRefreshMinutes) * time.Minute
+			if vlInterval <= 0 {
+				vlInterval = 6 * time.Hour
+			}
+			vlDone := make(chan struct{})
+			registerShutdownWork(vlDone)
+			go func() {
+				defer close(vlDone)
+				// Initial run after brief delay (10s) so server finishes startup first
+				select {
+				case <-appCtx.Done():
+					return
+				case <-time.After(10 * time.Second):
+					passCtx, cancel := context.WithTimeout(appCtx, 2*time.Minute)
+					_, runErr := vlMonitor.Run(passCtx, &virtuallibrary.RunTask{TaskKey: "monitor-media"})
+					cancel()
+					if runErr != nil {
+						slog.Warn("virtual library initial monitor pass failed", "error", runErr)
+					}
+				}
+
+				ticker := time.NewTicker(vlInterval)
+				defer ticker.Stop()
+				var running atomic.Bool
+				for {
+					select {
+					case <-appCtx.Done():
+						return
+					case <-ticker.C:
+						if !running.CompareAndSwap(false, true) {
+							slog.Warn("virtual library monitor pass skipped: prior pass still running")
+							continue
+						}
+						passCtx, cancel := context.WithTimeout(appCtx, 2*time.Minute)
+						_, runErr := vlMonitor.Run(passCtx, &virtuallibrary.RunTask{TaskKey: "monitor-media"})
+						cancel()
+						running.Store(false)
+						if runErr != nil {
+							slog.Warn("virtual library monitor pass failed", "error", runErr)
+						}
+					}
+				}
+			}()
+		}
+		if vlActive && vlSvc != nil {
+			// Destructive retirement is deferred until Step 6 (after core stream
+			// resolution and playback have been fully validated end-to-end).
+			// The plugin remains installed as a safety barrier during cutover.
+		}
 		deps.CollectionService = collectionService
 		collectionSyncScheduler = catalog.NewCollectionSyncScheduler(collectionRepo, collectionService, slog.Default())
 
@@ -3122,7 +3278,7 @@ func main() {
 			RecipeNodeStore: noderecipe.NewStore(apiRedisClient, 0),
 			SessionSyncer:   deps.SessionSyncer,
 		}
-		if pluginService != nil {
+		if pluginService != nil || (vlActive && vlSvc != nil) {
 			virtualRelay := remotestream.NewRelay()
 			compatDeps.RemoteStreamRelay = virtualRelay
 			go func() {
@@ -3135,50 +3291,123 @@ func main() {
 			}()
 
 			compatDeps.VirtualMediaResolver = jellycompat.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
-				return pluginService.ResolveVirtualPlaybackForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
+				if ownerInstallationID <= 0 && vlActive && vlSvc != nil {
+					return vlSvc.Resolve(ctx, path)
+				}
+				if pluginService != nil {
+					return pluginService.ResolveVirtualPlaybackForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
+				}
+				if ownerInstallationID > 0 {
+					return "", errors.New("plugin-owned virtual media resolver is unavailable")
+				}
+				return "", errors.New("virtual media resolver is unavailable")
 			})
 			compatDeps.VirtualMediaRefreshResolver = jellycompat.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
-				return pluginService.RefreshVirtualPlaybackForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
+				if ownerInstallationID <= 0 && vlActive && vlSvc != nil {
+					return vlSvc.Refresh(ctx, path)
+				}
+				if pluginService != nil {
+					return pluginService.RefreshVirtualPlaybackForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
+				}
+				if ownerInstallationID > 0 {
+					return "", errors.New("plugin-owned virtual media refresh resolver is unavailable")
+				}
+				return "", errors.New("virtual media refresh resolver is unavailable")
 			})
 			compatDeps.VirtualMediaDetailedResolver = jellycompat.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (jellycompat.ResolvedVirtualMedia, error) {
-				res, err := pluginService.ResolveVirtualPlaybackDetailedForInstallation(ctx, path, userID, profileID, ownerInstallationID, true, forceRefresh, excludedCandidateIDs, preferredCandidateID)
-				if err != nil {
-					return jellycompat.ResolvedVirtualMedia{}, err
+				if ownerInstallationID <= 0 && vlActive && vlSvc != nil {
+					res, err := vlSvc.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+					if err != nil {
+						return jellycompat.ResolvedVirtualMedia{}, err
+					}
+					return jellycompat.ResolvedVirtualMedia{
+						URL:            res.URL,
+						URI:            res.URI,
+						CandidateID:    res.CandidateID,
+						RequestHeaders: res.RequestHeaders,
+						ExpiresAt:      res.ExpiresAt,
+					}, nil
 				}
-				return jellycompat.ResolvedVirtualMedia{
-					URL:            res.URL,
-					URI:            res.URI,
-					CandidateID:    res.CandidateID,
-					RequestHeaders: res.RequestHeaders,
-					ExpiresAt:      res.ExpiresAt,
-				}, nil
+				if pluginService != nil {
+					res, err := pluginService.ResolveVirtualPlaybackDetailedForInstallation(ctx, path, userID, profileID, ownerInstallationID, true, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+					if err != nil {
+						return jellycompat.ResolvedVirtualMedia{}, err
+					}
+					return jellycompat.ResolvedVirtualMedia{
+						URL:            res.URL,
+						URI:            res.URI,
+						CandidateID:    res.CandidateID,
+						RequestHeaders: res.RequestHeaders,
+						ExpiresAt:      res.ExpiresAt,
+					}, nil
+				}
+				if ownerInstallationID > 0 {
+					return jellycompat.ResolvedVirtualMedia{}, errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
+				}
+				return jellycompat.ResolvedVirtualMedia{}, errors.New("virtual media detailed resolver is unavailable")
 			})
 			compatDeps.VirtualPlaybackStreamLister = jellycompat.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]jellycompat.VirtualPlaybackStream, error) {
-				streams, err := pluginService.ListVirtualPlaybackStreamsForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
-				if err != nil {
-					return nil, err
+				if ownerInstallationID <= 0 && vlActive && vlSvc != nil {
+					streams, err := vlSvc.ListStreams(ctx, path)
+					if err != nil {
+						return nil, err
+					}
+					out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
+					for _, stream := range streams {
+						out = append(out, jellycompat.VirtualPlaybackStream{
+							URI:                 stream.URI,
+							Label:               stream.Label,
+							Resolution:          stream.Resolution,
+							CodecVideo:          stream.CodecVideo,
+							CodecAudio:          stream.CodecAudio,
+							HDR:                 stream.HDR,
+							Container:           stream.Container,
+							FileSize:            stream.FileSize,
+							Bitrate:             stream.Bitrate,
+							AudioLanguages:      stream.AudioLanguages,
+							SubtitleLanguages:   stream.SubtitleLanguages,
+							OwnerInstallationID: stream.OwnerInstallationID,
+						})
+					}
+					return out, nil
 				}
-				out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
-				for _, stream := range streams {
-					out = append(out, jellycompat.VirtualPlaybackStream{
-						URI:                 stream.URI,
-						Label:               stream.Label,
-						Resolution:          stream.Resolution,
-						CodecVideo:          stream.CodecVideo,
-						CodecAudio:          stream.CodecAudio,
-						HDR:                 stream.HDR,
-						Container:           stream.Container,
-						FileSize:            stream.FileSize,
-						Bitrate:             stream.Bitrate,
-						AudioLanguages:      stream.AudioLanguages,
-						SubtitleLanguages:   stream.SubtitleLanguages,
-						OwnerInstallationID: stream.OwnerInstallationID,
-					})
+				if pluginService != nil {
+					streams, err := pluginService.ListVirtualPlaybackStreamsForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
+					if err != nil {
+						return nil, err
+					}
+					out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
+					for _, stream := range streams {
+						out = append(out, jellycompat.VirtualPlaybackStream{
+							URI:                 stream.URI,
+							Label:               stream.Label,
+							Resolution:          stream.Resolution,
+							CodecVideo:          stream.CodecVideo,
+							CodecAudio:          stream.CodecAudio,
+							HDR:                 stream.HDR,
+							Container:           stream.Container,
+							FileSize:            stream.FileSize,
+							Bitrate:             stream.Bitrate,
+							AudioLanguages:      stream.AudioLanguages,
+							SubtitleLanguages:   stream.SubtitleLanguages,
+							OwnerInstallationID: stream.OwnerInstallationID,
+						})
+					}
+					return out, nil
 				}
-				return out, nil
+				if ownerInstallationID > 0 {
+					return nil, errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
+				}
+				return nil, errors.New("virtual playback stream lister is unavailable")
 			})
 			compatDeps.AllowInsecureVirtual = func(installationID int) bool {
-				return pluginService.InstallationAllowsInsecure(context.Background(), installationID)
+				if installationID <= 0 && vlActive && vlSvc != nil {
+					return plugins.CoreVirtualInsecureAllowed(context.Background())
+				}
+				if pluginService != nil {
+					return pluginService.InstallationAllowsInsecure(context.Background(), installationID)
+				}
+				return false
 			}
 			ffprobePath := scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)
 			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
@@ -3187,7 +3416,9 @@ func main() {
 					var relayURL string
 					var cleanup func()
 					var err error
-					if pluginService.InstallationAllowsInsecure(context.Background(), probeFile.VirtualOwnerInstallationID) {
+					insecure := (probeFile.VirtualOwnerInstallationID <= 0 && plugins.CoreVirtualInsecureAllowed(probeCtx)) ||
+						(pluginService != nil && pluginService.InstallationAllowsInsecure(context.Background(), probeFile.VirtualOwnerInstallationID))
+					if insecure {
 						relayURL, cleanup, err = virtualRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
 					} else {
 						relayURL, cleanup, err = virtualRelay.RegisterWithHeaders(probeCtx, probeURL, headers)
@@ -4232,4 +4463,34 @@ type audiobooksSettingsAdapter struct {
 
 func (a *audiobooksSettingsAdapter) GetString(ctx context.Context, key string) (string, error) {
 	return a.repo.Get(ctx, key)
+}
+
+// vlPluginRetirer adapts the plugin host to virtuallibrary.PluginRetirer.
+// Stop halts the provider process; Clear flushes the plugin's in-memory
+// virtual caches; DeleteInstallation removes the row (cascading runtime
+// configs, virtual catalog state, and the install dir).
+type vlPluginRetirer struct {
+	svc   *plugins.Service
+	store *plugins.InstallationStore
+}
+
+func (r *vlPluginRetirer) Stop(installationID int) error {
+	if r.svc == nil {
+		return nil
+	}
+	return r.svc.Stop(installationID)
+}
+
+func (r *vlPluginRetirer) ClearCaches() {
+	if r.svc == nil {
+		return
+	}
+	r.svc.Clear()
+}
+
+func (r *vlPluginRetirer) DeleteInstallation(ctx context.Context, id int) error {
+	if r.store == nil {
+		return fmt.Errorf("plugin installation store unavailable")
+	}
+	return r.store.Delete(ctx, id)
 }

@@ -21,6 +21,7 @@ import GeneralSettings from "./GeneralSettings";
 import AppearanceSettings from "./AppearanceSettings";
 import SecurityAccessSettings from "./SecurityAccessSettings";
 import LibraryMetadataSettings from "./LibraryMetadataSettings";
+import StreamingSettings from "./StreamingSettings";
 import PlaybackSettings from "./PlaybackSettings";
 import DownloadsSettings from "./DownloadsSettings";
 import ProvidersSettings from "./ProvidersSettings";
@@ -41,6 +42,7 @@ const SETTINGS_COMPONENTS: Record<string, ComponentType> = {
   appearance: AppearanceSettings,
   security: SecurityAccessSettings,
   library: LibraryMetadataSettings,
+  streaming: StreamingSettings,
   playback: PlaybackSettings,
   downloads: DownloadsSettings,
   providers: ProvidersSettings,

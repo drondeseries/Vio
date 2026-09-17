@@ -113,6 +113,12 @@ var SensitiveSettingKeys = map[string]bool{
 
 	// Silo push relay bearer credential for APNs/FCM delivery.
 	"notifications.push_relay_api_key": true,
+
+	// Virtual library (Stremio streaming) secrets. The manifest URL carries a
+	// per-admin token; the TMDB key is a provider credential. Both are
+	// encrypted at rest like the other provider keys above.
+	"virtual_library.manifest_url": true,
+	"virtual_library.tmdb_api_key": true,
 }
 
 // EncryptedSettingsRepo decorates a raw settings store, transparently
