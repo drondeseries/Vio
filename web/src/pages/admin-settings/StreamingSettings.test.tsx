@@ -158,6 +158,13 @@ describe("StreamingSettings", () => {
     expect(form.setValue("virtual_library.series_library_id", "11"));
   });
 
+  it("exposes quality and custom format preset selects", () => {
+    renderPage();
+
+    expect(screen.getByLabelText("Quality preset")).toBeInTheDocument();
+    expect(screen.getByLabelText("Custom format preset")).toBeInTheDocument();
+  });
+
   it("exposes Prowlarr and AltMount inputs in the automation group", () => {
     renderPage();
 

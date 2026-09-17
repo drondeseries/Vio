@@ -19,6 +19,11 @@ const (
 	maxProfileRegexBytes     = 1024
 	maxProfileAttributeBytes = 64
 	maxPreferredOrder        = 10000
+
+	// patternTypeToken selects word-boundary keyword matching instead of
+	// regex for a custom format (AltMount parity).
+	patternTypeToken = "token"
+	patternTypeRegex = "regex"
 )
 
 type CustomFormat struct {
@@ -27,11 +32,98 @@ type CustomFormat struct {
 	Score  int    `json:"score"`
 	Reject bool   `json:"reject"`
 
+	// AltMount TRaSH parity fields (all optional, additive-only).
+	// ID is a stable rule identifier, Category groups rules in the admin
+	// UI (source/hdr/audio/release_group/resolution/custom), Pattern is
+	// the primary match expression (Regex kept as legacy alias),
+	// PatternType is "regex" (default) or "token" (word-boundary keyword
+	// match that avoids substring false positives like TS in DTS-HD),
+	// Enabled skips the rule when false (defaults true when absent),
+	// IsCustom marks user-defined rules preserved across preset switches,
+	// Invert flips the match (rule scores when the pattern does NOT match).
+	ID          string `json:"id,omitempty"`
+	Category    string `json:"category,omitempty"`
+	Pattern     string `json:"pattern,omitempty"`
+	PatternType string `json:"pattern_type,omitempty"`
+	Enabled     bool   `json:"enabled"`
+	IsCustom    bool   `json:"is_custom,omitempty"`
+	Invert      bool   `json:"invert,omitempty"`
+
 	match *regexp.Regexp
 }
 
 // Compiled returns the compiled match regex, or nil if unset.
 func (f *CustomFormat) Compiled() *regexp.Regexp { return f.match }
+
+// discardScoreThreshold mirrors AltMount's hard-discard line: any matching
+// format scoring at or below this rejects the candidate even without
+// Reject=true.
+const discardScoreThreshold = -1500
+
+// EffectivePattern prefers Pattern (AltMount field) over Regex (legacy Vio
+// field) so one rule representation serves both.
+func (f *CustomFormat) EffectivePattern() string {
+	if strings.TrimSpace(f.Pattern) != "" {
+		return strings.TrimSpace(f.Pattern)
+	}
+	return strings.TrimSpace(f.Regex)
+}
+
+// IsEnabled reports whether the rule participates in scoring. Legacy rules
+// built before the Enabled field existed (zero value, no AltMount fields)
+// default to enabled so old configs keep working without migration.
+func (f *CustomFormat) IsEnabled() bool {
+	if f.Enabled {
+		return true
+	}
+	return f.PatternType == "" && f.ID == "" && f.Category == "" &&
+		strings.TrimSpace(f.Pattern) == "" && !f.Invert && !f.IsCustom
+}
+
+// UnmarshalJSON accepts both legacy (regex) and AltMount (pattern,
+// pattern_type/patternType, enabled, is_custom/isCustom, category, id)
+// spellings. Enabled defaults to true when the key is absent so legacy
+// configs without the field keep scoring.
+func (f *CustomFormat) UnmarshalJSON(data []byte) error {
+	type rawFormat struct {
+		Name         string `json:"name"`
+		Regex        string `json:"regex"`
+		Pattern      string `json:"pattern"`
+		Score        int    `json:"score"`
+		Reject       bool   `json:"reject"`
+		ID           string `json:"id"`
+		Category     string `json:"category"`
+		PatternType  string `json:"pattern_type"`
+		PatternTypeC string `json:"patternType"`
+		IsCustom     bool   `json:"is_custom"`
+		IsCustomC    bool   `json:"isCustom"`
+		Invert       bool   `json:"invert"`
+		Enabled      *bool  `json:"enabled"`
+	}
+	var raw rawFormat
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	f.Name = raw.Name
+	f.Regex = raw.Regex
+	f.Pattern = raw.Pattern
+	f.Score = raw.Score
+	f.Reject = raw.Reject
+	f.ID = raw.ID
+	f.Category = raw.Category
+	f.PatternType = raw.PatternType
+	if f.PatternType == "" {
+		f.PatternType = raw.PatternTypeC
+	}
+	f.IsCustom = raw.IsCustom || raw.IsCustomC
+	f.Invert = raw.Invert
+	if raw.Enabled == nil {
+		f.Enabled = true
+	} else {
+		f.Enabled = *raw.Enabled
+	}
+	return nil
+}
 
 type QualityProfile struct {
 	Label          string `json:"label"`
@@ -90,7 +182,11 @@ func qualityPresetProfiles(preset string) []QualityProfile {
 }
 
 func customFormatPresets(preset string) []CustomFormat {
-	switch strings.ToLower(strings.TrimSpace(preset)) {
+	// Underscores and hyphens are equivalent so AltMount preset IDs
+	// (trash_recommended) resolve the same as Vio keys (trash-recommended).
+	normalized := strings.ToLower(strings.TrimSpace(preset))
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	switch normalized {
 	case "english-original":
 		return []CustomFormat{
 			{Name: "English", Regex: `(?i)\b(?:eng|en|english)\b`, Score: 100},
@@ -170,8 +266,75 @@ func customFormatPresets(preset string) []CustomFormat {
 			{Name: "WEB Tier 1", Regex: `(?i)-(?:NTb|FLUX|Kitsune|ETHEL|playWEB|NOGRP|DECiBEL|DON|CtrlHD|TrollHD|KiNGS|hallowed|CRiMSON|BLUTONiUM|NIMA)\b`, Score: 300},
 			{Name: "TrueHD Atmos / DTS:X", Regex: `(?i)(?:truehd[ ._-]*atmos|dts[ ._-]*x)`, Score: 250},
 		}
+	case "altmount-recommended":
+		return altmountRecommendedFormats()
+	case "altmount-remux":
+		return altmountRemuxEnthusiastFormats()
+	case "altmount-compatibility":
+		return altmountCompatibilityFormats()
 	default:
 		return nil
+	}
+}
+
+// altmountTrashFormat builds a CustomFormat from AltMount's TRaSH preset
+// definitions (frontend scoringPresets.ts). Pattern and Regex carry the same
+// expression so legacy Regex-only readers keep working.
+func altmountTrashFormat(id, name, category, pattern string, score int) CustomFormat {
+	return CustomFormat{
+		ID: id, Name: name, Category: category,
+		Pattern: pattern, Regex: pattern, PatternType: "regex",
+		Score: score, Enabled: true,
+	}
+}
+
+// altmountRecommendedFormats is a 1:1 port of AltMount's TRASH_RECOMMENDED
+// preset. Unlike Vio's legacy "trash-recommended" (which bundles language
+// rejects), language preference stays out of custom formats — AltMount
+// scores languages separately via preferred_languages.
+func altmountRecommendedFormats() []CustomFormat {
+	return []CustomFormat{
+		altmountTrashFormat("remux-4k", "4K UHD Remux (Disc)", "source", `\b(2160p|4k)\b.*\b(remux|bdremux|uhd\.remux)\b|\b(remux|bdremux|uhd\.remux)\b.*\b(2160p|4k)\b`, 500),
+		altmountTrashFormat("remux-1080p", "1080p Remux (Disc)", "source", `\b1080p\b.*\b(remux|bdremux)\b|\b(remux|bdremux)\b.*\b1080p\b`, 350),
+		altmountTrashFormat("dv-hdr", "Dolby Vision (P7/P8)", "hdr", `\b(dv|dovi|dolby[ ._-]?vision)\b`, 350),
+		altmountTrashFormat("hdr10-plus", "HDR10+ / HDR10", "hdr", `\b(hdr10\+|hdr10|hdr)\b`, 200),
+		altmountTrashFormat("lossless-atmos", "Lossless Atmos / TrueHD", "audio", `\b(truehd[ ._-]?atmos|truehd|atmos)\b`, 250),
+		altmountTrashFormat("dts-hd-ma", "DTS-HD MA / DTS:X", "audio", `\b(dts[ ._-]hd([ ._-]ma)?|dts[ ._-]?x)\b`, 200),
+		altmountTrashFormat("webdl-4k", "4K WEB-DL / WEBRip", "source", `\b(2160p|4k)\b.*\b(web[ ._-]?dl|webrip)\b`, 180),
+		altmountTrashFormat("tier1-groups", "Tier 1 High-Quality Release Groups", "release_group", `-(FLUX|FraMeSToR|EPSiLON|DON|playBD|CtrlHD|ZQ|TayTO|BHDStudio|SURCODE)\b`, 150),
+		altmountTrashFormat("webdl-1080p", "1080p WEB-DL", "source", `\b1080p\b.*\b(web[ ._-]?dl|webrip)\b`, 120),
+		altmountTrashFormat("aac-stereo-demote", "Low Bitrate Stereo Audio", "audio", `\b(aac[ ._-]?2\.0|stereo|mp3)\b`, -100),
+		altmountTrashFormat("cam-ts-discard", "CAM / TeleSync / Screener", "source", `\b(cam|camrip|telesync|ts|hdcam|hdts|screener|scr|dvdscr)\b`, -2000),
+	}
+}
+
+// altmountRemuxEnthusiastFormats ports AltMount's remux_enthusiast preset:
+// disc-first weighting with a WEB-DL demotion.
+func altmountRemuxEnthusiastFormats() []CustomFormat {
+	return []CustomFormat{
+		altmountTrashFormat("remux-4k", "4K UHD Remux (Disc)", "source", `\b(2160p|4k)\b.*\b(remux|bdremux|uhd\.remux)\b|\b(remux|bdremux|uhd\.remux)\b.*\b(2160p|4k)\b`, 800),
+		altmountTrashFormat("remux-1080p", "1080p Remux (Disc)", "source", `\b1080p\b.*\b(remux|bdremux)\b|\b(remux|bdremux)\b.*\b1080p\b`, 500),
+		altmountTrashFormat("dv-hdr", "Dolby Vision (P7/P8)", "hdr", `\b(dv|dovi|dolby[ ._-]?vision)\b`, 400),
+		altmountTrashFormat("hdr10-plus", "HDR10+ / HDR10", "hdr", `\b(hdr10\+|hdr10|hdr)\b`, 250),
+		altmountTrashFormat("lossless-atmos", "Lossless Atmos / TrueHD", "audio", `\b(truehd[ ._-]?atmos|truehd|atmos)\b`, 350),
+		altmountTrashFormat("dts-hd-ma", "DTS-HD MA / DTS:X", "audio", `\b(dts[ ._-]hd([ ._-]ma)?|dts[ ._-]?x)\b`, 300),
+		altmountTrashFormat("tier1-groups", "Tier 1 High-Quality Release Groups", "release_group", `-(FLUX|FraMeSToR|EPSiLON|DON|playBD|CtrlHD|ZQ|TayTO|BHDStudio|SURCODE)\b`, 200),
+		altmountTrashFormat("webdl-demote", "Compressed WEB-DL Demotion", "source", `\b(web[ ._-]?dl|webrip)\b`, -200),
+		altmountTrashFormat("cam-ts-discard", "CAM / TeleSync / Screener", "source", `\b(cam|camrip|telesync|ts|hdcam|hdts|screener|scr|dvdscr)\b`, -2000),
+	}
+}
+
+// altmountCompatibilityFormats ports AltMount's compatibility preset:
+// universal direct-play weighting (H.264, E-AC-3, AAC) with a remux demotion.
+func altmountCompatibilityFormats() []CustomFormat {
+	return []CustomFormat{
+		altmountTrashFormat("webdl-1080p", "1080p WEB-DL (High Compatibility)", "source", `\b1080p\b.*\b(web[ ._-]?dl|webrip)\b`, 400),
+		altmountTrashFormat("webdl-4k", "4K WEB-DL (SDR / Standard HDR)", "source", `\b(2160p|4k)\b.*\b(web[ ._-]?dl|webrip)\b`, 300),
+		altmountTrashFormat("h264-avc", "H.264 / AVC (Universal Playback)", "source", `\b(h[ ._-]?264|x264|avc)\b`, 250),
+		altmountTrashFormat("eac3-ddp", "Dolby Digital Plus (E-AC-3 / DDP)", "audio", `\b(e[ ._-]?ac[ ._-]?3|ddp|dd\+)\b`, 200),
+		altmountTrashFormat("aac-stereo", "AAC Audio", "audio", `\baac\b`, 150),
+		altmountTrashFormat("remux-demote", "Heavy High-Bitrate Remux Demotion", "source", `\b(remux|bdremux)\b`, -100),
+		altmountTrashFormat("cam-ts-discard", "CAM / TeleSync / Screener", "source", `\b(cam|camrip|telesync|ts|hdcam|hdts|screener|scr|dvdscr)\b`, -2000),
 	}
 }
 
@@ -215,21 +378,42 @@ func (q *QualityConfig) Validate() error {
 		format := &q.CustomFormats[i]
 		format.Name = strings.TrimSpace(format.Name)
 		format.Regex = strings.TrimSpace(format.Regex)
+		format.Pattern = strings.TrimSpace(format.Pattern)
+		format.PatternType = strings.ToLower(strings.TrimSpace(format.PatternType))
+		format.Category = strings.TrimSpace(format.Category)
+		format.ID = strings.TrimSpace(format.ID)
 		if format.Name == "" {
 			return errors.New("custom format name cannot be empty")
 		}
-		if format.Regex == "" {
+		pattern := format.EffectivePattern()
+		if pattern == "" {
 			return fmt.Errorf("custom format %s regex cannot be empty", format.Name)
 		}
-		if len(format.Name) > maxProfileLabelBytes || len(format.Regex) > maxProfileRegexBytes {
+		if len(format.Name) > maxProfileLabelBytes || len(pattern) > maxProfileRegexBytes {
 			return fmt.Errorf("custom format %s exceeds its size limit", format.Name)
+		}
+		if len(format.ID) > maxProfileLabelBytes || len(format.Category) > maxProfileAttributeBytes {
+			return fmt.Errorf("custom format %s exceeds its size limit", format.Name)
+		}
+		if format.PatternType != "" && format.PatternType != patternTypeRegex && format.PatternType != patternTypeToken {
+			return fmt.Errorf("custom format %s has invalid pattern_type %q: must be regex or token", format.Name, format.PatternType)
+		}
+		// Legacy rules predate the Enabled flag (zero value, no AltMount
+		// fields): normalize to enabled so old configs validate as before.
+		// Explicitly disabled modern rules keep Enabled=false.
+		if !format.Enabled && format.IsEnabled() {
+			format.Enabled = true
 		}
 		key := strings.ToLower(format.Name)
 		if seenFormats[key] {
 			return fmt.Errorf("duplicate custom format name: %s", format.Name)
 		}
 		seenFormats[key] = true
-		compiled, err := regexp.Compile(format.Regex)
+		if format.PatternType == patternTypeToken {
+			format.match = nil
+			continue
+		}
+		compiled, err := compileFormatRegex(pattern)
 		if err != nil {
 			return fmt.Errorf("invalid regex in custom format %s: %w", format.Name, err)
 		}
@@ -364,23 +548,124 @@ func customFormatScore(candidate stream.StreamCandidate, formats []CustomFormat)
 	}
 	score := 0
 	for _, format := range formats {
-		matcher := format.Compiled()
-		if matcher == nil && format.Regex != "" {
-			var err error
-			matcher, err = regexp.Compile(format.Regex)
-			if err != nil {
-				continue
-			}
-		}
-		if matcher == nil || !matcher.MatchString(text) {
+		if !format.IsEnabled() {
 			continue
 		}
-		if format.Reject {
+		pattern := format.EffectivePattern()
+		if pattern == "" {
+			continue
+		}
+		var matched bool
+		if strings.ToLower(strings.TrimSpace(format.PatternType)) == patternTypeToken {
+			matched = matchKeywordOrPattern(text, pattern)
+		} else {
+			matcher := format.Compiled()
+			if matcher == nil {
+				var err error
+				matcher, err = compileFormatRegex(pattern)
+				if err != nil {
+					continue
+				}
+			}
+			matched = matcher.MatchString(text)
+		}
+		if format.Invert {
+			matched = !matched
+		}
+		if !matched {
+			continue
+		}
+		// AltMount parity: scores at or below the discard line reject the
+		// candidate even without an explicit Reject flag.
+		if format.Reject || format.Score <= discardScoreThreshold {
 			return 0, true
 		}
 		score += format.Score
 	}
 	return score, false
+}
+
+// compileFormatRegex compiles a custom-format regex case-insensitively,
+// mirroring AltMount's regexcache (which prefixes (?i) unless present) so
+// ported TRaSH patterns match release titles regardless of case.
+func compileFormatRegex(pattern string) (*regexp.Regexp, error) {
+	if !strings.HasPrefix(pattern, "(?i)") {
+		pattern = "(?i)" + pattern
+	}
+	return regexp.Compile(pattern)
+}
+
+// Token/keyword matching ported from AltMount's prowlarr.MatchKeywordOrPattern
+// so token-typed custom formats agree with the Stremio addon backend.
+// Plain keywords match on token boundaries (TS matches "Movie.TS.1080p" but
+// not "DTS-HD" or "Knights"); explicit regex constructs and /pattern/flags
+// forms match as regex.
+
+var (
+	reExplicitRegexConstruct = regexp.MustCompile(`\\b|\\[dwsDWS]|\(\?|[|*+?^$]`)
+	reWhitespaceSplit        = regexp.MustCompile(`\s+`)
+)
+
+// slashPatternExpr builds a case-insensitive regex expression from a
+// slash-delimited pattern body and trailing flags. Only Go-supported inline
+// flags i, m, s are honored; unknown letters are dropped.
+func slashPatternExpr(raw, flags string) string {
+	var b strings.Builder
+	b.WriteString("(?i")
+	for _, f := range flags {
+		if f == 'm' || f == 's' {
+			b.WriteRune(f)
+		}
+	}
+	b.WriteString(")")
+	return b.String() + raw
+}
+
+// buildKeywordRegex matches a keyword phrase across release-name delimiters
+// (".", "_", "-", spaces) with token boundaries on both ends.
+func buildKeywordRegex(keyword string) string {
+	clean := strings.Trim(strings.Trim(keyword, "._- \t"), "._- \t")
+	if clean == "" {
+		return ""
+	}
+	parts := reWhitespaceSplit.Split(clean, -1)
+	escaped := make([]string, len(parts))
+	for i, p := range parts {
+		escaped[i] = regexp.QuoteMeta(p)
+	}
+	return `(?i)(?:^|[^a-zA-Z0-9])` + strings.Join(escaped, `[ ._\-]+`) + `(?:[^a-zA-Z0-9]|$)`
+}
+
+// matchKeywordOrPattern matches release text against a token keyword or an
+// explicit regex, mirroring AltMount (Go prowlarr.MatchKeywordOrPattern and
+// scoringPresets.ts matchKeywordOrPattern).
+func matchKeywordOrPattern(title, pattern string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" || title == "" {
+		return false
+	}
+	if strings.HasPrefix(pattern, "/") && len(pattern) >= 2 {
+		if lastSlash := strings.LastIndex(pattern, "/"); lastSlash > 0 {
+			expr := slashPatternExpr(pattern[1:lastSlash], pattern[lastSlash+1:])
+			if re, err := regexp.Compile(expr); err == nil && re != nil {
+				return re.MatchString(title)
+			}
+			return false
+		}
+	}
+	if reExplicitRegexConstruct.MatchString(pattern) {
+		if re, err := regexp.Compile(pattern); err == nil && re != nil {
+			return re.MatchString(title)
+		}
+	}
+	tokenPattern := buildKeywordRegex(pattern)
+	if tokenPattern == "" {
+		return false
+	}
+	if re, err := regexp.Compile(tokenPattern); err == nil && re != nil {
+		return re.MatchString(title)
+	}
+	return false
 }
 
 // SortCandidatesForProfile ranks candidates in place: non-rejected first,

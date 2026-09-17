@@ -40,6 +40,37 @@ const QUALITY_KEYS = [
   "virtual_library.fallback_to_any_stream",
 ];
 
+const QUALITY_PRESET_OPTIONS = [
+  { value: "custom", label: "Custom" },
+  { value: "balanced", label: "Balanced (1080p)" },
+  { value: "4k-hdr", label: "4K HDR" },
+  { value: "4k-dolby-vision", label: "4K Dolby Vision" },
+  { value: "no-dolby-vision", label: "4K HDR10 (no Dolby Vision)" },
+  { value: "no-hdr", label: "4K SDR (no HDR)" },
+  { value: "compatibility", label: "Compatibility (H.264/AAC)" },
+  { value: "anime", label: "Anime" },
+];
+
+const CUSTOM_FORMAT_PRESET_OPTIONS = [
+  { value: "custom", label: "Custom" },
+  { value: "trash-recommended", label: "TRaSH Recommended (legacy)" },
+  { value: "altmount-recommended", label: "AltMount TRaSH Recommended" },
+  { value: "altmount-remux", label: "AltMount 4K Remux Enthusiast" },
+  { value: "altmount-compatibility", label: "AltMount Compatibility" },
+  { value: "english-original", label: "English Original" },
+  { value: "english-strict", label: "English Strict" },
+  { value: "original-or-english", label: "Original or English" },
+  { value: "clean-quality", label: "Clean Quality (no CAM/3D/extras)" },
+  { value: "audio-hd", label: "HD Audio (Atmos/DTS-HD)" },
+  { value: "repack-proper", label: "Repack / Proper" },
+  { value: "top-web-sources", label: "Top WEB Sources" },
+  { value: "anime-enhanced", label: "Anime Enhanced" },
+  { value: "web-tier-01", label: "WEB Tier 1 Groups" },
+  { value: "web-tier-02", label: "WEB Tier 2 Groups" },
+  { value: "remux-tier-01", label: "Remux Tier 1 Groups" },
+  { value: "remux-tier-02", label: "Remux Tier 2 Groups" },
+];
+
 const AUTOMATION_KEYS = [
   "virtual_library.indexer_rss_url",
   "virtual_library.indexer_api_key",
@@ -291,7 +322,6 @@ export default function StreamingSettings() {
           />
           <SettingField
             label="Prowlarr API key"
-            type="password"
             description="API key for authenticated Prowlarr indexer queries."
             value={form.getValue("virtual_library.indexer_api_key")}
             onChange={(v) => form.setValue("virtual_library.indexer_api_key", v)}
@@ -315,7 +345,6 @@ export default function StreamingSettings() {
           />
           <SettingField
             label="AltMount API key"
-            type="password"
             description="API key for authenticated AltMount status queries."
             value={form.getValue("virtual_library.altmount_api_key")}
             onChange={(v) => form.setValue("virtual_library.altmount_api_key", v)}
@@ -339,6 +368,26 @@ export default function StreamingSettings() {
             value={form.getValue("virtual_library.enable_quality_profiles") || "false"}
             onChange={(v) => form.setValue("virtual_library.enable_quality_profiles", v)}
             restartRequired={restartKeys.has("virtual_library.enable_quality_profiles")}
+          />
+          <SettingField
+            label="Quality preset"
+            settingKey="virtual_library.quality_preset"
+            type="select"
+            options={QUALITY_PRESET_OPTIONS}
+            description="Named resolution/codec profile set applied when profiles are enabled."
+            value={form.getValue("virtual_library.quality_preset") || "custom"}
+            onChange={(v) => form.setValue("virtual_library.quality_preset", v)}
+            restartRequired={restartKeys.has("virtual_library.quality_preset")}
+          />
+          <SettingField
+            label="Custom format preset"
+            settingKey="virtual_library.custom_format_preset"
+            type="select"
+            options={CUSTOM_FORMAT_PRESET_OPTIONS}
+            description="TRaSH-style release scoring weights. AltMount presets mirror the Stremio addon scorer."
+            value={form.getValue("virtual_library.custom_format_preset") || "custom"}
+            onChange={(v) => form.setValue("virtual_library.custom_format_preset", v)}
+            restartRequired={restartKeys.has("virtual_library.custom_format_preset")}
           />
           <SettingField
             label="Single stream with failover"
