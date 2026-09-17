@@ -1357,32 +1357,31 @@ func newChiRouter(deps Dependencies) chi.Router {
 			deps.PluginService.AddLifecycleHook(func(context.Context) { playbackHandler.BestResultCache.Clear() })
 		}
 		playbackHandler.RemoteStreamRelay = remoteStreamRelay
-		if deps.PluginService != nil {
-			// Phase 2 provenance SSRF wiring: install the core-side
-			// virtual_library.allow_insecure_http reader. Nil-safe by
-			// design (plugins.CoreVirtualInsecureAllowed fails closed when
-			// unset); until Phase 4 sets this, every row takes the legacy
-			// per-installation path below, unchanged.
-			if settingsRepo != nil {
-				store := settingsRepo
-				plugins.CoreInsecureAllowed = func(ctx context.Context) bool {
-					if ctx == nil {
-						ctx = context.Background()
-					}
-					raw, err := store.Get(ctx, "virtual_library.allow_insecure_http")
-					if err != nil || raw == "" {
-						return false
-					}
-					on, err := strconv.ParseBool(strings.TrimSpace(raw))
-					if err != nil {
-						return false
-					}
-					return on
+		if settingsRepo != nil {
+			store := settingsRepo
+			plugins.CoreInsecureAllowed = func(ctx context.Context) bool {
+				if ctx == nil {
+					ctx = context.Background()
 				}
+				raw, err := store.Get(ctx, "virtual_library.allow_insecure_http")
+				if err != nil || raw == "" {
+					return false
+				}
+				on, err := strconv.ParseBool(strings.TrimSpace(raw))
+				if err != nil {
+					return false
+				}
+				return on
 			}
-			playbackHandler.AllowInsecureVirtual = func(installationID int) bool {
+		}
+		playbackHandler.AllowInsecureVirtual = func(installationID int) bool {
+			if installationID <= 0 {
+				return plugins.CoreVirtualInsecureAllowed(context.Background())
+			}
+			if deps.PluginService != nil {
 				return deps.PluginService.InstallationAllowsInsecure(context.Background(), installationID)
 			}
+			return false
 		}
 		if streamHandler != nil {
 			streamHandler.RemoteStreamRelay = remoteStreamRelay

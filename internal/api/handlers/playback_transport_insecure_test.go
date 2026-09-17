@@ -86,6 +86,21 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 			t.Fatal("expected private host to be rejected when no owner is resolved")
 		}
 	})
+
+	t.Run("core owner authorizes private host when AllowInsecureVirtual authorizes id 0", func(t *testing.T) {
+		h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "http://altmount:8080/stremio/test/play", OwnerID: 0}, nil
+		})
+		h.AllowInsecureVirtual = func(installationID int) bool { return installationID <= 0 }
+		res, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 0, 1, "profile", false, nil, "")
+		if err != nil {
+			t.Fatalf("expected core owner to authorize private host: %v", err)
+		}
+		defer cleanup()
+		if res.URL == "" {
+			t.Fatal("expected a relay URL")
+		}
+	})
 }
 
 type fakePinFileResolver struct {
