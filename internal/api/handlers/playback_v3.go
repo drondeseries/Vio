@@ -7549,6 +7549,14 @@ func (h *PlaybackHandler) plannerSettingsV3Result(ctx context.Context) (playback
 	return settings, nil
 }
 
+// softwareFallbackAllowedV3 reports whether the live playback policy permits
+// an automated software-decode fallback. The value is read live from the
+// playback config, so an operator's gpu_only choice takes effect without a
+// restart; the empty string is the default "allow".
+func (h *PlaybackHandler) softwareFallbackAllowedV3() bool {
+	return playback.SoftwareFallbackAllowed(h.playbackConfig().SoftwareFallback)
+}
+
 // dropStaleAudioTrackIdentityV3 reports whether the request's audio track ID
 // embeds a file identity that no longer matches file. Virtual candidate
 // rotation replaces media_files rows whenever the provider surfaces a new
