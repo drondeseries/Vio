@@ -6,17 +6,19 @@ ebook, and manga libraries behave the same way.
 
 ## Marker files: `.ignore` and `.nomedia`
 
-A directory containing a plain file named `.ignore` or `.nomedia` is skipped
-entirely, together with everything under it. The marker must be a file — a
-directory that happens to be named `.ignore` is ordinary content. The marker
-means "this folder is not media", so it has no pattern semantics and cannot
-be overridden by a deeper `.siloignore`.
+A directory containing a plain regular file named `.ignore` or `.nomedia` is
+skipped entirely, together with everything under it. The marker must be a
+regular file — a directory or symlink named `.ignore` is ordinary content.
+The marker means "this folder is not media", so it has no pattern semantics
+and cannot be overridden by a deeper `.siloignore`.
 
 ## Pattern file: `.siloignore`
 
 A `.siloignore` file holds one glob pattern per line and follows the same
 principles as Plex's `.plexignore`:
 
+- The file must be a regular file in the directory it applies to; symlinks
+  and directories do not count.
 - Patterns are matched against paths relative to the directory holding the
   file.
 - The file's patterns apply to that directory and every descendant. Nested

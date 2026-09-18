@@ -32,11 +32,11 @@ type ignoreRules struct {
 }
 
 // dirHasIgnoreMarker reports whether the entries contain an ignore marker
-// file. A directory merely named .ignore or .nomedia is not a marker; only
-// plain files count.
+// file. Only regular files count: a directory or symlink named .ignore or
+// .nomedia is not a marker.
 func dirHasIgnoreMarker(entries []fs.DirEntry) bool {
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if !entry.Type().IsRegular() {
 			continue
 		}
 		if entry.Name() == ignoreMarkerIgnore || entry.Name() == ignoreMarkerNoMedia {
@@ -92,10 +92,10 @@ func ignoreRulesMatch(rules []ignoreRules, logicalPath string) bool {
 
 // childIgnoreRules returns the rule set children of a directory inherit: the
 // inherited rules plus this directory's own .siloignore, if present. Only a
-// plain file counts as the pattern file.
+// regular file counts as the pattern file.
 func childIgnoreRules(inherited []ignoreRules, dirLogicalPath, dirPhysicalPath string, entries []fs.DirEntry) []ignoreRules {
 	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() != siloIgnoreFileName {
+		if !entry.Type().IsRegular() || entry.Name() != siloIgnoreFileName {
 			continue
 		}
 		patterns := readSiloIgnoreFile(dirPhysicalPath)

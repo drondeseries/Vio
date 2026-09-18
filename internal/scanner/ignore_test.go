@@ -115,6 +115,33 @@ func TestDirectoryNamedLikeMarkerIsNotAMarker(t *testing.T) {
 	}
 }
 
+func TestSymlinkedMarkerAndPatternFilesAreNotHonored(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "marker-target")
+	if err := os.WriteFile(target, []byte("test"), 0o644); err != nil {
+		t.Fatalf("write marker target: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, ".ignore")); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+	writeTestFile(t, filepath.Join(root, "Episode 01.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Sub", "Episode 02.mkv"), "test")
+	patternTarget := filepath.Join(root, "patterns")
+	if err := os.WriteFile(patternTarget, []byte("Sub\n"), 0o644); err != nil {
+		t.Fatalf("write pattern target: %v", err)
+	}
+	if err := os.Symlink(patternTarget, filepath.Join(root, ".siloignore")); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+
+	// Neither the symlinked marker nor the symlinked pattern file is honored:
+	// every media file stays scannable.
+	files := collectTestFilePaths(t, root, "series")
+	assertFilePaths(t, files, root, []string{"Episode 01.mkv", "Sub/Episode 02.mkv"})
+}
+
 func TestParseIgnorePatterns(t *testing.T) {
 	t.Parallel()
 

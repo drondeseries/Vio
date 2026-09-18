@@ -46,15 +46,16 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 			failures.addf("read root %s: %w", root, err)
 			continue
 		}
+		// An ignored root still takes part in missing-file reconciliation:
+		// its files are not in seenPaths, so their catalog rows are marked
+		// missing and retired instead of being protected forever.
+		reconcileRoots = append(reconcileRoots, root)
 		if dirHasIgnoreMarker(entries) {
-			// The whole podcast root is ignored; do not protect it from
-			// missing-file reconciliation, so its catalog entries retire.
 			continue
 		}
-		reconcileRoots = append(reconcileRoots, root)
 		var rootIgnoreRules []ignoreRules
 		for _, entry := range entries {
-			if !entry.IsDir() && entry.Name() == siloIgnoreFileName {
+			if entry.Type().IsRegular() && entry.Name() == siloIgnoreFileName {
 				if patterns := readSiloIgnoreFile(root); len(patterns) > 0 {
 					rootIgnoreRules = append(rootIgnoreRules, ignoreRules{basePath: root, patterns: patterns})
 				}
