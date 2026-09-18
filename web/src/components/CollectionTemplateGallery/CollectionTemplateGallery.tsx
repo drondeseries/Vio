@@ -342,7 +342,7 @@ function TemplateBundleApplyView({
   }, [groups]);
   const [libraryIds, setLibraryIds] = useState<number[]>(initialIds);
   const [deleteExisting, setDeleteExisting] = useState(false);
-  const [virtualPlayback, setVirtualPlayback] = useState(false);
+  const [virtualPlayback, setVirtualPlayback] = useState(true);
   const [homeFeatured, setHomeFeatured] = useState<string | null>(null);
   const [libraryFeatured, setLibraryFeatured] = useState<Record<number, string>>({});
   const [result, setResult] = useState<ApplyCollectionTemplateBundleResponse | null>(null);

@@ -706,7 +706,7 @@ function installationOptionValue(entry: RequestRouterInstallation): string {
   return `${entry.installationID}:${entry.capability.id}`;
 }
 
-function RequestIntegrationsTab() {
+export function RequestIntegrationsTab() {
   const integrations = useRequestIntegrations();
 
   if (integrations.isLoading) return <RowsSkeleton />;
@@ -848,13 +848,19 @@ function RequestIntegrationsForm({ integrations }: { integrations: RequestIntegr
   );
   // When exactly one request-router plugin is installed, default new/unseeded
   // connections to it so the admin doesn't have to pick.
-  const defaultSelection: Pick<IntegrationFormState, "installation_id" | "capability_id"> =
-    routerInstallations.length === 1
-      ? {
-          installation_id: String(routerInstallations[0]?.installationID ?? ""),
-          capability_id: routerInstallations[0]?.capability.id ?? "",
-        }
-      : { installation_id: "", capability_id: "" };
+  const soleInstallation = routerInstallations.length === 1 ? routerInstallations[0] : undefined;
+  const soleDefaults = soleInstallation
+    ? requestRouterConnectionDefaults(soleInstallation.capability.metadata)
+    : null;
+  const defaultSelection: Partial<IntegrationFormState> = soleInstallation
+    ? {
+        name: soleInstallation.capability.display_name || soleInstallation.pluginID,
+        installation_id: String(soleInstallation.installationID),
+        capability_id: soleInstallation.capability.id,
+        base_url: soleDefaults?.baseURL ?? "",
+        api_key_ref: soleDefaults?.apiKey ?? "",
+      }
+    : { installation_id: "", capability_id: "" };
 
   const [cards, setCards] = useState<IntegrationCard[]>(() =>
     integrations.map((integration) => ({
@@ -1065,14 +1071,22 @@ function IntegrationEditor({
 
   const selectedDefaults = requestRouterConnectionDefaults(selected?.capability.metadata);
   useEffect(() => {
-    if (!selectedDefaults || form.base_url.trim() || form.api_key_ref.trim() || form.has_api_key) {
-      return;
+    if (!selectedDefaults) return;
+    const updates: Partial<IntegrationFormState> = {};
+    if (!form.name.trim() && selected?.capability.display_name) {
+      updates.name = selected.capability.display_name;
     }
-    onChange({ base_url: selectedDefaults.baseURL, api_key_ref: selectedDefaults.apiKey });
-    // Default metadata is stable for an installed capability. Only fill a fully
-    // empty connection; never overwrite an administrator's saved credentials.
+    if (!form.base_url.trim() && !form.has_api_key) {
+      updates.base_url = selectedDefaults.baseURL;
+    }
+    if (!form.api_key_ref.trim() && !form.has_api_key) {
+      updates.api_key_ref = selectedDefaults.apiKey;
+    }
+    if (Object.keys(updates).length > 0) {
+      onChange(updates);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDefaults?.baseURL, selectedDefaults?.apiKey]);
+  }, [selectedDefaults?.baseURL, selectedDefaults?.apiKey, selected?.capability.display_name]);
 
   // Switching the selected plugin must drop the previous plugin's config (so its
   // keys never reach the new plugin's schema in the options probe or save) and
@@ -1080,21 +1094,24 @@ function IntegrationEditor({
   function handlePluginChange(value: string) {
     const entry = installations.find((e) => installationOptionValue(e) === value);
     if (!entry) return;
-    if (
-      entry.installationID === selectedInstallationID &&
-      entry.capability.id === form.capability_id
-    ) {
-      return; // no actual change; keep existing config
-    }
     const defaults = requestRouterConnectionDefaults(entry.capability.metadata);
-    patchForm({
+    const updates: Partial<IntegrationFormState> = {
       installation_id: String(entry.installationID),
       capability_id: entry.capability.id,
       base_url: defaults?.baseURL ?? "",
       api_key_ref: defaults?.apiKey ?? "",
       has_api_key: false,
-    });
-    onConfigChange({});
+    };
+    if (!form.name.trim() || form.name === selected?.capability.display_name) {
+      updates.name = entry.capability.display_name || entry.pluginID;
+    }
+    patchForm(updates);
+    if (
+      entry.installationID !== selectedInstallationID ||
+      entry.capability.id !== form.capability_id
+    ) {
+      onConfigChange({});
+    }
   }
   const selectedConfigSchema = selected?.capability.config_schema?.[0];
   const descriptor = selectedConfigSchema?.admin_form;

@@ -790,7 +790,7 @@ export function TMDBPresetForm({
   const [mediaType, setMediaType] = useState<TMDBMediaType>("all");
   const [limit, setLimit] = useState("");
   const [featured, setFeatured] = useState(true);
-  const [virtualPlayback, setVirtualPlayback] = useState(false);
+  const [virtualPlayback, setVirtualPlayback] = useState(true);
   const [posterFile, setPosterFile] = useState<File | null>(null);
   const [backdropFile, setBackdropFile] = useState<File | null>(null);
   const [posterSourceUrl, setPosterSourceUrl] = useState("");
@@ -1044,7 +1044,7 @@ export function TraktPresetForm({
   const [profileId, setProfileId] = useState("");
   const [limit, setLimit] = useState("");
   const [featured, setFeatured] = useState(true);
-  const [virtualPlayback, setVirtualPlayback] = useState(false);
+  const [virtualPlayback, setVirtualPlayback] = useState(true);
   const [posterFile, setPosterFile] = useState<File | null>(null);
   const [backdropFile, setBackdropFile] = useState<File | null>(null);
   const [posterSourceUrl, setPosterSourceUrl] = useState("");
@@ -1328,7 +1328,7 @@ export function MDBListImportForm({
   const [url, setURL] = useState("");
   const [limit, setLimit] = useState("");
   const [featured, setFeatured] = useState(true);
-  const [virtualPlayback, setVirtualPlayback] = useState(false);
+  const [virtualPlayback, setVirtualPlayback] = useState(true);
   const [posterFile, setPosterFile] = useState<File | null>(null);
   const [backdropFile, setBackdropFile] = useState<File | null>(null);
   const [posterSourceUrl, setPosterSourceUrl] = useState("");
