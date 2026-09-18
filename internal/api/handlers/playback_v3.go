@@ -5806,7 +5806,14 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		if executedHWAccel != "" && !strings.EqualFold(executedHWAccel, playback.HWAccelNone) &&
 			!playback.RequiresSoftwareVideoDecode(record.CurrentPlan.Source.VideoCodec, record.CurrentPlan.Source.VideoProfile, record.CurrentPlan.Source.BitDepth) {
 			if ts := h.tm.GetTranscodeSession(record.SessionID); ts != nil && ts.IsDecodeFailed() {
-				forceSoftwareDecode = softwareDecodeVariantPendingV3(record, req)
+				// gpu_only forbids the reactive CPU-decode retry: the operator
+				// asked for GPU playback, so a hardware decoder rejection is a
+				// terminal verdict for this candidate, not a prompt to decode
+				// on the CPU. The hardware plan key is already in the attempted
+				// set, so the planner surfaces adaptation_exhausted (or the
+				// virtual recovery loop re-grabs a different candidate with the
+				// failed one excluded). allow keeps the existing retry.
+				forceSoftwareDecode = h.softwareFallbackAllowedV3() && softwareDecodeVariantPendingV3(record, req)
 				if forceSoftwareDecode {
 					decodeFailureSample, decodeFailureCount = ts.DecodeFailureEvidence()
 				}
@@ -5850,7 +5857,17 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// excluded so it cannot be re-selected under a new row ID.
 				preferredCandidateID := virtualResultCandidateID(session.VirtualSourceURI)
 				var excludedCandidateIDs []string
-				if failedID := virtualResultCandidateID(currentEffectiveFile.FilePath); failedID != "" {
+				// A decode-classified failure with an untried software variant
+				// retries the SAME candidate. The current verdict is "this
+				// decoder could not read the source", not "this release is
+				// dead", so rotating away would hide the hardware/software
+				// question the software retry exists to answer. Resolving the
+				// preferred session candidate without excluding it re-binds the
+				// same release, and the forced software recipe (passed to the
+				// planner below) re-decodes it on the CPU. Any other failure —
+				// transport, timeout, or a software plan that already failed —
+				// keeps today's rotate-to-a-different-candidate behaviour.
+				if failedID := virtualResultCandidateID(currentEffectiveFile.FilePath); failedID != "" && !forceSoftwareDecode {
 					excludedCandidateIDs = []string{failedID}
 				}
 				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false)

@@ -754,3 +754,85 @@ func TestRelayCacheableResponseRejectsUnboundedAndPrivate(t *testing.T) {
 		})
 	}
 }
+
+// TestRelayDoesNotCacheLargeOpenEndedReads proves a read larger than the cache
+// entry bound streams through on every request and is never served from cache.
+// This is the guard against the range cache truncating or replaying a media
+// read: a 22 GB body (and any bounded range over 512 KiB) always comes from
+// upstream, so the cache cannot shorten it.
+func TestRelayDoesNotCacheLargeOpenEndedReads(t *testing.T) {
+	body := strings.Repeat("z", relayRangeCacheMaxEntrySize+1)
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", body)
+		response.Header.Set("Accept-Ranges", "bytes")
+		response.Header.Set("Content-Range", "bytes 0-524288/22613433146")
+		response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "large-open-ended", "https://1.1.1.1/media.mkv")
+	defer cleanup()
+
+	for attempt := 0; attempt < 2; attempt++ {
+		got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-")
+		if got.status != http.StatusPartialContent || len(got.body) != len(body) {
+			t.Fatalf("attempt %d = status %d, %d bytes, want %d", attempt, got.status, len(got.body), len(body))
+		}
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (a large read is never cached)", got)
+	}
+}
+
+// TestRelayRangeCacheKeyHonorsExactRange proves two different byte ranges of
+// the same source are cached independently: the exact Range header is part of
+// the key, so a hit can never answer a different offset with the wrong bytes.
+func TestRelayRangeCacheKeyHonorsExactRange(t *testing.T) {
+	bodies := map[string]string{
+		"bytes=100-199": strings.Repeat("A", 100),
+		"bytes=200-299": strings.Repeat("B", 100),
+	}
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		rangeHeader := request.Header.Get("Range")
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", bodies[rangeHeader])
+		response.Header.Set("Content-Range", strings.Replace(rangeHeader, "=", " ", 1)+"/1000")
+		response.Header.Set("Content-Length", strconv.Itoa(len(bodies[rangeHeader])))
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "exact-range", "https://1.1.1.1/media.mkv")
+	defer cleanup()
+
+	for _, tc := range []struct{ name, body string }{
+		{"bytes=100-199", bodies["bytes=100-199"]},
+		{"bytes=200-299", bodies["bytes=200-299"]},
+		{"bytes=100-199", bodies["bytes=100-199"]},
+	} {
+		got := fetchRelay(t, relay, relayURL, http.MethodGet, tc.name)
+		if got.body != tc.body {
+			t.Fatalf("range %s served %d bytes starting %q, want the body for that exact range",
+				tc.name, len(got.body), string(got.body[:min(8, len(got.body))]))
+		}
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (only the repeated exact range is cached)", got)
+	}
+}

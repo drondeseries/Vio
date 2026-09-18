@@ -3179,8 +3179,14 @@ func TestSoftwareFallbackAllowed(t *testing.T) {
 	if !softwareFallbackAllowed("allow") {
 		t.Fatal("allow should permit software fallback")
 	}
+	if !softwareFallbackAllowed("") {
+		t.Fatal("the unset default should permit software fallback")
+	}
 	if softwareFallbackAllowed("gpu_only") {
 		t.Fatal("gpu_only should disable software fallback")
+	}
+	if softwareFallbackAllowed("  GPU_ONLY  ") {
+		t.Fatal("gpu_only should be matched case-insensitively and trimmed")
 	}
 }
 
@@ -3233,6 +3239,63 @@ func TestSpawnReconstructDoesNotRegisterFailedSoftwareRetry(t *testing.T) {
 	}
 	if !strings.Contains(string(logData), "libx264") {
 		t.Fatalf("reconstruction did not attempt the software retry:\n%s", logData)
+	}
+}
+
+// A reconstruction whose VideoToolbox session died during startup must not
+// take the CPU software retry when playback.software_fallback=gpu_only. The
+// dead session is closed and surfaced rather than registered, and no software
+// encode is spawned.
+func TestSpawnReconstructHonorsGPUOnly(t *testing.T) {
+	server := newTestServer(t)
+	dir := t.TempDir()
+	ffmpegPath := filepath.Join(dir, "ffmpeg")
+	logPath := filepath.Join(dir, "invocations.log")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> " + logPath + "\n" +
+		"case \"$*\" in\n" +
+		"  *-hwaccels*) echo videotoolbox; exit 0 ;;\n" +
+		"  *-encoders*) echo ' V..... h264_videotoolbox x'; exit 0 ;;\n" +
+		"  *videotoolbox*'-f null'*) exit 0 ;;\n" +
+		"  *) exit 1 ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(ffmpegPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := server.watcher.Config()
+	cfg.Playback.FFmpegPath = ffmpegPath
+	cfg.Playback.HWAccel = tonemap.BackendVideoToolbox
+	cfg.Playback.SoftwareFallback = "gpu_only"
+
+	const sessionID = "gpu-only-reconstruct-retry"
+	card := playback.NewRecipeCard(7, "profile-1", 42, "", playback.TranscodeOpts{
+		SessionID: sessionID, InputPath: "/media/movie.mkv",
+		TargetCodecVideo: "h264", TargetCodecAudio: "aac", TargetResolution: "720p", TargetBitrateKbps: 2000,
+		SegmentDuration: 2,
+	})
+	session, err := server.spawnReconstruct(httptest.NewRequest(http.MethodGet, "/", nil), sessionID, -1, card)
+	if session != nil {
+		_ = session.Close()
+		t.Fatal("gpu_only reconstruct returned a session")
+	}
+	if err == nil {
+		t.Fatal("gpu_only reconstruct returned no error")
+	}
+	server.mu.RLock()
+	_, registered := server.sessions[sessionID]
+	server.mu.RUnlock()
+	if registered {
+		t.Fatal("dead gpu_only reconstruct was registered")
+	}
+	logData, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got := strings.Count(string(logData), "-f hls"); got != 1 {
+		t.Fatalf("real transcode attempts = %d, want only the hardware attempt under gpu_only:\n%s", got, logData)
+	}
+	if strings.Contains(string(logData), "libx264") {
+		t.Fatalf("gpu_only reconstruction attempted the software retry:\n%s", logData)
 	}
 }
 

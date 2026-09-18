@@ -146,6 +146,102 @@ func TestDecodeFailureRecordsSourceRejectionForEveryDecodeMode(t *testing.T) {
 	}
 }
 
+// TestDecodeFailureInvokesSourceRejectedMarkerOnce proves a decoder rejection
+// is handed to the source-candidate failure callback exactly once, past the
+// same threshold and with the same identity the demux marker uses, so the
+// candidate is stamped through the one existing failed_at mechanism. The
+// callback is the mark path: it fires for a hardware plan and for a software
+// plan (the source is bad, not the decoder mode), never for a copy target, and
+// never before the threshold.
+func TestDecodeFailureInvokesSourceRejectedMarkerOnce(t *testing.T) {
+	type call struct {
+		fileID    int
+		canonical string
+	}
+	newSession := func(opts TranscodeOpts, calls chan call) *TranscodeSession {
+		opts.OnSourceRejected = func(_ context.Context, fileID int, canonical string) error {
+			calls <- call{fileID: fileID, canonical: canonical}
+			return nil
+		}
+		return &TranscodeSession{opts: opts}
+	}
+	ctx := context.Background()
+
+	hardwareCalls := make(chan call, 4)
+	hardware := newSession(TranscodeOpts{
+		MediaFileID:        77,
+		CanonicalInputPath: "virtual://movie/tt1?result=bad",
+		TargetCodecVideo:   "h264",
+	}, hardwareCalls)
+	for i := 0; i < decodeErrorThreshold-1; i++ {
+		hardware.logFFmpegLine(ctx, hevcPOCErrorLine())
+	}
+	select {
+	case got := <-hardwareCalls:
+		t.Fatalf("marker invoked before the threshold: %+v", got)
+	default:
+	}
+	hardware.logFFmpegLine(ctx, hevcPOCErrorLine())
+	select {
+	case got := <-hardwareCalls:
+		if got.fileID != 77 || got.canonical != "virtual://movie/tt1?result=bad" {
+			t.Fatalf("marker call = %+v, want file 77 and the canonical virtual path", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("source-rejected marker was not invoked at the threshold")
+	}
+	// The notified flag is set under the mutex before dispatch, so a later
+	// error must not spawn a second marker call.
+	hardware.logFFmpegLine(ctx, hevcPOCErrorLine())
+	select {
+	case extra := <-hardwareCalls:
+		t.Fatalf("source-rejected marker invoked more than once: %+v", extra)
+	default:
+	}
+
+	// A software plan records the source rejection too: the bitstream is bad,
+	// not merely the hardware decoder.
+	softwareCalls := make(chan call, 1)
+	software := newSession(TranscodeOpts{
+		MediaFileID:         78,
+		CanonicalInputPath:  "virtual://movie/tt2?result=sw",
+		TargetCodecVideo:    "h264",
+		SoftwareVideoDecode: true,
+	}, softwareCalls)
+	for i := 0; i < decodeErrorThreshold; i++ {
+		software.logFFmpegLine(ctx, hevcPOCErrorLine())
+	}
+	select {
+	case got := <-softwareCalls:
+		if got.fileID != 78 || got.canonical != "virtual://movie/tt2?result=sw" {
+			t.Fatalf("software marker call = %+v, want file 78 and the canonical path", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("software source rejection did not invoke the marker")
+	}
+	if software.IsDecodeFailed() {
+		t.Fatal("software plan claimed the hardware decoder failed")
+	}
+
+	// A copy target never reports a decode verdict, so it never marks.
+	copyCalls := make(chan struct{}, 1)
+	copyTarget := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo: "copy",
+		OnSourceRejected: func(context.Context, int, string) error {
+			copyCalls <- struct{}{}
+			return nil
+		},
+	}}
+	for i := 0; i < decodeErrorThreshold*3; i++ {
+		copyTarget.logFFmpegLine(ctx, hevcPOCErrorLine())
+	}
+	select {
+	case <-copyCalls:
+		t.Fatal("copy target invoked the source-rejected marker")
+	default:
+	}
+}
+
 // TestLogFFmpegLineObservesDecodeFailure exercises the stderr plumbing the
 // transcode process uses, including the diagnostic sample kept for the replan
 // decision log.

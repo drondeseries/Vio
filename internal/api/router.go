@@ -1344,6 +1344,18 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed(ctx, fileID, expectedFilePath, nil)
 			}
+			// A decoder-rejected source is the same verdict as a repeated demux
+			// failure: the candidate is bad and the auto-pick must skip it. The
+			// write goes through the one existing failed_at mechanism, fenced on
+			// the candidate identity and the delivery grace; the dropdown still
+			// shows the row for a manual retry, and a later successful delivery
+			// clears the stamp.
+			playbackHandler.TranscodeManager().OnSourceRejected = func(ctx context.Context, fileID int, expectedFilePath string) error {
+				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(expectedFilePath)), "virtual://") {
+					return nil
+				}
+				return scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed(ctx, fileID, expectedFilePath, nil)
+			}
 			playbackHandler.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
 				if deps.DB == nil {
 					return 0, nil

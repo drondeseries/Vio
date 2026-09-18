@@ -50,6 +50,14 @@ func writePlaybackTestFFmpegDecodeFailure(t *testing.T) string {
 // play, so the only viable route is a server HLS transcode.
 func hardwareDecodeFailureHandler(t *testing.T) (*PlaybackHandler, *models.MediaFile) {
 	t.Helper()
+	return hardwareDecodeFailureHandlerWithFallback(t, "")
+}
+
+// hardwareDecodeFailureHandlerWithFallback is hardwareDecodeFailureHandler with
+// an explicit playback.software_fallback policy. The empty string is the
+// default "allow".
+func hardwareDecodeFailureHandlerWithFallback(t *testing.T, softwareFallback string) (*PlaybackHandler, *models.MediaFile) {
+	t.Helper()
 	source := v3HandlerFixtureFile(t)
 	source.Container = "mkv"
 	source.FilePath = writePlaybackTestMediaFile(t, "movie-hevc.mkv")
@@ -67,6 +75,7 @@ func hardwareDecodeFailureHandler(t *testing.T) (*PlaybackHandler, *models.Media
 	handler.PlaybackConfig = func() config.PlaybackConfig {
 		cfg := baseConfig()
 		cfg.HWAccel = "qsv"
+		cfg.SoftwareFallback = softwareFallback
 		return cfg
 	}
 	stubCopySeekAnchorV3(handler)
@@ -217,5 +226,233 @@ func TestHandleReplanPlaybackV3FailureRecoveryFallsBackToSoftwareDecode(t *testi
 	mu.Unlock()
 	if softwareSpawns != 1 {
 		t.Fatalf("software decode spawned %d times, want exactly one", softwareSpawns)
+	}
+}
+
+// TestHandleReplanPlaybackV3FailureRecoveryHonorsGPUOnly proves the operator's
+// playback.software_fallback=gpu_only choice suppresses the reactive
+// software-decode retry. After the live hardware decoder rejects the source,
+// the failure recovery must not return or spawn a software-decode plan: it
+// surfaces the exhausted route (or a different delivery) instead, and the HLS
+// delivery is not held open waiting for a CPU retry that policy forbids.
+func TestHandleReplanPlaybackV3FailureRecoveryHonorsGPUOnly(t *testing.T) {
+	handler, source := hardwareDecodeFailureHandlerWithFallback(t, "gpu_only")
+
+	start := v3HandlerStartRequest()
+	start.QualityPreference = "auto"
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Containers:        []string{"hls"},
+		VideoCodecs:       []string{"h264"},
+		AudioDecodeCodecs: []string{"aac"},
+	}
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if started.PlaybackPlan.Delivery != playback.DeliveryTranscodeHLSV3 || started.PlaybackPlan.EffectiveRecipe.SoftwareVideoDecode {
+		t.Fatalf("fixture start = delivery %s software=%v, want a hardware server transcode",
+			started.PlaybackPlan.Delivery, started.PlaybackPlan.EffectiveRecipe.SoftwareVideoDecode)
+	}
+	if started.PlaybackPlan.EffectiveMediaFileID != source.ID {
+		t.Fatalf("start effective file = %d, want %d", started.PlaybackPlan.EffectiveMediaFileID, source.ID)
+	}
+	defer handler.tm.CloseTranscodeSession(started.SessionID, "")
+
+	live := handler.tm.GetTranscodeSession(started.SessionID)
+	if live == nil {
+		t.Fatal("start registered no live transcode session")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !live.IsDecodeFailed() {
+		if time.Now().After(deadline) {
+			t.Fatal("hardware decode failure was never observed on the live session")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	var mu sync.Mutex
+	var captured []playback.TranscodeOpts
+	handler.StartTranscodeFunc = func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+		mu.Lock()
+		captured = append(captured, opts)
+		mu.Unlock()
+		return playback.StartTranscode(ctx, opts)
+	}
+
+	recovery := playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
+		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
+		ReplanRequestID: "gpu-only-recovery-0001", FailedPlanID: started.PlaybackPlan.PlanID,
+		PlanAttemptID: "gpu-only-attempt-0001", PlanAttemptKey: started.PlaybackPlan.PlanAttemptKey,
+		AttemptedPlanKeys: []string{started.PlaybackPlan.PlanAttemptKey}, AttemptCount: 1,
+		PositionSeconds: 10, SelectedTracks: started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "decode_error"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	}
+	recovered := postPlaybackReplanV3(t, handler, started.SessionID, recovery)
+	if recovered.PlaybackPlan != nil && recovered.PlaybackPlan.EffectiveRecipe.SoftwareVideoDecode {
+		t.Fatalf("gpu_only returned a software-decode plan: %#v", recovered.PlaybackPlan)
+	}
+	if recovered.PlaybackPlan == nil && recovered.Terminal == nil {
+		t.Fatal("failure recovery returned neither a plan nor a terminal")
+	}
+	if recovered.Terminal != nil && strings.TrimSpace(recovered.Terminal.Reason) == "" {
+		t.Fatalf("terminal has no reason: %#v", recovered.Terminal)
+	}
+	mu.Lock()
+	softwareSpawns := 0
+	for _, opts := range captured {
+		if opts.SoftwareVideoDecode {
+			softwareSpawns++
+		}
+	}
+	mu.Unlock()
+	if softwareSpawns != 0 {
+		t.Fatalf("gpu_only spawned %d software-decode transcodes, want 0", softwareSpawns)
+	}
+}
+
+// A decode-classified failure on a virtual candidate must retry the SAME
+// session-bound candidate on the software path before recovery rotates away.
+// The verdict is "this decoder could not read the source", not "this release is
+// dead", so excluding the candidate here would hide whether the hardware
+// decoder was the problem the software retry exists to answer. The test keeps
+// the catalog row and the session on the same result= candidate, so the
+// rehydration's exclusion decision is the only thing that can rotate recovery.
+func TestVirtualDecodeRecoveryRetriesSameCandidateOnSoftware(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 610
+	// The catalog row and the session bind the same result= candidate: the one
+	// the decoder rejected. Recovery must retry it, not rotate to a sibling.
+	source.FilePath = "virtual://movie/tt-vdec?result=pinned"
+	source.VirtualOwnerInstallationID = 5
+	// Incomplete container evidence keeps the start path on the candidate
+	// listing path so the session binds the pinned release.
+	source.Container = "virtual"
+	source.CodecVideo = "hevc"
+	source.Resolution = "1080p"
+	source.Bitrate = 8_000
+	source.VideoTracks = []models.VideoTrack{{
+		Codec: "hevc", Profile: "Main", Level: 120, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8,
+		VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: map[int]*models.MediaFile{source.ID: source}})
+	baseConfig := playbackTestConfig(writePlaybackTestFFmpegDecodeFailure(t), t.TempDir())
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		cfg := baseConfig()
+		cfg.HWAccel = "qsv"
+		return cfg
+	}
+	stubCopySeekAnchorV3(handler)
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
+		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
+		{Name: playback.TransformationVideoToH264V3, RecipeVersion: playback.TransformationVideoToH264RecipeVersionV3, Available: true},
+	}))
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "true", "allow_4k_transcode": "true"}}
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:9/stream?path=" + path, nil
+	})
+	// The listed candidate is the same pinned release the catalog row names, so
+	// the start binds it and the replan's exclusion decision is the only thing
+	// that can rotate recovery away from it.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "pinned", URI: "virtual://movie/tt-vdec?result=pinned",
+			Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mkv",
+		}}, nil
+	})
+	type resolveCall struct {
+		excluded  []string
+		preferred string
+	}
+	var resolveCalls []resolveCall
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, virtualURI string, _ int, _ int, _ string, _ bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+		resolveCalls = append(resolveCalls, resolveCall{
+			excluded:  append([]string(nil), excludedCandidateIDs...),
+			preferred: preferredCandidateID,
+		})
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/stream", URI: virtualURI, CandidateID: "pinned"}, nil
+	})
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		f.VideoTracks = source.VideoTracks
+		f.AudioTracks = source.AudioTracks
+		f.CodecVideo, f.CodecAudio, f.Resolution, f.Container = "hevc", "aac", "1080p", "mkv"
+		return f, nil
+	}
+
+	start := v3HandlerStartRequest()
+	start.FileID = source.ID
+	start.QualityPreference = "auto"
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Containers: []string{"hls"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if started.PlaybackPlan.Delivery != playback.DeliveryTranscodeHLSV3 {
+		t.Fatalf("fixture expected a server transcode start, got %s (%s)", started.PlaybackPlan.Delivery, started.PlaybackPlan.DecisionReason)
+	}
+	defer handler.tm.CloseTranscodeSession(started.SessionID, "")
+
+	live := handler.tm.GetTranscodeSession(started.SessionID)
+	if live == nil {
+		t.Fatal("start registered no live transcode session")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !live.IsDecodeFailed() {
+		if time.Now().After(deadline) {
+			t.Fatal("hardware decode failure was never observed on the live session")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, start.ClientPlaybackContext.Output.OutputContextID, nil)
+	recovery := playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
+		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
+		ReplanRequestID: "virtual-decode-recovery-0001", FailedPlanID: started.PlaybackPlan.PlanID,
+		PlanAttemptID: "virtual-decode-attempt-0001", PlanAttemptKey: currentKey,
+		AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1,
+		QualityPreference: "auto", PositionSeconds: 10, SelectedTracks: started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "decode_error"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	}
+	recovered := postPlaybackReplanV3(t, handler, started.SessionID, recovery)
+	if recovered.Terminal != nil || recovered.PlaybackPlan == nil {
+		t.Fatalf("virtual decode recovery terminal=%+v", recovered.Terminal)
+	}
+	if recovered.PlaybackPlan.Delivery != playback.DeliveryTranscodeHLSV3 || !recovered.PlaybackPlan.EffectiveRecipe.SoftwareVideoDecode {
+		t.Fatalf("recovered plan = delivery %s software=%v, want server transcode with software decode",
+			recovered.PlaybackPlan.Delivery, recovered.PlaybackPlan.EffectiveRecipe.SoftwareVideoDecode)
+	}
+	// The rehydration names the session candidate as preferred; the transport
+	// input resolve that follows passes neither, so locate the rehydration call
+	// by its preferred id rather than reading the last capture.
+	var retry *resolveCall
+	for i := range resolveCalls {
+		if resolveCalls[i].preferred == "pinned" {
+			retry = &resolveCalls[i]
+		}
+	}
+	if retry == nil {
+		t.Fatal("decode recovery never preferred the session-bound pinned candidate")
+	}
+	if len(retry.excluded) != 0 {
+		t.Fatalf("excluded candidates = %v, want none: a decode-classified retry must keep the same candidate", retry.excluded)
+	}
+	if recovered.PlaybackPlan.EffectiveMediaFileID != source.ID {
+		t.Fatalf("effective file = %d, want the same candidate %d", recovered.PlaybackPlan.EffectiveMediaFileID, source.ID)
 	}
 }

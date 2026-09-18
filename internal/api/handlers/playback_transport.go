@@ -61,6 +61,9 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	if opts.OnDemuxFailure == nil && h.tm != nil {
 		opts.OnDemuxFailure = h.tm.OnDemuxFailure
 	}
+	if opts.OnSourceRejected == nil && h.tm != nil {
+		opts.OnSourceRejected = h.tm.OnSourceRejected
+	}
 	if !strings.HasPrefix(strings.ToLower(opts.InputPath), virtualPlaybackPrefix) {
 		session, startErr := h.startTranscodeSession(context.WithoutCancel(ctx), opts)
 		if startErr != nil {

@@ -58,7 +58,14 @@ type TranscodeOpts struct {
 	// Runtime-only: recipe cards serialize byte-affecting fields explicitly and
 	// never carry callbacks. No-op when nil.
 	OnDemuxFailure func(ctx context.Context, mediaFileID int, canonicalPath string) error
-	OutputDir      string // e.g., /tmp/silo-transcode/{session_id}/
+	// OnSourceRejected is invoked once per session when the decoder rejects the
+	// source past the confidence threshold, which is evidence about the source
+	// candidate rather than a transport blip. It receives the effective
+	// media_files id and the durable source path, exactly like OnDemuxFailure,
+	// so the embedding handler can stamp the candidate known-bad with the same
+	// mechanism. A copy target never invokes it. Runtime-only: no-op when nil.
+	OnSourceRejected func(ctx context.Context, mediaFileID int, canonicalPath string) error
+	OutputDir        string // e.g., /tmp/silo-transcode/{session_id}/
 	// subtitleFilterInputPath is a parser-safe local alias used only by the
 	// libass subtitles filter. FFmpeg still opens InputPath as the media input.
 	subtitleFilterInputPath string
@@ -248,12 +255,15 @@ type TranscodeSession struct {
 	// non-copy plan, hardware or software, because a decoder that rejects this
 	// many frames is evidence about the source itself; the serve path uses it
 	// to report a permanent failure instead of stalling the player. Guarded by
-	// mu.
-	decodeErrorCount  int
-	lastDecodeErrorAt time.Time
-	decodeSample      string
-	decodeStamped     bool
-	sourceRejected    bool
+	// mu. sourceRejectNotified is set once the rejection has been handed to the
+	// source-candidate failure callback, so the marker is invoked exactly once
+	// per session regardless of how many decoder lines follow.
+	decodeErrorCount     int
+	lastDecodeErrorAt    time.Time
+	decodeSample         string
+	decodeStamped        bool
+	sourceRejected       bool
+	sourceRejectNotified bool
 	// generationStartedAt is when the currently-owning ffmpeg process was
 	// spawned. Output in the shared directory older than this timestamp was
 	// written by a previous generation (or a previous session sharing the
@@ -4207,6 +4217,46 @@ func (s *TranscodeSession) notifyDemuxFailure(ctx context.Context) {
 	}()
 }
 
+// notifySourceRejected invokes the source-candidate failure callback exactly
+// once, when the decoder rejection has crossed its confidence threshold. It is
+// the decode counterpart of notifyDemuxFailure and reuses the same identity
+// (effective media file id + durable canonical path) so the embedding handler
+// stamps the candidate through the one existing failed_at mechanism. The
+// callback is read under mu, then invoked off the stderr goroutine with a
+// detached, bounded context so a slow write cannot stall FFmpeg's pipe. It is a
+// no-op when the source was never rejected or the callback is unset.
+func (s *TranscodeSession) notifySourceRejected(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.sourceRejected || s.sourceRejectNotified {
+		s.mu.Unlock()
+		return
+	}
+	s.sourceRejectNotified = true
+	cb := s.opts.OnSourceRejected
+	fileID := s.opts.MediaFileID
+	canonical := strings.TrimSpace(s.opts.CanonicalInputPath)
+	if canonical == "" {
+		canonical = strings.TrimSpace(s.opts.InputPath)
+	}
+	s.mu.Unlock()
+	if cb == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		if err := cb(callCtx, fileID, canonical); err != nil {
+			log.Printf("playback: mark virtual candidate failed after decoder rejection (file_id=%d): %v", fileID, err)
+		}
+	}()
+}
+
 func (s *TranscodeSession) logFFmpegLine(ctx context.Context, line string) {
 	if demuxInputErrorLine(line) {
 		if s.observeDemuxError(time.Now()) {
@@ -4215,6 +4265,7 @@ func (s *TranscodeSession) logFFmpegLine(ctx context.Context, line string) {
 	}
 	if decodeErrorLine(line) {
 		s.observeDecodeError(time.Now(), line)
+		s.notifySourceRejected(ctx)
 	}
 	if s == nil || s.opts.FFmpegLogSink == nil {
 		return
