@@ -408,6 +408,30 @@ func (c *SubtitleCache) HasCommittedTextEntry(inputPath, cacheIdentity string, t
 	return ok
 }
 
+// HasCommittedEntry reports whether a committed full-track artifact exists for
+// the source identity + track ordinal in the format this codec/target maps to:
+// VTT, ASS, or SUP. It generalizes HasCommittedTextEntry to every sidecar class
+// so the implicit-window gate can serve an already-committed track whole
+// (cheap) instead of slicing it, for text, ASS, and PGS alike.
+//
+// Like HasCommittedTextEntry this is a non-binding snapshot: it exists for
+// admission decisions, not to prove the identity a later read will use. Callers
+// that skip track-identity validation must still resolve and pin the artifact
+// with ResolveCommittedTextEntry (text/ASS); PGS has no pinned-token path and
+// keeps its mandatory drift probe. A codec with no sidecar class, an unkeyable
+// source, or a nil cache reads as false.
+func (c *SubtitleCache) HasCommittedEntry(inputPath, cacheIdentity string, trackIndex int, codec, targetFormat string) bool {
+	if c == nil {
+		return false
+	}
+	format := subtitleCacheFormat(codec, targetFormat)
+	if format == "" {
+		return false
+	}
+	_, _, ok := c.cachedFormatEntryPath(inputPath, cacheIdentity, trackIndex, format)
+	return ok
+}
+
 // ServeSUPExtract serves the .sup extract for one source+track described by
 // opts (opts.Writer is ignored; the cache supplies it). Full-track requests
 // (no AllowWindow): a cache hit is served with http.ServeContent (Range

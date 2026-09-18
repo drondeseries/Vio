@@ -379,6 +379,53 @@ func TestHasCommittedTextEntryFormatAndBitmap(t *testing.T) {
 	}
 }
 
+// HasCommittedEntry generalizes HasCommittedTextEntry to every sidecar class
+// (VTT, ASS, SUP) so the implicit-window gate can leave a committed track whole
+// for text, ASS, and PGS alike.
+func TestHasCommittedEntryAllFormats(t *testing.T) {
+	c, source := newTestCache(t)
+
+	extractText := func(opts StreamExtractOpts, payload string) {
+		t.Helper()
+		if err := c.ServeExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle", nil), opts, func(_ context.Context, o StreamExtractOpts) error {
+			_, err := io.WriteString(o.Writer, payload)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	extractText(StreamExtractOpts{InputPath: source, SourceCodec: "subrip", TrackIndex: 0}, "FULL VTT")
+	extractText(StreamExtractOpts{InputPath: source, SourceCodec: "ass", TrackIndex: 1}, "[Script Info]\n")
+	if err := c.ServeSUPExtract(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/subtitle.sup", nil),
+		StreamExtractOpts{InputPath: source, SourceCodec: "hdmv_pgs_subtitle", TrackIndex: 2},
+		func(_ context.Context, o StreamExtractOpts) error {
+			_, err := o.Writer.Write([]byte("PG"))
+			return err
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		track int
+		codec string
+	}{
+		{0, "subrip"},
+		{1, "ass"},
+		{2, "hdmv_pgs_subtitle"},
+	} {
+		if !c.HasCommittedEntry(source, "", tc.track, tc.codec, "") {
+			t.Fatalf("committed %s track %d not visible", tc.codec, tc.track)
+		}
+	}
+	if c.HasCommittedEntry(source, "", 0, "hdmv_pgs_subtitle", "") {
+		t.Fatal("PGS must not read the VTT entry at the same ordinal")
+	}
+	var nilCache *SubtitleCache
+	if nilCache.HasCommittedEntry(source, "", 0, "subrip", "") {
+		t.Fatal("nil cache must read as a miss")
+	}
+}
+
 // HasCommittedTextEntry is identity-keyed for a virtual source: the same
 // generation bucket and identity that a warm commits under is what the serve
 // path queries, so a handler can trust a hit to be the artifact it will read.

@@ -739,7 +739,7 @@ parameter, and never carries a parameter across families.
 | --- | --- | --- |
 | Media | `/stream/{session_id}`, `/playback/transcode/{session_id}/master.m3u8` and its segments | `seek` only — the progressive-remux start offset in seconds, present only when it is non-zero |
 | Media on a designated origin | `{proxy}/stream/v3/{session_id}`, `{proxy}/stream/v3/{session_id}/master.m3u8` and its `segment/{name}` children (§4.1) | `seek` only, with the same meaning; these routes never accept a credential parameter of any kind |
-| Subtitle artifact | `/stream/{session_id}/subtitles/{combined_index}{.ext}`, `/stream/{session_id}/subtitles/{combined_index}/fonts` | `file_id`, always; one identity pin: `embedded_stream_index`, `external_subtitle_key`, or `downloaded_subtitle_id` (§8). VTT receivers may explicitly request `timestamp_offset` in seconds |
+| Subtitle artifact | `/stream/{session_id}/subtitles/{combined_index}{.ext}`, `/stream/{session_id}/subtitles/{combined_index}/fonts` | `file_id`, always; one identity pin: `embedded_stream_index`, `external_subtitle_key`, or `downloaded_subtitle_id` (§8). VTT receivers may explicitly request `timestamp_offset` in seconds. Embedded receivers may request a bounded window with `position` and `duration`; PGS windowing additionally requires `windowed=1` |
 
 A media route never carries `file_id` or `downloaded_subtitle_id` — the session
 already names the file it plays, and the media timeline is anchored by `seek`
@@ -749,6 +749,20 @@ fetched whole with absolute source timestamps and `subtitle.artifact.timing_orig
 `file_id` is required on a subtitle route because a plan can fall back to an
 alternate edition, so the session id alone does not fix which file's ordinal
 space `{combined_index}` addresses. `embedded_stream_index` pins the probed FFmpeg stream index; `external_subtitle_key` pins an opaque SHA-256 hash of the sidecar path; `downloaded_subtitle_id` pins the downloaded row. These identities keep already-issued subtitle and font URLs attached to the same track when inventory order changes. Missing or ambiguous pinned tracks return an error rather than falling back to the path ordinal. Legacy unpinned URLs retain ordinal lookup.
+
+An embedded artifact request may add a bounded window: `position` (nonnegative
+source seconds, default `0`) and `duration` (positive seconds, at most 3600);
+PGS windows additionally require `windowed=1`. For an embedded track on a large
+or unknown-size virtual release, the server serves a bounded window even when
+the request carries no window parameters, because a complete extract cannot
+finish within a client fetch deadline (see §8). Such a response is partial and
+advertises the source-time range it covers with `X-Subtitle-Coverage:
+<start>-<end>` — three-decimal seconds, with `*` for an open end — and
+`X-Subtitle-Windowed: true`. A whole-track response (local or small/known
+source, a committed full-track artifact, or a request whose codec class cannot
+be sliced) omits both headers. Clients must treat the header's absence as
+"complete", and its presence as "request the next window from the advertised
+end".
 
 An attempt that did not opt into `header_authenticated_media_v1` additionally
 carries the signed stream token `st` on its media URLs — never on subtitle or
@@ -1253,20 +1267,39 @@ ASS/SSA uses `.ass`. A suffix that does not match the selected track or a valid
 conversion is rejected with `415` rather than returning bytes of a different
 type under the requested extension.
 
-Embedded text URLs return the complete track from source time zero by default,
-including when playback starts at a resume position. Consumers that maintain a
-sliding window may explicitly supply `position` (nonnegative source seconds)
-and `duration` (positive seconds, at most 3600). They must request subsequent
-windows themselves; HTTP EOF ends only the requested window. ASS remains a
-complete script. PGS windows require `windowed=1` in addition to the window
-parameters. External and downloaded sidecars are always returned whole.
+Embedded URLs for a local or small/known source return the complete track from
+source time zero by default, including when playback starts at a resume
+position. Consumers that maintain a sliding window may explicitly supply
+`position` (nonnegative source seconds) and `duration` (positive seconds, at
+most 3600). They must request subsequent windows themselves; HTTP EOF ends only
+the requested window.
 
-Complete embedded text and PGS extracts are cached by source file identity,
-modification time, size, subtitle ordinal, and output format. Partial or failed
-extracts are never published. Text cache misses stream while extracting; repeated
-complete text requests reuse the finished artifact. A failed extraction returns
-an error response before output begins, or aborts an already-started stream so
-clients can distinguish failure from a complete track and retry.
+For an embedded track on a large or unknown-size virtual/remote release the
+default is a bounded first window rather than the complete track: extracting
+every byte of a multi-GB provider stream cannot finish within a client fetch
+deadline, and the aborted extraction commits nothing, so the whole-track default
+never converges. The server returns the playback-sized window described in §4.2
+and advertises it with `X-Subtitle-Coverage` and `X-Subtitle-Windowed`. This
+applies to converted text (WebVTT), lossless ASS/SSA, and PGS alike, and lasts
+only until a complete artifact has been committed; once one exists the whole
+artifact is served and both headers are absent. A client that requested the
+whole track therefore cannot assume a complete body: it reads the headers and
+requests subsequent windows from the advertised end, or treats the response as
+that one window. Explicit `position`/`duration` (and PGS `windowed=1`) always
+override the implicit window. External and downloaded sidecars are always
+returned whole. First-party native clients that fetch a complete embedded
+sidecar in one request (`silo-apple`, `silo-android`) must handle the bounded
+default and are coordinated with this change.
+
+Complete embedded text, ASS/SSA, and PGS extracts are cached by source file
+identity, modification time, size, subtitle ordinal, and output format. Partial
+or failed extracts are never published. Text and ASS cache misses stream while
+extracting; repeated complete requests reuse the finished artifact. A windowed
+miss on a large virtual source also starts a detached full-track warm so later
+requests read the small cached artifact instead of re-demuxing the source. A
+failed extraction returns an error response before output begins, or aborts an
+already-started stream so clients can distinguish failure from a complete track
+and retry.
 
 ---
 
