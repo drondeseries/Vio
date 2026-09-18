@@ -81,7 +81,7 @@ CTX_PLAYABLE='{
     "hls": {
       "enabled": true,
       "supported_on_device": true,
-      "containers": ["mp4", "mkv", "ts"],
+      "containers": ["hls", "mp4", "mkv", "ts"],
       "video_codecs": ["h264", "hevc", "vp9", "av1"],
       "audio_decode_codecs": ["aac", "ac3", "eac3", "opus", "flac", "mp3"],
       "audio_passthrough_codecs": ["aac", "ac3", "eac3", "opus", "flac", "mp3"],
