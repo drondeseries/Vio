@@ -826,7 +826,7 @@ func TestRelayRangeCacheKeyHonorsExactRange(t *testing.T) {
 		got := fetchRelay(t, relay, relayURL, http.MethodGet, tc.name)
 		if got.body != tc.body {
 			t.Fatalf("range %s served %d bytes starting %q, want the body for that exact range",
-				tc.name, len(got.body), string(got.body[:min(8, len(got.body))]))
+				tc.name, len(got.body), got.body[:min(8, len(got.body))])
 		}
 	}
 	mu.Lock()

@@ -5866,7 +5866,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// same release, and the forced software recipe (passed to the
 				// planner below) re-decodes it on the CPU. Any other failure —
 				// transport, timeout, or a software plan that already failed —
-				// keeps today's rotate-to-a-different-candidate behaviour.
+				// keeps today's rotate-to-a-different-candidate behavior.
 				if failedID := virtualResultCandidateID(currentEffectiveFile.FilePath); failedID != "" && !forceSoftwareDecode {
 					excludedCandidateIDs = []string{failedID}
 				}

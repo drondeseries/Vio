@@ -120,7 +120,7 @@ func h264EncoderAvailableV3(encoders []byte) bool {
 // hevcEncodersV3 lists every HEVC encoder the transcode pipeline can select.
 // HEVC is a client-capability upgrade over the H.264 floor, so a server that
 // only has a hardware HEVC encoder can still serve it.
-var hevcEncodersV3 = []string{"libx265", "hevc_qsv", "hevc_vaapi", "hevc_nvenc", "hevc_videotoolbox"}
+var hevcEncodersV3 = []string{"libx265", "hevc_qsv", "hevc_vaapi", "hevc_nvenc", "hevc_videotoolbox"} //nolint:goconst // mirrors the backend encoder ladder in transcode.go
 
 func hevcEncoderAvailableV3(encoders []byte) bool {
 	return encoderListContainsAnyV3(encoders, hevcEncodersV3)
