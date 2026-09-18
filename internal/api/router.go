@@ -1154,62 +1154,32 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		if deps.FileRepo != nil {
 			playbackHandler = handlers.NewPlaybackHandler(deps.SessionMgr, deps.FileRepo)
-			if deps.PluginService != nil || deps.VirtualLibraryService != nil {
+			// Virtual playback resolves exclusively through the core virtual
+			// library: the virtual-library plugin is retired, so every virtual
+			// URI — including rows left over from plugin ownership — resolves
+			// by path through core.
+			if deps.VirtualLibraryService != nil {
 				playbackHandler.VirtualPlaybackResolver = handlers.VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
-					if ownerInstallationID <= 0 && deps.VirtualLibraryService != nil {
-						return deps.VirtualLibraryService.Resolve(ctx, path)
-					}
-					if deps.PluginService != nil {
-						return deps.PluginService.ResolveVirtualPlaybackForInstallation(
-							ctx, path, userID, profileID, ownerInstallationID, true,
-						)
-					}
-					// Explicit ownership policy: core owns owner<=0, the plugin
-					// owns owner>0. Never fall back across that boundary — a
-					// plugin-owned row without a plugin service is an actionable
-					// error, not a core resolution.
-					if ownerInstallationID > 0 {
-						return "", errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
-					}
-					return "", errors.New("virtual playback resolver is unavailable")
+					return deps.VirtualLibraryService.Resolve(ctx, path)
 				})
 				playbackHandler.VirtualPlaybackStreamLister = handlers.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]handlers.VirtualPlaybackStream, error) {
-					if ownerInstallationID <= 0 && deps.VirtualLibraryService != nil {
-						streams, err := deps.VirtualLibraryService.ListStreams(ctx, path)
-						if err != nil {
-							return nil, err
-						}
-						out := make([]handlers.VirtualPlaybackStream, 0, len(streams))
-						for _, stream := range streams {
-							out = append(out, handlers.VirtualPlaybackStream{
-								ID: stream.ID, Label: stream.Label, URI: stream.URI, Resolution: stream.Resolution,
-								CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio, HasAtmos: stream.HasAtmos,
-								QualityScore: stream.QualityScore, RequestHeaders: stream.RequestHeaders,
-								HDR: stream.HDR, SourceType: stream.SourceType, FileSize: stream.FileSize, Container: stream.Container,
-								Bitrate: stream.Bitrate, FrameRate: stream.FrameRate, AudioLanguages: stream.AudioLanguages,
-								SubtitleLanguages: stream.SubtitleLanguages, OwnerInstallationID: stream.OwnerInstallationID,
-								Visible: stream.Visible, VisibilitySpecified: stream.VisibilitySpecified,
-							})
-						}
-						return out, nil
+					streams, err := deps.VirtualLibraryService.ListStreams(ctx, path)
+					if err != nil {
+						return nil, err
 					}
-					if deps.PluginService != nil {
-						streams, err := deps.PluginService.ListVirtualPlaybackStreamsForInstallation(
-							ctx, path, userID, profileID, ownerInstallationID, true,
-						)
-						if err != nil {
-							return nil, err
-						}
-						out := make([]handlers.VirtualPlaybackStream, 0, len(streams))
-						for _, stream := range streams {
-							out = append(out, handlers.VirtualPlaybackStream{ID: stream.ID, Label: stream.Label, URI: stream.URI, Resolution: stream.Resolution, CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio, HDR: stream.HDR, SourceType: stream.SourceType, FileSize: stream.FileSize, Container: stream.Container, Bitrate: stream.Bitrate, FrameRate: stream.FrameRate, AudioLanguages: stream.AudioLanguages, SubtitleLanguages: stream.SubtitleLanguages, OwnerInstallationID: stream.OwnerInstallationID, Visible: stream.Visible, VisibilitySpecified: stream.VisibilitySpecified})
-						}
-						return out, nil
+					out := make([]handlers.VirtualPlaybackStream, 0, len(streams))
+					for _, stream := range streams {
+						out = append(out, handlers.VirtualPlaybackStream{
+							ID: stream.ID, Label: stream.Label, URI: stream.URI, Resolution: stream.Resolution,
+							CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio, HasAtmos: stream.HasAtmos,
+							QualityScore: stream.QualityScore, RequestHeaders: stream.RequestHeaders,
+							HDR: stream.HDR, SourceType: stream.SourceType, FileSize: stream.FileSize, Container: stream.Container,
+							Bitrate: stream.Bitrate, FrameRate: stream.FrameRate, AudioLanguages: stream.AudioLanguages,
+							SubtitleLanguages: stream.SubtitleLanguages, OwnerInstallationID: stream.OwnerInstallationID,
+							Visible: stream.Visible, VisibilitySpecified: stream.VisibilitySpecified,
+						})
 					}
-					if ownerInstallationID > 0 {
-						return nil, errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
-					}
-					return nil, errors.New("virtual playback stream lister is unavailable")
+					return out, nil
 				})
 				playbackHandler.VirtualPlaybackStreamSink = func(ctx context.Context, source *models.MediaFile, streams []handlers.VirtualPlaybackStream) error {
 					candidates := make([]scanner.VirtualCandidate, 0, len(streams))
@@ -1262,86 +1232,31 @@ func newChiRouter(deps Dependencies) chi.Router {
 			streamHandler = handlers.NewStreamHandler(deps.SessionMgr, deps.FileRepo)
 		} else {
 			playbackHandler = handlers.NewPlaybackHandler(deps.SessionMgr)
-			if deps.PluginService != nil || deps.VirtualLibraryService != nil {
+			if deps.VirtualLibraryService != nil {
 				playbackHandler.VirtualPlaybackResolver = handlers.VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
-					if ownerInstallationID <= 0 && deps.VirtualLibraryService != nil {
-						return deps.VirtualLibraryService.Resolve(ctx, path)
-					}
-					if deps.PluginService != nil {
-						return deps.PluginService.ResolveVirtualPlaybackForInstallation(
-							ctx, path, userID, profileID, ownerInstallationID, true,
-						)
-					}
-					if ownerInstallationID > 0 {
-						return "", errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
-					}
-					return "", errors.New("virtual playback resolver is unavailable")
+					return deps.VirtualLibraryService.Resolve(ctx, path)
 				})
 			}
 		}
-		if deps.PluginService != nil || deps.VirtualLibraryService != nil {
+		if deps.VirtualLibraryService != nil {
 			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
-				if ownerInstallationID <= 0 && deps.VirtualLibraryService != nil {
-					return deps.VirtualLibraryService.Resolve(ctx, path)
-				}
-				if deps.PluginService != nil {
-					return deps.PluginService.ResolveVirtualPlaybackForInstallation(
-						ctx, path, userID, profileID, ownerInstallationID, true,
-					)
-				}
-				if ownerInstallationID > 0 {
-					return "", errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
-				}
-				return "", errors.New("virtual media resolver is unavailable")
+				return deps.VirtualLibraryService.Resolve(ctx, path)
 			})
 			playbackHandler.VirtualMediaRefreshResolver = handlers.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
-				if ownerInstallationID <= 0 && deps.VirtualLibraryService != nil {
-					return deps.VirtualLibraryService.Refresh(ctx, path)
-				}
-				if deps.PluginService != nil {
-					return deps.PluginService.RefreshVirtualPlaybackForInstallation(
-						ctx, path, userID, profileID, ownerInstallationID, true,
-					)
-				}
-				if ownerInstallationID > 0 {
-					return "", errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
-				}
-				return "", errors.New("virtual media refresh resolver is unavailable")
+				return deps.VirtualLibraryService.Refresh(ctx, path)
 			})
 			playbackHandler.VirtualMediaDetailedResolver = handlers.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (handlers.ResolvedVirtualMedia, error) {
-				if ownerInstallationID <= 0 && deps.VirtualLibraryService != nil {
-					res, err := deps.VirtualLibraryService.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID)
-					if err != nil {
-						return handlers.ResolvedVirtualMedia{}, err
-					}
-					return handlers.ResolvedVirtualMedia{
-						URL:            res.URL,
-						URI:            res.URI,
-						CandidateID:    res.CandidateID,
-						RequestHeaders: res.RequestHeaders,
-						ExpiresAt:      res.ExpiresAt,
-					}, nil
+				res, err := deps.VirtualLibraryService.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+				if err != nil {
+					return handlers.ResolvedVirtualMedia{}, err
 				}
-				if deps.PluginService != nil {
-					res, err := deps.PluginService.ResolveVirtualPlaybackDetailedForInstallation(
-						ctx, path, userID, profileID, ownerInstallationID, true, forceRefresh, excludedCandidateIDs, preferredCandidateID,
-					)
-					if err != nil {
-						return handlers.ResolvedVirtualMedia{}, err
-					}
-					return handlers.ResolvedVirtualMedia{
-						URL:            res.URL,
-						URI:            res.URI,
-						CandidateID:    res.CandidateID,
-						RequestHeaders: res.RequestHeaders,
-						ExpiresAt:      res.ExpiresAt,
-						OwnerID:        res.OwnerID,
-					}, nil
-				}
-				if ownerInstallationID > 0 {
-					return handlers.ResolvedVirtualMedia{}, errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
-				}
-				return handlers.ResolvedVirtualMedia{}, errors.New("virtual media detailed resolver is unavailable")
+				return handlers.ResolvedVirtualMedia{
+					URL:            res.URL,
+					URI:            res.URI,
+					CandidateID:    res.CandidateID,
+					RequestHeaders: res.RequestHeaders,
+					ExpiresAt:      res.ExpiresAt,
+				}, nil
 			})
 		}
 		playbackHandler.BestResultCache = handlers.NewVirtualBestResultCache(30*time.Minute, 512)
@@ -1375,13 +1290,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			}
 		}
 		playbackHandler.AllowInsecureVirtual = func(installationID int) bool {
-			if installationID <= 0 {
-				return plugins.CoreVirtualInsecureAllowed(context.Background())
-			}
-			if deps.PluginService != nil {
-				return deps.PluginService.InstallationAllowsInsecure(context.Background(), installationID)
-			}
-			return false
+			// SSRF posture for virtual traffic comes solely from the core
+			// virtual_library.allow_insecure_http opt-in: resolution is
+			// core-only, so per-installation plugin config no longer applies.
+			return plugins.CoreVirtualInsecureAllowed(context.Background())
 		}
 		if streamHandler != nil {
 			streamHandler.RemoteStreamRelay = remoteStreamRelay
@@ -1446,16 +1358,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 				return virtualProbeCache.Probe(ctx, sourceURL, file, func(probeCtx context.Context, probeURL string, probeFile *models.MediaFile) (*models.MediaFile, error) {
 					// Keep ffprobe behind the same pinned-IP relay as playback. A
 					// direct provider URL would let ffprobe resolve DNS independently
-					// of the server's SSRF policy.
+					// of the server's SSRF policy. The core
+					// virtual_library.allow_insecure_http opt-in governs all
+					// virtual traffic now that resolution is core-only.
 					var relayURL string
 					var release func()
 					var relayErr error
-					// Nil-receiver safe: AllowInsecureForProvenance handles a nil
-					// *Service (fails closed for plugin rows, consults the
-					// core setting for core rows), so no PluginService nil
-					// guard here — guarding would deny explicitly permitted
-					// core private-network streams when plugins are absent.
-					insecureProbe := deps.PluginService.AllowInsecureForProvenance(context.Background(), probeFile.ResolvedVirtualProvenance(), probeFile.VirtualOwnerInstallationID)
+					insecureProbe := plugins.CoreVirtualInsecureAllowed(context.Background())
 					if insecureProbe {
 						relayURL, release, relayErr = remoteStreamRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
 					} else {
@@ -1489,10 +1398,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		if deps.VirtualLibraryService != nil {
 			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
-				if ownerInstallationID <= 0 {
-					return deps.VirtualLibraryService.Resolve(ctx, virtualURI)
-				}
-				return "", errors.New("plugin-owned virtual media resolver is unavailable")
+				return deps.VirtualLibraryService.Resolve(ctx, virtualURI)
 			})
 		} else if deps.PluginHTTPProxy != nil {
 			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
@@ -1605,14 +1511,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				var relayURL string
 				var cleanup func()
-				// Provenance SSRF dispatch: core rows read
-				// virtual_library.allow_insecure_http via the wired core
-				// reader; legacy/plugin rows keep the per-installation check.
-				provenanceResolve := models.VirtualProvenance("")
-				if file != nil {
-					provenanceResolve = file.ResolvedVirtualProvenance()
-				}
-				insecure := deps.PluginService.AllowInsecureForProvenance(context.Background(), provenanceResolve, ownerInstallationID)
+				// SSRF posture for virtual traffic comes solely from the core
+				// virtual_library.allow_insecure_http opt-in now that
+				// resolution is core-only.
+				insecure := plugins.CoreVirtualInsecureAllowed(context.Background())
 				if insecure {
 					relayURL, cleanup, err = remoteStreamRelay.RegisterInsecureWithHeaders(ctx, resolved, headers)
 				} else {
@@ -2208,25 +2110,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 		if libraryCollectionService.MDBListAPI == nil && deps.MDBListClient != nil {
 			libraryCollectionService.MDBListAPI = deps.MDBListClient
 		}
-		// Core virtual library cutover: when the core service is active
-		// (migrate -> validate -> activate succeeded in main), its Variants
-		// replace the plugin closure. Otherwise the plugin path stays so
-		// existing plugin-owned catalog rows keep resolving — failure is
-		// explicit (core unavailable), never a silent downgrade.
+		// Virtual variants come only from the core virtual library: the
+		// virtual-library plugin is retired, so without an active core
+		// service there is no variants provider and virtual syncs fail
+		// explicit (provider unavailable), never a silent downgrade.
 		if deps.VirtualLibraryVariants != nil {
 			libraryCollectionService.VirtualVariants = deps.VirtualLibraryVariants
-		} else if deps.PluginService != nil {
-			libraryCollectionService.VirtualVariants = func(ctx context.Context, virtualURI, mediaType string) ([]catalog.VirtualPlaybackVariant, error) {
-				got, err := deps.PluginService.ConfiguredVirtualVariants(ctx, virtualURI, mediaType)
-				if err != nil {
-					return nil, err
-				}
-				out := make([]catalog.VirtualPlaybackVariant, 0, len(got))
-				for _, v := range got {
-					out = append(out, catalog.VirtualPlaybackVariant{VirtualURI: v.VirtualURI, Label: v.Label, Resolution: v.Resolution, CodecVideo: v.CodecVideo, CodecAudio: v.CodecAudio, HDR: v.HDR, OwnerInstallationID: v.OwnerInstallationID, VirtualProvenance: v.VirtualProvenance})
-				}
-				return out, nil
-			}
 		}
 		if refresher, ok := deps.MetadataService.(interface {
 			RefreshScheduledItem(context.Context, string) error

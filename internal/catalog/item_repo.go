@@ -1736,8 +1736,15 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItemWithVariants(ctx context.
 			}
 		}
 	}
-	if ownerInstallationID <= 0 {
+	if len(variants) == 0 {
 		return false, errors.New("virtual playback item requires an owning provider installation")
+	}
+	if ownerInstallationID == 0 {
+		// Core-owned variants carry OwnerInstallationID 0: the virtual-library
+		// plugin is retired, so persist under the core owner identity. Owner 0
+		// is covered by the partial unique index like any plugin owner, and
+		// playback dispatches owner<=0 to the core virtual library.
+		ownerIDs = append(ownerIDs, 0)
 	}
 	desiredPaths := make([]string, 0, len(variants)+len(ownerIDs))
 	desiredOwners := make([]int64, 0, len(variants)+len(ownerIDs))
@@ -2192,8 +2199,15 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 			}
 		}
 	}
-	if ownerInstallationID <= 0 {
+	if len(variants) == 0 {
 		return nil, fmt.Errorf("%w: virtual playback item requires an owning provider installation", ErrProviderUnavailable)
+	}
+	if ownerInstallationID == 0 {
+		// Core-owned variants carry OwnerInstallationID 0: the virtual-library
+		// plugin is retired, so persist under the core owner identity. Owner 0
+		// is covered by the partial unique index like any plugin owner, and
+		// playback dispatches owner<=0 to the core virtual library.
+		ownerIDs = append(ownerIDs, 0)
 	}
 
 	type desiredFile struct {

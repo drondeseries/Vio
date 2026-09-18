@@ -75,13 +75,9 @@ func TestRouterWiresVirtualLibraryService(t *testing.T) {
 }
 
 // TestRouterWiresCorePlaybackWithoutPlugin exercises the real playback
-// wiring path (SessionMgr + FileRepo present, PluginService absent). This is
-// the configuration the retirement cutover produces: core owns owner<=0
-// virtual media with no plugin process running. Before the cutover, the
-// resolver wiring blocks required PluginService != nil, so this test locks
-// in that core-only boot wires playback without nil-dereference panics
-// (notably the SSRF dispatch, which must fail closed via the nil-safe
-// AllowInsecureForProvenance rather than panicking).
+// wiring path (SessionMgr + FileRepo present, PluginService absent). Virtual
+// resolution is core-only, so the plugin service is simply not consulted:
+// core owns every virtual URI with no plugin process running.
 func TestRouterWiresCorePlaybackWithoutPlugin(t *testing.T) {
 	_, vlSvc := newCoreTestProvider(t)
 
@@ -177,10 +173,10 @@ func TestRouterStreamRouteMounted(t *testing.T) {
 	}
 }
 
-// TestRouterCoreOwnershipPolicy documents the unified dispatch contract the
-// router closures implement: core owns owner<=0, the plugin owns owner>0.
-// Plugin-owned rows without a plugin service are an explicit error, never a
-// silent core fallback or an empty success.
+// TestRouterCoreOwnershipPolicy documents the core-only dispatch contract the
+// router closures implement: every virtual URI resolves by path through the
+// core virtual library, including rows left over from plugin ownership. A nil
+// core service surfaces unavailability explicitly.
 func TestRouterCoreOwnershipPolicy(t *testing.T) {
 	_, vlSvc := newCoreTestProvider(t)
 

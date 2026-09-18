@@ -1056,12 +1056,13 @@ func (r *LibraryCollectionRepository) ReplaceItems(ctx context.Context, collecti
 			-- Claimless adoption: virtual_collection files with no ownership
 			-- claims at all (legacy materialization output) are adopted for
 			-- accepted members in target folders. Files claimed by any other
-			-- owner are never adopted here.
+			-- owner are never adopted here. Core-owned files (owner 0) adopt
+			-- like plugin-owned ones; local files (NULL owner) never do.
 			SELECT mf.virtual_owner_installation_id, mf.content_id,
 			       mf.media_folder_id, mf.file_path
 			FROM media_files mf
 			WHERE mf.probe_source = 'virtual_collection'
-			  AND mf.virtual_owner_installation_id > 0
+			  AND mf.virtual_owner_installation_id >= 0
 			  AND NOT EXISTS (
 			      SELECT 1 FROM virtual_media_file_source_claims existing_claim
 			      WHERE existing_claim.plugin_installation_id = mf.virtual_owner_installation_id
@@ -1074,7 +1075,7 @@ func (r *LibraryCollectionRepository) ReplaceItems(ctx context.Context, collecti
 		  ON lci.collection_id=$2 AND lci.media_item_id=file_claim.content_id
 		JOIN library_collection_libraries lcl
 		  ON lcl.collection_id=$2 AND lcl.library_id=file_claim.media_folder_id
-		WHERE file_claim.plugin_installation_id>0
+		WHERE file_claim.plugin_installation_id>=0
 		ON CONFLICT(plugin_installation_id,source_key,content_id,media_folder_id)
 		DO UPDATE SET
 			owns_item_metadata=EXCLUDED.owns_item_metadata,
@@ -1106,7 +1107,7 @@ func (r *LibraryCollectionRepository) ReplaceItems(ctx context.Context, collecti
 			       mf.media_folder_id, mf.file_path
 			FROM media_files mf
 			WHERE mf.probe_source = 'virtual_collection'
-			  AND mf.virtual_owner_installation_id > 0
+			  AND mf.virtual_owner_installation_id >= 0
 			  AND NOT EXISTS (
 			      SELECT 1 FROM virtual_media_file_source_claims existing_claim
 			      WHERE existing_claim.plugin_installation_id = mf.virtual_owner_installation_id
@@ -1119,7 +1120,7 @@ func (r *LibraryCollectionRepository) ReplaceItems(ctx context.Context, collecti
 		  ON lci.collection_id=$2 AND lci.media_item_id=file_claim.content_id
 		JOIN library_collection_libraries lcl
 		  ON lcl.collection_id=$2 AND lcl.library_id=file_claim.media_folder_id
-		WHERE file_claim.plugin_installation_id>0
+		WHERE file_claim.plugin_installation_id>=0
 		ON CONFLICT(plugin_installation_id,source_key,content_id,media_folder_id,file_path)
 		DO UPDATE SET last_seen_at=EXCLUDED.last_seen_at,staged_until=NULL,updated_at=NOW()`,
 		collectionSourceKey, collectionID); err != nil {

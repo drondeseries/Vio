@@ -2472,19 +2472,9 @@ func main() {
 		collItemRepo := catalog.NewItemRepository(deps.DB)
 		libraryItemRepo := catalog.NewLibraryItemRepository(deps.DB)
 		collectionService := catalog.NewLibraryCollectionService(collectionRepo, collItemRepo, libraryItemRepo, nil)
-		if deps.PluginService != nil {
-			collectionService.VirtualVariants = func(ctx context.Context, virtualURI, mediaType string) ([]catalog.VirtualPlaybackVariant, error) {
-				got, err := deps.PluginService.ConfiguredVirtualVariants(ctx, virtualURI, mediaType)
-				if err != nil {
-					return nil, err
-				}
-				out := make([]catalog.VirtualPlaybackVariant, 0, len(got))
-				for _, v := range got {
-					out = append(out, catalog.VirtualPlaybackVariant{VirtualURI: v.VirtualURI, Label: v.Label, Resolution: v.Resolution, CodecVideo: v.CodecVideo, CodecAudio: v.CodecAudio, HDR: v.HDR, OwnerInstallationID: v.OwnerInstallationID})
-				}
-				return out, nil
-			}
-		}
+		// Virtual variants come only from the core virtual library: the
+		// virtual-library plugin is retired, so without an active core
+		// service there is no variants provider (wired below on activation).
 		collectionService.TMDBCollections = api.NewTMDBCollectionFetcher(cfg.TMDBAPIKey)
 		discoverAdapter := api.NewTMDBDiscoverAdapter(cfg.TMDBAPIKey)
 		collectionService.TMDBDiscovers = discoverAdapter
@@ -3278,7 +3268,7 @@ func main() {
 			RecipeNodeStore: noderecipe.NewStore(apiRedisClient, 0),
 			SessionSyncer:   deps.SessionSyncer,
 		}
-		if pluginService != nil || (vlActive && vlSvc != nil) {
+		if vlActive && vlSvc != nil {
 			virtualRelay := remotestream.NewRelay()
 			compatDeps.RemoteStreamRelay = virtualRelay
 			go func() {
@@ -3290,125 +3280,58 @@ func main() {
 				}
 			}()
 
+			// Virtual playback resolves exclusively through the core virtual
+			// library: the virtual-library plugin is retired, so every virtual
+			// URI — including rows left over from plugin ownership — resolves
+			// by path through core.
 			compatDeps.VirtualMediaResolver = jellycompat.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
-				if ownerInstallationID <= 0 && vlActive && vlSvc != nil {
-					return vlSvc.Resolve(ctx, path)
-				}
-				if pluginService != nil {
-					return pluginService.ResolveVirtualPlaybackForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
-				}
-				if ownerInstallationID > 0 {
-					return "", errors.New("plugin-owned virtual media resolver is unavailable")
-				}
-				return "", errors.New("virtual media resolver is unavailable")
+				return vlSvc.Resolve(ctx, path)
 			})
 			compatDeps.VirtualMediaRefreshResolver = jellycompat.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
-				if ownerInstallationID <= 0 && vlActive && vlSvc != nil {
-					return vlSvc.Refresh(ctx, path)
-				}
-				if pluginService != nil {
-					return pluginService.RefreshVirtualPlaybackForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
-				}
-				if ownerInstallationID > 0 {
-					return "", errors.New("plugin-owned virtual media refresh resolver is unavailable")
-				}
-				return "", errors.New("virtual media refresh resolver is unavailable")
+				return vlSvc.Refresh(ctx, path)
 			})
 			compatDeps.VirtualMediaDetailedResolver = jellycompat.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (jellycompat.ResolvedVirtualMedia, error) {
-				if ownerInstallationID <= 0 && vlActive && vlSvc != nil {
-					res, err := vlSvc.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID)
-					if err != nil {
-						return jellycompat.ResolvedVirtualMedia{}, err
-					}
-					return jellycompat.ResolvedVirtualMedia{
-						URL:            res.URL,
-						URI:            res.URI,
-						CandidateID:    res.CandidateID,
-						RequestHeaders: res.RequestHeaders,
-						ExpiresAt:      res.ExpiresAt,
-					}, nil
+				res, err := vlSvc.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+				if err != nil {
+					return jellycompat.ResolvedVirtualMedia{}, err
 				}
-				if pluginService != nil {
-					res, err := pluginService.ResolveVirtualPlaybackDetailedForInstallation(ctx, path, userID, profileID, ownerInstallationID, true, forceRefresh, excludedCandidateIDs, preferredCandidateID)
-					if err != nil {
-						return jellycompat.ResolvedVirtualMedia{}, err
-					}
-					return jellycompat.ResolvedVirtualMedia{
-						URL:            res.URL,
-						URI:            res.URI,
-						CandidateID:    res.CandidateID,
-						RequestHeaders: res.RequestHeaders,
-						ExpiresAt:      res.ExpiresAt,
-						OwnerID:        res.OwnerID,
-					}, nil
-				}
-				if ownerInstallationID > 0 {
-					return jellycompat.ResolvedVirtualMedia{}, errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
-				}
-				return jellycompat.ResolvedVirtualMedia{}, errors.New("virtual media detailed resolver is unavailable")
+				return jellycompat.ResolvedVirtualMedia{
+					URL:            res.URL,
+					URI:            res.URI,
+					CandidateID:    res.CandidateID,
+					RequestHeaders: res.RequestHeaders,
+					ExpiresAt:      res.ExpiresAt,
+				}, nil
 			})
 			compatDeps.VirtualPlaybackStreamLister = jellycompat.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]jellycompat.VirtualPlaybackStream, error) {
-				if ownerInstallationID <= 0 && vlActive && vlSvc != nil {
-					streams, err := vlSvc.ListStreams(ctx, path)
-					if err != nil {
-						return nil, err
-					}
-					out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
-					for _, stream := range streams {
-						out = append(out, jellycompat.VirtualPlaybackStream{
-							URI:                 stream.URI,
-							Label:               stream.Label,
-							Resolution:          stream.Resolution,
-							CodecVideo:          stream.CodecVideo,
-							CodecAudio:          stream.CodecAudio,
-							HDR:                 stream.HDR,
-							Container:           stream.Container,
-							FileSize:            stream.FileSize,
-							Bitrate:             stream.Bitrate,
-							AudioLanguages:      stream.AudioLanguages,
-							SubtitleLanguages:   stream.SubtitleLanguages,
-							OwnerInstallationID: stream.OwnerInstallationID,
-						})
-					}
-					return out, nil
+				streams, err := vlSvc.ListStreams(ctx, path)
+				if err != nil {
+					return nil, err
 				}
-				if pluginService != nil {
-					streams, err := pluginService.ListVirtualPlaybackStreamsForInstallation(ctx, path, userID, profileID, ownerInstallationID, true)
-					if err != nil {
-						return nil, err
-					}
-					out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
-					for _, stream := range streams {
-						out = append(out, jellycompat.VirtualPlaybackStream{
-							URI:                 stream.URI,
-							Label:               stream.Label,
-							Resolution:          stream.Resolution,
-							CodecVideo:          stream.CodecVideo,
-							CodecAudio:          stream.CodecAudio,
-							HDR:                 stream.HDR,
-							Container:           stream.Container,
-							FileSize:            stream.FileSize,
-							Bitrate:             stream.Bitrate,
-							AudioLanguages:      stream.AudioLanguages,
-							SubtitleLanguages:   stream.SubtitleLanguages,
-							OwnerInstallationID: stream.OwnerInstallationID,
-						})
-					}
-					return out, nil
+				out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
+				for _, stream := range streams {
+					out = append(out, jellycompat.VirtualPlaybackStream{
+						URI:                 stream.URI,
+						Label:               stream.Label,
+						Resolution:          stream.Resolution,
+						CodecVideo:          stream.CodecVideo,
+						CodecAudio:          stream.CodecAudio,
+						HDR:                 stream.HDR,
+						Container:           stream.Container,
+						FileSize:            stream.FileSize,
+						Bitrate:             stream.Bitrate,
+						AudioLanguages:      stream.AudioLanguages,
+						SubtitleLanguages:   stream.SubtitleLanguages,
+						OwnerInstallationID: stream.OwnerInstallationID,
+					})
 				}
-				if ownerInstallationID > 0 {
-					return nil, errors.New("plugin-owned virtual media (owner installation " + strconv.Itoa(ownerInstallationID) + ") is unavailable: plugin service is unavailable")
-				}
-				return nil, errors.New("virtual playback stream lister is unavailable")
+				return out, nil
 			})
 			compatDeps.AllowInsecureVirtual = func(installationID int) bool {
-				if installationID <= 0 && vlActive && vlSvc != nil {
-					return plugins.CoreVirtualInsecureAllowed(context.Background())
-				}
-				if pluginService != nil {
-					return pluginService.InstallationAllowsInsecure(context.Background(), installationID)
-				}
-				return false
+				// SSRF posture for virtual traffic comes solely from the core
+				// virtual_library.allow_insecure_http opt-in: resolution is
+				// core-only, so per-installation plugin config no longer applies.
+				return plugins.CoreVirtualInsecureAllowed(context.Background())
 			}
 			ffprobePath := scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)
 			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
@@ -3417,8 +3340,7 @@ func main() {
 					var relayURL string
 					var cleanup func()
 					var err error
-					insecure := (probeFile.VirtualOwnerInstallationID <= 0 && plugins.CoreVirtualInsecureAllowed(probeCtx)) ||
-						(pluginService != nil && pluginService.InstallationAllowsInsecure(context.Background(), probeFile.VirtualOwnerInstallationID))
+					insecure := plugins.CoreVirtualInsecureAllowed(probeCtx)
 					if insecure {
 						relayURL, cleanup, err = virtualRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
 					} else {

@@ -698,6 +698,67 @@ func seedSharedCollectionAndRequestVirtualFile(t *testing.T, pool *pgxpool.Pool)
 	return contentID
 }
 
+// Core-owned variants (OwnerInstallationID 0, stamped by the core virtual
+// library) persist under the core owner identity now that the virtual-library
+// plugin is retired: the base file row carries owner 0 and re-materializing
+// is idempotent through the owner-0 unique index.
+func TestMaterializeCoreOwnedVirtualPlaybackItem(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	const contentID = "movie-tmdb-core951"
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled)
+		VALUES(951,'CoreOwned','movies',true)`); err != nil {
+		t.Fatalf("seed core-owned folder: %v", err)
+	}
+	item := &models.MediaItem{
+		ContentID: contentID, Type: "movie", Title: "Core Owned",
+		SortTitle: "Core Owned", TmdbID: "951", ImdbID: "tt951", Status: "matched",
+	}
+	variants := []VirtualPlaybackVariant{{
+		VirtualURI:          "virtual://movie/tt951",
+		OwnerInstallationID: 0,
+	}}
+	repo := NewItemRepository(pool)
+	created, err := repo.MaterializeVirtualPlaybackItemWithVariants(ctx, item, []int{951}, variants)
+	if err != nil || !created {
+		t.Fatalf("materialize core-owned item: created=%v err=%v", created, err)
+	}
+	again, err := repo.MaterializeVirtualPlaybackItemWithVariants(ctx, item, []int{951}, variants)
+	if err != nil || again {
+		t.Fatalf("re-materialize core-owned item: created=%v err=%v, want idempotent", again, err)
+	}
+	var files int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM media_files
+		WHERE content_id=$1 AND file_path='virtual://movie/tt951'
+		  AND virtual_owner_installation_id=0`, contentID).Scan(&files); err != nil {
+		t.Fatalf("inspect core-owned file: %v", err)
+	}
+	if files != 1 {
+		t.Fatalf("core-owned files=%d, want 1", files)
+	}
+}
+
+// Materializing without any variants is still rejected: there is no owner at
+// all to persist the file under, core or otherwise.
+func TestMaterializeVirtualPlaybackItemRejectsEmptyVariants(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_folders(id,name,type,enabled)
+		VALUES(952,'CoreEmpty','movies',true)`); err != nil {
+		t.Fatalf("seed core-empty folder: %v", err)
+	}
+	_, err := NewItemRepository(pool).MaterializeVirtualPlaybackItemWithVariants(ctx, &models.MediaItem{
+		ContentID: "movie-tmdb-core952", Type: "movie", Title: "Core Empty",
+		SortTitle: "Core Empty", TmdbID: "952", ImdbID: "tt952", Status: "matched",
+	}, []int{952}, nil)
+	if err == nil || !strings.Contains(err.Error(), "owning provider installation") {
+		t.Fatalf("err = %v, want owning-provider-installation rejection", err)
+	}
+}
+
 func TestCleanupRequestVirtualMediaPreservesSharedCollectionFile(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)
 	ctx := context.Background()

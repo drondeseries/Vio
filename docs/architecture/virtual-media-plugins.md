@@ -25,7 +25,9 @@ owns persistence, indexing, metadata refresh, authorization, and playback.
 2. Silo stores virtual `media_files` with `container=virtual`; no placeholder
    files are created.
 3. Playback planning recognizes a virtual source without filesystem probing.
-4. At playback time Silo asks the owning plugin to resolve the virtual URI.
+4. At playback time Silo resolves the virtual URI through the core virtual
+   library (`internal/virtuallibrary`) by path — including rows left over from
+   plugin ownership. No virtual traffic dispatches to plugin installations.
 5. Direct-compatible sources are proxied through Silo with byte-range support.
    Sources requiring conversion continue through Silo's normal capability-aware
    remux/transcode path. Provider credentials never enter client responses,
@@ -37,11 +39,10 @@ The resolver runs at playback time so signed upstream URLs are not persisted.
 
 In Vio, Stremio virtual streaming is built directly into core (`internal/virtuallibrary`),
 configured via `virtual_library.*` server settings (Admin › Settings › Streaming).
-
-The server administrator can also install external virtual-library plugins via the generic
-plugin runtime. The plugin configuration contains a compatible Stremio `manifest.json` URL,
-movie library ID, series library ID, an optional TMDB credential, and a durable
-monitored-queue path. Database access is neither requested nor supported.
+The standalone virtual-library plugin (`com.drondeseries.vio-virtual-library`) is
+retired: collection syncs, repairs, and variant discovery route to core, and new
+virtual rows persist under the core owner identity (installation 0). The plugin
+configuration reference below remains for the generic config mechanism only.
 
 ### Choosing a library in the plugin config
 
