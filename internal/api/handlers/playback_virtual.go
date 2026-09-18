@@ -529,37 +529,89 @@ func shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata, force
 // virtualResolveTrace accumulates the wall-clock cost of each phase inside
 // resolveVirtualPlaybackSource. The protocol v3 start timings collapse all of
 // this into a single file_load_probe mark; these attrs split it into the
-// provider candidate list, the RemuxDB match, the provider resolve loop, and
-// the synchronous probe, so a cold-start attribution can name the dominant
-// stage instead of guessing. It is observational only and never gates control
-// flow.
+// provider candidate list, the RemuxDB match, the provider resolve loop, the
+// synchronous probe, and the stale-source re-list fallback, so a cold-start
+// attribution can name the dominant stage instead of guessing. It is
+// observational only and never gates control flow.
+//
+// A stage that did not run must be distinguishable from one that ran in under
+// a millisecond: every stage carries a <name>_ran boolean, and its <name>_ms
+// duration is omitted entirely unless it ran. A plain 0 duration can therefore
+// only mean "ran in under 1 ms", never "skipped". total_ms is the sum of the
+// durations that ran, so the displayed stage fields add up to it exactly;
+// elapsed_ms is the wall-clock time of the whole resolve.
 type virtualResolveTrace struct {
-	started    time.Time
-	list       time.Duration
-	remux      time.Duration
+	started time.Time
+
+	list    time.Duration
+	listRan bool
+
+	remux    time.Duration
+	remuxRan bool
+
 	resolve    time.Duration
-	probe      time.Duration
+	resolveRan bool
+
+	probe    time.Duration
+	probeRan bool
+
+	fallback    time.Duration
+	fallbackRan bool
+
+	fastPath   bool
 	cached     bool
 	listed     bool
 	candidates int
+}
+
+// totalMS is the sum of the stage durations that ran, using the same rounded
+// millisecond values the per-stage fields report, so total_ms equals
+// list_ms+remux_ms+resolve_ms+probe_ms+fallback_ms exactly.
+func (t *virtualResolveTrace) totalMS() int64 {
+	return t.list.Milliseconds() +
+		t.remux.Milliseconds() +
+		t.resolve.Milliseconds() +
+		t.probe.Milliseconds() +
+		t.fallback.Milliseconds()
+}
+
+// fields returns the timing shape in a stable order. It is split out from log
+// so tests can assert the "ran" verdict per stage without capturing the logger.
+func (t *virtualResolveTrace) fields() []any {
+	attrs := []any{
+		"elapsed_ms", time.Since(t.started).Milliseconds(),
+		"total_ms", t.totalMS(),
+		"candidates", t.candidates,
+		"cache_hit", t.cached,
+		"listed", t.listed,
+		"fast_path", t.fastPath,
+	}
+	for _, stage := range [...]struct {
+		name string
+		ran  bool
+		d    time.Duration
+	}{
+		{"list", t.listRan, t.list},
+		{"remux", t.remuxRan, t.remux},
+		{"resolve", t.resolveRan, t.resolve},
+		{"probe", t.probeRan, t.probe},
+		{"fallback", t.fallbackRan, t.fallback},
+	} {
+		attrs = append(attrs, stage.name+"_ran", stage.ran)
+		if stage.ran {
+			attrs = append(attrs, stage.name+"_ms", stage.d.Milliseconds())
+		}
+	}
+	return attrs
 }
 
 func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 	if t == nil || file == nil {
 		return
 	}
-	slog.InfoContext(ctx, "virtual resolve timing",
-		logComponentKey, "api",
-		"content_id", file.ContentID,
-		"total_ms", time.Since(t.started).Milliseconds(),
-		"list_ms", t.list.Milliseconds(),
-		"remux_ms", t.remux.Milliseconds(),
-		"resolve_ms", t.resolve.Milliseconds(),
-		"probe_ms", t.probe.Milliseconds(),
-		"candidates", t.candidates,
-		"cache_hit", t.cached,
-		"listed", t.listed,
-	)
+	attrs := []any{logComponentKey, "api", "content_id", file.ContentID}
+	attrs = append(attrs, t.fields()...)
+	slog.InfoContext(ctx, "virtual resolve timing", attrs...)
 }
 
 // resolveVirtualPlaybackSource chooses a ranked provider-neutral result,
@@ -646,9 +698,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// call exists to fetch, so it does not need the provider round-trip even
 	// when the stored row has no probe evidence yet. Only a cold cache or an
 	// explicit relist forces the list.
-	listStart := time.Now()
 	if shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
+		trace.listRan = true
+		listStart := time.Now()
 		// Candidate listing is part of the startup critical path. Keep it
 		// bounded so the first-byte SLA cannot be defeated before resolution.
 		listCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
@@ -715,8 +768,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 		}
 		cancel()
+		trace.list = time.Since(listStart)
 	}
-	trace.list = time.Since(listStart)
 	maxAttempts := h.maxVirtualFailoverAttempts(r.Context())
 	if noResult {
 		candidates = h.applyVirtualStickyPin(stickyKey, pinnedURI, candidates, deviceCaps)
@@ -724,6 +777,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	remuxMatches := map[string]remuxdb.Evidence{}
 	remuxEnabled := false
 	if needsCandidateMetadata && len(candidates) > 0 {
+		trace.remuxRan = true
 		remuxStart := time.Now()
 		remuxMatches, remuxEnabled = h.matchRemuxDBCandidates(r.Context(), file, candidates)
 		trace.remux = time.Since(remuxStart)
@@ -774,6 +828,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			completeVirtualAudioEvidenceV3(file) &&
 			completeVirtualContainerEvidenceV3(file) {
 			fastPathHit = true
+			trace.fastPath = true
 			transient := *file
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid
@@ -804,6 +859,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			(h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) &&
 			virtualDeliveredWithinGrace(file) {
 			fastPathHit = true
+			trace.fastPath = true
 			transient := *file
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid
@@ -821,6 +877,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 		var streamURL string
 		var resolveErr error
+		trace.resolveRan = true
 		resolveStart := time.Now()
 		if h.VirtualMediaDetailedResolver != nil {
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
@@ -1056,6 +1113,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// Zero the duration so the synchronous probe measures the empirical
 		// duration instead of inheriting the catalog value.
 		syncProbeFile.Duration = 0
+		trace.probeRan = true
 		probeStart := time.Now()
 		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &syncProbeFile, cand.RequestHeaders)
 		trace.probe += time.Since(probeStart)
@@ -1191,7 +1249,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// before failing. This keeps one stale indexer/debrid result from turning
 	// a still-streamable item into a hard playback failure, without crossing
 	// the user's selected quality when a same-profile candidate exists.
-	if fb := h.fallbackResolveStaleVirtualSource(attemptCtx, file, userID, profileID); fb != nil {
+	// The stale-source fallback does its own provider re-list internally; time
+	// it as one stage so a fallback-driven resolve is attributable rather than
+	// silently folded into the loop's resolve time.
+	trace.fallbackRan = true
+	fallbackStart := time.Now()
+	fb := h.fallbackResolveStaleVirtualSource(attemptCtx, file, userID, profileID)
+	trace.fallback = time.Since(fallbackStart)
+	if fb != nil {
 		return *fb, nil
 	}
 	return resolvedVirtualPlaybackSource{}, attemptErr
