@@ -33,6 +33,7 @@ describe("useWizardSteps", () => {
       "storage",
       "library",
       "streaming",
+      "requests",
       "subtitles",
       "connect",
       "features",

@@ -5,6 +5,7 @@ import {
   ConnectionCheckAction,
   useConnectionCheck,
 } from "@/components/admin/ConnectionCheckAction";
+import { VioScoringProfilesCard } from "@/components/streaming/VioScoringProfilesCard";
 import { Button } from "@/components/ui/button";
 import { useAdminLibraries, useCreateLibrary } from "@/hooks/queries/admin/libraries";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
@@ -21,6 +22,13 @@ const STREAMING_KEYS = [
   "virtual_library.allow_insecure_http",
   "virtual_library.cache_ttl_minutes",
   "virtual_library.tmdb_api_key",
+  "virtual_library.enable_quality_profiles",
+  "virtual_library.quality_preset",
+  "virtual_library.custom_format_preset",
+  "virtual_library.quality_profiles",
+  "virtual_library.custom_formats",
+  "virtual_library.single_stream_with_failover",
+  "virtual_library.fallback_to_any_stream",
 ];
 
 export function StreamingStep() {
@@ -203,6 +211,10 @@ export function StreamingStep() {
               }
               onChange={(v) => form.setValue("virtual_library.allow_insecure_http", v)}
             />
+
+            <div className="pt-4">
+              <VioScoringProfilesCard form={form} defaultExpanded={false} />
+            </div>
           </>
         )}
       </StepSection>
