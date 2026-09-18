@@ -271,6 +271,19 @@ func TestAdminCollectionSyncRejectsUnsupportedMode(t *testing.T) {
 	}
 }
 
+// A sync that must materialize virtual items without an owning provider
+// installation is a dependency failure rather than a server fault: it must
+// answer 503 with a stable message, not 500 with a service diagnostic.
+func TestAdminCollectionSyncReportsMissingProviderAsUnavailable(t *testing.T) {
+	f := newFakeAdminCollections()
+	f.syncErr = fmt.Errorf("%w: virtual playback item requires an owning provider installation", catalogsvc.ErrProviderUnavailable)
+	h := adminCollectionsTestHandler(t, f)
+	p := requireProblem(t, do(t, h, http.MethodPost, "/api/v2/admin/collections/c1/sync", "", bearer(adminToken)), TypeDependencyUnavailable)
+	if p.Detail != "The virtual playback provider is unavailable." {
+		t.Fatalf("detail = %q, want stable unavailable message", p.Detail)
+	}
+}
+
 // The per-entry reason explains a skipped or failed template; v1 returns it and
 // v2 must reach the wire with it too.
 func TestAdminCollectionTemplateApplyKeepsEntryReason(t *testing.T) {

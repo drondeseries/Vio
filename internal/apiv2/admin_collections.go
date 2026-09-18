@@ -208,6 +208,8 @@ func adminCollectionError(err error) *Problem {
 		return NewProblem(TypeNotFound, "Collection or group not found.")
 	case errors.Is(err, catalogsvc.ErrLibraryCollectionInUse):
 		return NewProblem(TypeConflict, "The collection is used by a section.")
+	case errors.Is(err, catalogsvc.ErrProviderUnavailable):
+		return NewProblem(TypeDependencyUnavailable, "The virtual playback provider is unavailable.")
 	case errors.Is(err, userstore.ErrCollectionChanged):
 		return NewProblem(TypeInvalidCursor, "The collection changed; restart from its first page.")
 	}
