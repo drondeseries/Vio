@@ -52,6 +52,11 @@ func newVirtualSubtitleWindowFixture(t *testing.T, dir, ffmpegScript string) (*S
 		ID: "sess-window", UserID: 1, ProfileID: "profile-1", MediaFileID: file.ID,
 		VirtualSourceURI: virtualURI, VirtualSubtitleTracks: file.SubtitleTracks,
 	}
+	// The window-miss warm is detached; wait for it to settle before the
+	// fixture's temp dir is removed, or the warm keeps writing into a directory
+	// t.TempDir is tearing down. Registered after the relay-close cleanup so
+	// LIFO runs this wait first — the warm needs the relay it resolved through.
+	t.Cleanup(handler.waitForBackgroundSubtitleWarms)
 	return handler, session, file, virtualURI
 }
 
@@ -122,10 +127,11 @@ func TestVirtualTextWindowMissWarmsOnceWithServeIdentity(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	gate := filepath.Join(dir, "warm.gate")
-	// Always release the warm, even if an assertion fails, so the blocked fake
-	// ffmpeg cannot outlive the test.
-	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
 	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+	// Always release the warm, even if an assertion fails, so the blocked fake
+	// ffmpeg cannot outlive the test. Registered after the fixture's wait
+	// cleanup so LIFO releases the gate before the wait blocks on it.
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
 
 	serve := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/subtitle?position=600&duration=600", nil)
@@ -291,8 +297,10 @@ func TestVirtualPGSWholeTrackFetchServesImplicitWindowThenWarms(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	gate := filepath.Join(dir, "warm.gate")
-	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+	// Release the warm before the fixture's wait cleanup blocks on it, even if
+	// an assertion fails and the gate is never opened inline.
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
 	file.SubtitleTracks = []models.SubtitleTrack{{Index: 0, Codec: "hdmv_pgs_subtitle"}}
 	session.VirtualSubtitleTracks = file.SubtitleTracks
 
@@ -675,10 +683,11 @@ func TestVirtualWholeTrackTextFetchServesImplicitWindowThenWarms(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "ffmpeg.args")
 	gate := filepath.Join(dir, "warm.gate")
-	// Always release the warm, even if an assertion fails, so the blocked fake
-	// ffmpeg cannot outlive the test.
-	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
 	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+	// Always release the warm, even if an assertion fails, so the blocked fake
+	// ffmpeg cannot outlive the test. Registered after the fixture's wait
+	// cleanup so LIFO releases the gate before the wait blocks on it.
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
 
 	rec := httptest.NewRecorder()
 	// No position/duration: the native whole-track fetch the live measurement

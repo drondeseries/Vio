@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -79,9 +80,16 @@ type StreamHandler struct {
 	// dir so repeat selections skip the whole-file ffmpeg demux. May be nil
 	// (tests / minimal setups) — extraction then always streams uncached.
 	SubtitleCache *playback.SubtitleCache
-	SubtitleRepo  subtitles.Repository // optional; enables S3-sourced subtitles
-	S3Client      subtitles.S3Client   // optional; needed for fetching S3 subtitles
-	S3Bucket      string               // bucket for subtitle storage
+	// subtitleWarmWG tracks handler-owned detached subtitle warms
+	// (warmVirtualSubtitleAfterWindowMiss). They outlive the request by design —
+	// the request's relay registration is released when the request ends, so the
+	// handler starts its own warm — and a caller that owns the cache directory
+	// (a test with a temp dir, a graceful drain) waits on this to keep the warm
+	// from writing into a directory being torn down.
+	subtitleWarmWG sync.WaitGroup
+	SubtitleRepo   subtitles.Repository // optional; enables S3-sourced subtitles
+	S3Client       subtitles.S3Client   // optional; needed for fetching S3 subtitles
+	S3Bucket       string               // bucket for subtitle storage
 	// VirtualMediaResolver resolves virtual:// URIs to a real provider URL.
 	// Required for embedded subtitle extraction from virtual sources.
 	VirtualMediaResolver         VirtualMediaResolver
@@ -113,6 +121,18 @@ func (h *StreamHandler) ffmpegPath() string {
 		return h.PlaybackConfig().FFmpegPath
 	}
 	return ""
+}
+
+// waitForBackgroundSubtitleWarms blocks until every handler-owned detached
+// subtitle warm started so far has settled. A warm that was admitted by the
+// cache can run for its full warm budget, so callers that own the cache
+// directory should release any gate the warm is blocked on first. A nil
+// receiver returns immediately.
+func (h *StreamHandler) waitForBackgroundSubtitleWarms() {
+	if h == nil {
+		return
+	}
+	h.subtitleWarmWG.Wait()
 }
 
 // bindSessionVirtualSource returns a copy of a virtual file bound to the
@@ -1694,7 +1714,9 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 		return
 	}
 
+	h.subtitleWarmWG.Add(1)
 	go func() {
+		defer h.subtitleWarmWG.Done()
 		var cleanup func()
 		defer func() {
 			if cleanup != nil {
