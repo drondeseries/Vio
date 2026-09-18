@@ -1220,6 +1220,68 @@ func TestCreateIntegrationPassesCapabilitySubIDToPlugin(t *testing.T) {
 	}
 }
 
+// TestCreateVirtualIntegrationRejectedWhenVirtualLibraryDormant locks the
+// setup-wizard failure: saving the core virtual-library connection while the
+// virtual library is dormant (no manifest URL, so no virtual router is wired)
+// must be a ValidationError with an inline message, not the opaque internal
+// error the plugin resolver produced failing to find installation 0.
+func TestCreateVirtualIntegrationRejectedWhenVirtualLibraryDormant(t *testing.T) {
+	store := newFakeStore()
+	service := newTestService(store)
+	router := &fakeRouterProvider{}
+	service.SetRouterProvider(router)
+
+	zero := 0
+	_, err := service.CreateIntegration(context.Background(), Viewer{UserID: 1, IsAdmin: true}, Integration{
+		Name:           "Virtual Library",
+		CapabilityID:   VirtualLibraryRequestsCapability,
+		BaseURL:        "virtual://streaming",
+		APIKeyRef:      "core-managed",
+		InstallationID: &zero,
+	})
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if ve.FormError == "" {
+		t.Fatalf("form error empty, want virtual-library-dormant message")
+	}
+	if router.validateCalls != 0 {
+		t.Fatalf("plugin Validate calls = %d, want 0 (rejected before dispatch)", router.validateCalls)
+	}
+	if len(store.integrations) != 0 {
+		t.Fatalf("integrations = %d, want 0 (rejected before persist)", len(store.integrations))
+	}
+}
+
+// TestCreateVirtualIntegrationAllowedWhenVirtualLibraryActive confirms the
+// core connection saves without plugin dispatch once the virtual router is
+// wired.
+func TestCreateVirtualIntegrationAllowedWhenVirtualLibraryActive(t *testing.T) {
+	store := newFakeStore()
+	service := newTestService(store)
+	router := &fakeRouterProvider{}
+	service.SetRouterProvider(router)
+	service.SetDefaultVirtualRouter(func() bool { return true })
+
+	zero := 0
+	if _, err := service.CreateIntegration(context.Background(), Viewer{UserID: 1, IsAdmin: true}, Integration{
+		Name:           "Virtual Library",
+		CapabilityID:   VirtualLibraryRequestsCapability,
+		BaseURL:        "virtual://streaming",
+		APIKeyRef:      "core-managed",
+		InstallationID: &zero,
+	}); err != nil {
+		t.Fatalf("CreateIntegration err = %v, want nil", err)
+	}
+	if router.validateCalls != 0 {
+		t.Fatalf("plugin Validate calls = %d, want 0 (core has no plugin)", router.validateCalls)
+	}
+	if len(store.integrations) != 1 {
+		t.Fatalf("integrations = %d, want 1", len(store.integrations))
+	}
+}
+
 // TestUpdateIntegrationRefusesStoredKeyReuseOnChangedBaseURL covers the security
 // hardening: when the caller leaves api_key_ref blank ("keep saved key") but
 // changes the base_url, the service must refuse rather than pair the stored,

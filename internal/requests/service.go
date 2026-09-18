@@ -35,6 +35,10 @@ const externalIDHydrationConcurrency = 4
 
 const certificationHydrationConcurrency = 8
 
+// VirtualLibraryRequestsCapability is the request_router.v1 capability sub-id
+// served by the core virtual library (installation 0), not by a plugin.
+const VirtualLibraryRequestsCapability = "virtual-library-requests"
+
 type EntitlementResolver interface {
 	// MaxPlaybackQuality returns the requester's effective playback-quality
 	// ceiling (already combining account- and profile-level caps). Empty string
@@ -439,7 +443,7 @@ func (s *Service) resolveRouterConnections(ctx context.Context, fc *fulfillConte
 			APIKey:  "core-managed",
 			Config:  map[string]any{},
 		}}
-		return conns, 0, "virtual-library-requests", nil
+		return conns, 0, VirtualLibraryRequestsCapability, nil
 	}
 	return conns, installationID, capabilityID, nil
 }
@@ -1220,12 +1224,33 @@ func (s *Service) UpdateIntegration(ctx context.Context, viewer Viewer, in Integ
 	return s.store.SaveIntegrationWithDefaults(ctx, in, false)
 }
 
+// isVirtualRouterTarget mirrors compositeRequestRouter.isVirtual: installation 0
+// is the core virtual library, and the virtual-library-requests capability
+// sub-id is only ever served by it, never by a plugin.
+func isVirtualRouterTarget(installationID int, capabilityID string) bool {
+	return installationID <= 0 || capabilityID == VirtualLibraryRequestsCapability
+}
+
+func (s *Service) virtualRouterAvailable() bool {
+	return s != nil && s.hasDefaultVirtualRouter != nil && s.hasDefaultVirtualRouter()
+}
+
 // validateViaPlugin asks the bound request_router plugin to validate the
 // connection config on save. Field/form errors are surfaced as *ValidationError
 // so the API layer can render them inline.
 func (s *Service) validateViaPlugin(ctx context.Context, in Integration) error {
 	if s.router == nil || in.InstallationID == nil {
 		return nil
+	}
+	if isVirtualRouterTarget(*in.InstallationID, in.CapabilityID) {
+		// The core virtual router has no plugin behind it: when the virtual
+		// library is dormant there is nothing to validate against, so reject
+		// the save as a client error instead of letting the plugin resolver
+		// fail with an opaque internal error.
+		if s.virtualRouterAvailable() {
+			return nil
+		}
+		return &ValidationError{FormError: "The virtual library is not configured on this server."}
 	}
 	// On UPDATE the client omits api_key_ref ("leave blank to keep saved key"),
 	// so we would otherwise validate against an empty credential. Mirror

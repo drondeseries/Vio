@@ -422,7 +422,7 @@ func adminIntegrationOf(r mediarequests.Integration) AdminRequestIntegration {
 }
 func (b AdminRequestIntegrationBody) domain() (mediarequests.Integration, *Problem) {
 	id, err := strconv.Atoi(string(b.InstallationID))
-	if err != nil || id <= 0 {
+	if err != nil || id < 0 {
 		return mediarequests.Integration{}, NewProblem(TypeValidationFailed, "Invalid installation ID.")
 	}
 	return mediarequests.Integration{Name: b.Name, CapabilityID: b.CapabilityID, InstallationID: &id, SupportedMediaTypes: b.SupportedMediaTypes, PluginConfig: b.PluginConfig, Enabled: b.Enabled, BaseURL: b.BaseURL, APIKeyRef: b.APIKey}, nil
@@ -559,7 +559,7 @@ func (reg *Registry) loadAdminRequestOptions(ctx context.Context, in *AdminReque
 	var install *int
 	if b.InstallationID != nil {
 		id, e := strconv.Atoi(string(*b.InstallationID))
-		if e != nil || id <= 0 {
+		if e != nil || id < 0 {
 			return nil, NewProblem(TypeValidationFailed, "Invalid installation ID.")
 		}
 		install = &id
