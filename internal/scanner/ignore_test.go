@@ -102,6 +102,19 @@ func TestSiloIgnoreParentPatternsCascadeIntoSubdirectories(t *testing.T) {
 	assertFilePaths(t, files, root, []string{"Movie.mkv", "Series/Season 1/Episode 01.mkv"})
 }
 
+func TestDirectoryNamedLikeMarkerIsNotAMarker(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{".ignore", ".nomedia"} {
+		root := t.TempDir()
+		writeTestFile(t, filepath.Join(root, name, "Episode 01.mkv"), "test")
+		writeTestFile(t, filepath.Join(root, "Movie.mkv"), "test")
+
+		files := collectTestFilePaths(t, root, "series")
+		assertFilePaths(t, files, root, []string{name + "/Episode 01.mkv", "Movie.mkv"})
+	}
+}
+
 func TestParseIgnorePatterns(t *testing.T) {
 	t.Parallel()
 
@@ -168,11 +181,48 @@ func TestPodcastShowAudioFilesSkipsIgnoreMarkers(t *testing.T) {
 	writeTestFile(t, filepath.Join(show, "Episode 01.mp3"), "test")
 	writeTestFile(t, filepath.Join(show, ".nomedia"), "")
 
-	_, err := listPodcastShowAudioFiles(show)
+	_, err := listPodcastShowAudioFiles(show, nil)
 	if err == nil || !errors.Is(err, errFolderHasNoMedia) {
 		t.Fatalf("listPodcastShowAudioFiles err = %v, want errFolderHasNoMedia", err)
 	}
 	if !strings.Contains(err.Error(), show) {
 		t.Fatalf("error should mention the show folder: %v", err)
+	}
+}
+
+func TestPodcastShowAudioFilesHonorsShowSiloIgnore(t *testing.T) {
+	t.Parallel()
+
+	show := t.TempDir()
+	writeTestFile(t, filepath.Join(show, "Episode 01.mp3"), "test")
+	writeTestFile(t, filepath.Join(show, "Episode 02.mp3"), "test")
+	writeTestFile(t, filepath.Join(show, ".siloignore"), "Episode 02.mp3")
+
+	files, err := listPodcastShowAudioFiles(show, nil)
+	if err != nil {
+		t.Fatalf("listPodcastShowAudioFiles: %v", err)
+	}
+	want := []string{filepath.Join(show, "Episode 01.mp3")}
+	if len(files) != len(want) || files[0] != want[0] {
+		t.Fatalf("audio files = %v, want %v", files, want)
+	}
+}
+
+func TestPodcastShowAudioFilesAppliesInheritedRootPatterns(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	show := filepath.Join(root, "Show")
+	writeTestFile(t, filepath.Join(show, "Episode 01.mp3"), "test")
+	writeTestFile(t, filepath.Join(show, "Episode 02.mp3"), "test")
+	rules := []ignoreRules{{basePath: root, patterns: []string{"Show/Episode 02.mp3"}}}
+
+	files, err := listPodcastShowAudioFiles(show, rules)
+	if err != nil {
+		t.Fatalf("listPodcastShowAudioFiles: %v", err)
+	}
+	want := []string{filepath.Join(show, "Episode 01.mp3")}
+	if len(files) != len(want) || files[0] != want[0] {
+		t.Fatalf("audio files = %v, want %v", files, want)
 	}
 }

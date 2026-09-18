@@ -6,10 +6,11 @@ ebook, and manga libraries behave the same way.
 
 ## Marker files: `.ignore` and `.nomedia`
 
-A directory containing a file named `.ignore` or `.nomedia` is skipped
-entirely, together with everything under it. The marker means "this folder is
-not media", so it has no pattern semantics and cannot be overridden by a
-deeper `.siloignore`.
+A directory containing a plain file named `.ignore` or `.nomedia` is skipped
+entirely, together with everything under it. The marker must be a file — a
+directory that happens to be named `.ignore` is ordinary content. The marker
+means "this folder is not media", so it has no pattern semantics and cannot
+be overridden by a deeper `.siloignore`.
 
 ## Pattern file: `.siloignore`
 

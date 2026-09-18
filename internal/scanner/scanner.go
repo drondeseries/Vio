@@ -585,15 +585,10 @@ func walkLogicalTree(
 		return nil
 	}
 
-	entryNames := make([]string, len(entries))
-	for i, entry := range entries {
-		entryNames[i] = entry.Name()
-	}
-	if dirHasIgnoreMarker(entryNames) {
+	if dirHasIgnoreMarker(entries) {
 		return nil
 	}
-	childRules := childIgnoreRules(ignoreRulesStack, logicalPath, physicalPath, entryNames)
-
+	childRules := childIgnoreRules(ignoreRulesStack, logicalPath, physicalPath, entries)
 	for _, entry := range entries {
 		if ctx != nil {
 			if err := ctx.Err(); err != nil {

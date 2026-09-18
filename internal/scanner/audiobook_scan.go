@@ -243,14 +243,10 @@ func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookR
 		recordFailure(err)
 		return nil
 	}
-	names := make([]string, len(entries))
-	for i, entry := range entries {
-		names[i] = entry.Name()
-	}
-	if dirHasIgnoreMarker(names) {
+	if dirHasIgnoreMarker(entries) {
 		return nil
 	}
-	childRules := childIgnoreRules(ignoreRulesStack, path, path, names)
+	childRules := childIgnoreRules(ignoreRulesStack, path, path, entries)
 	directories := make([]string, 0)
 	hadAudio := false
 	for _, entry := range entries {

@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,10 +31,15 @@ type ignoreRules struct {
 	patterns []string
 }
 
-// dirHasIgnoreMarker reports whether any entry name is an ignore marker file.
-func dirHasIgnoreMarker(names []string) bool {
-	for _, name := range names {
-		if name == ignoreMarkerIgnore || name == ignoreMarkerNoMedia {
+// dirHasIgnoreMarker reports whether the entries contain an ignore marker
+// file. A directory merely named .ignore or .nomedia is not a marker; only
+// plain files count.
+func dirHasIgnoreMarker(entries []fs.DirEntry) bool {
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if entry.Name() == ignoreMarkerIgnore || entry.Name() == ignoreMarkerNoMedia {
 			return true
 		}
 	}
@@ -85,10 +91,11 @@ func ignoreRulesMatch(rules []ignoreRules, logicalPath string) bool {
 }
 
 // childIgnoreRules returns the rule set children of a directory inherit: the
-// inherited rules plus this directory's own .siloignore, if present.
-func childIgnoreRules(inherited []ignoreRules, dirLogicalPath, dirPhysicalPath string, entryNames []string) []ignoreRules {
-	for _, name := range entryNames {
-		if name != siloIgnoreFileName {
+// inherited rules plus this directory's own .siloignore, if present. Only a
+// plain file counts as the pattern file.
+func childIgnoreRules(inherited []ignoreRules, dirLogicalPath, dirPhysicalPath string, entries []fs.DirEntry) []ignoreRules {
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() != siloIgnoreFileName {
 			continue
 		}
 		patterns := readSiloIgnoreFile(dirPhysicalPath)

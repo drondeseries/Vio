@@ -46,10 +46,15 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 			failures.addf("read root %s: %w", root, err)
 			continue
 		}
+		if dirHasIgnoreMarker(entries) {
+			// The whole podcast root is ignored; do not protect it from
+			// missing-file reconciliation, so its catalog entries retire.
+			continue
+		}
 		reconcileRoots = append(reconcileRoots, root)
 		var rootIgnoreRules []ignoreRules
 		for _, entry := range entries {
-			if entry.Name() == siloIgnoreFileName {
+			if !entry.IsDir() && entry.Name() == siloIgnoreFileName {
 				if patterns := readSiloIgnoreFile(root); len(patterns) > 0 {
 					rootIgnoreRules = append(rootIgnoreRules, ignoreRules{basePath: root, patterns: patterns})
 				}
@@ -67,12 +72,12 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 				continue
 			}
 			attempted++
-			if paths, err := listPodcastShowAudioFiles(subPath); err == nil {
+			if paths, err := listPodcastShowAudioFiles(subPath, rootIgnoreRules); err == nil {
 				for _, path := range paths {
 					seenPaths[path] = true
 				}
 			}
-			episodePaths, err := s.reconcilePodcastShow(ctx, folder, subPath)
+			episodePaths, err := s.reconcilePodcastShow(ctx, folder, subPath, rootIgnoreRules)
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return err
@@ -101,8 +106,8 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 	return nil
 }
 
-func (s *Scanner) reconcilePodcastShow(ctx context.Context, folder *models.MediaFolder, folderPath string) ([]string, error) {
-	parsed, err := parsePodcastShow(ctx, s.ffprobePath, folderPath)
+func (s *Scanner) reconcilePodcastShow(ctx context.Context, folder *models.MediaFolder, folderPath string, rootIgnoreRules []ignoreRules) ([]string, error) {
+	parsed, err := parsePodcastShow(ctx, s.ffprobePath, folderPath, rootIgnoreRules)
 	if err != nil {
 		if errors.Is(err, errFolderHasNoMedia) {
 			return nil, nil
