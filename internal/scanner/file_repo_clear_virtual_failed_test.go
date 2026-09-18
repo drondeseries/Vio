@@ -588,7 +588,7 @@ func TestMarkVirtualCandidateFailedDefersKnownGood(t *testing.T) {
 
 // TestMarkVirtualCandidateDecodeRejectedBypassesDeliveryGrace verifies that a
 // decode-classified rejection stamps a candidate that delivered recently, while
-// the transport failure stamp keeps the delivered-grace behaviour. This is what
+// the transport failure stamp keeps the delivered-grace behavior. This is what
 // stops a repeatable decode rejection from being re-selected forever.
 func TestMarkVirtualCandidateDecodeRejectedBypassesDeliveryGrace(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -27,7 +26,7 @@ func (r *trackingRegistrar) Reconcile(_ context.Context, source string, _ []stri
 
 func newPassTestMonitor(t *testing.T) *mediaMonitor {
 	t.Helper()
-	m := newMediaMonitor(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := newMediaMonitor(nil, slog.New(slog.DiscardHandler))
 	dir := t.TempDir()
 	m.config.File = filepath.Join(dir, "queue.json")
 	m.config.ProwlarrIndexFile = filepath.Join(dir, "index.json")

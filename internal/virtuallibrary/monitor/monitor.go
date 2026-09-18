@@ -1264,18 +1264,18 @@ func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, regi
 	if budgetExhausted {
 		if advance != "" {
 			if err := m.setCursor(advance); err != nil {
-				m.logger.Warn("persist virtual library monitor cursor", "error", err)
+				m.logger.WarnContext(ctx, "persist virtual library monitor cursor", "error", err)
 			}
 		}
 	} else if processed > 0 {
 		if err := m.setCursor(""); err != nil {
-			m.logger.Warn("persist virtual library monitor cursor", "error", err)
+			m.logger.WarnContext(ctx, "persist virtual library monitor cursor", "error", err)
 		}
 	}
 	if budgetExhausted {
 		// Deadline exhaustion is normal operation, not a failed pass: the
 		// cursor decides where the next pass resumes.
-		m.logger.Info("virtual library monitor pass reached its deadline",
+		m.logger.InfoContext(ctx, "virtual library monitor pass reached its deadline",
 			"processed", processed, "total", n, "resume_after", advance)
 	}
 
@@ -1300,9 +1300,9 @@ func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, regi
 					// next pass. Context errors are the expected bounded-pass
 					// outcome and are logged quietly.
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-						m.logger.Debug("reconcile virtual source deferred", "source", source, "error", err)
+						m.logger.DebugContext(ctx, "reconcile virtual source deferred", "source", source, "error", err)
 					} else {
-						m.logger.Warn("reconcile virtual source", "source", source, "error", err)
+						m.logger.WarnContext(ctx, "reconcile virtual source", "source", source, "error", err)
 					}
 					continue
 				}
@@ -1360,7 +1360,7 @@ func (m *mediaMonitor) processItem(ctx context.Context, item monitoredMedia) (mo
 		case ctx.Err() != nil:
 			return item, "", itemBudgetExhausted
 		case itemCtx.Err() != nil, errors.Is(evaluationErr, context.Canceled), errors.Is(evaluationErr, context.DeadlineExceeded):
-			m.logger.Debug("defer virtual media item; per-item budget elapsed", "key", item.Key)
+			m.logger.DebugContext(itemCtx, "defer virtual media item; per-item budget elapsed", "key", item.Key)
 			return item, "", itemDeferred
 		default:
 			m.logger.Warn("evaluate virtual media", "key", item.Key, "error", evaluationErr)
@@ -1380,10 +1380,10 @@ func (m *mediaMonitor) processItem(ctx context.Context, item monitoredMedia) (mo
 			case ctx.Err() != nil:
 				return item, "", itemBudgetExhausted
 			case itemCtx.Err() != nil:
-				m.logger.Debug("defer virtual media registration; per-item budget elapsed", "key", updated.Key)
+				m.logger.DebugContext(itemCtx, "defer virtual media registration; per-item budget elapsed", "key", updated.Key)
 				return updated, "", itemDeferred
 			default:
-				m.logger.Error("register virtual media", "key", updated.Key, "error", err)
+				m.logger.ErrorContext(itemCtx, "register virtual media", "key", updated.Key, "error", err)
 				return updated, "", itemFailed
 			}
 		}

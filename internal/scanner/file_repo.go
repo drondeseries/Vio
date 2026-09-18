@@ -1459,7 +1459,7 @@ func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID 
 // about the bytes themselves — they are unplayable by the executor that just
 // tried — so a candidate that delivered recently is still branded dead and the
 // auto-pick rotates instead of re-selecting the same undecodable release
-// forever. Transport failures keep the grace behaviour: a provider flap is
+// forever. Transport failures keep the grace behavior: a provider flap is
 // forgiven for a candidate that demonstrably delivered; an undecodable release
 // is not.
 //
