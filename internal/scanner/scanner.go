@@ -505,6 +505,7 @@ func walkLogicalTree(
 	physicalPath string,
 	mode walkMode,
 	visitedPhysicalDirs map[string]struct{},
+	ignoreRulesStack []ignoreRules,
 	filePaths *[]string,
 	walkFailures *[]string,
 ) error {
@@ -535,7 +536,7 @@ func walkLogicalTree(
 			return nil
 		}
 		if targetInfo.IsDir() {
-			return walkLogicalTree(ctx, logicalPath, resolved, mode, visitedPhysicalDirs, filePaths, walkFailures)
+			return walkLogicalTree(ctx, logicalPath, resolved, mode, visitedPhysicalDirs, ignoreRulesStack, filePaths, walkFailures)
 		}
 		if mode == walkModeMovie && shouldSkipMovieSupplementalFile(logicalPath) {
 			return nil
@@ -570,6 +571,9 @@ func walkLogicalTree(
 	if isIgnoredDirectoryPath(logicalPath) {
 		return nil
 	}
+	if ignoreRulesMatch(ignoreRulesStack, logicalPath) {
+		return nil
+	}
 	if mode == walkModeMovie && shouldSkipMovieSupplementalDir(logicalPath) {
 		return nil
 	}
@@ -580,6 +584,16 @@ func walkLogicalTree(
 		recordWalkFailure(walkFailures, logicalPath)
 		return nil
 	}
+
+	entryNames := make([]string, len(entries))
+	for i, entry := range entries {
+		entryNames[i] = entry.Name()
+	}
+	if dirHasIgnoreMarker(entryNames) {
+		return nil
+	}
+	childRules := childIgnoreRules(ignoreRulesStack, logicalPath, physicalPath, entryNames)
+
 	for _, entry := range entries {
 		if ctx != nil {
 			if err := ctx.Err(); err != nil {
@@ -589,6 +603,9 @@ func walkLogicalTree(
 
 		logicalChild := filepath.Join(logicalPath, entry.Name())
 		physicalChild := filepath.Join(physicalPath, entry.Name())
+		if ignoreRulesMatch(childRules, logicalChild) {
+			continue
+		}
 
 		if entry.Type()&os.ModeSymlink != 0 {
 			resolved, err := filepath.EvalSymlinks(physicalChild)
@@ -604,7 +621,7 @@ func walkLogicalTree(
 				continue
 			}
 			if targetInfo.IsDir() {
-				if err := walkLogicalTree(ctx, logicalChild, resolved, mode, visitedPhysicalDirs, filePaths, walkFailures); err != nil {
+				if err := walkLogicalTree(ctx, logicalChild, resolved, mode, visitedPhysicalDirs, childRules, filePaths, walkFailures); err != nil {
 					return err
 				}
 				continue
@@ -619,7 +636,7 @@ func walkLogicalTree(
 		}
 
 		if entry.IsDir() {
-			if err := walkLogicalTree(ctx, logicalChild, physicalChild, mode, visitedPhysicalDirs, filePaths, walkFailures); err != nil {
+			if err := walkLogicalTree(ctx, logicalChild, physicalChild, mode, visitedPhysicalDirs, childRules, filePaths, walkFailures); err != nil {
 				return err
 			}
 			continue
@@ -667,7 +684,7 @@ func collectLogicalFilePaths(ctx context.Context, walkRoots []string, libraryTyp
 		if cleanRoot == "" || cleanRoot == "." {
 			continue
 		}
-		if err := walkLogicalTree(ctx, cleanRoot, cleanRoot, mode, visitedPhysicalDirs, &filePaths, &walkFailures); err != nil {
+		if err := walkLogicalTree(ctx, cleanRoot, cleanRoot, mode, visitedPhysicalDirs, nil, &filePaths, &walkFailures); err != nil {
 			return nil, nil, err
 		}
 	}

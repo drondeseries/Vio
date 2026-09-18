@@ -1,0 +1,178 @@
+package scanner
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+)
+
+func writeTestFile(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func collectTestFilePaths(t *testing.T, root string, libraryType string) []string {
+	t.Helper()
+	files, walkFailures, err := collectLogicalFilePaths(context.Background(), []string{root}, libraryType)
+	if err != nil {
+		t.Fatalf("collect logical paths: %v", err)
+	}
+	if len(walkFailures) != 0 {
+		t.Fatalf("walkFailures = %v, want none for a fully readable tree", walkFailures)
+	}
+	sort.Strings(files)
+	return files
+}
+
+func assertFilePaths(t *testing.T, got []string, root string, wantRel []string) {
+	t.Helper()
+	want := make([]string, 0, len(wantRel))
+	for _, rel := range wantRel {
+		want = append(want, filepath.Join(root, rel))
+	}
+	sort.Strings(want)
+	if len(got) != len(want) {
+		t.Fatalf("files = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("files[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestIgnoreMarkerFilesSkipEntireDirectory(t *testing.T) {
+	t.Parallel()
+
+	for _, marker := range []string{".ignore", ".nomedia"} {
+		root := t.TempDir()
+		writeTestFile(t, filepath.Join(root, "Movie.mkv"), "test")
+		writeTestFile(t, filepath.Join(root, "Ignored", "Hidden.mkv"), "test")
+		writeTestFile(t, filepath.Join(root, "Ignored", marker), "")
+		writeTestFile(t, filepath.Join(root, "Kept", "Episode 01.mkv"), "test")
+
+		files := collectTestFilePaths(t, root, "series")
+		assertFilePaths(t, files, root, []string{"Movie.mkv", "Kept/Episode 01.mkv"})
+	}
+}
+
+func TestSiloIgnoreSkipsMatchedFilesAndDirs(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "Movie.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "sample.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Extras", "Deleted Scenes.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Sub", "notes.txt"), "test")
+	writeTestFile(t, filepath.Join(root, "Sub", "clip.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Sub", "nested", "Episode 01.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, ".siloignore"), `# comments and blanks are ignored
+
+sample.mkv
+Extras
+*.txt
+`)
+
+	files := collectTestFilePaths(t, root, "series")
+	assertFilePaths(t, files, root, []string{"Movie.mkv", "Sub/clip.mkv", "Sub/nested/Episode 01.mkv"})
+}
+
+func TestSiloIgnoreParentPatternsCascadeIntoSubdirectories(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "Movie.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "junk", "ignore-me.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Series", "Season 1", "Episode 01.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Series", "Season 2", "Episode 01.mkv"), "test")
+	// Nested file adds its own rules on top of the inherited ones.
+	writeTestFile(t, filepath.Join(root, "Series", ".siloignore"), "Season 2")
+	writeTestFile(t, filepath.Join(root, ".siloignore"), "junk/*")
+
+	files := collectTestFilePaths(t, root, "series")
+	assertFilePaths(t, files, root, []string{"Movie.mkv", "Series/Season 1/Episode 01.mkv"})
+}
+
+func TestParseIgnorePatterns(t *testing.T) {
+	t.Parallel()
+
+	patterns := parseIgnorePatterns("# comment\n\n  sample.mkv  \nExtras\n\t*.txt\n")
+	want := []string{"sample.mkv", "Extras", "*.txt"}
+	if len(patterns) != len(want) {
+		t.Fatalf("patterns = %v, want %v", patterns, want)
+	}
+	for i := range want {
+		if patterns[i] != want[i] {
+			t.Fatalf("patterns[%d] = %q, want %q", i, patterns[i], want[i])
+		}
+	}
+}
+
+func TestSiloIgnoreDoesNotMatchAcrossPathSeparators(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "Movie.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Sub", "Episode 01.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, ".siloignore"), "*Episode*")
+
+	files := collectTestFilePaths(t, root, "series")
+	assertFilePaths(t, files, root, []string{"Movie.mkv", "Sub/Episode 01.mkv"})
+}
+
+func TestAudiobookScanHonorsIgnoreFiles(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "Book One", "Chapter 01.mp3"), "test")
+	writeTestFile(t, filepath.Join(root, "Book Two", "Chapter 01.mp3"), "test")
+	writeTestFile(t, filepath.Join(root, "Book Two", ".ignore"), "")
+	writeTestFile(t, filepath.Join(root, "sample", "Sample.mp3"), "test")
+	writeTestFile(t, filepath.Join(root, "junk", "Ignore Me.mp3"), "test")
+	writeTestFile(t, filepath.Join(root, ".siloignore"), "junk/*\nsample\n")
+
+	scans, err := collectAudiobookRootScans(context.Background(), 1, []string{root})
+	if err != nil {
+		t.Fatalf("collect audiobook root scans: %v", err)
+	}
+	if len(scans) != 1 {
+		t.Fatalf("scans len = %d, want 1", len(scans))
+	}
+	if scans[0].failed() {
+		t.Fatalf("scan failed: %v", scans[0].rootErr)
+	}
+	want := map[string]bool{filepath.Join(root, "Book One", "Chapter 01.mp3"): true}
+	if len(scans[0].seenPaths) != len(want) {
+		t.Fatalf("seenPaths = %v, want %v", scans[0].seenPaths, want)
+	}
+	for path := range want {
+		if !scans[0].seenPaths[path] {
+			t.Fatalf("seenPaths missing %q", path)
+		}
+	}
+}
+
+func TestPodcastShowAudioFilesSkipsIgnoreMarkers(t *testing.T) {
+	t.Parallel()
+
+	show := t.TempDir()
+	writeTestFile(t, filepath.Join(show, "Episode 01.mp3"), "test")
+	writeTestFile(t, filepath.Join(show, ".nomedia"), "")
+
+	_, err := listPodcastShowAudioFiles(show)
+	if err == nil || !errors.Is(err, errFolderHasNoMedia) {
+		t.Fatalf("listPodcastShowAudioFiles err = %v, want errFolderHasNoMedia", err)
+	}
+	if !strings.Contains(err.Error(), show) {
+		t.Fatalf("error should mention the show folder: %v", err)
+	}
+}

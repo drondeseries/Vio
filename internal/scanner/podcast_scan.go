@@ -47,6 +47,14 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 			continue
 		}
 		reconcileRoots = append(reconcileRoots, root)
+		var rootIgnoreRules []ignoreRules
+		for _, entry := range entries {
+			if entry.Name() == siloIgnoreFileName {
+				if patterns := readSiloIgnoreFile(root); len(patterns) > 0 {
+					rootIgnoreRules = append(rootIgnoreRules, ignoreRules{basePath: root, patterns: patterns})
+				}
+			}
+		}
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				continue
@@ -54,6 +62,9 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 			subPath := filepath.Join(root, entry.Name())
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			if ignoreRulesMatch(rootIgnoreRules, subPath) {
+				continue
 			}
 			attempted++
 			if paths, err := listPodcastShowAudioFiles(subPath); err == nil {

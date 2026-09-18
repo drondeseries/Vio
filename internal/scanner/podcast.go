@@ -82,6 +82,16 @@ func listPodcastShowAudioFiles(folderPath string) ([]string, error) {
 		}
 		return nil, fmt.Errorf("read podcast folder %s: %w", folderPath, err)
 	}
+	names := make([]string, len(entries))
+	for i, entry := range entries {
+		names[i] = entry.Name()
+	}
+	if dirHasIgnoreMarker(names) {
+		// A .ignore/.nomedia marker means the show folder (and its contents)
+		// are ignored; treat it as an empty show so the caller skips instead
+		// of failing.
+		return nil, fmt.Errorf("podcast show %s: %w", folderPath, errFolderHasNoMedia)
+	}
 	var audioFiles []string
 	for _, entry := range entries {
 		if entry.IsDir() {
