@@ -63,6 +63,45 @@ grep -q 'setVirtualPlayback] = useState(true)' web/src/pages/adminCollectionsSha
   && pass "virtual_playback add-flow defaults" \
   || reject "virtual_playback add-flow defaults flipped off"
 
+# 7. Image build pipeline: BuildKit frontend pruning, unshadowed Go module layer caching, Go compiler cache persistence, and single-runner manual frontend builds.
+grep -q 'FROM node:22-slim AS node-base' Dockerfile \
+  && grep -q 'COPY --from=node-base /usr/local/bin/node' Dockerfile \
+  && pass "Dockerfile decoupled node-base stage" \
+  || reject "Dockerfile missing decoupled node-base stage for BuildKit frontend pruning"
+
+if grep -E -q -- '--mount=type=cache.*target=/go/pkg/mod' Dockerfile; then
+  reject "Dockerfile contains --mount=type=cache targeting /go/pkg/mod (shadows Go module layer cache)"
+else
+  pass "Dockerfile unshadowed Go module cache"
+fi
+
+grep -q 'reproducible-containers/buildkit-cache-dance' .github/workflows/docker.yml \
+  && grep -q '/root/\.cache/go-build' .github/workflows/docker.yml \
+  && pass "docker workflow persists Go compiler cache via buildkit-cache-dance" \
+  || reject "docker workflow missing buildkit-cache-dance Go compiler cache persistence"
+
+if awk '/^on:/{flag=1; next} /^[a-z]/{flag=0} flag {print}' .github/workflows/docker.yml | grep -q 'push:'; then
+  reject "docker workflow contains stale on: push trigger"
+else
+  pass "docker workflow push trigger pruned"
+fi
+
+grep -q 'frontend-dist-' .github/workflows/docker.yml \
+  && grep -q 'actions/download-artifact@v4' .github/workflows/docker.yml \
+  && pass "docker workflow deduplicated manual frontend builds" \
+  || reject "docker workflow missing deduplicated manual frontend build artifact handoff"
+
+if [ -f .gitattributes ] && grep -q 'merge=ours' .gitattributes; then
+  driver="$(git config merge.ours.driver 2>/dev/null || true)"
+  if [ "$driver" = "true" ]; then
+    pass "git merge.ours.driver configured for .gitattributes"
+  elif git config merge.ours.driver true 2>/dev/null; then
+    pass "git merge.ours.driver configured for .gitattributes"
+  else
+    reject "git merge.ours.driver not configured (run: git config merge.ours.driver true)"
+  fi
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "fork invariants BROKEN — see docs/architecture/fork-divergence.md" >&2
   exit 1

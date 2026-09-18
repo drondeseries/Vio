@@ -69,6 +69,30 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Reject committed local SDK replaces
+        run: |
+          if grep -Eq '^replace github.com/Silo-Server/silo-plugin-sdk => /' go.mod; then
+            echo "go.mod contains a machine-local silo-plugin-sdk replace."
+            exit 1
+          fi
+
+      - name: Validate SDK resolves from the module graph
+        env:
+          GOWORK: off
+        run: |
+          sdk_module_json="$(mktemp)"
+          go list -m -json github.com/Silo-Server/silo-plugin-sdk > "$sdk_module_json"
+          if grep -q '"Main": true' "$sdk_module_json"; then
+            echo "silo-plugin-sdk resolved from the local workspace instead of go.mod."
+            cat "$sdk_module_json"
+            exit 1
+          fi
+
+      # Fork invariants: fail loudly when an upstream merge (or local edit)
+      # breaks a deliberate Vio divergence.
+      - name: Verify fork invariants
+        run: make verify-fork-invariants
+
       # cmd/silo embeds the built frontend, so nothing under ./... compiles
       # without web/dist. The Go jobs never serve it, so a placeholder is
       # enough; the Docker workflow builds the real bundle.

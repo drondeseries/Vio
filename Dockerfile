@@ -1,5 +1,7 @@
 # Stage 1: Build frontend
-FROM node:22-slim AS frontend
+FROM node:22-slim AS node-base
+
+FROM node-base AS frontend
 RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
 WORKDIR /app/web
 COPY web/package.json web/pnpm-lock.yaml ./
@@ -27,9 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libvips-dev && 
 WORKDIR /app
 COPY go.mod go.sum ./
 COPY internal/compat/zishang520-webtransport-go/ internal/compat/zishang520-webtransport-go/
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 COPY web/embed.go web/embed.go
 COPY --from=frontend_dist / web/dist
 COPY cmd/ cmd/
@@ -44,7 +44,6 @@ ARG BUILD_DIRTY=false
 ARG BUILD_NUMBER
 ARG BUILD_DATE
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
     go build \
     -ldflags "-X github.com/Silo-Server/silo-server/internal/buildinfo.revisionOverride=${BUILD_REVISION} -X github.com/Silo-Server/silo-server/internal/buildinfo.dirtyOverride=${BUILD_DIRTY} -X github.com/Silo-Server/silo-server/internal/buildinfo.buildNumberOverride=${BUILD_NUMBER} -X github.com/Silo-Server/silo-server/internal/buildinfo.builtAtOverride=${BUILD_DATE}" \
     -o /vio ./cmd/silo/
@@ -83,8 +82,8 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
       rm -rf "${runtime_dir}" /var/lib/apt/lists/*; \
     fi
 RUN mkdir -p /tmp/vio-transcode /var/lib/vio/artwork /var/lib/vio/compat/jellyfin-web
-COPY --from=frontend /usr/local/bin/node /usr/local/bin/node
-COPY --from=frontend /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+COPY --from=node-base /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-base /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 COPY --from=build /vio /usr/local/bin/vio
