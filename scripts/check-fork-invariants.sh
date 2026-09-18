@@ -67,4 +67,26 @@ if [ "$fail" -ne 0 ]; then
   echo "fork invariants BROKEN — see docs/architecture/fork-divergence.md" >&2
   exit 1
 fi
+
+# Working-tree formatting: CI gates gofmt and prettier --check, and the repo
+# pre-commit hook does not. Catch it here before pushing, not after.
+if [ -n "$(gofmt -l internal cmd 2>/dev/null)" ]; then
+  reject "gofmt clean: $(gofmt -l internal cmd 2>/dev/null | tr '\n' ' ')"
+else
+  pass "gofmt clean"
+fi
+if [ -d web/node_modules ]; then
+  if pnpm --dir web run format:check >/dev/null 2>&1; then
+    pass "prettier clean"
+  else
+    reject "prettier clean (run: pnpm --dir web exec prettier --write <files>)"
+  fi
+else
+  echo "skip  - prettier clean (web/node_modules absent)"
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "fork invariants BROKEN — see docs/architecture/fork-divergence.md" >&2
+  exit 1
+fi
 echo "fork invariants hold"

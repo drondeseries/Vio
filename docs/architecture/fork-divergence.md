@@ -39,9 +39,10 @@ that before it ships.
      resolve by regenerating (`make apiv2-*`), never by hand-editing.
 3. Merge with a merge commit so fork history stays readable. Never rebase
    pushed history.
-4. Verify before pushing: `scripts/check-fork-invariants.sh`, `go build
-   ./...`, the focused suites for touched areas (`internal/apiv2` including
-   the fixtures/document tests that pin the contract, `internal/catalog`
-   virtual suites against a disposable DB, `internal/api` router tests, web
-   typecheck plus touched step tests).
+4. Verify before pushing: `scripts/check-fork-invariants.sh` (includes gofmt
+   and prettier gates — the repo pre-commit hook does not check formatting),
+   `go build ./...`, the focused suites for touched areas (`internal/apiv2`
+   including the fixtures/document tests that pin the contract,
+   `internal/catalog` virtual suites against a disposable DB, `internal/api`
+   router tests, web typecheck plus touched step tests).
 5. Push. The image pipeline builds from the merge.

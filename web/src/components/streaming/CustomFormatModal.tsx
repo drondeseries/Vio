@@ -287,7 +287,10 @@ export function CustomFormatModal({
             <Button type="button" variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={Boolean(patternError) || !formData.name.trim() || !formData.pattern.trim()}>
+            <Button
+              type="submit"
+              disabled={Boolean(patternError) || !formData.name.trim() || !formData.pattern.trim()}
+            >
               Save Rule
             </Button>
           </DialogFooter>

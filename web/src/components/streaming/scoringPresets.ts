@@ -1,10 +1,4 @@
-export type CategoryType =
-  | "source"
-  | "hdr"
-  | "audio"
-  | "release_group"
-  | "resolution"
-  | "custom";
+export type CategoryType = "source" | "hdr" | "audio" | "release_group" | "resolution" | "custom";
 
 export interface CustomFormatRule {
   id: string;
