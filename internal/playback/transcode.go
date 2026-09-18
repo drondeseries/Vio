@@ -731,9 +731,12 @@ func ResolveToneMapExecutor(ctx context.Context, opts TranscodeOpts) (TranscodeO
 		return opts, fmt.Errorf("tone-map executor is not validated")
 	}
 	// A recipe frozen with the opt-in VPP tone map keeps it across a
-	// reconstruction; the live probe still has to validate the OpenCL executor
-	// so a deployment that lost its HDR hardware cannot silently downgrade.
-	if opts.ToneMapMode == tonemap.ModeHardware && opts.ToneMapFilter == tonemap.HardwareFilterQSVVPP {
+	// reconstruction only while the resolved backend is still QSV. If the
+	// deployment moved to another backend, fall through to the probed filter
+	// instead of forcing a chain that backend cannot run.
+	if opts.ToneMapMode == tonemap.ModeHardware &&
+		opts.ToneMapFilter == tonemap.HardwareFilterQSVVPP &&
+		strings.EqualFold(backend, transcodeHWQSV) {
 		opts.HWAccel = capabilities.BackendFor(opts.ToneMapMode, opts.ToneMapSourceKind)
 		return opts, nil
 	}
