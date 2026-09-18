@@ -580,8 +580,8 @@ func (t *virtualResolveTrace) totalMS() int64 {
 func (t *virtualResolveTrace) fields() []any {
 	attrs := []any{
 		"elapsed_ms", time.Since(t.started).Milliseconds(),
-		"total_ms", t.totalMS(),
-		"candidates", t.candidates,
+		"total_ms", t.totalMS(), //nolint:goconst // log attribute key/value, kept inline for readability.
+		"candidates", t.candidates, //nolint:goconst // log attribute key/value, kept inline for readability.
 		"cache_hit", t.cached,
 		"listed", t.listed,
 		"fast_path", t.fastPath,
@@ -591,9 +591,9 @@ func (t *virtualResolveTrace) fields() []any {
 		ran  bool
 		d    time.Duration
 	}{
-		{"list", t.listRan, t.list},
-		{"remux", t.remuxRan, t.remux},
-		{"resolve", t.resolveRan, t.resolve},
+		{"list", t.listRan, t.list}, //nolint:goconst // log attribute key/value, kept inline for readability.
+		{"remux", t.remuxRan, t.remux}, //nolint:goconst // log attribute key/value, kept inline for readability.
+		{"resolve", t.resolveRan, t.resolve}, //nolint:goconst // log attribute key/value, kept inline for readability.
 		{"probe", t.probeRan, t.probe},
 		{"fallback", t.fallbackRan, t.fallback},
 	} {
@@ -609,7 +609,7 @@ func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 	if t == nil || file == nil {
 		return
 	}
-	attrs := []any{logComponentKey, "api", "content_id", file.ContentID}
+	attrs := []any{logComponentKey, "api", "content_id", file.ContentID} //nolint:goconst // log attribute key/value, kept inline for readability.
 	attrs = append(attrs, t.fields()...)
 	slog.InfoContext(ctx, "virtual resolve timing", attrs...)
 }
