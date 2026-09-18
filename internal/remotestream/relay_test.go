@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -601,5 +602,155 @@ func TestRelayPostCommitFailureAbortsDownstreamConnection(t *testing.T) {
 	_, err = io.ReadAll(resp.Body)
 	if err == nil {
 		t.Fatal("expected read error on aborted stream, but got clean EOF")
+	}
+}
+
+func TestRelayServesCompleteRangeResponseFromCache(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		if got := request.Header.Get("Range"); got != "bytes=100-199" {
+			t.Errorf("upstream Range = %q, want bytes=100-199", got)
+		}
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", strings.Repeat("x", 100))
+		response.Header.Set("Accept-Ranges", "bytes")
+		response.Header.Set("Content-Range", "bytes 100-199/1000")
+		response.Header.Set("Content-Length", "100")
+		response.Header.Set("ETag", `"etag-1"`)
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "range-cache", "https://1.1.1.1/media.mkv")
+	defer cleanup()
+
+	first := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=100-199")
+	if first.status != http.StatusPartialContent || first.body != strings.Repeat("x", 100) {
+		t.Fatalf("first response = status %d, %d bytes", first.status, len(first.body))
+	}
+	second := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=100-199")
+	if second.status != first.status || second.body != first.body {
+		t.Fatalf("cached response differs: status %d/%d, body %d/%d",
+			first.status, second.status, len(first.body), len(second.body))
+	}
+	if got := second.header.Get("Content-Range"); got != "bytes 100-199/1000" {
+		t.Fatalf("cached Content-Range = %q", got)
+	}
+	if got := second.header.Get("ETag"); got != `"etag-1"` {
+		t.Fatalf("cached ETag = %q", got)
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (second request served from cache)", got)
+	}
+}
+
+func TestRelayRangeCacheLeavesOversizedAndNoStoreResponsesUpstream(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		switch request.URL.Path {
+		case "/large":
+			body := strings.Repeat("z", relayRangeCacheMaxEntrySize+1)
+			response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", body)
+			response.Header.Set("Content-Range", "bytes 0-524288/1000000")
+			response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+			return response, nil
+		case "/nostore":
+			response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", strings.Repeat("n", 64))
+			response.Header.Set("Content-Range", "bytes 0-63/1000")
+			response.Header.Set("Content-Length", "64")
+			response.Header.Set("Cache-Control", "no-store")
+			return response, nil
+		default:
+			t.Errorf("unexpected upstream path %q", request.URL.Path)
+			return relayResponse(request, http.StatusNotFound, "text/plain", ""), nil
+		}
+	})}
+
+	largeURL, largeCleanup := registerRelayForTest(t, relay, "large", "https://1.1.1.1/large")
+	defer largeCleanup()
+	noStoreURL, noStoreCleanup := registerRelayForTest(t, relay, "nostore", "https://1.1.1.1/nostore")
+	defer noStoreCleanup()
+
+	for i := 0; i < 2; i++ {
+		if got := fetchRelay(t, relay, largeURL, http.MethodGet, "bytes=0-524288"); got.status != http.StatusPartialContent {
+			t.Fatalf("large fetch %d status = %d", i, got.status)
+		}
+		if got := fetchRelay(t, relay, noStoreURL, http.MethodGet, "bytes=0-63"); got.status != http.StatusPartialContent {
+			t.Fatalf("no-store fetch %d status = %d", i, got.status)
+		}
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 4 {
+		t.Fatalf("upstream calls = %d, want 4 (oversized and no-store responses are never cached)", got)
+	}
+}
+
+func TestRelayRangeCacheEvictsAndExpires(t *testing.T) {
+	cache := newRelayRangeCache()
+	now := time.Unix(1_700_000_000, 0)
+	cache.now = func() time.Time { return now }
+
+	cache.put("entry", relayRangeCacheEntry{status: http.StatusPartialContent, body: []byte("body")})
+	if entry, ok := cache.get("entry"); !ok || string(entry.body) != "body" {
+		t.Fatalf("cache miss right after put: ok=%v body=%q", ok, entry.body)
+	}
+	now = now.Add(relayRangeCacheTTL + time.Second)
+	if _, ok := cache.get("entry"); ok {
+		t.Fatal("expired entry was served")
+	}
+
+	for i := 0; i < relayRangeCacheMaxEntries+8; i++ {
+		cache.put("k"+strconv.Itoa(i), relayRangeCacheEntry{status: http.StatusPartialContent, body: []byte("x")})
+	}
+	if len(cache.entries) > relayRangeCacheMaxEntries {
+		t.Fatalf("cache entries = %d, want <= %d", len(cache.entries), relayRangeCacheMaxEntries)
+	}
+}
+
+func TestRelayCacheableResponseRejectsUnboundedAndPrivate(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		length string
+		header map[string]string
+		want   bool
+	}{
+		{"complete", http.StatusPartialContent, "128", nil, true},
+		{"empty_length", http.StatusPartialContent, "", nil, false},
+		{"chunked", http.StatusPartialContent, "", map[string]string{"Transfer-Encoding": "chunked"}, false},
+		{"oversized", http.StatusPartialContent, strconv.Itoa(relayRangeCacheMaxEntrySize + 1), nil, false},
+		{"zero", http.StatusPartialContent, "0", nil, false},
+		{"server_error", http.StatusBadGateway, "128", nil, false},
+		{"no_store", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "no-store"}, false},
+		{"private", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "private, max-age=60"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: tc.status, Header: http.Header{}}
+			if tc.length != "" {
+				response.Header.Set("Content-Length", tc.length)
+			}
+			for k, v := range tc.header {
+				response.Header.Set(k, v)
+			}
+			_, ok := relayCacheableResponse(response)
+			if ok != tc.want {
+				t.Fatalf("cacheable = %v, want %v", ok, tc.want)
+			}
+		})
 	}
 }

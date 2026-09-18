@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +41,163 @@ const (
 	// 64 chunks ≈ 16 MiB per active stream — enough smoothing without letting
 	// many slow clients pin hundreds of megabytes of resident memory.
 	remoteBodyBufferChunks = 64
+
+	// relayRangeCache* bound the in-memory cache of complete, small upstream
+	// range responses. FFmpeg re-reads a container's index/seek tables from the
+	// same byte offsets on every open+seek (a fresh process per seek), and on a
+	// remote provider each of those reads is a full round trip. Caching only
+	// complete, byte-bounded 2xx range responses keeps a hit byte-exact and
+	// never has to synthesize a truncated body.
+	relayRangeCacheTTL          = 2 * time.Minute
+	relayRangeCacheMaxEntrySize = 512 << 10
+	relayRangeCacheMaxEntries   = 64
+	relayRangeCacheMaxTotalSize = 16 << 20
 )
+
+// relayRangeCacheEntry is one complete upstream range response. body is
+// immutable once stored; header holds only the media headers the relay
+// forwards, so a hit reproduces the original response exactly.
+type relayRangeCacheEntry struct {
+	status    int
+	header    http.Header
+	body      []byte
+	expiresAt time.Time
+}
+
+// relayRangeCache is a bounded TTL cache keyed by upstream URL and exact Range
+// header. now is injectable for tests.
+type relayRangeCache struct {
+	mu         sync.Mutex
+	entries    map[string]relayRangeCacheEntry
+	totalBytes int
+	now        func() time.Time
+}
+
+func newRelayRangeCache() *relayRangeCache {
+	return &relayRangeCache{entries: make(map[string]relayRangeCacheEntry)}
+}
+
+func (c *relayRangeCache) clock() time.Time {
+	if c != nil && c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *relayRangeCache) get(key string) (relayRangeCacheEntry, bool) {
+	if c == nil || key == "" {
+		return relayRangeCacheEntry{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok {
+		return relayRangeCacheEntry{}, false
+	}
+	if !c.clock().Before(entry.expiresAt) {
+		c.totalBytes -= len(entry.body)
+		delete(c.entries, key)
+		return relayRangeCacheEntry{}, false
+	}
+	return relayRangeCacheEntry{
+		status:    entry.status,
+		header:    entry.header.Clone(),
+		body:      entry.body,
+		expiresAt: entry.expiresAt,
+	}, true
+}
+
+func (c *relayRangeCache) put(key string, entry relayRangeCacheEntry) {
+	if c == nil || key == "" || len(entry.body) == 0 || len(entry.body) > relayRangeCacheMaxEntrySize {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]relayRangeCacheEntry)
+	}
+	now := c.clock()
+	for k, existing := range c.entries {
+		if !now.Before(existing.expiresAt) {
+			c.totalBytes -= len(existing.body)
+			delete(c.entries, k)
+		}
+	}
+	if existing, ok := c.entries[key]; ok {
+		c.totalBytes -= len(existing.body)
+		delete(c.entries, key)
+	}
+	for len(c.entries) >= relayRangeCacheMaxEntries || c.totalBytes+len(entry.body) > relayRangeCacheMaxTotalSize {
+		oldestKey := ""
+		var oldest time.Time
+		for k, existing := range c.entries {
+			if oldestKey == "" || existing.expiresAt.Before(oldest) {
+				oldestKey, oldest = k, existing.expiresAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		c.totalBytes -= len(c.entries[oldestKey].body)
+		delete(c.entries, oldestKey)
+	}
+	entry.expiresAt = now.Add(relayRangeCacheTTL)
+	c.entries[key] = entry
+	c.totalBytes += len(entry.body)
+}
+
+// relayRangeCacheKey names one complete upstream range response for a source.
+// The exact Range header is part of the key: a cache hit must answer the same
+// request the upstream answered.
+func relayRangeCacheKey(target *url.URL, rangeHeader string) string {
+	if target == nil {
+		return ""
+	}
+	rangeHeader = strings.TrimSpace(rangeHeader)
+	if rangeHeader == "" {
+		return ""
+	}
+	return target.String() + "\x00" + rangeHeader
+}
+
+// relayCacheableResponse reports the declared body size of a complete,
+// cacheable range response. Open-ended responses (Content-Length = the whole
+// remaining file), errors, streamed bodies, no-store responses, and anything
+// larger than the entry bound are rejected.
+func relayCacheableResponse(response *http.Response) (int, bool) {
+	if response == nil {
+		return 0, false
+	}
+	if response.StatusCode != http.StatusPartialContent && response.StatusCode != http.StatusOK {
+		return 0, false
+	}
+	rawLength := strings.TrimSpace(response.Header.Get("Content-Length"))
+	if rawLength == "" {
+		return 0, false
+	}
+	length, err := strconv.Atoi(rawLength)
+	if err != nil || length <= 0 || length > relayRangeCacheMaxEntrySize {
+		return 0, false
+	}
+	cacheControl := strings.ToLower(response.Header.Get("Cache-Control"))
+	if strings.Contains(cacheControl, "no-store") || strings.Contains(cacheControl, "private") {
+		return 0, false
+	}
+	return length, true
+}
+
+func relayCachedHeaders(response *http.Response) http.Header {
+	cached := make(http.Header, 8)
+	for _, header := range []string{
+		"Accept-Ranges", "Content-Length", "Content-Range", "Content-Type",
+		"ETag", "Last-Modified", "Cache-Control",
+	} {
+		if value := response.Header.Get(header); value != "" {
+			cached.Set(header, value)
+		}
+	}
+	return cached
+}
 
 // Relay exposes validated remote streams only on loopback. It gives FFmpeg a
 // credential-free input URL while retaining Range support and applying the
@@ -56,6 +213,7 @@ type Relay struct {
 	client         *http.Client
 	insecureClient *http.Client
 	sealKey        [32]byte
+	rangeCache     *relayRangeCache
 }
 
 type relayEntry struct {
@@ -88,7 +246,8 @@ func RetryableBeforeResponse(err error) bool {
 func NewRelay() *Relay {
 	transport := NewSafeTransport()
 	relay := &Relay{
-		entries: make(map[string]*relayEntry),
+		entries:    make(map[string]*relayEntry),
+		rangeCache: newRelayRangeCache(),
 		client: &http.Client{
 			Transport:     transport,
 			CheckRedirect: checkRedirect,
@@ -419,6 +578,27 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 			}
 		}
 	}
+	// A complete, byte-bounded range response for a registered source may
+	// already be cached. Conditional requests and unregistered proxy traffic
+	// never use the cache; a hit is byte-exact and returns before any upstream
+	// round trip, which is what makes a fresh FFmpeg open+seek cheap.
+	cacheKey := ""
+	if request.Method == http.MethodGet && relayToken != "" &&
+		upstream.Header.Get("If-Range") == "" &&
+		upstream.Header.Get("If-None-Match") == "" &&
+		upstream.Header.Get("If-Modified-Since") == "" {
+		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"))
+		if entry, ok := r.rangeCache.get(cacheKey); ok {
+			for key, values := range entry.header {
+				for _, value := range values {
+					w.Header().Set(key, value)
+				}
+			}
+			w.WriteHeader(entry.status)
+			_, writeErr := w.Write(entry.body)
+			return writeErr
+		}
+	}
 	response, err := client.Do(upstream)
 	if err != nil {
 		return errors.New("remote stream request failed")
@@ -502,11 +682,22 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		_, err = w.Write(rewritten)
 		return err
 	}
+	cacheLength, cacheable := relayCacheableResponse(response)
+	if cacheKey == "" {
+		cacheable = false
+	}
+	var cacheBody []byte
+	if cacheable {
+		cacheBody = make([]byte, 0, cacheLength)
+	}
 	copyRemoteResponseHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
 	flusher, _ := w.(http.Flusher)
 	if _, err := w.Write(first.data); err != nil {
 		return err
+	}
+	if cacheable {
+		cacheBody = append(cacheBody, first.data...)
 	}
 	if flusher != nil {
 		flusher.Flush()
@@ -520,12 +711,29 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 			if _, err := w.Write(first.data); err != nil {
 				return err
 			}
+			if cacheable {
+				if len(cacheBody)+len(first.data) <= cacheLength {
+					cacheBody = append(cacheBody, first.data...)
+				} else {
+					cacheable = false
+					cacheBody = nil
+				}
+			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
 	}
 	if errors.Is(first.err, io.EOF) {
+		// Cache only a response whose full declared body was read: a client
+		// disconnect or upstream error must never leave a partial entry.
+		if cacheable && len(cacheBody) == cacheLength {
+			r.rangeCache.put(cacheKey, relayRangeCacheEntry{
+				status: response.StatusCode,
+				header: relayCachedHeaders(response),
+				body:   cacheBody,
+			})
+		}
 		return nil
 	}
 	return errors.New("read remote media stream")

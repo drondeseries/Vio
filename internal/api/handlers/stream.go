@@ -283,6 +283,7 @@ func NewStreamHandler(sessionMgr SessionManagerInterface, fileResolver FilePathR
 // For remux: starts an ffmpeg remux and streams the output.
 // For transcode: returns 400 (transcode uses manifest/segment endpoints).
 func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
+	requestStart := time.Now()
 	userID := apimw.GetUserID(r.Context())
 	if userID == 0 {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
@@ -549,6 +550,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				SourceAudioChannels:    session.SourceAudioChannels,
 				TargetAudioChannels:    session.TargetAudioChannels,
 				TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
+				TimingStart:            requestStart,
 			})
 			if err == nil && isVirtualPlaybackFile(file) &&
 				virtualCandidateDeliveryEvidence(http.StatusOK, remuxWriter.BytesWritten()) {
