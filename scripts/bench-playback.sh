@@ -14,13 +14,29 @@ set -euo pipefail
 #
 # Env vars:
 #   SILO_SERVER   — base URL  (default: http://localhost:8090)
-#   SILO_API_KEY  — API key   (default: temp key below)
+#   SILO_API_KEY  — API key   (required; no default is committed)
+#
+# Settings are also read from .silo-dev.env when present (the same file
+# scripts/silo-dev reads). Never put the API key on the command line.
 # ──────────────────────────────────────────────────────────────────────────────
+
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ENV_FILE="${SILO_DEV_ENV_FILE:-$REPO_ROOT/.silo-dev.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
 
 WARM_REPS=${1:-20}
 COOLDOWN=${2:-35}
 SERVER="${SILO_SERVER:-http://localhost:8090}"
-API_KEY="${SILO_API_KEY:-sa_5782222a48a27bed071273614ea47e5d9f4d3692239e910811582f5913de1ee7}"
+API_KEY="${SILO_API_KEY:-}"
+if [[ -z "$API_KEY" ]]; then
+  printf 'bench-playback: SILO_API_KEY is not set. Export it or add it to %s (see .silo-dev.env.example).\n' "$ENV_FILE" >&2
+  exit 2
+fi
 SAMPLE_SIZE="${SAMPLE_SIZE:-0}"
 SEED="${SEED:-42}"
 PROFILE_ID="${PROFILE_ID:-06ddc31a-4694-4fa8-946c-a661f2099baf}"

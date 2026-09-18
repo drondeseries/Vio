@@ -200,3 +200,60 @@ Compare equivalent workloads and binaries before and after a change. Measure
 ordinary metrics, sampled tracing, CPU profiling, execution tracing, and
 contention sampling separately; their overhead and attribution differ. Use
 native-library or OS profiling tools when RSS/CPU evidence points outside Go.
+
+## End-to-end playback measurement
+
+`scripts/bench-playback-e2e.sh` measures the path a viewer actually takes against
+a live server, not just the planning request. It runs one or more items through
+plan/start, time to first media bytes, random seeks, resume, subtitle delivery,
+and session stop, then prints a table and can write a JSON report.
+
+Credentials follow `scripts/silo-dev`: `SILO_API_KEY` and `PROFILE_ID` come from
+the environment or `.silo-dev.env`, and `SILO_URL` selects the server. The script
+prints only `scheme://host/path`; it never emits the key, bearer tokens, or
+signed query strings.
+
+```sh
+SAMPLE_SIZE=1 SEEKS=2 SUBTITLE_REPEATS=1 scripts/bench-playback-e2e.sh --json e2e.json
+scripts/bench-playback-e2e.sh --item 12345 --json item-e2e.json
+scripts/bench-playback-e2e.sh --item 12345 --subtitle-ordinal 0 --json sub-e2e.json
+```
+
+`--item <file_id>` pins one media file so before/after runs measure the same
+bytes. Without it, the script samples items from `MOVIE_LIBRARY_ID` and
+`SERIES_LIBRARY_ID` using `SEED` and `SAMPLE_SIZE`. `--subtitle-ordinal N`
+restricts the subtitle phase to the track at combined ordinal N.
+
+Knobs: `SAMPLE_SIZE` items sampled (0 = all), `SEED` selection seed, `SEEKS`
+seek fetches per item, `SUBTITLE_REPEATS` warm subtitle fetches per track,
+`SETTLE_MS` pause between a cold and a warm subtitle fetch, `RANGE_BYTES` bounded
+read size, `RESUME_POSITION` seconds stored for the resume check, `CURL_TIMEOUT`
+per-request deadline, and `RUN_ID` request id prefix.
+
+Media reads are scored on the window the server returned, not on curl's exit
+code. A read that received the requested bytes is valid even when curl stops at
+its size cap (`--max-filesize`, exit 63); that case records
+`truncated_by_max_filesize: true` rather than a failure. Each media record also
+carries the `range_requested`, the `served_range` from `Content-Range` (or the
+bytes actually read when the server ignored the range, with `range_ignored:
+true`), and `total_size_bytes` parsed from `Content-Range`/`Content-Length` or
+`0` when the server reports no total.
+
+Subtitle tracks come from `playback_plan.subtitle.inventory`. A plan with no
+tracks records `no_tracks: true` instead of being silently skipped; tracks with
+no fetchable sidecar (for example `burn_in_only`) are recorded per track with
+`fetchable: false`.
+
+The JSON report has a `meta` block (server, profile, run id, timestamp, git
+revision and dirty flag, seed, sample size, discovered and measured counts, item
+ids, subtitle ordinal) and a `phases` block whose keys are `start`, `first_bytes`,
+`seek`, `resume`, `subtitles`, and `stop`. Every phase record carries RFC3339
+`started_at`/`ended_at` for correlation with server logs. A `summary` block
+carries counts and nearest-rank p50/p95 per phase. Each phase records the HTTP
+status and timing even when the request failed.
+
+Outcomes are recorded, not thrown: a deployment that rejects playback (for
+example `virtual_source_unavailable`) still exits 0 and reports the rejection
+per phase. Exit status is non-zero only for harness failures such as missing
+credentials, no discoverable items, or an unwritable report. Sessions the run
+creates are deleted on exit and on SIGINT/SIGTERM.
