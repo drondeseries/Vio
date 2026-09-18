@@ -1363,7 +1363,7 @@ func (m *mediaMonitor) processItem(ctx context.Context, item monitoredMedia) (mo
 			m.logger.DebugContext(itemCtx, "defer virtual media item; per-item budget elapsed", "key", item.Key)
 			return item, "", itemDeferred
 		default:
-			m.logger.Warn("evaluate virtual media", "key", item.Key, "error", evaluationErr)
+			m.logger.WarnContext(itemCtx, "evaluate virtual media", "key", item.Key, "error", evaluationErr)
 			return item, "", itemFailed
 		}
 	}
