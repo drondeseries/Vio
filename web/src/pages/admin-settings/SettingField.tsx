@@ -310,6 +310,9 @@ export function SettingField({
     <Input
       id={controlId}
       type="text"
+      autoComplete="off"
+      data-1p-ignore="true"
+      data-lpignore="true"
       value={value}
       onChange={(e) => onChange(e.target.value)}
       disabled={disabled}

@@ -5,6 +5,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Library } from "@/api/types";
 import StreamingSettings from "./StreamingSettings";
 
+class ResizeObserverStub {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+globalThis.ResizeObserver ??= ResizeObserverStub as unknown as typeof ResizeObserver;
+
 const useSettingsFormMock = vi.fn();
 const useAdminLibrariesMock = vi.fn();
 const mutateAsyncMock = vi.fn();
@@ -46,7 +53,7 @@ vi.mock("@/components/admin/ConnectionCheckAction", () => ({
   }),
 }));
 
-function makeForm(values: Record<string, string> = {}) {
+function makeForm(values: Record<string, string> = {}, sensitiveConfigured: string[] = []) {
   const formValues = { ...values };
   return {
     isLoading: false,
@@ -54,6 +61,9 @@ function makeForm(values: Record<string, string> = {}) {
     setValue: vi.fn((key: string, val: string) => {
       formValues[key] = val;
     }),
+    resetValue: vi.fn(),
+    isClearStaged: () => false,
+    sensitiveConfigured,
     isDirty: () => false,
     dirtyCount: 0,
     save: vi.fn(),
@@ -182,5 +192,46 @@ describe("StreamingSettings", () => {
     expect(screen.getByLabelText("AltMount URL")).toBeInTheDocument();
     expect(screen.getByLabelText("AltMount API key")).toBeInTheDocument();
     expect(screen.getByLabelText("AltMount check interval (minutes)")).toBeInTheDocument();
+  });
+
+  it("shows API key fields as not configured without a clear action", () => {
+    renderPage();
+
+    expect(screen.getByLabelText("Prowlarr API key")).toHaveAttribute(
+      "placeholder",
+      "Not configured",
+    );
+    expect(screen.getByLabelText("AltMount API key")).toHaveAttribute(
+      "placeholder",
+      "Not configured",
+    );
+    expect(screen.queryByRole("button", { name: "Clear saved value" })).not.toBeInTheDocument();
+  });
+
+  it("stages clearing a saved API key through the clear action", () => {
+    const form = makeForm({}, ["virtual_library.indexer_api_key"]);
+    useSettingsFormMock.mockReturnValue(form);
+    renderPage();
+
+    expect(screen.getByLabelText("Prowlarr API key")).toHaveAttribute(
+      "placeholder",
+      "••••••••••••",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear saved value" }));
+    expect(form.setValue).toHaveBeenCalledWith("virtual_library.indexer_api_key", "");
+  });
+
+  it("stages a typed API key replacement", () => {
+    const form = makeForm({}, ["virtual_library.indexer_api_key"]);
+    useSettingsFormMock.mockReturnValue(form);
+    renderPage();
+
+    fireEvent.change(screen.getByLabelText("Prowlarr API key"), {
+      target: { value: "new-prowlarr-key" },
+    });
+    expect(form.setValue).toHaveBeenCalledWith(
+      "virtual_library.indexer_api_key",
+      "new-prowlarr-key",
+    );
   });
 });

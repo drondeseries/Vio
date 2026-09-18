@@ -7,6 +7,8 @@ import {
   useConnectionCheck,
 } from "@/components/admin/ConnectionCheckAction";
 import { SettingsPageHeader } from "@/components/settings/SettingsPageHeader";
+import { SecretField } from "@/components/settings/SecretField";
+import { VioScoringProfilesCard } from "@/components/streaming/VioScoringProfilesCard";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAdminLibraries, useCreateLibrary } from "@/hooks/queries/admin/libraries";
@@ -38,37 +40,8 @@ const QUALITY_KEYS = [
   "virtual_library.custom_format_preset",
   "virtual_library.single_stream_with_failover",
   "virtual_library.fallback_to_any_stream",
-];
-
-const QUALITY_PRESET_OPTIONS = [
-  { value: "custom", label: "Custom" },
-  { value: "balanced", label: "Balanced (1080p)" },
-  { value: "4k-hdr", label: "4K HDR" },
-  { value: "4k-dolby-vision", label: "4K Dolby Vision" },
-  { value: "no-dolby-vision", label: "4K HDR10 (no Dolby Vision)" },
-  { value: "no-hdr", label: "4K SDR (no HDR)" },
-  { value: "compatibility", label: "Compatibility (H.264/AAC)" },
-  { value: "anime", label: "Anime" },
-];
-
-const CUSTOM_FORMAT_PRESET_OPTIONS = [
-  { value: "custom", label: "Custom" },
-  { value: "trash-recommended", label: "TRaSH Recommended (legacy)" },
-  { value: "altmount-recommended", label: "AltMount TRaSH Recommended" },
-  { value: "altmount-remux", label: "AltMount 4K Remux Enthusiast" },
-  { value: "altmount-compatibility", label: "AltMount Compatibility" },
-  { value: "english-original", label: "English Original" },
-  { value: "english-strict", label: "English Strict" },
-  { value: "original-or-english", label: "Original or English" },
-  { value: "clean-quality", label: "Clean Quality (no CAM/3D/extras)" },
-  { value: "audio-hd", label: "HD Audio (Atmos/DTS-HD)" },
-  { value: "repack-proper", label: "Repack / Proper" },
-  { value: "top-web-sources", label: "Top WEB Sources" },
-  { value: "anime-enhanced", label: "Anime Enhanced" },
-  { value: "web-tier-01", label: "WEB Tier 1 Groups" },
-  { value: "web-tier-02", label: "WEB Tier 2 Groups" },
-  { value: "remux-tier-01", label: "Remux Tier 1 Groups" },
-  { value: "remux-tier-02", label: "Remux Tier 2 Groups" },
+  "virtual_library.quality_profiles",
+  "virtual_library.custom_formats",
 ];
 
 const AUTOMATION_KEYS = [
@@ -320,11 +293,17 @@ export default function StreamingSettings() {
             onChange={(v) => form.setValue("virtual_library.indexer_rss_url", v)}
             restartRequired={restartKeys.has("virtual_library.indexer_rss_url")}
           />
-          <SettingField
+          <SecretField
             label="Prowlarr API key"
-            description="API key for authenticated Prowlarr indexer queries."
+            hint="API key for authenticated Prowlarr indexer queries."
             value={form.getValue("virtual_library.indexer_api_key")}
+            configured={form.sensitiveConfigured.includes("virtual_library.indexer_api_key")}
             onChange={(v) => form.setValue("virtual_library.indexer_api_key", v)}
+            onKeep={() => form.resetValue("virtual_library.indexer_api_key")}
+            // Nothing else on this page can empty the stored key, and a
+            // Prowlarr instance without auth needs it empty.
+            onClear={() => form.setValue("virtual_library.indexer_api_key", "")}
+            cleared={form.isClearStaged("virtual_library.indexer_api_key")}
             restartRequired={restartKeys.has("virtual_library.indexer_api_key")}
           />
           <SettingField
@@ -343,11 +322,17 @@ export default function StreamingSettings() {
             onChange={(v) => form.setValue("virtual_library.altmount_url", v)}
             restartRequired={restartKeys.has("virtual_library.altmount_url")}
           />
-          <SettingField
+          <SecretField
             label="AltMount API key"
-            description="API key for authenticated AltMount status queries."
+            hint="API key for authenticated AltMount status queries."
             value={form.getValue("virtual_library.altmount_api_key")}
+            configured={form.sensitiveConfigured.includes("virtual_library.altmount_api_key")}
             onChange={(v) => form.setValue("virtual_library.altmount_api_key", v)}
+            onKeep={() => form.resetValue("virtual_library.altmount_api_key")}
+            // Nothing else on this page can empty the stored key, and an
+            // AltMount instance without auth needs it empty.
+            onClear={() => form.setValue("virtual_library.altmount_api_key", "")}
+            cleared={form.isClearStaged("virtual_library.altmount_api_key")}
             restartRequired={restartKeys.has("virtual_library.altmount_api_key")}
           />
           <SettingField
@@ -361,50 +346,7 @@ export default function StreamingSettings() {
         </FieldGroup>
 
         <FieldGroup label="Quality" dirty={anyDirty(QUALITY_KEYS)}>
-          <SettingField
-            label="Enable quality profiles"
-            type="toggle"
-            description="Rank candidates by named resolution/codec profiles instead of provider order."
-            value={form.getValue("virtual_library.enable_quality_profiles") || "false"}
-            onChange={(v) => form.setValue("virtual_library.enable_quality_profiles", v)}
-            restartRequired={restartKeys.has("virtual_library.enable_quality_profiles")}
-          />
-          <SettingField
-            label="Quality preset"
-            settingKey="virtual_library.quality_preset"
-            type="select"
-            options={QUALITY_PRESET_OPTIONS}
-            description="Named resolution/codec profile set applied when profiles are enabled."
-            value={form.getValue("virtual_library.quality_preset") || "custom"}
-            onChange={(v) => form.setValue("virtual_library.quality_preset", v)}
-            restartRequired={restartKeys.has("virtual_library.quality_preset")}
-          />
-          <SettingField
-            label="Custom format preset"
-            settingKey="virtual_library.custom_format_preset"
-            type="select"
-            options={CUSTOM_FORMAT_PRESET_OPTIONS}
-            description="TRaSH-style release scoring weights. AltMount presets mirror the Stremio addon scorer."
-            value={form.getValue("virtual_library.custom_format_preset") || "custom"}
-            onChange={(v) => form.setValue("virtual_library.custom_format_preset", v)}
-            restartRequired={restartKeys.has("virtual_library.custom_format_preset")}
-          />
-          <SettingField
-            label="Single stream with failover"
-            type="toggle"
-            description="Register one winning stream per title; fall over to the next on failure."
-            value={form.getValue("virtual_library.single_stream_with_failover") || "true"}
-            onChange={(v) => form.setValue("virtual_library.single_stream_with_failover", v)}
-            restartRequired={restartKeys.has("virtual_library.single_stream_with_failover")}
-          />
-          <SettingField
-            label="Fallback to any stream"
-            type="toggle"
-            description="When no candidate matches the profiles, use the best available anyway."
-            value={form.getValue("virtual_library.fallback_to_any_stream") || "false"}
-            onChange={(v) => form.setValue("virtual_library.fallback_to_any_stream", v)}
-            restartRequired={restartKeys.has("virtual_library.fallback_to_any_stream")}
-          />
+          <VioScoringProfilesCard form={form} defaultExpanded={true} />
         </FieldGroup>
       </div>
 
