@@ -137,6 +137,14 @@ done until each of these has been handled or ruled out:
 - jellycompat parity was considered (does the Jellyfin surface need the same behavior?).
 - The relevant `docs/*-api.md` is updated when the contract changes.
 
+## Merging upstream
+
+This fork tracks Silo-Server/silo-server with deliberate divergences inventoried in
+[docs/architecture/fork-divergence.md](docs/architecture/fork-divergence.md) — read it before
+merging upstream, and apply it when an upstream change touches a listed area. Merge with a
+merge commit (never rebase pushed history), then run `scripts/check-fork-invariants.sh` plus
+the verification list in that doc before pushing.
+
 ## Building and verifying
 
 `make build`, `make dev-backend`, `make dev-frontend`, `make lint`, `make test`, `make migrate-status`
