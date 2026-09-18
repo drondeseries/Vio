@@ -62,6 +62,10 @@ const (
 	// rejection that could not be recovered, matching the media-route
 	// X-Vio-Decode-Error code clients already classify on.
 	sourceDecodeFailedReasonV3 = playback.DecodeErrorSourceRejectedCode
+	// sourceDecodeFailedMessageV3 is the user-facing text for
+	// sourceDecodeFailedReasonV3, shared by the start terminal and the replan
+	// paths so they cannot drift.
+	sourceDecodeFailedMessageV3 = "The selected media source could not be decoded."
 	// Failed capability fetches are memoized briefly so an unreachable node
 	// costs one timeout per window instead of one per planning request.
 	v3NodeCapabilityErrorTTL = 15 * time.Second
@@ -2076,7 +2080,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			}
 			return persisted, nil
 		}
-		if statusErr.reason == "transcode_start_failed" && isVirtualPlaybackFile(requestedFile) && req.FileSelection != playback.FileSelectionExplicitV3 {
+		if statusErr.reason == transcodeStartFailedReasonV3 && isVirtualPlaybackFile(requestedFile) && req.FileSelection != playback.FileSelectionExplicitV3 {
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
 			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder); alternateErr == nil && len(alternates) > 0 {
 				for _, altCandidate := range alternates {
@@ -2184,7 +2188,7 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 func sourceDecodeFailedTerminalResponseV3(fileSelection playback.FileSelectionV3) playback.DecisionResponseV3 {
 	terminal := &playback.TerminalV3{
 		Reason:    sourceDecodeFailedReasonV3,
-		Message:   "The selected media source could not be decoded.",
+		Message:   sourceDecodeFailedMessageV3,
 		Retryable: false,
 	}
 	hintExplicitSelectionAlternateAvailableV3(terminal, fileSelection)
@@ -6196,7 +6200,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
 				terminal := &playback.TerminalV3{
 					Reason:    sourceDecodeFailedReasonV3,
-					Message:   "The selected media source could not be decoded.",
+					Message:   sourceDecodeFailedMessageV3,
 					Retryable: false,
 				}
 				hintExplicitSelectionAlternateAvailableV3(terminal, record.NormalizedRequest.FileSelection)
@@ -6665,7 +6669,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					}
 					return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
 						reason:    sourceDecodeFailedReasonV3,
-						message:   "The selected media source could not be decoded.",
+						message:   sourceDecodeFailedMessageV3,
 						retryable: false,
 						cause:     transportErr.cause,
 					}
