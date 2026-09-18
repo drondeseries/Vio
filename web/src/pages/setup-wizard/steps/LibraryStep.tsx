@@ -14,6 +14,7 @@ import { librarySummary } from "../librarySummary";
 import { StepFrame, StepSection, StepSkeleton } from "../StepFrame";
 import { useStepSummary } from "../useStep";
 import { useWizardContext } from "../WizardContext";
+import { MetadataProvidersSection } from "./MetadataProvidersSection";
 
 /**
  * Name, type, and folders for one library. Creating and editing share the
@@ -190,6 +191,8 @@ export function LibraryStep() {
           Add another library
         </button>
       )}
+
+      <MetadataProvidersSection />
 
       <ConfirmDialog
         open={pendingDelete !== null}
