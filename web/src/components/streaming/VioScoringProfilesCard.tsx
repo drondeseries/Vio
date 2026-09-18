@@ -671,10 +671,34 @@ export function VioScoringProfilesCard({
                           <div className="text-muted-foreground space-y-0.5 font-mono text-[10px]">
                             {p.codec_video && <div>Video: {p.codec_video}</div>}
                             {p.codec_audio && <div>Audio: {p.codec_audio}</div>}
+                            {p.audio_channels && <div>Channels: {p.audio_channels}</div>}
+                            {p.language && <div>Lang: {p.language}</div>}
+                            {p.visual_tag && <div>Visual: {p.visual_tag}</div>}
+                            {p.require_multi_audio && <div>Require MULTi</div>}
+                            {(p.min_size_gb || p.max_size_gb || p.min_size || p.max_size) && (
+                              <div>
+                                Size:{" "}
+                                {p.min_size_gb
+                                  ? `${p.min_size_gb}GB`
+                                  : p.min_size
+                                    ? `${p.min_size / 1e9}GB`
+                                    : "0"}
+                                {" - "}
+                                {p.max_size_gb
+                                  ? `${p.max_size_gb}GB`
+                                  : p.max_size
+                                    ? `${p.max_size / 1e9}GB`
+                                    : "∞"}
+                              </div>
+                            )}
                             {p.include_regex && <div>Match: {p.include_regex}</div>}
                             {p.exclude_regex && <div>Exclude: {p.exclude_regex}</div>}
                             {!p.codec_video &&
                               !p.codec_audio &&
+                              !p.audio_channels &&
+                              !p.language &&
+                              !p.visual_tag &&
+                              !p.require_multi_audio &&
                               !p.include_regex &&
                               !p.exclude_regex && (
                                 <span className="text-muted-foreground">Standard</span>

@@ -126,21 +126,23 @@ func (f *CustomFormat) UnmarshalJSON(data []byte) error {
 }
 
 type QualityProfile struct {
-	Label             string `json:"label"`
-	Resolution        string `json:"resolution"`
-	IncludeRegex      string `json:"include_regex"`
-	ExcludeRegex      string `json:"exclude_regex"`
-	PreferredOrder    int    `json:"preferred_order"`
-	CodecVideo        string `json:"codec_video"`
-	CodecAudio        string `json:"codec_audio"`
-	HDR               string `json:"hdr"`
-	ExcludeHDR        string `json:"exclude_hdr"`
-	AudioChannels     string `json:"audio_channels,omitempty"`
-	Language          string `json:"language,omitempty"`
-	VisualTag         string `json:"visual_tag,omitempty"`
-	MinSize           int64  `json:"min_size,omitempty"`
-	MaxSize           int64  `json:"max_size,omitempty"`
-	RequireMultiAudio bool   `json:"require_multi_audio,omitempty"`
+	Label             string  `json:"label"`
+	Resolution        string  `json:"resolution"`
+	IncludeRegex      string  `json:"include_regex"`
+	ExcludeRegex      string  `json:"exclude_regex"`
+	PreferredOrder    int     `json:"preferred_order"`
+	CodecVideo        string  `json:"codec_video"`
+	CodecAudio        string  `json:"codec_audio"`
+	HDR               string  `json:"hdr"`
+	ExcludeHDR        string  `json:"exclude_hdr"`
+	AudioChannels     string  `json:"audio_channels,omitempty"`
+	Language          string  `json:"language,omitempty"`
+	VisualTag         string  `json:"visual_tag,omitempty"`
+	MinSizeGB         float64 `json:"min_size_gb,omitempty"`
+	MaxSizeGB         float64 `json:"max_size_gb,omitempty"`
+	MinSize           int64   `json:"min_size,omitempty"`
+	MaxSize           int64   `json:"max_size,omitempty"`
+	RequireMultiAudio bool    `json:"require_multi_audio,omitempty"`
 
 	include *regexp.Regexp
 	exclude *regexp.Regexp
@@ -532,10 +534,18 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	if p.AudioChannels != "" && c.AudioChannels != "" && !strings.EqualFold(c.AudioChannels, p.AudioChannels) {
 		return false
 	}
-	if p.MinSize > 0 && c.FileSize > 0 && c.FileSize < p.MinSize {
+	minSize := p.MinSize
+	if minSize <= 0 && p.MinSizeGB > 0 {
+		minSize = int64(p.MinSizeGB * 1e9)
+	}
+	maxSize := p.MaxSize
+	if maxSize <= 0 && p.MaxSizeGB > 0 {
+		maxSize = int64(p.MaxSizeGB * 1e9)
+	}
+	if minSize > 0 && c.FileSize > 0 && c.FileSize < minSize {
 		return false
 	}
-	if p.MaxSize > 0 && c.FileSize > p.MaxSize {
+	if maxSize > 0 && c.FileSize > maxSize {
 		return false
 	}
 	if p.RequireMultiAudio && !c.IsMultiAudio && !c.IsDualAudio && len(c.AudioLanguages) <= 1 {
@@ -766,6 +776,9 @@ func sortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProf
 			if ch1, ch2 := stream.AudioChannelsScore(c1.AudioChannels), stream.AudioChannelsScore(c2.AudioChannels); ch1 != ch2 {
 				return ch1 > ch2
 			}
+		}
+		if c1.FileSize != c2.FileSize {
+			return c1.FileSize > c2.FileSize
 		}
 		return c1.OriginalIndex < c2.OriginalIndex
 	})

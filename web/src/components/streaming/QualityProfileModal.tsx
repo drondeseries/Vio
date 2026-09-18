@@ -19,6 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 
 import type { QualityProfileRule } from "./scoringPresets";
 
@@ -37,6 +38,10 @@ const DEFAULT_PROFILE: QualityProfileRule = {
   exclude_hdr: "",
   codec_video: "",
   codec_audio: "",
+  audio_channels: "",
+  language: "",
+  visual_tag: "",
+  require_multi_audio: false,
   include_regex: "",
   exclude_regex: "",
   preferred_order: 1,
@@ -53,7 +58,15 @@ export function QualityProfileModal({
 
   useEffect(() => {
     if (editingProfile) {
-      setFormData({ ...editingProfile });
+      setFormData({
+        ...editingProfile,
+        min_size_gb:
+          editingProfile.min_size_gb ??
+          (editingProfile.min_size ? editingProfile.min_size / 1e9 : undefined),
+        max_size_gb:
+          editingProfile.max_size_gb ??
+          (editingProfile.max_size ? editingProfile.max_size / 1e9 : undefined),
+      });
     } else {
       setFormData({ ...DEFAULT_PROFILE, preferred_order: defaultOrder });
     }
@@ -65,6 +78,8 @@ export function QualityProfileModal({
     onSave({
       ...formData,
       label: formData.label.trim(),
+      min_size: formData.min_size_gb ? Math.round(formData.min_size_gb * 1e9) : undefined,
+      max_size: formData.max_size_gb ? Math.round(formData.max_size_gb * 1e9) : undefined,
     });
     onClose();
   };
@@ -190,6 +205,113 @@ export function QualityProfileModal({
                 placeholder="e.g. truehd, dts, eac3, aac"
                 value={formData.codec_audio || ""}
                 onChange={(e) => setFormData((p) => ({ ...p, codec_audio: e.target.value }))}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <Label htmlFor="qp-channels" className="text-xs font-semibold">
+                Audio Channels (optional)
+              </Label>
+              <Select
+                value={formData.audio_channels || "any"}
+                onValueChange={(val) =>
+                  setFormData((p) => ({ ...p, audio_channels: val === "any" ? "" : val }))
+                }
+              >
+                <SelectTrigger id="qp-channels">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="any">Any Channels</SelectItem>
+                  <SelectItem value="7.1">7.1 Surround</SelectItem>
+                  <SelectItem value="5.1">5.1 Surround</SelectItem>
+                  <SelectItem value="2.0">2.0 Stereo</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="qp-lang" className="text-xs font-semibold">
+                Preferred Language (optional)
+              </Label>
+              <Input
+                id="qp-lang"
+                placeholder="e.g. pt-BR, es-419, en, fr"
+                value={formData.language || ""}
+                onChange={(e) => setFormData((p) => ({ ...p, language: e.target.value }))}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <Label htmlFor="qp-vtag" className="text-xs font-semibold">
+                Visual Tag (optional)
+              </Label>
+              <Input
+                id="qp-vtag"
+                placeholder="e.g. imax, 10bit, hlg"
+                value={formData.visual_tag || ""}
+                onChange={(e) => setFormData((p) => ({ ...p, visual_tag: e.target.value }))}
+              />
+            </div>
+
+            <div className="flex flex-col justify-end space-y-1.5">
+              <div className="flex items-center justify-between rounded-lg border p-2">
+                <Label htmlFor="qp-multi" className="cursor-pointer text-xs font-semibold">
+                  Require MULTi Audio
+                </Label>
+                <Switch
+                  id="qp-multi"
+                  checked={formData.require_multi_audio ?? false}
+                  onCheckedChange={(checked) =>
+                    setFormData((p) => ({ ...p, require_multi_audio: checked }))
+                  }
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <Label htmlFor="qp-minsize" className="text-xs font-semibold">
+                Min File Size (GB, optional)
+              </Label>
+              <Input
+                id="qp-minsize"
+                type="number"
+                step="0.5"
+                min="0"
+                placeholder="e.g. 2"
+                value={formData.min_size_gb ?? ""}
+                onChange={(e) =>
+                  setFormData((p) => ({
+                    ...p,
+                    min_size_gb: e.target.value ? Number(e.target.value) : undefined,
+                  }))
+                }
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="qp-maxsize" className="text-xs font-semibold">
+                Max File Size (GB, optional)
+              </Label>
+              <Input
+                id="qp-maxsize"
+                type="number"
+                step="0.5"
+                min="0"
+                placeholder="e.g. 50"
+                value={formData.max_size_gb ?? ""}
+                onChange={(e) =>
+                  setFormData((p) => ({
+                    ...p,
+                    max_size_gb: e.target.value ? Number(e.target.value) : undefined,
+                  }))
+                }
               />
             </div>
           </div>

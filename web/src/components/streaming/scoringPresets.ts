@@ -20,6 +20,14 @@ export interface QualityProfileRule {
   exclude_hdr?: string;
   codec_video?: string;
   codec_audio?: string;
+  audio_channels?: string;
+  language?: string;
+  visual_tag?: string;
+  min_size_gb?: number;
+  max_size_gb?: number;
+  min_size?: number;
+  max_size?: number;
+  require_multi_audio?: boolean;
   include_regex?: string;
   exclude_regex?: string;
   preferred_order: number;
