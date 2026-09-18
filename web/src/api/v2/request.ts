@@ -267,7 +267,9 @@ export class V2TransportError extends Error {
 
 /** Identifies this client to the server; the same header pair the contract fixtures send. */
 export const V2_CLIENT_HEADERS: Readonly<Record<string, string>> = {
-  "X-Silo-Client": "Silo Web",
+  "X-Vio-Client": "Vio Web",
+  "X-Silo-Client": "Vio Web",
+  "X-Vio-Client-Version": typeof __SILO_WEB_VERSION__ === "string" ? __SILO_WEB_VERSION__ : "dev",
   "X-Silo-Client-Version": typeof __SILO_WEB_VERSION__ === "string" ? __SILO_WEB_VERSION__ : "dev",
 };
 

@@ -243,11 +243,15 @@ function detectDeviceName(): string {
 function getDeviceHeaders(): Record<string, string> {
   const deviceId = getOrCreateDeviceId();
   return {
+    "X-Vio-Device-Id": deviceId,
     "X-Silo-Device-Id": deviceId,
+    "X-Vio-Device-Name": detectDeviceName(),
     "X-Silo-Device-Name": detectDeviceName(),
+    "X-Vio-Device-Platform": detectDevicePlatform(),
     "X-Silo-Device-Platform": detectDevicePlatform(),
     // Browser preferences roam between browsers without changing TV, mobile,
     // tablet, or desktop-native layouts.
+    "X-Vio-Client-Family": "web",
     "X-Silo-Client-Family": "web",
   };
 }

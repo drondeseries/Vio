@@ -78,7 +78,7 @@ function buildPlexHeaders(token?: string): HeadersInit {
     "X-Plex-Version": PLEX_VERSION,
     "X-Plex-Platform": navigator.platform || "Web",
     "X-Plex-Device": "Browser",
-    "X-Plex-Device-Name": "Silo Web",
+    "X-Plex-Device-Name": "Vio Web",
   };
   if (token) {
     headers["X-Plex-Token"] = token;

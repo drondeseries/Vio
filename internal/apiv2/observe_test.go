@@ -163,7 +163,7 @@ func TestClientLabelIsBounded(t *testing.T) {
 			t.Fatalf("arbitrary client created label %q", got)
 		}
 	}
-	for name, want := range map[string]string{"": "none", "Silo Web": "web", "Silo Apple TV": "apple", "Silo iOS": "apple", "Silo Android TV": "android", "Silo Android": "android", "silo web private": "other"} {
+	for name, want := range map[string]string{"": "none", "Silo Web": "web", "Vio Web": "web", "Silo Apple TV": "apple", "Vio Apple TV": "apple", "Silo iOS": "apple", "Vio iOS": "apple", "Silo Android TV": "android", "Vio Android TV": "android", "Silo Android": "android", "silo web private": "other"} {
 		if got := clientLabel(name); got != want {
 			t.Fatalf("client %q => %q, want %q", name, got, want)
 		}
