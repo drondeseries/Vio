@@ -41,7 +41,12 @@ const subtitleTimeline = vi.hoisted(() => ({
   streamGeneration: 0,
 }));
 const toastError = vi.hoisted(() => vi.fn());
-const hlsJS = vi.hoisted(() => ({ supported: false, constructed: vi.fn() }));
+const hlsJS = vi.hoisted(() => ({
+  supported: false,
+  constructed: vi.fn(),
+  startLoad: vi.fn(),
+  errorHandler: null as null | ((event: unknown, data: unknown) => void),
+}));
 // Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
 // tests can drive a subtitle_source_changed (409) signal from the outside.
 const subtitleHooks = vi.hoisted(() => ({
@@ -105,9 +110,14 @@ vi.mock("hls.js", () => ({
       hlsJS.constructed(config);
     }
 
-    on() {}
+    on(event: string, handler: (event: unknown, data: unknown) => void) {
+      if (event === "error") hlsJS.errorHandler = handler;
+    }
     loadSource() {}
     attachMedia() {}
+    startLoad() {
+      hlsJS.startLoad();
+    }
     destroy() {}
   },
 }));
@@ -849,6 +859,95 @@ describe("VideoPlayer native HLS timeline", () => {
     renderPlayer({ plan });
 
     await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+  });
+});
+
+// The server's decode verdict is a 422 on the manifest, which hls.js raises as
+// a fatal network error. Retrying that manifest can never succeed, and the
+// generic network branch would burn its recovery budget and then report a
+// misleading unreachable-transport failure. The client must key on the verdict
+// and replan instead.
+describe("VideoPlayer decode failure recovery", () => {
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    hlsJS.supported = true;
+    hlsJS.constructed.mockClear();
+    hlsJS.startLoad.mockClear();
+    hlsJS.errorHandler = null;
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  function hlsTranscodePlan() {
+    return fixturePlanV3({
+      delivery: "server_transcode_hls",
+      stream: {
+        url: "/playback/transcode/session-1/master.m3u8",
+        protocol: "hls",
+        headers: {},
+        header_refresh: "none",
+      },
+    });
+  }
+
+  it("routes the server's decode verdict into failure_recovery instead of the network retry", async () => {
+    const onPlanFailure = vi.fn();
+    renderPlayer({ plan: hlsTranscodePlan(), onPlanFailure, shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+
+    act(() => {
+      hlsJS.errorHandler?.("error", {
+        fatal: true,
+        type: "networkError",
+        details: "manifestLoadError",
+        url: "/api/v2/playback/transcode/session-1/master.m3u8",
+        response: { code: 422, url: "/api/v2/playback/transcode/session-1/master.m3u8" },
+        networkDetails: {
+          status: 422,
+          headers: {
+            get: (name: string) => (name === "X-Vio-Decode-Error" ? "source_decode_failed" : null),
+          },
+        },
+      });
+    });
+
+    expect(onPlanFailure).toHaveBeenCalledTimes(1);
+    expect(onPlanFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ classification: "decode_error" }),
+      expect.any(Number),
+    );
+    expect(hlsJS.startLoad).not.toHaveBeenCalled();
+  });
+
+  it("keeps a genuine network error on the existing retry path", async () => {
+    const onPlanFailure = vi.fn();
+    renderPlayer({ plan: hlsTranscodePlan(), onPlanFailure, shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.errorHandler).toBeTypeOf("function"));
+
+    act(() => {
+      hlsJS.errorHandler?.("error", {
+        fatal: true,
+        type: "networkError",
+        details: "manifestLoadError",
+        url: "/api/v2/playback/transcode/session-1/master.m3u8",
+        response: { code: 503, url: "/api/v2/playback/transcode/session-1/master.m3u8" },
+        networkDetails: {
+          status: 503,
+          headers: { get: () => null },
+        },
+      });
+    });
+
+    expect(hlsJS.startLoad).toHaveBeenCalledTimes(1);
+    expect(onPlanFailure).not.toHaveBeenCalled();
   });
 });
 
