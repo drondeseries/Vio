@@ -191,7 +191,10 @@ func virtualProbeFailureKey(candidateURI string, ownerInstallationID int) string
 }
 
 func (h *PlaybackHandler) PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string) {
-	if h == nil || h.VirtualPlaybackResolver == nil || len(files) == 0 || profileID == "" {
+	if h == nil || len(files) == 0 || profileID == "" {
+		return
+	}
+	if h.VirtualPlaybackResolver == nil && h.VirtualPlaybackStreamLister == nil {
 		return
 	}
 	userID := apimw.GetUserID(ctx)
@@ -208,9 +211,54 @@ func (h *PlaybackHandler) PrefetchVirtualPlayback(ctx context.Context, files []*
 			if prefetchCtx.Err() != nil || file == nil || !isVirtualPlaybackFile(file) {
 				continue
 			}
-			_, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(prefetchCtx, virtualPlaybackNeutralKey(file.FilePath), userID, profileID, file.VirtualOwnerInstallationID)
+			neutralURI := virtualPlaybackNeutralKey(file.FilePath)
+			// Listing warms the shared resolver candidate cache and stores the
+			// device-neutral candidate set in the handler cache, so the first
+			// click skips the provider round-trip. The resolve below is then
+			// served from the resolver cache. Both are best-effort.
+			h.warmVirtualPlaybackListing(prefetchCtx, file, neutralURI, userID, profileID)
+			if h.VirtualPlaybackResolver != nil {
+				_, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(prefetchCtx, neutralURI, userID, profileID, file.VirtualOwnerInstallationID)
+			}
 		}
 	}()
+}
+
+// warmVirtualPlaybackListing lists provider candidates once and stores the
+// filtered, device-neutral set in the best-result cache under the neutral key
+// (no device fingerprint). A later start for any device falls back to that
+// entry, ranks it for the requesting device, and skips the provider list. It is
+// best-effort: the caller owns the prefetch budget and this function ignores
+// provider errors. Only the metadata cache is warmed here; the sticky pin is
+// deliberately not set, because a candidate that has never delivered bytes is
+// not yet evidence it should steer starts.
+func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *models.MediaFile, neutralURI string, userID int, profileID string) {
+	if h == nil || file == nil || neutralURI == "" {
+		return
+	}
+	if h.VirtualPlaybackStreamLister == nil || h.BestResultCache == nil {
+		return
+	}
+	streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(ctx, neutralURI, userID, profileID, file.VirtualOwnerInstallationID)
+	if err != nil || len(streams) == 0 {
+		return
+	}
+	if len(streams) > maxVirtualPlaybackStreams {
+		streams = streams[:maxVirtualPlaybackStreams]
+	}
+	// Filter against the neutral row, exactly as a start would, so the cached
+	// set is the same one the start path would persist.
+	base := *file
+	base.FilePath = neutralURI
+	filtered := filterVirtualPlaybackStreams(&base, streams)
+	if len(filtered) == 0 {
+		return
+	}
+	h.BestResultCache.setWithDetails(
+		bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID),
+		file.ContentID, neutralURI, file.VirtualOwnerInstallationID,
+		filtered, time.Now(),
+	)
 }
 
 func (h *PlaybackHandler) maxVirtualFailoverAttempts(ctx context.Context) int {
@@ -478,6 +526,42 @@ func shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata, force
 	return noResult || needsCandidateMetadata || forceRelist
 }
 
+// virtualResolveTrace accumulates the wall-clock cost of each phase inside
+// resolveVirtualPlaybackSource. The protocol v3 start timings collapse all of
+// this into a single file_load_probe mark; these attrs split it into the
+// provider candidate list, the RemuxDB match, the provider resolve loop, and
+// the synchronous probe, so a cold-start attribution can name the dominant
+// stage instead of guessing. It is observational only and never gates control
+// flow.
+type virtualResolveTrace struct {
+	started    time.Time
+	list       time.Duration
+	remux      time.Duration
+	resolve    time.Duration
+	probe      time.Duration
+	cached     bool
+	listed     bool
+	candidates int
+}
+
+func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
+	if t == nil || file == nil {
+		return
+	}
+	slog.InfoContext(ctx, "virtual resolve timing",
+		logComponentKey, "api",
+		"content_id", file.ContentID,
+		"total_ms", time.Since(t.started).Milliseconds(),
+		"list_ms", t.list.Milliseconds(),
+		"remux_ms", t.remux.Milliseconds(),
+		"resolve_ms", t.resolve.Milliseconds(),
+		"probe_ms", t.probe.Milliseconds(),
+		"candidates", t.candidates,
+		"cache_hit", t.cached,
+		"listed", t.listed,
+	)
+}
+
 // resolveVirtualPlaybackSource chooses a ranked provider-neutral result,
 // resolves it, and probes it before planning. A result URI is bound to the
 // session so later Range, seek, subtitle, and transcode requests cannot silently
@@ -510,6 +594,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if h.VirtualPlaybackResolver == nil {
 		return resolvedVirtualPlaybackSource{}, errors.New("virtual playback resolver is not configured")
 	}
+	// Split file_load_probe into its provider phases so a cold-start
+	// attribution is measured, not guessed. The deferred log runs on every
+	// return below, including the fast paths.
+	trace := &virtualResolveTrace{started: time.Now()}
+	defer trace.log(r.Context(), file)
 	userID := apimw.GetUserID(r.Context())
 	parsed, _ := url.Parse(file.FilePath)
 	candidates := []VirtualPlaybackStream{{
@@ -529,19 +618,37 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// Check the best-result cache before listing candidates. A previous
 	// successful play of this content may have a cached result= URI that
 	// lets us skip the entire list+resolve+probe sequence on replay.
+	cachedListing := false
 	if noResult && h.BestResultCache != nil {
 		neutralURI := virtualPlaybackNeutralKey(file.FilePath)
 		cacheKey := bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint)
-		if cached := h.BestResultCache.get(cacheKey, time.Now()); len(cached) > 0 {
+		cached := h.BestResultCache.get(cacheKey, time.Now())
+		if len(cached) == 0 && fingerprint != "" {
+			// A listing warmed without a device fingerprint (the bounded
+			// prefetch path) is still the filtered, device-neutral candidate
+			// set; only the ranking below is device-specific, so fall back to
+			// it rather than paying the provider list again on this device's
+			// first click.
+			cached = h.BestResultCache.get(bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID), time.Now())
+		}
+		if len(cached) > 0 {
 			// Cache holds the filtered, device-neutral candidate list; rank it
 			// for this device so a TV and a phone pick their own best stream
 			// without another provider round-trip.
 			candidates, _ = h.rankVirtualCandidatesForDevice(r, cached)
 			candidates = reorderVirtualCandidatesForQuality(candidates, qualityPreference, bandwidthCapKbps)
 			noResult = false // treated as if file already had a result=
+			cachedListing = len(candidates) > 0
+			trace.cached = cachedListing
 		}
 	}
-	if shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata, forceRelist) && h.VirtualPlaybackStreamLister != nil {
+	// A valid cached listing already carries the candidate metadata the list
+	// call exists to fetch, so it does not need the provider round-trip even
+	// when the stored row has no probe evidence yet. Only a cold cache or an
+	// explicit relist forces the list.
+	listStart := time.Now()
+	if shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) && h.VirtualPlaybackStreamLister != nil {
+		trace.listed = true
 		// Candidate listing is part of the startup critical path. Keep it
 		// bounded so the first-byte SLA cannot be defeated before resolution.
 		listCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
@@ -609,6 +716,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 		cancel()
 	}
+	trace.list = time.Since(listStart)
 	maxAttempts := h.maxVirtualFailoverAttempts(r.Context())
 	if noResult {
 		candidates = h.applyVirtualStickyPin(stickyKey, pinnedURI, candidates, deviceCaps)
@@ -616,11 +724,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	remuxMatches := map[string]remuxdb.Evidence{}
 	remuxEnabled := false
 	if needsCandidateMetadata && len(candidates) > 0 {
+		remuxStart := time.Now()
 		remuxMatches, remuxEnabled = h.matchRemuxDBCandidates(r.Context(), file, candidates)
+		trace.remux = time.Since(remuxStart)
 	}
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
 	}
+	trace.candidates = len(candidates)
 	attemptCtx, cancel := context.WithTimeout(r.Context(), virtualStartupBudget)
 	defer cancel()
 
@@ -710,6 +821,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 		var streamURL string
 		var resolveErr error
+		resolveStart := time.Now()
 		if h.VirtualMediaDetailedResolver != nil {
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 				attemptCtx, cand.URI, oid, userID, profileID, forceRelist, excludedCandidateIDs, preferredCandidateID,
@@ -741,6 +853,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		} else {
 			resolveErr = errors.New("virtual playback resolver is not configured")
 		}
+		trace.resolve += time.Since(resolveStart)
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
@@ -943,7 +1056,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// Zero the duration so the synchronous probe measures the empirical
 		// duration instead of inheriting the catalog value.
 		syncProbeFile.Duration = 0
+		probeStart := time.Now()
 		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &syncProbeFile, cand.RequestHeaders)
+		trace.probe += time.Since(probeStart)
 		probeCancel()
 		if probeErr != nil || probed == nil {
 			virtualProbeFailures.mark(probeKey)
