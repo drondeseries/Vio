@@ -16,6 +16,15 @@ type PlannerSettingsV3 struct {
 	Allow4KTranscode       bool
 	HardwareToneMapEnabled bool
 	SoftwareToneMapEnabled bool
+	// VPPToneMapEnabled selects the opt-in Intel media-engine HDR-to-SDR
+	// conversion (playback.transcode_vpp_tone_map_enabled). It is honored only
+	// when the transcode executes on QSV; every other backend keeps the
+	// validated OpenCL/VAAPI/CUDA/VideoToolbox recipe.
+	VPPToneMapEnabled bool
+	// HWAccel is the configured hardware backend (playback.hw_accel). The
+	// planner uses it to keep AV1 encodes on QSV, the only AV1 encoder whose
+	// throughput is realtime-safe; HEVC still runs on every validated backend.
+	HWAccel string
 }
 
 const (
@@ -177,6 +186,10 @@ type PlannerResultV3 struct {
 	ToneMapRecipeVersion     string
 	ToneMapPreflightRequired bool
 	ToneMapSourceRevision    tonemap.SourceRevision
+	// ToneMapVPPEnabled reports the opt-in VPP tone-map policy frozen into this
+	// plan. The transport turns it into the VPP filter only when the resolved
+	// executor is QSV; see prepareLocalTransportV3.
+	ToneMapVPPEnabled bool
 }
 
 // hlsToneMapCapabilities resolves the lazy pooled inventory when present and
@@ -945,6 +958,68 @@ func applyAudioOnlyAACConversionV3(plan *PlanV3, targetChannels, targetBitrateKb
 	}
 }
 
+// targetVideoSelectionV3 describes the video encoder a server transcode will
+// emit: the codec exposed on the plan, and the transformation/claim identity
+// that matches it.
+type targetVideoSelectionV3 struct {
+	codec          string
+	transformation string
+	recipeVersion  string
+	claim          string
+}
+
+// targetVideoPreferencesV3 is the encoder preference order. AV1 and HEVC are
+// upgrades the planner may only take when the client declares hardware decode
+// and the installed encoder advertises the matching transformation; H.264 is
+// the floor that must always remain available.
+var targetVideoPreferencesV3 = []targetVideoSelectionV3{
+	{codec: TargetVideoCodecAV1V3, transformation: TransformationVideoToAV1V3, recipeVersion: TransformationVideoToAV1RecipeVersionV3, claim: ClaimAV1DecodeV3},
+	{codec: TargetVideoCodecHEVCV3, transformation: TransformationVideoToHEVCV3, recipeVersion: TransformationVideoToHEVCRecipeVersionV3, claim: ClaimHEVCDecodeV3},
+}
+
+var targetVideoFloorV3 = targetVideoSelectionV3{codec: TargetVideoCodecH264V3, transformation: TransformationVideoToH264V3, recipeVersion: TransformationVideoToH264RecipeVersionV3, claim: ClaimH264DecodeV3}
+
+// selectTargetVideoCodecV3 chooses the HLS video encoder from the client's
+// declared hardware codecs. AV1 and HEVC are eligible only when the client
+// lists the codec as hardware-decodable, the HLS delivery accepts it, and the
+// registry advertises the matching encoder transformation. Missing or
+// unknown capabilities fall through to the H.264 floor.
+func selectTargetVideoCodecV3(input PlannerInputV3, registry *TransformationRegistryV3) (targetVideoSelectionV3, bool) {
+	if registry == nil {
+		return targetVideoSelectionV3{}, false
+	}
+	declared := input.Request.Capabilities.CodecsVideoHardware
+	delivery := hlsDeliveryVideoCodecsV3(input.Request)
+	for _, candidate := range targetVideoPreferencesV3 {
+		if !containsFoldV3(declared, candidate.codec) {
+			continue
+		}
+		// AV1 has no validated software encoder in this pipeline; only take it
+		// when the configured backend is QSV.
+		if candidate.codec == TargetVideoCodecAV1V3 && !strings.EqualFold(strings.TrimSpace(input.Settings.HWAccel), transcodeHWQSV) {
+			continue
+		}
+		if len(delivery) > 0 && !containsFoldV3(delivery, candidate.codec) {
+			continue
+		}
+		if !registry.Available(candidate.transformation) {
+			continue
+		}
+		return candidate, true
+	}
+	if registry.Available(targetVideoFloorV3.transformation) {
+		return targetVideoFloorV3, true
+	}
+	return targetVideoSelectionV3{}, false
+}
+
+// hlsDeliveryVideoCodecsV3 returns the client's declared HLS video codecs. An
+// empty list means the delivery did not constrain codecs and is not an
+// affirmative capability claim.
+func hlsDeliveryVideoCodecsV3(request StartRequestV3) []string {
+	return request.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3].VideoCodecs
+}
+
 // planVideoTranscodeV3 always executes on the HLS delivery, so the caller must
 // pass the subtitle policy resolved against DeliveryClassHLSV3.
 //
@@ -987,8 +1062,12 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	if hlsRegistry == nil {
 		hlsRegistry = input.hlsVideoRegistry()
 	}
-	if hlsRegistry == nil || !hlsRegistry.Available(TransformationVideoToH264V3) || !hlsRegistry.Available(TransformationAudioToAACV3) {
-		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated H.264/AAC conversion toolchain is unavailable.", true)
+	if hlsRegistry == nil || !hlsRegistry.Available(TransformationAudioToAACV3) {
+		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated video/AAC conversion toolchain is unavailable.", true)
+	}
+	targetVideo, videoTranscodeOK := selectTargetVideoCodecV3(input, hlsRegistry)
+	if !videoTranscodeOK {
+		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated video/AAC conversion toolchain is unavailable.", true)
 	}
 	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
 		base.AvailableQualities = availableQualitiesForRouteV3(input, source)
@@ -996,7 +1075,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	plan := base
 	plan.Delivery = DeliveryTranscodeHLSV3
 	plan.Stream = StreamV3{Protocol: StreamHLSV3, Container: "hls", MIMEType: "application/vnd.apple.mpegurl", Headers: map[string]string{}, HeaderRefresh: HeaderRefreshNoneV3}
-	plan.EffectiveRecipe.VideoCodec = "h264"
+	plan.EffectiveRecipe.VideoCodec = targetVideo.codec
 	plan.EffectiveRecipe.AudioCodec = "aac"
 	// A reactive software-decode retry is a distinct route from the hardware
 	// plan it replaces. The flag is frozen into the recipe so restarts and
@@ -1012,7 +1091,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	plan.EffectiveRecipe.AudioChannels = intPointerV3(targetAudioChannels)
 	plan.EffectiveRecipe.AudioLayout = audioLayout
 	plan.Transformations = append(plan.Transformations,
-		TransformationV3{Name: TransformationVideoToH264V3, Executor: ExecutorServerV3, RecipeVersion: TransformationVideoToH264RecipeVersionV3, ValidatedClaims: []string{ClaimH264DecodeV3}},
+		TransformationV3{Name: targetVideo.transformation, Executor: ExecutorServerV3, RecipeVersion: targetVideo.recipeVersion, ValidatedClaims: []string{targetVideo.claim}},
 		TransformationV3{Name: TransformationAudioToAACV3, Executor: ExecutorServerV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, ValidatedClaims: []string{ClaimAudioDecodeV3}},
 	)
 	toneMapPolicy := toneMapRecipe.policy
@@ -1062,7 +1141,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		}
 		return terminalPlannerResultV3("adaptation_exhausted", "All compatible playback recipes have already failed for this output route.", false)
 	}
-	return PlannerResultV3{Plan: &plan, PlayMethod: PlayTranscode, TranscodeAudio: true, TargetVideoCodec: "h264", TargetAudioCodec: "aac", SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, true), TargetAudioChannels: targetAudioChannels, TargetResolution: quality.Label, TargetBitrateKbps: quality.BitrateKbps, SubtitleTrackIndex: subtitle.SelectedIndex, SubtitleTransportTrackIndex: subtitle.TransportIndex, SubtitleBurnIn: subtitle.RequiresBurn, SubtitleCodec: subtitle.Codec, DownloadedSubtitleID: subtitle.DownloadedSubtitleID, ToneMapPolicy: toneMapPolicy, ToneMapMode: toneMapMode, ToneMapSourceKind: toneMapSourceKind, ToneMapRecipeVersion: toneMapRecipeVersionV3(toneMapOK), ToneMapPreflightRequired: toneMapResolution.PreflightRequired, ToneMapSourceRevision: toneMapRevision}
+	return PlannerResultV3{Plan: &plan, PlayMethod: PlayTranscode, TranscodeAudio: true, TargetVideoCodec: targetVideo.codec, TargetAudioCodec: "aac", SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, true), TargetAudioChannels: targetAudioChannels, TargetResolution: quality.Label, TargetBitrateKbps: quality.BitrateKbps, SubtitleTrackIndex: subtitle.SelectedIndex, SubtitleTransportTrackIndex: subtitle.TransportIndex, SubtitleBurnIn: subtitle.RequiresBurn, SubtitleCodec: subtitle.Codec, DownloadedSubtitleID: subtitle.DownloadedSubtitleID, ToneMapPolicy: toneMapPolicy, ToneMapMode: toneMapMode, ToneMapSourceKind: toneMapSourceKind, ToneMapRecipeVersion: toneMapRecipeVersionV3(toneMapOK), ToneMapPreflightRequired: toneMapResolution.PreflightRequired, ToneMapSourceRevision: toneMapRevision, ToneMapVPPEnabled: toneMapOK && input.Settings.VPPToneMapEnabled}
 }
 
 // applySubtitleDecisionV3 changes the delivery-specific subtitle policy without
@@ -1444,7 +1523,11 @@ func videoTranscodeExecutableV3(input PlannerInputV3, source SourceDescriptorV3)
 		return false
 	}
 	registry := input.hlsVideoRegistry()
-	return registry.Available(TransformationVideoToH264V3) && registry.Available(TransformationAudioToAACV3)
+	if registry == nil || !registry.Available(TransformationAudioToAACV3) {
+		return false
+	}
+	_, videoOK := selectTargetVideoCodecV3(input, registry)
+	return videoOK
 }
 
 func recipeFromSourceV3(source SourceDescriptorV3) EffectiveRecipeV3 {

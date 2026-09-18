@@ -3895,6 +3895,12 @@ func appendPlaybackQueryV3(rawURL, key, value string) string {
 // softwareToneMapRetryOptsV3 returns the software executor for a one-shot
 // hardware fallback when the recipe is allowed to adapt to live capabilities.
 func (h *PlaybackHandler) softwareToneMapRetryOptsV3(ctx context.Context, opts playback.TranscodeOpts, frozenSourceMetadata bool) (playback.TranscodeOpts, bool) {
+	// The software executor forces HWAccel=none, so it decodes and encodes on
+	// the CPU. gpu_only forbids that fallback even when the frozen tone-map
+	// policy would otherwise permit it.
+	if !h.softwareFallbackAllowedV3() {
+		return opts, false
+	}
 	if frozenSourceMetadata || opts.ToneMapMode != tonemap.ModeHardware ||
 		!opts.ToneMapPolicy.Allows(tonemap.ModeSoftware) {
 		return opts, false
@@ -4047,6 +4053,9 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 		} else {
 			opts.HWAccel = playback.HWAccelNone
 		}
+		// The opt-in VPP tone map replaces the OpenCL recipe only on QSV.
+		// Every other backend ignores the setting and keeps its validated chain.
+		opts.ToneMapFilter = playback.ResolveToneMapFilterV3(opts.ToneMapFilter, opts.ToneMapMode, opts.HWAccel, result.ToneMapVPPEnabled)
 	}
 	usedToneMapFallback := false
 	ts, startupFailure := h.startReadyLocalPlaybackTransportV3(r.Context(), opts)
@@ -4096,10 +4105,17 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			// FFmpeg and GPU drivers can fail before producing their first segment
 			// even though the recipe is valid. Retry one clean generation, preferring
 			// another configured render device so a transient device failure does not
-			// become an immediate client-visible transport error.
+			// become an immediate client-visible transport error. gpu_only suppresses
+			// the VideoToolbox retry to HWAccelNone, which decodes and encodes on the
+			// CPU, and surfaces the startup failure instead.
+			retryAccel := playback.StartupRetryHWAccel(opts)
+			if retryAccel == playback.HWAccelNone && !strings.EqualFold(opts.HWAccel, playback.HWAccelNone) && !h.softwareFallbackAllowedV3() {
+				unlock()
+				return preparedTransportV3{}, transportErr
+			}
 			retryOpts := opts
 			retryOpts.AvoidHWDevice = startupFailure.failedDevice
-			retryOpts.HWAccel = playback.StartupRetryHWAccel(opts)
+			retryOpts.HWAccel = retryAccel
 			slog.WarnContext(r.Context(), "local transcode crashed during startup; retrying once",
 				logComponentKey, playbackLogValueV3,
 				"playback_session_id", session.ID,
@@ -7489,14 +7505,16 @@ func (h *PlaybackHandler) plannerSettingsV3(ctx context.Context) playback.Planne
 // plannerSettingsV3Result reads the live settings used for an actual planning
 // decision. Callers must not persist a policy terminal when the store is down.
 func (h *PlaybackHandler) plannerSettingsV3Result(ctx context.Context) (playback.PlannerSettingsV3, error) {
-	settings := playback.PlannerSettingsV3{TranscodeEnabled: h.playbackConfig().TranscodeEnabled}
+	cfg := h.playbackConfig()
+	settings := playback.PlannerSettingsV3{TranscodeEnabled: cfg.TranscodeEnabled, HWAccel: cfg.HWAccel}
 	if h.SettingsRepo != nil {
-		var values [3]string
-		var errs [3]error
+		var values [4]string
+		var errs [4]error
 		keys := [...]string{
 			config.Allow4KTranscodeSettingKey,
 			config.PlaybackTranscodeHardwareToneMapSettingKey,
 			config.PlaybackTranscodeSoftwareToneMapSettingKey,
+			config.PlaybackTranscodeVPPToneMapSettingKey,
 		}
 		var group sync.WaitGroup
 		group.Add(len(keys))
@@ -7516,11 +7534,23 @@ func (h *PlaybackHandler) plannerSettingsV3Result(ctx context.Context) (playback
 		if errs[2] != nil {
 			return settings, fmt.Errorf("load software tone-map setting: %w", errs[2])
 		}
+		if errs[3] != nil {
+			return settings, fmt.Errorf("load VPP tone-map setting: %w", errs[3])
+		}
 		settings.Allow4KTranscode = strings.EqualFold(values[0], "true")
 		settings.HardwareToneMapEnabled = strings.EqualFold(values[1], "true")
 		settings.SoftwareToneMapEnabled = strings.EqualFold(values[2], "true")
+		settings.VPPToneMapEnabled = strings.EqualFold(values[3], "true")
 	}
 	return settings, nil
+}
+
+// softwareFallbackAllowedV3 reports whether playback.software_fallback permits
+// an automated software-decode fallback. The value is read live from the
+// playback config, so an operator's gpu_only choice takes effect without a
+// restart; the empty string is the default "allow".
+func (h *PlaybackHandler) softwareFallbackAllowedV3() bool {
+	return playback.SoftwareFallbackAllowed(h.playbackConfig().SoftwareFallback)
 }
 
 // dropStaleAudioTrackIdentityV3 reports whether the request's audio track ID
@@ -7816,7 +7846,8 @@ func failureRecoveryAbandonedDeliveryV3(operation playback.ReplanOperationV3, fa
 // recover from a decoder failure by changing decode mode.
 func planHasVideoEncodeV3(plan playback.PlanV3) bool {
 	for _, transformation := range plan.Transformations {
-		if transformation.Name == playback.TransformationVideoToH264V3 {
+		switch transformation.Name {
+		case playback.TransformationVideoToH264V3, playback.TransformationVideoToHEVCV3, playback.TransformationVideoToAV1V3:
 			return true
 		}
 	}
@@ -7866,7 +7897,10 @@ func softwareDecodeVariantPendingV3(record *playback.AttemptRecordV3, req playba
 // both the structural variant and the live decoder verdict, so a remote or
 // undetected decode failure still demotes as before.
 func (h *PlaybackHandler) softwareDecodeRetryPendingV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) bool {
-	if !softwareDecodeVariantPendingV3(record, req) {
+	// gpu_only means there is no pending software retry to protect, so the
+	// delivery demotes like any other transport failure instead of being held
+	// open for a CPU attempt that policy forbids.
+	if !h.softwareFallbackAllowedV3() || !softwareDecodeVariantPendingV3(record, req) {
 		return false
 	}
 	ts := h.tm.GetTranscodeSession(record.SessionID)

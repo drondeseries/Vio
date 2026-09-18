@@ -18,6 +18,10 @@ const (
 	HardwareFilterVAAPI        = "tonemap_vaapi"
 	HardwareFilterCUDA         = "tonemap_cuda"
 	HardwareFilterVideoToolbox = "scale_vt"
+	// HardwareFilterQSVVPP is Intel's media-engine (VPP) converter. It is an
+	// opt-in alternative to the OpenCL tone map used when the deployment turns
+	// on playback.transcode_vpp_tone_map_enabled; see QSVVPPToneMapFilter.
+	HardwareFilterQSVVPP = "vpp_qsv"
 
 	BackendSoftware     = "software"
 	BackendQSV          = "qsv"
@@ -636,6 +640,46 @@ func QSVFilter(kind SourceKind) string {
 		",hwmap=derive_device=opencl:mode=read" +
 		"," + openCLToneMapFilter() +
 		",hwmap=derive_device=vaapi:mode=write:reverse=1:extra_hw_frames=16,format=vaapi"
+}
+
+// QSVVPPTailFilter is QSVFilter with a shorter device tail: the OpenCL
+// tone-map result is mapped straight to the QSV device instead of detouring
+// back through a VAAPI surface. The subsequent vpp_qsv scale runs on the media
+// engine, so one interop hop and the shader-based VAAPI scale disappear while
+// the tone-map stage itself is byte-for-byte the validated OpenCL recipe.
+func QSVVPPTailFilter(kind SourceKind) string {
+	if IsSDRSource(kind) {
+		return VAAPIFilter(kind) + "," + qsvWriteMapFilter()
+	}
+	return SourceParameters(kind) +
+		",scale_vaapi=format=p010" +
+		",hwmap=derive_device=opencl:mode=read" +
+		"," + openCLToneMapFilter() +
+		"," + qsvWriteMapFilter()
+}
+
+// qsvWriteMapFilter derives the QSV device from the current hardware frames
+// with write access. reverse=1 and extra_hw_frames=16 are required for the
+// mapping to own its output surfaces.
+func qsvWriteMapFilter() string {
+	return "hwmap=derive_device=qsv:mode=write:reverse=1:extra_hw_frames=16,format=qsv"
+}
+
+// QSVVPPToneMapFilter builds the opt-in Intel media-engine HDR-to-SDR
+// conversion: VAAPI-decoded frames are mapped to QSV and converted by
+// vpp_qsv's hardware tonemapper. It replaces the OpenCL chain only when an
+// administrator enables playback.transcode_vpp_tone_map_enabled, because VPP
+// tone mapping is cheaper but not quality-identical to the OpenCL BT.2390
+// recipe. SDR base layers need no luminance mapping and keep the VAAPI color
+// conversion.
+func QSVVPPToneMapFilter(kind SourceKind) string {
+	if IsSDRSource(kind) {
+		return VAAPIFilter(kind) + "," + qsvWriteMapFilter()
+	}
+	return SourceParameters(kind) +
+		",scale_vaapi=format=p010" +
+		",hwmap=derive_device=qsv:mode=read+write,format=qsv" +
+		"," + HardwareFilterQSVVPP + "=tonemap=1:format=nv12:out_color_matrix=bt709:out_color_primaries=bt709:out_color_transfer=bt709:out_range=tv"
 }
 
 // openCLToneMapFilter matches Jellyfin's BT.2390 GPU recipe. A fixed 100-nit

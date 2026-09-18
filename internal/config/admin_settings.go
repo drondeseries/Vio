@@ -28,6 +28,11 @@ const (
 const (
 	PlaybackTranscodeHardwareToneMapSettingKey = "playback.transcode_hardware_tone_map_enabled"
 	PlaybackTranscodeSoftwareToneMapSettingKey = "playback.transcode_software_tone_map_enabled"
+	// PlaybackTranscodeVPPToneMapSettingKey selects Intel's media-engine (VPP)
+	// HDR-to-SDR converter for QSV transcodes instead of the default OpenCL
+	// recipe. It is opt-in because VPP tone mapping is cheaper but not
+	// quality-identical.
+	PlaybackTranscodeVPPToneMapSettingKey = "playback.transcode_vpp_tone_map_enabled"
 )
 
 // SetupCompletedSettingKey records that the first-run setup wizard reached its
@@ -152,6 +157,7 @@ var adminSettingDefaults = map[string]string{
 	chapterThumbnailSoftwareToneMapKey:               "false",
 	PlaybackTranscodeHardwareToneMapSettingKey:       "false",
 	PlaybackTranscodeSoftwareToneMapSettingKey:       "false",
+	PlaybackTranscodeVPPToneMapSettingKey:            "false",
 	CatalogScopeVersionsToLibrarySettingKey:          "false",
 	"playback.watched_threshold":                     "90",
 	"playback.min_resume_threshold":                  "5",
@@ -381,7 +387,8 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 	switch key {
 	case "metadata.cache_images", "playback.transcode_enabled",
 		chapterThumbnailSoftwareToneMapKey, PlaybackTranscodeHardwareToneMapSettingKey,
-		PlaybackTranscodeSoftwareToneMapSettingKey, CatalogScopeVersionsToLibrarySettingKey,
+		PlaybackTranscodeSoftwareToneMapSettingKey, PlaybackTranscodeVPPToneMapSettingKey,
+		CatalogScopeVersionsToLibrarySettingKey,
 		Allow4KTranscodeSettingKey, "enable_transcode_throttle", "audiobookshelf_compat.enabled",
 		"jellyfin_compat.enabled", "jellyfin_compat.web_enabled", "recommendations.enabled",
 		"subtitle_ai.enabled", "subtitle_ai.transcribe_enabled", "metadata_ai.enabled",

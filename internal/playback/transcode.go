@@ -181,6 +181,7 @@ func VideoSampleEntryForDVCopy(dvProfile int) string {
 const (
 	transcodeCodecH264       = "h264"
 	transcodeCodecHEVC       = "hevc"
+	transcodeCodecAV1        = "av1"
 	HWAccelNone              = "none"
 	transcodeHWQSV           = "qsv"
 	transcodeHWVAAPI         = "vaapi"
@@ -643,6 +644,17 @@ func normalizeTranscodeOptsContext(ctx context.Context, opts TranscodeOpts) Tran
 	return opts
 }
 
+// ResolveToneMapFilterV3 picks the tone-map filter for the resolved executor.
+// The opt-in VPP tone map replaces the probed filter only when the setting is
+// on, the mode is hardware, and the backend is QSV; every other combination
+// keeps the probed filter unchanged.
+func ResolveToneMapFilterV3(probedFilter string, mode tonemap.Mode, hwAccel string, vppEnabled bool) string {
+	if vppEnabled && mode == tonemap.ModeHardware && strings.EqualFold(hwAccel, transcodeHWQSV) {
+		return tonemap.HardwareFilterQSVVPP
+	}
+	return probedFilter
+}
+
 // validateToneMapOpts rejects partial, contradictory, or unsupported frozen
 // recipes before any FFmpeg process can be started.
 func validateToneMapOpts(opts TranscodeOpts) error {
@@ -673,7 +685,10 @@ func validateToneMapOpts(opts TranscodeOpts) error {
 			if opts.HWAccel == transcodeHWQSV {
 				expected = tonemap.HardwareFilterOpenCL
 			}
-			if opts.ToneMapFilter != expected {
+			// The opt-in VPP tone map is a validated QSV alternative to the
+			// default OpenCL recipe (playback.transcode_vpp_tone_map_enabled).
+			vppOverride := opts.HWAccel == transcodeHWQSV && opts.ToneMapFilter == tonemap.HardwareFilterQSVVPP
+			if opts.ToneMapFilter != expected && !vppOverride {
 				return fmt.Errorf("unsupported %s tone-map filter %q", opts.HWAccel, opts.ToneMapFilter)
 			}
 		case transcodeHWNVENC:
@@ -714,6 +729,13 @@ func ResolveToneMapExecutor(ctx context.Context, opts TranscodeOpts) (TranscodeO
 	}
 	if !capabilities.Supports(opts.ToneMapMode, opts.ToneMapSourceKind) {
 		return opts, fmt.Errorf("tone-map executor is not validated")
+	}
+	// A recipe frozen with the opt-in VPP tone map keeps it across a
+	// reconstruction; the live probe still has to validate the OpenCL executor
+	// so a deployment that lost its HDR hardware cannot silently downgrade.
+	if opts.ToneMapMode == tonemap.ModeHardware && opts.ToneMapFilter == tonemap.HardwareFilterQSVVPP {
+		opts.HWAccel = capabilities.BackendFor(opts.ToneMapMode, opts.ToneMapSourceKind)
+		return opts, nil
 	}
 	opts.ToneMapFilter = capabilities.FilterFor(opts.ToneMapMode, opts.ToneMapSourceKind)
 	if opts.ToneMapMode == tonemap.ModeHardware {
@@ -905,8 +927,8 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 	// race with fMP4 (hls.js #6337).
 	var segmentPattern string
 	segmentType := "mpegts"
-	copyVideoUsesFMP4 := copyVideoUsesFMP4(opts)
-	if copyVideoUsesFMP4 {
+	usesFMP4 := videoUsesFMP4(opts)
+	if usesFMP4 {
 		segmentType = "fmp4"
 		segmentPattern = filepath.Join(opts.OutputDir, "seg_%05d.m4s")
 	} else {
@@ -934,7 +956,7 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 	// Without this, some browsers (notably Chromium on macOS) can experience
 	// A/V sync issues during copy-mode HLS playback. Matches Jellyfin's
 	// proven fMP4 HLS pipeline.
-	if copyVideoUsesFMP4 {
+	if usesFMP4 {
 		args = append(args, "-hls_segment_options", "movflags=+frag_discont")
 	}
 	if opts.StartSegmentNumber > 0 {
@@ -1037,6 +1059,22 @@ func copyVideoUsesFMP4(opts TranscodeOpts) bool {
 		!IsMPEG2VideoCodec(opts.SourceVideoCodec)
 }
 
+// transcodeVideoUsesFMP4 reports whether an encoded video stream must be
+// packaged as fragmented MP4. AV1 has no MPEG-TS stream type: FFmpeg muxes it
+// as an unregistered private stream that HLS readers cannot identify, so an
+// AV1 transcode always uses fMP4. Every other encoded codec keeps the
+// established MPEG-TS packaging.
+func transcodeVideoUsesFMP4(opts TranscodeOpts) bool {
+	return !strings.EqualFold(opts.TargetCodecVideo, "copy") &&
+		strings.EqualFold(opts.TargetCodecVideo, transcodeCodecAV1)
+}
+
+// videoUsesFMP4 is the single packaging decision shared by the muxer arguments
+// and the on-disk segment extension.
+func videoUsesFMP4(opts TranscodeOpts) bool {
+	return copyVideoUsesFMP4(opts) || transcodeVideoUsesFMP4(opts)
+}
+
 // appendTimestampNormalizationArgs selects timestamp handling based on the
 // playback mode. Jellyfin-compatible copy-video fMP4 preserves source timing
 // while start_at_zero makes the output presentation timeline begin at zero.
@@ -1065,9 +1103,15 @@ func appendTimestampNormalizationArgs(args []string, opts TranscodeOpts) []strin
 			"-start_at_zero",
 		)
 	}
+	// Encoded fMP4 (AV1) carries tfdt like copied fMP4 and must lift negative
+	// encoder priming timestamps for the same reason; MPEG-TS has no tfdt.
+	negativeTS := "disabled"
+	if transcodeVideoUsesFMP4(opts) {
+		negativeTS = "make_non_negative"
+	}
 	return append(args,
 		"-copyts",
-		"-avoid_negative_ts", "disabled",
+		"-avoid_negative_ts", negativeTS,
 	)
 }
 
@@ -1220,6 +1264,17 @@ func appendVideoArgs(args []string, opts TranscodeOpts) []string {
 				"-bufsize", fmt.Sprintf("%dk", opts.TargetBitrateKbps*2))
 		} else {
 			args = append(args, "-c:v", "hevc_qsv", "-preset", preset, "-global_quality", "28")
+		}
+	case opts.HWAccel == "qsv" && codec == transcodeCodecAV1:
+		// AV1 is selected only when the client declares hardware decode and the
+		// deployment runs QSV; see selectTargetVideoCodecV3.
+		if hasBitrateCap {
+			args = append(args, "-c:v", "av1_qsv", "-preset", preset,
+				"-b:v", fmt.Sprintf("%dk", opts.TargetBitrateKbps),
+				"-maxrate", fmt.Sprintf("%dk", opts.TargetBitrateKbps),
+				"-bufsize", fmt.Sprintf("%dk", opts.TargetBitrateKbps*2))
+		} else {
+			args = append(args, "-c:v", "av1_qsv", "-preset", preset, "-global_quality", "30")
 		}
 	case opts.HWAccel == "vaapi" && codec == transcodeCodecH264:
 		args = append(args, "-c:v", "h264_vaapi", "-qp", "23")
@@ -1392,7 +1447,13 @@ func toneMapScaleFilter(opts TranscodeOpts) string {
 	case tonemap.ModeHardware:
 		switch opts.HWAccel {
 		case transcodeHWQSV:
-			return softwareToneMapUploadFilter(opts) + tonemap.QSVFilter(opts.ToneMapSourceKind) + "," + qsvToneMapScaleFilter(opts.TargetResolution) + "," + tonemap.HDRMetadataRemovalFilter()
+			if opts.ToneMapFilter == tonemap.HardwareFilterQSVVPP {
+				return softwareToneMapUploadFilter(opts) + tonemap.QSVVPPToneMapFilter(opts.ToneMapSourceKind) + "," + qsvVPPInputScaleFilter(opts.TargetResolution) + "," + tonemap.HDRMetadataRemovalFilter()
+			}
+			// The OpenCL tone map is unchanged; only its tail moves. The result
+			// maps directly to QSV and scaling runs on the media engine, which
+			// drops the VAAPI scale and one device hop without touching quality.
+			return softwareToneMapUploadFilter(opts) + tonemap.QSVVPPTailFilter(opts.ToneMapSourceKind) + "," + qsvVPPInputScaleFilter(opts.TargetResolution) + "," + tonemap.HDRMetadataRemovalFilter()
 		case transcodeHWVAAPI:
 			return softwareToneMapUploadFilter(opts) + tonemap.VAAPIFilter(opts.ToneMapSourceKind) + "," + vaapiScaleFilter(opts.TargetResolution) + "," + tonemap.HDRMetadataRemovalFilter()
 		case transcodeHWNVENC:
@@ -1848,6 +1909,29 @@ func qsvScaleFilterWithMapMode(res, mapMode string) string {
 // real decoded HEVC surfaces on Intel with ENOSYS during the first frame.
 func qsvToneMapScaleFilter(res string) string {
 	return qsvScaleFilterWithMapMode(res, "read+write")
+}
+
+// qsvVPPInputScaleFilter scales frames already mapped to the QSV device with
+// the media-engine VPP scaler. Width must use -1 rather than -2: the iHD driver
+// rejects any auto-width below -1 ("Size values less than -1 are not
+// acceptable"), the same constraint qsvScaleFilter documents for scale_qsv.
+func qsvVPPInputScaleFilter(res string) string {
+	switch res {
+	case "2160p":
+		return "vpp_qsv=w=-1:h=2160:format=nv12"
+	case "1080p":
+		return "vpp_qsv=w=-1:h=1080:format=nv12"
+	case "720p":
+		return "vpp_qsv=w=-1:h=720:format=nv12"
+	case "480p":
+		return "vpp_qsv=w=-1:h=480:format=nv12"
+	case transcodeResolution420p:
+		return "vpp_qsv=w=-1:h=420:format=nv12"
+	case transcodeResolution328p:
+		return "vpp_qsv=w=-1:h=328:format=nv12"
+	default:
+		return "vpp_qsv=format=nv12"
+	}
 }
 
 func qsvSoftwareDecodeFilter(res string) string {
@@ -2499,7 +2583,7 @@ func parseManifestTimeline(manifest []byte) (manifestTimeline, error) {
 }
 
 func hlsSegmentExtension(opts TranscodeOpts) string {
-	if strings.EqualFold(opts.TargetCodecVideo, "copy") && !opts.CopyVideoMPEGTS && !IsMPEG2VideoCodec(opts.SourceVideoCodec) {
+	if videoUsesFMP4(opts) {
 		return ".m4s"
 	}
 	return ".ts"

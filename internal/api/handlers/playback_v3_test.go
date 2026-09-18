@@ -626,7 +626,7 @@ func TestPlannerSettingsV3ResultPreservesAllow4KStoreFailure(t *testing.T) {
 
 func TestPlannerSettingsV3ResultReadsPolicyKeysConcurrently(t *testing.T) {
 	store := &gatedPlaybackSettingsV3{
-		started: make(chan string, 3),
+		started: make(chan string, 4),
 		release: make(chan struct{}),
 	}
 	handler := &PlaybackHandler{SettingsRepo: store}
@@ -636,13 +636,13 @@ func TestPlannerSettingsV3ResultReadsPolicyKeysConcurrently(t *testing.T) {
 		result <- err
 	}()
 
-	started := make(map[string]bool, 3)
-	for len(started) < 3 {
+	started := make(map[string]bool, 4)
+	for len(started) < 4 {
 		select {
 		case key := <-store.started:
 			started[key] = true
 		case <-time.After(time.Second):
-			t.Fatalf("settings reads started concurrently = %v, want all three keys", started)
+			t.Fatalf("settings reads started concurrently = %v, want all four keys", started)
 		}
 	}
 	close(store.release)
@@ -653,6 +653,7 @@ func TestPlannerSettingsV3ResultReadsPolicyKeysConcurrently(t *testing.T) {
 		config.Allow4KTranscodeSettingKey,
 		config.PlaybackTranscodeHardwareToneMapSettingKey,
 		config.PlaybackTranscodeSoftwareToneMapSettingKey,
+		config.PlaybackTranscodeVPPToneMapSettingKey,
 	} {
 		if !started[key] {
 			t.Fatalf("settings read missing key %q", key)
