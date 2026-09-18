@@ -10,19 +10,29 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/Silo-Server/silo-server/internal/lang"
 )
 
 var streamSizePattern = regexp.MustCompile(`(?i)\b\d+(?:\.\d+)?\s*(?:TB|GB|MB)\b`)
 var languagePattern = regexp.MustCompile(`(?i)\b(?:eng|en|fra|fre|fr|deu|ger|de|ita|es|spa|jpn|kor|zho|chi|por|rus|ara)\b`)
 var (
-	dolbyVisionPattern = regexp.MustCompile(`(?i)(?:\bdolby[ ._-]*vision\b|\bdv\b)`)
-	atmosPattern       = regexp.MustCompile(`(?i)\batmos\b`)
-	trueHDPattern      = regexp.MustCompile(`(?i)(?:\btrue[ ._-]*hd\b|\bthd\b)`)
-	dtsHDPattern       = regexp.MustCompile(`(?i)\bdts[ ._-]*hd\b`)
-	dtsPattern         = regexp.MustCompile(`(?i)\bdts\b`)
-	eac3Pattern        = regexp.MustCompile(`(?i)(?:\be[ ._-]*ac[ ._-]*3\b|\bdd\+)`)
-	ac3Pattern         = regexp.MustCompile(`(?i)(?:\bac[ ._-]*3\b|\bdd\b)`)
-	aacPattern         = regexp.MustCompile(`(?i)\baac\b`)
+	dolbyVisionPattern   = regexp.MustCompile(`(?i)(?:\bdolby[ ._-]*vision\b|\bdv\b)`)
+	atmosPattern         = regexp.MustCompile(`(?i)\batmos\b`)
+	trueHDPattern        = regexp.MustCompile(`(?i)(?:\btrue[ ._-]*hd\b|\bthd\b)`)
+	dtsHDPattern         = regexp.MustCompile(`(?i)\bdts[ ._-]*hd\b`)
+	dtsPattern           = regexp.MustCompile(`(?i)\bdts\b`)
+	eac3Pattern          = regexp.MustCompile(`(?i)(?:\be[ ._-]*ac[ ._-]*3\b|\bdd\+)`)
+	ac3Pattern           = regexp.MustCompile(`(?i)(?:\bac[ ._-]*3\b|\bdd\b)`)
+	aacPattern           = regexp.MustCompile(`(?i)\baac\b`)
+	audioChannelsPattern = regexp.MustCompile(`(?i)\b(?:7\.1(?:\.4)?|5\.1(?:\.2)?|2\.0|1\.0)\b`)
+	tenBitPattern        = regexp.MustCompile(`(?i)\b(?:10[ ._-]?bit|hi10p?)\b`)
+	imaxPattern          = regexp.MustCompile(`(?i)\bimax(?:[ ._-]enhanced)?\b`)
+	multiPattern         = regexp.MustCompile(`(?i)\b(?:multi(?:[ ._-]*(?:audio|lang|language|subs|sub))?|multilingual)\b`)
+	dualPattern          = regexp.MustCompile(`(?i)\bdual[ ._-]*audio\b`)
+	releaseGroupPattern  = regexp.MustCompile(`(?i)-([a-zA-Z0-9]+)(?:\[.*?\])?$`)
+	regionalLangPattern  = regexp.MustCompile(`(?i)\b(pt-br|es-419|zh-hans|zh-hant|zh-tw|en-us|en-gb|fr-ca)\b`)
+	fullNameLangPattern  = regexp.MustCompile(`(?i)\b(english|french|german|spanish|italian|japanese|korean|russian|chinese|portuguese|hindi|arabic|dutch|polish|swedish|norwegian|danish|finnish|turkish|ukrainian)\b`)
 )
 
 // subtitlePattern matches subtitle-track markers in release metadata: common
@@ -59,6 +69,13 @@ type StreamCandidate struct {
 	RequestHeaders    map[string]string
 	QualityScore      int
 	OriginalIndex     int
+	AudioChannels     string   `json:"audioChannels,omitempty"`
+	Bitrate           int      `json:"bitrate,omitempty"`
+	Is10Bit           bool     `json:"is10Bit,omitempty"`
+	IsMultiAudio      bool     `json:"isMultiAudio,omitempty"`
+	IsDualAudio       bool     `json:"isDualAudio,omitempty"`
+	VisualTags        []string `json:"visualTags,omitempty"`
+	AudioTags         []string `json:"audioTags,omitempty"`
 	// SourceConfirmed marks a candidate whose release the configured source of
 	// truth (AltMount's completed/imported state, or Prowlarr as a fallback)
 	// has already accepted. SourceFailed marks a release AltMount reports as
@@ -76,14 +93,25 @@ type StreamCandidate struct {
 }
 
 // ParseStreamDetails fills Resolution, CodecVideo, CodecAudio, HasAtmos, HDR,
-// SourceType, FileSize, Container, AudioLanguages, and SubtitleLanguages on
-// the candidate from its name/description/title/URL text.
+// SourceType, FileSize, Container, AudioLanguages, SubtitleLanguages,
+// AudioChannels, Is10Bit, VisualTags, and AudioTags on the candidate from its
+// name/description/title/URL text.
 func ParseStreamDetails(s *StreamCandidate) {
-	parseStreamDetails(s)
+	ParseStreamDetailsWithTitle(s, "")
+}
+
+// ParseStreamDetailsWithTitle fills derived fields on the candidate, optionally
+// masking itemTitle to prevent title words from triggering false positives.
+func ParseStreamDetailsWithTitle(s *StreamCandidate, itemTitle string) {
+	parseStreamDetailsWithTitle(s, itemTitle)
 	ParseStreamMetadata(s)
 }
 
 func parseStreamDetails(s *StreamCandidate) {
+	parseStreamDetailsWithTitle(s, "")
+}
+
+func parseStreamDetailsWithTitle(s *StreamCandidate, itemTitle string) {
 	metadataText := strings.ToLower(s.Name + " " + s.Description + " " + s.Title)
 	fullText := metadataText + " " + strings.ToLower(s.URL)
 
@@ -93,6 +121,11 @@ func parseStreamDetails(s *StreamCandidate) {
 	resolutionText := metadataText
 	if !hasResolutionMarker(resolutionText) {
 		resolutionText = fullText
+	}
+	if itemTitle = strings.TrimSpace(itemTitle); len(itemTitle) >= 3 {
+		escaped := regexp.QuoteMeta(strings.ToLower(itemTitle))
+		titleRe := regexp.MustCompile(`(?i)(?:^|[^a-z0-9])` + strings.ReplaceAll(escaped, `\ `, `[ ._-]+`) + `(?:[^a-z0-9]|$)`)
+		resolutionText = titleRe.ReplaceAllString(resolutionText, " ")
 	}
 	if strings.Contains(resolutionText, "2160p") || strings.Contains(resolutionText, "4k") || strings.Contains(resolutionText, "uhd") {
 		s.Resolution = "2160p"
@@ -121,29 +154,70 @@ func parseStreamDetails(s *StreamCandidate) {
 	s.HasAtmos = atmosPattern.MatchString(fullText)
 	if trueHDPattern.MatchString(fullText) {
 		s.CodecAudio = "truehd"
+		s.AudioTags = append(s.AudioTags, "truehd")
 	} else if dtsHDPattern.MatchString(fullText) {
 		s.CodecAudio = "dts-hd"
+		s.AudioTags = append(s.AudioTags, "dts-hd")
 	} else if dtsPattern.MatchString(fullText) {
 		s.CodecAudio = "dts"
+		s.AudioTags = append(s.AudioTags, "dts")
 	} else if eac3Pattern.MatchString(fullText) {
 		s.CodecAudio = "eac3"
+		s.AudioTags = append(s.AudioTags, "eac3")
 	} else if ac3Pattern.MatchString(fullText) {
 		s.CodecAudio = "ac3"
+		s.AudioTags = append(s.AudioTags, "ac3")
 	} else if aacPattern.MatchString(fullText) {
 		s.CodecAudio = "aac"
+		s.AudioTags = append(s.AudioTags, "aac")
+	} else if strings.Contains(fullText, "flac") {
+		s.CodecAudio = "flac"
+		s.AudioTags = append(s.AudioTags, "flac")
+	} else if strings.Contains(fullText, "opus") {
+		s.CodecAudio = "opus"
+		s.AudioTags = append(s.AudioTags, "opus")
 	} else if s.HasAtmos {
 		s.CodecAudio = "eac3"
 	}
+	if s.HasAtmos {
+		s.AudioTags = append(s.AudioTags, "atmos")
+	}
 
-	// HDR
+	// Audio Channels
+	if ch := audioChannelsPattern.FindString(fullText); ch != "" {
+		lowerCh := strings.ToLower(ch)
+		if strings.HasPrefix(lowerCh, "7.1") {
+			s.AudioChannels = "7.1"
+		} else if strings.HasPrefix(lowerCh, "5.1") {
+			s.AudioChannels = "5.1"
+		} else {
+			s.AudioChannels = lowerCh
+		}
+	}
+
+	// HDR & Visual Tags
 	if strings.Contains(fullText, "hdr10+") {
 		s.HDR = "hdr10+"
+		s.VisualTags = append(s.VisualTags, "hdr10+")
 	} else if strings.Contains(fullText, "hdr10") {
 		s.HDR = "hdr10"
+		s.VisualTags = append(s.VisualTags, "hdr10")
 	} else if dolbyVisionPattern.MatchString(fullText) {
 		s.HDR = "dv"
+		s.VisualTags = append(s.VisualTags, "dv")
 	} else if strings.Contains(fullText, "hdr") {
 		s.HDR = "hdr"
+		s.VisualTags = append(s.VisualTags, "hdr")
+	}
+	if strings.Contains(fullText, "hlg") {
+		s.VisualTags = append(s.VisualTags, "hlg")
+	}
+	if tenBitPattern.MatchString(fullText) {
+		s.Is10Bit = true
+		s.VisualTags = append(s.VisualTags, "10bit")
+	}
+	if imaxPattern.MatchString(fullText) {
+		s.VisualTags = append(s.VisualTags, "imax")
 	}
 
 	// Source Type
@@ -217,6 +291,73 @@ func CandidateDisplayName(candidate StreamCandidate) string {
 	return strings.TrimSpace(clean)
 }
 
+func canonicalAudioLanguage(token string) string {
+	lower := strings.ToLower(strings.TrimSpace(token))
+	switch lower {
+	case "eng", "en", "english":
+		return "ENG"
+	case "fre", "fra", "fr", "french":
+		return "FRE"
+	case "ger", "deu", "de", "german", "deutsch":
+		return "DEU"
+	case "ita", "it", "italian":
+		return "ITA"
+	case "spa", "es", "spanish":
+		return "SPA"
+	case "jpn", "ja", "japanese":
+		return "JPN"
+	case "kor", "ko", "korean":
+		return "KOR"
+	case "rus", "ru", "russian":
+		return "RUS"
+	case "zho", "chi", "zh", "chinese":
+		return "ZHO"
+	case "por", "pt", "portuguese":
+		return "POR"
+	case "pt-br", "brazilian portuguese":
+		return "PT-BR"
+	case "es-419":
+		return "ES-419"
+	case "zh-hans", "simplified chinese":
+		return "ZH-HANS"
+	case "zh-hant", "zh-tw", "traditional chinese":
+		return "ZH-HANT"
+	case "en-us":
+		return "EN-US"
+	case "en-gb":
+		return "EN-GB"
+	case "fr-ca":
+		return "FR-CA"
+	case "ara", "ar", "arabic":
+		return "ARA"
+	case "hin", "hi", "hindi":
+		return "HIN"
+	case "nld", "dut", "nl", "dutch":
+		return "NLD"
+	case "pol", "pl", "polish":
+		return "POL"
+	case "swe", "sv", "swedish":
+		return "SWE"
+	case "nor", "no", "norwegian":
+		return "NOR"
+	case "dan", "da", "danish":
+		return "DAN"
+	case "fin", "fi", "finnish":
+		return "FIN"
+	case "tur", "tr", "turkish":
+		return "TUR"
+	case "ukr", "uk", "ukrainian":
+		return "UKR"
+	default:
+		if len(lower) == 3 {
+			if c := lang.Canonical(lower); c != "" && c != "und" && c != "mul" {
+				return strings.ToUpper(lower)
+			}
+		}
+		return ""
+	}
+}
+
 // ParseStreamMetadata fills FileSize, AudioLanguages, SubtitleLanguages,
 // Container, ExpiresAt, and RequestHeaders on the candidate.
 func ParseStreamMetadata(s *StreamCandidate) {
@@ -238,13 +379,40 @@ func ParseStreamMetadata(s *StreamCandidate) {
 			}
 		}
 	}
-	seen := map[string]bool{}
-	for _, match := range languagePattern.FindAllString(strings.ToLower(text), -1) {
-		match = strings.ToUpper(match)
-		if !seen[match] {
-			seen[match] = true
-			s.AudioLanguages = append(s.AudioLanguages, match)
+
+	cleanText := text
+	if match := releaseGroupPattern.FindStringSubmatch(text); len(match) > 1 {
+		if strings.EqualFold(match[1], "ind") {
+			cleanText = strings.TrimSuffix(cleanText, match[0])
 		}
+	}
+
+	seen := map[string]bool{}
+	for _, match := range regionalLangPattern.FindAllString(cleanText, -1) {
+		if code := canonicalAudioLanguage(match); code != "" && !seen[code] {
+			seen[code] = true
+			s.AudioLanguages = append(s.AudioLanguages, code)
+		}
+	}
+	for _, match := range fullNameLangPattern.FindAllString(cleanText, -1) {
+		if code := canonicalAudioLanguage(match); code != "" && !seen[code] {
+			seen[code] = true
+			s.AudioLanguages = append(s.AudioLanguages, code)
+		}
+	}
+	for _, match := range languagePattern.FindAllString(strings.ToLower(cleanText), -1) {
+		if code := canonicalAudioLanguage(match); code != "" && !seen[code] {
+			seen[code] = true
+			s.AudioLanguages = append(s.AudioLanguages, code)
+		}
+	}
+
+	if multiPattern.MatchString(text) || strings.Contains(strings.ToLower(s.Name), "multi") {
+		s.IsMultiAudio = true
+	}
+	if dualPattern.MatchString(text) {
+		s.IsDualAudio = true
+		s.IsMultiAudio = true
 	}
 
 	// Subtitle languages: only parse when the release text actually carries a
@@ -253,11 +421,22 @@ func ParseStreamMetadata(s *StreamCandidate) {
 	// (e.g. "English DD5.1") must not be advertised as a subtitle track.
 	if subtitlePattern.MatchString(text) {
 		subSeen := map[string]bool{}
-		for _, match := range subtitleLanguagePattern.FindAllString(strings.ToLower(text), -1) {
-			match = strings.ToUpper(match)
-			if !subSeen[match] {
-				subSeen[match] = true
-				s.SubtitleLanguages = append(s.SubtitleLanguages, match)
+		for _, match := range regionalLangPattern.FindAllString(cleanText, -1) {
+			if code := canonicalAudioLanguage(match); code != "" && !subSeen[code] {
+				subSeen[code] = true
+				s.SubtitleLanguages = append(s.SubtitleLanguages, code)
+			}
+		}
+		for _, match := range fullNameLangPattern.FindAllString(cleanText, -1) {
+			if code := canonicalAudioLanguage(match); code != "" && !subSeen[code] {
+				subSeen[code] = true
+				s.SubtitleLanguages = append(s.SubtitleLanguages, code)
+			}
+		}
+		for _, match := range subtitleLanguagePattern.FindAllString(strings.ToLower(cleanText), -1) {
+			if code := canonicalAudioLanguage(match); code != "" && !subSeen[code] {
+				subSeen[code] = true
+				s.SubtitleLanguages = append(s.SubtitleLanguages, code)
 			}
 		}
 	}
@@ -427,4 +606,77 @@ func NormalizeResolution(value string) string {
 	default:
 		return strings.ToLower(strings.TrimSpace(value))
 	}
+}
+
+// AudioChannelsScore ranks channel counts for quality sorting.
+// Higher is better: 7.1=3, 5.1=2, 2.0=1, unknown=0.
+func AudioChannelsScore(ch string) int {
+	switch ch {
+	case "7.1":
+		return 3
+	case "5.1":
+		return 2
+	case "2.0":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// CandidateLanguageMatchRank ranks how well a candidate matches the preferred
+// language tag using upstream lang package semantics:
+//
+//	0: exact BCP-47 / regional tag match (e.g. pt-BR == pt-BR)
+//	1: bare language tag match (e.g. pt matches pt-BR)
+//	2: regional variant match (e.g. pt-PT matches pt-BR)
+//	3: candidate is MULTi audio (advertises multiple languages)
+//
+// -1: no match
+func CandidateLanguageMatchRank(candidate StreamCandidate, preferred string) int {
+	preferred = lang.CompatibleTag(preferred)
+	if preferred == "" {
+		return -1
+	}
+	bestRank := -1
+	for _, code := range candidate.AudioLanguages {
+		rank := candidateLangMatchRank(code, preferred)
+		if rank >= 0 && (bestRank == -1 || rank < bestRank) {
+			bestRank = rank
+		}
+		if bestRank == 0 {
+			return 0
+		}
+	}
+	if bestRank >= 0 {
+		return bestRank
+	}
+	if candidate.IsMultiAudio || candidate.IsDualAudio {
+		return 3
+	}
+	return -1
+}
+
+// CandidateHasLanguage reports whether candidate carries or supports the preferred language.
+func CandidateHasLanguage(candidate StreamCandidate, preferred string) bool {
+	return CandidateLanguageMatchRank(candidate, preferred) >= 0
+}
+
+func candidateLangMatchRank(candidate, preferred string) int {
+	candidate = lang.CompatibleTag(candidate)
+	preferred = lang.CompatibleTag(preferred)
+	if candidate == "" || preferred == "" {
+		return -1
+	}
+	if strings.EqualFold(candidate, preferred) {
+		return 0
+	}
+	candidateBase := lang.PrimaryLanguage(candidate)
+	preferredBase := lang.PrimaryLanguage(preferred)
+	if candidateBase == "" || candidateBase != preferredBase {
+		return -1
+	}
+	if !strings.Contains(candidate, "-") {
+		return 1
+	}
+	return 2
 }

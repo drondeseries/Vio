@@ -55,3 +55,78 @@ func TestParseStreamMetadataAudioLanguagesDeduplicates(t *testing.T) {
 		t.Errorf("ENG appeared %d times, want 1: %v", counts["ENG"], s.AudioLanguages)
 	}
 }
+
+func TestParseStreamDetailsRegionalLanguagesAndMulti(t *testing.T) {
+	s := &StreamCandidate{
+		Name: "Dune.Part.Two.2024.2160p.UHD.Remux.PT-BR.MULTI.TrueHD.Atmos.7.1-FLUX",
+	}
+	ParseStreamDetails(s)
+
+	if !s.IsMultiAudio {
+		t.Fatal("expected IsMultiAudio = true")
+	}
+	if s.AudioChannels != "7.1" {
+		t.Fatalf("expected AudioChannels = 7.1, got %q", s.AudioChannels)
+	}
+	foundPTBR := false
+	for _, l := range s.AudioLanguages {
+		if l == "PT-BR" {
+			foundPTBR = true
+		}
+	}
+	if !foundPTBR {
+		t.Fatalf("expected PT-BR in AudioLanguages, got %v", s.AudioLanguages)
+	}
+	if s.CodecAudio != "truehd" || !s.HasAtmos {
+		t.Fatalf("expected truehd with atmos, got %s (atmos=%v)", s.CodecAudio, s.HasAtmos)
+	}
+}
+
+func TestParseStreamDetailsTitleStripping(t *testing.T) {
+	s := &StreamCandidate{
+		Name: "Cam.2018.1080p.NF.WEB-DL.DDP5.1.x264-NTb",
+	}
+	ParseStreamDetailsWithTitle(s, "Cam")
+	if s.Resolution != "1080p" {
+		t.Fatalf("expected 1080p, got %q", s.Resolution)
+	}
+	if s.SourceType != "web-dl" {
+		t.Fatalf("expected web-dl, got %q", s.SourceType)
+	}
+}
+
+func TestCandidateLanguageMatchRank(t *testing.T) {
+	candExact := StreamCandidate{AudioLanguages: []string{"PT-BR"}}
+	candBase := StreamCandidate{AudioLanguages: []string{"POR"}}
+	candVariant := StreamCandidate{AudioLanguages: []string{"PT-PT"}}
+	candMulti := StreamCandidate{IsMultiAudio: true}
+	candOther := StreamCandidate{AudioLanguages: []string{"ENG"}}
+
+	if rank := CandidateLanguageMatchRank(candExact, "pt-BR"); rank != 0 {
+		t.Fatalf("exact match rank = %d, want 0", rank)
+	}
+	if rank := CandidateLanguageMatchRank(candBase, "pt-BR"); rank != 1 {
+		t.Fatalf("base match rank = %d, want 1", rank)
+	}
+	if rank := CandidateLanguageMatchRank(candVariant, "pt-BR"); rank != 2 {
+		t.Fatalf("variant match rank = %d, want 2", rank)
+	}
+	if rank := CandidateLanguageMatchRank(candMulti, "pt-BR"); rank != 3 {
+		t.Fatalf("multi match rank = %d, want 3", rank)
+	}
+	if rank := CandidateLanguageMatchRank(candOther, "pt-BR"); rank != -1 {
+		t.Fatalf("other match rank = %d, want -1", rank)
+	}
+}
+
+func TestParseStreamDetailsReleaseGroupINDNotIndonesian(t *testing.T) {
+	s := &StreamCandidate{
+		Name: "Alien.Romulus.2024.1080p.WEB-DL.DDP5.1.Atmos.H.264-IND",
+	}
+	ParseStreamDetails(s)
+	for _, l := range s.AudioLanguages {
+		if l == "IND" || l == "ID" {
+			t.Fatalf("release group -IND was falsely identified as Indonesian: %v", s.AudioLanguages)
+		}
+	}
+}

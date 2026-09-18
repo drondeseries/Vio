@@ -290,6 +290,8 @@ func cloneCandidates(candidates []StreamCandidate) []StreamCandidate {
 		out[i] = c
 		out[i].AudioLanguages = append([]string(nil), c.AudioLanguages...)
 		out[i].SubtitleLanguages = append([]string(nil), c.SubtitleLanguages...)
+		out[i].VisualTags = append([]string(nil), c.VisualTags...)
+		out[i].AudioTags = append([]string(nil), c.AudioTags...)
 		out[i].RequestHeaders = maps.Clone(c.RequestHeaders)
 		out[i].BehaviorHints.ProxyHeaders = maps.Clone(c.BehaviorHints.ProxyHeaders)
 	}

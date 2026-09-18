@@ -147,3 +147,60 @@ func TestValidateRejectsBadPatternType(t *testing.T) {
 		t.Fatal("expected pattern_type validation error")
 	}
 }
+
+func TestQualityProfileMatchingWithAudioChannelsAndLanguage(t *testing.T) {
+	p := QualityProfile{
+		Label:         "4K Surround Portuguese",
+		Resolution:    "2160p",
+		AudioChannels: "5.1",
+		Language:      "pt-BR",
+	}
+	cMatch := stream.StreamCandidate{
+		Resolution:     "2160p",
+		AudioChannels:  "5.1",
+		AudioLanguages: []string{"PT-BR"},
+	}
+	cWrongChannel := stream.StreamCandidate{
+		Resolution:     "2160p",
+		AudioChannels:  "2.0",
+		AudioLanguages: []string{"PT-BR"},
+	}
+	cWrongLang := stream.StreamCandidate{
+		Resolution:     "2160p",
+		AudioChannels:  "5.1",
+		AudioLanguages: []string{"ENG"},
+	}
+
+	if !MatchProfile(cMatch, p) {
+		t.Fatal("cMatch should match profile")
+	}
+	if MatchProfile(cWrongChannel, p) {
+		t.Fatal("cWrongChannel should not match profile")
+	}
+	if MatchProfile(cWrongLang, p) {
+		t.Fatal("cWrongLang should not match profile")
+	}
+}
+
+func TestSortCandidatesForProfileLanguageAndChannels(t *testing.T) {
+	p := QualityProfile{
+		Label:    "Portuguese Profile",
+		Language: "pt-BR",
+	}
+	c1 := stream.StreamCandidate{
+		OriginalIndex:  0,
+		Resolution:     "1080p",
+		AudioLanguages: []string{"ENG"},
+	}
+	c2 := stream.StreamCandidate{
+		OriginalIndex:  1,
+		Resolution:     "1080p",
+		AudioLanguages: []string{"PT-BR"},
+	}
+	candidates := []stream.StreamCandidate{c1, c2}
+	SortCandidatesForProfile(candidates, p, nil)
+
+	if candidates[0].OriginalIndex != 1 {
+		t.Fatalf("expected candidate 1 (PT-BR) to sort ahead of candidate 0 (ENG), got candidate %d", candidates[0].OriginalIndex)
+	}
+}

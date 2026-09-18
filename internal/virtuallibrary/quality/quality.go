@@ -126,15 +126,21 @@ func (f *CustomFormat) UnmarshalJSON(data []byte) error {
 }
 
 type QualityProfile struct {
-	Label          string `json:"label"`
-	Resolution     string `json:"resolution"`
-	IncludeRegex   string `json:"include_regex"`
-	ExcludeRegex   string `json:"exclude_regex"`
-	PreferredOrder int    `json:"preferred_order"`
-	CodecVideo     string `json:"codec_video"`
-	CodecAudio     string `json:"codec_audio"`
-	HDR            string `json:"hdr"`
-	ExcludeHDR     string `json:"exclude_hdr"`
+	Label             string `json:"label"`
+	Resolution        string `json:"resolution"`
+	IncludeRegex      string `json:"include_regex"`
+	ExcludeRegex      string `json:"exclude_regex"`
+	PreferredOrder    int    `json:"preferred_order"`
+	CodecVideo        string `json:"codec_video"`
+	CodecAudio        string `json:"codec_audio"`
+	HDR               string `json:"hdr"`
+	ExcludeHDR        string `json:"exclude_hdr"`
+	AudioChannels     string `json:"audio_channels,omitempty"`
+	Language          string `json:"language,omitempty"`
+	VisualTag         string `json:"visual_tag,omitempty"`
+	MinSize           int64  `json:"min_size,omitempty"`
+	MaxSize           int64  `json:"max_size,omitempty"`
+	RequireMultiAudio bool   `json:"require_multi_audio,omitempty"`
 
 	include *regexp.Regexp
 	exclude *regexp.Regexp
@@ -439,11 +445,14 @@ func (q *QualityConfig) Validate() error {
 			return fmt.Errorf("profile label exceeds %d bytes", maxProfileLabelBytes)
 		}
 		for name, value := range map[string]string{
-			"resolution":  p.Resolution,
-			"codec_video": p.CodecVideo,
-			"codec_audio": p.CodecAudio,
-			"hdr":         p.HDR,
-			"exclude_hdr": p.ExcludeHDR,
+			"resolution":     p.Resolution,
+			"codec_video":    p.CodecVideo,
+			"codec_audio":    p.CodecAudio,
+			"hdr":            p.HDR,
+			"exclude_hdr":    p.ExcludeHDR,
+			"audio_channels": p.AudioChannels,
+			"language":       p.Language,
+			"visual_tag":     p.VisualTag,
 		} {
 			if len(value) > maxProfileAttributeBytes {
 				return fmt.Errorf("%s in profile %s exceeds %d bytes", name, p.Label, maxProfileAttributeBytes)
@@ -519,6 +528,34 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	}
 	if p.ExcludeHDR != "" && p.ExcludeHDR != "*" && strings.EqualFold(c.HDR, p.ExcludeHDR) {
 		return false
+	}
+	if p.AudioChannels != "" && c.AudioChannels != "" && !strings.EqualFold(c.AudioChannels, p.AudioChannels) {
+		return false
+	}
+	if p.MinSize > 0 && c.FileSize > 0 && c.FileSize < p.MinSize {
+		return false
+	}
+	if p.MaxSize > 0 && c.FileSize > p.MaxSize {
+		return false
+	}
+	if p.RequireMultiAudio && !c.IsMultiAudio && !c.IsDualAudio && len(c.AudioLanguages) <= 1 {
+		return false
+	}
+	if p.Language != "" && !stream.CandidateHasLanguage(c, p.Language) {
+		return false
+	}
+	if p.VisualTag != "" {
+		matchedTag := false
+		lowerTag := strings.ToLower(p.VisualTag)
+		for _, vt := range c.VisualTags {
+			if strings.EqualFold(vt, lowerTag) {
+				matchedTag = true
+				break
+			}
+		}
+		if !matchedTag && !strings.Contains(strings.ToLower(fullText), lowerTag) {
+			return false
+		}
 	}
 	return true
 }
@@ -700,14 +737,35 @@ func sortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProf
 		if scored[i].rejected != scored[j].rejected {
 			return !scored[i].rejected
 		}
+		if c1.SourceConfirmed != c2.SourceConfirmed {
+			return c1.SourceConfirmed
+		}
 		if c1.QualityScore != c2.QualityScore {
 			return c1.QualityScore > c2.QualityScore
+		}
+		if p.Language != "" {
+			r1 := stream.CandidateLanguageMatchRank(c1, p.Language)
+			r2 := stream.CandidateLanguageMatchRank(c2, p.Language)
+			if r1 >= 0 && r2 < 0 {
+				return true
+			}
+			if r2 >= 0 && r1 < 0 {
+				return false
+			}
+			if r1 >= 0 && r2 >= 0 && r1 != r2 {
+				return r1 < r2
+			}
 		}
 		if r1, r2 := stream.ResolutionScore(c1.Resolution), stream.ResolutionScore(c2.Resolution); r1 != r2 {
 			return r1 > r2
 		}
 		if s1, s2 := stream.SourceScore(c1.SourceType), stream.SourceScore(c2.SourceType); s1 != s2 {
 			return s1 > s2
+		}
+		if c1.AudioChannels != c2.AudioChannels {
+			if ch1, ch2 := stream.AudioChannelsScore(c1.AudioChannels), stream.AudioChannelsScore(c2.AudioChannels); ch1 != ch2 {
+				return ch1 > ch2
+			}
 		}
 		return c1.OriginalIndex < c2.OriginalIndex
 	})
