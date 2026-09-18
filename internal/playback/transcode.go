@@ -241,13 +241,18 @@ type TranscodeSession struct {
 	// decodeErrorCount counts decoder failure lines within the current decay
 	// window; lastDecodeErrorAt timestamps the newest and decodeSample keeps a
 	// representative matched line for diagnostics. decodeStamped is set once
-	// the count crosses decodeErrorThreshold, which reports that the executed
-	// hardware decoder rejected the source and a software retry is warranted.
-	// Guarded by mu.
+	// the count crosses decodeErrorThreshold on a hardware plan, which reports
+	// that the executed hardware decoder rejected the source and a software
+	// retry is warranted. sourceRejected is set on the same crossing for every
+	// non-copy plan, hardware or software, because a decoder that rejects this
+	// many frames is evidence about the source itself; the serve path uses it
+	// to report a permanent failure instead of stalling the player. Guarded by
+	// mu.
 	decodeErrorCount  int
 	lastDecodeErrorAt time.Time
 	decodeSample      string
 	decodeStamped     bool
+	sourceRejected    bool
 	// generationStartedAt is when the currently-owning ffmpeg process was
 	// spawned. Output in the shared directory older than this timestamp was
 	// written by a previous generation (or a previous session sharing the
@@ -3956,18 +3961,24 @@ func decodeErrorLine(line string) bool {
 // observeDecodeError records one decoder failure line and reports whether it is
 // the occurrence that crosses the known-bad threshold. The counter resets when
 // more than decodeErrorDecay elapsed since the previous failure, so decoder
-// blips that recover are forgiven. It reports true at most once per session:
-// decodeStamped is set under mu before returning, keeping the marker
-// idempotent when concurrent stderr lines arrive. A software-decode plan or a
-// copy target never stamps: a decoder error there is a bad bitstream, not
-// evidence that a hardware decoder should be replaced by a software one.
+// blips that recover are forgiven. It reports true at most once per session,
+// when a hardware plan crosses the threshold and a software-decode retry is
+// warranted. A copy target never stamps: a decoder error there is an
+// output/remux anomaly, not a decode verdict. A software plan does not report
+// the hardware transition (there is no decoder to replace) but still records
+// sourceRejected so the serve path can fail the session permanently rather than
+// let the player retry a stream the CPU decoder also cannot read.
 func (s *TranscodeSession) observeDecodeError(now time.Time, sample string) bool {
 	if s == nil {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.decodeStamped || s.opts.SoftwareVideoDecode || strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
+	if strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
+		return false
+	}
+	if s.decodeStamped || s.sourceRejected {
+		// Already decided; the transition fires once.
 		return false
 	}
 	if !s.lastDecodeErrorAt.IsZero() && now.Sub(s.lastDecodeErrorAt) > decodeErrorDecay {
@@ -3981,9 +3992,37 @@ func (s *TranscodeSession) observeDecodeError(now time.Time, sample string) bool
 	if s.decodeErrorCount < decodeErrorThreshold {
 		return false
 	}
+	s.sourceRejected = true
+	if s.opts.SoftwareVideoDecode {
+		// A software decoder rejecting the bitstream indicts the source, not
+		// the decode mode; there is no further decoder to fall back to.
+		return false
+	}
 	s.decodeStamped = true
 	return true
 }
+
+// IsSourceRejected reports whether the running plan's decoder rejected the
+// source past the confidence threshold. The serve path treats it as permanent:
+// once true, no segment produced by this generation is trustworthy and the
+// client should replan (and, for a hardware plan, get the software-decode
+// variant) instead of waiting out its own startup timeout.
+func (s *TranscodeSession) IsSourceRejected() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sourceRejected
+}
+
+// DecodeErrorHeader names the machine-readable decode verdict on a media
+// response that revokes a generation whose decoder rejected the source.
+// DecodeErrorSourceRejectedCode is its only value today.
+const (
+	DecodeErrorHeader             = "X-Vio-Decode-Error"
+	DecodeErrorSourceRejectedCode = "source_decode_failed"
+)
 
 // IsDecodeFailed reports whether repeated decoder failures stamped this
 // session's hardware decoder as unable to handle the source. The handler reads

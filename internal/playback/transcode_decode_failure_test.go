@@ -110,6 +110,42 @@ func TestDecodeFailureDoesNotStampSoftwareOrCopy(t *testing.T) {
 	}
 }
 
+// TestDecodeFailureRecordsSourceRejectionForEveryDecodeMode proves the source
+// verdict is independent of the decode-mode retry: a software plan records the
+// rejection at the threshold (so the serve path can report it as permanent)
+// without claiming the hardware decoder failed, and a copy target records
+// neither.
+func TestDecodeFailureRecordsSourceRejectionForEveryDecodeMode(t *testing.T) {
+	software := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "h264", SoftwareVideoDecode: true}}
+	for i := 0; i < decodeErrorThreshold; i++ {
+		if software.observeDecodeError(time.Unix(5000, 0), hevcPOCErrorLine()) {
+			t.Fatal("software plan reported a hardware-decode transition")
+		}
+	}
+	if !software.IsSourceRejected() {
+		t.Fatal("software plan did not record the source rejection")
+	}
+	if software.IsDecodeFailed() {
+		t.Fatal("software plan claimed the hardware decoder failed")
+	}
+
+	hardware := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "h264"}}
+	for i := 0; i < decodeErrorThreshold; i++ {
+		hardware.observeDecodeError(time.Unix(5100, 0), hevcPOCErrorLine())
+	}
+	if !hardware.IsSourceRejected() || !hardware.IsDecodeFailed() {
+		t.Fatalf("hardware plan rejected=%v decodeFailed=%v, want both true", hardware.IsSourceRejected(), hardware.IsDecodeFailed())
+	}
+
+	copyTarget := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "copy"}}
+	for i := 0; i < decodeErrorThreshold*3; i++ {
+		copyTarget.observeDecodeError(time.Unix(6000, 0), hevcPOCErrorLine())
+	}
+	if copyTarget.IsSourceRejected() {
+		t.Fatal("copy target recorded a source decode rejection")
+	}
+}
+
 // TestLogFFmpegLineObservesDecodeFailure exercises the stderr plumbing the
 // transcode process uses, including the diagnostic sample kept for the replan
 // decision log.

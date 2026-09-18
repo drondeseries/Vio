@@ -821,6 +821,15 @@ func writeStreamDenied(w http.ResponseWriter) {
 	http.Error(w, "playback session ended", http.StatusGone)
 }
 
+// writeSourceDecodeRejected answers a media route whose running decoder has
+// rejected the source. It mirrors the API server's verdict so a clustered
+// deployment surfaces the same permanent failure through the proxy instead of
+// letting the player retry a stream this node cannot decode.
+func writeSourceDecodeRejected(w http.ResponseWriter) {
+	w.Header().Set(playback.DecodeErrorHeader, playback.DecodeErrorSourceRejectedCode)
+	http.Error(w, "the media source could not be decoded", http.StatusUnprocessableEntity)
+}
+
 // sealedHandler is what Handler hands out: the finished router behind an
 // unexported field and a ServeHTTP method, nothing else, so no assertion or
 // type switch recovers a registration surface from it, and the route
@@ -2448,6 +2457,11 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	}
 	s.attachTelemetrySession(r, sessionID)
 
+	if session.IsSourceRejected() {
+		writeSourceDecodeRejected(w)
+		return
+	}
+
 	var manifest []byte
 	var err error
 	if r.URL.Query().Get(playback.SourceTimelineQueryParam) == "1" {
@@ -2503,6 +2517,14 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		s.touchSession(sessionID)
 	}
 	s.attachTelemetrySession(r, sessionID)
+
+	// A generation whose decoder has rejected the source cannot produce a
+	// playable segment; answer permanently so the client replans instead of
+	// retrying garbage output.
+	if session.IsSourceRejected() {
+		writeSourceDecodeRejected(w)
+		return
+	}
 
 	segmentLease, err := session.OpenSegment(name)
 	if err != nil && err == playback.ErrSegmentNotFound {

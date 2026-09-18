@@ -1917,6 +1917,15 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 	}
 	h.touchSessionActivity(sessionID)
 
+	// A generation whose decoder has already rejected the source cannot produce
+	// a playable manifest; answer permanently so the client replans instead of
+	// reloading a playlist it can never play. The hardware->software retry runs
+	// through the client's failure_recovery replan, keyed on this verdict.
+	if transcodeSession.IsSourceRejected() {
+		writePlaybackDecodeError(w)
+		return
+	}
+
 	manifest, err := transcodeSession.BuildPlaybackManifest("segment/", r.URL.RawQuery)
 	if err != nil {
 		// A client stop (DELETE) cancels the transcode context, killing the
@@ -1957,6 +1966,26 @@ func writePlaybackToneMapExecutionError(w http.ResponseWriter, err error) bool {
 		return true
 	}
 	return false
+}
+
+// transcodeDecodeErrorHeader names the machine-readable decode verdict on a
+// manifest/segment response that revokes a generation whose decoder rejected
+// the source. Clients classify on it to replan instead of retrying the stream.
+// transcodeDecodeErrorCode is the value of that header, distinct from the
+// tone-map header so a client can tell an undecodable source from an
+// executor-recipe mismatch.
+const (
+	transcodeDecodeErrorHeader = playback.DecodeErrorHeader
+	transcodeDecodeErrorCode   = playback.DecodeErrorSourceRejectedCode
+)
+
+// writePlaybackDecodeError answers a media route whose running decoder has
+// rejected the source. It is deliberately permanent (422, not a 404 retry
+// loop): hls.js would otherwise exhaust its recovery budget and report only a
+// startup timeout, leaving the reason invisible to the player and the owner.
+func writePlaybackDecodeError(w http.ResponseWriter) {
+	w.Header().Set(transcodeDecodeErrorHeader, transcodeDecodeErrorCode)
+	writeError(w, http.StatusUnprocessableEntity, "decode_failed", "The media source could not be decoded.")
 }
 
 // HandleGetTranscodeSegment handles GET /playback/transcode/{session_id}/segment/{name}.
@@ -2040,6 +2069,15 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		}
 	}
 	h.touchSessionActivity(sessionID)
+
+	// Fail the generation before opening any segment: once the decoder has
+	// rejected the source, the files on disk are garbage output and serving
+	// them only delays the client's fatal error until its startup guard times
+	// out. The permanent verdict drives the client's failure_recovery replan.
+	if transcodeSession.IsSourceRejected() {
+		writePlaybackDecodeError(w)
+		return
+	}
 
 	segmentName := chi.URLParam(r, "name")
 	segmentLease, err := transcodeSession.OpenSegment(segmentName)
