@@ -522,3 +522,178 @@ func waitForLoggedURL(t *testing.T, path string) string {
 	t.Fatal("font extraction never recorded its relay input URL")
 	return ""
 }
+
+// A cold whole-track text fetch against a virtual source must be bounded to an
+// implicit first window instead of demuxing the entire container, then start
+// exactly one detached full-track warm so later fetches read a small artifact.
+// Without this the response needs a full multi-GB read and is aborted by the
+// client long before it completes.
+func TestVirtualWholeTrackTextFetchServesImplicitWindowThenWarms(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	gate := filepath.Join(dir, "warm.gate")
+	// Always release the warm, even if an assertion fails, so the blocked fake
+	// ffmpeg cannot outlive the test.
+	t.Cleanup(func() { _ = os.WriteFile(gate, []byte("go"), 0o644) })
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir, warmArgsLogScript(argsLog, gate))
+
+	rec := httptest.NewRecorder()
+	// No position/duration: the native whole-track fetch the live measurement
+	// showed. The server must synthesize the window itself.
+	req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+		t.Fatalf("whole-track fetch = %d %q, want a bounded window body", rec.Code, rec.Body.String())
+	}
+
+	waitForWarmInvocation(t, argsLog)
+	if err := os.WriteFile(gate, []byte("go"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	waitForCommittedTextEntry(t, handler.SubtitleCache, identity, 0, "subrip")
+
+	window, warm := ffmpegLogLines(t, argsLog)
+	if window != 1 {
+		t.Fatalf("windowed extracts = %d, want exactly 1", window)
+	}
+	if warm != 1 {
+		t.Fatalf("full-track warms = %d, want exactly 1", warm)
+	}
+
+	data, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var windowLine string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.Contains(line, "-ss") {
+			windowLine = line
+		}
+	}
+	if !strings.Contains(windowLine, "-ss 0.000") || !strings.Contains(windowLine, "-to 600.000") {
+		t.Fatalf("implicit window args = %q, want -ss 0.000 -to 600.000", windowLine)
+	}
+}
+
+// When a committed full-track artifact already exists, a whole-track request
+// must serve it whole from the cache — no window, no ffmpeg — so an established
+// virtual track still returns every cue in one response.
+func TestVirtualWholeTrackTextFetchServesCommittedWholeTrack(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, virtualURI := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+
+	identity := playback.VirtualSubtitleCacheIdentity(file.ID, virtualURI, 0)
+	done := handler.SubtitleCache.WarmTrackInBackground(playback.StreamExtractOpts{
+		InputPath:     "unused",
+		CacheIdentity: identity,
+		TrackIndex:    0,
+		SourceCodec:   "subrip",
+		FFmpegPath:    filepath.Join(dir, "ffmpeg"),
+	}, playback.StreamExtractSubtitle)
+	<-done
+	if !handler.SubtitleCache.HasCommittedTextEntry("unused", identity, 0, "subrip", "") {
+		t.Fatal("pre-warm did not commit the whole-track artifact")
+	}
+	if err := os.Remove(argsLog); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+	if rec.Code != http.StatusOK || rec.Body.String() != warmSubtitleVTT {
+		t.Fatalf("whole-track cache serve = %d %q, want the committed artifact", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+		t.Fatalf("ffmpeg ran for a whole-track cache hit: %v", err)
+	}
+}
+
+// Local files keep the existing whole-track behavior: a local read is cheap and
+// bounding it would silently drop cues for a client that wants the complete
+// artifact.
+func TestLocalWholeTrackTextFetchStaysUnwindowed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	writeExecutableScript(t, filepath.Join(dir, "ffmpeg"),
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	mediaPath := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(mediaPath, []byte("media"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewStreamHandler(nil, nil)
+	handler.PlaybackConfig = playbackTestConfig(filepath.Join(dir, "ffmpeg"), dir)
+	handler.SubtitleCache = playback.NewSubtitleCache(func() string { return dir })
+	file := &models.MediaFile{
+		ID: 12, ContentID: "local-movie", FilePath: mediaPath,
+		SubtitleTracks: []models.SubtitleTrack{{Index: 0, Codec: "subrip"}},
+	}
+	session := &playback.Session{ID: "sess-local", UserID: 1, ProfileID: "profile-1", MediaFileID: file.ID}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+		t.Fatalf("local whole-track fetch = %d %q", rec.Code, rec.Body.String())
+	}
+
+	window, warm := ffmpegLogLines(t, argsLog)
+	if window != 0 || warm != 1 {
+		t.Fatalf("local whole-track fetch ran window=%d warm=%d, want window=0 warm=1", window, warm)
+	}
+}
+
+// A small known virtual source keeps the complete artifact: reading it whole is
+// cheap, so bounding it would only drop cues.
+func TestVirtualSmallKnownSourceWholeTrackFetchStaysUnwindowed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	file.FileSize = 10 << 20 // 10 MiB, below the implicit-window threshold
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+		t.Fatalf("small virtual whole-track fetch = %d %q", rec.Code, rec.Body.String())
+	}
+
+	window, whole := ffmpegLogLines(t, argsLog)
+	if window != 0 || whole != 1 {
+		t.Fatalf("small virtual fetch ran window=%d whole=%d, want window=0 whole=1", window, whole)
+	}
+}
+
+// The implicit window start follows the session position (pulled back a little)
+// so a resumed fetch covers playback, and falls back to zero for a fresh start.
+func TestImplicitVirtualTextWindowStart(t *testing.T) {
+	if got := implicitVirtualTextWindowStart(nil); got != 0 {
+		t.Fatalf("nil session start = %v, want 0", got)
+	}
+	if got := implicitVirtualTextWindowStart(&playback.Session{Position: 0}); got != 0 {
+		t.Fatalf("fresh session start = %v, want 0", got)
+	}
+	if got := implicitVirtualTextWindowStart(&playback.Session{Position: 1}); got != 0 {
+		t.Fatalf("position within backoff start = %v, want 0", got)
+	}
+	if got := implicitVirtualTextWindowStart(&playback.Session{Position: 3600}); got != 3598 {
+		t.Fatalf("resumed session start = %v, want 3598", got)
+	}
+}

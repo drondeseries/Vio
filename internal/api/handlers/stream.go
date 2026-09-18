@@ -1535,6 +1535,8 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	h.applyImplicitVirtualTextWindow(&opts, file, session, virtualActive)
+
 	_, extractErr := h.SubtitleCache.ServeExtractWithResult(response, r, opts, playback.StreamExtractSubtitle)
 	if errors.Is(extractErr, playback.ErrCommittedTextArtifactGone) {
 		// The artifact that allowed the drift probe to be skipped was evicted
@@ -1552,6 +1554,10 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			return
 		}
 		opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+		// The pinned artifact is gone, so the committed-entry check that
+		// suppressed the implicit window on the first attempt no longer holds.
+		// Re-evaluate against the now-cold source before retrying.
+		h.applyImplicitVirtualTextWindow(&opts, file, session, virtualActive)
 		_, extractErr = h.SubtitleCache.ServeExtractWithResult(response, r, opts, playback.StreamExtractSubtitle)
 	}
 	if extractErr != nil {
@@ -1708,6 +1714,111 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 		}
 		<-h.SubtitleCache.WarmTrackInBackground(opts, extract)
 	}()
+}
+
+// Defaults for the implicit first window served to a cold whole-track text
+// subtitle request against a virtual/remote source. The duration matches the
+// web player's sliding-window cadence (see web/src/player/hooks/useSubtitleTracks.ts)
+// so a client that manages its own windows and one that does not observe the
+// same coverage. The backoff pulls the window start behind the session
+// position so a small scrub back stays covered, mirroring that player's
+// SEEK_BACKOFF.
+const (
+	virtualSubtitleImplicitWindowSeconds        = 600.0
+	virtualSubtitleImplicitWindowBackoffSeconds = 2.0
+	// virtualSubtitleImplicitWindowMinSourceBytes is the source size above
+	// which a whole-track virtual text read is considered untenable and is
+	// bounded to the implicit window. A small known source is read whole (cheap
+	// and complete); an unknown size (0) is treated as large, because a virtual
+	// row's size is not always populated.
+	virtualSubtitleImplicitWindowMinSourceBytes = 256 << 20
+)
+
+// applyImplicitVirtualTextWindow bounds a cold whole-track text subtitle fetch
+// against a virtual/remote source to the first playback-sized window instead of
+// an unbounded whole-container extract.
+//
+// A virtual source is served over HTTP from a provider; extracting a complete
+// text track requires demuxing every byte of the container, because subtitle
+// blocks are interleaved with the audio/video packets. A 6.6 GB remux therefore
+// costs ~100 s of sequential reads before the response can complete, while the
+// client's fetch deadline is ~30-60 s — the request is aborted and the partial
+// fill is discarded, so retrying never makes progress. Local files are cheap to
+// read whole and keep the existing whole-track behavior.
+//
+// The window is only synthesized when the caller did not ask for a specific
+// window and no committed full-track artifact exists. A windowed serve is fast
+// (ffmpeg seeks near the requested position) and the handler starts the usual
+// detached full-track warm afterwards, so this request completes in seconds and
+// later requests — or a client that fetched this window — read the small cached
+// artifact. When an artifact is already present the whole track is served, so
+// an established virtual track still returns every cue in one response.
+//
+// Correctness: this changes what a cold, implicit whole-track virtual text
+// response contains — a bounded window rather than every cue — so a client that
+// never re-requests will stop seeing cues past the window. Explicitly-windowed
+// callers (the web player) are unaffected, and local, small virtual, ASS/SSA,
+// and PGS tracks keep their existing paths. The old whole-track behavior
+// remains available by sending an explicit position/duration (any window intent
+// bypasses this).
+//
+// This deliberately bends the documented default in
+// docs/architecture/playback-protocol-v3.md §4.2/§8 ("embedded text URLs return
+// the complete track from source time zero by default; consumers that maintain
+// a sliding window may explicitly supply position and duration"). A remote
+// multi-GB source makes that default unservable within a client fetch deadline.
+// The fully contract-conformant fix is for every client to request windows the
+// way the web player does (or a v3 contract amendment making windowed sidecars
+// the default for virtual sources); this helper is a server-side stopgap until
+// that lands. It is gated to large/unknown virtual text sources so nothing else
+// changes.
+func (h *StreamHandler) applyImplicitVirtualTextWindow(opts *playback.StreamExtractOpts, file *models.MediaFile, session *playback.Session, virtualActive bool) {
+	if h == nil || opts == nil || !virtualActive {
+		return
+	}
+	// A small known source costs little to read whole, so keep the complete
+	// artifact. Unknown size (0) stays windowed: virtual rows do not always
+	// carry a populated size.
+	if file != nil && file.FileSize > 0 && file.FileSize < virtualSubtitleImplicitWindowMinSourceBytes {
+		return
+	}
+	// ASS preserves authored styling and is copied whole script; PGS is a
+	// bitmap elementary stream. Only converted text (WebVTT) is safe to slice
+	// with the same whole-artifact semantics.
+	if playback.IsASS(opts.SourceCodec) || playback.IsPGS(opts.SourceCodec) {
+		return
+	}
+	// Any explicit window intent is authoritative, including position=0 and a
+	// duration-only request; leave it untouched.
+	if opts.WindowRequested || opts.SeekSeconds > 0 || opts.DurationSeconds > 0 {
+		return
+	}
+	// A committed full-track artifact is cheap to serve whole, so do not slice
+	// it. (A pinned artifact resolves as committed here, so the drift-probe
+	// skip path also serves whole.)
+	if h.hasCommittedTextSubtitleEntry(opts) {
+		return
+	}
+
+	opts.WindowRequested = true
+	opts.SeekSeconds = implicitVirtualTextWindowStart(session)
+	opts.DurationSeconds = virtualSubtitleImplicitWindowSeconds
+	slog.Info("virtual text subtitle served as an implicit window",
+		"component", "api",
+		"seek_seconds", opts.SeekSeconds,
+		"duration_seconds", opts.DurationSeconds,
+		"track", opts.TrackIndex)
+}
+
+// implicitVirtualTextWindowStart returns the source-time start of the implicit
+// window: the session position pulled back slightly, or zero when the session
+// has no meaningful position yet (a fresh start, so the window covers the
+// opening of the track).
+func implicitVirtualTextWindowStart(session *playback.Session) float64 {
+	if session == nil || session.Position <= virtualSubtitleImplicitWindowBackoffSeconds {
+		return 0
+	}
+	return session.Position - virtualSubtitleImplicitWindowBackoffSeconds
 }
 
 // verifyVirtualSubtitleLayout probes the live relay input once and, when its
