@@ -294,6 +294,31 @@ func (o StreamExtractOpts) windowable() bool {
 		(!IsASS(o.SourceCodec) || windowRequested)
 }
 
+// ClampOpenEndedWindow bounds an explicitly-started window that carries no
+// duration so it cannot extract to end-of-file. A request that supplies a
+// position but no duration is authoritative window intent (position=0 included,
+// see WindowRequested), but ffmpeg would otherwise emit `-ss <position>` with
+// no `-to`, demuxing the rest of the container — the unbounded whole-container
+// extract the implicit window exists to prevent. maxDuration fills in the same
+// implicit window a whole-track request gets.
+//
+// It is a no-op for a whole-track request (no position intent), an explicit
+// position+duration, a codec that cannot window at all (PGS without
+// AllowWindow), and a non-positive cap. Returns true when it set a duration.
+func (o *StreamExtractOpts) ClampOpenEndedWindow(maxDuration float64) bool {
+	if o == nil || maxDuration <= 0 || o.DurationSeconds > 0 {
+		return false
+	}
+	if !(o.WindowRequested || o.SeekSeconds > 0) {
+		return false
+	}
+	if !o.windowable() {
+		return false
+	}
+	o.DurationSeconds = maxDuration
+	return true
+}
+
 // windowSeekApplied reports whether the extract both has a window intent and a
 // codec/muxer that supports slicing, i.e. whether streamExtractArgs emits
 // `-ss`/`-copyts` and therefore returns only a bounded slice of the track. A

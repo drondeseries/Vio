@@ -12,15 +12,16 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
-// writeDecodeRejectingFFmpeg writes a fake ffmpeg that emits repeated decoder
-// failure lines from the first frame and then idles, so a real TranscodeSession
-// records the source rejection without producing any media.
+// writeDecodeRejectingFFmpeg writes a fake ffmpeg that emits repeated
+// invalid-bitstream decoder failure lines from the first frame and then idles,
+// so a real TranscodeSession records the source rejection without producing any
+// media.
 func writeDecodeRejectingFFmpeg(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fake-ffmpeg-decode-reject.sh")
 	script := "#!/bin/sh\n" +
 		"i=0\n" +
-		"while [ $i -lt 12 ]; do echo \"[hevc @ 0x1] Could not find ref with POC $i\" >&2; i=$((i+1)); done\n" +
+		"while [ $i -lt 12 ]; do echo \"[hevc @ 0x1] Error submitting packet to decoder: Invalid data found when processing input\" >&2; i=$((i+1)); done\n" +
 		"sleep 30\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)

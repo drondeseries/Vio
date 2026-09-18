@@ -5801,8 +5801,8 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "internal_error", message: "The live session manager does not support atomic replacement."}
 	}
 	// Reactive software-decode recovery. A hardware decoder can reject a source
-	// the planner believed it could decode (POC/reference-picture failures from
-	// the first frame). The planner has no way to express a software-decode
+	// the planner believed it could decode (invalid-bitstream failures from the
+	// first frame). The planner has no way to express a software-decode
 	// retry, so when the live transcode session reports the decoder gave up,
 	// force the next server-transcode plan onto the software decode path. This
 	// stays client-driven: the retry happens inside the existing

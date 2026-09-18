@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -144,7 +145,25 @@ const (
 	maxMonitorStateBytes = 32 << 20
 	maxMonitoredEpisodes = 10000
 	maxMonitorKeyBytes   = 512
+	// monitorPerItemTimeout bounds a single item's evaluate/register work (and
+	// a single source reconciliation) so one hung provider or poison item
+	// cannot consume the whole pass budget. It is set above the 20s metadata
+	// client timeout so an ordinary multi-call series evaluation still fits,
+	// while remaining below the ~2 minute pass deadline so a hung provider
+	// always leaves budget for later items. A per-item timeout is a deferral,
+	// not a pass failure: the item is retried on a later pass.
+	monitorPerItemTimeout = 45 * time.Second
 )
+
+// monitorState is the on-disk monitor queue. Older releases wrote a bare JSON
+// array of items; loadMonitorConfig still accepts that legacy shape (with an
+// empty cursor), while saves always write the object below. cursor is the key
+// of the last item whose evaluation completed in the previous partial pass;
+// it is cleared after a pass that reaches the end of the sorted queue.
+type monitorState struct {
+	Cursor string           `json:"cursor,omitempty"`
+	Items  []monitoredMedia `json:"items"`
+}
 
 type Config struct {
 	TMDBAPIKey        string
@@ -176,6 +195,16 @@ type mediaMonitor struct {
 	altmount     *altmountStateClient
 	registered   map[string]struct{}
 	releaseStore *release.ReleaseStore
+	// cursor is the key of the last item whose evaluation completed in a
+	// partial pass. It is persisted with the queue so the next pass resumes
+	// instead of restarting from the front.
+	cursor string
+	// itemTimeout bounds evaluate/register and per-source reconciliation.
+	// Zero disables the extra bound (caller deadline only).
+	itemTimeout time.Duration
+	// evaluateFn is the per-item evaluation step; tests replace it to make
+	// pass budgeting deterministic without provider network calls.
+	evaluateFn func(context.Context, monitoredMedia) (monitoredMedia, string, error)
 }
 
 type virtualMediaLister interface {
@@ -287,22 +316,47 @@ func newMediaMonitor(resolver streamResolver, logger *slog.Logger) *mediaMonitor
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &mediaMonitor{
-		resolver:   resolver,
-		logger:     logger,
-		config:     Config{File: ".vio-virtual-library-monitored.json", ProwlarrIndexFile: ".vio-virtual-library-prowlarr-index.json"},
-		items:      map[string]monitoredMedia{},
-		prowlarr:   nil,
-		registered: map[string]struct{}{},
+	m := &mediaMonitor{
+		resolver:    resolver,
+		logger:      logger,
+		config:      Config{File: ".vio-virtual-library-monitored.json", ProwlarrIndexFile: ".vio-virtual-library-prowlarr-index.json"},
+		items:       map[string]monitoredMedia{},
+		prowlarr:    nil,
+		registered:  map[string]struct{}{},
+		itemTimeout: monitorPerItemTimeout,
 	}
+	m.evaluateFn = m.evaluate
+	return m
 }
+
 func (m *mediaMonitor) Configure(c Config) error {
-	configured, loaded, err := loadMonitorConfig(c)
+	configured, loaded, cursor, err := loadMonitorConfig(c)
 	if err != nil {
 		return err
 	}
 	m.applyConfiguration(configured, loaded, nil, false)
+	m.mu.Lock()
+	m.cursor = cursor
+	m.mu.Unlock()
 	return nil
+}
+
+// currentCursor returns the persisted resume position, empty when the next
+// pass should start from the front.
+func (m *mediaMonitor) currentCursor() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cursor
+}
+
+// setCursor persists the resume position. A failure is best-effort: the queue
+// items are unchanged, so the worst case is a restart from the previous
+// cursor, never data loss.
+func (m *mediaMonitor) setCursor(cursor string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cursor = cursor
+	return m.saveLocked()
 }
 
 func (m *mediaMonitor) reconcileLibraryIDs() []int {
@@ -311,7 +365,7 @@ func (m *mediaMonitor) reconcileLibraryIDs() []int {
 	return append([]int(nil), m.config.LibraryIDs...)
 }
 
-func loadMonitorConfig(c Config) (Config, map[string]monitoredMedia, error) {
+func loadMonitorConfig(c Config) (Config, map[string]monitoredMedia, string, error) {
 	if c.File == "" {
 		c.File = ".vio-virtual-library-monitored.json"
 	}
@@ -345,40 +399,52 @@ func loadMonitorConfig(c Config) (Config, map[string]monitoredMedia, error) {
 		}
 	}
 	loaded := make(map[string]monitoredMedia)
+	cursor := ""
 	file, err := os.Open(c.File)
 	if err == nil {
 		defer file.Close()
 		data, readErr := io.ReadAll(io.LimitReader(file, maxMonitorStateBytes+1))
 		if readErr != nil {
-			return Config{}, nil, fmt.Errorf("read monitored queue: %w", readErr)
+			return Config{}, nil, "", fmt.Errorf("read monitored queue: %w", readErr)
 		}
 		if len(data) > maxMonitorStateBytes {
-			return Config{}, nil, fmt.Errorf("monitored queue exceeds %d bytes", maxMonitorStateBytes)
+			return Config{}, nil, "", fmt.Errorf("monitored queue exceeds %d bytes", maxMonitorStateBytes)
 		}
 		var items []monitoredMedia
-		if err := json.Unmarshal(data, &items); err != nil {
-			return Config{}, nil, fmt.Errorf("decode monitored queue: %w", err)
+		if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '[' {
+			// Legacy shape: a bare array of items, written before the cursor
+			// existed. It simply has no resume position.
+			if err := json.Unmarshal(data, &items); err != nil {
+				return Config{}, nil, "", fmt.Errorf("decode monitored queue: %w", err)
+			}
+		} else {
+			var state monitorState
+			if err := json.Unmarshal(data, &state); err != nil {
+				return Config{}, nil, "", fmt.Errorf("decode monitored queue: %w", err)
+			}
+			items = state.Items
+			cursor = state.Cursor
 		}
 		if len(items) > maxMonitoredItems {
-			return Config{}, nil, fmt.Errorf("monitored queue exceeds %d items", maxMonitoredItems)
+			return Config{}, nil, "", fmt.Errorf("monitored queue exceeds %d items", maxMonitoredItems)
 		}
 		duplicateKeys := make(map[string]struct{}, len(items))
 		for _, item := range items {
 			if _, exists := duplicateKeys[item.Key]; exists {
-				return Config{}, nil, fmt.Errorf("monitored queue contains duplicate key %q", item.Key)
+				return Config{}, nil, "", fmt.Errorf("monitored queue contains duplicate key %q", item.Key)
 			}
 			duplicateKeys[item.Key] = struct{}{}
 		}
 		for _, item := range items {
 			if err := validateMonitoredMedia(item); err != nil {
-				return Config{}, nil, fmt.Errorf("invalid monitored queue item: %w", err)
+				return Config{}, nil, "", fmt.Errorf("invalid monitored queue item: %w", err)
 			}
 			loaded[item.Key] = item
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return Config{}, nil, fmt.Errorf("open monitored queue: %w", err)
+		return Config{}, nil, "", fmt.Errorf("open monitored queue: %w", err)
 	}
-	return c, loaded, nil
+	return c, loaded, cursor, nil
 }
 
 func (m *mediaMonitor) applyConfiguration(c Config, items map[string]monitoredMedia, registrar virtualMediaRegistrar, replaceRegistrar bool) {
@@ -480,7 +546,7 @@ func (m *mediaMonitor) saveLocked() error {
 		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Key < items[j].Key })
-	data, err := json.MarshalIndent(items, "", "  ")
+	data, err := json.MarshalIndent(monitorState{Cursor: m.cursor, Items: items}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -1062,6 +1128,11 @@ func (s *Monitor) Run(ctx context.Context, req *RunScheduledTaskRequest) (*RunSc
 	for _, item := range itemsByKey {
 		items = append(items, item)
 	}
+	// Deterministic order is what makes the persisted cursor meaningful: the
+	// same key set always sorts the same way, so a pass resumes exactly where
+	// the previous one stopped instead of at a random map position.
+	sort.Slice(items, func(i, j int) bool { return items[i].Key < items[j].Key })
+
 	s.monitor.mu.Lock()
 	client := s.monitor.prowlarr
 	altmount := s.monitor.altmount
@@ -1076,21 +1147,66 @@ func (s *Monitor) Run(ctx context.Context, req *RunScheduledTaskRequest) (*RunSc
 			s.monitor.logger.Warn("refresh AltMount state", "error", err)
 		}
 	}
-	ready, pending := 0, 0
+	return s.monitor.runPass(ctx, items, registrar)
+}
+
+// itemOutcome classifies the bounded work done for one queue item.
+type itemOutcome int
+
+const (
+	// itemReady: evaluated and registered (or already registered).
+	itemReady itemOutcome = iota
+	// itemPending: evaluated successfully but not ready yet, or queued for
+	// more metadata; the updated item is persisted.
+	itemPending
+	// itemDeferred: the per-item bound (or an unattributable context error)
+	// fired while the pass still had budget. The item is skipped for this
+	// pass and its source is barred from reconciliation.
+	itemDeferred
+	// itemFailed: a non-context evaluation/registration error. The item is
+	// skipped for this pass.
+	itemFailed
+	// itemBudgetExhausted: the pass deadline fired; stop the whole pass.
+	itemBudgetExhausted
+)
+
+// runPass performs one bounded monitoring pass over a deterministic snapshot.
+//
+// Resumability: items are sorted by key and the pass starts at the first key
+// after the persisted cursor, wrapping to the front. When the pass stops early
+// the cursor is advanced to the last item whose evaluation completed, so the
+// next pass continues from there; a complete pass clears the cursor so the
+// normal refresh cycle restarts from the front. Every item is attempted at
+// most once per pass and the cursor only ever moves forward through the sorted
+// keys, so later items are never starved and a poison item cannot trap the pass
+// in a loop.
+//
+// Budget: the item loop honors the caller's deadline. A per-item timeout bounds
+// evaluate/register so one hung provider cannot consume the whole budget; a
+// per-item timeout is a deferral, never a pass failure. Exhausting the pass
+// deadline is normal operation: the pass records progress and returns a
+// successful response with the remainder left for the next pass.
+func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, registrar virtualMediaRegistrar) (*RunScheduledTaskResponse, error) {
+	sourceTotals := make(map[string]int, len(items))
+	for _, item := range items {
+		sourceTotals[monitorItemSource(item)]++
+	}
 	keepBySource := make(map[string][]string)
 	reconcileSafeBySource := make(map[string]bool)
-	for _, item := range items {
+	sourceProgress := make(map[string]int)
+
+	start := m.passStartIndex(items)
+	advance := ""
+	processed, ready, pending, deferred := 0, 0, 0, 0
+	budgetExhausted := false
+	n := len(items)
+	for i := 0; i < n; i++ {
 		if ctx.Err() != nil {
-			// Host deadline (2 minutes for scheduled tasks) hit mid-pass:
-			// stop evaluating and report what was completed so the run
-			// degrades gracefully instead of dying inside a fetch.
-			s.monitor.logger.Warn("monitor run stopped by context deadline", "completed", ready+pending, "total", len(items))
+			budgetExhausted = true
 			break
 		}
-		source := item.SourceKey
-		if source == "" {
-			source = "monitor"
-		}
+		item := items[(start+i)%n]
+		source := monitorItemSource(item)
 		if _, exists := keepBySource[source]; !exists {
 			keepBySource[source] = nil
 			reconcileSafeBySource[source] = true
@@ -1101,71 +1217,214 @@ func (s *Monitor) Run(ctx context.Context, req *RunScheduledTaskRequest) (*RunSc
 		if contentID := virtualContentID(item); contentID != "" {
 			keepBySource[source] = appendUniqueString(keepBySource[source], contentID)
 		}
-		updated, _, evaluationErr := s.monitor.evaluate(ctx, item)
-		if evaluationErr != nil {
+		sourceProgress[source]++
+
+		updated, _, outcome := m.processItem(ctx, item)
+		switch outcome {
+		case itemBudgetExhausted:
+			// Do not advance the cursor past an item that never finished; the
+			// next pass retries it first.
+			budgetExhausted = true
+		case itemDeferred:
+			pending++
+			deferred++
+			reconcileSafeBySource[source] = false
+			advance = item.Key
+		case itemFailed:
 			pending++
 			reconcileSafeBySource[source] = false
-			if ctx.Err() != nil || errors.Is(evaluationErr, context.Canceled) || errors.Is(evaluationErr, context.DeadlineExceeded) || strings.Contains(evaluationErr.Error(), "context canceled") || strings.Contains(evaluationErr.Error(), "deadline exceeded") {
-				s.monitor.logger.Warn("monitor run stopped by context deadline", "completed", ready+pending, "total", len(items))
-				break
-			}
-			s.monitor.logger.Warn("evaluate virtual media", "key", item.Key, "error", evaluationErr)
-			continue
-		}
-		if updated.Ready && (strings.TrimSpace(updated.Title) == "" || (updated.MediaType == "series" && len(updated.Episodes) == 0)) {
-			updated.Ready = false
-			pending++
-			if err := s.monitor.remember(updated); err != nil {
+			advance = item.Key
+		case itemReady:
+			advance = item.Key
+			if err := m.remember(updated); err != nil {
 				return nil, err
 			}
-			continue
-		}
-		if updated.Ready {
-			if updated.MediaType == "movie" && s.monitor.isRegistered(updated.Key) {
-				pending++
-				continue
+			ready++
+		case itemPending:
+			advance = item.Key
+			if err := m.remember(updated); err != nil {
+				return nil, err
 			}
-			if err := s.monitor.register(ctx, updated); err != nil {
-				pending++
-				reconcileSafeBySource[source] = false
-				if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context canceled") || strings.Contains(err.Error(), "deadline exceeded") {
-					s.monitor.logger.Warn("monitor run stopped by context deadline", "completed", ready+pending, "total", len(items))
+			pending++
+		}
+		// Evaluation can enrich the item with a content identity it did not
+		// have before (for example resolving an IMDb ID from TMDB); add the
+		// post-evaluation identity to the keep set as the original pass did.
+		if contentID := virtualContentID(updated); contentID != "" {
+			keepBySource[source] = appendUniqueString(keepBySource[source], contentID)
+		}
+		if budgetExhausted {
+			break
+		}
+		processed++
+	}
+
+	// Persist the resume position. A failed save is not fatal: the queue is
+	// untouched, so the next pass merely redoes work from the previous cursor.
+	if budgetExhausted {
+		if advance != "" {
+			if err := m.setCursor(advance); err != nil {
+				m.logger.Warn("persist virtual library monitor cursor", "error", err)
+			}
+		}
+	} else if processed > 0 {
+		if err := m.setCursor(""); err != nil {
+			m.logger.Warn("persist virtual library monitor cursor", "error", err)
+		}
+	}
+	if budgetExhausted {
+		// Deadline exhaustion is normal operation, not a failed pass: the
+		// cursor decides where the next pass resumes.
+		m.logger.Info("virtual library monitor pass reached its deadline",
+			"processed", processed, "total", n, "resume_after", advance)
+	}
+
+	if !budgetExhausted && ctx.Err() == nil {
+		if reconciler, ok := registrar.(mediaReconciler); ok {
+			libraryIDs := m.reconcileLibraryIDs()
+			for _, source := range sortedSourceKeys(keepBySource) {
+				if ctx.Err() != nil {
 					break
 				}
-				s.monitor.logger.Error("register virtual media", "key", updated.Key, "error", err)
-				continue
-			}
-			s.monitor.markRegistered(updated.Key)
-			ready++
-			source := updated.SourceKey
-			if source == "" {
-				source = "monitor"
-			}
-			if contentID := virtualContentID(updated); contentID != "" {
-				keepBySource[source] = appendUniqueString(keepBySource[source], contentID)
-			}
-			if err := s.monitor.remember(updated); err != nil {
-				return nil, err
-			}
-		} else {
-			pending++
-			if err := s.monitor.remember(updated); err != nil {
-				return nil, err
-			}
-		}
-	}
-	if reconciler, ok := registrar.(mediaReconciler); ok {
-		libraryIDs := s.monitor.reconcileLibraryIDs()
-		for source, keep := range keepBySource {
-			if !reconcileSafeBySource[source] {
-				continue
-			}
-			if err := reconciler.Reconcile(ctx, source, keep, libraryIDs); err != nil {
-				return nil, fmt.Errorf("reconcile virtual source %q: %w", source, err)
+				if !reconcileSafeBySource[source] {
+					continue
+				}
+				// Reconcile a source only when every item that belongs to it
+				// was evaluated this pass. A partial keep set could look like
+				// a withdrawal and delete still-live media.
+				if sourceProgress[source] != sourceTotals[source] {
+					continue
+				}
+				if err := m.reconcileSource(ctx, reconciler, source, keepBySource[source], libraryIDs); err != nil {
+					// One bad source must not fail the pass; it is retried
+					// next pass. Context errors are the expected bounded-pass
+					// outcome and are logged quietly.
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+						m.logger.Debug("reconcile virtual source deferred", "source", source, "error", err)
+					} else {
+						m.logger.Warn("reconcile virtual source", "source", source, "error", err)
+					}
+					continue
+				}
 			}
 		}
 	}
-	return &RunScheduledTaskResponse{Output: map[string]any{"media_checked": len(items), "ready": ready, "pending": pending}}, nil
+
+	output := map[string]any{
+		"media_checked":    len(items),
+		"processed":        processed,
+		"remaining":        n - processed,
+		"ready":            ready,
+		"pending":          pending,
+		"budget_exhausted": budgetExhausted,
+		"cursor":           m.currentCursor(),
+	}
+	if deferred > 0 {
+		output["deferred"] = deferred
+	}
+	return &RunScheduledTaskResponse{Output: output}, nil
+}
+
+// passStartIndex returns the index in the sorted snapshot where the pass
+// resumes, wrapping to the front once the cursor is at or past the last key.
+func (m *mediaMonitor) passStartIndex(items []monitoredMedia) int {
+	cursor := m.currentCursor()
+	if cursor == "" || len(items) == 0 {
+		return 0
+	}
+	i := sort.Search(len(items), func(i int) bool { return items[i].Key > cursor })
+	if i >= len(items) {
+		return 0
+	}
+	return i
+}
+
+// processItem runs bounded evaluate/register work for a single queue item and
+// classifies the result. The pass deadline wins over the per-item bound so an
+// expired pass stops cleanly; a per-item timeout (or an unattributable context
+// error) is a deferral, and any other error is a per-item failure.
+func (m *mediaMonitor) processItem(ctx context.Context, item monitoredMedia) (monitoredMedia, string, itemOutcome) {
+	itemCtx := ctx
+	if m.itemTimeout > 0 {
+		var cancel context.CancelFunc
+		itemCtx, cancel = context.WithTimeout(ctx, m.itemTimeout)
+		defer cancel()
+	}
+	evaluate := m.evaluateFn
+	if evaluate == nil {
+		evaluate = m.evaluate
+	}
+	updated, message, evaluationErr := evaluate(itemCtx, item)
+	if evaluationErr != nil {
+		switch {
+		case ctx.Err() != nil:
+			return item, "", itemBudgetExhausted
+		case itemCtx.Err() != nil, errors.Is(evaluationErr, context.Canceled), errors.Is(evaluationErr, context.DeadlineExceeded):
+			m.logger.Debug("defer virtual media item; per-item budget elapsed", "key", item.Key)
+			return item, "", itemDeferred
+		default:
+			m.logger.Warn("evaluate virtual media", "key", item.Key, "error", evaluationErr)
+			return item, "", itemFailed
+		}
+	}
+	if updated.Ready && (strings.TrimSpace(updated.Title) == "" || (updated.MediaType == "series" && len(updated.Episodes) == 0)) {
+		updated.Ready = false
+		return updated, message, itemPending
+	}
+	if updated.Ready {
+		if updated.MediaType == "movie" && m.isRegistered(updated.Key) {
+			return updated, message, itemPending
+		}
+		if err := m.register(itemCtx, updated); err != nil {
+			switch {
+			case ctx.Err() != nil:
+				return item, "", itemBudgetExhausted
+			case itemCtx.Err() != nil:
+				m.logger.Debug("defer virtual media registration; per-item budget elapsed", "key", updated.Key)
+				return updated, "", itemDeferred
+			default:
+				m.logger.Error("register virtual media", "key", updated.Key, "error", err)
+				return updated, "", itemFailed
+			}
+		}
+		m.markRegistered(updated.Key)
+		if updated.MediaType == "series" {
+			m.rememberSeriesEpisodes(updated.Key, updated.Episodes)
+		}
+		return updated, message, itemReady
+	}
+	return updated, message, itemPending
+}
+
+// reconcileSource bounds one source's reconciliation by the per-item timeout so
+// a single slow sweep cannot run past the pass budget.
+func (m *mediaMonitor) reconcileSource(ctx context.Context, reconciler mediaReconciler, source string, keepIDs []string, libraryIDs []int) error {
+	recCtx := ctx
+	if m.itemTimeout > 0 {
+		var cancel context.CancelFunc
+		recCtx, cancel = context.WithTimeout(ctx, m.itemTimeout)
+		defer cancel()
+	}
+	return reconciler.Reconcile(recCtx, source, keepIDs, libraryIDs)
+}
+
+// monitorItemSource names a queue item's source key, defaulting to the shared
+// "monitor" bucket when it carries none.
+func monitorItemSource(item monitoredMedia) string {
+	if item.SourceKey != "" {
+		return item.SourceKey
+	}
+	return "monitor"
+}
+
+// sortedSourceKeys returns map keys in deterministic order.
+func sortedSourceKeys(m map[string][]string) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (m *mediaMonitor) fetchCinemeta(ctx context.Context, item monitoredMedia) (monitoredMedia, error) {

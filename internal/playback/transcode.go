@@ -369,11 +369,16 @@ const (
 	demuxErrorDecay     = 60 * time.Second
 )
 
-// Decoder failure classification. A hardware decoder that cannot construct a
-// reference picture set emits a fatal line for every frame from the first one,
-// so a source it rejects crosses decodeErrorThreshold within milliseconds
-// while an isolated warning never approaches it. The window decays so failures
-// separated by a long healthy stretch do not accumulate into a false stamp.
+// Decoder failure classification. Only invalid-bitstream decoder lines count
+// (see decodeErrorLine): a source the decoder truly cannot read emits them for
+// every frame from the first one, so it crosses decodeErrorThreshold within
+// milliseconds while an isolated warning never approaches it. Reference-list
+// warnings ("Could not find ref with POC" / "Error constructing the frame RPS")
+// are not counted: a decoder priming its reference lists on a Dolby Vision
+// profile 8 stream emits a bounded burst of them and then produces valid
+// segments (verified live), so counting them declared playable sources
+// rejected. The window decays so failures separated by a long healthy stretch
+// do not accumulate into a false stamp.
 const (
 	decodeErrorThreshold = 10
 	decodeErrorDecay     = 60 * time.Second
@@ -4037,14 +4042,27 @@ func demuxInputErrorLine(line string) bool {
 }
 
 // decodeErrorLine reports whether an FFmpeg stderr line is a decoder rejecting
-// the source bitstream. Only decoder failures count; encoder, muxer, output,
-// HLS, and network chatter ([h264_qsv], Error writing, Broken pipe, HTTP error,
-// reconnecting) never match, mirroring demuxInputErrorLine's discipline.
+// the source bitstream. Only failures that mean the bitstream itself is invalid
+// count; encoder, muxer, output, HLS, and network chatter ([h264_qsv], Error
+// writing, Broken pipe, HTTP error, reconnecting) never match, mirroring
+// demuxInputErrorLine's discipline.
+//
+// Reference-list warnings are deliberately excluded. "Could not find ref with
+// POC" / "Error constructing the frame RPS" are emitted by the HEVC decoder as
+// a bounded opening burst while it primes its reference lists on a Dolby Vision
+// profile 8 stream, and the decoder keeps producing valid, muxable frames
+// afterwards: live sessions with 50-170 of those lines produced 17 to 1600
+// decodable segments while the session was wrongly stamped as source-rejected.
+// Counting them fatalised playable content. The lines that do mean the bytes
+// are undecodable (a bad NAL split, an invalid NAL size, or the decoder
+// refusing a packet) are matched instead.
 func decodeErrorLine(line string) bool {
 	switch {
-	case strings.Contains(line, "Could not find ref with POC"):
+	case strings.Contains(line, "Error submitting packet to decoder"):
 		return true
-	case strings.Contains(line, "Error constructing the frame RPS"):
+	case strings.Contains(line, "Invalid NAL unit size"):
+		return true
+	case strings.Contains(line, "Error splitting the input into NAL units"):
 		return true
 	case strings.Contains(line, "Failed to decode"):
 		return true

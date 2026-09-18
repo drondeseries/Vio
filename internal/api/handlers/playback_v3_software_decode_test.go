@@ -19,15 +19,17 @@ import (
 )
 
 // writePlaybackTestFFmpegDecodeFailure writes a fake ffmpeg that emits the
-// hardware decoder's fatal HEVC lines to stderr from the first frame and then
-// produces a ready manifest, so the real TranscodeSession observes the decode
-// failure while the local HLS transport starts normally.
+// decoder's invalid-bitstream failure lines to stderr from the first frame and
+// then produces a ready manifest, so the real TranscodeSession observes the
+// decode failure while the local HLS transport starts normally. Reference-list
+// warnings would not do: a bounded burst of those is tolerated and the decoder
+// keeps producing segments.
 func writePlaybackTestFFmpegDecodeFailure(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fake-ffmpeg-decode-failure.sh")
 	script := "#!/bin/sh\n" +
 		"i=0\n" +
-		"while [ $i -lt 20 ]; do echo \"[hevc @ 0x1] Could not find ref with POC $i\" >&2; i=$((i+1)); done\n" +
+		"while [ $i -lt 20 ]; do echo \"[hevc @ 0x1] Error submitting packet to decoder: Invalid data found when processing input\" >&2; i=$((i+1)); done\n" +
 		"last=\"\"\n" +
 		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
 		"case \"$last\" in\n" +

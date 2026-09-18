@@ -865,6 +865,89 @@ func TestVirtualSmallKnownSourceWholeTrackFetchStaysUnwindowed(t *testing.T) {
 	}
 }
 
+// A virtual position without a duration is window intent but open-ended. On a
+// large/unknown source the server must supply the implicit window duration so
+// the extract cannot run to EOF, and must advertise the resulting bounded range
+// rather than `0.000-*`.
+func TestVirtualPositionWithoutDurationClampsToImplicitWindow(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=0", nil)
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+		t.Fatalf("position-only fetch = %d %q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-600.000" {
+		t.Fatalf("position-only coverage header = %q, want 0.000-600.000", got)
+	}
+	if got := rec.Header().Get(playback.SubtitleWindowedHeader); got != "true" {
+		t.Fatalf("position-only windowed marker = %q, want true", got)
+	}
+	// The advertised range must match the ffmpeg command: the open `-ss 0`
+	// without a `-to` was the unbounded extract this finding is about.
+	windowLine := windowedFFmpegArgs(t, argsLog)
+	for _, want := range []string{"-ss 0.000", "-to 600.000"} {
+		if !strings.Contains(windowLine, want) {
+			t.Fatalf("position-only window args %q missing %q", windowLine, want)
+		}
+	}
+}
+
+// A small known virtual source keeps its existing open-ended behavior: reading
+// it whole is cheap, so the implicit-window clamp must not touch it.
+func TestVirtualSmallKnownSourcePositionOnlyStaysOpenEnded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "ffmpeg.args")
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+argsLog+"'\ncat <<'VTT'\n"+warmSubtitleVTT+"VTT\n")
+	file.FileSize = 10 << 20 // below the implicit-window threshold
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=0", nil)
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
+		t.Fatalf("small-source position-only fetch = %d %q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "0.000-*" {
+		t.Fatalf("small-source coverage header = %q, want open-ended 0.000-*", got)
+	}
+}
+
+// A subtitle error response that never committed a 200 must not carry the
+// bounded-window markers: a header-only classifier would otherwise read a
+// failure as a valid window.
+func TestSubtitleErrorResponseOmitsCoverageHeaders(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	dir := t.TempDir()
+	handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
+		"#!/bin/sh\necho 'intentional generic extract failure' >&2\nexit 1\n")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/subtitle?position=0", nil)
+	handler.streamEmbeddedSubtitle(rec, req, file, 0, session, false, "vtt")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("failing extract = %d %q, want 500", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(playback.SubtitleCoverageHeader); got != "" {
+		t.Fatalf("error response carried coverage header %q", got)
+	}
+	if got := rec.Header().Get(playback.SubtitleWindowedHeader); got != "" {
+		t.Fatalf("error response carried windowed marker %q", got)
+	}
+}
+
 // The implicit window start follows the session position (pulled back a little)
 // so a resumed fetch covers playback, and falls back to zero for a fresh start.
 func TestImplicitVirtualWindowStart(t *testing.T) {

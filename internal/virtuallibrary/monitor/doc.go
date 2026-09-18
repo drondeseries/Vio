@@ -13,28 +13,42 @@
 // goroutines, owns no ticker/cron/sleep, and performs no background work
 // (verified: no `go` statements, no time.Ticker/Sleep in this package;
 // Configure only loads the queue file). Each Run snapshots the item map
-// under mutex, iterates it exactly once, and returns {media_checked, ready,
-// pending}. There is no loop and no requeue timer; repetition is the
-// caller's job.
+// under mutex, sorts it by key, and iterates it once, starting at the key
+// after the persisted cursor and wrapping to the front. There is no loop
+// and no requeue timer; repetition is the caller's job.
+//
+// A pass is resumable rather than all-or-nothing. The cursor (the key of
+// the last item whose evaluation completed) is persisted in the queue file
+// and cleared only after a full pass, so a pass cut off by its deadline
+// records progress and the next pass continues from there. Exhausting the
+// deadline is normal operation: the pass logs at Info, returns a successful
+// response, and leaves the remainder for the next call. Because the cursor
+// only moves forward through the sorted keys and only wraps once per cycle,
+// a poison item is attempted at most once per cycle and cannot starve items
+// behind it.
 //
 // Cancellation is honored. Run checks ctx.Err() at the top of each item
-// iteration and breaks out gracefully after evaluate/register errors that
-// wrap context.Canceled/DeadlineExceeded. All outbound HTTP (Cinemeta,
-// TVMaze, TMDB, Prowlarr, AltMount) is built with NewRequestWithContext, the
-// metadata client has a 20s timeout, and TestConnection imposes its own 8s
-// deadline. Run itself sets no internal timeout: it relies on the caller's
-// deadline (the code assumes the ~2 minute scheduled-task host deadline).
-// A caller that invokes Run without a deadline invites an unbounded wall
-// clock when many items each sequentially fetch metadata.
+// iteration and stops cleanly when the pass deadline fires. Each item's
+// evaluate/register work (and each source reconciliation) additionally runs
+// under a per-item timeout (monitorPerItemTimeout), so one hung provider
+// cannot consume the whole budget; a per-item timeout is a deferral, not a
+// pass failure, and its source is barred from reconciliation that pass. All
+// outbound HTTP (Cinemeta, TVMaze, TMDB, Prowlarr, AltMount) is built with
+// NewRequestWithContext, the metadata client has a 20s timeout, and
+// TestConnection imposes its own 8s deadline. Run still relies on the
+// caller's deadline for the overall pass budget (the code assumes the ~2
+// minute scheduled-task host deadline); a caller that invokes Run without a
+// deadline invites an unbounded wall clock when many items each sequentially
+// fetch metadata.
 //
 // Retries are across invocations, not within a call. No retry loop or
 // backoff exists in Run, evaluate, the metadata fetchers, or
 // RefreshIfStale: a per-item failure (evaluate error, register error,
 // stale-refresh error) is logged, counted as pending, and left queued for
-// the next Run. A failed item therefore retries exactly once per future Run
-// (O(items) work per tick), and a persistently failing provider makes every
-// tick pay the full metadata cost. Stale Prowlarr/AltMount refresh failures
-// are warn-and-continue, never fatal.
+// a later Run. An item's source is reconciled only after every item in it
+// was evaluated successfully this pass, so a persistently failing provider
+// never turns an incomplete keep set into destructive reconciliation. Stale
+// Prowlarr/AltMount refresh failures are warn-and-continue, never fatal.
 //
 // Duplicate submissions converge by key but with gaps. Queue keys are
 // deterministic (type:streamID), load rejects duplicate keys, and remember()

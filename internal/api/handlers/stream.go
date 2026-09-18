@@ -477,7 +477,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			proxy.ServeHTTP(streamWriter, r)
 			if lastProxyErr != nil {
-				if streamWriter.StatusCode() == 0 && (h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil) {
+				// A client that navigated away is not a candidate failure:
+				// never stamp the pinned release known-bad or spend a failover
+				// resolve on it. The upstream request already aborted with the
+				// canceled request context.
+				if !isClientCancellation(r.Context(), lastProxyErr) && streamWriter.StatusCode() == 0 && (h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil) {
 					if releaseInput != nil {
 						releaseInput()
 						releaseInput = nil
@@ -587,8 +591,10 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// The remux only commits 200 after FFmpeg produces media bytes, so
 			// a failure here means the provider release served no output
 			// (corrupted NZB, dead URL). Mark the candidate failed and retry
-			// once with it excluded so the next-ranked release is tried.
-			if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
+			// once with it excluded so the next-ranked release is tried. A
+			// client that disconnected is not a candidate failure: the remux
+			// (and its provider fetch) already aborted on the request context.
+			if !isClientCancellation(r.Context(), remuxErr) && isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 				failedID := virtualResultCandidateID(deliveredPath)
 				if failedID != "" {
 					h.markVirtualCandidateFailed(r.Context(), file, failedID)
@@ -1354,6 +1360,22 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 	if ctx == nil || session == nil || err == nil {
 		return
 	}
+	// Client cancellation is not a transport failure: the viewer navigated off
+	// (or hls.js gave up) while the upstream fetch was in flight. The request
+	// context propagates into the virtual provider resolve / relay, so the
+	// upstream work is already canceled. Check this before preflight so a
+	// canceled request is never rewritten into a missing-file abort, and
+	// downgrade to debug; a timeout or provider error stays at WARN.
+	if isClientCancellation(ctx, err) {
+		slog.DebugContext(ctx, "stream transport canceled by client",
+			"component", "api",
+			"session", session.ID,
+			"file_id", session.MediaFileID,
+			"reason", "client_canceled",
+			"playback_session_id", session.ID,
+		)
+		return
+	}
 	if preflightErr := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); preflightErr != nil {
 		err = preflightErr
 	}
@@ -1597,6 +1619,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	if extractErr != nil {
 		playback.LogSubtitleStreamError(r.Context(), extractErr, file.ID, embeddedIndex)
 		if r.Context().Err() != nil {
+			clearSubtitleCoverageHeaders(w.Header())
 			return
 		}
 		// A successful HTTP EOF would make clients accept the partial track.
@@ -1604,6 +1627,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			panic(http.ErrAbortHandler)
 		}
 		if !virtualActive || !playback.IsSubtitleStreamMapError(extractErr) {
+			clearSubtitleCoverageHeaders(w.Header())
 			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
 			return
 		}
@@ -1632,6 +1656,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		if retryErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle); retryErr != nil {
 			playback.LogSubtitleStreamError(r.Context(), retryErr, file.ID, embeddedIndex)
 			if r.Context().Err() != nil {
+				clearSubtitleCoverageHeaders(w.Header())
 				return
 			}
 			if response.Status() != 0 {
@@ -1641,6 +1666,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				writeSubtitleSourceChanged(w)
 				return
 			}
+			clearSubtitleCoverageHeaders(w.Header())
 			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
 			return
 		}
@@ -1808,8 +1834,13 @@ const (
 //     cheap to read whole;
 //   - an already-committed full-track artifact: cheap to serve whole and the
 //     validated bytes a pinned text artifact promised;
-//   - an explicit client window (position/duration, or PGS ?windowed=1):
-//     authoritative, never overridden.
+//   - an explicit client window with a duration (position+duration, or PGS
+//     ?windowed=1 with a duration): authoritative, never overridden.
+//
+// A position without a duration is window intent but open-ended: its missing
+// cap is filled with the implicit window (the caller's position is kept) so it
+// cannot demux to EOF and advertise `start-*`. A codec that cannot window
+// (PGS without the ?windowed=1 opt-in) is left untouched.
 func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractOpts, file *models.MediaFile, session *playback.Session, virtualActive bool) {
 	if h == nil || opts == nil || !virtualActive {
 		return
@@ -1820,16 +1851,32 @@ func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractO
 	if file != nil && file.FileSize > 0 && file.FileSize < virtualSubtitleImplicitWindowMinSourceBytes {
 		return
 	}
-	// Any explicit window intent is authoritative, including position=0, a
-	// duration-only request, and the PGS ?windowed=1 opt-in (AllowWindow);
-	// leave it untouched.
-	if opts.WindowRequested || opts.SeekSeconds > 0 || opts.DurationSeconds > 0 || opts.AllowWindow {
+	// An explicit duration (with or without a position) is authoritative;
+	// leave it exactly as the client asked.
+	if opts.DurationSeconds > 0 {
 		return
 	}
 	// A committed full-track artifact is cheap to serve whole, so do not slice
 	// it. (A pinned text artifact resolves as committed here, so the
 	// drift-probe skip path also serves whole.)
 	if h.SubtitleCache.HasCommittedEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat) {
+		return
+	}
+	// A position without a duration is window intent but open-ended: fill in the
+	// implicit window so it cannot extract to EOF (advertised as `start-*`). The
+	// caller's position is kept; only the missing cap is supplied.
+	if opts.ClampOpenEndedWindow(virtualSubtitleImplicitWindowSeconds) {
+		slog.Info("virtual subtitle open window clamped to implicit window",
+			"component", "api",
+			"codec", opts.SourceCodec,
+			"seek_seconds", opts.SeekSeconds,
+			"duration_seconds", opts.DurationSeconds,
+			"track", opts.TrackIndex)
+		return
+	}
+	// Any other explicit intent is authoritative: a position-only codec that
+	// cannot window, or the PGS ?windowed=1 opt-in with no position/duration.
+	if opts.WindowRequested || opts.SeekSeconds > 0 || opts.AllowWindow {
 		return
 	}
 
@@ -1928,12 +1975,26 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 	return true, nil
 }
 
+// clearSubtitleCoverageHeaders removes the bounded-window markers before an
+// error response is written. SetSubtitleCoverageHeader records the window
+// before the serve so a successful response advertises its covered range, but
+// an error that never committed a 200 must not be readable as a bounded window
+// by a header-only classifier. Safe to call before the headers are set.
+func clearSubtitleCoverageHeaders(h http.Header) {
+	if h == nil {
+		return
+	}
+	h.Del(playback.SubtitleCoverageHeader)
+	h.Del(playback.SubtitleWindowedHeader)
+}
+
 // writeSubtitleSourceChanged answers a clean retryable 4xx when a virtual
 // release rotated so the requested subtitle representation can no longer be
 // produced from the live source. Clients already retry through the
 // sliding-window fetcher / replan flow, so the response is deliberately a
 // retryable 4xx, never a 500 or an ambiguous partial stream.
 func writeSubtitleSourceChanged(w http.ResponseWriter) {
+	clearSubtitleCoverageHeaders(w.Header())
 	writeError(w, http.StatusConflict, "subtitle_source_changed",
 		"The selected subtitle track changed on the media source; retry")
 }
@@ -1944,6 +2005,7 @@ func writeSubtitleSourceChanged(w http.ResponseWriter) {
 // post-spawn recovery, so the server fails closed rather than stream a
 // possibly-truncated track; the client can retry once the source settles.
 func writeSubtitleSourceUnavailable(w http.ResponseWriter) {
+	clearSubtitleCoverageHeaders(w.Header())
 	writeError(w, http.StatusServiceUnavailable, "subtitle_source_unavailable",
 		"Unable to verify the subtitle source; retry")
 }

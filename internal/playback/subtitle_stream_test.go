@@ -577,3 +577,95 @@ func TestWindowCoverageAndHeader(t *testing.T) {
 		})
 	}
 }
+
+// ClampOpenEndedWindow fills in a missing duration for an explicitly-started
+// window, so a position-without-duration request cannot extract to EOF, while
+// leaving every authoritative case untouched.
+func TestClampOpenEndedWindow(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    StreamExtractOpts
+		limit   float64
+		wantSet bool
+		wantDur float64
+	}{
+		{
+			name:    "text explicit zero position",
+			opts:    StreamExtractOpts{SourceCodec: "subrip", WindowRequested: true, SeekSeconds: 0},
+			limit:   600,
+			wantSet: true,
+			wantDur: 600,
+		},
+		{
+			name:    "text nonzero position",
+			opts:    StreamExtractOpts{SourceCodec: "subrip", SeekSeconds: 120},
+			limit:   600,
+			wantSet: true,
+			wantDur: 600,
+		},
+		{
+			name:    "ass windowed zero position",
+			opts:    StreamExtractOpts{SourceCodec: "ass", WindowRequested: true, SeekSeconds: 0},
+			limit:   600,
+			wantSet: true,
+			wantDur: 600,
+		},
+		{
+			name:    "pgs explicit window opt-in",
+			opts:    StreamExtractOpts{SourceCodec: "hdmv_pgs_subtitle", AllowWindow: true, WindowRequested: true, SeekSeconds: 0},
+			limit:   600,
+			wantSet: true,
+			wantDur: 600,
+		},
+		{
+			name:    "explicit duration authoritative",
+			opts:    StreamExtractOpts{SourceCodec: "subrip", WindowRequested: true, SeekSeconds: 0, DurationSeconds: 30},
+			limit:   600,
+			wantSet: false,
+			wantDur: 30,
+		},
+		{
+			name:    "whole-track request untouched",
+			opts:    StreamExtractOpts{SourceCodec: "subrip"},
+			limit:   600,
+			wantSet: false,
+			wantDur: 0,
+		},
+		{
+			name:    "pgs without opt-in cannot window",
+			opts:    StreamExtractOpts{SourceCodec: "hdmv_pgs_subtitle", WindowRequested: true, SeekSeconds: 0},
+			limit:   600,
+			wantSet: false,
+			wantDur: 0,
+		},
+		{
+			name:    "non-positive cap is a no-op",
+			opts:    StreamExtractOpts{SourceCodec: "subrip", WindowRequested: true, SeekSeconds: 0},
+			limit:   0,
+			wantSet: false,
+			wantDur: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := tc.opts
+			if got := opts.ClampOpenEndedWindow(tc.limit); got != tc.wantSet {
+				t.Fatalf("ClampOpenEndedWindow = %v, want %v", got, tc.wantSet)
+			}
+			if opts.DurationSeconds != tc.wantDur {
+				t.Fatalf("duration = %v, want %v", opts.DurationSeconds, tc.wantDur)
+			}
+			// A clamped window must advertise a bounded range and emit -to.
+			if tc.wantSet {
+				windowed, _, _, open := opts.WindowCoverage()
+				if !windowed || open {
+					t.Fatalf("clamped window coverage = windowed:%v open:%v, want bounded", windowed, open)
+				}
+				args := strings.Join(streamExtractArgs(opts), " ")
+				if !strings.Contains(args, "-to ") {
+					t.Fatalf("clamped window args lack -to: %s", args)
+				}
+			}
+		})
+	}
+}
