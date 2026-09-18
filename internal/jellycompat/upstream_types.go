@@ -54,6 +54,9 @@ type upstreamListItem struct {
 	Countries         []string                `json:"countries,omitempty"`
 	Tagline           string                  `json:"tagline,omitempty"`
 	RatingTMDB        *float64                `json:"rating_tmdb,omitempty"`
+	ImdbID            string                  `json:"imdb_id,omitempty"`
+	TmdbID            string                  `json:"tmdb_id,omitempty"`
+	TvdbID            string                  `json:"tvdb_id,omitempty"`
 	UserData          *catalog.SeasonUserData `json:"user_data,omitempty"`
 	// DurationSeconds is the probed duration of the backing media file, 0 when
 	// unknown. Read-time only -- never persisted onto the item row, because one
@@ -85,6 +88,9 @@ type upstreamItemDetail struct {
 	Genres            []string                `json:"genres"`
 	RatingIMDB        *float64                `json:"rating_imdb"`
 	RatingTMDB        *float64                `json:"rating_tmdb"`
+	ImdbID            string                  `json:"imdb_id,omitempty"`
+	TmdbID            string                  `json:"tmdb_id,omitempty"`
+	TvdbID            string                  `json:"tvdb_id,omitempty"`
 	PosterURL         string                  `json:"poster_url"`
 	BackdropURL       string                  `json:"backdrop_url"`
 	LogoURL           string                  `json:"logo_url"`
@@ -148,6 +154,9 @@ type upstreamEpisode struct {
 	StillURL       string                  `json:"still_url,omitempty"`
 	StillPath      string                  `json:"-"`
 	StillThumbhash string                  `json:"-"`
+	ImdbID         string                  `json:"imdb_id,omitempty"`
+	TmdbID         string                  `json:"tmdb_id,omitempty"`
+	TvdbID         string                  `json:"tvdb_id,omitempty"`
 	UpdatedAt      time.Time               `json:"-"`
 	UserData       *catalog.SeasonUserData `json:"user_data,omitempty"`
 	Files          []upstreamEpisodeFile   `json:"files,omitempty"`

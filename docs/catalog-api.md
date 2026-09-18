@@ -137,6 +137,23 @@ all, so it cannot be used to detect the personal-list kinds. When
 materialize virtual placeholder files for a collection item. The document supports
 `If-None-Match` and returns `304` when the caller's copy is current.
 
+## Library-scoped version lists
+
+`library_id` on `getCatalogItem`, `listCatalogItemVersions`, `listCatalogItemEpisodes`,
+`listSeriesSeasons`, `getSeriesSeason`, and `listSeasonEpisodes` names the library the
+viewer opened the item from. It always validates that the item is a member of that
+library and picks the library's metadata language as the presentation fallback. It
+does not, by default, change which files come back: an item stored in several
+libraries lists every version the viewer may access, so a "Movies" and "Movies 4K"
+split still shows both files from either library.
+
+The administrator setting `catalog.scope_versions_to_library` (default `false`)
+makes those reads answer only the versions stored in the named library. A read
+without `library_id` is unaffected, and so is `getWatchDetail`, watch-together
+selection, and the Jellyfin compatibility surface: an item always plays from its
+full accessible version list. No client change is needed: the setting only
+changes what an existing `library_id` request returns.
+
 ## Section quality badges
 
 Home and library section cards derive `overlay_summary` from the best accessible,

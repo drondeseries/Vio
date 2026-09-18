@@ -266,6 +266,9 @@ const FIREFOX_COMPATIBILITY_FALLBACK_DELAY_MS = 8_000;
 // arrives. The budget is small so a genuinely blocked autoplay settles into a
 // paused player with working controls instead of retrying forever.
 const AUTOPLAY_RETRY_DELAY_MS = 400;
+// Mouse clicks on the video surface wait this long for a second click
+// (fullscreen toggle) before toggling play/pause.
+const DOUBLE_CLICK_WINDOW_MS = 250;
 const MAX_AUTOPLAY_ATTEMPTS = 4;
 
 interface PlaybackNoticeState {
@@ -2260,6 +2263,9 @@ export function VideoPlayer({
   const isCoarsePointer = useCoarsePointer();
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const surfaceTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Inverse of the play/pause a fired single-click timer applied, so a
+  // browser-recognized second click (event.detail === 2) can undo it.
+  const singleClickRevertRef = useRef<"play" | "pause" | null>(null);
 
   const clearControlsTimer = useCallback(() => {
     if (hideTimerRef.current) {
@@ -2801,50 +2807,119 @@ export function VideoPlayer({
   ]);
 
   // -- Control callbacks --
-  const handlePlayPause = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    if (
-      watchTogetherRoomId &&
-      !watchTogether.closedReason &&
-      (watchTogether.connectionState !== "connected" || !watchTogether.room)
+  const setPlayback = useCallback(
+    (action: "play" | "pause" | "toggle") => {
+      const video = videoRef.current;
+      if (!video) return;
+      const shouldPlay = action === "toggle" ? video.paused : action === "play";
+      if (
+        watchTogetherRoomId &&
+        !watchTogether.closedReason &&
+        (watchTogether.connectionState !== "connected" || !watchTogether.room)
+      ) {
+        showWatchTogetherNotice(
+          "Reconnecting to room. Controls are temporarily unavailable.",
+          "warning",
+        );
+        return;
+      }
+      if (watchTogether.room && !watchTogether.room.self_can_control_transport) {
+        showWatchTogetherNotice("Only the host can control playback.", "warning");
+        return;
+      }
+      if (watchTogether.room && watchTogetherSync.attachedSessionId !== sessionId) {
+        showWatchTogetherNotice("Joining room playback. Try again in a moment.", "info");
+        return;
+      }
+
+      if (watchTogether.room) {
+        watchTogetherSync.requestTransport(
+          shouldPlay ? "play" : "pause",
+          currentTimeRef.current,
+          !shouldPlay,
+        );
+        return;
+      }
+
+      if (shouldPlay) {
+        video.play().catch(() => {});
+        return;
+      }
+
+      video.pause();
+    },
+    [sessionId, showWatchTogetherNotice, watchTogether, watchTogetherRoomId, watchTogetherSync],
+  );
+
+  // Zero-argument form for button and keyboard handlers, which pass the
+  // click event as the first argument.
+  const handlePlayPause = useCallback(() => setPlayback("toggle"), [setPlayback]);
+
+  const handleFullscreenToggle = useCallback(() => {
+    const video = videoRef.current as
+      | (HTMLVideoElement & {
+          webkitSupportsFullscreen?: boolean;
+          webkitDisplayingFullscreen?: boolean;
+          webkitEnterFullscreen?: () => void;
+          webkitExitFullscreen?: () => void;
+        })
+      | null;
+
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else if (video?.webkitDisplayingFullscreen) {
+      video.webkitExitFullscreen?.();
+    } else if (containerRef.current?.requestFullscreen) {
+      containerRef.current.requestFullscreen().catch(() => {
+        if (
+          video?.webkitSupportsFullscreen !== false &&
+          typeof video?.webkitEnterFullscreen === "function"
+        ) {
+          video.webkitEnterFullscreen();
+        }
+      });
+    } else if (
+      video?.webkitSupportsFullscreen !== false &&
+      typeof video?.webkitEnterFullscreen === "function"
     ) {
-      showWatchTogetherNotice(
-        "Reconnecting to room. Controls are temporarily unavailable.",
-        "warning",
-      );
-      return;
+      video.webkitEnterFullscreen();
     }
-    if (watchTogether.room && !watchTogether.room.self_can_control_transport) {
-      showWatchTogetherNotice("Only the host can control playback.", "warning");
-      return;
-    }
-    if (watchTogether.room && watchTogetherSync.attachedSessionId !== sessionId) {
-      showWatchTogetherNotice("Joining room playback. Try again in a moment.", "info");
-      return;
-    }
-
-    if (watchTogether.room) {
-      watchTogetherSync.requestTransport(
-        video.paused ? "play" : "pause",
-        currentTimeRef.current,
-        !video.paused,
-      );
-      return;
-    }
-
-    if (video.paused) {
-      video.play().catch(() => {});
-      return;
-    }
-
-    video.pause();
-  }, [sessionId, showWatchTogetherNotice, watchTogether, watchTogetherRoomId, watchTogetherSync]);
+  }, []);
 
   const handleSurfaceTap = useCallback(
     (event?: React.MouseEvent<HTMLElement>) => {
       if (!isCoarsePointer) {
-        handlePlayPause();
+        // Mouse: single click toggles play/pause, double click toggles
+        // fullscreen. The browser's click count (event.detail) is the only
+        // double-click signal, so the user's OS interval and positional
+        // tolerance apply. Play/pause is deferred for a short window so a
+        // fast double click doesn't pause and immediately resume before
+        // entering fullscreen; a slower double click undoes the play/pause
+        // that already fired by sending the explicit inverse action. Clicks
+        // beyond the second in one sequence are ignored.
+        const clickCount = event?.detail ?? 1;
+        if (clickCount >= 3) return;
+        if (clickCount === 2) {
+          if (surfaceTapTimerRef.current) {
+            clearTimeout(surfaceTapTimerRef.current);
+            surfaceTapTimerRef.current = null;
+          } else if (singleClickRevertRef.current) {
+            setPlayback(singleClickRevertRef.current);
+          }
+          singleClickRevertRef.current = null;
+          handleFullscreenToggle();
+          return;
+        }
+        // A second single click (different spot, so the browser did not
+        // count it as a double) restarts the window; one toggle results.
+        if (surfaceTapTimerRef.current) clearTimeout(surfaceTapTimerRef.current);
+        singleClickRevertRef.current = null;
+        surfaceTapTimerRef.current = setTimeout(() => {
+          surfaceTapTimerRef.current = null;
+          const willPlay = videoRef.current?.paused ?? false;
+          singleClickRevertRef.current = willPlay ? "pause" : "play";
+          setPlayback(willPlay ? "play" : "pause");
+        }, DOUBLE_CLICK_WINDOW_MS);
         return;
       }
       if (surfaceTapTimerRef.current) {
@@ -2881,10 +2956,12 @@ export function VideoPlayer({
       controlsVisible,
       currentTime,
       duration,
+      handleFullscreenToggle,
       handlePlayPause,
       handlePlayerSeek,
       isCoarsePointer,
       resetControlsTimer,
+      setPlayback,
     ],
   );
 
@@ -3005,37 +3082,6 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (!video) return;
     video.muted = m;
-  }, []);
-
-  const handleFullscreenToggle = useCallback(() => {
-    const video = videoRef.current as
-      | (HTMLVideoElement & {
-          webkitSupportsFullscreen?: boolean;
-          webkitDisplayingFullscreen?: boolean;
-          webkitEnterFullscreen?: () => void;
-          webkitExitFullscreen?: () => void;
-        })
-      | null;
-
-    if (document.fullscreenElement) {
-      document.exitFullscreen().catch(() => {});
-    } else if (video?.webkitDisplayingFullscreen) {
-      video.webkitExitFullscreen?.();
-    } else if (containerRef.current?.requestFullscreen) {
-      containerRef.current.requestFullscreen().catch(() => {
-        if (
-          video?.webkitSupportsFullscreen !== false &&
-          typeof video?.webkitEnterFullscreen === "function"
-        ) {
-          video.webkitEnterFullscreen();
-        }
-      });
-    } else if (
-      video?.webkitSupportsFullscreen !== false &&
-      typeof video?.webkitEnterFullscreen === "function"
-    ) {
-      video.webkitEnterFullscreen();
-    }
   }, []);
 
   // -- Keyboard shortcuts --
@@ -3642,7 +3688,7 @@ export function VideoPlayer({
           onVolumeChange={handleVolumeChange}
           onMutedChange={handleMutedChange}
           onFullscreenToggle={handleFullscreenToggle}
-          onSurfaceTap={isCoarsePointer ? handleSurfaceTap : undefined}
+          onSurfaceTap={handleSurfaceTap}
           showPlaybackInfo={showPlaybackInfo}
           onTogglePlaybackInfo={() => setShowPlaybackInfo((v) => !v)}
           hasPrevEpisode={!!prevEpisodeRef}

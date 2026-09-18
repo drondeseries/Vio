@@ -12,6 +12,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	catalogpkg "github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -566,6 +567,7 @@ func (reg *Registry) itemViewer(ctx context.Context, imageSize string, libraryID
 			return handlers.ItemViewer{}, p
 		}
 		opts.PresentationLibraryID = &n
+		opts.ScopeFilesToLibrary = reg.versionsScopedToLibrary(ctx)
 	}
 	if fileID != "" {
 		n, p := fileID.positive("query.file_id")
@@ -584,6 +586,20 @@ func (reg *Registry) itemViewer(ctx context.Context, imageSize string, libraryID
 	}
 	filter.ImageSize = size
 	return handlers.ItemViewer{Access: filter, ProfileID: profileID}, nil
+}
+
+// versionsScopedToLibrary reads catalog.scope_versions_to_library. A read
+// failure keeps the default (off) rather than failing the catalog read: the
+// setting only narrows a document, it never protects one.
+func (reg *Registry) versionsScopedToLibrary(ctx context.Context) bool {
+	if reg.deps.CatalogSettings == nil {
+		return false
+	}
+	value, err := reg.deps.CatalogSettings.Get(ctx, config.CatalogScopeVersionsToLibrarySettingKey)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(value), "true")
 }
 
 // positive parses a canonical decimal ID that must name a positive integer.

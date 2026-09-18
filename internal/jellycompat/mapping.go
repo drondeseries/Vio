@@ -188,7 +188,7 @@ func (m *mapper) itemFromList(item upstreamListItem, isFavorite bool, progress *
 		}
 	}
 	if allFields || fields["providerids"] {
-		dto.ProviderIDs = map[string]string{}
+		dto.ProviderIDs = providerIDMap(item.ImdbID, item.TmdbID, item.TvdbID)
 	}
 	// Fields that are never populated in list view — only include in detail.
 	if allFields {
@@ -328,6 +328,9 @@ func (m *mapper) itemFromDetailWithFields(item upstreamItemDetail, isFavorite bo
 		EpisodeCount:      item.EpisodeCount,
 		Runtime:           item.Runtime,
 		AirDate:           derefString(item.AirDate),
+		ImdbID:            item.ImdbID,
+		TmdbID:            item.TmdbID,
+		TvdbID:            item.TvdbID,
 		UserData:          item.UserData,
 	}, isFavorite, progress, allDetailFields)
 
@@ -488,6 +491,7 @@ func (m *mapper) episodeFromUpstream(ep upstreamEpisode, isFavorite bool, progre
 		UserData:     userDataDTO(m.codec.EncodeStringID(EncodedIDItem, ep.ContentID), ep.UserData, isFavorite, progress),
 	}
 	applyPlayableLocation(&dto, ep.HasMediaFiles == nil || *ep.HasMediaFiles)
+	dto.ProviderIDs = providerIDMap(ep.ImdbID, ep.TmdbID, ep.TvdbID)
 	dto.IndexNumber = &ep.EpisodeNumber
 	dto.ParentIndexNumber = &ep.SeasonNumber
 	if ep.SeriesID != "" {

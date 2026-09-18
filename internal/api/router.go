@@ -5057,6 +5057,7 @@ func v2Dependencies(
 	}
 	if settings != nil {
 		out.DemoSettings = settings
+		out.CatalogSettings = settings
 	}
 	if deps.RateLimitMW != nil {
 		out.RateLimit = deps.RateLimitMW.Handler

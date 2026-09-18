@@ -203,6 +203,9 @@ func (h *ItemsHandler) fetchCompatEpisodeTargetsByContentIDs(ctx context.Context
 			e.updated_at,
 			e.season_number,
 			e.episode_number,
+			e.imdb_id,
+			e.tmdb_id,
+			e.tvdb_id,
 			COALESCE(e.season_id, ''),
 			COALESCE(se.title, ''),
 			si.content_id,
@@ -245,6 +248,9 @@ func (h *ItemsHandler) fetchCompatEpisodeTargetsByContentIDs(ctx context.Context
 			updatedAt        time.Time
 			seasonNumber     int
 			episodeNumber    int
+			episodeImdbID    string
+			episodeTmdbID    string
+			episodeTvdbID    string
 			seasonID         string
 			seasonName       string
 			seriesID         string
@@ -273,6 +279,9 @@ func (h *ItemsHandler) fetchCompatEpisodeTargetsByContentIDs(ctx context.Context
 			&updatedAt,
 			&seasonNumber,
 			&episodeNumber,
+			&episodeImdbID,
+			&episodeTmdbID,
+			&episodeTvdbID,
 			&seasonID,
 			&seasonName,
 			&seriesID,
@@ -316,6 +325,9 @@ func (h *ItemsHandler) fetchCompatEpisodeTargetsByContentIDs(ctx context.Context
 			SeriesTitle:       seriesTitle,
 			SeasonNumber:      intPtr(seasonNumber),
 			EpisodeNumber:     intPtr(episodeNumber),
+			ImdbID:            episodeImdbID,
+			TmdbID:            episodeTmdbID,
+			TvdbID:            episodeTvdbID,
 			Runtime:           runtime,
 			HasMediaFiles:     &hasMediaFiles,
 		}
@@ -442,6 +454,9 @@ func (h *ItemsHandler) fetchCompatEpisodeTargetsByContentIDsFallback(ctx context
 			SeriesTitle:       series.Title,
 			SeasonNumber:      intPtr(episode.SeasonNumber),
 			EpisodeNumber:     intPtr(episode.EpisodeNumber),
+			ImdbID:            episode.ImdbID,
+			TmdbID:            episode.TmdbID,
+			TvdbID:            episode.TvdbID,
 			Runtime:           episode.Runtime,
 			HasMediaFiles:     boolPtr(hasFiles[episode.ContentID]),
 		}

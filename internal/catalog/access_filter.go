@@ -17,7 +17,12 @@ type AccessFilter struct {
 	AllowedContentIDs     []string
 	DisabledLibraryIDs    []int // libraries whose membership globally hides an item
 	PresentationLibraryID *int
-	PresentationLanguage  string
+	// ScopeFilesToLibrary limits file versions to PresentationLibraryID when
+	// both are set. Callers opt in per read from the server setting
+	// catalog.scope_versions_to_library; playback and watch-together reads never
+	// set it, so an item always plays from its full accessible version list.
+	ScopeFilesToLibrary  bool
+	PresentationLanguage string
 	// ProfilePreferredLanguage is the viewer profile's preferred metadata
 	// language. Presentation language resolves: explicit PresentationLanguage
 	// → ProfilePreferredLanguage → the library's metadata_language.
@@ -208,12 +213,15 @@ func intInSlice(value int, values []int) bool {
 	return false
 }
 
-// FilterMediaFilesByAccess drops file versions the viewer cannot access:
-// files in libraries outside their allowed set, in libraries they disabled,
-// or above their effective quality ceiling — the same predicate as
-// FileAllowedByAccess.
+// FilterMediaFilesByAccess drops file versions the viewer cannot access —
+// the FileAllowedByAccess predicate — and, when the read opted in through
+// ScopeFilesToLibrary, versions stored outside the presentation library. The
+// library scope is Go-only: MediaFileAccessSQL does not mirror it because no
+// SQL caller sets a presentation library.
 func FilterMediaFilesByAccess(files []*models.MediaFile, filter AccessFilter) []*models.MediaFile {
+	scopeLibrary := filter.ScopeFilesToLibrary && filter.PresentationLibraryID != nil
 	unrestricted := filter.AllowedLibraryIDs == nil &&
+		!scopeLibrary &&
 		len(filter.DisabledLibraryIDs) == 0 &&
 		strings.TrimSpace(filter.MaxPlaybackQuality) == ""
 	if len(files) == 0 || unrestricted {
@@ -222,7 +230,8 @@ func FilterMediaFilesByAccess(files []*models.MediaFile, filter AccessFilter) []
 
 	filtered := make([]*models.MediaFile, 0, len(files))
 	for _, file := range files {
-		if FileAllowedByAccess(file, filter) {
+		if FileAllowedByAccess(file, filter) &&
+			(!scopeLibrary || file.MediaFolderID == *filter.PresentationLibraryID) {
 			filtered = append(filtered, file)
 		}
 	}

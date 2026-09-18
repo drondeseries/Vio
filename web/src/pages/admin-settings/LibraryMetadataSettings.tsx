@@ -24,6 +24,8 @@ import { WORKER_SETTING_DEFAULTS, hasWorkerOverrides } from "./settingsWorkerDef
 
 const ARTWORK_KEYS = ["metadata.cache_images"];
 
+const BROWSING_KEYS = ["catalog.scope_versions_to_library"];
+
 const SCANNER_KEYS = [
   "scanner.workers",
   "matcher.workers",
@@ -53,7 +55,7 @@ const SEARCH_KEYS = ["catalog.search.provider", ...MEILI_KEYS];
 // without a control here because the defaults are right for every deployment we
 // support — catalog.search.meilisearch.{rebuild_batch_size,
 // rebuild_task_queue_depth,index_types,embedder,binary_quantized}.
-const KEYS = [...ARTWORK_KEYS, ...SCANNER_KEYS, ...MARKER_KEYS, ...SEARCH_KEYS];
+const KEYS = [...ARTWORK_KEYS, ...BROWSING_KEYS, ...SCANNER_KEYS, ...MARKER_KEYS, ...SEARCH_KEYS];
 
 export default function LibraryMetadataSettings() {
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
@@ -130,6 +132,21 @@ export default function LibraryMetadataSettings() {
             value={form.getValue("metadata.cache_images")}
             onChange={(value) => form.setValue("metadata.cache_images", value)}
             restartRequired={restartKeys.has("metadata.cache_images")}
+          />
+        </FieldGroup>
+
+        <FieldGroup
+          label="Browsing"
+          description="How an item that lives in more than one library is shown."
+          restartAll={allRestart(BROWSING_KEYS)}
+        >
+          <SettingField
+            label="Show only the browsed library's versions"
+            type="toggle"
+            description="When an item is in several libraries, opening it from one library lists only the files stored there. Off, every version the viewer can access is listed no matter where they opened it. Playback always sees every version."
+            value={form.getValue("catalog.scope_versions_to_library") || "false"}
+            onChange={(value) => form.setValue("catalog.scope_versions_to_library", value)}
+            restartRequired={restartKeys.has("catalog.scope_versions_to_library")}
           />
         </FieldGroup>
 

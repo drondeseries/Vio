@@ -27,7 +27,7 @@ type fakeCatalog struct {
 }
 
 func (f *fakeCatalog) ContextAccessFilter(ctx context.Context, opts handlers.AccessFilterOptions) (catalogpkg.AccessFilter, error) {
-	return catalogpkg.AccessFilter{UserID: claimsFrom(ctx).UserID, ProfileID: "p-owner", AllowedLibraryIDs: []int{1, 2}, PresentationLibraryID: opts.PresentationLibraryID, SelectedFileID: opts.SelectedFileID}, nil
+	return catalogpkg.AccessFilter{UserID: claimsFrom(ctx).UserID, ProfileID: "p-owner", AllowedLibraryIDs: []int{1, 2}, PresentationLibraryID: opts.PresentationLibraryID, ScopeFilesToLibrary: opts.ScopeFilesToLibrary, SelectedFileID: opts.SelectedFileID}, nil
 }
 
 func fakeListingCard(id string) handlers.CollectionItemView {
@@ -470,7 +470,7 @@ func TestGetCatalogItem(t *testing.T) {
 	if string(body["status"]) != `""` {
 		t.Errorf("status = %s; the detail service does not load the match state", body["status"])
 	}
-	if fake.lastViewer.Access.PresentationLibraryID == nil || *fake.lastViewer.Access.PresentationLibraryID != 2 || fake.lastViewer.Access.SelectedFileID != 120 {
+	if fake.lastViewer.Access.PresentationLibraryID == nil || *fake.lastViewer.Access.PresentationLibraryID != 2 || fake.lastViewer.Access.SelectedFileID != 120 || fake.lastViewer.Access.ScopeFilesToLibrary {
 		t.Fatalf("viewer = %+v", fake.lastViewer.Access)
 	}
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:nope", "", viewerHeaders()), TypeNotFound)
@@ -608,5 +608,40 @@ func TestCatalogStructuredSearchRelevance(t *testing.T) {
 		`{"source":"favorites","q":"heat","sort":"relevance","groups":[]}`,
 	} {
 		requireProblem(t, do(t, h, http.MethodPost, "/api/v2/catalog/query", body, viewerHeaders()), TypeValidationFailed)
+	}
+}
+
+type fakeCatalogSettings map[string]string
+
+func (f fakeCatalogSettings) Get(_ context.Context, key string) (string, error) { return f[key], nil }
+
+// The library scope is opt-in through catalog.scope_versions_to_library and
+// only reaches a read that named a library.
+func TestGetCatalogItemScopesVersionsToLibraryWhenEnabled(t *testing.T) {
+	deps, fake := catalogDeps(t)
+	deps.CatalogSettings = fakeCatalogSettings{"catalog.scope_versions_to_library": "true"}
+	h := newTestHandler(t, deps)
+
+	if rec := do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995?library_id=2", "", viewerHeaders()); rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	if !fake.lastViewer.Access.ScopeFilesToLibrary || fake.lastViewer.Access.PresentationLibraryID == nil {
+		t.Fatalf("viewer = %+v", fake.lastViewer.Access)
+	}
+
+	if rec := do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995", "", viewerHeaders()); rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	if fake.lastViewer.Access.ScopeFilesToLibrary || fake.lastViewer.Access.PresentationLibraryID != nil {
+		t.Fatalf("viewer = %+v", fake.lastViewer.Access)
+	}
+
+	deps.CatalogSettings = nil
+	h = newTestHandler(t, deps)
+	if rec := do(t, h, http.MethodGet, "/api/v2/catalog/items/movie:heat-1995?library_id=2", "", viewerHeaders()); rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	if fake.lastViewer.Access.ScopeFilesToLibrary {
+		t.Fatalf("viewer = %+v", fake.lastViewer.Access)
 	}
 }

@@ -243,6 +243,9 @@ type Dependencies struct {
 	// DemoSettings reads the demo.enabled setting; nil means demo mode is
 	// never on.
 	DemoSettings apimw.DemoSettingsReader
+	// CatalogSettings reads the server settings catalog reads consult per
+	// request (catalog.scope_versions_to_library); nil means every default.
+	CatalogSettings CatalogSettingsReader
 	// RateLimit is the generic authenticated-route limiter.
 	RateLimit func(http.Handler) http.Handler
 	// CursorSecret keys pagination cursors. It must be shared by every replica
@@ -1002,6 +1005,12 @@ type MediaRequestService interface {
 	BrowseStudio(ctx context.Context, viewer mediarequests.Viewer, slug, sort string, page int) (*mediarequests.DiscoverBrowseResponse, error)
 	BrowseNetwork(ctx context.Context, viewer mediarequests.Viewer, slug, sort string, page int) (*mediarequests.DiscoverBrowseResponse, error)
 	BrowseGenre(ctx context.Context, viewer mediarequests.Viewer, slug string, mediaType mediarequests.MediaType, sort string, page int) (*mediarequests.DiscoverBrowseResponse, error)
+}
+
+// CatalogSettingsReader is the slice of the server settings store catalog
+// reads consult.
+type CatalogSettingsReader interface {
+	Get(ctx context.Context, key string) (string, error)
 }
 
 // CatalogAccessService is the slice of *handlers.ItemsHandler every catalog

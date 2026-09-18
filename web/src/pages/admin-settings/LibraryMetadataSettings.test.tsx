@@ -93,7 +93,13 @@ describe("LibraryMetadataSettings", () => {
   it("renders every field group heading", () => {
     const rendered = text(render({ "catalog.search.provider": "meilisearch" }));
 
-    for (const heading of ["Artwork", "Scanning", "Intro and credits markers", "Search"]) {
+    for (const heading of [
+      "Artwork",
+      "Browsing",
+      "Scanning",
+      "Intro and credits markers",
+      "Search",
+    ]) {
       expect(rendered).toContain(heading);
     }
   });
@@ -138,6 +144,7 @@ describe("LibraryMetadataSettings", () => {
     expect(keys).toEqual(
       expect.arrayContaining([
         "metadata.cache_images",
+        "catalog.scope_versions_to_library",
         "scanner.workers",
         "matcher.workers",
         "matcher.batch_size",

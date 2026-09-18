@@ -981,3 +981,8 @@ without a restart.
 
 `metadata.cache_images` defaults to `true` on fresh installations. It no longer
 requires a public S3 bucket because local artwork storage is available.
+
+`catalog.scope_versions_to_library` (default `false`) makes a library-scoped v2
+catalog read return only the versions stored in the `library_id` it was given.
+It is server-wide, applies without a restart, and never affects playback; see
+"Library-scoped version lists" in [catalog-api.md](catalog-api.md).
