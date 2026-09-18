@@ -205,8 +205,9 @@ native-library or OS profiling tools when RSS/CPU evidence points outside Go.
 
 `scripts/bench-playback-e2e.sh` measures the path a viewer actually takes against
 a live server, not just the planning request. It runs one or more items through
-plan/start, time to first media bytes, random seeks, resume, subtitle delivery,
-and session stop, then prints a table and can write a JSON report.
+plan/start, time to first media bytes, sustained throughput, seeks, resume,
+subtitle delivery, and session stop, then prints a table and can write a JSON
+report.
 
 Credentials follow `scripts/silo-dev`: `SILO_API_KEY` and `PROFILE_ID` come from
 the environment or `.silo-dev.env`, and `SILO_URL` selects the server. The script
@@ -214,20 +215,25 @@ prints only `scheme://host/path`; it never emits the key, bearer tokens, or
 signed query strings.
 
 ```sh
-SAMPLE_SIZE=1 SEEKS=2 SUBTITLE_REPEATS=1 scripts/bench-playback-e2e.sh --json e2e.json
-scripts/bench-playback-e2e.sh --item 12345 --json item-e2e.json
+SAMPLE_SIZE=1 SEEKS=5 SUBTITLE_REPEATS=2 scripts/bench-playback-e2e.sh --item 12345 --json e2e.json
 scripts/bench-playback-e2e.sh --item 12345 --subtitle-ordinal 0 --json sub-e2e.json
+scripts/bench-playback-e2e.sh --find-subtitles 10 --json subs.json
 ```
 
 `--item <file_id>` pins one media file so before/after runs measure the same
 bytes. Without it, the script samples items from `MOVIE_LIBRARY_ID` and
-`SERIES_LIBRARY_ID` using `SEED` and `SAMPLE_SIZE`. `--subtitle-ordinal N`
-restricts the subtitle phase to the track at combined ordinal N.
+`SERIES_LIBRARY_ID` using `SEED` and `SAMPLE_SIZE`; if both configured libraries
+return no items (for example after a re-scan moved them), discovery falls back to
+the unfiltered catalog. `--subtitle-ordinal N` restricts the subtitle phase to
+the track at combined ordinal N.
 
 Knobs: `SAMPLE_SIZE` items sampled (0 = all), `SEED` selection seed, `SEEKS`
-seek fetches per item, `SUBTITLE_REPEATS` warm subtitle fetches per track,
-`SETTLE_MS` pause between a cold and a warm subtitle fetch, `RANGE_BYTES` bounded
-read size, `RESUME_POSITION` seconds stored for the resume check, `CURL_TIMEOUT`
+seeks per item, `SUBTITLE_REPEATS` warm subtitle fetches per track, `SETTLE_MS`
+pause between a cold and a warm subtitle fetch, `RANGE_BYTES` bounded read size,
+`THROUGHPUT_BYTES` sustained read size (default 8 MiB), `STALL_MS` single-read
+stall threshold (default 500), `SUBTITLE_TIMEOUT` per-subtitle-request deadline,
+`SUBTITLE_ORDINALS` ordinals probed when the plan publishes none,
+`RESUME_POSITION` seconds stored for the resume check, `CURL_TIMEOUT`
 per-request deadline, and `RUN_ID` request id prefix.
 
 Media reads are scored on the window the server returned, not on curl's exit
@@ -239,18 +245,43 @@ bytes actually read when the server ignored the range, with `range_ignored:
 true`), and `total_size_bytes` parsed from `Content-Range`/`Content-Length` or
 `0` when the server reports no total.
 
-Subtitle tracks come from `playback_plan.subtitle.inventory`. A plan with no
-tracks records `no_tracks: true` instead of being silently skipped; tracks with
-no fetchable sidecar (for example `burn_in_only`) are recorded per track with
-`fetchable: false`.
+Seeks use the mechanism the delivery actually supports and name it in
+`mechanism`. Progressive remux (`server_remux_progressive`) sends
+`GET <stream_url>` with the `seek=<seconds>` query parameter; honour is verified
+by comparing the response to a non-seek baseline, and a body identical to the
+baseline records `honoured: false` instead of being credited as a seek. Direct /
+`original_http` deliveries use byte ranges (`mechanism: range`), honoured only
+when the response is a 206 whose served start is the requested offset. HLS
+deliveries request a segment a random distance ahead (`mechanism: hls_segment`).
+A delivery with no seek mechanism records `attempted: false` with a reason.
+
+The throughput phase reads `THROUGHPUT_BYTES` contiguously (ranged for direct
+deliveries, sequential otherwise, concatenated segments for HLS) and records
+`ttfb_ms`, `total_ms`, `bytes`, `mib_per_s`, `time_to_first_256kib_ms`,
+`time_to_first_2mib_ms`, `stalled`, and `max_read_ms`. `stalled` is true when a
+single read attempt exceeds `STALL_MS` after the first bytes, or the read fails
+before reaching the target.
+
+Subtitle tracks are enumerated from `playback_plan.subtitle.inventory` when it is
+published. Because a plan with no subtitle selection reports `mode: off` and an
+empty inventory even for a file with tracks, an empty inventory falls back to
+HEAD-probing combined ordinals on a session and then fetches each available
+track through `GET /api/v1/stream/{session_id}/subtitles/{track}`. Each fetch is
+classified from the payload (VTT/SRT text, ASS, or PGS `PG` magic), not from the
+requested extension, and cold versus warm repeats are separate because the
+server caches the extracted artifact. A completed extraction can end its
+session, so each fetch starts its own. `--find-subtitles [N]` scans up to N items
+and reports the plan mode, inventory count, resolving ordinals, and the real
+format of one text and one bitmap candidate per item.
 
 The JSON report has a `meta` block (server, profile, run id, timestamp, git
 revision and dirty flag, seed, sample size, discovered and measured counts, item
-ids, subtitle ordinal) and a `phases` block whose keys are `start`, `first_bytes`,
-`seek`, `resume`, `subtitles`, and `stop`. Every phase record carries RFC3339
-`started_at`/`ended_at` for correlation with server logs. A `summary` block
-carries counts and nearest-rank p50/p95 per phase. Each phase records the HTTP
-status and timing even when the request failed.
+ids, subtitle ordinal, throughput and stall knobs) and a `phases` block whose keys are
+`start`, `first_bytes`, `throughput`, `seek`, `resume`, `subtitles`, and `stop`.
+Every phase record carries RFC3339 `started_at`/`ended_at` for correlation with
+server logs. A `summary` block carries counts and nearest-rank p50/p95 per phase,
+and the seek summary breaks down `mechanisms` and honoured counts. Each phase
+records the HTTP status and timing even when the request failed.
 
 Outcomes are recorded, not thrown: a deployment that rejects playback (for
 example `virtual_source_unavailable`) still exits 0 and reports the rejection

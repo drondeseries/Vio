@@ -40,6 +40,8 @@ set -euo pipefail
 #   RANGE_BYTES         bounded media read size (default 262144)
 #   THROUGHPUT_BYTES    sustained read size (default 8388608)
 #   STALL_MS            a single read attempt slower than this is a stall (default 500)
+#   SUBTITLE_TIMEOUT    per-subtitle-request deadline seconds (default 240)
+#   SUBTITLE_ORDINALS   subtitle ordinals probed when the plan publishes none (default 8)
 #   RESUME_POSITION     seconds to store for the resume check (default 300)
 #   CURL_TIMEOUT        per-request curl --max-time seconds (default 60)
 #   RUN_ID              stable id reused by every request in this run
@@ -74,7 +76,8 @@ and prints a table.
   --item FILE_ID        measure exactly this media file id (skips discovery)
   --subtitle-ordinal N  measure only the subtitle track at combined ordinal N
   --throughput-bytes N  sustained read size in bytes (default 8388608)
-  --find-subtitles [N]  scan up to N items for subtitle tracks; no fetches
+  --find-subtitles [N]  scan up to N items for subtitle tracks; HEAD-enumerates
+                        ordinals and cold-fetches one text/bitmap track per item
   -h, --help            print this help and exit
 
 Settings come from the environment or .silo-dev.env: SILO_API_KEY (required),
@@ -168,11 +171,13 @@ SETTLE_MS="${SETTLE_MS:-300}"
 RANGE_BYTES="${RANGE_BYTES:-262144}"
 THROUGHPUT_BYTES="${THROUGHPUT_BYTES:-8388608}"
 STALL_MS="${STALL_MS:-500}"
+SUBTITLE_TIMEOUT="${SUBTITLE_TIMEOUT:-240}"
+SUBTITLE_ORDINALS="${SUBTITLE_ORDINALS:-8}"
 RESUME_POSITION="${RESUME_POSITION:-300}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-60}"
 RUN_ID="${RUN_ID:-e2e-$(date +%s)-$$}"
 
-for knob in SAMPLE_SIZE SEED SEEKS SUBTITLE_REPEATS SETTLE_MS RANGE_BYTES THROUGHPUT_BYTES STALL_MS CURL_TIMEOUT FIND_SUBTITLES_LIMIT; do
+for knob in SAMPLE_SIZE SEED SEEKS SUBTITLE_REPEATS SETTLE_MS RANGE_BYTES THROUGHPUT_BYTES STALL_MS SUBTITLE_TIMEOUT SUBTITLE_ORDINALS CURL_TIMEOUT FIND_SUBTITLES_LIMIT; do
 	[[ "${!knob}" =~ ^[0-9]+$ ]] || die "$knob must be a non-negative integer (got '${!knob}')." 2
 done
 [[ "$THROUGHPUT_BYTES" -gt 0 ]] || die "THROUGHPUT_BYTES must be greater than 0." 2
@@ -393,13 +398,30 @@ rec() {
 }
 
 # Fetch URL into body/hdr files. Prints "status|ttfb_s|total_s|bytes|ctype|rc".
-http_get() {
-	local url="$1" body="$2" hdr="$3"
-	shift 3
+http_get_tmo() {
+	local tmo="$1" url="$2" body="$3" hdr="$4"
+	shift 4
 	local out rc=0
-	out=$(curl -sS --max-time "$CURL_TIMEOUT" -D "$hdr" -o "$body" \
+	out=$(curl -sS --max-time "$tmo" -D "$hdr" -o "$body" \
 		-H "$AUTH" -H "X-Profile-Id: $PROFILE_ID" -H "X-Device-Id: bench-e2e-$RUN_ID" \
 		-w '%{http_code}|%{time_starttransfer}|%{time_total}|%{size_download}|%{content_type}' \
+		"$@" "$url" 2>/dev/null) || rc=$?
+	printf '%s|%s' "$out" "$rc"
+}
+
+http_get() {
+	http_get_tmo "$CURL_TIMEOUT" "$@"
+}
+
+# HEAD a URL. Prints "status|ctype|rc" without a body, used to enumerate
+# subtitle ordinals cheaply (a HEAD never spawns extraction).
+http_head() {
+	local url="$1" hdr="$2"
+	shift 2
+	local out rc=0
+	out=$(curl -sS --max-time "$CURL_TIMEOUT" -I -D "$hdr" -o /dev/null \
+		-H "$AUTH" -H "X-Profile-Id: $PROFILE_ID" -H "X-Device-Id: bench-e2e-$RUN_ID" \
+		-w '%{http_code}|%{content_type}' \
 		"$@" "$url" 2>/dev/null) || rc=$?
 	printf '%s|%s' "$out" "$rc"
 }
@@ -435,38 +457,53 @@ print('ok')
 PY
 }
 
-# Validate a subtitle payload for its advertised format.
-validate_subtitle() {
-	local body="$1" ctype="$2" fmt="$3"
-	[[ -s "$body" ]] || { echo "empty"; return; }
-	python3 - "$body" "$ctype" "$fmt" <<'PY'
+# Classify a served subtitle body without trusting the requested extension: the
+# extractor converts text tracks to WebVTT, so an ".ass" request proves ASS only
+# when the body really is ASS. Echoes "format|valid|failure".
+classify_subtitle() {
+	local body="$1" ctype="$2"
+	python3 - "$body" "$ctype" <<'PY'
 import sys
-path, ctype, fmt = sys.argv[1], (sys.argv[2] or "").lower(), (sys.argv[3] or "").lower()
-with open(path, 'rb') as fh:
-    data = fh.read(65536)
-head = data.lstrip()
-low = head[:64].lower()
-if ctype.startswith('text/html') or low.startswith(b'<!doctype') or low.startswith(b'<html'):
-    print('html_body'); raise SystemExit(0)
-if fmt in ('sup', 'pgs'):
-    print('ok' if data[:2] == b'PG' else 'bad_pgs_magic'); raise SystemExit(0)
+path, ctype = sys.argv[1], (sys.argv[2] or "").lower()
+try:
+    data = open(path, 'rb').read(262144)
+except Exception:
+    print("unknown|false|unreadable")
+    raise SystemExit(0)
+if not data:
+    print("unknown|false|empty")
+    raise SystemExit(0)
+head = data.lstrip()[:64].lower()
+if 'json' in ctype or head[:1] in (b'{', b'['):
+    print("unknown|false|json_error")
+    raise SystemExit(0)
+if ctype.startswith('text/html') or head.startswith(b'<!doctype') or head.startswith(b'<html'):
+    print("unknown|false|html_body")
+    raise SystemExit(0)
+if data[:2] == b'PG':
+    print("pgs|true|")
+    raise SystemExit(0)
 text = data.decode('utf-8', 'replace')
-if '-->' in text or text.lstrip().upper().startswith('WEBVTT'):
-    print('ok'); raise SystemExit(0)
 if '[script info]' in text.lower() or '[v4+' in text.lower() or '[v4 styles]' in text.lower():
-    print('ok'); raise SystemExit(0)
-if head[:1] in (b'{', b'['):
-    print('json_body'); raise SystemExit(0)
-print('unrecognized_text')
+    print("ass|true|")
+    raise SystemExit(0)
+if '-->' in text or text.lstrip().upper().startswith('WEBVTT'):
+    print("vtt|true|")
+    raise SystemExit(0)
+print("unknown|false|unrecognized_payload")
 PY
 }
 
-subtitle_format() {
-	case "$1" in
-		*ass*|*ssa*|*substation*) printf 'ass' ;;
-		*pgs*|*hdmv*) printf 'sup' ;;
-		*) printf 'vtt' ;;
-	esac
+# Set or replace one query parameter, preserving every other parameter (the
+# plan's stream URL already carries a signed token and a seek value).
+set_query_param() {
+	python3 - "$1" "$2" "$3" <<'PY'
+import sys, urllib.parse as up
+parts = up.urlsplit(sys.argv[1])
+query = [(k, v) for k, v in up.parse_qsl(parts.query, keep_blank_values=True) if k != sys.argv[2]]
+query.append((sys.argv[2], sys.argv[3]))
+print(up.urlunsplit((parts.scheme, parts.netloc, parts.path, up.urlencode(query), parts.fragment)))
+PY
 }
 
 # Deterministic random byte offsets beyond the first bounded range. Without a
@@ -487,22 +524,6 @@ print("\n".join(str(x) for x in out))
 PY
 }
 
-# Deterministic segment picks beyond the first segment, as "index<TAB>url".
-gen_segment_picks() {
-	python3 - "$1" "$2" "$3" <<'PY'
-import random, sys
-lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
-n = int(sys.argv[2]); seed = int(sys.argv[3])
-idxs = list(range(1, len(lines)))
-if not idxs:
-    raise SystemExit(0)
-r = random.Random(seed)
-r.shuffle(idxs)
-for i in range(n):
-    p = idxs[i % len(idxs)]
-    print(f"{p}\t{lines[p]}")
-PY
-}
 
 # Short content hash of a response body, used to tell a real seek response from
 # a non-seek response that streamed the same bytes from the beginning.
@@ -510,19 +531,27 @@ body_sha() {
 	sha256sum "${1:-/dev/null}" 2>/dev/null | cut -c1-16
 }
 
-# Deterministic random seek targets in seconds across the media timeline.
+# Deterministic random seek targets in seconds across the media timeline,
+# keeping a margin from an excluded current position so a seek is a real jump.
 gen_seek_seconds() {
-	python3 - "$1" "$2" "$3" <<'PY'
+	python3 - "$1" "$2" "$3" "${4:-}" <<'PY'
 import random, sys
 duration = float(sys.argv[1] or 0); n = int(sys.argv[2]); seed = int(sys.argv[3])
+exclude = float(sys.argv[4]) if sys.argv[4] not in ("", None) else -1.0
 r = random.Random(seed)
 if duration > 0:
     lo = max(1.0, duration * 0.05)
     hi = max(lo + 1.0, duration * 0.95)
 else:
     lo, hi = 10.0, 1800.0
+margin = max(60.0, duration * 0.05) if duration > 0 else 60.0
 for _ in range(n):
-    print(f"{r.uniform(lo, hi):.1f}")
+    target = r.uniform(lo, hi)
+    for _attempt in range(30):
+        if exclude < 0 or abs(target - exclude) >= margin:
+            break
+        target = r.uniform(lo, hi)
+    print(f"{target:.1f}")
 PY
 }
 
@@ -685,6 +714,7 @@ PY
 cat > "$TMPDIR/throughput_read.py" <<'PY'
 import json, os, socket, sys, time
 import urllib.request
+import urllib.error
 
 urls = [l.strip() for l in open(os.environ["BENCH_URLS_FILE"]) if l.strip()]
 target = int(os.environ["BENCH_BYTES"])
@@ -710,7 +740,7 @@ try:
             break
         headers = {}
         if auth:
-            headers["Authorization"] = auth
+            headers["Authorization"] = "Bearer " + auth
         if profile:
             headers["X-Profile-Id"] = profile
         if use_range and index == 0:
@@ -737,6 +767,10 @@ try:
                 if milestones[mark] is None and bytes_total >= mark:
                     milestones[mark] = (t1 - start) * 1000.0
         resp.close()
+except urllib.error.HTTPError as exc:
+    stalled = True
+    status = exc.code
+    error = f"http_{exc.code}"
 except socket.timeout:
     stalled = True
     error = "timeout"
@@ -804,14 +838,23 @@ first_valid = [r for r in first_attempted if r.get("valid") is True]
 
 seeks = phases.get("seek", [])
 seek_attempted = [r for r in seeks if r.get("index") is not None]
-seek_valid = [r for r in seek_attempted if r.get("valid") is True]
+seek_honoured = [r for r in seek_attempted if r.get("honoured") is True]
+seek_mechanisms = {}
+for r in seek_attempted:
+    m = str(r.get("mechanism") or "unknown")
+    seek_mechanisms[m] = seek_mechanisms.get(m, 0) + 1
 seeks_by_item = {}
 for r in seek_attempted:
     seeks_by_item.setdefault(str(r.get("item")), []).append(r)
 
+throughput_all = [r for r in phases.get("throughput", []) if r.get("attempted") is True]
+throughput_valid = [r for r in throughput_all if r.get("valid") is True]
+
 subs = phases.get("subtitles", [])
-subs_cold = [r for r in subs if r.get("warm") is False]
-subs_warm = [r for r in subs if r.get("warm") is True]
+sub_fetch = [r for r in subs if "warm" in r]
+subs_cold = [r for r in sub_fetch if r.get("warm") is False]
+subs_warm = [r for r in sub_fetch if r.get("warm") is True]
+sub_plan = [r for r in subs if r.get("plan_only") is True]
 
 resumes = phases.get("resume", [])
 resume_attempted = [r for r in resumes if r.get("attempted") is True]
@@ -836,12 +879,25 @@ summary = {
         "total_ms": dist([r.get("total_ms") for r in first_valid]),
         "mib_per_s": dist([r.get("mib_per_s") for r in first_valid]),
     },
+    "throughput": {
+        "count": len(throughput_all),
+        "valid": len(throughput_valid),
+        "stalled": sum(1 for r in throughput_all if r.get("stalled") is True),
+        "bytes": dist([r.get("bytes") for r in throughput_valid]),
+        "ttfb_ms": dist([r.get("ttfb_ms") for r in throughput_valid]),
+        "total_ms": dist([r.get("total_ms") for r in throughput_valid]),
+        "mib_per_s": dist([r.get("mib_per_s") for r in throughput_valid]),
+        "time_to_first_256kib_ms": dist([r.get("time_to_first_256kib_ms") for r in throughput_valid]),
+        "time_to_first_2mib_ms": dist([r.get("time_to_first_2mib_ms") for r in throughput_valid]),
+    },
     "seek": {
         "count": len(seek_attempted),
         "skipped": len(seeks) - len(seek_attempted),
-        "valid": len(seek_valid),
-        "ttfb_ms": dist([r.get("ttfb_ms") for r in seek_valid]),
-        "total_ms": dist([r.get("total_ms") for r in seek_valid]),
+        "valid": len(seek_honoured),
+        "honoured": len(seek_honoured),
+        "mechanisms": seek_mechanisms,
+        "ttfb_ms": dist([r.get("ttfb_ms") for r in seek_honoured]),
+        "total_ms": dist([r.get("total_ms") for r in seek_honoured]),
         "by_item": {},
     },
     "resume": {
@@ -854,9 +910,12 @@ summary = {
         "cold_count": len(subs_cold),
         "warm_count": len(subs_warm),
         "valid": sum(1 for r in subs if r.get("valid") is True),
-        "tracks": max((int(r.get("track_count") or 0) for r in subs), default=0),
+        "tracks": max((int(r.get("track_count") or r.get("available_count") or 0)
+                       for r in subs), default=0),
         "no_tracks": any(r.get("no_tracks") is True for r in subs),
-        "tracks_fetchable": sum(1 for r in subs if r.get("warm") is False and r.get("fetchable") is True),
+        "plan_modes": sorted({str(r.get("plan_mode")) for r in subs if r.get("plan_mode")}),
+        "inventory_count": max((int(r.get("inventory_count") or 0) for r in subs), default=0),
+        "ordinal_source": (sub_plan[0].get("ordinal_source") if sub_plan else None),
     },
     "stop": {
         "count": len(stop_attempted),
@@ -864,12 +923,13 @@ summary = {
     },
 }
 for item, rows in seeks_by_item.items():
-    valid = [r for r in rows if r.get("valid") is True]
+    honoured = [r for r in rows if r.get("honoured") is True]
     summary["seek"]["by_item"][item] = {
         "count": len(rows),
-        "valid": len(valid),
-        "ttfb_ms": dist([r.get("ttfb_ms") for r in valid]),
-        "total_ms": dist([r.get("total_ms") for r in valid]),
+        "honoured": len(honoured),
+        "mechanisms": sorted({str(r.get("mechanism") or "unknown") for r in rows}),
+        "ttfb_ms": dist([r.get("ttfb_ms") for r in honoured]),
+        "total_ms": dist([r.get("total_ms") for r in honoured]),
     }
 
 report = {
@@ -898,8 +958,9 @@ print(f"  seed={meta.get('seed')}  sample_size={meta.get('sample_size')}  "
       f"seeks={meta.get('seeks')}  subtitle_repeats={meta.get('subtitle_repeats')}  "
       f"settle_ms={meta.get('settle_ms')}")
 print("")
-header = ("file_id", "type", "start", "ttfb", "first_ms", "fb", "seek_p50", "seek_p95", "resume", "sub_cold", "sub_warm", "stop_ms")
-widths = (10, 10, 24, 8, 9, 6, 9, 9, 8, 9, 9, 9)
+header = ("file_id", "type", "start", "ttfb", "first_ms", "fb", "thr_mib", "stall",
+          "seek_mech", "seek_p50", "seek_p95", "resume", "sub_mode", "sub_cold", "sub_warm", "stop_ms")
+widths = (10, 8, 22, 8, 9, 5, 8, 6, 12, 9, 9, 7, 9, 9, 9, 9)
 
 
 def render(cols):
@@ -924,15 +985,22 @@ for item in item_ids:
     fb_rec = fb[0] if fb else {}
     fb_ttfb = fb_rec.get("ttfb_ms") if fb_rec.get("attempted") else None
     fb_valid = fb_rec.get("valid") if fb_rec.get("attempted") else None
-    sk_valid = [r.get("ttfb_ms") for r in sk if r.get("valid") is True]
+    sk_rows = [r for r in sk if r.get("index") is not None]
+    sk_hon = [r.get("ttfb_ms") for r in sk_rows if r.get("honoured") is True]
+    sk_mech = ",".join(sorted({str(r.get("mechanism") or "?") for r in sk_rows})) or "n/a"
+    thr_rows = [r for r in for_item("throughput", item) if r.get("attempted") is True]
+    thr_valid = [r for r in thr_rows if r.get("valid") is True]
+    thr_mib = fmt(dist([r.get("mib_per_s") for r in thr_valid]).get("p50"))
+    stall = ("yes" if any(r.get("stalled") is True for r in thr_rows)
+             else ("no" if thr_rows else "n/a"))
     resume_ok = rs[0].get("resume_honoured") if rs and rs[0].get("attempted") else None
     cold_ok = sum(1 for r in sc if r.get("valid") is True)
     warm_ok = sum(1 for r in sw if r.get("valid") is True)
     stop_ms = st[0].get("total_ms") if st and st[0].get("attempted") else None
+    sub_modes = sorted({str(r.get("plan_mode")) for r in sub_rows if r.get("plan_mode")})
+    sub_mode = ",".join(sub_modes) or "n/a"
     if any(r.get("no_tracks") for r in sub_rows):
         sub_cold = sub_warm = "no tracks"
-    elif any(r.get("found") is False or r.get("reason") == "no_such_ordinal" for r in sub_rows):
-        sub_cold = sub_warm = "no track"
     elif sub_fetch:
         sub_cold = f"{cold_ok}/{len(sc)}"
         sub_warm = f"{warm_ok}/{len(sw)}"
@@ -942,14 +1010,18 @@ for item in item_ids:
         sub_cold = sub_warm = "n/a"
     row = (
         str(item),
-        str(im.get("type", ""))[:9],
+        str(im.get("type", ""))[:8],
         str(outcome),
         fmt(sttfb),
         fmt(fb_ttfb),
         ("ok" if fb_valid else "FAIL") if fb_rec.get("attempted") else "n/a",
-        fmt(dist(sk_valid).get("p50")),
-        fmt(dist(sk_valid).get("p95")),
+        thr_mib,
+        stall,
+        sk_mech,
+        fmt(dist(sk_hon).get("p50")),
+        fmt(dist(sk_hon).get("p95")),
         ("yes" if resume_ok else "no") if resume_ok is not None else "n/a",
+        sub_mode,
         sub_cold,
         sub_warm,
         fmt(stop_ms),
@@ -974,14 +1046,23 @@ print(f"  first bytes:     attempted={s['attempted']} valid={s['valid']}")
 dline("  first ttfb", s["ttfb_ms"], "ms")
 dline("  first total", s["total_ms"], "ms")
 dline("  first mbps", s["mib_per_s"], " MiB/s")
+t = summary["throughput"]
+print(f"  throughput:      count={t['count']} valid={t['valid']} stalled={t['stalled']}")
+dline("  thr ttfb", t["ttfb_ms"], "ms")
+dline("  thr total", t["total_ms"], "ms")
+dline("  thr mbps", t["mib_per_s"], " MiB/s")
+dline("  first 256k", t["time_to_first_256kib_ms"], "ms")
+dline("  first 2miB", t["time_to_first_2mib_ms"], "ms")
 dline("seek ttfb", summary["seek"]["ttfb_ms"], "ms")
-print(f"  seek:            valid {summary['seek']['valid']}/{summary['seek']['count']}"
+print(f"  seek:            honoured {summary['seek']['honoured']}/{summary['seek']['count']}"
+      f"  mechanisms={summary['seek']['mechanisms']}"
       + (f"  skipped={summary['seek']['skipped']}" if summary["seek"]["skipped"] else ""))
 print(f"  resume:          {summary['resume']['honoured']}/{summary['resume']['attempted']} honoured")
 dline("sub cold ttfb", summary["subtitles"]["cold"], "ms")
 dline("sub warm ttfb", summary["subtitles"]["warm"], "ms")
 _sub = summary["subtitles"]
-print(f"  subtitles:       tracks={_sub['tracks']} fetchable={_sub['tracks_fetchable']} "
+print(f"  subtitles:       plan_modes={_sub['plan_modes']} inventory={_sub['inventory_count']} "
+      f"source={_sub['ordinal_source']} tracks={_sub['tracks']} "
       f"cold={_sub['cold_count']} warm={_sub['warm_count']} valid={_sub['valid']}"
       + ("  no tracks" if _sub["no_tracks"] else ""))
 dline("stop", summary["stop"]["total_ms"], "ms")
@@ -1038,6 +1119,11 @@ fetch_catalog() {
 		-o "$out" >/dev/null 2>&1
 }
 
+fetch_catalog_all() {
+	curl -sS --max-time "$CURL_TIMEOUT" -H "$AUTH" \
+		"$SERVER/api/v1/catalog?limit=500" -o "$1" >/dev/null 2>&1
+}
+
 catalog_lines() {
 	python3 - "$1" "$2" <<'PY'
 import json, sys
@@ -1053,18 +1139,43 @@ for it in data.get("items") or []:
 PY
 }
 
+catalog_lines_all() {
+	python3 - "$1" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+for it in data.get("items") or []:
+    cid = it.get("content_id", "")
+    title = (it.get("title") or "").replace("\t", " ").replace("\n", " ")
+    kind = it.get("type") or "item"
+    if cid:
+        print(f"{cid}\t{title}\t{kind}")
+PY
+}
+
 discover_candidates() {
-	local out lines
+	local out lines combined="" found=0
 	out="$TMPDIR/catalog-movies.json"
 	if fetch_catalog "$MOVIE_LIBRARY_ID" movie "$out"; then
 		lines=$(catalog_lines "$out" movie) || true
-		[[ -n "$lines" ]] && printf '%s\n' "$lines"
+		[[ -n "$lines" ]] && { combined+="$lines"$'\n'; found=1; }
 	fi
 	out="$TMPDIR/catalog-episodes.json"
 	if fetch_catalog "$SERIES_LIBRARY_ID" episode "$out"; then
 		lines=$(catalog_lines "$out" episode) || true
-		[[ -n "$lines" ]] && printf '%s\n' "$lines"
+		[[ -n "$lines" ]] && { combined+="$lines"$'\n'; found=1; }
 	fi
+	# A reconfigured deployment can leave the configured library ids empty or
+	# disabled; fall back to the unfiltered catalog so discovery still works.
+	if [[ "$found" -eq 0 ]]; then
+		out="$TMPDIR/catalog-all.json"
+		if fetch_catalog_all "$out"; then
+			combined=$(catalog_lines_all "$out") || true
+		fi
+	fi
+	printf '%s' "$combined"
 }
 
 sample_candidates() {
@@ -1164,6 +1275,184 @@ phase_first_bytes() {
 		manifest_http_status="${manifest_status:-0}" manifest_ttfb_ms="${manifest_ttfb:-0}"
 }
 
+# ── Sustained throughput ───────────────────────────────────────────────────────
+
+# Write the URL list for the throughput read and echo the mode: a single stream
+# URL for progressive/direct, or the HLS segment list for HLS deliveries.
+throughput_urls() {
+	local fid="$1" delivery="$2" proto="$3" plan_url="$4"
+	local out="$TMPDIR/thr-urls-${fid}.txt"
+	: > "$out"
+	case "$(seek_mechanism "$delivery" "$proto")" in
+		range)
+			resolve_media_url "$plan_url" > "$out"
+			printf 'range'
+			;;
+		seek_param)
+			resolve_media_url "$plan_url" > "$out"
+			printf 'stream'
+			;;
+		hls_segment)
+			if [[ -s "$TMPDIR/hls-${fid}.tsv" ]]; then
+				cut -f4 "$TMPDIR/hls-${fid}.tsv" > "$out"
+				printf 'segments'
+			fi
+			;;
+		*) printf '' ;;
+	esac
+}
+
+phase_throughput() {
+	local fid="$1" delivery="$2" proto="$3" plan_url="$4"
+	local mode
+	mode=$(throughput_urls "$fid" "$delivery" "$proto" "$plan_url")
+	if [[ -z "$mode" ]]; then
+		rec throughput item="$fid" attempted=false valid=false \
+			reason="unsupported_delivery_${delivery:-unknown}"
+		return
+	fi
+	local range_flag=0
+	[[ "$mode" == "range" ]] && range_flag=1
+	phase_begin
+	local json
+	json=$(BENCH_URLS_FILE="$TMPDIR/thr-urls-${fid}.txt" \
+		BENCH_BYTES="$THROUGHPUT_BYTES" BENCH_TIMEOUT="$CURL_TIMEOUT" \
+		BENCH_STALL_MS="$STALL_MS" BENCH_AUTH="$API_KEY" BENCH_PROFILE="$PROFILE_ID" \
+		BENCH_RANGE="$range_flag" python3 "$TMPDIR/throughput_read.py" 2>/dev/null) || json="{}"
+	phase_end
+	local out
+	out=$(python3 - "$json" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    d = {}
+keys = ("http_status", "bytes", "target_bytes", "ttfb_ms", "total_ms", "mib_per_s",
+        "time_to_first_256kib_ms", "time_to_first_2mib_ms", "stalled", "max_read_ms",
+        "complete", "error")
+print("|".join("" if d.get(k) is None else str(d.get(k, "")) for k in keys))
+PY
+)
+	IFS='|' read -r http_status bytes target ttfb total mib first256 first2 stalled maxread complete error <<< "$out"
+	[[ "$stalled" == "True" ]] && stalled=true
+	[[ "$stalled" == "False" ]] && stalled=false
+	[[ "$complete" == "True" ]] && complete=true
+	[[ "$complete" == "False" ]] && complete=false
+	local valid=false
+	[[ "$complete" == "true" ]] && valid=true
+	rec throughput item="$fid" attempted=true mode="$mode" mechanism="$(seek_mechanism "$delivery" "$proto")" \
+		http_status="${http_status:-0}" bytes="${bytes:-0}" target_bytes="${target:-$THROUGHPUT_BYTES}" \
+		ttfb_ms="${ttfb:-}" total_ms="${total:-}" mib_per_s="${mib:-}" \
+		time_to_first_256kib_ms="${first256:-}" time_to_first_2mib_ms="${first2:-}" \
+		stalled="${stalled:-false}" max_read_ms="${maxread:-}" complete="${complete:-false}" \
+		valid="$valid" failure="${error:-}"
+}
+
+# ── Subtitle discovery and delivery ────────────────────────────────────────────
+
+# Start a throwaway session and echo its id. The session is registered for
+# cleanup. A completed subtitle extraction can end its session, so each fetch
+# gets its own.
+start_probe_session() {
+	local fid="$1" tag="$2"
+	local attempt="e2e-${RUN_ID}-${fid}-${tag}"
+	local body="$TMPDIR/${tag}-${fid}.req.json"
+	local resp="$TMPDIR/${tag}-${fid}.json"
+	build_body "$fid" "$attempt" > "$body"
+	post_start "$resp" "$body" "$attempt" >/dev/null
+	local sid
+	sid=$(py_field "$resp" session_id)
+	[[ -n "$sid" ]] && printf '%s\n' "$sid" >> "$SESSIONS"
+	printf '%s' "$sid"
+}
+
+# HEAD-enumerate subtitle ordinals on a session. Prints "ordinal<TAB>family"
+# for each present ordinal; family is text or bitmap. Cheap: no extraction.
+subtitle_ordinals() {
+	local sid="$1" fid="$2" n=0
+	while [[ "$n" -lt "$SUBTITLE_ORDINALS" ]]; do
+		local vtt sup vstatus sstatus sctype
+		vtt=$(http_head "$SERVER/api/v1/stream/$sid/subtitles/$n.vtt?file_id=$fid" "$TMPDIR/h-${sid}-${n}.hdr")
+		IFS='|' read -r vstatus _ _ <<< "$vtt"
+		sup=$(http_head "$SERVER/api/v1/stream/$sid/subtitles/$n.sup?file_id=$fid" "$TMPDIR/h-${sid}-${n}sup.hdr")
+		IFS='|' read -r sstatus sctype _ <<< "$sup"
+		local present=0 family="text"
+		if [[ "$vstatus" -ge 200 && "$vstatus" -lt 300 ]]; then
+			present=1
+		fi
+		if [[ "$sstatus" -ge 200 && "$sstatus" -lt 300 ]]; then
+			present=1
+			case "$sctype" in
+				*text/*|*json*) family="text" ;;
+				*) family="bitmap" ;;
+			esac
+		fi
+		[[ "$present" -eq 1 ]] && printf '%s\t%s\n' "$n" "$family"
+		n=$((n + 1))
+	done
+}
+
+# Candidate subtitle representations from the plan inventory, as
+# "ordinal<TAB>ext<TAB>track_id". Empty when the plan published no sidecar URLs
+# (which does not mean the file has no tracks).
+subtitle_candidates_from_plan() {
+	python3 - "$1" <<'PY'
+import json, sys, urllib.parse
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+plan = data.get("playback_plan") or {}
+inventory = ((plan.get("subtitle") or {}).get("inventory")) or []
+for item in inventory:
+    url = item.get("url") or ""
+    if item.get("delivery") != "sidecar" or not url:
+        continue
+    path = urllib.parse.urlparse(url).path
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else "vtt"
+    print(f"{item.get('combined_index', '')}\t{ext}\t{item.get('track_id', '')}")
+PY
+}
+
+# Fetch one subtitle representation on a fresh session, classify the payload,
+# and record it. warm=false is the cold extraction, warm=true a repeat.
+subtitle_fetch() {
+	local fid="$1" ordinal="$2" ext="$3" warm="$4" attempt_n="$5" track_id="${6:-}"
+	local body="$TMPDIR/sf-${fid}-${ordinal}-${ext}.body"
+	local hdr="$TMPDIR/sf-${fid}-${ordinal}-${ext}.hdr"
+	local sid
+	sid=$(start_probe_session "$fid" "sub${ordinal}${warm}${attempt_n}")
+	if [[ -z "$sid" ]]; then
+		rec subtitles item="$fid" ordinal="$ordinal" track_id="$track_id" warm="$warm" \
+			attempt="$attempt_n" valid=false failure=session_unavailable
+		return
+	fi
+	local url="$SERVER/api/v1/stream/$sid/subtitles/$ordinal.$ext?file_id=$fid"
+	local out status ttfb total bytes ctype rc
+	phase_begin
+	out=$(http_get_tmo "$SUBTITLE_TIMEOUT" "$url" "$body" "$hdr")
+	phase_end
+	IFS='|' read -r status ttfb total bytes ctype rc <<< "$out"
+	local cls fmt valid failure timed_out=false
+	cls=$(classify_subtitle "$body" "${ctype:-}")
+	IFS='|' read -r fmt valid failure <<< "$cls"
+	local failure_reason="$failure"
+	if [[ "$rc" != "0" ]]; then
+		if [[ "$valid" == "true" && "$rc" == "28" ]]; then
+			timed_out=true
+		else
+			failure_reason="curl_rc_${rc}"
+		fi
+	fi
+	rec subtitles item="$fid" ordinal="$ordinal" track_id="$track_id" warm="$warm" \
+		attempt="$attempt_n" request="$(sanitize_url "$url")" http_status="${status:-0}" \
+		ttfb_ms="$(ms "${ttfb:-0}")" total_ms="$(ms "${total:-0}")" bytes="${bytes:-0}" \
+		content_type="${ctype:-}" format="$fmt" valid="$valid" failure="$failure_reason" \
+		timed_out="$timed_out"
+	curl -sS --max-time 10 -X DELETE "$SERVER/api/v1/playback/$sid" \
+		-H "$AUTH" -H "X-Profile-Id: $PROFILE_ID" -o /dev/null 2>/dev/null || true
+}
+
 # ── Seek mechanisms ───────────────────────────────────────────────────────────
 
 # Progressive/remux: the stream handler seeks when the URL carries ?seek=<sec>.
@@ -1182,15 +1471,18 @@ seek_via_param() {
 	baseline_sha=""
 	[[ -s "$body" ]] && baseline_sha=$(body_sha "$body")
 
-	local secs s i=0
-	secs=$(gen_seek_seconds "$duration" "$SEEKS" "$((SEED + fid))")
+	local secs s i=0 baseline_pos=""
+	baseline_pos=$(python3 - "$full" <<'PY'
+import sys, urllib.parse as up
+q = dict(up.parse_qsl(up.urlsplit(sys.argv[1]).query))
+print(q.get("seek", ""))
+PY
+)
+	secs=$(gen_seek_seconds "$duration" "$SEEKS" "$((SEED + fid))" "$baseline_pos")
 	while IFS= read -r s; do
 		[[ -z "$s" ]] && continue
-		local seek_url="$full"
-		case "$full" in
-			*\?*) seek_url="${full}&seek=${s}" ;;
-			*) seek_url="${full}?seek=${s}" ;;
-		esac
+		local seek_url
+		seek_url=$(set_query_param "$full" seek "$s")
 		phase_begin
 		out=$(http_get "$seek_url" "$body" "$hdr" --max-filesize "$((RANGE_BYTES * 2))")
 		phase_end
@@ -1304,81 +1596,235 @@ phase_seek() {
 	esac
 }
 
+# Subtitle delivery. The plan's inventory is only populated when a subtitle is
+# selected, so an empty inventory is not proof the file has no tracks. Tracks
+# are enumerated from the plan when present, otherwise by HEAD-probing combined
+# ordinals on a throwaway session, then each available track is fetched through
+# the stream subtitle endpoint. A completed extraction can end its session, so
+# cold and each warm fetch use their own session; the server caches the
+# extracted artifact, which is what makes the warm fetch fast.
 phase_subtitles() {
 	local fid="$1" resp="$2"
-	local tsv="$TMPDIR/subs-${fid}.tsv"
-	local inv_total
-	inv_total=$(python3 - "$resp" "$tsv" "$SUBTITLE_ORDINAL" <<'PY'
-import json, sys
-try:
-    data = json.load(open(sys.argv[1]))
-except Exception:
-    print(0)
-    raise SystemExit(0)
-plan = data.get("playback_plan") or {}
-inventory = ((plan.get("subtitle") or {}).get("inventory")) or []
-want = sys.argv[3]
-rows = [it for it in inventory if want == "" or str(it.get("combined_index", "")) == want]
-with open(sys.argv[2], "w") as fh:
-    for it in rows:
-        fields = [it.get("track_id", ""), it.get("combined_index", ""), it.get("codec", ""),
-                  it.get("source", ""), it.get("delivery", ""), it.get("url", "")]
-        fh.write("\t".join(str(f) for f in fields) + "\n")
-print(len(inventory))
-PY
-)
+	local plan_mode inv_count
+	plan_mode=$(py_field "$resp" playback_plan.subtitle.mode)
+	inv_count=$(subtitle_candidates_from_plan "$resp" | grep -c . || true)
+	[[ -z "$inv_count" ]] && inv_count=0
 
-	if [[ "${inv_total:-0}" -eq 0 ]]; then
-		rec subtitles item="$fid" track_count=0 inventory_total=0 no_tracks=true valid=false
+	local cands="$TMPDIR/subs-${fid}.tsv"
+	subtitle_candidates_from_plan "$resp" > "$cands"
+	local source="plan"
+	if [[ ! -s "$cands" ]]; then
+		source="probe"
+		local probe_sid ords
+		probe_sid=$(start_probe_session "$fid" "subprobe")
+		if [[ -z "$probe_sid" ]]; then
+			rec subtitles item="$fid" plan_mode="${plan_mode:-unknown}" inventory_count="$inv_count" \
+				ordinal_source="$source" no_tracks=true valid=false failure=session_unavailable
+			return
+		fi
+		ords=$(subtitle_ordinals "$probe_sid" "$fid")
+		while IFS=$'\t' read -r ordinal family; do
+			[[ -z "$ordinal" ]] && continue
+			local ext="ass"
+			[[ "$family" == "bitmap" ]] && ext="sup"
+			printf '%s\t%s\t\n' "$ordinal" "$ext" >> "$cands"
+		done <<< "$ords"
+		curl -sS --max-time 10 -X DELETE "$SERVER/api/v1/playback/$probe_sid" \
+			-H "$AUTH" -H "X-Profile-Id: $PROFILE_ID" -o /dev/null 2>/dev/null || true
+	fi
+
+	# Honor --subtitle-ordinal by narrowing to one combined ordinal.
+	if [[ -n "$SUBTITLE_ORDINAL" && -s "$cands" ]]; then
+		awk -F'\t' -v want="$SUBTITLE_ORDINAL" '$1 == want' "$cands" > "$cands.filtered" || true
+		mv "$cands.filtered" "$cands"
+	fi
+
+	local track_count
+	track_count=$(grep -c . "$cands" 2>/dev/null || true)
+	[[ -z "$track_count" ]] && track_count=0
+	rec subtitles item="$fid" plan_only=true plan_mode="${plan_mode:-unknown}" \
+		inventory_count="$inv_count" ordinal_source="$source" track_count="$track_count" \
+		available_count="$track_count" valid=false
+
+	if [[ "$track_count" -eq 0 ]]; then
+		if [[ -n "$SUBTITLE_ORDINAL" ]]; then
+			rec subtitles item="$fid" plan_mode="${plan_mode:-unknown}" inventory_count="$inv_count" \
+				ordinal_source="$source" requested_ordinal="$SUBTITLE_ORDINAL" reason=no_such_ordinal valid=false
+		else
+			rec subtitles item="$fid" plan_mode="${plan_mode:-unknown}" inventory_count="$inv_count" \
+				ordinal_source="$source" no_tracks=true valid=false
+		fi
 		return
 	fi
 
-	if [[ ! -s "$tsv" ]]; then
-		rec subtitles item="$fid" track_count="$inv_total" requested_ordinal="${SUBTITLE_ORDINAL:-0}" \
-			found=false reason=no_such_ordinal valid=false
+	local ordinal ext track_id i
+	while IFS=$'\t' read -r ordinal ext track_id; do
+		[[ -z "$ordinal" ]] && continue
+		[[ -z "$ext" ]] && ext="ass"
+		subtitle_fetch "$fid" "$ordinal" "$ext" false 0 "$track_id"
+		for i in $(seq 1 "$SUBTITLE_REPEATS"); do
+			[[ "$SETTLE_MS" -gt 0 ]] && sleep "$(awk -v m="$SETTLE_MS" 'BEGIN{printf "%.3f", m/1000}')"
+			subtitle_fetch "$fid" "$ordinal" "$ext" true "$i" "$track_id"
+		done
+	done < "$cands"
+}
+
+# Cold-fetch one representation to learn its real format, without recording a
+# phase record. Echoes the classified format (ass, pgs, vtt, unknown).
+subtitle_probe_format() {
+	local fid="$1" ordinal="$2" ext="$3"
+	local sid
+	sid=$(start_probe_session "$fid" "ft${ordinal}${ext}")
+	if [[ -z "$sid" ]]; then
+		printf 'unknown'
 		return
 	fi
+	local body="$TMPDIR/ft-${fid}-${ordinal}.${ext}.body"
+	local hdr="$TMPDIR/ft-${fid}-${ordinal}.${ext}.hdr"
+	local out status ttfb total bytes ctype rc
+	out=$(http_get_tmo "$SUBTITLE_TIMEOUT" "$SERVER/api/v1/stream/$sid/subtitles/$ordinal.$ext?file_id=$fid" "$body" "$hdr")
+	IFS='|' read -r status ttfb total bytes ctype rc <<< "$out"
+	local cls fmt
+	cls=$(classify_subtitle "$body" "${ctype:-}")
+	fmt="${cls%%|*}"
+	curl -sS --max-time 10 -X DELETE "$SERVER/api/v1/playback/$sid" \
+		-H "$AUTH" -H "X-Profile-Id: $PROFILE_ID" -o /dev/null 2>/dev/null || true
+	printf '%s' "$fmt"
+}
 
-	local body="$TMPDIR/sub.body" hdr="$TMPDIR/sub.hdr"
-	local track_id cidx codec source delivery surl fmt out status ttfb total bytes ctype rc valid failure i why
-	while IFS=$'\t' read -r track_id cidx codec source delivery surl; do
-		fmt=$(subtitle_format "$codec")
-		if [[ "$delivery" != "sidecar" || -z "$surl" ]]; then
-			why="no_url"
-			[[ -n "$delivery" ]] && why="$delivery"
-			rec subtitles item="$fid" track_id="$track_id" combined_index="${cidx:-0}" codec="${codec:-}" \
-				source="${source:-}" format="$fmt" delivery="${delivery:-}" track_count="$inv_total" \
-				fetchable=false failure="$why" valid=false
+# --find-subtitles: scan up to FIND_SUBTITLES_LIMIT items and report the plan's
+# subtitle mode, whether it published an inventory, the combined ordinals that
+# resolve, and the real format of one text and one bitmap candidate. HEAD
+# probes are cheap; format classification needs one cold fetch per family.
+run_find_subtitles() {
+	local limit="$FIND_SUBTITLES_LIMIT"
+	local results="$TMPDIR/find-subs.jsonl"
+	: > "$results"
+	local list
+	if [[ -n "$ITEM_FILTER" ]]; then
+		list="$ITEM_FILTER	item	item"
+	else
+		list=$(discover_candidates) || true
+	fi
+	if [[ -z "$list" ]]; then
+		die "no candidates discovered from libraries $MOVIE_LIBRARY_ID/$SERIES_LIBRARY_ID; pass --item <file_id>" 3
+	fi
+
+	local scanned=0 with_tracks=0
+	while IFS=$'\t' read -r cid title typ; do
+		[[ -z "$cid" ]] && continue
+		[[ "$scanned" -ge "$limit" ]] && break
+		local fid="$cid"
+		if [[ -z "$ITEM_FILTER" ]]; then
+			fid=$(resolve_file_id "$cid") || true
+			[[ -z "$fid" ]] && continue
+		fi
+		scanned=$((scanned + 1))
+
+		local sid mode inv_count
+		sid=$(start_probe_session "$fid" "ftprobe")
+		if [[ -z "$sid" ]]; then
+			printf '  file_id=%s  <unplayable>  %s\n' "$fid" "$title"
 			continue
 		fi
-		local full
-		full=$(resolve_media_url "$surl")
-		phase_begin
-		out=$(http_get "$full" "$body" "$hdr")
-		phase_end
-		IFS='|' read -r status ttfb total bytes ctype rc <<< "$out"
-		failure=$(validate_subtitle "$body" "$ctype" "$fmt")
-		if [[ "$failure" == "ok" && "${rc:-0}" -eq 0 ]]; then valid=true; failure=""; else valid=false; [[ "$failure" == "ok" ]] && failure="curl_rc_${rc}"; fi
-		rec subtitles item="$fid" track_id="$track_id" combined_index="${cidx:-0}" codec="${codec:-}" \
-			source="${source:-}" format="$fmt" delivery="${delivery:-}" track_count="$inv_total" fetchable=true \
-			warm=false attempt=0 request="$(sanitize_url "$full")" \
-			http_status="${status:-0}" ttfb_ms="$(ms "${ttfb:-0}")" total_ms="$(ms "${total:-0}")" \
-			bytes="${bytes:-0}" content_type="${ctype:-}" valid="$valid" failure="$failure"
-		[[ "$SETTLE_MS" -gt 0 ]] && sleep "$(awk -v m="$SETTLE_MS" 'BEGIN{printf "%.3f", m/1000}')"
-		for i in $(seq 1 "$SUBTITLE_REPEATS"); do
-			phase_begin
-			out=$(http_get "$full" "$body" "$hdr")
-			phase_end
-			IFS='|' read -r status ttfb total bytes ctype rc <<< "$out"
-			failure=$(validate_subtitle "$body" "$ctype" "$fmt")
-			if [[ "$failure" == "ok" && "${rc:-0}" -eq 0 ]]; then valid=true; failure=""; else valid=false; [[ "$failure" == "ok" ]] && failure="curl_rc_${rc}"; fi
-			rec subtitles item="$fid" track_id="$track_id" combined_index="${cidx:-0}" codec="${codec:-}" \
-				source="${source:-}" format="$fmt" delivery="${delivery:-}" track_count="$inv_total" fetchable=true \
-				warm=true attempt="$i" request="$(sanitize_url "$full")" \
-				http_status="${status:-0}" ttfb_ms="$(ms "${ttfb:-0}")" total_ms="$(ms "${total:-0}")" \
-				bytes="${bytes:-0}" content_type="${ctype:-}" valid="$valid" failure="$failure"
-		done
-	done < "$tsv"
+		mode=$(py_field "$TMPDIR/ftprobe-${fid}.json" playback_plan.subtitle.mode)
+		inv_count=$(subtitle_candidates_from_plan "$TMPDIR/ftprobe-${fid}.json" | grep -c . || true)
+		[[ -z "$inv_count" ]] && inv_count=0
+
+		local ords candidates="$TMPDIR/ft-cands-${fid}.tsv"
+		: > "$candidates"
+		subtitle_candidates_from_plan "$TMPDIR/ftprobe-${fid}.json" |
+			awk -F'\t' '{ family=($2=="sup")?"bitmap":"text"; print $1"\t"$2"\t"family"\t"$3 }' > "$candidates"
+		if [[ ! -s "$candidates" ]]; then
+			ords=$(subtitle_ordinals "$sid" "$fid")
+			while IFS=$'\t' read -r ordinal family; do
+				[[ -z "$ordinal" ]] && continue
+				local ext="ass"
+				[[ "$family" == "bitmap" ]] && ext="sup"
+				printf '%s\t%s\t%s\t\n' "$ordinal" "$ext" "$family" >> "$candidates"
+			done <<< "$ords"
+		fi
+		curl -sS --max-time 10 -X DELETE "$SERVER/api/v1/playback/$sid" \
+			-H "$AUTH" -H "X-Profile-Id: $PROFILE_ID" -o /dev/null 2>/dev/null || true
+
+		local ordinal_list="" text_ord="" text_ext="" bitmap_ord="" bitmap_ext="" family
+		while IFS=$'\t' read -r ordinal ext family _; do
+			[[ -z "$ordinal" ]] && continue
+			ordinal_list="${ordinal_list}${ordinal}:${family} "
+			if [[ "$family" == "bitmap" ]]; then
+				[[ -z "$bitmap_ext" ]] && { bitmap_ord="$ordinal"; bitmap_ext="$ext"; }
+			else
+				[[ -z "$text_ext" ]] && { text_ord="$ordinal"; text_ext="ass"; }
+			fi
+		done < "$candidates"
+
+		local formats="" fmt
+		if [[ -n "$text_ext" ]]; then
+			fmt=$(subtitle_probe_format "$fid" "$text_ord" "$text_ext")
+			formats="${formats}ordinal ${text_ord}=${fmt} "
+		fi
+		if [[ -n "$bitmap_ext" ]]; then
+			fmt=$(subtitle_probe_format "$fid" "$bitmap_ord" "$bitmap_ext")
+			formats="${formats}ordinal ${bitmap_ord}=${fmt} "
+		fi
+		local track_count
+		track_count=$(grep -c . "$candidates" 2>/dev/null || true)
+		[[ -z "$track_count" ]] && track_count=0
+		[[ "$track_count" -gt 0 ]] && with_tracks=$((with_tracks + 1))
+
+		META_FID="$fid" META_TITLE="$title" META_TYPE="$typ" META_MODE="${mode:-unknown}" \
+		META_INV="$inv_count" META_ORDS="$ordinal_list" META_FORMATS="$formats" \
+		META_TRACKS="$track_count" python3 - "$results" <<'PY'
+import json, os, sys
+rec = {
+    "file_id": int(os.environ["META_FID"]) if os.environ["META_FID"].isdigit() else os.environ["META_FID"],
+    "title": os.environ["META_TITLE"],
+    "type": os.environ["META_TYPE"],
+    "plan_subtitle_mode": os.environ["META_MODE"],
+    "plan_inventory_count": int(os.environ["META_INV"]),
+    "track_count": int(os.environ["META_TRACKS"]),
+    "ordinals": os.environ["META_ORDS"].split(),
+    "formats": os.environ["META_FORMATS"].strip(),
+}
+with open(sys.argv[1], "a") as fh:
+    fh.write(json.dumps(rec) + "\n")
+PY
+		printf '  file_id=%-9s mode=%-6s inventory=%s tracks=%s ordinals=%s formats=%s  %s\n' \
+			"$fid" "${mode:-?}" "$inv_count" "$track_count" "${ordinal_list:-none}" "${formats:-none}" "$title"
+	done <<< "$list"
+
+	echo ""
+	if [[ "$with_tracks" -eq 0 ]]; then
+		echo "  scanned $scanned item(s); none expose subtitle tracks."
+	else
+		echo "  scanned $scanned item(s); $with_tracks expose subtitle tracks."
+	fi
+
+	if [[ -n "$JSON_OUT" ]]; then
+		META_SERVER="$(sanitize_url "$SERVER")" META_PROFILE="$PROFILE_ID" \
+		META_RUN_ID="$RUN_ID" META_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		META_SCANNED="$scanned" META_WITH="$with_tracks" META_RESULTS="$results" \
+		python3 - "$JSON_OUT" <<'PY'
+import json, os, sys
+items = [json.loads(l) for l in open(os.environ["META_RESULTS"]) if l.strip()]
+report = {
+    "meta": {
+        "tool": "bench-playback-e2e",
+        "mode": "find_subtitles",
+        "server": os.environ["META_SERVER"],
+        "profile_id": os.environ["META_PROFILE"],
+        "run_id": os.environ["META_RUN_ID"],
+        "timestamp": os.environ["META_TIMESTAMP"],
+        "scanned": int(os.environ["META_SCANNED"]),
+        "with_tracks": int(os.environ["META_WITH"]),
+    },
+    "items": items,
+}
+json.dump(report, open(sys.argv[1], "w"), indent=2)
+PY
+		echo "JSON report written to $JSON_OUT"
+	fi
+	exit 0
 }
 
 # Stop the primary session. Measured as the stop phase.
@@ -1472,11 +1918,9 @@ run_item() {
 		delivery="${delivery:-}" protocol="${proto:-}" stream_url="$surl" session_id="${sid:-}" \
 		source_start_seconds="${src_start:-0}"
 
-	local mode="direct"
-	[[ "$proto" == "hls" ]] && mode="hls"
-
 	if [[ "$playable" != "true" ]]; then
 		rec first_bytes item="$fid" attempted=false reason=not_playable valid=false
+		rec throughput item="$fid" attempted=false reason=not_playable valid=false
 		rec seek item="$fid" attempted=false reason=not_playable valid=false
 		rec resume item="$fid" attempted=false reason=not_playable
 		phase_stop "$fid" "$sid"
@@ -1498,15 +1942,15 @@ for line in open(sys.argv[1]):
 print(total)
 PY
 )
-	phase_seek "$fid" "$mode" "$plan_url" "$total_size"
-	phase_subtitles "$fid" "$resp"
+	local duration
+	duration=$(py_field "$resp" playback_plan.source.duration_seconds)
+	phase_throughput "$fid" "$delivery" "$proto" "$plan_url"
+	phase_seek "$fid" "$delivery" "$proto" "$plan_url" "$total_size" "$duration"
 
 	# Resume check: store a position on the live session, stop the session
 	# (measured), then start again with start_position omitted.
 	local position progress_status
-	local dur
-	dur=$(py_field "$resp" playback_plan.source.duration_seconds)
-	position=$(awk -v d="${dur:-0}" -v p="$RESUME_POSITION" \
+	position=$(awk -v d="${duration:-0}" -v p="$RESUME_POSITION" \
 		'BEGIN{ if (d+0>0) { x=d*0.5; if (x<p) printf "%.1f", x; else printf "%.1f", p } else printf "%.1f", p }')
 	progress_status=$(curl -sS --max-time "$CURL_TIMEOUT" -X POST "$SERVER/api/v1/playback/$sid/progress" \
 		-H "$AUTH" -H 'Content-Type: application/json' -H "X-Profile-Id: $PROFILE_ID" \
@@ -1514,9 +1958,17 @@ PY
 		-d "{\"position\": $position, \"is_paused\": false}" 2>/dev/null || echo "0")
 	phase_stop "$fid" "$sid"
 	phase_resume "$fid" "$position" "$progress_status"
+
+	# Subtitles use their own sessions: a completed extraction can end the one
+	# that requested it.
+	phase_subtitles "$fid" "$resp"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+if [[ "$FIND_SUBTITLES" -eq 1 ]]; then
+	run_find_subtitles
+fi
 
 ITEMS=()
 if [[ -n "$ITEM_FILTER" ]]; then
@@ -1567,6 +2019,9 @@ META_SEEKS="$SEEKS" \
 META_SUBTITLE_REPEATS="$SUBTITLE_REPEATS" \
 META_SETTLE_MS="$SETTLE_MS" \
 META_RANGE_BYTES="$RANGE_BYTES" \
+META_THROUGHPUT_BYTES="$THROUGHPUT_BYTES" \
+META_STALL_MS="$STALL_MS" \
+META_SUBTITLE_TIMEOUT="$SUBTITLE_TIMEOUT" \
 META_RESUME_POSITION="$RESUME_POSITION" \
 META_SUBTITLE_ORDINAL="$SUBTITLE_ORDINAL" \
 META_DISCOVERED="$DISCOVERED_COUNT" \
@@ -1600,6 +2055,9 @@ meta = {
     "subtitle_repeats": int(os.environ["META_SUBTITLE_REPEATS"]),
     "settle_ms": int(os.environ["META_SETTLE_MS"]),
     "range_bytes": int(os.environ["META_RANGE_BYTES"]),
+    "throughput_bytes": int(os.environ["META_THROUGHPUT_BYTES"]),
+    "stall_ms": int(os.environ["META_STALL_MS"]),
+    "subtitle_timeout": int(os.environ["META_SUBTITLE_TIMEOUT"]),
     "resume_position": float(os.environ["META_RESUME_POSITION"]),
     "subtitle_ordinal": (int(os.environ["META_SUBTITLE_ORDINAL"])
                          if os.environ.get("META_SUBTITLE_ORDINAL") else None),
