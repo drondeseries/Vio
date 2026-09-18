@@ -591,8 +591,8 @@ func (t *virtualResolveTrace) fields() []any {
 		ran  bool
 		d    time.Duration
 	}{
-		{"list", t.listRan, t.list}, //nolint:goconst // log attribute key/value, kept inline for readability.
-		{"remux", t.remuxRan, t.remux}, //nolint:goconst // log attribute key/value, kept inline for readability.
+		{"list", t.listRan, t.list},          //nolint:goconst // log attribute key/value, kept inline for readability.
+		{"remux", t.remuxRan, t.remux},       //nolint:goconst // log attribute key/value, kept inline for readability.
 		{"resolve", t.resolveRan, t.resolve}, //nolint:goconst // log attribute key/value, kept inline for readability.
 		{"probe", t.probeRan, t.probe},
 		{"fallback", t.fallbackRan, t.fallback},
