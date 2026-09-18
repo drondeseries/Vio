@@ -294,6 +294,11 @@ Note the deliberate asymmetry with start: a store outage during replan is `500`,
 never `404`. Clients tear playback down on session-not-found, so a transient
 store failure must read as retryable rather than as the session having vanished.
 
+A `failure_recovery` replan with a decode failure classification
+(`decode_error`) rotates the virtual provider candidate without changing the
+delivery class; see §6 for the rotation rules and the `source_decode_failed`
+terminal.
+
 ### 2.4 `POST /playback/route-events`
 
 Reports what happened on the device. Auth + `X-Profile-Id` required. Request body
@@ -909,6 +914,30 @@ the server will not hand back a plan whose key is in that list. `attempt_count`
 (1–8) bounds the whole recovery chain. Together they mean a device that fails
 every route reaches a terminal instead of cycling forever.
 
+**Decode-rejection rotation.** A release whose video decoder rejects the source
+answers the HLS manifest and segment routes with `422` and
+`X-Vio-Decode-Error: source_decode_failed`. The client reports that as a
+`failure_recovery` replan with `failure.classification = "decode_error"`. When
+the effective selection is not explicit, the server treats the rejected release
+as a bad *candidate*, not a bad route: it re-resolves the same request with the
+failed provider result id in `excluded_candidate_ids`, plans the next-ranked
+release, and commits that plan. Rotation is bounded by the server's virtual
+failover attempt limit (`playback.max_virtual_failover_attempts`); excluding the
+failed id each round is what guarantees termination. The failed id is carried
+explicitly in the exclusion list, so rotation does not depend on the
+asynchronous catalog `failed_at` stamp having landed. A fresh start whose first
+generation is rejected during startup rotates the same way, before the plan is
+committed, so a client never receives a manifest for a generation the decoder
+already rejected.
+
+Rotation is candidate substitution and never a decode-mode change: the
+`gpu_only` / `software_fallback` policy is untouched, and an explicit version pin
+is never substituted. If no sibling candidate recovers the selection — or when
+the selection is explicit — the attempt terminates with
+`source_decode_failed` (§7.3); an explicit pick also gets the version-list hint.
+The `422` + `X-Vio-Decode-Error` media responses remain the fallback for clients
+that do not run the `decode_error` recovery path.
+
 Failure, seek, and quality replans may omit unchanged track identities. The
 server overlays only identities present in those requests and preserves the
 durable selected subtitle otherwise. Only `operation: "track_change"` gives an
@@ -1138,6 +1167,7 @@ HDR, 4K, or transcode-policy reason — deselecting the subtitle restores playba
 `subtitle_artifact_unavailable`, `capacity_unavailable`,
 `local_transcode_disabled`,
 `audio_transcoding_disabled`,
+`source_decode_failed`,
 `transcode_start_failed`, `transcode_node_unavailable`,
 `transcode_node_capability_unavailable`, `track_unavailable`,
 `invalid_seek_position`, `invalid_replan`, `seek_reanchor_route_changed`,

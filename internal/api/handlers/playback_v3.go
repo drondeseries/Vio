@@ -53,6 +53,15 @@ const (
 	subtitleUnavailableReasonV3  = "subtitle_artifact_unavailable"
 	transcodeStartFailedReasonV3 = "transcode_start_failed"
 	seekRestorationPlayerV3      = "player_position"
+	// candidateSourceDecodeRejectedReasonV3 is the internal transport reason for
+	// a local generation whose decoder already rejected the source. It is never
+	// a client terminal: the start/replan rotation loop consumes it to substitute
+	// another provider candidate, and exhaustion persists sourceDecodeFailedReasonV3.
+	candidateSourceDecodeRejectedReasonV3 = "candidate_source_decode_rejected"
+	// sourceDecodeFailedReasonV3 is the durable terminal reason for a decode
+	// rejection that could not be recovered, matching the media-route
+	// X-Vio-Decode-Error code clients already classify on.
+	sourceDecodeFailedReasonV3 = playback.DecodeErrorSourceRejectedCode
 	// Failed capability fetches are memoized briefly so an unreachable node
 	// costs one timeout per window instead of one per planning request.
 	v3NodeCapabilityErrorTTL = 15 * time.Second
@@ -1718,12 +1727,21 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		return playback.DecisionResponseV3{}, playbackFileOperationError(err)
 	}
 	timings.mark("file_load")
+	// The authorized catalog row is kept so a decode-rejection rotation can
+	// re-resolve the same request with each rejected provider candidate
+	// excluded, after requestedFile has been replaced by a resolved candidate.
+	catalogRequestedFile := requestedFile
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve and
 	// probe them through the virtual provider before the generic probe repair
 	// path, which only understands local/HTTP media files.
 	if isVirtualPlaybackFile(requestedFile) {
 		requestedCatalogFileID := requestedFile.ID
-		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink)
+		// An auto selection skips a catalog row the catalog marked failed, even
+		// when the row already carries a concrete result= identity adopted by an
+		// earlier auto pick; only an explicit pick or a forced relink re-tries
+		// the known-bad candidate.
+		allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
+		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, allowFailedCandidate)
 		if resolveErr != nil {
 			termFileID := requestedFile.ID
 			if requestedFile.EpisodeID != "" && h.VirtualEpisodeFileLookup != nil {
@@ -2039,6 +2057,25 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, result, clientInfo)
 	timings.mark("session_transport_commit")
 	if statusErr != nil {
+		// A decoder-rejected source is a candidate failure, not a route failure:
+		// rotate to the next provider release before any terminal. An explicit
+		// pin is never substituted; it terminalls with the version-list hint.
+		if statusErr.reason == candidateSourceDecodeRejectedReasonV3 && isVirtualPlaybackFile(requestedFile) {
+			if req.FileSelection != playback.FileSelectionExplicitV3 {
+				rejectedID := virtualResultCandidateID(effectiveFile.FilePath)
+				if rejectedID == "" {
+					rejectedID = virtualResultCandidateID(requestedFile.FilePath)
+				}
+				if rotated, ok := h.rotateRejectedVirtualCandidateStartV3(r, userID, profileID, req, requestDigests, catalogRequestedFile, settings, settingsErr, clientInfo, rejectedID); ok {
+					return rotated, nil
+				}
+			}
+			persisted, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, sourceDecodeFailedTerminalResponseV3(req.FileSelection))
+			if persistErr != nil {
+				return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
+			}
+			return persisted, nil
+		}
 		if statusErr.reason == "transcode_start_failed" && isVirtualPlaybackFile(requestedFile) {
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
 			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder); alternateErr == nil && len(alternates) > 0 {
@@ -2139,6 +2176,92 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 		}
 	}
 	return resolved.File, nil
+}
+
+// sourceDecodeFailedTerminalResponseV3 builds the durable terminal for a
+// decode rejection that could not be recovered. The explicit-pick version-list
+// hint is appended here because an explicit pin is never substituted.
+func sourceDecodeFailedTerminalResponseV3(fileSelection playback.FileSelectionV3) playback.DecisionResponseV3 {
+	terminal := &playback.TerminalV3{
+		Reason:    sourceDecodeFailedReasonV3,
+		Message:   "The selected media source could not be decoded.",
+		Retryable: false,
+	}
+	hintExplicitSelectionAlternateAvailableV3(terminal, fileSelection)
+	return playback.NewTerminalResponseFromTerminalV3(terminal)
+}
+
+// rotateRejectedVirtualCandidateStartV3 retries a virtual start whose local
+// transport the decoder rejected, excluding each rejected provider result id so
+// the provider offers the next-ranked release. It is bounded by
+// maxVirtualFailoverAttempts; excluding the failed id on every iteration is what
+// guarantees termination even when a provider keeps returning the dead release.
+//
+// It rotates on the provider result id rather than the catalog failed_at stamp,
+// so rotation does not depend on the asynchronous mark having landed. It returns
+// ok=false when no replacement candidate starts, leaving the caller to persist
+// the source_decode_failed terminal.
+func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
+	r *http.Request,
+	userID int,
+	profileID string,
+	req playback.StartRequestV3,
+	requestDigests playbackStartRequestDigestsV3,
+	catalogFile *models.MediaFile,
+	settings playback.PlannerSettingsV3,
+	settingsErr error,
+	clientInfo playback.ClientInfo,
+	firstRejectedID string,
+) (playback.DecisionResponseV3, bool) {
+	if catalogFile == nil || firstRejectedID == "" {
+		return playback.DecisionResponseV3{}, false
+	}
+	maxAttempts := h.maxVirtualFailoverAttempts(r.Context())
+	excluded := []string{firstRejectedID}
+	for attempt := 1; attempt < maxAttempts; attempt++ {
+		// An auto selection: allowFailedCandidate=false keeps the catalog
+		// failed_at rule, and the explicit exclusion carries the live verdict.
+		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, catalogFile, profileID, true, excluded, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, false)
+		if resolveErr != nil || resolved.File == nil {
+			return playback.DecisionResponseV3{}, false
+		}
+		nextID := virtualResultCandidateID(resolved.URI)
+		if nextID != "" && containsStringExactV3(excluded, nextID) {
+			// The resolver handed back an already-excluded candidate; stop
+			// rather than spin on the same release.
+			return playback.DecisionResponseV3{}, false
+		}
+		resolvedFile := *resolved.File
+		resolvedFile.ID = catalogFile.ID
+		resolvedFile.FilePath = resolved.URI
+		resolvedFile.VirtualOwnerInstallationID = resolved.OwnerID
+		audioIndex, audioErr := resolveV3AudioIndex(&resolvedFile, req.AudioTrackID, req.AudioTrackIndex)
+		if audioErr != nil {
+			return playback.DecisionResponseV3{}, false
+		}
+		planResult, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
+			Request: req, RequestedFile: &resolvedFile, EffectiveFile: &resolvedFile,
+			AudioTrackIndex: audioIndex, Settings: settings,
+			Registry:        h.transformationRegistryV3(r.Context()),
+			DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), &resolvedFile),
+			Now:             time.Now(),
+		})
+		planResult = retryIncompleteToneMapPlanningV3(planResult, toneMapCapabilityErr)
+		planResult = retryIncompletePlaybackSettingsV3(planResult, settingsErr)
+		clampPlannerTargetResolution(&planResult, &resolvedFile)
+		if planResult.Terminal != nil || planResult.Plan == nil {
+			return playback.DecisionResponseV3{}, false
+		}
+		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, &resolvedFile, &resolvedFile, audioIndex, planResult, clientInfo)
+		if statusErr == nil {
+			return response, true
+		}
+		if statusErr.reason != candidateSourceDecodeRejectedReasonV3 || nextID == "" {
+			return playback.DecisionResponseV3{}, false
+		}
+		excluded = append(excluded, nextID)
+	}
+	return playback.DecisionResponseV3{}, false
 }
 
 type playbackStartRequestDigestsV3 struct {
@@ -2598,6 +2721,13 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 			transport, transportErr := h.prepareLocalTransportV3(r, session, file, result, timeline, mode)
 			if transportErr == nil {
 				return transport, nil
+			}
+			if transportErr.reason == candidateSourceDecodeRejectedReasonV3 {
+				// A source the decoder rejected is bad for every executor, so
+				// rotating to another delivery shape would only re-encode the
+				// same undecodable bytes. Surface it immediately so the start or
+				// replan rotation loop can substitute a provider candidate.
+				return preparedTransportV3{}, transportErr
 			}
 			lastErr = combineTransportErrorsV3(lastErr, transportErr)
 			excludedShapes[decision.Shape.ID] = struct{}{}
@@ -4133,6 +4263,27 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			}
 		}
 	}
+	// Start-commit decode pre-check. A virtual generation whose decoder already
+	// rejected the source during startup cannot produce a playable plan, so fail
+	// it before it is published and let the start/replan rotation loop substitute
+	// another provider candidate. This is a flag read on the candidate we are
+	// about to commit, never a wait, and only a video encode has a decode verdict
+	// to give up on. It deliberately reads the SUCCESSOR ts, not the registered
+	// predecessor: a replan to a healthy sibling must not be aborted by the
+	// generation it is replacing. Non-virtual files keep the existing behavior —
+	// the start commits and the media routes answer 422 + X-Vio-Decode-Error,
+	// which remains the fallback for clients without the recovery path.
+	if isVirtualPlaybackFile(file) && result.Plan != nil && planHasVideoEncodeV3(*result.Plan) && ts.IsSourceRejected() {
+		// The generation is never published; close its process before the
+		// lifecycle lock is released so a rejected candidate does not leak a
+		// running ffmpeg.
+		_ = ts.Close()
+		unlock()
+		return preparedTransportV3{}, &transportErrorV3{
+			reason:  candidateSourceDecodeRejectedReasonV3,
+			message: "The selected media source was rejected by the video decoder.",
+		}
+	}
 	cardOpts := ts.Opts()
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), "virtual://") {
 		cardOpts.CanonicalInputPath = file.FilePath
@@ -5626,12 +5777,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// a client-authority change: a fresh start of the same file still negotiates
 	// normally, and an explicit user retry can re-enable the route by going
 	// through a new start.
-	// A decode failure defers the demotion while a software-decode variant of
-	// the same server-transcode delivery is still untried and the live decoder
-	// actually gave up: the retry is the next hop, so demoting first would
-	// strand the session on a route that has no decode-mode dimension. Every
-	// other transport failure demotes exactly as before.
-	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) && (!decodeFailureClassificationV3(req.Failure.Classification) || !h.softwareDecodeRetryPendingV3(record, req)) {
+	// A decode failure defers the demotion while the next hop can still recover
+	// the same server-transcode delivery: either an untried software-decode
+	// variant of the same source, or a provider candidate rotation under the
+	// same virtual release. Demoting first would strand the session on a route
+	// shape that rotation needs. Every other transport failure demotes exactly
+	// as before.
+	//
+	// virtualDecodeRotation is the rotation predicate for a non-explicit
+	// virtual failure: candidate substitution is the recovery, so the delivery
+	// stays eligible until rotation exhausts.
+	virtualDecodeRotation := h.virtualCandidateRotationPendingV3(record, req)
+	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
+		(!decodeFailureClassificationV3(req.Failure.Classification) ||
+			(!h.softwareDecodeRetryPendingV3(record, req) && !virtualDecodeRotation)) {
 		// Demote on both copies: the record (the durable attempt this replan
 		// may still terminal-persist) and the seeded start, whose payload the
 		// success commit writes back via updated.NormalizedRequest. Demoting
@@ -5800,6 +5959,23 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if !ok {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "internal_error", message: "The live session manager does not support atomic replacement."}
 	}
+	// An explicit virtual version pin is never substituted. A decode rejection
+	// on it terminalls immediately with the version-list hint so the viewer can
+	// pick another release; rotation is reserved for auto selections.
+	if strings.TrimSpace(session.VirtualSourceURI) != "" &&
+		operation == playback.ReplanOperationFailureRecoveryV3 &&
+		decodeFailureClassificationV3(req.Failure.Classification) &&
+		record.CurrentPlan.Delivery == playback.DeliveryTranscodeHLSV3 &&
+		planHasVideoEncodeV3(record.CurrentPlan) &&
+		record.NormalizedRequest.FileSelection == playback.FileSelectionExplicitV3 {
+		terminal := &playback.TerminalV3{
+			Reason:    sourceDecodeFailedReasonV3,
+			Message:   "The selected media version could not be decoded.",
+			Retryable: false,
+		}
+		hintExplicitSelectionAlternateAvailableV3(terminal, record.NormalizedRequest.FileSelection)
+		return playback.NewTerminalResponseFromTerminalV3(terminal), *record, nil, nil
+	}
 	// Reactive software-decode recovery. A hardware decoder can reject a source
 	// the planner believed it could decode (invalid-bitstream failures from the
 	// first frame). The planner has no way to express a software-decode
@@ -5841,6 +6017,14 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// empty when the planner returns adaptation_exhausted.
 		decodeAttemptDetail = fmt.Sprintf("hardware and software video decode both attempted for %s (hw_accel=%s)", record.CurrentPlan.Delivery, strings.TrimSpace(session.TranscodeHWAccel))
 	}
+	// Rotation is candidate substitution, never a decode-mode change: an
+	// explicit pin is not substituted, and for a virtual non-explicit decode
+	// failure the recovery is another provider release under the same delivery,
+	// not a forced CPU decode of the rejected one. The operator's gpu_only /
+	// software-fallback policy therefore stays untouched for local sources.
+	if virtualDecodeRotation {
+		forceSoftwareDecode = false
+	}
 	virtualRehydrationFailed := false
 	var virtualRehydrationErr error
 	if isVirtualPlaybackFile(currentEffectiveFile) {
@@ -5860,7 +6044,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			evidenceComplete := completeVirtualVideoEvidenceV3(currentEffectiveFile) &&
 				completeVirtualAudioEvidenceV3(currentEffectiveFile) &&
 				completeVirtualContainerEvidenceV3(currentEffectiveFile)
-			if candidateUnchanged && evidenceComplete {
+			// A decode-classified failure on a non-explicit selection always
+			// takes the exclusion path, even when the catalog row still names
+			// the session-bound candidate and its evidence is complete: that
+			// short-circuit would re-mount the exact release the decoder just
+			// rejected. Rotation must happen on the provider result id.
+			if candidateUnchanged && evidenceComplete && !virtualDecodeRotation {
 				currentEffectiveFile.FilePath = session.VirtualSourceURI
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
 			} else {
@@ -5870,20 +6059,26 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// excluded so it cannot be re-selected under a new row ID.
 				preferredCandidateID := virtualResultCandidateID(session.VirtualSourceURI)
 				var excludedCandidateIDs []string
-				// A decode-classified failure with an untried software variant
-				// retries the SAME candidate. The current verdict is "this
-				// decoder could not read the source", not "this release is
-				// dead", so rotating away would hide the hardware/software
-				// question the software retry exists to answer. Resolving the
-				// preferred session candidate without excluding it re-binds the
-				// same release, and the forced software recipe (passed to the
-				// planner below) re-decodes it on the CPU. Any other failure —
-				// transport, timeout, or a software plan that already failed —
-				// keeps today's rotate-to-a-different-candidate behavior.
-				if failedID := virtualResultCandidateID(currentEffectiveFile.FilePath); failedID != "" && !forceSoftwareDecode {
+				// A decode-classified failure on a non-explicit selection
+				// excludes the rejected result id and rotates. The exclusion is
+				// the live verdict, so rotation never depends on the async
+				// catalog stamp. A non-rotation decode failure with an untried
+				// software variant retries the SAME candidate: the verdict is
+				// "this decoder could not read the source", not "this release is
+				// dead", and the forced software recipe re-decodes it on the CPU.
+				// Any other failure — transport, timeout, or a software plan
+				// that already failed — keeps the rotate-to-a-sibling behavior.
+				failedID := virtualResultCandidateID(currentEffectiveFile.FilePath)
+				if failedID == "" {
+					// The row may have been neutralized between planning and
+					// this replan; the session holds the authoritative failed
+					// result id.
+					failedID = virtualResultCandidateID(session.VirtualSourceURI)
+				}
+				if failedID != "" && (!forceSoftwareDecode || virtualDecodeRotation) {
 					excludedCandidateIDs = []string{failedID}
 				}
-				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false)
+				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false, true)
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true
@@ -5993,6 +6188,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			}
 		}
 		if !virtualRecoverySucceeded {
+			if virtualDecodeRotation {
+				// The rejected release had no untried sibling (and no sibling
+				// edition recovered it). Retire the delivery and terminal with
+				// the decode reason so the viewer can pick another release.
+				demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+				demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
+				terminal := &playback.TerminalV3{
+					Reason:    sourceDecodeFailedReasonV3,
+					Message:   "The selected media source could not be decoded.",
+					Retryable: false,
+				}
+				hintExplicitSelectionAlternateAvailableV3(terminal, record.NormalizedRequest.FileSelection)
+				return playback.NewTerminalResponseFromTerminalV3(terminal), *record, nil, nil
+			}
 			return playback.DecisionResponseV3{}, *record, nil, classifyVirtualReplanExhaustionV3(virtualRehydrationErr, candidateErrs)
 		}
 	} else {
@@ -6220,6 +6429,18 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	result = retryIncompleteToneMapPlanningV3(result, toneMapCapabilityErr)
 	result = retryIncompletePlaybackSettingsV3(result, plannerSettingsErr)
 	h.clarifyOriginalQuality4KTerminalV3(r.Context(), result.Terminal, requestedFile, replanAlternateFilePinnedByOriginalQualityV3(operation, start.QualityPreference))
+	if result.Terminal != nil && virtualDecodeRotation {
+		// No provider candidate recovered the decode rejection. Report the
+		// client-facing decode reason (which the media-route 422 already uses)
+		// and retire the server-transcode delivery so a later replan does not
+		// chase the same rejected route.
+		result.Terminal.Reason = sourceDecodeFailedReasonV3
+		result.Terminal.Message = "The selected media source could not be decoded."
+		result.Terminal.Retryable = false
+		hintExplicitSelectionAlternateAvailableV3(result.Terminal, record.NormalizedRequest.FileSelection)
+		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+		demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
+	}
 	if decodeAttemptDetail != "" && result.Terminal != nil && strings.TrimSpace(result.Terminal.Detail) == "" {
 		// The software decode mode was the plan that just failed. Name both
 		// attempted decode modes on any terminal so an exhausted route never
@@ -6402,6 +6623,28 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				policy.RemuxEgress = config.PlaybackEgressAPIOnly
 				policy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
 				transportRequest = r.WithContext(withPlaybackRoutingPolicySnapshotV3(r.Context(), policy))
+			}
+			// A decode-driven candidate rotation rebinds the session to the
+			// replacement release before the transport is prepared. The local
+			// transport resolves the session-bound candidate in preference to
+			// the plan's input, so without this rebind the replacement
+			// generation would be built from the rejected source again. The
+			// durable session replacement below re-applies the same binding on
+			// commit.
+			if virtualDecodeRotation && isVirtualPlaybackFile(effectiveFile) &&
+				strings.TrimSpace(session.VirtualSourceURI) != "" &&
+				effectiveFile.FilePath != session.VirtualSourceURI {
+				if setter, ok := h.sessionMgr.(interface {
+					SetVirtualSource(string, string, int) error
+				}); ok {
+					if rebindErr := setter.SetVirtualSource(session.ID, effectiveFile.FilePath, effectiveFile.VirtualOwnerInstallationID); rebindErr != nil {
+						return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
+							reason:  "internal_error",
+							message: "Failed to rebind the rotated virtual source.",
+							cause:   rebindErr,
+						}
+					}
+				}
 			}
 			transport, transportErr = h.prepareTransportV3(transportRequest, session, effectiveFile, result, mode)
 			if transportErr != nil {
@@ -7243,7 +7486,7 @@ func terminalAllowsAlternateFileV3(terminal *playback.TerminalV3) bool {
 		return false
 	}
 	switch terminal.Reason {
-	case terminalNoAlternateVersionV3, terminalHDRTranscodeUnsupportedV3, terminalSubtitleConversionUnsupportedV3:
+	case terminalNoAlternateVersionV3, terminalHDRTranscodeUnsupportedV3, terminalSubtitleConversionUnsupportedV3, sourceDecodeFailedReasonV3:
 		return true
 	default:
 		return false
@@ -7935,6 +8178,40 @@ func (h *PlaybackHandler) softwareDecodeRetryPendingV3(record *playback.AttemptR
 	}
 	ts := h.tm.GetTranscodeSession(record.SessionID)
 	return ts != nil && ts.IsDecodeFailed()
+}
+
+// virtualCandidateRotationPendingV3 reports whether a decode-classified failure
+// recovery on a non-explicit virtual selection can still rotate to another
+// provider candidate under the same server-transcode delivery. When true the
+// delivery must not be demoted: rotation, not delivery retirement, is the next
+// hop, and demoting first would make the planner abandon the only delivery the
+// replacement candidate can use.
+//
+// The predicate is structural and deliberately conservative: it does not list
+// candidates (that would put a provider round-trip on the demotion decision).
+// If rotation later finds no sibling, executeReplanV3 retires the delivery
+// explicitly on the exhausted path. An explicit pin is never a rotation.
+func (h *PlaybackHandler) virtualCandidateRotationPendingV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) bool {
+	if h == nil || record == nil {
+		return false
+	}
+	if req.EffectiveOperation() != playback.ReplanOperationFailureRecoveryV3 {
+		return false
+	}
+	if !decodeFailureClassificationV3(req.Failure.Classification) {
+		return false
+	}
+	if record.NormalizedRequest.FileSelection == playback.FileSelectionExplicitV3 {
+		return false
+	}
+	if record.CurrentPlan.Delivery != playback.DeliveryTranscodeHLSV3 || !planHasVideoEncodeV3(record.CurrentPlan) {
+		return false
+	}
+	session, err := h.sessionMgr.GetSession(record.SessionID)
+	if err != nil || session == nil || strings.TrimSpace(session.VirtualSourceURI) == "" {
+		return false
+	}
+	return true
 }
 
 // demoteDeliveryCapabilityV3 disables one delivery class in the context's

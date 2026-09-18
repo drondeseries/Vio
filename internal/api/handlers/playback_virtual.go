@@ -639,7 +639,20 @@ func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 // so the retry sees the provider's current list. The pinned candidate is kept
 // at index 0 while it is still listed; once the pin is gone the fresh list
 // takes over.
-func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *models.MediaFile, profileID string, deferProbe bool, excludedCandidateIDs []string, preferredCandidateID string, qualityPreference string, bandwidthCapKbps int, forceRelist bool) (resolvedVirtualPlaybackSource, error) {
+//
+// allowFailedCandidate permits re-selecting a catalog row stamped failed_at. It
+// defaults to false so an auto selection always skips a known-bad row, even when
+// the row already carries a concrete result= identity (the adopted-candidate
+// case). It is true only for an explicit user retry or a forced relink, and for
+// internal paths (replan rehydration) that resolve a session-bound candidate
+// whose deadness is conveyed by excludedCandidateIDs instead of the async stamp.
+// It is variadic so the many existing callers keep their positional signature;
+// production callers pass the value explicitly.
+func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *models.MediaFile, profileID string, deferProbe bool, excludedCandidateIDs []string, preferredCandidateID string, qualityPreference string, bandwidthCapKbps int, forceRelist bool, allowFailedCandidate ...bool) (resolvedVirtualPlaybackSource, error) {
+	allowFailed := false
+	if len(allowFailedCandidate) > 0 {
+		allowFailed = allowFailedCandidate[0]
+	}
 	if !isVirtualPlaybackFile(file) {
 		return resolvedVirtualPlaybackSource{File: file}, nil
 	}
@@ -931,9 +944,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 		if dbFile != nil && dbFile.ID > 0 {
 			// Auto-pick skips candidates whose catalog row is marked failed
-			// (a transport produced no bytes on a prior attempt). An explicit
-			// result= selection still allows a manual retry.
-			if noResult && dbFile.FailedAt != nil {
+			// (a transport produced no bytes, or the decoder rejected the
+			// source, on a prior attempt). An explicit selection and a forced
+			// relink allow a manual retry; a decode-driven rotation carries its
+			// exclusion explicitly so it never depends on the async stamp.
+			if !allowFailed && dbFile.FailedAt != nil {
 				return nil, fmt.Errorf("candidate %s is marked failed", cand.URI)
 			}
 			transient = *dbFile
