@@ -54,12 +54,47 @@ func (h *PlaybackHandler) startTranscodeSession(ctx context.Context, opts playba
 	return playback.StartTranscode(ctx, opts)
 }
 
+// virtualSourceRotationContextKeyV3 scopes an explicit replacement candidate to
+// a single transport preparation.
+type virtualSourceRotationContextKeyV3 struct{}
+
+type virtualSourceRotationV3 struct {
+	URI   string
+	Owner int
+}
+
+// withVirtualSourceRotationV3 threads the replacement virtual candidate for a
+// decode-driven rotation through one transport preparation. The live session is
+// still bound to the rejected candidate until the durable session replacement
+// commits, so the transport must be told which candidate this generation serves
+// without mutating session state early.
+func withVirtualSourceRotationV3(ctx context.Context, uri string, owner int) context.Context {
+	if ctx == nil || strings.TrimSpace(uri) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, virtualSourceRotationContextKeyV3{}, virtualSourceRotationV3{URI: uri, Owner: owner})
+}
+
+func virtualSourceRotationFromContextV3(ctx context.Context) (string, int, bool) {
+	if ctx == nil {
+		return "", 0, false
+	}
+	rotation, ok := ctx.Value(virtualSourceRotationContextKeyV3{}).(virtualSourceRotationV3)
+	if !ok || strings.TrimSpace(rotation.URI) == "" {
+		return "", 0, false
+	}
+	return rotation.URI, rotation.Owner, true
+}
+
 func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
 	// Repeated input demux failures stamp the virtual candidate known-bad; the
 	// manager owns the callback so every local start (fresh or reconstructed)
 	// reaches the same marker without the transcode package importing handlers.
 	if opts.OnDemuxFailure == nil && h.tm != nil {
 		opts.OnDemuxFailure = h.tm.OnDemuxFailure
+	}
+	if opts.OnSourceRejected == nil && h.tm != nil {
+		opts.OnSourceRejected = h.tm.OnSourceRejected
 	}
 	if !strings.HasPrefix(strings.ToLower(opts.InputPath), virtualPlaybackPrefix) {
 		session, startErr := h.startTranscodeSession(context.WithoutCancel(ctx), opts)
@@ -89,7 +124,23 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	userID, profileID := 0, ""
 	ownerInstallationID := file.VirtualOwnerInstallationID
 	sessionVirtualURI := ""
-	if session, sessionErr := h.sessionMgr.GetSession(opts.SessionID); sessionErr == nil && session != nil {
+	if rotationURI, rotationOwner, rotationSet := virtualSourceRotationFromContextV3(ctx); rotationSet {
+		// A decode-driven candidate rotation deliberately serves the plan's
+		// replacement release. Prefer it over the session's still-rejected
+		// binding; the durable session replacement commits the same binding.
+		copy := *file
+		copy.FilePath = rotationURI
+		if rotationOwner > 0 {
+			copy.VirtualOwnerInstallationID = rotationOwner
+		}
+		file = &copy
+		ownerInstallationID = file.VirtualOwnerInstallationID
+		opts.InputPath = file.FilePath
+		sessionVirtualURI = rotationURI
+		if session, sessionErr := h.sessionMgr.GetSession(opts.SessionID); sessionErr == nil && session != nil {
+			userID, profileID = session.UserID, session.ProfileID
+		}
+	} else if session, sessionErr := h.sessionMgr.GetSession(opts.SessionID); sessionErr == nil && session != nil {
 		userID, profileID = session.UserID, session.ProfileID
 		sessionVirtualURI = session.VirtualSourceURI
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(session.VirtualSourceURI)), virtualPlaybackPrefix) && (!isUnplayableVirtualURI(session.VirtualSourceURI) || isUnplayableVirtualURI(file.FilePath)) {

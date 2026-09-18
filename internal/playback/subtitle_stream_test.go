@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -493,5 +494,178 @@ func TestStreamExtractArgs_PGSProducesSup(t *testing.T) {
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "-map 0:s:1 -c:s copy -f sup pipe:1") {
 		t.Fatalf("PGS extract should copy into a sup stream: %s", joined)
+	}
+}
+
+// WindowCoverage must agree exactly with streamExtractArgs' seek decision, and
+// SetSubtitleCoverageHeader must advertise the range only when the response is
+// bounded. A missing header is the client's signal that it received the whole
+// track.
+func TestWindowCoverageAndHeader(t *testing.T) {
+	cases := []struct {
+		name     string
+		opts     StreamExtractOpts
+		windowed bool
+		start    float64
+		end      float64
+		open     bool
+		header   string
+	}{
+		{
+			name:     "text explicit-zero window",
+			opts:     StreamExtractOpts{SourceCodec: "subrip", WindowRequested: true, SeekSeconds: 0, DurationSeconds: 600},
+			windowed: true, start: 0, end: 600, header: "0.000-600.000",
+		},
+		{
+			name:     "text open ended",
+			opts:     StreamExtractOpts{SourceCodec: "subrip", SeekSeconds: 120},
+			windowed: true, start: 120, open: true, header: "120.000-*",
+		},
+		{
+			name:     "text duration-only bounded from zero",
+			opts:     StreamExtractOpts{SourceCodec: "subrip", DurationSeconds: 600},
+			windowed: true, start: 0, end: 600, header: "0.000-600.000",
+		},
+		{
+			name:     "ass duration-only stays whole",
+			opts:     StreamExtractOpts{SourceCodec: "ass", DurationSeconds: 600},
+			windowed: false, header: "",
+		},
+		{
+			name:     "ass windowed",
+			opts:     StreamExtractOpts{SourceCodec: "ass", WindowRequested: true, SeekSeconds: 0, DurationSeconds: 600},
+			windowed: true, start: 0, end: 600, header: "0.000-600.000",
+		},
+		{
+			name:     "pgs whole ignores position",
+			opts:     StreamExtractOpts{SourceCodec: "hdmv_pgs_subtitle", SeekSeconds: 100, DurationSeconds: 600},
+			windowed: false, header: "",
+		},
+		{
+			name:     "pgs implicit window",
+			opts:     StreamExtractOpts{SourceCodec: "hdmv_pgs_subtitle", AllowWindow: true, WindowRequested: true, SeekSeconds: 0, DurationSeconds: 600},
+			windowed: true, start: 0, end: 600, header: "0.000-600.000",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			windowed, start, end, open := tc.opts.WindowCoverage()
+			if windowed != tc.windowed || start != tc.start || end != tc.end || open != tc.open {
+				t.Fatalf("WindowCoverage = (%v,%v,%v,%v), want (%v,%v,%v,%v)",
+					windowed, start, end, open, tc.windowed, tc.start, tc.end, tc.open)
+			}
+			// The advertised window must match the ffmpeg command: a windowed
+			// extract is bounded by `-ss` and/or `-to`, a whole-track one by
+			// neither.
+			args := strings.Join(streamExtractArgs(tc.opts), " ")
+			hasBound := strings.Contains(args, "-ss ") || strings.Contains(args, "-to ")
+			if hasBound != windowed {
+				t.Fatalf("WindowCoverage windowed=%v but args bounded=%v: %s", windowed, hasBound, args)
+			}
+			header := http.Header{}
+			SetSubtitleCoverageHeader(header, tc.opts)
+			if got := header.Get(SubtitleCoverageHeader); got != tc.header {
+				t.Fatalf("coverage header = %q, want %q", got, tc.header)
+			}
+			wantWindowed := ""
+			if tc.windowed {
+				wantWindowed = "true"
+			}
+			if got := header.Get(SubtitleWindowedHeader); got != wantWindowed {
+				t.Fatalf("windowed header = %q, want %q", got, wantWindowed)
+			}
+		})
+	}
+}
+
+// ClampOpenEndedWindow fills in a missing duration for an explicitly-started
+// window, so a position-without-duration request cannot extract to EOF, while
+// leaving every authoritative case untouched.
+func TestClampOpenEndedWindow(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    StreamExtractOpts
+		limit   float64
+		wantSet bool
+		wantDur float64
+	}{
+		{
+			name:    "text explicit zero position",
+			opts:    StreamExtractOpts{SourceCodec: "subrip", WindowRequested: true, SeekSeconds: 0},
+			limit:   600,
+			wantSet: true,
+			wantDur: 600,
+		},
+		{
+			name:    "text nonzero position",
+			opts:    StreamExtractOpts{SourceCodec: "subrip", SeekSeconds: 120},
+			limit:   600,
+			wantSet: true,
+			wantDur: 600,
+		},
+		{
+			name:    "ass windowed zero position",
+			opts:    StreamExtractOpts{SourceCodec: "ass", WindowRequested: true, SeekSeconds: 0},
+			limit:   600,
+			wantSet: true,
+			wantDur: 600,
+		},
+		{
+			name:    "pgs explicit window opt-in",
+			opts:    StreamExtractOpts{SourceCodec: "hdmv_pgs_subtitle", AllowWindow: true, WindowRequested: true, SeekSeconds: 0},
+			limit:   600,
+			wantSet: true,
+			wantDur: 600,
+		},
+		{
+			name:    "explicit duration authoritative",
+			opts:    StreamExtractOpts{SourceCodec: "subrip", WindowRequested: true, SeekSeconds: 0, DurationSeconds: 30},
+			limit:   600,
+			wantSet: false,
+			wantDur: 30,
+		},
+		{
+			name:    "whole-track request untouched",
+			opts:    StreamExtractOpts{SourceCodec: "subrip"},
+			limit:   600,
+			wantSet: false,
+			wantDur: 0,
+		},
+		{
+			name:    "pgs without opt-in cannot window",
+			opts:    StreamExtractOpts{SourceCodec: "hdmv_pgs_subtitle", WindowRequested: true, SeekSeconds: 0},
+			limit:   600,
+			wantSet: false,
+			wantDur: 0,
+		},
+		{
+			name:    "non-positive cap is a no-op",
+			opts:    StreamExtractOpts{SourceCodec: "subrip", WindowRequested: true, SeekSeconds: 0},
+			limit:   0,
+			wantSet: false,
+			wantDur: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := tc.opts
+			if got := opts.ClampOpenEndedWindow(tc.limit); got != tc.wantSet {
+				t.Fatalf("ClampOpenEndedWindow = %v, want %v", got, tc.wantSet)
+			}
+			if opts.DurationSeconds != tc.wantDur {
+				t.Fatalf("duration = %v, want %v", opts.DurationSeconds, tc.wantDur)
+			}
+			// A clamped window must advertise a bounded range and emit -to.
+			if tc.wantSet {
+				windowed, _, _, open := opts.WindowCoverage()
+				if !windowed || open {
+					t.Fatalf("clamped window coverage = windowed:%v open:%v, want bounded", windowed, open)
+				}
+				args := strings.Join(streamExtractArgs(opts), " ")
+				if !strings.Contains(args, "-to ") {
+					t.Fatalf("clamped window args lack -to: %s", args)
+				}
+			}
+		})
 	}
 }

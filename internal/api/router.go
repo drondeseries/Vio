@@ -1344,6 +1344,30 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed(ctx, fileID, expectedFilePath, nil)
 			}
+			// A decoder-rejected source is the same verdict as a repeated demux
+			// failure: the candidate is bad and the auto-pick must skip it. The
+			// write goes through the one existing failed_at mechanism, fenced on
+			// the candidate identity, but a decode verdict bypasses the
+			// delivered-grace rule (MarkVirtualCandidateDecodeRejected): bytes
+			// that cannot be decoded are not playable regardless of how
+			// recently they delivered, so a repeatable decode rejection must not
+			// be re-selected forever. The dropdown still shows the row for a
+			// manual retry, and a later successful delivery clears the stamp.
+			playbackHandler.TranscodeManager().OnSourceRejected = func(ctx context.Context, fileID int, expectedFilePath string) error {
+				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(expectedFilePath)), "virtual://") {
+					return nil
+				}
+				return scanner.NewFileRepository(deps.DB).MarkVirtualCandidateDecodeRejected(ctx, fileID, expectedFilePath, nil)
+			}
+			// The recovered marker clears a known-bad stamp after the candidate
+			// actually delivered media bytes. The HLS/transcode serve path
+			// reports a full segment as delivery evidence (first successful
+			// segment), clearing exactly the failure state observed before the
+			// delivering request, with the same identity/failed_at fence as the
+			// direct-play path. A candidate rejected on hardware decode and then
+			// delivered on a retry therefore re-enters the auto-pick without
+			// waiting for a provider re-list.
+			playbackHandler.VirtualCandidateRecoveredMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateRecovered
 			playbackHandler.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
 				if deps.DB == nil {
 					return 0, nil

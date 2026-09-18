@@ -61,6 +61,7 @@ import type {
   SubtitleMode,
 } from "../types";
 import type { FailureV3, PlanV3, SubtitleInventoryItemV3 } from "../protocol-v3";
+import { decodeFailure, isServerDecodeFailure } from "../decode-failure";
 import {
   mediaDurationSeconds,
   subtitleStartPositionSeconds,
@@ -1955,6 +1956,26 @@ export function VideoPlayer({
                 url: data.frag?.url ?? data.url,
                 error: data.error?.message,
               });
+
+              // A decode rejection reaches hls.js as a fatal manifest network
+              // error carrying the server's 422 and X-Vio-Decode-Error verdict.
+              // Retrying the manifest can never succeed, and reporting it as a
+              // generic network failure hides the reason, so route it into the
+              // ordinary failure_recovery replan before the network retry budget
+              // is spent. This check sits before the recovery throttle because
+              // the verdict is authoritative and idempotent on the plan key.
+              if (data.type === Hls.ErrorTypes.NETWORK_ERROR && isServerDecodeFailure(data)) {
+                console.warn("[hls.js] Server could not decode the source; replanning", {
+                  details: data.details,
+                  url: data.frag?.url ?? data.url,
+                });
+                if (!reportCurrentPlanFailure(decodeFailure())) {
+                  setError("Playback failed. This release could not be decoded.");
+                }
+                hls?.destroy();
+                hlsRef.current = null;
+                return;
+              }
 
               const now = Date.now();
               if (now - lastRecoveryRef.current < 3000) return;

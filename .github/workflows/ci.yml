@@ -264,7 +264,7 @@ jobs:
           BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
         run: |
           git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-          golangci-lint run --new-from-merge-base="origin/${BASE_REF}" ./...
+          golangci-lint run --timeout=20m --new-from-merge-base="origin/${BASE_REF}" ./...
 
   # The inventory's lint rule (recovering a router from a handler) has to hold
   # over the whole tree, not only the lines a branch touched: an old line

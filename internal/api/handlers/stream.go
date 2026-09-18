@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -79,9 +80,16 @@ type StreamHandler struct {
 	// dir so repeat selections skip the whole-file ffmpeg demux. May be nil
 	// (tests / minimal setups) — extraction then always streams uncached.
 	SubtitleCache *playback.SubtitleCache
-	SubtitleRepo  subtitles.Repository // optional; enables S3-sourced subtitles
-	S3Client      subtitles.S3Client   // optional; needed for fetching S3 subtitles
-	S3Bucket      string               // bucket for subtitle storage
+	// subtitleWarmWG tracks handler-owned detached subtitle warms
+	// (warmVirtualSubtitleAfterWindowMiss). They outlive the request by design —
+	// the request's relay registration is released when the request ends, so the
+	// handler starts its own warm — and a caller that owns the cache directory
+	// (a test with a temp dir, a graceful drain) waits on this to keep the warm
+	// from writing into a directory being torn down.
+	subtitleWarmWG sync.WaitGroup
+	SubtitleRepo   subtitles.Repository // optional; enables S3-sourced subtitles
+	S3Client       subtitles.S3Client   // optional; needed for fetching S3 subtitles
+	S3Bucket       string               // bucket for subtitle storage
 	// VirtualMediaResolver resolves virtual:// URIs to a real provider URL.
 	// Required for embedded subtitle extraction from virtual sources.
 	VirtualMediaResolver         VirtualMediaResolver
@@ -113,6 +121,18 @@ func (h *StreamHandler) ffmpegPath() string {
 		return h.PlaybackConfig().FFmpegPath
 	}
 	return ""
+}
+
+// waitForBackgroundSubtitleWarms blocks until every handler-owned detached
+// subtitle warm started so far has settled. A warm that was admitted by the
+// cache can run for its full warm budget, so callers that own the cache
+// directory should release any gate the warm is blocked on first. A nil
+// receiver returns immediately.
+func (h *StreamHandler) waitForBackgroundSubtitleWarms() {
+	if h == nil {
+		return
+	}
+	h.subtitleWarmWG.Wait()
 }
 
 // bindSessionVirtualSource returns a copy of a virtual file bound to the
@@ -283,6 +303,7 @@ func NewStreamHandler(sessionMgr SessionManagerInterface, fileResolver FilePathR
 // For remux: starts an ffmpeg remux and streams the output.
 // For transcode: returns 400 (transcode uses manifest/segment endpoints).
 func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
+	requestStart := time.Now()
 	userID := apimw.GetUserID(r.Context())
 	if userID == 0 {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
@@ -456,7 +477,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			proxy.ServeHTTP(streamWriter, r)
 			if lastProxyErr != nil {
-				if streamWriter.StatusCode() == 0 && (h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil) {
+				// A client that navigated away is not a candidate failure:
+				// never stamp the pinned release known-bad or spend a failover
+				// resolve on it. The upstream request already aborted with the
+				// canceled request context.
+				if !isClientCancellation(r.Context(), lastProxyErr) && streamWriter.StatusCode() == 0 && (h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil) {
 					if releaseInput != nil {
 						releaseInput()
 						releaseInput = nil
@@ -549,6 +574,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				SourceAudioChannels:    session.SourceAudioChannels,
 				TargetAudioChannels:    session.TargetAudioChannels,
 				TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
+				TimingStart:            requestStart,
 			})
 			if err == nil && isVirtualPlaybackFile(file) &&
 				virtualCandidateDeliveryEvidence(http.StatusOK, remuxWriter.BytesWritten()) {
@@ -565,8 +591,10 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// The remux only commits 200 after FFmpeg produces media bytes, so
 			// a failure here means the provider release served no output
 			// (corrupted NZB, dead URL). Mark the candidate failed and retry
-			// once with it excluded so the next-ranked release is tried.
-			if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
+			// once with it excluded so the next-ranked release is tried. A
+			// client that disconnected is not a candidate failure: the remux
+			// (and its provider fetch) already aborted on the request context.
+			if !isClientCancellation(r.Context(), remuxErr) && isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 				failedID := virtualResultCandidateID(deliveredPath)
 				if failedID != "" {
 					h.markVirtualCandidateFailed(r.Context(), file, failedID)
@@ -1332,6 +1360,22 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 	if ctx == nil || session == nil || err == nil {
 		return
 	}
+	// Client cancellation is not a transport failure: the viewer navigated off
+	// (or hls.js gave up) while the upstream fetch was in flight. The request
+	// context propagates into the virtual provider resolve / relay, so the
+	// upstream work is already canceled. Check this before preflight so a
+	// canceled request is never rewritten into a missing-file abort, and
+	// downgrade to debug; a timeout or provider error stays at WARN.
+	if isClientCancellation(ctx, err) {
+		slog.DebugContext(ctx, "stream transport canceled by client",
+			"component", "api",
+			"session", session.ID,
+			"file_id", session.MediaFileID,
+			"reason", "client_canceled",
+			"playback_session_id", session.ID,
+		)
+		return
+	}
 	if preflightErr := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); preflightErr != nil {
 		err = preflightErr
 	}
@@ -1535,6 +1579,19 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	// A HEAD probe (.sup is the only embedded format that does not early-return)
+	// exists to read representation headers, not to extract: keep its previous
+	// whole-track/committed behavior and never synthesize a window or warm from
+	// it.
+	if r.Method != http.MethodHead {
+		h.applyImplicitVirtualWindow(&opts, file, session, virtualActive)
+	}
+	// Advertise the bounded range before any header commits. A whole-track
+	// serve (committed artifact, small/local source, or a codec that cannot be
+	// sliced) omits the header, so a client that asked for the complete track
+	// can tell it received only a window.
+	playback.SetSubtitleCoverageHeader(w.Header(), opts)
+
 	_, extractErr := h.SubtitleCache.ServeExtractWithResult(response, r, opts, playback.StreamExtractSubtitle)
 	if errors.Is(extractErr, playback.ErrCommittedTextArtifactGone) {
 		// The artifact that allowed the drift probe to be skipped was evicted
@@ -1552,11 +1609,17 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			return
 		}
 		opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+		// The pinned artifact is gone, so the committed-entry check that
+		// suppressed the implicit window on the first attempt no longer holds.
+		// Re-evaluate against the now-cold source before retrying.
+		h.applyImplicitVirtualWindow(&opts, file, session, virtualActive)
+		playback.SetSubtitleCoverageHeader(w.Header(), opts)
 		_, extractErr = h.SubtitleCache.ServeExtractWithResult(response, r, opts, playback.StreamExtractSubtitle)
 	}
 	if extractErr != nil {
 		playback.LogSubtitleStreamError(r.Context(), extractErr, file.ID, embeddedIndex)
 		if r.Context().Err() != nil {
+			clearSubtitleCoverageHeaders(w.Header())
 			return
 		}
 		// A successful HTTP EOF would make clients accept the partial track.
@@ -1564,6 +1627,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			panic(http.ErrAbortHandler)
 		}
 		if !virtualActive || !playback.IsSubtitleStreamMapError(extractErr) {
+			clearSubtitleCoverageHeaders(w.Header())
 			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
 			return
 		}
@@ -1592,6 +1656,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		if retryErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle); retryErr != nil {
 			playback.LogSubtitleStreamError(r.Context(), retryErr, file.ID, embeddedIndex)
 			if r.Context().Err() != nil {
+				clearSubtitleCoverageHeaders(w.Header())
 				return
 			}
 			if response.Status() != 0 {
@@ -1601,6 +1666,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				writeSubtitleSourceChanged(w)
 				return
 			}
+			clearSubtitleCoverageHeaders(w.Header())
 			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
 			return
 		}
@@ -1628,15 +1694,6 @@ func (h *StreamHandler) resolveCommittedTextSubtitleEntry(opts *playback.StreamE
 	return h.SubtitleCache.ResolveCommittedTextEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat)
 }
 
-// hasCommittedTextSubtitleEntry reports whether such an artifact currently
-// exists. It is a non-binding presence check used only for warm admission
-// decisions; callers that skip track-identity validation must use
-// resolveCommittedTextSubtitleEntry and pin the returned token.
-func (h *StreamHandler) hasCommittedTextSubtitleEntry(opts *playback.StreamExtractOpts) bool {
-	_, ok := h.resolveCommittedTextSubtitleEntry(opts)
-	return ok
-}
-
 // virtualSubtitleWarmResolveTimeout bounds the relay resolution a detached
 // virtual subtitle warm performs. It is a child of the extraction context the
 // cache hands the warm, so resolution can never outlive extraction; a resolver
@@ -1646,9 +1703,9 @@ func (h *StreamHandler) hasCommittedTextSubtitleEntry(opts *playback.StreamExtra
 var virtualSubtitleWarmResolveTimeout = 2 * time.Minute
 
 // warmVirtualSubtitleAfterWindowMiss starts a detached full-track warm for a
-// windowed virtual text request that could not be served from the cache. It is
-// called after the window itself has streamed, so the warm cannot contend with
-// the triggering request's own read.
+// windowed virtual subtitle request (text, ASS/SSA, or PGS) that could not be
+// served from the cache. It is called after the window itself has streamed, so
+// the warm cannot contend with the triggering request's own read.
 //
 // The warm resolves and holds its own relay registration: the request's
 // registration is released when the request ends, which is exactly why the
@@ -1666,24 +1723,26 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 	if opts.CacheIdentity == "" {
 		return
 	}
-	// Only text tracks get this handler-owned warm. PGS keeps its existing
-	// window path (its mandatory drift probe and progressive .sup handling are
-	// deliberately unchanged).
-	if playback.IsPGS(opts.SourceCodec) {
-		return
-	}
+	// Every sidecar class gets this handler-owned warm. PGS matters most: its
+	// whole-track .sup exceeds a client fetch deadline on a large virtual
+	// source, so without a warm no committed artifact ever appears and every
+	// repeat is a fresh full remote demux. The warm's mandatory drift probe and
+	// progressive .sup handling are unchanged — only the populate step is new.
 	// Full-track requests already fill the cache inline through ServeExtract's
 	// tee; only explicit windows need a detached warm.
 	if opts.SeekSeconds == 0 && opts.DurationSeconds == 0 {
 		return
 	}
 	// A committed entry means this request served its window from the cached
-	// artifact; nothing to warm.
-	if h.hasCommittedTextSubtitleEntry(&opts) {
+	// artifact; nothing to warm. Format-aware, so a committed .sup suppresses
+	// the warm exactly as a committed VTT/ASS does.
+	if h.SubtitleCache.HasCommittedEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat) {
 		return
 	}
 
+	h.subtitleWarmWG.Add(1)
 	go func() {
+		defer h.subtitleWarmWG.Done()
 		var cleanup func()
 		defer func() {
 			if cleanup != nil {
@@ -1708,6 +1767,145 @@ func (h *StreamHandler) warmVirtualSubtitleAfterWindowMiss(file *models.MediaFil
 		}
 		<-h.SubtitleCache.WarmTrackInBackground(opts, extract)
 	}()
+}
+
+// Defaults for the implicit first window served to a cold whole-track subtitle
+// request against a large/unknown virtual/remote source. The duration matches
+// the web player's sliding-window cadence (see web/src/player/hooks/useSubtitleTracks.ts)
+// so a client that manages its own windows and one that does not observe the
+// same coverage. The backoff pulls the window start behind the session
+// position so a small scrub back stays covered, mirroring that player's
+// SEEK_BACKOFF.
+const (
+	virtualSubtitleImplicitWindowSeconds        = 600.0
+	virtualSubtitleImplicitWindowBackoffSeconds = 2.0
+	// virtualSubtitleImplicitWindowMinSourceBytes is the source size above
+	// which a whole-track virtual read is considered untenable and is bounded
+	// to the implicit window. A small known source is read whole (cheap and
+	// complete); an unknown size (0) is treated as large, because a virtual
+	// row's size is not always populated.
+	virtualSubtitleImplicitWindowMinSourceBytes = 256 << 20
+)
+
+// applyImplicitVirtualWindow bounds a cold whole-track subtitle fetch against a
+// large/unknown virtual/remote source to the first playback-sized window
+// instead of an unbounded whole-container extract. It applies to every
+// sidecar class the server can serve — converted text (WebVTT), lossless
+// ASS/SSA, and PGS — because a virtual source is served over HTTP from a
+// provider and a complete extract of any class requires demuxing every byte of
+// the container. A 6.6 GB remux therefore costs ~100 s of sequential reads
+// before the response can complete, while the client's fetch deadline is
+// ~30-60 s; the request is aborted and the partial fill is discarded, so
+// retrying never makes progress. Local files are cheap to read whole and keep
+// the existing whole-track behavior.
+//
+// The window is only synthesized when the caller did not ask for a specific
+// window, the source is not small/known, and no committed full-track artifact
+// exists. A windowed serve is fast (ffmpeg seeks near the requested position)
+// and the handler starts the usual detached full-track warm afterwards, so this
+// request completes in seconds and later requests — or a client that fetched
+// this window — read the small cached artifact. When an artifact is already
+// present the whole track is served, so an established virtual track still
+// returns every cue in one response.
+//
+// Correctness: this changes what a cold, implicit whole-track virtual response
+// contains — a bounded window rather than every cue — so a client that never
+// re-requests will stop seeing cues past the window. The response advertises
+// the covered range with X-Subtitle-Coverage/X-Subtitle-Windowed so such a
+// client can tell and request subsequent windows. Explicitly-windowed callers
+// (the web player) are unaffected, and local and small/known sources keep their
+// whole-track paths. An explicit position/duration is honored exactly as asked
+// and bypasses this default; a client-managed window is never widened.
+//
+// This deliberately bends the documented default in
+// docs/architecture/playback-protocol-v3.md §4.2/§8 ("embedded
+// URLs return the complete track from source time zero by default; consumers
+// that maintain a sliding window may explicitly supply position and duration").
+// A remote multi-GB source makes that default unservable within a client fetch
+// deadline. The fully contract-conformant fix is for every client to request
+// windows the way the web player does (or a v3 contract amendment making
+// windowed sidecars the default for virtual sources); this helper is a
+// server-side stopgap until that lands. It is gated to large/unknown virtual
+// sources so nothing else changes.
+//
+// Which cases stay whole-track, and why:
+//   - local files: cheap to read whole, and bounding would silently drop cues;
+//   - small known sources (< virtualSubtitleImplicitWindowMinSourceBytes):
+//     cheap to read whole;
+//   - an already-committed full-track artifact: cheap to serve whole and the
+//     validated bytes a pinned text artifact promised;
+//   - an explicit client window with a duration (position+duration, or PGS
+//     ?windowed=1 with a duration): authoritative, never overridden.
+//
+// A position without a duration is window intent but open-ended: its missing
+// cap is filled with the implicit window (the caller's position is kept) so it
+// cannot demux to EOF and advertise `start-*`. A codec that cannot window
+// (PGS without the ?windowed=1 opt-in) is left untouched.
+func (h *StreamHandler) applyImplicitVirtualWindow(opts *playback.StreamExtractOpts, file *models.MediaFile, session *playback.Session, virtualActive bool) {
+	if h == nil || opts == nil || !virtualActive {
+		return
+	}
+	// A small known source costs little to read whole, so keep the complete
+	// artifact. Unknown size (0) stays windowed: virtual rows do not always
+	// carry a populated size.
+	if file != nil && file.FileSize > 0 && file.FileSize < virtualSubtitleImplicitWindowMinSourceBytes {
+		return
+	}
+	// An explicit duration (with or without a position) is authoritative;
+	// leave it exactly as the client asked.
+	if opts.DurationSeconds > 0 {
+		return
+	}
+	// A committed full-track artifact is cheap to serve whole, so do not slice
+	// it. (A pinned text artifact resolves as committed here, so the
+	// drift-probe skip path also serves whole.)
+	if h.SubtitleCache.HasCommittedEntry(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, opts.SourceCodec, opts.TargetFormat) {
+		return
+	}
+	// A position without a duration is window intent but open-ended: fill in the
+	// implicit window so it cannot extract to EOF (advertised as `start-*`). The
+	// caller's position is kept; only the missing cap is supplied.
+	if opts.ClampOpenEndedWindow(virtualSubtitleImplicitWindowSeconds) {
+		slog.Info("virtual subtitle open window clamped to implicit window",
+			"component", "api",
+			"codec", opts.SourceCodec,
+			"seek_seconds", opts.SeekSeconds,
+			"duration_seconds", opts.DurationSeconds,
+			"track", opts.TrackIndex)
+		return
+	}
+	// Any other explicit intent is authoritative: a position-only codec that
+	// cannot window, or the PGS ?windowed=1 opt-in with no position/duration.
+	if opts.WindowRequested || opts.SeekSeconds > 0 || opts.AllowWindow {
+		return
+	}
+
+	opts.WindowRequested = true
+	opts.SeekSeconds = implicitVirtualWindowStart(session)
+	opts.DurationSeconds = virtualSubtitleImplicitWindowSeconds
+	if playback.IsPGS(opts.SourceCodec) {
+		// PGS routes through ServeSUPExtract, which windows only when
+		// AllowWindow is set (the explicit ?windowed=1 opt-in). This window is
+		// server-authored, so grant it here.
+		opts.AllowWindow = true
+	}
+	slog.Info("virtual subtitle served as an implicit window",
+		"component", "api",
+		"codec", opts.SourceCodec,
+		"seek_seconds", opts.SeekSeconds,
+		"duration_seconds", opts.DurationSeconds,
+		"track", opts.TrackIndex)
+}
+
+// implicitVirtualWindowStart returns the source-time start of the implicit
+// window: the session position pulled back slightly, or zero when the session
+// has no meaningful position yet (a fresh start, so the window covers the
+// opening of the track).
+func implicitVirtualWindowStart(session *playback.Session) float64 {
+	if session == nil || session.Position <= virtualSubtitleImplicitWindowBackoffSeconds {
+		return 0
+	}
+	return session.Position - virtualSubtitleImplicitWindowBackoffSeconds
 }
 
 // verifyVirtualSubtitleLayout probes the live relay input once and, when its
@@ -1777,12 +1975,26 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 	return true, nil
 }
 
+// clearSubtitleCoverageHeaders removes the bounded-window markers before an
+// error response is written. SetSubtitleCoverageHeader records the window
+// before the serve so a successful response advertises its covered range, but
+// an error that never committed a 200 must not be readable as a bounded window
+// by a header-only classifier. Safe to call before the headers are set.
+func clearSubtitleCoverageHeaders(h http.Header) {
+	if h == nil {
+		return
+	}
+	h.Del(playback.SubtitleCoverageHeader)
+	h.Del(playback.SubtitleWindowedHeader)
+}
+
 // writeSubtitleSourceChanged answers a clean retryable 4xx when a virtual
 // release rotated so the requested subtitle representation can no longer be
 // produced from the live source. Clients already retry through the
 // sliding-window fetcher / replan flow, so the response is deliberately a
 // retryable 4xx, never a 500 or an ambiguous partial stream.
 func writeSubtitleSourceChanged(w http.ResponseWriter) {
+	clearSubtitleCoverageHeaders(w.Header())
 	writeError(w, http.StatusConflict, "subtitle_source_changed",
 		"The selected subtitle track changed on the media source; retry")
 }
@@ -1793,6 +2005,7 @@ func writeSubtitleSourceChanged(w http.ResponseWriter) {
 // post-spawn recovery, so the server fails closed rather than stream a
 // possibly-truncated track; the client can retry once the source settles.
 func writeSubtitleSourceUnavailable(w http.ResponseWriter) {
+	clearSubtitleCoverageHeaders(w.Header())
 	writeError(w, http.StatusServiceUnavailable, "subtitle_source_unavailable",
 		"Unable to verify the subtitle source; retry")
 }

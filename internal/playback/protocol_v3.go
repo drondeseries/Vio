@@ -213,12 +213,26 @@ const (
 const (
 	TransformationAudioToAACV3      = "audio_to_aac"
 	TransformationVideoToH264V3     = "video_to_h264"
+	TransformationVideoToHEVCV3     = "video_to_hevc"
+	TransformationVideoToAV1V3      = "video_to_av1"
 	TransformationServerDV7HDR10V3  = "server_dv7_to_hdr10"
 	TransformationHDRToSDRToneMapV3 = "hdr_to_sdr_tonemap"
 
 	TransformationVideoToH264RecipeVersionV3     = "2"
+	TransformationVideoToHEVCRecipeVersionV3     = "1"
+	TransformationVideoToAV1RecipeVersionV3      = "1"
 	TransformationAudioToAACRecipeVersionV3      = "4"
 	TransformationHDRToSDRToneMapRecipeVersionV3 = "1"
+)
+
+// Target video codecs a server HLS transcode may emit. H.264 is the floor:
+// the planner selects AV1 or HEVC only when the client declares hardware
+// decode for that codec, the HLS delivery accepts it, and the installed
+// encoder toolchain advertises the matching transformation.
+const (
+	TargetVideoCodecAV1V3  = "av1"
+	TargetVideoCodecHEVCV3 = "hevc"
+	TargetVideoCodecH264V3 = "h264"
 )
 
 // Transformation executors: who runs the transformation. A "server"
@@ -234,6 +248,8 @@ const (
 const (
 	ClaimAudioDecodeV3                = "audio_decode"
 	ClaimH264DecodeV3                 = "h264_decode"
+	ClaimHEVCDecodeV3                 = "hevc_decode"
+	ClaimAV1DecodeV3                  = "av1_decode"
 	ClaimDolbyVisionMetadataRemovedV3 = "dolby_vision_metadata_removed"
 	ClaimHDR10BaseLayerPreservedV3    = "hdr10_base_layer_preserved"
 	ClaimEnhancementLayerDiscardedV3  = "enhancement_layer_discarded"

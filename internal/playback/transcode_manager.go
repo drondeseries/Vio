@@ -76,6 +76,10 @@ type TranscodeManager struct {
 	// or reconstructs so repeated input demux failures can stamp the source
 	// candidate known-bad. No-op when nil.
 	OnDemuxFailure func(ctx context.Context, mediaFileID int, canonicalPath string) error
+	// OnSourceRejected is forwarded alongside OnDemuxFailure so a decoder that
+	// rejects the source stamps the same candidate known-bad. It shares the
+	// callback shape and the one failed_at mechanism. No-op when nil.
+	OnSourceRejected func(ctx context.Context, mediaFileID int, canonicalPath string) error
 	// StartThrottler optionally starts the segment throttler for a (re)started
 	// transcode, reading the embedding handler's settings. No-op when nil.
 	StartThrottler func(ctx context.Context, ts *TranscodeSession)
@@ -880,6 +884,7 @@ func (m *TranscodeManager) doReconstructTranscode(ctx context.Context, sessionID
 	// never exposes a hardware encoder after only one fragment.
 	opts.FastStart = false
 	opts.OnDemuxFailure = m.OnDemuxFailure
+	opts.OnSourceRejected = m.OnSourceRejected
 
 	if m.ResolveInput != nil {
 		resolved, cleanup, err := m.ResolveInput(ctx, card.MediaFileID, card.VirtualSourceOwnerInstallationID, card.UserID, card.ProfileID, opts.InputPath)

@@ -177,12 +177,41 @@ func effectiveVirtualOwner(owners ...int) int {
 	return 0
 }
 
+// isClientCancellation reports whether err is the viewer going away rather
+// than a transport or provider failure. The request context being canceled is
+// authoritative: net/http surfaces a canceled request as a wrapped *url.Error,
+// so errors.Is(err, context.Canceled) catches both the direct and wrapped
+// forms, and a non-nil canceled ctx catches an error the provider masked.
+// DeadlineExceeded is deliberately NOT client cancellation: it is a real
+// timeout and must keep its WARN.
+func isClientCancellation(ctx context.Context, err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return ctx != nil && errors.Is(ctx.Err(), context.Canceled)
+}
+
 // logVirtualStreamFailure records the sanitized cause behind a virtual-stream
 // 502. A provider URL can be embedded in a wrapped *url.Error, so the cause is
 // passed through logredact; only the provider-neutral virtual URI, the file,
 // the session, and the owner installation are logged directly.
+//
+// A client cancellation is not a transport failure: the upstream fetch runs on
+// the request context, so the viewer navigating away (or hls.js giving up)
+// already canceled it. That case is a debug line with an explicit reason so it
+// cannot be mistaken for a provider outage; genuine timeouts and provider
+// errors stay at WARN.
 func logVirtualStreamFailure(ctx context.Context, sessionID string, file *models.MediaFile, err error) {
 	if err == nil || file == nil {
+		return
+	}
+	if isClientCancellation(ctx, err) {
+		slog.DebugContext(ctx, "virtual stream transport canceled by client",
+			"component", "api",
+			"session", sessionID,
+			"file_id", file.ID,
+			"reason", "client_canceled",
+		)
 		return
 	}
 	slog.WarnContext(ctx, "virtual stream transport failed",
@@ -330,6 +359,14 @@ type PlaybackHandler struct {
 	// progressSideEffectLocks serializes v2 progress side effects per session
 	// (see persistProgressV2).
 	progressSideEffectLocks sync.Map
+	// virtualDeliveryCleared records playback sessions whose first fully
+	// delivered HLS/transcode segment already recorded delivery evidence and
+	// cleared the candidate's failed mark. One entry per served session keeps a
+	// long segment stream from issuing a read+write per segment; a newer failure
+	// after the first delivery is preserved, mirroring the direct-play path's
+	// transport-start capture. Precedent for the un-cleaned per-session map:
+	// progressSideEffectLocks.
+	virtualDeliveryCleared sync.Map
 	// ProxyGrantStore hands a proxy the recipe it serves a header-authenticated
 	// session from. Optional: without it an attempt that negotiated
 	// authorized_media_origins_v1 simply stays on the API origin.
@@ -388,7 +425,14 @@ type PlaybackHandler struct {
 	RemoteStreamRelay            *remotestream.Relay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for private/local stream hosts.
-	AllowInsecureVirtual                   func(installationID int) bool
+	AllowInsecureVirtual func(installationID int) bool
+	// VirtualCandidateRecoveredMarker clears a virtual candidate's known-bad
+	// stamp after an HLS/transcode delivery actually served a full segment to
+	// the client. It mirrors StreamHandler.VirtualCandidateRecoveredMarker:
+	// the write is fenced on the delivered candidate identity and the failure
+	// state observed before the delivering request, so a rotation or a newer
+	// failure is never cleared. Nil disables the clear.
+	VirtualCandidateRecoveredMarker        func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error
 	VirtualPlaybackSourceProber            VirtualPlaybackSourceProber
 	VirtualPlaybackSourceProberWithHeaders VirtualPlaybackSourceProberWithHeaders
 	VirtualProbeCacheLookup                VirtualProbeCacheLookup
@@ -1898,7 +1942,7 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 		// No local session — try proxying to remote transcode node.
 		if session.TranscodeNodeURL != "" {
 			h.touchSessionActivity(sessionID)
-			h.proxyToTranscodeNode(w, r, session.TranscodeNodeURL,
+			_ = h.proxyToTranscodeNode(w, r, session.TranscodeNodeURL,
 				"/transcode/"+remoteTransportID(session)+"/master.m3u8")
 			return
 		}
@@ -1916,6 +1960,15 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 		}
 	}
 	h.touchSessionActivity(sessionID)
+
+	// A generation whose decoder has already rejected the source cannot produce
+	// a playable manifest; answer permanently so the client replans instead of
+	// reloading a playlist it can never play. The hardware->software retry runs
+	// through the client's failure_recovery replan, keyed on this verdict.
+	if transcodeSession.IsSourceRejected() {
+		writePlaybackDecodeError(w)
+		return
+	}
 
 	manifest, err := transcodeSession.BuildPlaybackManifest("segment/", r.URL.RawQuery)
 	if err != nil {
@@ -1957,6 +2010,26 @@ func writePlaybackToneMapExecutionError(w http.ResponseWriter, err error) bool {
 		return true
 	}
 	return false
+}
+
+// transcodeDecodeErrorHeader names the machine-readable decode verdict on a
+// manifest/segment response that revokes a generation whose decoder rejected
+// the source. Clients classify on it to replan instead of retrying the stream.
+// transcodeDecodeErrorCode is the value of that header, distinct from the
+// tone-map header so a client can tell an undecodable source from an
+// executor-recipe mismatch.
+const (
+	transcodeDecodeErrorHeader = playback.DecodeErrorHeader
+	transcodeDecodeErrorCode   = playback.DecodeErrorSourceRejectedCode
+)
+
+// writePlaybackDecodeError answers a media route whose running decoder has
+// rejected the source. It is deliberately permanent (422, not a 404 retry
+// loop): hls.js would otherwise exhaust its recovery budget and report only a
+// startup timeout, leaving the reason invisible to the player and the owner.
+func writePlaybackDecodeError(w http.ResponseWriter) {
+	w.Header().Set(transcodeDecodeErrorHeader, transcodeDecodeErrorCode)
+	writeError(w, http.StatusUnprocessableEntity, "decode_failed", "The media source could not be decoded.")
 }
 
 // HandleGetTranscodeSegment handles GET /playback/transcode/{session_id}/segment/{name}.
@@ -2017,13 +2090,34 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	}
 	attachPlaybackSession(r.Context(), session, claims)
 
+	// Capture the delivered virtual candidate and its health state before the
+	// segment is served. A full-segment delivery may clear exactly the failure
+	// stamp observed here; a failure that lands while bytes are in flight is
+	// newer and the identity/failed_at fence preserves it, mirroring the
+	// direct-play path's transport-start capture. Recovery runs once per
+	// delivered session (the first fully served segment), so a long stream does
+	// not issue a read+write per segment.
+	virtualFileID, virtualDeliveredPath, virtualDelivery := virtualTranscodeDelivery(session, card)
+	if virtualDelivery {
+		if _, cleared := h.virtualDeliveryCleared.Load(sessionID); cleared {
+			virtualDelivery = false
+		}
+	}
+	var virtualObservedFailedAt *time.Time
+	if virtualDelivery {
+		virtualObservedFailedAt = h.observeVirtualCandidateFailure(r.Context(), virtualFileID)
+	}
+
 	transcodeSession := h.tm.GetTranscodeSession(sessionID)
 	if transcodeSession == nil {
 		if session.TranscodeNodeURL != "" {
 			h.touchSessionActivity(sessionID)
 			segmentName := chi.URLParam(r, "name")
-			h.proxyToTranscodeNode(w, r, session.TranscodeNodeURL,
+			delivered := h.proxyToTranscodeNode(w, r, session.TranscodeNodeURL,
 				"/transcode/"+remoteTransportID(session)+"/segment/"+segmentName)
+			if delivered && virtualDelivery && h.clearVirtualCandidateRecovered(r.Context(), virtualFileID, virtualDeliveredPath, virtualObservedFailedAt) {
+				h.virtualDeliveryCleared.Store(sessionID, struct{}{})
+			}
 			return
 		}
 		// Resume near the segment the client is fetching so reconstruct does not
@@ -2040,6 +2134,15 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		}
 	}
 	h.touchSessionActivity(sessionID)
+
+	// Fail the generation before opening any segment: once the decoder has
+	// rejected the source, the files on disk are garbage output and serving
+	// them only delays the client's fatal error until its startup guard times
+	// out. The permanent verdict drives the client's failure_recovery replan.
+	if transcodeSession.IsSourceRejected() {
+		writePlaybackDecodeError(w)
+		return
+	}
 
 	segmentName := chi.URLParam(r, "name")
 	segmentLease, err := transcodeSession.OpenSegment(segmentName)
@@ -2185,7 +2288,77 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		if segNum, parseErr := playback.ParseSegmentNumber(segmentName); parseErr == nil {
 			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, segmentLease.Generation)
 		}
+		// The complete representation reached the client, so this is the
+		// HLS/transcode "it really delivered" signal — the counterpart of the
+		// direct-play positive-byte evidence. Report it before the lease closes.
+		if virtualDelivery && h.clearVirtualCandidateRecovered(r.Context(), virtualFileID, virtualDeliveredPath, virtualObservedFailedAt) {
+			h.virtualDeliveryCleared.Store(sessionID, struct{}{})
+		}
 	}
+}
+
+// virtualTranscodeDelivery reports the catalog row and pinned candidate URI an
+// HLS/transcode session is delivering when that session is virtual. The
+// delivered path is the durable virtual URI captured by the session or recipe
+// card (the pinned result= candidate), which the row retains until a candidate
+// rotation rewrites it; the fence in MarkVirtualCandidateRecovered is what
+// makes a rotated row a no-op. Non-virtual or unidentified deliveries return
+// ok=false, so no recovery is attempted.
+func virtualTranscodeDelivery(session *playback.Session, card *playback.RecipeCard) (fileID int, deliveredPath string, ok bool) {
+	if session != nil {
+		fileID = session.MediaFileID
+		deliveredPath = strings.TrimSpace(session.VirtualSourceURI)
+	}
+	if card != nil {
+		if fileID <= 0 {
+			fileID = card.MediaFileID
+		}
+		if deliveredPath == "" {
+			deliveredPath = strings.TrimSpace(card.InputPath)
+		}
+	}
+	if fileID <= 0 || !strings.HasPrefix(strings.ToLower(deliveredPath), virtualPlaybackPrefix) {
+		return 0, "", false
+	}
+	return fileID, deliveredPath, true
+}
+
+// observeVirtualCandidateFailure reads the delivered candidate's current
+// failed_at before a segment is served. The returned stamp is the only health
+// state a successful delivery may clear; a failure that lands after this read
+// is newer and the fence preserves it. A read error or an absent resolver
+// yields nil, which can only match a row that is already unstamped.
+func (h *PlaybackHandler) observeVirtualCandidateFailure(ctx context.Context, fileID int) *time.Time {
+	if h == nil || h.fileResolver == nil || fileID <= 0 {
+		return nil
+	}
+	current, err := h.fileResolver.GetByID(ctx, fileID)
+	if err != nil || current == nil {
+		return nil
+	}
+	return current.FailedAt
+}
+
+// clearVirtualCandidateRecovered clears a virtual candidate's known-bad stamp
+// after an HLS/transcode delivery actually served a full segment to the client,
+// and records the delivery evidence. It is the transcode counterpart of
+// StreamHandler.clearVirtualCandidateRecovered and shares its fence: only the
+// delivered candidate identity and the failure state observed before the
+// delivering request may be cleared. It reports whether the write ran so the
+// caller can record the session as recovered and stop re-reading per segment.
+// Best-effort: a persistence failure must not fail a delivering stream.
+func (h *PlaybackHandler) clearVirtualCandidateRecovered(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) bool {
+	if h == nil || fileID <= 0 || strings.TrimSpace(deliveredFilePath) == "" || h.VirtualCandidateRecoveredMarker == nil {
+		return false
+	}
+	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := h.VirtualCandidateRecoveredMarker(clearCtx, fileID, deliveredFilePath, observedFailedAt); err != nil {
+		slog.WarnContext(ctx, "clear virtual candidate recovered from transcode delivery",
+			"component", "api", "file_id", fileID, "delivered", deliveredFilePath, "error", err)
+		return false
+	}
+	return true
 }
 
 // buildProxyManifestURL signs a stream token carrying the session's full
@@ -2205,8 +2378,12 @@ func (h *PlaybackHandler) buildProxyManifestURL(card playback.RecipeCard, proxyN
 	return nodepool.NodeEndpoint(proxyNode.ClientURL(), "/stream/transcode/"+token+"/master.m3u8")
 }
 
-// proxyToTranscodeNode forwards a request to the remote transcode node.
-func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, transcodeNodeURL, path string) {
+// proxyToTranscodeNode forwards a request to the remote transcode node and
+// reports whether a complete media segment reached the downstream client. A
+// manifest rewrite or a failed/proxied-away response returns false; the report
+// is the remote-executor counterpart of the local segment's
+// CompletedFullResponse evidence used for virtual-candidate recovery.
+func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, transcodeNodeURL, path string) bool {
 	sessionID := chi.URLParam(r, "session_id")
 	targetURL := transcodeNodeURL + path
 	isSegmentRoute := strings.Contains(path, "/segment/")
@@ -2228,7 +2405,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURL, nil)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		return false
 	}
 	req.Header.Set("Authorization", "Bearer "+h.JWTSecret)
 	if isSegmentRoute {
@@ -2260,7 +2437,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		slog.ErrorContext(r.Context(), "proxy to transcode node", "component", "api", "error", err, "url", targetURL, "playback_session_id", sessionID)
 		http.Error(w, "transcode node unavailable", http.StatusBadGateway)
-		return
+		return false
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -2275,7 +2452,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 		if readErr != nil {
 			slog.ErrorContext(r.Context(), "read transcode node manifest", "component", "api", "error", readErr, "url", targetURL, "playback_session_id", sessionID)
 			http.Error(w, "transcode node unavailable", http.StatusBadGateway)
-			return
+			return false
 		}
 		rewritten := playback.AppendManifestQueryParam(body, streamTokenParam, validToken)
 		for k, vv := range resp.Header {
@@ -2289,7 +2466,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 		w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(rewritten)
-		return
+		return false
 	}
 
 	generation := resp.Header.Get(transcodeproxy.GenerationHeader)
@@ -2299,15 +2476,17 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	sw.WriteHeader(resp.StatusCode)
 	if _, copyErr := io.Copy(sw, resp.Body); copyErr != nil {
-		return
+		return false
 	}
 	fullSize := transcodeproxy.FullRepresentationSize(resp)
-	if isMediaSegment && generation != "" && r.Method == http.MethodGet &&
-		sw.CompletedFullResponse(fullSize) {
+	delivered := isMediaSegment && generation != "" && r.Method == http.MethodGet &&
+		sw.CompletedFullResponse(fullSize)
+	if delivered {
 		if ackErr := transcodeproxy.Acknowledge(r.Context(), http.DefaultClient, transcodeNodeURL+path, h.JWTSecret, generation); ackErr != nil {
 			slog.WarnContext(r.Context(), "acknowledge transcode segment completion", "component", "api", "error", ackErr, "playback_session_id", sessionID)
 		}
 	}
+	return delivered
 }
 
 // maybeStartThrottler reads throttle settings and starts the throttler if enabled.

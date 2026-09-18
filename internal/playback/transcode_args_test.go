@@ -23,7 +23,7 @@ func TestToneMapFFmpegGraphsCoverSupportedExecutors(t *testing.T) {
 	}{
 		{name: "software PQ", mode: tonemap.ModeSoftware, hwAccel: "none", filter: "tonemapx", sourceKind: tonemap.SourcePQ, want: []string{"tonemapx=tonemap=bt2390", "color_trc=smpte2084", "libx264"}},
 		{name: "software HLG fallback", mode: tonemap.ModeSoftware, hwAccel: "none", filter: "tonemap", sourceKind: tonemap.SourceHLG, want: []string{"tonemap=hable", "color_trc=arib-std-b67", "libx264"}},
-		{name: "QSV", mode: tonemap.ModeHardware, hwAccel: "qsv", filter: "tonemap_opencl", sourceKind: tonemap.SourcePQ, want: []string{"-init_hw_device opencl=ocl@va", "tonemap_opencl", "hwmap=derive_device=qsv:mode=read+write", "h264_qsv"}},
+		{name: "QSV", mode: tonemap.ModeHardware, hwAccel: "qsv", filter: "tonemap_opencl", sourceKind: tonemap.SourcePQ, want: []string{"-init_hw_device opencl=ocl@va", "tonemap_opencl", "hwmap=derive_device=qsv:mode=write:reverse=1:extra_hw_frames=16", "vpp_qsv=w=-1:h=1080", "h264_qsv"}},
 		{name: "VAAPI", mode: tonemap.ModeHardware, hwAccel: "vaapi", filter: "tonemap_vaapi", sourceKind: tonemap.SourceHLG, want: []string{"tonemap_vaapi", "scale_vaapi", "h264_vaapi"}},
 		{name: "NVENC", mode: tonemap.ModeHardware, hwAccel: "nvenc", filter: "tonemap_cuda", sourceKind: tonemap.SourcePQ, want: []string{"color_trc=smpte2084", "tonemap_cuda", "scale_cuda", "h264_nvenc"}},
 		{name: "VideoToolbox", mode: tonemap.ModeHardware, hwAccel: "videotoolbox", filter: "scale_vt", sourceKind: tonemap.SourcePQ, want: []string{"-hwaccel videotoolbox", "-hwaccel_output_format videotoolbox_vld", "scale_vt=w=-2:h=1080", "hwdownload,format=p010le,format=nv12", "h264_videotoolbox"}},
@@ -57,6 +57,113 @@ func TestToneMapFFmpegGraphsCoverSupportedExecutors(t *testing.T) {
 				t.Fatalf("hardware graph requested a software pixel format conversion: %s", joined)
 			}
 		})
+	}
+}
+
+// qsvToneMapChainForTest extracts the -vf graph from built args.
+func qsvToneMapChainForTest(t *testing.T, args []string) string {
+	t.Helper()
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "-vf" {
+			return args[i+1]
+		}
+	}
+	t.Fatalf("no -vf filter in args: %v", args)
+	return ""
+}
+
+// TestQSVHDRToneMapChainMapsStraightToQSVAndScalesOnVPP pins the quality
+// contract of the QSV HDR chain: the OpenCL tone-map stage is byte-for-byte
+// unchanged, the graph maps the OpenCL result straight to QSV, and the only
+// scaler left is vpp_qsv. Three hwmap hops become two.
+func TestQSVHDRToneMapChainMapsStraightToQSVAndScalesOnVPP(t *testing.T) {
+	args := buildFFmpegArgs(TranscodeOpts{
+		InputPath: "/media/hdr.mkv", OutputDir: t.TempDir(), TargetCodecVideo: "h264", TargetCodecAudio: "aac",
+		SourceVideoCodec: "hevc", SourceVideoProfile: "Main 10", SourceVideoBitDepth: 10,
+		TargetResolution: "1080p", HWAccel: "qsv", ToneMapPolicy: tonemap.PolicyHardwareOnly,
+		ToneMapMode: tonemap.ModeHardware, ToneMapSourceKind: tonemap.SourcePQ, ToneMapFilter: tonemap.HardwareFilterOpenCL,
+		ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3,
+	})
+	chain := qsvToneMapChainForTest(t, args)
+	if hops := strings.Count(chain, "hwmap=derive_device="); hops != 2 {
+		t.Fatalf("QSV HDR chain has %d hwmap hops, want 2: %s", hops, chain)
+	}
+	openCL := "tonemap_opencl=format=nv12:p=bt709:t=bt709:m=bt709:tonemap=bt2390:peak=100:desat=0"
+	openCLIndex := strings.Index(chain, openCL)
+	if openCLIndex < 0 {
+		t.Fatalf("OpenCL tone-map stage changed: %s", chain)
+	}
+	qsvMap := "hwmap=derive_device=qsv:mode=write:reverse=1:extra_hw_frames=16,format=qsv"
+	qsvMapIndex := strings.Index(chain, qsvMap)
+	if qsvMapIndex < openCLIndex {
+		t.Fatalf("QSV map must follow the OpenCL stage: %s", chain)
+	}
+	scaleIndex := strings.Index(chain, "vpp_qsv=w=-1:h=1080:format=nv12")
+	if scaleIndex < qsvMapIndex {
+		t.Fatalf("vpp_qsv scale must follow the QSV map: %s", chain)
+	}
+	for _, forbidden := range []string{"scale_vaapi=w=-2:h=1080", "mode=read+write", "derive_device=vaapi"} {
+		if strings.Contains(chain, forbidden) {
+			t.Fatalf("QSV HDR chain retains the removed interop hop %q: %s", forbidden, chain)
+		}
+	}
+}
+
+// TestBuildFFmpegArgs_VPPToneMapOptInOnly builds the opt-in media-engine
+// conversion and asserts it replaces the OpenCL chain rather than running
+// beside it.
+func TestBuildFFmpegArgs_VPPToneMapOptInOnly(t *testing.T) {
+	args := buildFFmpegArgs(TranscodeOpts{
+		InputPath: "/media/hdr.mkv", OutputDir: t.TempDir(), TargetCodecVideo: "h264", TargetCodecAudio: "aac",
+		SourceVideoCodec: "hevc", SourceVideoProfile: "Main 10", SourceVideoBitDepth: 10,
+		TargetResolution: "1080p", HWAccel: "qsv", ToneMapPolicy: tonemap.PolicyHardwareOnly,
+		ToneMapMode: tonemap.ModeHardware, ToneMapSourceKind: tonemap.SourcePQ, ToneMapFilter: tonemap.HardwareFilterQSVVPP,
+		ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3,
+	})
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "vpp_qsv=tonemap=1") || !strings.Contains(joined, "vpp_qsv=w=-1:h=1080:format=nv12") {
+		t.Fatalf("VPP tone map chain missing: %s", joined)
+	}
+	if strings.Contains(joined, "tonemap_opencl") || strings.Contains(joined, "-init_hw_device opencl=ocl@va") {
+		t.Fatalf("VPP tone map must replace the OpenCL chain: %s", joined)
+	}
+	if !strings.Contains(joined, "-c:v h264_qsv") {
+		t.Fatalf("VPP tone map left the QSV encoder: %s", joined)
+	}
+}
+
+// TestValidateToneMapOptsAllowsVPPOnlyOnQSV covers the intended on/off and
+// backend combinations of playback.transcode_vpp_tone_map_enabled.
+func TestValidateToneMapOptsAllowsVPPOnlyOnQSV(t *testing.T) {
+	base := TranscodeOpts{
+		TargetCodecVideo: "h264", ToneMapMode: tonemap.ModeHardware,
+		ToneMapSourceKind: tonemap.SourcePQ, ToneMapPolicy: tonemap.PolicyHardwareOnly,
+		ToneMapRecipeVersion:  TransformationHDRToSDRToneMapRecipeVersionV3,
+		ToneMapSourceRevision: tonemap.SourceRevision{MediaFileID: 1, FileSize: 1, StreamSignature: "stream"},
+	}
+	vppQSV := base
+	vppQSV.HWAccel = "qsv"
+	vppQSV.ToneMapFilter = tonemap.HardwareFilterQSVVPP
+	if err := validateToneMapOpts(vppQSV); err != nil {
+		t.Fatalf("VPP on QSV rejected: %v", err)
+	}
+	openclQSV := base
+	openclQSV.HWAccel = "qsv"
+	openclQSV.ToneMapFilter = tonemap.HardwareFilterOpenCL
+	if err := validateToneMapOpts(openclQSV); err != nil {
+		t.Fatalf("OpenCL on QSV rejected: %v", err)
+	}
+	vppVAAPI := base
+	vppVAAPI.HWAccel = "vaapi"
+	vppVAAPI.ToneMapFilter = tonemap.HardwareFilterQSVVPP
+	if err := validateToneMapOpts(vppVAAPI); err == nil {
+		t.Fatal("VPP on VAAPI must be rejected")
+	}
+	vppNone := base
+	vppNone.HWAccel = HWAccelNone
+	vppNone.ToneMapFilter = tonemap.HardwareFilterQSVVPP
+	if err := validateToneMapOpts(vppNone); err == nil {
+		t.Fatal("VPP without a hardware backend must be rejected")
 	}
 }
 

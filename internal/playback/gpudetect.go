@@ -1306,6 +1306,20 @@ func videoToolboxProbeCacheKey(execPath string) string {
 	return strconv.FormatUint(hwProbeGeneration(), 10) + "\x00" + execPath + "\x00" + ffmpegIdentityKey(execPath)
 }
 
+// SoftwareFallbackGPUOnly is the playback.software_fallback policy value that
+// forbids the server from starting any automated CPU-decode fallback. It lives
+// in the playback domain so every surface that can silently choose software
+// decode compares against the same spelling.
+const SoftwareFallbackGPUOnly = "gpu_only"
+
+// SoftwareFallbackAllowed reports whether a playback.software_fallback policy
+// value permits an automated software-decode fallback. The empty string is the
+// default "allow", matching config loading, so a zero-value TranscodeOpts or
+// PlaybackConfig never disables fallback by accident.
+func SoftwareFallbackAllowed(value string) bool {
+	return !strings.EqualFold(strings.TrimSpace(value), SoftwareFallbackGPUOnly)
+}
+
 // StartupRetryHWAccel returns the acceleration for the single retry after a
 // transcode dies before producing its first segment. VideoToolbox has no
 // alternate render device to move to, so an ordinary encode retries on the
@@ -1313,6 +1327,10 @@ func videoToolboxProbeCacheKey(execPath string) string {
 // shortcut because its mode and filter would no longer describe the executor;
 // the owner must replan it as a complete software recipe instead. Every other
 // accel keeps its configured value and moves render devices via AvoidHWDevice.
+//
+// A caller under playback.software_fallback=gpu_only must not take the retry
+// when it returns HWAccelNone: that path is a CPU decode+encode fallback. The
+// callers gate on SoftwareFallbackAllowed for exactly this case.
 func StartupRetryHWAccel(opts TranscodeOpts) string {
 	if opts.ToneMapMode != tonemap.ModeHardware &&
 		ResolveHWAccelWithFFmpeg(opts.HWAccel, opts.FFmpegPath, opts.HWDevice) == transcodeHWVideoToolbox {

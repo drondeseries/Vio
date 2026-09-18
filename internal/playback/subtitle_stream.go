@@ -223,10 +223,8 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 	// its events on the source timeline, which the client's JASSUB
 	// `timeOffset` relies on. Without a window request the whole script is
 	// emitted, so native clients that fetch .ass once are unaffected.
-	windowRequested := opts.WindowRequested || opts.SeekSeconds > 0
-	windowable := (!IsPGS(opts.SourceCodec) || opts.AllowWindow) &&
-		(!IsASS(opts.SourceCodec) || windowRequested)
-	seekApplied := windowRequested && windowable
+	windowable := opts.windowable()
+	seekApplied := opts.windowSeekApplied()
 	if seekApplied {
 		args = append(args, "-ss", strconv.FormatFloat(opts.SeekSeconds, 'f', 3, 64))
 	}
@@ -281,6 +279,115 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 		"-f", outFormat,
 		"pipe:1",
 	)
+}
+
+// windowable reports whether the extract's codec/muxer can be sliced by a
+// window at all. Text always can; ASS carries self-contained script headers per
+// window and requires a window request; PGS is a bitmap elementary stream that
+// only windows when the caller explicitly allowed it (AllowWindow). This is the
+// codec half of the seek decision, shared by streamExtractArgs and
+// WindowCoverage so an advertised range can never disagree with the ffmpeg
+// command.
+func (o StreamExtractOpts) windowable() bool {
+	windowRequested := o.WindowRequested || o.SeekSeconds > 0
+	return (!IsPGS(o.SourceCodec) || o.AllowWindow) &&
+		(!IsASS(o.SourceCodec) || windowRequested)
+}
+
+// ClampOpenEndedWindow bounds an explicitly-started window that carries no
+// duration so it cannot extract to end-of-file. A request that supplies a
+// position but no duration is authoritative window intent (position=0 included,
+// see WindowRequested), but ffmpeg would otherwise emit `-ss <position>` with
+// no `-to`, demuxing the rest of the container — the unbounded whole-container
+// extract the implicit window exists to prevent. maxDuration fills in the same
+// implicit window a whole-track request gets.
+//
+// It is a no-op for a whole-track request (no position intent), an explicit
+// position+duration, a codec that cannot window at all (PGS without
+// AllowWindow), and a non-positive cap. Returns true when it set a duration.
+func (o *StreamExtractOpts) ClampOpenEndedWindow(maxDuration float64) bool {
+	if o == nil || maxDuration <= 0 || o.DurationSeconds > 0 {
+		return false
+	}
+	if !(o.WindowRequested || o.SeekSeconds > 0) {
+		return false
+	}
+	if !o.windowable() {
+		return false
+	}
+	o.DurationSeconds = maxDuration
+	return true
+}
+
+// windowSeekApplied reports whether the extract both has a window intent and a
+// codec/muxer that supports slicing, i.e. whether streamExtractArgs emits
+// `-ss`/`-copyts` and therefore returns only a bounded slice of the track. A
+// duration-only request on a codec that does not window (legacy ASS callers)
+// reads as false even though windowIntent is true.
+func (o StreamExtractOpts) windowSeekApplied() bool {
+	windowRequested := o.WindowRequested || o.SeekSeconds > 0
+	return windowRequested && o.windowable()
+}
+
+// SubtitleCoverageHeader carries the source-time range a windowed subtitle
+// response covers, as `<start>-<end>` with three-decimal seconds and `*` for an
+// open end. It is present only on a bounded response. A client that requested
+// the whole track (present in the API as a request with no position/duration)
+// uses it to learn that it received a slice and must request subsequent
+// windows; a whole-track or committed-artifact response omits it.
+const SubtitleCoverageHeader = "X-Subtitle-Coverage"
+
+// SubtitleWindowedHeader is `true` on a bounded subtitle response and absent on
+// a whole-track one. It mirrors the presence of SubtitleCoverageHeader for
+// clients that only need the boolean.
+const SubtitleWindowedHeader = "X-Subtitle-Windowed"
+
+// WindowCoverage reports whether opts produces a bounded window and, if so, the
+// source-time range it covers. openEnded is true when the caller supplied a
+// start with no duration cap (the extract runs to EOF from the start).
+// windowed mirrors the exact `-ss`/`-to` decision streamExtractArgs makes, so
+// the advertised range is the range ffmpeg is told to produce.
+func (o StreamExtractOpts) WindowCoverage() (windowed bool, startSeconds, endSeconds float64, openEnded bool) {
+	if !o.windowIntent() || !o.windowable() {
+		return false, 0, 0, false
+	}
+	seekApplied := o.windowSeekApplied()
+	start := o.SeekSeconds
+	if !seekApplied {
+		// A duration-only text request is bounded by `-to` without an input
+		// seek, so it starts at source zero and ends at the duration.
+		start = 0
+	}
+	if o.DurationSeconds > 0 {
+		end := o.DurationSeconds
+		if seekApplied {
+			end = o.SeekSeconds + o.DurationSeconds
+		}
+		return true, start, end, false
+	}
+	return true, start, 0, true
+}
+
+// SetSubtitleCoverageHeader records the window an extract covers on the
+// response. It is a no-op for a whole-track extract, so a client can rely on
+// the header's presence to detect a bounded response.
+func SetSubtitleCoverageHeader(h http.Header, opts StreamExtractOpts) {
+	if h == nil {
+		return
+	}
+	windowed, start, end, openEnded := opts.WindowCoverage()
+	if !windowed {
+		return
+	}
+	value := strconv.FormatFloat(start, 'f', 3, 64) + "-*"
+	if !openEnded {
+		value = strconv.FormatFloat(start, 'f', 3, 64) + "-" + strconv.FormatFloat(end, 'f', 3, 64)
+	}
+	h.Set(SubtitleCoverageHeader, value)
+	h.Set(SubtitleWindowedHeader, "true")
+	// The subtitle routes already answer cross-origin; expose the two markers
+	// so a browser-based client (not just a native one) can read them.
+	h.Set("Access-Control-Expose-Headers", SubtitleCoverageHeader+", "+SubtitleWindowedHeader)
 }
 
 // windowIntent reports whether the caller asked for a bounded window rather

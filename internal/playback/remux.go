@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/processmetrics"
@@ -446,6 +447,9 @@ type RemuxServeOptions struct {
 	// route the client is still being fed. Callers that serve a session pass
 	// SessionManager.WatchTransportStop's channel.
 	Abort <-chan struct{}
+	// TimingStart is when the serving request arrived, used only for the
+	// per-seek timing log. Zero omits the handler-setup segment.
+	TimingStart time.Time
 }
 
 // RemuxContentType returns the override required for an audio-only fMP4.
@@ -454,6 +458,43 @@ func RemuxContentType(audioOnly bool) string {
 		return AudioOnlyRemuxMIMEV3
 	}
 	return ""
+}
+
+// logRemuxSeekTiming emits one structured line per progressive remux seek so a
+// client-side time-to-first-byte can be attributed to handler setup, FFmpeg
+// spawn, and FFmpeg's own first output. It is deliberately silent for seek 0
+// (an ordinary start) to keep the log to the user-visible seek path.
+// logKeyComponent names the slog attribute every playback log line carries.
+const logKeyComponent = "component"
+
+func logRemuxSeekTiming(ctx context.Context, seekSeconds float64, filePath, outputFormat string, timingStart, spawnStart, spawnDone, firstByte time.Time) {
+	if seekSeconds <= 0 {
+		return
+	}
+	attrs := []any{
+		logKeyComponent, "playback",
+		"seek_seconds", seekSeconds,
+		"output_format", outputFormat,
+		"remote_input", isRemoteRemuxInput(filePath),
+		"spawn_ms", spawnDone.Sub(spawnStart).Milliseconds(),
+	}
+	if !timingStart.IsZero() {
+		attrs = append(attrs, "handler_ms", spawnStart.Sub(timingStart).Milliseconds())
+	}
+	if !firstByte.IsZero() {
+		attrs = append(attrs,
+			"first_byte_ms", firstByte.Sub(spawnDone).Milliseconds(),
+			"total_ms", firstByte.Sub(spawnStart).Milliseconds())
+		if !timingStart.IsZero() {
+			attrs = append(attrs, "request_to_first_byte_ms", firstByte.Sub(timingStart).Milliseconds())
+		}
+	}
+	slog.InfoContext(ctx, "progressive remux seek started", attrs...)
+}
+
+func isRemoteRemuxInput(filePath string) bool {
+	lower := strings.ToLower(strings.TrimSpace(filePath))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "virtual://")
 }
 
 // ServeRemux streams a remuxed file to the HTTP response.
@@ -495,7 +536,9 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 		}
 	}
 
+	spawnStart := time.Now()
 	session, err := startRemuxWithOptions(r.Context(), filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, opts.AudioOnly, opts.SourceAudioChannels, opts.TargetAudioChannels, opts.TargetAudioBitrateKbps)
+	spawnDone := time.Now()
 	if err != nil {
 		http.Error(w, "failed to start remux", http.StatusInternalServerError)
 		return err
@@ -526,10 +569,12 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 	// Do not commit 200 until FFmpeg produces media bytes. A relay/provider
 	// failure is therefore still safe for the handler to retry.
 	var first []byte
+	var firstByteAt time.Time
 	for len(first) == 0 {
 		n, readErr := session.Read(buf)
 		if n > 0 {
 			first = buf[:n]
+			firstByteAt = time.Now()
 		}
 		if readErr != nil {
 			if len(first) == 0 {
@@ -540,6 +585,7 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 			break
 		}
 	}
+	logRemuxSeekTiming(r.Context(), seekSeconds, filePath, outputFormat, opts.TimingStart, spawnStart, spawnDone, firstByteAt)
 
 	contentType := opts.ContentType
 	if contentType == "" {

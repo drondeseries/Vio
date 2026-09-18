@@ -2605,17 +2605,43 @@ func main() {
 			registerShutdownWork(vlDone)
 			go func() {
 				defer close(vlDone)
+				// drainMonitorPasses runs bounded passes back-to-back until a
+				// pass completes a full cycle (or makes no progress). Each pass
+				// persists its cursor, so a large library drains in one tick
+				// instead of waiting a whole refresh interval between passes.
+				// A pass that exhausts its deadline is normal: it returns a
+				// successful response with budget_exhausted set.
+				drainMonitorPasses := func() {
+					for {
+						if appCtx.Err() != nil {
+							return
+						}
+						passCtx, cancel := context.WithTimeout(appCtx, 2*time.Minute)
+						resp, runErr := vlMonitor.Run(passCtx, &virtuallibrary.RunTask{TaskKey: "monitor-media"})
+						cancel()
+						if runErr != nil {
+							slog.Warn("virtual library monitor pass failed", "error", runErr)
+							return
+						}
+						if resp == nil {
+							return
+						}
+						budgetExhausted, _ := resp.Output["budget_exhausted"].(bool)
+						processed, _ := resp.Output["processed"].(int)
+						if !budgetExhausted || processed == 0 {
+							// Full cycle done, or a pass too short to make any
+							// progress: stop draining to avoid a hot loop and
+							// let the next tick try again.
+							return
+						}
+					}
+				}
 				// Initial run after brief delay (10s) so server finishes startup first
 				select {
 				case <-appCtx.Done():
 					return
 				case <-time.After(10 * time.Second):
-					passCtx, cancel := context.WithTimeout(appCtx, 2*time.Minute)
-					_, runErr := vlMonitor.Run(passCtx, &virtuallibrary.RunTask{TaskKey: "monitor-media"})
-					cancel()
-					if runErr != nil {
-						slog.Warn("virtual library initial monitor pass failed", "error", runErr)
-					}
+					drainMonitorPasses()
 				}
 
 				ticker := time.NewTicker(vlInterval)
@@ -2630,13 +2656,8 @@ func main() {
 							slog.Warn("virtual library monitor pass skipped: prior pass still running")
 							continue
 						}
-						passCtx, cancel := context.WithTimeout(appCtx, 2*time.Minute)
-						_, runErr := vlMonitor.Run(passCtx, &virtuallibrary.RunTask{TaskKey: "monitor-media"})
-						cancel()
+						drainMonitorPasses()
 						running.Store(false)
-						if runErr != nil {
-							slog.Warn("virtual library monitor pass failed", "error", runErr)
-						}
 					}
 				}
 			}()

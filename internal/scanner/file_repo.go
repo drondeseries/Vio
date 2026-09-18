@@ -1421,10 +1421,12 @@ func virtualCandidateGroup(raw string) (string, bool) {
 // guards the transport no-bytes marker.
 const VirtualCandidateDeliveryGrace = 7 * 24 * time.Hour
 
-// virtualCandidateFailureGracePredicate is the SQL predicate that any failed_at
-// stamp site applies: known-good rows inside the delivery grace are skipped,
-// while rows that never delivered (or whose last delivery is stale) stamp as
-// before. It consumes the query's next placeholder as the grace in seconds. The
+// virtualCandidateFailureGracePredicate is the SQL predicate the transport
+// failed_at stamp applies: known-good rows inside the delivery grace are
+// skipped, while rows that never delivered (or whose last delivery is stale)
+// stamp as before. It consumes the query's next placeholder as the grace in
+// seconds. The decode-rejection stamp deliberately omits this clause: bytes
+// that cannot be decoded are unplayable regardless of delivery evidence. The
 // transport no-bytes marker in NewRouter applies the equivalent predicate
 // directly (it does not go through this package); keep the two in sync if the
 // rule changes.
@@ -1448,6 +1450,31 @@ const virtualCandidateFailureGracePredicate = `(last_delivered_at IS NULL OR las
 // clearing fresh evidence. This mirrors ReplaceVirtualResultPin's
 // `WHERE id=$1 AND file_path=$2` guard.
 func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
+	return r.markVirtualCandidateFailed(ctx, fileID, expectedFilePath, observedFailedAt, true)
+}
+
+// MarkVirtualCandidateDecodeRejected stamps a virtual candidate row as
+// known-bad after a decoder rejected the source, bypassing the delivery grace
+// that MarkVirtualCandidateFailed applies. A decode verdict is a statement
+// about the bytes themselves — they are unplayable by the executor that just
+// tried — so a candidate that delivered recently is still branded dead and the
+// auto-pick rotates instead of re-selecting the same undecodable release
+// forever. Transport failures keep the grace behavior: a provider flap is
+// forgiven for a candidate that demonstrably delivered; an undecodable release
+// is not.
+//
+// The identity/failed_at fence is identical to MarkVirtualCandidateFailed, so a
+// rotation or a newer stamp is never mis-marked by a stale verdict.
+func (r *FileRepository) MarkVirtualCandidateDecodeRejected(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
+	return r.markVirtualCandidateFailed(ctx, fileID, expectedFilePath, observedFailedAt, false)
+}
+
+// markVirtualCandidateFailed is the shared failed_at stamp. applyGrace selects
+// the transport rule: true (MarkVirtualCandidateFailed) skips known-good rows
+// inside VirtualCandidateDeliveryGrace, false (MarkVirtualCandidateDecodeRejected)
+// stamps regardless of delivery evidence. The fence and the placeholder order
+// are identical either way; only the grace clause is conditional.
+func (r *FileRepository) markVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time, applyGrace bool) error {
 	if r == nil || r.pool == nil {
 		return errors.New("file repository is not configured")
 	}
@@ -1455,9 +1482,14 @@ func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID 
 		return nil
 	}
 	query := `UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
-		WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3
+		WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3`
+	args := []any{fileID, expectedFilePath, observedFailedAt}
+	if applyGrace {
+		query += `
 		  AND ` + virtualCandidateFailureGracePredicate
-	_, err := r.pool.Exec(ctx, query, fileID, expectedFilePath, observedFailedAt, VirtualCandidateDeliveryGrace.Seconds())
+		args = append(args, VirtualCandidateDeliveryGrace.Seconds())
+	}
+	_, err := r.pool.Exec(ctx, query, args...)
 	return err
 }
 

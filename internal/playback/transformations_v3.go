@@ -60,6 +60,8 @@ func ProbeTransformationRegistryWithToneMapV3Result(ctx context.Context, ffmpegP
 		{Name: TransformationServerDV7HDR10V3, RecipeVersion: "1", Available: bytes.Contains(bsfs, []byte("dovi_rpu")), RequiredCapability: "ffmpeg_bsf:dovi_rpu", PromisedDynamicRange: DynamicRangeHDR10V3, ValidatedClaims: DV7ToHDR10ClaimsV3(), TerminalReason: TerminalDVConversionUnsupportedV3},
 		{Name: TransformationAudioToAACV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, Available: ffmpegErr == nil && bytes.Contains(encoders, []byte(" aac ")) && normalizeRecipeErr == nil && downmixRecipeErr == nil, RequiredCapability: "ffmpeg_encoder:aac+ffmpeg_filter_smoke:timestamp_normalization_and_stereo_downmix_v4", ValidatedClaims: []string{ClaimAudioDecodeV3}, TerminalReason: TerminalAudioConversionUnsupportedV3},
 		{Name: TransformationVideoToH264V3, RecipeVersion: TransformationVideoToH264RecipeVersionV3, Available: ffmpegErr == nil && h264EncoderAvailableV3(encoders), RequiredCapability: "ffmpeg_encoder:h264", PromisedDynamicRange: DynamicRangeSDRV3, ValidatedClaims: []string{ClaimH264DecodeV3}, TerminalReason: TerminalVideoConversionUnsupportedV3},
+		{Name: TransformationVideoToHEVCV3, RecipeVersion: TransformationVideoToHEVCRecipeVersionV3, Available: ffmpegErr == nil && hevcEncoderAvailableV3(encoders), RequiredCapability: "ffmpeg_encoder:hevc", PromisedDynamicRange: DynamicRangeSDRV3, ValidatedClaims: []string{ClaimHEVCDecodeV3}, TerminalReason: TerminalVideoConversionUnsupportedV3},
+		{Name: TransformationVideoToAV1V3, RecipeVersion: TransformationVideoToAV1RecipeVersionV3, Available: ffmpegErr == nil && av1EncoderAvailableV3(encoders), RequiredCapability: "ffmpeg_encoder:av1", PromisedDynamicRange: DynamicRangeSDRV3, ValidatedClaims: []string{ClaimAV1DecodeV3}, TerminalReason: TerminalVideoConversionUnsupportedV3},
 		{Name: TransformationHDRToSDRToneMapV3, RecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3, Available: len(toneMapCapabilities) > 0, RequiredCapability: "ffmpeg_filter:hdr_to_sdr_tonemap", PromisedDynamicRange: DynamicRangeSDRV3, ValidatedClaims: []string{ClaimHDRMetadataRemovedV3, ClaimSDRBT709OutputV3}, TerminalReason: TerminalHDRTranscodeUnsupportedV3},
 	})
 	return registry, errors.Join(
@@ -108,6 +110,33 @@ var h264EncodersV3 = []string{"libx264", "h264_qsv", "h264_vaapi", "h264_nvenc",
 
 func h264EncoderAvailableV3(encoders []byte) bool {
 	for _, encoder := range h264EncodersV3 {
+		if bytes.Contains(encoders, []byte(encoder)) {
+			return true
+		}
+	}
+	return false
+}
+
+// hevcEncodersV3 lists every HEVC encoder the transcode pipeline can select.
+// HEVC is a client-capability upgrade over the H.264 floor, so a server that
+// only has a hardware HEVC encoder can still serve it.
+var hevcEncodersV3 = []string{"libx265", "hevc_qsv", "hevc_vaapi", "hevc_nvenc", "hevc_videotoolbox"} //nolint:goconst // mirrors the backend encoder ladder in transcode.go
+
+func hevcEncoderAvailableV3(encoders []byte) bool {
+	return encoderListContainsAnyV3(encoders, hevcEncodersV3)
+}
+
+// av1EncodersV3 is deliberately the QSV encoder only: AV1 software encoders
+// are far too slow for realtime playback, and the QSV path is the one this
+// capability exists to unlock.
+var av1EncodersV3 = []string{"av1_qsv"}
+
+func av1EncoderAvailableV3(encoders []byte) bool {
+	return encoderListContainsAnyV3(encoders, av1EncodersV3)
+}
+
+func encoderListContainsAnyV3(encoders []byte, names []string) bool {
+	for _, encoder := range names {
 		if bytes.Contains(encoders, []byte(encoder)) {
 			return true
 		}

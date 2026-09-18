@@ -821,6 +821,15 @@ func writeStreamDenied(w http.ResponseWriter) {
 	http.Error(w, "playback session ended", http.StatusGone)
 }
 
+// writeSourceDecodeRejected answers a media route whose running decoder has
+// rejected the source. It mirrors the API server's verdict so a clustered
+// deployment surfaces the same permanent failure through the proxy instead of
+// letting the player retry a stream this node cannot decode.
+func writeSourceDecodeRejected(w http.ResponseWriter) {
+	w.Header().Set(playback.DecodeErrorHeader, playback.DecodeErrorSourceRejectedCode)
+	http.Error(w, "the media source could not be decoded", http.StatusUnprocessableEntity)
+}
+
 // sealedHandler is what Handler hands out: the finished router behind an
 // unexported field and a ServeHTTP method, nothing else, so no assertion or
 // type switch recovers a registration surface from it, and the route
@@ -1639,7 +1648,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 			// session this Mac cannot create does not fail clustered
 			// playback while CPU encoding was available.
 			retryAccel := playback.StartupRetryHWAccel(opts)
-			if wasRunning || retryAccel == opts.HWAccel {
+			// gpu_only forbids the VideoToolbox CPU retry: retryAccel is
+			// HWAccelNone only when the configured accel was VideoToolbox and
+			// the retry would decode and encode on the CPU. Surface the
+			// readiness failure instead of silently taking a CPU path.
+			if wasRunning || retryAccel == opts.HWAccel ||
+				(retryAccel == playback.HWAccelNone && !softwareFallbackAllowed(cfg.Playback.SoftwareFallback)) {
 				unlock()
 				slog.ErrorContext(r.Context(), "transcode failed readiness check", "component", "transcodenode", "error", err, "session", req.SessionID, "playback_session_id", req.SessionID)
 				http.Error(w, "transcode did not become ready", http.StatusInternalServerError)
@@ -1724,7 +1738,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func softwareFallbackAllowed(value string) bool {
-	return !strings.EqualFold(strings.TrimSpace(value), "gpu_only")
+	return playback.SoftwareFallbackAllowed(value)
 }
 
 func (s *Server) requireApprovedInputPath(w http.ResponseWriter, r *http.Request, path string) bool {
@@ -1975,6 +1989,14 @@ func (s *Server) spawnReconstruct(r *http.Request, sessionID string, requestedSe
 			if session.IsRunning() {
 				slog.WarnContext(r.Context(), "reconstructed transcode slow to produce a manifest", "component", "transcodenode",
 					"error", waitErr, "session", sessionID, "playback_session_id", sessionID)
+			} else if !softwareFallbackAllowed(cfg.Playback.SoftwareFallback) {
+				// gpu_only forbids the CPU decode+encode retry: close the dead
+				// session and surface the failure instead of registering it as
+				// a permanently missing source.
+				_ = session.Close()
+				slog.ErrorContext(r.Context(), "reconstructed transcode crashed during startup and software fallback is disabled",
+					"component", "transcodenode", "error", waitErr, "session", sessionID, "playback_session_id", sessionID)
+				return nil, waitErr
 			} else {
 				// Keep the shared output directory: the retry writes into it.
 				_ = session.CloseProcess()
@@ -2448,6 +2470,11 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	}
 	s.attachTelemetrySession(r, sessionID)
 
+	if session.IsSourceRejected() {
+		writeSourceDecodeRejected(w)
+		return
+	}
+
 	var manifest []byte
 	var err error
 	if r.URL.Query().Get(playback.SourceTimelineQueryParam) == "1" {
@@ -2503,6 +2530,14 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		s.touchSession(sessionID)
 	}
 	s.attachTelemetrySession(r, sessionID)
+
+	// A generation whose decoder has rejected the source cannot produce a
+	// playable segment; answer permanently so the client replans instead of
+	// retrying garbage output.
+	if session.IsSourceRejected() {
+		writeSourceDecodeRejected(w)
+		return
+	}
 
 	segmentLease, err := session.OpenSegment(name)
 	if err != nil && err == playback.ErrSegmentNotFound {

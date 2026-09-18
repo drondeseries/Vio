@@ -585,3 +585,83 @@ func TestMarkVirtualCandidateFailedDefersKnownGood(t *testing.T) {
 		t.Fatal("never-delivered candidate was not stamped")
 	}
 }
+
+// TestMarkVirtualCandidateDecodeRejectedBypassesDeliveryGrace verifies that a
+// decode-classified rejection stamps a candidate that delivered recently, while
+// the transport failure stamp keeps the delivered-grace behavior. This is what
+// stops a repeatable decode rejection from being re-selected forever.
+func TestMarkVirtualCandidateDecodeRejectedBypassesDeliveryGrace(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("decode-grace-%d", suffix)
+
+	var folderID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("Decode Grace %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_item_libraries WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_items(content_id,type,title,status,genres)
+		VALUES($1,'movie','Decode Grace','matched','{}'::text[])`, contentID); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+
+	repo := NewFileRepository(pool)
+	freshly := time.Now().Add(-time.Hour)
+	seed := func(path string) int {
+		var id int
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,last_delivered_at)
+			VALUES($1,$2,$3,1000,'virtual',7,$4) RETURNING id`,
+			contentID, folderID, path, &freshly).Scan(&id); err != nil {
+			t.Fatalf("seed virtual file %q: %v", path, err)
+		}
+		return id
+	}
+	readFailedAt := func(id int) *time.Time {
+		t.Helper()
+		var failedAt *time.Time
+		if err := pool.QueryRow(ctx, `SELECT failed_at FROM media_files WHERE id=$1`, id).Scan(&failedAt); err != nil {
+			t.Fatalf("read failed_at: %v", err)
+		}
+		return failedAt
+	}
+
+	// A transport failure on a freshly-delivered candidate is still forgiven.
+	transportPath := fmt.Sprintf("virtual://movie/tt%d?result=transport", suffix)
+	transportID := seed(transportPath)
+	if err := repo.MarkVirtualCandidateFailed(ctx, transportID, transportPath, nil); err != nil {
+		t.Fatalf("mark transport failed: %v", err)
+	}
+	if readFailedAt(transportID) != nil {
+		t.Fatal("transport failure stamped a candidate inside the delivery grace")
+	}
+
+	// The same delivery evidence does not shelter a decode rejection: the bytes
+	// are unplayable now, so the auto-pick must rotate.
+	decodePath := fmt.Sprintf("virtual://movie/tt%d?result=decode", suffix)
+	decodeID := seed(decodePath)
+	if err := repo.MarkVirtualCandidateDecodeRejected(ctx, decodeID, decodePath, nil); err != nil {
+		t.Fatalf("mark decode rejected: %v", err)
+	}
+	if readFailedAt(decodeID) == nil {
+		t.Fatal("decode rejection did not stamp a recently-delivered candidate")
+	}
+}
