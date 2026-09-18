@@ -22,6 +22,18 @@ import (
 	"time"
 )
 
+// Canonical header names reused by the relay's range cache and header
+// filtering. Each literal appears once, here.
+const (
+	headerAcceptRanges  = "Accept-Ranges"
+	headerCacheControl  = "Cache-Control"
+	headerContentLength = "Content-Length"
+	headerContentRange  = "Content-Range"
+	headerContentType   = "Content-Type"
+	headerETag          = "ETag"
+	headerLastModified  = "Last-Modified"
+)
+
 const (
 	relayEntryLifetime        = 24 * time.Hour
 	relayMaxEntries           = 512
@@ -171,7 +183,7 @@ func relayCacheableResponse(response *http.Response) (int, bool) {
 	if response.StatusCode != http.StatusPartialContent && response.StatusCode != http.StatusOK {
 		return 0, false
 	}
-	rawLength := strings.TrimSpace(response.Header.Get("Content-Length"))
+	rawLength := strings.TrimSpace(response.Header.Get(headerContentLength))
 	if rawLength == "" {
 		return 0, false
 	}
@@ -179,7 +191,7 @@ func relayCacheableResponse(response *http.Response) (int, bool) {
 	if err != nil || length <= 0 || length > relayRangeCacheMaxEntrySize {
 		return 0, false
 	}
-	cacheControl := strings.ToLower(response.Header.Get("Cache-Control"))
+	cacheControl := strings.ToLower(response.Header.Get(headerCacheControl))
 	if strings.Contains(cacheControl, "no-store") || strings.Contains(cacheControl, "private") {
 		return 0, false
 	}
@@ -189,8 +201,8 @@ func relayCacheableResponse(response *http.Response) (int, bool) {
 func relayCachedHeaders(response *http.Response) http.Header {
 	cached := make(http.Header, 8)
 	for _, header := range []string{
-		"Accept-Ranges", "Content-Length", "Content-Range", "Content-Type",
-		"ETag", "Last-Modified", "Cache-Control",
+		headerAcceptRanges, headerContentLength, headerContentRange, headerContentType,
+		headerETag, headerLastModified, headerCacheControl,
 	} {
 		if value := response.Header.Get(header); value != "" {
 			cached.Set(header, value)
@@ -609,7 +621,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	// the response so clients don't assume range support and fail on seek.
 	hadRange := upstream.Header.Get("Range") != ""
 	if hadRange && response.StatusCode == http.StatusOK && relayToken != "" {
-		response.Header.Del("Accept-Ranges")
+		response.Header.Del(headerAcceptRanges)
 	}
 	if response.StatusCode >= 400 && response.StatusCode != http.StatusRequestedRangeNotSatisfiable {
 		drainCtx, drainCancel := context.WithTimeout(request.Context(), 1*time.Second)
@@ -626,7 +638,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	}
 	if request.Method == http.MethodHead || response.StatusCode == http.StatusNotModified ||
 		response.StatusCode == http.StatusNoContent || response.StatusCode == http.StatusRequestedRangeNotSatisfiable ||
-		strings.TrimSpace(response.Header.Get("Content-Length")) == "0" {
+		strings.TrimSpace(response.Header.Get(headerContentLength)) == "0" {
 		copyRemoteResponseHeaders(w.Header(), response.Header)
 		w.WriteHeader(response.StatusCode)
 		return nil
@@ -672,12 +684,12 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		if err != nil {
 			return err
 		}
-		for _, header := range []string{"Content-Type", "Cache-Control", "Last-Modified"} {
+		for _, header := range []string{headerContentType, headerCacheControl, headerLastModified} {
 			if value := response.Header.Get(header); value != "" {
 				w.Header().Set(header, value)
 			}
 		}
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(rewritten)))
+		w.Header().Set(headerContentLength, fmt.Sprintf("%d", len(rewritten)))
 		w.WriteHeader(response.StatusCode)
 		_, err = w.Write(rewritten)
 		return err
@@ -786,8 +798,8 @@ func nextRemoteBodyChunk(ctx context.Context, chunks <-chan remoteBodyChunk, tim
 
 func copyRemoteResponseHeaders(destination, source http.Header) {
 	for _, header := range []string{
-		"Accept-Ranges", "Content-Length", "Content-Range", "Content-Type",
-		"ETag", "Last-Modified", "Cache-Control",
+		headerAcceptRanges, headerContentLength, headerContentRange, headerContentType,
+		headerETag, headerLastModified, headerCacheControl,
 	} {
 		if value := source.Get(header); value != "" {
 			destination.Set(header, value)
@@ -801,7 +813,7 @@ func looksLikeHLSPlaylist(body []byte) bool {
 
 func isDASHManifestResponse(response *http.Response, body []byte) bool {
 	if response != nil {
-		contentType := strings.ToLower(response.Header.Get("Content-Type"))
+		contentType := strings.ToLower(response.Header.Get(headerContentType))
 		if strings.Contains(contentType, "dash+xml") ||
 			(response.Request != nil && response.Request.URL != nil && strings.HasSuffix(strings.ToLower(response.Request.URL.Path), ".mpd")) {
 			return true
@@ -818,7 +830,7 @@ func isHLSPlaylistResponse(response *http.Response) bool {
 	if response == nil || response.Request == nil || response.Request.URL == nil {
 		return false
 	}
-	contentType := strings.ToLower(response.Header.Get("Content-Type"))
+	contentType := strings.ToLower(response.Header.Get(headerContentType))
 	if strings.Contains(contentType, "mpegurl") || strings.Contains(contentType, "m3u8") {
 		return true
 	}

@@ -464,12 +464,15 @@ func RemuxContentType(audioOnly bool) string {
 // client-side time-to-first-byte can be attributed to handler setup, FFmpeg
 // spawn, and FFmpeg's own first output. It is deliberately silent for seek 0
 // (an ordinary start) to keep the log to the user-visible seek path.
+// logKeyComponent names the slog attribute every playback log line carries.
+const logKeyComponent = "component"
+
 func logRemuxSeekTiming(ctx context.Context, seekSeconds float64, filePath, outputFormat string, timingStart, spawnStart, spawnDone, firstByte time.Time) {
 	if seekSeconds <= 0 {
 		return
 	}
 	attrs := []any{
-		"component", "playback",
+		logKeyComponent, "playback",
 		"seek_seconds", seekSeconds,
 		"output_format", outputFormat,
 		"remote_input", isRemoteRemuxInput(filePath),
