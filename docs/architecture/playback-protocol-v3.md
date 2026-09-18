@@ -930,13 +930,19 @@ generation is rejected during startup rotates the same way, before the plan is
 committed, so a client never receives a manifest for a generation the decoder
 already rejected.
 
-Rotation is candidate substitution and never a decode-mode change: the
-`gpu_only` / `software_fallback` policy is untouched, and an explicit version pin
-is never substituted. If no sibling candidate recovers the selection — or when
-the selection is explicit — the attempt terminates with
+Rotation requires server-side evidence: the live generation must actually have
+been rejected by its decoder (`IsSourceRejected`), so a client-supplied
+`decode_error` on a healthy session neither rotates nor retires the delivery. It
+is candidate substitution and never a decode-mode change: the `gpu_only` /
+`software_fallback` policy is untouched (a virtual decode rejection never forces
+the CPU-decode retry), and an explicit version pin is never substituted — not by
+rotation, the start alternate fallback, or the replan alternate loop. If no
+sibling candidate recovers the selection the attempt terminates with
 `source_decode_failed` (§7.3); an explicit pick also gets the version-list hint.
-The `422` + `X-Vio-Decode-Error` media responses remain the fallback for clients
-that do not run the `decode_error` recovery path.
+A rotated sibling that fails to plan for a non-decode reason surfaces its own
+terminal unchanged rather than being rewritten as a decode rejection. The `422` +
+`X-Vio-Decode-Error` media responses remain the fallback for clients that do not
+run the `decode_error` recovery path.
 
 Failure, seek, and quality replans may omit unchanged track identities. The
 server overlays only identities present in those requests and preserves the

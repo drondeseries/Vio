@@ -20,18 +20,22 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
+const decodeRotationNeutralURI = "virtual://movie/tt-rot"
+
+func decodeRotationCandidateURI(id string) string {
+	return decodeRotationNeutralURI + "?result=" + id
+}
+
 // writePlaybackTestFFmpegDecodeFailureBeforeManifest emits the decoder's
 // invalid-bitstream failure past the rejection threshold and only then writes a
 // ready manifest, so a start that waits for the manifest observes the rejected
-// source deterministically. The existing helper writes the manifest first and
-// leans on a later wait, which races the decode rejection.
+// source deterministically and the start pre-check fires.
 func writePlaybackTestFFmpegDecodeFailureBeforeManifest(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "fake-ffmpeg-decode-fail-first.sh")
 	script := "#!/bin/sh\n" +
 		"i=0\n" +
 		"while [ $i -lt 20 ]; do echo \"[hevc @ 0x1] Error submitting packet to decoder: Invalid data found when processing input\" >&2; i=$((i+1)); done\n" +
-		"sleep 0.5\n" +
+		"sleep 1\n" +
 		"last=\"\"\n" +
 		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
 		"case \"$last\" in\n" +
@@ -44,17 +48,69 @@ func writePlaybackTestFFmpegDecodeFailureBeforeManifest(t *testing.T) string {
 		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
 		"esac\n" +
 		"sleep 30\n"
+	return writeDecodeRotationFFmpeg(t, "decode-fail-before-manifest.sh", script)
+}
+
+// writePlaybackTestFFmpegRejectAfterManifest writes a ready manifest first and
+// only then emits the decoder failures, so a start commits a live generation
+// that subsequently becomes source-rejected. This is the shape a real decoder
+// rejection has once playback is already running.
+func writePlaybackTestFFmpegRejectAfterManifest(t *testing.T) string {
+	t.Helper()
+	script := "#!/bin/sh\n" +
+		"last=\"\"\n" +
+		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
+		"case \"$last\" in\n" +
+		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
+		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
+		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
+		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
+		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
+		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
+		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
+		"esac\n" +
+		"sleep 1\n" +
+		"i=0\n" +
+		"while [ $i -lt 20 ]; do echo \"[hevc @ 0x1] Error submitting packet to decoder: Invalid data found when processing input\" >&2; i=$((i+1)); done\n" +
+		"sleep 30\n"
+	return writeDecodeRotationFFmpeg(t, "decode-fail-after-manifest.sh", script)
+}
+
+func writeDecodeRotationFFmpeg(t *testing.T, name, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}
 	return path
 }
 
+type decodeRotationOptions struct {
+	candidateIDs        []string
+	softwareFallback    string
+	decodeFailCalls     int32
+	rejectAfterManifest bool
+	// requestedResult makes the catalog row a concrete result= selection; empty
+	// keeps it neutral.
+	requestedResult string
+	// probeEvidence gives the catalog row complete probe evidence so the P0
+	// repeat-play fast path would normally apply.
+	probeEvidence bool
+	// requestedFailed marks the catalog row failed_at.
+	requestedFailed bool
+	// requestedDelivered stamps last_delivered_at inside the delivery grace.
+	requestedDelivered bool
+	// startFailureCalls makes the next N transcode starts fail to start (a
+	// non-decode transport failure), used to prove the rotation rebind is not
+	// applied to the live session before the durable replacement commits.
+	startFailureCalls int32
+}
+
 // decodeRotationFixture is a virtual HLS-transcode handler whose provider
 // candidates are named in order. The first N transcode starts are configured to
-// reject the source during startup; later starts are ready. It records the
-// exclusion list every detailed resolve received and the software-decode flag of
-// every spawn.
+// reject the source; later starts are ready. It records the exclusion list every
+// detailed resolve received, the candidates the rejection callback stamped, and
+// the software-decode flag of every spawn.
 type decodeRotationFixture struct {
 	handler      *PlaybackHandler
 	file         *models.MediaFile
@@ -67,14 +123,13 @@ type decodeRotationFixture struct {
 	transcodeCalls  int32
 }
 
-func newDecodeRotationFixture(t *testing.T, candidateIDs []string, softwareFallback string, decodeFailCalls int32) *decodeRotationFixture {
+func newDecodeRotationFixture(t *testing.T, opt decodeRotationOptions) *decodeRotationFixture {
 	t.Helper()
 	source := v3HandlerFixtureFile(t)
 	source.ID = 610
 	source.ContentID = "movie-rot"
-	source.FilePath = "virtual://movie/tt-rot"
+	source.FilePath = decodeRotationNeutralURI
 	source.VirtualOwnerInstallationID = 5
-	source.Container = "virtual"
 	source.CodecVideo = "hevc"
 	source.Resolution = "1080p"
 	source.Bitrate = 8_000
@@ -83,15 +138,34 @@ func newDecodeRotationFixture(t *testing.T, candidateIDs []string, softwareFallb
 		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8,
 		VideoRange: "SDR", VideoRangeType: "SDR",
 	}}
+	source.Container = "virtual"
+	if opt.probeEvidence {
+		source.Container = "mkv"
+		stamp := time.Now().Add(-time.Hour)
+		source.ProbeUpdatedAt = &stamp
+	}
+	if opt.requestedResult != "" {
+		source.FilePath = decodeRotationCandidateURI(opt.requestedResult)
+	}
+	if opt.requestedFailed {
+		stamp := time.Now().Add(-time.Hour)
+		source.FailedAt = &stamp
+	}
+	if opt.requestedDelivered {
+		delivered := time.Now().Add(-time.Hour)
+		source.LastDeliveredAt = &delivered
+	}
 
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: map[int]*models.MediaFile{source.ID: source}})
-	decodeFFmpeg := writePlaybackTestFFmpegDecodeFailureBeforeManifest(t)
+	decodeBeforeFFmpeg := writePlaybackTestFFmpegDecodeFailureBeforeManifest(t)
+	rejectAfterFFmpeg := writePlaybackTestFFmpegRejectAfterManifest(t)
+	failingFFmpeg := writePlaybackTestFFmpegAlwaysFailing(t)
 	readyFFmpeg := writePlaybackTestFFmpeg(t)
-	baseConfig := playbackTestConfig(decodeFFmpeg, t.TempDir())
+	baseConfig := playbackTestConfig(decodeBeforeFFmpeg, t.TempDir())
 	handler.PlaybackConfig = func() config.PlaybackConfig {
 		cfg := baseConfig()
 		cfg.HWAccel = "qsv"
-		cfg.SoftwareFallback = softwareFallback
+		cfg.SoftwareFallback = opt.softwareFallback
 		return cfg
 	}
 	stubCopySeekAnchorV3(handler)
@@ -106,11 +180,11 @@ func newDecodeRotationFixture(t *testing.T, candidateIDs []string, softwareFallb
 		"playback.max_virtual_failover_attempts": "3",
 	}}
 
-	f := &decodeRotationFixture{handler: handler, file: source, candidateIDs: candidateIDs}
+	f := &decodeRotationFixture{handler: handler, file: source, candidateIDs: opt.candidateIDs}
 	resolved := func(id string) ResolvedVirtualMedia {
 		return ResolvedVirtualMedia{
 			URL:         "http://127.0.0.1:9/stream?result=" + id,
-			URI:         "virtual://movie/tt-rot?result=" + id,
+			URI:         decodeRotationCandidateURI(id),
 			CandidateID: id,
 		}
 	}
@@ -118,15 +192,24 @@ func newDecodeRotationFixture(t *testing.T, candidateIDs []string, softwareFallb
 		return "http://127.0.0.1:9/stream?path=" + path, nil
 	})
 	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
-		out := make([]VirtualPlaybackStream, 0, len(candidateIDs))
-		for _, id := range candidateIDs {
+		out := make([]VirtualPlaybackStream, 0, len(opt.candidateIDs))
+		for _, id := range opt.candidateIDs {
 			out = append(out, VirtualPlaybackStream{
-				ID: id, URI: "virtual://movie/tt-rot?result=" + id,
+				ID: id, URI: decodeRotationCandidateURI(id),
 				Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mkv",
 			})
 		}
 		return out, nil
 	})
+	// Candidate rows are looked up by exact URI so the requested row's failed
+	// stamp is visible while its siblings stay eligible.
+	handler.VirtualFileLookup = func(_ context.Context, path string) (*models.MediaFile, error) {
+		if opt.requestedFailed && strings.TrimSpace(path) == source.FilePath {
+			row := *source
+			return &row, nil
+		}
+		return nil, nil
+	}
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, virtualURI string, _ int, _ int, _ string, _ bool, excluded []string, preferred string) (ResolvedVirtualMedia, error) {
 		f.mu.Lock()
 		f.resolveExcluded = append(f.resolveExcluded, append([]string(nil), excluded...))
@@ -141,7 +224,7 @@ func newDecodeRotationFixture(t *testing.T, candidateIDs []string, softwareFallb
 		if preferred != "" && !containsStringExactV3(excluded, preferred) {
 			return resolved(preferred), nil
 		}
-		for _, id := range candidateIDs {
+		for _, id := range opt.candidateIDs {
 			if !containsStringExactV3(excluded, id) {
 				return resolved(id), nil
 			}
@@ -156,9 +239,14 @@ func newDecodeRotationFixture(t *testing.T, candidateIDs []string, softwareFallb
 	}
 	handler.StartTranscodeFunc = func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
 		call := atomic.AddInt32(&f.transcodeCalls, 1)
-		if call <= decodeFailCalls {
-			opts.FFmpegPath = decodeFFmpeg
-		} else {
+		switch {
+		case call <= opt.decodeFailCalls && opt.rejectAfterManifest:
+			opts.FFmpegPath = rejectAfterFFmpeg
+		case call <= opt.decodeFailCalls:
+			opts.FFmpegPath = decodeBeforeFFmpeg
+		case opt.startFailureCalls > 0 && call <= opt.decodeFailCalls+opt.startFailureCalls:
+			opts.FFmpegPath = failingFFmpeg
+		default:
 			opts.FFmpegPath = readyFFmpeg
 		}
 		if opts.SoftwareVideoDecode {
@@ -210,12 +298,35 @@ func (f *decodeRotationFixture) sessionVirtualURI(t *testing.T, sessionID string
 	return session.VirtualSourceURI
 }
 
+// waitForSourceRejected waits on the live generation's observable decode
+// verdict rather than racing it with a fixed sleep.
+func (f *decodeRotationFixture) waitForSourceRejected(t *testing.T, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		live := f.handler.tm.GetTranscodeSession(sessionID)
+		if live != nil && live.IsSourceRejected() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the decoder rejection was never observed on the live session")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func (f *decodeRotationFixture) recordedExclusions() [][]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([][]string, len(f.resolveExcluded))
 	copy(out, f.resolveExcluded)
 	return out
+}
+
+func (f *decodeRotationFixture) softwareSpawnCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.softwareSpawns
 }
 
 // waitForMarked waits on the observable rejection stamp the async transcode
@@ -256,12 +367,26 @@ func containsExclusion(exclusions [][]string, want ...string) bool {
 	return false
 }
 
+func decodeRotationReplanRequest(start playback.StartRequestV3, plan *playback.PlanV3, replanID string) playback.ReplanRequestV3 {
+	return playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
+		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
+		ReplanRequestID: replanID, FailedPlanID: plan.PlanID,
+		PlanAttemptID: replanID + "-attempt", PlanAttemptKey: plan.PlanAttemptKey,
+		AttemptedPlanKeys: []string{plan.PlanAttemptKey}, AttemptCount: 1,
+		PositionSeconds: 10, SelectedTracks: plan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "decode_error"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	}
+}
+
 // TestVirtualStartRotatesDecodeRejectedCandidate drives an auto start whose first
 // provider release is rejected during startup. The server must substitute the
 // second release before committing, so the client receives a playable plan (no
 // 422) bound to the second candidate and the requested catalog id is preserved.
 func TestVirtualStartRotatesDecodeRejectedCandidate(t *testing.T) {
-	f := newDecodeRotationFixture(t, []string{"A", "B"}, "", 1)
+	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B"}, decodeFailCalls: 1})
 
 	code, response := f.start(t, f.request())
 	if code != http.StatusCreated {
@@ -276,13 +401,88 @@ func TestVirtualStartRotatesDecodeRejectedCandidate(t *testing.T) {
 	if response.PlaybackPlan.EffectiveMediaFileID != f.file.ID {
 		t.Fatalf("effective file = %d, want the requested catalog id %d", response.PlaybackPlan.EffectiveMediaFileID, f.file.ID)
 	}
-	if got := f.sessionVirtualURI(t, response.SessionID); got != "virtual://movie/tt-rot?result=B" {
+	if got := f.sessionVirtualURI(t, response.SessionID); got != decodeRotationCandidateURI("B") {
 		t.Fatalf("effective virtual uri = %q, want the rotated candidate B", got)
 	}
 	if !containsExclusion(f.recordedExclusions(), "A") {
 		t.Fatalf("rotation never excluded the rejected candidate; exclusions = %v", f.recordedExclusions())
 	}
+	if got := f.softwareSpawnCount(); got != 0 {
+		t.Fatalf("rotation spawned %d software-decode transcodes, want 0", got)
+	}
 	f.waitForMarked(t)
+}
+
+// TestVirtualStartRotationExcludesProbedRequestedRow repeats the start rotation
+// with a requested row that already carries a pinned result= and complete probe
+// evidence. The first generation still binds that row, but once it is rejected
+// the exclusion must override the repeat-play fast path and rotate to the
+// sibling; before the fix the fast path returned the excluded row and rotation
+// terminalled.
+func TestVirtualStartRotationExcludesProbedRequestedRow(t *testing.T) {
+	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		candidateIDs:    []string{"A", "B"},
+		decodeFailCalls: 1,
+		requestedResult: "A",
+		probeEvidence:   true,
+	})
+
+	code, response := f.start(t, f.request())
+	if code != http.StatusCreated {
+		t.Fatalf("start status = %d, want %d; body = %+v", code, http.StatusCreated, response)
+	}
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("probed-row rotation did not commit a replacement plan: terminal=%+v plan=%#v", response.Terminal, response.PlaybackPlan)
+	}
+	if got := f.sessionVirtualURI(t, response.SessionID); got != decodeRotationCandidateURI("B") {
+		t.Fatalf("effective virtual uri = %q, want the rotated candidate B", got)
+	}
+}
+
+// TestVirtualAutoStartSkipsFailedProbedRow proves a fresh auto start does not
+// serve a requested row stamped failed_at even when it has complete probe
+// evidence and would otherwise take the repeat-play fast path.
+func TestVirtualAutoStartSkipsFailedProbedRow(t *testing.T) {
+	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		candidateIDs:    []string{"A", "B"},
+		requestedResult: "A",
+		probeEvidence:   true,
+		requestedFailed: true,
+	})
+
+	code, response := f.start(t, f.request())
+	if code != http.StatusCreated {
+		t.Fatalf("start status = %d, want %d; body = %+v", code, http.StatusCreated, response)
+	}
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("failed-row start did not select a healthy sibling: terminal=%+v plan=%#v", response.Terminal, response.PlaybackPlan)
+	}
+	if got := f.sessionVirtualURI(t, response.SessionID); got != decodeRotationCandidateURI("B") {
+		t.Fatalf("effective virtual uri = %q, want the healthy candidate B, not the failed A", got)
+	}
+}
+
+// TestVirtualAutoStartSkipsFailedRowWithinDeliveryGrace proves the optimistic
+// delivery-grace fast path does not serve a failed row: a row that delivered
+// recently but is now stamped failed must still be skipped.
+func TestVirtualAutoStartSkipsFailedRowWithinDeliveryGrace(t *testing.T) {
+	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		candidateIDs:       []string{"A", "B"},
+		requestedResult:    "A",
+		requestedFailed:    true,
+		requestedDelivered: true,
+	})
+
+	code, response := f.start(t, f.request())
+	if code != http.StatusCreated {
+		t.Fatalf("start status = %d, want %d; body = %+v", code, http.StatusCreated, response)
+	}
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("grace failed-row start did not select a healthy sibling: terminal=%+v plan=%#v", response.Terminal, response.PlaybackPlan)
+	}
+	if got := f.sessionVirtualURI(t, response.SessionID); got != decodeRotationCandidateURI("B") {
+		t.Fatalf("effective virtual uri = %q, want the healthy candidate B, not the failed A", got)
+	}
 }
 
 // TestVirtualExplicitStartDecodeRejectionTerminals proves an explicit version
@@ -290,7 +490,7 @@ func TestVirtualStartRotatesDecodeRejectedCandidate(t *testing.T) {
 // source_decode_failed plus the version-list hint, and the rejection is still
 // stamped on the candidate.
 func TestVirtualExplicitStartDecodeRejectionTerminals(t *testing.T) {
-	f := newDecodeRotationFixture(t, []string{"A", "B"}, "", 1)
+	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B"}, decodeFailCalls: 1})
 	start := f.request()
 	start.FileSelection = playback.FileSelectionExplicitV3
 
@@ -319,7 +519,7 @@ func TestVirtualExplicitStartDecodeRejectionTerminals(t *testing.T) {
 // configured failover attempts and excludes every rejected id, so a provider
 // that only offers bad releases cannot loop forever.
 func TestVirtualDecodeRotationBoundedExhaustion(t *testing.T) {
-	f := newDecodeRotationFixture(t, []string{"A", "B", "C"}, "", 3)
+	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B", "C"}, decodeFailCalls: 3})
 
 	code, response := f.start(t, f.request())
 	if code != http.StatusCreated {
@@ -341,10 +541,15 @@ func TestVirtualDecodeRotationBoundedExhaustion(t *testing.T) {
 }
 
 // TestVirtualReplanDecodeErrorRotates drives a decode_error failure_recovery on
-// a healthy virtual session. The replan must exclude the session-bound candidate
-// and commit the next release, without demoting the HLS delivery.
+// a session whose live generation actually rejected the source. The replan must
+// exclude the session-bound candidate and commit the next release, without
+// demoting the HLS delivery and without spawning a software decode.
 func TestVirtualReplanDecodeErrorRotates(t *testing.T) {
-	f := newDecodeRotationFixture(t, []string{"A", "B"}, "", 0)
+	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		candidateIDs:        []string{"A", "B"},
+		decodeFailCalls:     1,
+		rejectAfterManifest: true,
+	})
 	start := f.request()
 
 	code, started := f.start(t, start)
@@ -352,22 +557,12 @@ func TestVirtualReplanDecodeErrorRotates(t *testing.T) {
 		t.Fatalf("start status=%d response=%+v", code, started)
 	}
 	defer f.handler.tm.CloseTranscodeSession(started.SessionID, "")
-	if got := f.sessionVirtualURI(t, started.SessionID); got != "virtual://movie/tt-rot?result=A" {
+	if got := f.sessionVirtualURI(t, started.SessionID); got != decodeRotationCandidateURI("A") {
 		t.Fatalf("start candidate = %q, want A", got)
 	}
+	f.waitForSourceRejected(t, started.SessionID)
 
-	recovery := playback.ReplanRequestV3{
-		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
-		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
-		ReplanRequestID: "decode-rotation-replan-0001", FailedPlanID: started.PlaybackPlan.PlanID,
-		PlanAttemptID: "decode-rotation-attempt-0001", PlanAttemptKey: started.PlaybackPlan.PlanAttemptKey,
-		AttemptedPlanKeys: []string{started.PlaybackPlan.PlanAttemptKey}, AttemptCount: 1,
-		PositionSeconds: 10, SelectedTracks: started.PlaybackPlan.SelectedTracks,
-		Failure:               playback.FailureV3{Classification: "decode_error"},
-		Capabilities:          start.Capabilities,
-		ClientPlaybackContext: start.ClientPlaybackContext,
-	}
-	recovered := postPlaybackReplanV3(t, f.handler, started.SessionID, recovery)
+	recovered := postPlaybackReplanV3(t, f.handler, started.SessionID, decodeRotationReplanRequest(start, started.PlaybackPlan, "decode-rotation-replan-0001"))
 	if recovered.Terminal != nil || recovered.PlaybackPlan == nil {
 		t.Fatalf("decode replan terminal=%+v", recovered.Terminal)
 	}
@@ -377,8 +572,11 @@ func TestVirtualReplanDecodeErrorRotates(t *testing.T) {
 	if !containsExclusion(f.recordedExclusions(), "A") {
 		t.Fatalf("replan did not exclude the rejected session candidate; exclusions = %v", f.recordedExclusions())
 	}
-	if got := f.sessionVirtualURI(t, started.SessionID); got != "virtual://movie/tt-rot?result=B" {
+	if got := f.sessionVirtualURI(t, started.SessionID); got != decodeRotationCandidateURI("B") {
 		t.Fatalf("replanned effective virtual uri = %q, want B", got)
+	}
+	if got := f.softwareSpawnCount(); got != 0 {
+		t.Fatalf("allow-policy rotation spawned %d software-decode transcodes, want 0", got)
 	}
 	record, err := f.handler.PlanStoreV3.GetAttempt(t.Context(), started.SessionID)
 	if err != nil {
@@ -390,11 +588,18 @@ func TestVirtualReplanDecodeErrorRotates(t *testing.T) {
 	}
 }
 
-// TestVirtualDecodeRotationGPUOnlyRetiresOnNoAlternate proves gpu_only never
-// spawns a software decode and, when no sibling candidate exists, the delivery
-// is retired and the replan terminalls with source_decode_failed.
-func TestVirtualDecodeRotationGPUOnlyRetiresOnNoAlternate(t *testing.T) {
-	f := newDecodeRotationFixture(t, []string{"A"}, "gpu_only", 0)
+// TestVirtualDecodeRotationFailureKeepsSessionBinding proves the rotation's
+// replacement candidate is not written to the live session before the durable
+// session replacement commits: when the rotated transport fails to start, the
+// session still names the previous candidate, so later resolution and the
+// serve-side recovery never disagree with the committed plan/record.
+func TestVirtualDecodeRotationFailureKeepsSessionBinding(t *testing.T) {
+	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		candidateIDs:        []string{"A", "B"},
+		decodeFailCalls:     1,
+		rejectAfterManifest: true,
+		startFailureCalls:   5,
+	})
 	start := f.request()
 
 	code, started := f.start(t, start)
@@ -402,27 +607,69 @@ func TestVirtualDecodeRotationGPUOnlyRetiresOnNoAlternate(t *testing.T) {
 		t.Fatalf("start status=%d response=%+v", code, started)
 	}
 	defer f.handler.tm.CloseTranscodeSession(started.SessionID, "")
+	f.waitForSourceRejected(t, started.SessionID)
 
-	recovery := playback.ReplanRequestV3{
-		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
-		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
-		ReplanRequestID: "gpu-only-decode-replan-0001", FailedPlanID: started.PlaybackPlan.PlanID,
-		PlanAttemptID: "gpu-only-decode-attempt-0001", PlanAttemptKey: started.PlaybackPlan.PlanAttemptKey,
-		AttemptedPlanKeys: []string{started.PlaybackPlan.PlanAttemptKey}, AttemptCount: 1,
-		PositionSeconds: 10, SelectedTracks: started.PlaybackPlan.SelectedTracks,
-		Failure:               playback.FailureV3{Classification: "decode_error"},
-		Capabilities:          start.Capabilities,
-		ClientPlaybackContext: start.ClientPlaybackContext,
+	recovered := postPlaybackReplanV3(t, f.handler, started.SessionID, decodeRotationReplanRequest(start, started.PlaybackPlan, "rotation-failure-replan-0001"))
+	if recovered.Terminal == nil {
+		t.Fatalf("failed rotation unexpectedly committed a plan: %#v", recovered.PlaybackPlan)
 	}
-	recovered := postPlaybackReplanV3(t, f.handler, started.SessionID, recovery)
+	if got := f.sessionVirtualURI(t, started.SessionID); got != decodeRotationCandidateURI("A") {
+		t.Fatalf("failed rotation rebound the live session to %q, want the unchanged candidate A", got)
+	}
+}
+
+// TestVirtualDecodeRotationRequiresServerEvidence proves a client-supplied
+// decode_error on a healthy session is not treated as a decode rejection: the
+// server's own decoder verdict is required, so the decode reason and the
+// rotation-specific retirement are not applied. (The generic failure-recovery
+// candidate exclusion is unchanged and is not a decode classification.)
+func TestVirtualDecodeRotationRequiresServerEvidence(t *testing.T) {
+	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A"}})
+	start := f.request()
+
+	code, started := f.start(t, start)
+	if code != http.StatusCreated || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d response=%+v", code, started)
+	}
+	defer f.handler.tm.CloseTranscodeSession(started.SessionID, "")
+	if live := f.handler.tm.GetTranscodeSession(started.SessionID); live == nil || live.IsSourceRejected() {
+		t.Fatal("fixture precondition: live generation must be healthy")
+	}
+
+	recovered := postPlaybackReplanV3(t, f.handler, started.SessionID, decodeRotationReplanRequest(start, started.PlaybackPlan, "healthy-decode-replan-0001"))
+	if recovered.Terminal == nil {
+		t.Fatalf("healthy single-candidate decode replan unexpectedly planned a route: %#v", recovered.PlaybackPlan)
+	}
+	if recovered.Terminal.Reason == sourceDecodeFailedReasonV3 {
+		t.Fatalf("healthy session was retagged as a decode rejection: %#v", recovered.Terminal)
+	}
+}
+
+// TestVirtualDecodeRotationGPUOnlyRetiresOnNoAlternate proves gpu_only never
+// spawns a software decode and, when no sibling candidate exists, the delivery
+// is retired and the replan terminalls with source_decode_failed.
+func TestVirtualDecodeRotationGPUOnlyRetiresOnNoAlternate(t *testing.T) {
+	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		candidateIDs:        []string{"A"},
+		softwareFallback:    "gpu_only",
+		decodeFailCalls:     1,
+		rejectAfterManifest: true,
+	})
+	start := f.request()
+
+	code, started := f.start(t, start)
+	if code != http.StatusCreated || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d response=%+v", code, started)
+	}
+	defer f.handler.tm.CloseTranscodeSession(started.SessionID, "")
+	f.waitForSourceRejected(t, started.SessionID)
+
+	recovered := postPlaybackReplanV3(t, f.handler, started.SessionID, decodeRotationReplanRequest(start, started.PlaybackPlan, "gpu-only-decode-replan-0001"))
 	if recovered.Terminal == nil || recovered.Terminal.Reason != sourceDecodeFailedReasonV3 {
 		t.Fatalf("gpu_only no-alternate terminal = %#v, want %q", recovered.Terminal, sourceDecodeFailedReasonV3)
 	}
-	f.mu.Lock()
-	softwareSpawns := f.softwareSpawns
-	f.mu.Unlock()
-	if softwareSpawns != 0 {
-		t.Fatalf("gpu_only spawned %d software-decode transcodes, want 0", softwareSpawns)
+	if got := f.softwareSpawnCount(); got != 0 {
+		t.Fatalf("gpu_only spawned %d software-decode transcodes, want 0", got)
 	}
 	record, err := f.handler.PlanStoreV3.GetAttempt(t.Context(), started.SessionID)
 	if err != nil {
@@ -437,7 +684,11 @@ func TestVirtualDecodeRotationGPUOnlyRetiresOnNoAlternate(t *testing.T) {
 // TestVirtualDecodeRotationReplanIsIdempotent proves replaying the same
 // replan_request_id returns the first response without rotating again.
 func TestVirtualDecodeRotationReplanIsIdempotent(t *testing.T) {
-	f := newDecodeRotationFixture(t, []string{"A", "B"}, "", 0)
+	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		candidateIDs:        []string{"A", "B"},
+		decodeFailCalls:     1,
+		rejectAfterManifest: true,
+	})
 	start := f.request()
 
 	code, started := f.start(t, start)
@@ -445,28 +696,22 @@ func TestVirtualDecodeRotationReplanIsIdempotent(t *testing.T) {
 		t.Fatalf("start status=%d response=%+v", code, started)
 	}
 	defer f.handler.tm.CloseTranscodeSession(started.SessionID, "")
+	f.waitForSourceRejected(t, started.SessionID)
 
-	recovery := playback.ReplanRequestV3{
-		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
-		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
-		ReplanRequestID: "idempotent-decode-replan-0001", FailedPlanID: started.PlaybackPlan.PlanID,
-		PlanAttemptID: "idempotent-decode-attempt-0001", PlanAttemptKey: started.PlaybackPlan.PlanAttemptKey,
-		AttemptedPlanKeys: []string{started.PlaybackPlan.PlanAttemptKey}, AttemptCount: 1,
-		PositionSeconds: 10, SelectedTracks: started.PlaybackPlan.SelectedTracks,
-		Failure:               playback.FailureV3{Classification: "decode_error"},
-		Capabilities:          start.Capabilities,
-		ClientPlaybackContext: start.ClientPlaybackContext,
-	}
+	recovery := decodeRotationReplanRequest(start, started.PlaybackPlan, "idempotent-decode-replan-0001")
 	first := postPlaybackReplanV3(t, f.handler, started.SessionID, recovery)
+	if first.PlaybackPlan == nil {
+		t.Fatalf("first rotation replan returned a terminal: %#v", first.Terminal)
+	}
 	firstResolves := len(f.recordedExclusions())
 	firstJSON, err := json.Marshal(first)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	replay := recovery
-	replay.FailedPlanID = first.PlaybackPlan.PlanID
-	second := postPlaybackReplanV3(t, f.handler, started.SessionID, replay)
+	// The replay must be byte-identical: replan idempotency keys on the request
+	// id plus the body digest, and a changed body is a different request.
+	second := postPlaybackReplanV3(t, f.handler, started.SessionID, recovery)
 	secondJSON, err := json.Marshal(second)
 	if err != nil {
 		t.Fatal(err)

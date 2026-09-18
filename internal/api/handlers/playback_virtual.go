@@ -711,7 +711,16 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// call exists to fetch, so it does not need the provider round-trip even
 	// when the stored row has no probe evidence yet. Only a cold cache or an
 	// explicit relist forces the list.
-	if shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) && h.VirtualPlaybackStreamLister != nil {
+	//
+	// A failed requested row or a pending exclusion additionally requires the
+	// provider list even when the row has complete probe evidence: the fast
+	// paths are gated off for those rows, so without a list the candidate set
+	// would contain only the rejected row and rotation could never find a
+	// sibling.
+	exclusionPending := len(excludedCandidateIDs) > 0
+	requestedRowUnusable := !allowFailed && file.FailedAt != nil
+	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
+		((exclusionPending || requestedRowUnusable) && !cachedListing)) && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
 		trace.listRan = true
 		listStart := time.Now()
@@ -834,7 +843,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// different release to index 0; binding that release here would pin it
 		// and copy the row's probed inventory onto a candidate that never
 		// produced it.
-		if deferProbe && !forceRelist && !noResult && h.VirtualMediaDetailedResolver != nil &&
+		// The fast path skips the provider resolve, so it must not bypass the
+		// caller's exclusion list or the known-bad stamp: with an exclusion
+		// pending (decode rotation) or a failed row, fall through to the
+		// resolve path, which honors both.
+		if deferProbe && !forceRelist && !noResult &&
+			len(excludedCandidateIDs) == 0 && (allowFailed || file.FailedAt == nil) &&
+			h.VirtualMediaDetailedResolver != nil &&
 			((persistedResultURI && cand.URI == file.FilePath) || (pinnedURI != "" && cand.URI == pinnedURI)) &&
 			file.ProbeUpdatedAt != nil &&
 			completeVirtualVideoEvidenceV3(file) &&
@@ -867,6 +882,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// on a real pinned/adopted candidate plus a configured resolver and
 		// prober; no pin or no delivery grace keeps the synchronous resolve.
 		if deferProbe && !forceRelist && !noResult &&
+			len(excludedCandidateIDs) == 0 && (allowFailed || file.FailedAt == nil) &&
 			(persistedResultURI || pinnedURI != "") &&
 			(h.VirtualMediaDetailedResolver != nil || h.VirtualPlaybackResolver != nil) &&
 			(h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) &&
