@@ -15,6 +15,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
 // writePlaybackTestFFmpegDecodeFailure writes a fake ffmpeg that emits the
@@ -303,6 +304,22 @@ func TestHandleReplanPlaybackV3FailureRecoveryHonorsGPUOnly(t *testing.T) {
 	if recovered.Terminal != nil && strings.TrimSpace(recovered.Terminal.Reason) == "" {
 		t.Fatalf("terminal has no reason: %#v", recovered.Terminal)
 	}
+	// gpu_only must not defer the delivery demotion for a software variant that
+	// executeReplanV3 will never force: holding the undecodable HLS route open
+	// would strand the session on it instead of demoting and choosing another
+	// delivery. The demotion is durable on the attempt record, and the recovery
+	// must not reselect the demoted server-transcode delivery.
+	record, err := handler.PlanStoreV3.GetAttempt(t.Context(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps := record.NormalizedRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3]
+	if caps.Enabled || caps.FailureReason != demoteDeliveryReasonV3 {
+		t.Fatalf("gpu_only stranded the undecodable HLS delivery instead of demoting it: %+v", caps)
+	}
+	if recovered.PlaybackPlan != nil && playback.DeliveryClassV3(recovered.PlaybackPlan.Delivery) == playback.DeliveryClassHLSV3 {
+		t.Fatalf("gpu_only reselected the demoted HLS delivery class: %#v", recovered.PlaybackPlan)
+	}
 	mu.Lock()
 	softwareSpawns := 0
 	for _, opts := range captured {
@@ -454,5 +471,93 @@ func TestVirtualDecodeRecoveryRetriesSameCandidateOnSoftware(t *testing.T) {
 	}
 	if recovered.PlaybackPlan.EffectiveMediaFileID != source.ID {
 		t.Fatalf("effective file = %d, want the same candidate %d", recovered.PlaybackPlan.EffectiveMediaFileID, source.ID)
+	}
+}
+
+// TestSoftwareToneMapRetryOptsV3HonorsGPUOnly proves the operator's
+// playback.software_fallback=gpu_only choice blocks the one-shot software
+// tone-map retry. That retry sets HWAccel=none, so it is a full CPU
+// decode+encode plus software tone map. The allow policy keeps it, proving the
+// policy guard is the only difference and that the happy path still works.
+func TestSoftwareToneMapRetryOptsV3HonorsGPUOnly(t *testing.T) {
+	baseOpts := playback.TranscodeOpts{
+		HWAccel:           "qsv",
+		ToneMapMode:       tonemap.ModeHardware,
+		ToneMapPolicy:     tonemap.PolicyHardwareThenSoftware,
+		ToneMapSourceKind: tonemap.SourcePQ,
+	}
+	for _, tc := range []struct {
+		name         string
+		software     string
+		wantEligible bool
+	}{
+		{name: "gpu_only refuses the CPU tone-map retry", software: "gpu_only", wantEligible: false},
+		{name: "allow keeps the software tone-map retry", software: "", wantEligible: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+			handler.PlaybackConfig = func() config.PlaybackConfig {
+				return config.PlaybackConfig{
+					SoftwareFallback: tc.software,
+					HWAccel:          playback.HWAccelNone,
+					FFmpegPath:       "/does/not/exist",
+				}
+			}
+			handler.v3ToneMapProbe = func(context.Context, string, string, string) (tonemap.Capabilities, error) {
+				return tonemap.Capabilities{{
+					Mode: tonemap.ModeSoftware, Backend: tonemap.BackendSoftware,
+					Filter: tonemap.SoftwareFilterBT2390, SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ},
+				}}, nil
+			}
+			retryOpts, eligible := handler.softwareToneMapRetryOptsV3(context.Background(), baseOpts, false)
+			if eligible != tc.wantEligible {
+				t.Fatalf("eligible = %v, want %v (retryOpts = %+v)", eligible, tc.wantEligible, retryOpts)
+			}
+			if !tc.wantEligible {
+				if retryOpts.HWAccel != baseOpts.HWAccel || retryOpts.ToneMapMode != baseOpts.ToneMapMode {
+					t.Fatalf("refused retry mutated opts: hw %q mode %q", retryOpts.HWAccel, retryOpts.ToneMapMode)
+				}
+				return
+			}
+			if retryOpts.HWAccel != playback.HWAccelNone || retryOpts.ToneMapMode != tonemap.ModeSoftware {
+				t.Fatalf("software tone-map retry = hw %q mode %q, want none/software", retryOpts.HWAccel, retryOpts.ToneMapMode)
+			}
+			if retryOpts.ToneMapFilter == "" {
+				t.Fatal("software tone-map retry carried no software filter")
+			}
+		})
+	}
+}
+
+// TestStartupRetryAllowedV3HonorsGPUOnly proves that under
+// playback.software_fallback=gpu_only a VideoToolbox startup failure is
+// surfaced instead of retrying on HWAccelNone, a CPU decode+encode fallback.
+// allow keeps the retry, and retries that keep the configured accelerator or
+// that are already on none are never treated as a software fallback.
+func TestStartupRetryAllowedV3HonorsGPUOnly(t *testing.T) {
+	videotoolbox := playback.TranscodeOpts{HWAccel: "videotoolbox", FFmpegPath: "/does/not/exist"}
+	retryAccel := playback.StartupRetryHWAccel(videotoolbox)
+	if retryAccel != playback.HWAccelNone {
+		t.Fatalf("fixture: VideoToolbox startup retry accel = %q, want none", retryAccel)
+	}
+
+	allow := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	allow.PlaybackConfig = func() config.PlaybackConfig { return config.PlaybackConfig{} }
+	gpuOnly := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	gpuOnly.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{SoftwareFallback: "gpu_only"}
+	}
+
+	if !allow.startupRetryAllowedV3(videotoolbox, retryAccel) {
+		t.Fatal("allow refused the VideoToolbox startup retry")
+	}
+	if gpuOnly.startupRetryAllowedV3(videotoolbox, retryAccel) {
+		t.Fatal("gpu_only allowed a startup retry to HWAccelNone")
+	}
+	if !gpuOnly.startupRetryAllowedV3(playback.TranscodeOpts{HWAccel: "qsv"}, "qsv") {
+		t.Fatal("gpu_only refused a retry that stays on the configured accelerator")
+	}
+	if !gpuOnly.startupRetryAllowedV3(playback.TranscodeOpts{HWAccel: playback.HWAccelNone}, playback.HWAccelNone) {
+		t.Fatal("gpu_only refused a retry for a recipe already on HWAccelNone")
 	}
 }
