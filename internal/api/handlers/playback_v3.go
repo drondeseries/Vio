@@ -3895,12 +3895,6 @@ func appendPlaybackQueryV3(rawURL, key, value string) string {
 // softwareToneMapRetryOptsV3 returns the software executor for a one-shot
 // hardware fallback when the recipe is allowed to adapt to live capabilities.
 func (h *PlaybackHandler) softwareToneMapRetryOptsV3(ctx context.Context, opts playback.TranscodeOpts, frozenSourceMetadata bool) (playback.TranscodeOpts, bool) {
-	// The software executor forces HWAccel=none, so it decodes and encodes on
-	// the CPU. gpu_only forbids that fallback even when the frozen tone-map
-	// policy would otherwise permit it.
-	if !h.softwareFallbackAllowedV3() {
-		return opts, false
-	}
 	if frozenSourceMetadata || opts.ToneMapMode != tonemap.ModeHardware ||
 		!opts.ToneMapPolicy.Allows(tonemap.ModeSoftware) {
 		return opts, false
@@ -4105,17 +4099,10 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			// FFmpeg and GPU drivers can fail before producing their first segment
 			// even though the recipe is valid. Retry one clean generation, preferring
 			// another configured render device so a transient device failure does not
-			// become an immediate client-visible transport error. gpu_only suppresses
-			// the VideoToolbox retry to HWAccelNone, which decodes and encodes on the
-			// CPU, and surfaces the startup failure instead.
-			retryAccel := playback.StartupRetryHWAccel(opts)
-			if retryAccel == playback.HWAccelNone && !strings.EqualFold(opts.HWAccel, playback.HWAccelNone) && !h.softwareFallbackAllowedV3() {
-				unlock()
-				return preparedTransportV3{}, transportErr
-			}
+			// become an immediate client-visible transport error.
 			retryOpts := opts
 			retryOpts.AvoidHWDevice = startupFailure.failedDevice
-			retryOpts.HWAccel = retryAccel
+			retryOpts.HWAccel = playback.StartupRetryHWAccel(opts)
 			slog.WarnContext(r.Context(), "local transcode crashed during startup; retrying once",
 				logComponentKey, playbackLogValueV3,
 				"playback_session_id", session.ID,
@@ -7545,14 +7532,6 @@ func (h *PlaybackHandler) plannerSettingsV3Result(ctx context.Context) (playback
 	return settings, nil
 }
 
-// softwareFallbackAllowedV3 reports whether playback.software_fallback permits
-// an automated software-decode fallback. The value is read live from the
-// playback config, so an operator's gpu_only choice takes effect without a
-// restart; the empty string is the default "allow".
-func (h *PlaybackHandler) softwareFallbackAllowedV3() bool {
-	return playback.SoftwareFallbackAllowed(h.playbackConfig().SoftwareFallback)
-}
-
 // dropStaleAudioTrackIdentityV3 reports whether the request's audio track ID
 // embeds a file identity that no longer matches file. Virtual candidate
 // rotation replaces media_files rows whenever the provider surfaces a new
@@ -7897,10 +7876,7 @@ func softwareDecodeVariantPendingV3(record *playback.AttemptRecordV3, req playba
 // both the structural variant and the live decoder verdict, so a remote or
 // undetected decode failure still demotes as before.
 func (h *PlaybackHandler) softwareDecodeRetryPendingV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) bool {
-	// gpu_only means there is no pending software retry to protect, so the
-	// delivery demotes like any other transport failure instead of being held
-	// open for a CPU attempt that policy forbids.
-	if !h.softwareFallbackAllowedV3() || !softwareDecodeVariantPendingV3(record, req) {
+	if !softwareDecodeVariantPendingV3(record, req) {
 		return false
 	}
 	ts := h.tm.GetTranscodeSession(record.SessionID)
