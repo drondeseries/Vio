@@ -202,7 +202,8 @@ func checkRemuxDBConnection(ctx context.Context, settings map[string]string) con
 	defer cancel()
 	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/public/stats", nil)
 	if err != nil {
-		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB URL is invalid: %v", err)}
+		msg := fmt.Sprintf("RemuxDB URL is invalid: %v", err)
+		return connectionCheckResponse{Success: false, Message: msg, safeMessage: msg}
 	}
 	req.Header.Set("x-client-id", "silo-server")
 	if token != "" {
@@ -210,17 +211,20 @@ func checkRemuxDBConnection(ctx context.Context, settings map[string]string) con
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB connection check failed: %v", err)}
+		msg := fmt.Sprintf("RemuxDB connection check failed: %v", err)
+		return connectionCheckResponse{Success: false, Message: msg, safeMessage: msg}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB returned status %d.", resp.StatusCode)}
+		msg := fmt.Sprintf("RemuxDB returned status %d.", resp.StatusCode)
+		return connectionCheckResponse{Success: false, Message: msg, safeMessage: msg}
 	}
 	var stats struct {
 		TotalMediainfo int64 `json:"total_mediainfo"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB returned an unexpected response: %v", err)}
+		msg := fmt.Sprintf("RemuxDB returned an unexpected response: %v", err)
+		return connectionCheckResponse{Success: false, Message: msg, safeMessage: msg}
 	}
 	return connectionCheckResponse{Success: true, Message: fmt.Sprintf("RemuxDB verified (%d mediainfo records).", stats.TotalMediainfo)}
 }
@@ -228,7 +232,11 @@ func checkRemuxDBConnection(ctx context.Context, settings map[string]string) con
 func checkVirtualLibraryConnection(ctx context.Context, settings map[string]string) connectionCheckResponse {
 	manifestURL := strings.TrimSpace(settings["virtual_library.manifest_url"])
 	if manifestURL == "" {
-		return connectionCheckResponse{Success: false, Message: "Manifest URL is required."}
+		return connectionCheckResponse{
+			Success:     false,
+			Message:     "Manifest URL is required.",
+			safeMessage: "Manifest URL is required.",
+		}
 	}
 	allowInsecure := strings.EqualFold(strings.TrimSpace(settings["virtual_library.allow_insecure_http"]), "true")
 	tmdbKey := strings.TrimSpace(settings["virtual_library.tmdb_api_key"])
@@ -241,7 +249,12 @@ func checkVirtualLibraryConnection(ctx context.Context, settings map[string]stri
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := r.ValidateConnection(checkCtx); err != nil {
-		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("Streaming provider connection failed: %v", err)}
+		msg := fmt.Sprintf("Streaming provider connection failed: %v", err)
+		return connectionCheckResponse{
+			Success:     false,
+			Message:     msg,
+			safeMessage: msg,
+		}
 	}
 	return connectionCheckResponse{Success: true, Message: "Streaming provider manifest verified successfully."}
 }

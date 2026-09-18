@@ -70,6 +70,32 @@ func TestTranscriptionCheckReportsSafeProviderFailure(t *testing.T) {
 	}
 }
 
+func TestVirtualLibrarySettingsCheckService(t *testing.T) {
+	h := &AdminHandler{SettingsRepo: &fakeServerSettingsStore{values: map[string]string{}}}
+	res, err := h.CheckAdminSettingsConnection(t.Context(), "virtual_library", nil, nil)
+	if err != nil || res.Success || res.Message != "Manifest URL is required." {
+		t.Fatalf("expected missing manifest error, got res=%+v, err=%v", res, err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/manifest.json" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"org.test","name":"Test","version":"1.0.0","resources":["stream"],"types":["movie","series"]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	res, err = h.CheckAdminSettingsConnection(t.Context(), "virtual_library", map[string]string{
+		"virtual_library.manifest_url":        srv.URL + "/manifest.json",
+		"virtual_library.allow_insecure_http": "true",
+	}, []string{"virtual_library.manifest_url", "virtual_library.allow_insecure_http"})
+	if err != nil || !res.Success || res.Message != "Streaming provider manifest verified successfully." {
+		t.Fatalf("expected verified manifest, got res=%+v, err=%v", res, err)
+	}
+}
+
 func TestTranscriptionCheckRetryFailureMessages(t *testing.T) {
 	for _, tc := range []struct {
 		err  error

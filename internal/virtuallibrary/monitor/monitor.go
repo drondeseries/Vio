@@ -318,6 +318,32 @@ func loadMonitorConfig(c Config) (Config, map[string]monitoredMedia, error) {
 	if c.ProwlarrIndexFile == "" {
 		c.ProwlarrIndexFile = ".vio-virtual-library-prowlarr-index.json"
 	}
+	if !filepath.IsAbs(c.File) {
+		if _, err := os.Stat(c.File); errors.Is(err, os.ErrNotExist) {
+			for _, fb := range []string{
+				filepath.Join("/var/lib/silo/plugins/com.drondeseries.vio-virtual-library", c.File),
+				filepath.Join("/var/lib/silo/plugins", c.File),
+			} {
+				if _, sErr := os.Stat(fb); sErr == nil {
+					c.File = fb
+					break
+				}
+			}
+		}
+	}
+	if !filepath.IsAbs(c.ProwlarrIndexFile) {
+		if _, err := os.Stat(c.ProwlarrIndexFile); errors.Is(err, os.ErrNotExist) {
+			for _, fb := range []string{
+				filepath.Join("/var/lib/silo/plugins/com.drondeseries.vio-virtual-library", c.ProwlarrIndexFile),
+				filepath.Join("/var/lib/silo/plugins", c.ProwlarrIndexFile),
+			} {
+				if _, sErr := os.Stat(fb); sErr == nil {
+					c.ProwlarrIndexFile = fb
+					break
+				}
+			}
+		}
+	}
 	loaded := make(map[string]monitoredMedia)
 	file, err := os.Open(c.File)
 	if err == nil {

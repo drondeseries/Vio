@@ -215,7 +215,11 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 		}
 	}
 	if registrar != nil {
-		m.SetRegistrar(&catalogMonitorRegistrar{registrar: registrar})
+		m.SetRegistrar(&catalogMonitorRegistrar{
+			registrar:       registrar,
+			movieLibraryID:  cfg.MovieLibraryID,
+			seriesLibraryID: cfg.SeriesLibraryID,
+		})
 		m.SetHost(&catalogRegistrarAdapter{registrar: registrar})
 	}
 	return &Service{Resolver: r, Monitor: m, cfg: cfg, logger: logger}
