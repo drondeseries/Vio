@@ -2870,49 +2870,34 @@ func qualityRungHeightV3(qualityPreference string) int {
 	}
 }
 
-// virtualCapRungHeightV3 derives a resolution-class height from a bandwidth
-// cap, mirroring the planner's ladderHeightForBandwidthV3 thresholds so a
-// client's delivery ceiling is honored when picking a native provider stream.
-// The planner applies a 0.8 safety factor to the cap before selecting a rung
-// (ladderHeightForBandwidthV3(int(float64(capKbps) * 0.8))), so the same
-// factor is applied here to keep the virtual candidate pick consistent with
-// the transcode ladder.
-func virtualCapRungHeightV3(bandwidthCapKbps int) int {
-	effective := int(float64(bandwidthCapKbps) * 0.8)
-	switch {
-	case effective >= 20_000:
-		return 2160
-	case effective >= 8_000:
-		return 1080
-	case effective >= 4_000:
-		return 720
-	default:
-		return 480
-	}
-}
-
 // reorderVirtualCandidatesForQuality prefers candidates whose resolution class
-// is at or below the requested fixed rung (further constrained by the
-// bandwidth cap), keeping the device ranking stable within each group. When no
-// candidate matches the rung (a provider that only offers higher
-// resolutions), the device ranking is returned unchanged. The reorder is a
-// preference, never a hard filter: a client that asked for 720p still gets the
-// best device-ranked stream when no native 720p-or-below candidate exists.
+// is at or below the requested fixed rung, keeping the device ranking stable
+// within each group. When no candidate matches the rung (a provider that only
+// offers higher resolutions), the device ranking is returned unchanged. The
+// reorder is a preference, never a hard filter: a client that asked for 720p
+// still gets the best device-ranked stream when no native 720p-or-below
+// candidate exists.
+//
+// The cap is applied per candidate through the planner's own
+// playback.CappedRungHeightV3, using the candidate as the effective source.
+// That keeps the picker and the planner in agreement: an explicit preference is
+// reduced to the cap's rung only when the candidate's bitrate exceeds the cap,
+// so a source-preserving encode under the cap is not displaced by a lower rung.
+// "auto"/"original" return no rung and keep the device ranking untouched.
 func reorderVirtualCandidatesForQuality(candidates []VirtualPlaybackStream, qualityPreference string, bandwidthCapKbps int) []VirtualPlaybackStream {
 	rungHeight := qualityRungHeightV3(qualityPreference)
 	if rungHeight <= 0 || len(candidates) <= 1 {
 		return candidates
 	}
-	if bandwidthCapKbps > 0 {
-		if capHeight := virtualCapRungHeightV3(bandwidthCapKbps); capHeight < rungHeight {
-			rungHeight = capHeight
-		}
-	}
 	preferred := make([]VirtualPlaybackStream, 0, len(candidates))
 	rest := make([]VirtualPlaybackStream, 0, len(candidates))
 	for _, cand := range candidates {
 		height := resolutionHeight(cand.Resolution)
-		if height > 0 && height <= rungHeight {
+		effectiveRung := rungHeight
+		if height > 0 {
+			effectiveRung, _ = playback.CappedRungHeightV3(rungHeight, height, cand.Bitrate, bandwidthCapKbps)
+		}
+		if height > 0 && height <= effectiveRung {
 			preferred = append(preferred, cand)
 		} else {
 			rest = append(rest, cand)

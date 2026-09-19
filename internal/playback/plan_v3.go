@@ -1307,12 +1307,9 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 	// cap, and a transcode rung whose ladder bitrate exceeds the cap drops to
 	// the cap's rung.
 	if capKbps > 0 && !capApplied {
-		wouldPreserve := source.Height > 0 && targetHeight >= source.Height
-		if (wouldPreserve && capExceededBySource) || (!wouldPreserve && ladderBitrateKbpsV3(targetHeight) > capKbps) {
+		if adjusted, applied := CappedRungHeightV3(targetHeight, source.Height, source.BitrateKbps, capKbps); applied {
 			capApplied = true
-			if capHeight := ladderHeightForBandwidthV3(int(float64(capKbps) * 0.8)); capHeight < targetHeight {
-				targetHeight = capHeight
-			}
+			targetHeight = adjusted
 		}
 	}
 	if capApplied {
@@ -1682,6 +1679,35 @@ func minPositiveV3(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// CappedRungHeightV3 returns an explicit rung height after a bandwidth cap is
+// applied exactly as ResolveQualityPolicyV3 applies it to a fixed rung: a rung
+// that would preserve the source is lowered only when the source bitrate
+// exceeds the cap, and a lower (transcode) rung is lowered only when its own
+// ladder bitrate exceeds the cap. It returns the adjusted height and whether
+// the cap constrained the rung.
+//
+// The virtual candidate picker shares this derivation so a native
+// source-preserving stream under the cap is never displaced by a lower rung,
+// while a stream whose bitrate exceeds the cap still falls to the cap's rung.
+func CappedRungHeightV3(rungHeight, sourceHeight, sourceBitrateKbps, capKbps int) (int, bool) {
+	targetHeight := rungHeight
+	if sourceHeight > 0 && targetHeight > sourceHeight {
+		targetHeight = sourceHeight
+	}
+	if capKbps <= 0 {
+		return targetHeight, false
+	}
+	wouldPreserve := sourceHeight > 0 && targetHeight >= sourceHeight
+	if !((wouldPreserve && sourceBitrateKbps > capKbps) ||
+		(!wouldPreserve && ladderBitrateKbpsV3(targetHeight) > capKbps)) {
+		return targetHeight, false
+	}
+	if capHeight := ladderHeightForBandwidthV3(int(float64(capKbps) * 0.8)); capHeight < targetHeight {
+		targetHeight = capHeight
+	}
+	return targetHeight, true
 }
 
 // ladderBitrateKbpsV3 retains the established bitrate for each plain

@@ -207,6 +207,14 @@ constant:
 | `start_position` | The profile's saved resume point for this item, or `0` when there is none, it is already complete, or the file is one part of a multipart item (every part shares the item's resume point, so a part-local seek to it would land somewhere arbitrary). It is required when `progress_persistence` is `client` | Exactly that position. `0` means *start over* |
 | `audio_track_id` / `audio_track_index` | The profile's preferred audio track, resolved from the series preference, then the profile's audio-language setting, then the library override | Exactly that track |
 
+Within that audio resolution, a track the client can render directly — its codec
+is in the client's declared decode codecs or passthrough list — is preferred
+over a same-language track it cannot. The preference order still chooses among
+playable tracks, and language is never traded for codec: when only a
+non-playable track carries the preferred language, it is selected and the
+planner transforms the audio. A caller that supplies no client capabilities
+(catalog metadata, cross-version remap) keeps the historical selection.
+
 `progress_persistence` separates the live session clock from durable resume
 ownership. Omission (or `server`) means session progress may update the item's
 resume/history normally. `client` keeps heartbeats, route diagnostics, and live

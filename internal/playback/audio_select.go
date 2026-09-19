@@ -77,11 +77,68 @@ func trackHasLanguage(track models.AudioTrack, preferred string) bool {
 // Language matches rank exact tag > bare language > another variant of the same
 // language. Track order breaks ties within a language rank. Saved signatures
 // and compatible saved indices take precedence over language-only preferences.
-func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPref *AudioTrackPreference) int {
+//
+// clientPlayableCodecs, when non-empty, is the set of audio codecs the client
+// can render directly: the device-wide decode list plus any codecs it can pass
+// through. If the ordered selection's codec is not in that set, the same
+// priority order is run over the playable tracks and its result is used only
+// when it preserves the selected track's language. The intent is to keep a file
+// that contains a playable track on a direct route without trading language
+// away for codec; when no playable language-equivalent track exists, the
+// original selection stands and the planner transforms the audio as before.
+// Callers without client capabilities (catalog metadata, cross-version remap)
+// omit the list and keep the historical selection.
+func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPref *AudioTrackPreference, clientPlayableCodecs ...string) int {
 	if len(tracks) == 0 {
 		return 0
 	}
+	selected := selectAudioTrackOrdered(tracks, preferredLang, seriesPref)
+	if len(clientPlayableCodecs) == 0 || audioTrackPlayable(tracks[selected], clientPlayableCodecs) {
+		return selected
+	}
+	playable := make([]models.AudioTrack, 0, len(tracks))
+	playableIndex := make([]int, 0, len(tracks))
+	for i, track := range tracks {
+		if audioTrackPlayable(track, clientPlayableCodecs) {
+			playable = append(playable, track)
+			playableIndex = append(playableIndex, i)
+		}
+	}
+	if len(playable) == 0 {
+		return selected
+	}
+	alternative := playableIndex[selectAudioTrackOrdered(playable, preferredLang, seriesPref)]
+	if audioTrackLanguagePreserved(tracks[selected], tracks[alternative]) {
+		return alternative
+	}
+	return selected
+}
 
+// audioTrackPlayable reports whether the client can render the track's codec
+// directly, using the same device-wide decode and passthrough codec lists
+// audioEligibilityV3 evaluates.
+func audioTrackPlayable(track models.AudioTrack, playableCodecs []string) bool {
+	return containsFoldV3(playableCodecs, track.Codec)
+}
+
+// audioTrackLanguagePreserved reports whether substituting alternative for
+// selected keeps the selected track's language intent. A selected track that
+// carries no concrete language (empty, "und"/"mul" with no language list) has
+// no intent to preserve, so any decodable alternative is allowed.
+func audioTrackLanguagePreserved(selected, alternative models.AudioTrack) bool {
+	selectedLanguages := crossVersionAudioLanguages(selected)
+	if len(selectedLanguages) == 0 {
+		return true
+	}
+	for _, code := range selectedLanguages {
+		if trackHasLanguage(alternative, code) {
+			return true
+		}
+	}
+	return false
+}
+
+func selectAudioTrackOrdered(tracks []models.AudioTrack, preferredLang string, seriesPref *AudioTrackPreference) int {
 	// 1. Series preference: try exact signature match first.
 	if seriesPref != nil {
 		if idx := findExactAudioTrack(tracks, seriesPref.TrackSignature); idx >= 0 {
