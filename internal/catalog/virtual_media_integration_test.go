@@ -59,8 +59,14 @@ func newVirtualMediaTestPool(t *testing.T) *pgxpool.Pool {
 		lockConn.Release()
 	})
 
-	// Clean out related tables for isolation.
+	// Clean out related tables for isolation. The user/playback tables are
+	// cleared explicitly because the retention guards consult them and a
+	// leftover row could otherwise retain a file in an unrelated test.
 	for _, statement := range []string{
+		"DELETE FROM user_watch_progress",
+		"DELETE FROM user_watch_history",
+		"DELETE FROM playback_v3_attempts",
+		"DELETE FROM abs_playback_sessions",
 		"DELETE FROM media_files",
 		"TRUNCATE public.episodes CASCADE",
 		"DELETE FROM seasons",

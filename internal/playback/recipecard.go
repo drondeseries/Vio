@@ -97,22 +97,27 @@ type RecipeCard struct {
 	StreamOriginSeconds        float64                `json:"stream_origin_seconds,omitempty"`
 	CopySeekAnchorResolved     bool                   `json:"copy_seek_anchor_resolved,omitempty"`
 	TargetResolution           string                 `json:"target_resolution,omitempty"`
-	TargetCodecVideo           string                 `json:"target_codec_video,omitempty"`
-	TargetCodecAudio           string                 `json:"target_codec_audio,omitempty"`
-	TargetAudioChannels        int                    `json:"target_audio_channels,omitempty"`
-	TargetAudioBitrateKbps     int                    `json:"target_audio_bitrate_kbps,omitempty"`
-	SegmentDuration            int                    `json:"segment_duration"`
-	StartSegmentNumber         int                    `json:"start_segment_number"`
-	HWAccel                    string                 `json:"hw_accel,omitempty"`
-	HWDevice                   string                 `json:"hw_device,omitempty"`
-	SubtitleTrackIndex         int                    `json:"subtitle_track_index"`
-	SubtitleBurnIn             bool                   `json:"subtitle_burn_in,omitempty"`
-	SubtitleCodec              string                 `json:"subtitle_codec,omitempty"`
-	AudioTrackIndex            int                    `json:"audio_track_index"`
-	TargetBitrateKbps          int                    `json:"target_bitrate_kbps,omitempty"`
-	TotalDuration              float64                `json:"total_duration"`
-	FastStart                  bool                   `json:"fast_start,omitempty"`
-	ThrottleSeconds            int                    `json:"throttle_seconds,omitempty"`
+	// SourceFrameRate and SourceHeight keep a rebuilt encode's GOP aligned with
+	// the real source cadence and let the filter chain detect a no-op scale.
+	// Zero is the historical 30 fps / unknown-height behaviour.
+	SourceFrameRate        float64 `json:"source_frame_rate,omitempty"`
+	SourceHeight           int     `json:"source_height,omitempty"`
+	TargetCodecVideo       string  `json:"target_codec_video,omitempty"`
+	TargetCodecAudio       string  `json:"target_codec_audio,omitempty"`
+	TargetAudioChannels    int     `json:"target_audio_channels,omitempty"`
+	TargetAudioBitrateKbps int     `json:"target_audio_bitrate_kbps,omitempty"`
+	SegmentDuration        int     `json:"segment_duration"`
+	StartSegmentNumber     int     `json:"start_segment_number"`
+	HWAccel                string  `json:"hw_accel,omitempty"`
+	HWDevice               string  `json:"hw_device,omitempty"`
+	SubtitleTrackIndex     int     `json:"subtitle_track_index"`
+	SubtitleBurnIn         bool    `json:"subtitle_burn_in,omitempty"`
+	SubtitleCodec          string  `json:"subtitle_codec,omitempty"`
+	AudioTrackIndex        int     `json:"audio_track_index"`
+	TargetBitrateKbps      int     `json:"target_bitrate_kbps,omitempty"`
+	TotalDuration          float64 `json:"total_duration"`
+	FastStart              bool    `json:"fast_start,omitempty"`
+	ThrottleSeconds        int     `json:"throttle_seconds,omitempty"`
 }
 
 const playMethodCopyFMP4V1 PlayMethod = streamtoken.PlayMethodCopyFMP4Transcode
@@ -196,6 +201,8 @@ func NewRecipeCard(userID int, profileID string, mediaFileID int, transcodeNodeU
 		StreamOriginSeconds:              opts.StreamOriginSeconds,
 		CopySeekAnchorResolved:           opts.CopySeekAnchorResolved,
 		TargetResolution:                 opts.TargetResolution,
+		SourceFrameRate:                  opts.SourceFrameRate,
+		SourceHeight:                     opts.SourceHeight,
 		TargetCodecVideo:                 opts.TargetCodecVideo,
 		TargetCodecAudio:                 opts.TargetCodecAudio,
 		TargetAudioChannels:              opts.TargetAudioChannels,
@@ -299,6 +306,8 @@ func (c RecipeCard) TranscodeOpts(outputDir, ffmpegPath string, logSink FFmpegLo
 		StreamOriginSeconds:              c.StreamOriginSeconds,
 		CopySeekAnchorResolved:           c.CopySeekAnchorResolved,
 		TargetResolution:                 c.TargetResolution,
+		SourceFrameRate:                  c.SourceFrameRate,
+		SourceHeight:                     c.SourceHeight,
 		TargetCodecVideo:                 c.TargetCodecVideo,
 		TargetCodecAudio:                 c.TargetCodecAudio,
 		TargetAudioChannels:              c.TargetAudioChannels,
@@ -374,6 +383,8 @@ func (c RecipeCard) ToClaims() streamtoken.Claims {
 		RoutingEgressNodeID:              c.RoutingEgressNodeID,
 		TargetCodec:                      c.TargetCodecVideo,
 		TargetRes:                        c.TargetResolution,
+		SourceFrameRate:                  c.SourceFrameRate,
+		SourceHeight:                     c.SourceHeight,
 		AudioTrackIndex:                  c.AudioTrackIndex,
 		UserID:                           c.UserID,
 		ProfileID:                        c.ProfileID,
@@ -492,6 +503,8 @@ func RecipeCardFromClaims(c *streamtoken.Claims) RecipeCard {
 		StreamOriginSeconds:              c.StreamOriginSeconds,
 		CopySeekAnchorResolved:           c.CopySeekAnchorResolved,
 		TargetResolution:                 c.TargetRes,
+		SourceFrameRate:                  c.SourceFrameRate,
+		SourceHeight:                     c.SourceHeight,
 		TargetCodecVideo:                 c.TargetCodec,
 		TargetCodecAudio:                 c.TargetCodecAudio,
 		TargetAudioChannels:              c.TargetAudioChannels,

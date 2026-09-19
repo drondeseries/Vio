@@ -48,6 +48,7 @@ import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { usePageActivity } from "@/hooks/usePageActivity";
 import { adminKeys, historyImportKeys, libraryKeys, sectionKeys } from "@/hooks/queries/keys";
 import {
+  isTerminalItemDetailNotFound,
   scheduleMediaSurfaceInvalidation,
   updateCatalogItemDetail,
 } from "@/hooks/queries/mediaSurfaceRefresh";
@@ -737,7 +738,8 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     shouldCatchUpOnFocusRef.current = false;
     void queryClient.refetchQueries({
       type: "active",
-      predicate: (query) => !isDashboardQueryKey(query.queryKey),
+      predicate: (query) =>
+        !isDashboardQueryKey(query.queryKey) && !isTerminalItemDetailNotFound(query),
     });
   }, [
     authenticatedUserID,

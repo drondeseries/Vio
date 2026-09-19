@@ -2,6 +2,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ItemDetail } from "@/api/types";
 import { ApiClientError } from "@/api/client";
+import { v2Problem } from "@/api/v2/problems.test-support";
 import {
   catalogKeys,
   favoriteKeys,
@@ -120,7 +121,7 @@ describe("invalidateMediaSurfaceQueries", () => {
     const query = queryClient.getQueryCache().build(queryClient, { queryKey: missingKey });
     query.setState({
       status: "error",
-      error: new ApiClientError(404, "not_found", "Not Found"),
+      error: v2Problem(404, "not_found", "Not Found"),
     });
 
     await invalidateMediaSurfaceQueries(queryClient);
@@ -135,12 +136,42 @@ describe("invalidateMediaSurfaceQueries", () => {
     const query = queryClient.getQueryCache().build(queryClient, { queryKey: missingKey });
     query.setState({
       status: "error",
+      error: v2Problem(404, "not_found", "Not Found"),
+    });
+
+    await invalidateMediaSurfaceQueries(queryClient);
+
+    expect(queryClient.getQueryState(missingKey)?.isInvalidated).toBe(false);
+  });
+
+  it("does not invalidate a legacy ApiClientError 404 detail query", async () => {
+    const queryClient = new QueryClient();
+    const missingKey = catalogKeys.itemDetail("movie-tmdb-1319522");
+
+    const query = queryClient.getQueryCache().build(queryClient, { queryKey: missingKey });
+    query.setState({
+      status: "error",
       error: new ApiClientError(404, "not_found", "Not Found"),
     });
 
     await invalidateMediaSurfaceQueries(queryClient);
 
     expect(queryClient.getQueryState(missingKey)?.isInvalidated).toBe(false);
+  });
+
+  it("still invalidates a v2 detail query that failed with a 5xx", async () => {
+    const queryClient = new QueryClient();
+    const flakyKey = catalogKeys.itemDetail("movie-tmdb-1319522");
+
+    const query = queryClient.getQueryCache().build(queryClient, { queryKey: flakyKey });
+    query.setState({
+      status: "error",
+      error: v2Problem(500, "internal_error", "Internal Server Error"),
+    });
+
+    await invalidateMediaSurfaceQueries(queryClient);
+
+    expect(queryClient.getQueryState(flakyKey)?.isInvalidated).toBe(true);
   });
 
   it("still invalidates a catalog detail query that failed for a transient reason", async () => {

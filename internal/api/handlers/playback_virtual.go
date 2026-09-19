@@ -968,6 +968,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	fastPathHit := false
 
 	resolveAndProbe := func(i int, cand VirtualPlaybackStream) (*resolvedVirtualPlaybackSource, error) {
+		// requestedURI is the candidate this iteration asked the resolver for.
+		// The detailed resolver may rewrite cand.URI to a substituted sibling
+		// (a fresh-selection fall-through or a dedup keeper); keeping the
+		// original lets every error name the candidate the attempt is actually
+		// about instead of the substitute it happened to resolve to.
+		requestedURI := cand.URI
 		// Evidence is keyed by the pre-resolution candidate URI: the detailed
 		// resolver below may rewrite cand.URI, but the match map was populated
 		// from the original candidate list.
@@ -1118,13 +1124,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		transient := *file
 		transient.FilePath = cand.URI
 		transient.VirtualOwnerInstallationID = oid
-		dbFile := (*models.MediaFile)(nil)
-		if h.VirtualFileLookup != nil {
-			dbFile, _ = h.VirtualFileLookup(attemptCtx, cand.URI)
-		}
-		if (dbFile == nil || dbFile.ID <= 0) && h.VirtualCandidateFileLookup != nil {
-			dbFile, _ = h.VirtualCandidateFileLookup(attemptCtx, virtualPlaybackNeutralKey(cand.URI), file.ContentID, file.EpisodeID, oid)
-		}
+		dbFile := h.lookupVirtualCandidateRow(attemptCtx, cand.URI, file.ContentID, file.EpisodeID, oid)
 		if dbFile != nil && dbFile.ID > 0 {
 			// Auto-pick skips candidates whose catalog row is marked failed
 			// (a transport produced no bytes, or the decoder rejected the
@@ -1132,6 +1132,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// relink allow a manual retry; a decode-driven rotation carries its
 			// exclusion explicitly so it never depends on the async stamp.
 			if !allowFailed && dbFile.FailedAt != nil {
+				// Name the candidate this attempt is about first. On a
+				// substitution, cand.URI is the sibling the resolver selected,
+				// so reporting only it made the log's candidate_uri and error
+				// disagree about who failed; name both so an operator can
+				// trust the attribution.
+				if cand.URI != requestedURI {
+					return nil, fmt.Errorf("candidate %s resolved to %s, which is marked failed", requestedURI, cand.URI)
+				}
 				return nil, fmt.Errorf("candidate %s is marked failed", cand.URI)
 			}
 			transient = *dbFile
@@ -1934,10 +1942,37 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 	}()
 }
 
+// lookupVirtualCandidateRow resolves the catalog row that owns a concrete
+// candidate URI. It prefers an exact path match and falls back to the
+// provider-neutral path for rows stored without the result= pick. A nil or
+// zero-id row means no catalog row owns the candidate.
+func (h *PlaybackHandler) lookupVirtualCandidateRow(ctx context.Context, candidateURI, contentID, episodeID string, ownerID int) *models.MediaFile {
+	if h == nil || candidateURI == "" {
+		return nil
+	}
+	if h.VirtualFileLookup != nil {
+		if file, _ := h.VirtualFileLookup(ctx, candidateURI); file != nil && file.ID > 0 {
+			return file
+		}
+	}
+	if h.VirtualCandidateFileLookup != nil {
+		if file, _ := h.VirtualCandidateFileLookup(ctx, virtualPlaybackNeutralKey(candidateURI), contentID, episodeID, ownerID); file != nil && file.ID > 0 {
+			return file
+		}
+	}
+	return nil
+}
+
 // fallbackResolveStaleVirtualSource re-lists the provider's current candidates
 // and resolves the first healthy provider-neutral stream. It returns nil when
 // the original URI carried no stale result= pick, or when no substitute
 // candidate can be resolved, so the caller preserves its original error.
+//
+// Under a session binding it refuses to swap the release unless the caller
+// explicitly declared candidate rotation: it first re-resolves the session's
+// own candidate (reusing the same release), and otherwise returns nil so the
+// caller surfaces the original failure. A sibling is only tried when rotation
+// was declared or the resolve is not session-bound.
 func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 	ctx context.Context,
 	file *models.MediaFile,
@@ -1971,6 +2006,48 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 	// Guard against cross-identity candidates: only consider streams that
 	// share the same scheme, host, path, and profile as the original file.
 	streams = filterVirtualPlaybackStreams(file, streams)
+
+	// The session-bound release is the one the viewer chose. A stale or dead
+	// session candidate must not be silently replaced by a sibling release:
+	// only an explicit candidate rotation may substitute. The rotation and
+	// session-binding intents are carried on ctx by resolveVirtualPlaybackSource
+	// and forwarded by the detailed-resolver adapter; they are read here, never
+	// inferred from the candidate list.
+	sessionID := virtualResultCandidateID(file.FilePath)
+	if VirtualSessionBinding(ctx) && !VirtualCandidateRotationAllowed(ctx) {
+		sessionCandidate := VirtualPlaybackStream{
+			ID:                  sessionID,
+			URI:                 file.FilePath,
+			OwnerInstallationID: file.VirtualOwnerInstallationID,
+			Resolution:          file.Resolution,
+			CodecVideo:          file.CodecVideo,
+			CodecAudio:          file.CodecAudio,
+			HDR:                 mediaFileHDRString(file),
+		}
+		resolved, err := h.resolveVirtualCandidateSource(ctx, file, sessionCandidate, userID, profileID)
+		switch {
+		case err == nil && (sessionID == "" || virtualResultCandidateID(resolved.URI) == sessionID):
+			// Reuse the session's own resolved URL: re-resolving the chosen
+			// candidate refreshes stale credentials without changing the bytes
+			// under the viewer.
+			slog.InfoContext(ctx, "virtual stale fallback: re-resolved the session-bound candidate",
+				"component", "api", "original", file.FilePath)
+			return resolved
+		case err == nil:
+			// The resolver returned a different result= identity (a dedup
+			// keeper or a ranked sibling); serving it would swap the release.
+			slog.WarnContext(ctx, "virtual stale fallback: refusing to substitute a different release",
+				"component", "api", "original", file.FilePath, "resolved", resolved.URI,
+				"reason", "candidate rotation was not requested")
+		default:
+			slog.WarnContext(ctx, "virtual stale fallback: refusing to substitute a different release",
+				"component", "api", "original", file.FilePath,
+				"reason", "the session-bound candidate did not resolve and candidate rotation was not requested",
+				"error", err)
+		}
+		return nil
+	}
+
 	maxAttempts := h.maxVirtualFailoverAttempts(ctx)
 	attempts := 0
 	for _, stream := range streams {
@@ -2038,6 +2115,15 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	// failure for that stream rather than silently resolving a different one
 	// while the caller persists this stream's URI.
 	ctx = withVirtualSessionBindingV3(ctx, true)
+	// A stale-source fallback must never hand back a candidate the serve layer
+	// already marked failed: the verdict is active until a real delivery clears
+	// it. The main candidate loop checks the resolved row's failed_at before
+	// serving; this fallback path runs after those failures and used to skip
+	// that check, so a sibling with an active verdict could be selected as the
+	// substitute. Resolve the candidate's own row and refuse it here.
+	if row := h.lookupVirtualCandidateRow(ctx, candidate.URI, file.ContentID, file.EpisodeID, ownerID); row != nil && row.FailedAt != nil {
+		return nil, fmt.Errorf("candidate %s is marked failed", candidate.URI)
+	}
 	var streamURL string
 	if h.VirtualMediaDetailedResolver != nil {
 		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(

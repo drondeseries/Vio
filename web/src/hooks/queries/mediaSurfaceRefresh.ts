@@ -1,6 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 import type { HomeSectionItemsResponse, ItemDetail } from "@/api/types";
 import { ApiClientError } from "@/api/client";
+import { V2ProblemError } from "@/api/v2/request";
 import {
   adminKeys,
   catalogKeys,
@@ -204,13 +205,25 @@ export async function invalidateMediaSurfaceQueries(
   });
 }
 
+/**
+ * True when an API error is a terminal 404: the resource does not exist, so
+ * retrying or re-fetching it cannot succeed. Recognises both the v2 error type
+ * (`V2ProblemError`, what `v2(...)` throws today) and the legacy
+ * `ApiClientError`, and keys on the status rather than the class alone so a
+ * non-404 of either type is still treated as retryable.
+ */
+export function isTerminalNotFoundError(error: unknown): boolean {
+  if (error instanceof ApiClientError) return error.status === 404;
+  if (error instanceof V2ProblemError) return error.status === 404;
+  return false;
+}
+
 export function isTerminalItemDetailNotFound(query: {
   queryKey: readonly unknown[];
   state?: { status?: string; error?: unknown };
 }): boolean {
   if (query.state?.status !== "error") return false;
-  const error = query.state.error;
-  if (!(error instanceof ApiClientError) || error.status !== 404) return false;
+  if (!isTerminalNotFoundError(query.state.error)) return false;
   const key = query.queryKey;
   return (
     Array.isArray(key) &&

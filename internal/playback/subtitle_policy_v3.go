@@ -25,8 +25,11 @@ type SubtitlePolicyResultV3 struct {
 // SubtitleInventoryEntryV3 is one subtitle track that exists for the file but
 // is not carried on models.MediaFile — today, downloaded and AI-generated
 // tracks. Callers supply them in the order that defines their ordinals (see
-// BuildSubtitleInventoryV3); CombinedIndex records the ordinal each entry was
-// assigned so a caller holding an entry alone can still address it.
+// BuildSubtitleInventoryV3); CombinedIndex records the entry's source-space
+// ordinal so a caller holding an entry alone can still address it. The
+// published ordinal BuildSubtitleInventoryV3 assigns may be lower once
+// duplicates are suppressed; subtitleEntryAtCombinedIndexV3 translates between
+// the two.
 type SubtitleInventoryEntryV3 struct {
 	CombinedIndex        int
 	Codec                string
@@ -93,7 +96,11 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 	trackID := TrackIDV3(file.ID, "subtitle", index)
 	transportIndex := -1
 	if source == "embedded" {
-		transportIndex = index - len(file.ExternalSubtitles)
+		// entry.CombinedIndex is the source-space ordinal; the transport index
+		// is the embedded track's position within file.SubtitleTracks. The
+		// request's index is the dense published one, which can differ when the
+		// inventory de-duplicated an earlier track.
+		transportIndex = entry.CombinedIndex - len(file.ExternalSubtitles)
 	}
 	deliveryCaps := request.ClientPlaybackContext.Deliveries[deliveryClass]
 	text := isTextSubtitleV3(codec)
@@ -165,22 +172,38 @@ func ResolveSubtitlePolicyV3(file *models.MediaFile, request StartRequestV3, tra
 	return subtitleTerminalV3("subtitle_conversion_unsupported", fmt.Sprintf("Subtitle format %s cannot meet the selected fidelity policy.", codec))
 }
 
-// subtitleEntryAtCombinedIndexV3 resolves a combined ordinal through the same
-// three inventory ranges the plan publishes while retaining the stable row ID
-// of a downloaded subtitle for frozen seek recipes.
+// subtitleEntryAtCombinedIndexV3 resolves a published combined ordinal to the
+// source-space entry it names. The ordinal the client echoes is the dense one
+// BuildSubtitleInventoryV3 publishes, but the file's own arrays and the
+// additional entries keep their source ordinals, so the published ordinal is
+// translated back through the same de-duplication before the segment lookup.
+// The returned entry carries the source-space ordinal in CombinedIndex, which
+// the policy uses for the embedded transport index and the extraction pins.
 func subtitleEntryAtCombinedIndexV3(file *models.MediaFile, index int, additional []SubtitleInventoryEntryV3) (SubtitleInventoryEntryV3, bool) {
 	if file == nil || index < 0 {
 		return SubtitleInventoryEntryV3{}, false
 	}
-	if index < len(file.ExternalSubtitles) {
-		return SubtitleInventoryEntryV3{CombinedIndex: index, Codec: normalizeCodecV3(file.ExternalSubtitles[index].Format), Source: "external"}, true
+	sourceIndex, ok := subtitleInventorySourceIndexV3(file, additional, index)
+	if !ok {
+		return SubtitleInventoryEntryV3{}, false
 	}
-	embedded := index - len(file.ExternalSubtitles)
+	if sourceIndex < len(file.ExternalSubtitles) {
+		return SubtitleInventoryEntryV3{CombinedIndex: sourceIndex, Codec: normalizeCodecV3(file.ExternalSubtitles[sourceIndex].Format), Source: "external"}, true
+	}
+	embedded := sourceIndex - len(file.ExternalSubtitles)
 	if embedded >= 0 && embedded < len(file.SubtitleTracks) {
-		return SubtitleInventoryEntryV3{CombinedIndex: index, Codec: normalizeCodecV3(file.SubtitleTracks[embedded].Codec), Source: "embedded"}, true
+		return SubtitleInventoryEntryV3{CombinedIndex: sourceIndex, Codec: normalizeCodecV3(file.SubtitleTracks[embedded].Codec), Source: "embedded"}, true
 	}
-	for _, entry := range additional {
-		if entry.CombinedIndex == index {
+	// Match the additional entry by the same source ordinal the builder
+	// assigned it: CombinedIndex when it is positive, otherwise the entry's
+	// position after the file's own ranges.
+	base := len(file.ExternalSubtitles) + len(file.SubtitleTracks)
+	for position, entry := range additional {
+		assigned := entry.CombinedIndex
+		if assigned <= 0 {
+			assigned = base + position
+		}
+		if assigned == sourceIndex {
 			entry.Codec = normalizeCodecV3(entry.Codec)
 			return entry, true
 		}

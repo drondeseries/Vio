@@ -164,10 +164,17 @@ type PlannerResultV3 struct {
 	SourceAudioChannels int
 	// TargetAudioChannels caps the transcode's re-encoded channel count;
 	// 0 keeps the historical stereo downmix.
-	TargetAudioChannels         int
-	TargetAudioBitrateKbps      int
-	TargetResolution            string
-	TargetBitrateKbps           int
+	TargetAudioChannels    int
+	TargetAudioBitrateKbps int
+	TargetResolution       string
+	TargetBitrateKbps      int
+	// SourceFrameRate and SourceHeight are the probed source video facts a
+	// forced encode needs to keep its GOP aligned with the real frame rate and
+	// to detect a no-op scale. They are frozen into the recipe card, stream
+	// token, and transcode request so a restart reconstructs the same GOP.
+	// Zero means unknown and decodes to the historical 30 fps assumption.
+	SourceFrameRate             float64
+	SourceHeight                int
 	SubtitleTrackIndex          int
 	SubtitleTransportTrackIndex int
 	SubtitleBurnIn              bool
@@ -979,19 +986,46 @@ var targetVideoPreferencesV3 = []targetVideoSelectionV3{
 
 var targetVideoFloorV3 = targetVideoSelectionV3{codec: TargetVideoCodecH264V3, transformation: TransformationVideoToH264V3, recipeVersion: TransformationVideoToH264RecipeVersionV3, claim: ClaimH264DecodeV3}
 
+// targetVideoBurnInPreferencesV3 is the burn-in encoder order: H.264 first,
+// then HEVC, then AV1 only as a last resort. A burn-in encode runs overlays and
+// often a tone-map on top of the encode, so the slowest hardware encoder on the
+// box (AV1) must not be chosen when a realtime-safe H.264/HEVC path exists.
+var targetVideoBurnInPreferencesV3 = []targetVideoSelectionV3{
+	targetVideoFloorV3,
+	{codec: TargetVideoCodecHEVCV3, transformation: TransformationVideoToHEVCV3, recipeVersion: TransformationVideoToHEVCRecipeVersionV3, claim: ClaimHEVCDecodeV3},
+	{codec: TargetVideoCodecAV1V3, transformation: TransformationVideoToAV1V3, recipeVersion: TransformationVideoToAV1RecipeVersionV3, claim: ClaimAV1DecodeV3},
+}
+
 // selectTargetVideoCodecV3 chooses the HLS video encoder from the client's
 // declared hardware codecs. AV1 and HEVC are eligible only when the client
 // lists the codec as hardware-decodable, the HLS delivery accepts it, and the
 // registry advertises the matching encoder transformation. Missing or
 // unknown capabilities fall through to the H.264 floor.
 func selectTargetVideoCodecV3(input PlannerInputV3, registry *TransformationRegistryV3) (targetVideoSelectionV3, bool) {
+	return selectTargetVideoCodecForV3(input, registry, false)
+}
+
+// selectBurnInTargetVideoCodecV3 is selectTargetVideoCodecV3 for a plan that
+// must burn subtitles into the video: the ordered preferences put H.264 ahead
+// of the codecs ordinary selection would prefer.
+func selectBurnInTargetVideoCodecV3(input PlannerInputV3, registry *TransformationRegistryV3) (targetVideoSelectionV3, bool) {
+	return selectTargetVideoCodecForV3(input, registry, true)
+}
+
+func selectTargetVideoCodecForV3(input PlannerInputV3, registry *TransformationRegistryV3, burnIn bool) (targetVideoSelectionV3, bool) {
 	if registry == nil {
 		return targetVideoSelectionV3{}, false
 	}
 	declared := input.Request.Capabilities.CodecsVideoHardware
 	delivery := hlsDeliveryVideoCodecsV3(input.Request)
-	for _, candidate := range targetVideoPreferencesV3 {
-		if !containsFoldV3(declared, candidate.codec) {
+	preferences := targetVideoPreferencesV3
+	if burnIn {
+		preferences = targetVideoBurnInPreferencesV3
+	}
+	for _, candidate := range preferences {
+		// H.264 is the universal floor: it never needs the client to declare
+		// hardware decode. HEVC and AV1 are upgrades gated on that claim.
+		if candidate.codec != TargetVideoCodecH264V3 && !containsFoldV3(declared, candidate.codec) {
 			continue
 		}
 		// AV1 has no validated software encoder in this pipeline; only take it
@@ -1065,14 +1099,34 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	if hlsRegistry == nil || !hlsRegistry.Available(TransformationAudioToAACV3) {
 		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated video/AAC conversion toolchain is unavailable.", true)
 	}
-	targetVideo, videoTranscodeOK := selectTargetVideoCodecV3(input, hlsRegistry)
+	var targetVideo targetVideoSelectionV3
+	var videoTranscodeOK bool
+	if subtitle.RequiresBurn {
+		targetVideo, videoTranscodeOK = selectBurnInTargetVideoCodecV3(input, hlsRegistry)
+	} else {
+		targetVideo, videoTranscodeOK = selectTargetVideoCodecV3(input, hlsRegistry)
+	}
 	if !videoTranscodeOK {
 		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated video/AAC conversion toolchain is unavailable.", true)
+	}
+	// A forced encode triggered by burn-in, HDR handling, or capability
+	// evidence must not inherit a source-preserving "original quality" bitrate:
+	// that yields a source-bitrate encode no hardware encoder can keep up with.
+	// Replace it with the source-class ladder rung.
+	sourcePreservingEncodeForced := quality.PreservesSource
+	if sourcePreservingEncodeForced {
+		quality = forcedEncodeQualityResultV3(source, quality)
 	}
 	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 {
 		base.AvailableQualities = availableQualitiesForRouteV3(input, source)
 	}
 	plan := base
+	if sourcePreservingEncodeForced {
+		plan.DegradationWarnings = append(plan.DegradationWarnings, DegradationWarningV3{
+			Code:    "quality_source_requires_transcode",
+			Message: "This route must re-encode the source; the encode uses the source-class quality ladder rung instead of the source bitrate.",
+		})
+	}
 	plan.Delivery = DeliveryTranscodeHLSV3
 	plan.Stream = StreamV3{Protocol: StreamHLSV3, Container: "hls", MIMEType: "application/vnd.apple.mpegurl", Headers: map[string]string{}, HeaderRefresh: HeaderRefreshNoneV3}
 	plan.EffectiveRecipe.VideoCodec = targetVideo.codec
@@ -1141,7 +1195,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		}
 		return terminalPlannerResultV3("adaptation_exhausted", "All compatible playback recipes have already failed for this output route.", false)
 	}
-	return PlannerResultV3{Plan: &plan, PlayMethod: PlayTranscode, TranscodeAudio: true, TargetVideoCodec: targetVideo.codec, TargetAudioCodec: "aac", SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, true), TargetAudioChannels: targetAudioChannels, TargetResolution: quality.Label, TargetBitrateKbps: quality.BitrateKbps, SubtitleTrackIndex: subtitle.SelectedIndex, SubtitleTransportTrackIndex: subtitle.TransportIndex, SubtitleBurnIn: subtitle.RequiresBurn, SubtitleCodec: subtitle.Codec, DownloadedSubtitleID: subtitle.DownloadedSubtitleID, ToneMapPolicy: toneMapPolicy, ToneMapMode: toneMapMode, ToneMapSourceKind: toneMapSourceKind, ToneMapRecipeVersion: toneMapRecipeVersionV3(toneMapOK), ToneMapPreflightRequired: toneMapResolution.PreflightRequired, ToneMapSourceRevision: toneMapRevision, ToneMapVPPEnabled: toneMapOK && input.Settings.VPPToneMapEnabled}
+	return PlannerResultV3{Plan: &plan, PlayMethod: PlayTranscode, TranscodeAudio: true, TargetVideoCodec: targetVideo.codec, TargetAudioCodec: "aac", SourceAudioChannels: stereoDownmixSourceChannelsV3(source.AudioChannels, targetAudioChannels, true), TargetAudioChannels: targetAudioChannels, TargetResolution: quality.Label, TargetBitrateKbps: quality.BitrateKbps, SourceFrameRate: source.FrameRate, SourceHeight: source.Height, SubtitleTrackIndex: subtitle.SelectedIndex, SubtitleTransportTrackIndex: subtitle.TransportIndex, SubtitleBurnIn: subtitle.RequiresBurn, SubtitleCodec: subtitle.Codec, DownloadedSubtitleID: subtitle.DownloadedSubtitleID, ToneMapPolicy: toneMapPolicy, ToneMapMode: toneMapMode, ToneMapSourceKind: toneMapSourceKind, ToneMapRecipeVersion: toneMapRecipeVersionV3(toneMapOK), ToneMapPreflightRequired: toneMapResolution.PreflightRequired, ToneMapSourceRevision: toneMapRevision, ToneMapVPPEnabled: toneMapOK && input.Settings.VPPToneMapEnabled}
 }
 
 // applySubtitleDecisionV3 changes the delivery-specific subtitle policy without
@@ -1408,6 +1462,45 @@ func compoundRungQualityResultV3(rung ladderRungV3, source SourceDescriptorV3, c
 		Reason:            reason,
 		Warnings:          warnings,
 	}
+}
+
+// sourceClassLadderRungV3 returns the highest-bitrate ladder rung for a
+// resolution class. ladderRungsV3 is ordered by descending class and bitrate,
+// so the first matching height is the class's ceiling (2160p -> 40 Mbps,
+// 1080p -> 10 Mbps, 720p -> 4 Mbps).
+func sourceClassLadderRungV3(classHeight int) (ladderRungV3, bool) {
+	if classHeight <= 0 {
+		return ladderRungV3{}, false
+	}
+	for _, rung := range ladderRungsV3 {
+		if rung.Height == classHeight {
+			return rung, true
+		}
+	}
+	return ladderRungV3{}, false
+}
+
+// forcedEncodeQualityResultV3 replaces a source-preserving quality result with
+// the source-class ladder rung when an otherwise source-preserving route is
+// forced to encode (burn-in, HDR handling, or capability evidence). Without
+// this the encode inherits the source bitrate — a ~76 Mbps "original quality"
+// result — which no hardware encoder keeps up with in realtime. The compound
+// rung machinery preserves the source's exact dimensions and clamps to a lower
+// source bitrate when one exists.
+func forcedEncodeQualityResultV3(source SourceDescriptorV3, quality QualityResultV3) QualityResultV3 {
+	rung, ok := sourceClassLadderRungV3(sourceLadderHeightV3(source))
+	if !ok {
+		return quality
+	}
+	replaced := compoundRungQualityResultV3(rung, source, 0, quality.Warnings)
+	// The encode is happening regardless of whether the source already fit the
+	// rung, so the result must not advertise a source-preserving route or a
+	// user-selected fixed rung.
+	replaced.PreservesSource = false
+	replaced.RequiresTranscode = true
+	replaced.ExplicitRung = quality.ExplicitRung
+	replaced.Reason = quality.Reason
+	return replaced
 }
 
 func originalQualityResultV3(source SourceDescriptorV3) QualityResultV3 {

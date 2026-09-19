@@ -983,15 +983,20 @@ func (r *Repo) UpsertCowatchPairs(ctx context.Context, pairs []CowatchPair) erro
 	return tx.Commit(ctx)
 }
 
+// cowatchNeighborsQuery joins media_items so a co-watch row whose neighbor no
+// longer exists is never returned. Embedding candidates already get this
+// guarantee from FindSimilar's join; item_cowatch historically had none.
+var cowatchNeighborsQuery = `
+	SELECT c.item_id, c.similar_item_id, c.jaccard_score, c.cowatch_count
+	FROM   item_cowatch c
+	JOIN   media_items mi ON mi.content_id = c.similar_item_id
+	WHERE  c.item_id = $1
+	ORDER  BY c.jaccard_score DESC
+	LIMIT  $2`
+
 // GetCowatchNeighbors returns the top co-watch neighbors for an item.
 func (r *Repo) GetCowatchNeighbors(ctx context.Context, itemID string, limit int) ([]CowatchPair, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT item_id, similar_item_id, jaccard_score, cowatch_count
-		FROM   item_cowatch
-		WHERE  item_id = $1
-		ORDER  BY jaccard_score DESC
-		LIMIT  $2`,
-		itemID, limit)
+	rows, err := r.pool.Query(ctx, cowatchNeighborsQuery, itemID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get cowatch neighbors: %w", err)
 	}
@@ -1006,6 +1011,39 @@ func (r *Repo) GetCowatchNeighbors(ctx context.Context, itemID string, limit int
 		pairs = append(pairs, p)
 	}
 	return pairs, rows.Err()
+}
+
+// ExistingItemIDs returns the subset of itemIDs that currently exist in
+// media_items. It is an existence check only: no viewer, library, or content
+// rating filtering is applied. Callers use it to drop candidate IDs that a
+// derived source (item_cowatch, a stale cache) produced for an item the
+// catalog no longer has.
+func (r *Repo) ExistingItemIDs(ctx context.Context, itemIDs []string) (map[string]struct{}, error) {
+	if len(itemIDs) == 0 {
+		return map[string]struct{}{}, nil
+	}
+
+	rows, err := r.pool.Query(ctx, `
+		SELECT content_id
+		FROM   media_items
+		WHERE  content_id = ANY($1)`, itemIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query existing item ids: %w", err)
+	}
+	defer rows.Close()
+
+	existing := make(map[string]struct{}, len(itemIDs))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan existing item id: %w", err)
+		}
+		existing[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate existing item ids: %w", err)
+	}
+	return existing, nil
 }
 
 // CowatchPairCount returns the total number of co-watch pairs stored.
@@ -1279,6 +1317,10 @@ func (r *Repo) GetRewatchCounts(ctx context.Context, userID int, profileID strin
 // floor ($2) is a sparsity/privacy threshold and must count distinct login
 // ACCOUNTS: one household account with N profiles must not satisfy it alone,
 // so the HAVING clause counts DISTINCT user_id rather than watcher rows.
+//
+// media_items is joined so an item removed after its watch activity was
+// recorded drops out instead of seeding co-watch pairs for an id the catalog
+// no longer has.
 var itemWatchersQuery = fmt.Sprintf(`
 	WITH %s,
 	user_watches AS (
@@ -1291,6 +1333,7 @@ var itemWatchersQuery = fmt.Sprintf(`
 	)
 	SELECT media_item_id, ARRAY_AGG(watcher_id) AS watchers
 	FROM   user_watches
+	JOIN   media_items mi ON mi.content_id = user_watches.media_item_id
 	WHERE  rn <= $1
 	GROUP  BY media_item_id
 	HAVING COUNT(DISTINCT user_id) >= $2`, watchedActivityCTE)

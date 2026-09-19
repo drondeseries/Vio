@@ -187,14 +187,18 @@ func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, erro
 //     or absent falls through to the best live candidate that satisfies the
 //     profile and is re-pinned by the caller; when nothing satisfies the
 //     profile and fallback is disallowed the caller gets the existing
-//     no-stream-matches-profile error. A dead/absent pin falls back either way;
+//     no-stream-matches-profile error. A session-bound dead/absent pin is
+//     refused when substitution is disallowed; otherwise a dead/absent pin
+//     falls back;
 //   - a pin whose multi-file variant dedup collapsed resolves to the surviving
 //     keeper of that release (a file swap inside the release, never a release
 //     swap), because dedup preserves exactly one candidate per release and
 //     reports the dropped -> keeper map; the translated pin then overrides
 //     rank and reject and respects exclusions, the profile filter and
 //     allowCandidateSubstitution exactly like the original pin;
-//   - a genuinely dead pin (absent with no keeper) still falls back;
+//   - a genuinely dead pin (absent with no keeper) still falls back when
+//     substitution is allowed or the resolve is not session-bound; a
+//     session-bound dead pin with substitution disallowed is refused;
 //   - when substitution is refused and a preferredCandidateID names a
 //     resolvable session release, the candidate actually served must belong to
 //     that release: a present resultID for a different release is refused
@@ -353,14 +357,29 @@ func (s *Service) ResolveDetailed(
 	// handler probes candidates by URI, so resultID is the probed candidate and
 	// the session pin arrives only as preferredCandidateID; without this guard a
 	// present resultID for a different release wins and swaps the release under
-	// the session binding even though substitution was refused. A session pin
-	// whose release is not resolvable (a genuinely dead release) is left to the
-	// documented dead-pin fallback. When substitution is allowed the explicit
-	// resultID still wins.
+	// the session binding even though substitution was refused. When
+	// substitution is allowed the explicit resultID still wins.
 	if !allowSubstitution && sessionReleaseResolvable && effectiveResultID != "" && effectiveResultID != effectivePreferredID {
 		return ResolvedVirtualStream{}, fmt.Errorf(
 			"session-bound virtual candidate %q does not match resolved candidate %q and candidate rotation was not requested",
 			effectivePreferredID, effectiveResultID)
+	}
+	// A session-bound pin that is absent from the provider list with no
+	// surviving keeper is a genuinely dead release. With substitution refused
+	// the ranked-alternatives loop below would serve a different release under
+	// the session binding; refuse instead. The earlier guards only cover a pin
+	// whose release is still resolvable (preferred) or explicitly excluded, so
+	// without this a dead session pin silently swaps releases. When substitution
+	// is allowed (a confirmed rotation) the documented dead-pin fallback still
+	// runs, and a resolve with no session binding is unaffected.
+	sessionReleasePresent := sessionReleaseResolvable ||
+		(preferredCandidateID == "" && effectiveResultID != "" && candidateIDPresent(candidates, effectiveResultID))
+	if sessionBound && !allowSubstitution && effectiveResultID != "" && !pinBlocked && !sessionReleasePresent {
+		if s.logger != nil {
+			s.logger.WarnContext(ctx, "refusing to substitute a dead session-bound virtual candidate",
+				"candidate_id", effectiveResultID)
+		}
+		return ResolvedVirtualStream{}, fmt.Errorf("session-bound virtual candidate %q is no longer listed and candidate rotation was not requested", effectiveResultID)
 	}
 
 	ordered := orderCandidates(candidates, effectivePreferredID)

@@ -9310,3 +9310,255 @@ func TestPlaybackRoutingPolicySnapshotContextV3(t *testing.T) {
 		t.Fatalf("unsnapshotted policy = %#v, want current config", got)
 	}
 }
+
+// dedupSubtitleFileV3 builds a file whose second embedded track duplicates the
+// first. The published inventory suppresses the duplicate, so the surviving deu
+// track moves from source ordinal 3 down to published ordinal 2.
+func dedupSubtitleFileV3(id int) *models.MediaFile {
+	return &models.MediaFile{
+		ID:                id,
+		ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}},
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 10, Language: "fra", Codec: "subrip"},
+			{Index: 11, Language: "fra", Codec: "subrip"}, // duplicate of the fra track, suppressed
+			{Index: 12, Language: "deu", Codec: "subrip"},
+		},
+	}
+}
+
+// legacySubtitleFileV3 is the dense pre-de-duplication shape: published and
+// source ordinals agree.
+func legacySubtitleFileV3(id int) *models.MediaFile {
+	return &models.MediaFile{
+		ID:                id,
+		ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}},
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 10, Language: "fra", Codec: "subrip"},
+			{Index: 12, Language: "deu", Codec: "subrip"},
+		},
+	}
+}
+
+func TestClassifySubtitleIndexV3MapsPublishedOrdinals(t *testing.T) {
+	dedup := dedupSubtitleFileV3(1)
+	legacy := legacySubtitleFileV3(2)
+	tests := []struct {
+		name  string
+		file  *models.MediaFile
+		index int
+		want  subtitleIndexLocationV3
+	}{
+		{"dedup external", dedup, 0, subtitleIndexLocationV3{source: playback.SubtitleSourceExternalV3, offset: 0}},
+		{"dedup embedded before the suppressed track", dedup, 1, subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: 0}},
+		{"dedup embedded after the suppressed track maps to source 2", dedup, 2, subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: 2}},
+		{"dedup downloaded follows the published own count", dedup, 3, subtitleIndexLocationV3{source: playback.SubtitleSourceDownloadedV3, offset: 0}},
+		{"legacy external", legacy, 0, subtitleIndexLocationV3{source: playback.SubtitleSourceExternalV3, offset: 0}},
+		{"legacy first embedded", legacy, 1, subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: 0}},
+		{"legacy second embedded", legacy, 2, subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: 1}},
+		{"legacy downloaded", legacy, 3, subtitleIndexLocationV3{source: playback.SubtitleSourceDownloadedV3, offset: 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := classifySubtitleIndexV3(tt.file, tt.index)
+			if !ok {
+				t.Fatalf("classify(%d) = !ok", tt.index)
+			}
+			if got != tt.want {
+				t.Fatalf("classify(%d) = %#v, want %#v", tt.index, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAttachSubtitleArtifactV3ValidatesDeduplicatedEmbeddedSelection(t *testing.T) {
+	handler := &PlaybackHandler{}
+	file := dedupSubtitleFileV3(42)
+	// Published 2 names the deu track at source ordinal 3. The old
+	// selectedIndex-len(external) arithmetic would have checked source ordinal 1
+	// (the suppressed fra duplicate) and rejected the correct identity.
+	plan := &playback.PlanV3{
+		Delivery: playback.DeliveryOriginalHTTPV3,
+		Subtitle: playback.SubtitleDecisionV3{
+			Mode:      playback.SubtitleRenderV3,
+			Inventory: playback.BuildSubtitleInventoryV3(file, nil),
+			Embedded:  &playback.EmbeddedSubtitleV3{StreamIndex: 12, ContainerTrackID: "3"},
+			TrackID:   playback.TrackIDV3(file.ID, "subtitle", 2),
+		},
+	}
+	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-dedup-artifact", file, plan, 2, nil); err != nil {
+		t.Fatalf("published 2 must validate against the deu embedded track: %v", err)
+	}
+	if plan.Subtitle.Artifact != nil {
+		t.Fatal("an embedded render selection must not publish a sidecar artifact")
+	}
+
+	// The same published ordinal claiming the fra track's stream index must
+	// still be rejected: the mapping resolved the actual track, not just any
+	// in-range source slot.
+	mismatch := &playback.PlanV3{
+		Delivery: playback.DeliveryOriginalHTTPV3,
+		Subtitle: playback.SubtitleDecisionV3{
+			Mode:      playback.SubtitleRenderV3,
+			Inventory: playback.BuildSubtitleInventoryV3(file, nil),
+			Embedded:  &playback.EmbeddedSubtitleV3{StreamIndex: 10, ContainerTrackID: "0"},
+			TrackID:   playback.TrackIDV3(file.ID, "subtitle", 2),
+		},
+	}
+	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-dedup-artifact", file, mismatch, 2, nil); err == nil {
+		t.Fatal("a mismatched embedded identity was accepted")
+	}
+}
+
+func TestRemapSubtitleSelectionV3WritesTargetPublishedOrdinal(t *testing.T) {
+	t.Run("deduplicated own track", func(t *testing.T) {
+		source := dedupSubtitleFileV3(1)
+		target := dedupSubtitleFileV3(2)
+		target.SubtitleTracks[0].Index = 20
+		target.SubtitleTracks[1].Index = 21
+		target.SubtitleTracks[2].Index = 22
+		// Published 2 is the deu embedded track at source ordinal 3 on both
+		// files. A source-space read would pick the suppressed fra duplicate.
+		index := 2
+		request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(source.ID, "subtitle", index)}
+		if err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+			t.Fatalf("remap: %v", err)
+		}
+		if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 2 {
+			t.Fatalf("target published index = %v, want 2 (deu)", request.SubtitleTrackIndex)
+		}
+		if request.SubtitleTrackID != playback.TrackIDV3(target.ID, "subtitle", 2) {
+			t.Fatalf("target identity = %q, want published 2", request.SubtitleTrackID)
+		}
+	})
+
+	t.Run("deduplicated downloaded base", func(t *testing.T) {
+		source := &models.MediaFile{ID: 1, SubtitleTracks: []models.SubtitleTrack{
+			{Index: 10, Language: "fra", Codec: "subrip"},
+			{Index: 11, Language: "fra", Codec: "subrip"}, // suppressed, so own published is 1
+		}}
+		target := &models.MediaFile{ID: 2, SubtitleTracks: []models.SubtitleTrack{
+			{Index: 30, Language: "deu", Codec: "subrip"}, // own published is 1
+		}}
+		repo := downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+			source.ID: {
+				{ID: 71, MediaFileID: source.ID, Language: "fra", Format: subtitles.FormatSRT},
+				{ID: 72, MediaFileID: source.ID, Language: "deu", Format: subtitles.FormatSRT},
+			},
+			target.ID: {
+				{ID: 72, MediaFileID: target.ID, Language: "deu", Format: subtitles.FormatSRT},
+				{ID: 71, MediaFileID: target.ID, Language: "fra", Format: subtitles.FormatSRT},
+			},
+		}}
+		handler := &PlaybackHandler{SubtitleRepo: repo}
+		// Source own published is 1, so published 2 is the second downloaded row
+		// (ID 72). Target's own published base is 1, and ID 72 sits first there.
+		index := 2
+		request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(source.ID, "subtitle", index)}
+		if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+			t.Fatalf("remap: %v", err)
+		}
+		if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+			t.Fatalf("target published index = %v, want 1 (downloaded ID 72 after the own base)", request.SubtitleTrackIndex)
+		}
+	})
+
+	t.Run("legacy dense file keeps source ordinals", func(t *testing.T) {
+		source := legacySubtitleFileV3(1)
+		target := legacySubtitleFileV3(2)
+		index := 1
+		request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(source.ID, "subtitle", index)}
+		if err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+			t.Fatalf("remap: %v", err)
+		}
+		if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+			t.Fatalf("target index = %v, want 1 (unchanged dense ordinal)", request.SubtitleTrackIndex)
+		}
+	})
+}
+
+func TestPrepareRemoteTransportV3CarriesSourceFrameRateAndHeight(t *testing.T) {
+	var got transcodenode.TranscodeStartRequest
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/transcode/start" {
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Errorf("decode remote start: %v", err)
+			}
+			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{SessionID: got.SessionID, Status: "started", AudioRecipeVersion: got.AudioRecipeVersion})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer node.Close()
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	recipes := &recordingRecipeCardStoreV3{}
+	handler.NodeRecipeStore = recipes
+	result := remoteHLSResultV3()
+	result.SourceFrameRate = 23.976
+	result.SourceHeight = 2160
+
+	transport, transportErr := handler.prepareRemoteTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-source-cadence", UserID: 7, ProfileID: "profile-1"},
+		v3HandlerFixtureFile(t), result,
+		nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}},
+		preparedTimelineV3{},
+		headerAuthenticatedMediaV3([]string{playback.FeatureHeaderAuthenticatedMediaV3}),
+	)
+	if transportErr != nil {
+		t.Fatalf("prepare remote transport: %v", transportErr)
+	}
+	defer transport.rollback()
+
+	if got.SourceFrameRate != 23.976 || got.SourceHeight != 2160 {
+		t.Fatalf("remote request source facts = (%v, %d), want (23.976, 2160)", got.SourceFrameRate, got.SourceHeight)
+	}
+	card, ok := recipes.cards[transport.transportID]
+	if !ok {
+		t.Fatalf("no recipe stored under transport %q", transport.transportID)
+	}
+	if card.SourceFrameRate != 23.976 || card.SourceHeight != 2160 {
+		t.Fatalf("stored recipe source facts = (%v, %d), want (23.976, 2160)", card.SourceFrameRate, card.SourceHeight)
+	}
+}
+
+func TestPrepareLocalTransportV3CarriesSourceFrameRateAndHeight(t *testing.T) {
+	file := audioOrdinalFixtureFileV3(t)
+	transcodeDir := t.TempDir()
+	argsPath := filepath.Join(t.TempDir(), "source-cadence-args.txt")
+	ffmpegPath := writePlaybackArgsRecordingFFmpegV3(t, argsPath)
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: ffmpegPath, TranscodeDir: transcodeDir, TranscodeEnabled: true, HWAccel: playback.HWAccelNone}
+	}
+	result := audioOrdinalResultV3(0)
+	result.SourceFrameRate = 23.976
+	result.SourceHeight = 2160
+	transport, transportErr := handler.prepareLocalTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-source-cadence-local", UserID: 7, ProfileID: "profile-1"},
+		file, result, preparedTimelineV3{}, mediaAuthModeV3{},
+	)
+	if transportErr != nil {
+		t.Fatalf("prepare local transport: %v (cause: %v)", transportErr, transportErr.cause)
+	}
+	defer transport.rollback()
+
+	parsed, err := url.Parse(transport.url)
+	if err != nil {
+		t.Fatalf("parse local manifest url: %v", err)
+	}
+	token := parsed.Query().Get(streamTokenParam)
+	if token == "" {
+		t.Fatalf("local manifest url carries no stream token: %q", transport.url)
+	}
+	claims, err := streamtoken.Verify(token, handler.JWTSecret)
+	if err != nil {
+		t.Fatalf("verify local stream token: %v", err)
+	}
+	if claims.SourceFrameRate != 23.976 || claims.SourceHeight != 2160 {
+		t.Fatalf("local recipe source facts = (%v, %d), want (23.976, 2160)", claims.SourceFrameRate, claims.SourceHeight)
+	}
+}

@@ -158,7 +158,7 @@ func (r *ItemRepository) ReconcileCollectionVirtualLibraryLinks(ctx context.Cont
 		DELETE FROM media_files mf
 		USING reconcile_virtual_file_targets target
 		WHERE mf.id=target.id
-		  AND (target.target_exists OR target.target_rank>1)`)
+		  AND (target.target_exists OR target.target_rank>1)`+virtualFileRetentionGuard)
 	if err != nil {
 		return 0, 0, fmt.Errorf("remove duplicate collection virtual files: %w", err)
 	}
@@ -614,7 +614,7 @@ func (r *ItemRepository) CleanupRequestVirtualMedia(ctx context.Context, mediaTy
 		  AND NOT EXISTS (
 		      SELECT 1 FROM library_collection_items membership
 		      WHERE membership.media_item_id=target.content_id
-		  )`); err != nil {
+		  )`+virtualFileRetentionGuard); err != nil {
 		return fmt.Errorf("delete unshared request virtual files: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -649,7 +649,7 @@ func (r *ItemRepository) CleanupRequestVirtualMedia(ctx context.Context, mediaTy
 		  AND NOT EXISTS (
 		      SELECT 1 FROM library_collection_items lci
 		      WHERE lci.media_item_id=mi.content_id
-		  )`); err != nil {
+		  )`+virtualFileRetentionGuard); err != nil {
 		return fmt.Errorf("delete legacy request virtual files: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -688,7 +688,7 @@ func (r *ItemRepository) CleanupRequestVirtualMedia(ctx context.Context, mediaTy
 		WHERE mi.content_id IN (SELECT content_id FROM request_virtual_items)
 		  AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.content_id = mi.content_id)
 		  AND NOT EXISTS (SELECT 1 FROM library_collection_items lci WHERE lci.media_item_id = mi.content_id)
-		  AND NOT EXISTS (SELECT 1 FROM virtual_media_source_claims claim WHERE claim.content_id=mi.content_id)
+		  AND NOT EXISTS (SELECT 1 FROM virtual_media_source_claims claim WHERE claim.content_id=mi.content_id)`+virtualItemRetentionGuard+`
 		RETURNING mi.content_id`)
 	if err != nil {
 		return fmt.Errorf("delete request virtual media items: %w", err)
@@ -1854,7 +1854,7 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItemWithVariants(ctx context.
 		        AND claim.media_folder_id=mf.media_folder_id
 		        AND claim.file_path=mf.file_path
 		        AND claim.plugin_installation_id=mf.virtual_owner_installation_id
-		  )`, item.ContentID, folderID, desiredOwners, desiredPaths); err != nil {
+		  )`+virtualFileRetentionGuard, item.ContentID, folderID, desiredOwners, desiredPaths); err != nil {
 		return false, fmt.Errorf("removing stale collection virtual files: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -2467,7 +2467,7 @@ func (r *ItemRepository) ensureVirtualCollectionItemMaterializedTx(ctx context.C
 		        AND claim.media_folder_id = mf.media_folder_id
 		        AND claim.file_path = mf.file_path
 		        AND claim.plugin_installation_id = mf.virtual_owner_installation_id
-		  )`, item.ContentID, folderID, desiredOwners, desiredPaths, desiredFolders); err != nil {
+		  )`+virtualFileRetentionGuard, item.ContentID, folderID, desiredOwners, desiredPaths, desiredFolders); err != nil {
 		return nil, fmt.Errorf("removing stale collection virtual files: %w", err)
 	}
 
@@ -2592,7 +2592,7 @@ func (r *ItemRepository) CleanupUnreferencedCollectionVirtualItems(ctx context.C
 			        AND claim.content_id = mf.content_id
 			        AND claim.media_folder_id = mf.media_folder_id
 			        AND claim.file_path = mf.file_path
-			  )
+			  )`+virtualFileRetentionGuard+`
 			RETURNING content_id, media_folder_id
 		)
 		SELECT DISTINCT content_id, media_folder_id FROM removed`, candidateIDs); err != nil {
@@ -2645,7 +2645,7 @@ func (r *ItemRepository) CleanupUnreferencedCollectionVirtualItems(ctx context.C
 		  AND NOT EXISTS (
 		      SELECT 1 FROM virtual_media_source_claims claim
 		      WHERE claim.content_id = mi.content_id
-		  )
+		  )`+virtualItemRetentionGuard+`
 		RETURNING mi.content_id`, candidateIDs)
 	if err != nil {
 		return 0, fmt.Errorf("clean up candidate collection items: %w", err)
@@ -2908,7 +2908,7 @@ func (r *ItemRepository) CleanupLegacyUnscopedCollectionClaims(ctx context.Conte
 		        AND claim.content_id = mf.content_id
 		        AND claim.media_folder_id = mf.media_folder_id
 		        AND claim.file_path = mf.file_path
-		  )`); err != nil {
+		  )`+virtualFileRetentionGuard); err != nil {
 		return 0, fmt.Errorf("cleaning orphaned virtual files after legacy claim cleanup: %w", err)
 	}
 
@@ -2956,7 +2956,7 @@ func (r *ItemRepository) CleanupLegacyUnscopedCollectionClaims(ctx context.Conte
 		WHERE mi.content_id = ANY($1::text[])
 		  AND NOT EXISTS (SELECT 1 FROM library_collection_items lci WHERE lci.media_item_id = mi.content_id)
 		  AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.content_id = mi.content_id)
-		  AND NOT EXISTS (SELECT 1 FROM virtual_media_source_claims claim WHERE claim.content_id = mi.content_id)
+		  AND NOT EXISTS (SELECT 1 FROM virtual_media_source_claims claim WHERE claim.content_id = mi.content_id)`+virtualItemRetentionGuard+`
 		RETURNING mi.content_id`,
 		contentIDs)
 	if err != nil {
@@ -3732,7 +3732,7 @@ func cleanupStaleVirtualEpisodesTx(ctx context.Context, tx pgx.Tx, seriesID, col
 		        AND claim.content_id = mf.content_id
 		        AND claim.media_folder_id = mf.media_folder_id
 		        AND claim.file_path = mf.file_path
-		  )`,
+		  )`+virtualFileRetentionGuard,
 		seriesID, expectedOwners, expectedPaths, expectedFolders, collectionID); err != nil {
 		return fmt.Errorf("remove stale virtual episodes: %w", err)
 	}

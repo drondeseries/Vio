@@ -58,6 +58,64 @@ const (
 	reconcileImplausibleRemovalFloor = 5
 )
 
+// virtualItemRetentionGuard is a SQL predicate fragment, correlated to the
+// candidate media_items alias `mi`, that stops a background virtual-catalog
+// sweep from deleting an item that still has user-visible state. Watch history
+// and watch progress reference content by bare ID with no foreign key, so a
+// delete silently strands Continue Watching/history rows the client then 404s
+// and refetches in a loop. Open abs sessions and unexpired protocol-v3 attempts
+// are live playback state. Embed the fragment inside the DELETE so the check and
+// the delete are one statement, rather than a separate read that a concurrent
+// insert could overtake. The last_file_id correlation only sees surviving files,
+// so the file sweep must carry the matching reference in
+// virtualFileRetentionGuard.
+const virtualItemRetentionGuard = `
+	  AND NOT EXISTS (SELECT 1 FROM user_watch_history uwh WHERE uwh.media_item_id = mi.content_id)
+	  AND NOT EXISTS (
+	      SELECT 1 FROM user_watch_progress uwp
+	      WHERE uwp.media_item_id = mi.content_id
+	         OR uwp.last_file_id IN (SELECT mf.id FROM media_files mf WHERE mf.content_id = mi.content_id)
+	  )
+	  AND NOT EXISTS (
+	      SELECT 1 FROM abs_playback_sessions aps
+	      WHERE aps.content_id = mi.content_id AND aps.closed_at IS NULL
+	  )
+	  AND NOT EXISTS (
+	      SELECT 1 FROM playback_v3_attempts pva
+	      WHERE pva.expires_at > NOW()
+	        AND (pva.effective_media_file_id IN (SELECT mf.id FROM media_files mf WHERE mf.content_id = mi.content_id)
+	          OR pva.requested_media_file_id IN (SELECT mf.id FROM media_files mf WHERE mf.content_id = mi.content_id))
+	  )`
+
+// virtualFileRetentionGuard is a SQL predicate fragment, correlated to the
+// candidate media_files alias `mf`, that stops a virtual file delete from
+// destroying live playback or the user's last-played version. playback_v3_attempts
+// has ON DELETE CASCADE foreign keys to media_files, so without this a file
+// sweep would destroy the live attempt before the item-level guard could observe
+// it. An open abs_playback_sessions row references its file with ON DELETE SET
+// NULL, so deleting the row silently strips a live session's file identity. A
+// stale candidate that is still user_watch_progress.last_file_id is retained so
+// a known-working version does not vanish when the provider re-lists with new
+// result ids — the same retention the scanner applies in
+// ReplaceVirtualCandidates. This is what makes the last_file_id case in
+// virtualItemRetentionGuard effective: the file sweep runs before the item
+// delete, so without the file-level guard the item-level subquery would already
+// be looking at a deleted row. Embedding it in the DELETE keeps the check and
+// the delete in one statement so a concurrent insert cannot race it.
+const virtualFileRetentionGuard = `
+	  AND NOT EXISTS (
+	      SELECT 1 FROM user_watch_progress uwp WHERE uwp.last_file_id = mf.id
+	  )
+	  AND NOT EXISTS (
+	      SELECT 1 FROM abs_playback_sessions aps
+	      WHERE aps.media_file_id = mf.id AND aps.closed_at IS NULL
+	  )
+	  AND NOT EXISTS (
+	      SELECT 1 FROM playback_v3_attempts pva
+	      WHERE pva.expires_at > NOW()
+	        AND (pva.effective_media_file_id = mf.id OR pva.requested_media_file_id = mf.id)
+	  )`
+
 var (
 	virtualPathSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	imdbIDPattern             = regexp.MustCompile(`^tt[0-9]{1,16}$`)
@@ -590,7 +648,7 @@ func syncVirtualFileSourceClaims(ctx context.Context, tx pgx.Tx, installationID 
 				  AND vmfsc.content_id=$1
 				  AND vmfsc.media_folder_id=$2
 				  AND vmfsc.file_path=mf.file_path
-			  )`, contentID, folderID, deletedPaths, installationID); err != nil {
+			  )`+virtualFileRetentionGuard, contentID, folderID, deletedPaths, installationID); err != nil {
 			return fmt.Errorf("remove stale virtual media files: %w", err)
 		}
 	}
@@ -758,7 +816,7 @@ func (r *VirtualMediaRegistrar) reconcileVirtualMedia(ctx context.Context, insta
 			  AND remaining.content_id=stale.content_id
 			  AND remaining.media_folder_id=stale.media_folder_id
 			  AND remaining.file_path=stale.file_path
-		  )`)
+		  )`+virtualFileRetentionGuard)
 	if err != nil {
 		return result, fmt.Errorf("delete unclaimed virtual files: %w", err)
 	}
@@ -827,7 +885,7 @@ func (r *VirtualMediaRegistrar) reconcileVirtualMedia(ctx context.Context, insta
 		  AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.content_id = mi.content_id)
 		  AND NOT EXISTS (SELECT 1 FROM library_collection_items lci WHERE lci.media_item_id = mi.content_id)
 		  AND NOT EXISTS (SELECT 1 FROM virtual_media_source_claims vmsc WHERE vmsc.content_id=mi.content_id)
-		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)
+		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)`+virtualItemRetentionGuard+`
 		RETURNING mi.content_id`)
 	if err != nil {
 		return result, fmt.Errorf("delete stale virtual media: %w", err)
@@ -1002,7 +1060,7 @@ func RemoveVirtualMediaInstallation(ctx context.Context, tx pgx.Tx, installation
 		  AND NOT EXISTS (
 			SELECT 1 FROM retained_virtual_files retained
 			WHERE retained.id=mf.id
-		)`)
+		)`+virtualFileRetentionGuard)
 	if err != nil {
 		return result, fmt.Errorf("delete unclaimed virtual files: %w", err)
 	}
@@ -1093,7 +1151,7 @@ func RemoveVirtualMediaInstallation(ctx context.Context, tx pgx.Tx, installation
 		        AND vmsc.owns_item_metadata
 		        AND vmsc.plugin_installation_id<>$1
 		  )
-		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)
+		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)`+virtualItemRetentionGuard+`
 		RETURNING mi.content_id`, installationID)
 	if err != nil {
 		return result, fmt.Errorf("delete orphaned virtual media items: %w", err)
@@ -1764,14 +1822,14 @@ func adoptVirtualFileRow(ctx context.Context, tx pgx.Tx, contentID, episodeID st
 // an adoption, so superseded hashes don't linger as phantom versions.
 func dropVirtualSiblingRows(ctx context.Context, tx pgx.Tx, contentID, episodeID string, folderID, installationID, keepID int, neutralURI, editionLabel string) {
 	_, _ = tx.Exec(ctx, `
-		DELETE FROM media_files
-		WHERE content_id=$1
-		  AND COALESCE(episode_id,'') = COALESCE(NULLIF($2,''),'')
-		  AND virtual_owner_installation_id=$3
-		  AND media_folder_id=$4
-		  AND id <> $5
-		  AND regexp_replace(file_path, '[?&]result=[^&]*', '', 'g') = $6
-		  AND COALESCE(edition_raw,'') = $7`,
+		DELETE FROM media_files mf
+		WHERE mf.content_id=$1
+		  AND COALESCE(mf.episode_id,'') = COALESCE(NULLIF($2,''),'')
+		  AND mf.virtual_owner_installation_id=$3
+		  AND mf.media_folder_id=$4
+		  AND mf.id <> $5
+		  AND regexp_replace(mf.file_path, '[?&]result=[^&]*', '', 'g') = $6
+		  AND COALESCE(mf.edition_raw,'') = $7`+virtualFileRetentionGuard,
 		contentID, episodeID, installationID, folderID, keepID, neutralURI, editionLabel)
 }
 

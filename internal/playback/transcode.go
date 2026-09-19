@@ -90,9 +90,13 @@ type TranscodeOpts struct {
 	StreamOriginSeconds float64
 	// CopySeekAnchorResolved distinguishes a valid zero-second origin from
 	// older/shared recipes that never resolved a copy seek anchor.
-	CopySeekAnchorResolved  bool
-	TargetResolution        string // e.g., 1080p, 720p
-	ToneMapHDRToSDR         bool
+	CopySeekAnchorResolved bool
+	TargetResolution       string // e.g., 1080p, 720p
+	// SourceFrameRate and SourceHeight are the probed source video facts a
+	// forced encode needs to derive a frame-accurate GOP and to skip a no-op
+	// scale. Zero is the historical 30 fps / unknown-height fallback.
+	SourceFrameRate         float64
+	SourceHeight            int
 	TargetCodecVideo        string // e.g., h264 (or hevc if allowed)
 	TargetCodecAudio        string // e.g., aac
 	SegmentDuration         int    // seconds, default 6
@@ -387,6 +391,26 @@ const (
 // ManifestStartupTimeout is the maximum wait for FFmpeg's first safe playback
 // window before the caller reports a retryable startup timeout.
 const ManifestStartupTimeout = 30 * time.Second
+
+// ManifestStartupBurnInTimeout is the longer first-window budget for a plan
+// that composites a subtitle into the video. Burn-in runs extra filter work
+// (libass rendering, bitmap overlay, and usually a tone-map) before the first
+// segment can be muxed, so a slow-but-progressing burn-in must not be read as
+// a dead release at the ordinary budget. It is deliberately bounded, not
+// unbounded: a burn-in that truly produced nothing still reports a
+// subtitle-local failure rather than rotating the release.
+const ManifestStartupBurnInTimeout = 90 * time.Second
+
+// ManifestStartupTimeoutFor returns the first-window budget for a session.
+// A burn-in session gets the longer budget so a slow-but-progressing subtitle
+// composite is not reclassified as a transport failure; every other plan keeps
+// the historical timeout, so video-failure startup behavior is unchanged.
+func ManifestStartupTimeoutFor(opts TranscodeOpts) time.Duration {
+	if opts.SubtitleBurnIn && opts.SubtitleTrackIndex >= 0 {
+		return ManifestStartupBurnInTimeout
+	}
+	return ManifestStartupTimeout
+}
 
 const (
 	maxSequentialMissingSegments = 2
@@ -991,9 +1015,6 @@ func resolveEffectiveTranscodeHWAccel(opts TranscodeOpts) string {
 }
 
 func resolveEffectiveTranscodeHWAccelContext(ctx context.Context, opts TranscodeOpts) string {
-	if opts.ToneMapHDRToSDR && opts.SubtitleBurnIn {
-		return "none"
-	}
 	// The device goes with the backend: resolution probes it, so a host whose
 	// first render node belongs to another vendor is not verified on hardware
 	// the transcode will never open.
@@ -1045,6 +1066,45 @@ func bitmapBurnInActive(opts TranscodeOpts) bool {
 		opts.SubtitleTrackIndex >= 0 &&
 		NeedsBurnIn(opts.SubtitleCodec) &&
 		!strings.EqualFold(opts.TargetCodecVideo, "copy")
+}
+
+// burnInEncodeActive reports whether this transcode encodes video while
+// compositing a subtitle. Unlike bitmapBurnInActive it also covers text
+// burn-in, because both paths share the realtime-sensitive quality-based rate
+// control.
+func burnInEncodeActive(opts TranscodeOpts) bool {
+	return opts.SubtitleBurnIn &&
+		opts.SubtitleTrackIndex >= 0 &&
+		!strings.EqualFold(opts.TargetCodecVideo, "copy")
+}
+
+// burnInPeakCapKbps is the hard peak bitrate ceiling for a burn-in encode. It
+// is keyed by output resolution rather than the requested target bitrate so a
+// source-preserving encode can never run at the source bitrate.
+func burnInPeakCapKbps(opts TranscodeOpts) int {
+	switch resolutionHeightV3(opts.TargetResolution) {
+	case 2160:
+		return 40_000
+	case 1080:
+		return 10_000
+	case 720:
+		return 4_000
+	}
+	return opts.TargetBitrateKbps
+}
+
+// burnInPeakCapArgs emits the peak cap shared by every hardware burn-in
+// encoder. It never emits -b:v: the quantizer drives quality, and -maxrate is a
+// ceiling only.
+func burnInPeakCapArgs(opts TranscodeOpts) []string {
+	capKbps := burnInPeakCapKbps(opts)
+	if capKbps <= 0 {
+		return nil
+	}
+	return []string{
+		"-maxrate", fmt.Sprintf("%dk", capKbps),
+		"-bufsize", fmt.Sprintf("%dk", capKbps*2),
+	}
 }
 
 // appendStreamSelectionArgs limits output to primary video/audio streams.
@@ -1133,6 +1193,25 @@ func appendTimestampNormalizationArgs(args []string, opts TranscodeOpts) []strin
 	)
 }
 
+// framesPerSegment is the GOP length that makes one segment an integer number
+// of source frames. The historical 30 fps ceiling is used when the source rate
+// is unknown, so zero-valued legacy recipes keep their old GOP.
+func framesPerSegment(opts TranscodeOpts) int {
+	fps := opts.SourceFrameRate
+	if fps <= 0 || math.IsNaN(fps) || math.IsInf(fps, 0) {
+		fps = 30
+	}
+	segmentDuration := opts.SegmentDuration
+	if segmentDuration <= 0 {
+		segmentDuration = defaultSegmentDuration
+	}
+	frames := int(math.Round(fps * float64(segmentDuration)))
+	if frames < 1 {
+		frames = segmentDuration
+	}
+	return frames
+}
+
 // appendSegmentBoundaryArgs forces keyframes on segment boundaries so each HLS
 // fragment starts cleanly and can be appended independently by the player.
 //
@@ -1148,12 +1227,13 @@ func appendSegmentBoundaryArgs(args []string, opts TranscodeOpts) []string {
 
 	// Hardware encoders (QSV, VAAPI, NVENC, VideoToolbox) may not reliably
 	// honor force_key_frames expressions. Set explicit GOP size so segment
-	// boundaries always start with an intra frame. We assume 30 fps as a
-	// safe ceiling — the GOP will be at most segmentDuration * 30 frames.
-	// Matches Jellyfin's approach for hardware encoders.
+	// boundaries always start with an intra frame. Derive it from the real
+	// source frame rate so a 23.976 fps source gets a 2.0 s GOP instead of the
+	// 30 fps ceiling's 2.5 s fragments. Unknown rates keep the historical 30 fps
+	// assumption.
 	if opts.HWAccel == transcodeHWQSV || opts.HWAccel == transcodeHWVAAPI ||
 		opts.HWAccel == transcodeHWNVENC || opts.HWAccel == transcodeHWVideoToolbox {
-		gopSize := fmt.Sprintf("%d", opts.SegmentDuration*30)
+		gopSize := fmt.Sprintf("%d", framesPerSegment(opts))
 		args = append(args, "-g", gopSize, "-keyint_min", gopSize)
 	}
 	// QSV otherwise encodes force_key_frames requests as non-IDR intra frames.
@@ -1253,17 +1333,29 @@ func appendVideoArgs(args []string, opts TranscodeOpts) []string {
 	preset := videoPreset(opts, opts.HWAccel)
 	hasBitrateCap := opts.TargetBitrateKbps > 0
 
+	burnInEncode := burnInEncodeActive(opts)
+
 	switch {
-	case opts.ToneMapHDRToSDR && (opts.HWAccel == "qsv" || opts.HWAccel == "vaapi") && codec == transcodeCodecH264:
-		// The tone-map pipeline runs in the VAAPI domain even when the session
-		// selected QSV: tonemap_vaapi and h264_vaapi operate on VAAPI frames
-		// (see appendHWAccelArgs/hdrToSDRFilter).
+	// A burn-in encode composites subtitles (and usually a tone-map) on top of
+	// the encode, so the encode itself must stay light. Use quality-based rate
+	// control with a hard peak cap instead of CBR at the target bitrate: a CBR
+	// encode at a source-class rung still burns the encoder trying to hit it.
+	case burnInEncode && opts.HWAccel == transcodeHWQSV && codec == transcodeCodecH264:
+		args = append(args, "-c:v", "h264_qsv", "-preset", preset, "-global_quality", "23", "-look_ahead", "0")
+		args = append(args, burnInPeakCapArgs(opts)...)
+	case burnInEncode && opts.HWAccel == transcodeHWQSV && codec == transcodeCodecHEVC:
+		args = append(args, "-c:v", "hevc_qsv", "-preset", preset, "-global_quality", "26", "-look_ahead", "0")
+		args = append(args, burnInPeakCapArgs(opts)...)
+	case burnInEncode && opts.HWAccel == transcodeHWQSV && codec == transcodeCodecAV1:
+		// AV1 is the burn-in last resort: loosest quantizer, no look-ahead.
+		args = append(args, "-c:v", "av1_qsv", "-preset", preset, "-global_quality", "30")
+		args = append(args, burnInPeakCapArgs(opts)...)
+	case burnInEncode && opts.HWAccel == transcodeHWVAAPI && codec == transcodeCodecH264:
 		args = append(args, "-c:v", "h264_vaapi", "-qp", "23")
-		if hasBitrateCap {
-			args = append(args,
-				"-maxrate", fmt.Sprintf("%dk", opts.TargetBitrateKbps),
-				"-bufsize", fmt.Sprintf("%dk", opts.TargetBitrateKbps*2))
-		}
+		args = append(args, burnInPeakCapArgs(opts)...)
+	case burnInEncode && opts.HWAccel == transcodeHWVAAPI && codec == transcodeCodecHEVC:
+		args = append(args, "-c:v", "hevc_vaapi", "-qp", "26")
+		args = append(args, burnInPeakCapArgs(opts)...)
 	case opts.HWAccel == "qsv" && codec == transcodeCodecH264:
 		if hasBitrateCap {
 			// VBR mode with bitrate cap instead of global_quality.
@@ -1541,9 +1633,11 @@ func appendToneMappedBitmapSubtitleArgs(args []string, opts TranscodeOpts) []str
 
 	switch opts.HWAccel {
 	case transcodeHWQSV:
+		// The subtitle overlay stays after the tone-map: bitmap subtitle planes
+		// are SDR and must not be converted as if they were HDR.
 		graph = "[0:v:0]" + softwareToneMapUploadFilter(opts) + tonemap.QSVFilter(opts.ToneMapSourceKind) + "[vmain];" +
 			subInput + "format=bgra,hwupload[sub];[vmain][sub]overlay_vaapi=eof_action=pass," +
-			qsvToneMapScaleFilter(opts.TargetResolution) + "," + tonemap.HDRMetadataRemovalFilter() + "[vout]"
+			qsvToneMapTailFilter(opts) + "," + tonemap.HDRMetadataRemovalFilter() + "[vout]"
 	case transcodeHWVAAPI:
 		graph = "[0:v:0]" + softwareToneMapUploadFilter(opts) + tonemap.VAAPIFilter(opts.ToneMapSourceKind) + "[vmain];" +
 			subInput + "format=bgra,hwupload[sub];[vmain][sub]overlay_vaapi=eof_action=pass," +
@@ -1906,7 +2000,10 @@ func qsvScaleFilterWithMapMode(res, mapMode string) string {
 	}
 	switch res {
 	case "2160p":
-		return "scale_vaapi=w=-2:h=2160:format=nv12," + hwmap + ",format=qsv"
+		// min(2160,ih) mirrors vaapiScaleFilter: a 2160p target must not
+		// upscale a shorter source (for example a 1440p version) that reached
+		// this path without the planner's source-height clamp.
+		return "scale_vaapi=w=-2:h=min(2160\\,ih):format=nv12," + hwmap + ",format=qsv"
 	case "1080p":
 		return "scale_vaapi=w=-2:h=1080:format=nv12," + hwmap + ",format=qsv"
 	case "720p":
@@ -1929,6 +2026,19 @@ func qsvToneMapScaleFilter(res string) string {
 	return qsvScaleFilterWithMapMode(res, "read+write")
 }
 
+// qsvToneMapTailFilter maps VAAPI tone-map output onto the QSV encoder device.
+// When the target height is not below the source height the full-frame
+// scale_vaapi is a no-op, so a map-only tail avoids one shader pass over every
+// frame. A real reduction keeps the scale. Unknown dimensions keep the
+// established filter so no driver interop step is skipped blindly.
+func qsvToneMapTailFilter(opts TranscodeOpts) string {
+	targetHeight := resolutionHeightV3(opts.TargetResolution)
+	if targetHeight > 0 && opts.SourceHeight > 0 && targetHeight >= opts.SourceHeight {
+		return "hwmap=derive_device=qsv:mode=read+write,format=qsv"
+	}
+	return qsvToneMapScaleFilter(opts.TargetResolution)
+}
+
 // qsvVPPInputScaleFilter scales frames already mapped to the QSV device with
 // the media-engine VPP scaler. Width must use -1 rather than -2: the iHD driver
 // rejects any auto-width below -1 ("Size values less than -1 are not
@@ -1936,7 +2046,7 @@ func qsvToneMapScaleFilter(res string) string {
 func qsvVPPInputScaleFilter(res string) string {
 	switch res {
 	case "2160p":
-		return "vpp_qsv=w=-1:h=2160:format=nv12"
+		return "vpp_qsv=w=-1:h=min(2160\\,ih):format=nv12"
 	case "1080p":
 		return "vpp_qsv=w=-1:h=1080:format=nv12"
 	case "720p":
@@ -2821,7 +2931,12 @@ func (s *TranscodeSession) GenerateFullManifest(segPrefix, rawQuery string) []by
 	buf.WriteString("#EXTM3U\n")
 	buf.WriteString(fmt.Sprintf("#EXT-X-VERSION:%d\n", hlsVersion))
 	buf.WriteString(queryDefinition)
-	buf.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", segDur))
+	// Target duration is the maximum segment duration rounded to the nearest
+	// integer. A frame-accurate GOP can slightly exceed the nominal segment
+	// length (23.976 fps * 2 s rounds to 48 frames = 2.002 s), so advertise
+	// SegDuration+1. EXTINF keeps the nominal duration and segment indexing is
+	// unchanged.
+	buf.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", segDur+1))
 	buf.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 	buf.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 

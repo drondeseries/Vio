@@ -603,6 +603,38 @@ func TestResolveDetailedDeadPinStillFallsBack(t *testing.T) {
 	}
 }
 
+// TestResolveDetailedSessionBoundDeadPinRefusesWithoutRotation proves the
+// session-binding guard covers a genuinely dead pin: a session-bound pin absent
+// from the provider list with no keeper must not fall through to a sibling
+// release when substitution was not declared, while declaring substitution
+// still recovers through the dead-pin fallback and a fresh (unbound) resolve is
+// unchanged.
+func TestResolveDetailedSessionBoundDeadPinRefusesWithoutRotation(t *testing.T) {
+	svc, _, _, otherID := collapsedPinFixture(t)
+	ctx := context.Background()
+	const deadPin = "ffffffffffffffffffffffff"
+
+	if _, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+deadPin, false, nil, deadPin, true, false); err == nil {
+		t.Fatal("expected refusal for a session-bound dead pin without declared rotation")
+	}
+	rotated, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+deadPin, false, nil, deadPin, true, true)
+	if err != nil {
+		t.Fatalf("declared-rotation dead-pin resolve: %v", err)
+	}
+	if rotated.CandidateID != otherID {
+		t.Fatalf("declared-rotation dead pin resolved to %q, want %q", rotated.CandidateID, otherID)
+	}
+	// A fresh (unbound) dead pin still falls back without substitution, so a
+	// genuinely unavailable provider still recovers on a new selection.
+	fresh, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+deadPin, false, nil, "", false, false)
+	if err != nil {
+		t.Fatalf("fresh dead-pin resolve: %v", err)
+	}
+	if fresh.CandidateID != otherID {
+		t.Fatalf("fresh dead pin resolved to %q, want %q", fresh.CandidateID, otherID)
+	}
+}
+
 // TestResolveDetailedRefusesDifferentReleaseForSessionPin reproduces the
 // handler's per-candidate shape: the session pinned variant A of release X
 // (dedup collapsed A -> keeper B) and the request's resultID names a

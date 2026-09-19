@@ -2007,6 +2007,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 						audioIndex = subtitleMissAudioIndex
 						result = degradeResult
 						toneMapCapabilityErr = degradeToneMapErr
+						annotateSubtitleDroppedV3(&result)
 					}
 				}
 			}
@@ -2742,6 +2743,14 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 				// rotating to another delivery shape would only re-encode the
 				// same undecodable bytes. Surface it immediately so the start or
 				// replan rotation loop can substitute a provider candidate.
+				return preparedTransportV3{}, transportErr
+			}
+			if transportErr.reason == subtitleUnavailableReasonV3 {
+				// A subtitle-local failure is not a route problem: every other
+				// shape or node would run the same release and prepare the same
+				// subtitle. Surface it unchanged so the release and the
+				// subtitle decision stay with the caller; never route around it
+				// into a different delivery.
 				return preparedTransportV3{}, transportErr
 			}
 			lastErr = combineTransportErrorsV3(lastErr, transportErr)
@@ -4148,6 +4157,8 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 		SourceVideoProfile:               sourceProfile,
 		SourceVideoBitDepth:              sourceBitDepth,
 		SourceAudioChannels:              result.SourceAudioChannels,
+		SourceFrameRate:                  result.SourceFrameRate,
+		SourceHeight:                     result.SourceHeight,
 		SoftwareVideoDecode:              sourceMetadata.SoftwareVideoDecode,
 		ToneMapPolicy:                    result.ToneMapPolicy,
 		ToneMapMode:                      result.ToneMapMode,
@@ -4221,7 +4232,7 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to start the playback transport.", retryable: false, cause: startupFailure.cause}
 	}
 	if startupFailure != nil {
-		transportErr := manifestStartupTransportErrorV3(startupFailure.wasRunning, startupFailure.cause)
+		transportErr := localTransportReadinessErrorV3(opts, startupFailure.wasRunning, startupFailure.cause)
 		if usedToneMapFallback {
 			unlock()
 			return preparedTransportV3{}, transportErr
@@ -4241,7 +4252,7 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			}
 			if startupFailure != nil {
 				unlock()
-				return preparedTransportV3{}, manifestStartupTransportErrorV3(startupFailure.wasRunning, startupFailure.cause)
+				return preparedTransportV3{}, localTransportReadinessErrorV3(opts, startupFailure.wasRunning, startupFailure.cause)
 			}
 		} else if startupFailure.wasRunning {
 			unlock()
@@ -4274,7 +4285,7 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			}
 			if startupFailure != nil {
 				unlock()
-				return preparedTransportV3{}, manifestStartupTransportErrorV3(startupFailure.wasRunning, startupFailure.cause)
+				return preparedTransportV3{}, localTransportReadinessErrorV3(retryOpts, startupFailure.wasRunning, startupFailure.cause)
 			}
 		}
 	}
@@ -4375,6 +4386,24 @@ func manifestStartupTransportErrorV3(running bool, cause error) *transportErrorV
 	return &transportErrorV3{reason: transcodeStartFailedReasonV3, message: message, retryable: running, cause: cause}
 }
 
+// localTransportReadinessErrorV3 classifies a local first-window timeout. A
+// plan that burns in a subtitle and whose FFmpeg is still running is slow, not
+// dead: a generic transcode_start_failed would let the start/replan candidate
+// machinery substitute another release for a subtitle problem. It is reported
+// as the subtitle-local reason instead, so the release is unchanged and the
+// client gets a clear subtitle outcome.
+func localTransportReadinessErrorV3(opts playback.TranscodeOpts, running bool, cause error) *transportErrorV3 {
+	if running && opts.SubtitleBurnIn && opts.SubtitleTrackIndex >= 0 {
+		return &transportErrorV3{
+			reason:    subtitleUnavailableReasonV3,
+			message:   "The selected subtitle could not be prepared in time on this release; retry, or start with subtitles off. The video release is unchanged.",
+			retryable: true,
+			cause:     cause,
+		}
+	}
+	return manifestStartupTransportErrorV3(running, cause)
+}
+
 func toneMapExecutionTransportErrorV3(cause error, message string) *transportErrorV3 {
 	return &transportErrorV3{
 		reason:    transcodeStartFailedReasonV3,
@@ -4424,7 +4453,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 			hwAccel = playback.HWAccelNone
 		}
 	}
-	req := transcodenode.TranscodeStartRequest{SessionID: transportID, InputPath: file.FilePath, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, HWAccel: hwAccel, AudioTrackIndex: audioStreamOrdinalV3(file, plannedAudioTrackIndexV3(result, session.AudioTrackIndex)), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, TotalDuration: sourceMetadata.DurationSeconds, RequireReady: true}
+	req := transcodenode.TranscodeStartRequest{SessionID: transportID, InputPath: file.FilePath, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SourceFrameRate: result.SourceFrameRate, SourceHeight: result.SourceHeight, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, HWAccel: hwAccel, AudioTrackIndex: audioStreamOrdinalV3(file, plannedAudioTrackIndexV3(result, session.AudioTrackIndex)), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, TotalDuration: sourceMetadata.DurationSeconds, RequireReady: true}
 	req.ThrottleSeconds = playback.ConfiguredTranscodeThrottleSeconds(r.Context(), h.SettingsRepo)
 	if strings.EqualFold(videoCodec, "copy") {
 		req.CopyFMP4RecipeVersion = playback.CopyFMP4RecipeVersion
@@ -4614,7 +4643,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 // not part of the node's request/response contract, so the caller supplies it.
 func remoteTranscodeRecipeCardV3(session *playback.Session, file *models.MediaFile, nodeURL, transportID string, req transcodenode.TranscodeStartRequest, nodeResp transcodenode.TranscodeStartResponse, toneMapFilter string) playback.RecipeCard {
 	hw := firstNonEmptyHandlerV3(strings.TrimSpace(nodeResp.HWAccel), strings.TrimSpace(req.HWAccel))
-	card := playback.NewRecipeCard(session.UserID, session.ProfileID, file.ID, nodeURL, playback.TranscodeOpts{InputPath: req.InputPath, SessionID: session.ID, TranscodeTransportID: transportID, SourceVideoCodec: req.SourceVideoCodec, SourceVideoProfile: req.SourceVideoProfile, SourceVideoBitDepth: req.SourceVideoBitDepth, SourceAudioChannels: req.SourceAudioChannels, SoftwareVideoDecode: req.SoftwareVideoDecode, ToneMapPolicy: req.ToneMapPolicy, ToneMapMode: req.ToneMapMode, ToneMapSourceKind: req.ToneMapSourceKind, ToneMapFilter: toneMapFilter, ToneMapRecipeVersion: req.ToneMapRecipeVersion, ToneMapPreflightRequired: req.ToneMapPreflightRequired, ToneMapSourceRevision: req.ToneMapSourceRevision, VideoBitstreamFilter: req.VideoBitstreamFilter, VideoSampleEntry: req.VideoSampleEntry, SeekSeconds: req.SeekSeconds, StreamOriginSeconds: req.StreamOriginSeconds, CopySeekAnchorResolved: req.CopySeekAnchorResolved, StartSegmentNumber: req.StartSegmentNumber, TargetResolution: req.TargetResolution, TargetCodecVideo: req.TargetCodecVideo, TargetCodecAudio: req.TargetCodecAudio, TargetAudioChannels: req.TargetAudioChannels, TargetAudioBitrateKbps: req.TargetAudioBitrateKbps, TargetBitrateKbps: req.TargetBitrateKbps, SegmentDuration: req.SegmentDuration, HWAccel: hw, AudioTrackIndex: req.AudioTrackIndex, SubtitleTrackIndex: req.SubtitleTrackIndex, SubtitleBurnIn: req.SubtitleBurnIn, SubtitleCodec: req.SubtitleCodec, TotalDuration: req.TotalDuration, ThrottleSeconds: req.ThrottleSeconds})
+	card := playback.NewRecipeCard(session.UserID, session.ProfileID, file.ID, nodeURL, playback.TranscodeOpts{InputPath: req.InputPath, SessionID: session.ID, TranscodeTransportID: transportID, SourceVideoCodec: req.SourceVideoCodec, SourceVideoProfile: req.SourceVideoProfile, SourceVideoBitDepth: req.SourceVideoBitDepth, SourceAudioChannels: req.SourceAudioChannels, SourceFrameRate: req.SourceFrameRate, SourceHeight: req.SourceHeight, SoftwareVideoDecode: req.SoftwareVideoDecode, ToneMapPolicy: req.ToneMapPolicy, ToneMapMode: req.ToneMapMode, ToneMapSourceKind: req.ToneMapSourceKind, ToneMapFilter: toneMapFilter, ToneMapRecipeVersion: req.ToneMapRecipeVersion, ToneMapPreflightRequired: req.ToneMapPreflightRequired, ToneMapSourceRevision: req.ToneMapSourceRevision, VideoBitstreamFilter: req.VideoBitstreamFilter, VideoSampleEntry: req.VideoSampleEntry, SeekSeconds: req.SeekSeconds, StreamOriginSeconds: req.StreamOriginSeconds, CopySeekAnchorResolved: req.CopySeekAnchorResolved, StartSegmentNumber: req.StartSegmentNumber, TargetResolution: req.TargetResolution, TargetCodecVideo: req.TargetCodecVideo, TargetCodecAudio: req.TargetCodecAudio, TargetAudioChannels: req.TargetAudioChannels, TargetAudioBitrateKbps: req.TargetAudioBitrateKbps, TargetBitrateKbps: req.TargetBitrateKbps, SegmentDuration: req.SegmentDuration, HWAccel: hw, AudioTrackIndex: req.AudioTrackIndex, SubtitleTrackIndex: req.SubtitleTrackIndex, SubtitleBurnIn: req.SubtitleBurnIn, SubtitleCodec: req.SubtitleCodec, TotalDuration: req.TotalDuration, ThrottleSeconds: req.ThrottleSeconds})
 	card.ToneMapDVConfigPresent = req.ToneMapDVConfigPresent
 	card.ToneMapDVBLCompatIDPresent = req.ToneMapDVBLCompatIDPresent
 	card.ToneMapDVBLPresent = req.ToneMapDVBLPresent
@@ -5087,7 +5116,13 @@ func (h *PlaybackHandler) attachSubtitleArtifactV3(ctx context.Context, sessionI
 		if plan.Delivery != playback.DeliveryOriginalHTTPV3 || plan.Subtitle.Mode != playback.SubtitleRenderV3 || !ok || item.Source != playback.SubtitleSourceEmbeddedV3 || item.TrackID != plan.Subtitle.TrackID {
 			return errors.New("invalid embedded subtitle route")
 		}
-		ordinal := selectedIndex - len(file.ExternalSubtitles)
+		// selectedIndex is a published ordinal; the underlying container track
+		// lives at the source ordinal the de-duplication assigns it.
+		sourceIndex, mapped := playback.SubtitleInventoryOwnSourceIndexV3(file, selectedIndex)
+		if !mapped {
+			return errors.New("the selected embedded subtitle identity changed")
+		}
+		ordinal := sourceIndex - len(file.ExternalSubtitles)
 		if ordinal < 0 || ordinal >= len(file.SubtitleTracks) || file.SubtitleTracks[ordinal].Index != embedded.StreamIndex || file.SubtitleTracks[ordinal].ContainerTrackID != embedded.ContainerTrackID {
 			return errors.New("the selected embedded subtitle identity changed")
 		}
@@ -5498,6 +5533,22 @@ func (e *candidateErrorV3) Unwrap() error {
 	return e.Err
 }
 
+// candidateSubtitleLocalFailureV3 reports whether a candidate was rejected for
+// a subtitle reason rather than a video/transport one. Such a candidate is held
+// as the subtitle-degrade target: dropping the subtitle and playing its video
+// changes the release less than skipping it for a sibling that also cannot
+// honor the selection. A video/transport rejection is deliberately excluded so
+// the genuine failover paths are untouched.
+func candidateSubtitleLocalFailureV3(err *candidateErrorV3) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errSubtitleUnavailableInTargetV3) {
+		return true
+	}
+	return err.Stage == candidateStageSubtitleArtifact
+}
+
 func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []*candidateErrorV3) *transportErrorV3 {
 	var joinedErr error
 	if initialVirtualErr != nil {
@@ -5577,6 +5628,13 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 			}
 		case candidateStageSubtitleArtifact:
 			return subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", joinedErr)
+		case candidateStageSubtitleRemap:
+			// A subtitle remap miss is a subtitle-local outcome. Reporting it
+			// as virtual_source_unavailable would let the generic candidate
+			// machinery treat a track that every compatible version lacks as
+			// a failed media source. Name the subtitle instead so the client
+			// can drop or re-pick it without a release swap.
+			return subtitleArtifactErrorV3("The selected subtitle is unavailable in every compatible media version.", joinedErr)
 		case candidateStageTranscodePerm:
 			return &transportErrorV3{
 				reason:    "transcoding_disabled",
@@ -5635,6 +5693,27 @@ func (h *PlaybackHandler) evaluateReplanCandidateV3(
 		}
 		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: fmt.Sprintf("candidate %d resolution failed", candidateAlternate.ID), Err: err}
 	}
+	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+}
+
+// evaluatePreparedReplanCandidateV3 is evaluateReplanCandidateV3 with the
+// candidate file already resolved. It exists so a subtitle degrade can re-plan
+// the session's own file in place: re-resolving the same virtual candidate
+// through the provider could return a different release, which is exactly what
+// a subtitle problem must never cause.
+func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
+	r *http.Request,
+	session *playback.Session,
+	record *playback.AttemptRecordV3,
+	req playback.ReplanRequestV3,
+	baseStart playback.StartRequestV3,
+	sourceFile *models.MediaFile,
+	candidateFile *models.MediaFile,
+	plannerRequestedFile *models.MediaFile,
+	plannerSettings playback.PlannerSettingsV3,
+	plannerSettingsErr error,
+	attemptedKeys []string,
+) (*candidateEvaluationV3, *candidateErrorV3) {
 	candidateStart := baseStart
 	if err := remapAudioSelectionV3(sourceFile, candidateFile, &candidateStart); err != nil {
 		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio remap failed", candidateFile.ID), Err: err}
@@ -5763,10 +5842,63 @@ func (h *PlaybackHandler) evaluateSubtitleDegradedCandidateV3(
 	plannerSettingsErr error,
 	attemptedKeys []string,
 ) (*candidateEvaluationV3, *candidateErrorV3) {
+	degradedStart := subtitleDegradedStartV3(baseStart)
+	eval, evalErr := h.evaluateReplanCandidateV3(r, session, record, req, degradedStart, sourceFile, candidateAlternate, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+	if eval != nil {
+		annotateSubtitleDroppedV3(&eval.result)
+	}
+	return eval, evalErr
+}
+
+// evaluateSubtitleDegradeInPlaceV3 re-plans the session's own file with the
+// subtitle selection cleared, without re-resolving the provider candidate. It
+// is the same-release counterpart of evaluateSubtitleDegradedCandidateV3: a
+// subtitle-only refusal keeps the playing release and drops the subtitle,
+// because the viewer picked the release and a subtitle must not move them off
+// it. The candidate file is used verbatim, so a virtual release is never
+// re-listed or substituted mid-degrade.
+func (h *PlaybackHandler) evaluateSubtitleDegradeInPlaceV3(
+	r *http.Request,
+	session *playback.Session,
+	record *playback.AttemptRecordV3,
+	req playback.ReplanRequestV3,
+	baseStart playback.StartRequestV3,
+	file *models.MediaFile,
+	plannerRequestedFile *models.MediaFile,
+	plannerSettings playback.PlannerSettingsV3,
+	plannerSettingsErr error,
+	attemptedKeys []string,
+) (*candidateEvaluationV3, *candidateErrorV3) {
+	if file == nil {
+		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil same-release subtitle degrade target"}
+	}
+	degradedStart := subtitleDegradedStartV3(baseStart)
+	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+	if eval != nil {
+		annotateSubtitleDroppedV3(&eval.result)
+	}
+	return eval, evalErr
+}
+
+func subtitleDegradedStartV3(baseStart playback.StartRequestV3) playback.StartRequestV3 {
 	degradedStart := baseStart
 	degradedStart.SubtitleTrackIndex = nil
 	degradedStart.SubtitleTrackID = ""
-	return h.evaluateReplanCandidateV3(r, session, record, req, degradedStart, sourceFile, candidateAlternate, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+	return degradedStart
+}
+
+// annotateSubtitleDroppedV3 states plainly on a successful degraded plan that
+// the subtitle was dropped. The plan keeps the same effective file and
+// delivery; only the subtitle selection is gone, and the warning is how the
+// client learns that rather than inferring a route failure.
+func annotateSubtitleDroppedV3(result *playback.PlannerResultV3) {
+	if result == nil || result.Terminal != nil || result.Plan == nil {
+		return
+	}
+	result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.DegradationWarningV3{
+		Code:    "subtitle_dropped_unavailable",
+		Message: "The selected subtitle is unavailable on this release; playback continues without it on the same release.",
+	})
 }
 
 // executeReplanV3 prepares an atomic replacement for a failed playback route.
@@ -6193,7 +6325,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			eval, err := h.evaluateReplanCandidateV3(r, session, record, req, start, failedEffectiveFile, alternate, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
 			if err != nil {
 				candidateErrs = append(candidateErrs, err)
-				if errors.Is(err, errSubtitleUnavailableInTargetV3) && subtitleMissAlternate == nil {
+				if candidateSubtitleLocalFailureV3(err) && subtitleMissAlternate == nil {
 					subtitleMissAlternate = alternate
 				}
 				slog.WarnContext(r.Context(), "virtual replan candidate alternate failed",
@@ -6406,10 +6538,28 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail})
 			clampPlannerTargetResolution(&result, effectiveFile)
 		}
-		if terminalAllowsAlternateFileV3(result.Terminal) &&
+		alternateFileAllowed := terminalAllowsAlternateFileV3(result.Terminal) &&
 			record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3 &&
 			(replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
-				(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3)) {
+				(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3))
+		if alternateFileAllowed && subtitleOnlyTerminalV3(result.Terminal) {
+			// A subtitle-only refusal must not move the release. Re-plan the
+			// file already mounted with the subtitle dropped; the in-place
+			// helper uses the resolved file verbatim, so a virtual release is
+			// never re-listed or substituted. If the same release cannot play
+			// without the subtitle either, the original subtitle terminal
+			// stands and no sibling is tried.
+			if eval, evalErr := h.evaluateSubtitleDegradeInPlaceV3(r, session, record, req, start, effectiveFile, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys); evalErr == nil && eval != nil && eval.result.Terminal == nil {
+				start = eval.start
+				effectiveFile = eval.file
+				result = eval.result
+				toneMapCapabilityErr = eval.toneMapErr
+				artifactRecipe = eval.frozenRecipe
+				preparedTransport = &eval.transport
+				transportPrepared = true
+				reservationHeld = eval.reservationHeld
+			}
+		} else if alternateFileAllowed {
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
 			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder); alternateErr == nil {
 				baseStart := start
@@ -6436,7 +6586,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 							"requested_file_id", record.RequestedMediaFileID, "base_file_id", baseEffectiveFile.ID,
 							"candidate_file_id", alternate.ID, "error", logredact.SanitizeURLError(err),
 						)
-						if errors.Is(err, errSubtitleUnavailableInTargetV3) && subtitleMissAlternate == nil {
+						if candidateSubtitleLocalFailureV3(err) && subtitleMissAlternate == nil {
 							subtitleMissAlternate = alternate
 						}
 						// A planner terminal of transcode_start_failed here is
@@ -6851,23 +7001,30 @@ type subtitleIndexLocationV3 struct {
 	offset int
 }
 
-// classifySubtitleIndexV3 maps the combined subtitle index used by
-// buildSubtitleURLs to its inventory segment and segment-local offset.
+// classifySubtitleIndexV3 maps the dense published combined subtitle index used
+// by buildSubtitleURLs to its inventory segment and segment-local offset. The
+// published space suppresses de-duplicated tracks, so the file's own range is
+// translated back to its source ordinal before the external/embedded split; an
+// index past the file's own published count is a downloaded entry whose offset
+// follows that same published base.
 func classifySubtitleIndexV3(file *models.MediaFile, index int) (subtitleIndexLocationV3, bool) {
 	if file == nil || index < 0 {
 		return subtitleIndexLocationV3{}, false
 	}
-	externalCount := len(file.ExternalSubtitles)
-	if index < externalCount {
-		return subtitleIndexLocationV3{source: playback.SubtitleSourceExternalV3, offset: index}, true
-	}
-	embeddedOffset := index - externalCount
-	if embeddedOffset < len(file.SubtitleTracks) {
-		return subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: embeddedOffset}, true
+	ownPublished := len(playback.BuildSubtitleInventoryV3(file, nil))
+	if index < ownPublished {
+		sourceIndex, ok := playback.SubtitleInventoryOwnSourceIndexV3(file, index)
+		if !ok {
+			return subtitleIndexLocationV3{}, false
+		}
+		if sourceIndex < len(file.ExternalSubtitles) {
+			return subtitleIndexLocationV3{source: playback.SubtitleSourceExternalV3, offset: sourceIndex}, true
+		}
+		return subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: sourceIndex - len(file.ExternalSubtitles)}, true
 	}
 	return subtitleIndexLocationV3{
 		source: playback.SubtitleSourceDownloadedV3,
-		offset: embeddedOffset - len(file.SubtitleTracks),
+		offset: index - ownPublished,
 	}, true
 }
 
@@ -7558,6 +7715,18 @@ func terminalAllowsAlternateFileV3(terminal *playback.TerminalV3) bool {
 	}
 }
 
+// subtitleOnlyTerminalV3 reports whether a refusal names a subtitle problem
+// rather than a video/policy one. Such a refusal must never move the session to
+// another release: the subtitle is dropped on the release already mounted (with
+// the drop stated on the plan), or the subtitle terminal stands unchanged. The
+// video-failure reasons keep their existing alternate-file failover.
+func subtitleOnlyTerminalV3(terminal *playback.TerminalV3) bool {
+	if terminal == nil {
+		return false
+	}
+	return terminal.Reason == terminalSubtitleConversionUnsupportedV3
+}
+
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {
 	switch operation {
 	case playback.ReplanOperationFailureRecoveryV3, playback.ReplanOperationQualityChangeV3, playback.ReplanOperationOutputChangeV3:
@@ -8071,21 +8240,37 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	if index < 0 {
 		return errors.New("The selected subtitle track index is invalid.")
 	}
+	// index is a published combined ordinal. classify maps it to the source
+	// segment and segment-local track, and the equivalent target track is
+	// translated back to the target's published ordinal before it is written:
+	// the target's own published base can differ from its source array sizes
+	// once de-duplication suppressed a track, and downloaded entries follow
+	// that published base.
+	sourceLocation, classified := classifySubtitleIndexV3(source, index)
+	if !classified {
+		return errSubtitleUnavailableInTargetV3
+	}
 	targetIndex := -1
-	switch {
-	case index < len(source.ExternalSubtitles):
-		wanted := source.ExternalSubtitles[index]
+	switch sourceLocation.source {
+	case playback.SubtitleSourceExternalV3:
+		wanted := source.ExternalSubtitles[sourceLocation.offset]
 		for candidateIndex, candidate := range target.ExternalSubtitles {
-			if strings.EqualFold(candidate.Language, wanted.Language) && strings.EqualFold(candidate.Format, wanted.Format) && candidate.Forced == wanted.Forced && candidate.HearingImpaired == wanted.HearingImpaired {
-				targetIndex = candidateIndex
+			if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Format, wanted.Format) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
+				continue
+			}
+			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, candidateIndex); mapped {
+				targetIndex = published
 				break
 			}
 		}
-	case index < len(source.ExternalSubtitles)+len(source.SubtitleTracks):
-		wanted := source.SubtitleTracks[index-len(source.ExternalSubtitles)]
+	case playback.SubtitleSourceEmbeddedV3:
+		wanted := source.SubtitleTracks[sourceLocation.offset]
 		for candidateIndex, candidate := range target.SubtitleTracks {
-			if strings.EqualFold(candidate.Language, wanted.Language) && strings.EqualFold(candidate.Codec, wanted.Codec) && candidate.Forced == wanted.Forced && candidate.HearingImpaired == wanted.HearingImpaired {
-				targetIndex = len(target.ExternalSubtitles) + candidateIndex
+			if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Codec, wanted.Codec) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
+				continue
+			}
+			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(target, len(target.ExternalSubtitles)+candidateIndex); mapped {
+				targetIndex = published
 				break
 			}
 		}
@@ -8093,10 +8278,10 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 		if h.SubtitleRepo != nil {
 			sourceDownloaded, sourceErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, source.ID)
 			targetDownloaded, targetErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, target.ID)
-			downloadedIndex := index - len(source.ExternalSubtitles) - len(source.SubtitleTracks)
+			downloadedIndex := sourceLocation.offset
 			if sourceErr == nil && targetErr == nil && downloadedIndex >= 0 && downloadedIndex < len(sourceDownloaded) {
 				wanted := sourceDownloaded[downloadedIndex]
-				base := len(target.ExternalSubtitles) + len(target.SubtitleTracks)
+				base := len(playback.BuildSubtitleInventoryV3(target, nil))
 				// The stable downloaded-subtitle row id (carried in the plan
 				// inventory) is the only reliable identity here. Virtual rows
 				// persist release_name as "" (see ReplaceVirtualCandidates and

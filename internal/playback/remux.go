@@ -405,6 +405,25 @@ func (s *RemuxSession) Close() error {
 	return s.closeErr
 }
 
+// errRemuxNoOutput marks an ffmpeg remux that exited, or whose output pipe
+// failed, before producing a single media byte. The concrete read error is
+// wrapped alongside it so the cause stays diagnosable while callers get a
+// stable identity to match.
+var errRemuxNoOutput = errors.New("remux produced no output")
+
+// writeStartError records a remux failure that happened before any media byte
+// reached the client. When deferToCaller is set the failure is left
+// uncommitted so a byte handler that can still fail over to a sibling candidate
+// owns the final status: committing a 4xx/5xx here locks a v2 response writer
+// into its rejected state and discards the retry's body. Callers that cannot
+// fail over keep the historical text error.
+func writeStartError(w http.ResponseWriter, deferToCaller bool, message string, status int) {
+	if deferToCaller {
+		return
+	}
+	http.Error(w, message, status)
+}
+
 // containerMIME maps output format names to MIME types for HTTP responses.
 func containerMIME(format string) string {
 	switch format {
@@ -447,6 +466,16 @@ type RemuxServeOptions struct {
 	// route the client is still being fed. Callers that serve a session pass
 	// SessionManager.WatchTransportStop's channel.
 	Abort <-chan struct{}
+	// DeferStartError returns a failure that happened before FFmpeg produced
+	// any media byte to the caller without writing a response, so a byte
+	// handler that can still fail over to a sibling candidate owns the final
+	// status. Committing a 4xx/5xx here is what locked a v2 response writer
+	// into its rejected state and discarded the retry's successful body. The
+	// zero value preserves the historical behavior for callers that cannot
+	// fail over, such as the proxy and transcode node relays. It has no effect
+	// once streaming has begun: a mid-stream failure never reaches this path
+	// and still ends the response normally.
+	DeferStartError bool
 	// TimingStart is when the serving request arrived, used only for the
 	// per-seek timing log. Zero omits the handler-setup segment.
 	TimingStart time.Time
@@ -528,10 +557,10 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 		!strings.HasPrefix(lowerPath, "virtual://") {
 		if _, err := os.Stat(filePath); err != nil {
 			if os.IsNotExist(err) {
-				http.Error(w, "file not found", http.StatusNotFound)
+				writeStartError(w, opts.DeferStartError, "file not found", http.StatusNotFound)
 				return err
 			}
-			http.Error(w, "failed to access file", http.StatusInternalServerError)
+			writeStartError(w, opts.DeferStartError, "failed to access file", http.StatusInternalServerError)
 			return err
 		}
 	}
@@ -540,7 +569,7 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 	session, err := startRemuxWithOptions(r.Context(), filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, opts.AudioOnly, opts.SourceAudioChannels, opts.TargetAudioChannels, opts.TargetAudioBitrateKbps)
 	spawnDone := time.Now()
 	if err != nil {
-		http.Error(w, "failed to start remux", http.StatusInternalServerError)
+		writeStartError(w, opts.DeferStartError, "failed to start remux", http.StatusInternalServerError)
 		return err
 	}
 	defer func() { _ = session.Close() }()
@@ -579,8 +608,8 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 		if readErr != nil {
 			if len(first) == 0 {
 				_ = session.Close()
-				http.Error(w, "failed to start remux", http.StatusBadGateway)
-				return errors.New("remux produced no output")
+				writeStartError(w, opts.DeferStartError, "failed to start remux", http.StatusBadGateway)
+				return fmt.Errorf("%w: %w", errRemuxNoOutput, readErr)
 			}
 			break
 		}

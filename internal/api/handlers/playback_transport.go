@@ -201,8 +201,12 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				break
 			}
 		}
+		// An exclusion is only a substitution verdict when this startup loop
+		// just indicted that candidate (attempt > 0 with a failed id). Declare
+		// it explicitly so the resolver may serve a sibling; a neutral first
+		// attempt, or a failure that identified no candidate, keeps refusing.
 		resolvedMedia, cleanup, resolveErr := h.resolveVirtualInputURI(
-			startupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0, failedCandidateIDs, preferredID,
+			startupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0, failedCandidateIDs, preferredID, attempt > 0 && len(failedCandidateIDs) > 0,
 		)
 		if resolveErr != nil {
 			lastErr = resolveErr
@@ -320,6 +324,14 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	return nil, lastErr
 }
 
+// resolveVirtualInputURI resolves a virtual input for a transport start. The
+// final rotateCandidates argument is the caller's explicit declaration that
+// excluding a candidate is a verdict against that release, which authorizes
+// serving a sibling. It defaults to false, so an exclusion on its own never
+// authorizes a silent release swap (see resolveVirtualInputURIExcluding on the
+// stream handler for the same contract). The variadic form keeps the many
+// non-excluding callers unchanged; only a serve-layer failover that just
+// indicted the candidate passes true.
 func (h *PlaybackHandler) resolveVirtualInputURI(
 	ctx context.Context,
 	virtualURI string,
@@ -329,14 +341,18 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	forceRefresh bool,
 	excludedCandidateIDs []string,
 	preferredCandidateID string,
+	rotateCandidates ...bool,
 ) (ResolvedVirtualMedia, func(), error) {
+	rotationRequested := false
+	if len(rotateCandidates) > 0 {
+		rotationRequested = rotateCandidates[0]
+	}
 	var res ResolvedVirtualMedia
 	var err error
 	if h.VirtualMediaDetailedResolver != nil {
-		// An exclusion here is a dead-candidate failover, so candidate
-		// substitution is intended. The intent travels with the context so the
-		// resolver can distinguish it from a display-driven same-file re-plan.
-		ctx = withVirtualCandidateRotationV3(ctx, len(excludedCandidateIDs) > 0)
+		// The intent travels with the context so the resolver can distinguish a
+		// serve-layer indictment from a display-driven same-file re-plan.
+		ctx = withVirtualCandidateRotationV3(ctx, rotationRequested)
 		// The transport serve layer re-resolves a release an existing session
 		// already serves, so it declares session-bound: a profile-removed
 		// candidate refuses instead of silently swapping the release.
@@ -445,15 +461,23 @@ func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, node
 }
 
 func (h *PlaybackHandler) remotePlaybackTransportTimeout(nodeURL string, request transcodenode.TranscodeStartRequest) time.Duration {
+	// A burn-in node waits longer for its first segment, so the caller's HTTP
+	// budget must cover the same budget or it would abort a slow-but-healthy
+	// subtitle composite before the node answers. Non-burn-in plans keep the
+	// historical numbers (TranscodeStartReadinessTimeout == ManifestStartupTimeout).
+	readinessBudget := playback.ManifestStartupTimeoutFor(playback.TranscodeOpts{
+		SubtitleBurnIn:     request.SubtitleBurnIn,
+		SubtitleTrackIndex: request.SubtitleTrackIndex,
+	})
 	if request.ToneMapMode == "" {
-		return playback.ManifestStartupTimeout + 5*time.Second
+		return readinessBudget + 5*time.Second
 	}
-	timeout := h.remoteToneMapProbeTimeoutV3(nodeURL) + playback.ManifestStartupTimeout
+	timeout := h.remoteToneMapProbeTimeoutV3(nodeURL) + readinessBudget
 	if request.ToneMapPreflightRequired {
 		timeout += tonemap.SourcePreflightTimeout(request.TotalDuration)
 	}
 	if request.RequireReady {
-		timeout += transcodenode.TranscodeStartReadinessTimeout
+		timeout += readinessBudget
 	}
 	return timeout
 }
