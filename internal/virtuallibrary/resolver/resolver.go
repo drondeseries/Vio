@@ -321,7 +321,7 @@ func cloneCandidates(candidates []StreamCandidate) []StreamCandidate {
 // a pin that dedup collapsed can be translated instead of falling through to an
 // unrelated release. The custom format verdict is applied later
 // (rankCandidatesForVirtualPath), so reject never interacts with confirmation.
-func (r *Resolver) preferConfirmedCandidates(candidates []StreamCandidate) ([]StreamCandidate, map[string]string) {
+func (r *Resolver) preferConfirmedCandidates(ctx context.Context, candidates []StreamCandidate) ([]StreamCandidate, map[string]string) {
 	if len(candidates) == 0 {
 		return candidates, nil
 	}
@@ -345,7 +345,7 @@ func (r *Resolver) preferConfirmedCandidates(candidates []StreamCandidate) ([]St
 		logger := r.logger
 		r.mu.RUnlock()
 		if logger != nil {
-			logger.Warn("every provider candidate was dropped as failed by the classifier",
+			logger.WarnContext(ctx, "every provider candidate was dropped as failed by the classifier",
 				"count", beforeDrop, "candidates", failedNames)
 		}
 	}
@@ -360,10 +360,27 @@ func (r *Resolver) preferConfirmedCandidates(candidates []StreamCandidate) ([]St
 // the selectable cap. It is called on every serve so a classifier state change
 // takes effect without waiting for the cache TTL, and it returns the
 // dropped-variant -> keeper map for that answer.
-func (r *Resolver) processCandidates(candidates []StreamCandidate) ([]StreamCandidate, map[string]string) {
-	candidates, dropped := r.preferConfirmedCandidates(candidates)
+//
+// The keeper map is filtered to the surviving candidates after truncation: a
+// dropped variant whose keeper ranked beyond the selectable cap has no surviving
+// representative, so the entry is dropped and a pin on it is treated as a
+// genuinely dead release (the existing dead-pin fallback) instead of being
+// translated to a keeper that is not in the list.
+func (r *Resolver) processCandidates(ctx context.Context, candidates []StreamCandidate) ([]StreamCandidate, map[string]string) {
+	candidates, dropped := r.preferConfirmedCandidates(ctx, candidates)
 	if len(candidates) > maxVirtualCandidates {
 		candidates = candidates[:maxVirtualCandidates]
+	}
+	if len(dropped) > 0 {
+		surviving := make(map[string]struct{}, len(candidates))
+		for i := range candidates {
+			surviving[stream.CandidateVariantID(candidates[i])] = struct{}{}
+		}
+		for droppedID, keeperID := range dropped {
+			if _, ok := surviving[keeperID]; !ok {
+				delete(dropped, droppedID)
+			}
+		}
 	}
 	return candidates, dropped
 }
@@ -654,7 +671,7 @@ func (r *Resolver) getCandidatesWithKeepers(ctx context.Context, virtualPath str
 	if err != nil {
 		return nil, nil, mediaType, mediaID, err
 	}
-	processed, dropped := r.processCandidates(candidates)
+	processed, dropped := r.processCandidates(ctx, candidates)
 	return processed, dropped, mediaType, mediaID, nil
 }
 
@@ -716,7 +733,7 @@ func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, for
 				if airDate != nil && !airDate.IsZero() {
 					attrs = append(attrs, "air_date", airDate.UTC().Format(time.RFC3339))
 				}
-				logger.Warn("virtual playback blocked by the release gate", attrs...)
+				logger.WarnContext(ctx, "virtual playback blocked by the release gate", attrs...)
 			}
 			return nil, mediaType, mediaID, newUnreleasedError(imdbID, airDate, mediaType)
 		}

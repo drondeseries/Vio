@@ -424,6 +424,126 @@ func TestResolveDetailedDeadPinStillFallsBack(t *testing.T) {
 	}
 }
 
+// TestResolveDetailedRefusesDifferentReleaseForSessionPin reproduces the
+// handler's per-candidate shape: the session pinned variant A of release X
+// (dedup collapsed A -> keeper B) and the request's resultID names a
+// higher-ranked different release C while substitution is refused. The resolver
+// must refuse C rather than serve it under the session binding; with
+// substitution allowed the explicit resultID still wins; and probing the
+// session's own keeper is always allowed. The ordinary non-pinned path is
+// unaffected.
+func TestResolveDetailedRefusesDifferentReleaseForSessionPin(t *testing.T) {
+	svc, droppedID, keeperID, otherID := collapsedPinFixture(t)
+	ctx := context.Background()
+
+	// Substitution refused, probing the different release: refuse instead of
+	// swapping the release under the session binding.
+	if _, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, droppedID, false); err == nil {
+		t.Fatalf("expected refusal when probing %q for session pin %q with substitution refused", otherID, droppedID)
+	}
+	// Substitution allowed: the explicit resultID wins.
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, droppedID, true)
+	if err != nil {
+		t.Fatalf("substitution-allowed resolve: %v", err)
+	}
+	if resolved.CandidateID != otherID {
+		t.Fatalf("substitution-allowed resolve = %q, want the explicit candidate %q", resolved.CandidateID, otherID)
+	}
+	// Probing the session's own resolved keeper is allowed even when
+	// substitution is refused.
+	resolved, err = svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+keeperID, false, nil, droppedID, false)
+	if err != nil {
+		t.Fatalf("session keeper resolve: %v", err)
+	}
+	if resolved.CandidateID != keeperID {
+		t.Fatalf("session keeper resolve = %q, want %q", resolved.CandidateID, keeperID)
+	}
+	// The ordinary non-pinned path is unaffected.
+	resolved, err = svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, "", false)
+	if err != nil {
+		t.Fatalf("non-pinned resolve: %v", err)
+	}
+	if resolved.CandidateID != otherID {
+		t.Fatalf("non-pinned resolve = %q, want %q", resolved.CandidateID, otherID)
+	}
+}
+
+// TestKeeperMapDropsKeepersBeyondTheCandidateCap proves the dropped -> keeper
+// map is filtered to the surviving candidates: when a release's keeper ranks
+// beyond the selectable cap, its entry is removed so a pin on the collapsed
+// variant is treated as a genuinely dead release and takes the existing
+// dead-pin fallback, instead of being translated to a keeper that is not in the
+// list.
+func TestKeeperMapDropsKeepersBeyondTheCandidateCap(t *testing.T) {
+	const others = 51 // more than the cap, so the low-ranked keeper is cut
+	entries := make([]map[string]any, 0, others+2)
+	for i := 0; i < others; i++ {
+		entries = append(entries, map[string]any{
+			"name":  fmt.Sprintf("Other.%02d.2160p.WEB-DL", i),
+			"title": fmt.Sprintf("Other.%02d.2160p.WEB-DL", i),
+			"url":   fmt.Sprintf("http://192.168.1.10/other-%d.mkv", i),
+		})
+	}
+	// Release X has two per-file variants sharing a content hash and is 1080p,
+	// so its keeper sorts below every 2160p release and falls beyond the cap.
+	entries = append(entries,
+		map[string]any{
+			"name": "Pinned.2024.1080p.WEB-DL-0", "title": "Pinned.2024.1080p.WEB-DL",
+			"url": "http://192.168.1.10/pinned-0.mkv", "behaviorHints": map[string]any{"videoHash": "release-pinned"},
+		},
+		map[string]any{
+			"name": "Pinned.2024.1080p.WEB-DL-1", "title": "Pinned.2024.1080p.WEB-DL",
+			"url": "http://192.168.1.10/pinned-1.mkv", "behaviorHints": map[string]any{"videoHash": "release-pinned"},
+		},
+	)
+	svc := newProviderService(t, nil, virtuallibrary.Config{}, entries...)
+	ctx := context.Background()
+
+	candidates, keepers, _, _, err := svc.Resolver.GetCandidatesWithKeepers(ctx, "virtual://movie/tt100")
+	if err != nil {
+		t.Fatalf("GetCandidatesWithKeepers: %v", err)
+	}
+	if len(candidates) != 50 {
+		t.Fatalf("surviving candidates = %d, want the 50-candidate cap", len(candidates))
+	}
+
+	variantID := func(name, rawURL string) string {
+		candidate := stream.StreamCandidate{
+			Name: name, Title: "Pinned.2024.1080p.WEB-DL", URL: rawURL,
+		}
+		candidate.BehaviorHints.VideoHash = "release-pinned"
+		stream.ParseStreamDetails(&candidate)
+		return stream.CandidateVariantID(candidate)
+	}
+	keeperID := variantID("Pinned.2024.1080p.WEB-DL-0", "http://192.168.1.10/pinned-0.mkv")
+	droppedID := variantID("Pinned.2024.1080p.WEB-DL-1", "http://192.168.1.10/pinned-1.mkv")
+	if keeperID == "" || droppedID == "" || keeperID == droppedID {
+		t.Fatalf("bad variant ids: keeper=%q dropped=%q", keeperID, droppedID)
+	}
+
+	for _, c := range candidates {
+		if stream.CandidateVariantID(c) == keeperID {
+			t.Fatal("test setup: the low-ranked keeper unexpectedly survived the cap")
+		}
+	}
+	if _, ok := keepers[droppedID]; ok {
+		t.Fatalf("keeper map retained an entry for %q whose keeper was truncated", droppedID)
+	}
+
+	// A pin on the collapsed variant therefore takes the dead-pin fallback and
+	// resolves to a surviving candidate, never the truncated keeper.
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, nil, "", true)
+	if err != nil {
+		t.Fatalf("dead-pin fallback resolve: %v", err)
+	}
+	if resolved.CandidateID == keeperID {
+		t.Fatal("resolve returned the truncated keeper")
+	}
+	if resolved.CandidateID == "" {
+		t.Fatal("dead-pin fallback returned no candidate")
+	}
+}
+
 // TestIngestionMovesConfirmedFirst proves the classifier's confirmation is
 // authoritative for order at ingestion.
 func TestIngestionMovesConfirmedFirst(t *testing.T) {

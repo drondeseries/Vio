@@ -133,7 +133,7 @@ func (s *Service) rankCandidatesForVirtualPath(virtualPath string, candidates []
 // custom formats. Reject is rank-last, last-resort selectable, never a hard
 // drop, so the caller still uses the best rejected candidate; the Warn tells
 // the operator that no accepted release was available.
-func (s *Service) warnIfAllRejected(virtualPath string, candidates []stream.StreamCandidate) {
+func (s *Service) warnIfAllRejected(ctx context.Context, virtualPath string, candidates []stream.StreamCandidate) {
 	if s == nil || s.logger == nil || len(candidates) == 0 {
 		return
 	}
@@ -143,7 +143,7 @@ func (s *Service) warnIfAllRejected(virtualPath string, candidates []stream.Stre
 		}
 	}
 	profile := s.qualityProfileForPath(virtualPath)
-	s.logger.Warn("every virtual candidate is rejected by custom formats; using the best rejected stream",
+	s.logger.WarnContext(ctx, "every virtual candidate is rejected by custom formats; using the best rejected stream",
 		"profile", strings.TrimSpace(profile.Label),
 		"candidates", len(candidates),
 		"rejected_by", quality.RejectingFormatNames(candidates[0], s.cfg.Quality.CustomFormats))
@@ -182,6 +182,11 @@ func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, erro
 //     rank and reject and respects exclusions, the profile filter and
 //     allowCandidateSubstitution exactly like the original pin;
 //   - a genuinely dead pin (absent with no keeper) still falls back;
+//   - when substitution is refused and a preferredCandidateID names a
+//     resolvable session release, the candidate actually served must belong to
+//     that release: a present resultID for a different release is refused
+//     rather than swapped in, while substitution allowed still lets the
+//     explicit resultID win;
 //   - every stream URL is validated against outbound SSRF.
 //
 // allowCandidateSubstitution gates the fallback that lets a pinned result= URI
@@ -241,12 +246,12 @@ func (s *Service) ResolveDetailed(
 	// the resolver agree on order and on the rejected verdict. Reject is
 	// rank-last, last-resort selectable; an all-rejected set still resolves.
 	s.rankCandidatesForVirtualPath(virtualPath, candidates)
-	s.warnIfAllRejected(virtualPath, candidates)
+	s.warnIfAllRejected(ctx, virtualPath, candidates)
 
 	// A pin whose variant dedup collapsed is absent from the list, but its
 	// release survives as a keeper. Translate it to that keeper before any pin
 	// state is computed, so a collapsed pin behaves exactly like the real pin:
-	// it overrides rank and reject, honours its exclusions and the profile
+	// it overrides rank and reject, honors its exclusions and the profile
 	// filter, and respects allowSubstitution=false. A genuinely dead pin (no
 	// keeper) is left unchanged and still falls back as before.
 	requestedResultID := resultID
@@ -262,6 +267,10 @@ func (s *Service) ResolveDetailed(
 			effectivePreferredID = keeperID
 		}
 	}
+	// Whether the session's pinned release, as resolved through the keeper map,
+	// is present in the ranked set. Captured before the profile filter so a
+	// session release the profile removes still blocks substitution below.
+	sessionReleaseResolvable := preferredCandidateID != "" && candidateIDPresent(candidates, effectivePreferredID)
 
 	profile := s.qualityProfileForPath(virtualPath)
 	profileActive := strings.TrimSpace(profile.Label) != ""
@@ -287,7 +296,7 @@ func (s *Service) ResolveDetailed(
 		}
 		if len(filtered) == 0 && !s.cfg.Quality.FallbackToAnyStream {
 			if s.logger != nil {
-				s.logger.Warn("virtual candidate set empty after profile filter",
+				s.logger.WarnContext(ctx, "virtual candidate set empty after profile filter",
 					"profile", strings.TrimSpace(profile.Label),
 					"total", len(candidates), "matched", 0, "fallback", false)
 			}
@@ -309,6 +318,20 @@ func (s *Service) ResolveDetailed(
 	// under the same session binding.
 	if pinBlocked && !allowSubstitution {
 		return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q is excluded and candidate rotation was not requested", effectiveResultID)
+	}
+	// When substitution is refused and the session's pinned release is
+	// resolvable, the candidate actually served must belong to that release. The
+	// handler probes candidates by URI, so resultID is the probed candidate and
+	// the session pin arrives only as preferredCandidateID; without this guard a
+	// present resultID for a different release wins and swaps the release under
+	// the session binding even though substitution was refused. A session pin
+	// whose release is not resolvable (a genuinely dead release) is left to the
+	// documented dead-pin fallback. When substitution is allowed the explicit
+	// resultID still wins.
+	if !allowSubstitution && sessionReleaseResolvable && effectiveResultID != "" && effectiveResultID != effectivePreferredID {
+		return ResolvedVirtualStream{}, fmt.Errorf(
+			"session-bound virtual candidate %q does not match resolved candidate %q and candidate rotation was not requested",
+			effectivePreferredID, effectiveResultID)
 	}
 
 	ordered := orderCandidates(candidates, effectivePreferredID)
@@ -379,7 +402,7 @@ func (s *Service) ListStreams(ctx context.Context, virtualPath string) ([]Playba
 	// ResolveDetailed, so the profile/custom-format order and the rejected
 	// verdict must be carried on the stream records.
 	s.rankCandidatesForVirtualPath(virtualPath, candidates)
-	s.warnIfAllRejected(virtualPath, candidates)
+	s.warnIfAllRejected(ctx, virtualPath, candidates)
 	streams := make([]PlaybackStream, 0, len(candidates))
 	for _, c := range candidates {
 		id := stream.CandidateVariantID(c)

@@ -53,7 +53,7 @@
 // end, and not been cut short by its budget or context. The monitor attests
 // that with ReconcileEvidence (FullCycle plus the source and queue counts)
 // and the catalog refuses destructive reconciliation without it, so a
-// truncated or replaced queue cannot authorise deleting live media. Stale
+// truncated or replaced queue cannot authorize deleting live media. Stale
 // Prowlarr/AltMount refresh failures are warn-and-continue, never fatal.
 //
 // Duplicate submissions converge by key but with gaps. Queue keys are

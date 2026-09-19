@@ -655,7 +655,7 @@ type virtualResolveOptionsV3 struct {
 	// even when the row already carries a concrete result= identity; true is
 	// only for an explicit user retry, a forced relink, or a decode-rejection
 	// rotation. A replan rehydration that is not a confirmed rotation must
-	// leave it false so it honours the stamp and finds a live sibling instead
+	// leave it false so it honors the stamp and finds a live sibling instead
 	// of looping back onto a candidate the serve layer already marked dead.
 	allowFailedCandidate bool
 	// rotateCandidates marks an exclusion as a deliberate candidate rotation: a

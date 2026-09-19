@@ -1700,8 +1700,8 @@ func CappedRungHeightV3(rungHeight, sourceHeight, sourceBitrateKbps, capKbps int
 		return targetHeight, false
 	}
 	wouldPreserve := sourceHeight > 0 && targetHeight >= sourceHeight
-	if !((wouldPreserve && sourceBitrateKbps > capKbps) ||
-		(!wouldPreserve && ladderBitrateKbpsV3(targetHeight) > capKbps)) {
+	if (!wouldPreserve || sourceBitrateKbps <= capKbps) &&
+		(wouldPreserve || ladderBitrateKbpsV3(targetHeight) <= capKbps) {
 		return targetHeight, false
 	}
 	if capHeight := ladderHeightForBandwidthV3(int(float64(capKbps) * 0.8)); capHeight < targetHeight {

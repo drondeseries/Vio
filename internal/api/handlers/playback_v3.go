@@ -6091,7 +6091,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// Only a confirmed rotation may re-select a candidate the
 				// catalog marked failed (for example one this serve layer just
 				// stamped after it produced no bytes). Every other replan must
-				// honour the known-bad stamp so the resolver skips it and either
+				// honor the known-bad stamp so the resolver skips it and either
 				// finds a live sibling or fails with a retryable terminal,
 				// instead of looping back onto the dead pin.
 				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false, virtualResolveOptionsV3{allowFailedCandidate: virtualDecodeRotation, rotateCandidates: virtualDecodeRotation})

@@ -221,6 +221,10 @@ const (
 	// always leaves budget for later items. A per-item timeout is a deferral,
 	// not a pass failure: the item is retried on a later pass.
 	monitorPerItemTimeout = 45 * time.Second
+
+	// mediaTypeMovie is the movie media-type value shared by the queue's
+	// movie/series branches.
+	mediaTypeMovie = "movie"
 )
 
 // monitorState is the on-disk monitor queue. Older releases wrote a bare JSON
@@ -717,7 +721,7 @@ func (m *mediaMonitor) pruneCompletedMoviesLocked() (int, error) {
 	for key, item := range m.items {
 		source := monitorItemSource(item)
 		bySource[source] = append(bySource[source], key)
-		if _, registered := m.registered[key]; !registered || item.MediaType != "movie" || !item.Ready {
+		if _, registered := m.registered[key]; !registered || item.MediaType != mediaTypeMovie || !item.Ready {
 			complete[source] = false
 			continue
 		}

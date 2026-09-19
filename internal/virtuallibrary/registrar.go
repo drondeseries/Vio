@@ -149,7 +149,7 @@ func (r *catalogMonitorRegistrar) Reconcile(ctx context.Context, source string, 
 		// Keep the catalog's source and counts in the message while preserving
 		// the refusal identity so the monitor can log it loudly instead of
 		// treating it as an ordinary retryable failure.
-		return fmt.Errorf("%w: %v", monitor.ErrReconcileRefused, err)
+		return fmt.Errorf("%w: %w", monitor.ErrReconcileRefused, err)
 	}
 	return err
 }
