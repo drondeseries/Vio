@@ -969,6 +969,22 @@ past an excluded pinned candidate unless the caller explicitly asked for
 candidate rotation, so a display-driven re-plan can never silently swap the bytes
 mid-stream.
 
+**Same-file invariant for audio.** An audio problem — a track whose decoder
+fails, an unsupported audio codec, an unmappable or absent track, a node that
+declines the audio recipe — never moves the video candidate. The server resolves
+it on the release already mounted: the planner converts or downmixes the audio
+in place, or the server tries another track in the same file (`track_change` is
+the viewer explicitly doing the same). On a fresh start a same-release resolution
+that also fails proves the release itself is blocked, and only then does the
+existing video/policy failover apply; on a replan the release is known to be
+playable, so the audio terminal stands instead of substituting a sibling. An
+explicit audio pick is never silently replaced — it surfaces its failure and the
+client can re-pick. The decoder/demux indictment is video-scoped: a decode or
+demux stderr line is only evidence about the video stream when it carries a
+video stream identity (`vist#`, a video codec, or a NAL/bitstream token) and no
+audio identity (`aist#`, an audio codec tag, or explicit audio-stream wording),
+so an audio failure can never stamp the candidate or reject the source.
+
 **Residual candidate-identity notes.** Two paths deliberately stop short of
 rewriting the in-flight plan, and neither is a client-requested swap:
 
@@ -1185,6 +1201,7 @@ The plan will play, but something the user might notice was given up.
 | `dolby_vision_base_layer_only` | Profile 8 played unchanged through an HEVC decoder as its HDR10/HLG/SDR base layer; DV metadata not presented |
 | `hdr_tone_mapped` | HDR video converted to limited-range BT.709 SDR |
 | `audio_converted` | Audio re-encoded rather than copied |
+| `audio_track_substituted` | The selected audio track could not be adapted; another track in the same file plays instead |
 | `subtitle_burn_in` | Subtitles rendered into the video |
 | `quality_reduction_unavailable` | Requested rung could not be produced |
 | `quality_preference_normalized` | Unknown `quality_preference` normalized to `auto` |
@@ -1206,6 +1223,11 @@ help. Delivered inside a `201` (start) or `200` (replan), never a 4xx.
 subtitle burn-in requirement and cannot execute, the terminal is
 `subtitle_conversion_unsupported` naming the subtitle rather than the underlying
 HDR, 4K, or transcode-policy reason — deselecting the subtitle restores playback.
+`audio_conversion_unsupported` is the audio counterpart: the selected track needs
+an adaptation no eligible executor can run, so the server first tries another
+audio track in the same file and the release is unchanged. Only when no track on
+the release is playable does the audio refusal stand or, on a fresh start, fall
+through to the alternate-version failover.
 
 *Subtitle policy:* `subtitle_burn_in_source_unsupported`,
 `subtitle_codec_unsupported`, `subtitle_track_invalid`,
@@ -1214,7 +1236,7 @@ HDR, 4K, or transcode-policy reason — deselecting the subtitle restores playba
 *Transport and session:* `internal_error`, `session_expired`,
 `subtitle_artifact_unavailable`, `capacity_unavailable`,
 `local_transcode_disabled`,
-`audio_transcoding_disabled`,
+`audio_transcoding_disabled`, `audio_adaptation_failed`,
 `source_decode_failed`,
 `transcode_start_failed`, `transcode_node_unavailable`,
 `transcode_node_capability_unavailable`, `track_unavailable`,

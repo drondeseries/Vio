@@ -99,7 +99,7 @@ type RecipeCard struct {
 	TargetResolution           string                 `json:"target_resolution,omitempty"`
 	// SourceFrameRate and SourceHeight keep a rebuilt encode's GOP aligned with
 	// the real source cadence and let the filter chain detect a no-op scale.
-	// Zero is the historical 30 fps / unknown-height behaviour.
+	// Zero is the historical 30 fps / unknown-height behavior.
 	SourceFrameRate        float64 `json:"source_frame_rate,omitempty"`
 	SourceHeight           int     `json:"source_height,omitempty"`
 	TargetCodecVideo       string  `json:"target_codec_video,omitempty"`

@@ -2929,14 +2929,14 @@ func (s *TranscodeSession) GenerateFullManifest(segPrefix, rawQuery string) []by
 
 	var buf bytes.Buffer
 	buf.WriteString("#EXTM3U\n")
-	buf.WriteString(fmt.Sprintf("#EXT-X-VERSION:%d\n", hlsVersion))
+	fmt.Fprintf(&buf, "#EXT-X-VERSION:%d\n", hlsVersion)
 	buf.WriteString(queryDefinition)
 	// Target duration is the maximum segment duration rounded to the nearest
 	// integer. A frame-accurate GOP can slightly exceed the nominal segment
 	// length (23.976 fps * 2 s rounds to 48 frames = 2.002 s), so advertise
 	// SegDuration+1. EXTINF keeps the nominal duration and segment indexing is
 	// unchanged.
-	buf.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", segDur+1))
+	fmt.Fprintf(&buf, "#EXT-X-TARGETDURATION:%d\n", segDur+1)
 	buf.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 	buf.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
@@ -4171,6 +4171,10 @@ func demuxInputErrorLine(line string) bool {
 // Counting them fatalised playable content. The lines that do mean the bytes
 // are undecodable (a bad NAL split, an invalid NAL size, or the decoder
 // refusing a packet) are matched instead.
+//
+// The pattern alone does not name a stream: a corrupt subtitle stream can make
+// the same decoder refuse a packet, so logFFmpegLine only counts a match that
+// videoStreamEvidenceV3 resolves to the video stream.
 func decodeErrorLine(line string) bool {
 	switch {
 	case strings.Contains(line, "Error submitting packet to decoder"):
@@ -4186,6 +4190,79 @@ func decodeErrorLine(line string) bool {
 	default:
 		return false
 	}
+}
+
+// videoIdentityTokensV3 are the codec and bitstream identifiers FFmpeg prints
+// when a line names a video stream without the media-type stream-class prefix.
+var videoIdentityTokensV3 = []string{
+	"h264", "avc1", "hevc", "h265", "hev1", "hvc1", "dvh1",
+	"av1", "vp9", "vp8", "mpeg2video", "mpeg4", "mpegvideo",
+	"vc1", "prores", "dnxhd", "theora", "h263", "wmv3",
+	"nal unit", "bitstream", "slice_header",
+}
+
+// audioIdentityTagsV3 are the FFmpeg decoder tags that name an audio codec.
+// FFmpeg prints the offending decoder in brackets when it rejects a packet
+// ("[aac @ 0x...] Error submitting packet to decoder"), so the tag is matched
+// with its opening bracket. Matching the bare codec substring would silence a
+// video indictment whenever a hex address happened to contain "aac", "ac3", or
+// "dts"; the bracket anchor keeps that collision out even though a missed
+// indictment is cheaper than a wrong one. dca is the DTS decoder's FFmpeg name,
+// and pcm_ covers the linear PCM family.
+var audioIdentityTagsV3 = []string{
+	"[aac", "[ac3", "[eac3", "[ec3", "[truehd", "[mlp", "[dts", "[dca",
+	"[flac", "[opus", "[vorbis", "[alac", "[mp3", "[mp2", "[mp1",
+	"[pcm_", "[adpcm_", "[s302m",
+}
+
+// audioStreamEvidenceV3 reports whether an FFmpeg stderr line names an audio
+// stream as the subject of its error. The decoder tag is the strongest signal;
+// the explicit "audio stream" wording catches the panics FFmpeg reports without
+// a codec tag. It is deliberately narrower than a bare "audio" substring so an
+// unrelated mention cannot silence a genuine video failure.
+func audioStreamEvidenceV3(lower string) bool {
+	for _, tag := range audioIdentityTagsV3 {
+		if strings.Contains(lower, tag) {
+			return true
+		}
+	}
+	return strings.Contains(lower, "audio stream")
+}
+
+// videoStreamEvidenceV3 reports whether an FFmpeg stderr line positively
+// identifies a video stream as the subject of its error. FFmpeg tags
+// stream-scoped lines with a media-type prefix: vist#<file>:<stream>/<codec>
+// is a video stream, aist#/sist# name audio and subtitle streams, and ost#
+// names an output stream. A line with no stream-class tag falls back to an
+// audio identity first, then a video codec or bitstream identifier. A
+// container-level line such as "[in#0/matroska,webm @ 0x...] Error during
+// demuxing" carries none of these: the same input holds the audio and subtitle
+// streams, and a corrupt subtitle demuxes through the same container and can
+// produce the same error. That ambiguity must not indict the video candidate —
+// a missed indictment costs one failed start, a wrong one costs the viewer
+// their release.
+//
+// The audio check runs before the video-token fallback because an audio decoder
+// error can contain a video-shaped word ("bitstream", "NAL") while naming an
+// audio codec; without the ordering an audio failure would stamp the video
+// candidate or reject the source.
+func videoStreamEvidenceV3(line string) bool {
+	lower := strings.ToLower(line)
+	switch {
+	case strings.Contains(lower, "vist#"):
+		return true
+	case strings.Contains(lower, "aist#"), strings.Contains(lower, "sist#"), strings.Contains(lower, "ost#"):
+		return false
+	}
+	if audioStreamEvidenceV3(lower) {
+		return false
+	}
+	for _, token := range videoIdentityTokensV3 {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
 }
 
 // observeDecodeError records one decoder failure line and reports whether it is
@@ -4391,12 +4468,17 @@ func (s *TranscodeSession) notifySourceRejected(ctx context.Context) {
 }
 
 func (s *TranscodeSession) logFFmpegLine(ctx context.Context, line string) {
-	if demuxInputErrorLine(line) {
+	// Both verdicts indict the video source candidate, so both require the line
+	// to resolve to the video stream. A demux or decoder failure with no video
+	// identity is left unstamped rather than risk stamping the release for a
+	// corrupt audio or subtitle stream sharing the input container.
+	video := videoStreamEvidenceV3(line)
+	if video && demuxInputErrorLine(line) {
 		if s.observeDemuxError(time.Now()) {
 			s.notifyDemuxFailure(ctx)
 		}
 	}
-	if decodeErrorLine(line) {
+	if video && decodeErrorLine(line) {
 		s.observeDecodeError(time.Now(), line)
 		s.notifySourceRejected(ctx)
 	}

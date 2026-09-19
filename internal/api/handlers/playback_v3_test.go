@@ -409,6 +409,118 @@ func TestHandleStartPlaybackV3TriesAlternateAfterHDRTerminal(t *testing.T) {
 	}
 }
 
+// A subtitle-only refusal at start must degrade in place on the release the
+// viewer selected, with the subtitle dropped, instead of hunting another
+// version. The alternate here carries a subtitle the refusal would not have
+// blocked, so any move to it would prove the version changed for a subtitle
+// reason.
+func TestHandleStartPlaybackV3SubtitleOnlyTerminalDegradesInPlace(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.SubtitleTracks = []models.SubtitleTrack{{Index: 4, Codec: "hdmv_pgs_subtitle", Language: "eng", Title: "English"}}
+
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.SubtitleTracks = nil
+	alternate.ExternalSubtitles = []models.ExternalSubtitle{{Path: writePlaybackTestMediaFile(t, "movie.eng.srt"), Language: "eng", Format: "srt"}}
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, alternate},
+	}}
+	// Transcoding disabled makes the embedded PGS track a burn-in requirement
+	// the source cannot meet, so the subtitle policy terminalls with
+	// subtitle_conversion_unsupported before any video adaptation.
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", t.TempDir())
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	start := v3HandlerStartRequest()
+	start.QualityPreference = "auto"
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{Enabled: true, SupportedOnDevice: true}
+	subtitleIndex := 0
+	start.SubtitleTrackIndex = &subtitleIndex
+	start.SubtitleTrackID = playback.TrackIDV3(source.ID, "subtitle", subtitleIndex)
+
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+
+	var response playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != source.ID {
+		t.Fatalf("effective file = %d, want the mounted source %d (a subtitle reason must not move the release)",
+			response.PlaybackPlan.EffectiveMediaFileID, source.ID)
+	}
+	if response.PlaybackPlan.Subtitle.Mode != playback.SubtitleOffV3 || response.PlaybackPlan.SelectedTracks.Subtitle != nil {
+		t.Fatalf("degraded subtitle = %#v / %#v, want off with no selection", response.PlaybackPlan.Subtitle, response.PlaybackPlan.SelectedTracks.Subtitle)
+	}
+	dropped := false
+	for _, warning := range response.PlaybackPlan.DegradationWarnings {
+		if warning.Code == "subtitle_dropped_unavailable" {
+			dropped = true
+		}
+	}
+	if !dropped {
+		t.Fatalf("in-place degrade did not state the subtitle drop: %#v", response.PlaybackPlan.DegradationWarnings)
+	}
+}
+
+// A subtitle_conversion_unsupported terminal whose same-release subtitle drop
+// also fails is not subtitle-only in effect: the release's video/policy is what
+// blocks it. That case must keep the alternate-version failover rather than
+// terminalling. Here the source is HEVC on an H.264-only client with
+// transcoding disabled, so dropping the bitmap subtitle still leaves
+// transcoding_disabled; the H.264 sibling direct-plays.
+func TestHandleStartPlaybackV3SubtitleReasonWithBlockedVideoStillMovesVersion(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.CodecVideo = "hevc"
+	source.VideoTracks = []models.VideoTrack{{
+		Codec: "hevc", Profile: "main", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+	source.SubtitleTracks = []models.SubtitleTrack{{Index: 4, Codec: "hdmv_pgs_subtitle", Language: "eng", Title: "English"}}
+
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.CodecVideo = "h264"
+	alternate.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+	alternate.SubtitleTracks = nil
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, alternate},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", t.TempDir())
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	start := v3HandlerStartRequest()
+	start.QualityPreference = "auto"
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{Enabled: true, SupportedOnDevice: true}
+	subtitleIndex := 0
+	start.SubtitleTrackIndex = &subtitleIndex
+	start.SubtitleTrackID = playback.TrackIDV3(source.ID, "subtitle", subtitleIndex)
+
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+
+	var response playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("effective file = %d, want the directly playable alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
+	}
+}
+
 func TestHandleStartPlaybackV3TriesLater4KAlternateAfterNon4KTerminal(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.CodecVideo = "hevc"
@@ -7071,19 +7183,22 @@ func TestPrepareTransportV3ClearsRemoteTransportMarkWhenServingLocally(t *testin
 	}
 }
 
-// A burn-in requirement that only an SDR alternate can satisfy must still reach
-// the alternate-version fallback. The planner reports that refusal in terms of
-// the subtitle rather than the HDR pipeline, so a gate listing only the HDR and
-// version reasons silently retires the fallback and refuses playback outright.
-func TestTerminalAllowsAlternateFileV3CoversSubtitleForcedRefusals(t *testing.T) {
+// A subtitle-only refusal is routed to the in-place subtitle degrade before the
+// alternate-version hunt: the predicate does not treat it as a direct hunt
+// trigger. The start path re-admits the hunt only after that same-release
+// degrade also fails; the genuine video/policy reasons keep their failover.
+func TestTerminalAllowsAlternateFileV3RoutesSubtitleOnlyToInPlaceDegrade(t *testing.T) {
 	for _, reason := range []string{
 		terminalNoAlternateVersionV3,
 		terminalHDRTranscodeUnsupportedV3,
-		terminalSubtitleConversionUnsupportedV3,
+		sourceDecodeFailedReasonV3,
 	} {
 		if !terminalAllowsAlternateFileV3(&playback.TerminalV3{Reason: reason}) {
-			t.Fatalf("terminal %q must allow an alternate-version retry", reason)
+			t.Fatalf("video/policy terminal %q must allow an alternate-version retry", reason)
 		}
+	}
+	if terminalAllowsAlternateFileV3(&playback.TerminalV3{Reason: terminalSubtitleConversionUnsupportedV3}) {
+		t.Fatal("a subtitle-only refusal must not trigger an alternate-version retry; it degrades in place")
 	}
 	if terminalAllowsAlternateFileV3(&playback.TerminalV3{Reason: "client_hls_unsupported"}) {
 		t.Fatal("a client-route refusal must not trigger an alternate-version retry")

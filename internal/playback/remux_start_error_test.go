@@ -85,7 +85,7 @@ func TestServeRemuxPreBodyNoOutputDefersResponse(t *testing.T) {
 	if !errors.Is(err, errRemuxNoOutput) {
 		t.Fatalf("error = %v, want it to identify the no-output failure", err)
 	}
-	if err == errRemuxNoOutput {
+	if err == errRemuxNoOutput { //nolint:errorlint // identity check: the error must wrap the sentinel, not equal it
 		t.Fatalf("error = %v, want the underlying read cause wrapped alongside it", err)
 	}
 	if !errors.Is(err, io.EOF) {

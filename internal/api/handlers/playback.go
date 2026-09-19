@@ -525,6 +525,28 @@ type PlaybackHandler struct {
 	// Guarded by v3DVRPUMu.
 	v3DVRPUMu    sync.Mutex
 	v3DVRPUVerds map[dvRPUMemoKeyV3]bool
+
+	// ServiceContext is the server lifecycle context. Detached virtual work
+	// (background probes, optimistic revalidation, candidate-sink writes,
+	// subtitle searches, prefetch) is parented to it so shutdown cancels
+	// outstanding work instead of leaking it. nil behaves as
+	// context.Background() for handlers built outside the router (tests).
+	ServiceContext context.Context
+
+	// detachedWorkOnce guards lazy construction of detachedWorkGate for
+	// handlers built as literals rather than through NewPlaybackHandler. The
+	// gate bounds all detached virtual work server-wide; see
+	// playback_virtual.go.
+	detachedWorkOnce sync.Once
+	detachedWorkGate *virtualDetachedGate
+
+	// virtualEvidenceOnce guards lazy construction of the bounded queue and
+	// worker pool that persist virtual probe evidence. Evidence persistence is
+	// queued rather than admitted through the aggregate gate so a burst of
+	// probes cannot crowd delivery/failure evidence out; see
+	// playback_virtual.go.
+	virtualEvidenceOnce  sync.Once
+	virtualEvidenceQueue chan models.VirtualFilePersistArgs
 }
 
 type PlaybackWatchScrobbler interface {
@@ -548,6 +570,9 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 		realtimeCommands:       make(map[string]playbackCommandRecord),
 		tm:                     playback.NewTranscodeManager(),
 		PlanStoreV3:            playback.NewMemoryPlanStoreV3(),
+		// Detached virtual work is parented to this until the router replaces
+		// it with the server lifecycle context.
+		ServiceContext: context.Background(),
 	}
 	if len(opts) > 0 {
 		h.fileResolver = opts[0]

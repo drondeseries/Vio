@@ -52,7 +52,14 @@ const (
 	subtitleMIMEVTTV3            = "text/vtt"
 	subtitleUnavailableReasonV3  = "subtitle_artifact_unavailable"
 	transcodeStartFailedReasonV3 = "transcode_start_failed"
-	seekRestorationPlayerV3      = "player_position"
+	// audioAdaptationFailedReasonV3 is the transport reason for a remote node
+	// that could not confirm the audio adaptation recipe for a release. It is
+	// deliberately distinct from transcodeStartFailedReasonV3: an audio problem
+	// must be resolved on the release already mounted (another audio track, or
+	// the planner's own audio transcode/downmix), so the start/replan
+	// alternate-version hunts must not treat it as a video/policy trigger.
+	audioAdaptationFailedReasonV3 = "audio_adaptation_failed"
+	seekRestorationPlayerV3       = "player_position"
 	// candidateSourceDecodeRejectedReasonV3 is the internal transport reason for
 	// a local generation whose decoder already rejected the source. It is never
 	// a client terminal: the start/replan rotation loop consumes it to substitute
@@ -1901,7 +1908,55 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		AdditionalSubtitles: subtitleInventoryFor(effectiveFile),
 	})
 	timings.mark("planning")
-	if terminalAllowsAlternateFileV3(result.Terminal) && shouldTryAlternateFileV3(req.QualityPreference) && req.FileSelection != playback.FileSelectionExplicitV3 {
+	// A subtitle-only refusal is resolved on the release already mounted: before
+	// any alternate-file hunt, re-plan that file with the subtitle dropped. The
+	// helper plans the effective file verbatim, so a virtual release is never
+	// re-resolved or substituted. Only when that same-release degrade also fails
+	// does the refusal fall through to the alternate-version failover, because
+	// the failure proves the release itself is blocked.
+	subtitleDegradeUnresolved := false
+	if subtitleOnlyTerminalV3(result.Terminal) {
+		if degradedReq, degradedResult, degradedToneMapErr, ok := h.degradeStartSubtitleInPlaceV3(r, req, requestedFile, effectiveFile, audioIndex, settings); ok {
+			req = degradedReq
+			result = degradedResult
+			toneMapCapabilityErr = degradedToneMapErr
+		} else {
+			// The same release cannot play without the subtitle either. The
+			// reason is not subtitle-only in effect: the underlying policy
+			// (HDR re-encode, 4K, transcoding disabled) is what blocks the
+			// release, so the alternate-version failover applies as it does
+			// for the genuine video/policy reasons. `terminalAllowsAlternateFileV3`
+			// deliberately omits the subtitle reason as a direct trigger; this
+			// is the one path that re-admits it, and only after the in-place
+			// degrade has proved the release itself is blocked.
+			subtitleDegradeUnresolved = true
+		}
+	}
+	// An audio-only refusal takes the same same-release route: re-plan the file
+	// already mounted with a different audio track before any alternate version
+	// is considered. The helper keeps an explicit audio pick untouched, so a
+	// viewer's choice is never silently overridden. Only when no track makes the
+	// release playable does the refusal fall through, because that proves the
+	// release itself is blocked rather than one track on it.
+	audioDegradeUnresolved := false
+	if audioOnlyTerminalV3(result.Terminal) && req.AudioTrackID == "" && req.AudioTrackIndex == nil {
+		// Only an omitted (server-resolved) audio selection is substituted. An
+		// explicit audio pick is the viewer's intent: its failure surfaces as
+		// an audio terminal so the client can re-pick, and it never re-admits
+		// the version hunt.
+		if degradedReq, degradedIndex, degradedResult, degradedToneMapErr, ok := h.degradeStartAudioInPlaceV3(r, req, requestedFile, effectiveFile, audioIndex, settings); ok {
+			req = degradedReq
+			audioIndex = degradedIndex
+			result = degradedResult
+			toneMapCapabilityErr = degradedToneMapErr
+		} else {
+			audioDegradeUnresolved = true
+		}
+	}
+	huntAllowed := terminalAllowsAlternateFileV3(result.Terminal) ||
+		(subtitleDegradeUnresolved && subtitleOnlyTerminalV3(result.Terminal)) ||
+		(audioDegradeUnresolved && audioOnlyTerminalV3(result.Terminal))
+	if huntAllowed && shouldTryAlternateFileV3(req.QualityPreference) && req.FileSelection != playback.FileSelectionExplicitV3 {
 		alternateOrder := alternateOrderingForClient(req.Capabilities)
 		if alternates, alternateErr := h.findAlternateFiles(r.Context(), alternateBase, alternateOrder); alternateErr == nil {
 			if alternateBase != requestedFile {
@@ -2092,7 +2147,12 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			}
 			return persisted, nil
 		}
-		if statusErr.reason == transcodeStartFailedReasonV3 && isVirtualPlaybackFile(requestedFile) && req.FileSelection != playback.FileSelectionExplicitV3 {
+		// A transport failure that names an audio condition (a node declining
+		// the audio recipe, audio transcoding disabled) must not rotate the
+		// release. The reason split already keeps those out of this branch; the
+		// guard makes the audio exclusion explicit so a future caller cannot
+		// fold an audio reason back into the video transport reason.
+		if statusErr.reason == transcodeStartFailedReasonV3 && !audioOnlyTransportReasonV3(statusErr.reason) && isVirtualPlaybackFile(requestedFile) && req.FileSelection != playback.FileSelectionExplicitV3 {
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
 			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder); alternateErr == nil && len(alternates) > 0 {
 				for _, altCandidate := range alternates {
@@ -2710,6 +2770,11 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 		excludedShapes[shapeID] = struct{}{}
 	}
 	var lastErr *transportErrorV3
+	// Every candidate failure being audio-local is reported as the audio reason
+	// rather than the generic route exhaustion, so the client gets a clear
+	// audio outcome. A single non-audio failure makes the exhaustion a route
+	// failure.
+	audioOnlyFailure := true
 	for attempts := 0; attempts < 32; attempts++ {
 		decision := h.resolveHLSRouteWithPolicyV3(r.Context(), session, result, policy, proxyAllowed, excludedNodes, excludedShapes)
 		if !decision.Selected() {
@@ -2730,6 +2795,7 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 
 		if decision.Shape.Execution == noderouting.ExecutionAPI {
 			if capabilityErr := h.validateLocalTransportCapabilitiesV3(r.Context(), result); capabilityErr != nil {
+				audioOnlyFailure = false
 				lastErr = combineTransportErrorsV3(lastErr, capabilityErr)
 				excludedShapes[decision.Shape.ID] = struct{}{}
 				continue
@@ -2752,6 +2818,9 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 				// subtitle decision stay with the caller; never route around it
 				// into a different delivery.
 				return preparedTransportV3{}, transportErr
+			}
+			if !audioOnlyTransportReasonV3(transportErr.reason) {
+				audioOnlyFailure = false
 			}
 			lastErr = combineTransportErrorsV3(lastErr, transportErr)
 			excludedShapes[decision.Shape.ID] = struct{}{}
@@ -2778,6 +2847,7 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 				releaser.ReleaseSession(session.ID)
 			}
 			excludedNodes[nodeURL] = struct{}{}
+			audioOnlyFailure = false
 			lastErr = combineTransportErrorsV3(lastErr, &transportErrorV3{reason: routeCapabilityUnavailableReasonV3, message: "No available worker can execute the selected playback recipe.", retryable: true, cause: capabilityErr})
 			continue
 		}
@@ -2816,7 +2886,15 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 		} else {
 			excludedNodes[nodeURL] = struct{}{}
 		}
+		if !audioOnlyTransportReasonV3(transportErr.reason) {
+			audioOnlyFailure = false
+		}
 		lastErr = combineTransportErrorsV3(lastErr, transportErr)
+	}
+	if audioOnlyFailure && lastErr != nil {
+		// Every route failed on the audio recipe, so the exhaustion is an audio
+		// outcome: surface it locally instead of the generic route failure.
+		return preparedTransportV3{}, lastErr
 	}
 	return preparedTransportV3{}, &transportErrorV3{reason: "route_preparation_failed", message: "Playback route preparation exhausted every candidate.", retryable: true, cause: lastErr}
 }
@@ -4509,7 +4587,12 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	}
 	if err := transcodenode.ValidateAudioRecipeAttestation(req, nodeResp); err != nil {
 		h.tm.StopRemoteTranscode(transportID, node.URL)
-		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the audio recipe.", retryable: true, cause: err}
+		// A node that cannot confirm the audio adaptation recipe is an audio
+		// failure, not a video one. The distinct reason keeps the start/replan
+		// alternate-version hunts from rotating the release over it; the
+		// transport loop still tries the same recipe on another node, which is
+		// the same-release resolution for a node-local audio condition.
+		return preparedTransportV3{}, &transportErrorV3{reason: audioAdaptationFailedReasonV3, message: "The selected transcode node did not confirm the audio recipe.", retryable: true, cause: err}
 	}
 	if err := transcodenode.ValidateCopyFMP4RecipeAttestation(req, nodeResp); err != nil {
 		h.tm.StopRemoteTranscode(transportID, node.URL)
@@ -5635,6 +5718,19 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 			// a failed media source. Name the subtitle instead so the client
 			// can drop or re-pick it without a release swap.
 			return subtitleArtifactErrorV3("The selected subtitle is unavailable in every compatible media version.", joinedErr)
+		case candidateStageAudioRemap:
+			// An audio remap miss is an audio-local outcome. The candidate's
+			// audio inventory is what failed to bind, not its video stream.
+			// Reporting virtual_source_unavailable would let the generic
+			// candidate machinery indict the release for a track the file
+			// lacks or the client sent malformed. Name the audio so the client
+			// can pick another track without a release swap.
+			return &transportErrorV3{
+				reason:    "track_unavailable",
+				message:   "The selected audio track is unavailable in every compatible media version.",
+				retryable: false,
+				cause:     joinedErr,
+			}
 		case candidateStageTranscodePerm:
 			return &transportErrorV3{
 				reason:    "transcoding_disabled",
@@ -5899,6 +5995,175 @@ func annotateSubtitleDroppedV3(result *playback.PlannerResultV3) {
 		Code:    "subtitle_dropped_unavailable",
 		Message: "The selected subtitle is unavailable on this release; playback continues without it on the same release.",
 	})
+}
+
+// degradeStartSubtitleInPlaceV3 re-plans a fresh start's effective file with the
+// subtitle selection cleared, keeping the release. It is the start-path
+// counterpart of evaluateSubtitleDegradeInPlaceV3: a subtitle-only refusal must
+// not send the viewer hunting for another version. The effective file is planned
+// verbatim, so a virtual release is never re-resolved or substituted. It reports
+// false when the same release still has no playable plan, leaving the caller's
+// original subtitle terminal in place.
+func (h *PlaybackHandler) degradeStartSubtitleInPlaceV3(
+	r *http.Request,
+	req playback.StartRequestV3,
+	requestedFile, effectiveFile *models.MediaFile,
+	audioIndex int,
+	settings playback.PlannerSettingsV3,
+) (playback.StartRequestV3, playback.PlannerResultV3, error, bool) {
+	degradedReq := subtitleDegradedStartV3(req)
+	degradedResult, degradedToneMapErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
+		Request: degradedReq, RequestedFile: requestedFile, EffectiveFile: effectiveFile,
+		AudioTrackIndex: audioIndex, Settings: settings,
+		Registry:            h.transformationRegistryV3(r.Context()),
+		DVRPUStrippable:     h.lazyDVRPUStrippableV3(r.Context(), effectiveFile),
+		Now:                 time.Now(),
+		AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile),
+	})
+	clampPlannerTargetResolution(&degradedResult, effectiveFile)
+	if degradedResult.Terminal != nil {
+		return req, playback.PlannerResultV3{}, degradedToneMapErr, false
+	}
+	annotateSubtitleDroppedV3(&degradedResult)
+	return degradedReq, degradedResult, degradedToneMapErr, true
+}
+
+// maxInPlaceAudioCandidatesV3 bounds how many alternative tracks a same-release
+// audio resolution will plan. Planning can resolve a registry and probe, and a
+// file with many commentary tracks must not turn one audio failure into an
+// unbounded planning loop.
+const maxInPlaceAudioCandidatesV3 = 4
+
+// annotateAudioTrackSubstitutedV3 states plainly on a successful degraded plan
+// that the failing audio track was swapped for another track in the same file.
+// The plan keeps the same effective file and delivery; the warning is how the
+// client learns the audio selection changed rather than inferring a route
+// failure. The substituted track is also visible in the plan's selected tracks.
+func annotateAudioTrackSubstitutedV3(result *playback.PlannerResultV3, index int) {
+	if result == nil || result.Terminal != nil || result.Plan == nil {
+		return
+	}
+	result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.DegradationWarningV3{
+		Code:    "audio_track_substituted",
+		Message: fmt.Sprintf("The selected audio track could not be played on this release; audio track %d in the same file is used instead.", index),
+	})
+}
+
+// inPlaceAudioCandidateOrderV3 orders the file's alternative audio tracks for a
+// same-release resolution: tracks the client can already render come first,
+// because the planner only needs a copy for those, then the rest. Each index is
+// planned at most once and the list is bounded by maxInPlaceAudioCandidatesV3.
+func inPlaceAudioCandidateOrderV3(req playback.StartRequestV3, file *models.MediaFile, current int) []int {
+	if file == nil || len(file.AudioTracks) < 2 {
+		return nil
+	}
+	playable := playback.AudioTrackPlayableFuncV3(req)
+	order := make([]int, 0, len(file.AudioTracks))
+	for index := range file.AudioTracks {
+		if index != current && playable(file.AudioTracks[index]) {
+			order = append(order, index)
+		}
+	}
+	for index := range file.AudioTracks {
+		if index != current && !playable(file.AudioTracks[index]) {
+			order = append(order, index)
+		}
+	}
+	if len(order) > maxInPlaceAudioCandidatesV3 {
+		order = order[:maxInPlaceAudioCandidatesV3]
+	}
+	return order
+}
+
+// audioDegradedStartV3 rebinds a start request's audio selection to another
+// track in the same file. Both the id and the index are set so the pair agrees
+// at the request boundary.
+func audioDegradedStartV3(baseStart playback.StartRequestV3, file *models.MediaFile, index int) playback.StartRequestV3 {
+	degradedStart := baseStart
+	indexCopy := index
+	degradedStart.AudioTrackIndex = &indexCopy
+	if file != nil {
+		degradedStart.AudioTrackID = playback.TrackIDV3(file.ID, "audio", index)
+	}
+	return degradedStart
+}
+
+// degradeStartAudioInPlaceV3 re-plans a fresh start's effective file with a
+// different audio track when the selected one cannot be adapted. It is the
+// audio counterpart of degradeStartSubtitleInPlaceV3: an audio problem must be
+// resolved on the release already mounted, never by rotating the video
+// candidate. The effective file is planned verbatim, so a virtual release is
+// never re-resolved or substituted. An explicit audio pick is left untouched: a
+// viewer's track choice surfaces its failure instead of being silently
+// overridden. It reports false when no alternative track yields a playable plan.
+func (h *PlaybackHandler) degradeStartAudioInPlaceV3(
+	r *http.Request,
+	req playback.StartRequestV3,
+	requestedFile, effectiveFile *models.MediaFile,
+	currentAudioIndex int,
+	settings playback.PlannerSettingsV3,
+) (playback.StartRequestV3, int, playback.PlannerResultV3, error, bool) {
+	if req.AudioTrackID != "" || req.AudioTrackIndex != nil {
+		return req, currentAudioIndex, playback.PlannerResultV3{}, nil, false
+	}
+	for _, index := range inPlaceAudioCandidateOrderV3(req, effectiveFile, currentAudioIndex) {
+		degradedReq := audioDegradedStartV3(req, effectiveFile, index)
+		degradedResult, degradedToneMapErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
+			Request: degradedReq, RequestedFile: requestedFile, EffectiveFile: effectiveFile,
+			AudioTrackIndex: index, Settings: settings,
+			Registry:            h.transformationRegistryV3(r.Context()),
+			DVRPUStrippable:     h.lazyDVRPUStrippableV3(r.Context(), effectiveFile),
+			Now:                 time.Now(),
+			AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile),
+		})
+		clampPlannerTargetResolution(&degradedResult, effectiveFile)
+		if degradedResult.Terminal == nil {
+			annotateAudioTrackSubstitutedV3(&degradedResult, index)
+			return degradedReq, index, degradedResult, degradedToneMapErr, true
+		}
+	}
+	return req, currentAudioIndex, playback.PlannerResultV3{}, nil, false
+}
+
+// evaluateAudioDegradeInPlaceV3 re-plans the session's own file with a different
+// audio track, without re-resolving the provider candidate. It is the replan
+// counterpart of degradeStartAudioInPlaceV3: an audio-only refusal keeps the
+// playing release. The file is used verbatim, so a virtual release is never
+// re-listed or substituted mid-degrade. An explicit audio pick in this replan
+// (selected_tracks.audio present) is left untouched. It reports false when no
+// alternative track yields a playable plan, leaving the caller's terminal in
+// place.
+func (h *PlaybackHandler) evaluateAudioDegradeInPlaceV3(
+	r *http.Request,
+	session *playback.Session,
+	record *playback.AttemptRecordV3,
+	req playback.ReplanRequestV3,
+	baseStart playback.StartRequestV3,
+	file *models.MediaFile,
+	plannerRequestedFile *models.MediaFile,
+	plannerSettings playback.PlannerSettingsV3,
+	plannerSettingsErr error,
+	attemptedKeys []string,
+) (*candidateEvaluationV3, *candidateErrorV3, bool) {
+	if file == nil {
+		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil same-release audio degrade target"}, false
+	}
+	if req.SelectedTracks.Audio != nil {
+		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: "explicit audio selection is not auto-substituted"}, false
+	}
+	current := 0
+	if baseStart.AudioTrackIndex != nil {
+		current = *baseStart.AudioTrackIndex
+	}
+	for _, index := range inPlaceAudioCandidateOrderV3(baseStart, file, current) {
+		degradedStart := audioDegradedStartV3(baseStart, file, index)
+		eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+		if evalErr == nil && eval != nil && eval.result.Terminal == nil {
+			annotateAudioTrackSubstitutedV3(&eval.result, index)
+			return eval, nil, true
+		}
+	}
+	return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: "no alternative audio track is playable on this release"}, false
 }
 
 // executeReplanV3 prepares an atomic replacement for a failed playback route.
@@ -6538,11 +6803,26 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail})
 			clampPlannerTargetResolution(&result, effectiveFile)
 		}
-		alternateFileAllowed := terminalAllowsAlternateFileV3(result.Terminal) &&
-			record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3 &&
+		// A subtitle-only refusal and a video/policy refusal take different
+		// recovery routes. The in-place subtitle degrade is gated on the same
+		// operation/quality/selection rules the alternate hunt uses, but not on
+		// terminalAllowsAlternateFileV3: subtitle_conversion_unsupported is no
+		// longer in that set precisely so a subtitle problem cannot reach the
+		// sibling hunt.
+		replanFallbackAllowed := record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3 &&
 			(replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
 				(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3))
-		if alternateFileAllowed && subtitleOnlyTerminalV3(result.Terminal) {
+		subtitleOnlyAllowed := replanFallbackAllowed && subtitleOnlyTerminalV3(result.Terminal)
+		// An audio-only refusal takes the same in-place route as a subtitle
+		// one: keep the mounted release and re-plan it with another audio
+		// track. audio_conversion_unsupported is not in
+		// terminalAllowsAlternateFileV3, so an audio problem never reaches the
+		// sibling hunt. On a replan the mounted release is known to be
+		// playable, so a failed in-place resolution leaves the terminal in
+		// place rather than substituting a sibling.
+		audioOnlyAllowed := replanFallbackAllowed && audioOnlyTerminalV3(result.Terminal)
+		alternateFileAllowed := replanFallbackAllowed && terminalAllowsAlternateFileV3(result.Terminal)
+		if subtitleOnlyAllowed {
 			// A subtitle-only refusal must not move the release. Re-plan the
 			// file already mounted with the subtitle dropped; the in-place
 			// helper uses the resolved file verbatim, so a virtual release is
@@ -6550,6 +6830,22 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// without the subtitle either, the original subtitle terminal
 			// stands and no sibling is tried.
 			if eval, evalErr := h.evaluateSubtitleDegradeInPlaceV3(r, session, record, req, start, effectiveFile, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys); evalErr == nil && eval != nil && eval.result.Terminal == nil {
+				start = eval.start
+				effectiveFile = eval.file
+				result = eval.result
+				toneMapCapabilityErr = eval.toneMapErr
+				artifactRecipe = eval.frozenRecipe
+				preparedTransport = &eval.transport
+				transportPrepared = true
+				reservationHeld = eval.reservationHeld
+			}
+		} else if audioOnlyAllowed {
+			// An audio-only refusal must not move the release. Re-plan the file
+			// already mounted with another audio track; the helper uses the
+			// resolved file verbatim, so a virtual release is never re-listed or
+			// substituted. If no track is playable the original audio terminal
+			// stands and no sibling is tried.
+			if eval, evalErr, ok := h.evaluateAudioDegradeInPlaceV3(r, session, record, req, start, effectiveFile, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys); ok && evalErr == nil && eval != nil && eval.result.Terminal == nil {
 				start = eval.start
 				effectiveFile = eval.file
 				result = eval.result
@@ -7695,20 +7991,33 @@ const (
 // terminalAllowsAlternateFileV3 reports whether a refusal is the kind another
 // version of the same item could satisfy.
 //
-// subtitle_conversion_unsupported belongs here because it is not only a
-// subtitle-format refusal: when a burn-in requirement is the sole trigger of an
-// adaptation the source cannot take, the planner reports the blocker in terms
-// of the subtitle rather than the HDR pipeline or the 4K policy. Those cases
-// used to surface as hdr_transcode_unsupported / no_alternate_version and were
-// the exact reason this gate exists — a bitmap subtitle needing burn-in that an
-// HDR source cannot support while an SDR alternate can. Leaving the new reason
-// out silently retired that fallback and refused playback outright.
+// subtitle_conversion_unsupported is deliberately absent as a direct trigger.
+// It is emitted when a subtitle burn-in is the sole trigger of a video
+// adaptation the source cannot take (HDR re-encode, 4K policy, transcoding
+// disabled) or when a subtitle simply cannot be delivered, and deselecting the
+// subtitle restores playback on the same release. A subtitle problem must never
+// move the video candidate, so the reason is routed to the in-place subtitle
+// degrade first; only when that same-release degrade also fails does the start
+// path re-admit the alternate-version failover, because the failure proves the
+// release itself is blocked and the refusal is a video/policy one in disguise.
+// The genuine video/policy refusals (HDR pipeline, 4K policy without a subtitle
+// trigger, a corrupt source) keep their alternate-version failover directly.
+//
+// audio_conversion_unsupported is deliberately absent for the same reason as the
+// subtitle reason: it names an audio codec or track the available executors
+// cannot adapt, not a video stream they cannot play. It is routed to the
+// in-place audio resolution (another track in the same file, or the planner's
+// own transcode/downmix) before any sibling hunt. The decode reason is only
+// video-scoped evidence (videoStreamEvidenceV3); an audio decoder/demux failure
+// can no longer produce it.
 func terminalAllowsAlternateFileV3(terminal *playback.TerminalV3) bool {
 	if terminal == nil {
 		return false
 	}
 	switch terminal.Reason {
-	case terminalNoAlternateVersionV3, terminalHDRTranscodeUnsupportedV3, terminalSubtitleConversionUnsupportedV3, sourceDecodeFailedReasonV3:
+	case playback.TerminalAudioConversionUnsupportedV3:
+		return false
+	case terminalNoAlternateVersionV3, terminalHDRTranscodeUnsupportedV3, sourceDecodeFailedReasonV3:
 		return true
 	default:
 		return false
@@ -7716,15 +8025,51 @@ func terminalAllowsAlternateFileV3(terminal *playback.TerminalV3) bool {
 }
 
 // subtitleOnlyTerminalV3 reports whether a refusal names a subtitle problem
-// rather than a video/policy one. Such a refusal must never move the session to
-// another release: the subtitle is dropped on the release already mounted (with
-// the drop stated on the plan), or the subtitle terminal stands unchanged. The
+// rather than a video/policy one. Such a refusal is first resolved on the
+// release already mounted by dropping the subtitle (with the drop stated on the
+// plan). On a replan the subtitle terminal then stands unchanged, because the
+// playing release is known to be playable. On a fresh start, a same-release
+// degrade that also fails proves the release itself is blocked, so the start
+// path may still fall back to another version as a video/policy refusal. The
 // video-failure reasons keep their existing alternate-file failover.
 func subtitleOnlyTerminalV3(terminal *playback.TerminalV3) bool {
 	if terminal == nil {
 		return false
 	}
 	return terminal.Reason == terminalSubtitleConversionUnsupportedV3
+}
+
+// audioOnlyTerminalV3 reports whether a refusal names an audio problem rather
+// than a video/policy one. The planner emits audio_conversion_unsupported when
+// the selected audio track needs an adaptation no eligible executor can run.
+// That is a statement about the audio stream, not the picture, so the refusal
+// is first resolved on the release already mounted by selecting another audio
+// track in the same file (the planner already chooses an audio transcode or
+// downmix during planning). A track change is the viewer's call, so an explicit
+// audio pick is never silently replaced. The video/policy reasons keep their
+// alternate-file failover. On a fresh start a same-release resolution that also
+// fails proves the release itself is blocked, and only then may the start path
+// re-admit the version failover.
+func audioOnlyTerminalV3(terminal *playback.TerminalV3) bool {
+	if terminal == nil {
+		return false
+	}
+	return terminal.Reason == playback.TerminalAudioConversionUnsupportedV3
+}
+
+// audioOnlyTransportReasonV3 reports whether a transport failure names an audio
+// condition. Such a failure must stay on the release already mounted: it is not
+// evidence the video candidate is bad. The audio recipe a node declined to
+// confirm is the audio counterpart of the subtitle-local readiness timeout, and
+// audio_transcoding_disabled is a policy statement about the audio adaptation,
+// never about the picture.
+func audioOnlyTransportReasonV3(reason string) bool {
+	switch reason {
+	case audioAdaptationFailedReasonV3, "audio_transcoding_disabled":
+		return true
+	default:
+		return false
+	}
 }
 
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {

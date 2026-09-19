@@ -371,7 +371,7 @@ func TestVirtualReconcileRequestSourceStillWithdrawsUnreferencedItem(t *testing.
 }
 
 // TestVirtualReconcileRequestSourceRetainsWatchedItem proves the request:
-// bypass only skips the empty-keep-set refusal; it does not authorise deleting
+// bypass only skips the empty-keep-set refusal; it does not authorize deleting
 // an item the new guards protect.
 func TestVirtualReconcileRequestSourceRetainsWatchedItem(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)
@@ -403,7 +403,7 @@ func TestVirtualReconcileRequestSourceRetainsWatchedItem(t *testing.T) {
 }
 
 // TestCleanupRequestVirtualMediaRetainsWatchedItem guards the sibling
-// request-cancellation path: cancelling a request must not delete an item the
+// request-cancellation path: canceling a request must not delete an item the
 // user has watch history for.
 func TestCleanupRequestVirtualMediaRetainsWatchedItem(t *testing.T) {
 	pool := newVirtualMediaTestPool(t)

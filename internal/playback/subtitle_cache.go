@@ -131,6 +131,16 @@ const (
 	// generation bucket, not the cooldown, is what re-keys it after a real
 	// source rotation).
 	subtitleWarmFailureMaxCooldown = 30 * time.Minute
+	// subtitleWarmGuardMaxEntries caps the per-identity failed-warm cooldown
+	// map. A live entry is an identity still inside its cooldown; without a cap
+	// a long-lived server accumulates one entry for every identity that ever
+	// failed to warm, including identities whose cooldown lapsed long ago.
+	// 4096 is far above the number of distinct tracks that can fail inside the
+	// 30m maximum cooldown, so eviction only fires under pathological churn.
+	// It does not change when a retained entry suppresses a warm: an evicted
+	// live entry simply lets the next attempt for that identity run sooner
+	// than its backoff would have allowed.
+	subtitleWarmGuardMaxEntries = 4096
 )
 
 // subtitleWarmGuard is the per-identity warm admission state: how many
@@ -569,10 +579,51 @@ func (c *SubtitleCache) warmAdmitted(key string, now time.Time) bool {
 	c.warmMu.Lock()
 	defer c.warmMu.Unlock()
 	guard, ok := c.warmGuard[key]
+	// At the cap, drop entries whose cooldown has lapsed. They no longer
+	// suppress anything, so this keeps the map from retaining memory the
+	// admission check will never consult.
+	if len(c.warmGuard) >= subtitleWarmGuardMaxEntries {
+		c.pruneExpiredWarmGuardLocked(now)
+	}
 	if !ok {
 		return true
 	}
 	return !now.Before(guard.retryAt)
+}
+
+// pruneExpiredWarmGuardLocked drops entries whose cooldown has lapsed. Caller
+// holds warmMu.
+func (c *SubtitleCache) pruneExpiredWarmGuardLocked(now time.Time) {
+	for k, guard := range c.warmGuard {
+		if !now.Before(guard.retryAt) {
+			delete(c.warmGuard, k)
+		}
+	}
+}
+
+// sweepWarmGuardLocked makes room when the map is at its cap. It first drops
+// lapsed entries (behaviorally dead), then, if every remaining entry is still
+// live, evicts the one closest to lapsing. The soonest-expiring entry would
+// stop suppressing within the shortest time anyway. Caller holds warmMu.
+func (c *SubtitleCache) sweepWarmGuardLocked(now time.Time) {
+	if len(c.warmGuard) < subtitleWarmGuardMaxEntries {
+		return
+	}
+	c.pruneExpiredWarmGuardLocked(now)
+	if len(c.warmGuard) < subtitleWarmGuardMaxEntries {
+		return
+	}
+	victim := ""
+	var victimAt time.Time
+	for k, guard := range c.warmGuard {
+		if victim == "" || guard.retryAt.Before(victimAt) || (guard.retryAt.Equal(victimAt) && k < victim) {
+			victim = k
+			victimAt = guard.retryAt
+		}
+	}
+	if victim != "" {
+		delete(c.warmGuard, victim)
+	}
 }
 
 // noteWarmOutcome records a warm result for the cache key. Success clears the
@@ -592,6 +643,12 @@ func (c *SubtitleCache) noteWarmOutcome(key string, success bool, now time.Time)
 	}
 	if c.warmGuard == nil {
 		c.warmGuard = make(map[string]subtitleWarmGuard)
+	}
+	// Make room before inserting a new entry. Refreshing an existing entry does
+	// not grow the map, so it never needs the sweep and never evicts the entry
+	// it is about to refresh.
+	if _, exists := c.warmGuard[key]; !exists && len(c.warmGuard) >= subtitleWarmGuardMaxEntries {
+		c.sweepWarmGuardLocked(now)
 	}
 	guard := c.warmGuard[key]
 	guard.failures++

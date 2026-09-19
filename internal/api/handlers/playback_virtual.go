@@ -55,6 +55,17 @@ const (
 	// unknown; only a repeat is treated as evidence it should stop steering
 	// starts.
 	virtualProbeFailureRepeatThreshold = 2
+	// virtualProbeFailureMaxEntries caps the process-wide probe-failure damper.
+	// A live marker is a candidate still inside its backoff window; a
+	// long-lived server that probes many distinct candidates would otherwise
+	// retain one marker per candidate forever. The live set is bounded in
+	// practice by how many distinct candidates can fail inside the 60m maximum
+	// window, so 4096 is far above any plausible concurrent failure set and
+	// eviction only fires under pathological churn. It does not change when a
+	// retained marker counts as valid: an evicted live marker simply means the
+	// next probe for that candidate runs sooner than its backoff would have
+	// allowed.
+	virtualProbeFailureMaxEntries = 4096
 )
 
 // virtualBackgroundProbeBudget bounds a background probe. Production uses the
@@ -100,11 +111,54 @@ func (c *virtualProbeFailureCache) recent(key string) bool {
 	if !ok {
 		return false
 	}
-	if !c.clock().Before(mark.expiresAt) {
+	now := c.clock()
+	if !now.Before(mark.expiresAt) {
 		delete(c.marks, key)
 		return false
 	}
+	// At the cap, drop markers whose window has lapsed. They are already
+	// ignored by recent/count, so this changes nothing about validity; it
+	// keeps the map from holding memory the damper will never consult.
+	if len(c.marks) >= virtualProbeFailureMaxEntries {
+		c.pruneExpiredLocked(now)
+	}
 	return true
+}
+
+// pruneExpiredLocked drops every marker whose backoff window has lapsed. Caller
+// holds c.mu.
+func (c *virtualProbeFailureCache) pruneExpiredLocked(now time.Time) {
+	for k, mark := range c.marks {
+		if !now.Before(mark.expiresAt) {
+			delete(c.marks, k)
+		}
+	}
+}
+
+// sweepLocked makes room when the map is at its cap. It first drops lapsed
+// markers (behaviorally dead), then, if every remaining marker is still live,
+// evicts the one closest to lapsing. The soonest-expiring marker is the least
+// useful: it would stop suppressing within the shortest time anyway. Caller
+// holds c.mu.
+func (c *virtualProbeFailureCache) sweepLocked(now time.Time) {
+	if len(c.marks) < virtualProbeFailureMaxEntries {
+		return
+	}
+	c.pruneExpiredLocked(now)
+	if len(c.marks) < virtualProbeFailureMaxEntries {
+		return
+	}
+	victim := ""
+	var victimAt time.Time
+	for k, mark := range c.marks {
+		if victim == "" || mark.expiresAt.Before(victimAt) || (mark.expiresAt.Equal(victimAt) && k < victim) {
+			victim = k
+			victimAt = mark.expiresAt
+		}
+	}
+	if victim != "" {
+		delete(c.marks, victim)
+	}
 }
 
 func (c *virtualProbeFailureCache) mark(key string) {
@@ -117,6 +171,12 @@ func (c *virtualProbeFailureCache) mark(key string) {
 		c.marks = make(map[string]virtualProbeFailureMark)
 	}
 	now := c.clock()
+	// Make room before inserting a new marker. An update of an existing key
+	// does not grow the map, so it never needs the sweep and never evicts the
+	// marker it is about to refresh.
+	if _, exists := c.marks[key]; !exists && len(c.marks) >= virtualProbeFailureMaxEntries {
+		c.sweepLocked(now)
+	}
 	// Prune markers that have been idle well past their window so a long-lived
 	// process only retains failures still in backoff.
 	for k, mark := range c.marks {
@@ -148,9 +208,13 @@ func (c *virtualProbeFailureCache) count(key string) int {
 	if !ok {
 		return 0
 	}
-	if !c.clock().Before(mark.expiresAt) {
+	now := c.clock()
+	if !now.Before(mark.expiresAt) {
 		delete(c.marks, key)
 		return 0
+	}
+	if len(c.marks) >= virtualProbeFailureMaxEntries {
+		c.pruneExpiredLocked(now)
 	}
 	return mark.failures
 }
@@ -190,6 +254,181 @@ func virtualProbeFailureKey(candidateURI string, ownerInstallationID int) string
 	return virtualPlaybackNeutralKey(candidateURI) + "\x00" + strconv.Itoa(ownerInstallationID) + "\x00" + candidateID
 }
 
+// virtualDetachedWorkerCap bounds detached virtual-playback work server-wide
+// per handler. Every goroutine spawned per request or per candidate acquires
+// one of these slots before it starts: background probes, optimistic
+// revalidation, candidate-sink writes, subtitle searches, and prefetch. The
+// value is deliberately small because one slot can hold a remote resolve or
+// ffprobe for up to a minute. Acquisition is non-blocking, so the request path
+// sheds best-effort work rather than waiting. Probe evidence persistence has
+// its own bounded queue instead (see enqueueVirtualProbeEvidence) so a burst
+// of long probes cannot crowd delivery/failure evidence out.
+const virtualDetachedWorkerCap = 32
+
+// virtualSubtitleSearchBudget bounds one detached subtitle search. The search
+// used to run on context.Background() with no deadline, so a hung provider or
+// downloader leaked the goroutine forever. On timeout or shutdown the in-flight
+// dedupe key is released and a later start may retry.
+const virtualSubtitleSearchBudget = 2 * time.Minute
+
+// virtualDetachedGate is a non-blocking counting semaphore for detached work.
+// A nil gate admits everything so handlers built as literals in tests behave as
+// before; the handler constructs a bounded one lazily through detachedGate.
+type virtualDetachedGate struct {
+	slots chan struct{}
+}
+
+func newVirtualDetachedGate(capacity int) *virtualDetachedGate {
+	if capacity <= 0 {
+		capacity = virtualDetachedWorkerCap
+	}
+	return &virtualDetachedGate{slots: make(chan struct{}, capacity)}
+}
+
+func (g *virtualDetachedGate) capacity() int {
+	if g == nil {
+		return 0
+	}
+	return cap(g.slots)
+}
+
+// tryAcquire takes a slot without blocking. A false result means the caller
+// must skip the best-effort work and return; it must not queue or wait, or a
+// slow worker would stall the request path.
+func (g *virtualDetachedGate) tryAcquire() bool {
+	if g == nil {
+		return true
+	}
+	select {
+	case g.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// release returns a slot. It never blocks: a release without a matching acquire
+// is a bug, and blocking on it would make things worse.
+func (g *virtualDetachedGate) release() {
+	if g == nil {
+		return
+	}
+	select {
+	case <-g.slots:
+	default:
+	}
+}
+
+// detachedGate returns the handler's bounded detached-work gate, constructing
+// it lazily for handlers built outside NewPlaybackHandler (tests).
+func (h *PlaybackHandler) detachedGate() *virtualDetachedGate {
+	if h == nil {
+		return nil
+	}
+	h.detachedWorkOnce.Do(func() {
+		if h.detachedWorkGate == nil {
+			h.detachedWorkGate = newVirtualDetachedGate(virtualDetachedWorkerCap)
+		}
+	})
+	return h.detachedWorkGate
+}
+
+// virtualDetachedContext builds the context for one detached worker. It keeps
+// base's values (so request-scoped logging and identity still flow) while
+// discarding base's cancellation, and additionally cancels when the handler's
+// service context ends so shutdown stops outstanding work. It always applies
+// its own timeout. A nil base uses the service context directly.
+func (h *PlaybackHandler) virtualDetachedContext(base context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	service := context.Background()
+	if h != nil && h.ServiceContext != nil {
+		service = h.ServiceContext
+	}
+	if base == nil {
+		return context.WithTimeout(service, timeout)
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(base), timeout)
+	stop := context.AfterFunc(service, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+const (
+	// virtualEvidenceQueueSize bounds queued probe-evidence writes. Each task
+	// is a small argument struct (no response data), so a few hundred is cheap
+	// and absorbs a burst while the two workers drain it.
+	virtualEvidenceQueueSize = 256
+	// virtualEvidenceWorkers is the number of workers that persist queued
+	// evidence. Two keeps a burst moving without competing with probe workers
+	// for the aggregate gate.
+	virtualEvidenceWorkers = 2
+	// virtualEvidencePersistBudget bounds one queued evidence write.
+	virtualEvidencePersistBudget = 5 * time.Second
+)
+
+// enqueueVirtualProbeEvidence queues one catalog write for the evidence worker
+// pool. Queueing rather than admitting through the aggregate gate is
+// deliberate: probe evidence is what turns an optimistic start into a fast
+// replay, so it must not be crowded out by a burst of long probes. The queue is
+// bounded; when it is full the write is dropped with an Error-level log naming
+// the reason, never silently.
+func (h *PlaybackHandler) enqueueVirtualProbeEvidence(ctx context.Context, args models.VirtualFilePersistArgs) {
+	if h == nil || h.VirtualFileSaver == nil {
+		return
+	}
+	h.virtualEvidenceOnce.Do(func() {
+		h.virtualEvidenceQueue = make(chan models.VirtualFilePersistArgs, virtualEvidenceQueueSize)
+		for range virtualEvidenceWorkers {
+			go h.runVirtualEvidenceWorker()
+		}
+	})
+	select {
+	case h.virtualEvidenceQueue <- args:
+	default:
+		slog.ErrorContext(ctx, "virtual probe evidence persist dropped: detached evidence queue full",
+			"component", "api", "file_id", args.FileID, "stamp_probe", args.StampProbe,
+			"queue_size", virtualEvidenceQueueSize)
+	}
+}
+
+// runVirtualEvidenceWorker drains queued evidence writes until the service
+// context is canceled. Work still queued when the context ends is abandoned
+// with the process.
+func (h *PlaybackHandler) runVirtualEvidenceWorker() {
+	var serviceDone <-chan struct{}
+	if h.ServiceContext != nil {
+		serviceDone = h.ServiceContext.Done()
+	}
+	for {
+		select {
+		case <-serviceDone:
+			// Never abandon queued evidence silently: say how much was left
+			// behind when shutdown interrupted the drain.
+			if n := len(h.virtualEvidenceQueue); n > 0 {
+				slog.Warn("virtual probe evidence persist abandoned at shutdown",
+					"component", "api", "queued", n)
+			}
+			return
+		case args := <-h.virtualEvidenceQueue:
+			h.persistVirtualEvidenceNow(args)
+		}
+	}
+}
+
+func (h *PlaybackHandler) persistVirtualEvidenceNow(args models.VirtualFilePersistArgs) {
+	saver := h.VirtualFileSaver
+	if saver == nil {
+		return
+	}
+	ctx, cancel := h.virtualDetachedContext(nil, virtualEvidencePersistBudget)
+	defer cancel()
+	if _, err := saver(ctx, args); err != nil {
+		slog.ErrorContext(ctx, "virtual probe evidence persist failed",
+			"component", "api", "file_id", args.FileID, "error", err)
+	}
+}
+
 func (h *PlaybackHandler) PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string) {
 	if h == nil || len(files) == 0 || profileID == "" {
 		return
@@ -204,8 +443,15 @@ func (h *PlaybackHandler) PrefetchVirtualPlayback(ctx context.Context, files []*
 	if len(files) > maxVirtualPlaybackPrefetchFiles {
 		files = files[:maxVirtualPlaybackPrefetchFiles]
 	}
-	prefetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualPlaybackPrefetchBudget)
+	gate := h.detachedGate()
+	if !gate.tryAcquire() {
+		slog.DebugContext(ctx, "virtual playback prefetch skipped: detached worker budget exhausted",
+			"component", "api")
+		return
+	}
+	prefetchCtx, cancel := h.virtualDetachedContext(ctx, virtualPlaybackPrefetchBudget)
 	go func() {
+		defer gate.release()
 		defer cancel()
 		for _, file := range files {
 			if prefetchCtx.Err() != nil || file == nil || !isVirtualPlaybackFile(file) {
@@ -888,11 +1134,17 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				visible := visibleVirtualPlaybackStreams(streams)
 				sinkFn := h.VirtualPlaybackStreamSink
 				sinkFile := *file
-				go func() {
-					sinkCtx, cancel := context.WithTimeout(context.WithoutCancel(listCtx), 15*time.Second)
-					defer cancel()
-					_ = sinkFn(sinkCtx, &sinkFile, visible)
-				}()
+				if gate := h.detachedGate(); gate.tryAcquire() {
+					sinkCtx, sinkCancel := h.virtualDetachedContext(listCtx, 15*time.Second)
+					go func() {
+						defer gate.release()
+						defer sinkCancel()
+						_ = sinkFn(sinkCtx, &sinkFile, visible)
+					}()
+				} else {
+					slog.DebugContext(listCtx, "virtual playback stream sink skipped: detached worker budget exhausted",
+						"component", "api")
+				}
 			}
 			filtered := filterVirtualPlaybackStreams(file, streams)
 			if h.BestResultCache != nil && len(filtered) > 0 {
@@ -1270,16 +1522,23 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 				probeCand := cand
 				expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
-				go func() {
+				if gate := h.detachedGate(); gate.tryAcquire() {
 					// The start path may outlive the request (the client can
-					// disconnect while the probe completes), so it keeps a
-					// WithoutCancel context. The goroutine starts after the
+					// disconnect while the probe completes), so its context
+					// drops the request cancellation but still follows the
+					// service lifecycle. The goroutine starts after the
 					// synchronous provider resolve returned, so the fetch time
 					// does not consume this budget.
-					bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(r.Context()), virtualBackgroundProbeBudget)
-					defer bgCancel()
-					h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
-				}()
+					bgCtx, bgCancel := h.virtualDetachedContext(r.Context(), virtualBackgroundProbeBudget)
+					go func() {
+						defer gate.release()
+						defer bgCancel()
+						h.probeVirtualSourceAndPersist(bgCtx, stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
+					}()
+				} else {
+					slog.WarnContext(r.Context(), "virtual background probe skipped: detached worker budget exhausted",
+						"component", "api", "candidate_uri", cand.URI)
+				}
 			}
 			return &resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
@@ -1644,8 +1903,18 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 	profileID string,
 	targetID int,
 ) {
+	gate := h.detachedGate()
+	if !gate.tryAcquire() {
+		slog.WarnContext(requestCtx, "optimistic virtual revalidation skipped: detached worker budget exhausted",
+			"component", "api", "candidate_uri", cand.URI)
+		return
+	}
 	go func() {
-		bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(requestCtx), virtualStartupBudget)
+		defer gate.release()
+		// The optimistic start may already have been sent, so the context
+		// drops the request cancellation but still follows the service
+		// lifecycle; it carries its own startup budget.
+		bgCtx, bgCancel := h.virtualDetachedContext(requestCtx, virtualStartupBudget)
 		defer bgCancel()
 		// This revalidates the specific candidate the optimistic start is
 		// already serving, so it is session-bound: a profile-removed candidate
@@ -1902,6 +2171,11 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, sna
 // desired set and would delete an adopted path as stale. They are stamped in
 // place under their neutral path instead, which is still enough for the
 // repeat-play gates (cache/pin + probe stamp + complete evidence) to fire.
+//
+// The write is queued to the bounded evidence worker pool rather than spawned
+// per call. That keeps it off the aggregate detached-work gate (a burst of long
+// probes must not crowd evidence out) while still bounding memory; see
+// enqueueVirtualProbeEvidence for the overload behaviour.
 func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) {
 	if h == nil || h.VirtualFileSaver == nil || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
 		return
@@ -1932,14 +2206,9 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 		LibraryID:        snap.LibraryID,
 		AdoptPath:        adoptPath,
 	}
-	go func() {
-		bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer bgCancel()
-		if _, err := h.VirtualFileSaver(bgCtx, args); err != nil {
-			slog.ErrorContext(bgCtx, "virtual probe evidence persist failed",
-				"component", "api", "file_id", args.FileID, "error", err)
-		}
-	}()
+	// The queue worker owns the write context; ctx is used only to tie a
+	// queue-full drop to the caller's request.
+	h.enqueueVirtualProbeEvidence(ctx, args)
 }
 
 // lookupVirtualCandidateRow resolves the catalog row that owns a concrete
@@ -2323,15 +2592,32 @@ func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 	if file.ID <= 0 {
 		searchKey = "virtual:" + file.ContentID + ":" + cand.URI
 	}
+	// Admit before touching the dedupe map: a saturated budget must shed the
+	// search without leaving a key behind.
+	gate := h.detachedGate()
+	if !gate.tryAcquire() {
+		slog.WarnContext(ctx, "virtual subtitle search skipped: detached worker budget exhausted",
+			"component", "api", "content_id", file.ContentID)
+		return
+	}
 	// Dedupe: one in-flight search per file. Rapid replays or multiple
 	// candidates resolving the same file must not hammer subtitle providers.
 	if _, loaded := h.SubtitleSearchInFlight.LoadOrStore(searchKey, struct{}{}); loaded {
+		gate.release()
 		return
 	}
 	go func() {
-		defer h.SubtitleSearchInFlight.Delete(searchKey)
+		defer func() {
+			h.SubtitleSearchInFlight.Delete(searchKey)
+			gate.release()
+		}()
+		// The search outlives the request but is bounded and follows the
+		// service lifecycle, so a hung provider cannot leak the goroutine and
+		// shutdown stops it.
+		searchCtx, searchCancel := h.virtualDetachedContext(ctx, virtualSubtitleSearchBudget)
+		defer searchCancel()
 		h.VirtualSubtitleSearcher(
-			context.Background(),
+			searchCtx,
 			file.ContentID,
 			"", // IMDb ID resolved from contentID by the caller
 			"", // title resolved by the caller
@@ -2612,7 +2898,7 @@ func (h *PlaybackHandler) maybeSubmitRemuxDBEvidence(ctx context.Context, probed
 		for range remuxSubmitWorkers {
 			go func() {
 				for task := range h.remuxSubmitCh {
-					submitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					submitCtx, cancel := h.virtualDetachedContext(nil, 10*time.Second)
 					client := remuxdb.NewClient(task.baseURL, task.token)
 					if err := client.SubmitProbe(submitCtx, task.payload); err != nil {
 						slog.DebugContext(submitCtx, "remuxdb probe submission failed", "component", "api", "filename", task.payload.Filename, "error", err)

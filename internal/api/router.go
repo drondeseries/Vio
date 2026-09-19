@@ -1239,6 +1239,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 				})
 			}
 		}
+		if deps.AppContext != nil {
+			// Parent detached virtual work to the server lifecycle so shutdown
+			// cancels outstanding probes, revalidations, and searches.
+			playbackHandler.ServiceContext = deps.AppContext
+		}
 		if deps.VirtualLibraryService != nil {
 			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
 				return deps.VirtualLibraryService.Resolve(ctx, path)

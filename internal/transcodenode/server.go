@@ -70,7 +70,7 @@ type TranscodeStartRequest struct {
 	TargetResolution           string                 `json:"target_resolution"`
 	// SourceFrameRate and SourceHeight keep the remote encode's GOP aligned
 	// with the real source cadence and let its filter chain detect a no-op
-	// scale. Zero is the historical 30 fps / unknown-height behaviour.
+	// scale. Zero is the historical 30 fps / unknown-height behavior.
 	SourceFrameRate        float64 `json:"source_frame_rate,omitempty"`
 	SourceHeight           int     `json:"source_height,omitempty"`
 	TargetCodecVideo       string  `json:"target_codec_video"`

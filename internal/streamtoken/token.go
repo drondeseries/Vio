@@ -55,7 +55,7 @@ type Claims struct {
 	TargetRes              string `json:"tres,omitempty"`
 	// SourceFrameRate and SourceHeight let a token-carried reconstruction keep
 	// the frame-accurate GOP and detect a no-op scale. Zero decodes to the
-	// historical 30 fps / unknown-height behaviour.
+	// historical 30 fps / unknown-height behavior.
 	SourceFrameRate float64 `json:"sfr,omitempty"`
 	SourceHeight    int     `json:"sh,omitempty"`
 	AudioCodec      string  `json:"ac,omitempty"`

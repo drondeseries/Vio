@@ -21,7 +21,7 @@ type ExecutableRecipeV3 struct {
 	TargetBitrateKbps      int        `json:"target_bitrate_kbps,omitempty"`
 	// SourceFrameRate and SourceHeight keep a rebuilt transcode's GOP aligned
 	// with the real source cadence and let the filter chain detect a no-op
-	// scale. Zero is the historical 30 fps / unknown-height behaviour.
+	// scale. Zero is the historical 30 fps / unknown-height behavior.
 	SourceFrameRate             float64                `json:"source_frame_rate,omitempty"`
 	SourceHeight                int                    `json:"source_height,omitempty"`
 	SourceVideoCodec            string                 `json:"source_video_codec,omitempty"`

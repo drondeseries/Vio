@@ -7,15 +7,38 @@ import (
 	"time"
 )
 
-// demuxIOErrorLine mirrors the prod stderr shape that triggered the loop:
-// an input container read failure, not an output error.
+// demuxIOErrorLine mirrors the prod stderr shape the loop originally keyed on:
+// an input container read failure. The container tag names no stream, so it is
+// ambiguous evidence about the video candidate: the same input holds the audio
+// and subtitle streams, and any of them can fail the demuxer.
 func demuxIOErrorLine() string {
 	return `[in#0/matroska,webm @ 0x55d0] Error during demuxing: Input/output error`
 }
 
+// demuxVideoIOErrorLine mirrors a demux failure FFmpeg attributes to the video
+// input stream through its vist# stream-class tag. That is the positive video
+// identity an indictment now requires.
+func demuxVideoIOErrorLine() string {
+	return `[vist#0:0/h264 @ 0x55d0] Error during demuxing: Input/output error`
+}
+
+// demuxSubtitleIOErrorLine mirrors a corrupt subtitle stream failing during
+// demux. The error is real but names a subtitle stream, so it must never stamp
+// the video candidate.
+func demuxSubtitleIOErrorLine() string {
+	return `[sist#0:3/subrip @ 0x55d0] Error during demuxing: Invalid data found when processing input`
+}
+
+// demuxAudioIOErrorLine mirrors a corrupt audio stream failing during demux.
+// The error names an audio codec, so it must never stamp the video candidate.
+func demuxAudioIOErrorLine() string {
+	return `[aac @ 0x55d0] Error during demuxing: Invalid data found when processing input`
+}
+
 // TestDemuxFailureStampsCandidateAfterThreeErrors covers the three-strike
 // threshold: the callback fires exactly once, with the effective media file id
-// and the canonical source path, and only after the third failure.
+// and the canonical source path, and only after the third failure. The line
+// names the video stream, so the indictment is justified.
 func TestDemuxFailureStampsCandidateAfterThreeErrors(t *testing.T) {
 	type call struct {
 		fileID    int
@@ -34,13 +57,13 @@ func TestDemuxFailureStampsCandidateAfterThreeErrors(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	s.logFFmpegLine(ctx, demuxIOErrorLine())
-	s.logFFmpegLine(ctx, demuxIOErrorLine())
+	s.logFFmpegLine(ctx, demuxVideoIOErrorLine())
+	s.logFFmpegLine(ctx, demuxVideoIOErrorLine())
 	if s.IsDemuxFailed() {
 		t.Fatal("session marked demux-failed after only two errors")
 	}
 
-	s.logFFmpegLine(ctx, demuxIOErrorLine())
+	s.logFFmpegLine(ctx, demuxVideoIOErrorLine())
 	if !s.IsDemuxFailed() {
 		t.Fatal("session not marked demux-failed after three errors")
 	}
@@ -55,11 +78,42 @@ func TestDemuxFailureStampsCandidateAfterThreeErrors(t *testing.T) {
 
 	// The stamp is set under the session mutex before the callback is
 	// dispatched, so a fourth error must not spawn a second marker call.
-	s.logFFmpegLine(ctx, demuxIOErrorLine())
+	s.logFFmpegLine(ctx, demuxVideoIOErrorLine())
 	select {
 	case extra := <-calls:
 		t.Fatalf("candidate failure marker invoked more than once: %+v", extra)
 	default:
+	}
+}
+
+// TestDemuxFailureRequiresVideoStreamIdentity proves the candidate indictment is
+// scoped to the video stream. A container-level demux error, a corrupt subtitle
+// stream, and a corrupt audio stream all fail to demux but name no video
+// identity, so none may stamp; a video-tagged line still does.
+func TestDemuxFailureRequiresVideoStreamIdentity(t *testing.T) {
+	stamped := func(line string) bool {
+		s := &TranscodeSession{opts: TranscodeOpts{MediaFileID: 9}}
+		ctx := context.Background()
+		for i := 0; i < demuxErrorThreshold; i++ {
+			s.logFFmpegLine(ctx, line)
+		}
+		return s.IsDemuxFailed()
+	}
+
+	if stamped(demuxIOErrorLine()) {
+		t.Fatal("an ambiguous container-level demux error stamped the video candidate")
+	}
+	if stamped(demuxSubtitleIOErrorLine()) {
+		t.Fatal("a subtitle-stream demux error stamped the video candidate")
+	}
+	if stamped(demuxAudioIOErrorLine()) {
+		t.Fatal("an audio-stream demux error stamped the video candidate")
+	}
+	if stamped(`[aist#0:1/ac3 @ 0x55d0] Error during demuxing: Invalid data found when processing input`) {
+		t.Fatal("a tagged audio-stream demux error stamped the video candidate")
+	}
+	if !stamped(demuxVideoIOErrorLine()) {
+		t.Fatal("a video-stream demux error no longer stamped the candidate")
 	}
 }
 
@@ -78,8 +132,8 @@ func TestDemuxFailureDoesNotStampBeforeThreshold(t *testing.T) {
 		},
 	}
 	ctx := context.Background()
-	s.logFFmpegLine(ctx, demuxIOErrorLine())
-	s.logFFmpegLine(ctx, demuxIOErrorLine())
+	s.logFFmpegLine(ctx, demuxVideoIOErrorLine())
+	s.logFFmpegLine(ctx, demuxVideoIOErrorLine())
 
 	if s.IsDemuxFailed() {
 		t.Fatal("session marked demux-failed after two errors")
