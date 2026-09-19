@@ -946,6 +946,80 @@ func TestHandleStartPlaybackV3AcceptsPreDeviceDigestReplay(t *testing.T) {
 	}
 }
 
+// An idempotent start replay must never return a plan whose session is not the
+// one the durable attempt owns. Without the guard the stored StartResponse is
+// replayed verbatim, and the client later renders the transport guard
+// ("The playback plan does not belong to the session being prepared.") as a
+// replacement plan belonging to another session.
+func TestHandleStartPlaybackV3ReplayRejectsForeignPlanSession(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	startRequest := v3HandlerStartRequest()
+	body := marshalV3StartRequest(t, startRequest)
+
+	start := func() (int, playback.DecisionResponseV3) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(body)).WithContext(newAuthorizedPlaybackContext()))
+		var response playback.DecisionResponseV3
+		if rr.Code == http.StatusCreated {
+			if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return rr.Code, response
+	}
+
+	code, first := start()
+	if code != http.StatusCreated || first.PlaybackPlan == nil {
+		t.Fatalf("first start status=%d response=%#v", code, first)
+	}
+	record, err := handler.PlanStoreV3.GetAttempt(context.Background(), first.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A mixed-version or partially applied writer left the durable decision
+	// describing a different session than the attempt owns.
+	const foreignSession = "99999999-9999-4999-8999-999999999999"
+	record.StartResponse.SessionID = foreignSession
+	if record.StartResponse.PlaybackPlan != nil {
+		record.StartResponse.PlaybackPlan.SessionID = foreignSession
+	}
+	handler.PlanStoreV3.(*playback.MemoryPlanStoreV3).ReplaceAttempt(context.Background(), *record)
+
+	code, replayed := start()
+	if code != http.StatusCreated {
+		t.Fatalf("replay status = %d", code)
+	}
+	if replayed.Terminal == nil || replayed.Terminal.Reason != "session_expired" || !replayed.Terminal.Retryable {
+		t.Fatalf("foreign-session replay = %#v, want retryable session_expired terminal", replayed)
+	}
+	if replayed.PlaybackPlan != nil || replayed.SessionID == foreignSession {
+		t.Fatalf("foreign-session replay returned the foreign plan: %#v", replayed)
+	}
+}
+
+// A limit-provider blip is a transient dependency failure, not a capacity
+// limit: the replan exhaustion terminal must say so rather than claiming
+// capacity_unavailable.
+func TestClassifyVirtualReplanExhaustionLimitProviderUnavailableIsNotCapacityV3(t *testing.T) {
+	cause := errors.Join(playback.ErrLimitProviderUnavailable, errors.New("scanning user: context deadline exceeded"))
+	transportErr := classifyVirtualReplanExhaustionV3(nil, []*candidateErrorV3{{
+		Stage:   candidateStageAdmission,
+		Message: "candidate 42 replacement admission denied",
+		Err:     cause,
+	}})
+	if transportErr == nil {
+		t.Fatal("expected a transport error")
+	}
+	if transportErr.reason != "limit_provider_unavailable" || !transportErr.retryable {
+		t.Fatalf("classification = %#v, want retryable limit_provider_unavailable, not capacity_unavailable", transportErr)
+	}
+}
+
 func TestHandlePlaybackCapabilityV3AdvertisesTheFinalizedContract(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 

@@ -73,6 +73,33 @@ func TestPlaybackDeliveryProblemDropsLegacyBodyAndHeaders(t *testing.T) {
 	}
 }
 
+// A v1 media handler signals a retryable upstream/dependency failure with 502
+// (virtual source resolve/relay, transcode node). The catalog has no 502 type,
+// so without the delivery-layer mapping the status default reports
+// internal_error/500 and tells the client it hit a server bug. It must surface
+// as 503 dependency_unavailable instead.
+func TestPlaybackDeliveryMapsUpstreamFailureToDependencyUnavailable(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	deps.PlaybackMedia = &PlaybackMediaHandlers{Original: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "PRIVATE_UPSTREAM_DETAIL", http.StatusBadGateway)
+	})}
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"?st=opaque", "", viewerHeaders())
+	requireProblem(t, rec, TypeDependencyUnavailable)
+	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "PRIVATE_UPSTREAM_DETAIL") {
+		t.Fatalf("upstream failure problem: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// The same mapping covers the writer-level fast path (a local refusal
+	// before any streaming work) independently of the route.
+	w := httptest.NewRecorder()
+	writer := &playbackDeliveryWriter{ResponseWriter: w, request: httptest.NewRequest(http.MethodGet, Prefix+"/stream/"+deliveryTestSession, nil)}
+	writer.WriteHeader(http.StatusBadGateway)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("writer fast-path status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
 func TestPlaybackDeliveryFailureAfterBytesAborts(t *testing.T) {
 	w := httptest.NewRecorder()
 	writer := &playbackDeliveryWriter{ResponseWriter: w, request: httptest.NewRequest(http.MethodGet, "/", nil)}

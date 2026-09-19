@@ -427,6 +427,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if resolveErr != nil {
 			logVirtualStreamFailure(r.Context(), sessionID, file, resolveErr)
+			// A provider resolve failure is a dependency problem, not an
+			// internal error. The v1 status stays 502; the v2 byte-delivery
+			// adapter maps it to a defined, retryable dependency_unavailable,
+			// because the catalog has no 502 entry and a raw 502 would surface
+			// as internal_error/500.
 			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
 			return
 		}

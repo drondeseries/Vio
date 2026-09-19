@@ -513,6 +513,69 @@ func TestSessionManager_ReplacementAdmissionDeciderTimeoutFallsBackToInline(t *t
 	}
 }
 
+// A replacement is for the same session and user whose limits were already
+// loaded at start, so a transient limit-provider failure must not deny it. The
+// manager-wide inline caps still apply, and genuine over-cap limits still deny.
+func TestCheckReplacementAllowedFailsOpenWhenLimitProviderUnavailable(t *testing.T) {
+	sm := playback.NewSessionManager(10, 1)
+	direct, err := sm.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	sm.SetLimitProvider(func(context.Context, int) (playback.SessionLimits, error) {
+		return playback.SessionLimits{}, errors.Join(playback.ErrLimitProviderUnavailable, errors.New("db unavailable"))
+	})
+	if err := sm.CheckReplacementAllowed(context.Background(), direct.ID, playback.PlayTranscode, false); err != nil {
+		t.Fatalf("replacement admission with unavailable provider = %v, want nil (fail open)", err)
+	}
+
+	// A genuine cap must still deny when the provider answers.
+	capped := playback.NewSessionManager(10, 1)
+	capped.SetLimitProvider(func(context.Context, int) (playback.SessionLimits, error) {
+		return playback.SessionLimits{MaxStreams: 10, MaxTranscodes: 1}, nil
+	})
+	if _, err := capped.StartSession(1, "profile-1", 200, playback.PlayTranscode, false); err != nil {
+		t.Fatalf("StartSession(seed transcode): %v", err)
+	}
+	cappedDirect, err := capped.StartSession(1, "profile-1", 201, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession(seed direct): %v", err)
+	}
+	if err := capped.CheckReplacementAllowed(context.Background(), cappedDirect.ID, playback.PlayTranscode, false); !errors.Is(err, playback.ErrTooManyTranscodes) {
+		t.Fatalf("replacement at genuine transcode cap = %v, want ErrTooManyTranscodes", err)
+	}
+}
+
+// The limit-provider read is decoupled from the caller's context: a replan
+// whose request budget is already spent must not cancel a lookup that is still
+// valid and fast.
+func TestCheckReplacementAllowedLimitLookupSurvivesCancelledParent(t *testing.T) {
+	sm := playback.NewSessionManager(10, 1)
+	direct, err := sm.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	lookupRan := false
+	var lookupErr error
+	sm.SetLimitProvider(func(ctx context.Context, _ int) (playback.SessionLimits, error) {
+		lookupRan = true
+		lookupErr = ctx.Err()
+		return playback.SessionLimits{MaxStreams: 10, MaxTranscodes: 1}, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sm.CheckReplacementAllowed(ctx, direct.ID, playback.PlayTranscode, false); err != nil {
+		t.Fatalf("replacement admission with cancelled parent = %v, want nil", err)
+	}
+	if !lookupRan {
+		t.Fatal("limit lookup did not run under a cancelled parent context")
+	}
+	if lookupErr != nil {
+		t.Fatalf("limit lookup inherited the parent cancellation: %v", lookupErr)
+	}
+}
+
 func TestSessionManager_AdmissionReasonCodesMapToSentinelErrors(t *testing.T) {
 	cases := []struct {
 		name       string

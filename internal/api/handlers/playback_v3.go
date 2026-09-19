@@ -1715,6 +1715,17 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		if existing.SessionID == "" {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Stored playback attempt has no replayable decision")
 		}
+		if !startReplayResponseBelongsToAttemptV3(response, existing) {
+			// The durable decision names a session other than the one this
+			// attempt owns. Replaying it would hand the client a plan it can
+			// never stream (transport preparation rejects a plan whose
+			// SessionID differs) and the client would read that guard as a
+			// replacement belonging to another session. Refuse the replay as a
+			// retryable terminal so the client mints a fresh attempt id; the
+			// replan path guards the same invariant in
+			// completedReplanResponseMatchesAttemptV3.
+			return playback.NewTerminalResponseV3("session_expired", "The playback plan for this attempt does not belong to its session.", true), nil
+		}
 		if existing.StoppedAt != nil {
 			return playback.NewTerminalResponseV3("session_expired", "The playback session for this attempt has ended.", true), nil
 		}
@@ -5530,6 +5541,22 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 		}
 	}
 
+	// A limit-provider blip is not a capacity limit. Replacement admission
+	// fails open on it, but if it still surfaces (for example through a later
+	// transcode-permission lookup) classify it as the transient dependency
+	// failure it is instead of reporting capacity_unavailable or
+	// transcoding_disabled.
+	if highestCandidate != nil &&
+		(highestCandidate.Stage == candidateStageAdmission || highestCandidate.Stage == candidateStageTranscodePerm) &&
+		errors.Is(highestCandidate.Err, playback.ErrLimitProviderUnavailable) {
+		return &transportErrorV3{
+			reason:    "limit_provider_unavailable",
+			message:   "Playback limits could not be checked. Please retry.",
+			retryable: true,
+			cause:     joinedErr,
+		}
+	}
+
 	if highestCandidate != nil {
 		if highestCandidate.TransportErr != nil {
 			cloned := *highestCandidate.TransportErr
@@ -8428,6 +8455,23 @@ func decisionResponseFromAttemptV3(record *playback.AttemptRecordV3) playback.De
 		plan.RuntimeCorrections = []string{}
 	}
 	return normalizeDecisionResponseV3(playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: playback.ServerFeaturesV3(), Outcome: playback.OutcomePlayableV3, SessionID: record.SessionID, PlaybackPlan: &plan})
+}
+
+// startReplayResponseBelongsToAttemptV3 reports whether the decision replayed
+// for a durable attempt describes the session that attempt owns. A response
+// whose SessionID or plan SessionID names another session must never be
+// replayed as this attempt's plan. The replan replay path guards the same
+// invariant in completedReplanResponseMatchesAttemptV3.
+func startReplayResponseBelongsToAttemptV3(response playback.DecisionResponseV3, record *playback.AttemptRecordV3) bool {
+	if record == nil || record.SessionID == "" {
+		return false
+	}
+	if response.SessionID != record.SessionID {
+		return false
+	}
+	// A playable response carries a plan; mirror the replan guard's strict
+	// equality rather than tolerating an empty plan session.
+	return response.PlaybackPlan == nil || response.PlaybackPlan.SessionID == record.SessionID
 }
 
 func normalizeDecisionResponseV3(response playback.DecisionResponseV3) playback.DecisionResponseV3 {

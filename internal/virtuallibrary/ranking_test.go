@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -203,11 +202,10 @@ func TestResolveDetailedPinOverridesReject(t *testing.T) {
 }
 
 // TestResolveDetailedProfileRemovedPinFreshVsSessionBound proves the corrected
-// precedence: a profile-removed pin only blocks a genuine session binding. A
-// fresh selection (preferredCandidateID empty) falls through to the best live
-// profile-satisfying candidate instead of failing, while a session bound to
-// that same profile-removed pin still refuses without substitution and
-// substitutes with it.
+// precedence: a quality profile is a selection preference, not a gate. A fresh
+// selection (no session binding) falls through to the best profile-satisfying
+// candidate, while a session bound to a profile-removed candidate is served
+// that candidate — with substitution refused or allowed — never refused.
 func TestResolveDetailedProfileRemovedPinFreshVsSessionBound(t *testing.T) {
 	cfg := virtuallibrary.Config{Quality: quality.QualityConfig{
 		EnableProfiles: true,
@@ -247,32 +245,39 @@ func TestResolveDetailedProfileRemovedPinFreshVsSessionBound(t *testing.T) {
 		t.Fatalf("fresh start resolved to %q, want the profile-satisfying %q", fresh.CandidateID, fhd1080)
 	}
 
-	// Session-bound: the same pin still refuses without substitution.
-	if _, err := svc.ResolveDetailed(ctx, pinURI, false, nil, pinned720, true, false); err == nil {
-		t.Fatal("expected refusal for a profile-removed pin bound to a session without substitution")
+	// Session-bound: the session's own candidate exists in the provider list, so
+	// it is served even though it fails the profile, with substitution refused...
+	bound, err := svc.ResolveDetailed(ctx, pinURI, false, nil, pinned720, true, false)
+	if err != nil {
+		t.Fatalf("session-bound profile-removed candidate refused: %v", err)
 	}
-	// With substitution allowed the session-bound pin may rotate.
+	if bound.CandidateID != pinned720 {
+		t.Fatalf("session-bound resolve = %q, want the bound candidate %q", bound.CandidateID, pinned720)
+	}
+	// ...and with substitution allowed the bound pin still wins.
 	rotated, err := svc.ResolveDetailed(ctx, pinURI, false, nil, pinned720, true, true)
 	if err != nil {
-		t.Fatalf("session-bound substitution resolve: %v", err)
+		t.Fatalf("session-bound substitution-allowed resolve: %v", err)
 	}
-	if rotated.CandidateID == pinned720 {
-		t.Fatal("substitution returned the profile-removed pin")
+	if rotated.CandidateID != pinned720 {
+		t.Fatalf("session-bound substitution-allowed resolve = %q, want the bound candidate %q", rotated.CandidateID, pinned720)
 	}
 }
 
-// TestResolveDetailedServeResolveProfileRemovedRefuses proves the serve-layer
-// shape: a session-bound re-resolve passes an empty preferred candidate id
-// (the session's candidate is the URI's ?result=) and must refuse a
-// profile-removed candidate instead of silently swapping the release. The
-// refusal is a typed *ProfileRejectedError naming the candidate and profile so
-// a too-strict profile is diagnosable.
-func TestResolveDetailedServeResolveProfileRemovedRefuses(t *testing.T) {
+// TestResolveDetailedServeResolveProfileRemovedServed proves the serve-layer
+// shape: a session-bound re-resolve passes an empty preferred candidate id (the
+// session's candidate is the URI's ?result=) and serves that candidate even
+// when it fails the quality profile, logging the mismatch at Info instead of
+// refusing. Refusing would not prevent a release swap — nothing is substituted
+// — it would only break playback.
+func TestResolveDetailedServeResolveProfileRemovedServed(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg := virtuallibrary.Config{Quality: quality.QualityConfig{
 		EnableProfiles: true,
 		Profiles:       []quality.QualityProfile{{Label: "fhd", Resolution: "1080p"}},
 	}}
-	svc := newProviderService(t, nil, cfg,
+	svc := newProviderService(t, logger, cfg,
 		streamEntry("1080p", "http://192.168.1.10/1080.mkv"),
 		streamEntry("720p", "http://192.168.1.10/720.mkv"),
 	)
@@ -293,22 +298,18 @@ func TestResolveDetailedServeResolveProfileRemovedRefuses(t *testing.T) {
 	}
 	// Session-bound, empty preferred, substitution refused: exactly what the
 	// serve layer (stream.go / playback_transport.go) declares.
-	_, err = svc.ResolveDetailed(ctx, "virtual://movie/tt100?profile=fhd&result="+pinned720, false, nil, "", true, false)
-	if err == nil {
-		t.Fatal("expected a profile rejection for a session-bound profile-removed candidate")
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?profile=fhd&result="+pinned720, false, nil, "", true, false)
+	if err != nil {
+		t.Fatalf("session-bound serve resolve refused a profile-removed candidate: %v", err)
 	}
-	var rejected *virtuallibrary.ProfileRejectedError
-	if !errors.As(err, &rejected) {
-		t.Fatalf("error = %v, want *ProfileRejectedError", err)
+	if resolved.CandidateID != pinned720 {
+		t.Fatalf("served candidate = %q, want the bound candidate %q", resolved.CandidateID, pinned720)
 	}
-	if rejected.CandidateID != pinned720 {
-		t.Fatalf("rejected candidate = %q, want %q", rejected.CandidateID, pinned720)
+	if !strings.Contains(logs.String(), `level=INFO msg="session-bound virtual candidate does not satisfy the quality profile; serving the bound candidate"`) {
+		t.Fatalf("profile mismatch not logged at Info: %s", logs.String())
 	}
-	if rejected.ProfileLabel != "fhd" {
-		t.Fatalf("rejected profile = %q, want %q", rejected.ProfileLabel, "fhd")
-	}
-	if !strings.Contains(rejected.Error(), "fhd") || !strings.Contains(rejected.Error(), pinned720) {
-		t.Fatalf("error is not actionable: %v", rejected)
+	if !strings.Contains(logs.String(), "candidate_id="+pinned720) || !strings.Contains(logs.String(), "profile=fhd") {
+		t.Fatalf("profile mismatch log missing the candidate/profile identity: %s", logs.String())
 	}
 }
 

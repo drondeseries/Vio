@@ -131,6 +131,9 @@ func registerPlaybackDelivery(reg *Registry) {
 			responses["304"] = &huma.Response{Description: "The authorized representation has not changed"}
 			params = append(params, &huma.Param{Name: ifMatchField, In: paramInHeader, Schema: &huma.Schema{Type: huma.TypeString}}, &huma.Param{Name: "If-Unmodified-Since", In: paramInHeader, Schema: &huma.Schema{Type: huma.TypeString}}, &huma.Param{Name: "Range", In: paramInHeader, Schema: &huma.Schema{Type: huma.TypeString}}, &huma.Param{Name: "If-Range", In: paramInHeader, Schema: &huma.Schema{Type: huma.TypeString}}, &huma.Param{Name: ifNoneMatchField, In: paramInHeader, Schema: &huma.Schema{Type: huma.TypeString}}, &huma.Param{Name: "If-Modified-Since", In: paramInHeader, Schema: &huma.Schema{Type: huma.TypeString}})
 		}
+		// 503 covers a v1 handler's own 503 dependency failure and its
+		// retryable 502 upstream failures, which playbackDeliveryProblemType
+		// remaps onto dependency_unavailable.
 		statuses := []int{400, 404, 409, 410, 422, 500, 503}
 		if route.ranges {
 			statuses = append(statuses, 412, 416)
@@ -219,10 +222,18 @@ func (w *playbackDeliveryWriter) transport() *streamResponseWriter {
 
 // playbackDeliveryProblemType maps a pre-body failure status of a v1 media
 // handler onto the catalog. A 410 is the stream deny marker (the session was
-// stopped or expired), which has its own corrective action: start again.
+// stopped or expired), which has its own corrective action: start again. A 502
+// is a retryable upstream/dependency failure (a virtual source resolve, relay,
+// or transcode node), not a server defect: the catalog represents temporary
+// dependency unavailability as 503 dependency_unavailable, so map it there
+// rather than letting the catalog's internal_error default report a server bug.
+// The v2 route declares 503 for exactly this reason.
 func playbackDeliveryProblemType(status int) ProblemType {
-	if status == http.StatusGone {
+	switch status {
+	case http.StatusGone:
 		return TypePlaybackSessionEnded
+	case http.StatusBadGateway:
+		return TypeDependencyUnavailable
 	}
 	return TypeForStatus(status)
 }

@@ -23,21 +23,6 @@ type ResolvedVirtualStream struct {
 	ExpiresAt      time.Time
 }
 
-// ProfileRejectedError reports that a session-bound virtual candidate does not
-// satisfy the active quality profile and candidate substitution was refused. It
-// is deliberately distinct from an excluded or dead pin so a caller can tell a
-// too-strict profile from a genuinely unavailable release; the message names
-// both the candidate and the profile so the failure is actionable rather than a
-// dead end.
-type ProfileRejectedError struct {
-	CandidateID  string
-	ProfileLabel string
-}
-
-func (e *ProfileRejectedError) Error() string {
-	return fmt.Sprintf("session-bound virtual candidate %q does not satisfy quality profile %q and candidate rotation was not requested", e.CandidateID, e.ProfileLabel)
-}
-
 // PlaybackStream represents an available stream candidate formatted for
 // playback selection in API handlers and Jellyfin compatibility.
 type PlaybackStream struct {
@@ -191,9 +176,13 @@ func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, erro
 //   - excludedCandidateIDs are skipped;
 //   - preferredCandidateID is tried first;
 //   - sessionBound declares whether the caller is resolving a release an
-//     existing session is already serving. A session-bound profile-removed pin
-//     refuses with a *ProfileRejectedError (logged with the profile and
-//     candidate identity) rather than swapping the release. A fresh selection
+//     existing session is already serving. A quality profile is a selection
+//     preference, not a gate: a session-bound candidate that still exists in
+//     the provider list is served even when it fails the profile (the mismatch
+//     is logged, never an error), because refusing would not prevent a release
+//     swap and would only break playback. Only an indicted candidate (an
+//     explicit exclusion, a collapsed-keeper exclusion, or a confirmed decode
+//     rejection) is refused when substitution is disallowed. A fresh selection
 //     (sessionBound false) whose probed pin is profile-removed, stale-failed,
 //     or absent falls through to the best live candidate that satisfies the
 //     profile and is re-pinned by the caller; when nothing satisfies the
@@ -300,20 +289,33 @@ func (s *Service) ResolveDetailed(
 	profile := s.qualityProfileForPath(virtualPath)
 	profileActive := strings.TrimSpace(profile.Label) != ""
 
-	// Whether the probed pin is removed by the active profile. On its own this
-	// does not block a fresh selection (see the pinBlocked gate below): a
-	// candidate whose own ?profile= label rejects it must fall through to a
-	// profile-satisfying candidate rather than fail the whole start.
-	pinProfileRemoved := false
-	if profileActive && effectiveResultID != "" {
+	// A quality profile is a selection preference, not a gate on a release an
+	// existing session is already bound to. When the session's own candidate
+	// still exists in the provider list it is served even if it fails the
+	// profile: refusing would not prevent a release swap (nothing is
+	// substituted) and would only break playback. The mismatch is logged for
+	// diagnosis.
+	sessionCandidatePresent := sessionBound && effectiveResultID != "" && candidateIDPresent(candidates, effectiveResultID)
+	if sessionCandidatePresent && profileActive {
 		for _, c := range candidates {
-			if stream.CandidateVariantID(c) == effectiveResultID {
-				pinProfileRemoved = !quality.MatchProfile(c, profile)
-				break
+			if stream.CandidateVariantID(c) != effectiveResultID {
+				continue
 			}
+			if !quality.MatchProfile(c, profile) && s.logger != nil {
+				s.logger.InfoContext(ctx, "session-bound virtual candidate does not satisfy the quality profile; serving the bound candidate",
+					"candidate_id", effectiveResultID, "profile", strings.TrimSpace(profile.Label))
+			}
+			break
 		}
 	}
-	if profileActive {
+
+	// The profile filter selects among candidates. It must not remove a
+	// session-bound candidate that still exists: the session binding wins over
+	// the selection preference. For a fresh selection (or a session candidate
+	// that is gone) it applies as before, and the no-stream-matches-profile
+	// error stays for a selection that cannot be satisfied with fallback
+	// disallowed.
+	if profileActive && !sessionCandidatePresent {
 		filtered := make([]stream.StreamCandidate, 0, len(candidates))
 		for _, c := range candidates {
 			if quality.MatchProfile(c, profile) {
@@ -333,36 +335,17 @@ func (s *Service) ResolveDetailed(
 		}
 	}
 
-	// Excluding either the requested variant or its keeper blocks the pin:
-	// they are one release, so an exclusion of either is an exclusion of the
-	// session-bound release. Exclusions are ungated: an explicit exclusion must
-	// refuse even for a fresh selection. The profile verdict is gated on the
-	// explicit sessionBound declaration, which is the only signal that
-	// distinguishes a session re-resolve from a fresh start (both arrive as a
-	// ?result= in the URI): a session-bound profile-removed candidate refuses,
-	// while a fresh selection's profile-removed, stale-failed or absent pin
-	// falls through to the best live profile-satisfying candidate below and is
-	// re-pinned by the caller.
+	// Only an indicted candidate is refused when substitution is disallowed: an
+	// explicit exclusion, a collapsed-keeper exclusion, or a confirmed decode
+	// rejection. All three arrive through excludedCandidateIDs. A profile
+	// mismatch is a selection preference and never blocks.
 	_, requestedExcluded := excluded[requestedResultID]
 	_, keeperExcluded := excluded[effectiveResultID]
-	pinBlocked := effectiveResultID != "" &&
-		(requestedExcluded || keeperExcluded || (pinProfileRemoved && sessionBound))
+	pinBlocked := effectiveResultID != "" && (requestedExcluded || keeperExcluded)
 	// A blocked pin is only substitutable when the caller asked for candidate
 	// rotation. Otherwise refuse rather than hand back a different release
 	// under the same session binding.
 	if pinBlocked && !allowSubstitution {
-		if pinProfileRemoved && !requestedExcluded && !keeperExcluded {
-			// A too-strict profile is a different failure from a dead release:
-			// name the profile and the candidate so it is diagnosable.
-			if s.logger != nil {
-				s.logger.WarnContext(ctx, "session-bound virtual candidate rejected by the quality profile",
-					"candidate_id", effectiveResultID, "profile", strings.TrimSpace(profile.Label))
-			}
-			return ResolvedVirtualStream{}, &ProfileRejectedError{
-				CandidateID:  effectiveResultID,
-				ProfileLabel: strings.TrimSpace(profile.Label),
-			}
-		}
 		return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q is excluded and candidate rotation was not requested", effectiveResultID)
 	}
 	// When substitution is refused and the session's pinned release is
