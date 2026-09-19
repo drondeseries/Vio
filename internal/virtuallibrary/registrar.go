@@ -2,6 +2,7 @@ package virtuallibrary
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -20,7 +21,7 @@ type catalogMonitorRegistrar struct {
 
 var _ monitor.MediaRegistrar = (*catalogMonitorRegistrar)(nil)
 var _ interface {
-	Reconcile(context.Context, string, []string, []int) error
+	Reconcile(context.Context, string, []string, []int, monitor.ReconcileEvidence) error
 } = (*catalogMonitorRegistrar)(nil)
 
 func virtualURIForMonitored(item monitor.MonitoredMedia) string {
@@ -83,11 +84,27 @@ func (r *catalogMonitorRegistrar) Register(ctx context.Context, item monitor.Mon
 		RuntimeMinutes: item.Runtime,
 		Source:         item.SourceKey,
 		VirtualURI:     virtualURIForMonitored(item),
-		Episodes:       make([]catalog.VirtualEpisode, 0, len(item.Episodes)),
+		Episodes:       monitoredEpisodePayload(item),
 		Variants:       make([]catalog.VirtualMediaVariant, 0),
 	}
+	_, err := r.registrar.Upsert(ctx, in)
+	return err
+}
+
+// monitoredEpisodePayload maps monitor episodes onto the catalog payload.
+//
+// Season 0 is the provider's specials bucket and the catalog rejects
+// non-positive season/episode coordinates (see catalog.validateVirtualEpisode);
+// a single special must not fail the whole series registration, so specials are
+// omitted here. Genuinely malformed input (a negative season, a missing field)
+// is intentionally preserved so catalog validation still rejects it.
+func monitoredEpisodePayload(item monitor.MonitoredMedia) []catalog.VirtualEpisode {
+	episodes := make([]catalog.VirtualEpisode, 0, len(item.Episodes))
 	for _, episode := range item.Episodes {
-		in.Episodes = append(in.Episodes, catalog.VirtualEpisode{
+		if episode.Season == 0 {
+			continue
+		}
+		episodes = append(episodes, catalog.VirtualEpisode{
 			SeasonNumber:   episode.Season,
 			EpisodeNumber:  episode.Episode,
 			Title:          episode.Title,
@@ -98,11 +115,20 @@ func (r *catalogMonitorRegistrar) Register(ctx context.Context, item monitor.Mon
 			VirtualURI:     virtualEpisodeURI(item, episode),
 		})
 	}
-	_, err := r.registrar.Upsert(ctx, in)
-	return err
+	return episodes
 }
 
-func (r *catalogMonitorRegistrar) Reconcile(ctx context.Context, source string, keepIDs []string, libraryIDs []int) error {
+// MissingVirtualMedia reports which of the given content IDs no longer exist
+// in the catalog, so the monitor can evict queue entries whose media was
+// genuinely removed.
+func (r *catalogMonitorRegistrar) MissingVirtualMedia(ctx context.Context, contentIDs []string) (map[string]struct{}, error) {
+	if r == nil || r.registrar == nil {
+		return nil, fmt.Errorf("virtual catalog registrar is unavailable")
+	}
+	return r.registrar.MissingVirtualMediaContentIDs(ctx, contentIDs)
+}
+
+func (r *catalogMonitorRegistrar) Reconcile(ctx context.Context, source string, keepIDs []string, libraryIDs []int, evidence monitor.ReconcileEvidence) error {
 	if r == nil || r.registrar == nil {
 		return fmt.Errorf("virtual catalog registrar is unavailable")
 	}
@@ -114,6 +140,16 @@ func (r *catalogMonitorRegistrar) Reconcile(ctx context.Context, source string, 
 			libraryIDs = append(libraryIDs, r.seriesLibraryID)
 		}
 	}
-	_, err := r.registrar.ReconcileVirtualMedia(ctx, 0, source, keepIDs, libraryIDs)
+	_, err := r.registrar.ReconcileVirtualMediaVerified(ctx, 0, source, keepIDs, libraryIDs, catalog.VirtualReconcileEvidence{
+		FullCycle:   evidence.FullCycle,
+		SourceCount: evidence.SourceCount,
+		QueueCount:  evidence.QueueCount,
+	})
+	if errors.Is(err, catalog.ErrVirtualReconcileRefused) {
+		// Keep the catalog's source and counts in the message while preserving
+		// the refusal identity so the monitor can log it loudly instead of
+		// treating it as an ordinary retryable failure.
+		return fmt.Errorf("%w: %v", monitor.ErrReconcileRefused, err)
+	}
 	return err
 }
