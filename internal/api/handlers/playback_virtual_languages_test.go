@@ -65,11 +65,34 @@ func TestReorderVirtualCandidatesForQualityPrefersAtOrBelowRung(t *testing.T) {
 		t.Fatalf("no-match reorder changed the ranking: %#v", out)
 	}
 
-	// A bandwidth cap tightens the rung: 8Mbps cap on a 1080p preference
-	// prefers 720p-or-below candidates.
+	// A bandwidth cap lowers the rung only when the candidate's own bitrate
+	// exceeds it (the planner's rule). An 8Mbps cap on a 1080p preference with
+	// undeclared candidate bitrates keeps 1080p-or-below ahead of 4K: the
+	// planner would preserve a 1080p stream, so the picker must not demote it.
 	capped := reorderVirtualCandidatesForQuality(candidates, "1080p", 8_000)
-	if capped[0].URI != "virtual://movie/1?result=720p" {
-		t.Fatalf("capped reorder = %v, want 720p first", capped)
+	if capped[0].URI != "virtual://movie/1?result=1080p" {
+		t.Fatalf("capped reorder = %v, want 1080p first", capped)
+	}
+
+	// A low cap must not displace a 2160p candidate for an explicit 2160p
+	// preference when the candidate's bitrate is under the cap (or unknown):
+	// the planner would preserve the source, so the picker must too.
+	kept4K := reorderVirtualCandidatesForQuality(candidates, "2160p", 8_000)
+	if kept4K[0].URI != "virtual://movie/1?result=4k" {
+		t.Fatalf("2160p preference with a low cap = %v, want 4K first", kept4K)
+	}
+
+	// A candidate whose declared bitrate exceeds the cap still falls to the
+	// cap's rung, matching the planner.
+	cappedByBitrate := append([]VirtualPlaybackStream(nil), candidates...)
+	for i := range cappedByBitrate {
+		if virtualResultCandidateID(cappedByBitrate[i].URI) == "4k" {
+			cappedByBitrate[i].Bitrate = 20_000
+		}
+	}
+	demoted := reorderVirtualCandidatesForQuality(cappedByBitrate, "2160p", 8_000)
+	if demoted[0].URI != "virtual://movie/1?result=1080p" {
+		t.Fatalf("high-bitrate 4K with a low cap = %v, want a sub-4K rung first", demoted)
 	}
 }
 

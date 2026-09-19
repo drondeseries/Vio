@@ -393,3 +393,83 @@ func TestMatchAudioTrackAcrossVersionsFallsBackToDefaultWhenNoLanguageMatches(t 
 		t.Fatalf("no-language-match remap = %d, want target default 0", got)
 	}
 }
+
+// TestSelectAudioTrackPrefersDecodableSameLanguageTrack proves a default track
+// the client cannot decode yields to a decodable track of the same language, so
+// a file with an AAC compatibility track does not force an AAC transcode.
+func TestSelectAudioTrackPrefersDecodableSameLanguageTrack(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "eng", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "", nil, "aac", "mp3", "opus"); got != 1 {
+		t.Fatalf("SelectAudioTrack() = %d, want the decodable English AAC track 1", got)
+	}
+}
+
+// TestSelectAudioTrackPrefersDecodableWithinPreferredLanguage proves the
+// language preference still decides which track is chosen: the decodable track
+// of the preferred language wins over a non-decodable one.
+func TestSelectAudioTrackPrefersDecodableWithinPreferredLanguage(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "eng", Codec: "aac", Channels: 2},
+		{Language: "fra", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "eng", nil, "aac"); got != 1 {
+		t.Fatalf("SelectAudioTrack() = %d, want the English AAC track 1", got)
+	}
+}
+
+// TestSelectAudioTrackDoesNotTradeLanguageForCodec proves decodability never
+// overrides the language intent: with only a foreign-language decodable track,
+// the non-decodable preferred-language track is kept and the planner transforms
+// its audio as before.
+func TestSelectAudioTrackDoesNotTradeLanguageForCodec(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "fra", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "eng", nil, "aac", "mp3", "opus"); got != 0 {
+		t.Fatalf("SelectAudioTrack() = %d, want the English track to keep language over codec", got)
+	}
+}
+
+// TestSelectAudioTrackSavedIndexDecidesAmongDecodableTracks proves the saved
+// index still chooses which track is used when several decodable candidates
+// exist.
+func TestSelectAudioTrackSavedIndexDecidesAmongDecodableTracks(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "aac", Channels: 2},
+		{Language: "eng", Codec: "aac", Channels: 6, Layout: "5.1"},
+	}
+	pref := &playback.AudioTrackPreference{AudioTrackIndex: 1, AudioLanguage: "eng"}
+	if got := playback.SelectAudioTrack(tracks, "eng", pref, "aac"); got != 1 {
+		t.Fatalf("SelectAudioTrack() = %d, want the saved index 1 among decodable tracks", got)
+	}
+}
+
+// TestSelectAudioTrackWithoutClientCodecsKeepsHistoricalOrder proves callers
+// without client capabilities (catalog metadata, cross-version remap) keep the
+// pre-existing selection.
+func TestSelectAudioTrackWithoutClientCodecsKeepsHistoricalOrder(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "eng", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "", nil); got != 0 {
+		t.Fatalf("SelectAudioTrack() = %d, want the default track when no client codecs are given", got)
+	}
+}
+
+// TestSelectAudioTrackAllNonDecodableKeepsDefault proves that when no track is
+// decodable the historical selection stands and the planner transcodes.
+func TestSelectAudioTrackAllNonDecodableKeepsDefault(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "eng", Codec: "dts", Channels: 6},
+	}
+	if got := playback.SelectAudioTrack(tracks, "", nil, "aac", "mp3", "opus"); got != 0 {
+		t.Fatalf("SelectAudioTrack() = %d, want the default track when nothing is decodable", got)
+	}
+}

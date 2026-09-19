@@ -1317,7 +1317,7 @@ func TestPreferredAudioTrackIndexV3PropagatesSeriesPreferenceReadFailure(t *test
 		AudioTracks: []models.AudioTrack{{Codec: "aac", Language: "eng"}, {Codec: "aac", Language: "spa"}},
 	}
 
-	if _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "", file); !errors.Is(err, wantErr) {
+	if _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "", file, nil); !errors.Is(err, wantErr) {
 		t.Fatalf("preferredAudioTrackIndexV3 error = %v, want %v", err, wantErr)
 	}
 }
@@ -1331,7 +1331,7 @@ func TestPreferredAudioTrackIndexV3PropagatesCanonicalPreferenceReadFailure(t *t
 		AudioTracks: []models.AudioTrack{{Codec: "aac", Language: "eng"}, {Codec: "aac", Language: "spa"}},
 	}
 
-	if _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "living-room", file); !errors.Is(err, wantErr) {
+	if _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "living-room", file, nil); !errors.Is(err, wantErr) {
 		t.Fatalf("preferredAudioTrackIndexV3 error = %v, want %v", err, wantErr)
 	}
 }
