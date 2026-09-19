@@ -506,7 +506,12 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						if parsed, err := url.Parse(file.FilePath); err == nil {
 							expectedCandidateID = parsed.Query().Get("result")
 						}
-						if expectedCandidateID != "" && refreshedMedia.CandidateID != "" && refreshedMedia.CandidateID != expectedCandidateID {
+						// A failed pin this serve layer just marked is an
+						// intended substitution: the retry excluded that id, so
+						// it can only return a sibling. The guard exists to stop
+						// a *silent* swap of a live candidate, so it only applies
+						// when no failed candidate was identified.
+						if failedID == "" && expectedCandidateID != "" && refreshedMedia.CandidateID != "" && refreshedMedia.CandidateID != expectedCandidateID {
 							if refreshCleanup != nil {
 								refreshCleanup()
 							}
@@ -614,15 +619,16 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				if retryErr == nil {
 					// Same pinned-candidate guard direct play has: a retry that
 					// resolved a different release than the session-bound pin
-					// must not silently swap the bytes mid-stream. Keep the
-					// original remux failure so the client replans (where the
-					// display-driven fallback changes the transformation on the
-					// same file).
+					// must not silently swap the bytes mid-stream. A failed pin
+					// this serve layer just marked is an intended substitution
+					// (the retry excluded it, so it can only return a sibling),
+					// so the guard applies only when no failed candidate was
+					// identified.
 					expectedCandidateID := ""
 					if parsed, err := url.Parse(file.FilePath); err == nil {
 						expectedCandidateID = parsed.Query().Get("result")
 					}
-					if expectedCandidateID != "" && retried.CandidateID != "" && retried.CandidateID != expectedCandidateID {
+					if failedID == "" && expectedCandidateID != "" && retried.CandidateID != "" && retried.CandidateID != expectedCandidateID {
 						if retryCleanup != nil {
 							retryCleanup()
 						}

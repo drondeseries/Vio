@@ -207,11 +207,15 @@ constant:
 | `start_position` | The profile's saved resume point for this item, or `0` when there is none, it is already complete, or the file is one part of a multipart item (every part shares the item's resume point, so a part-local seek to it would land somewhere arbitrary). It is required when `progress_persistence` is `client` | Exactly that position. `0` means *start over* |
 | `audio_track_id` / `audio_track_index` | The profile's preferred audio track, resolved from the series preference, then the profile's audio-language setting, then the library override | Exactly that track |
 
-Within that audio resolution, a track the client can render directly — its codec
-is in the client's declared decode codecs or passthrough list — is preferred
-over a same-language track it cannot. The preference order still chooses among
-playable tracks, and language is never traded for codec: when only a
-non-playable track carries the preferred language, it is selected and the
+Within that audio resolution, a track the client can render directly is
+preferred over a same-language track it cannot. "Directly" is the same rule the
+planner's audio eligibility applies, not the codec lists by themselves: a
+passthrough codec counts only with `exact` audio evidence, the
+`layout_aware_passthrough` feature, and a matching `audio_passthrough.entries[]`
+channel/layout entry; any declared decode codec counts. The preference order
+still chooses among playable tracks, and neither language nor track role is
+traded for codec: when only a non-playable track carries the preferred language
+or the selected role (for example a commentary track), it is selected and the
 planner transforms the audio. A caller that supplies no client capabilities
 (catalog metadata, cross-version remap) keeps the historical selection.
 
@@ -965,6 +969,23 @@ past an excluded pinned candidate unless the caller explicitly asked for
 candidate rotation, so a display-driven re-plan can never silently swap the bytes
 mid-stream.
 
+**Residual candidate-identity notes.** Two paths deliberately stop short of
+rewriting the in-flight plan, and neither is a client-requested swap:
+
+- Transport-internal startup failover (`startLocalPlaybackTransportOnce`)
+  retries a pin that produced no bytes on a neutral URI. When a sibling wins, it
+  starts ffmpeg on that sibling and compare-and-swaps the session's persisted
+  result pin. Because the plan was already built, a path that resolved through
+  a local file copy can serve the sibling while the plan still names the
+  original candidate; the next replan or start resolves from the updated pin.
+  The substitution is server-decided (the original produced no bytes), never
+  display-driven.
+- A non-indicting failure that still needs a re-resolve can mint a fresh
+  `result=` id for the same release. A changed result id is therefore not
+  evidence of a dead release: the session re-anchors to the fresh URL and the
+  bytes are unchanged. Only a pinned id absent from the provider list is a dead
+  release, and the resolver's fallback still recovers it.
+
 Failure, seek, and quality replans may omit unchanged track identities. The
 server overlays only identities present in those requests and preserves the
 durable selected subtitle otherwise. Only `operation: "track_change"` gives an
@@ -1436,7 +1457,12 @@ step instead of being upscaled to 2160 lines.
 Compound rungs are strict resolution/bitrate selections. A bandwidth cap can
 clamp their bitrate but does not silently demote their resolution. Plain labels
 remain accepted for stored/default preferences and retain their existing
-height-only behavior.
+height-only behavior. The virtual candidate picker mirrors this: it applies the
+cap per candidate only for plain rungs, and it can only demote a candidate when
+that candidate declares a bitrate. The core virtual lister does not populate
+`Bitrate` on listed candidates, so on the core path the picker never demotes at
+pick time and the planner enforces the cap after probing the selected file; a
+plugin lister that reports bitrate gets the earlier pick-time demotion.
 
 Registry availability is deliberately *not* consulted when building the menu: a
 capability check there could trigger lazy node fetches that a source-preserving

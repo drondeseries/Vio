@@ -1245,19 +1245,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			playbackHandler.VirtualMediaRefreshResolver = handlers.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
 				return deps.VirtualLibraryService.Refresh(ctx, path)
 			})
-			playbackHandler.VirtualMediaDetailedResolver = handlers.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (handlers.ResolvedVirtualMedia, error) {
-				res, err := deps.VirtualLibraryService.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID, handlers.VirtualCandidateRotationAllowed(ctx))
-				if err != nil {
-					return handlers.ResolvedVirtualMedia{}, err
-				}
-				return handlers.ResolvedVirtualMedia{
-					URL:            res.URL,
-					URI:            res.URI,
-					CandidateID:    res.CandidateID,
-					RequestHeaders: res.RequestHeaders,
-					ExpiresAt:      res.ExpiresAt,
-				}, nil
-			})
+			playbackHandler.VirtualMediaDetailedResolver = newVirtualMediaDetailedResolver(deps.VirtualLibraryService)
 		}
 		playbackHandler.BestResultCache = handlers.NewVirtualBestResultCache(30*time.Minute, 512)
 		if deps.UserStoreProvider != nil {

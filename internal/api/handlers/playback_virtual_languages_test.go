@@ -96,6 +96,27 @@ func TestReorderVirtualCandidatesForQualityPrefersAtOrBelowRung(t *testing.T) {
 	}
 }
 
+func TestReorderVirtualCandidatesForQualityCompoundRungKeepsClassUnderCap(t *testing.T) {
+	candidates := []VirtualPlaybackStream{
+		{URI: "virtual://movie/1?result=4k", Resolution: "2160p", Bitrate: 20_000},
+		{URI: "virtual://movie/1?result=1080p", Resolution: "1080p", Bitrate: 20_000},
+		{URI: "virtual://movie/1?result=480p", Resolution: "480p"},
+	}
+	// compoundRungQualityResultV3 never changes a compound rung's resolution
+	// class under a cap, only its bitrate, so 1080p-high keeps the 1080p
+	// candidate ahead even though the high-bitrate candidate exceeds the cap.
+	compound := reorderVirtualCandidatesForQuality(candidates, "1080p-high", 4_000)
+	if compound[0].URI != "virtual://movie/1?result=1080p" {
+		t.Fatalf("compound rung under cap = %v, want the 1080p candidate first", compound)
+	}
+	// A plain 1080p rung does lower to the cap's rung when its bitrate exceeds
+	// the cap, so the picker must still demote the high-bitrate 1080p candidate.
+	plain := reorderVirtualCandidatesForQuality(candidates, "1080p", 4_000)
+	if plain[0].URI != "virtual://movie/1?result=480p" {
+		t.Fatalf("plain rung under cap = %v, want the cap's 480p rung first", plain)
+	}
+}
+
 func TestMergeVirtualCandidateLanguagesSynthesizesAudioTracksOnly(t *testing.T) {
 	probed := &models.MediaFile{
 		VideoTracks:    []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},

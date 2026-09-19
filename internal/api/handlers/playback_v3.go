@@ -1809,7 +1809,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		}
 	}
 	if req.AudioTrackID == "" && req.AudioTrackIndex == nil {
-		audioIndex, err = h.preferredAudioTrackIndexV3(r.Context(), userID, profileID, deviceID, requestedFile, playableAudioCodecsV3(req))
+		audioIndex, err = h.preferredAudioTrackIndexV3(r.Context(), userID, profileID, deviceID, requestedFile, playback.AudioTrackPlayableFuncV3(req))
 		if err != nil {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the saved audio preference")
 		}
@@ -3903,22 +3903,6 @@ func (h *PlaybackHandler) multipartResumeFileV3(ctx context.Context, file *model
 	return nil, 0, nil
 }
 
-// playableAudioCodecsV3 returns the audio codecs the client can render without
-// a server transform: the device-wide decode list plus any codecs it can pass
-// through. It mirrors the two paths audioEligibilityV3 accepts, so the track
-// selector never abandons a track the planner could deliver unchanged.
-func playableAudioCodecsV3(req playback.StartRequestV3) []string {
-	codecs := append([]string(nil), req.Capabilities.CodecsAudio...)
-	passthrough := req.ClientPlaybackContext.Output.AudioPassthrough
-	if passthrough == nil {
-		passthrough = req.Capabilities.AudioPassthrough
-	}
-	if passthrough != nil {
-		codecs = append(codecs, passthrough.PassthroughCodecs...)
-	}
-	return codecs
-}
-
 // preferredAudioTrackIndexV3 answers what an omitted audio track means: the
 // language this profile has settled on for this series, this library, this
 // device, or generally — the same resolution the catalog performs when it
@@ -3927,7 +3911,7 @@ func playableAudioCodecsV3(req playback.StartRequestV3) []string {
 //
 // The client sends a track identity only when the viewer picked one. Defaulting
 // to ordinal zero instead would silently play the first track on the reel.
-func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID int, profileID, deviceID string, file *models.MediaFile, clientPlayableCodecs []string) (int, error) {
+func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID int, profileID, deviceID string, file *models.MediaFile, playable func(models.AudioTrack) bool) (int, error) {
 	if file == nil || len(file.AudioTracks) == 0 || h.StoreProvider == nil {
 		return 0, nil
 	}
@@ -3979,7 +3963,7 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		// settings own the language and its scope precedence.
 		seriesPref.AudioLanguage = preferredLang
 	}
-	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(file.AudioTracks, preferredLang, seriesPref, clientPlayableCodecs...)), nil
+	return normalizeAudioTrackIndex(file, playback.SelectAudioTrackPreferringPlayable(file.AudioTracks, preferredLang, seriesPref, playable)), nil
 }
 
 // resumePositionV3 answers what an omitted `start_position` means: resume where
@@ -6104,7 +6088,13 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				if failedID != "" && virtualDecodeRotation {
 					excludedCandidateIDs = []string{failedID}
 				}
-				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false, virtualResolveOptionsV3{allowFailedCandidate: true, rotateCandidates: virtualDecodeRotation})
+				// Only a confirmed rotation may re-select a candidate the
+				// catalog marked failed (for example one this serve layer just
+				// stamped after it produced no bytes). Every other replan must
+				// honour the known-bad stamp so the resolver skips it and either
+				// finds a live sibling or fails with a retryable terminal,
+				// instead of looping back onto the dead pin.
+				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false, virtualResolveOptionsV3{allowFailedCandidate: virtualDecodeRotation, rotateCandidates: virtualDecodeRotation})
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true

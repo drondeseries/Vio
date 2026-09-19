@@ -647,9 +647,10 @@ type virtualResolveOptionsV3 struct {
 	// allowFailedCandidate permits re-selecting a catalog row stamped failed_at.
 	// False (the zero value) keeps an auto selection skipping a known-bad row,
 	// even when the row already carries a concrete result= identity; true is
-	// only for an explicit user retry, a forced relink, or a replan rehydration
-	// whose deadness is conveyed by excludedCandidateIDs instead of the async
-	// stamp.
+	// only for an explicit user retry, a forced relink, or a decode-rejection
+	// rotation. A replan rehydration that is not a confirmed rotation must
+	// leave it false so it honours the stamp and finds a live sibling instead
+	// of looping back onto a candidate the serve layer already marked dead.
 	allowFailedCandidate bool
 	// rotateCandidates marks an exclusion as a deliberate candidate rotation: a
 	// verdict that indicts the release (server-confirmed decode rejection) lets
@@ -668,6 +669,14 @@ func withVirtualCandidateRotationV3(ctx context.Context, allowed bool) context.C
 		return ctx
 	}
 	return context.WithValue(ctx, virtualCandidateRotationContextKeyV3{}, allowed)
+}
+
+// WithVirtualCandidateRotation returns a context carrying the rotation intent
+// for a detailed virtual resolve. It is the exported form of the internal
+// setter, for callers outside this package that need to exercise intent
+// threading (the core router's service adapter).
+func WithVirtualCandidateRotation(ctx context.Context, allowed bool) context.Context {
+	return withVirtualCandidateRotationV3(ctx, allowed)
 }
 
 // VirtualCandidateRotationAllowed reports whether the caller of a detailed
@@ -2882,32 +2891,37 @@ func resolutionHeight(label string) int {
 }
 
 // qualityRungHeightV3 maps a normalized quality preference to its resolution
-// class height. Only explicit fixed rungs return a height; "auto" and
+// class height. Only explicit fixed rungs return a nonzero height; "auto" and
 // "original" return 0 so the caller keeps the device ranking unchanged.
 // Compound ladder rungs ("1080p-high") carry their resolution class in the
-// label prefix.
-func qualityRungHeightV3(qualityPreference string) int {
+// label prefix; compound reports whether the preference was one of those.
+//
+// The distinction matters for the bandwidth cap: ResolveQualityPolicyV3 lowers
+// a plain fixed rung's class when its ladder bitrate exceeds the cap, but
+// compoundRungQualityResultV3 never changes a compound rung's class (only its
+// bitrate), so the picker must not lower a compound rung either.
+func qualityRungHeightV3(qualityPreference string) (height int, compound bool) {
 	normalized, _ := playback.NormalizeQualityV3(qualityPreference)
 	class := normalized
 	if idx := strings.IndexByte(class, '-'); idx > 0 {
 		class = class[:idx]
+		compound = true
 	}
 	switch class {
 	case "2160p":
-		return 2160
+		height = 2160
 	case "1080p":
-		return 1080
+		height = 1080
 	case "720p":
-		return 720
+		height = 720
 	case "480p":
-		return 480
+		height = 480
 	case "420p":
-		return 420
+		height = 420
 	case "328p":
-		return 328
-	default:
-		return 0
+		height = 328
 	}
+	return height, compound && height > 0
 }
 
 // reorderVirtualCandidatesForQuality prefers candidates whose resolution class
@@ -2918,14 +2932,16 @@ func qualityRungHeightV3(qualityPreference string) int {
 // still gets the best device-ranked stream when no native 720p-or-below
 // candidate exists.
 //
-// The cap is applied per candidate through the planner's own
-// playback.CappedRungHeightV3, using the candidate as the effective source.
+// For a plain fixed rung the cap is applied per candidate through the planner's
+// own playback.CappedRungHeightV3, using the candidate as the effective source.
 // That keeps the picker and the planner in agreement: an explicit preference is
 // reduced to the cap's rung only when the candidate's bitrate exceeds the cap,
 // so a source-preserving encode under the cap is not displaced by a lower rung.
-// "auto"/"original" return no rung and keep the device ranking untouched.
+// A compound rung never changes class under a cap, so it keeps its class and the
+// cap only clamps the planner's bitrate. "auto"/"original" return no rung and
+// keep the device ranking untouched.
 func reorderVirtualCandidatesForQuality(candidates []VirtualPlaybackStream, qualityPreference string, bandwidthCapKbps int) []VirtualPlaybackStream {
-	rungHeight := qualityRungHeightV3(qualityPreference)
+	rungHeight, compoundRung := qualityRungHeightV3(qualityPreference)
 	if rungHeight <= 0 || len(candidates) <= 1 {
 		return candidates
 	}
@@ -2934,7 +2950,7 @@ func reorderVirtualCandidatesForQuality(candidates []VirtualPlaybackStream, qual
 	for _, cand := range candidates {
 		height := resolutionHeight(cand.Resolution)
 		effectiveRung := rungHeight
-		if height > 0 {
+		if height > 0 && !compoundRung {
 			effectiveRung, _ = playback.CappedRungHeightV3(rungHeight, height, cand.Bitrate, bandwidthCapKbps)
 		}
 		if height > 0 && height <= effectiveRung {
