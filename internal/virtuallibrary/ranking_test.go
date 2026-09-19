@@ -313,51 +313,114 @@ func TestIngestionDedupesPerFileVariantsBeforeCap(t *testing.T) {
 	}
 }
 
-// TestResolveDetailedPinCollapsedByDedupResolvesToKeeper proves a pin that one
-// multi-file release's dedup collapsed resolves to the surviving keeper of that
-// release: a file swap inside a release, never a different release and never a
-// hard failure.
-func TestResolveDetailedPinCollapsedByDedupResolvesToKeeper(t *testing.T) {
+// collapsedPinFixture builds a listing with one multi-file release X (variants
+// file-0 keeper and file-1 dropped) plus a distinct, higher-ranked release C.
+// It returns the service, the dropped variant's id (the pin), the keeper's id,
+// and C's id. The higher-ranked C is what makes the collapse test discriminating:
+// an unfixed resolver returns C, a fixed one returns the keeper.
+func collapsedPinFixture(t *testing.T) (svc *virtuallibrary.Service, droppedID, keeperID, otherID string) {
+	t.Helper()
 	entries := []map[string]any{
 		{
 			"name": "Movie.2024.1080p.WEB-DL-0", "title": "Movie.2024.1080p.WEB-DL",
-			"url": "http://192.168.1.10/file-0.mkv", "behaviorHints": map[string]any{"videoHash": "same-release-hash"},
+			"url": "http://192.168.1.10/file-0.mkv", "behaviorHints": map[string]any{"videoHash": "release-x"},
 		},
 		{
 			"name": "Movie.2024.1080p.WEB-DL-1", "title": "Movie.2024.1080p.WEB-DL",
-			"url": "http://192.168.1.10/file-1.mkv", "behaviorHints": map[string]any{"videoHash": "same-release-hash"},
+			"url": "http://192.168.1.10/file-1.mkv", "behaviorHints": map[string]any{"videoHash": "release-x"},
+		},
+		{
+			"name": "Other.2024.2160p.WEB-DL", "title": "Other.2024.2160p.WEB-DL",
+			"url": "http://192.168.1.10/other.mkv",
 		},
 	}
-	svc := newProviderService(t, nil, virtuallibrary.Config{}, entries...)
-	ctx := context.Background()
-
-	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
+	svc = newProviderService(t, nil, virtuallibrary.Config{}, entries...)
+	streams, err := svc.ListStreams(context.Background(), "virtual://movie/tt100")
 	if err != nil {
 		t.Fatalf("ListStreams: %v", err)
 	}
-	if len(streams) != 1 {
-		t.Fatalf("dedup left %d candidates, want 1", len(streams))
+	if len(streams) != 2 {
+		t.Fatalf("ranked candidates = %d, want 2 (release X keeper + release C)", len(streams))
 	}
-	keeperID := streams[0].ID
+	for _, s := range streams {
+		switch s.Resolution {
+		case "1080p":
+			keeperID = s.ID
+		case "2160p":
+			otherID = s.ID
+		}
+	}
+	if keeperID == "" || otherID == "" {
+		t.Fatalf("failed to identify candidates: keeper=%q other=%q", keeperID, otherID)
+	}
+	if streams[0].ID != otherID {
+		t.Fatalf("higher-ranked release is not first: %+v", streams)
+	}
 
 	// Recompute the dropped variant's stable id the same way the resolver does.
 	dropped := stream.StreamCandidate{
 		Name: "Movie.2024.1080p.WEB-DL-1", Title: "Movie.2024.1080p.WEB-DL",
 		URL: "http://192.168.1.10/file-1.mkv",
 	}
-	dropped.BehaviorHints.VideoHash = "same-release-hash"
+	dropped.BehaviorHints.VideoHash = "release-x"
 	stream.ParseStreamDetails(&dropped)
-	droppedID := stream.CandidateVariantID(dropped)
+	droppedID = stream.CandidateVariantID(dropped)
 	if droppedID == "" || droppedID == keeperID {
 		t.Fatalf("dropped variant id = %q, keeper = %q", droppedID, keeperID)
 	}
+	return svc, droppedID, keeperID, otherID
+}
 
-	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, nil, "")
+// TestResolveDetailedPinCollapsedByDedupResolvesToKeeper proves a pin whose
+// variant dedup collapsed resolves to the surviving keeper of its release even
+// when a different, higher-ranked release is present: a file swap inside a
+// release, never a release swap and never a hard failure.
+func TestResolveDetailedPinCollapsedByDedupResolvesToKeeper(t *testing.T) {
+	svc, droppedID, keeperID, otherID := collapsedPinFixture(t)
+
+	resolved, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result="+droppedID, false, nil, "")
 	if err != nil {
 		t.Fatalf("ResolveDetailed(collapsed pin): %v", err)
 	}
 	if resolved.CandidateID != keeperID {
-		t.Fatalf("collapsed pin resolved to %q, want its release keeper %q", resolved.CandidateID, keeperID)
+		t.Fatalf("collapsed pin resolved to %q, want its release keeper %q (not the higher-ranked %q)", resolved.CandidateID, keeperID, otherID)
+	}
+}
+
+// TestResolveDetailedCollapsedPinHonoursExclusion proves the translated pin is
+// still governed by the caller's exclusion list: excluding the collapsed
+// variant refuses without substitution, and an explicit rotation substitutes a
+// different release rather than the excluded release's keeper.
+func TestResolveDetailedCollapsedPinHonoursExclusion(t *testing.T) {
+	svc, droppedID, keeperID, otherID := collapsedPinFixture(t)
+	ctx := context.Background()
+
+	if _, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, []string{droppedID}, "", false); err == nil {
+		t.Fatal("expected refusal when the collapsed pin's release is excluded without rotation")
+	}
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, []string{droppedID}, "", true)
+	if err != nil {
+		t.Fatalf("rotation resolve: %v", err)
+	}
+	if resolved.CandidateID == keeperID {
+		t.Fatal("rotation returned the excluded release's keeper")
+	}
+	if resolved.CandidateID != otherID {
+		t.Fatalf("rotation resolved to %q, want the alternative release %q", resolved.CandidateID, otherID)
+	}
+}
+
+// TestResolveDetailedDeadPinStillFallsBack proves a genuinely dead pin (absent
+// with no keeper) still resolves to an alternative under substitution, so a
+// genuinely unavailable provider recovers.
+func TestResolveDetailedDeadPinStillFallsBack(t *testing.T) {
+	svc, _, _, otherID := collapsedPinFixture(t)
+	resolved, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result=ffffffffffffffffffffffff", false, nil, "", true)
+	if err != nil {
+		t.Fatalf("dead-pin resolve: %v", err)
+	}
+	if resolved.CandidateID != otherID {
+		t.Fatalf("dead pin resolved to %q, want the top alternative %q", resolved.CandidateID, otherID)
 	}
 }
 
@@ -404,5 +467,46 @@ func TestReleaseGateBlocksFutureAndFailsOpen(t *testing.T) {
 	unknown.Resolver.SetReleaseGate(fakeGate{released: true})
 	if _, err := unknown.ListStreams(ctx, "virtual://movie/tt100"); err != nil {
 		t.Fatalf("unknown release was blocked: %v", err)
+	}
+}
+
+// TestAllFailedListingWarnsAndRecoversWithoutNegativeCache proves a non-empty
+// provider answer the classifier drops entirely is not a two-minute negative
+// cache entry: it warns with the count and recovers as soon as the classifier
+// state changes, without waiting for a TTL.
+func TestAllFailedListingWarnsAndRecoversWithoutNegativeCache(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	svc := newProviderService(t, logger, virtuallibrary.Config{},
+		streamEntry("1080p", "http://192.168.1.10/a.mkv"),
+		streamEntry("720p", "http://192.168.1.10/b.mkv"),
+	)
+	ctx := context.Background()
+
+	svc.Resolver.SetCandidateClassifier(classifyByURL{
+		"http://192.168.1.10/a.mkv": {failed: true},
+		"http://192.168.1.10/b.mkv": {failed: true},
+	})
+	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
+	if err != nil {
+		t.Fatalf("all-failed ListStreams: %v", err)
+	}
+	if len(streams) != 0 {
+		t.Fatalf("all-failed listing returned %d candidates, want 0", len(streams))
+	}
+	if !strings.Contains(logs.String(), "every provider candidate was dropped as failed") {
+		t.Fatalf("all-failed warning not logged: %s", logs.String())
+	}
+
+	// The same cached answer must recover immediately when the classifier
+	// changes: a non-empty all-failed answer is cached as data, not as a
+	// negative entry.
+	svc.Resolver.SetCandidateClassifier(classifyByURL{})
+	streams, err = svc.ListStreams(ctx, "virtual://movie/tt100")
+	if err != nil {
+		t.Fatalf("recovered ListStreams: %v", err)
+	}
+	if len(streams) != 2 {
+		t.Fatalf("recovered listing = %d candidates, want 2 (all-failed must not negative-cache)", len(streams))
 	}
 }

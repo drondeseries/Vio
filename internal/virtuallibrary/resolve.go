@@ -177,7 +177,11 @@ func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, erro
 //   - preferredCandidateID is tried first;
 //   - a pin whose multi-file variant dedup collapsed resolves to the surviving
 //     keeper of that release (a file swap inside the release, never a release
-//     swap), because dedup preserves exactly one candidate per release;
+//     swap), because dedup preserves exactly one candidate per release and
+//     reports the dropped -> keeper map; the translated pin then overrides
+//     rank and reject and respects exclusions, the profile filter and
+//     allowCandidateSubstitution exactly like the original pin;
+//   - a genuinely dead pin (absent with no keeper) still falls back;
 //   - every stream URL is validated against outbound SSRF.
 //
 // allowCandidateSubstitution gates the fallback that lets a pinned result= URI
@@ -212,12 +216,13 @@ func (s *Service) ResolveDetailed(
 
 	var (
 		candidates []stream.StreamCandidate
+		keepers    map[string]string
 		err        error
 	)
 	if forceRefresh {
-		candidates, _, _, err = s.Resolver.GetCandidatesFresh(ctx, virtualPath)
+		candidates, keepers, _, _, err = s.Resolver.GetCandidatesFreshWithKeepers(ctx, virtualPath)
 	} else {
-		candidates, _, _, err = s.Resolver.GetCandidates(ctx, virtualPath)
+		candidates, keepers, _, _, err = s.Resolver.GetCandidatesWithKeepers(ctx, virtualPath)
 	}
 	if err != nil {
 		return ResolvedVirtualStream{}, err
@@ -238,6 +243,26 @@ func (s *Service) ResolveDetailed(
 	s.rankCandidatesForVirtualPath(virtualPath, candidates)
 	s.warnIfAllRejected(virtualPath, candidates)
 
+	// A pin whose variant dedup collapsed is absent from the list, but its
+	// release survives as a keeper. Translate it to that keeper before any pin
+	// state is computed, so a collapsed pin behaves exactly like the real pin:
+	// it overrides rank and reject, honours its exclusions and the profile
+	// filter, and respects allowSubstitution=false. A genuinely dead pin (no
+	// keeper) is left unchanged and still falls back as before.
+	requestedResultID := resultID
+	effectiveResultID := resultID
+	if effectiveResultID != "" && !candidateIDPresent(candidates, effectiveResultID) {
+		if keeperID := keepers[effectiveResultID]; keeperID != "" {
+			effectiveResultID = keeperID
+		}
+	}
+	effectivePreferredID := preferredCandidateID
+	if effectivePreferredID != "" && !candidateIDPresent(candidates, effectivePreferredID) {
+		if keeperID := keepers[effectivePreferredID]; keeperID != "" {
+			effectivePreferredID = keeperID
+		}
+	}
+
 	profile := s.qualityProfileForPath(virtualPath)
 	profileActive := strings.TrimSpace(profile.Label) != ""
 
@@ -245,9 +270,9 @@ func (s *Service) ResolveDetailed(
 	// refuses it without an explicit rotation request rather than substituting
 	// a different release under the session binding.
 	pinProfileRemoved := false
-	if profileActive && resultID != "" {
+	if profileActive && effectiveResultID != "" {
 		for _, c := range candidates {
-			if stream.CandidateVariantID(c) == resultID {
+			if stream.CandidateVariantID(c) == effectiveResultID {
 				pinProfileRemoved = !quality.MatchProfile(c, profile)
 				break
 			}
@@ -273,16 +298,20 @@ func (s *Service) ResolveDetailed(
 		}
 	}
 
-	_, pinnedExcluded := excluded[resultID]
-	pinBlocked := resultID != "" && (pinnedExcluded || pinProfileRemoved)
+	// Excluding either the requested variant or its keeper blocks the pin:
+	// they are one release, so an exclusion of either is an exclusion of the
+	// session-bound release.
+	_, requestedExcluded := excluded[requestedResultID]
+	_, keeperExcluded := excluded[effectiveResultID]
+	pinBlocked := effectiveResultID != "" && (requestedExcluded || keeperExcluded || pinProfileRemoved)
 	// A blocked pin is only substitutable when the caller asked for candidate
 	// rotation. Otherwise refuse rather than hand back a different release
 	// under the same session binding.
 	if pinBlocked && !allowSubstitution {
-		return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q is excluded and candidate rotation was not requested", resultID)
+		return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q is excluded and candidate rotation was not requested", effectiveResultID)
 	}
 
-	ordered := orderCandidates(candidates, preferredCandidateID)
+	ordered := orderCandidates(candidates, effectivePreferredID)
 
 	var lastErr error
 	// tryCandidate returns the resolved stream for one candidate, or false when
@@ -293,10 +322,10 @@ func (s *Service) ResolveDetailed(
 		if _, skip := excluded[id]; skip {
 			return ResolvedVirtualStream{}, false
 		}
-		if pinBlocked && id == resultID {
+		if pinBlocked && id == effectiveResultID {
 			return ResolvedVirtualStream{}, false
 		}
-		if requirePin && id != resultID {
+		if requirePin && id != effectiveResultID {
 			return ResolvedVirtualStream{}, false
 		}
 		validated, validateErr := s.validateStreamURL(ctx, c.URL)
@@ -315,7 +344,7 @@ func (s *Service) ResolveDetailed(
 
 	// The explicit pin is tried first even when rank or a custom-format reject
 	// would place it last: a pin overrides rank and reject.
-	if resultID != "" && !pinBlocked {
+	if effectiveResultID != "" && !pinBlocked {
 		for _, c := range ordered {
 			if resolved, ok := tryCandidate(c, true); ok {
 				return resolved, nil
@@ -381,6 +410,20 @@ func (s *Service) ListStreams(ctx context.Context, virtualPath string) ([]Playba
 		})
 	}
 	return streams, nil
+}
+
+// candidateIDPresent reports whether any candidate carries the given stable
+// variant id.
+func candidateIDPresent(candidates []stream.StreamCandidate, id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, c := range candidates {
+		if stream.CandidateVariantID(c) == id {
+			return true
+		}
+	}
+	return false
 }
 
 func orderCandidates(candidates []stream.StreamCandidate, preferredID string) []stream.StreamCandidate {

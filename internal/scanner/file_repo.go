@@ -1375,9 +1375,13 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 		// someone's last-played file so a known-working version does not vanish
 		// from the version list when the provider re-lists with new result ids.
 		// A retained row keeps its failed_at. A failed retained row stays out
-		// of the auto-pick (a re-list no longer clears the verdict) until a real
-		// delivery or an explicit retry recovers it; the dropdown still shows
-		// it for that manual retry.
+		// of the auto-pick (a re-list no longer clears the verdict), and the
+		// resolver drops SourceFailed candidates before the version-list sink,
+		// so a failed release is neither re-persisted nor offered for manual
+		// retry through the version list. Only a real delivery
+		// (MarkVirtualCandidateRecovered) or a liveness success
+		// (ClearVirtualCandidateFailed) clears the verdict; the next listing
+		// then re-adds the release if the provider still offers it.
 		//
 		// A row that actually delivered media bytes (last_delivered_at set) is
 		// retained on the same principle even if no progress row points at it:
