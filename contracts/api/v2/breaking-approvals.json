@@ -1,25 +1,3 @@
 {
-  "approvals": [
-    {
-      "operation_id": "createRequestIntegration",
-      "change_id": "request-property-pattern-changed",
-      "fingerprint": "f49e964592bd5968f78870707c9bde7ae0bec95e53faf3de8dcb9745a26d4b24",
-      "reason": "Vio virtual streaming core integration allows installation_id 0 for core virtual library request routing.",
-      "approved_in": "#4"
-    },
-    {
-      "operation_id": "updateRequestIntegration",
-      "change_id": "request-property-pattern-changed",
-      "fingerprint": "35aa6a4ab101a7aef00b2bac8645bdc15fe3790465f669d3b4462030f7ffc3c0",
-      "reason": "Vio virtual streaming core integration allows installation_id 0 for core virtual library request routing.",
-      "approved_in": "#4"
-    },
-    {
-      "operation_id": "loadRequestIntegrationOptions",
-      "change_id": "request-property-pattern-changed",
-      "fingerprint": "9f59de4a44febd1517b36df32b2f045d40e8591e50b07c6cbecfed180efcc8bd",
-      "reason": "Vio virtual streaming core integration allows installation_id 0 for core virtual library request routing.",
-      "approved_in": "#4"
-    }
-  ]
+  "approvals": []
 }

@@ -52,6 +52,14 @@ const (
 	subtitleMIMEVTTV3            = "text/vtt"
 	subtitleUnavailableReasonV3  = "subtitle_artifact_unavailable"
 	transcodeStartFailedReasonV3 = "transcode_start_failed"
+	// trackUnavailableReasonV3 is the transport reason for an audio remap miss:
+	// the candidate's audio inventory did not bind, not its video stream, so the
+	// client may pick another track without swapping the release.
+	trackUnavailableReasonV3 = "track_unavailable"
+	// subtitleDroppedUnavailableCodeV3 is the degradation-warning code for a
+	// successful plan whose selected subtitle was dropped; playback continues on
+	// the same release without it.
+	subtitleDroppedUnavailableCodeV3 = "subtitle_dropped_unavailable"
 	// audioAdaptationFailedReasonV3 is the transport reason for a remote node
 	// that could not confirm the audio adaptation recipe for a release. It is
 	// deliberately distinct from transcodeStartFailedReasonV3: an audio problem
@@ -5726,7 +5734,7 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 			// lacks or the client sent malformed. Name the audio so the client
 			// can pick another track without a release swap.
 			return &transportErrorV3{
-				reason:    "track_unavailable",
+				reason:    trackUnavailableReasonV3,
 				message:   "The selected audio track is unavailable in every compatible media version.",
 				retryable: false,
 				cause:     joinedErr,
@@ -5992,7 +6000,7 @@ func annotateSubtitleDroppedV3(result *playback.PlannerResultV3) {
 		return
 	}
 	result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, playback.DegradationWarningV3{
-		Code:    "subtitle_dropped_unavailable",
+		Code:    subtitleDroppedUnavailableCodeV3,
 		Message: "The selected subtitle is unavailable on this release; playback continues without it on the same release.",
 	})
 }
@@ -6679,7 +6687,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					candidateStart.SubtitleTrackID = ""
 					start = candidateStart
 				} else if remapErr != nil {
-					return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "track_unavailable", message: remapErr.Error()}
+					return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: remapErr.Error()}
 				} else {
 					start = candidateStart
 				}
@@ -6720,7 +6728,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			}
 			audioIndex, err = resolveV3AudioIndex(effectiveFile, start.AudioTrackID, start.AudioTrackIndex)
 			if err != nil {
-				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "track_unavailable", message: err.Error()}
+				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: err.Error()}
 			}
 		}
 		attemptedKeys := []string(nil)
@@ -6798,7 +6806,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			}
 			audioIndex, err = resolveV3AudioIndex(effectiveFile, start.AudioTrackID, start.AudioTrackIndex)
 			if err != nil {
-				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "track_unavailable", message: err.Error()}
+				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: err.Error()}
 			}
 			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail})
 			clampPlannerTargetResolution(&result, effectiveFile)

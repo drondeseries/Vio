@@ -193,6 +193,7 @@ const (
 	transcodeCodecH264       = "h264"
 	transcodeCodecHEVC       = "hevc"
 	transcodeCodecAV1        = "av1"
+	transcodeCodecVP9        = "vp9"
 	HWAccelNone              = "none"
 	transcodeHWQSV           = "qsv"
 	transcodeHWVAAPI         = "vaapi"
@@ -4195,8 +4196,8 @@ func decodeErrorLine(line string) bool {
 // videoIdentityTokensV3 are the codec and bitstream identifiers FFmpeg prints
 // when a line names a video stream without the media-type stream-class prefix.
 var videoIdentityTokensV3 = []string{
-	"h264", "avc1", "hevc", "h265", "hev1", "hvc1", "dvh1",
-	"av1", "vp9", "vp8", "mpeg2video", "mpeg4", "mpegvideo",
+	transcodeCodecH264, "avc1", transcodeCodecHEVC, "h265", "hev1", "hvc1", "dvh1",
+	transcodeCodecAV1, transcodeCodecVP9, "vp8", "mpeg2video", "mpeg4", "mpegvideo",
 	"vc1", "prores", "dnxhd", "theora", "h263", "wmv3",
 	"nal unit", "bitstream", "slice_header",
 }

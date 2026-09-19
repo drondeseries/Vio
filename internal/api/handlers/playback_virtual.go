@@ -421,7 +421,7 @@ func (h *PlaybackHandler) persistVirtualEvidenceNow(args models.VirtualFilePersi
 	if saver == nil {
 		return
 	}
-	ctx, cancel := h.virtualDetachedContext(nil, virtualEvidencePersistBudget)
+	ctx, cancel := h.virtualDetachedContext(h.ServiceContext, virtualEvidencePersistBudget)
 	defer cancel()
 	if _, err := saver(ctx, args); err != nil {
 		slog.ErrorContext(ctx, "virtual probe evidence persist failed",
@@ -2175,7 +2175,7 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, sna
 // The write is queued to the bounded evidence worker pool rather than spawned
 // per call. That keeps it off the aggregate detached-work gate (a burst of long
 // probes must not crowd evidence out) while still bounding memory; see
-// enqueueVirtualProbeEvidence for the overload behaviour.
+// enqueueVirtualProbeEvidence for the overload behavior.
 func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) {
 	if h == nil || h.VirtualFileSaver == nil || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
 		return
@@ -2898,7 +2898,7 @@ func (h *PlaybackHandler) maybeSubmitRemuxDBEvidence(ctx context.Context, probed
 		for range remuxSubmitWorkers {
 			go func() {
 				for task := range h.remuxSubmitCh {
-					submitCtx, cancel := h.virtualDetachedContext(nil, 10*time.Second)
+					submitCtx, cancel := h.virtualDetachedContext(h.ServiceContext, 10*time.Second)
 					client := remuxdb.NewClient(task.baseURL, task.token)
 					if err := client.SubmitProbe(submitCtx, task.payload); err != nil {
 						slog.DebugContext(submitCtx, "remuxdb probe submission failed", "component", "api", "filename", task.payload.Filename, "error", err)

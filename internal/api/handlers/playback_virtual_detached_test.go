@@ -128,7 +128,7 @@ func TestSaturatedDetachedGateShedsSubtitleSearchWithoutBlocking(t *testing.T) {
 	}
 }
 
-// Cancelling the service context must stop a detached search, release its gate
+// Canceling the service context must stop a detached search, release its gate
 // slot, and drop its in-flight dedupe key so shutdown leaks neither a goroutine
 // nor admission state.
 func TestServiceContextCancellationStopsDetachedSubtitleSearch(t *testing.T) {
@@ -158,7 +158,7 @@ func TestServiceContextCancellationStopsDetachedSubtitleSearch(t *testing.T) {
 	select {
 	case <-stopped:
 	case <-time.After(2 * time.Second):
-		t.Fatal("detached subtitle search did not stop when the service context was cancelled")
+		t.Fatal("detached subtitle search did not stop when the service context was canceled")
 	}
 
 	gate := h.detachedGate()
