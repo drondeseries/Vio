@@ -258,6 +258,10 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 		// Excluding a candidate at the serve layer is a dead-candidate failover,
 		// so substitution is intended and must be declared to the resolver.
 		ctx = withVirtualCandidateRotationV3(ctx, len(excludedCandidateIDs) > 0)
+		// The serve layer re-resolves a release an existing session already
+		// serves, so it declares session-bound: a profile-removed candidate
+		// refuses instead of silently swapping the release.
+		ctx = withVirtualSessionBindingV3(ctx, true)
 		resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 			ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, "",
 		)

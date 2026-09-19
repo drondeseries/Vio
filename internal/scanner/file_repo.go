@@ -16,6 +16,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/pathscope"
 	"github.com/Silo-Server/silo-server/internal/scanbatch"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1589,11 +1590,13 @@ func languageAudioTracks(languages []string) []models.AudioTrack {
 }
 
 func languageSubtitleTracks(languages []string) []models.SubtitleTrack {
-	result := make([]models.SubtitleTrack, 0, len(languages))
-	for _, language := range languages {
-		if language = strings.TrimSpace(language); language != "" {
-			result = append(result, models.SubtitleTrack{Language: language})
-		}
+	// Collapse language aliases onto one entry per base language so a re-list
+	// cannot persist two placeholder rows for the same language (for example
+	// "EN-US" and "ENG" from a release name).
+	deduped := stream.DedupeLanguageAliases(languages)
+	result := make([]models.SubtitleTrack, 0, len(deduped))
+	for _, language := range deduped {
+		result = append(result, models.SubtitleTrack{Language: language})
 	}
 	return result
 }

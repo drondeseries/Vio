@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -2727,5 +2728,55 @@ func TestMissingVirtualMediaContentIDsReportsGenuinelyRemoved(t *testing.T) {
 	}
 	if _, ok := missing["movie-tmdb-4403"]; !ok {
 		t.Fatalf("wrong missing set: %v", missing)
+	}
+}
+
+// TestVirtualMediaVariantsDeduplicateSubtitleLanguageAliases proves the stored
+// JSONB subtitle inventory carries one track per base language: a release that
+// declared both "EN-US"/"ENG" and "FRE"/"FR-CA" persists two rows, not four.
+func TestVirtualMediaVariantsDeduplicateSubtitleLanguageAliases(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	reg := newReleasedVirtualMediaRegistrar(pool)
+	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(998,'SubtitleDedupe','mixed',true)"); err != nil {
+		t.Fatalf("seed subtitle dedupe folder: %v", err)
+	}
+	in := VirtualMedia{
+		LibraryID: "998", MediaType: "movie", Title: "Subtitle Dedupe", IMDbID: "tt300", TMDBID: "3", Source: "provider-a",
+		Year: 2020, RuntimeMinutes: 100,
+		Variants: []VirtualMediaVariant{
+			{
+				VirtualURI: "virtual://movie/tt300?profile=1080p", Resolution: "1080p", CodecVideo: "h264",
+				SubtitleLanguages: []string{"EN-US", "ENG", "FRE", "FR-CA"},
+			},
+		},
+	}
+	res, err := reg.UpsertVirtualMedia(ctx, 11, in)
+	if err != nil {
+		t.Fatalf("upsert subtitle dedupe movie: %v", err)
+	}
+	var raw []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT subtitle_tracks FROM media_files
+		WHERE content_id=$1 AND file_path=$2`,
+		res.MediaID, "virtual://movie/tt300?profile=1080p").Scan(&raw); err != nil {
+		t.Fatalf("load stored subtitle tracks: %v", err)
+	}
+	var tracks []models.SubtitleTrack
+	if err := json.Unmarshal(raw, &tracks); err != nil {
+		t.Fatalf("decode stored subtitle tracks: %v", err)
+	}
+	if len(tracks) != 2 {
+		t.Fatalf("stored subtitle tracks = %#v, want 2 (one per base language)", tracks)
+	}
+	got := map[string]bool{}
+	for _, track := range tracks {
+		got[track.Language] = true
+	}
+	if !got["EN-US"] || !got["FR-CA"] {
+		t.Fatalf("stored subtitle tracks = %#v, want EN-US and FR-CA", tracks)
+	}
+	if got["ENG"] || got["FRE"] {
+		t.Fatalf("stored subtitle tracks = %#v, kept a redundant alias", tracks)
 	}
 }

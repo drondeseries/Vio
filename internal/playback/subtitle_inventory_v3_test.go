@@ -176,6 +176,127 @@ func TestScopeSubtitleInventoryV3_EncodesEmptyInventoryAsArray(t *testing.T) {
 	}
 }
 
+// TestBuildSubtitleInventoryV3_DeduplicatesIdenticalEmbeddedTracks is the
+// regression for the duplicate subtitle list: a file carrying both a regional
+// code and its bare base (the placeholder pair "EN-US" and "ENG") publishes one
+// track, and the surviving tracks keep their source ordinals.
+func TestBuildSubtitleInventoryV3_DeduplicatesIdenticalEmbeddedTracks(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 50,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 0, Language: "EN-US", Codec: "subrip"},
+			{Index: 0, Language: "ENG", Codec: "subrip"},
+			{Index: 2, Language: "FR-CA", Codec: "subrip"},
+			{Index: 2, Language: "FRE", Codec: "subrip"},
+		},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want 2 (one per base language)", items)
+	}
+	if items[0].CombinedIndex != 0 || items[0].Language != "EN-US" {
+		t.Fatalf("items[0] = %#v, want EN-US at source ordinal 0", items[0])
+	}
+	if items[1].CombinedIndex != 2 || items[1].Language != "FR-CA" {
+		t.Fatalf("items[1] = %#v, want FR-CA at source ordinal 2", items[1])
+	}
+	if _, ok := SubtitleInventoryItemAtV3(items, 2); !ok {
+		t.Fatal("the surviving track must still resolve at its source ordinal")
+	}
+	if _, ok := SubtitleInventoryItemAtV3(items, 1); ok {
+		t.Fatal("a suppressed duplicate must not leave a published ordinal")
+	}
+}
+
+// TestBuildSubtitleInventoryV3_DeduplicatesAcrossRanges proves the seen-set
+// spans the concatenated ranges: an additional entry that names the same
+// source range, language, codec and flags as an external sidecar collapses.
+func TestBuildSubtitleInventoryV3_DeduplicatesAcrossRanges(t *testing.T) {
+	file := &models.MediaFile{
+		ID:                51,
+		ExternalSubtitles: []models.ExternalSubtitle{{Path: "/media/movie.en.srt", Language: "en", Format: "srt"}},
+	}
+	additional := []SubtitleInventoryEntryV3{
+		{CombinedIndex: 1, Codec: "srt", Source: SubtitleSourceExternalV3, Language: "ENG", Label: "English"},
+	}
+
+	items := BuildSubtitleInventoryV3(file, additional)
+
+	if len(items) != 1 {
+		t.Fatalf("items = %#v, want the cross-range duplicate collapsed", items)
+	}
+	if items[0].Source != SubtitleSourceExternalV3 || items[0].CombinedIndex != 0 {
+		t.Fatalf("items[0] = %#v, want the external sidecar at ordinal 0", items[0])
+	}
+}
+
+// TestBuildSubtitleInventoryV3_KeepsDistinctLanguageCodecForcedCombinations
+// proves de-duplication is keyed on the whole combination, not the language
+// alone.
+func TestBuildSubtitleInventoryV3_KeepsDistinctLanguageCodecForcedCombinations(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 52,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 0, Language: "en", Codec: "subrip"},
+			{Index: 1, Language: "en", Codec: "subrip", Forced: true},
+			{Index: 2, Language: "en", Codec: "ass"},
+			{Index: 3, Language: "en", Codec: "subrip", HearingImpaired: true},
+			{Index: 4, Language: "de", Codec: "subrip"},
+		},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 5 {
+		t.Fatalf("items = %#v, want every distinct language/codec/forced combination", items)
+	}
+}
+
+// TestBuildSubtitleInventoryV3_KeepsDownloadedBesideEmbeddedSameLanguage
+// proves a downloaded/AI track is not silently dropped because the file has an
+// embedded track in the same language.
+func TestBuildSubtitleInventoryV3_KeepsDownloadedBesideEmbeddedSameLanguage(t *testing.T) {
+	file := &models.MediaFile{
+		ID:             53,
+		SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "en", Codec: "srt"}},
+	}
+	additional := []SubtitleInventoryEntryV3{
+		{CombinedIndex: 1, Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "en", DownloadedSubtitleID: 77},
+	}
+
+	items := BuildSubtitleInventoryV3(file, additional)
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want both the embedded and the downloaded track", items)
+	}
+}
+
+// TestBuildSubtitleInventoryV3_KeepsDistinctDownloadedRows proves two distinct
+// downloaded rows in one language are preserved; only a genuinely repeated row
+// is collapsed.
+func TestBuildSubtitleInventoryV3_KeepsDistinctDownloadedRows(t *testing.T) {
+	file := &models.MediaFile{ID: 54}
+	additional := []SubtitleInventoryEntryV3{
+		{Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "en", DownloadedSubtitleID: 77},
+		{Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "ENG", DownloadedSubtitleID: 88},
+	}
+
+	items := BuildSubtitleInventoryV3(file, additional)
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want both downloaded rows kept", items)
+	}
+	repeated := []SubtitleInventoryEntryV3{
+		{Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "en", DownloadedSubtitleID: 77},
+		{Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "ENG", DownloadedSubtitleID: 77},
+	}
+	if deduped := BuildSubtitleInventoryV3(file, repeated); len(deduped) != 1 {
+		t.Fatalf("deduped = %#v, want the repeated row collapsed", deduped)
+	}
+}
+
 func TestSubtitleInventoryItemAtV3(t *testing.T) {
 	file := &models.MediaFile{
 		ID: 9,

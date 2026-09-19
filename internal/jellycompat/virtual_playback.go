@@ -20,6 +20,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
+	virtstream "github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 const (
@@ -724,18 +725,28 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 	}
 
 	if len(candidate.SubtitleLanguages) > 0 {
+		// Key by base language (folding regional, bibliographic and display-name
+		// aliases), not the lowercase string: a candidate alias ("EN-US") of a
+		// probed language ("ENG", "en") must not be appended as a second track
+		// for the same language.
 		existing := make(map[string]bool, len(probed.SubtitleTracks))
 		for _, track := range probed.SubtitleTracks {
 			if language := strings.TrimSpace(track.Language); language != "" {
-				existing[strings.ToLower(language)] = true
+				if base := virtstream.CanonicalLanguageBase(language); base != "" {
+					existing[base] = true
+				}
 			}
 		}
 		for _, language := range candidate.SubtitleLanguages {
 			language = strings.TrimSpace(language)
-			if language == "" || existing[strings.ToLower(language)] {
+			if language == "" {
 				continue
 			}
-			existing[strings.ToLower(language)] = true
+			base := virtstream.CanonicalLanguageBase(language)
+			if base == "" || existing[base] {
+				continue
+			}
+			existing[base] = true
 			probed.SubtitleTracks = append(probed.SubtitleTracks, models.SubtitleTrack{
 				Index:    len(probed.SubtitleTracks),
 				Language: language,

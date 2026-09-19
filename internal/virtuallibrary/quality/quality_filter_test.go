@@ -71,3 +71,75 @@ func TestSortCandidatesForProfileRecordsRejected(t *testing.T) {
 		t.Fatalf("RejectingFormatNames = %v, want [No CAM]", names)
 	}
 }
+
+// TestMatchProfileGenericHDRMatchesHDR10Family proves the "4K HDR" profile
+// (HDR: "hdr") matches the HDR10 family the classifier emits, instead of
+// rejecting the content it exists to match. Dolby Vision is a distinct format
+// and is only matched by a profile that asks for "dv" explicitly.
+func TestMatchProfileGenericHDRMatchesHDR10Family(t *testing.T) {
+	profile := QualityProfile{Label: "4K HDR", Resolution: "2160p", HDR: "hdr"}
+	for _, candidateHDR := range []string{"hdr", "hdr10", "hdr10+"} {
+		candidate := stream.StreamCandidate{Resolution: "2160p", HDR: candidateHDR}
+		if !MatchProfile(candidate, profile) {
+			t.Fatalf("HDR %q did not satisfy a generic hdr profile", candidateHDR)
+		}
+	}
+	if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "dv"}, profile) {
+		t.Fatal("generic hdr profile matched Dolby Vision, which is not HDR10")
+	}
+
+	dvProfile := QualityProfile{Label: "4K DV", Resolution: "2160p", HDR: "dv"}
+	if !MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "dv"}, dvProfile) {
+		t.Fatal("dv profile did not match dv content")
+	}
+	if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "hdr10"}, dvProfile) {
+		t.Fatal("dv profile matched HDR10 content")
+	}
+}
+
+// TestSortCandidatesForProfileRanksProfileMatchedFirst proves the shared
+// ranking keeps the auto picker's candidate list in agreement with the
+// resolver's profile filter: a profile-satisfying candidate ranks ahead of a
+// profile-removed one even when the provider listed the removed one first.
+func TestSortCandidatesForProfileRanksProfileMatchedFirst(t *testing.T) {
+	profile := QualityProfile{Label: "fhd", Resolution: "1080p"}
+	removed := stream.StreamCandidate{Name: "720p", Resolution: "720p", OriginalIndex: 0}
+	matched := stream.StreamCandidate{Name: "1080p", Resolution: "1080p", OriginalIndex: 1}
+	candidates := []stream.StreamCandidate{removed, matched}
+
+	SortCandidatesForProfile(candidates, profile, nil)
+
+	if candidates[0].Resolution != "1080p" {
+		t.Fatalf("profile-matching candidate not ranked first: %+v", candidates)
+	}
+	// A zero profile imposes no profile ordering.
+	zero := []stream.StreamCandidate{removed, matched}
+	SortCandidatesForProfile(zero, QualityProfile{}, nil)
+	if zero[0].Resolution != "720p" {
+		t.Fatalf("zero profile changed the order: %+v", zero)
+	}
+}
+
+// TestMatchProfileExcludeHDRSymmetricWithRequirement proves the exclude side
+// uses the same sibling rule as the requirement side: ExcludeHDR "hdr" excludes
+// the HDR10 family but not Dolby Vision, while ExcludeHDR "dv" excludes only
+// DV.
+func TestMatchProfileExcludeHDRSymmetricWithRequirement(t *testing.T) {
+	hdrExclude := QualityProfile{Label: "no hdr", Resolution: "2160p", ExcludeHDR: "hdr"}
+	for _, candidateHDR := range []string{"hdr", "hdr10", "hdr10+"} {
+		if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: candidateHDR}, hdrExclude) {
+			t.Fatalf("ExcludeHDR \"hdr\" did not exclude %q", candidateHDR)
+		}
+	}
+	if !MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "dv"}, hdrExclude) {
+		t.Fatal("ExcludeHDR \"hdr\" excluded Dolby Vision")
+	}
+
+	dvExclude := QualityProfile{Label: "no dv", Resolution: "2160p", ExcludeHDR: "dv"}
+	if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "dv"}, dvExclude) {
+		t.Fatal("ExcludeHDR \"dv\" did not exclude dv")
+	}
+	if !MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "hdr10"}, dvExclude) {
+		t.Fatal("ExcludeHDR \"dv\" excluded HDR10")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 // Subtitle source classes in the combined-ordinal space.
@@ -81,19 +82,22 @@ type SubtitleInventoryItemV3 struct {
 // combined-ordinal ordering rule, and the only place in the server that
 // assigns subtitle ordinals.
 //
-// Ordinals are dense and gap-free across three consecutive ranges, in this
-// order:
+// Ordinals are assigned across three consecutive ranges, in this order:
 //
 //	[0, len(ExternalSubtitles))                       external sidecar files
 //	[len(External), len(External)+len(SubtitleTracks)) embedded container tracks
 //	[that, +len(additional))                           downloaded/generated tracks
 //
-// Every track occupies an ordinal, including bitmap tracks that have no
-// client-fetchable sidecar: a track that cannot be delivered as a sidecar is
-// published with SubtitleDeliveryBurnInOnlyV3 and no URL rather than omitted.
-// Omitting it would leave a hole in the sequence, and any client deriving the
-// downloaded-track base by counting published tracks would then undercount and
-// address the wrong track.
+// Every track occupies the ordinal of its position in its source array, so the
+// stream handler and subtitleEntryAtCombinedIndexV3 resolve a published
+// ordinal against the same array slot. With no suppressed duplicates the
+// ordinals are dense and gap-free; a duplicate suppressed by the de-duplication
+// below simply leaves its ordinal unpublished, and the tracks after it keep
+// their original ordinals (and remain correctly addressable).
+//
+// A track that cannot be delivered as a sidecar is still published — with
+// SubtitleDeliveryBurnInOnlyV3 and no URL — rather than omitted, so the
+// ordinal space never shifts under a client.
 //
 // Within each range the order is the source order: catalog order for
 // externals, container stream order for embedded tracks, and
@@ -101,35 +105,86 @@ type SubtitleInventoryItemV3 struct {
 // therefore stable for as long as the file's track set is, which is what makes
 // the `file:{id}:subtitle:{ordinal}` identity meaningful.
 //
+// Entries that are genuinely the same track are collapsed: same source range,
+// same base language, same normalized codec, and the same forced and
+// hearing-impaired flags. The seen-set spans all three ranges, so a duplicate
+// later in the combined list de-duplicates against an earlier one. Downloaded
+// entries additionally key on their stable row ID, so two distinct downloads
+// in one language are both kept, and a downloaded or AI subtitle is never
+// dropped merely because an embedded track shares its language (the source
+// range differs).
+//
 // The returned items carry no URLs; use SubtitleInventoryV3 once a session
 // exists.
 func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInventoryEntryV3) []SubtitleInventoryItemV3 {
 	if file == nil {
 		return nil
 	}
-	items := make([]SubtitleInventoryItemV3, 0, len(file.ExternalSubtitles)+len(file.SubtitleTracks)+len(additional))
-	for _, sub := range file.ExternalSubtitles {
-		items = append(items, subtitleInventoryItemV3(file.ID, len(items), SubtitleSourceExternalV3, sub.Format,
+	externalCount := len(file.ExternalSubtitles)
+	base := externalCount + len(file.SubtitleTracks)
+	items := make([]SubtitleInventoryItemV3, 0, base+len(additional))
+	seen := make(map[string]struct{}, base+len(additional))
+
+	for index, sub := range file.ExternalSubtitles {
+		if subtitleInventoryDuplicateV3(seen, SubtitleSourceExternalV3, "", sub.Format, sub.Language, sub.Forced, sub.HearingImpaired) {
+			continue
+		}
+		items = append(items, subtitleInventoryItemV3(file.ID, index, SubtitleSourceExternalV3, sub.Format,
 			sub.Language, firstNonEmptySubtitleLabelV3(sub.Title, sub.EmbeddedTitle, filepath.Base(sub.Path), sub.Language),
 			sub.Forced, sub.Default, sub.HearingImpaired))
 	}
-	for _, track := range file.SubtitleTracks {
-		items = append(items, subtitleInventoryItemV3(file.ID, len(items), SubtitleSourceEmbeddedV3, track.Codec,
+	for index, track := range file.SubtitleTracks {
+		if subtitleInventoryDuplicateV3(seen, SubtitleSourceEmbeddedV3, "", track.Codec, track.Language, track.Forced, track.HearingImpaired) {
+			continue
+		}
+		items = append(items, subtitleInventoryItemV3(file.ID, externalCount+index, SubtitleSourceEmbeddedV3, track.Codec,
 			track.Language, firstNonEmptySubtitleLabelV3(track.Title, track.EmbeddedTitle, track.Language),
 			track.Forced, track.Default, track.HearingImpaired))
 	}
-	for _, entry := range additional {
+	for index, entry := range additional {
 		source := entry.Source
 		if source == "" {
 			source = SubtitleSourceDownloadedV3
 		}
-		item := subtitleInventoryItemV3(file.ID, len(items), source, entry.Codec,
+		identity := ""
+		if source == SubtitleSourceDownloadedV3 {
+			identity = strconv.Itoa(entry.DownloadedSubtitleID)
+		}
+		if subtitleInventoryDuplicateV3(seen, source, identity, entry.Codec, entry.Language, entry.Forced, entry.HearingImpaired) {
+			continue
+		}
+		ordinal := entry.CombinedIndex
+		if ordinal <= 0 {
+			ordinal = base + index
+		}
+		item := subtitleInventoryItemV3(file.ID, ordinal, source, entry.Codec,
 			entry.Language, firstNonEmptySubtitleLabelV3(entry.Label, entry.Language),
 			entry.Forced, false, entry.HearingImpaired)
 		item.downloadedSubtitleID = entry.DownloadedSubtitleID
 		items = append(items, item)
 	}
 	return items
+}
+
+// subtitleInventoryDuplicateV3 records an inventory entry's de-duplication key
+// and reports whether an equivalent track was already seen. The key captures
+// the source range and, for downloaded rows, the stable row ID, plus the base
+// language, normalized codec, forced flag and hearing-impaired flag. Entries
+// that differ in any of those are distinct tracks and are preserved.
+func subtitleInventoryDuplicateV3(seen map[string]struct{}, source, identity, codec, language string, forced, hearingImpaired bool) bool {
+	key := strings.Join([]string{
+		source,
+		identity,
+		normalizeCodecV3(codec),
+		stream.CanonicalLanguageBase(language),
+		strconv.FormatBool(forced),
+		strconv.FormatBool(hearingImpaired),
+	}, "\x00")
+	if _, ok := seen[key]; ok {
+		return true
+	}
+	seen[key] = struct{}{}
+	return false
 }
 
 // SubtitleInventoryV3 returns the combined-ordinal inventory with

@@ -365,6 +365,87 @@ func canonicalAudioLanguage(token string) string {
 	}
 }
 
+// canonicalLanguageBaseCodes folds the canonical codes canonicalAudioLanguage
+// emits onto their base (ISO 639-1) language. Bibliographic 3-letter forms
+// ("FRE") are not understood by the x/text parser, so they are mapped here
+// rather than left to lang.PrimaryLanguage.
+var canonicalLanguageBaseCodes = map[string]string{
+	"ENG": "en", "FRE": "fr", "DEU": "de", "ITA": "it", "SPA": "es",
+	"JPN": "ja", "KOR": "ko", "RUS": "ru", "ZHO": "zh", "POR": "pt",
+	"ARA": "ar", "HIN": "hi", "NLD": "nl", "POL": "pl", "SWE": "sv",
+	"NOR": "no", "DAN": "da", "FIN": "fi", "TUR": "tr", "UKR": "uk",
+}
+
+// CanonicalLanguageBase folds a language token onto a stable base-language
+// key. ISO 639-1/2 codes, their bibliographic variants, English display names
+// and regional/script forms all collapse to one key per base language:
+// "EN-US", "en-GB", "ENG", "en" and "English" yield "en"; "FR-CA", "FRE" and
+// "fr" yield "fr". It is the de-duplication key shared by the stream parser
+// and the stored/protocol subtitle inventories. Callers that must display a
+// language keep the more specific canonical code separately. Unidentifiable
+// input yields "".
+func CanonicalLanguageBase(value string) string {
+	code := canonicalAudioLanguage(value)
+	if code == "" {
+		return ""
+	}
+	if base, ok := canonicalLanguageBaseCodes[code]; ok {
+		return base
+	}
+	if index := strings.IndexByte(code, '-'); index > 0 {
+		base := strings.ToLower(code[:index])
+		if base != "" && base != "und" && base != "mul" {
+			return base
+		}
+	}
+	if base := lang.PrimaryLanguage(code); base != "" && base != "und" && base != "mul" {
+		return base
+	}
+	lower := strings.ToLower(code)
+	if index := strings.IndexByte(lower, '-'); index > 0 {
+		lower = lower[:index]
+	}
+	return lower
+}
+
+// DedupeLanguageAliases collapses language aliases that share a base-language
+// key, keeping exactly one entry per base language. The first occurrence's
+// position is preserved; when a later alias is more specific (it carries a
+// region or script subtag) and the kept entry for that base is not, the more
+// specific code replaces it, so a regional tag wins over its bare base. Order
+// is otherwise first-seen, which makes the result deterministic. Empty or
+// unidentifiable entries are dropped. Returns nil when nothing remains.
+func DedupeLanguageAliases(languages []string) []string {
+	if len(languages) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(languages))
+	position := make(map[string]int, len(languages))
+	for _, language := range languages {
+		language = strings.TrimSpace(language)
+		if language == "" {
+			continue
+		}
+		base := CanonicalLanguageBase(language)
+		if base == "" {
+			continue
+		}
+		index, seen := position[base]
+		if !seen {
+			position[base] = len(out)
+			out = append(out, language)
+			continue
+		}
+		if !strings.Contains(out[index], "-") && strings.Contains(language, "-") {
+			out[index] = language
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // ParseStreamMetadata fills FileSize, AudioLanguages, SubtitleLanguages,
 // Container, ExpiresAt, and RequestHeaders on the candidate.
 func ParseStreamMetadata(s *StreamCandidate) {
@@ -431,25 +512,29 @@ func ParseStreamMetadata(s *StreamCandidate) {
 	// qualifier). A bare language token that only appears in the audio context
 	// (e.g. "English DD5.1") must not be advertised as a subtitle track.
 	if subtitlePattern.MatchString(text) {
-		subSeen := map[string]bool{}
+		// Collect every canonical match in pass order (regional first, so a
+		// specific code precedes its bare base), then collapse aliases of one
+		// base language onto a single entry. The previous exact-code seen-set
+		// let "…en-US.srt" yield both "EN-US" (regional pass) and "ENG" (base
+		// pass), because "-" is a word boundary; downstream surfaces then
+		// listed the one language twice.
+		var matches []string
 		for _, match := range regionalLangPattern.FindAllString(cleanText, -1) {
-			if code := canonicalAudioLanguage(match); code != "" && !subSeen[code] {
-				subSeen[code] = true
-				s.SubtitleLanguages = append(s.SubtitleLanguages, code)
+			if code := canonicalAudioLanguage(match); code != "" {
+				matches = append(matches, code)
 			}
 		}
 		for _, match := range fullNameLangPattern.FindAllString(cleanText, -1) {
-			if code := canonicalAudioLanguage(match); code != "" && !subSeen[code] {
-				subSeen[code] = true
-				s.SubtitleLanguages = append(s.SubtitleLanguages, code)
+			if code := canonicalAudioLanguage(match); code != "" {
+				matches = append(matches, code)
 			}
 		}
 		for _, match := range subtitleLanguagePattern.FindAllString(strings.ToLower(cleanText), -1) {
-			if code := canonicalAudioLanguage(match); code != "" && !subSeen[code] {
-				subSeen[code] = true
-				s.SubtitleLanguages = append(s.SubtitleLanguages, code)
+			if code := canonicalAudioLanguage(match); code != "" {
+				matches = append(matches, code)
 			}
 		}
+		s.SubtitleLanguages = DedupeLanguageAliases(append(s.SubtitleLanguages, matches...))
 	}
 
 	// Container resolution: prefer behaviorHints.filename, then URL, then text

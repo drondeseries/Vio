@@ -664,6 +664,14 @@ type virtualResolveOptionsV3 struct {
 	// fall past an excluded pinned candidate, so a display-driven fallback can
 	// never silently swap the release.
 	rotateCandidates bool
+	// sessionBound declares that this resolve is for a release an existing
+	// session is already serving (a replan rehydration or a serve-layer
+	// re-resolve), as opposed to a fresh selection probing candidates. It is the
+	// only reliable signal: both cases arrive as a ?result= in the URI, so the
+	// presence of a preferred id cannot distinguish them. A session-bound
+	// profile-removed pin refuses instead of swapping the release; a fresh
+	// selection falls through to a profile-satisfying candidate.
+	sessionBound bool
 }
 
 // virtualCandidateRotationContextKeyV3 carries the rotation intent across the
@@ -698,6 +706,91 @@ func VirtualCandidateRotationAllowed(ctx context.Context) bool {
 		return true
 	}
 	return allowed
+}
+
+// virtualSessionBindingContextKeyV3 carries the session-binding intent across
+// the detailed-resolver interface to the service that owns the profile refusal.
+type virtualSessionBindingContextKeyV3 struct{}
+
+func withVirtualSessionBindingV3(ctx context.Context, bound bool) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, virtualSessionBindingContextKeyV3{}, bound)
+}
+
+// WithVirtualSessionBinding returns a context carrying the session-binding
+// intent for a detailed virtual resolve. It is the exported form of the
+// internal setter, for callers outside this package (the core router's service
+// adapter and tests).
+func WithVirtualSessionBinding(ctx context.Context, bound bool) context.Context {
+	return withVirtualSessionBindingV3(ctx, bound)
+}
+
+// VirtualSessionBinding reports whether the caller of a detailed virtual
+// resolve is re-resolving a release an existing session is serving. Absent
+// means session-bound (true): the conservative default, so a caller that does
+// not participate still refuses a profile-removed substitution rather than
+// silently swapping the release. Fresh-selection callers declare false
+// explicitly.
+func VirtualSessionBinding(ctx context.Context) bool {
+	if ctx == nil {
+		return true
+	}
+	bound, ok := ctx.Value(virtualSessionBindingContextKeyV3{}).(bool)
+	if !ok {
+		return true
+	}
+	return bound
+}
+
+// resetSubstitutedCandidateMetadata clears the declared media identity of the
+// candidate the handler probed after the resolver served a different release
+// (a fresh-selection fall-through). Without it the served transient would
+// inherit the probed candidate's resolution, codecs and tracks, contradicting
+// the resolved identity. The resolved candidate's catalog row or the forced
+// probe then supplies the real metadata.
+func resetSubstitutedCandidateMetadata(cand *VirtualPlaybackStream) {
+	if cand == nil {
+		return
+	}
+	cand.Resolution = ""
+	cand.CodecVideo = ""
+	cand.CodecAudio = ""
+	cand.HDR = ""
+	cand.SourceType = ""
+	cand.FileSize = 0
+	cand.Container = ""
+	cand.Bitrate = 0
+	cand.FrameRate = ""
+	cand.HasAtmos = false
+	cand.AudioLanguages = nil
+	cand.SubtitleLanguages = nil
+	cand.QualityScore = 0
+}
+
+// clearVirtualCandidateDeclaredMetadata clears the candidate-declared media
+// fields on a transient file so a substituted resolve cannot serve the probed
+// candidate's metadata under the resolved identity. Row identity and duration
+// are preserved; the caller forces the probe so the resolved bytes supply the
+// metadata.
+func clearVirtualCandidateDeclaredMetadata(file *models.MediaFile) {
+	if file == nil {
+		return
+	}
+	file.Resolution = ""
+	file.CodecVideo = ""
+	file.CodecAudio = ""
+	file.HDR = false
+	file.Container = ""
+	file.FileSize = 0
+	file.Bitrate = 0
+	file.AudioChannels = 0
+	file.VideoTracks = nil
+	file.AudioTracks = nil
+	file.SubtitleTracks = nil
+	file.ProbeSource = ""
+	file.ProbeUpdatedAt = nil
 }
 
 func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *models.MediaFile, profileID string, deferProbe bool, excludedCandidateIDs []string, preferredCandidateID string, qualityPreference string, bandwidthCapKbps int, forceRelist bool, opts ...virtualResolveOptionsV3) (resolvedVirtualPlaybackSource, error) {
@@ -863,6 +956,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	attemptCtx, cancel := context.WithTimeout(r.Context(), virtualStartupBudget)
 	defer cancel()
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
+	attemptCtx = withVirtualSessionBindingV3(attemptCtx, options.sessionBound)
 
 	// persistedResultURI is true when the catalog row already points at an
 	// adopted provider-neutral candidate rather than the neutral virtual path.
@@ -961,6 +1055,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		var resolveErr error
 		trace.resolveRan = true
 		resolveStart := time.Now()
+		// probedCandidateID is the candidate this iteration asked the resolver
+		// for. A fresh-selection fall-through can return a different one; when
+		// it does, the probed candidate's declared metadata must not be served
+		// under the resolved identity.
+		probedCandidateID := virtualResultCandidateID(cand.URI)
+		substituted := false
 		if h.VirtualMediaDetailedResolver != nil {
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 				attemptCtx, cand.URI, oid, userID, profileID, forceRelist, excludedCandidateIDs, preferredCandidateID,
@@ -968,11 +1068,25 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if err == nil {
 				streamURL = res.URL
 				cand.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
+				resolvedID := res.CandidateID
+				if resolvedID == "" && res.URI != "" {
+					resolvedID = virtualResultCandidateID(res.URI)
+				}
+				substituted = resolvedID != "" && probedCandidateID != "" && resolvedID != probedCandidateID
 				if res.URI != "" {
 					cand.URI = res.URI
 				}
 				if res.CandidateID != "" {
 					cand.ID = res.CandidateID
+				}
+				if substituted {
+					// The resolver served a different release than the one
+					// probed (a fresh-selection fall-through). Drop the probed
+					// candidate's declared media identity so the transient and
+					// the merge below cannot serve its resolution, codecs or
+					// tracks under the resolved candidate; the resolved row or
+					// the forced probe supplies the real metadata.
+					resetSubstitutedCandidateMetadata(&cand)
 				}
 				// The provider that answered is the runtime owner for a
 				// legacy file row whose stored owner is 0. Adopt it so the
@@ -1024,6 +1138,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid
 		}
+		if substituted && (dbFile == nil || dbFile.ID <= 0) {
+			// No catalog row for the resolved candidate: do not carry the
+			// probed candidate's declared metadata onto it. The forced probe
+			// below supplies the resolved bytes' metadata.
+			clearVirtualCandidateDeclaredMetadata(&transient)
+		}
 		if transient.Duration <= 0 {
 			if file.Duration > 0 {
 				transient.Duration = file.Duration
@@ -1050,6 +1170,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// Capture this before the candidate merge so a candidate-declared
 		// inventory never counts as stored evidence.
 		storedProbeMissing := transient.ProbeUpdatedAt == nil
+		if substituted {
+			// A substituted candidate has no trustworthy declared metadata left;
+			// force the probe so the served file reflects the resolved bytes
+			// rather than the probed candidate's resolution, codecs or tracks.
+			skipProbe = false
+			storedProbeMissing = true
+		}
 		if !skipProbe && cand.CodecVideo != "" && cand.Resolution != "" && cand.CodecAudio != "" && canSkipProbeForContainer(cand.Container) {
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
@@ -1073,9 +1200,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 		ev, _ := remuxMatches[origKey]
 		appliedRemux := false
-		if backfilled := applyRemuxDBEvidence(&transient, remuxMatches, origKey); backfilled != &transient {
-			transient = *backfilled
-			appliedRemux = true
+		if !substituted {
+			// The remux evidence is keyed by the probed candidate's URI; a
+			// substitute must not inherit it.
+			if backfilled := applyRemuxDBEvidence(&transient, remuxMatches, origKey); backfilled != &transient {
+				transient = *backfilled
+				appliedRemux = true
+			}
 		}
 		allowDefer := allowDeferredProbe(
 			deferProbe,
@@ -1088,6 +1219,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			ev.Resolution,
 			ev.CodecVideo,
 		)
+		if substituted {
+			// The probed candidate's declared metadata is gone, so the deferred
+			// declared-metadata path cannot be trusted; probe the resolved URL
+			// synchronously and serve the bytes' real metadata.
+			allowDefer = false
+		}
 		if allowDefer {
 			h.pinVirtualSticky(stickyKey, cand.URI)
 			// Resolution precedence: stored evidence wins; otherwise adopt
@@ -1502,6 +1639,11 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 	go func() {
 		bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(requestCtx), virtualStartupBudget)
 		defer bgCancel()
+		// This revalidates the specific candidate the optimistic start is
+		// already serving, so it is session-bound: a profile-removed candidate
+		// is reported as a resolve failure (damper + unpin) instead of being
+		// silently substituted by a different release.
+		bgCtx = withVirtualSessionBindingV3(bgCtx, true)
 
 		var streamURL string
 		var resolveErr error
@@ -1890,6 +2032,12 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	if ownerID <= 0 {
 		ownerID = file.VirtualOwnerInstallationID
 	}
+	// This resolves one specific candidate for the stale-source fallback; the
+	// caller loop provides substitution by trying the next listed stream. It is
+	// therefore session-bound: a profile-removed candidate is reported as a
+	// failure for that stream rather than silently resolving a different one
+	// while the caller persists this stream's URI.
+	ctx = withVirtualSessionBindingV3(ctx, true)
 	var streamURL string
 	if h.VirtualMediaDetailedResolver != nil {
 		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(

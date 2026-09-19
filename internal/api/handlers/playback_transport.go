@@ -337,6 +337,10 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 		// substitution is intended. The intent travels with the context so the
 		// resolver can distinguish it from a display-driven same-file re-plan.
 		ctx = withVirtualCandidateRotationV3(ctx, len(excludedCandidateIDs) > 0)
+		// The transport serve layer re-resolves a release an existing session
+		// already serves, so it declares session-bound: a profile-removed
+		// candidate refuses instead of silently swapping the release.
+		ctx = withVirtualSessionBindingV3(ctx, true)
 		res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 			ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID,
 		)

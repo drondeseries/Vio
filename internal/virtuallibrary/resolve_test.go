@@ -18,7 +18,7 @@ func TestResolveNilServiceReturnsUnavailable(t *testing.T) {
 		t.Fatalf("Resolve: err = %v, want ErrVirtualLibraryUnavailable", err)
 	}
 
-	_, err = s.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	_, err = s.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "", false)
 	if err != virtuallibrary.ErrVirtualLibraryUnavailable {
 		t.Fatalf("ResolveDetailed: err = %v, want ErrVirtualLibraryUnavailable", err)
 	}
@@ -137,12 +137,12 @@ func TestResolveDetailedPinnedExcludedCandidateSubstitution(t *testing.T) {
 
 	// Excluding the pinned candidate without a rotation request must refuse
 	// rather than silently serving a different release.
-	if _, err := svc.ResolveDetailed(ctx, pinnedURI, false, []string{pinned}, "", false); err == nil {
+	if _, err := svc.ResolveDetailed(ctx, pinnedURI, false, []string{pinned}, "", false, false); err == nil {
 		t.Fatal("expected refusal when the pinned candidate is excluded without rotation")
 	}
 
 	// An explicit rotation request may substitute the sibling.
-	rotated, err := svc.ResolveDetailed(ctx, pinnedURI, false, []string{pinned}, "", true)
+	rotated, err := svc.ResolveDetailed(ctx, pinnedURI, false, []string{pinned}, "", false, true)
 	if err != nil {
 		t.Fatalf("rotation resolve: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestResolveDetailedPinnedExcludedCandidateSubstitution(t *testing.T) {
 
 	// A pinned id absent from the provider list is a dead release: the
 	// dead-provider fallback still substitutes even without a rotation request.
-	dead, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result=ffffffffffffffffffffffff", false, nil, "", false)
+	dead, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result=ffffffffffffffffffffffff", false, nil, "", false, false)
 	if err != nil {
 		t.Fatalf("dead-pin resolve: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestResolveDetailedWithFakeProvider(t *testing.T) {
 	if svcSecure == nil {
 		t.Fatal("expected non-nil service")
 	}
-	_, errSecure := svcSecure.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	_, errSecure := svcSecure.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "", false)
 	if errSecure == nil {
 		t.Fatal("expected SSRF error when AllowInsecureHTTP is false for private stream URL")
 	}
@@ -212,7 +212,7 @@ func TestResolveDetailedWithFakeProvider(t *testing.T) {
 	if svcInsecure == nil {
 		t.Fatal("expected non-nil service")
 	}
-	res, err := svcInsecure.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	res, err := svcInsecure.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "", false)
 	if err != nil {
 		t.Fatalf("ResolveDetailed failed: %v", err)
 	}

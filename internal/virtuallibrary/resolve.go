@@ -23,6 +23,21 @@ type ResolvedVirtualStream struct {
 	ExpiresAt      time.Time
 }
 
+// ProfileRejectedError reports that a session-bound virtual candidate does not
+// satisfy the active quality profile and candidate substitution was refused. It
+// is deliberately distinct from an excluded or dead pin so a caller can tell a
+// too-strict profile from a genuinely unavailable release; the message names
+// both the candidate and the profile so the failure is actionable rather than a
+// dead end.
+type ProfileRejectedError struct {
+	CandidateID  string
+	ProfileLabel string
+}
+
+func (e *ProfileRejectedError) Error() string {
+	return fmt.Sprintf("session-bound virtual candidate %q does not satisfy quality profile %q and candidate rotation was not requested", e.CandidateID, e.ProfileLabel)
+}
+
 // PlaybackStream represents an available stream candidate formatted for
 // playback selection in API handlers and Jellyfin compatibility.
 type PlaybackStream struct {
@@ -151,7 +166,7 @@ func (s *Service) warnIfAllRejected(ctx context.Context, virtualPath string, can
 
 // Resolve resolves a virtual path to a concrete stream URL.
 func (s *Service) Resolve(ctx context.Context, virtualPath string) (string, error) {
-	res, err := s.ResolveDetailed(ctx, virtualPath, false, nil, "")
+	res, err := s.ResolveDetailed(ctx, virtualPath, false, nil, "", true)
 	if err != nil {
 		return "", err
 	}
@@ -160,7 +175,7 @@ func (s *Service) Resolve(ctx context.Context, virtualPath string) (string, erro
 
 // Refresh resolves a virtual path with forceRefresh enabled.
 func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, error) {
-	res, err := s.ResolveDetailed(ctx, virtualPath, true, nil, "")
+	res, err := s.ResolveDetailed(ctx, virtualPath, true, nil, "", true)
 	if err != nil {
 		return "", err
 	}
@@ -175,6 +190,15 @@ func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, erro
 //   - profile filtering applies if ?profile= is present and profiles are enabled;
 //   - excludedCandidateIDs are skipped;
 //   - preferredCandidateID is tried first;
+//   - sessionBound declares whether the caller is resolving a release an
+//     existing session is already serving. A session-bound profile-removed pin
+//     refuses with a *ProfileRejectedError (logged with the profile and
+//     candidate identity) rather than swapping the release. A fresh selection
+//     (sessionBound false) whose probed pin is profile-removed, stale-failed,
+//     or absent falls through to the best live candidate that satisfies the
+//     profile and is re-pinned by the caller; when nothing satisfies the
+//     profile and fallback is disallowed the caller gets the existing
+//     no-stream-matches-profile error. A dead/absent pin falls back either way;
 //   - a pin whose multi-file variant dedup collapsed resolves to the surviving
 //     keeper of that release (a file swap inside the release, never a release
 //     swap), because dedup preserves exactly one candidate per release and
@@ -203,6 +227,7 @@ func (s *Service) ResolveDetailed(
 	forceRefresh bool,
 	excludedCandidateIDs []string,
 	preferredCandidateID string,
+	sessionBound bool,
 	allowCandidateSubstitution ...bool,
 ) (ResolvedVirtualStream, error) {
 	allowSubstitution := true
@@ -275,9 +300,10 @@ func (s *Service) ResolveDetailed(
 	profile := s.qualityProfileForPath(virtualPath)
 	profileActive := strings.TrimSpace(profile.Label) != ""
 
-	// A pin the profile removes is treated like an excluded pin: the resolver
-	// refuses it without an explicit rotation request rather than substituting
-	// a different release under the session binding.
+	// Whether the probed pin is removed by the active profile. On its own this
+	// does not block a fresh selection (see the pinBlocked gate below): a
+	// candidate whose own ?profile= label rejects it must fall through to a
+	// profile-satisfying candidate rather than fail the whole start.
 	pinProfileRemoved := false
 	if profileActive && effectiveResultID != "" {
 		for _, c := range candidates {
@@ -309,14 +335,34 @@ func (s *Service) ResolveDetailed(
 
 	// Excluding either the requested variant or its keeper blocks the pin:
 	// they are one release, so an exclusion of either is an exclusion of the
-	// session-bound release.
+	// session-bound release. Exclusions are ungated: an explicit exclusion must
+	// refuse even for a fresh selection. The profile verdict is gated on the
+	// explicit sessionBound declaration, which is the only signal that
+	// distinguishes a session re-resolve from a fresh start (both arrive as a
+	// ?result= in the URI): a session-bound profile-removed candidate refuses,
+	// while a fresh selection's profile-removed, stale-failed or absent pin
+	// falls through to the best live profile-satisfying candidate below and is
+	// re-pinned by the caller.
 	_, requestedExcluded := excluded[requestedResultID]
 	_, keeperExcluded := excluded[effectiveResultID]
-	pinBlocked := effectiveResultID != "" && (requestedExcluded || keeperExcluded || pinProfileRemoved)
+	pinBlocked := effectiveResultID != "" &&
+		(requestedExcluded || keeperExcluded || (pinProfileRemoved && sessionBound))
 	// A blocked pin is only substitutable when the caller asked for candidate
 	// rotation. Otherwise refuse rather than hand back a different release
 	// under the same session binding.
 	if pinBlocked && !allowSubstitution {
+		if pinProfileRemoved && !requestedExcluded && !keeperExcluded {
+			// A too-strict profile is a different failure from a dead release:
+			// name the profile and the candidate so it is diagnosable.
+			if s.logger != nil {
+				s.logger.WarnContext(ctx, "session-bound virtual candidate rejected by the quality profile",
+					"candidate_id", effectiveResultID, "profile", strings.TrimSpace(profile.Label))
+			}
+			return ResolvedVirtualStream{}, &ProfileRejectedError{
+				CandidateID:  effectiveResultID,
+				ProfileLabel: strings.TrimSpace(profile.Label),
+			}
+		}
 		return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q is excluded and candidate rotation was not requested", effectiveResultID)
 	}
 	// When substitution is refused and the session's pinned release is

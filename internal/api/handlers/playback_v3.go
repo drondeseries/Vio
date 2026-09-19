@@ -1745,7 +1745,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// earlier auto pick; only an explicit pick or a forced relink re-tries
 		// the known-bad candidate.
 		allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
-		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, virtualResolveOptionsV3{allowFailedCandidate: allowFailedCandidate})
+		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, virtualResolveOptionsV3{allowFailedCandidate: allowFailedCandidate, sessionBound: false})
 		if resolveErr != nil {
 			termFileID := requestedFile.ID
 			if requestedFile.EpisodeID != "" && h.VirtualEpisodeFileLookup != nil {
@@ -2156,7 +2156,7 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 	if !isVirtualPlaybackFile(alternate) {
 		return h.ensurePlaybackProbe(r.Context(), alternate), nil
 	}
-	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false)
+	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false})
 	if err != nil {
 		return nil, err
 	}
@@ -2225,7 +2225,7 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 	for attempt := 1; attempt < maxAttempts; attempt++ {
 		// An auto selection: allowFailedCandidate=false keeps the catalog
 		// failed_at rule, and the explicit exclusion carries the live verdict.
-		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, catalogFile, profileID, true, excluded, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, virtualResolveOptionsV3{rotateCandidates: true})
+		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, catalogFile, profileID, true, excluded, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, virtualResolveOptionsV3{rotateCandidates: true, sessionBound: false})
 		if resolveErr != nil || resolved.File == nil {
 			return playback.DecisionResponseV3{}, false
 		}
@@ -6094,7 +6094,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// honor the known-bad stamp so the resolver skips it and either
 				// finds a live sibling or fails with a retryable terminal,
 				// instead of looping back onto the dead pin.
-				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false, virtualResolveOptionsV3{allowFailedCandidate: virtualDecodeRotation, rotateCandidates: virtualDecodeRotation})
+				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false, virtualResolveOptionsV3{allowFailedCandidate: virtualDecodeRotation, rotateCandidates: virtualDecodeRotation, sessionBound: true})
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true

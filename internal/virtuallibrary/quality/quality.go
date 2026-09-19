@@ -503,6 +503,28 @@ func (q *QualityConfig) Validate() error {
 	return nil
 }
 
+// hdrSatisfies reports whether a candidate's classifier HDR value satisfies a
+// profile's HDR requirement. The classifier's emitted values are the source of
+// truth: hdr, hdr10, hdr10+, dv (see stream.ParseStreamDetails).
+//
+// A profile requiring the generic "hdr" accepts the HDR10 family (hdr, hdr10,
+// hdr10+) but not Dolby Vision. DV is a distinct HDR format, not HDR10, and a
+// profile that wants it must say so explicitly with HDR "dv" (the 4K Dolby
+// Vision preset already does). Conflating them would let a plain-HDR profile
+// select DV content whose dynamic metadata the client may not render. Every
+// other value matches case-insensitively and exactly.
+func hdrSatisfies(required, candidate string) bool {
+	required = strings.ToLower(strings.TrimSpace(required))
+	candidate = strings.ToLower(strings.TrimSpace(candidate))
+	if required == candidate {
+		return true
+	}
+	if required == "hdr" {
+		return candidate == "hdr10" || candidate == "hdr10+"
+	}
+	return false
+}
+
 // MatchProfile reports whether a candidate satisfies a quality profile's
 // include/exclude regex, resolution, codecs, and HDR constraints.
 func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
@@ -522,13 +544,16 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	if p.CodecAudio != "" && c.CodecAudio != p.CodecAudio {
 		return false
 	}
-	if p.HDR != "" && c.HDR != p.HDR {
+	if p.HDR != "" && !hdrSatisfies(p.HDR, c.HDR) {
 		return false
 	}
 	if p.ExcludeHDR == "*" && c.HDR != "" {
 		return false
 	}
-	if p.ExcludeHDR != "" && p.ExcludeHDR != "*" && strings.EqualFold(c.HDR, p.ExcludeHDR) {
+	// The same sibling rule as the requirement side: ExcludeHDR "hdr" excludes
+	// the HDR10 family (hdr, hdr10, hdr10+) but not Dolby Vision, while
+	// ExcludeHDR "dv" excludes only DV. The two sides stay symmetric.
+	if p.ExcludeHDR != "" && p.ExcludeHDR != "*" && hdrSatisfies(p.ExcludeHDR, c.HDR) {
 		return false
 	}
 	if p.AudioChannels != "" && c.AudioChannels != "" && !strings.EqualFold(c.AudioChannels, p.AudioChannels) {
@@ -753,7 +778,11 @@ func matchKeywordOrPattern(title, pattern string) bool {
 }
 
 // SortCandidatesForProfile ranks candidates in place: non-rejected first,
-// then by custom-format score, resolution, source type, and original order.
+// then profile-matching candidates, then by custom-format score, resolution,
+// source type, and original order. Ordering a profile-matching candidate ahead
+// of a profile-removed one is what keeps the auto picker's candidate list in
+// agreement with the resolver's profile filter; a zero profile (profiles
+// disabled or an unknown label) imposes no such ordering.
 func SortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProfile, formats []CustomFormat) {
 	sortCandidatesForProfile(candidates, p, formats)
 }
@@ -769,21 +798,32 @@ func sortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProf
 	type scoredCandidate struct {
 		candidate stream.StreamCandidate
 		rejected  bool
+		// profileMatched is true when the candidate satisfies the active
+		// profile. It is computed once per candidate so the comparator does not
+		// re-run the profile's regexes, and it orders matching candidates
+		// ahead of non-matching ones so the shared ranking (used by the auto
+		// picker's candidate list) agrees with the resolver's profile filter.
+		profileMatched bool
 	}
+	profileActive := strings.TrimSpace(p.Label) != ""
 	scored := make([]scoredCandidate, len(candidates))
 	for idx := range candidates {
 		score, reject := customFormatScore(candidates[idx], formats)
 		candidates[idx].QualityScore = score
 		candidates[idx].CustomFormatRejected = reject
 		scored[idx] = scoredCandidate{
-			candidate: candidates[idx],
-			rejected:  reject,
+			candidate:      candidates[idx],
+			rejected:       reject,
+			profileMatched: !profileActive || MatchProfile(candidates[idx], p),
 		}
 	}
 	sort.SliceStable(scored, func(i, j int) bool {
 		c1, c2 := scored[i].candidate, scored[j].candidate
 		if scored[i].rejected != scored[j].rejected {
 			return !scored[i].rejected
+		}
+		if scored[i].profileMatched != scored[j].profileMatched {
+			return scored[i].profileMatched
 		}
 		if c1.SourceConfirmed != c2.SourceConfirmed {
 			return c1.SourceConfirmed

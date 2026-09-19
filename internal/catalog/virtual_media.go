@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/requestlock"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 var ErrInvalidVirtualMedia = errors.New("invalid virtual media")
@@ -1790,7 +1791,9 @@ func upsertVirtualFileWithMeta(ctx context.Context, tx pgx.Tx, contentID, episod
 	if audioLangs == nil {
 		audioLangs = []string{}
 	}
-	subLangs := in.SubtitleLanguages
+	// Collapse language aliases so one language never lands as two JSONB
+	// subtitle tracks, whatever order the caller supplied.
+	subLangs := stream.DedupeLanguageAliases(in.SubtitleLanguages)
 	if subLangs == nil {
 		subLangs = []string{}
 	}
@@ -1896,7 +1899,7 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 	if audioLangs == nil {
 		audioLangs = []string{}
 	}
-	subLangs := v.SubtitleLanguages
+	subLangs := stream.DedupeLanguageAliases(v.SubtitleLanguages)
 	if subLangs == nil {
 		subLangs = []string{}
 	}

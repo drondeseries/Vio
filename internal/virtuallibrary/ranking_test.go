@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -192,7 +193,7 @@ func TestResolveDetailedPinOverridesReject(t *testing.T) {
 		t.Fatal("no 1080p candidate to pin")
 	}
 
-	resolved, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result="+pinnedID, false, nil, "")
+	resolved, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result="+pinnedID, false, nil, "", false)
 	if err != nil {
 		t.Fatalf("ResolveDetailed: %v", err)
 	}
@@ -201,10 +202,13 @@ func TestResolveDetailedPinOverridesReject(t *testing.T) {
 	}
 }
 
-// TestResolveDetailedPinnedProfileRemovedRefusesWithoutSubstitution proves a
-// pin the profile removes is treated like an excluded pin: refused without a
-// rotation request, substitutable with one.
-func TestResolveDetailedPinnedProfileRemovedRefusesWithoutSubstitution(t *testing.T) {
+// TestResolveDetailedProfileRemovedPinFreshVsSessionBound proves the corrected
+// precedence: a profile-removed pin only blocks a genuine session binding. A
+// fresh selection (preferredCandidateID empty) falls through to the best live
+// profile-satisfying candidate instead of failing, while a session bound to
+// that same profile-removed pin still refuses without substitution and
+// substitutes with it.
+func TestResolveDetailedProfileRemovedPinFreshVsSessionBound(t *testing.T) {
 	cfg := virtuallibrary.Config{Quality: quality.QualityConfig{
 		EnableProfiles: true,
 		Profiles:       []quality.QualityProfile{{Label: "fhd", Resolution: "1080p"}},
@@ -213,8 +217,68 @@ func TestResolveDetailedPinnedProfileRemovedRefusesWithoutSubstitution(t *testin
 		streamEntry("1080p", "http://192.168.1.10/1080.mkv"),
 		streamEntry("720p", "http://192.168.1.10/720.mkv"),
 	)
+	ctx := context.Background()
 
-	streams, err := svc.ListStreams(context.Background(), "virtual://movie/tt100?profile=fhd")
+	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100?profile=fhd")
+	if err != nil {
+		t.Fatalf("ListStreams: %v", err)
+	}
+	var pinned720, fhd1080 string
+	for _, s := range streams {
+		switch s.Resolution {
+		case "720p":
+			pinned720 = s.ID
+		case "1080p":
+			fhd1080 = s.ID
+		}
+	}
+	if pinned720 == "" || fhd1080 == "" {
+		t.Fatalf("failed to identify candidates: 720p=%q 1080p=%q", pinned720, fhd1080)
+	}
+	pinURI := "virtual://movie/tt100?profile=fhd&result=" + pinned720
+
+	// Fresh selection: no session binding, so the profile-removed pin must not
+	// fail the start; the profile-satisfying candidate is served instead.
+	fresh, err := svc.ResolveDetailed(ctx, pinURI, false, nil, "", false, false)
+	if err != nil {
+		t.Fatalf("fresh start with a profile-removed pin failed: %v", err)
+	}
+	if fresh.CandidateID != fhd1080 {
+		t.Fatalf("fresh start resolved to %q, want the profile-satisfying %q", fresh.CandidateID, fhd1080)
+	}
+
+	// Session-bound: the same pin still refuses without substitution.
+	if _, err := svc.ResolveDetailed(ctx, pinURI, false, nil, pinned720, true, false); err == nil {
+		t.Fatal("expected refusal for a profile-removed pin bound to a session without substitution")
+	}
+	// With substitution allowed the session-bound pin may rotate.
+	rotated, err := svc.ResolveDetailed(ctx, pinURI, false, nil, pinned720, true, true)
+	if err != nil {
+		t.Fatalf("session-bound substitution resolve: %v", err)
+	}
+	if rotated.CandidateID == pinned720 {
+		t.Fatal("substitution returned the profile-removed pin")
+	}
+}
+
+// TestResolveDetailedServeResolveProfileRemovedRefuses proves the serve-layer
+// shape: a session-bound re-resolve passes an empty preferred candidate id
+// (the session's candidate is the URI's ?result=) and must refuse a
+// profile-removed candidate instead of silently swapping the release. The
+// refusal is a typed *ProfileRejectedError naming the candidate and profile so
+// a too-strict profile is diagnosable.
+func TestResolveDetailedServeResolveProfileRemovedRefuses(t *testing.T) {
+	cfg := virtuallibrary.Config{Quality: quality.QualityConfig{
+		EnableProfiles: true,
+		Profiles:       []quality.QualityProfile{{Label: "fhd", Resolution: "1080p"}},
+	}}
+	svc := newProviderService(t, nil, cfg,
+		streamEntry("1080p", "http://192.168.1.10/1080.mkv"),
+		streamEntry("720p", "http://192.168.1.10/720.mkv"),
+	)
+	ctx := context.Background()
+
+	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100?profile=fhd")
 	if err != nil {
 		t.Fatalf("ListStreams: %v", err)
 	}
@@ -227,17 +291,125 @@ func TestResolveDetailedPinnedProfileRemovedRefusesWithoutSubstitution(t *testin
 	if pinned720 == "" {
 		t.Fatal("no 720p candidate to pin")
 	}
-	pinURI := "virtual://movie/tt100?profile=fhd&result=" + pinned720
+	// Session-bound, empty preferred, substitution refused: exactly what the
+	// serve layer (stream.go / playback_transport.go) declares.
+	_, err = svc.ResolveDetailed(ctx, "virtual://movie/tt100?profile=fhd&result="+pinned720, false, nil, "", true, false)
+	if err == nil {
+		t.Fatal("expected a profile rejection for a session-bound profile-removed candidate")
+	}
+	var rejected *virtuallibrary.ProfileRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("error = %v, want *ProfileRejectedError", err)
+	}
+	if rejected.CandidateID != pinned720 {
+		t.Fatalf("rejected candidate = %q, want %q", rejected.CandidateID, pinned720)
+	}
+	if rejected.ProfileLabel != "fhd" {
+		t.Fatalf("rejected profile = %q, want %q", rejected.ProfileLabel, "fhd")
+	}
+	if !strings.Contains(rejected.Error(), "fhd") || !strings.Contains(rejected.Error(), pinned720) {
+		t.Fatalf("error is not actionable: %v", rejected)
+	}
+}
 
-	if _, err := svc.ResolveDetailed(context.Background(), pinURI, false, nil, "", false); err == nil {
-		t.Fatal("expected refusal for a profile-removed pin without substitution")
-	}
-	resolved, err := svc.ResolveDetailed(context.Background(), pinURI, false, nil, "", true)
+// TestResolveDetailedFreshStartFallsThroughToProfileMatch proves a fresh start
+// whose highest-ranked candidates fail the profile still succeeds: it serves
+// the best live candidate that satisfies the profile rather than failing. The
+// profile-matching candidate is ranked last by the provider, so this also
+// exercises the resolver's profile filter rather than luck of ordering.
+func TestResolveDetailedFreshStartFallsThroughToProfileMatch(t *testing.T) {
+	cfg := virtuallibrary.Config{Quality: quality.QualityConfig{
+		EnableProfiles: true,
+		Profiles:       []quality.QualityProfile{{Label: "fhd", Resolution: "1080p"}},
+	}}
+	svc := newProviderService(t, nil, cfg,
+		streamEntry("720p", "http://192.168.1.10/low-0.mkv"),
+		streamEntry("720p", "http://192.168.1.10/low-1.mkv"),
+		streamEntry("1080p", "http://192.168.1.10/match.mkv"),
+	)
+	ctx := context.Background()
+
+	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100?profile=fhd")
 	if err != nil {
-		t.Fatalf("rotation resolve: %v", err)
+		t.Fatalf("ListStreams: %v", err)
 	}
-	if resolved.CandidateID == pinned720 {
-		t.Fatal("substitution returned the profile-removed pin")
+	var pinned720, fhd1080 string
+	for _, s := range streams {
+		switch s.Resolution {
+		case "720p":
+			if pinned720 == "" {
+				pinned720 = s.ID
+			}
+		case "1080p":
+			fhd1080 = s.ID
+		}
+	}
+	if pinned720 == "" || fhd1080 == "" {
+		t.Fatalf("failed to identify candidates: 720p=%q 1080p=%q", pinned720, fhd1080)
+	}
+
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?profile=fhd&result="+pinned720, false, nil, "", false, false)
+	if err != nil {
+		t.Fatalf("fresh start with profile-removed candidates failed: %v", err)
+	}
+	if resolved.CandidateID != fhd1080 {
+		t.Fatalf("fresh start resolved to %q, want the profile-satisfying %q", resolved.CandidateID, fhd1080)
+	}
+}
+
+// TestResolveDetailedSessionBoundExclusionStillRefuses proves a session-bound
+// pin with an exclusion and no rotation still refuses, preserving the
+// no-silent-swap invariant independently of the profile gate.
+func TestResolveDetailedSessionBoundExclusionStillRefuses(t *testing.T) {
+	svc := newProviderService(t, nil, virtuallibrary.Config{},
+		streamEntry("1080p", "http://192.168.1.10/a.mkv"),
+		streamEntry("720p", "http://192.168.1.10/b.mkv"),
+	)
+	ctx := context.Background()
+	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
+	if err != nil || len(streams) < 2 {
+		t.Fatalf("ListStreams: count=%d err=%v", len(streams), err)
+	}
+	pinned := streams[0].ID
+	pinURI := "virtual://movie/tt100?result=" + pinned
+
+	if _, err := svc.ResolveDetailed(ctx, pinURI, false, []string{pinned}, pinned, true, false); err == nil {
+		t.Fatal("expected refusal for a session-bound excluded pin without substitution")
+	}
+	resolved, err := svc.ResolveDetailed(ctx, pinURI, false, []string{pinned}, pinned, true, true)
+	if err != nil {
+		t.Fatalf("session-bound rotation resolve: %v", err)
+	}
+	if resolved.CandidateID == pinned {
+		t.Fatal("rotation returned the excluded pin")
+	}
+}
+
+// TestResolveDetailedStaleFailedPinFreshStartFallsThrough proves a stale stored
+// preference (a result= pin the provider no longer lists, as a failed row is
+// after a re-list) does not fail a fresh start: with no session binding it takes
+// the dead-pin fallback and serves a live candidate.
+func TestResolveDetailedStaleFailedPinFreshStartFallsThrough(t *testing.T) {
+	cfg := virtuallibrary.Config{Quality: quality.QualityConfig{
+		EnableProfiles: true,
+		Profiles:       []quality.QualityProfile{{Label: "fhd", Resolution: "1080p"}},
+	}}
+	svc := newProviderService(t, nil, cfg,
+		streamEntry("1080p", "http://192.168.1.10/match.mkv"),
+		streamEntry("720p", "http://192.168.1.10/low.mkv"),
+	)
+	ctx := context.Background()
+
+	// No session binding; the stored pin is absent from the provider list.
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?profile=fhd&result=ffffffffffffffffffffffff", false, nil, "", false, false)
+	if err != nil {
+		t.Fatalf("fresh start with a stale failed pin failed: %v", err)
+	}
+	if resolved.CandidateID == "" {
+		t.Fatal("stale failed pin produced no candidate")
+	}
+	if resolved.CandidateID == "ffffffffffffffffffffffff" {
+		t.Fatal("stale failed pin was served")
 	}
 }
 
@@ -280,7 +452,7 @@ func TestServeRerunsClassificationAndNeverResurrectsFailed(t *testing.T) {
 
 	// Rotation that excludes the (now absent) failed candidate must not
 	// resurrect it.
-	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+failedID, false, []string{failedID}, "", true)
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+failedID, false, []string{failedID}, "", false, true)
 	if err != nil {
 		t.Fatalf("rotation resolve: %v", err)
 	}
@@ -378,7 +550,7 @@ func collapsedPinFixture(t *testing.T) (svc *virtuallibrary.Service, droppedID, 
 func TestResolveDetailedPinCollapsedByDedupResolvesToKeeper(t *testing.T) {
 	svc, droppedID, keeperID, otherID := collapsedPinFixture(t)
 
-	resolved, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result="+droppedID, false, nil, "")
+	resolved, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result="+droppedID, false, nil, "", false)
 	if err != nil {
 		t.Fatalf("ResolveDetailed(collapsed pin): %v", err)
 	}
@@ -395,10 +567,16 @@ func TestResolveDetailedCollapsedPinHonoursExclusion(t *testing.T) {
 	svc, droppedID, keeperID, otherID := collapsedPinFixture(t)
 	ctx := context.Background()
 
-	if _, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, []string{droppedID}, "", false); err == nil {
+	if _, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, []string{droppedID}, "", false, false); err == nil {
 		t.Fatal("expected refusal when the collapsed pin's release is excluded without rotation")
 	}
-	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, []string{droppedID}, "", true)
+	// A session-bound collapsed-pin exclusion must refuse too: the exclusion
+	// gate is ungated by the session-binding intent, so a bound serve-layer
+	// re-resolve of an excluded (or collapsed) pin cannot substitute.
+	if _, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, []string{droppedID}, "", true, false); err == nil {
+		t.Fatal("expected refusal when a session-bound collapsed pin's release is excluded without rotation")
+	}
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, []string{droppedID}, "", false, true)
 	if err != nil {
 		t.Fatalf("rotation resolve: %v", err)
 	}
@@ -415,7 +593,7 @@ func TestResolveDetailedCollapsedPinHonoursExclusion(t *testing.T) {
 // genuinely unavailable provider recovers.
 func TestResolveDetailedDeadPinStillFallsBack(t *testing.T) {
 	svc, _, _, otherID := collapsedPinFixture(t)
-	resolved, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result=ffffffffffffffffffffffff", false, nil, "", true)
+	resolved, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result=ffffffffffffffffffffffff", false, nil, "", false, true)
 	if err != nil {
 		t.Fatalf("dead-pin resolve: %v", err)
 	}
@@ -438,11 +616,11 @@ func TestResolveDetailedRefusesDifferentReleaseForSessionPin(t *testing.T) {
 
 	// Substitution refused, probing the different release: refuse instead of
 	// swapping the release under the session binding.
-	if _, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, droppedID, false); err == nil {
+	if _, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, droppedID, true, false); err == nil {
 		t.Fatalf("expected refusal when probing %q for session pin %q with substitution refused", otherID, droppedID)
 	}
 	// Substitution allowed: the explicit resultID wins.
-	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, droppedID, true)
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, droppedID, true, true)
 	if err != nil {
 		t.Fatalf("substitution-allowed resolve: %v", err)
 	}
@@ -451,7 +629,7 @@ func TestResolveDetailedRefusesDifferentReleaseForSessionPin(t *testing.T) {
 	}
 	// Probing the session's own resolved keeper is allowed even when
 	// substitution is refused.
-	resolved, err = svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+keeperID, false, nil, droppedID, false)
+	resolved, err = svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+keeperID, false, nil, droppedID, true, false)
 	if err != nil {
 		t.Fatalf("session keeper resolve: %v", err)
 	}
@@ -459,7 +637,7 @@ func TestResolveDetailedRefusesDifferentReleaseForSessionPin(t *testing.T) {
 		t.Fatalf("session keeper resolve = %q, want %q", resolved.CandidateID, keeperID)
 	}
 	// The ordinary non-pinned path is unaffected.
-	resolved, err = svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, "", false)
+	resolved, err = svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, "", false, false)
 	if err != nil {
 		t.Fatalf("non-pinned resolve: %v", err)
 	}
@@ -532,7 +710,7 @@ func TestKeeperMapDropsKeepersBeyondTheCandidateCap(t *testing.T) {
 
 	// A pin on the collapsed variant therefore takes the dead-pin fallback and
 	// resolves to a surviving candidate, never the truncated keeper.
-	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, nil, "", true)
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, nil, "", false, true)
 	if err != nil {
 		t.Fatalf("dead-pin fallback resolve: %v", err)
 	}

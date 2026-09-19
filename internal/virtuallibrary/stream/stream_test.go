@@ -2,6 +2,111 @@ package stream
 
 import "testing"
 
+// TestCanonicalLanguageBaseFoldsAliases pins the de-duplication key: a
+// regional/script code, its bare ISO base, the bibliographic 3-letter variant
+// and the English display name all fold onto one base language.
+func TestCanonicalLanguageBaseFoldsAliases(t *testing.T) {
+	cases := map[string]string{
+		"EN-US":   "en",
+		"en-GB":   "en",
+		"ENG":     "en",
+		"en":      "en",
+		"English": "en",
+		"ES-419":  "es",
+		"SPA":     "es",
+		"es":      "es",
+		"FR-CA":   "fr",
+		"FRE":     "fr",
+		"fra":     "fr",
+		"ZH-HANS": "zh",
+		"ZHO":     "zh",
+		"":        "",
+	}
+	for token, want := range cases {
+		if got := CanonicalLanguageBase(token); got != want {
+			t.Errorf("CanonicalLanguageBase(%q) = %q, want %q", token, got, want)
+		}
+	}
+}
+
+// TestDedupeLanguageAliasesPrefersTheMoreSpecificCode proves the alias collapse
+// keeps one entry per base language, prefers a regional code over its bare
+// base, and preserves the first position deterministically.
+func TestDedupeLanguageAliasesPrefersTheMoreSpecificCode(t *testing.T) {
+	for name, tc := range map[string]struct {
+		in   []string
+		want []string
+	}{
+		"regional wins over base": {[]string{"ENG", "EN-US"}, []string{"EN-US"}},
+		"base kept when alone":    {[]string{"ENG", "ENG"}, []string{"ENG"}},
+		"distinct bases kept":     {[]string{"EN-US", "DEU"}, []string{"EN-US", "DEU"}},
+		"first regional wins":     {[]string{"EN-GB", "EN-US"}, []string{"EN-GB"}},
+		"empty dropped":           {[]string{"", "  ", "ENG"}, []string{"ENG"}},
+		"nothing left":            {[]string{"", " "}, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := DedupeLanguageAliases(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("DedupeLanguageAliases(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("DedupeLanguageAliases(%v) = %v, want %v", tc.in, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestParseStreamMetadataSubtitleRegionalAliasesDeduplicate is the regression
+// for the duplicate subtitle list: "…en-US.srt" matched both the regional and
+// base subtitle patterns and emitted "EN-US" and "ENG" as two languages.
+func TestParseStreamMetadataSubtitleRegionalAliasesDeduplicate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{"Movie.2024.1080p.WEB-DL.EN-US.srt", "EN-US"},
+		{"Movie.2024.1080p.WEB-DL.ES-419.srt", "ES-419"},
+		{"Movie.2024.1080p.WEB-DL.FR-CA.srt", "FR-CA"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			candidate := &StreamCandidate{Name: tc.name}
+			ParseStreamMetadata(candidate)
+			if len(candidate.SubtitleLanguages) != 1 || candidate.SubtitleLanguages[0] != tc.want {
+				t.Fatalf("SubtitleLanguages = %v, want [%s]", candidate.SubtitleLanguages, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseStreamMetadataSubtitleDistinctBasesRemain proves genuinely different
+// base languages are not collapsed into one.
+func TestParseStreamMetadataSubtitleDistinctBasesRemain(t *testing.T) {
+	candidate := &StreamCandidate{Name: "Movie.2024.1080p.WEB-DL.EN-US.DEU.srt"}
+	ParseStreamMetadata(candidate)
+	if len(candidate.SubtitleLanguages) != 2 {
+		t.Fatalf("SubtitleLanguages = %v, want two distinct base languages", candidate.SubtitleLanguages)
+	}
+	seen := map[string]bool{}
+	for _, language := range candidate.SubtitleLanguages {
+		seen[language] = true
+	}
+	if !seen["EN-US"] || !seen["DEU"] {
+		t.Fatalf("SubtitleLanguages = %v, want EN-US and DEU", candidate.SubtitleLanguages)
+	}
+}
+
+// TestParseStreamMetadataSubtitleBaseOnlyUnchanged proves an input that only
+// carries a bare base code still yields exactly that one entry.
+func TestParseStreamMetadataSubtitleBaseOnlyUnchanged(t *testing.T) {
+	candidate := &StreamCandidate{Name: "Movie.2024.1080p.WEB-DL.ENG.srt"}
+	ParseStreamMetadata(candidate)
+	if len(candidate.SubtitleLanguages) != 1 || candidate.SubtitleLanguages[0] != "ENG" {
+		t.Fatalf("SubtitleLanguages = %v, want [ENG]", candidate.SubtitleLanguages)
+	}
+}
+
 // A release marker is not a language: "MULTI" in a release name must not be
 // declared as an audio language on the candidate. The server's virtual-track
 // merge filters it with the ISO language tagger, but the declared list should
