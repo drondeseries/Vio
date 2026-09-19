@@ -1204,10 +1204,6 @@ type VirtualCandidate struct {
 	Bitrate             int
 	AudioLanguages      []string
 	SubtitleLanguages   []string
-	// FailedAt marks a candidate that produced no bytes at stream-open
-	// (corrupted NZB, dead provider URL). A fresh listing clears it; the
-	// auto-pick skips failed candidates while the dropdown still shows them.
-	FailedAt *time.Time
 }
 
 // ReplaceVirtualCandidates atomically replaces the just-in-time candidates
@@ -1314,9 +1310,13 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				-- real track inventory later.
 				probe_updated_at = CASE WHEN media_files.probe_updated_at IS NULL THEN NULL ELSE media_files.probe_updated_at END,
 				missing_since=NULL,
-				-- A fresh listing means the provider still offers this release;
-				-- the failed flag is a runtime signal, not a permanent verdict.
-				failed_at=NULL,
+				-- A re-list is not a recovery. The provider still offering the
+				-- release says nothing about the bytes that failed to arrive or
+				-- failed to decode, so the persisted verdict survives the
+				-- listing. Clearing is the job of MarkVirtualCandidateRecovered
+				-- (real delivery), ClearVirtualCandidateFailed (a liveness
+				-- success), or an explicit user retry/forced relink. A genuinely
+				-- new row is inserted without a failed_at and is unaffected.
 				updated_at=NOW()
 			RETURNING id`,
 			source.ContentID, source.EpisodeID, source.MediaFolderID, candidate.URI,
@@ -1374,9 +1374,10 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 		// user_watch_progress.last_file_id. Keep stale rows that are still
 		// someone's last-played file so a known-working version does not vanish
 		// from the version list when the provider re-lists with new result ids.
-		// A retained row keeps its failed_at; if it was healthy it stays
-		// selectable (a fresh listing would clear failed_at), so it remains
-		// visible until the provider truly stops offering it.
+		// A retained row keeps its failed_at. A failed retained row stays out
+		// of the auto-pick (a re-list no longer clears the verdict) until a real
+		// delivery or an explicit retry recovers it; the dropdown still shows
+		// it for that manual retry.
 		//
 		// A row that actually delivered media bytes (last_delivered_at set) is
 		// retained on the same principle even if no progress row points at it:
@@ -1390,6 +1391,30 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			  AND NOT EXISTS (
 				SELECT 1 FROM user_watch_progress p
 				WHERE p.last_file_id = media_files.id
+			  )
+			  -- Never delete a row a live playback attempt points at. The
+			  -- attempt's effective_media_file_id has an ON DELETE CASCADE
+			  -- foreign key, so deleting the row would destroy the attempt and
+			  -- session state out from under an active stream. The sweep runs on
+			  -- every version-list fetch, so without this guard a long session is
+			  -- unprotected for most of its life (last_delivered_at is only
+			  -- written after a direct stream finishes). The FK's key-share lock
+			  -- serializes this against a concurrent attempt insert, so the
+			  -- check cannot race a new attempt. The live window matches the
+			  -- planstore's retention: an expired attempt is already cleanup.
+			  AND NOT EXISTS (
+				SELECT 1 FROM playback_v3_attempts a
+				WHERE a.expires_at > NOW()
+				  AND a.effective_media_file_id = media_files.id
+			  )
+			  -- The same protection for the ABS-compatible session table: an
+			  -- open session references its media file with ON DELETE SET NULL,
+			  -- so deleting the row silently strips a live session's file
+			  -- identity.
+			  AND NOT EXISTS (
+				SELECT 1 FROM abs_playback_sessions s
+				WHERE s.media_file_id = media_files.id
+				  AND s.closed_at IS NULL
 			  )`, stale); err != nil {
 			return fmt.Errorf("delete stale virtual candidates: %w", err)
 		}
@@ -1427,14 +1452,16 @@ const VirtualCandidateDeliveryGrace = 7 * 24 * time.Hour
 // stamp as before. It consumes the query's next placeholder as the grace in
 // seconds. The decode-rejection stamp deliberately omits this clause: bytes
 // that cannot be decoded are unplayable regardless of delivery evidence. The
-// transport no-bytes marker in NewRouter applies the equivalent predicate
-// directly (it does not go through this package); keep the two in sync if the
-// rule changes.
+// transport no-bytes marker in NewRouter delegates here (MarkVirtualCandidateFailed),
+// so this predicate is the single definition of the rule.
 const virtualCandidateFailureGracePredicate = `(last_delivered_at IS NULL OR last_delivered_at < NOW() - make_interval(secs => $4))`
 
 // MarkVirtualCandidateFailed stamps a virtual candidate row as known-bad after
 // a transport produced no bytes (corrupted NZB, dead provider URL). The
-// auto-pick skips failed candidates; a fresh listing clears the flag.
+// auto-pick skips failed candidates. The verdict survives a provider re-list
+// (ReplaceVirtualCandidates no longer clears it): only real delivery
+// (MarkVirtualCandidateRecovered), a liveness success
+// (ClearVirtualCandidateFailed), or an explicit user retry clears it.
 //
 // A known-good row (last_delivered_at set) inside VirtualCandidateDeliveryGrace
 // is not stamped: the failure is treated as a transient flap and the candidate

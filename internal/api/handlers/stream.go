@@ -103,8 +103,12 @@ type StreamHandler struct {
 	AllowInsecureVirtual func(installationID int) bool
 	// VirtualCandidateFailMarker stamps a virtual candidate row as known-bad
 	// after a transport produced no bytes, so the auto-pick skips it on the
-	// next play while the dropdown still shows it for a manual retry.
-	VirtualCandidateFailMarker func(ctx context.Context, fileID int) error
+	// next play while the dropdown still shows it for a manual retry. It is
+	// fenced on the candidate identity the transport served (expectedFilePath)
+	// and the failure state observed when it started (observedFailedAt): a row
+	// rotated in place to a sibling is never stamped by a late failure of the
+	// candidate the session actually served.
+	VirtualCandidateFailMarker func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
 	// VirtualCandidateRecoveredMarker clears a known-bad stamp after the
 	// candidate actually delivered media bytes to a client — the only evidence
 	// that forgives a transport failure. The callback is fenced on the
@@ -1430,7 +1434,7 @@ func (h *StreamHandler) markVirtualCandidateFailed(ctx context.Context, file *mo
 	}
 	markCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	if err := h.VirtualCandidateFailMarker(markCtx, file.ID); err != nil {
+	if err := h.VirtualCandidateFailMarker(markCtx, file.ID, file.FilePath, file.FailedAt); err != nil {
 		slog.WarnContext(ctx, "mark virtual candidate failed", "component", "api", "file_id", file.ID, "candidate", candidateID, "error", err)
 	}
 }

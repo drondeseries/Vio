@@ -359,26 +359,65 @@ func (h *PlaybackHandler) writeProgressSideEffectsV2(ctx context.Context, record
 	h.persistProgress(ctx, h.attemptSessionV2(ctx, record, sample.Position, sample.IsPaused))
 }
 
-// progressSideEffectLock serializes progress side effects for one session.
-// Entries are dropped when the session stops (forgetProgressSideEffectLock);
-// a late caller that still holds a dropped mutex simply finishes on it.
-func (h *PlaybackHandler) progressSideEffectLock(sessionID string) func() {
-	entry, _ := h.progressSideEffectLocks.LoadOrStore(sessionID, &sync.Mutex{})
-	mu, ok := entry.(*sync.Mutex)
-	if !ok {
-		return func() {}
-	}
-	mu.Lock()
-	return mu.Unlock
+// progressSideEffectLockEntry is one session's progress side-effect lock plus a
+// reference count of the callers currently holding or waiting for it.
+type progressSideEffectLockEntry struct {
+	mu   sync.Mutex
+	refs int
 }
 
-// forgetProgressSideEffectLock releases the per-session lock entry once the
-// attempt is terminal, so a long-lived replica does not retain one entry per
-// historical session.
+// progressSideEffectLock serializes progress side effects for one session.
+//
+// The entry is reference-counted: the first acquire creates it, and the unlock
+// closure deletes it only when the last in-flight holder releases. The map is
+// therefore bounded by concurrently running progress writers, not by the number
+// of sessions the process has served, and an entry is never deleted while any
+// caller still holds or is waiting on its mutex — deleting a held mutex would
+// let a later caller create a second one for the same session and run side
+// effects concurrently, which is exactly what this lock prevents.
+func (h *PlaybackHandler) progressSideEffectLock(sessionID string) func() {
+	if h == nil || sessionID == "" {
+		return func() {}
+	}
+	h.progressSideEffectLocksMu.Lock()
+	if h.progressSideEffectLocks == nil {
+		h.progressSideEffectLocks = make(map[string]*progressSideEffectLockEntry)
+	}
+	entry := h.progressSideEffectLocks[sessionID]
+	if entry == nil {
+		entry = &progressSideEffectLockEntry{}
+		h.progressSideEffectLocks[sessionID] = entry
+	}
+	entry.refs++
+	h.progressSideEffectLocksMu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		h.progressSideEffectLocksMu.Lock()
+		entry.refs--
+		if entry.refs <= 0 {
+			delete(h.progressSideEffectLocks, sessionID)
+		}
+		h.progressSideEffectLocksMu.Unlock()
+	}
+}
+
+// forgetProgressSideEffectLock drops the per-session state once the attempt is
+// terminal, so a long-lived replica does not retain one entry per historical
+// session.
+//
+// progressSideEffectLocks self-evicts when the last in-flight holder releases
+// (see progressSideEffectLock); deleting it here while a writer still holds the
+// old mutex would reintroduce the two-mutex race. virtualDeliveryCleared is a
+// once-per-session delivery flag with no holder, so it is dropped here: after
+// the session is terminal no legitimate segment can need it. A late duplicate
+// segment simply records the fenced, idempotent delivery evidence again.
 func (h *PlaybackHandler) forgetProgressSideEffectLock(sessionID string) {
-	// Keep the mutex identity for the lifetime of the handler. Deleting it
-	// while a writer still holds the old mutex lets a late writer create a
-	// second mutex for the same session and run side effects concurrently.
+	if h == nil || sessionID == "" {
+		return
+	}
+	h.virtualDeliveryCleared.Delete(sessionID)
 }
 
 func (h *PlaybackHandler) scrobblePauseTransitionV2(ctx context.Context, sess *playback.Session, wasPaused bool) {

@@ -1291,18 +1291,17 @@ func newChiRouter(deps Dependencies) chi.Router {
 			streamHandler.AllowInsecureVirtual = playbackHandler.AllowInsecureVirtual
 		}
 		if deps.DB != nil {
-			// Transport no-bytes failure path. Same delivered-grace rule as
-			// scanner.MarkVirtualCandidateFailed: a candidate that delivered
-			// bytes within scanner.VirtualCandidateDeliveryGrace is not branded
-			// dead by a single later failure, so the auto-pick keeps preferring
-			// and re-verifying it.
-			streamHandler.VirtualCandidateFailMarker = func(ctx context.Context, fileID int) error {
-				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
-					WHERE id = $1
-					  AND (last_delivered_at IS NULL OR last_delivered_at < NOW() - make_interval(secs => $2))`,
-					fileID, scanner.VirtualCandidateDeliveryGrace.Seconds())
-				return err
-			}
+			// Transport no-bytes failure path. The marker goes through the
+			// scanner's fenced stamp rather than a bare `WHERE id=$1` update,
+			// because a virtual candidate row's file_path is rewritten in place
+			// when the session rotates to a sibling (ReplaceVirtualResultPin).
+			// A no-bytes verdict for candidate A that lands after that rewrite
+			// must not brand the healthy replacement B: the scanner fence
+			// requires the row to still name the candidate the caller inspected
+			// (file_path) and to still carry the failure state it observed
+			// (failed_at). The same delivered-grace rule as
+			// scanner.MarkVirtualCandidateFailed applies.
+			streamHandler.VirtualCandidateFailMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed
 			// The recovered marker clears a known-bad stamp after the candidate
 			// actually delivered media bytes. Fenced on the delivered candidate
 			// identity AND the failure state observed at transport start: a row
@@ -1326,6 +1325,15 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// node-side work to detect the repeated demux failure and report
 			// the candidate identity; there is deliberately no stderr
 			// forwarding protocol invented here.
+			//
+			// observedFailedAt is deliberately nil. The transcode-manager
+			// callback carries only the candidate identity, and nil is the
+			// correct comparison for this verdict: the file_path argument
+			// already stops a rotated row from being stamped, and the
+			// `failed_at IS NULL` arm refuses to overwrite a newer failure
+			// stamp that landed while the transcode ran. If the row recovered
+			// mid-transcode, the demux failure is fresh evidence against the
+			// bytes that just failed, so stamping it again is correct.
 			playbackHandler.TranscodeManager().OnDemuxFailure = func(ctx context.Context, fileID int, expectedFilePath string) error {
 				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(expectedFilePath)), "virtual://") {
 					return nil
@@ -1341,6 +1349,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// recently they delivered, so a repeatable decode rejection must not
 			// be re-selected forever. The dropdown still shows the row for a
 			// manual retry, and a later successful delivery clears the stamp.
+			// As with OnDemuxFailure, observedFailedAt is deliberately nil: the
+			// callback carries only the identity, the file_path arm rejects a
+			// rotated row, and nil refuses to overwrite a newer failure stamp.
 			playbackHandler.TranscodeManager().OnSourceRejected = func(ctx context.Context, fileID int, expectedFilePath string) error {
 				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(expectedFilePath)), "virtual://") {
 					return nil

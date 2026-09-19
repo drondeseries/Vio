@@ -3,6 +3,7 @@ package remotestream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -416,6 +417,145 @@ func registerRelayForTest(t *testing.T, relay *Relay, token, rawURL string) (str
 		relay.mu.Unlock()
 	}
 	return "/source/" + token + "/" + url.PathEscape(baseName), cleanup
+}
+
+// registerRelayWithHeadersForTest seeds an entry with forwarded headers, which
+// registerRelayForTest does not model.
+func registerRelayWithHeadersForTest(t *testing.T, relay *Relay, token, rawURL string, headers map[string]string) (string, func()) {
+	t.Helper()
+	source, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseName := safeRelayBaseName(source)
+	relay.mu.Lock()
+	relay.entries[token] = &relayEntry{
+		source: source, baseName: baseName, createdAt: time.Now(), headers: cloneHeaderMap(headers),
+	}
+	relay.mu.Unlock()
+	cleanup := func() {
+		relay.mu.Lock()
+		relay.deleteEntryLocked(token)
+		relay.mu.Unlock()
+	}
+	return "/source/" + token + "/" + url.PathEscape(baseName), cleanup
+}
+
+// TestRelayEvictsOldestAtCapacity proves the registry bounds itself by dropping
+// the oldest registration instead of refusing new playback once relayMaxEntries
+// is reached.
+func TestRelayEvictsOldestAtCapacity(t *testing.T) {
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+
+	relay.mu.Lock()
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < relayMaxEntries; i++ {
+		source, _ := url.Parse("https://1.1.1.1/evict")
+		relay.entries[fmt.Sprintf("old-%d", i)] = &relayEntry{
+			source: source, baseName: "stream", createdAt: base.Add(time.Duration(i) * time.Second),
+		}
+	}
+	relay.mu.Unlock()
+
+	relayURL, release, err := relay.RegisterInsecure(context.Background(), "https://1.1.1.1/new")
+	if err != nil {
+		t.Fatalf("RegisterInsecure at capacity: %v", err)
+	}
+	defer release()
+
+	relay.mu.Lock()
+	size := len(relay.entries)
+	_, oldestPresent := relay.entries["old-0"]
+	_, newestPresent := relay.entries[fmt.Sprintf("old-%d", relayMaxEntries-1)]
+	relay.mu.Unlock()
+	if size != relayMaxEntries {
+		t.Fatalf("entries = %d, want %d", size, relayMaxEntries)
+	}
+	if oldestPresent {
+		t.Fatal("oldest entry was not evicted at capacity")
+	}
+	if !newestPresent {
+		t.Fatal("a newer entry was evicted before the oldest")
+	}
+	if !strings.Contains(relayURL, "/source/") {
+		t.Fatalf("registration URL = %q", relayURL)
+	}
+}
+
+// TestRelayRejectsExpiredEntryOnPresentation proves token expiry is enforced
+// when the token is presented, not only when an unrelated registration happens
+// to trigger eviction.
+func TestRelayRejectsExpiredEntryOnPresentation(t *testing.T) {
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		response := relayResponse(request, http.StatusOK, "video/mp4", "ok")
+		response.Header.Set("Content-Length", "2")
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "expired", "https://1.1.1.1/media.mkv")
+	defer cleanup()
+
+	if got := fetchRelay(t, relay, relayURL, http.MethodGet, ""); got.status == http.StatusNotFound {
+		t.Fatal("fresh entry was rejected")
+	}
+
+	relay.mu.Lock()
+	relay.entries["expired"].createdAt = time.Now().Add(-relayEntryLifetime - time.Minute)
+	relay.mu.Unlock()
+
+	if got := fetchRelay(t, relay, relayURL, http.MethodGet, ""); got.status != http.StatusNotFound {
+		t.Fatalf("expired entry status = %d, want 404", got.status)
+	}
+	relay.mu.Lock()
+	_, stillPresent := relay.entries["expired"]
+	relay.mu.Unlock()
+	if stillPresent {
+		t.Fatal("expired entry was not dropped on presentation")
+	}
+}
+
+// TestRelayRangeCacheKeyIncludesRegistrationHeaders proves two registrations of
+// the same URL with different forwarded headers never share cached bytes.
+func TestRelayRangeCacheKeyIncludesRegistrationHeaders(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		body := "referer:" + request.Header.Get("Referer")
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", body)
+		response.Header.Set("Content-Range", "bytes 0-4/100")
+		response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return response, nil
+	})}
+
+	urlA, cleanupA := registerRelayWithHeadersForTest(t, relay, "hdr-a", "https://1.1.1.1/media.mkv", map[string]string{"Referer": "https://provider-a/"})
+	defer cleanupA()
+	urlB, cleanupB := registerRelayWithHeadersForTest(t, relay, "hdr-b", "https://1.1.1.1/media.mkv", map[string]string{"Referer": "https://provider-b/"})
+	defer cleanupB()
+
+	gotA := fetchRelay(t, relay, urlA, http.MethodGet, "bytes=0-4")
+	gotB := fetchRelay(t, relay, urlB, http.MethodGet, "bytes=0-4")
+	if gotA.body != "referer:https://provider-a/" {
+		t.Fatalf("registration A body = %q", gotA.body)
+	}
+	if gotB.body != "referer:https://provider-b/" {
+		t.Fatalf("registration B body = %q", gotB.body)
+	}
+	if got := fetchRelay(t, relay, urlA, http.MethodGet, "bytes=0-4"); got.body != gotA.body {
+		t.Fatalf("registration A repeat body = %q, want %q", got.body, gotA.body)
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (each registration caches under its own header identity)", got)
+	}
 }
 
 func TestSafeRelayBaseNameDoesNotExposeProviderPath(t *testing.T) {

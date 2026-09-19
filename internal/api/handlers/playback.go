@@ -357,15 +357,23 @@ type PlaybackHandler struct {
 	// carry it and are refused when it differs. Empty leaves v2 unconfigured.
 	InstallationID string
 	// progressSideEffectLocks serializes v2 progress side effects per session
-	// (see persistProgressV2).
-	progressSideEffectLocks sync.Map
+	// (see persistProgressV2). It is reference-counted and bounded: the entry
+	// is created on the first acquire for a session and deleted when the last
+	// in-flight holder releases, so the map tracks concurrent writers rather
+	// than every session the process has ever served. progressSideEffectLocksMu
+	// guards the map and each entry's refcount; the entry's own mutex is the
+	// per-session side-effect lock.
+	progressSideEffectLocks   map[string]*progressSideEffectLockEntry
+	progressSideEffectLocksMu sync.Mutex
 	// virtualDeliveryCleared records playback sessions whose first fully
 	// delivered HLS/transcode segment already recorded delivery evidence and
 	// cleared the candidate's failed mark. One entry per served session keeps a
 	// long segment stream from issuing a read+write per segment; a newer failure
 	// after the first delivery is preserved, mirroring the direct-play path's
-	// transport-start capture. Precedent for the un-cleaned per-session map:
-	// progressSideEffectLocks.
+	// transport-start capture. The entry is dropped on session end (see
+	// forgetProgressSideEffectLock), so it is bounded by live sessions; unlike
+	// the side-effect lock it is not refcounted, because a late duplicate
+	// segment request simply records the (idempotent, fenced) evidence again.
 	virtualDeliveryCleared sync.Map
 	// ProxyGrantStore hands a proxy the recipe it serves a header-authenticated
 	// session from. Optional: without it an attempt that negotiated

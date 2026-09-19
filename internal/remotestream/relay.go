@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -159,9 +161,10 @@ func (c *relayRangeCache) put(key string, entry relayRangeCacheEntry) {
 }
 
 // relayRangeCacheKey names one complete upstream range response for a source.
-// The exact Range header is part of the key: a cache hit must answer the same
-// request the upstream answered.
-func relayRangeCacheKey(target *url.URL, rangeHeader string) string {
+// The exact Range header and the per-registration header identity are part of
+// the key: a cache hit must answer the same request the upstream answered, under
+// the same upstream credentials.
+func relayRangeCacheKey(target *url.URL, rangeHeader, headerIdentity string) string {
 	if target == nil {
 		return ""
 	}
@@ -169,7 +172,33 @@ func relayRangeCacheKey(target *url.URL, rangeHeader string) string {
 	if rangeHeader == "" {
 		return ""
 	}
-	return target.String() + "\x00" + rangeHeader
+	return target.String() + "\x00" + rangeHeader + "\x00" + headerIdentity
+}
+
+// relayRangeCacheHeaderIdentity hashes the per-registration headers that
+// proxyWithClient actually forwards upstream. Two registrations of the same URL
+// that differ only in a forwarded header (for example a provider Referer) must
+// never share cached bytes, so their keys differ. Headers the relay drops —
+// cookies, authorization — cannot change the upstream response and are excluded.
+// Values are hashed, not embedded, so a cache key never carries a credential.
+// Returns "" when there is no forwarded header, preserving the plain key.
+func relayRangeCacheHeaderIdentity(headers map[string]string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	relevant := make([]string, 0, len(headers))
+	for name, value := range headers {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "referer" || name == "origin" || name == "user-agent" {
+			relevant = append(relevant, name+"\x00"+value)
+		}
+	}
+	if len(relevant) == 0 {
+		return ""
+	}
+	sort.Strings(relevant)
+	sum := sha256.Sum256([]byte(strings.Join(relevant, "\x1f")))
+	return hex.EncodeToString(sum[:])
 }
 
 // relayCacheableResponse reports the declared body size of a complete,
@@ -408,10 +437,12 @@ func (r *Relay) register(ctx context.Context, source string, insecure bool, head
 		return "", nil, errors.New("remote stream relay is closed")
 	}
 	r.evictLocked(now)
-	if len(r.entries) >= relayMaxEntries {
-		r.mu.Unlock()
-		return "", nil, errors.New("remote stream relay is at capacity")
-	}
+	// Bound the table by evicting the oldest registrations instead of refusing
+	// new ones: a hard capacity error would make every new virtual playback
+	// fail once the bound is reached. An evicted entry's stream gets a 404 on
+	// its next request and the client re-plans; a released entry is already
+	// gone, so the oldest remaining entries are the long-lived or leaked ones.
+	r.evictOldestLocked(relayMaxEntries - 1)
 	r.entries[token] = &relayEntry{
 		source: sourceURL, baseName: baseName, createdAt: now, insecure: insecure, headers: cloneHeaderMap(headers),
 	}
@@ -437,6 +468,41 @@ func (r *Relay) evictLocked(now time.Time) {
 	}
 }
 
+// evictOldestLocked removes the oldest entries until at most limit remain.
+// register calls it with relayMaxEntries-1 so a new registration always fits.
+// Caller holds r.mu.
+func (r *Relay) evictOldestLocked(limit int) {
+	for len(r.entries) > limit {
+		oldestToken := ""
+		var oldest time.Time
+		for token, entry := range r.entries {
+			if oldestToken == "" || entry.createdAt.Before(oldest) {
+				oldestToken, oldest = token, entry.createdAt
+			}
+		}
+		if oldestToken == "" {
+			return
+		}
+		r.deleteEntryLocked(oldestToken)
+	}
+}
+
+// entryForRequestLocked returns the live entry for a presented token. An entry
+// whose lifetime has elapsed is dropped and reported as absent, so expiry is
+// enforced when the token is presented rather than only when an unrelated
+// registration happens to run eviction. Caller holds r.mu.
+func (r *Relay) entryForRequestLocked(token string, now time.Time) (*relayEntry, bool) {
+	entry, ok := r.entries[token]
+	if !ok {
+		return nil, false
+	}
+	if now.Sub(entry.createdAt) >= relayEntryLifetime {
+		r.deleteEntryLocked(token)
+		return nil, false
+	}
+	return entry, true
+}
+
 func (r *Relay) deleteEntryLocked(token string) {
 	if _, ok := r.entries[token]; !ok {
 		return
@@ -457,7 +523,7 @@ func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	r.mu.Lock()
-	entry, ok := r.entries[token]
+	entry, ok := r.entryForRequestLocked(token, time.Now())
 	r.mu.Unlock()
 	if !ok {
 		http.NotFound(w, request)
@@ -599,7 +665,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		upstream.Header.Get("If-Range") == "" &&
 		upstream.Header.Get("If-None-Match") == "" &&
 		upstream.Header.Get("If-Modified-Since") == "" {
-		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"))
+		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"), relayRangeCacheHeaderIdentity(extraHeaders))
 		if entry, ok := r.rangeCache.get(cacheKey); ok {
 			for key, values := range entry.header {
 				for _, value := range values {
