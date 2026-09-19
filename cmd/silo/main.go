@@ -3312,7 +3312,9 @@ func main() {
 				return vlSvc.Refresh(ctx, path)
 			})
 			compatDeps.VirtualMediaDetailedResolver = jellycompat.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (jellycompat.ResolvedVirtualMedia, error) {
-				res, err := vlSvc.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+				// Jellyfin-compat only excludes a candidate for a dead-provider
+				// failover, so an exclusion is an explicit rotation request.
+				res, err := vlSvc.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID, len(excludedCandidateIDs) > 0)
 				if err != nil {
 					return jellycompat.ResolvedVirtualMedia{}, err
 				}

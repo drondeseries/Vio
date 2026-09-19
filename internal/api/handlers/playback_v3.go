@@ -1745,7 +1745,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// earlier auto pick; only an explicit pick or a forced relink re-tries
 		// the known-bad candidate.
 		allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
-		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, allowFailedCandidate)
+		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, virtualResolveOptionsV3{allowFailedCandidate: allowFailedCandidate})
 		if resolveErr != nil {
 			termFileID := requestedFile.ID
 			if requestedFile.EpisodeID != "" && h.VirtualEpisodeFileLookup != nil {
@@ -2225,7 +2225,7 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 	for attempt := 1; attempt < maxAttempts; attempt++ {
 		// An auto selection: allowFailedCandidate=false keeps the catalog
 		// failed_at rule, and the explicit exclusion carries the live verdict.
-		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, catalogFile, profileID, true, excluded, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, false)
+		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, catalogFile, profileID, true, excluded, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, virtualResolveOptionsV3{rotateCandidates: true})
 		if resolveErr != nil || resolved.File == nil {
 			return playback.DecisionResponseV3{}, false
 		}
@@ -6044,7 +6044,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// again would force a synchronous provider probe (up to 15s) for
 			// metadata the planner already has. Skip the round-trip entirely
 			// and use the loaded row directly.
-			candidateUnchanged := currentEffectiveFile.FilePath == session.VirtualSourceURI
+			// Widened reuse guard: a same-release identity (same provider result
+			// id under the same provider-neutral path) counts as unchanged even
+			// when the catalog row string differs, so a same-file re-plan reuses
+			// the probed row and lets the attempted-key guard advance the
+			// transformation rung instead of short-circuiting into a re-list.
+			candidateUnchanged := currentEffectiveFile.FilePath == session.VirtualSourceURI ||
+				(virtualResultCandidateID(currentEffectiveFile.FilePath) != "" &&
+					virtualResultCandidateID(currentEffectiveFile.FilePath) == virtualResultCandidateID(session.VirtualSourceURI) &&
+					virtualPlaybackNeutralKey(currentEffectiveFile.FilePath) == virtualPlaybackNeutralKey(session.VirtualSourceURI))
 			evidenceComplete := completeVirtualVideoEvidenceV3(currentEffectiveFile) &&
 				completeVirtualAudioEvidenceV3(currentEffectiveFile) &&
 				completeVirtualContainerEvidenceV3(currentEffectiveFile)
@@ -6058,20 +6066,18 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
 			} else {
 				// The session-bound release is preferred so re-ranking cannot
-				// drift to a different provider candidate; the failed
-				// candidate (the effective file the failed plan mounted) is
-				// excluded so it cannot be re-selected under a new row ID.
+				// drift to a different provider candidate.
 				preferredCandidateID := virtualResultCandidateID(session.VirtualSourceURI)
 				var excludedCandidateIDs []string
-				// A decode-classified failure on a non-explicit selection
-				// excludes the rejected result id and rotates. The exclusion is
-				// the live verdict, so rotation never depends on the async
-				// catalog stamp. A non-rotation decode failure with an untried
-				// software variant retries the SAME candidate: the verdict is
-				// "this decoder could not read the source", not "this release is
-				// dead", and the forced software recipe re-decodes it on the CPU.
-				// Any other failure — transport, timeout, or a software plan
-				// that already failed — keeps the rotate-to-a-sibling behavior.
+				// Only a verdict that indicts the release may exclude the
+				// session-bound candidate. `virtualDecodeRotation` is the
+				// server-confirmed decode rejection; a dead or unavailable
+				// provider surfaces as the pinned id being absent from the
+				// provider list, which the resolver still substitutes. Every
+				// other failure — display-driven fallback, route error, stale
+				// credential — keeps the same file so the attempted-key guard
+				// advances to the next transformation rung on it (for example
+				// the server DV7->HDR10 strip) instead of swapping the release.
 				failedID := virtualResultCandidateID(currentEffectiveFile.FilePath)
 				if failedID == "" {
 					// The row may have been neutralized between planning and
@@ -6079,10 +6085,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					// result id.
 					failedID = virtualResultCandidateID(session.VirtualSourceURI)
 				}
-				if failedID != "" && (!forceSoftwareDecode || virtualDecodeRotation) {
+				if failedID != "" && virtualDecodeRotation {
 					excludedCandidateIDs = []string{failedID}
 				}
-				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false, true)
+				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false, virtualResolveOptionsV3{allowFailedCandidate: true, rotateCandidates: virtualDecodeRotation})
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true

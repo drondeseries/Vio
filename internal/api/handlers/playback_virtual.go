@@ -640,19 +640,58 @@ func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 // at index 0 while it is still listed; once the pin is gone the fresh list
 // takes over.
 //
-// allowFailedCandidate permits re-selecting a catalog row stamped failed_at. It
-// defaults to false so an auto selection always skips a known-bad row, even when
-// the row already carries a concrete result= identity (the adopted-candidate
-// case). It is true only for an explicit user retry or a forced relink, and for
-// internal paths (replan rehydration) that resolve a session-bound candidate
-// whose deadness is conveyed by excludedCandidateIDs instead of the async stamp.
-// It is variadic so the many existing callers keep their positional signature;
-// production callers pass the value explicitly.
-func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *models.MediaFile, profileID string, deferProbe bool, excludedCandidateIDs []string, preferredCandidateID string, qualityPreference string, bandwidthCapKbps int, forceRelist bool, allowFailedCandidate ...bool) (resolvedVirtualPlaybackSource, error) {
-	allowFailed := false
-	if len(allowFailedCandidate) > 0 {
-		allowFailed = allowFailedCandidate[0]
+// virtualResolveOptionsV3 carries the per-call intent of a detailed virtual
+// resolve. It is variadic so the many existing callers keep their positional
+// signature; production callers pass it explicitly.
+type virtualResolveOptionsV3 struct {
+	// allowFailedCandidate permits re-selecting a catalog row stamped failed_at.
+	// False (the zero value) keeps an auto selection skipping a known-bad row,
+	// even when the row already carries a concrete result= identity; true is
+	// only for an explicit user retry, a forced relink, or a replan rehydration
+	// whose deadness is conveyed by excludedCandidateIDs instead of the async
+	// stamp.
+	allowFailedCandidate bool
+	// rotateCandidates marks an exclusion as a deliberate candidate rotation: a
+	// verdict that indicts the release (server-confirmed decode rejection) lets
+	// the resolver substitute a sibling. When false, the resolver refuses to
+	// fall past an excluded pinned candidate, so a display-driven fallback can
+	// never silently swap the release.
+	rotateCandidates bool
+}
+
+// virtualCandidateRotationContextKeyV3 carries the rotation intent across the
+// detailed-resolver interface to the service that owns the candidate fallback.
+type virtualCandidateRotationContextKeyV3 struct{}
+
+func withVirtualCandidateRotationV3(ctx context.Context, allowed bool) context.Context {
+	if ctx == nil {
+		return ctx
 	}
+	return context.WithValue(ctx, virtualCandidateRotationContextKeyV3{}, allowed)
+}
+
+// VirtualCandidateRotationAllowed reports whether the caller of a detailed
+// virtual resolve asked to substitute a sibling for an excluded pinned
+// candidate. Absent means allowed, so resolve paths that do not participate
+// keep their pre-existing substitution behavior.
+func VirtualCandidateRotationAllowed(ctx context.Context) bool {
+	if ctx == nil {
+		return true
+	}
+	allowed, ok := ctx.Value(virtualCandidateRotationContextKeyV3{}).(bool)
+	if !ok {
+		return true
+	}
+	return allowed
+}
+
+func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *models.MediaFile, profileID string, deferProbe bool, excludedCandidateIDs []string, preferredCandidateID string, qualityPreference string, bandwidthCapKbps int, forceRelist bool, opts ...virtualResolveOptionsV3) (resolvedVirtualPlaybackSource, error) {
+	options := virtualResolveOptionsV3{}
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	allowFailed := options.allowFailedCandidate
+	rotateCandidates := options.rotateCandidates
 	if !isVirtualPlaybackFile(file) {
 		return resolvedVirtualPlaybackSource{File: file}, nil
 	}
@@ -810,6 +849,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	trace.candidates = len(candidates)
 	attemptCtx, cancel := context.WithTimeout(r.Context(), virtualStartupBudget)
 	defer cancel()
+	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
 
 	// persistedResultURI is true when the catalog row already points at an
 	// adopted provider-neutral candidate rather than the neutral virtual path.

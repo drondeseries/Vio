@@ -333,6 +333,10 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	var res ResolvedVirtualMedia
 	var err error
 	if h.VirtualMediaDetailedResolver != nil {
+		// An exclusion here is a dead-candidate failover, so candidate
+		// substitution is intended. The intent travels with the context so the
+		// resolver can distinguish it from a display-driven same-file re-plan.
+		ctx = withVirtualCandidateRotationV3(ctx, len(excludedCandidateIDs) > 0)
 		res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 			ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID,
 		)

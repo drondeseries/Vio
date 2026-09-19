@@ -118,13 +118,27 @@ func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, erro
 //   - excludedCandidateIDs are skipped;
 //   - preferredCandidateID is tried first;
 //   - every stream URL is validated against outbound SSRF.
+//
+// allowCandidateSubstitution gates the fallback that lets a pinned result= URI
+// resolve to a *different* sibling candidate. It defaults to true so existing
+// callers keep their behavior. A caller that excludes the pinned candidate
+// without a verdict that indicts the release must pass false: a display-driven
+// fallback (Dolby Vision to HDR10/HDR10+/DV8.1) changes the transformation on
+// the same file and must never silently swap the release mid-stream. A pinned
+// id that is merely absent from the provider list is a dead release and still
+// falls back, so a genuinely unavailable provider recovers.
 func (s *Service) ResolveDetailed(
 	ctx context.Context,
 	virtualPath string,
 	forceRefresh bool,
 	excludedCandidateIDs []string,
 	preferredCandidateID string,
+	allowCandidateSubstitution ...bool,
 ) (ResolvedVirtualStream, error) {
+	allowSubstitution := true
+	if len(allowCandidateSubstitution) > 0 {
+		allowSubstitution = allowCandidateSubstitution[0]
+	}
 	if s == nil || s.Resolver == nil {
 		return ResolvedVirtualStream{}, ErrVirtualLibraryUnavailable
 	}
@@ -202,6 +216,13 @@ func (s *Service) ResolveDetailed(
 			RequestHeaders: c.RequestHeaders,
 			ExpiresAt:      c.ExpiresAt,
 		}, nil
+	}
+
+	// A pinned candidate the caller explicitly excluded is only substitutable
+	// when the caller asked for candidate rotation. Otherwise refuse rather
+	// than hand back a different release under the same session binding.
+	if _, pinnedExcluded := excluded[resultID]; resultID != "" && pinnedExcluded && !allowSubstitution {
+		return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q is excluded and candidate rotation was not requested", resultID)
 	}
 
 	// Pinned resultID not found/invalid: fall back to best alternative candidate

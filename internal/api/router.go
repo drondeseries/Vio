@@ -1246,7 +1246,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				return deps.VirtualLibraryService.Refresh(ctx, path)
 			})
 			playbackHandler.VirtualMediaDetailedResolver = handlers.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (handlers.ResolvedVirtualMedia, error) {
-				res, err := deps.VirtualLibraryService.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+				res, err := deps.VirtualLibraryService.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID, handlers.VirtualCandidateRotationAllowed(ctx))
 				if err != nil {
 					return handlers.ResolvedVirtualMedia{}, err
 				}

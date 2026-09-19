@@ -944,6 +944,19 @@ terminal unchanged rather than being rewritten as a decode rejection. The `422` 
 `X-Vio-Decode-Error` media responses remain the fallback for clients that do not
 run the `decode_error` recovery path.
 
+**Same-file invariant for display-driven fallback.** A fallback driven by what a
+display can present — Dolby Vision Profile 7 to Profile 8.1 base layer, Profile 7
+to HDR10 — stays on the same file and changes only the transformation, never the
+release. A `failure_recovery` whose classification does not indict the release
+therefore keeps the session-bound provider candidate and lets the attempted-key
+guard advance to the next transformation rung on that file (for example the
+server DV7 to HDR10 strip). The server excludes the session-bound candidate only
+when a verdict actually indicts it: a server-confirmed decode rejection, or a
+provider that no longer lists the pinned result id. The resolver refuses to fall
+past an excluded pinned candidate unless the caller explicitly asked for
+candidate rotation, so a display-driven re-plan can never silently swap the bytes
+mid-stream.
+
 Failure, seek, and quality replans may omit unchanged track identities. The
 server overlays only identities present in those requests and preserves the
 durable selected subtitle otherwise. Only `operation: "track_change"` gives an

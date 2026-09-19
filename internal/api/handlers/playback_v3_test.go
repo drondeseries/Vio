@@ -7324,15 +7324,16 @@ func TestHandleReplanPlaybackV3SkipsRehydrationOfUnchangedVirtualCandidate(t *te
 	}
 }
 
-// A replan whose pinned candidate changed must thread the session-bound
-// candidate as preferred and the failed candidate as excluded into the
-// detailed resolver, so re-ranking cannot drift to a different release or
-// re-select the failed candidate under a new row ID.
-func TestHandleReplanPlaybackV3ThreadsExcludedAndPreferredCandidateIDs(t *testing.T) {
+// A replan whose verdict does not indict the release must keep the
+// session-bound candidate as preferred and must not exclude any candidate, so
+// re-ranking cannot drift to a different release or silently swap it under the
+// same session. The catalog row's stale pick differs from the session binding;
+// it is still not excluded because the failure did not indict the release.
+func TestHandleReplanPlaybackV3KeepsPinnedCandidateForNonIndictingFailure(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.ID = 510
-	// The catalog row carries the failed candidate's result= pick; the session
-	// later binds to a different pinned release.
+	// The catalog row carries a stale result= pick; the session later binds to a
+	// different pinned release.
 	source.FilePath = "virtual://movie/replan-source-510?result=failed-cand"
 	source.VirtualOwnerInstallationID = 5
 	// Incomplete container evidence keeps the start path on the candidate
@@ -7399,10 +7400,13 @@ func TestHandleReplanPlaybackV3ThreadsExcludedAndPreferredCandidateIDs(t *testin
 		t.Fatalf("expected successful replan, got response=%#v terminal=%#v", response, response.Terminal)
 	}
 	if gotPreferred != "pinned" {
-		t.Fatalf("preferred candidate = %q, want pinned", gotPreferred)
+		t.Fatalf("preferred candidate = %q, want the session-bound pin", gotPreferred)
 	}
-	if len(gotExcluded) != 1 || gotExcluded[0] != "failed-cand" {
-		t.Fatalf("excluded candidates = %v, want [failed-cand] (the failed candidate)", gotExcluded)
+	if len(gotExcluded) != 0 {
+		t.Fatalf("excluded candidates = %v, want none for a non-indicting failure", gotExcluded)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != source.ID {
+		t.Fatalf("effective file = %d, want the unchanged session file %d", response.PlaybackPlan.EffectiveMediaFileID, source.ID)
 	}
 }
 

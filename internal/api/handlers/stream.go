@@ -251,6 +251,9 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	resolved := ResolvedVirtualMedia{}
 	var err error
 	if h.VirtualMediaDetailedResolver != nil {
+		// Excluding a candidate at the serve layer is a dead-candidate failover,
+		// so substitution is intended and must be declared to the resolver.
+		ctx = withVirtualCandidateRotationV3(ctx, len(excludedCandidateIDs) > 0)
 		resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 			ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, "",
 		)
@@ -609,14 +612,31 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				}
 				retried, retryCleanup, retryErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded)
 				if retryErr == nil {
-					releaseInput = retryCleanup
-					retryURL, parseErr := url.Parse(retried.URL)
-					if parseErr == nil && retryURL.Scheme == "http" {
-						retryHost := retryURL.Hostname()
-						if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
-							inputPath = retried.URL
-							deliveredPath = resolvedVirtualCandidatePath(retried)
-							remuxErr = serveRemux()
+					// Same pinned-candidate guard direct play has: a retry that
+					// resolved a different release than the session-bound pin
+					// must not silently swap the bytes mid-stream. Keep the
+					// original remux failure so the client replans (where the
+					// display-driven fallback changes the transformation on the
+					// same file).
+					expectedCandidateID := ""
+					if parsed, err := url.Parse(file.FilePath); err == nil {
+						expectedCandidateID = parsed.Query().Get("result")
+					}
+					if expectedCandidateID != "" && retried.CandidateID != "" && retried.CandidateID != expectedCandidateID {
+						if retryCleanup != nil {
+							retryCleanup()
+						}
+						remuxErr = fmt.Errorf("retried candidate %q does not match pinned candidate %q", retried.CandidateID, expectedCandidateID)
+					} else {
+						releaseInput = retryCleanup
+						retryURL, parseErr := url.Parse(retried.URL)
+						if parseErr == nil && retryURL.Scheme == "http" {
+							retryHost := retryURL.Hostname()
+							if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
+								inputPath = retried.URL
+								deliveredPath = resolvedVirtualCandidatePath(retried)
+								remuxErr = serveRemux()
+							}
 						}
 					}
 				}
