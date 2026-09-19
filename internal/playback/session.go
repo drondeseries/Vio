@@ -850,7 +850,7 @@ func (m *SessionManager) limitsForUser(ctx context.Context, userID int) (Session
 		return limits, nil
 	}
 	// The lookup is a small, independent database/policy read. A parent
-	// context that is already cancelled or nearly spent (the replan request
+	// context that is already canceled or nearly spent (the replan request
 	// budget) would abort it even though the read itself is still valid and
 	// fast, so run it under its own short budget decoupled from the parent's
 	// cancellation and deadline.

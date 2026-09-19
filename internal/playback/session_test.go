@@ -566,10 +566,10 @@ func TestCheckReplacementAllowedLimitLookupSurvivesCancelledParent(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := sm.CheckReplacementAllowed(ctx, direct.ID, playback.PlayTranscode, false); err != nil {
-		t.Fatalf("replacement admission with cancelled parent = %v, want nil", err)
+		t.Fatalf("replacement admission with canceled parent = %v, want nil", err)
 	}
 	if !lookupRan {
-		t.Fatal("limit lookup did not run under a cancelled parent context")
+		t.Fatal("limit lookup did not run under a canceled parent context")
 	}
 	if lookupErr != nil {
 		t.Fatalf("limit lookup inherited the parent cancellation: %v", lookupErr)
