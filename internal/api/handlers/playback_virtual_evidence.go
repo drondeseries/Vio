@@ -83,16 +83,25 @@ const (
 	virtualEvidenceRejected
 )
 
+// String forms of virtualEvidenceAdmission. They are the stable textual result
+// of an admission, distinct from the autoscan delivery status of the same name.
+const (
+	virtualEvidenceResultAccepted  = "accepted"
+	virtualEvidenceResultCoalesced = "coalesced"
+	virtualEvidenceResultRejected  = "rejected"
+	virtualEvidenceResultUnknown   = "unknown"
+)
+
 func (a virtualEvidenceAdmission) String() string {
 	switch a {
 	case virtualEvidenceAccepted:
-		return "accepted"
+		return virtualEvidenceResultAccepted
 	case virtualEvidenceCoalesced:
-		return "coalesced"
+		return virtualEvidenceResultCoalesced
 	case virtualEvidenceRejected:
-		return "rejected"
+		return virtualEvidenceResultRejected
 	default:
-		return "unknown"
+		return virtualEvidenceResultUnknown
 	}
 }
 
@@ -160,7 +169,6 @@ type virtualEvidenceBuffer struct {
 	capacity int
 	seq      uint64
 	signalCh chan struct{}
-	stopped  bool
 }
 
 func newVirtualEvidenceBuffer(capacity int) *virtualEvidenceBuffer {
@@ -301,7 +309,9 @@ func (h *PlaybackHandler) runVirtualEvidenceWorker(buf *virtualEvidenceBuffer) {
 	}
 	for {
 		if task := buf.pop(); task != nil {
-			h.persistVirtualEvidenceTask(task, time.Time{})
+			// persistVirtualEvidenceTask logs terminal failures itself, so the
+			// worker reports and drops them there and moves to the next task.
+			_ = h.persistVirtualEvidenceTask(task, time.Time{})
 			continue
 		}
 		select {
@@ -324,7 +334,8 @@ func (h *PlaybackHandler) drainVirtualEvidence(buf *virtualEvidenceBuffer) {
 		if task == nil {
 			return
 		}
-		h.persistVirtualEvidenceTask(task, deadline)
+		// persistVirtualEvidenceTask logs terminal failures itself.
+		_ = h.persistVirtualEvidenceTask(task, deadline)
 	}
 	if n := buf.len(); n > 0 {
 		slog.Warn("virtual probe evidence abandoned at shutdown",

@@ -115,7 +115,7 @@ func TestPrefetchDistinctKeyFloodIsBounded(t *testing.T) {
 }
 
 // TestPrefetchStalledProviderShedsAndDoesNotBlock pins the skip/reject
-// behaviour: when a stalled provider holds both workers and the queue fills,
+// behavior: when a stalled provider holds both workers and the queue fills,
 // further requests are shed immediately rather than piling up.
 func TestPrefetchStalledProviderShedsAndDoesNotBlock(t *testing.T) {
 	release := make(chan struct{})

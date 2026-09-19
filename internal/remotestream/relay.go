@@ -26,6 +26,7 @@ import (
 // Canonical header names reused by the relay's range cache and header
 // filtering. Each literal appears once, here.
 const (
+	headerAccept        = "Accept"
 	headerAcceptRanges  = "Accept-Ranges"
 	headerAge           = "Age"
 	headerCacheControl  = "Cache-Control"
@@ -36,7 +37,18 @@ const (
 	headerETag          = "ETag"
 	headerExpires       = "Expires"
 	headerLastModified  = "Last-Modified"
+	headerOrigin        = "Origin"
+	headerReferer       = "Referer"
+	headerUserAgent     = "User-Agent"
 	headerVary          = "Vary"
+)
+
+// Cache-Control directive names the range cache inspects.
+// relayCacheControlDirectives lowercases names, so these are lowercase too.
+const (
+	cacheControlNoStore = "no-store"
+	cacheControlPrivate = "private"
+	cacheControlNoCache = "no-cache"
 )
 
 const (
@@ -200,7 +212,7 @@ func relayRangeCacheKey(target *url.URL, rangeHeader, headerIdentity string) str
 // Values are hashed, not embedded, so a cache key never carries a credential.
 func relayRangeCacheHeaderIdentity(headers http.Header) string {
 	parts := make([]string, 0, 4)
-	for _, name := range []string{"Accept", "User-Agent", "Referer", "Origin"} {
+	for _, name := range []string{headerAccept, headerUserAgent, headerReferer, headerOrigin} {
 		parts = append(parts, strings.ToLower(name)+"\x00"+headers.Get(name))
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x1f")))
@@ -246,7 +258,7 @@ func relayRangeResponseCacheability(response *http.Response, receivedAt time.Tim
 		return 0, time.Time{}, false
 	}
 	directives := relayCacheControlDirectives(response.Header.Values(headerCacheControl))
-	for _, blocked := range []string{"no-store", "private", "no-cache"} {
+	for _, blocked := range []string{cacheControlNoStore, cacheControlPrivate, cacheControlNoCache} {
 		if _, ok := directives[blocked]; ok {
 			return 0, time.Time{}, false
 		}
