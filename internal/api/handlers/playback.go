@@ -540,13 +540,40 @@ type PlaybackHandler struct {
 	detachedWorkOnce sync.Once
 	detachedWorkGate *virtualDetachedGate
 
-	// virtualEvidenceOnce guards lazy construction of the bounded queue and
-	// worker pool that persist virtual probe evidence. Evidence persistence is
-	// queued rather than admitted through the aggregate gate so a burst of
-	// probes cannot crowd delivery/failure evidence out; see
-	// playback_virtual.go.
-	virtualEvidenceOnce  sync.Once
-	virtualEvidenceQueue chan models.VirtualFilePersistArgs
+	// virtualEvidenceOnce guards lazy construction of the coalescing buffer
+	// and worker pool that persist virtual probe evidence. Evidence
+	// persistence is queued rather than admitted through the aggregate gate so
+	// a burst of probes cannot crowd delivery/failure evidence out; see
+	// playback_virtual_evidence.go.
+	virtualEvidenceOnce   sync.Once
+	virtualEvidenceBuffer *virtualEvidenceBuffer
+
+	// subtitleSlotsOnce guards lazy construction of the dedicated subtitle
+	// search gate. Subtitle searches can run for the full two-minute provider
+	// budget, so they are additionally capped well below the aggregate
+	// detached gate: a hung provider can tie up at most subtitleSearchCap
+	// aggregate slots and still leave capacity for probes and prefetch. A slot
+	// (there and on the aggregate gate) is held until the callback returns,
+	// never released when only its context expired, so a non-cooperative
+	// provider cannot cause replacement goroutines to pile up.
+	subtitleSlotsOnce sync.Once
+	subtitleSlots     *virtualDetachedGate
+
+	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
+	// admitted into a bounded queue (prefetchQueue) before any goroutine
+	// handles it, deduplicated by source+profile equivalence key
+	// (prefetchInFlight), and drained by a fixed pool of
+	// virtualPrefetchWorkers goroutines. Active, pending and dedup state are
+	// therefore all bounded, and prefetch can never spawn one goroutine per
+	// request. See PrefetchVirtualPlayback.
+	prefetchOnce     sync.Once
+	prefetchQueue    chan virtualPrefetchTask
+	prefetchMu       sync.Mutex
+	prefetchInFlight map[string]struct{}
+	// prefetchStopped is set under prefetchMu when the service context ends.
+	// New admissions are refused after that so a request racing shutdown cannot
+	// enqueue work the workers will never drain.
+	prefetchStopped bool
 }
 
 type PlaybackWatchScrobbler interface {

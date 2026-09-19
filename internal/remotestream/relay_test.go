@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -389,9 +390,17 @@ type relayFetch struct {
 
 func fetchRelay(t *testing.T, relay *Relay, rawURL, method, byteRange string) relayFetch {
 	t.Helper()
+	return fetchRelayWithHeaders(t, relay, rawURL, method, byteRange, nil)
+}
+
+func fetchRelayWithHeaders(t *testing.T, relay *Relay, rawURL, method, byteRange string, headers map[string]string) relayFetch {
+	t.Helper()
 	request := httptest.NewRequest(method, "http://relay"+rawURL, nil)
 	if byteRange != "" {
 		request.Header.Set("Range", byteRange)
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
 	}
 	recorder := httptest.NewRecorder()
 	relay.handle(recorder, request)
@@ -555,6 +564,44 @@ func TestRelayRangeCacheKeyIncludesRegistrationHeaders(t *testing.T) {
 	mu.Unlock()
 	if got != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (each registration caches under its own header identity)", got)
+	}
+}
+
+// TestRelayRangeCacheKeyIncludesRegistrationOrigin proves a differing
+// registration Origin alone forces a separate cache entry.
+func TestRelayRangeCacheKeyIncludesRegistrationOrigin(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		body := "origin:" + request.Header.Get("Origin")
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", body)
+		response.Header.Set("Content-Range", "bytes 0-4/100")
+		response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return response, nil
+	})}
+	urlA, cleanupA := registerRelayWithHeadersForTest(t, relay, "origin-a", "https://1.1.1.1/media.mkv", map[string]string{"Origin": "https://origin-a"})
+	defer cleanupA()
+	urlB, cleanupB := registerRelayWithHeadersForTest(t, relay, "origin-b", "https://1.1.1.1/media.mkv", map[string]string{"Origin": "https://origin-b"})
+	defer cleanupB()
+
+	gotA := fetchRelay(t, relay, urlA, http.MethodGet, "bytes=0-4")
+	gotB := fetchRelay(t, relay, urlB, http.MethodGet, "bytes=0-4")
+	if gotA.body != "origin:https://origin-a" || gotB.body != "origin:https://origin-b" {
+		t.Fatalf("bodies = %q / %q", gotA.body, gotB.body)
+	}
+	if got := fetchRelay(t, relay, urlA, http.MethodGet, "bytes=0-4"); got.body != gotA.body {
+		t.Fatalf("registration A repeat body = %q, want %q", got.body, gotA.body)
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (a differing Origin alone forces its own entry)", got)
 	}
 }
 
@@ -861,7 +908,11 @@ func TestRelayRangeCacheEvictsAndExpires(t *testing.T) {
 	}
 }
 
-func TestRelayCacheableResponseRejectsUnboundedAndPrivate(t *testing.T) {
+// TestRelayRangeResponseCacheabilityRejectsUnboundedAndNonReusable proves the
+// length/status bounds still hold and that every origin directive the review
+// called out keeps a response out of the cache.
+func TestRelayRangeResponseCacheabilityRejectsUnboundedAndNonReusable(t *testing.T) {
+	receivedAt := time.Unix(1_700_000_000, 0)
 	cases := []struct {
 		name   string
 		status int
@@ -877,6 +928,13 @@ func TestRelayCacheableResponseRejectsUnboundedAndPrivate(t *testing.T) {
 		{"server_error", http.StatusBadGateway, "128", nil, false},
 		{"no_store", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "no-store"}, false},
 		{"private", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "private, max-age=60"}, false},
+		{"no_cache", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "no-cache"}, false},
+		{"max_age_zero", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=0"}, false},
+		{"s_maxage_zero", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "s-maxage=0"}, false},
+		{"malformed_max_age", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=soon"}, false},
+		{"vary_star", http.StatusPartialContent, "128", map[string]string{"Vary": "*"}, false},
+		{"vary_star_list", http.StatusPartialContent, "128", map[string]string{"Vary": "Accept, *"}, false},
+		{"vary_accept", http.StatusPartialContent, "128", map[string]string{"Vary": "Accept"}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -887,9 +945,96 @@ func TestRelayCacheableResponseRejectsUnboundedAndPrivate(t *testing.T) {
 			for k, v := range tc.header {
 				response.Header.Set(k, v)
 			}
-			_, ok := relayCacheableResponse(response)
+			_, _, ok := relayRangeResponseCacheability(response, receivedAt)
 			if ok != tc.want {
 				t.Fatalf("cacheable = %v, want %v", ok, tc.want)
+			}
+		})
+	}
+}
+
+// TestRelayRangeResponseCacheabilityFreshness pins the freshness predicate: the
+// expiry is measured from the response's own Age (or backdated Date), never
+// restarted at receipt, and a response whose freshness is already spent is not
+// reusable.
+func TestRelayRangeResponseCacheabilityFreshness(t *testing.T) {
+	receivedAt := time.Unix(1_700_000_000, 0)
+	date := func(offset time.Duration) string {
+		return receivedAt.Add(offset).UTC().Format(http.TimeFormat)
+	}
+	cases := []struct {
+		name       string
+		header     http.Header
+		wantOK     bool
+		wantExpiry time.Time
+	}{
+		{
+			name:       "no directive uses bounded relay default",
+			header:     http.Header{},
+			wantOK:     true,
+			wantExpiry: receivedAt.Add(relayRangeCacheTTL),
+		},
+		{
+			name:       "max-age measured from receipt",
+			header:     http.Header{"Cache-Control": {"max-age=60"}},
+			wantOK:     true,
+			wantExpiry: receivedAt.Add(60 * time.Second),
+		},
+		{
+			name:       "age consumes max-age",
+			header:     http.Header{"Cache-Control": {"max-age=60"}, "Age": {"55"}},
+			wantOK:     true,
+			wantExpiry: receivedAt.Add(5 * time.Second),
+		},
+		{
+			name:   "age equal to max-age is not reusable",
+			header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"60"}},
+			wantOK: false,
+		},
+		{
+			name:   "age beyond max-age is not reusable",
+			header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"120"}},
+			wantOK: false,
+		},
+		{
+			name:       "s-maxage wins for a shared cache",
+			header:     http.Header{"Cache-Control": {"s-maxage=30, max-age=600"}},
+			wantOK:     true,
+			wantExpiry: receivedAt.Add(30 * time.Second),
+		},
+		{
+			name:       "backdated date counts as age",
+			header:     http.Header{"Cache-Control": {"max-age=60"}, "Date": {date(-10 * time.Second)}},
+			wantOK:     true,
+			wantExpiry: receivedAt.Add(50 * time.Second),
+		},
+		{
+			name:       "future expires",
+			header:     http.Header{"Date": {date(0)}, "Expires": {date(30 * time.Second)}},
+			wantOK:     true,
+			wantExpiry: receivedAt.Add(30 * time.Second),
+		},
+		{
+			name:   "past expires",
+			header: http.Header{"Date": {date(-60 * time.Second)}, "Expires": {date(-1 * time.Second)}},
+			wantOK: false,
+		},
+		{
+			name:   "malformed age cannot establish freshness",
+			header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"not-a-number"}},
+			wantOK: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: http.StatusPartialContent, Header: tc.header.Clone()}
+			response.Header.Set("Content-Length", "128")
+			_, expiry, ok := relayRangeResponseCacheability(response, receivedAt)
+			if ok != tc.wantOK {
+				t.Fatalf("cacheable = %v, want %v", ok, tc.wantOK)
+			}
+			if tc.wantOK && !expiry.Equal(tc.wantExpiry) {
+				t.Fatalf("expiry = %v, want %v", expiry, tc.wantExpiry)
 			}
 		})
 	}
@@ -974,5 +1119,308 @@ func TestRelayRangeCacheKeyHonorsExactRange(t *testing.T) {
 	mu.Unlock()
 	if got != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (only the repeated exact range is cached)", got)
+	}
+}
+
+// TestRelayRangeCacheReusesOnlyRemainingFreshness proves freshness is measured
+// from the response's own Age, not restarted at insertion: a max-age=60
+// response that arrived already 55s old is a hit at +4s and must be re-fetched
+// at +6s.
+func TestRelayRangeCacheReusesOnlyRemainingFreshness(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		body := strings.Repeat("a", 64)
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", body)
+		response.Header.Set("Content-Range", "bytes 0-63/1000")
+		response.Header.Set("Content-Length", "64")
+		response.Header.Set("Cache-Control", "max-age=60")
+		response.Header.Set("Age", "55")
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "age-freshness", "https://1.1.1.1/media.mkv")
+	defer cleanup()
+
+	now := time.Unix(1_700_000_000, 0)
+	relay.rangeCache.now = func() time.Time { return now }
+
+	first := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63")
+	if first.status != http.StatusPartialContent || len(first.body) != 64 {
+		t.Fatalf("first response = status %d, %d bytes", first.status, len(first.body))
+	}
+	now = now.Add(4 * time.Second)
+	if got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63"); got.status != http.StatusPartialContent || got.body != first.body {
+		t.Fatalf("within-freshness response = status %d, %d bytes", got.status, len(got.body))
+	}
+	now = now.Add(2 * time.Second)
+	if got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63"); got.status != http.StatusPartialContent || got.body != first.body {
+		t.Fatalf("past-freshness response = status %d, %d bytes", got.status, len(got.body))
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (one miss, then a re-fetch once Age exhausted max-age)", got)
+	}
+}
+
+// TestRelayRangeCacheNoDirectiveBoundedReuse documents the conservative default
+// when the origin sends no freshness directive: reuse is bounded to
+// relayRangeCacheTTL and never extended.
+func TestRelayRangeCacheNoDirectiveBoundedReuse(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		body := strings.Repeat("b", 32)
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", body)
+		response.Header.Set("Content-Range", "bytes 0-31/1000")
+		response.Header.Set("Content-Length", "32")
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "no-directive", "https://1.1.1.1/media.mkv")
+	defer cleanup()
+
+	now := time.Unix(1_700_000_000, 0)
+	relay.rangeCache.now = func() time.Time { return now }
+
+	if got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-31"); got.status != http.StatusPartialContent {
+		t.Fatalf("first status = %d", got.status)
+	}
+	if got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-31"); got.status != http.StatusPartialContent {
+		t.Fatalf("second status = %d", got.status)
+	}
+	now = now.Add(relayRangeCacheTTL + time.Second)
+	if got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-31"); got.status != http.StatusPartialContent {
+		t.Fatalf("expired status = %d", got.status)
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (default reuse bounded to relayRangeCacheTTL)", got)
+	}
+}
+
+// TestRelayRangeCacheBypassesOriginNonReusable proves every directive the review
+// named keeps the response out of the cache end to end.
+func TestRelayRangeCacheBypassesOriginNonReusable(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		header map[string]string
+	}{
+		{"no-cache", map[string]string{"Cache-Control": "no-cache"}},
+		{"max-age=0", map[string]string{"Cache-Control": "max-age=0"}},
+		{"no-store", map[string]string{"Cache-Control": "no-store"}},
+		{"private", map[string]string{"Cache-Control": "private"}},
+		{"vary-star", map[string]string{"Vary": "*"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			calls := 0
+			want := strings.Repeat("n", 32)
+			relay := NewRelay()
+			defer func() { _ = relay.Close(context.Background()) }()
+			relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				mu.Lock()
+				calls++
+				mu.Unlock()
+				response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", want)
+				response.Header.Set("Content-Range", "bytes 0-31/1000")
+				response.Header.Set("Content-Length", "32")
+				for name, value := range tc.header {
+					response.Header.Set(name, value)
+				}
+				return response, nil
+			})}
+			relayURL, cleanup := registerRelayForTest(t, relay, "non-reusable", "https://1.1.1.1/media.mkv")
+			defer cleanup()
+			for attempt := 0; attempt < 2; attempt++ {
+				got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-31")
+				if got.status != http.StatusPartialContent || got.body != want {
+					t.Fatalf("attempt %d = status %d, %d bytes", attempt, got.status, len(got.body))
+				}
+			}
+			mu.Lock()
+			got := calls
+			mu.Unlock()
+			if got != 2 {
+				t.Fatalf("upstream calls = %d, want 2 (origin marked the response non-reusable)", got)
+			}
+		})
+	}
+}
+
+// TestRelayRangeCacheIdentityUsesEffectiveOutboundHeaders proves request-level
+// Accept and User-Agent differences produce distinct entries, exactly as they
+// change the outbound request.
+func TestRelayRangeCacheIdentityUsesEffectiveOutboundHeaders(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		body := "accept=" + request.Header.Get("Accept") + ";ua=" + request.Header.Get("User-Agent")
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", body)
+		response.Header.Set("Content-Range", "bytes 0-0/1")
+		response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "effective-headers", "https://1.1.1.1/media.mkv")
+	defer cleanup()
+
+	first := fetchRelayWithHeaders(t, relay, relayURL, http.MethodGet, "bytes=0-0", map[string]string{"Accept": "video/mp4", "User-Agent": "player-a"})
+	otherUA := fetchRelayWithHeaders(t, relay, relayURL, http.MethodGet, "bytes=0-0", map[string]string{"Accept": "video/mp4", "User-Agent": "player-b"})
+	otherAccept := fetchRelayWithHeaders(t, relay, relayURL, http.MethodGet, "bytes=0-0", map[string]string{"Accept": "application/octet-stream", "User-Agent": "player-a"})
+	repeat := fetchRelayWithHeaders(t, relay, relayURL, http.MethodGet, "bytes=0-0", map[string]string{"Accept": "video/mp4", "User-Agent": "player-a"})
+
+	if first.body != "accept=video/mp4;ua=player-a" {
+		t.Fatalf("first body = %q", first.body)
+	}
+	if otherUA.body != "accept=video/mp4;ua=player-b" {
+		t.Fatalf("other-UA body = %q", otherUA.body)
+	}
+	if otherAccept.body != "accept=application/octet-stream;ua=player-a" {
+		t.Fatalf("other-Accept body = %q", otherAccept.body)
+	}
+	if repeat.body != first.body {
+		t.Fatalf("repeat body = %q, want %q", repeat.body, first.body)
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 3 {
+		t.Fatalf("upstream calls = %d, want 3 (only the exact effective-header variant is reused)", got)
+	}
+}
+
+// TestRelayRangeCacheIdentityUsesRegistrationOverride proves the identity is
+// computed after per-registration overrides: two client User-Agent values that
+// the registration pins to one value share a single entry.
+func TestRelayRangeCacheIdentityUsesRegistrationOverride(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		body := "ua=" + request.Header.Get("User-Agent")
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", body)
+		response.Header.Set("Content-Range", "bytes 0-0/1")
+		response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayWithHeadersForTest(t, relay, "override-headers", "https://1.1.1.1/media.mkv", map[string]string{"User-Agent": "provider-pinned"})
+	defer cleanup()
+
+	first := fetchRelayWithHeaders(t, relay, relayURL, http.MethodGet, "bytes=0-0", map[string]string{"User-Agent": "client-a"})
+	second := fetchRelayWithHeaders(t, relay, relayURL, http.MethodGet, "bytes=0-0", map[string]string{"User-Agent": "client-b"})
+	if first.body != "ua=provider-pinned" || second.body != "ua=provider-pinned" {
+		t.Fatalf("bodies = %q / %q, want the registration override", first.body, second.body)
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (identical effective headers share an entry)", got)
+	}
+}
+
+// TestRelayRangeCacheConcurrentMissesServeCompleteBodies proves concurrent
+// misses each receive a complete body and that only a fully read entry is
+// published: the next request after the burst is served from cache.
+func TestRelayRangeCacheConcurrentMissesServeCompleteBodies(t *testing.T) {
+	const concurrent = 4
+	body := strings.Repeat("c", 128)
+	var calls int32
+	arrived := make(chan struct{}, concurrent)
+	release := make(chan struct{})
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&calls, 1)
+		arrived <- struct{}{}
+		<-release
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", body)
+		response.Header.Set("Content-Range", "bytes 0-127/1000")
+		response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "concurrent-miss", "https://1.1.1.1/media.mkv")
+	defer cleanup()
+
+	type result struct {
+		status int
+		body   string
+	}
+	results := make(chan result, concurrent)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-127")
+			results <- result{status: got.status, body: got.body}
+		}()
+	}
+	for i := 0; i < concurrent; i++ {
+		select {
+		case <-arrived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent upstream requests did not start")
+		}
+	}
+	close(release)
+	wg.Wait()
+	close(results)
+	for got := range results {
+		if got.status != http.StatusPartialContent || got.body != body {
+			t.Fatalf("concurrent response = status %d, %d bytes, want a complete %d-byte body", got.status, len(got.body), len(body))
+		}
+	}
+	if got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-127"); got.status != http.StatusPartialContent || got.body != body {
+		t.Fatalf("post-concurrency response = status %d, %d bytes, want the cached complete body", got.status, len(got.body))
+	}
+	if got := atomic.LoadInt32(&calls); got != concurrent {
+		t.Fatalf("upstream calls = %d, want %d (a concurrent miss must not serve a partial or stale entry)", got, concurrent)
+	}
+}
+
+// TestRelayRangeCacheEvictsUnderByteCap proves the total-bytes cap is enforced
+// and that accounting stays exact after eviction.
+func TestRelayRangeCacheEvictsUnderByteCap(t *testing.T) {
+	cache := newRelayRangeCache()
+	now := time.Unix(1_700_000_000, 0)
+	cache.now = func() time.Time { return now }
+	body := make([]byte, relayRangeCacheMaxEntrySize)
+	for i := 0; i < 80; i++ {
+		cache.put("key-"+strconv.Itoa(i), relayRangeCacheEntry{status: http.StatusPartialContent, body: body})
+	}
+	if cache.totalBytes > relayRangeCacheMaxTotalSize {
+		t.Fatalf("cached bytes = %d, want <= %d", cache.totalBytes, relayRangeCacheMaxTotalSize)
+	}
+	if want := relayRangeCacheMaxTotalSize / relayRangeCacheMaxEntrySize; len(cache.entries) > want {
+		t.Fatalf("entries = %d, want <= %d", len(cache.entries), want)
+	}
+	sum := 0
+	for _, entry := range cache.entries {
+		sum += len(entry.body)
+	}
+	if sum != cache.totalBytes {
+		t.Fatalf("totalBytes = %d, want the retained body sum %d", cache.totalBytes, sum)
 	}
 }

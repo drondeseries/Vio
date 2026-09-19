@@ -1,11 +1,8 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -227,14 +224,9 @@ func TestProbeFailureCacheStaysBoundedUnderChurn(t *testing.T) {
 }
 
 // Evidence persistence is queued, not gated: a burst must not block the
-// request path, and an overflow must be dropped with a loud reason rather than
+// request path, and an overflow must be rejected explicitly rather than
 // silently. Accepted writes must still drain.
-func TestEvidencePersistQueueOverloadIsLoudAndNonBlocking(t *testing.T) {
-	var logs bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError})))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-
+func TestEvidencePersistQueueOverloadIsExplicitAndNonBlocking(t *testing.T) {
 	serviceCtx, serviceCancel := context.WithCancel(context.Background())
 	release := make(chan struct{})
 	var saved int64
@@ -246,11 +238,14 @@ func TestEvidencePersistQueueOverloadIsLoudAndNonBlocking(t *testing.T) {
 		},
 	}
 
+	var rejected int
 	for i := 0; i < virtualEvidenceQueueSize+virtualEvidenceWorkers+16; i++ {
-		h.enqueueVirtualProbeEvidence(context.Background(), models.VirtualFilePersistArgs{FileID: i})
+		if adm := h.enqueueVirtualProbeEvidence(context.Background(), models.VirtualFilePersistArgs{FileID: i}); adm == virtualEvidenceRejected {
+			rejected++
+		}
 	}
-	if !strings.Contains(logs.String(), "detached evidence queue full") {
-		t.Fatalf("queue-full drop was not logged; logs:\n%s", logs.String())
+	if rejected == 0 {
+		t.Fatal("no admission was rejected under a burst larger than the buffer bound")
 	}
 
 	close(release)

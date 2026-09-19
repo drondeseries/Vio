@@ -431,9 +431,10 @@ func TestHandleStartPlaybackV3SubtitleOnlyTerminalDegradesInPlace(t *testing.T) 
 	}}
 	// Transcoding disabled makes the embedded PGS track a burn-in requirement
 	// the source cannot meet, so the subtitle policy terminalls with
-	// subtitle_conversion_unsupported before any video adaptation.
-	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "false"}}
-	handler.PlaybackConfig = playbackTestConfig("", t.TempDir())
+	// subtitle_conversion_unsupported before any video adaptation. The planner
+	// reads TranscodeEnabled from the config snapshot, not the settings store,
+	// so disable it on the config.
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 
 	start := v3HandlerStartRequest()
@@ -498,8 +499,10 @@ func TestHandleStartPlaybackV3SubtitleReasonWithBlockedVideoStillMovesVersion(t 
 	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
 		source.ContentID: {source, alternate},
 	}}
-	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "false"}}
-	handler.PlaybackConfig = playbackTestConfig("", t.TempDir())
+	// Transcoding disabled is what makes dropping the subtitle insufficient:
+	// the HEVC source still cannot play on this H.264-only client. The planner
+	// reads TranscodeEnabled from the config snapshot, not the settings store.
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 
 	start := v3HandlerStartRequest()
@@ -9434,9 +9437,13 @@ func dedupSubtitleFileV3(id int) *models.MediaFile {
 		ID:                id,
 		ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}},
 		SubtitleTracks: []models.SubtitleTrack{
-			{Index: 10, Language: "fra", Codec: "subrip"},
-			{Index: 11, Language: "fra", Codec: "subrip"}, // duplicate of the fra track, suppressed
-			{Index: 12, Language: "deu", Codec: "subrip"},
+			{Index: 10, ContainerTrackID: "0", Language: "fra", Codec: "subrip"},
+			{Index: 11, ContainerTrackID: "1", Language: "fra", Codec: "subrip"}, // duplicate of the fra track, suppressed
+			// Published combined ordinal 2 resolves here (source combined
+			// ordinal 3). The plan's embedded identity carries this track's
+			// container id, so the fixture must supply it for the identity
+			// validation to exercise a legitimate deu selection.
+			{Index: 12, ContainerTrackID: "3", Language: "deu", Codec: "subrip"},
 		},
 	}
 }

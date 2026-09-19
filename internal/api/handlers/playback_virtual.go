@@ -38,6 +38,12 @@ const (
 	virtualProbeBudget                = 15 * time.Second
 	maxVirtualPlaybackPrefetchFiles   = 2
 	virtualPlaybackPrefetchBudget     = 20 * time.Second
+	// virtualPrefetchQueueSize bounds pending prefetch work: how many distinct
+	// source/profile prefetches may wait for a worker. virtualPrefetchWorkers
+	// bounds active work. Together they bound the dedup map, whose entries exist
+	// only while a task is pending or active.
+	virtualPrefetchQueueSize = 64
+	virtualPrefetchWorkers   = 2
 	// virtualProbeFailureTTL is the base damper window and
 	// virtualProbeFailureMaxTTL caps its exponential growth. A candidate that
 	// just consumed the whole virtualProbeBudget without producing usable
@@ -240,6 +246,57 @@ func (c *virtualProbeFailureCache) clear(key string) {
 // clear entries directly.
 var virtualProbeFailures = &virtualProbeFailureCache{marks: make(map[string]virtualProbeFailureMark)}
 
+// virtualFailedVerdictMaxAge is the backstop age after which a durable
+// media_files.failed_at verdict stops excluding a candidate from automatic
+// selection. The primary lifecycle is explicit: a verdict is cleared by a real
+// delivery (MarkVirtualCandidateRecovered), by an explicit user retry
+// (allowFailedCandidate), or by a fresh candidate listing replacing the row.
+// This age exists only so a row that is never listed again cannot stay
+// excluded forever; it is deliberately long so a genuinely dead provider URL
+// is not retried on every start. It is a var so tests can shrink it.
+var virtualFailedVerdictMaxAge = 24 * time.Hour
+
+// virtualCandidateVerdictActive reports whether a failed_at stamp still
+// excludes a candidate from automatic resolution and adoption. An explicit
+// retry (allowFailedCandidate) is handled by callers and bypasses this check;
+// this helper only answers the passive-eligibility question.
+func virtualCandidateVerdictActive(failedAt *time.Time, now time.Time) bool {
+	if failedAt == nil {
+		return false
+	}
+	return !now.After(failedAt.Add(virtualFailedVerdictMaxAge))
+}
+
+// virtualFallbackEligibility is the explicit release-identity contract for the
+// stale-source fallback. The caller builds it from the resolve intent and the
+// anchored release so the fallback never infers session binding or rotation
+// from a defaulted context value. It is enforced both before resolving a
+// sibling and before persisting a replacement.
+type virtualFallbackEligibility struct {
+	// sessionBound is true when an existing session is already serving the
+	// anchored release (a replan rehydration or serve-layer re-resolve).
+	sessionBound bool
+	// rotationAllowed is true only when the caller explicitly declared
+	// candidate rotation (a verdict that indicts the release). Session-bound
+	// playback must not change releases without it.
+	rotationAllowed bool
+	// allowFailed permits re-resolving a candidate whose failed_at verdict is
+	// still active: the explicit retry policy. It never by itself authorizes a
+	// sibling release.
+	allowFailed bool
+	// releaseID is the concrete release identity (the ?result= candidate id)
+	// the fallback is anchored to. It is carried for logging and for asserting
+	// that a same-release refresh did not drift.
+	releaseID string
+}
+
+// allowsSibling reports whether the fallback may resolve (and, when it wins,
+// persist) a release other than the anchored one. A session-bound request may
+// only do so under explicit rotation.
+func (e virtualFallbackEligibility) allowsSibling() bool {
+	return !e.sessionBound || e.rotationAllowed
+}
+
 // virtualProbeFailureKey identifies a probe target across replans. The resolved
 // stream URL carries rotating credentials, so the candidate's provider-neutral
 // identity is the stable key. The candidate's own result= identity and the
@@ -333,6 +390,28 @@ func (h *PlaybackHandler) detachedGate() *virtualDetachedGate {
 	return h.detachedWorkGate
 }
 
+// virtualSubtitleSearchCap bounds concurrent detached subtitle searches on
+// top of the aggregate detached gate. A search can hold a provider RPC and a
+// download for the whole virtualSubtitleSearchBudget, so without a tighter cap
+// a handful of stalled providers would consume the aggregate gate and starve
+// probes and prefetch. Four searches in flight is far more than a household
+// needs and still leaves the aggregate gate mostly free.
+const virtualSubtitleSearchCap = 4
+
+// subtitleSearchGate returns the handler's dedicated, bounded subtitle-search
+// gate, constructing it lazily for handlers built as literals (tests).
+func (h *PlaybackHandler) subtitleSearchGate() *virtualDetachedGate {
+	if h == nil {
+		return nil
+	}
+	h.subtitleSlotsOnce.Do(func() {
+		if h.subtitleSlots == nil {
+			h.subtitleSlots = newVirtualDetachedGate(virtualSubtitleSearchCap)
+		}
+	})
+	return h.subtitleSlots
+}
+
 // virtualDetachedContext builds the context for one detached worker. It keeps
 // base's values (so request-scoped logging and identity still flow) while
 // discarding base's cancellation, and additionally cancels when the handler's
@@ -354,81 +433,41 @@ func (h *PlaybackHandler) virtualDetachedContext(base context.Context, timeout t
 	}
 }
 
-const (
-	// virtualEvidenceQueueSize bounds queued probe-evidence writes. Each task
-	// is a small argument struct (no response data), so a few hundred is cheap
-	// and absorbs a burst while the two workers drain it.
-	virtualEvidenceQueueSize = 256
-	// virtualEvidenceWorkers is the number of workers that persist queued
-	// evidence. Two keeps a burst moving without competing with probe workers
-	// for the aggregate gate.
-	virtualEvidenceWorkers = 2
-	// virtualEvidencePersistBudget bounds one queued evidence write.
-	virtualEvidencePersistBudget = 5 * time.Second
-)
-
-// enqueueVirtualProbeEvidence queues one catalog write for the evidence worker
-// pool. Queueing rather than admitting through the aggregate gate is
-// deliberate: probe evidence is what turns an optimistic start into a fast
-// replay, so it must not be crowded out by a burst of long probes. The queue is
-// bounded; when it is full the write is dropped with an Error-level log naming
-// the reason, never silently.
-func (h *PlaybackHandler) enqueueVirtualProbeEvidence(ctx context.Context, args models.VirtualFilePersistArgs) {
-	if h == nil || h.VirtualFileSaver == nil {
-		return
-	}
-	h.virtualEvidenceOnce.Do(func() {
-		h.virtualEvidenceQueue = make(chan models.VirtualFilePersistArgs, virtualEvidenceQueueSize)
-		for range virtualEvidenceWorkers {
-			go h.runVirtualEvidenceWorker()
-		}
-	})
-	select {
-	case h.virtualEvidenceQueue <- args:
-	default:
-		slog.ErrorContext(ctx, "virtual probe evidence persist dropped: detached evidence queue full",
-			"component", "api", "file_id", args.FileID, "stamp_probe", args.StampProbe,
-			"queue_size", virtualEvidenceQueueSize)
-	}
+// virtualPrefetchTask is one admitted, deduplicated unit of prefetch work. The
+// file is copied at admission so a caller that mutates its slice afterward
+// cannot change what the worker prefetches, and it carries the exact identity
+// the admission key was computed from.
+type virtualPrefetchTask struct {
+	file       models.MediaFile
+	neutralURI string
+	userID     int
+	profileID  string
+	key        string
 }
 
-// runVirtualEvidenceWorker drains queued evidence writes until the service
-// context is canceled. Work still queued when the context ends is abandoned
-// with the process.
-func (h *PlaybackHandler) runVirtualEvidenceWorker() {
-	var serviceDone <-chan struct{}
-	if h.ServiceContext != nil {
-		serviceDone = h.ServiceContext.Done()
-	}
-	for {
-		select {
-		case <-serviceDone:
-			// Never abandon queued evidence silently: say how much was left
-			// behind when shutdown interrupted the drain.
-			if n := len(h.virtualEvidenceQueue); n > 0 {
-				slog.Warn("virtual probe evidence persist abandoned at shutdown",
-					"component", "api", "queued", n)
-			}
-			return
-		case args := <-h.virtualEvidenceQueue:
-			h.persistVirtualEvidenceNow(args)
-		}
-	}
+// virtualPrefetchKey is the equivalence key for prefetch deduplication. Two
+// requests are equivalent only when they name the same source (content identity
+// plus provider-neutral URI plus owning installation) for the same viewer
+// profile (account and profile). Any difference is a distinct prefetch: a
+// different release under the same content, or the same content for a different
+// profile, must not be collapsed.
+func virtualPrefetchKey(contentID, neutralURI string, ownerInstallationID, userID int, profileID string) string {
+	return contentID + "\x00" + neutralURI + "\x00" + strconv.Itoa(ownerInstallationID) + "\x00" + strconv.Itoa(userID) + "\x00" + profileID
 }
 
-func (h *PlaybackHandler) persistVirtualEvidenceNow(args models.VirtualFilePersistArgs) {
-	saver := h.VirtualFileSaver
-	if saver == nil {
-		return
-	}
-	ctx, cancel := h.virtualDetachedContext(h.ServiceContext, virtualEvidencePersistBudget)
-	defer cancel()
-	if _, err := saver(ctx, args); err != nil {
-		slog.ErrorContext(ctx, "virtual probe evidence persist failed",
-			"component", "api", "file_id", args.FileID, "error", err)
-	}
-}
-
+// PrefetchVirtualPlayback warms the metadata caches for up to
+// maxVirtualPlaybackPrefetchFiles virtual files, best-effort.
+//
+// Work is admitted into a process-wide bounded queue before any goroutine
+// handles it and deduplicated by virtualPrefetchKey, so duplicate requests
+// collapse while distinct-source floods are rejected instead of spawning
+// goroutines. A fixed worker pool bounds active work; the queue bounds pending
+// work; the dedup map is bounded because an entry exists only while its task is
+// pending or active. Under overload the request is shed with a debug log and a
+// false admission, never queued without bound and never blocking the caller.
+// Each admitted task runs under a context bound to the prefetch budget and the
+// service lifecycle, and the work is metadata-only: it warms the listing and
+// resolver caches and never pins sticky playback evidence.
 func (h *PlaybackHandler) PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string) {
 	if h == nil || len(files) == 0 || profileID == "" {
 		return
@@ -443,31 +482,135 @@ func (h *PlaybackHandler) PrefetchVirtualPlayback(ctx context.Context, files []*
 	if len(files) > maxVirtualPlaybackPrefetchFiles {
 		files = files[:maxVirtualPlaybackPrefetchFiles]
 	}
+	h.startVirtualPrefetchWorkers()
+	for _, file := range files {
+		if file == nil || !isVirtualPlaybackFile(file) {
+			continue
+		}
+		neutralURI := virtualPlaybackNeutralKey(file.FilePath)
+		key := virtualPrefetchKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, userID, profileID)
+		if !h.admitVirtualPrefetch(key) {
+			continue
+		}
+		task := virtualPrefetchTask{
+			file:       *file,
+			neutralURI: neutralURI,
+			userID:     userID,
+			profileID:  profileID,
+			key:        key,
+		}
+		select {
+		case h.prefetchQueue <- task:
+		default:
+			// The queue filled between admission and enqueue (a worker burst
+			// drained and refilled it). Undo the dedup entry so a later request
+			// can be admitted, and drop this one loudly but without blocking.
+			h.releaseVirtualPrefetch(key)
+			slog.DebugContext(ctx, "virtual playback prefetch rejected: pending queue full",
+				"component", "api", "queue_size", virtualPrefetchQueueSize)
+		}
+	}
+}
+
+// startVirtualPrefetchWorkers lazily starts the fixed prefetch worker pool. The
+// pool is bounded (virtualPrefetchWorkers) so no request can spawn a goroutine.
+func (h *PlaybackHandler) startVirtualPrefetchWorkers() {
+	h.prefetchOnce.Do(func() {
+		if h.prefetchQueue == nil {
+			h.prefetchQueue = make(chan virtualPrefetchTask, virtualPrefetchQueueSize)
+		}
+		if h.prefetchInFlight == nil {
+			h.prefetchInFlight = make(map[string]struct{})
+		}
+		for range virtualPrefetchWorkers {
+			go h.runVirtualPrefetchWorker()
+		}
+	})
+}
+
+// admitVirtualPrefetch records an in-flight key and reports whether admission
+// succeeded. It rejects when the dedup set is at its bound, which is the same
+// bound as pending+active work.
+func (h *PlaybackHandler) admitVirtualPrefetch(key string) bool {
+	h.prefetchMu.Lock()
+	defer h.prefetchMu.Unlock()
+	if h.prefetchStopped {
+		return false
+	}
+	if h.prefetchInFlight == nil {
+		h.prefetchInFlight = make(map[string]struct{})
+	}
+	if _, dup := h.prefetchInFlight[key]; dup {
+		return false
+	}
+	if len(h.prefetchInFlight) >= virtualPrefetchQueueSize+virtualPrefetchWorkers {
+		slog.Debug("virtual playback prefetch rejected: in-flight set full",
+			"component", "api", "bound", virtualPrefetchQueueSize+virtualPrefetchWorkers)
+		return false
+	}
+	h.prefetchInFlight[key] = struct{}{}
+	return true
+}
+
+func (h *PlaybackHandler) releaseVirtualPrefetch(key string) {
+	h.prefetchMu.Lock()
+	delete(h.prefetchInFlight, key)
+	h.prefetchMu.Unlock()
+}
+
+// runVirtualPrefetchWorker drains admitted prefetch tasks until the service
+// context ends. Queued work at shutdown is abandoned with the process; the
+// dedup set is cleared so nothing is retained past shutdown.
+func (h *PlaybackHandler) runVirtualPrefetchWorker() {
+	var serviceDone <-chan struct{}
+	if h.ServiceContext != nil {
+		serviceDone = h.ServiceContext.Done()
+	}
+	for {
+		select {
+		case <-serviceDone:
+			h.prefetchMu.Lock()
+			h.prefetchStopped = true
+			if n := len(h.prefetchInFlight); n > 0 {
+				slog.Warn("virtual playback prefetch abandoned at shutdown",
+					"component", "api", "in_flight", n)
+			}
+			h.prefetchInFlight = make(map[string]struct{})
+			h.prefetchMu.Unlock()
+			return
+		case task := <-h.prefetchQueue:
+			h.prefetchOne(task)
+			h.releaseVirtualPrefetch(task.key)
+		}
+	}
+}
+
+// prefetchOne runs one admitted task: listing plus resolver warm, under its own
+// budget and the service lifecycle, gated by the aggregate detached gate so a
+// prefetch burst cannot exceed the shared bound. It never pins sticky evidence.
+func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 	gate := h.detachedGate()
 	if !gate.tryAcquire() {
-		slog.DebugContext(ctx, "virtual playback prefetch skipped: detached worker budget exhausted",
+		slog.Debug("virtual playback prefetch skipped: detached worker budget exhausted",
 			"component", "api")
 		return
 	}
-	prefetchCtx, cancel := h.virtualDetachedContext(ctx, virtualPlaybackPrefetchBudget)
-	go func() {
-		defer gate.release()
-		defer cancel()
-		for _, file := range files {
-			if prefetchCtx.Err() != nil || file == nil || !isVirtualPlaybackFile(file) {
-				continue
-			}
-			neutralURI := virtualPlaybackNeutralKey(file.FilePath)
-			// Listing warms the shared resolver candidate cache and stores the
-			// device-neutral candidate set in the handler cache, so the first
-			// click skips the provider round-trip. The resolve below is then
-			// served from the resolver cache. Both are best-effort.
-			h.warmVirtualPlaybackListing(prefetchCtx, file, neutralURI, userID, profileID)
-			if h.VirtualPlaybackResolver != nil {
-				_, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(prefetchCtx, neutralURI, userID, profileID, file.VirtualOwnerInstallationID)
-			}
-		}
-	}()
+	defer gate.release()
+	prefetchCtx, cancel := h.virtualDetachedContext(h.ServiceContext, virtualPlaybackPrefetchBudget)
+	defer cancel()
+	if prefetchCtx.Err() != nil {
+		return
+	}
+	// Listing warms the shared resolver candidate cache and stores the
+	// device-neutral candidate set in the handler cache, so the first click
+	// skips the provider round-trip. The resolve below is then served from the
+	// resolver cache. Both are best-effort and metadata-only.
+	h.warmVirtualPlaybackListing(prefetchCtx, &task.file, task.neutralURI, task.userID, task.profileID)
+	if h.VirtualPlaybackResolver != nil {
+		_, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(
+			prefetchCtx, task.neutralURI, task.userID, task.profileID, task.file.VirtualOwnerInstallationID,
+		)
+	}
 }
 
 // warmVirtualPlaybackListing lists provider candidates once and stores the
@@ -483,6 +626,11 @@ func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *
 		return
 	}
 	if h.VirtualPlaybackStreamLister == nil || h.BestResultCache == nil {
+		return
+	}
+	// Admitted work is bound to a deadline and the service lifecycle; an
+	// already-expired context must not start a provider round-trip.
+	if ctx != nil && ctx.Err() != nil {
 		return
 	}
 	streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(ctx, neutralURI, userID, profileID, file.VirtualOwnerInstallationID)
@@ -1111,7 +1259,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// would contain only the rejected row and rotation could never find a
 	// sibling.
 	exclusionPending := len(excludedCandidateIDs) > 0
-	requestedRowUnusable := !allowFailed && file.FailedAt != nil
+	requestedRowUnusable := !allowFailed && virtualCandidateVerdictActive(file.FailedAt, time.Now())
 	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
 		((exclusionPending || requestedRowUnusable) && !cachedListing)) && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
@@ -1253,7 +1401,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// pending (decode rotation) or a failed row, fall through to the
 		// resolve path, which honors both.
 		if deferProbe && !forceRelist && !noResult &&
-			len(excludedCandidateIDs) == 0 && (allowFailed || file.FailedAt == nil) &&
+			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
 			h.VirtualMediaDetailedResolver != nil &&
 			((persistedResultURI && cand.URI == file.FilePath) || (pinnedURI != "" && cand.URI == pinnedURI)) &&
 			file.ProbeUpdatedAt != nil &&
@@ -1287,7 +1435,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// on a real pinned/adopted candidate plus a configured resolver and
 		// prober; no pin or no delivery grace keeps the synchronous resolve.
 		if deferProbe && !forceRelist && !noResult &&
-			len(excludedCandidateIDs) == 0 && (allowFailed || file.FailedAt == nil) &&
+			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
 			(persistedResultURI || pinnedURI != "") &&
 			(h.VirtualMediaDetailedResolver != nil || h.VirtualPlaybackResolver != nil) &&
 			(h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) &&
@@ -1383,7 +1531,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// source, on a prior attempt). An explicit selection and a forced
 			// relink allow a manual retry; a decode-driven rotation carries its
 			// exclusion explicitly so it never depends on the async stamp.
-			if !allowFailed && dbFile.FailedAt != nil {
+			if !allowFailed && virtualCandidateVerdictActive(dbFile.FailedAt, time.Now()) {
 				// Name the candidate this attempt is about first. On a
 				// substitution, cand.URI is the sibling the resolver selected,
 				// so reporting only it made the log's candidate_uri and error
@@ -1742,7 +1890,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// silently folded into the loop's resolve time.
 	trace.fallbackRan = true
 	fallbackStart := time.Now()
-	fb := h.fallbackResolveStaleVirtualSource(attemptCtx, file, userID, profileID)
+	// Carry the resolve intent explicitly into fallback eligibility rather
+	// than letting the fallback read defaulted context values. A session-bound
+	// start may refresh its own release but may not substitute a sibling
+	// unless this request declared rotation; an unbound (fresh) start may
+	// substitute normally. allowFailed is the explicit-retry policy for a
+	// failed_at verdict and never authorizes a sibling by itself.
+	fallbackEligibility := virtualFallbackEligibility{
+		sessionBound:    options.sessionBound,
+		rotationAllowed: rotateCandidates,
+		allowFailed:     allowFailed,
+		releaseID:       virtualResultCandidateID(file.FilePath),
+	}
+	fb := h.fallbackResolveStaleVirtualSource(attemptCtx, file, userID, profileID, fallbackEligibility)
 	trace.fallback = time.Since(fallbackStart)
 	if fb != nil {
 		return *fb, nil
@@ -2128,15 +2288,22 @@ func snapshotVirtualRow(file *models.MediaFile) virtualSnapshot {
 	}
 }
 
-func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, snap virtualSnapshot, expectedFilePath string, file *models.MediaFile, stampProbe bool) (int64, error) {
+// persistVirtualMetadataBounded admits a probe-evidence write into the
+// bounded, coalescing evidence buffer and reports the explicit admission
+// result. It no longer writes synchronously: saturation is expressed as
+// virtualEvidenceRejected rather than a silent drop, accepted work is retried
+// with backoff by the buffer workers, and coalescing keeps the newest snapshot
+// for a given row identity. Callers that need a synchronous, CAS-fenced write
+// use ExecVirtualFileMetadataUpdate directly.
+func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, snap virtualSnapshot, expectedFilePath string, file *models.MediaFile, stampProbe bool) (virtualEvidenceAdmission, error) {
 	if h == nil || h.VirtualFileSaver == nil || file == nil || snap.FileID <= 0 {
-		return 0, nil
+		return virtualEvidenceRejected, nil
 	}
 	videoJSON := marshalTracksJSON(sanitizeTrackSlice(file.VideoTracks))
 	audioJSON := marshalTracksJSON(sanitizeTrackSlice(file.AudioTracks))
 	subJSON := marshalTracksJSON(sanitizeTrackSlice(file.SubtitleTracks))
 	res, vCodec, aCodec, container, hdr, bitrate, duration := file.Resolution, file.CodecVideo, file.CodecAudio, file.Container, file.HDR, file.Bitrate, file.Duration
-	return h.VirtualFileSaver(ctx, models.VirtualFilePersistArgs{
+	return h.enqueueVirtualProbeEvidence(ctx, models.VirtualFilePersistArgs{
 		FileID:           snap.FileID,
 		ExpectedFilePath: expectedFilePath,
 		VideoTracks:      videoJSON,
@@ -2154,7 +2321,7 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, sna
 		ProbeUpdatedAt:   snap.ProbeUpdatedAt,
 		OwnerID:          snap.OwnerID,
 		LibraryID:        snap.LibraryID,
-	})
+	}), nil
 }
 
 // persistVirtualProbeEvidence writes probed track inventory and the probe stamp
@@ -2206,9 +2373,32 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 		LibraryID:        snap.LibraryID,
 		AdoptPath:        adoptPath,
 	}
-	// The queue worker owns the write context; ctx is used only to tie a
-	// queue-full drop to the caller's request.
-	h.enqueueVirtualProbeEvidence(ctx, args)
+	// The evidence buffer owns the write context and retry policy; ctx is used
+	// only to tie a rejection to the caller's request. Admission is explicit so
+	// the caller can distinguish an accepted, a coalesced (superseded but
+	// still represented) and a rejected (buffer full) write.
+	switch h.enqueueVirtualProbeEvidence(ctx, args) {
+	case virtualEvidenceRejected:
+		slog.ErrorContext(ctx, "virtual probe evidence persist rejected: evidence buffer full",
+			"component", "api", "file_id", args.FileID, "stamp_probe", args.StampProbe)
+	}
+}
+
+// virtualCandidateVerdictError reports a non-nil error when the concrete
+// candidate URI is owned by a catalog row whose failed_at verdict is still
+// active and the caller did not request an explicit retry. It is the single
+// verdict gate used before a fallback resolution and again before the resolved
+// identity can be adopted, so every candidate — the requested pin, a resolved
+// sibling, or a resolver-substituted release — is checked the same way.
+func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, candidateURI string, file *models.MediaFile, ownerID int, allowFailed bool) error {
+	if h == nil || file == nil || candidateURI == "" || allowFailed {
+		return nil
+	}
+	row := h.lookupVirtualCandidateRow(ctx, candidateURI, file.ContentID, file.EpisodeID, ownerID)
+	if row == nil || !virtualCandidateVerdictActive(row.FailedAt, time.Now()) {
+		return nil
+	}
+	return fmt.Errorf("candidate %s is marked failed", candidateURI)
 }
 
 // lookupVirtualCandidateRow resolves the catalog row that owns a concrete
@@ -2237,16 +2427,21 @@ func (h *PlaybackHandler) lookupVirtualCandidateRow(ctx context.Context, candida
 // the original URI carried no stale result= pick, or when no substitute
 // candidate can be resolved, so the caller preserves its original error.
 //
-// Under a session binding it refuses to swap the release unless the caller
-// explicitly declared candidate rotation: it first re-resolves the session's
-// own candidate (reusing the same release), and otherwise returns nil so the
-// caller surfaces the original failure. A sibling is only tried when rotation
-// was declared or the resolve is not session-bound.
+// elig is the explicit release-identity contract built by the caller from the
+// resolve intent (session binding + explicit rotation) and the anchored
+// release. Under a session binding the fallback refuses to swap the release
+// unless rotation was declared: it first re-resolves the session's own
+// candidate (reusing the same release), and otherwise returns nil so the caller
+// surfaces the original failure. A sibling is only tried when rotation was
+// declared or the resolve is not session-bound, and the same check is enforced
+// again before a replacement is persisted, so there is no path that resolves or
+// adopts a sibling outside the declared intent.
 func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 	ctx context.Context,
 	file *models.MediaFile,
 	userID int,
 	profileID string,
+	elig virtualFallbackEligibility,
 ) *resolvedVirtualPlaybackSource {
 	parsed, _ := url.Parse(file.FilePath)
 	if parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) == "" {
@@ -2278,12 +2473,14 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 
 	// The session-bound release is the one the viewer chose. A stale or dead
 	// session candidate must not be silently replaced by a sibling release:
-	// only an explicit candidate rotation may substitute. The rotation and
-	// session-binding intents are carried on ctx by resolveVirtualPlaybackSource
-	// and forwarded by the detailed-resolver adapter; they are read here, never
-	// inferred from the candidate list.
+	// only an explicit candidate rotation may substitute. The intent arrives
+	// as the eligibility contract, never inferred from the candidate list.
 	sessionID := virtualResultCandidateID(file.FilePath)
-	if VirtualSessionBinding(ctx) && !VirtualCandidateRotationAllowed(ctx) {
+	if !elig.allowsSibling() {
+		if sessionID == "" {
+			// No anchored release to refresh and siblings are forbidden.
+			return nil
+		}
 		sessionCandidate := VirtualPlaybackStream{
 			ID:                  sessionID,
 			URI:                 file.FilePath,
@@ -2293,7 +2490,7 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 			CodecAudio:          file.CodecAudio,
 			HDR:                 mediaFileHDRString(file),
 		}
-		resolved, err := h.resolveVirtualCandidateSource(ctx, file, sessionCandidate, userID, profileID)
+		resolved, err := h.resolveVirtualCandidateSource(ctx, file, sessionCandidate, userID, profileID, elig.allowFailed)
 		switch {
 		case err == nil && (sessionID == "" || virtualResultCandidateID(resolved.URI) == sessionID):
 			// Reuse the session's own resolved URL: re-resolving the chosen
@@ -2323,16 +2520,27 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		if stream.URI == "" || stream.URI == file.FilePath {
 			continue
 		}
+		// Re-enforce the release-identity contract at the point of deciding to
+		// contact a sibling; a caller cannot reach the loop with a forbidden
+		// intent, but the check is the invariant, not the branch above.
+		if !elig.allowsSibling() {
+			return nil
+		}
 		attempts++
 		if attempts > maxAttempts {
 			break
 		}
-		resolved, err := h.resolveVirtualCandidateSource(ctx, file, stream, userID, profileID)
+		resolved, err := h.resolveVirtualCandidateSource(ctx, file, stream, userID, profileID, elig.allowFailed)
 		if err == nil {
 			slog.InfoContext(ctx, "virtual stale fallback: resolved substitute", "component", "api", "original", file.FilePath, "substitute", stream.URI)
 			// Persist the substitute's path and probed metadata back to the
 			// catalog row in a single CAS-fenced save, replacing the stale
-			// result= URI the next start would have to re-list.
+			// result= URI the next start would have to re-list. The identity
+			// contract is enforced once more here: a session-bound request
+			// must never adopt a replacement it was not allowed to resolve.
+			if !elig.allowsSibling() {
+				return nil
+			}
 			if resolved.File != nil && resolved.Provenance == ProbeProvenanceVerified && h.VirtualFileSaver != nil {
 				snap := snapshotVirtualRow(file)
 				if _, saveErr := h.VirtualFileSaver(ctx, models.VirtualFilePersistArgs{
@@ -2373,6 +2581,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	candidate VirtualPlaybackStream,
 	userID int,
 	profileID string,
+	allowFailed bool,
 ) (*resolvedVirtualPlaybackSource, error) {
 	ownerID := candidate.OwnerInstallationID
 	if ownerID <= 0 {
@@ -2385,13 +2594,13 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	// while the caller persists this stream's URI.
 	ctx = withVirtualSessionBindingV3(ctx, true)
 	// A stale-source fallback must never hand back a candidate the serve layer
-	// already marked failed: the verdict is active until a real delivery clears
-	// it. The main candidate loop checks the resolved row's failed_at before
-	// serving; this fallback path runs after those failures and used to skip
-	// that check, so a sibling with an active verdict could be selected as the
-	// substitute. Resolve the candidate's own row and refuse it here.
-	if row := h.lookupVirtualCandidateRow(ctx, candidate.URI, file.ContentID, file.EpisodeID, ownerID); row != nil && row.FailedAt != nil {
-		return nil, fmt.Errorf("candidate %s is marked failed", candidate.URI)
+	// already marked failed. Check the candidate before contacting the provider
+	// and again on the identity the resolver actually returned, because a
+	// fresh-selection fall-through or a dedup keeper can substitute a sibling
+	// whose row carries an active verdict. The explicit retry policy
+	// (allowFailed) is the only bypass.
+	if err := h.virtualCandidateVerdictError(ctx, candidate.URI, file, ownerID, allowFailed); err != nil {
+		return nil, err
 	}
 	var streamURL string
 	if h.VirtualMediaDetailedResolver != nil {
@@ -2417,6 +2626,13 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		candidate.RequestHeaders = nil
 	} else {
 		return nil, errors.New("virtual playback resolver is not configured")
+	}
+	// The resolver may have substituted a different release. The verdict is
+	// part of the release's identity, so re-check the identity that will be
+	// served and, if it wins, adopted. A failed substitute is refused here
+	// rather than persisted by the caller.
+	if err := h.virtualCandidateVerdictError(ctx, candidate.URI, file, ownerID, allowFailed); err != nil {
+		return nil, err
 	}
 	transient := *file
 	transient.FilePath = candidate.URI
@@ -2577,6 +2793,15 @@ func virtualResultCandidateID(virtualPath string) string {
 // virtual stream enters playback with no embedded or external subtitle tracks.
 // Results are downloaded and associated with the file so they appear in the
 // player's subtitle selector without blocking playback start.
+//
+// Admission takes two slots before the goroutine is spawned: one from the
+// aggregate detached gate and one from the tighter subtitle-search gate. Both
+// are held until the callback returns — never released merely because the
+// search context expired — so a provider that ignores cancellation cannot have
+// a replacement goroutine admitted behind it. Shutdown cancels the search
+// context but does not touch the slots; the callback's deferred cleanup is the
+// only place they are released, which keeps "capacity reserved until the
+// callback exits" true even on the non-cooperative path.
 func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 	ctx context.Context,
 	file *models.MediaFile,
@@ -2600,22 +2825,46 @@ func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 			"component", "api", "content_id", file.ContentID)
 		return
 	}
+	slots := h.subtitleSearchGate()
+	if !slots.tryAcquire() {
+		gate.release()
+		slog.WarnContext(ctx, "virtual subtitle search skipped: subtitle search budget exhausted",
+			"component", "api", "content_id", file.ContentID, "cap", virtualSubtitleSearchCap)
+		return
+	}
+	if h.SubtitleSearchInFlight == nil {
+		h.SubtitleSearchInFlight = &sync.Map{}
+	}
 	// Dedupe: one in-flight search per file. Rapid replays or multiple
 	// candidates resolving the same file must not hammer subtitle providers.
 	if _, loaded := h.SubtitleSearchInFlight.LoadOrStore(searchKey, struct{}{}); loaded {
+		slots.release()
 		gate.release()
 		return
 	}
 	go func() {
+		// Release only after the callback has actually returned. A context
+		// expiry inside the callback must not free the slot: the goroutine may
+		// still be in a provider RPC, and admitting a replacement there is the
+		// unbounded-replacement bug this ordering avoids.
 		defer func() {
 			h.SubtitleSearchInFlight.Delete(searchKey)
+			slots.release()
 			gate.release()
 		}()
 		// The search outlives the request but is bounded and follows the
-		// service lifecycle, so a hung provider cannot leak the goroutine and
-		// shutdown stops it.
+		// service lifecycle, so a hung provider cannot leak the goroutine
+		// forever and shutdown stops it. The context carries a finite deadline
+		// through to the provider search/download and the persistence callback.
 		searchCtx, searchCancel := h.virtualDetachedContext(ctx, virtualSubtitleSearchBudget)
 		defer searchCancel()
+		// Re-check after admission: a shutdown or budget that fired while the
+		// goroutine was being scheduled must not start new provider I/O.
+		if err := searchCtx.Err(); err != nil {
+			slog.DebugContext(ctx, "virtual subtitle search not started: context already done",
+				"component", "api", "content_id", file.ContentID, "error", err)
+			return
+		}
 		h.VirtualSubtitleSearcher(
 			searchCtx,
 			file.ContentID,

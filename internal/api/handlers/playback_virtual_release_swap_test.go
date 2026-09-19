@@ -49,10 +49,9 @@ func TestFallbackResolveStaleVirtualSourceRefusesSessionReleaseSwapWithoutRotati
 	}
 	file := &models.MediaFile{ID: 10, ContentID: "movie-tt-swap", FilePath: sessionURI, VirtualOwnerInstallationID: 5}
 
-	ctx := withVirtualSessionBindingV3(context.Background(), true)
-	ctx = withVirtualCandidateRotationV3(ctx, false)
+	ctx := context.Background()
 
-	result := h.fallbackResolveStaleVirtualSource(ctx, file, 1, "profile-1")
+	result := h.fallbackResolveStaleVirtualSource(ctx, file, 1, "profile-1", virtualFallbackEligibility{sessionBound: true, rotationAllowed: false})
 	if result != nil {
 		t.Fatalf("fallback returned %#v, want nil (no silent release swap)", result)
 	}
@@ -96,10 +95,9 @@ func TestFallbackResolveStaleVirtualSourceReusesSessionCandidate(t *testing.T) {
 	}
 	file := &models.MediaFile{ID: 11, ContentID: "movie-tt-reuse", FilePath: sessionURI, VirtualOwnerInstallationID: 5}
 
-	ctx := withVirtualSessionBindingV3(context.Background(), true)
-	ctx = withVirtualCandidateRotationV3(ctx, false)
+	ctx := context.Background()
 
-	result := h.fallbackResolveStaleVirtualSource(ctx, file, 1, "profile-1")
+	result := h.fallbackResolveStaleVirtualSource(ctx, file, 1, "profile-1", virtualFallbackEligibility{sessionBound: true, rotationAllowed: false})
 	if result == nil {
 		t.Fatal("fallback returned nil, want the re-resolved session candidate")
 	}
@@ -150,9 +148,9 @@ func TestFallbackResolveStaleVirtualSourceSkipsFailedSubstitute(t *testing.T) {
 	file := &models.MediaFile{ID: 12, ContentID: "movie-tt-failed", FilePath: sessionURI, VirtualOwnerInstallationID: 5}
 
 	// Rotation declared: the fallback is allowed to substitute a sibling.
-	ctx := withVirtualCandidateRotationV3(context.Background(), true)
+	ctx := context.Background()
 
-	result := h.fallbackResolveStaleVirtualSource(ctx, file, 1, "profile-1")
+	result := h.fallbackResolveStaleVirtualSource(ctx, file, 1, "profile-1", virtualFallbackEligibility{sessionBound: true, rotationAllowed: true})
 	if result == nil {
 		t.Fatal("fallback returned nil, want the healthy substitute")
 	}

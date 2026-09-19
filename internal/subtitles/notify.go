@@ -40,12 +40,23 @@ func DownloadBestMatches(
 	if downloader == nil || len(req.Languages) == 0 {
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	results, err := downloader.Search(ctx, req)
 	if err != nil || results == nil || len(results.Results) == 0 {
 		return
 	}
 	for _, lang := range req.Languages {
+		// Cancellation or a deadline that fired between provider calls must
+		// stop the loop before the next network round-trip, not after it.
+		if ctx.Err() != nil {
+			return
+		}
 		for _, r := range results.Results {
+			if ctx.Err() != nil {
+				return
+			}
 			if !strings.EqualFold(r.Language, lang) {
 				continue
 			}

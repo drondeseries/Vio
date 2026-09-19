@@ -591,7 +591,7 @@ func TestFallbackResolveStaleVirtualSourceRespectsMaxFailoverLimit(t *testing.T)
 	}
 
 	file := &models.MediaFile{ID: 10, ContentID: "movie-1", FilePath: "virtual://movie/1?result=dead"}
-	result := h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1")
+	result := h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1", virtualFallbackEligibility{})
 	if result != nil {
 		t.Fatalf("result = %#v, want nil after all attempts fail", result)
 	}
@@ -646,7 +646,7 @@ func TestFallbackResolveStaleVirtualSourcePersistsSubstituteMetadata(t *testing.
 	}
 
 	file := &models.MediaFile{ID: 10, ContentID: "movie-1", FilePath: "virtual://movie/1?result=dead"}
-	result := h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1")
+	result := h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1", virtualFallbackEligibility{})
 	if result == nil {
 		t.Fatal("fallback returned nil, want resolved substitute")
 	}
