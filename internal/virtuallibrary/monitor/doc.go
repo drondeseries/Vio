@@ -47,7 +47,13 @@
 // stale-refresh error) is logged, counted as pending, and left queued for
 // a later Run. An item's source is reconciled only after every item in it
 // was evaluated successfully this pass, so a persistently failing provider
-// never turns an incomplete keep set into destructive reconciliation. Stale
+// never turns an incomplete keep set into destructive reconciliation. On top
+// of the per-source condition, reconciliation now requires full-cycle
+// evidence: the pass must have begun at the first queue item, reached the
+// end, and not been cut short by its budget or context. The monitor attests
+// that with ReconcileEvidence (FullCycle plus the source and queue counts)
+// and the catalog refuses destructive reconciliation without it, so a
+// truncated or replaced queue cannot authorise deleting live media. Stale
 // Prowlarr/AltMount refresh failures are warn-and-continue, never fatal.
 //
 // Duplicate submissions converge by key but with gaps. Queue keys are

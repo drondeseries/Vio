@@ -9,7 +9,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
-	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 const maxVirtualLabelLen = 256
@@ -96,10 +95,11 @@ func (s *Service) Variants(ctx context.Context, virtualPath string, mediaType st
 // variantsFromProfiles produces one VirtualPlaybackVariant per configured
 // quality profile, validating labels and building profile-aware URIs.
 func (s *Service) variantsFromProfiles(ctx context.Context, virtualPath string, cfg quality.QualityConfig) ([]catalog.VirtualPlaybackVariant, error) {
-	// Resolve candidates once; individual profiles will sort/filter at
-	// playback time. We still need a live call to validate the URI is sane.
-	candidates, _, _, err := s.Resolver.GetCandidates(ctx, virtualPath)
-	if err != nil {
+	// Resolve candidates once so the URI is validated against a live provider
+	// answer. Ranking and filtering happen at playback time (ResolveDetailed
+	// and ListStreams), not here; the old per-profile sort ran on a discarded
+	// copy and never reached a client.
+	if _, _, _, err := s.Resolver.GetCandidates(ctx, virtualPath); err != nil {
 		return nil, err
 	}
 
@@ -109,10 +109,6 @@ func (s *Service) variantsFromProfiles(ctx context.Context, virtualPath string, 
 			return nil, err
 		}
 		label := strings.TrimSpace(p.Label)
-		// For each profile, sort candidates so the quality hint is available.
-		candidatesCopy := cloneStreamCandidates(candidates)
-		quality.SortCandidatesForProfile(candidatesCopy, p, cfg.CustomFormats)
-
 		variants = append(variants, catalog.VirtualPlaybackVariant{
 			VirtualURI:          buildProfileURI(virtualPath, label),
 			Label:               label,
@@ -171,29 +167,4 @@ func buildProfileURI(virtualPath, label string) string {
 	query.Del("result")
 	parsed.RawQuery = query.Encode()
 	return parsed.String()
-}
-
-// cloneStreamCandidates returns a shallow copy of the candidate slice with
-// independent inner slices (AudioLanguages, SubtitleLanguages, RequestHeaders,
-// ProxyHeaders) so sorting one profile's copy does not affect another.
-func cloneStreamCandidates(candidates []resolver.StreamCandidate) []resolver.StreamCandidate {
-	out := make([]resolver.StreamCandidate, len(candidates))
-	for i, c := range candidates {
-		out[i] = c
-		out[i].AudioLanguages = append([]string(nil), c.AudioLanguages...)
-		out[i].SubtitleLanguages = append([]string(nil), c.SubtitleLanguages...)
-		if c.RequestHeaders != nil {
-			out[i].RequestHeaders = make(map[string]string, len(c.RequestHeaders))
-			for k, v := range c.RequestHeaders {
-				out[i].RequestHeaders[k] = v
-			}
-		}
-		if c.BehaviorHints.ProxyHeaders != nil {
-			out[i].BehaviorHints.ProxyHeaders = make(map[string]any, len(c.BehaviorHints.ProxyHeaders))
-			for k, v := range c.BehaviorHints.ProxyHeaders {
-				out[i].BehaviorHints.ProxyHeaders[k] = v
-			}
-		}
-	}
-	return out
 }

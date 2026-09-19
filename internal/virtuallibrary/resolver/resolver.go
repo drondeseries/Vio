@@ -41,6 +41,14 @@ const (
 	maxResponseBytes         = 4 << 20
 	maxCandidateCacheEntries = 256
 	maxCandidateCacheBytes   = 16 << 20
+	// maxProviderCandidates is the parse-time bound, deliberately far above the
+	// selectable cap. Deduplication and failure classification run at
+	// ingestion, so a provider that returns one candidate per file of many
+	// multi-file releases must be parsed in full before the per-release collapse
+	// and the maxVirtualCandidates truncation. Without it, a flood of per-file
+	// variants filled the 50-slot list before dedup could merge them.
+	maxProviderCandidates = 500
+	// maxVirtualCandidates is the selectable/version-list cap after dedup.
 	maxVirtualCandidates     = 50
 	maxManifestResponseBytes = 256 << 10
 
@@ -298,18 +306,19 @@ func cloneCandidates(candidates []StreamCandidate) []StreamCandidate {
 	return out
 }
 
-// preferConfirmedCandidates applies the source-of-truth state to the ranked
-// candidate list: releases AltMount reports as failed are dropped, and
-// completed/imported releases are stably moved ahead of unconfirmed ones.
-// Order within each group is preserved, so the operator's quality ranking
-// still decides which confirmed release wins. Candidates reaching this point
-// already passed the profile and custom-format filters, so confirmation never
-// overrides an explicit reject.
+// preferConfirmedCandidates applies the source-of-truth state to the candidate
+// list at ingestion and again on every serve: it honors the provider's cached
+// badge, runs the classifier (AltMount's authoritative completed/failed state,
+// then Prowlarr's confirmation), drops releases AltMount reports as failed, and
+// stably moves confirmed releases ahead of unconfirmed ones. Order within each
+// group is preserved, so the quality ranking still decides which confirmed
+// release wins. Classification runs before dedup so a failed variant can never
+// shadow a live duplicate of the same release.
 //
-// After classification the list is deduplicated: one torrent surfaces one
-// candidate per contained file, and those per-file variants share a release
-// identity. Collapsing them keeps the version list to one entry per playable
-// release; the confirmed variant wins its group when one exists.
+// Deduplication collapses the per-file variants of one release to a single
+// candidate; the confirmed variant wins its group when one exists. The custom
+// format verdict is applied later (rankCandidatesForVirtualPath), so reject
+// never interacts with confirmation here.
 func (r *Resolver) preferConfirmedCandidates(candidates []StreamCandidate) []StreamCandidate {
 	if len(candidates) == 0 {
 		return candidates
@@ -327,6 +336,21 @@ func (r *Resolver) preferConfirmedCandidates(candidates []StreamCandidate) []Str
 	candidates = dropFailedCandidates(candidates)
 	candidates = dedupeCandidates(candidates)
 	return stablePartitionCandidates(candidates)
+}
+
+// processCandidates runs the per-answer ingestion pipeline: apply AltMount's
+// badge/classifier state and Prowlarr's confirmation, drop releases the source
+// of truth reports failed, collapse per-file variants to one candidate per
+// release, move confirmed releases ahead of unconfirmed ones, and truncate to
+// the selectable cap. It is idempotent and is called both before the cache
+// store and on every serve, so a classifier state change takes effect without
+// waiting for the cache TTL.
+func (r *Resolver) processCandidates(candidates []StreamCandidate) []StreamCandidate {
+	candidates = r.preferConfirmedCandidates(candidates)
+	if len(candidates) > maxVirtualCandidates {
+		candidates = candidates[:maxVirtualCandidates]
+	}
+	return candidates
 }
 
 // dropFailedCandidates removes releases the source of truth reports as dead
@@ -531,7 +555,19 @@ func (r *Resolver) GetCandidatesFreshUnbounded(ctx context.Context, virtualPath 
 	return r.getCandidates(ctx, virtualPath, true, true)
 }
 
+// getCandidates serves the candidate list and re-runs the ingestion pipeline
+// on every answer. The classifier is a live source of truth, so a release that
+// completed or failed since the cache entry was written is reflected
+// immediately instead of after the TTL.
 func (r *Resolver) getCandidates(ctx context.Context, virtualPath string, forceRefresh bool, bypassFloor bool) ([]StreamCandidate, string, string, error) {
+	candidates, mediaType, mediaID, err := r.getCandidatesRaw(ctx, virtualPath, forceRefresh, bypassFloor)
+	if err != nil {
+		return candidates, mediaType, mediaID, err
+	}
+	return r.processCandidates(candidates), mediaType, mediaID, nil
+}
+
+func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, forceRefresh bool, bypassFloor bool) ([]StreamCandidate, string, string, error) {
 	mediaType, mediaID, err := parseVirtualPath(virtualPath)
 	if err != nil {
 		return nil, mediaType, mediaID, err
@@ -581,6 +617,16 @@ func (r *Resolver) getCandidates(ctx context.Context, virtualPath string, forceR
 			}
 		}
 		if released, airDate := releaseGate.IsReleased(mediaType, imdbID, season, episode); !released {
+			r.mu.RLock()
+			logger := r.logger
+			r.mu.RUnlock()
+			if logger != nil {
+				attrs := []any{"media_type", mediaType, "media_id", imdbID}
+				if airDate != nil && !airDate.IsZero() {
+					attrs = append(attrs, "air_date", airDate.UTC().Format(time.RFC3339))
+				}
+				logger.Warn("virtual playback blocked by the release gate", attrs...)
+			}
 			return nil, mediaType, mediaID, newUnreleasedError(imdbID, airDate, mediaType)
 		}
 	}
@@ -836,11 +882,16 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 			}
 			enrich(&stream)
 			validCandidates = append(validCandidates, stream)
-			if len(validCandidates) >= maxVirtualCandidates {
+			if len(validCandidates) >= maxProviderCandidates {
 				break
 			}
 		}
 	}
+	// Ingestion pipeline before the cache store: badge + classify (AltMount
+	// then Prowlarr) -> drop SourceFailed -> dedupe -> confirmed-first stable
+	// partition -> truncate to the selectable cap. Dedup runs on the full
+	// provider answer, so one multi-file release cannot flood the list.
+	validCandidates = r.processCandidates(validCandidates)
 	now := time.Now()
 	r.storeCandidateCache(cacheKey, validCandidates, now.Add(config.CacheTTL), now, generation)
 	r.mu.RLock()

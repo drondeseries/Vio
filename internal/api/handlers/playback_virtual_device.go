@@ -26,6 +26,50 @@ func (h *PlaybackHandler) requestDeviceCapabilities(r *http.Request) (plugins.De
 	return h.DeviceCapabilitySource.DeviceCapabilitiesFor(r.Context(), apimw.GetProfileID(r.Context()), requestDeviceID(r))
 }
 
+// finalizeVirtualCandidateOrder applies the handler-side candidate ordering:
+// device rank, then the explicit quality-rung reorder, then a stable
+// rejected-last partition. The partition runs last so a custom-format-rejected
+// candidate can never sit at index 0 even when device fit would promote it
+// (plugins.ScoreCandidate clamps QualityScore, so reject cannot be expressed as
+// a low score alone). With a single candidate the input is returned unchanged:
+// a lone rejected stream is a last-resort choice, not an ordering decision.
+func (h *PlaybackHandler) finalizeVirtualCandidateOrder(r *http.Request, streams []VirtualPlaybackStream, qualityPreference string, bandwidthCapKbps int) []VirtualPlaybackStream {
+	if len(streams) <= 1 {
+		return streams
+	}
+	ranked, _ := h.rankVirtualCandidatesForDevice(r, streams)
+	ranked = reorderVirtualCandidatesForQuality(ranked, qualityPreference, bandwidthCapKbps)
+	return partitionVirtualStreamsAcceptedFirst(ranked)
+}
+
+// partitionVirtualStreamsAcceptedFirst stably moves rejected streams behind
+// accepted ones, preserving the ranked order within each group. Accepted
+// always sort before rejected; a rejected stream stays selectable as a
+// last resort.
+func partitionVirtualStreamsAcceptedFirst(streams []VirtualPlaybackStream) []VirtualPlaybackStream {
+	rejected := 0
+	for _, stream := range streams {
+		if stream.Rejected {
+			rejected++
+		}
+	}
+	if rejected == 0 || rejected == len(streams) {
+		return streams
+	}
+	ordered := make([]VirtualPlaybackStream, 0, len(streams))
+	for _, stream := range streams {
+		if !stream.Rejected {
+			ordered = append(ordered, stream)
+		}
+	}
+	for _, stream := range streams {
+		if stream.Rejected {
+			ordered = append(ordered, stream)
+		}
+	}
+	return ordered
+}
+
 // rankVirtualCandidatesForDevice ranks the candidate list for the requesting
 // device using its persisted capability profile. When no profile is known the
 // provider returns candidates unchanged (device order), preserving the

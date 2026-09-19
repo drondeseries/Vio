@@ -542,7 +542,13 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	if maxSize <= 0 && p.MaxSizeGB > 0 {
 		maxSize = int64(p.MaxSizeGB * 1e9)
 	}
-	if minSize > 0 && c.FileSize > 0 && c.FileSize < minSize {
+	// Size bounds are deliberately asymmetric for an unknown (0) size. A
+	// minimum is a requirement the candidate must prove it meets, so an
+	// unknown size fails it; a maximum is a ceiling only a known size can
+	// exceed, so an unknown size passes it. A min-size profile therefore never
+	// admits a release whose size could not be parsed, while a max-size profile
+	// never rejects purely for missing metadata.
+	if minSize > 0 && (c.FileSize <= 0 || c.FileSize < minSize) {
 		return false
 	}
 	if maxSize > 0 && c.FileSize > maxSize {
@@ -556,14 +562,16 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	}
 	if p.VisualTag != "" {
 		matchedTag := false
-		lowerTag := strings.ToLower(p.VisualTag)
 		for _, vt := range c.VisualTags {
-			if strings.EqualFold(vt, lowerTag) {
+			if strings.EqualFold(strings.TrimSpace(vt), strings.TrimSpace(p.VisualTag)) {
 				matchedTag = true
 				break
 			}
 		}
-		if !matchedTag && !strings.Contains(strings.ToLower(fullText), lowerTag) {
+		// The text fallback uses the package's token/boundary matcher, not a
+		// substring contains: a plain Contains made "dv" match "DVD-Rip".
+		// Exact parsed VisualTags matching stays authoritative.
+		if !matchedTag && !matchKeywordOrPattern(fullText, p.VisualTag) {
 			return false
 		}
 	}
@@ -576,7 +584,10 @@ func CustomFormatScore(candidate stream.StreamCandidate, formats []CustomFormat)
 	return customFormatScore(candidate, formats)
 }
 
-func customFormatScore(candidate stream.StreamCandidate, formats []CustomFormat) (int, bool) {
+// customFormatMatchText is the text a custom format is matched against: the
+// display fields plus the filename and URL in their decoded spellings, so an
+// encoded release name still matches.
+func customFormatMatchText(candidate stream.StreamCandidate) string {
 	text := candidate.Name + " " + candidate.Description + " " + candidate.Title + " " + candidate.URL
 	if candidate.BehaviorHints.Filename != "" {
 		text += " " + candidate.BehaviorHints.Filename
@@ -593,33 +604,41 @@ func customFormatScore(candidate stream.StreamCandidate, formats []CustomFormat)
 	if u, err := url.PathUnescape(candidate.URL); err == nil && u != "" {
 		text += " " + u
 	}
+	return text
+}
+
+// formatMatchesText reports whether one custom format matches the candidate
+// text, applying the rule's Invert flag.
+func formatMatchesText(format CustomFormat, text string) bool {
+	pattern := format.EffectivePattern()
+	if pattern == "" {
+		return false
+	}
+	var matched bool
+	if strings.ToLower(strings.TrimSpace(format.PatternType)) == patternTypeToken {
+		matched = matchKeywordOrPattern(text, pattern)
+	} else {
+		matcher := format.Compiled()
+		if matcher == nil {
+			var err error
+			matcher, err = compileFormatRegex(pattern)
+			if err != nil {
+				return false
+			}
+		}
+		matched = matcher.MatchString(text)
+	}
+	if format.Invert {
+		matched = !matched
+	}
+	return matched
+}
+
+func customFormatScore(candidate stream.StreamCandidate, formats []CustomFormat) (int, bool) {
+	text := customFormatMatchText(candidate)
 	score := 0
 	for _, format := range formats {
-		if !format.IsEnabled() {
-			continue
-		}
-		pattern := format.EffectivePattern()
-		if pattern == "" {
-			continue
-		}
-		var matched bool
-		if strings.ToLower(strings.TrimSpace(format.PatternType)) == patternTypeToken {
-			matched = matchKeywordOrPattern(text, pattern)
-		} else {
-			matcher := format.Compiled()
-			if matcher == nil {
-				var err error
-				matcher, err = compileFormatRegex(pattern)
-				if err != nil {
-					continue
-				}
-			}
-			matched = matcher.MatchString(text)
-		}
-		if format.Invert {
-			matched = !matched
-		}
-		if !matched {
+		if !format.IsEnabled() || !formatMatchesText(format, text) {
 			continue
 		}
 		// AltMount parity: scores at or below the discard line reject the
@@ -630,6 +649,24 @@ func customFormatScore(candidate stream.StreamCandidate, formats []CustomFormat)
 		score += format.Score
 	}
 	return score, false
+}
+
+// RejectingFormatNames returns the names of the enabled custom formats that
+// reject a candidate (an explicit Reject rule or a score at/below the discard
+// line). It is diagnostic only: the resolver logs it when every candidate in a
+// set is rejected and the best rejected one has to be used.
+func RejectingFormatNames(candidate stream.StreamCandidate, formats []CustomFormat) []string {
+	text := customFormatMatchText(candidate)
+	var names []string
+	for _, format := range formats {
+		if !format.IsEnabled() || !formatMatchesText(format, text) {
+			continue
+		}
+		if format.Reject || format.Score <= discardScoreThreshold {
+			names = append(names, strings.TrimSpace(format.Name))
+		}
+	}
+	return names
 }
 
 // compileFormatRegex compiles a custom-format regex case-insensitively,
@@ -726,7 +763,7 @@ func sortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProf
 		return
 	}
 	if len(candidates) == 1 {
-		candidates[0].QualityScore, _ = customFormatScore(candidates[0], formats)
+		candidates[0].QualityScore, candidates[0].CustomFormatRejected = customFormatScore(candidates[0], formats)
 		return
 	}
 	type scoredCandidate struct {
@@ -737,6 +774,7 @@ func sortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProf
 	for idx := range candidates {
 		score, reject := customFormatScore(candidates[idx], formats)
 		candidates[idx].QualityScore = score
+		candidates[idx].CustomFormatRejected = reject
 		scored[idx] = scoredCandidate{
 			candidate: candidates[idx],
 			rejected:  reject,

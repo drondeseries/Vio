@@ -47,6 +47,10 @@ type PlaybackStream struct {
 	OwnerInstallationID int
 	Visible             bool
 	VisibilitySpecified bool
+	// Rejected marks a candidate a configured custom format rejects. It is a
+	// transient ranking signal, recomputed on every list; reject means
+	// rank-last and last-resort selectable, never a hard drop.
+	Rejected bool
 }
 
 // validateStreamURL checks structural syntax and enforces SSRF protection
@@ -91,6 +95,60 @@ func withResultKey(virtualPath, candID string) string {
 	return parsed.String()
 }
 
+// qualityProfileForPath returns the quality profile selected by a virtual
+// URI's ?profile= label. It returns the zero profile when profiles are
+// disabled or the label is unknown; ranking still applies custom formats with
+// a zero profile, it just leaves the profile-specific tie-breaks inert.
+func (s *Service) qualityProfileForPath(virtualPath string) quality.QualityProfile {
+	if s == nil || !s.cfg.Quality.EnableProfiles {
+		return quality.QualityProfile{}
+	}
+	parsed, err := url.Parse(virtualPath)
+	if err != nil || parsed == nil {
+		return quality.QualityProfile{}
+	}
+	label := strings.TrimSpace(parsed.Query().Get("profile"))
+	if label == "" {
+		return quality.QualityProfile{}
+	}
+	for _, p := range s.cfg.Quality.Profiles {
+		if strings.EqualFold(strings.TrimSpace(p.Label), label) {
+			return p
+		}
+	}
+	return quality.QualityProfile{}
+}
+
+// rankCandidatesForVirtualPath is the single ranking step shared by
+// ListStreams and ResolveDetailed. It scores custom formats, records the
+// rejected verdict on each candidate, and orders accepted before rejected,
+// then by score, resolution, source, language and OriginalIndex. It mutates
+// the slice in place; the resolver hands out a private clone per call, so the
+// caller owns it.
+func (s *Service) rankCandidatesForVirtualPath(virtualPath string, candidates []stream.StreamCandidate) {
+	quality.SortCandidatesForProfile(candidates, s.qualityProfileForPath(virtualPath), s.cfg.Quality.CustomFormats)
+}
+
+// warnIfAllRejected logs once when every candidate in the set is rejected by
+// custom formats. Reject is rank-last, last-resort selectable, never a hard
+// drop, so the caller still uses the best rejected candidate; the Warn tells
+// the operator that no accepted release was available.
+func (s *Service) warnIfAllRejected(virtualPath string, candidates []stream.StreamCandidate) {
+	if s == nil || s.logger == nil || len(candidates) == 0 {
+		return
+	}
+	for _, c := range candidates {
+		if !c.CustomFormatRejected {
+			return
+		}
+	}
+	profile := s.qualityProfileForPath(virtualPath)
+	s.logger.Warn("every virtual candidate is rejected by custom formats; using the best rejected stream",
+		"profile", strings.TrimSpace(profile.Label),
+		"candidates", len(candidates),
+		"rejected_by", quality.RejectingFormatNames(candidates[0], s.cfg.Quality.CustomFormats))
+}
+
 // Resolve resolves a virtual path to a concrete stream URL.
 func (s *Service) Resolve(ctx context.Context, virtualPath string) (string, error) {
 	res, err := s.ResolveDetailed(ctx, virtualPath, false, nil, "")
@@ -117,6 +175,9 @@ func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, erro
 //   - profile filtering applies if ?profile= is present and profiles are enabled;
 //   - excludedCandidateIDs are skipped;
 //   - preferredCandidateID is tried first;
+//   - a pin whose multi-file variant dedup collapsed resolves to the surviving
+//     keeper of that release (a file swap inside the release, never a release
+//     swap), because dedup preserves exactly one candidate per release;
 //   - every stream URL is validated against outbound SSRF.
 //
 // allowCandidateSubstitution gates the fallback that lets a pinned result= URI
@@ -145,10 +206,8 @@ func (s *Service) ResolveDetailed(
 
 	parsedURI, parseErr := url.Parse(virtualPath)
 	resultID := ""
-	profileLabel := ""
 	if parseErr == nil && parsedURI != nil {
 		resultID = parsedURI.Query().Get("result")
-		profileLabel = parsedURI.Query().Get("profile")
 	}
 
 	var (
@@ -169,45 +228,81 @@ func (s *Service) ResolveDetailed(
 		excluded[id] = struct{}{}
 	}
 
-	ordered := orderCandidates(candidates, preferredCandidateID)
+	if len(candidates) == 0 {
+		return ResolvedVirtualStream{}, fmt.Errorf("no streams available from provider")
+	}
 
-	// Filter by quality profile if specified in the URI
-	if profileLabel != "" && s.cfg.Quality.EnableProfiles {
-		var matchedProfile *quality.QualityProfile
-		for _, p := range s.cfg.Quality.Profiles {
-			if strings.EqualFold(p.Label, profileLabel) {
-				matchedProfile = &p
+	// Rank through the same helper ListStreams uses, so the version list and
+	// the resolver agree on order and on the rejected verdict. Reject is
+	// rank-last, last-resort selectable; an all-rejected set still resolves.
+	s.rankCandidatesForVirtualPath(virtualPath, candidates)
+	s.warnIfAllRejected(virtualPath, candidates)
+
+	profile := s.qualityProfileForPath(virtualPath)
+	profileActive := strings.TrimSpace(profile.Label) != ""
+
+	// A pin the profile removes is treated like an excluded pin: the resolver
+	// refuses it without an explicit rotation request rather than substituting
+	// a different release under the session binding.
+	pinProfileRemoved := false
+	if profileActive && resultID != "" {
+		for _, c := range candidates {
+			if stream.CandidateVariantID(c) == resultID {
+				pinProfileRemoved = !quality.MatchProfile(c, profile)
 				break
 			}
 		}
-		if matchedProfile != nil {
-			profileFiltered := make([]stream.StreamCandidate, 0, len(ordered))
-			for _, c := range ordered {
-				if quality.MatchProfile(c, *matchedProfile) {
-					profileFiltered = append(profileFiltered, c)
-				}
+	}
+	if profileActive {
+		filtered := make([]stream.StreamCandidate, 0, len(candidates))
+		for _, c := range candidates {
+			if quality.MatchProfile(c, profile) {
+				filtered = append(filtered, c)
 			}
-			if len(profileFiltered) > 0 {
-				ordered = profileFiltered
-			} else if !s.cfg.Quality.FallbackToAnyStream {
-				return ResolvedVirtualStream{}, fmt.Errorf("no stream matches profile %q", profileLabel)
+		}
+		if len(filtered) == 0 && !s.cfg.Quality.FallbackToAnyStream {
+			if s.logger != nil {
+				s.logger.Warn("virtual candidate set empty after profile filter",
+					"profile", strings.TrimSpace(profile.Label),
+					"total", len(candidates), "matched", 0, "fallback", false)
 			}
+			return ResolvedVirtualStream{}, fmt.Errorf("no stream matches profile %q", strings.TrimSpace(profile.Label))
+		}
+		if len(filtered) > 0 {
+			candidates = filtered
 		}
 	}
 
+	_, pinnedExcluded := excluded[resultID]
+	pinBlocked := resultID != "" && (pinnedExcluded || pinProfileRemoved)
+	// A blocked pin is only substitutable when the caller asked for candidate
+	// rotation. Otherwise refuse rather than hand back a different release
+	// under the same session binding.
+	if pinBlocked && !allowSubstitution {
+		return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q is excluded and candidate rotation was not requested", resultID)
+	}
+
+	ordered := orderCandidates(candidates, preferredCandidateID)
+
 	var lastErr error
-	for _, c := range ordered {
+	// tryCandidate returns the resolved stream for one candidate, or false when
+	// the candidate is excluded, is the blocked pin, does not satisfy
+	// requirePin, or fails URL validation.
+	tryCandidate := func(c stream.StreamCandidate, requirePin bool) (ResolvedVirtualStream, bool) {
 		id := stream.CandidateVariantID(c)
 		if _, skip := excluded[id]; skip {
-			continue
+			return ResolvedVirtualStream{}, false
 		}
-		if resultID != "" && id != resultID {
-			continue
+		if pinBlocked && id == resultID {
+			return ResolvedVirtualStream{}, false
+		}
+		if requirePin && id != resultID {
+			return ResolvedVirtualStream{}, false
 		}
 		validated, validateErr := s.validateStreamURL(ctx, c.URL)
 		if validateErr != nil {
 			lastErr = validateErr
-			continue
+			return ResolvedVirtualStream{}, false
 		}
 		return ResolvedVirtualStream{
 			URL:            validated,
@@ -215,34 +310,24 @@ func (s *Service) ResolveDetailed(
 			CandidateID:    id,
 			RequestHeaders: c.RequestHeaders,
 			ExpiresAt:      c.ExpiresAt,
-		}, nil
+		}, true
 	}
 
-	// A pinned candidate the caller explicitly excluded is only substitutable
-	// when the caller asked for candidate rotation. Otherwise refuse rather
-	// than hand back a different release under the same session binding.
-	if _, pinnedExcluded := excluded[resultID]; resultID != "" && pinnedExcluded && !allowSubstitution {
-		return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q is excluded and candidate rotation was not requested", resultID)
-	}
-
-	// Pinned resultID not found/invalid: fall back to best alternative candidate
-	if resultID != "" && len(ordered) > 1 {
+	// The explicit pin is tried first even when rank or a custom-format reject
+	// would place it last: a pin overrides rank and reject.
+	if resultID != "" && !pinBlocked {
 		for _, c := range ordered {
-			id := stream.CandidateVariantID(c)
-			if _, skip := excluded[id]; skip {
-				continue
+			if resolved, ok := tryCandidate(c, true); ok {
+				return resolved, nil
 			}
-			validated, validateErr := s.validateStreamURL(ctx, c.URL)
-			if validateErr != nil {
-				continue
-			}
-			return ResolvedVirtualStream{
-				URL:            validated,
-				URI:            withResultKey(virtualPath, id),
-				CandidateID:    id,
-				RequestHeaders: c.RequestHeaders,
-				ExpiresAt:      c.ExpiresAt,
-			}, nil
+		}
+	}
+	// Ranked alternatives. A session preferredCandidateID is already promoted
+	// to the front by orderCandidates; a dead pin, or a blocked pin whose
+	// substitution was requested, resolves here.
+	for _, c := range ordered {
+		if resolved, ok := tryCandidate(c, false); ok {
+			return resolved, nil
 		}
 	}
 
@@ -261,6 +346,11 @@ func (s *Service) ListStreams(ctx context.Context, virtualPath string) ([]Playba
 	if err != nil {
 		return nil, err
 	}
+	// Rank here too: the handler's auto-pick walks ListStreams, not
+	// ResolveDetailed, so the profile/custom-format order and the rejected
+	// verdict must be carried on the stream records.
+	s.rankCandidatesForVirtualPath(virtualPath, candidates)
+	s.warnIfAllRejected(virtualPath, candidates)
 	streams := make([]PlaybackStream, 0, len(candidates))
 	for _, c := range candidates {
 		id := stream.CandidateVariantID(c)
@@ -274,6 +364,7 @@ func (s *Service) ListStreams(ctx context.Context, virtualPath string) ([]Playba
 			CodecAudio:          c.CodecAudio,
 			HasAtmos:            c.HasAtmos,
 			QualityScore:        c.QualityScore,
+			Rejected:            c.CustomFormatRejected,
 			RequestHeaders:      c.RequestHeaders,
 			ExpiresAt:           c.ExpiresAt,
 			HDR:                 c.HDR,

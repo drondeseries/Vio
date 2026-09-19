@@ -130,3 +130,31 @@ func TestParseStreamDetailsReleaseGroupINDNotIndonesian(t *testing.T) {
 		}
 	}
 }
+
+// TestIsMultiAudioRequiresMultiPattern proves the name-substring fallback is
+// gone: titles like "Multiplicity" and "The Multiverse" must not be advertised
+// as multi-audio releases, while a real MULTI token still is.
+func TestIsMultiAudioRequiresMultiPattern(t *testing.T) {
+	for _, name := range []string{
+		"The.Multiverse.2024.1080p.WEB-DL",
+		"Multiplicity.1996.1080p.WEB-DL",
+	} {
+		candidate := &StreamCandidate{Name: name}
+		ParseStreamMetadata(candidate)
+		if candidate.IsMultiAudio {
+			t.Fatalf("%q parsed as multi-audio through a name substring", name)
+		}
+	}
+
+	multi := &StreamCandidate{Name: "Movie.2024.MULTI.1080p.WEB-DL"}
+	ParseStreamMetadata(multi)
+	if !multi.IsMultiAudio {
+		t.Fatal("a real MULTI release was not parsed as multi-audio")
+	}
+
+	dual := &StreamCandidate{Name: "Movie.2024.Dual.Audio.1080p.WEB-DL"}
+	ParseStreamMetadata(dual)
+	if !dual.IsMultiAudio || !dual.IsDualAudio {
+		t.Fatal("a dual-audio release was not parsed as multi/dual audio")
+	}
+}

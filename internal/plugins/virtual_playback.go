@@ -121,6 +121,10 @@ type VirtualPlaybackStream struct {
 	OwnerInstallationID int               `json:"-"`
 	Visible             bool              `json:"-"`
 	VisibilitySpecified bool              `json:"-"`
+	// Rejected marks a candidate a configured custom format rejects. It is a
+	// transient ranking signal (rank-last, last-resort selectable), never part
+	// of the wire shape.
+	Rejected bool `json:"-"`
 }
 
 // Get* accessors satisfy plugins.VirtualStreamMetadata so the shared device

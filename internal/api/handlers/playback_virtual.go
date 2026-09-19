@@ -471,6 +471,12 @@ type VirtualPlaybackStream struct {
 	OwnerInstallationID int               `json:"-"`
 	Visible             bool              `json:"-"`
 	VisibilitySpecified bool              `json:"-"`
+	// Rejected marks a candidate a configured custom format rejects. It is a
+	// transient ranking signal: accepted candidates always sort before
+	// rejected ones, and the final ordering partition keeps a rejected
+	// candidate behind every accepted one so device fit can never promote it
+	// to the front. Rejected remains last-resort selectable.
+	Rejected bool `json:"-"`
 }
 
 // Get* accessors satisfy plugins.VirtualStreamMetadata so the shared device
@@ -747,9 +753,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if len(cached) > 0 {
 			// Cache holds the filtered, device-neutral candidate list; rank it
 			// for this device so a TV and a phone pick their own best stream
-			// without another provider round-trip.
-			candidates, _ = h.rankVirtualCandidatesForDevice(r, cached)
-			candidates = reorderVirtualCandidatesForQuality(candidates, qualityPreference, bandwidthCapKbps)
+			// without another provider round-trip, then keep rejected streams
+			// behind accepted ones.
+			candidates = h.finalizeVirtualCandidateOrder(r, cached, qualityPreference, bandwidthCapKbps)
 			noResult = false // treated as if file already had a result=
 			cachedListing = len(candidates) > 0
 			trace.cached = cachedListing
@@ -803,8 +809,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			if noResult {
 				if len(filtered) > 0 {
-					candidates, _ = h.rankVirtualCandidatesForDevice(r, filtered)
-					candidates = reorderVirtualCandidatesForQuality(candidates, qualityPreference, bandwidthCapKbps)
+					candidates = h.finalizeVirtualCandidateOrder(r, filtered, qualityPreference, bandwidthCapKbps)
 				}
 			} else {
 				// Explicit candidate selected. Find it in streams to enrich its metadata,
@@ -822,8 +827,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					}
 				}
 				if len(filtered) > 0 {
-					rankedAlternatives, _ := h.rankVirtualCandidatesForDevice(r, filtered)
-					rankedAlternatives = reorderVirtualCandidatesForQuality(rankedAlternatives, qualityPreference, bandwidthCapKbps)
+					rankedAlternatives := h.finalizeVirtualCandidateOrder(r, filtered, qualityPreference, bandwidthCapKbps)
 					if forceRelist && !pinFound {
 						// The forced fresh listing no longer carries the pinned
 						// version. Drop the stale pin instead of retrying a

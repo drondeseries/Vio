@@ -1177,6 +1177,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 							Bitrate: stream.Bitrate, FrameRate: stream.FrameRate, AudioLanguages: stream.AudioLanguages,
 							SubtitleLanguages: stream.SubtitleLanguages, OwnerInstallationID: stream.OwnerInstallationID,
 							Visible: stream.Visible, VisibilitySpecified: stream.VisibilitySpecified,
+							Rejected: stream.Rejected,
 						})
 					}
 					return out, nil

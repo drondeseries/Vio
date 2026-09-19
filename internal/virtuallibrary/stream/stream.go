@@ -90,6 +90,13 @@ type StreamCandidate struct {
 	// Like the flags above it is provider-local derived state and never part
 	// of the Stremio payload.
 	SourceGUID string `json:"-"`
+	// CustomFormatRejected marks a candidate a configured custom format
+	// rejects (an explicit Reject rule or a score at/below the discard line).
+	// It is a transient ranking signal, never persisted: reject means
+	// rank-last and last-resort selectable, not a hard drop, so it is
+	// recomputed on every resolve/list and carried through device ranking so a
+	// rejected candidate can never be promoted to the front by device fit.
+	CustomFormatRejected bool `json:"-"`
 }
 
 // ParseStreamDetails fills Resolution, CodecVideo, CodecAudio, HasAtmos, HDR,
@@ -407,7 +414,11 @@ func ParseStreamMetadata(s *StreamCandidate) {
 		}
 	}
 
-	if multiPattern.MatchString(text) || strings.Contains(strings.ToLower(s.Name), "multi") {
+	// multiPattern alone: the removed `strings.Contains(name, "multi")`
+	// fallback matched titles like "Multiplicity" and "The Multiverse" and
+	// advertised them as multi-audio releases. A bare word "multi" still
+	// matches through the pattern's word boundary.
+	if multiPattern.MatchString(text) {
 		s.IsMultiAudio = true
 	}
 	if dualPattern.MatchString(text) {

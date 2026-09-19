@@ -27,6 +27,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/prowlarr"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/release"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 // --- Core port compatibility shims ---
@@ -142,6 +143,49 @@ func (s *Monitor) SetResolver(resolver connectionValidator) { s.resolver = resol
 
 // SetRegistrar installs the catalog registrar used by Fulfill/CheckStatus/Run.
 func (s *Monitor) SetRegistrar(registrar MediaRegistrar) { s.monitor.setRegistrar(registrar) }
+
+// ReleaseStore returns the in-memory release schedule cache the monitor
+// populates while evaluating items. A nil result means the monitor is
+// unconfigured. The store implements the resolver's ReleaseGate: it fails open
+// on unknown or partial schedule data and blocks only a concrete future air
+// date.
+func (s *Monitor) ReleaseStore() *release.ReleaseStore {
+	if s == nil || s.monitor == nil {
+		return nil
+	}
+	return s.monitor.releaseStore
+}
+
+// ClassifyCandidates applies the configured completion state to a candidate
+// list for the resolver. AltMount's authoritative completed/failed state runs
+// first; Prowlarr's cached confirmation runs second and only adds
+// SourceConfirmed/SourceGUID, so it can never clear an AltMount SourceFailed
+// verdict.
+func (s *Monitor) ClassifyCandidates(candidates []stream.StreamCandidate) {
+	if s == nil || s.monitor == nil {
+		return
+	}
+	s.monitor.classifyCandidates(candidates)
+}
+
+func (m *mediaMonitor) classifyCandidates(candidates []stream.StreamCandidate) {
+	if m == nil || len(candidates) == 0 {
+		return
+	}
+	// Read the configured clients directly: the altmountClient/prowlarrClient
+	// accessors allocate an empty client on a miss, and this runs on every
+	// serve. An unconfigured source is simply skipped.
+	m.mu.Lock()
+	altmountClient := m.altmount
+	prowlarrClient := m.prowlarr
+	m.mu.Unlock()
+	if altmountClient != nil {
+		altmountClient.ClassifyCandidates(candidates)
+	}
+	if prowlarrClient != nil {
+		prowlarrClient.ClassifyCandidates(candidates)
+	}
+}
 
 // Configure loads/persists the monitored queue (delegates to mediaMonitor).
 func (s *Monitor) Configure(c Config) error { return s.monitor.Configure(c) }
@@ -341,13 +385,14 @@ func newMediaMonitor(resolver streamResolver, logger *slog.Logger) *mediaMonitor
 		logger = slog.Default()
 	}
 	m := &mediaMonitor{
-		resolver:    resolver,
-		logger:      logger,
-		config:      Config{File: ".vio-virtual-library-monitored.json", ProwlarrIndexFile: ".vio-virtual-library-prowlarr-index.json"},
-		items:       map[string]monitoredMedia{},
-		prowlarr:    nil,
-		registered:  map[string]struct{}{},
-		itemTimeout: monitorPerItemTimeout,
+		resolver:     resolver,
+		logger:       logger,
+		config:       Config{File: ".vio-virtual-library-monitored.json", ProwlarrIndexFile: ".vio-virtual-library-prowlarr-index.json"},
+		items:        map[string]monitoredMedia{},
+		prowlarr:     nil,
+		registered:   map[string]struct{}{},
+		releaseStore: release.NewReleaseStore(),
+		itemTimeout:  monitorPerItemTimeout,
 	}
 	m.evaluateFn = m.evaluate
 	return m
