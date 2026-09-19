@@ -297,6 +297,33 @@ func TestBuildSubtitleInventoryV3_KeepsDistinctDownloadedRows(t *testing.T) {
 	}
 }
 
+// TestBuildSubtitleInventoryV3_KeepsUnknownLanguageEntriesWithSameCodec is the
+// regression for the over-eager de-duplication: several tracks whose language
+// is unknown and which share a codec must all survive, because they carry no
+// positive identity proving they are the same track.
+func TestBuildSubtitleInventoryV3_KeepsUnknownLanguageEntriesWithSameCodec(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 55,
+		ExternalSubtitles: []models.ExternalSubtitle{
+			{Format: "srt"},
+			{Format: "srt"},
+			{Format: "srt"},
+		},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 4, Codec: "hdmv_pgs_subtitle"}},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 4 {
+		t.Fatalf("items = %#v, want all four unknown-language entries kept", items)
+	}
+	for i, item := range items {
+		if item.CombinedIndex != i {
+			t.Fatalf("items[%d].CombinedIndex = %d, want %d", i, item.CombinedIndex, i)
+		}
+	}
+}
+
 func TestSubtitleInventoryItemAtV3(t *testing.T) {
 	file := &models.MediaFile{
 		ID: 9,

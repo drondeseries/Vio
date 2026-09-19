@@ -24,6 +24,12 @@ const (
 	// regex for a custom format (AltMount parity).
 	patternTypeToken = "token"
 	patternTypeRegex = "regex"
+
+	// HDR10 classifier values emitted by stream.ParseStreamDetails. The generic
+	// "hdr" requirement and exclusion cover this family, so its members are
+	// named once rather than repeated as literals.
+	hdrValueHDR10     = "hdr10"
+	hdrValueHDR10Plus = "hdr10+"
 )
 
 type CustomFormat struct {
@@ -520,7 +526,7 @@ func hdrSatisfies(required, candidate string) bool {
 		return true
 	}
 	if required == "hdr" {
-		return candidate == "hdr10" || candidate == "hdr10+"
+		return candidate == hdrValueHDR10 || candidate == hdrValueHDR10Plus
 	}
 	return false
 }
@@ -822,7 +828,10 @@ func sortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProf
 		if scored[i].rejected != scored[j].rejected {
 			return !scored[i].rejected
 		}
-		if scored[i].profileMatched != scored[j].profileMatched {
+		// Only an active profile contributes profile ordering. With a zero
+		// profile every candidate is profileMatched, but gating the comparison
+		// on profileActive makes the no-op structural rather than incidental.
+		if profileActive && scored[i].profileMatched != scored[j].profileMatched {
 			return scored[i].profileMatched
 		}
 		if c1.SourceConfirmed != c2.SourceConfirmed {

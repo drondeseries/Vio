@@ -490,7 +490,7 @@ func TestMergeCompatCandidateTracksDoesNotAppendBibliographicAlias(t *testing.T)
 }
 
 // TestMergeCompatCandidateTracksAppendsDistinctSubtitleLanguage proves a
-// genuinely different base language is still synthesised.
+// genuinely different base language is still synthesized.
 func TestMergeCompatCandidateTracksAppendsDistinctSubtitleLanguage(t *testing.T) {
 	file := &models.MediaFile{
 		SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "ENG", Codec: "subrip"}},

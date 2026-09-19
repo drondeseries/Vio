@@ -78,7 +78,7 @@ func TestSortCandidatesForProfileRecordsRejected(t *testing.T) {
 // and is only matched by a profile that asks for "dv" explicitly.
 func TestMatchProfileGenericHDRMatchesHDR10Family(t *testing.T) {
 	profile := QualityProfile{Label: "4K HDR", Resolution: "2160p", HDR: "hdr"}
-	for _, candidateHDR := range []string{"hdr", "hdr10", "hdr10+"} {
+	for _, candidateHDR := range []string{"hdr", hdrValueHDR10, hdrValueHDR10Plus} {
 		candidate := stream.StreamCandidate{Resolution: "2160p", HDR: candidateHDR}
 		if !MatchProfile(candidate, profile) {
 			t.Fatalf("HDR %q did not satisfy a generic hdr profile", candidateHDR)
@@ -92,7 +92,7 @@ func TestMatchProfileGenericHDRMatchesHDR10Family(t *testing.T) {
 	if !MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "dv"}, dvProfile) {
 		t.Fatal("dv profile did not match dv content")
 	}
-	if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "hdr10"}, dvProfile) {
+	if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: hdrValueHDR10}, dvProfile) {
 		t.Fatal("dv profile matched HDR10 content")
 	}
 }
@@ -112,11 +112,22 @@ func TestSortCandidatesForProfileRanksProfileMatchedFirst(t *testing.T) {
 	if candidates[0].Resolution != "1080p" {
 		t.Fatalf("profile-matching candidate not ranked first: %+v", candidates)
 	}
-	// A zero profile imposes no profile ordering.
-	zero := []stream.StreamCandidate{removed, matched}
+	// A zero profile contributes no profile ordering. It does not disable the
+	// shared scoring or the OriginalIndex tie-break, so equally-scored
+	// candidates keep the provider's OriginalIndex order...
+	zeroA := stream.StreamCandidate{Name: "1080p A", Resolution: "1080p", OriginalIndex: 0}
+	zeroB := stream.StreamCandidate{Name: "1080p B", Resolution: "1080p", OriginalIndex: 1}
+	zero := []stream.StreamCandidate{zeroA, zeroB}
 	SortCandidatesForProfile(zero, QualityProfile{}, nil)
-	if zero[0].Resolution != "720p" {
-		t.Fatalf("zero profile changed the order: %+v", zero)
+	if zero[0].OriginalIndex != 0 || zero[1].OriginalIndex != 1 {
+		t.Fatalf("zero profile changed the provider order: %+v", zero)
+	}
+	// ...and a resolution difference still ranks, because the scoring keys
+	// apply with no profile too (custom-format scoring is the same path).
+	scored := []stream.StreamCandidate{removed, matched}
+	SortCandidatesForProfile(scored, QualityProfile{}, nil)
+	if scored[0].Resolution != "1080p" {
+		t.Fatalf("zero profile disabled the shared resolution scoring: %+v", scored)
 	}
 }
 
@@ -126,7 +137,7 @@ func TestSortCandidatesForProfileRanksProfileMatchedFirst(t *testing.T) {
 // DV.
 func TestMatchProfileExcludeHDRSymmetricWithRequirement(t *testing.T) {
 	hdrExclude := QualityProfile{Label: "no hdr", Resolution: "2160p", ExcludeHDR: "hdr"}
-	for _, candidateHDR := range []string{"hdr", "hdr10", "hdr10+"} {
+	for _, candidateHDR := range []string{"hdr", hdrValueHDR10, hdrValueHDR10Plus} {
 		if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: candidateHDR}, hdrExclude) {
 			t.Fatalf("ExcludeHDR \"hdr\" did not exclude %q", candidateHDR)
 		}
@@ -139,7 +150,7 @@ func TestMatchProfileExcludeHDRSymmetricWithRequirement(t *testing.T) {
 	if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "dv"}, dvExclude) {
 		t.Fatal("ExcludeHDR \"dv\" did not exclude dv")
 	}
-	if !MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "hdr10"}, dvExclude) {
+	if !MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: hdrValueHDR10}, dvExclude) {
 		t.Fatal("ExcludeHDR \"dv\" excluded HDR10")
 	}
 }
