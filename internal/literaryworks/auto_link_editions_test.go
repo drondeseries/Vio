@@ -494,3 +494,43 @@ func TestAutoLinkGeneratedWorkCollisionPreservesExistingWork(t *testing.T) {
 		})
 	}
 }
+
+func TestAutoLinkPrefersExistingWorkOnScoreTie(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		unlinkedCount      int
+		unlinkedIsStronger bool
+	}{
+		{name: "same page", unlinkedCount: 1},
+		{name: "later page", unlinkedCount: 100},
+		{name: "stronger unlinked candidate", unlinkedCount: 1, unlinkedIsStronger: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEditionLinkFixture(t)
+			source := f.add("source", FormatEbook, "")
+			var unlinked []string
+			for i := range tc.unlinkedCount {
+				unlinked = append(unlinked, f.add(fmt.Sprintf("a-unlinked-%03d", i), FormatAudiobook, ""))
+			}
+			existing := f.add("z-linked", FormatAudiobook, "")
+			existingWork := f.link(existing)
+			if tc.unlinkedIsStronger {
+				if _, err := f.pool.Exec(t.Context(), `INSERT INTO media_item_provider_ids (content_id, provider, provider_id, item_type) VALUES ($1,'isbn',$3,'ebook'), ($2,'isbn',$3,'audiobook')`, source, unlinked[0], f.prefix+"isbn"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			work, linked, err := f.service.AutoLinkContent(t.Context(), source)
+			if err != nil || !linked || work == "" {
+				t.Fatalf("link source: work=%q linked=%t err=%v", work, linked, err)
+			}
+			if (work == existingWork) == tc.unlinkedIsStronger {
+				t.Fatalf("work=%q existing=%q stronger unlinked=%t; existing work should win only on equal score", work, existingWork, tc.unlinkedIsStronger)
+			}
+			f.assertWork(source, work)
+			f.assertWork(existing, existingWork)
+			for _, id := range unlinked {
+				f.assertWork(id, work)
+			}
+		})
+	}
+}

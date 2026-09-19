@@ -92,13 +92,12 @@ func TestMetadataUpdateLinksChangedBookTitles(t *testing.T) {
 	}
 }
 
-func TestMetadataUpdateOnlyLinksChangedBookTitles(t *testing.T) {
+func TestMetadataUpdateOnlyLinksExplicitBookTitleSaves(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		mediaType string
 		update    catalog.MetadataUpdate
 	}{
-		{name: "same title", mediaType: FormatEbook, update: catalog.MetadataUpdate{Title: new("Original title")}},
 		{name: "other metadata", mediaType: FormatAudiobook, update: catalog.MetadataUpdate{Overview: new("New overview")}},
 		{name: "movie title", mediaType: "movie", update: catalog.MetadataUpdate{Title: new("New title")}},
 	} {
@@ -120,6 +119,43 @@ func TestMetadataUpdateOnlyLinksChangedBookTitles(t *testing.T) {
 			if linker.calls != 0 {
 				t.Fatalf("literary matcher called %d times for %s", linker.calls, tc.name)
 			}
+		})
+	}
+}
+
+func TestMetadataTitleSaveRetriesLinkingAfterFailure(t *testing.T) {
+	for _, sourceType := range []string{FormatEbook, FormatAudiobook} {
+		t.Run(sourceType, func(t *testing.T) {
+			f := newEditionLinkFixture(t)
+			source := f.add("source", sourceType, f.prefix+"original title")
+			targetType := FormatAudiobook
+			if sourceType == FormatAudiobook {
+				targetType = FormatEbook
+			}
+			target := f.add("target", targetType, "")
+			items := catalog.NewItemRepository(f.pool)
+			linker := &metadataUpdateLinker{service: f.service, err: errors.New("temporary literary matching failure")}
+			detail := catalog.NewDetailService(items, nil, nil, nil, nil)
+			detail.SetLiteraryWorkLinker(linker)
+			if err := detail.UpdateMediaItemMetadata(t.Context(), source, &catalog.MetadataUpdate{Title: &f.title}); err != nil {
+				t.Fatalf("title save failed because of linking: %v", err)
+			}
+			saved, err := items.GetByID(t.Context(), source)
+			if err != nil || saved.Title != f.title || linker.calls != 1 {
+				t.Fatalf("first save: item=%+v calls=%d err=%v", saved, linker.calls, err)
+			}
+			f.assertWork(source, "")
+			f.assertWork(target, "")
+
+			linker.err = nil
+			if err := detail.UpdateMediaItemMetadata(t.Context(), source, &catalog.MetadataUpdate{Title: &f.title}); err != nil {
+				t.Fatal(err)
+			}
+			work, err := f.repo.GetFirstWorkIDForContentIDs(t.Context(), []string{source})
+			if err != nil || work == "" || linker.calls != 2 {
+				t.Fatalf("same-title retry: work=%q calls=%d err=%v; want successful linking on second save", work, linker.calls, err)
+			}
+			f.assertWork(target, work)
 		})
 	}
 }

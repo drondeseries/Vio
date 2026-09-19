@@ -164,7 +164,10 @@ func (s *Service) AutoLinkContent(ctx context.Context, contentID string) (string
 				continue
 			}
 			candidate := ScoreCandidate(source.MatchItem, target.MatchItem)
-			if candidate.Score > best.Score {
+			// On equal evidence, reuse an eligible existing work instead of
+			// splitting its editions merely because an unlinked item sorted first.
+			preferExistingWork := candidate.Score == best.Score && bestTarget.WorkID == "" && target.WorkID != ""
+			if candidate.Score > best.Score || preferExistingWork {
 				best = candidate
 				bestTarget = target
 			}

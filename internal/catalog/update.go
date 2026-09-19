@@ -64,7 +64,7 @@ func (s *DetailService) UpdateMediaItemMetadata(ctx context.Context, contentID s
 		if err != nil {
 			return err
 		}
-		relinkWork = (item.Type == searchTypeEbook || item.Type == detailTypeAudiobook) && item.Title != *upd.Title
+		relinkWork = item.Type == searchTypeEbook || item.Type == detailTypeAudiobook
 	}
 	if err := applyDefaultSortTitleOnAdminUpdate(ctx, s.itemRepo, contentID, upd); err != nil {
 		return err
@@ -72,8 +72,8 @@ func (s *DetailService) UpdateMediaItemMetadata(ctx context.Context, contentID s
 	if err := s.itemRepo.UpdateMetadata(ctx, contentID, upd); err != nil {
 		return err
 	}
-	// A corrected title may now match an existing book in the other format.
-	// Recheck at the edit; unchanged-file scans do not retry literary matching.
+	// Every explicit book-title save retries best-effort linking, including
+	// resubmitting a saved title after an earlier linking failure.
 	if relinkWork {
 		if _, _, err := s.workLinker.AutoLinkContent(ctx, contentID); err != nil {
 			slog.WarnContext(ctx, "catalog: literary work auto-link after metadata update failed", "content_id", contentID, "error", err)
