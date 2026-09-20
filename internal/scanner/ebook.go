@@ -970,7 +970,12 @@ func pdfStartsWithIndirectReference(data []byte) bool {
 		return false
 	}
 	rest = bytes.TrimLeft(rest, pdfWhitespace)
-	return len(rest) > 0 && rest[0] == 'R'
+	if len(rest) == 0 || rest[0] != 'R' {
+		return false
+	}
+	// "R" must be its own token: "9 0 R2" is not an indirect reference, and
+	// accepting it would cost an unencrypted file its metadata.
+	return len(rest) == 1 || isPDFTokenDelimiter(rest[1])
 }
 
 // pdfInfoValueLooksBinary reports whether a decoded Info value carries control

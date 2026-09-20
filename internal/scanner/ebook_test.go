@@ -2363,3 +2363,22 @@ func TestParseEbookPDFKeepsMetadataWhenEncryptIsStreamNoise(t *testing.T) {
 		t.Fatalf("Title = %q, want Real Title", got.Title)
 	}
 }
+
+func TestParseEbookPDFKeepsMetadataWhenEncryptReferenceIsUndelimited(t *testing.T) {
+	// "9 0 R2" is not an indirect reference, so it does not declare encryption.
+	path := filepath.Join(t.TempDir(), "book.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-1.7\n"+
+		"5 0 obj\n<< /Length 16 >>\nstream\n/Encrypt 9 0 R2\nendstream\nendobj\n"+
+		"1 0 obj\n<< /Title (Real Title) >>\nendobj\n"+
+		"trailer\n<< /Info 1 0 R >>\n%%EOF"), 0o644); err != nil {
+		t.Fatalf("write pdf: %v", err)
+	}
+
+	got, err := parseEbookFile(path)
+	if err != nil {
+		t.Fatalf("parseEbookFile: %v", err)
+	}
+	if got.Title != "Real Title" {
+		t.Fatalf("Title = %q, want Real Title", got.Title)
+	}
+}
