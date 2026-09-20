@@ -74,10 +74,24 @@ func TestEvidenceApplicationShutdownRacesAdmission(t *testing.T) {
 			return 1, nil
 		},
 	}
+	// This test exercises the shutdown admission race, not queue saturation.
+	// The production-sized queue is small enough that a loaded runner can fill
+	// it before every producer has landed a first admission (starved workers,
+	// the other producers admitting), which rejects a producer for fullness
+	// before shutdown even starts. A roomy queue keeps the only rejection this
+	// test is about: shutdown winning the admission race. Saturation is covered
+	// separately by TestEvidenceAdmissionSaturationIsExplicit.
+	h.virtualEvidenceBuffer = newVirtualEvidenceBuffer(1 << 16)
 	buf := h.evidenceBuffer()
 
 	const producers = 4
-	firstAdmitted := make(chan struct{}, producers)
+	// firstAttempted reports that a producer has reached the admission race.
+	// The test waits on these signals, not on a fixed wall clock, so a loaded
+	// runner cannot fail the race on scheduling alone: the producers' job is to
+	// race shutdown, not to start within an arbitrary window. A producer
+	// rejected before it ever admitted still reports, so the test never blocks
+	// on a producer that never joined the accepted path.
+	firstAttempted := make(chan struct{}, producers)
 	var acceptedMu sync.Mutex
 	accepted := map[int]struct{}{}
 	var wg sync.WaitGroup
@@ -86,6 +100,12 @@ func TestEvidenceApplicationShutdownRacesAdmission(t *testing.T) {
 		go func(base int) {
 			defer wg.Done()
 			first := true
+			reportFirst := func() {
+				if first {
+					first = false
+					firstAttempted <- struct{}{}
+				}
+			}
 			for i := 0; ; i++ {
 				fileID := base*1_000_000 + i + 1
 				switch h.enqueueVirtualProbeEvidence(context.Background(), models.VirtualFilePersistArgs{FileID: fileID, UpdatedAt: time.Now()}) {
@@ -93,24 +113,23 @@ func TestEvidenceApplicationShutdownRacesAdmission(t *testing.T) {
 					acceptedMu.Lock()
 					accepted[fileID] = struct{}{}
 					acceptedMu.Unlock()
-					if first {
-						first = false
-						firstAdmitted <- struct{}{}
-					}
+					reportFirst()
 				case virtualEvidenceRejected:
 					// Shutdown won the admission race for this producer.
+					reportFirst()
 					return
 				}
 			}
 		}(p)
 	}
-	// Wait until every producer has admitted at least once, so the stop below
-	// races live admission rather than running before the producers start.
+	// The timeout is only a deadlock guard, far longer than any plausible
+	// scheduling delay. The wait itself is on observable admission progress,
+	// so the stop below races live admission rather than a wall clock.
 	for i := 0; i < producers; i++ {
 		select {
-		case <-firstAdmitted:
-		case <-time.After(5 * time.Second):
-			t.Fatal("producers never admitted; test did not exercise the race")
+		case <-firstAttempted:
+		case <-time.After(60 * time.Second):
+			t.Fatal("producers never attempted admission; test did not exercise the race")
 		}
 	}
 	h.StopVirtualEvidence()
