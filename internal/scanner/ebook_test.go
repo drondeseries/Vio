@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5"
@@ -2201,5 +2202,164 @@ func TestEbookAuthorFromPath(t *testing.T) {
 				t.Fatalf("ebookAuthorFromPath(%q) = %q, want %q", tc.path, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestParseEbookPDFSkipsControlCharacterInfoNoise(t *testing.T) {
+	// A compressed stream can hold "/Subject"-shaped bytes that parse as a
+	// well-formed hex string. Parsing is therefore not evidence that the match
+	// was the Info dictionary, and the noise sorts before the real dictionary
+	// here, so only the control-character check keeps it out.
+	noise := "5 0 obj\n<< /Length 20 >>\nstream\n/Subject <0041000212>\nendstream\nendobj\n"
+	info := "1 0 obj\n" +
+		"<< /Title (Real Title)\n" +
+		"   /Author (Ada Writer)\n" +
+		"   /Subject (A real subject)\n" +
+		">>\nendobj\ntrailer\n<< /Info 1 0 R >>\n%%EOF"
+
+	path := filepath.Join(t.TempDir(), "book.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-1.7\n"+noise+info), 0o644); err != nil {
+		t.Fatalf("write pdf: %v", err)
+	}
+
+	got, err := parseEbookFile(path)
+	if err != nil {
+		t.Fatalf("parseEbookFile: %v", err)
+	}
+	if got.Description != "A real subject" {
+		t.Fatalf("Description = %q, want the real Info value", got.Description)
+	}
+	if got.Title != "Real Title" {
+		t.Fatalf("Title = %q, want Real Title", got.Title)
+	}
+}
+
+func TestParseEbookPDFDropsInfoKeyPresentOnlyAsStreamNoise(t *testing.T) {
+	// The production case: the file has no /Subject anywhere, so the only
+	// match is stream noise. The right answer is an empty description, not the
+	// noise -- which carries a NUL and fails the media_items insert outright.
+	noise := "5 0 obj\n<< /Length 20 >>\nstream\n/Subject <0041000212>\nendstream\nendobj\n"
+	info := "1 0 obj\n" +
+		"<< /Title (Real Title)\n" +
+		"   /Author (Ada Writer)\n" +
+		">>\nendobj\ntrailer\n<< /Info 1 0 R >>\n%%EOF"
+
+	path := filepath.Join(t.TempDir(), "book.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-1.7\n"+noise+info), 0o644); err != nil {
+		t.Fatalf("write pdf: %v", err)
+	}
+
+	got, err := parseEbookFile(path)
+	if err != nil {
+		t.Fatalf("parseEbookFile: %v", err)
+	}
+	if got.Description != "" {
+		t.Fatalf("Description = %q, want empty when the key is only stream noise", got.Description)
+	}
+	if got.Title != "Real Title" || strings.Join(got.Authors, ", ") != "Ada Writer" {
+		t.Fatalf("title/authors = %q/%v, want the real Info values kept", got.Title, got.Authors)
+	}
+}
+
+func TestParseEbookPDFKeepsNewlinesInsideInfoValues(t *testing.T) {
+	// Tab, newline, and carriage return are legitimate inside a description
+	// and must not trip the binary check.
+	path := filepath.Join(t.TempDir(), "book.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-1.7\n"+
+		"1 0 obj\n<< /Subject (First line\nSecond line) >>\nendobj\n"+
+		"trailer\n<< /Info 1 0 R >>\n%%EOF"), 0o644); err != nil {
+		t.Fatalf("write pdf: %v", err)
+	}
+
+	got, err := parseEbookFile(path)
+	if err != nil {
+		t.Fatalf("parseEbookFile: %v", err)
+	}
+	if got.Description != "First line Second line" {
+		t.Fatalf("Description = %q, want the newline collapsed to a space", got.Description)
+	}
+}
+
+func TestEbookSanitizeStripsControlCharacters(t *testing.T) {
+	// Backstop for every format: Postgres rejects U+0000 anywhere in a text
+	// value, and NUL is valid UTF-8 so a UTF-8 check does not catch it.
+	book := parsedEbook{
+		Format:      ".pdf",
+		Title:       "Good\x00Title",
+		Description: "First\x01Second",
+		Publisher:   "Pub\x00lisher",
+		Language:    "en\x02",
+		Series:      "Series\x00One",
+		SeriesIndex: "3\x00",
+		Authors:     []string{"Ada\x00Writer"},
+		Genres:      []string{"sci\x1bfi"},
+	}
+	book.sanitize()
+
+	for name, value := range map[string]string{
+		"Title":       book.Title,
+		"Description": book.Description,
+		"Publisher":   book.Publisher,
+		"Language":    book.Language,
+		"Series":      book.Series,
+		"SeriesIndex": book.SeriesIndex,
+		"Authors[0]":  book.Authors[0],
+		"Genres[0]":   book.Genres[0],
+	} {
+		if strings.ContainsFunc(value, unicode.IsControl) {
+			t.Fatalf("%s = %q, want control characters removed", name, value)
+		}
+	}
+	if book.Title != "GoodTitle" || book.Authors[0] != "AdaWriter" {
+		t.Fatalf("title/author = %q/%q, want the surrounding text preserved", book.Title, book.Authors[0])
+	}
+}
+
+func TestScrubEbookMetadataTextLeavesOrdinaryTextAlone(t *testing.T) {
+	const value = "Ibañez, Isabel (Novelist), author"
+	if got := scrubEbookMetadataText(value); got != value {
+		t.Fatalf("scrubEbookMetadataText(%q) = %q, want it unchanged", value, got)
+	}
+}
+
+func TestParseEbookPDFSkipsEncryptedDocumentMetadata(t *testing.T) {
+	// Strings in an encrypted PDF are ciphertext. Storing them yields a
+	// random-looking title, so extraction is skipped entirely.
+	path := filepath.Join(t.TempDir(), "book.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-1.7\n"+
+		"1 0 obj\n<< /Title (Looks Real But Is Ciphertext) >>\nendobj\n"+
+		"trailer\n<< /Info 1 0 R /Encrypt 9 0 R >>\n%%EOF"), 0o644); err != nil {
+		t.Fatalf("write pdf: %v", err)
+	}
+
+	got, err := parseEbookFile(path)
+	if err != nil {
+		t.Fatalf("parseEbookFile: %v", err)
+	}
+	if got.Format != "pdf" {
+		t.Fatalf("Format = %q, want pdf", got.Format)
+	}
+	if got.Title != "" || len(got.Authors) != 0 {
+		t.Fatalf("title/authors = %q/%v, want no metadata from an encrypted PDF", got.Title, got.Authors)
+	}
+}
+
+func TestParseEbookPDFKeepsMetadataWhenEncryptIsStreamNoise(t *testing.T) {
+	// A bare "/Encrypt" without an indirect reference is not a trailer
+	// declaration and must not cost the file its metadata.
+	path := filepath.Join(t.TempDir(), "book.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-1.7\n"+
+		"5 0 obj\n<< /Length 12 >>\nstream\n/Encrypt xy\nendstream\nendobj\n"+
+		"1 0 obj\n<< /Title (Real Title) >>\nendobj\n"+
+		"trailer\n<< /Info 1 0 R >>\n%%EOF"), 0o644); err != nil {
+		t.Fatalf("write pdf: %v", err)
+	}
+
+	got, err := parseEbookFile(path)
+	if err != nil {
+		t.Fatalf("parseEbookFile: %v", err)
+	}
+	if got.Title != "Real Title" {
+		t.Fatalf("Title = %q, want Real Title", got.Title)
 	}
 }

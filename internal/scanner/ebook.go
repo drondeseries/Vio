@@ -213,6 +213,13 @@ func parseEbookPDF(path string) (parsedEbook, error) {
 	if err != nil {
 		return book, err
 	}
+	// Strings in an encrypted PDF are ciphertext. Decrypting them needs the
+	// document key, so the only honest options are to skip extraction or to
+	// store random bytes as the title; the filename is a better title than
+	// ciphertext.
+	if pdfTrailerDeclaresEncryption(head) || pdfTrailerDeclaresEncryption(tail) {
+		return book, nil
+	}
 	info := parsePDFInfoFields(head)
 	// A head match comes from a linearized PDF whose Info dictionary sits at
 	// the start of the file and is authoritative; non-linearized PDFs (the
@@ -284,15 +291,17 @@ func ebookFileFormat(path string) string {
 
 func (b *parsedEbook) sanitize() {
 	b.Format = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(b.Format)), ".")
-	b.Title = strings.TrimSpace(b.Title)
-	b.Description = cleanEbookDescription(b.Description)
-	b.Publisher = strings.TrimSpace(b.Publisher)
-	b.Language = strings.TrimSpace(b.Language)
+	b.Title = scrubEbookMetadataText(b.Title)
+	// Scrub after cleaning: cleanEbookDescription collapses runs of whitespace,
+	// so removing control runes first would glue words together.
+	b.Description = scrubEbookMetadataText(cleanEbookDescription(b.Description))
+	b.Publisher = scrubEbookMetadataText(b.Publisher)
+	b.Language = scrubEbookMetadataText(b.Language)
 	b.ISBN = normalizeEbookISBN(b.ISBN)
-	b.Series = strings.TrimSpace(b.Series)
-	b.SeriesIndex = strings.TrimSpace(b.SeriesIndex)
-	b.Authors = uniqueTrimmedStrings(b.Authors)
-	b.Genres = uniqueTrimmedStrings(b.Genres)
+	b.Series = scrubEbookMetadataText(b.Series)
+	b.SeriesIndex = scrubEbookMetadataText(b.SeriesIndex)
+	b.Authors = uniqueTrimmedStrings(scrubEbookMetadataTexts(b.Authors))
+	b.Genres = uniqueTrimmedStrings(scrubEbookMetadataTexts(b.Genres))
 	if b.PageCount < 0 {
 		b.PageCount = 0
 	}
@@ -340,6 +349,37 @@ func cleanEbookDescription(value string) string {
 			}
 		}
 	}
+}
+
+// scrubEbookMetadataText removes control characters from extracted metadata.
+// Postgres rejects U+0000 anywhere in a text value and fails the whole
+// statement, and NUL is valid UTF-8, so a UTF-8 validity check does not catch
+// it. Strip every control rune rather than NUL alone: a value carrying one
+// normally carries more, and none of them belong in a title or a description.
+func scrubEbookMetadataText(value string) string {
+	if !utf8.ValidString(value) {
+		value = strings.ToValidUTF8(value, "")
+	}
+	if strings.ContainsFunc(value, unicode.IsControl) {
+		value = strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) {
+				return -1
+			}
+			return r
+		}, value)
+	}
+	return strings.TrimSpace(value)
+}
+
+func scrubEbookMetadataTexts(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, scrubEbookMetadataText(value))
+	}
+	return out
 }
 
 func startsWithClosingPunctuation(value string) bool {
@@ -884,6 +924,69 @@ func parsePDFInfoFields(data []byte) map[string]string {
 	return fields
 }
 
+// pdfTrailerDeclaresEncryption reports whether the window contains a trailer
+// "/Encrypt n g R" reference. It insists on the indirect-reference shape rather
+// than the bare name so that "/Encrypt"-shaped bytes inside a compressed stream
+// do not cost an unencrypted file its metadata.
+func pdfTrailerDeclaresEncryption(data []byte) bool {
+	token := []byte("/Encrypt")
+	for offset := 0; offset < len(data); {
+		idx := bytes.Index(data[offset:], token)
+		if idx < 0 {
+			return false
+		}
+		idx += offset
+		offset = idx + len(token)
+		rest := data[offset:]
+		if len(rest) == 0 || !isPDFTokenDelimiter(rest[0]) {
+			continue
+		}
+		if pdfStartsWithIndirectReference(rest) {
+			return true
+		}
+	}
+	return false
+}
+
+// pdfStartsWithIndirectReference reports whether data begins with whitespace
+// followed by "n g R".
+func pdfStartsWithIndirectReference(data []byte) bool {
+	readNumber := func(b []byte) ([]byte, bool) {
+		b = bytes.TrimLeft(b, pdfWhitespace)
+		digits := 0
+		for digits < len(b) && b[digits] >= '0' && b[digits] <= '9' {
+			digits++
+		}
+		if digits == 0 {
+			return nil, false
+		}
+		return b[digits:], true
+	}
+	rest, ok := readNumber(data)
+	if !ok {
+		return false
+	}
+	if rest, ok = readNumber(rest); !ok {
+		return false
+	}
+	rest = bytes.TrimLeft(rest, pdfWhitespace)
+	return len(rest) > 0 && rest[0] == 'R'
+}
+
+// pdfInfoValueLooksBinary reports whether a decoded Info value carries control
+// characters that real metadata does not. Tab, newline, and carriage return
+// stay allowed because producers do emit them inside descriptions.
+func pdfInfoValueLooksBinary(value string) bool {
+	return strings.ContainsFunc(value, func(r rune) bool {
+		switch r {
+		case '\t', '\n', '\r':
+			return false
+		default:
+			return unicode.IsControl(r)
+		}
+	})
+}
+
 // pdfWhitespace is the PDF whitespace character set (ISO 32000-1, table 1).
 const pdfWhitespace = "\x00\t\n\f\r "
 
@@ -900,10 +1003,15 @@ func isPDFTokenDelimiter(b byte) bool {
 }
 
 // findPDFInfoValue scans every occurrence of "/<key>" in the window and
-// returns the first whose token is properly delimited and whose value parses
-// as a PDF string. Raw byte search can match key-shaped noise inside
-// compressed streams, so a failed parse moves on to the next occurrence
-// instead of giving up.
+// returns the first whose token is properly delimited, whose value parses as a
+// PDF string, and whose value does not look like binary. Raw byte search can
+// match key-shaped noise inside compressed streams, so a failed parse moves on
+// to the next occurrence instead of giving up.
+//
+// Parsing is not enough on its own: compressed bytes regularly parse as a
+// well-formed hex string, which then reaches the catalog as a title or
+// description. Rejecting values that carry control characters skips those
+// matches and keeps scanning for the real Info dictionary.
 func findPDFInfoValue(data []byte, key string) (string, bool) {
 	token := []byte("/" + key)
 	for offset := 0; offset < len(data); {
@@ -925,6 +1033,9 @@ func findPDFInfoValue(data []byte, key string) (string, bool) {
 			return "", false
 		}
 		if value, ok := readPDFString(trimmed); ok {
+			if pdfInfoValueLooksBinary(value) {
+				continue
+			}
 			return value, true
 		}
 	}
