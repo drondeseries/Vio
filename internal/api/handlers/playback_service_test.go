@@ -697,3 +697,80 @@ func TestReplanRefusesAStoppedAttempt(t *testing.T) {
 	_, err = f.handler.ReplanPlaybackV2(f.ctx, f.caller, f.session.ID, PlaybackReplanCommand{Request: playback.ReplanRequestV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: record.PlaybackAttemptID, ReplanRequestID: "replan-0123456789", FailedPlanID: "plan-0123456789", PlanAttemptID: "plan-attempt-0123", PlanAttemptKey: "v3:0123456789abcdef", AttemptCount: 1, QualityPreference: "auto"}, Digest: "d"})
 	assertPlaybackOperationError(t, err, http.StatusNotFound, "session_not_found")
 }
+
+// TestProgressSideEffectLockReleasesEntryWhenIdle proves the per-session lock
+// map is bounded: the entry disappears once the last holder releases, so it
+// tracks concurrent writers rather than every session ever served.
+func TestProgressSideEffectLockReleasesEntryWhenIdle(t *testing.T) {
+	h := &PlaybackHandler{}
+	unlock := h.progressSideEffectLock("session-idle")
+	h.progressSideEffectLocksMu.Lock()
+	held := len(h.progressSideEffectLocks)
+	h.progressSideEffectLocksMu.Unlock()
+	if held != 1 {
+		t.Fatalf("locks held = %d, want 1", held)
+	}
+
+	unlock()
+	h.progressSideEffectLocksMu.Lock()
+	after := len(h.progressSideEffectLocks)
+	h.progressSideEffectLocksMu.Unlock()
+	if after != 0 {
+		t.Fatalf("locks held after release = %d, want 0", after)
+	}
+}
+
+// TestProgressSideEffectLockSerializesConcurrentHolders proves the refcount
+// keeps the same mutex for a waiter, so a second holder cannot run while the
+// first is inside the critical section, and the entry is dropped only after
+// both release.
+func TestProgressSideEffectLockSerializesConcurrentHolders(t *testing.T) {
+	h := &PlaybackHandler{}
+	first := h.progressSideEffectLock("session-concurrent")
+
+	acquired := make(chan struct{})
+	go func() {
+		unlock := h.progressSideEffectLock("session-concurrent")
+		close(acquired)
+		unlock()
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("second holder acquired while the first was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+	first()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("second holder did not acquire after the first released")
+	}
+
+	// Both released: the entry is gone.
+	deadline := time.Now().Add(time.Second)
+	for {
+		h.progressSideEffectLocksMu.Lock()
+		remaining := len(h.progressSideEffectLocks)
+		h.progressSideEffectLocksMu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("locks held after both released = %d, want 0", remaining)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestForgetProgressSideEffectLockClearsDeliveryFlag proves session end drops
+// the once-per-session virtual delivery flag so the map does not grow with
+// every historical session.
+func TestForgetProgressSideEffectLockClearsDeliveryFlag(t *testing.T) {
+	h := &PlaybackHandler{}
+	h.virtualDeliveryCleared.Store("session-delivered", struct{}{})
+	h.forgetProgressSideEffectLock("session-delivered")
+	if _, ok := h.virtualDeliveryCleared.Load("session-delivered"); ok {
+		t.Fatal("delivery flag survived session end")
+	}
+}

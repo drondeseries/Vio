@@ -41,6 +41,14 @@ const (
 	maxResponseBytes         = 4 << 20
 	maxCandidateCacheEntries = 256
 	maxCandidateCacheBytes   = 16 << 20
+	// maxProviderCandidates is the parse-time bound, deliberately far above the
+	// selectable cap. Deduplication and failure classification run at
+	// ingestion, so a provider that returns one candidate per file of many
+	// multi-file releases must be parsed in full before the per-release collapse
+	// and the maxVirtualCandidates truncation. Without it, a flood of per-file
+	// variants filled the 50-slot list before dedup could merge them.
+	maxProviderCandidates = 500
+	// maxVirtualCandidates is the selectable/version-list cap after dedup.
 	maxVirtualCandidates     = 50
 	maxManifestResponseBytes = 256 << 10
 
@@ -298,21 +306,24 @@ func cloneCandidates(candidates []StreamCandidate) []StreamCandidate {
 	return out
 }
 
-// preferConfirmedCandidates applies the source-of-truth state to the ranked
-// candidate list: releases AltMount reports as failed are dropped, and
-// completed/imported releases are stably moved ahead of unconfirmed ones.
-// Order within each group is preserved, so the operator's quality ranking
-// still decides which confirmed release wins. Candidates reaching this point
-// already passed the profile and custom-format filters, so confirmation never
-// overrides an explicit reject.
+// preferConfirmedCandidates applies the source-of-truth state to the candidate
+// list on every serve: it honors the provider's cached badge, runs the
+// classifier (AltMount's authoritative completed/failed state, then Prowlarr's
+// confirmation), drops releases AltMount reports as failed, and stably moves
+// confirmed releases ahead of unconfirmed ones. Order within each group is
+// preserved, so the quality ranking still decides which confirmed release wins.
+// Classification runs before dedup so a failed variant can never shadow a live
+// duplicate of the same release.
 //
-// After classification the list is deduplicated: one torrent surfaces one
-// candidate per contained file, and those per-file variants share a release
-// identity. Collapsing them keeps the version list to one entry per playable
-// release; the confirmed variant wins its group when one exists.
-func (r *Resolver) preferConfirmedCandidates(candidates []StreamCandidate) []StreamCandidate {
+// Deduplication collapses the per-file variants of one release to a single
+// candidate; the confirmed variant wins its group when one exists. The dropped
+// variants' ids are returned mapped to their release's surviving keeper id, so
+// a pin that dedup collapsed can be translated instead of falling through to an
+// unrelated release. The custom format verdict is applied later
+// (rankCandidatesForVirtualPath), so reject never interacts with confirmation.
+func (r *Resolver) preferConfirmedCandidates(ctx context.Context, candidates []StreamCandidate) ([]StreamCandidate, map[string]string) {
 	if len(candidates) == 0 {
-		return candidates
+		return candidates, nil
 	}
 	// The AltMount Stremio addon marks releases it already imported with a
 	// "⚡ Cached" badge. That is a free, zero-config signal even when the
@@ -324,9 +335,78 @@ func (r *Resolver) preferConfirmedCandidates(candidates []StreamCandidate) []Str
 	if classifier != nil {
 		classifier.ClassifyCandidates(candidates)
 	}
+	// Capture failed identities before the drop mutates the slice, so an
+	// all-failed answer is diagnosable rather than a silent empty result.
+	beforeDrop := len(candidates)
+	failedNames := failedCandidateIdentities(candidates, 8)
 	candidates = dropFailedCandidates(candidates)
-	candidates = dedupeCandidates(candidates)
-	return stablePartitionCandidates(candidates)
+	if len(candidates) == 0 && beforeDrop > 0 {
+		r.mu.RLock()
+		logger := r.logger
+		r.mu.RUnlock()
+		if logger != nil {
+			logger.WarnContext(ctx, "every provider candidate was dropped as failed by the classifier",
+				"count", beforeDrop, "candidates", failedNames)
+		}
+	}
+	candidates, dropped := dedupeCandidates(candidates)
+	return stablePartitionCandidates(candidates), dropped
+}
+
+// processCandidates runs the per-answer ingestion pipeline: apply AltMount's
+// badge/classifier state and Prowlarr's confirmation, drop releases the source
+// of truth reports failed, collapse per-file variants to one candidate per
+// release, move confirmed releases ahead of unconfirmed ones, and truncate to
+// the selectable cap. It is called on every serve so a classifier state change
+// takes effect without waiting for the cache TTL, and it returns the
+// dropped-variant -> keeper map for that answer.
+//
+// The keeper map is filtered to the surviving candidates after truncation: a
+// dropped variant whose keeper ranked beyond the selectable cap has no surviving
+// representative, so the entry is dropped and a pin on it is treated as a
+// genuinely dead release (the existing dead-pin fallback) instead of being
+// translated to a keeper that is not in the list.
+func (r *Resolver) processCandidates(ctx context.Context, candidates []StreamCandidate) ([]StreamCandidate, map[string]string) {
+	candidates, dropped := r.preferConfirmedCandidates(ctx, candidates)
+	if len(candidates) > maxVirtualCandidates {
+		candidates = candidates[:maxVirtualCandidates]
+	}
+	if len(dropped) > 0 {
+		surviving := make(map[string]struct{}, len(candidates))
+		for i := range candidates {
+			surviving[stream.CandidateVariantID(candidates[i])] = struct{}{}
+		}
+		for droppedID, keeperID := range dropped {
+			if _, ok := surviving[keeperID]; !ok {
+				delete(dropped, droppedID)
+			}
+		}
+	}
+	return candidates, dropped
+}
+
+// failedCandidateIdentities returns up to limit display identities of the
+// candidates the classifier marked failed. Names are provider display text;
+// provider URLs are deliberately never logged.
+func failedCandidateIdentities(candidates []StreamCandidate, limit int) []string {
+	names := make([]string, 0, limit)
+	for _, candidate := range candidates {
+		if !candidate.SourceFailed {
+			continue
+		}
+		if len(names) >= limit {
+			break
+		}
+		name := strings.TrimSpace(candidate.Name)
+		if name == "" {
+			name = strings.TrimSpace(candidate.Title)
+		}
+		if name == "" {
+			name = "(unnamed)"
+		}
+		names = append(names, name)
+	}
+	return names
 }
 
 // dropFailedCandidates removes releases the source of truth reports as dead
@@ -443,11 +523,16 @@ func trimPerFileIndex(name string) string {
 // variant, that variant is the keeper regardless of rank: confirmation is
 // authoritative for the release, and the remaining variants differ only in
 // which file the provider selects server-side at stream time.
-func dedupeCandidates(candidates []StreamCandidate) []StreamCandidate {
+//
+// It also returns the dropped-variant -> keeper-variant map for the collapsed
+// groups. A caller holding a pinned variant id that is no longer in the list
+// (because this collapse removed it) can use the map to resolve to its release's
+// surviving keeper instead of substituting an unrelated release.
+func dedupeCandidates(candidates []StreamCandidate) ([]StreamCandidate, map[string]string) {
 	if len(candidates) < 2 {
-		return candidates
+		return candidates, nil
 	}
-	keeper := make(map[string]int, len(candidates))
+	keyKeeper := make(map[string]int, len(candidates))
 	keep := make([]bool, len(candidates))
 	for i, candidate := range candidates {
 		key := candidateDedupKey(candidate)
@@ -455,25 +540,50 @@ func dedupeCandidates(candidates []StreamCandidate) []StreamCandidate {
 			keep[i] = true
 			continue
 		}
-		existing, seen := keeper[key]
+		existing, seen := keyKeeper[key]
 		if !seen {
-			keeper[key] = i
+			keyKeeper[key] = i
 			keep[i] = true
 			continue
 		}
 		if candidate.SourceConfirmed && !candidates[existing].SourceConfirmed {
 			keep[existing] = false
-			keeper[key] = i
+			keyKeeper[key] = i
 			keep[i] = true
 		}
 	}
-	kept := candidates[:0]
+	// Build the dropped -> keeper map before compacting: the compaction below
+	// reuses the backing array, so the original indices must be read first.
+	var dropped map[string]string
+	for i := range candidates {
+		if keep[i] {
+			continue
+		}
+		key := candidateDedupKey(candidates[i])
+		if key == "" {
+			continue
+		}
+		keeperIdx, ok := keyKeeper[key]
+		if !ok || keeperIdx < 0 || keeperIdx >= len(candidates) || !keep[keeperIdx] {
+			continue
+		}
+		droppedID := stream.CandidateVariantID(candidates[i])
+		keeperID := stream.CandidateVariantID(candidates[keeperIdx])
+		if droppedID == "" || keeperID == "" || droppedID == keeperID {
+			continue
+		}
+		if dropped == nil {
+			dropped = make(map[string]string)
+		}
+		dropped[droppedID] = keeperID
+	}
+	kept := make([]StreamCandidate, 0, len(candidates))
 	for i := range candidates {
 		if keep[i] {
 			kept = append(kept, candidates[i])
 		}
 	}
-	return kept
+	return kept, dropped
 }
 
 // stablePartitionCandidates drops known-dead candidates and stably moves
@@ -512,13 +622,15 @@ func stablePartitionCandidates(candidates []StreamCandidate) []StreamCandidate {
 // GetCandidates returns the ranked provider candidates for a virtual:// URI,
 // serving the bounded candidate cache when possible.
 func (r *Resolver) GetCandidates(ctx context.Context, virtualPath string) ([]StreamCandidate, string, string, error) {
-	return r.getCandidates(ctx, virtualPath, false, false)
+	candidates, _, mediaType, mediaID, err := r.getCandidatesWithKeepers(ctx, virtualPath, false, false)
+	return candidates, mediaType, mediaID, err
 }
 
 // GetCandidatesFresh bypasses the bounded candidate cache for an explicit
 // user refresh/retry while retaining the normal cache behavior by default.
 func (r *Resolver) GetCandidatesFresh(ctx context.Context, virtualPath string) ([]StreamCandidate, string, string, error) {
-	return r.getCandidates(ctx, virtualPath, true, false)
+	candidates, _, mediaType, mediaID, err := r.getCandidatesWithKeepers(ctx, virtualPath, true, false)
+	return candidates, mediaType, mediaID, err
 }
 
 // GetCandidatesFreshUnbounded re-lists candidates from the provider even when
@@ -528,10 +640,42 @@ func (r *Resolver) GetCandidatesFresh(ctx context.Context, virtualPath string) (
 // for a fresh answer after the relay returned 502 — must not be served the
 // same dead candidates it is trying to escape.
 func (r *Resolver) GetCandidatesFreshUnbounded(ctx context.Context, virtualPath string) ([]StreamCandidate, string, string, error) {
-	return r.getCandidates(ctx, virtualPath, true, true)
+	candidates, _, mediaType, mediaID, err := r.getCandidatesWithKeepers(ctx, virtualPath, true, true)
+	return candidates, mediaType, mediaID, err
 }
 
-func (r *Resolver) getCandidates(ctx context.Context, virtualPath string, forceRefresh bool, bypassFloor bool) ([]StreamCandidate, string, string, error) {
+// GetCandidatesWithKeepers is GetCandidates plus the deduplicated-variant map
+// for that answer: a candidate id that dedup collapsed maps to the keeper id of
+// its release. ResolveDetailed uses it so a pin whose variant was collapsed
+// resolves to its release's surviving keeper instead of falling through to a
+// different release.
+func (r *Resolver) GetCandidatesWithKeepers(ctx context.Context, virtualPath string) ([]StreamCandidate, map[string]string, string, string, error) {
+	return r.getCandidatesWithKeepers(ctx, virtualPath, false, false)
+}
+
+// GetCandidatesFreshWithKeepers is GetCandidatesWithKeepers with forceRefresh.
+func (r *Resolver) GetCandidatesFreshWithKeepers(ctx context.Context, virtualPath string) ([]StreamCandidate, map[string]string, string, string, error) {
+	return r.getCandidatesWithKeepers(ctx, virtualPath, true, false)
+}
+
+// getCandidatesWithKeepers serves the candidate list and runs the ingestion
+// pipeline on every answer. The classifier is a live source of truth, so a
+// release that completed or failed since the cache entry was written is
+// reflected immediately instead of after the TTL. The pipeline is applied here
+// (not before the cache store) so it runs exactly once per answer; the cache
+// holds the provider's raw, enriched candidates and the returned dropped ->
+// keeper map is recomputed from them, which means it is current on every
+// cache hit rather than stale relative to the classifier.
+func (r *Resolver) getCandidatesWithKeepers(ctx context.Context, virtualPath string, forceRefresh bool, bypassFloor bool) ([]StreamCandidate, map[string]string, string, string, error) {
+	candidates, mediaType, mediaID, err := r.getCandidatesRaw(ctx, virtualPath, forceRefresh, bypassFloor)
+	if err != nil {
+		return nil, nil, mediaType, mediaID, err
+	}
+	processed, dropped := r.processCandidates(ctx, candidates)
+	return processed, dropped, mediaType, mediaID, nil
+}
+
+func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, forceRefresh bool, bypassFloor bool) ([]StreamCandidate, string, string, error) {
 	mediaType, mediaID, err := parseVirtualPath(virtualPath)
 	if err != nil {
 		return nil, mediaType, mediaID, err
@@ -581,6 +725,16 @@ func (r *Resolver) getCandidates(ctx context.Context, virtualPath string, forceR
 			}
 		}
 		if released, airDate := releaseGate.IsReleased(mediaType, imdbID, season, episode); !released {
+			r.mu.RLock()
+			logger := r.logger
+			r.mu.RUnlock()
+			if logger != nil {
+				attrs := []any{"media_type", mediaType, "media_id", imdbID}
+				if airDate != nil && !airDate.IsZero() {
+					attrs = append(attrs, "air_date", airDate.UTC().Format(time.RFC3339))
+				}
+				logger.WarnContext(ctx, "virtual playback blocked by the release gate", attrs...)
+			}
 			return nil, mediaType, mediaID, newUnreleasedError(imdbID, airDate, mediaType)
 		}
 	}
@@ -836,11 +990,19 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 			}
 			enrich(&stream)
 			validCandidates = append(validCandidates, stream)
-			if len(validCandidates) >= maxVirtualCandidates {
+			if len(validCandidates) >= maxProviderCandidates {
 				break
 			}
 		}
 	}
+	// Cache the provider's raw, enriched answer. The ingestion pipeline
+	// (badge + classify -> drop SourceFailed -> dedupe -> confirmed-first
+	// partition -> cap) runs exactly once per answer in
+	// getCandidatesWithKeepers, so a classifier state change lands immediately
+	// and the classifier is not run twice. Dedup still runs before the
+	// selectable cap on every answer, so one multi-file release cannot flood
+	// the list, and a non-empty all-failed answer is cached as data rather than
+	// as an ordinary negative entry.
 	now := time.Now()
 	r.storeCandidateCache(cacheKey, validCandidates, now.Add(config.CacheTTL), now, generation)
 	r.mu.RLock()
@@ -908,10 +1070,15 @@ func candidateCacheSize(candidates []StreamCandidate) int64 {
 func (r *Resolver) storeCandidateCache(key string, candidates []StreamCandidate, expiresAt, now time.Time, generation uint64) {
 	size := int64(0)
 	if len(candidates) == 0 {
-		// Negative caching: an empty provider answer is stored briefly so
-		// repeated resolves of an unavailable title fail in microseconds
-		// instead of paying another 3-8s round-trip each. The short TTL keeps
-		// newly added sources discoverable without operator action.
+		// Negative caching: a genuinely EMPTY provider answer is stored
+		// briefly so repeated resolves of an unavailable title fail in
+		// microseconds instead of paying another 3-8s round-trip each. The
+		// short TTL keeps newly added sources discoverable without operator
+		// action. A non-empty answer whose releases the classifier all rejects
+		// is deliberately never treated this way: it reaches here non-empty and
+		// is cached as data, so classification re-runs on every serve and the
+		// title recovers the moment the classifier changes rather than after a
+		// two-minute blackhole.
 		expiresAt = now.Add(negativeCacheTTL)
 	} else {
 		size = candidateCacheSize(candidates)

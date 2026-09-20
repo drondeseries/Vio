@@ -308,3 +308,125 @@ func TestLogFFmpegLineObservesDecodeFailure(t *testing.T) {
 		t.Fatalf("evidence = (%q, %d), want (%q, %d)", sample, count, hevcFatalErrorLine(), decodeErrorThreshold)
 	}
 }
+
+// TestDecodeFailureRequiresVideoStreamIdentity proves the source-rejection
+// verdict is scoped to the video stream: a subtitle decoder refusing a corrupt
+// subtitle packet, and a decoder line with no stream identity at all, must not
+// reject the video source. A video codec/NAL failure still does.
+func TestDecodeFailureRequiresVideoStreamIdentity(t *testing.T) {
+	stamped := func(line string) (rejected, marked bool) {
+		markedCh := make(chan struct{}, 1)
+		s := &TranscodeSession{opts: TranscodeOpts{
+			MediaFileID:        11,
+			CanonicalInputPath: "virtual://movie/tt-id?result=x",
+			TargetCodecVideo:   "h264",
+			OnSourceRejected: func(context.Context, int, string) error {
+				markedCh <- struct{}{}
+				return nil
+			},
+		}}
+		ctx := context.Background()
+		for i := 0; i < decodeErrorThreshold; i++ {
+			s.logFFmpegLine(ctx, line)
+		}
+		rejected = s.IsSourceRejected()
+		select {
+		case <-markedCh:
+			marked = true
+		case <-time.After(time.Second):
+		}
+		return rejected, marked
+	}
+
+	ambiguous := `Error submitting packet to decoder: Invalid data found when processing input`
+	if rejected, marked := stamped(ambiguous); rejected || marked {
+		t.Fatal("a decoder failure with no stream identity rejected the video source")
+	}
+	subtitle := `[sist#0:2/subrip @ 0x55d0] [dec:subrip @ 0x55d1] Error submitting packet to decoder: Invalid data found when processing input`
+	if rejected, marked := stamped(subtitle); rejected || marked {
+		t.Fatal("a subtitle decoder failure rejected the video source")
+	}
+	videoNAL := `[hevc @ 0x55d0] Invalid NAL unit size (1215484279 > 206).`
+	if rejected, marked := stamped(videoNAL); !rejected || !marked {
+		t.Fatal("a video NAL failure no longer rejected the video source")
+	}
+}
+
+// TestVideoStreamEvidenceRejectsAudioStreams pins the lexical rule directly: an
+// audio decoder tag or explicit audio-stream wording never counts as video
+// evidence, even when the line also carries a video-shaped word, while a
+// video-tagged or video-codec line does.
+func TestVideoStreamEvidenceRejectsAudioStreams(t *testing.T) {
+	for _, line := range []string{
+		`[aac @ 0x55d0] Error submitting packet to decoder`,
+		`[ac3 @ 0x55d0] error decoding audio bitstream`,
+		`[eac3 @ 0x55d0] error decoding audio bitstream`,
+		`[truehd @ 0x55d0] error decoding audio bitstream`,
+		`[dts @ 0x55d0] error decoding audio bitstream`,
+		`[flac @ 0x55d0] error decoding audio bitstream`,
+		`[opus @ 0x55d0] error decoding audio bitstream`,
+		`[aist#0:1/aac @ 0x55d0] error decoding audio bitstream`,
+		`Audio stream 0:1 failed to decode bitstream`,
+	} {
+		if videoStreamEvidenceV3(line) {
+			t.Fatalf("audio stream line %q was treated as video evidence", line)
+		}
+	}
+	if !videoStreamEvidenceV3(`[vist#0:0/h264 @ 0x55d0] Error during demuxing`) {
+		t.Fatal("a vist# line must remain video evidence")
+	}
+	if !videoStreamEvidenceV3(`[hevc @ 0x55d0] Invalid NAL unit size (1215484279 > 206)`) {
+		t.Fatal("a video codec line must remain video evidence")
+	}
+}
+
+// TestDecodeFailureAudioStreamIdentityNeverStamps proves an audio decoder error
+// can never stamp the video candidate or reject the source, even when the line
+// carries a word ("bitstream") that also appears in video failures. A genuine
+// video failure on the same line shape still indicts.
+func TestDecodeFailureAudioStreamIdentityNeverStamps(t *testing.T) {
+	stamped := func(line string) (rejected, marked bool) {
+		markedCh := make(chan struct{}, 1)
+		s := &TranscodeSession{opts: TranscodeOpts{
+			MediaFileID:      11,
+			TargetCodecVideo: "h264",
+			OnSourceRejected: func(context.Context, int, string) error {
+				markedCh <- struct{}{}
+				return nil
+			},
+		}}
+		ctx := context.Background()
+		for i := 0; i < decodeErrorThreshold; i++ {
+			s.logFFmpegLine(ctx, line)
+		}
+		rejected = s.IsSourceRejected()
+		select {
+		case <-markedCh:
+			marked = true
+		case <-time.After(time.Second):
+		}
+		return rejected, marked
+	}
+
+	for _, line := range []string{
+		`[aac @ 0x55d0] Error submitting packet to decoder: Invalid data found when processing input`,
+		`[ac3 @ 0x55d0] Error submitting packet to decoder: Invalid data found when processing input`,
+		`[eac3 @ 0x55d0] Error submitting packet to decoder: Invalid data found when processing input`,
+		`[truehd @ 0x55d0] Error submitting packet to decoder: Invalid data found when processing input`,
+		`[dca @ 0x55d0] Error submitting packet to decoder: Invalid data found when processing input`,
+		`[flac @ 0x55d0] Failed to decode audio bitstream`,
+		`[opus @ 0x55d0] Error splitting the input into NAL units`, // audio tag wins over the video-shaped phrase
+		`[aist#0:1/aac @ 0x55d0] Error submitting packet to decoder: Invalid data found when processing input`,
+		`Audio stream 0:1 Error submitting packet to decoder: Invalid data found when processing input`,
+	} {
+		if rejected, marked := stamped(line); rejected || marked {
+			t.Fatalf("an audio decoder failure %q rejected the video source", line)
+		}
+	}
+	// A video decoder failure is unchanged even though it mentions the same
+	// "bitstream" word an audio failure can carry.
+	videoBitstream := `[hevc @ 0x55d0] Invalid NAL unit size (1215484279 > 206) while parsing bitstream.`
+	if rejected, marked := stamped(videoBitstream); !rejected || !marked {
+		t.Fatal("a video bitstream failure no longer rejected the video source")
+	}
+}

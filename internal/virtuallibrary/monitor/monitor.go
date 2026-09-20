@@ -27,6 +27,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/prowlarr"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/release"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 // --- Core port compatibility shims ---
@@ -64,8 +65,32 @@ type MediaRegistrar interface {
 	Register(ctx context.Context, item MonitoredMedia) error
 }
 
+// ReconcileEvidence attests that a source's keep set came from a pass that
+// enumerated the entire queue from the front. FullCycle is false for resumed
+// or deadline-cut passes. The monitor reconciles only after a full cycle, and
+// the catalog refuses destructive reconciliation without complete evidence; a
+// keep set that shrinks implausibly is refused there as well.
+type ReconcileEvidence struct {
+	FullCycle   bool
+	SourceCount int
+	QueueCount  int
+}
+
+// ErrReconcileRefused marks a reconciliation the catalog rejected because the
+// completeness evidence was missing or the keep set shrank implausibly. It is
+// reported at Error rather than Debug because live media was about to be
+// deleted.
+var ErrReconcileRefused = errors.New("virtual reconciliation refused")
+
 type mediaReconciler interface {
-	Reconcile(ctx context.Context, source string, keepIDs []string, libraryIDs []int) error
+	Reconcile(ctx context.Context, source string, keepIDs []string, libraryIDs []int, evidence ReconcileEvidence) error
+}
+
+// mediaPresence is the optional capability a registrar may expose so the
+// monitor can evict queue entries whose catalog content was genuinely removed.
+// A registrar without it simply never prunes on absence.
+type mediaPresence interface {
+	MissingVirtualMedia(ctx context.Context, contentIDs []string) (map[string]struct{}, error)
 }
 
 type virtualMediaRegistrar = MediaRegistrar
@@ -119,6 +144,49 @@ func (s *Monitor) SetResolver(resolver connectionValidator) { s.resolver = resol
 // SetRegistrar installs the catalog registrar used by Fulfill/CheckStatus/Run.
 func (s *Monitor) SetRegistrar(registrar MediaRegistrar) { s.monitor.setRegistrar(registrar) }
 
+// ReleaseStore returns the in-memory release schedule cache the monitor
+// populates while evaluating items. A nil result means the monitor is
+// unconfigured. The store implements the resolver's ReleaseGate: it fails open
+// on unknown or partial schedule data and blocks only a concrete future air
+// date.
+func (s *Monitor) ReleaseStore() *release.ReleaseStore {
+	if s == nil || s.monitor == nil {
+		return nil
+	}
+	return s.monitor.releaseStore
+}
+
+// ClassifyCandidates applies the configured completion state to a candidate
+// list for the resolver. AltMount's authoritative completed/failed state runs
+// first; Prowlarr's cached confirmation runs second and only adds
+// SourceConfirmed/SourceGUID, so it can never clear an AltMount SourceFailed
+// verdict.
+func (s *Monitor) ClassifyCandidates(candidates []stream.StreamCandidate) {
+	if s == nil || s.monitor == nil {
+		return
+	}
+	s.monitor.classifyCandidates(candidates)
+}
+
+func (m *mediaMonitor) classifyCandidates(candidates []stream.StreamCandidate) {
+	if m == nil || len(candidates) == 0 {
+		return
+	}
+	// Read the configured clients directly: the altmountClient/prowlarrClient
+	// accessors allocate an empty client on a miss, and this runs on every
+	// serve. An unconfigured source is simply skipped.
+	m.mu.Lock()
+	altmountClient := m.altmount
+	prowlarrClient := m.prowlarr
+	m.mu.Unlock()
+	if altmountClient != nil {
+		altmountClient.ClassifyCandidates(candidates)
+	}
+	if prowlarrClient != nil {
+		prowlarrClient.ClassifyCandidates(candidates)
+	}
+}
+
 // Configure loads/persists the monitored queue (delegates to mediaMonitor).
 func (s *Monitor) Configure(c Config) error { return s.monitor.Configure(c) }
 
@@ -153,6 +221,10 @@ const (
 	// always leaves budget for later items. A per-item timeout is a deferral,
 	// not a pass failure: the item is retried on a later pass.
 	monitorPerItemTimeout = 45 * time.Second
+
+	// mediaTypeMovie is the movie media-type value shared by the queue's
+	// movie/series branches.
+	mediaTypeMovie = "movie"
 )
 
 // monitorState is the on-disk monitor queue. Older releases wrote a bare JSON
@@ -317,13 +389,14 @@ func newMediaMonitor(resolver streamResolver, logger *slog.Logger) *mediaMonitor
 		logger = slog.Default()
 	}
 	m := &mediaMonitor{
-		resolver:    resolver,
-		logger:      logger,
-		config:      Config{File: ".vio-virtual-library-monitored.json", ProwlarrIndexFile: ".vio-virtual-library-prowlarr-index.json"},
-		items:       map[string]monitoredMedia{},
-		prowlarr:    nil,
-		registered:  map[string]struct{}{},
-		itemTimeout: monitorPerItemTimeout,
+		resolver:     resolver,
+		logger:       logger,
+		config:       Config{File: ".vio-virtual-library-monitored.json", ProwlarrIndexFile: ".vio-virtual-library-prowlarr-index.json"},
+		items:        map[string]monitoredMedia{},
+		prowlarr:     nil,
+		registered:   map[string]struct{}{},
+		releaseStore: release.NewReleaseStore(),
+		itemTimeout:  monitorPerItemTimeout,
 	}
 	m.evaluateFn = m.evaluate
 	return m
@@ -464,6 +537,15 @@ func (m *mediaMonitor) remember(item monitoredMedia) error {
 	defer m.mu.Unlock()
 	previous, existed := m.items[item.Key]
 	if !existed && len(m.items) >= maxMonitoredItems {
+		// Reclaim space from finished items before refusing the request so a
+		// full queue does not silently drop a new one. A queue full of
+		// unfinished work still refuses, preserving the bound.
+		if pruned, err := m.pruneCompletedMoviesLocked(); err == nil && pruned > 0 {
+			m.logger.Info("pruned completed virtual media to admit a new queue item",
+				"pruned", pruned, "bound", maxMonitoredItems, "remaining", len(m.items))
+		}
+	}
+	if !existed && len(m.items) >= maxMonitoredItems {
 		return fmt.Errorf("monitored queue is at its %d item limit", maxMonitoredItems)
 	}
 	m.items[item.Key] = item
@@ -524,16 +606,170 @@ func episodeKey(episode virtualEpisode) string {
 func (m *mediaMonitor) forget(key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.forgetLocked(key)
+}
+
+// forgetLocked evicts one queue item and its registration marker. Dropping the
+// marker means a re-request re-registers through the idempotent upsert instead
+// of being silently skipped as already-registered.
+func (m *mediaMonitor) forgetLocked(key string) error {
 	previous, existed := m.items[key]
+	_, wasRegistered := m.registered[key]
 	delete(m.items, key)
+	delete(m.registered, key)
 	if err := m.saveLocked(); err != nil {
 		if existed {
 			m.items[key] = previous
+		}
+		if wasRegistered {
+			m.registered[key] = struct{}{}
 		}
 		return err
 	}
 	return nil
 }
+
+// forgetMany evicts several queue items and their registration markers in one
+// persisted write, restoring all of them if the save fails.
+func (m *mediaMonitor) forgetMany(keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	previous := make(map[string]monitoredMedia, len(keys))
+	previousRegistered := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if item, ok := m.items[key]; ok {
+			previous[key] = item
+		}
+		if _, ok := m.registered[key]; ok {
+			previousRegistered[key] = struct{}{}
+		}
+		delete(m.items, key)
+		delete(m.registered, key)
+	}
+	if err := m.saveLocked(); err != nil {
+		for key, item := range previous {
+			m.items[key] = item
+		}
+		for key := range previousRegistered {
+			m.registered[key] = struct{}{}
+		}
+		return err
+	}
+	return nil
+}
+
+// evictMissing drops queue entries whose content ID no longer has a catalog
+// item. Only previously-registered items are probed, so a request that has not
+// been registered yet is never mistaken for removed media. A probe failure
+// returns an error and prunes nothing.
+func (m *mediaMonitor) evictMissing(ctx context.Context, presence mediaPresence, items []monitoredMedia) (int, error) {
+	m.mu.Lock()
+	byContent := make(map[string][]string)
+	for _, item := range items {
+		if _, registered := m.registered[item.Key]; !registered {
+			continue
+		}
+		contentID := virtualContentID(item)
+		if contentID == "" {
+			continue
+		}
+		byContent[contentID] = append(byContent[contentID], item.Key)
+	}
+	m.mu.Unlock()
+	if len(byContent) == 0 {
+		return 0, nil
+	}
+	contentIDs := make([]string, 0, len(byContent))
+	for contentID := range byContent {
+		contentIDs = append(contentIDs, contentID)
+	}
+	missing, err := presence.MissingVirtualMedia(context.WithoutCancel(ctx), contentIDs)
+	if err != nil {
+		return 0, err
+	}
+	if len(missing) == 0 {
+		return 0, nil
+	}
+	keys := make([]string, 0, len(missing))
+	for contentID := range missing {
+		keys = append(keys, byContent[contentID]...)
+	}
+	if err := m.forgetMany(keys); err != nil {
+		return 0, err
+	}
+	return len(keys), nil
+}
+
+// pruneCompletedMovies bounds the queue by evicting movies whose monitoring
+// work is finished: they evaluated ready and were registered in the catalog.
+// A completed movie needs no further passes, so keeping it only consumes the
+// queue bound. Deferred or failed items are never Ready and are left for retry,
+// and a source is evicted only when every one of its items is complete, so a
+// source never loses part of its keep set while it remains in reconciliation.
+func (m *mediaMonitor) pruneCompletedMovies() (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pruneCompletedMoviesLocked()
+}
+
+func (m *mediaMonitor) pruneCompletedMoviesLocked() (int, error) {
+	bySource := make(map[string][]string)
+	complete := make(map[string]bool)
+	for key, item := range m.items {
+		source := monitorItemSource(item)
+		bySource[source] = append(bySource[source], key)
+		if _, registered := m.registered[key]; !registered || item.MediaType != mediaTypeMovie || !item.Ready {
+			complete[source] = false
+			continue
+		}
+		if _, decided := complete[source]; !decided {
+			complete[source] = true
+		}
+	}
+	prune := make(map[string]struct{})
+	for source, keys := range bySource {
+		if !complete[source] {
+			continue
+		}
+		for _, key := range keys {
+			prune[key] = struct{}{}
+		}
+	}
+	if len(prune) == 0 {
+		return 0, nil
+	}
+
+	previous := make(map[string]monitoredMedia, len(prune))
+	previousRegistered := make(map[string]struct{}, len(prune))
+	for key := range prune {
+		previous[key] = m.items[key]
+		if _, ok := m.registered[key]; ok {
+			previousRegistered[key] = struct{}{}
+		}
+		delete(m.items, key)
+		delete(m.registered, key)
+	}
+	if err := m.saveLocked(); err != nil {
+		for key, item := range previous {
+			m.items[key] = item
+		}
+		for key := range previousRegistered {
+			m.registered[key] = struct{}{}
+		}
+		return 0, err
+	}
+	return len(prune), nil
+}
+
+func (m *mediaMonitor) itemCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.items)
+}
+
 func (m *mediaMonitor) item(key string) (monitoredMedia, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1200,6 +1436,11 @@ func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, regi
 	processed, ready, pending, deferred := 0, 0, 0, 0
 	budgetExhausted := false
 	n := len(items)
+	// A pass that starts at the front and is not cut short by the deadline has
+	// enumerated every queue item exactly once. Only such a full cycle can
+	// attest that a source's keep set is complete; a resumed or deadline-cut
+	// pass observed only a suffix and must never authorize deletion.
+	fullCycle := start == 0 && n > 0
 	for i := 0; i < n; i++ {
 		if ctx.Err() != nil {
 			budgetExhausted = true
@@ -1279,7 +1520,7 @@ func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, regi
 			"processed", processed, "total", n, "resume_after", advance)
 	}
 
-	if !budgetExhausted && ctx.Err() == nil {
+	if fullCycle && !budgetExhausted && ctx.Err() == nil {
 		if reconciler, ok := registrar.(mediaReconciler); ok {
 			libraryIDs := m.reconcileLibraryIDs()
 			for _, source := range sortedSourceKeys(keepBySource) {
@@ -1295,17 +1536,62 @@ func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, regi
 				if sourceProgress[source] != sourceTotals[source] {
 					continue
 				}
-				if err := m.reconcileSource(ctx, reconciler, source, keepBySource[source], libraryIDs); err != nil {
+				evidence := ReconcileEvidence{
+					FullCycle:   fullCycle,
+					SourceCount: sourceTotals[source],
+					QueueCount:  n,
+				}
+				if err := m.reconcileSource(ctx, reconciler, source, keepBySource[source], libraryIDs, evidence); err != nil {
 					// One bad source must not fail the pass; it is retried
 					// next pass. Context errors are the expected bounded-pass
-					// outcome and are logged quietly.
-					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					// outcome and are logged quietly. A refusal is different:
+					// it means live media was about to be deleted, so it is
+					// logged loudly with the source and counts.
+					switch {
+					case errors.Is(err, ErrReconcileRefused):
+						m.logger.ErrorContext(ctx, "virtual library reconciliation refused; live media preserved",
+							"source", source, "source_items", sourceTotals[source],
+							"keep_ids", len(keepBySource[source]), "queue_items", n, "error", err)
+					case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
 						m.logger.DebugContext(ctx, "reconcile virtual source deferred", "source", source, "error", err)
-					} else {
+					default:
 						m.logger.WarnContext(ctx, "reconcile virtual source", "source", source, "error", err)
 					}
 					continue
 				}
+			}
+		}
+	}
+
+	// Bound the queue by evicting monitoring work that is finished. This runs
+	// after reconciliation so a completed item still contributed to its
+	// source's keep set for this pass; once a source is fully evicted it drops
+	// out of future keep sets and is no longer reconciled, leaving its catalog
+	// rows in place.
+	pruned := 0
+	if !budgetExhausted && ctx.Err() == nil {
+		count, err := m.pruneCompletedMovies()
+		if err != nil {
+			m.logger.WarnContext(ctx, "prune completed virtual media", "error", err)
+		} else {
+			pruned = count
+			if count > 0 {
+				m.logger.InfoContext(ctx, "pruned completed virtual media from the monitor queue",
+					"pruned", count, "bound", maxMonitoredItems, "remaining", m.itemCount())
+			}
+		}
+		// A registered item whose catalog row has disappeared was removed
+		// elsewhere; keeping it in the queue cannot protect or restore it, so
+		// evict it. This is the only pruning signal that positively means
+		// "gone"; deferred and failing items are never probed.
+		if presence, ok := registrar.(mediaPresence); ok {
+			missing, err := m.evictMissing(ctx, presence, items)
+			if err != nil {
+				m.logger.WarnContext(ctx, "prune missing virtual media", "error", err)
+			} else if missing > 0 {
+				pruned += missing
+				m.logger.InfoContext(ctx, "evicted missing virtual media from the monitor queue",
+					"evicted", missing, "bound", maxMonitoredItems, "remaining", m.itemCount())
 			}
 		}
 	}
@@ -1318,9 +1604,13 @@ func (m *mediaMonitor) runPass(ctx context.Context, items []monitoredMedia, regi
 		"pending":          pending,
 		"budget_exhausted": budgetExhausted,
 		"cursor":           m.currentCursor(),
+		"queue_bound":      maxMonitoredItems,
 	}
 	if deferred > 0 {
 		output["deferred"] = deferred
+	}
+	if pruned > 0 {
+		output["pruned"] = pruned
 	}
 	return &RunScheduledTaskResponse{Output: output}, nil
 }
@@ -1398,14 +1688,14 @@ func (m *mediaMonitor) processItem(ctx context.Context, item monitoredMedia) (mo
 
 // reconcileSource bounds one source's reconciliation by the per-item timeout so
 // a single slow sweep cannot run past the pass budget.
-func (m *mediaMonitor) reconcileSource(ctx context.Context, reconciler mediaReconciler, source string, keepIDs []string, libraryIDs []int) error {
+func (m *mediaMonitor) reconcileSource(ctx context.Context, reconciler mediaReconciler, source string, keepIDs []string, libraryIDs []int, evidence ReconcileEvidence) error {
 	recCtx := ctx
 	if m.itemTimeout > 0 {
 		var cancel context.CancelFunc
 		recCtx, cancel = context.WithTimeout(ctx, m.itemTimeout)
 		defer cancel()
 	}
-	return reconciler.Reconcile(recCtx, source, keepIDs, libraryIDs)
+	return reconciler.Reconcile(recCtx, source, keepIDs, libraryIDs, evidence)
 }
 
 // monitorItemSource names a queue item's source key, defaulting to the shared

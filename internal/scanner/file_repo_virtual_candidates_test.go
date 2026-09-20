@@ -165,7 +165,8 @@ func TestReplaceVirtualCandidatesRetainsLastPlayed(t *testing.T) {
 	}
 	playedID := seed(playedPath, false)
 	_ = seed(unplayedPath, false)
-	// The re-listed row is seeded failed to prove a fresh listing clears it.
+	// The re-listed row is seeded failed to prove a fresh listing preserves the
+	// verdict rather than clearing it (only real delivery recovers a row).
 	relistedID := seed(relistedPath, true)
 
 	if _, err := pool.Exec(ctx, `
@@ -220,15 +221,17 @@ func TestReplaceVirtualCandidatesRetainsLastPlayed(t *testing.T) {
 		t.Fatalf("retained played row changed: path=%q failed=%v, want %q/NULL", playedPathNow, playedFailed, playedPath)
 	}
 
-	// The re-listed row keeps its id and has failed_at cleared by the re-list.
+	// The re-listed row keeps its id and keeps its failure verdict: a provider
+	// re-list is not a recovery, so the auto-pick keeps skipping it until a
+	// real delivery clears the stamp.
 	var relistedPathNow string
 	var relistedFailed *time.Time
 	if err := pool.QueryRow(ctx, `SELECT file_path, failed_at FROM media_files WHERE id=$1`, relistedID).
 		Scan(&relistedPathNow, &relistedFailed); err != nil {
 		t.Fatalf("fetch relisted row: %v", err)
 	}
-	if relistedPathNow != relistedPath || relistedFailed != nil {
-		t.Fatalf("relisted row not updated: path=%q failed=%v, want %q/NULL", relistedPathNow, relistedFailed, relistedPath)
+	if relistedPathNow != relistedPath || relistedFailed == nil {
+		t.Fatalf("relisted row verdict lost: path=%q failed=%v, want %q/non-NULL", relistedPathNow, relistedFailed, relistedPath)
 	}
 }
 
@@ -813,8 +816,8 @@ func TestReplaceVirtualResultPin_NoCollisionReplaces(t *testing.T) {
 // retention rule in ReplaceVirtualCandidates: a stale candidate that once
 // delivered media bytes (last_delivered_at set) survives a provider re-list
 // even when no user_watch_progress row points at it, an undelivered stale
-// candidate is still deleted, and a re-listed known-good row keeps its
-// evidence while a fresh listing clears its failed_at.
+// candidate is still deleted, and a re-listed known-good row keeps both its
+// delivery evidence and its failure verdict (a re-list is not a recovery).
 func TestReplaceVirtualCandidatesRetainsDelivered(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -873,7 +876,8 @@ func TestReplaceVirtualCandidatesRetainsDelivered(t *testing.T) {
 	}
 	deliveredID := seed(deliveredPath, false, true)
 	_ = seed(unplayedPath, false, false)
-	// The re-listed row is seeded failed to prove a fresh listing clears it.
+	// The re-listed row is seeded failed to prove a fresh listing preserves the
+	// verdict (only real delivery recovers a row).
 	relistedID := seed(relistedPath, true, true)
 
 	repo := NewFileRepository(pool)
@@ -912,10 +916,10 @@ func TestReplaceVirtualCandidatesRetainsDelivered(t *testing.T) {
 		t.Fatalf("undelivered stale candidate survived: count=%d, want 0", unplayedCount)
 	}
 
-	// The re-listed row keeps its id and delivery evidence while the fresh
-	// listing clears failed_at.
+	// The re-listed row keeps its id and delivery evidence, and the fresh
+	// listing preserves its failure verdict: a re-list is not a recovery.
 	relistedPathNow, relistedFailed, relistedEvidence := read(relistedID)
-	if relistedPathNow != relistedPath || relistedFailed != nil || relistedEvidence == nil {
+	if relistedPathNow != relistedPath || relistedFailed == nil || relistedEvidence == nil {
 		t.Fatalf("relisted known-good row not updated: path=%q failed=%v delivered=%v", relistedPathNow, relistedFailed, relistedEvidence)
 	}
 }
@@ -1081,5 +1085,227 @@ func TestReplaceVirtualResultPin_ResetsCandidateEvidence(t *testing.T) {
 	if len(file.VideoTracks) != 0 || len(file.AudioTracks) != 0 || len(file.SubtitleTracks) != 0 {
 		t.Fatalf("track evidence survived replacement: video=%d audio=%d subtitle=%d",
 			len(file.VideoTracks), len(file.AudioTracks), len(file.SubtitleTracks))
+	}
+}
+
+// TestReplaceVirtualCandidatesRetainsActiveSessionCandidates proves the sweep
+// never deletes the media_files row an active playback attempt or an open
+// ABS-compatible session is streaming. Deleting it would cascade the attempt
+// (playback_v3_attempts.effective_media_file_id is ON DELETE CASCADE) and strip
+// a session's file identity (ON DELETE SET NULL). An expired attempt does not
+// protect its row, and an unreferenced stale row is still deleted.
+func TestReplaceVirtualCandidatesRetainsActiveSessionCandidates(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	profileID := fmt.Sprintf("active-session-%d", suffix)
+	contentID := fmt.Sprintf("virtual-active-session-%d", suffix)
+	basePath := fmt.Sprintf("virtual://movie/tt%d?profile=1080p", suffix)
+	liveAttemptPath := basePath + "&result=live-attempt"
+	openSessionPath := basePath + "&result=open-session"
+	expiredAttemptPath := basePath + "&result=expired-attempt"
+	unreferencedPath := basePath + "&result=unreferenced"
+	relistedPath := basePath + "&result=relisted"
+
+	var folderID, userID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("Active Session %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO users(username, role) VALUES($1,'user') RETURNING id`,
+		fmt.Sprintf("active-session-%d", suffix)).Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM abs_playback_sessions WHERE id LIKE $1`, fmt.Sprintf("abs-%d-%%", suffix))
+		_, _ = pool.Exec(ctx, `DELETE FROM playback_v3_attempts WHERE profile_id=$1`, profileID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_item_libraries WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+		_, _ = pool.Exec(ctx, `DELETE FROM users WHERE id=$1`, userID)
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_items(content_id,type,title,status,genres)
+		VALUES($1,'movie','Active Session','matched','{}'::text[])`, contentID); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+
+	seed := func(path string) int {
+		var id int
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id)
+			VALUES($1,$2,$3,0,'virtual',5) RETURNING id`,
+			contentID, folderID, path).Scan(&id); err != nil {
+			t.Fatalf("seed virtual candidate %q: %v", path, err)
+		}
+		return id
+	}
+	liveAttemptID := seed(liveAttemptPath)
+	openSessionID := seed(openSessionPath)
+	expiredAttemptID := seed(expiredAttemptPath)
+	_ = seed(unreferencedPath)
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO playback_v3_attempts(
+			playback_attempt_id, session_id, user_id, profile_id,
+			requested_media_file_id, effective_media_file_id,
+			current_plan_id, current_plan, normalized_request, expires_at)
+		VALUES($1, gen_random_uuid(), $2, $3, $4, $4, 'plan-live', '{}'::jsonb, '{}'::jsonb, NOW() + INTERVAL '1 hour')`,
+		fmt.Sprintf("attempt-live-%d", suffix), userID, profileID, liveAttemptID); err != nil {
+		t.Fatalf("seed live attempt: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO playback_v3_attempts(
+			playback_attempt_id, session_id, user_id, profile_id,
+			requested_media_file_id, effective_media_file_id,
+			current_plan_id, current_plan, normalized_request, expires_at)
+		VALUES($1, gen_random_uuid(), $2, $3, $4, $4, 'plan-expired', '{}'::jsonb, '{}'::jsonb, NOW() - INTERVAL '1 hour')`,
+		fmt.Sprintf("attempt-expired-%d", suffix), userID, profileID, expiredAttemptID); err != nil {
+		t.Fatalf("seed expired attempt: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO abs_playback_sessions(id, user_id, profile_id, content_id, media_file_id)
+		VALUES($1, $2, 'default', $3, $4)`,
+		fmt.Sprintf("abs-%d-open", suffix), userID, contentID, openSessionID); err != nil {
+		t.Fatalf("seed open ABS session: %v", err)
+	}
+
+	repo := NewFileRepository(pool)
+	source := &models.MediaFile{
+		ContentID:                  contentID,
+		MediaFolderID:              folderID,
+		FilePath:                   basePath,
+		VirtualOwnerInstallationID: 5,
+	}
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{URI: relistedPath, Label: "1080p"}}); err != nil {
+		t.Fatalf("replace virtual candidates: %v", err)
+	}
+
+	count := func(path string) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path=$2`, contentID, path).Scan(&n); err != nil {
+			t.Fatalf("count %q: %v", path, err)
+		}
+		return n
+	}
+	if got := count(liveAttemptPath); got != 1 {
+		t.Fatalf("live-attempt candidate deleted: count=%d, want 1", got)
+	}
+	if got := count(openSessionPath); got != 1 {
+		t.Fatalf("open-session candidate deleted: count=%d, want 1", got)
+	}
+	if got := count(expiredAttemptPath); got != 0 {
+		t.Fatalf("expired-attempt candidate survived: count=%d, want 0", got)
+	}
+	if got := count(unreferencedPath); got != 0 {
+		t.Fatalf("unreferenced stale candidate survived: count=%d, want 0", got)
+	}
+	if got := count(relistedPath); got != 1 {
+		t.Fatalf("relisted candidate missing: count=%d, want 1", got)
+	}
+}
+
+// TestReplaceVirtualCandidatesKeepsFailureVerdictUntilDelivery proves a
+// decode-rejected candidate stays failed across a provider re-list, so the
+// auto-pick does not re-select the same undecodable release, and that a real
+// delivery clears the verdict. A genuinely new candidate is inserted unfailed.
+func TestReplaceVirtualCandidatesKeepsFailureVerdictUntilDelivery(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("virtual-verdict-%d", suffix)
+	basePath := fmt.Sprintf("virtual://movie/tt%d?profile=1080p", suffix)
+	rejectedPath := basePath + "&result=rejected"
+	freshPath := basePath + "&result=fresh"
+
+	var folderID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("Verdict %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_items(content_id,type,title,status,genres)
+		VALUES($1,'movie','Verdict','matched','{}'::text[])`, contentID); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+
+	repo := NewFileRepository(pool)
+	source := &models.MediaFile{
+		ContentID: contentID, MediaFolderID: folderID, FilePath: basePath, VirtualOwnerInstallationID: 5,
+	}
+
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{URI: rejectedPath, Label: "1080p"}}); err != nil {
+		t.Fatalf("initial replace: %v", err)
+	}
+	rejected, err := repo.GetByPath(ctx, rejectedPath)
+	if err != nil || rejected == nil {
+		t.Fatalf("load rejected candidate: file=%v err=%v", rejected, err)
+	}
+	if err := repo.MarkVirtualCandidateDecodeRejected(ctx, rejected.ID, rejectedPath, nil); err != nil {
+		t.Fatalf("mark decode rejected: %v", err)
+	}
+
+	// The provider re-lists the rejected candidate and adds a new one. The
+	// re-list must not clear the verdict.
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{
+		{URI: rejectedPath, Label: "1080p"},
+		{URI: freshPath, Label: "720p"},
+	}); err != nil {
+		t.Fatalf("re-list replace: %v", err)
+	}
+	var rejectedFailed *time.Time
+	if err := pool.QueryRow(ctx, `SELECT failed_at FROM media_files WHERE id=$1`, rejected.ID).Scan(&rejectedFailed); err != nil {
+		t.Fatalf("read rejected verdict: %v", err)
+	}
+	if rejectedFailed == nil {
+		t.Fatal("re-list cleared the decode-rejection verdict; the auto-pick would re-select the undecodable release")
+	}
+	var freshFailed *time.Time
+	if err := pool.QueryRow(ctx, `SELECT failed_at FROM media_files WHERE content_id=$1 AND file_path=$2`, contentID, freshPath).Scan(&freshFailed); err != nil {
+		t.Fatalf("read fresh verdict: %v", err)
+	}
+	if freshFailed != nil {
+		t.Fatalf("new candidate inserted failed: failed_at=%v", freshFailed)
+	}
+
+	// Real delivery is the recovery path: it clears the verdict and records
+	// delivery evidence in the same update.
+	if err := repo.MarkVirtualCandidateRecovered(ctx, rejected.ID, rejectedPath, rejectedFailed); err != nil {
+		t.Fatalf("mark recovered: %v", err)
+	}
+	var clearedAt, deliveredAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT failed_at, last_delivered_at FROM media_files WHERE id=$1`, rejected.ID).Scan(&clearedAt, &deliveredAt); err != nil {
+		t.Fatalf("read recovered row: %v", err)
+	}
+	if clearedAt != nil || deliveredAt == nil {
+		t.Fatalf("recovery did not clear/record: failed_at=%v last_delivered_at=%v", clearedAt, deliveredAt)
 	}
 }

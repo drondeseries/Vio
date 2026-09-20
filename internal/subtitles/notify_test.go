@@ -159,6 +159,62 @@ func TestSubtitleDownloadBestMatchesSkipsSearchWhenNoLanguagesRequested(t *testi
 	}
 }
 
+// A canceled context must stop the chain before any provider I/O: no search,
+// no download, no notification.
+func TestSubtitleDownloadBestMatchesStopsBeforeSearchWhenCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	downloader := &fakeSubtitleDownloader{searchResp: &SearchResponse{Results: []SubtitleResult{
+		{ID: "en", Provider: "opensubtitles", Language: "en"},
+	}}}
+	notifier := &recordingReadyNotifier{}
+
+	DownloadBestMatches(ctx, downloader, notifier, 7, SearchRequest{Languages: []string{"en"}})
+
+	if downloader.searchCalls != 0 {
+		t.Fatalf("search calls = %d, want 0 for a canceled context", downloader.searchCalls)
+	}
+	if len(downloader.downloads) != 0 || len(notifier.calls) != 0 {
+		t.Fatalf("downloads=%d notifications=%d, want 0 for a canceled context", len(downloader.downloads), len(notifier.calls))
+	}
+}
+
+// cancellationDownloader cancels the request context inside the first
+// download, so the loop must stop before attempting the next language.
+type cancellationDownloader struct {
+	fakeSubtitleDownloader
+	cancel context.CancelFunc
+}
+
+func (d *cancellationDownloader) Download(_ context.Context, req DownloadRequest) (*DownloadedSubtitle, error) {
+	d.downloads = append(d.downloads, req)
+	d.cancel()
+	return &DownloadedSubtitle{ID: 1, MediaFileID: req.MediaFileID, Language: req.Language}, nil
+}
+
+// A deadline that fires during a download must stop the next language's
+// provider round-trip rather than finishing the whole request.
+func TestSubtitleDownloadBestMatchesStopsBetweenLanguagesWhenCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	downloader := &cancellationDownloader{
+		fakeSubtitleDownloader: fakeSubtitleDownloader{searchResp: &SearchResponse{Results: []SubtitleResult{
+			{ID: "en", Provider: "opensubtitles", Language: "en"},
+			{ID: "es", Provider: "opensubtitles", Language: "es"},
+		}}},
+		cancel: cancel,
+	}
+	notifier := &recordingReadyNotifier{}
+
+	DownloadBestMatches(ctx, downloader, notifier, 7, SearchRequest{Languages: []string{"en", "es"}})
+
+	if len(downloader.downloads) != 1 {
+		t.Fatalf("downloads = %d, want only the first language before cancellation", len(downloader.downloads))
+	}
+	if downloader.downloads[0].Language != "en" {
+		t.Fatalf("downloaded language %q, want en", downloader.downloads[0].Language)
+	}
+}
+
 func TestNotifyDownloadedSubtitleIgnoresUnpersistedRowsAndNilNotifier(t *testing.T) {
 	notifier := &recordingReadyNotifier{}
 	NotifyDownloadedSubtitle(context.Background(), notifier, nil)

@@ -75,6 +75,24 @@ func (e *Engine) SimilarItems(ctx context.Context, itemID string, limit int) ([]
 	// 5. Blend scores (70% embedding, 30% co-watch).
 	blended := blendScores(embCandidates, cowatchMap, 0.7, 0.3)
 
+	// 5b. Drop candidates the catalog no longer has before validation and MMR
+	// run. Embedding candidates already come from a media_items join, but
+	// co-watch rows historically carried no such guarantee, so an item deleted
+	// or relinked after the matrix was computed could still surface as an id
+	// that resolves to 404. Existence only — this endpoint is deliberately not
+	// viewer-filtered, as in v1.
+	if len(blended) > 0 {
+		ids := make([]string, len(blended))
+		for i, item := range blended {
+			ids[i] = item.MediaItemID
+		}
+		existing, existsErr := e.repo.ExistingItemIDs(ctx, ids)
+		if existsErr != nil {
+			return nil, fmt.Errorf("filter missing similar items: %w", existsErr)
+		}
+		blended = dropMissingItems(blended, existing)
+	}
+
 	// 6. Validation pipeline.
 	if sourceMeta != nil && len(blended) > 0 {
 		blended = e.applyValidation(ctx, sourceMeta, blended)
@@ -92,6 +110,25 @@ func (e *Engine) SimilarItems(ctx context.Context, itemID string, limit int) ([]
 	e.assignReasons(ctx, itemID, sourceMeta, result)
 
 	return result, nil
+}
+
+// dropMissingItems removes candidates whose media item no longer exists in the
+// catalog, preserving the input order (score-descending from blendScores). It
+// is an existence filter only and applies no viewer or permission filtering:
+// the similar-items endpoint is deliberately not viewer-filtered, as in v1.
+func dropMissingItems(items []ScoredItem, existing map[string]struct{}) []ScoredItem {
+	if len(items) == 0 {
+		return items
+	}
+
+	filtered := make([]ScoredItem, 0, len(items))
+	for _, item := range items {
+		if _, ok := existing[item.MediaItemID]; !ok {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 // applyValidation filters and penalizes candidates using the validation pipeline.

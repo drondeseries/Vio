@@ -1,26 +1,32 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
-// trackingRegistrar records reconciliation calls and can inject a failure.
+// trackingRegistrar records reconciliation calls and their evidence, and can
+// inject a failure.
 type trackingRegistrar struct {
-	reconcileCalls []string
-	reconcileErr   error
+	reconcileCalls    []string
+	reconcileEvidence []ReconcileEvidence
+	reconcileErr      error
 }
 
 func (r *trackingRegistrar) Register(context.Context, MonitoredMedia) error { return nil }
 
-func (r *trackingRegistrar) Reconcile(_ context.Context, source string, _ []string, _ []int) error {
+func (r *trackingRegistrar) Reconcile(_ context.Context, source string, _ []string, _ []int, evidence ReconcileEvidence) error {
 	r.reconcileCalls = append(r.reconcileCalls, source)
+	r.reconcileEvidence = append(r.reconcileEvidence, evidence)
 	return r.reconcileErr
 }
 
@@ -40,6 +46,29 @@ func movieQueueItem(key string) monitoredMedia {
 		SourceKey: "request:" + key,
 		Title:     key,
 	}
+}
+
+func identifiedQueueItem(key, tmdbID string) monitoredMedia {
+	return monitoredMedia{
+		Key:       key,
+		MediaType: "movie",
+		SourceKey: "request:" + key,
+		Title:     key,
+		TMDBID:    tmdbID,
+	}
+}
+
+// fakePresence reports catalog content the test declares removed.
+type fakePresence struct {
+	missing map[string]struct{}
+	err     error
+}
+
+func (f *fakePresence) MissingVirtualMedia(context.Context, []string) (map[string]struct{}, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.missing, nil
 }
 
 func readMonitorCursor(t *testing.T, path string) string {
@@ -203,6 +232,249 @@ func TestRunPassReconcileFailureDoesNotFailPass(t *testing.T) {
 	}
 	if len(registrar.reconcileCalls) != 2 {
 		t.Fatalf("reconcile calls = %v, want both sources", registrar.reconcileCalls)
+	}
+}
+
+// TestRunPassResumedCompletionBarsReconciliation proves that a pass which
+// resumes from the cursor and reaches the end does not reconcile: it observed
+// only the suffix, so its keep set is a partial enumeration and cannot
+// authorize a delete.
+func TestRunPassResumedCompletionBarsReconciliation(t *testing.T) {
+	m := newPassTestMonitor(t)
+	m.itemTimeout = time.Hour
+
+	items := []monitoredMedia{
+		movieQueueItem("a"),
+		movieQueueItem("b"),
+		movieQueueItem("c"),
+	}
+	blocked := true
+	m.evaluateFn = func(ctx context.Context, item monitoredMedia) (monitoredMedia, string, error) {
+		if item.Key == "c" && blocked {
+			<-ctx.Done()
+			return item, "", ctx.Err()
+		}
+		return item, "", nil
+	}
+
+	firstRegistrar := &trackingRegistrar{}
+	passCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	_, err := m.runPass(passCtx, items, firstRegistrar)
+	cancel()
+	if err != nil {
+		t.Fatalf("first pass returned error: %v", err)
+	}
+	if len(firstRegistrar.reconcileCalls) != 0 {
+		t.Fatalf("budget-exhausted pass reconciled %v", firstRegistrar.reconcileCalls)
+	}
+	if cursor := m.currentCursor(); cursor != "b" {
+		t.Fatalf("cursor = %q, want %q", cursor, "b")
+	}
+
+	// The resumed pass processes c, wraps through a and b, and clears the
+	// cursor. It must still refuse to reconcile because it started mid-queue.
+	blocked = false
+	resumedRegistrar := &trackingRegistrar{}
+	if _, err := m.runPass(context.Background(), items, resumedRegistrar); err != nil {
+		t.Fatalf("resumed pass returned error: %v", err)
+	}
+	if len(resumedRegistrar.reconcileCalls) != 0 {
+		t.Fatalf("resumed pass reconciled %v; a partial enumeration must not sweep", resumedRegistrar.reconcileCalls)
+	}
+	if cursor := m.currentCursor(); cursor != "" {
+		t.Fatalf("cursor after resumed completion = %q, want empty", cursor)
+	}
+}
+
+// TestRunPassFullCycleCarriesCompleteEvidence proves a front-to-back pass hands
+// the reconciler positive completeness evidence for every source.
+func TestRunPassFullCycleCarriesCompleteEvidence(t *testing.T) {
+	m := newPassTestMonitor(t)
+	items := []monitoredMedia{movieQueueItem("a"), movieQueueItem("b")}
+	m.evaluateFn = func(_ context.Context, item monitoredMedia) (monitoredMedia, string, error) {
+		return item, "", nil
+	}
+
+	registrar := &trackingRegistrar{}
+	if _, err := m.runPass(context.Background(), items, registrar); err != nil {
+		t.Fatalf("pass returned error: %v", err)
+	}
+	if len(registrar.reconcileEvidence) != 2 {
+		t.Fatalf("evidence count = %d, want 2 (one per source)", len(registrar.reconcileEvidence))
+	}
+	for i, evidence := range registrar.reconcileEvidence {
+		if !evidence.FullCycle {
+			t.Fatalf("evidence[%d].FullCycle = false, want true", i)
+		}
+		if evidence.SourceCount != 1 || evidence.QueueCount != 2 {
+			t.Fatalf("evidence[%d] = %+v, want source 1 / queue 2", i, evidence)
+		}
+	}
+}
+
+// TestRunPassReconcileRefusalLoggedLoud proves a catalog refusal does not fail
+// the pass and is logged at Error with the source, and that the queue bound is
+// reported.
+func TestRunPassReconcileRefusalLoggedLoud(t *testing.T) {
+	m := newPassTestMonitor(t)
+	var logs bytes.Buffer
+	m.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	items := []monitoredMedia{movieQueueItem("a")}
+	m.evaluateFn = func(_ context.Context, item monitoredMedia) (monitoredMedia, string, error) {
+		return item, "", nil
+	}
+	registrar := &trackingRegistrar{reconcileErr: fmt.Errorf("%w: truncated keep set", ErrReconcileRefused)}
+
+	resp, err := m.runPass(context.Background(), items, registrar)
+	if err != nil {
+		t.Fatalf("refusal must not fail the pass: %v", err)
+	}
+	if len(registrar.reconcileCalls) != 1 {
+		t.Fatalf("reconcile calls = %v, want 1", registrar.reconcileCalls)
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "level=ERROR") || !strings.Contains(logged, "refused") || !strings.Contains(logged, "request:a") {
+		t.Fatalf("refusal was not logged loudly with the source:\n%s", logged)
+	}
+	if got := resp.Output["queue_bound"]; got != maxMonitoredItems {
+		t.Fatalf("queue_bound = %v, want %d", got, maxMonitoredItems)
+	}
+}
+
+// TestPruneCompletedMoviesEvictsOnlyCompleteSources proves the queue bound is
+// enforced by evicting finished movies while leaving deferred/failing and
+// series items for the next pass.
+func TestPruneCompletedMoviesEvictsOnlyCompleteSources(t *testing.T) {
+	m := newPassTestMonitor(t)
+
+	completed := movieQueueItem("completed")
+	completed.Ready = true
+	unregistered := movieQueueItem("unregistered")
+	unregistered.Ready = true
+	pending := movieQueueItem("pending")
+	series := movieQueueItem("series")
+	series.MediaType = "series"
+	series.Ready = true
+
+	for _, item := range []monitoredMedia{completed, unregistered, pending, series} {
+		if err := m.remember(item); err != nil {
+			t.Fatalf("remember %s: %v", item.Key, err)
+		}
+	}
+	m.markRegistered("completed")
+	m.markRegistered("pending")
+	m.markRegistered("series")
+
+	pruned, err := m.pruneCompletedMovies()
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned = %d, want 1 (only the completed movie)", pruned)
+	}
+	if _, ok := m.item("completed"); ok {
+		t.Fatal("completed movie survived pruning")
+	}
+	for _, key := range []string{"unregistered", "pending", "series"} {
+		if _, ok := m.item(key); !ok {
+			t.Fatalf("pruning dropped %q", key)
+		}
+	}
+
+	// The eviction is durable: a reload must not resurrect the item.
+	reloaded := newMediaMonitor(nil, nil)
+	if err := reloaded.Configure(Config{File: m.config.File, ProwlarrIndexFile: m.config.ProwlarrIndexFile}); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if _, ok := reloaded.item("completed"); ok {
+		t.Fatal("pruned item returned after reload")
+	}
+}
+
+// TestEvictMissingPrunesOnlyAbsentRegisteredItems proves the existence probe
+// evicts registered media that is genuinely gone, never an unregistered
+// request, and prunes nothing when the probe fails.
+func TestEvictMissingPrunesOnlyAbsentRegisteredItems(t *testing.T) {
+	m := newPassTestMonitor(t)
+	keep := identifiedQueueItem("keep", "10")
+	gone := identifiedQueueItem("gone", "20")
+	pending := identifiedQueueItem("pending", "30")
+	items := []monitoredMedia{keep, gone, pending}
+	for _, item := range items {
+		if err := m.remember(item); err != nil {
+			t.Fatalf("remember %s: %v", item.Key, err)
+		}
+	}
+	m.markRegistered("keep")
+	m.markRegistered("gone")
+
+	presence := &fakePresence{missing: map[string]struct{}{"movie-tmdb-20": {}}}
+	evicted, err := m.evictMissing(context.Background(), presence, items)
+	if err != nil {
+		t.Fatalf("evictMissing: %v", err)
+	}
+	if evicted != 1 {
+		t.Fatalf("evicted = %d, want 1", evicted)
+	}
+	if _, ok := m.item("gone"); ok {
+		t.Fatal("genuinely-missing registered item survived")
+	}
+	for _, key := range []string{"keep", "pending"} {
+		if _, ok := m.item(key); !ok {
+			t.Fatalf("evictMissing dropped %q", key)
+		}
+	}
+
+	// A probe failure must not prune anything.
+	m2 := newPassTestMonitor(t)
+	failing := identifiedQueueItem("fail", "40")
+	if err := m2.remember(failing); err != nil {
+		t.Fatalf("remember: %v", err)
+	}
+	m2.markRegistered("fail")
+	if _, err := m2.evictMissing(context.Background(), &fakePresence{err: errors.New("database unavailable")}, []monitoredMedia{failing}); err == nil {
+		t.Fatal("expected probe failure")
+	}
+	if _, ok := m2.item("fail"); !ok {
+		t.Fatal("probe failure pruned an item")
+	}
+
+	// A registered item whose content was never probed as missing stays.
+	m3 := newPassTestMonitor(t)
+	untouched := identifiedQueueItem("untouched", "50")
+	if err := m3.remember(untouched); err != nil {
+		t.Fatalf("remember: %v", err)
+	}
+	m3.markRegistered(untouched.Key)
+	if evicted, err := m3.evictMissing(context.Background(), &fakePresence{}, []monitoredMedia{untouched}); err != nil || evicted != 0 {
+		t.Fatalf("empty missing set: evicted=%d err=%v, want 0/nil", evicted, err)
+	}
+	if _, ok := m3.item(untouched.Key); !ok {
+		t.Fatal("item was pruned with no missing evidence")
+	}
+}
+
+// TestForgetClearsRegistrationMarker proves forgetting an item also drops its
+// registration marker so a re-request re-registers instead of being skipped.
+func TestForgetClearsRegistrationMarker(t *testing.T) {
+	m := newPassTestMonitor(t)
+	item := movieQueueItem("done")
+	if err := m.remember(item); err != nil {
+		t.Fatalf("remember: %v", err)
+	}
+	m.markRegistered(item.Key)
+	if !m.isRegistered(item.Key) {
+		t.Fatal("registration marker not set")
+	}
+	if err := m.forget(item.Key); err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	if _, ok := m.item(item.Key); ok {
+		t.Fatal("forgotten item still queued")
+	}
+	if m.isRegistered(item.Key) {
+		t.Fatal("forget left a stale registration marker")
 	}
 }
 

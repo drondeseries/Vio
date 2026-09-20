@@ -263,6 +263,27 @@ func TestValidateCanonicalVirtualURIRejectsInvalidNamespaces(t *testing.T) {
 	}
 }
 
+// TestValidateVirtualEpisodeRejectsNonPositiveCoordinates pins the strictness
+// the monitor relies on: its registrar adapter skips season-0 specials before
+// validation, but a genuinely malformed coordinate (a negative season, or a
+// non-positive episode) must still be rejected.
+func TestValidateVirtualEpisodeRejectsNonPositiveCoordinates(t *testing.T) {
+	for name, episode := range map[string]VirtualEpisode{
+		"season 0 special": {SeasonNumber: 0, EpisodeNumber: 1},
+		"negative season":  {SeasonNumber: -1, EpisodeNumber: 1},
+		"episode 0":        {SeasonNumber: 1, EpisodeNumber: 0},
+		"negative episode": {SeasonNumber: 1, EpisodeNumber: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := validVirtualSeries()
+			input.Episodes = []VirtualEpisode{episode}
+			if !errors.Is(validateVirtualMedia(input), ErrInvalidVirtualMedia) {
+				t.Fatal("non-positive episode coordinates were accepted")
+			}
+		})
+	}
+}
+
 func TestVirtualContentIDPrefersCanonicalProvider(t *testing.T) {
 	series := virtualContentID(VirtualMedia{MediaType: "series", TVDBID: "450088", TMDBID: "1", IMDbID: "tt1"})
 	if series != "series-tvdb-450088" {

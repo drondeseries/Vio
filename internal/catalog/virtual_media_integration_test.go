@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -58,8 +59,14 @@ func newVirtualMediaTestPool(t *testing.T) *pgxpool.Pool {
 		lockConn.Release()
 	})
 
-	// Clean out related tables for isolation.
+	// Clean out related tables for isolation. The user/playback tables are
+	// cleared explicitly because the retention guards consult them and a
+	// leftover row could otherwise retain a file in an unrelated test.
 	for _, statement := range []string{
+		"DELETE FROM user_watch_progress",
+		"DELETE FROM user_watch_history",
+		"DELETE FROM playback_v3_attempts",
+		"DELETE FROM abs_playback_sessions",
 		"DELETE FROM media_files",
 		"TRUNCATE public.episodes CASCADE",
 		"DELETE FROM seasons",
@@ -2571,5 +2578,211 @@ func TestVirtualMovieRegistrationPermitsPossessedMovieWithoutProvider(t *testing
 	}
 	if virtualFiles != 1 || physicalFiles != 1 {
 		t.Fatalf("virtual=%d physical=%d, want coexistence 1/1", virtualFiles, physicalFiles)
+	}
+}
+
+// seedVerifiedReconcileClaims inserts a folder, one media item per content ID,
+// and a single-source claim for each, returning the content IDs.
+func seedVerifiedReconcileClaims(t *testing.T, pool *pgxpool.Pool, folderID int, source string, contentIDs []string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES($1,'Verified','movies',true)`, folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	for _, contentID := range contentIDs {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO media_items(content_id,type,title,sort_title,status)
+			VALUES($1,'movie',$1,$1,'matched')`, contentID); err != nil {
+			t.Fatalf("seed item %s: %v", contentID, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO virtual_media_source_claims(plugin_installation_id,source_key,content_id,media_folder_id)
+			VALUES(11,$1,$2,$3)`, source, contentID, folderID); err != nil {
+			t.Fatalf("seed claim %s: %v", contentID, err)
+		}
+	}
+}
+
+// TestReconcileVirtualMediaVerifiedRequiresFullCycleEvidence proves a partial
+// enumeration (or no evidence at all) is refused and deletes nothing, while the
+// refusal is distinguishable from an ordinary failure.
+func TestReconcileVirtualMediaVerifiedRequiresFullCycleEvidence(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	const source = "verified-partial"
+	ids := []string{"movie-tmdb-4101", "movie-tmdb-4102", "movie-tmdb-4103"}
+	seedVerifiedReconcileClaims(t, pool, 4110, source, ids)
+
+	reg := &VirtualMediaRegistrar{pool: pool}
+	// A keep set that omits 4103 would delete live media if accepted. The pass
+	// only enumerated a suffix, so it must be refused.
+	_, err := reg.ReconcileVirtualMediaVerified(ctx, 11, source, ids[:2], []int{4110}, VirtualReconcileEvidence{
+		FullCycle:   false,
+		SourceCount: 2,
+		QueueCount:  3,
+	})
+	if !errors.Is(err, ErrVirtualReconcileRefused) {
+		t.Fatalf("partial enumeration error = %v, want ErrVirtualReconcileRefused", err)
+	}
+
+	// The zero evidence value is likewise not complete.
+	if _, err := reg.ReconcileVirtualMediaVerified(ctx, 11, source, ids[:2], []int{4110}, VirtualReconcileEvidence{}); !errors.Is(err, ErrVirtualReconcileRefused) {
+		t.Fatalf("zero evidence error = %v, want ErrVirtualReconcileRefused", err)
+	}
+
+	var claims int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM virtual_media_source_claims WHERE plugin_installation_id=11 AND source_key=$1`, source).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != len(ids) {
+		t.Fatalf("refused reconciliation changed claims: %d, want %d", claims, len(ids))
+	}
+	var items int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_items`).Scan(&items); err != nil {
+		t.Fatal(err)
+	}
+	if items != len(ids) {
+		t.Fatalf("refused reconciliation removed media: %d items, want %d", items, len(ids))
+	}
+}
+
+// TestReconcileVirtualMediaVerifiedCompletePassDeletesStaleClaim proves a
+// genuine full-cycle enumeration still reconciles and deletes the withdrawal.
+func TestReconcileVirtualMediaVerifiedCompletePassDeletesStaleClaim(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	const source = "verified-complete"
+	ids := []string{"movie-tmdb-4201", "movie-tmdb-4202", "movie-tmdb-4203"}
+	seedVerifiedReconcileClaims(t, pool, 4120, source, ids)
+
+	result, err := (&VirtualMediaRegistrar{pool: pool}).ReconcileVirtualMediaVerified(ctx, 11, source, ids[:2], []int{4120}, VirtualReconcileEvidence{
+		FullCycle:   true,
+		SourceCount: 3,
+		QueueCount:  3,
+	})
+	if err != nil {
+		t.Fatalf("complete pass refused: %v", err)
+	}
+	if result.ItemsRemoved != 1 {
+		t.Fatalf("ItemsRemoved = %d, want 1", result.ItemsRemoved)
+	}
+	var remaining int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM virtual_media_source_claims WHERE plugin_installation_id=11 AND source_key=$1`, source).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 2 {
+		t.Fatalf("remaining claims = %d, want 2", remaining)
+	}
+	var gone int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_items WHERE content_id='movie-tmdb-4203'`).Scan(&gone); err != nil {
+		t.Fatal(err)
+	}
+	if gone != 0 {
+		t.Fatalf("withdrawn item survived: %d", gone)
+	}
+}
+
+// TestReconcileVirtualMediaVerifiedRefusesImplausibleShrink proves a complete
+// attestation cannot authorize a keep set that drops most of the source at
+// once, which is the signature of a truncated or replaced queue.
+func TestReconcileVirtualMediaVerifiedRefusesImplausibleShrink(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	const source = "verified-truncated"
+	ids := []string{
+		"movie-tmdb-4301", "movie-tmdb-4302", "movie-tmdb-4303",
+		"movie-tmdb-4304", "movie-tmdb-4305", "movie-tmdb-4306",
+	}
+	seedVerifiedReconcileClaims(t, pool, 4130, source, ids)
+
+	_, err := (&VirtualMediaRegistrar{pool: pool}).ReconcileVirtualMediaVerified(ctx, 11, source, ids[:1], []int{4130}, VirtualReconcileEvidence{
+		FullCycle:   true,
+		SourceCount: 1,
+		QueueCount:  6,
+	})
+	if !errors.Is(err, ErrVirtualReconcileRefused) {
+		t.Fatalf("implausible shrink error = %v, want ErrVirtualReconcileRefused", err)
+	}
+	var claims int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM virtual_media_source_claims WHERE plugin_installation_id=11 AND source_key=$1`, source).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != len(ids) {
+		t.Fatalf("implausible-shrink refusal changed claims: %d, want %d", claims, len(ids))
+	}
+}
+
+// TestMissingVirtualMediaContentIDsReportsGenuinelyRemoved confirms the monitor
+// existence probe reports only content with no catalog row.
+func TestMissingVirtualMediaContentIDsReportsGenuinelyRemoved(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_items(content_id,type,title,sort_title,status)
+		VALUES('movie-tmdb-4401','movie','A','A','matched'),
+		      ('movie-tmdb-4402','movie','B','B','matched')`); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := (&VirtualMediaRegistrar{pool: pool}).MissingVirtualMediaContentIDs(ctx, []string{
+		"movie-tmdb-4401", "movie-tmdb-4402", "movie-tmdb-4403",
+	})
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if len(missing) != 1 {
+		t.Fatalf("missing = %v, want only movie-tmdb-4403", missing)
+	}
+	if _, ok := missing["movie-tmdb-4403"]; !ok {
+		t.Fatalf("wrong missing set: %v", missing)
+	}
+}
+
+// TestVirtualMediaVariantsDeduplicateSubtitleLanguageAliases proves the stored
+// JSONB subtitle inventory carries one track per base language: a release that
+// declared both "EN-US"/"ENG" and "FRE"/"FR-CA" persists two rows, not four.
+func TestVirtualMediaVariantsDeduplicateSubtitleLanguageAliases(t *testing.T) {
+	pool := newVirtualMediaTestPool(t)
+	ctx := context.Background()
+	reg := newReleasedVirtualMediaRegistrar(pool)
+	if _, err := pool.Exec(ctx, "INSERT INTO media_folders(id,name,type,enabled) VALUES(998,'SubtitleDedupe','mixed',true)"); err != nil {
+		t.Fatalf("seed subtitle dedupe folder: %v", err)
+	}
+	in := VirtualMedia{
+		LibraryID: "998", MediaType: "movie", Title: "Subtitle Dedupe", IMDbID: "tt300", TMDBID: "3", Source: "provider-a",
+		Year: 2020, RuntimeMinutes: 100,
+		Variants: []VirtualMediaVariant{
+			{
+				VirtualURI: "virtual://movie/tt300?profile=1080p", Resolution: "1080p", CodecVideo: "h264",
+				SubtitleLanguages: []string{"EN-US", "ENG", "FRE", "FR-CA"},
+			},
+		},
+	}
+	res, err := reg.UpsertVirtualMedia(ctx, 11, in)
+	if err != nil {
+		t.Fatalf("upsert subtitle dedupe movie: %v", err)
+	}
+	var raw []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT subtitle_tracks FROM media_files
+		WHERE content_id=$1 AND file_path=$2`,
+		res.MediaID, "virtual://movie/tt300?profile=1080p").Scan(&raw); err != nil {
+		t.Fatalf("load stored subtitle tracks: %v", err)
+	}
+	var tracks []models.SubtitleTrack
+	if err := json.Unmarshal(raw, &tracks); err != nil {
+		t.Fatalf("decode stored subtitle tracks: %v", err)
+	}
+	if len(tracks) != 2 {
+		t.Fatalf("stored subtitle tracks = %#v, want 2 (one per base language)", tracks)
+	}
+	got := map[string]bool{}
+	for _, track := range tracks {
+		got[track.Language] = true
+	}
+	if !got["EN-US"] || !got["FR-CA"] {
+		t.Fatalf("stored subtitle tracks = %#v, want EN-US and FR-CA", tracks)
+	}
+	if got["ENG"] || got["FRE"] {
+		t.Fatalf("stored subtitle tracks = %#v, kept a redundant alias", tracks)
 	}
 }

@@ -35,6 +35,12 @@ const (
 	subtitleFormatASS = "ass"
 	subtitleFormatSSA = "ssa"
 	subtitleFormatSUP = "sup"
+	// subtitleSourceUnavailableErrorCode is the subtitle-local resolve failure.
+	// A subtitle sidecar/font request that cannot resolve its provider source is
+	// a subtitle-delivery problem, never the playback transport's
+	// virtual_resolve_failed: the client must not read it as the video source
+	// having failed and move off the release.
+	subtitleSourceUnavailableErrorCode = "subtitle_source_unavailable"
 )
 
 // FilePathResolver looks up a media file by its ID.
@@ -103,8 +109,12 @@ type StreamHandler struct {
 	AllowInsecureVirtual func(installationID int) bool
 	// VirtualCandidateFailMarker stamps a virtual candidate row as known-bad
 	// after a transport produced no bytes, so the auto-pick skips it on the
-	// next play while the dropdown still shows it for a manual retry.
-	VirtualCandidateFailMarker func(ctx context.Context, fileID int) error
+	// next play while the dropdown still shows it for a manual retry. It is
+	// fenced on the candidate identity the transport served (expectedFilePath)
+	// and the failure state observed when it started (observedFailedAt): a row
+	// rotated in place to a sibling is never stamped by a late failure of the
+	// candidate the session actually served.
+	VirtualCandidateFailMarker func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
 	// VirtualCandidateRecoveredMarker clears a known-bad stamp after the
 	// candidate actually delivered media bytes to a client — the only evidence
 	// that forgives a transport failure. The callback is fenced on the
@@ -233,13 +243,23 @@ func (h *StreamHandler) resolveVirtualInputURI(
 	profileID string,
 	forceRefresh bool,
 ) (ResolvedVirtualMedia, func(), error) {
-	return h.resolveVirtualInputURIExcluding(ctx, file, userID, profileID, forceRefresh, nil)
+	// A plain re-resolve indicts nothing, so it must not authorize a release
+	// substitution.
+	return h.resolveVirtualInputURIExcluding(ctx, file, userID, profileID, forceRefresh, nil, false)
 }
 
 // resolveVirtualInputURIExcluding resolves a virtual input, optionally
 // excluding a failed candidate so the next-ranked release is tried. The
 // excluded candidate ID is threaded into the detailed resolver, which re-lists
 // and skips it (see plugins.ResolveVirtualPlaybackDetailedWithRouting).
+//
+// rotateCandidates declares whether the exclusion is the serve layer's own
+// indictment of that release — a delivery that produced no bytes, a decode
+// rejection, or a dead candidate — which is what authorizes substituting a
+// sibling. It is explicit, not inferred from a non-empty exclusion list: an
+// exclusion alone is not a verdict, so a caller that excludes a candidate for
+// any other reason must pass false and let the resolver keep refusing a silent
+// release swap.
 func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	ctx context.Context,
 	file *models.MediaFile,
@@ -247,10 +267,18 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	profileID string,
 	forceRefresh bool,
 	excludedCandidateIDs []string,
+	rotateCandidates bool,
 ) (ResolvedVirtualMedia, func(), error) {
 	resolved := ResolvedVirtualMedia{}
 	var err error
 	if h.VirtualMediaDetailedResolver != nil {
+		// The caller declares whether excluding the candidate indicted the
+		// release; a display-driven same-file re-plan never does.
+		ctx = withVirtualCandidateRotationV3(ctx, rotateCandidates)
+		// The serve layer re-resolves a release an existing session already
+		// serves, so it declares session-bound: a profile-removed candidate
+		// refuses instead of silently swapping the release.
+		ctx = withVirtualSessionBindingV3(ctx, true)
 		resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 			ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, "",
 		)
@@ -416,6 +444,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if resolveErr != nil {
 			logVirtualStreamFailure(r.Context(), sessionID, file, resolveErr)
+			// A provider resolve failure is a dependency problem, not an
+			// internal error. The v1 status stays 502; the v2 byte-delivery
+			// adapter maps it to a defined, retryable dependency_unavailable,
+			// because the catalog has no 502 entry and a raw 502 would surface
+			// as internal_error/500.
 			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
 			return
 		}
@@ -497,13 +530,23 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					if failedID == "" {
 						excluded = nil
 					}
-					refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded)
+					// The retry is only reached because this serve layer just
+					// indicted the delivered candidate (failedID non-empty) and
+					// excluded it; declare substitution so the resolver may
+					// serve a sibling. A retry with no indictment (failedID
+					// empty) keeps refusing.
+					refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded, failedID != "")
 					if refreshErr == nil {
 						expectedCandidateID := ""
 						if parsed, err := url.Parse(file.FilePath); err == nil {
 							expectedCandidateID = parsed.Query().Get("result")
 						}
-						if expectedCandidateID != "" && refreshedMedia.CandidateID != "" && refreshedMedia.CandidateID != expectedCandidateID {
+						// A failed pin this serve layer just marked is an
+						// intended substitution: the retry excluded that id, so
+						// it can only return a sibling. The guard exists to stop
+						// a *silent* swap of a live candidate, so it only applies
+						// when no failed candidate was identified.
+						if failedID == "" && expectedCandidateID != "" && refreshedMedia.CandidateID != "" && refreshedMedia.CandidateID != expectedCandidateID {
 							if refreshCleanup != nil {
 								refreshCleanup()
 							}
@@ -575,6 +618,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				TargetAudioChannels:    session.TargetAudioChannels,
 				TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
 				TimingStart:            requestStart,
+				// A pre-body start failure must leave the response
+				// uncommitted so the handler can fail over to a sibling
+				// candidate; the v2 writer locks the first >=400 status and
+				// would discard a successful retry.
+				DeferStartError: true,
 			})
 			if err == nil && isVirtualPlaybackFile(file) &&
 				virtualCandidateDeliveryEvidence(http.StatusOK, remuxWriter.BytesWritten()) {
@@ -607,22 +655,51 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				if failedID == "" {
 					excluded = nil
 				}
-				retried, retryCleanup, retryErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded)
+				// The remux failed because this serve layer just indicted the
+				// delivered candidate; declare substitution so the resolver may
+				// serve a sibling release. A retry with no indictment keeps
+				// refusing.
+				retried, retryCleanup, retryErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded, failedID != "")
 				if retryErr == nil {
-					releaseInput = retryCleanup
-					retryURL, parseErr := url.Parse(retried.URL)
-					if parseErr == nil && retryURL.Scheme == "http" {
-						retryHost := retryURL.Hostname()
-						if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
-							inputPath = retried.URL
-							deliveredPath = resolvedVirtualCandidatePath(retried)
-							remuxErr = serveRemux()
+					// Same pinned-candidate guard direct play has: a retry that
+					// resolved a different release than the session-bound pin
+					// must not silently swap the bytes mid-stream. A failed pin
+					// this serve layer just marked is an intended substitution
+					// (the retry excluded it, so it can only return a sibling),
+					// so the guard applies only when no failed candidate was
+					// identified.
+					expectedCandidateID := ""
+					if parsed, err := url.Parse(file.FilePath); err == nil {
+						expectedCandidateID = parsed.Query().Get("result")
+					}
+					if failedID == "" && expectedCandidateID != "" && retried.CandidateID != "" && retried.CandidateID != expectedCandidateID {
+						if retryCleanup != nil {
+							retryCleanup()
+						}
+						remuxErr = fmt.Errorf("retried candidate %q does not match pinned candidate %q", retried.CandidateID, expectedCandidateID)
+					} else {
+						releaseInput = retryCleanup
+						retryURL, parseErr := url.Parse(retried.URL)
+						if parseErr == nil && retryURL.Scheme == "http" {
+							retryHost := retryURL.Hostname()
+							if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
+								inputPath = retried.URL
+								deliveredPath = resolvedVirtualCandidatePath(retried)
+								remuxErr = serveRemux()
+							}
 						}
 					}
 				}
 			}
 			if remuxErr != nil {
 				h.handleTransportStartFailure(r.Context(), session, file, remuxErr)
+				// The remux defers pre-body start failures, so with that option set
+				// nothing has committed a status and the v2 writer is still
+				// unlocked; a mid-stream failure returns nil instead. Commit one
+				// coherent error here. A client that disconnected needs no body.
+				if !isClientCancellation(r.Context(), remuxErr) {
+					http.Error(w, "failed to start remux", http.StatusBadGateway)
+				}
 			}
 		}
 
@@ -1169,7 +1246,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			resolved, releaseInput, err = h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 			if err != nil {
 				logVirtualStreamFailure(r.Context(), session.ID, file, err)
-				writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
+				writeError(w, http.StatusBadGateway, subtitleSourceUnavailableErrorCode, "Failed to resolve virtual source for the subtitle font bundle")
 				return
 			}
 			inputPath = resolved.URL
@@ -1225,7 +1302,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		if errors.Is(err, errVirtualFontResolve) {
 			logVirtualStreamFailure(r.Context(), session.ID, file, err)
-			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
+			writeError(w, http.StatusBadGateway, subtitleSourceUnavailableErrorCode, "Failed to resolve virtual source for the subtitle font bundle")
 			return
 		}
 		slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
@@ -1404,7 +1481,7 @@ func (h *StreamHandler) markVirtualCandidateFailed(ctx context.Context, file *mo
 	}
 	markCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	if err := h.VirtualCandidateFailMarker(markCtx, file.ID); err != nil {
+	if err := h.VirtualCandidateFailMarker(markCtx, file.ID, file.FilePath, file.FailedAt); err != nil {
 		slog.WarnContext(ctx, "mark virtual candidate failed", "component", "api", "file_id", file.ID, "candidate", candidateID, "error", err)
 	}
 }
@@ -1497,8 +1574,8 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) && h.RemoteStreamRelay != nil && session != nil {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if resolveErr != nil {
-			writeError(w, http.StatusBadGateway, "virtual_resolve_failed",
-				"Failed to resolve virtual source for subtitle extraction.")
+			writeError(w, http.StatusBadGateway, subtitleSourceUnavailableErrorCode,
+				"Failed to resolve the virtual source for subtitle extraction; the video source is unchanged.")
 			return
 		}
 		opts.InputPath = resolved.URL

@@ -455,6 +455,55 @@ func TestMergeCompatCandidateTracks(t *testing.T) {
 	}
 }
 
+// TestMergeCompatCandidateTracksDoesNotAppendSubtitleAlias proves the
+// synthesis key is canonical: a candidate "EN-US" is an alias of a probed
+// "ENG" and must not be appended as a second English track.
+func TestMergeCompatCandidateTracksDoesNotAppendSubtitleAlias(t *testing.T) {
+	file := &models.MediaFile{
+		SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "ENG", Codec: "subrip"}},
+	}
+	candidate := VirtualPlaybackStream{SubtitleLanguages: []string{"EN-US"}}
+
+	mergeCompatCandidateTracks(file, candidate)
+
+	if len(file.SubtitleTracks) != 1 {
+		t.Fatalf("SubtitleTracks = %#v, want the alias not appended", file.SubtitleTracks)
+	}
+	if file.SubtitleTracks[0].Language != "ENG" {
+		t.Fatalf("SubtitleTracks[0] = %#v, want the probed track preserved", file.SubtitleTracks[0])
+	}
+}
+
+// TestMergeCompatCandidateTracksDoesNotAppendBibliographicAlias covers the
+// ffprobe bibliographic code "fre" against the candidate "FR-CA".
+func TestMergeCompatCandidateTracksDoesNotAppendBibliographicAlias(t *testing.T) {
+	file := &models.MediaFile{
+		SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "fre", Codec: "subrip"}},
+	}
+	candidate := VirtualPlaybackStream{SubtitleLanguages: []string{"FR-CA"}}
+
+	mergeCompatCandidateTracks(file, candidate)
+
+	if len(file.SubtitleTracks) != 1 {
+		t.Fatalf("SubtitleTracks = %#v, want the French alias not appended", file.SubtitleTracks)
+	}
+}
+
+// TestMergeCompatCandidateTracksAppendsDistinctSubtitleLanguage proves a
+// genuinely different base language is still synthesized.
+func TestMergeCompatCandidateTracksAppendsDistinctSubtitleLanguage(t *testing.T) {
+	file := &models.MediaFile{
+		SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "ENG", Codec: "subrip"}},
+	}
+	candidate := VirtualPlaybackStream{SubtitleLanguages: []string{"FRE"}}
+
+	mergeCompatCandidateTracks(file, candidate)
+
+	if len(file.SubtitleTracks) != 2 {
+		t.Fatalf("SubtitleTracks = %#v, want the distinct language appended", file.SubtitleTracks)
+	}
+}
+
 func TestMergeCompatCandidateTracksPreservesDVProfile(t *testing.T) {
 	file := &models.MediaFile{Resolution: "2160p", CodecVideo: "hevc"}
 	mergeCompatCandidateTracks(file, VirtualPlaybackStream{HDR: "Dolby Vision Profile 8.1"})
@@ -1355,7 +1404,7 @@ func TestResolveAndProbeVirtualSourceProbesUnprobedRowAndPersists(t *testing.T) 
 		// No concrete candidate row: the save must fall back to the neutral
 		// row's own id and file_path so the id+file_path fence still matches.
 		VirtualCandidateFileLookup: func(context.Context, string, string, string, int) (*models.MediaFile, error) {
-			return nil, errors.New("candidate row not found")
+			return nil, ErrVirtualCandidateNotFound
 		},
 	}
 

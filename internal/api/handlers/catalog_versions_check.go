@@ -121,6 +121,10 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 
 	perFileCtx, cancel := context.WithTimeout(ctx, versionCheckPerFileBudget)
 	defer cancel()
+	// A strict availability check of the requested pin, not a fresh selection:
+	// declare it session-bound so a profile-removed pin reports ambiguous
+	// (do not stamp) instead of being substituted by a different candidate.
+	perFileCtx = withVirtualSessionBindingV3(perFileCtx, true)
 	requestedCandidateID := virtualResultCandidateID(file.FilePath)
 	resolved, err := h.VirtualResolver.ResolveVirtualMediaDetailed(
 		perFileCtx, file.FilePath, file.VirtualOwnerInstallationID,

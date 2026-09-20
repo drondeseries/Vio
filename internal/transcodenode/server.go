@@ -68,20 +68,25 @@ type TranscodeStartRequest struct {
 	CopySeekAnchorResolved     bool                   `json:"copy_seek_anchor_resolved,omitempty"`
 	StartSegmentNumber         int                    `json:"start_segment_number"`
 	TargetResolution           string                 `json:"target_resolution"`
-	TargetCodecVideo           string                 `json:"target_codec_video"`
-	TargetCodecAudio           string                 `json:"target_codec_audio"`
-	TargetAudioChannels        int                    `json:"target_audio_channels,omitempty"`
-	TargetAudioBitrateKbps     int                    `json:"target_audio_bitrate_kbps,omitempty"`
-	TargetBitrateKbps          int                    `json:"target_bitrate_kbps"`
-	SegmentDuration            int                    `json:"segment_duration"`
-	HWAccel                    string                 `json:"hw_accel"`
-	AudioTrackIndex            int                    `json:"audio_track_index"`
-	SubtitleTrackIndex         int                    `json:"subtitle_track_index"`
-	SubtitleBurnIn             bool                   `json:"subtitle_burn_in"`
-	SubtitleCodec              string                 `json:"subtitle_codec,omitempty"`
-	TotalDuration              float64                `json:"total_duration"`
-	RequireReady               bool                   `json:"require_ready,omitempty"`
-	ThrottleSeconds            int                    `json:"throttle_seconds,omitempty"`
+	// SourceFrameRate and SourceHeight keep the remote encode's GOP aligned
+	// with the real source cadence and let its filter chain detect a no-op
+	// scale. Zero is the historical 30 fps / unknown-height behavior.
+	SourceFrameRate        float64 `json:"source_frame_rate,omitempty"`
+	SourceHeight           int     `json:"source_height,omitempty"`
+	TargetCodecVideo       string  `json:"target_codec_video"`
+	TargetCodecAudio       string  `json:"target_codec_audio"`
+	TargetAudioChannels    int     `json:"target_audio_channels,omitempty"`
+	TargetAudioBitrateKbps int     `json:"target_audio_bitrate_kbps,omitempty"`
+	TargetBitrateKbps      int     `json:"target_bitrate_kbps"`
+	SegmentDuration        int     `json:"segment_duration"`
+	HWAccel                string  `json:"hw_accel"`
+	AudioTrackIndex        int     `json:"audio_track_index"`
+	SubtitleTrackIndex     int     `json:"subtitle_track_index"`
+	SubtitleBurnIn         bool    `json:"subtitle_burn_in"`
+	SubtitleCodec          string  `json:"subtitle_codec,omitempty"`
+	TotalDuration          float64 `json:"total_duration"`
+	RequireReady           bool    `json:"require_ready,omitempty"`
+	ThrottleSeconds        int     `json:"throttle_seconds,omitempty"`
 }
 
 // TranscodeStartResponse is the JSON response for POST /transcode/start.
@@ -1548,6 +1553,8 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		CopySeekAnchorResolved:     req.CopySeekAnchorResolved,
 		StartSegmentNumber:         req.StartSegmentNumber,
 		TargetResolution:           req.TargetResolution,
+		SourceFrameRate:            req.SourceFrameRate,
+		SourceHeight:               req.SourceHeight,
 		TargetCodecVideo:           req.TargetCodecVideo,
 		TargetCodecAudio:           req.TargetCodecAudio,
 		TargetAudioChannels:        req.TargetAudioChannels,
@@ -1639,7 +1646,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.RequireReady {
-		if _, err := session.WaitForManifest(TranscodeStartReadinessTimeout); err != nil {
+		if _, err := session.WaitForManifest(playback.ManifestStartupTimeoutFor(opts)); err != nil {
 			wasRunning := session.IsRunning()
 			_ = session.Close()
 			// Mirror the API server's local-transport retry: an early death
@@ -1670,7 +1677,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "failed to start transcode", http.StatusInternalServerError)
 				return
 			}
-			if _, retryErr := session.WaitForManifest(TranscodeStartReadinessTimeout); retryErr != nil {
+			if _, retryErr := session.WaitForManifest(playback.ManifestStartupTimeoutFor(retryOpts)); retryErr != nil {
 				_ = session.Close()
 				unlock()
 				slog.ErrorContext(r.Context(), "transcode failed readiness check", "component", "transcodenode", "error", retryErr, "session", req.SessionID, "playback_session_id", req.SessionID)

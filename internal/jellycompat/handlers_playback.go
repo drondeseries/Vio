@@ -330,8 +330,20 @@ type PlaybackHandler struct {
 	VirtualSourceProber            VirtualSourceProber
 	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
 	VirtualFileSaver               VirtualFileSaver
-	VirtualCandidateFileLookup     VirtualCandidateFileLookup
-	RemoteStreamRelay              RemoteStreamRelay
+	// VirtualFileMetadataSaver, when wired, is preferred over VirtualFileSaver
+	// by paths that must distinguish metadata persistence from identity
+	// adoption. Nil keeps legacy behavior.
+	VirtualFileMetadataSaver VirtualFileMetadataSaver
+	// compatBackgroundMu/WG/closed own the lifecycle of detached compat
+	// virtual evidence writes: admission is refused after Close, in-flight
+	// work is tracked, and the shutdown cleanup waits for it within a bounded
+	// drain timeout. Mirrors the native evidence lifecycle without sharing
+	// its implementation (jellycompat cannot import the handlers package).
+	compatBackgroundMu         sync.Mutex
+	compatBackgroundWG         sync.WaitGroup
+	compatBackgroundClosed     bool
+	VirtualCandidateFileLookup VirtualCandidateFileLookup
+	RemoteStreamRelay          RemoteStreamRelay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for private/local stream URLs. When
 	// nil or false, virtual streams are proxied through the strict SSRF-protected
@@ -746,12 +758,20 @@ func (h *PlaybackHandler) remoteTranscodeStartTimeout(request transcodenode.Tran
 	if request.ToneMapMode == "" {
 		return 20 * time.Second
 	}
-	timeout := playback.NormalizeProbeRequestTimeout(nodeProbeTimeoutMillis, h.toneMapCapabilityTimeout()) + playback.ManifestStartupTimeout
+	// A burn-in node waits longer for its first segment; the compat caller's
+	// budget must cover the same value or it would abort a slow-but-healthy
+	// subtitle composite. Non-burn-in plans keep the historical numbers
+	// (TranscodeStartReadinessTimeout == ManifestStartupTimeout).
+	readinessBudget := playback.ManifestStartupTimeoutFor(playback.TranscodeOpts{
+		SubtitleBurnIn:     request.SubtitleBurnIn,
+		SubtitleTrackIndex: request.SubtitleTrackIndex,
+	})
+	timeout := playback.NormalizeProbeRequestTimeout(nodeProbeTimeoutMillis, h.toneMapCapabilityTimeout()) + readinessBudget
 	if request.ToneMapPreflightRequired {
 		timeout += tonemap.SourcePreflightTimeout(request.TotalDuration)
 	}
 	if request.RequireReady {
-		timeout += transcodenode.TranscodeStartReadinessTimeout
+		timeout += readinessBudget
 	}
 	return timeout
 }

@@ -24,6 +24,12 @@ const (
 	// regex for a custom format (AltMount parity).
 	patternTypeToken = "token"
 	patternTypeRegex = "regex"
+
+	// HDR10 classifier values emitted by stream.ParseStreamDetails. The generic
+	// "hdr" requirement and exclusion cover this family, so its members are
+	// named once rather than repeated as literals.
+	hdrValueHDR10     = "hdr10"
+	hdrValueHDR10Plus = "hdr10+"
 )
 
 type CustomFormat struct {
@@ -503,6 +509,28 @@ func (q *QualityConfig) Validate() error {
 	return nil
 }
 
+// hdrSatisfies reports whether a candidate's classifier HDR value satisfies a
+// profile's HDR requirement. The classifier's emitted values are the source of
+// truth: hdr, hdr10, hdr10+, dv (see stream.ParseStreamDetails).
+//
+// A profile requiring the generic "hdr" accepts the HDR10 family (hdr, hdr10,
+// hdr10+) but not Dolby Vision. DV is a distinct HDR format, not HDR10, and a
+// profile that wants it must say so explicitly with HDR "dv" (the 4K Dolby
+// Vision preset already does). Conflating them would let a plain-HDR profile
+// select DV content whose dynamic metadata the client may not render. Every
+// other value matches case-insensitively and exactly.
+func hdrSatisfies(required, candidate string) bool {
+	required = strings.ToLower(strings.TrimSpace(required))
+	candidate = strings.ToLower(strings.TrimSpace(candidate))
+	if required == candidate {
+		return true
+	}
+	if required == "hdr" {
+		return candidate == hdrValueHDR10 || candidate == hdrValueHDR10Plus
+	}
+	return false
+}
+
 // MatchProfile reports whether a candidate satisfies a quality profile's
 // include/exclude regex, resolution, codecs, and HDR constraints.
 func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
@@ -522,13 +550,16 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	if p.CodecAudio != "" && c.CodecAudio != p.CodecAudio {
 		return false
 	}
-	if p.HDR != "" && c.HDR != p.HDR {
+	if p.HDR != "" && !hdrSatisfies(p.HDR, c.HDR) {
 		return false
 	}
 	if p.ExcludeHDR == "*" && c.HDR != "" {
 		return false
 	}
-	if p.ExcludeHDR != "" && p.ExcludeHDR != "*" && strings.EqualFold(c.HDR, p.ExcludeHDR) {
+	// The same sibling rule as the requirement side: ExcludeHDR "hdr" excludes
+	// the HDR10 family (hdr, hdr10, hdr10+) but not Dolby Vision, while
+	// ExcludeHDR "dv" excludes only DV. The two sides stay symmetric.
+	if p.ExcludeHDR != "" && p.ExcludeHDR != "*" && hdrSatisfies(p.ExcludeHDR, c.HDR) {
 		return false
 	}
 	if p.AudioChannels != "" && c.AudioChannels != "" && !strings.EqualFold(c.AudioChannels, p.AudioChannels) {
@@ -542,7 +573,13 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	if maxSize <= 0 && p.MaxSizeGB > 0 {
 		maxSize = int64(p.MaxSizeGB * 1e9)
 	}
-	if minSize > 0 && c.FileSize > 0 && c.FileSize < minSize {
+	// Size bounds are deliberately asymmetric for an unknown (0) size. A
+	// minimum is a requirement the candidate must prove it meets, so an
+	// unknown size fails it; a maximum is a ceiling only a known size can
+	// exceed, so an unknown size passes it. A min-size profile therefore never
+	// admits a release whose size could not be parsed, while a max-size profile
+	// never rejects purely for missing metadata.
+	if minSize > 0 && (c.FileSize <= 0 || c.FileSize < minSize) {
 		return false
 	}
 	if maxSize > 0 && c.FileSize > maxSize {
@@ -556,14 +593,16 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	}
 	if p.VisualTag != "" {
 		matchedTag := false
-		lowerTag := strings.ToLower(p.VisualTag)
 		for _, vt := range c.VisualTags {
-			if strings.EqualFold(vt, lowerTag) {
+			if strings.EqualFold(strings.TrimSpace(vt), strings.TrimSpace(p.VisualTag)) {
 				matchedTag = true
 				break
 			}
 		}
-		if !matchedTag && !strings.Contains(strings.ToLower(fullText), lowerTag) {
+		// The text fallback uses the package's token/boundary matcher, not a
+		// substring contains: a plain Contains made "dv" match "DVD-Rip".
+		// Exact parsed VisualTags matching stays authoritative.
+		if !matchedTag && !matchKeywordOrPattern(fullText, p.VisualTag) {
 			return false
 		}
 	}
@@ -576,7 +615,10 @@ func CustomFormatScore(candidate stream.StreamCandidate, formats []CustomFormat)
 	return customFormatScore(candidate, formats)
 }
 
-func customFormatScore(candidate stream.StreamCandidate, formats []CustomFormat) (int, bool) {
+// customFormatMatchText is the text a custom format is matched against: the
+// display fields plus the filename and URL in their decoded spellings, so an
+// encoded release name still matches.
+func customFormatMatchText(candidate stream.StreamCandidate) string {
 	text := candidate.Name + " " + candidate.Description + " " + candidate.Title + " " + candidate.URL
 	if candidate.BehaviorHints.Filename != "" {
 		text += " " + candidate.BehaviorHints.Filename
@@ -593,33 +635,41 @@ func customFormatScore(candidate stream.StreamCandidate, formats []CustomFormat)
 	if u, err := url.PathUnescape(candidate.URL); err == nil && u != "" {
 		text += " " + u
 	}
+	return text
+}
+
+// formatMatchesText reports whether one custom format matches the candidate
+// text, applying the rule's Invert flag.
+func formatMatchesText(format CustomFormat, text string) bool {
+	pattern := format.EffectivePattern()
+	if pattern == "" {
+		return false
+	}
+	var matched bool
+	if strings.ToLower(strings.TrimSpace(format.PatternType)) == patternTypeToken {
+		matched = matchKeywordOrPattern(text, pattern)
+	} else {
+		matcher := format.Compiled()
+		if matcher == nil {
+			var err error
+			matcher, err = compileFormatRegex(pattern)
+			if err != nil {
+				return false
+			}
+		}
+		matched = matcher.MatchString(text)
+	}
+	if format.Invert {
+		matched = !matched
+	}
+	return matched
+}
+
+func customFormatScore(candidate stream.StreamCandidate, formats []CustomFormat) (int, bool) {
+	text := customFormatMatchText(candidate)
 	score := 0
 	for _, format := range formats {
-		if !format.IsEnabled() {
-			continue
-		}
-		pattern := format.EffectivePattern()
-		if pattern == "" {
-			continue
-		}
-		var matched bool
-		if strings.ToLower(strings.TrimSpace(format.PatternType)) == patternTypeToken {
-			matched = matchKeywordOrPattern(text, pattern)
-		} else {
-			matcher := format.Compiled()
-			if matcher == nil {
-				var err error
-				matcher, err = compileFormatRegex(pattern)
-				if err != nil {
-					continue
-				}
-			}
-			matched = matcher.MatchString(text)
-		}
-		if format.Invert {
-			matched = !matched
-		}
-		if !matched {
+		if !format.IsEnabled() || !formatMatchesText(format, text) {
 			continue
 		}
 		// AltMount parity: scores at or below the discard line reject the
@@ -630,6 +680,24 @@ func customFormatScore(candidate stream.StreamCandidate, formats []CustomFormat)
 		score += format.Score
 	}
 	return score, false
+}
+
+// RejectingFormatNames returns the names of the enabled custom formats that
+// reject a candidate (an explicit Reject rule or a score at/below the discard
+// line). It is diagnostic only: the resolver logs it when every candidate in a
+// set is rejected and the best rejected one has to be used.
+func RejectingFormatNames(candidate stream.StreamCandidate, formats []CustomFormat) []string {
+	text := customFormatMatchText(candidate)
+	var names []string
+	for _, format := range formats {
+		if !format.IsEnabled() || !formatMatchesText(format, text) {
+			continue
+		}
+		if format.Reject || format.Score <= discardScoreThreshold {
+			names = append(names, strings.TrimSpace(format.Name))
+		}
+	}
+	return names
 }
 
 // compileFormatRegex compiles a custom-format regex case-insensitively,
@@ -716,7 +784,11 @@ func matchKeywordOrPattern(title, pattern string) bool {
 }
 
 // SortCandidatesForProfile ranks candidates in place: non-rejected first,
-// then by custom-format score, resolution, source type, and original order.
+// then profile-matching candidates, then by custom-format score, resolution,
+// source type, and original order. Ordering a profile-matching candidate ahead
+// of a profile-removed one is what keeps the auto picker's candidate list in
+// agreement with the resolver's profile filter; a zero profile (profiles
+// disabled or an unknown label) imposes no such ordering.
 func SortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProfile, formats []CustomFormat) {
 	sortCandidatesForProfile(candidates, p, formats)
 }
@@ -726,26 +798,41 @@ func sortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProf
 		return
 	}
 	if len(candidates) == 1 {
-		candidates[0].QualityScore, _ = customFormatScore(candidates[0], formats)
+		candidates[0].QualityScore, candidates[0].CustomFormatRejected = customFormatScore(candidates[0], formats)
 		return
 	}
 	type scoredCandidate struct {
 		candidate stream.StreamCandidate
 		rejected  bool
+		// profileMatched is true when the candidate satisfies the active
+		// profile. It is computed once per candidate so the comparator does not
+		// re-run the profile's regexes, and it orders matching candidates
+		// ahead of non-matching ones so the shared ranking (used by the auto
+		// picker's candidate list) agrees with the resolver's profile filter.
+		profileMatched bool
 	}
+	profileActive := strings.TrimSpace(p.Label) != ""
 	scored := make([]scoredCandidate, len(candidates))
 	for idx := range candidates {
 		score, reject := customFormatScore(candidates[idx], formats)
 		candidates[idx].QualityScore = score
+		candidates[idx].CustomFormatRejected = reject
 		scored[idx] = scoredCandidate{
-			candidate: candidates[idx],
-			rejected:  reject,
+			candidate:      candidates[idx],
+			rejected:       reject,
+			profileMatched: !profileActive || MatchProfile(candidates[idx], p),
 		}
 	}
 	sort.SliceStable(scored, func(i, j int) bool {
 		c1, c2 := scored[i].candidate, scored[j].candidate
 		if scored[i].rejected != scored[j].rejected {
 			return !scored[i].rejected
+		}
+		// Only an active profile contributes profile ordering. With a zero
+		// profile every candidate is profileMatched, but gating the comparison
+		// on profileActive makes the no-op structural rather than incidental.
+		if profileActive && scored[i].profileMatched != scored[j].profileMatched {
+			return scored[i].profileMatched
 		}
 		if c1.SourceConfirmed != c2.SourceConfirmed {
 			return c1.SourceConfirmed

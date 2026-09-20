@@ -42,7 +42,7 @@ func TestCatalogMonitorRegistrarNilFailsClosed(t *testing.T) {
 	if err := r.Register(context.Background(), monitor.MonitoredMedia{}); err == nil {
 		t.Fatal("expected error registering with nil registrar")
 	}
-	if err := r.Reconcile(context.Background(), "monitor", []string{"id1"}, []int{1}); err == nil {
+	if err := r.Reconcile(context.Background(), "monitor", []string{"id1"}, []int{1}, monitor.ReconcileEvidence{FullCycle: true, SourceCount: 1, QueueCount: 1}); err == nil {
 		t.Fatal("expected error reconciling with nil registrar")
 	}
 
@@ -50,8 +50,57 @@ func TestCatalogMonitorRegistrarNilFailsClosed(t *testing.T) {
 	if err := empty.Register(context.Background(), monitor.MonitoredMedia{}); err == nil {
 		t.Fatal("expected error registering with empty registrar")
 	}
-	if err := empty.Reconcile(context.Background(), "monitor", []string{"id1"}, []int{1}); err == nil {
+	if err := empty.Reconcile(context.Background(), "monitor", []string{"id1"}, []int{1}, monitor.ReconcileEvidence{FullCycle: true, SourceCount: 1, QueueCount: 1}); err == nil {
 		t.Fatal("expected error reconciling with empty registrar")
+	}
+}
+
+func TestMonitoredEpisodePayloadOmitsSeasonZeroSpecials(t *testing.T) {
+	item := monitor.MonitoredMedia{
+		Key:       "series:tt100",
+		MediaType: "series",
+		IMDbID:    "tt100",
+		Episodes: []monitor.VirtualEpisode{
+			{Season: 0, Episode: 1, Title: "Special"},
+			{Season: 0, Episode: 2, Title: "Another special"},
+			{Season: 1, Episode: 1, Title: "Pilot"},
+			{Season: 2, Episode: 5, Title: "Finale"},
+		},
+	}
+	payload := monitoredEpisodePayload(item)
+	if len(payload) != 2 {
+		t.Fatalf("payload episodes = %d, want 2 (specials omitted)", len(payload))
+	}
+	if payload[0].SeasonNumber != 1 || payload[0].EpisodeNumber != 1 {
+		t.Fatalf("payload[0] = S%dE%d, want S1E1", payload[0].SeasonNumber, payload[0].EpisodeNumber)
+	}
+	if payload[1].SeasonNumber != 2 || payload[1].EpisodeNumber != 5 {
+		t.Fatalf("payload[1] = S%dE%d, want S2E5", payload[1].SeasonNumber, payload[1].EpisodeNumber)
+	}
+	// A season-0 episode produces no usable URI; confirm it is not silently
+	// replaced by a placeholder.
+	for _, episode := range payload {
+		if episode.VirtualURI == "" {
+			t.Fatalf("payload episode S%dE%d has an empty virtual URI", episode.SeasonNumber, episode.EpisodeNumber)
+		}
+	}
+}
+
+func TestMonitoredEpisodePayloadKeepsMalformedEpisodesForValidation(t *testing.T) {
+	item := monitor.MonitoredMedia{
+		Key:       "series:tt100",
+		MediaType: "series",
+		IMDbID:    "tt100",
+		Episodes: []monitor.VirtualEpisode{
+			{Season: -1, Episode: 1, Title: "Malformed negative season"},
+		},
+	}
+	payload := monitoredEpisodePayload(item)
+	if len(payload) != 1 {
+		t.Fatalf("payload episodes = %d, want 1; a negative season must reach catalog validation", len(payload))
+	}
+	if payload[0].SeasonNumber != -1 {
+		t.Fatalf("payload[0].SeasonNumber = %d, want -1 preserved", payload[0].SeasonNumber)
 	}
 }
 

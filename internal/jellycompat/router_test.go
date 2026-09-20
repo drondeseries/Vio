@@ -16,7 +16,7 @@ import (
 )
 
 func TestRouterRegistersTranscodeShutdownWork(t *testing.T) {
-	registered := make(chan (<-chan struct{}), 1)
+	registered := make(chan (<-chan struct{}), 8)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	NewRouter(Dependencies{
@@ -27,16 +27,26 @@ func TestRouterRegistersTranscodeShutdownWork(t *testing.T) {
 		},
 	})
 
-	select {
-	case done := <-registered:
-		cancel()
+	var dones []<-chan struct{}
+drain:
+	for {
+		select {
+		case done := <-registered:
+			dones = append(dones, done)
+		default:
+			break drain
+		}
+	}
+	if len(dones) < 2 {
+		t.Fatalf("registrations = %d, want transcode and virtual evidence cleanup", len(dones))
+	}
+	cancel()
+	for _, done := range dones {
 		select {
 		case <-done:
-		case <-time.After(time.Second):
-			t.Fatal("registered transcode cleanup did not finish after cancellation")
+		case <-time.After(5 * time.Second):
+			t.Fatal("registered shutdown cleanup did not finish after cancellation")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("router did not register transcode shutdown work")
 	}
 }
 

@@ -401,6 +401,67 @@ func TestVirtualTranscodeStartupFailureEvictsExactCandidate(t *testing.T) {
 	}
 }
 
+// TestVirtualTranscodeStartupFailoverDeclaresCandidateRotation pins that the
+// startup failover declares substitution only for the attempt that indicted a
+// candidate. Attempt 0 is a plain resolve (no rotation); the retry excludes the
+// candidate the failed start named and declares rotation, so the resolver is
+// allowed to serve a sibling instead of refusing the swap.
+func TestVirtualTranscodeStartupFailoverDeclaresCandidateRotation(t *testing.T) {
+	tempDir := t.TempDir()
+	fileRes := &fakePinFileResolver{file: &models.MediaFile{
+		ID:                         10,
+		ContentID:                  "content-rotation",
+		FilePath:                   "virtual://series/tt1/1/1?result=broken",
+		VirtualOwnerInstallationID: 5,
+	}}
+	var rotationFlags []bool
+	var excludedSeen [][]string
+	h := &PlaybackHandler{
+		fileResolver: fileRes,
+		sessionMgr:   playback.NewSessionManager(0, 0),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, uri string, _ int, _ int, _ string, _ bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
+			rotationFlags = append(rotationFlags, VirtualCandidateRotationAllowed(ctx))
+			excludedSeen = append(excludedSeen, append([]string(nil), excluded...))
+			if len(excluded) == 0 {
+				return ResolvedVirtualMedia{URL: "http://localhost:8080/broken.mp4", URI: uri, CandidateID: "broken"}, nil
+			}
+			return ResolvedVirtualMedia{URL: "http://localhost:8080/live.mp4", URI: "virtual://series/tt1/1/1?result=live", CandidateID: "live"}, nil
+		}),
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			opts.OutputDir = tempDir
+			if strings.Contains(opts.InputPath, "broken.mp4") {
+				return nil, errors.New("manifest startup failed")
+			}
+			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
+	}
+
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), playback.TranscodeOpts{
+		MediaFileID:                      10,
+		InputPath:                        "virtual://series/tt1/1/1?result=broken",
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "rotation-declared",
+		OutputDir:                        tempDir,
+	})
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if len(rotationFlags) < 2 {
+		t.Fatalf("resolution calls = %d, want the initial resolve and the indicting retry", len(rotationFlags))
+	}
+	if rotationFlags[0] {
+		t.Fatal("initial resolve declared rotation")
+	}
+	if !rotationFlags[1] {
+		t.Fatalf("indicting retry did not declare rotation: flags=%#v excluded=%#v", rotationFlags, excludedSeen)
+	}
+	if len(excludedSeen[1]) != 1 || excludedSeen[1][0] != "broken" {
+		t.Fatalf("retry exclusions = %#v, want [broken]", excludedSeen[1])
+	}
+}
+
 func TestVirtualTranscodeManifestFailureEvictsExactCandidate(t *testing.T) {
 	tempDir := t.TempDir()
 	cache := NewVirtualBestResultCache(time.Minute, 10)

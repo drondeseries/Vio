@@ -590,10 +590,18 @@ func (c *Client) DeletePrefix(ctx context.Context, bucket, prefix string) (int, 
 }
 
 // DeleteObjects deletes the given keys in batches of up to 1000 (the S3 API
-// limit). Returns the total number of successfully deleted objects.
+// limit). Returns the number of objects that are no longer present after the
+// call: successfully deleted plus already absent. Object deletion is
+// idempotent, so an already-absent key has reached the desired end state and
+// is not a failure. Genuine per-object or per-batch failures (permissions,
+// throttling, transport, and similar) are reported as an error carrying the
+// number of keys that could not be deleted.
 func (c *Client) DeleteObjects(ctx context.Context, bucket string, keys []string) (int, error) {
 	const batchSize = 1000
-	deleted := 0
+	handled := 0
+	failed := 0
+	absent := 0
+	firstFailure := ""
 
 	for i := 0; i < len(keys); i += batchSize {
 		end := i + batchSize
@@ -617,26 +625,65 @@ func (c *Client) DeleteObjects(ctx context.Context, bucket string, keys []string
 		if err != nil {
 			// Fall back to individual deletes if batch is not supported.
 			for _, key := range batch {
-				if delErr := c.DeleteObject(ctx, bucket, key); delErr != nil {
-					slog.WarnContext(ctx, "s3 DeleteObjects fallback: failed to delete", "component", "s3client", "key", key, "error", delErr)
+				delErr := c.DeleteObject(ctx, bucket, key)
+				if delErr == nil {
+					handled++
 					continue
 				}
-				deleted++
+				if isNotFoundErr(delErr) {
+					handled++
+					absent++
+					continue
+				}
+				failed++
+				if firstFailure == "" {
+					firstFailure = fmt.Sprintf("%s: %v", key, delErr)
+				}
+				slog.WarnContext(ctx, "s3 DeleteObjects fallback: failed to delete", "component", "s3client", "key", key, "error", delErr)
 			}
 			continue
 		}
 
-		deleted += len(batch)
+		handled += len(batch)
 		if out != nil {
-			deleted -= len(out.Errors)
 			for _, e := range out.Errors {
+				if isNotFoundDeleteCode(aws.ToString(e.Code)) {
+					// Already gone: the caller's intent is satisfied.
+					absent++
+					continue
+				}
+				handled--
+				failed++
+				if firstFailure == "" {
+					firstFailure = fmt.Sprintf("%s: %s: %s",
+						aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
+				}
 				slog.WarnContext(ctx, "s3 DeleteObjects: partial failure", "component", "s3client",
 					"key", aws.ToString(e.Key), "code", aws.ToString(e.Code), "message", aws.ToString(e.Message))
 			}
 		}
 	}
 
-	return deleted, nil
+	if absent > 0 {
+		slog.DebugContext(ctx, "s3 DeleteObjects: objects were already absent", "component", "s3client", "count", absent)
+	}
+	if failed > 0 {
+		return handled, fmt.Errorf("s3 DeleteObjects: %d of %d objects failed to delete (first: %s)",
+			failed, len(keys), firstFailure)
+	}
+	return handled, nil
+}
+
+// isNotFoundDeleteCode reports whether a batch-delete per-object error code
+// means the object was already absent. Deletion is idempotent, so an absent
+// object is not a failure for the caller.
+func isNotFoundDeleteCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "nosuchkey", "notfound":
+		return true
+	default:
+		return false
+	}
 }
 
 // ListObjects lists all object keys with the given prefix.

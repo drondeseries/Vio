@@ -815,7 +815,29 @@ func (m *SessionManager) ConfirmReconstructedToneMap(expected *Session, mode ton
 	return current
 }
 
+// sessionLimitLookupTimeout bounds the per-user limit provider read once it is
+// decoupled from the caller's context. The provider is a small database/policy
+// read; a caller whose own deadline is nearly spent (the replan request budget
+// after a slow virtual rehydration) must not cancel it.
+const sessionLimitLookupTimeout = 3 * time.Second
+
+// sessionAdmissionTimeout bounds a replacement admission (the limit lookup plus
+// the optional policy decision) once it is decoupled from the request budget.
+const sessionAdmissionTimeout = 5 * time.Second
+
+// inlineLimits returns the manager-wide concurrency caps: the fallback when no
+// per-user provider is configured, and the fail-open fallback when a provider
+// lookup fails transiently.
+func (m *SessionManager) inlineLimits() SessionLimits {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return SessionLimits{MaxStreams: m.maxStreams, MaxTranscodes: m.maxTranscodes}
+}
+
 func (m *SessionManager) limitsForUser(ctx context.Context, userID int) (SessionLimits, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.mu.RLock()
 	provider := m.limitProvider
 	limits := SessionLimits{
@@ -827,11 +849,18 @@ func (m *SessionManager) limitsForUser(ctx context.Context, userID int) (Session
 	if provider == nil {
 		return limits, nil
 	}
-	limits, err := provider(ctx, userID)
+	// The lookup is a small, independent database/policy read. A parent
+	// context that is already canceled or nearly spent (the replan request
+	// budget) would abort it even though the read itself is still valid and
+	// fast, so run it under its own short budget decoupled from the parent's
+	// cancellation and deadline.
+	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionLimitLookupTimeout)
+	defer cancel()
+	limits, err := provider(lookupCtx, userID)
 	if err != nil {
-		// Tag provider failures with ErrLimitProviderUnavailable so the
-		// reconstruct admission path can distinguish a transient limit-lookup
-		// failure (which it may fail open on) from a genuine over-cap rejection.
+		// Tag provider failures with ErrLimitProviderUnavailable so callers can
+		// distinguish a transient limit-lookup failure (which replacement
+		// admission may fail open on) from a genuine over-cap rejection.
 		return SessionLimits{}, fmt.Errorf("load session limits for user %d: %w",
 			userID, errors.Join(ErrLimitProviderUnavailable, err))
 	}
@@ -856,6 +885,14 @@ func (m *SessionManager) CheckReplacementAllowed(ctx context.Context, sessionID 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// A replacement admission is a bounded, in-memory plus policy check for a
+	// request that is still live. A nearly-spent replan budget (virtual
+	// rehydration can consume most of it before the candidate loop runs) must
+	// not cancel the limit read or the policy decision, so run the admission
+	// under its own budget decoupled from the parent's cancellation/deadline.
+	admissionCtx, cancelAdmission := context.WithTimeout(context.WithoutCancel(ctx), sessionAdmissionTimeout)
+	defer cancelAdmission()
+	ctx = admissionCtx
 	// Bounded CAS: persistent count churn means the user is actively starting
 	// and stopping sessions; failing closed after a few rounds beats spinning
 	// with a limit-provider DB call per iteration.
@@ -880,7 +917,18 @@ func (m *SessionManager) CheckReplacementAllowed(ctx context.Context, sessionID 
 
 		limits, err := m.limitsForUser(ctx, userID)
 		if err != nil {
-			return err
+			if !errors.Is(err, ErrLimitProviderUnavailable) {
+				return err
+			}
+			// The replacement is for the same session and user whose limits
+			// were already loaded at start, so denying on a transient provider
+			// read blip is both redundant and wrong: it blocks playback for a
+			// limit decision the start admission already made. Fall back to the
+			// manager-wide inline caps and admit (the inline transcode cap is
+			// still enforced below), exactly as the decider-timeout path does.
+			slog.WarnContext(ctx, "playback replacement limit lookup unavailable; admitting with inline limits", "component", "playback",
+				"user_id", userID, "session", sessionID, "method", method, "error", err)
+			limits = m.inlineLimits()
 		}
 		if err := transcodingDisabledError(method == PlayTranscode, transcodeAudio, limits); err != nil {
 			return err

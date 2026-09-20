@@ -470,31 +470,70 @@ func dolbyVisionBaseLayerRangeV3(compatID int) (string, bool) {
 	}
 }
 
+// audioRenderModeV3 classifies how a client can render an audio codec without a
+// server transform.
+type audioRenderModeV3 int
+
+const (
+	audioRenderUnsupportedV3 audioRenderModeV3 = iota
+	audioRenderDecodeV3
+	audioRenderPassthroughV3
+)
+
+// audioRenderModeForTrackV3 is the single rule shared by the planner's
+// audioEligibilityV3 and the track selector's playability predicate, so both
+// agree on exactly which codecs/channels/layouts are directly renderable.
+//
+// Passthrough claims require exact audio evidence and the layout-passthrough
+// feature: only a client that can attest real sink layouts (Android audio HAL
+// enumeration) may earn a validated passthrough claim, and it must still name a
+// matching channel/layout entry. platform_attested and declared decode evidence
+// still qualifies for the decode path.
+func audioRenderModeForTrackV3(codec string, channels int, layout string, request StartRequestV3) audioRenderModeV3 {
+	passthroughCaps := request.ClientPlaybackContext.Output.AudioPassthrough
+	if passthroughCaps == nil {
+		passthroughCaps = request.Capabilities.AudioPassthrough
+	}
+	if request.Capabilities.AudioEvidence == EvidenceExactV3 &&
+		passthroughCaps != nil && containsFoldV3(passthroughCaps.PassthroughCodecs, codec) &&
+		HasFeatureV3(request.ClientFeatures, FeatureLayoutPassthrough) {
+		for _, entry := range passthroughCaps.Entries {
+			if !strings.EqualFold(entry.Codec, codec) || len(entry.ChannelCounts) == 0 || len(entry.Layouts) == 0 ||
+				!containsIntV3(entry.ChannelCounts, channels) || !containsFoldV3(entry.Layouts, layout) {
+				continue
+			}
+			return audioRenderPassthroughV3
+		}
+	}
+	if containsFoldV3(request.Capabilities.CodecsAudio, codec) {
+		return audioRenderDecodeV3
+	}
+	return audioRenderUnsupportedV3
+}
+
+// AudioTrackPlayableFuncV3 returns a predicate reporting whether the client can
+// render an audio track without a server transform. The track selector uses it
+// so it prefers exactly the tracks audioEligibilityV3 would accept, including
+// only the passthrough claims that pass the evidence/layout/feature gate.
+func AudioTrackPlayableFuncV3(request StartRequestV3) func(models.AudioTrack) bool {
+	return func(track models.AudioTrack) bool {
+		return audioRenderModeForTrackV3(track.Codec, track.Channels, track.Layout, request) != audioRenderUnsupportedV3
+	}
+}
+
 func audioEligibilityV3(source SourceDescriptorV3, request StartRequestV3) (copyOK, passthrough bool, claim AudioClaimsV3) {
 	claim.Codec = source.AudioCodec
 	passthroughCaps := request.ClientPlaybackContext.Output.AudioPassthrough
 	if passthroughCaps == nil {
 		passthroughCaps = request.Capabilities.AudioPassthrough
 	}
-	// Passthrough claims require exact audio evidence: only a client that can
-	// attest real sink layouts (Android audio HAL enumeration) may earn a
-	// validated passthrough claim. platform_attested and declared decode
-	// evidence still qualifies for copy routes below.
-	if request.Capabilities.AudioEvidence == EvidenceExactV3 &&
-		passthroughCaps != nil && containsFoldV3(passthroughCaps.PassthroughCodecs, source.AudioCodec) &&
-		HasFeatureV3(request.ClientFeatures, FeatureLayoutPassthrough) {
-		for _, entry := range passthroughCaps.Entries {
-			if !strings.EqualFold(entry.Codec, source.AudioCodec) || len(entry.ChannelCounts) == 0 || len(entry.Layouts) == 0 ||
-				!containsIntV3(entry.ChannelCounts, source.AudioChannels) || !containsFoldV3(entry.Layouts, source.AudioLayout) {
-				continue
-			}
-			claim.Passthrough = true
-			claim.AtmosPreserved = strings.Contains(strings.ToLower(source.AudioLayout), "joc") || strings.Contains(strings.ToLower(source.AudioLayout), "atmos")
-			claim.Reason = "sink_passthrough_validated"
-			return true, true, claim
-		}
-	}
-	if containsFoldV3(request.Capabilities.CodecsAudio, source.AudioCodec) {
+	switch audioRenderModeForTrackV3(source.AudioCodec, source.AudioChannels, source.AudioLayout, request) {
+	case audioRenderPassthroughV3:
+		claim.Passthrough = true
+		claim.AtmosPreserved = strings.Contains(strings.ToLower(source.AudioLayout), "joc") || strings.Contains(strings.ToLower(source.AudioLayout), "atmos")
+		claim.Reason = "sink_passthrough_validated"
+		return true, true, claim
+	case audioRenderDecodeV3:
 		claim.Reason = "client_decode_supported"
 		return true, false, claim
 	}

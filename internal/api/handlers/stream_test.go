@@ -500,7 +500,9 @@ func TestHandleStream_VirtualDirectPlayRefreshRejectsMismatchedCandidateID(t *te
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
 	handler.AllowInsecureVirtual = func(int) bool { return true }
 
-	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+	var rotationFlags []bool
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		rotationFlags = append(rotationFlags, VirtualCandidateRotationAllowed(ctx))
 		if forceRefresh {
 			return ResolvedVirtualMedia{
 				URL:         candBServer.URL + "/video.mp4",
@@ -524,6 +526,204 @@ func TestHandleStream_VirtualDirectPlayRefreshRejectsMismatchedCandidateID(t *te
 	}
 	if rr.Body.String() == "candidate-B-bytes" {
 		t.Fatal("handler served candidate B bytes instead of rejecting mismatched candidate")
+	}
+	// No candidate was indicted (the resolve carried no URI to name the
+	// delivered release), so the retry must not declare substitution: the
+	// mismatch stays a silent-swap refusal.
+	if len(rotationFlags) < 2 {
+		t.Fatalf("resolution calls = %d, want the initial resolve and the retry", len(rotationFlags))
+	}
+	if rotationFlags[0] || rotationFlags[1] {
+		t.Fatalf("non-indicting retry declared rotation: %#v", rotationFlags)
+	}
+}
+
+// multiWriteHeaderRecorder records every WriteHeader a handler emits. A remux
+// first attempt commits its own 502 through remux.go, so the status a plain
+// recorder keeps is the 502; the recorded sequence still shows the retry's 200.
+type multiWriteHeaderRecorder struct {
+	*httptest.ResponseRecorder
+	statuses []int
+}
+
+func (w *multiWriteHeaderRecorder) WriteHeader(code int) {
+	w.statuses = append(w.statuses, code)
+	w.ResponseRecorder.WriteHeader(code)
+}
+
+// TestHandleStream_VirtualDirectPlayIndictingRetryServesSibling covers the
+// direct-play serve-layer failover: a pinned candidate that produced no bytes is
+// indicted (marked failed) and excluded, and the retry must declare substitution
+// so the resolver may serve a sibling release. Without the declaration the
+// resolver refuses the swap and the failover degenerates into a replan.
+func TestHandleStream_VirtualDirectPlayIndictingRetryServesSibling(t *testing.T) {
+	liveServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("candidate-B-bytes"))
+	}))
+	defer liveServer.Close()
+
+	deadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer deadServer.Close()
+
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-indict",
+		FilePath:                   "virtual://movie/movie-indict?result=cand-A",
+		VirtualOwnerInstallationID: 7,
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, file.FilePath, file.VirtualOwnerInstallationID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.RemoteStreamRelay = remotestream.NewRelay()
+	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
+	handler.AllowInsecureVirtual = func(int) bool { return true }
+
+	var rotationFlags []bool
+	var excludedSeen [][]string
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, forceRefresh bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
+		rotationFlags = append(rotationFlags, VirtualCandidateRotationAllowed(ctx))
+		excludedSeen = append(excludedSeen, append([]string(nil), excluded...))
+		if forceRefresh && len(excluded) == 1 && excluded[0] == "cand-A" {
+			return ResolvedVirtualMedia{
+				URL:         liveServer.URL + "/video.mp4",
+				URI:         "virtual://movie/movie-indict?result=cand-B",
+				CandidateID: "cand-B",
+			}, nil
+		}
+		return ResolvedVirtualMedia{
+			URL:         deadServer.URL + "/video.mp4",
+			URI:         "virtual://movie/movie-indict?result=cand-A",
+			CandidateID: "cand-A",
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+	rr := httptest.NewRecorder()
+	handler.HandleStream(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != "candidate-B-bytes" {
+		t.Fatalf("body = %q, want the sibling candidate's bytes", rr.Body.String())
+	}
+	if len(rotationFlags) < 2 {
+		t.Fatalf("resolution calls = %d, want the initial resolve and the indicting retry", len(rotationFlags))
+	}
+	if rotationFlags[0] {
+		t.Fatal("initial resolve declared rotation")
+	}
+	if !rotationFlags[1] {
+		t.Fatalf("indicting retry did not declare rotation: flags=%#v excluded=%#v", rotationFlags, excludedSeen)
+	}
+	if len(excludedSeen[1]) != 1 || excludedSeen[1][0] != "cand-A" {
+		t.Fatalf("retry exclusions = %#v, want [cand-A]", excludedSeen[1])
+	}
+}
+
+// TestHandleStream_VirtualRemuxIndictingRetryServesSibling covers the remux
+// serve layer. A remux that produced no output indicted the delivered candidate,
+// and the retry must declare substitution and serve a sibling. The first attempt
+// commits its own 502 through remux.go, so the recorded status sequence (502
+// then 200) and the sibling bytes are what prove the retry served.
+func TestHandleStream_VirtualRemuxIndictingRetryServesSibling(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	ffmpeg := filepath.Join(dir, "ffmpeg.sh")
+	script := "#!/bin/sh\n" +
+		"for arg in \"$@\"; do\n" +
+		"  case \"$arg\" in\n" +
+		"    -bsfs) printf 'dovi_rpu'; exit 0 ;;\n" +
+		"  esac\n" +
+		"done\n" +
+		"if [ -e \"" + started + "\" ]; then printf 'sibling-bytes'; exit 0; fi\n" +
+		": > \"" + started + "\"\n" +
+		"echo 'intentional remux failure' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-remux-indict",
+		FilePath:                   "virtual://movie/movie-remux-indict?result=cand-A",
+		VirtualOwnerInstallationID: 7,
+		CodecVideo:                 "h264",
+		VideoTracks:                []models.VideoTrack{{Codec: "h264"}},
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayRemux, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, file.FilePath, file.VirtualOwnerInstallationID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.RemoteStreamRelay = remotestream.NewRelay()
+	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
+	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: ffmpeg}
+	}
+
+	var rotationFlags []bool
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, forceRefresh bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
+		rotationFlags = append(rotationFlags, VirtualCandidateRotationAllowed(ctx))
+		if forceRefresh && len(excluded) == 1 && excluded[0] == "cand-A" {
+			return ResolvedVirtualMedia{
+				URL:         "http://127.0.0.1:9/cand-b.mp4",
+				URI:         "virtual://movie/movie-remux-indict?result=cand-B",
+				CandidateID: "cand-B",
+			}, nil
+		}
+		return ResolvedVirtualMedia{
+			URL:         "http://127.0.0.1:9/cand-a.mp4",
+			URI:         "virtual://movie/movie-remux-indict?result=cand-A",
+			CandidateID: "cand-A",
+		}, nil
+	})
+
+	rr := &multiWriteHeaderRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+	handler.HandleStream(rr, req)
+
+	if !strings.Contains(rr.Body.String(), "sibling-bytes") {
+		t.Fatalf("body = %q, want the sibling remux output", rr.Body.String())
+	}
+	servedSibling := false
+	for _, status := range rr.statuses {
+		if status == http.StatusOK {
+			servedSibling = true
+		}
+	}
+	if !servedSibling {
+		t.Fatalf("write statuses = %#v, want a 200 for the sibling attempt after the first 502", rr.statuses)
+	}
+	if len(rotationFlags) < 2 {
+		t.Fatalf("resolution calls = %d, want the initial resolve and the indicting retry", len(rotationFlags))
+	}
+	if rotationFlags[0] {
+		t.Fatal("initial resolve declared rotation")
+	}
+	if !rotationFlags[1] {
+		t.Fatalf("remux indicting retry did not declare rotation: %#v", rotationFlags)
 	}
 }
 

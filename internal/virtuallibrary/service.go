@@ -222,6 +222,17 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 		})
 		m.SetHost(&catalogRegistrarAdapter{registrar: registrar})
 	}
+	// Wire the resolver's ingestion hooks. The monitor owns the classifier
+	// (AltMount's authoritative completed/failed state, then Prowlarr's
+	// confirmation) and the release-schedule store; both must be installed
+	// before the first resolve, and the enricher is the stream parser the
+	// retired plugin path used to supply.
+	r.SetCandidateEnricher(resolver.DefaultEnricher)
+	r.SetCandidateClassifier(m)
+	r.SetLogger(logger)
+	if store := m.ReleaseStore(); store != nil {
+		r.SetReleaseGate(store)
+	}
 	return &Service{Resolver: r, Monitor: m, cfg: cfg, logger: logger}
 }
 

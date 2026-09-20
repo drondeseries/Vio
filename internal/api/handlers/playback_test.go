@@ -666,6 +666,20 @@ func playbackTestConfig(ffmpegPath, transcodeDir string) func() config.PlaybackC
 	}
 }
 
+// playbackTestConfigNoTranscode is playbackTestConfig with server transcoding
+// disabled. The planner reads TranscodeEnabled from the config snapshot the
+// handler holds (production wires it to the live config), not from the settings
+// store, so a test that wants the "transcoding disabled" policy must set it on
+// the config rather than in the settings repo.
+func playbackTestConfigNoTranscode(transcodeDir string) func() config.PlaybackConfig {
+	base := playbackTestConfig("", transcodeDir)
+	return func() config.PlaybackConfig {
+		cfg := base()
+		cfg.TranscodeEnabled = false
+		return cfg
+	}
+}
+
 func requireWorkerRoutingV3(handler *PlaybackHandler) {
 	previous := handler.PlaybackConfig
 	handler.PlaybackConfig = func() config.PlaybackConfig {

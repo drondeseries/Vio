@@ -1,4 +1,5 @@
 import { adminSessionsKey } from "@/api/v2/adminSessionsCache";
+import { v2Problem } from "@/api/v2/problems.test-support";
 import {
   captureProfileRequestContext,
   setAccessToken,
@@ -517,6 +518,65 @@ describe("RealtimeEventsProvider", () => {
       type: "active",
       predicate: expect.any(Function),
     });
+  });
+
+  it("excludes terminal 404 item details from the broad catch-up refetch", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    const refetchQueries = vi.spyOn(queryClient, "refetchQueries").mockResolvedValue(undefined);
+    mockState.pathname = "/item/movie-1";
+    const provider = () => (
+      <QueryClientProvider client={queryClient}>
+        <RealtimeEventsProvider>
+          <div />
+        </RealtimeEventsProvider>
+      </QueryClientProvider>
+    );
+
+    const view = render(provider());
+
+    await act(async () => {
+      mockState.pageActivity = {
+        ...mockState.pageActivity,
+        isVisible: false,
+        canApplyRealtimeUpdates: false,
+      };
+      view.rerender(provider());
+    });
+
+    await act(async () => {
+      mockState.pageActivity = {
+        ...mockState.pageActivity,
+        isVisible: true,
+        canApplyRealtimeUpdates: true,
+      };
+      view.rerender(provider());
+    });
+
+    const predicate = refetchQueries.mock.calls[0]?.[0]?.predicate as
+      | ((query: {
+          queryKey: readonly unknown[];
+          state?: { status?: string; error?: unknown };
+        }) => boolean)
+      | undefined;
+    expect(predicate).toBeDefined();
+
+    expect(
+      predicate?.({
+        queryKey: catalogKeys.itemDetail("movie-tmdb-1083381"),
+        state: { status: "error", error: v2Problem(404, "not_found", "Not Found") },
+      }),
+    ).toBe(false);
+    expect(
+      predicate?.({
+        queryKey: catalogKeys.itemDetail("movie-1"),
+        state: { status: "success" },
+      }),
+    ).toBe(true);
   });
 
   it("preserves cached watched state when a favorite-only event arrives", async () => {

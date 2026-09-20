@@ -33,6 +33,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
+	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/settingskeys"
 	"github.com/Silo-Server/silo-server/internal/settingsresolve"
@@ -268,6 +269,12 @@ type VirtualProbeCacheLookup func(sourceURL string, file *models.MediaFile) *mod
 // rows updated (0 means the snapshot was stale — a newer write landed first).
 type VirtualFileSaver func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error)
 
+// VirtualFileMetadataSaver is VirtualFileSaver with an explicit result that
+// separates metadata persistence from identity adoption. Prefer it wherever
+// the caller must distinguish "evidence landed" from "the row adopted the
+// requested path"; the row-count contract cannot express that difference.
+type VirtualFileMetadataSaver func(ctx context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error)
+
 // VirtualPlaybackSourceProber resolves a virtual provider URL and probes the
 // stream metadata.
 
@@ -292,6 +299,12 @@ type copySeekAnchorResolver func(
 type VirtualFileLookup func(ctx context.Context, path string) (*models.MediaFile, error)
 
 type VirtualCandidateFileLookup func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error)
+
+var ErrVirtualCandidateNotFound = errors.New("virtual candidate not found")
+
+func isVirtualCandidateNotFound(err error) bool {
+	return err != nil && (errors.Is(err, ErrVirtualCandidateNotFound) || errors.Is(err, scanner.ErrFileNotFound))
+}
 
 type VirtualPlaybackPrefetchRequest struct {
 	FileIDs []int `json:"file_ids"`
@@ -357,15 +370,23 @@ type PlaybackHandler struct {
 	// carry it and are refused when it differs. Empty leaves v2 unconfigured.
 	InstallationID string
 	// progressSideEffectLocks serializes v2 progress side effects per session
-	// (see persistProgressV2).
-	progressSideEffectLocks sync.Map
+	// (see persistProgressV2). It is reference-counted and bounded: the entry
+	// is created on the first acquire for a session and deleted when the last
+	// in-flight holder releases, so the map tracks concurrent writers rather
+	// than every session the process has ever served. progressSideEffectLocksMu
+	// guards the map and each entry's refcount; the entry's own mutex is the
+	// per-session side-effect lock.
+	progressSideEffectLocks   map[string]*progressSideEffectLockEntry
+	progressSideEffectLocksMu sync.Mutex
 	// virtualDeliveryCleared records playback sessions whose first fully
 	// delivered HLS/transcode segment already recorded delivery evidence and
 	// cleared the candidate's failed mark. One entry per served session keeps a
 	// long segment stream from issuing a read+write per segment; a newer failure
 	// after the first delivery is preserved, mirroring the direct-play path's
-	// transport-start capture. Precedent for the un-cleaned per-session map:
-	// progressSideEffectLocks.
+	// transport-start capture. The entry is dropped on session end (see
+	// forgetProgressSideEffectLock), so it is bounded by live sessions; unlike
+	// the side-effect lock it is not refcounted, because a late duplicate
+	// segment request simply records the (idempotent, fenced) evidence again.
 	virtualDeliveryCleared sync.Map
 	// ProxyGrantStore hands a proxy the recipe it serves a header-authenticated
 	// session from. Optional: without it an attempt that negotiated
@@ -438,13 +459,17 @@ type PlaybackHandler struct {
 	VirtualProbeCacheLookup                VirtualProbeCacheLookup
 	BestResultCache                        *VirtualBestResultCache
 	VirtualFileSaver                       VirtualFileSaver
-	VirtualSubtitleSearcher                SubtitleSearchTrigger
-	SubtitleSearchInFlight                 *sync.Map
-	DeviceCapabilitySource                 DeviceCapabilityProfileSource
-	RemuxDBConfig                          func(ctx context.Context) remuxdb.Config
-	RemuxDBStore                           *remuxdb.Store
-	remuxSubmitOnce                        sync.Once
-	remuxSubmitCh                          chan remuxSubmitTask
+	// VirtualFileMetadataSaver, when wired, is preferred over VirtualFileSaver
+	// by paths that must distinguish metadata persistence from identity
+	// adoption (stale fallback, evidence workers). Nil keeps legacy behavior.
+	VirtualFileMetadataSaver VirtualFileMetadataSaver
+	VirtualSubtitleSearcher  SubtitleSearchTrigger
+	SubtitleSearchInFlight   *sync.Map
+	DeviceCapabilitySource   DeviceCapabilityProfileSource
+	RemuxDBConfig            func(ctx context.Context) remuxdb.Config
+	RemuxDBStore             *remuxdb.Store
+	remuxSubmitOnce          sync.Once
+	remuxSubmitCh            chan remuxSubmitTask
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through
@@ -517,6 +542,67 @@ type PlaybackHandler struct {
 	// Guarded by v3DVRPUMu.
 	v3DVRPUMu    sync.Mutex
 	v3DVRPUVerds map[dvRPUMemoKeyV3]bool
+
+	// ServiceContext is the server lifecycle context. Detached virtual work
+	// (background probes, optimistic revalidation, candidate-sink writes,
+	// subtitle searches, prefetch) is parented to it so shutdown cancels
+	// outstanding work instead of leaking it. nil behaves as
+	// context.Background() for handlers built outside the router (tests).
+	ServiceContext context.Context
+
+	// detachedWorkOnce guards lazy construction of detachedWorkGate for
+	// handlers built as literals rather than through NewPlaybackHandler. The
+	// gate bounds all detached virtual work server-wide; see
+	// playback_virtual.go.
+	detachedWorkOnce sync.Once
+	detachedWorkGate *virtualDetachedGate
+
+	// virtualEvidenceOnce guards lazy construction of the coalescing buffer
+	// and worker pool that persist virtual probe evidence. Evidence
+	// persistence is queued rather than admitted through the aggregate gate so
+	// a burst of probes cannot crowd delivery/failure evidence out; see
+	// playback_virtual_evidence.go.
+	virtualEvidenceOnce   sync.Once
+	virtualEvidenceBuffer *virtualEvidenceBuffer
+	// virtualEvidenceWG tracks the evidence workers so shutdown can await work
+	// they already dequeued before draining the accepted remainder. A dequeued
+	// task is still in a worker's hands, so an empty pending buffer alone is
+	// not proof that shutdown is safe.
+	virtualEvidenceWG sync.WaitGroup
+	// virtualEvidenceStopOnce makes the shutdown sequence single-flight. The
+	// application shutdown sequence calls StopVirtualEvidence explicitly (wired
+	// through api.Dependencies.RegisterShutdownFunc); the service-context
+	// watcher is only a safety net. A caller that races the other blocks until
+	// the one closure, worker await and drain have all completed, so tests and
+	// shutdown observe the same terminal state.
+	virtualEvidenceStopOnce sync.Once
+
+	// subtitleSlotsOnce guards lazy construction of the dedicated subtitle
+	// search gate. Subtitle searches can run for the full two-minute provider
+	// budget, so they are additionally capped well below the aggregate
+	// detached gate: a hung provider can tie up at most subtitleSearchCap
+	// aggregate slots and still leave capacity for probes and prefetch. A slot
+	// (there and on the aggregate gate) is held until the callback returns,
+	// never released when only its context expired, so a non-cooperative
+	// provider cannot cause replacement goroutines to pile up.
+	subtitleSlotsOnce sync.Once
+	subtitleSlots     *virtualDetachedGate
+
+	// prefetchOnce guards the lazy prefetch worker pool. Prefetch work is
+	// admitted into a bounded queue (prefetchQueue) before any goroutine
+	// handles it, deduplicated by source+profile equivalence key
+	// (prefetchInFlight), and drained by a fixed pool of
+	// virtualPrefetchWorkers goroutines. Active, pending and dedup state are
+	// therefore all bounded, and prefetch can never spawn one goroutine per
+	// request. See PrefetchVirtualPlayback.
+	prefetchOnce     sync.Once
+	prefetchQueue    chan virtualPrefetchTask
+	prefetchMu       sync.Mutex
+	prefetchInFlight map[string]struct{}
+	// prefetchStopped is set under prefetchMu when the service context ends.
+	// New admissions are refused after that so a request racing shutdown cannot
+	// enqueue work the workers will never drain.
+	prefetchStopped bool
 }
 
 type PlaybackWatchScrobbler interface {
@@ -540,6 +626,9 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 		realtimeCommands:       make(map[string]playbackCommandRecord),
 		tm:                     playback.NewTranscodeManager(),
 		PlanStoreV3:            playback.NewMemoryPlanStoreV3(),
+		// Detached virtual work is parented to this until the router replaces
+		// it with the server lifecycle context.
+		ServiceContext: context.Background(),
 	}
 	if len(opts) > 0 {
 		h.fileResolver = opts[0]
@@ -2032,18 +2121,40 @@ func writePlaybackDecodeError(w http.ResponseWriter) {
 	writeError(w, http.StatusUnprocessableEntity, "decode_failed", "The media source could not be decoded.")
 }
 
+// writePlaybackSegmentError maps a segment-retrieval failure to its HTTP
+// response. A segment that is absent (ErrSegmentNotFound) or whose transcode
+// process exited before the segment materialized (ErrTranscodeFailed) is
+// terminal for this generation: it will never appear, so the client re-plans
+// instead of retrying a dead encode. A user stop that kills ffmpeg while a
+// segment request is already waiting surfaces as ErrTranscodeFailed, and a
+// stopped session is not a server defect. Both map to 404, mirroring
+// hlsSegmentErrorResponse on the Jellyfin-compatible surface. A playlist that
+// is still being produced (ErrManifestNotReady) is transient and stays
+// retryable as 503. Everything else is an unexpected server error.
+func writePlaybackSegmentError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, playback.ErrSegmentNotFound), errors.Is(err, playback.ErrTranscodeFailed):
+		writeError(w, http.StatusNotFound, "not_found", "Segment not found")
+	case errors.Is(err, playback.ErrManifestNotReady):
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode session is temporarily unavailable")
+	default:
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load segment")
+	}
+}
+
 // HandleGetTranscodeSegment handles GET /playback/transcode/{session_id}/segment/{name}.
 // Authorization follows the same negotiated legacy-versus-header-authenticated
 // rule as the manifest endpoint above.
 //
 // Errors: 404 (playback_session_not_found / not_found) when the session is
-// missing or cannot be reconstructed, or the segment does not exist; 503
-// (unavailable) while the transcode is temporarily unavailable; and — for
-// tone-map execution failures — 422 (unsupported) with an
-// X-Vio-Tone-Map-Execution-Error header of source_revision_changed or
-// source_preflight_rejected. The 422 responses are additive to the existing
-// 404 and 503 cases; the Jellyfin-compatible 415 mapping is a separate surface
-// and unchanged.
+// missing or cannot be reconstructed, or the segment does not exist, or the
+// transcode process exited before the segment materialized (including a stop
+// that killed ffmpeg mid-request); 503 (unavailable) while the transcode is
+// temporarily unavailable; and — for tone-map execution failures — 422
+// (unsupported) with an X-Vio-Tone-Map-Execution-Error header of
+// source_revision_changed or source_preflight_rejected. The 422 responses are
+// additive to the existing 404 and 503 cases; the Jellyfin-compatible 415
+// mapping is a separate surface and unchanged.
 func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "session_id")
 	requestedSegment := -1
@@ -2270,11 +2381,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		if writePlaybackToneMapExecutionError(w, err) {
 			return
 		}
-		if errors.Is(err, playback.ErrSegmentNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "Segment not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load segment")
+		writePlaybackSegmentError(w, err)
 		return
 	}
 

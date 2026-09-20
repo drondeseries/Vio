@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { v2Problem } from "@/api/v2/problems.test-support";
 import { UICustomizationContext } from "@/contexts/uiCustomizationContext";
 import RecommendationGrid from "./RecommendationGrid";
 
@@ -113,5 +114,40 @@ describe("RecommendationGrid", () => {
     expect(markup).toContain('href="/item/series-1"');
     expect(markup).toContain('href="/watch/episode-4"');
     expect(markup).toContain('aria-label="Play Running Show"');
+  });
+
+  it("renders a pulse placeholder while a recommendation detail is loading", () => {
+    mocks.useCatalogItemDetail.mockReturnValue({ data: undefined, error: null });
+
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <RecommendationGrid items={[{ content_id: "movie-1" }]} />
+      </MemoryRouter>,
+    );
+
+    expect(markup).toContain("animate-pulse");
+  });
+
+  it("skips a terminally-failed recommendation while still rendering healthy cards", () => {
+    mocks.useCatalogItemDetail.mockImplementation((itemId: string) =>
+      itemId === "movie-tmdb-1083381"
+        ? { data: undefined, error: v2Problem(404, "not_found", "Not Found") }
+        : {
+            data: { content_id: itemId, title: "Heat", poster_url: "/heat.jpg" },
+            error: null,
+          },
+    );
+
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <RecommendationGrid
+          items={[{ content_id: "movie-tmdb-1083381" }, { content_id: "movie-2" }]}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(markup).not.toContain("/item/movie-tmdb-1083381");
+    expect(markup).not.toContain("animate-pulse");
+    expect(markup).toContain('href="/item/movie-2"');
   });
 });

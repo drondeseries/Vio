@@ -150,8 +150,13 @@ func TestPrepareRemoteTransportV3RejectsOldNodeAfterStaleAudioCapabilityProbe(t 
 		httptest.NewRequest(http.MethodPost, "/", nil),
 		&playback.Session{ID: "session-stale-audio-node", UserID: 7, ProfileID: "profile-1"},
 		v3HandlerFixtureFile(t), remoteHLSResultV3(), mediaAuthModeV3{}, policy)
-	if transportErr == nil || transportErr.reason != transcodeStartFailedReasonV3 {
-		t.Fatalf("transport error = %#v, want %q", transportErr, transcodeStartFailedReasonV3)
+	// The request carries an audio downmix recipe (asserted below), and the
+	// stale node's receipt is checked for that recipe first. A node that cannot
+	// attest the audio recipe is an audio-local failure, not a video one: the
+	// distinct reason keeps the release and lets the transport loop retry the
+	// same recipe on another node instead of rotating the video candidate.
+	if transportErr == nil || transportErr.reason != audioAdaptationFailedReasonV3 {
+		t.Fatalf("transport error = %#v, want %q", transportErr, audioAdaptationFailedReasonV3)
 	}
 	if startRequest.AudioRecipeVersion != playback.TransformationAudioToAACRecipeVersionV3 || startRequest.SourceAudioChannels != 6 {
 		t.Fatalf("remote request = %#v, want source channels plus audio recipe v2", startRequest)

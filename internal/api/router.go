@@ -117,6 +117,12 @@ type Dependencies struct {
 	// RegisterShutdownWork retains asynchronous cleanup completion until main's
 	// graceful-shutdown deadline. Nil is valid in tests and embedded routers.
 	RegisterShutdownWork func(<-chan struct{})
+	// RegisterShutdownFunc registers a named, idempotent application-shutdown
+	// step that main invokes explicitly under its own bounded timeout, before
+	// waiting on the context-triggered RegisterShutdownWork channels. Use it for
+	// work whose drain must be awaited by shutdown rather than only triggered by
+	// service-context cancellation. Nil is valid in tests and embedded routers.
+	RegisterShutdownFunc func(name string, run func())
 
 	DB              *pgxpool.Pool
 	SecretCipher    *secret.Cipher // at-rest credential cipher (required when DB is set)
@@ -1177,6 +1183,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 							Bitrate: stream.Bitrate, FrameRate: stream.FrameRate, AudioLanguages: stream.AudioLanguages,
 							SubtitleLanguages: stream.SubtitleLanguages, OwnerInstallationID: stream.OwnerInstallationID,
 							Visible: stream.Visible, VisibilitySpecified: stream.VisibilitySpecified,
+							Rejected: stream.Rejected,
 						})
 					}
 					return out, nil
@@ -1198,10 +1205,18 @@ func newChiRouter(deps Dependencies) chi.Router {
 					return deps.FileRepo.ReplaceVirtualCandidates(ctx, source, candidates)
 				}
 				playbackHandler.VirtualFileLookup = func(ctx context.Context, path string) (*models.MediaFile, error) {
-					return deps.FileRepo.GetByPath(ctx, path)
+					file, err := deps.FileRepo.GetByPath(ctx, path)
+					if err != nil && errors.Is(err, scanner.ErrFileNotFound) {
+						return nil, handlers.ErrVirtualCandidateNotFound
+					}
+					return file, err
 				}
 				playbackHandler.VirtualCandidateFileLookup = func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
-					return deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+					file, err := deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+					if err != nil && errors.Is(err, scanner.ErrFileNotFound) {
+						return nil, handlers.ErrVirtualCandidateNotFound
+					}
+					return file, err
 				}
 				playbackHandler.VirtualEpisodeFileLookup = func(ctx context.Context, episodeID string) (*models.MediaFile, error) {
 					files, err := deps.FileRepo.GetByEpisodeID(ctx, episodeID)
@@ -1238,6 +1253,18 @@ func newChiRouter(deps Dependencies) chi.Router {
 				})
 			}
 		}
+		if deps.AppContext != nil {
+			// Parent detached virtual work to the server lifecycle so shutdown
+			// cancels outstanding probes, revalidations, and searches.
+			playbackHandler.ServiceContext = deps.AppContext
+		}
+		if deps.RegisterShutdownFunc != nil {
+			// Primary trigger for evidence draining. The handler also has a
+			// service-context watcher, but that is only a safety net: this
+			// registration makes application shutdown call the drain and wait
+			// for accepted, in-memory evidence rather than firing it detached.
+			deps.RegisterShutdownFunc("virtual-evidence-drain", playbackHandler.StopVirtualEvidence)
+		}
 		if deps.VirtualLibraryService != nil {
 			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
 				return deps.VirtualLibraryService.Resolve(ctx, path)
@@ -1245,19 +1272,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			playbackHandler.VirtualMediaRefreshResolver = handlers.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
 				return deps.VirtualLibraryService.Refresh(ctx, path)
 			})
-			playbackHandler.VirtualMediaDetailedResolver = handlers.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (handlers.ResolvedVirtualMedia, error) {
-				res, err := deps.VirtualLibraryService.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID)
-				if err != nil {
-					return handlers.ResolvedVirtualMedia{}, err
-				}
-				return handlers.ResolvedVirtualMedia{
-					URL:            res.URL,
-					URI:            res.URI,
-					CandidateID:    res.CandidateID,
-					RequestHeaders: res.RequestHeaders,
-					ExpiresAt:      res.ExpiresAt,
-				}, nil
-			})
+			playbackHandler.VirtualMediaDetailedResolver = newVirtualMediaDetailedResolver(deps.VirtualLibraryService)
 		}
 		playbackHandler.BestResultCache = handlers.NewVirtualBestResultCache(30*time.Minute, 512)
 		if deps.UserStoreProvider != nil {
@@ -1303,18 +1318,17 @@ func newChiRouter(deps Dependencies) chi.Router {
 			streamHandler.AllowInsecureVirtual = playbackHandler.AllowInsecureVirtual
 		}
 		if deps.DB != nil {
-			// Transport no-bytes failure path. Same delivered-grace rule as
-			// scanner.MarkVirtualCandidateFailed: a candidate that delivered
-			// bytes within scanner.VirtualCandidateDeliveryGrace is not branded
-			// dead by a single later failure, so the auto-pick keeps preferring
-			// and re-verifying it.
-			streamHandler.VirtualCandidateFailMarker = func(ctx context.Context, fileID int) error {
-				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW()
-					WHERE id = $1
-					  AND (last_delivered_at IS NULL OR last_delivered_at < NOW() - make_interval(secs => $2))`,
-					fileID, scanner.VirtualCandidateDeliveryGrace.Seconds())
-				return err
-			}
+			// Transport no-bytes failure path. The marker goes through the
+			// scanner's fenced stamp rather than a bare `WHERE id=$1` update,
+			// because a virtual candidate row's file_path is rewritten in place
+			// when the session rotates to a sibling (ReplaceVirtualResultPin).
+			// A no-bytes verdict for candidate A that lands after that rewrite
+			// must not brand the healthy replacement B: the scanner fence
+			// requires the row to still name the candidate the caller inspected
+			// (file_path) and to still carry the failure state it observed
+			// (failed_at). The same delivered-grace rule as
+			// scanner.MarkVirtualCandidateFailed applies.
+			streamHandler.VirtualCandidateFailMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed
 			// The recovered marker clears a known-bad stamp after the candidate
 			// actually delivered media bytes. Fenced on the delivered candidate
 			// identity AND the failure state observed at transport start: a row
@@ -1338,6 +1352,15 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// node-side work to detect the repeated demux failure and report
 			// the candidate identity; there is deliberately no stderr
 			// forwarding protocol invented here.
+			//
+			// observedFailedAt is deliberately nil. The transcode-manager
+			// callback carries only the candidate identity, and nil is the
+			// correct comparison for this verdict: the file_path argument
+			// already stops a rotated row from being stamped, and the
+			// `failed_at IS NULL` arm refuses to overwrite a newer failure
+			// stamp that landed while the transcode ran. If the row recovered
+			// mid-transcode, the demux failure is fresh evidence against the
+			// bytes that just failed, so stamping it again is correct.
 			playbackHandler.TranscodeManager().OnDemuxFailure = func(ctx context.Context, fileID int, expectedFilePath string) error {
 				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(expectedFilePath)), "virtual://") {
 					return nil
@@ -1353,6 +1376,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// recently they delivered, so a repeatable decode rejection must not
 			// be re-selected forever. The dropdown still shows the row for a
 			// manual retry, and a later successful delivery clears the stamp.
+			// As with OnDemuxFailure, observedFailedAt is deliberately nil: the
+			// callback carries only the identity, the file_path arm rejects a
+			// rotated row, and nil refuses to overwrite a newer failure stamp.
 			playbackHandler.TranscodeManager().OnSourceRejected = func(ctx context.Context, fileID int, expectedFilePath string) error {
 				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(expectedFilePath)), "virtual://") {
 					return nil
@@ -1373,6 +1399,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 					return 0, nil
 				}
 				return handlers.ExecVirtualFileMetadataUpdate(ctx, deps.DB, args)
+			}
+			playbackHandler.VirtualFileMetadataSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (handlers.VirtualFileMetadataUpdateResult, error) {
+				if deps.DB == nil {
+					return handlers.VirtualFileMetadataUpdateResult{}, nil
+				}
+				return handlers.ExecVirtualFileMetadataUpdateResult(ctx, deps.DB, args)
 			}
 		}
 		if deps.Config != nil {

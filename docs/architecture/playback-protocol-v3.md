@@ -207,6 +207,18 @@ constant:
 | `start_position` | The profile's saved resume point for this item, or `0` when there is none, it is already complete, or the file is one part of a multipart item (every part shares the item's resume point, so a part-local seek to it would land somewhere arbitrary). It is required when `progress_persistence` is `client` | Exactly that position. `0` means *start over* |
 | `audio_track_id` / `audio_track_index` | The profile's preferred audio track, resolved from the series preference, then the profile's audio-language setting, then the library override | Exactly that track |
 
+Within that audio resolution, a track the client can render directly is
+preferred over a same-language track it cannot. "Directly" is the same rule the
+planner's audio eligibility applies, not the codec lists by themselves: a
+passthrough codec counts only with `exact` audio evidence, the
+`layout_aware_passthrough` feature, and a matching `audio_passthrough.entries[]`
+channel/layout entry; any declared decode codec counts. The preference order
+still chooses among playable tracks, and neither language nor track role is
+traded for codec: when only a non-playable track carries the preferred language
+or the selected role (for example a commentary track), it is selected and the
+planner transforms the audio. A caller that supplies no client capabilities
+(catalog metadata, cross-version remap) keeps the historical selection.
+
 `progress_persistence` separates the live session clock from durable resume
 ownership. Omission (or `server`) means session progress may update the item's
 resume/history normally. `client` keeps heartbeats, route diagnostics, and live
@@ -944,6 +956,52 @@ terminal unchanged rather than being rewritten as a decode rejection. The `422` 
 `X-Vio-Decode-Error` media responses remain the fallback for clients that do not
 run the `decode_error` recovery path.
 
+**Same-file invariant for display-driven fallback.** A fallback driven by what a
+display can present — Dolby Vision Profile 7 to Profile 8.1 base layer, Profile 7
+to HDR10 — stays on the same file and changes only the transformation, never the
+release. A `failure_recovery` whose classification does not indict the release
+therefore keeps the session-bound provider candidate and lets the attempted-key
+guard advance to the next transformation rung on that file (for example the
+server DV7 to HDR10 strip). The server excludes the session-bound candidate only
+when a verdict actually indicts it: a server-confirmed decode rejection, or a
+provider that no longer lists the pinned result id. The resolver refuses to fall
+past an excluded pinned candidate unless the caller explicitly asked for
+candidate rotation, so a display-driven re-plan can never silently swap the bytes
+mid-stream.
+
+**Same-file invariant for audio.** An audio problem — a track whose decoder
+fails, an unsupported audio codec, an unmappable or absent track, a node that
+declines the audio recipe — never moves the video candidate. The server resolves
+it on the release already mounted: the planner converts or downmixes the audio
+in place, or the server tries another track in the same file (`track_change` is
+the viewer explicitly doing the same). On a fresh start a same-release resolution
+that also fails proves the release itself is blocked, and only then does the
+existing video/policy failover apply; on a replan the release is known to be
+playable, so the audio terminal stands instead of substituting a sibling. An
+explicit audio pick is never silently replaced — it surfaces its failure and the
+client can re-pick. The decoder/demux indictment is video-scoped: a decode or
+demux stderr line is only evidence about the video stream when it carries a
+video stream identity (`vist#`, a video codec, or a NAL/bitstream token) and no
+audio identity (`aist#`, an audio codec tag, or explicit audio-stream wording),
+so an audio failure can never stamp the candidate or reject the source.
+
+**Residual candidate-identity notes.** Two paths deliberately stop short of
+rewriting the in-flight plan, and neither is a client-requested swap:
+
+- Transport-internal startup failover (`startLocalPlaybackTransportOnce`)
+  retries a pin that produced no bytes on a neutral URI. When a sibling wins, it
+  starts ffmpeg on that sibling and compare-and-swaps the session's persisted
+  result pin. Because the plan was already built, a path that resolved through
+  a local file copy can serve the sibling while the plan still names the
+  original candidate; the next replan or start resolves from the updated pin.
+  The substitution is server-decided (the original produced no bytes), never
+  display-driven.
+- A non-indicting failure that still needs a re-resolve can mint a fresh
+  `result=` id for the same release. A changed result id is therefore not
+  evidence of a dead release: the session re-anchors to the fresh URL and the
+  bytes are unchanged. Only a pinned id absent from the provider list is a dead
+  release, and the resolver's fallback still recovers it.
+
 Failure, seek, and quality replans may omit unchanged track identities. The
 server overlays only identities present in those requests and preserves the
 durable selected subtitle otherwise. Only `operation: "track_change"` gives an
@@ -1143,6 +1201,7 @@ The plan will play, but something the user might notice was given up.
 | `dolby_vision_base_layer_only` | Profile 8 played unchanged through an HEVC decoder as its HDR10/HLG/SDR base layer; DV metadata not presented |
 | `hdr_tone_mapped` | HDR video converted to limited-range BT.709 SDR |
 | `audio_converted` | Audio re-encoded rather than copied |
+| `audio_track_substituted` | The selected audio track could not be adapted; another track in the same file plays instead |
 | `subtitle_burn_in` | Subtitles rendered into the video |
 | `quality_reduction_unavailable` | Requested rung could not be produced |
 | `quality_preference_normalized` | Unknown `quality_preference` normalized to `auto` |
@@ -1164,6 +1223,11 @@ help. Delivered inside a `201` (start) or `200` (replan), never a 4xx.
 subtitle burn-in requirement and cannot execute, the terminal is
 `subtitle_conversion_unsupported` naming the subtitle rather than the underlying
 HDR, 4K, or transcode-policy reason — deselecting the subtitle restores playback.
+`audio_conversion_unsupported` is the audio counterpart: the selected track needs
+an adaptation no eligible executor can run, so the server first tries another
+audio track in the same file and the release is unchanged. Only when no track on
+the release is playable does the audio refusal stand or, on a fresh start, fall
+through to the alternate-version failover.
 
 *Subtitle policy:* `subtitle_burn_in_source_unsupported`,
 `subtitle_codec_unsupported`, `subtitle_track_invalid`,
@@ -1172,7 +1236,7 @@ HDR, 4K, or transcode-policy reason — deselecting the subtitle restores playba
 *Transport and session:* `internal_error`, `session_expired`,
 `subtitle_artifact_unavailable`, `capacity_unavailable`,
 `local_transcode_disabled`,
-`audio_transcoding_disabled`,
+`audio_transcoding_disabled`, `audio_adaptation_failed`,
 `source_decode_failed`,
 `transcode_start_failed`, `transcode_node_unavailable`,
 `transcode_node_capability_unavailable`, `track_unavailable`,
@@ -1415,7 +1479,12 @@ step instead of being upscaled to 2160 lines.
 Compound rungs are strict resolution/bitrate selections. A bandwidth cap can
 clamp their bitrate but does not silently demote their resolution. Plain labels
 remain accepted for stored/default preferences and retain their existing
-height-only behavior.
+height-only behavior. The virtual candidate picker mirrors this: it applies the
+cap per candidate only for plain rungs, and it can only demote a candidate when
+that candidate declares a bitrate. The core virtual lister does not populate
+`Bitrate` on listed candidates, so on the core path the picker never demotes at
+pick time and the planner enforces the cap after probing the selected file; a
+plugin lister that reports bitrate gets the earlier pick-time demotion.
 
 Registry availability is deliberately *not* consulted when building the menu: a
 capability check there could trigger lazy node fetches that a source-preserving

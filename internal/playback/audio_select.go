@@ -77,11 +77,86 @@ func trackHasLanguage(track models.AudioTrack, preferred string) bool {
 // Language matches rank exact tag > bare language > another variant of the same
 // language. Track order breaks ties within a language rank. Saved signatures
 // and compatible saved indices take precedence over language-only preferences.
+//
+// SelectAudioTrack is SelectAudioTrackPreferringPlayable without a client
+// capability predicate: callers with no client context (catalog metadata,
+// cross-version remap) keep the historical selection.
 func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPref *AudioTrackPreference) int {
+	return SelectAudioTrackPreferringPlayable(tracks, preferredLang, seriesPref, nil)
+}
+
+// SelectAudioTrackPreferringPlayable determines which audio track to use,
+// preferring a track the client can render directly when one exists.
+//
+// playable, when non-nil, reports whether the client can render a track without
+// a server transform (see AudioTrackPlayableFuncV3). If the ordered selection
+// is not playable, the same priority order is run over the playable tracks and
+// its result is used only when the replacement preserves both the selected
+// track's language and its role. The intent is to keep a file that contains a
+// playable track on a direct route without trading language or track role away
+// for codec; when no such replacement exists, the original selection stands and
+// the planner transforms the audio as before.
+func SelectAudioTrackPreferringPlayable(tracks []models.AudioTrack, preferredLang string, seriesPref *AudioTrackPreference, playable func(models.AudioTrack) bool) int {
 	if len(tracks) == 0 {
 		return 0
 	}
+	selected := selectAudioTrackOrdered(tracks, preferredLang, seriesPref)
+	if playable == nil || playable(tracks[selected]) {
+		return selected
+	}
+	playableTracks := make([]models.AudioTrack, 0, len(tracks))
+	playableIndex := make([]int, 0, len(tracks))
+	for i, track := range tracks {
+		if playable(track) {
+			playableTracks = append(playableTracks, track)
+			playableIndex = append(playableIndex, i)
+		}
+	}
+	if len(playableTracks) == 0 {
+		return selected
+	}
+	alternative := playableIndex[selectAudioTrackOrdered(playableTracks, preferredLang, seriesPref)]
+	if audioTrackReplacementPreserved(tracks[selected], tracks[alternative]) {
+		return alternative
+	}
+	return selected
+}
 
+// audioTrackReplacementPreserved reports whether substituting alternative for
+// selected keeps the selected track's identity: the same language and the same
+// role. Language alone is not enough because a same-language replacement could
+// otherwise swap a commentary or descriptive track for the main track.
+func audioTrackReplacementPreserved(selected, alternative models.AudioTrack) bool {
+	return audioTrackLanguagePreserved(selected, alternative) && audioTrackRolePreserved(selected, alternative)
+}
+
+// audioTrackRolePreserved reports whether the replacement carries the same role
+// as the selected track. The role is the descriptive identity (title/embedded
+// title), not the codec, so a codec-only compatibility track keeps the role
+// while a commentary track does not.
+func audioTrackRolePreserved(selected, alternative models.AudioTrack) bool {
+	return strings.EqualFold(strings.TrimSpace(selected.Title), strings.TrimSpace(alternative.Title)) &&
+		strings.EqualFold(strings.TrimSpace(selected.EmbeddedTitle), strings.TrimSpace(alternative.EmbeddedTitle))
+}
+
+// audioTrackLanguagePreserved reports whether substituting alternative for
+// selected keeps the selected track's language intent. A selected track that
+// carries no concrete language (empty, "und"/"mul" with no language list) has
+// no intent to preserve, so any playable alternative is allowed.
+func audioTrackLanguagePreserved(selected, alternative models.AudioTrack) bool {
+	selectedLanguages := crossVersionAudioLanguages(selected)
+	if len(selectedLanguages) == 0 {
+		return true
+	}
+	for _, code := range selectedLanguages {
+		if trackHasLanguage(alternative, code) {
+			return true
+		}
+	}
+	return false
+}
+
+func selectAudioTrackOrdered(tracks []models.AudioTrack, preferredLang string, seriesPref *AudioTrackPreference) int {
 	// 1. Series preference: try exact signature match first.
 	if seriesPref != nil {
 		if idx := findExactAudioTrack(tracks, seriesPref.TrackSignature); idx >= 0 {

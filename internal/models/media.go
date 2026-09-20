@@ -877,4 +877,18 @@ type VirtualFilePersistArgs struct {
 	// probe_source is 'virtual_collection'). Empty string retains the
 	// current path.
 	AdoptPath string
+	// RequireAdopt makes identity adoption a condition of success: when
+	// AdoptPath is non-empty the saver must confirm the row's file_path became
+	// AdoptPath, and must report a non-nil error when a uniqueness conflict,
+	// the probe_source guard, or a live failed_at verdict prevented adoption.
+	// The write is atomic with that fence: a refused adoption writes no track
+	// inventory or probe stamp. Metadata-only evidence writers leave this false
+	// so a skipped adoption is not an error and the metadata still lands.
+	RequireAdopt bool
+	// AllowFailedVerdict is the explicit-retry policy. When true, an active
+	// failed_at stamp on the validated identity does not block adoption; the
+	// caller has deliberately asked to retry a known-bad candidate. The
+	// automatic path leaves it false so a failure committed after the caller's
+	// last verdict read is still fenced out at write time.
+	AllowFailedVerdict bool
 }

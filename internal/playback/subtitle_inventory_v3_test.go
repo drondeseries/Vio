@@ -176,6 +176,276 @@ func TestScopeSubtitleInventoryV3_EncodesEmptyInventoryAsArray(t *testing.T) {
 	}
 }
 
+// TestBuildSubtitleInventoryV3_DeduplicatesIdenticalEmbeddedTracks is the
+// regression for the duplicate subtitle list: a file carrying both a regional
+// code and its bare base (the placeholder pair "EN-US" and "ENG") publishes one
+// track, and the published ordinals stay dense even though a source ordinal was
+// suppressed.
+func TestBuildSubtitleInventoryV3_DeduplicatesIdenticalEmbeddedTracks(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 50,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 0, Language: "EN-US", Codec: "subrip"},
+			{Index: 0, Language: "ENG", Codec: "subrip"},
+			{Index: 2, Language: "FR-CA", Codec: "subrip"},
+			{Index: 2, Language: "FRE", Codec: "subrip"},
+		},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want 2 (one per base language)", items)
+	}
+	if items[0].CombinedIndex != 0 || items[0].TrackID != TrackIDV3(file.ID, "subtitle", 0) || items[0].Language != "EN-US" {
+		t.Fatalf("items[0] = %#v, want EN-US at published ordinal 0", items[0])
+	}
+	if items[1].CombinedIndex != 1 || items[1].TrackID != TrackIDV3(file.ID, "subtitle", 1) || items[1].Language != "FR-CA" {
+		t.Fatalf("items[1] = %#v, want FR-CA renumbered to published ordinal 1", items[1])
+	}
+	if _, ok := SubtitleInventoryItemAtV3(items, 1); !ok {
+		t.Fatal("the renumbered surviving track must resolve at its published ordinal")
+	}
+	if _, ok := SubtitleInventoryItemAtV3(items, 2); ok {
+		t.Fatal("a suppressed duplicate must not leave a published ordinal")
+	}
+	// The suppression did not erase the underlying track: the served identity
+	// still points at the FR-CA source track (offset 2).
+	if source, ok := SubtitleInventoryOwnSourceIndexV3(file, 1); !ok || source != 2 {
+		t.Fatalf("published ordinal 1 source index = (%d, %v), want the FR-CA source ordinal 2", source, ok)
+	}
+}
+
+// TestBuildSubtitleInventoryV3_RenumbersDeduplicatedGapToDense is the Android
+// TV regression: nine embedded ordinals where 1..7 duplicate track 0 used to
+// publish its survivors at 0 and 8, leaving the client-visible list with a gap.
+// The published list is now dense and the source mapping survives underneath.
+func TestBuildSubtitleInventoryV3_RenumbersDeduplicatedGapToDense(t *testing.T) {
+	tracks := make([]models.SubtitleTrack, 9)
+	for i := range 8 {
+		tracks[i] = models.SubtitleTrack{Index: i, Language: "en", Codec: "subrip"}
+	}
+	tracks[8] = models.SubtitleTrack{Index: 12, Language: "fr", Codec: "subrip"}
+	file := &models.MediaFile{ID: 60, SubtitleTracks: tracks}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want 2 survivors", items)
+	}
+	for i, item := range items {
+		if item.CombinedIndex != i {
+			t.Errorf("item %d combined_index = %d; the published space must be dense", i, item.CombinedIndex)
+		}
+		if want := TrackIDV3(file.ID, "subtitle", i); item.TrackID != want {
+			t.Errorf("item %d track_id = %q, want %q", i, item.TrackID, want)
+		}
+	}
+	if items[1].Language != "fr" {
+		t.Fatalf("items[1] = %#v, want the surviving French track", items[1])
+	}
+	// The French track occupied source ordinal 8; only its published ordinal is
+	// renumbered.
+	if source, ok := SubtitleInventoryOwnSourceIndexV3(file, 1); !ok || source != 8 {
+		t.Fatalf("published ordinal 1 source index = (%d, %v), want 8", source, ok)
+	}
+}
+
+// TestSubtitleEntryAtCombinedIndexV3_ResolvesLastPublishedOrdinal is the
+// selection-path half of the regression: the ordinal a client echoes from the
+// dense inventory must resolve to the track that ordinal now names, not to the
+// source-space slot that position used to hold.
+func TestSubtitleEntryAtCombinedIndexV3_ResolvesLastPublishedOrdinal(t *testing.T) {
+	tracks := make([]models.SubtitleTrack, 9)
+	for i := range 8 {
+		tracks[i] = models.SubtitleTrack{Index: i, Language: "en", Codec: "subrip"}
+	}
+	tracks[8] = models.SubtitleTrack{Index: 12, Language: "fr", Codec: "ass"}
+	file := &models.MediaFile{ID: 61, SubtitleTracks: tracks}
+
+	entry, ok := subtitleEntryAtCombinedIndexV3(file, 1, nil)
+	if !ok {
+		t.Fatal("the last published ordinal must resolve")
+	}
+	if entry.Source != SubtitleSourceEmbeddedV3 || entry.Codec != "ass" {
+		t.Fatalf("published ordinal 1 resolved to %#v; want the embedded ASS track that ordinal now names", entry)
+	}
+	if entry.CombinedIndex != 8 {
+		t.Fatalf("resolved entry source ordinal = %d, want 8", entry.CombinedIndex)
+	}
+	if _, ok := subtitleEntryAtCombinedIndexV3(file, 2, nil); ok {
+		t.Fatal("an ordinal past the dense inventory must not resolve")
+	}
+}
+
+// TestResolveSubtitlePolicyV3ResolvesRenumberedPublishedOrdinal closes the loop
+// at the planner boundary: the client echoes the last published ordinal and the
+// policy must report the published index while driving the embedded transport
+// index from the source track it names.
+func TestResolveSubtitlePolicyV3ResolvesRenumberedPublishedOrdinal(t *testing.T) {
+	file := detailedFixtureFileV3()
+	tracks := make([]models.SubtitleTrack, 9)
+	for i := range 8 {
+		tracks[i] = models.SubtitleTrack{Index: i, Language: "en", Codec: "subrip"}
+	}
+	tracks[8] = models.SubtitleTrack{Index: 12, Language: "fr", Codec: "subrip"}
+	file.ExternalSubtitles = nil
+	file.SubtitleTracks = tracks
+
+	req := validStartRequestV3()
+	index := 1
+	req.SubtitleTrackIndex = &index
+	req.SubtitleTrackID = TrackIDV3(file.ID, "subtitle", index)
+
+	result := ResolveSubtitlePolicyV3(file, req, true, DeliveryClassOriginalHTTPV3, nil)
+	if result.Terminal != nil {
+		t.Fatalf("terminal = %#v, want the renumbered selection resolved", result.Terminal)
+	}
+	if result.SelectedIndex != 1 || result.TransportIndex != 8 || result.Source != SubtitleSourceEmbeddedV3 || result.Codec != "subrip" {
+		t.Fatalf("result = %#v, want published ordinal 1 mapped to embedded transport 8", result)
+	}
+}
+
+// TestScopeSubtitleInventoryV3_PinsSourceIdentityAfterDedup proves the
+// published URL a client fetches stays resolvable after renumbering: the path
+// carries the dense published ordinal while the pin still names the source
+// track's container index, which is what the stream route resolves.
+func TestScopeSubtitleInventoryV3_PinsSourceIdentityAfterDedup(t *testing.T) {
+	tracks := make([]models.SubtitleTrack, 9)
+	for i := range 8 {
+		tracks[i] = models.SubtitleTrack{Index: i, Language: "en", Codec: "subrip"}
+	}
+	tracks[8] = models.SubtitleTrack{Index: 12, Language: "fr", Codec: "ass"}
+	file := &models.MediaFile{ID: 62, SubtitleTracks: tracks}
+
+	items := SubtitleInventoryV3("sess-dedup", file, nil)
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want 2 survivors", items)
+	}
+	// The surviving French ASS track is published at ordinal 1 but its URL pins
+	// the live container stream index 12, not the renumbered ordinal.
+	if got, want := items[1].URL, "/stream/sess-dedup/subtitles/1.ass?file_id=62&embedded_stream_index=12"; got != want {
+		t.Errorf("url = %q, want %q", got, want)
+	}
+	if got, want := items[1].FontBundleURL, "/stream/sess-dedup/subtitles/1/fonts?file_id=62&embedded_stream_index=12"; got != want {
+		t.Errorf("font_bundle_url = %q, want %q", got, want)
+	}
+}
+
+// TestBuildSubtitleInventoryV3_DeduplicatesAcrossRanges proves the seen-set
+// spans the concatenated ranges: an additional entry that names the same
+// source range, language, codec and flags as an external sidecar collapses.
+func TestBuildSubtitleInventoryV3_DeduplicatesAcrossRanges(t *testing.T) {
+	file := &models.MediaFile{
+		ID:                51,
+		ExternalSubtitles: []models.ExternalSubtitle{{Path: "/media/movie.en.srt", Language: "en", Format: "srt"}},
+	}
+	additional := []SubtitleInventoryEntryV3{
+		{CombinedIndex: 1, Codec: "srt", Source: SubtitleSourceExternalV3, Language: "ENG", Label: "English"},
+	}
+
+	items := BuildSubtitleInventoryV3(file, additional)
+
+	if len(items) != 1 {
+		t.Fatalf("items = %#v, want the cross-range duplicate collapsed", items)
+	}
+	if items[0].Source != SubtitleSourceExternalV3 || items[0].CombinedIndex != 0 {
+		t.Fatalf("items[0] = %#v, want the external sidecar at ordinal 0", items[0])
+	}
+}
+
+// TestBuildSubtitleInventoryV3_KeepsDistinctLanguageCodecForcedCombinations
+// proves de-duplication is keyed on the whole combination, not the language
+// alone.
+func TestBuildSubtitleInventoryV3_KeepsDistinctLanguageCodecForcedCombinations(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 52,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 0, Language: "en", Codec: "subrip"},
+			{Index: 1, Language: "en", Codec: "subrip", Forced: true},
+			{Index: 2, Language: "en", Codec: "ass"},
+			{Index: 3, Language: "en", Codec: "subrip", HearingImpaired: true},
+			{Index: 4, Language: "de", Codec: "subrip"},
+		},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 5 {
+		t.Fatalf("items = %#v, want every distinct language/codec/forced combination", items)
+	}
+}
+
+// TestBuildSubtitleInventoryV3_KeepsDownloadedBesideEmbeddedSameLanguage
+// proves a downloaded/AI track is not silently dropped because the file has an
+// embedded track in the same language.
+func TestBuildSubtitleInventoryV3_KeepsDownloadedBesideEmbeddedSameLanguage(t *testing.T) {
+	file := &models.MediaFile{
+		ID:             53,
+		SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "en", Codec: "srt"}},
+	}
+	additional := []SubtitleInventoryEntryV3{
+		{CombinedIndex: 1, Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "en", DownloadedSubtitleID: 77},
+	}
+
+	items := BuildSubtitleInventoryV3(file, additional)
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want both the embedded and the downloaded track", items)
+	}
+}
+
+// TestBuildSubtitleInventoryV3_KeepsDistinctDownloadedRows proves two distinct
+// downloaded rows in one language are preserved; only a genuinely repeated row
+// is collapsed.
+func TestBuildSubtitleInventoryV3_KeepsDistinctDownloadedRows(t *testing.T) {
+	file := &models.MediaFile{ID: 54}
+	additional := []SubtitleInventoryEntryV3{
+		{Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "en", DownloadedSubtitleID: 77},
+		{Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "ENG", DownloadedSubtitleID: 88},
+	}
+
+	items := BuildSubtitleInventoryV3(file, additional)
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want both downloaded rows kept", items)
+	}
+	repeated := []SubtitleInventoryEntryV3{
+		{Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "en", DownloadedSubtitleID: 77},
+		{Codec: "srt", Source: SubtitleSourceDownloadedV3, Language: "ENG", DownloadedSubtitleID: 77},
+	}
+	if deduped := BuildSubtitleInventoryV3(file, repeated); len(deduped) != 1 {
+		t.Fatalf("deduped = %#v, want the repeated row collapsed", deduped)
+	}
+}
+
+// TestBuildSubtitleInventoryV3_KeepsUnknownLanguageEntriesWithSameCodec is the
+// regression for the over-eager de-duplication: several tracks whose language
+// is unknown and which share a codec must all survive, because they carry no
+// positive identity proving they are the same track.
+func TestBuildSubtitleInventoryV3_KeepsUnknownLanguageEntriesWithSameCodec(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 55,
+		ExternalSubtitles: []models.ExternalSubtitle{
+			{Format: "srt"},
+			{Format: "srt"},
+			{Format: "srt"},
+		},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 4, Codec: "hdmv_pgs_subtitle"}},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 4 {
+		t.Fatalf("items = %#v, want all four unknown-language entries kept", items)
+	}
+	for i, item := range items {
+		if item.CombinedIndex != i {
+			t.Fatalf("items[%d].CombinedIndex = %d, want %d", i, item.CombinedIndex, i)
+		}
+	}
+}
+
 func TestSubtitleInventoryItemAtV3(t *testing.T) {
 	file := &models.MediaFile{
 		ID: 9,

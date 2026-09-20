@@ -1,6 +1,7 @@
 package playback_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -391,5 +392,150 @@ func TestMatchAudioTrackAcrossVersionsFallsBackToDefaultWhenNoLanguageMatches(t 
 	// wins over the first track.
 	if got := playback.MatchAudioTrackAcrossVersions(requested, effective, 0); got != 0 {
 		t.Fatalf("no-language-match remap = %d, want target default 0", got)
+	}
+}
+
+// playableByCodec builds the playability predicate a track selector receives,
+// matching the codec only. The real predicate is AudioTrackPlayableFuncV3; this
+// keeps the selector mechanics tests focused.
+func playableByCodec(codecs ...string) func(models.AudioTrack) bool {
+	return func(track models.AudioTrack) bool {
+		for _, codec := range codecs {
+			if strings.EqualFold(strings.TrimSpace(codec), strings.TrimSpace(track.Codec)) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// TestSelectAudioTrackPrefersPlayableSameLanguageTrack proves a default track
+// the client cannot render yields to a renderable track of the same language, so
+// a file with an AAC compatibility track does not force an AAC transcode.
+func TestSelectAudioTrackPrefersPlayableSameLanguageTrack(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "eng", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrackPreferringPlayable(tracks, "", nil, playableByCodec("aac", "mp3", "opus")); got != 1 {
+		t.Fatalf("SelectAudioTrackPreferringPlayable() = %d, want the playable English AAC track 1", got)
+	}
+}
+
+// TestSelectAudioTrackPrefersPlayableWithinPreferredLanguage proves the
+// language preference still decides which track is chosen: the playable track
+// of the preferred language wins over a non-playable one.
+func TestSelectAudioTrackPrefersPlayableWithinPreferredLanguage(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "eng", Codec: "aac", Channels: 2},
+		{Language: "fra", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrackPreferringPlayable(tracks, "eng", nil, playableByCodec("aac")); got != 1 {
+		t.Fatalf("SelectAudioTrackPreferringPlayable() = %d, want the English AAC track 1", got)
+	}
+}
+
+// TestSelectAudioTrackDoesNotTradeLanguageForCodec proves playability never
+// overrides the language intent: with only a foreign-language playable track,
+// the non-playable preferred-language track is kept and the planner transforms
+// its audio as before.
+func TestSelectAudioTrackDoesNotTradeLanguageForCodec(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "fra", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrackPreferringPlayable(tracks, "eng", nil, playableByCodec("aac", "mp3", "opus")); got != 0 {
+		t.Fatalf("SelectAudioTrackPreferringPlayable() = %d, want the English track to keep language over codec", got)
+	}
+}
+
+// TestSelectAudioTrackDoesNotTradeRoleForCodec proves a same-language
+// replacement does not swap the track role: the selector must not abandon a
+// commentary track for the main track just because only the latter is playable.
+func TestSelectAudioTrackDoesNotTradeRoleForCodec(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Title: "Commentary", Default: true},
+		{Language: "eng", Codec: "aac", Channels: 2, Title: "Main"},
+	}
+	if got := playback.SelectAudioTrackPreferringPlayable(tracks, "eng", nil, playableByCodec("aac")); got != 0 {
+		t.Fatalf("SelectAudioTrackPreferringPlayable() = %d, want the commentary track to keep its role", got)
+	}
+}
+
+// TestSelectAudioTrackSavedIndexDecidesAmongPlayableTracks proves the saved
+// index still chooses which track is used when several playable candidates
+// exist.
+func TestSelectAudioTrackSavedIndexDecidesAmongPlayableTracks(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "aac", Channels: 2, Title: "Main"},
+		{Language: "eng", Codec: "aac", Channels: 6, Layout: "5.1", Title: "Main"},
+	}
+	pref := &playback.AudioTrackPreference{AudioTrackIndex: 1, AudioLanguage: "eng"}
+	if got := playback.SelectAudioTrackPreferringPlayable(tracks, "eng", pref, playableByCodec("aac")); got != 1 {
+		t.Fatalf("SelectAudioTrackPreferringPlayable() = %d, want the saved index 1 among playable tracks", got)
+	}
+}
+
+// TestSelectAudioTrackWithoutClientCapabilitiesKeepsHistoricalOrder proves
+// callers without a client predicate (catalog metadata, cross-version remap)
+// keep the pre-existing selection.
+func TestSelectAudioTrackWithoutClientCapabilitiesKeepsHistoricalOrder(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "eng", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "", nil); got != 0 {
+		t.Fatalf("SelectAudioTrack() = %d, want the default track when no playability predicate is given", got)
+	}
+}
+
+// TestSelectAudioTrackAllNonPlayableKeepsDefault proves that when no track is
+// playable the historical selection stands and the planner transcodes.
+func TestSelectAudioTrackAllNonPlayableKeepsDefault(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "eng", Codec: "truehd", Channels: 8, Default: true},
+		{Language: "eng", Codec: "dts", Channels: 6},
+	}
+	if got := playback.SelectAudioTrackPreferringPlayable(tracks, "", nil, playableByCodec("aac", "mp3", "opus")); got != 0 {
+		t.Fatalf("SelectAudioTrackPreferringPlayable() = %d, want the default track when nothing is playable", got)
+	}
+}
+
+// TestAudioTrackPlayableFuncV3GatesPassthroughOnExactEvidence proves the
+// selector's predicate shares audioEligibilityV3's rule rather than trusting the
+// passthrough codec list alone: a passthrough codec with declared (not exact)
+// evidence or without a matching layout entry is not directly renderable.
+func TestAudioTrackPlayableFuncV3GatesPassthroughOnExactEvidence(t *testing.T) {
+	passthrough := &playback.AudioPassthroughV3{
+		PassthroughCodecs: []string{"eac3"},
+		Entries:           []playback.AudioPassthroughEntryV3{{Codec: "eac3", ChannelCounts: []int{6}, Layouts: []string{"5.1"}}},
+	}
+	base := playback.StartRequestV3{
+		ClientFeatures: []string{playback.FeatureLayoutPassthrough},
+		Capabilities: playback.ClientCodecCapabilitiesV3{
+			CodecsAudio:      []string{"aac"},
+			AudioEvidence:    playback.EvidenceDeclaredV3,
+			AudioPassthrough: passthrough,
+		},
+	}
+	eac3 := models.AudioTrack{Codec: "eac3", Channels: 6, Layout: "5.1"}
+	if playback.AudioTrackPlayableFuncV3(base)(eac3) {
+		t.Fatal("passthrough codec must not be playable without exact audio evidence")
+	}
+
+	base.Capabilities.AudioEvidence = playback.EvidenceExactV3
+	if !playback.AudioTrackPlayableFuncV3(base)(eac3) {
+		t.Fatal("exact-evidence passthrough codec with a matching layout entry must be playable")
+	}
+
+	unmatched := models.AudioTrack{Codec: "eac3", Channels: 2, Layout: "stereo"}
+	if playback.AudioTrackPlayableFuncV3(base)(unmatched) {
+		t.Fatal("passthrough codec without a matching channel/layout entry must not be playable")
+	}
+
+	aac := models.AudioTrack{Codec: "aac", Channels: 2}
+	if !playback.AudioTrackPlayableFuncV3(base)(aac) {
+		t.Fatal("declared decode codec must remain playable")
 	}
 }

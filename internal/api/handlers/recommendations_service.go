@@ -295,7 +295,11 @@ func (h *RecommendationsHandler) ForYouRowCards(ctx context.Context, userID int,
 }
 
 // SimilarItems answers items similar to itemID; an unavailable engine
-// answers an empty list. The list is not viewer-filtered, as in v1.
+// answers an empty list. The engine drops candidates whose media item no
+// longer exists, so every returned id resolves against the catalog. The list
+// is still not viewer-filtered, as in v1: adding per-profile access filtering
+// here would change the v2 contract and needs a coordinated client/doc
+// change, so it stays a deliberate follow-up.
 func (h *RecommendationsHandler) SimilarItems(ctx context.Context, itemID string, limit int) ([]recommendations.ScoredItem, error) {
 	if h.engineUnavailable() {
 		return []recommendations.ScoredItem{}, nil

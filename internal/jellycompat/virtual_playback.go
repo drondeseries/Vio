@@ -20,6 +20,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
+	virtstream "github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 const (
@@ -144,6 +145,8 @@ type VirtualSourceProberWithHeaders func(context.Context, string, *models.MediaF
 // persist probe metadata against the row it actually belongs to.
 type VirtualCandidateFileLookup func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error)
 
+var ErrVirtualCandidateNotFound = errors.New("virtual candidate not found")
+
 // VirtualFileSaver persists a probed virtual inventory back to the catalog
 // row, mirroring the native VirtualFileSaver contract. jellycompat cannot
 // import internal/api/handlers (that package imports jellycompat), so both
@@ -151,6 +154,21 @@ type VirtualCandidateFileLookup func(ctx context.Context, path, contentID, episo
 // handlers.VirtualFileMetadataUpdateSQL with the same 18-arg execution as
 // the native wiring.
 type VirtualFileSaver func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error)
+
+// VirtualFileMetadataUpdateResult reports metadata persistence separately
+// from identity adoption, mirroring handlers.VirtualFileMetadataUpdateResult
+// (which jellycompat cannot import). A successful UPDATE is not adoption when
+// the row is collection-owned or a sibling guard retained its existing path.
+type VirtualFileMetadataUpdateResult struct {
+	RowsAffected    int64
+	MetadataUpdated bool
+	IdentityAdopted bool
+}
+
+// VirtualFileMetadataSaver is VirtualFileSaver with the explicit adoption
+// result. Prefer it wherever the caller must distinguish "evidence landed"
+// from "the row adopted the requested path".
+type VirtualFileMetadataSaver func(ctx context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error)
 
 // RemoteStreamRelay is the credential-hiding, SSRF-protected transport shared
 // by direct delivery and FFmpeg inputs.
@@ -414,6 +432,96 @@ func (h *PlaybackHandler) probeVirtualSourceWithHeaders(ctx context.Context, sou
 	return file, errors.New("virtual playback source prober is not configured")
 }
 
+// compatEvidenceShutdownDrainTimeout bounds how long server shutdown waits
+// for in-flight detached compat evidence writes. It is a var so tests can
+// shrink the wait.
+var compatEvidenceShutdownDrainTimeout = 10 * time.Second
+
+// compatEvidenceMaxConcurrent bounds simultaneous detached compat evidence
+// writes server-wide. Beyond the cap the write is dropped and retried by the
+// next playback, mirroring the native persist-slot bound.
+const compatEvidenceMaxConcurrent = 4
+
+var compatEvidenceSlots = make(chan struct{}, compatEvidenceMaxConcurrent)
+
+func acquireCompatEvidenceSlot() bool {
+	select {
+	case compatEvidenceSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseCompatEvidenceSlot() {
+	select {
+	case <-compatEvidenceSlots:
+	default:
+	}
+}
+
+func (h *PlaybackHandler) acquireCompatBackgroundWork() bool {
+	if h == nil {
+		return false
+	}
+	h.compatBackgroundMu.Lock()
+	defer h.compatBackgroundMu.Unlock()
+	if h.compatBackgroundClosed {
+		return false
+	}
+	h.compatBackgroundWG.Add(1)
+	return true
+}
+
+func (h *PlaybackHandler) releaseCompatBackgroundWork() {
+	if h == nil {
+		return
+	}
+	h.compatBackgroundWG.Done()
+}
+
+func (h *PlaybackHandler) closeCompatBackgroundWork() {
+	if h == nil {
+		return
+	}
+	h.compatBackgroundMu.Lock()
+	defer h.compatBackgroundMu.Unlock()
+	h.compatBackgroundClosed = true
+}
+
+// StartCompatBackgroundShutdownCleanup waits for ctx (the application
+// lifecycle) before closing admission, then drains in-flight detached compat
+// evidence work within a bounded drain timeout, following the same
+// RegisterShutdownWork done-channel contract as the transcode manager
+// cleanup. A worker that ignores cancellation only delays shutdown up to the
+// drain timeout; the expiry is logged loudly.
+func (h *PlaybackHandler) StartCompatBackgroundShutdownCleanup(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if h == nil || ctx == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		h.closeCompatBackgroundWork()
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			h.compatBackgroundWG.Wait()
+		}()
+		timer := time.NewTimer(compatEvidenceShutdownDrainTimeout)
+		defer timer.Stop()
+		select {
+		case <-drained:
+		case <-timer.C:
+			slog.WarnContext(ctx, "compat background work did not drain before shutdown timeout; proceeding with shutdown",
+				"component", "jellycompat", "drain_timeout", compatEvidenceShutdownDrainTimeout)
+		}
+	}()
+	return done
+}
+
 // persistCompatVirtualMetadata stamps a successfully probed virtual inventory
 // back to the catalog row in the background, mirroring the native
 // persistVirtualProbeEvidence pattern. It stamps probe_updated_at through the
@@ -426,7 +534,7 @@ func (h *PlaybackHandler) probeVirtualSourceWithHeaders(ctx context.Context, sou
 // performed after the probe, and never to a pointer captured across the
 // goroutine boundary.
 func (h *PlaybackHandler) persistCompatVirtualMetadata(ctx context.Context, file *models.MediaFile, neutral *models.MediaFile, candidateURI string) {
-	if h == nil || h.VirtualFileSaver == nil || file == nil || file.ID <= 0 {
+	if h == nil || (h.VirtualFileMetadataSaver == nil && h.VirtualFileSaver == nil) || file == nil || file.ID <= 0 {
 		return
 	}
 	// Snapshot evidence bytes by value now — the caller's `file` pointer is
@@ -463,15 +571,46 @@ func (h *PlaybackHandler) persistCompatVirtualMetadata(ctx context.Context, file
 	args.ProbeUpdatedAt = target.ProbeUpdatedAt
 	args.OwnerID = target.OwnerID
 	args.LibraryID = target.LibraryID
+	if !h.acquireCompatBackgroundWork() {
+		slog.DebugContext(ctx, "compat virtual metadata persist dropped: background workers closed",
+			"component", "jellycompat", "file_id", args.FileID)
+		return
+	}
+	if !acquireCompatEvidenceSlot() {
+		h.releaseCompatBackgroundWork()
+		slog.DebugContext(ctx, "compat virtual metadata persist dropped: all persist slots busy",
+			"component", "jellycompat", "file_id", args.FileID)
+		return
+	}
 	go func(save models.VirtualFilePersistArgs) {
+		defer h.releaseCompatBackgroundWork()
+		defer releaseCompatEvidenceSlot()
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		rows, err := h.VirtualFileSaver(persistCtx, save)
+		var updated bool
+		var err error
+		if h.VirtualFileMetadataSaver != nil {
+			var result VirtualFileMetadataUpdateResult
+			result, err = h.VirtualFileMetadataSaver(persistCtx, save)
+			if err == nil {
+				if save.AdoptPath != "" && !result.IdentityAdopted {
+					slog.DebugContext(persistCtx, "compat virtual metadata persisted without identity adoption",
+						"component", "jellycompat", "file_id", save.FileID)
+				}
+				updated = result.MetadataUpdated
+			}
+		} else if h.VirtualFileSaver != nil {
+			var rows int64
+			rows, err = h.VirtualFileSaver(persistCtx, save)
+			updated = err == nil && rows > 0
+		} else {
+			return
+		}
 		if err != nil {
 			slog.ErrorContext(persistCtx, "compat virtual metadata persist failed", "component", "jellycompat", "file_id", save.FileID, "error", err)
 			return
 		}
-		if rows == 0 {
+		if !updated {
 			slog.DebugContext(persistCtx, "compat virtual metadata persist skipped: stale snapshot", "component", "jellycompat", "file_id", save.FileID)
 		}
 	}(args)
@@ -515,7 +654,11 @@ func (h *PlaybackHandler) compatVirtualPersistSnapshot(ctx context.Context, prob
 	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	candidate, err := h.VirtualCandidateFileLookup(lookupCtx, compatVirtualNeutralURI(candidateURI), neutral.ContentID, neutral.EpisodeID, neutral.VirtualOwnerInstallationID)
-	if err != nil || candidate == nil || candidate.ID <= 0 {
+	if err != nil && !errors.Is(err, ErrVirtualCandidateNotFound) {
+		slog.WarnContext(ctx, "compat virtual candidate lookup failed; refusing persistence target", "component", "jellycompat", "error", err)
+		return out
+	}
+	if errors.Is(err, ErrVirtualCandidateNotFound) || candidate == nil || candidate.ID <= 0 {
 		out.FileID = neutral.ID
 		out.ExpectedFilePath = neutral.FilePath
 		out.UpdatedAt = neutral.UpdatedAt
@@ -724,18 +867,28 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 	}
 
 	if len(candidate.SubtitleLanguages) > 0 {
+		// Key by base language (folding regional, bibliographic and display-name
+		// aliases), not the lowercase string: a candidate alias ("EN-US") of a
+		// probed language ("ENG", "en") must not be appended as a second track
+		// for the same language.
 		existing := make(map[string]bool, len(probed.SubtitleTracks))
 		for _, track := range probed.SubtitleTracks {
 			if language := strings.TrimSpace(track.Language); language != "" {
-				existing[strings.ToLower(language)] = true
+				if base := virtstream.CanonicalLanguageBase(language); base != "" {
+					existing[base] = true
+				}
 			}
 		}
 		for _, language := range candidate.SubtitleLanguages {
 			language = strings.TrimSpace(language)
-			if language == "" || existing[strings.ToLower(language)] {
+			if language == "" {
 				continue
 			}
-			existing[strings.ToLower(language)] = true
+			base := virtstream.CanonicalLanguageBase(language)
+			if base == "" || existing[base] {
+				continue
+			}
+			existing[base] = true
 			probed.SubtitleTracks = append(probed.SubtitleTracks, models.SubtitleTrack{
 				Index:    len(probed.SubtitleTracks),
 				Language: language,

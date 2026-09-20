@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -25,13 +26,31 @@ import (
 // Canonical header names reused by the relay's range cache and header
 // filtering. Each literal appears once, here.
 const (
+	headerAccept        = "Accept"
 	headerAcceptRanges  = "Accept-Ranges"
+	headerAge           = "Age"
 	headerCacheControl  = "Cache-Control"
 	headerContentLength = "Content-Length"
 	headerContentRange  = "Content-Range"
 	headerContentType   = "Content-Type"
+	headerDate          = "Date"
 	headerETag          = "ETag"
+	headerExpires       = "Expires"
 	headerLastModified  = "Last-Modified"
+	headerOrigin        = "Origin"
+	headerReferer       = "Referer"
+	headerUserAgent     = "User-Agent"
+	headerVary          = "Vary"
+)
+
+// Cache-Control directive names the range cache inspects.
+// relayCacheControlDirectives lowercases names, so these are lowercase too.
+const (
+	cacheControlNoStore = "no-store"
+	cacheControlPrivate = "private"
+	cacheControlNoCache = "no-cache"
+	cacheControlMaxAge  = "max-age"
+	cacheControlSMaxAge = "s-maxage"
 )
 
 const (
@@ -64,7 +83,21 @@ const (
 	relayRangeCacheMaxEntrySize = 512 << 10
 	relayRangeCacheMaxEntries   = 64
 	relayRangeCacheMaxTotalSize = 16 << 20
+
+	// relayMaxFreshness caps every duration derived from the origin's freshness
+	// headers at the relay's own range-cache lifetime. An Age, max-age or
+	// s-maxage above it is refused as non-cacheable, and every other derived
+	// duration (apparent age, response delay, lifetime minus corrected age) is
+	// saturated to it. That keeps an unbounded delta-seconds conversion or a
+	// pair of additions from wrapping int64 nanoseconds, and bounds
+	// responseReceivedAt.Add(remaining) to relayRangeCacheTTL: a longer origin
+	// freshness can never outlive the entry the relay is willing to serve.
+	relayMaxFreshness = relayRangeCacheTTL
 )
+
+// relayMaxFreshnessSeconds is relayMaxFreshness in whole delta-seconds, the
+// largest value relayParseBoundedSeconds accepts.
+const relayMaxFreshnessSeconds = int64(relayMaxFreshness / time.Second)
 
 // relayRangeCacheEntry is one complete upstream range response. body is
 // immutable once stored; header holds only the media headers the relay
@@ -129,6 +162,16 @@ func (c *relayRangeCache) put(key string, entry relayRangeCacheEntry) {
 		c.entries = make(map[string]relayRangeCacheEntry)
 	}
 	now := c.clock()
+	// Callers that measured origin freshness supply expiresAt; a zero value
+	// (direct unit use) falls back to the bounded default. An entry that is
+	// already stale by the time the full body has streamed is never stored, so
+	// a concurrent reader can only ever see a complete, fresh entry.
+	if entry.expiresAt.IsZero() {
+		entry.expiresAt = now.Add(relayRangeCacheTTL)
+	}
+	if !now.Before(entry.expiresAt) {
+		return
+	}
 	for k, existing := range c.entries {
 		if !now.Before(existing.expiresAt) {
 			c.totalBytes -= len(existing.body)
@@ -153,15 +196,16 @@ func (c *relayRangeCache) put(key string, entry relayRangeCacheEntry) {
 		c.totalBytes -= len(c.entries[oldestKey].body)
 		delete(c.entries, oldestKey)
 	}
-	entry.expiresAt = now.Add(relayRangeCacheTTL)
 	c.entries[key] = entry
 	c.totalBytes += len(entry.body)
 }
 
 // relayRangeCacheKey names one complete upstream range response for a source.
-// The exact Range header is part of the key: a cache hit must answer the same
-// request the upstream answered.
-func relayRangeCacheKey(target *url.URL, rangeHeader string) string {
+// The exact Range header and the effective outbound-header identity are part of
+// the key: a cache hit must answer the same request the upstream answered, under
+// the same source URL (which carries provider credentials) and the same
+// forwarded headers.
+func relayRangeCacheKey(target *url.URL, rangeHeader, headerIdentity string) string {
 	if target == nil {
 		return ""
 	}
@@ -169,33 +213,301 @@ func relayRangeCacheKey(target *url.URL, rangeHeader string) string {
 	if rangeHeader == "" {
 		return ""
 	}
-	return target.String() + "\x00" + rangeHeader
+	return target.String() + "\x00" + rangeHeader + "\x00" + headerIdentity
 }
 
-// relayCacheableResponse reports the declared body size of a complete,
-// cacheable range response. Open-ended responses (Content-Length = the whole
-// remaining file), errors, streamed bodies, no-store responses, and anything
-// larger than the entry bound are rejected.
-func relayCacheableResponse(response *http.Response) (int, bool) {
+// relayRangeCacheHeaderIdentity hashes the effective outbound request headers
+// that the relay forwards upstream and that can change the response: Accept,
+// User-Agent, Referer and Origin. It is computed from the built upstream
+// request, after the relay's defaults and the per-registration overrides are
+// applied, so two requests that differ in any of these cannot share a cache
+// entry even when they target the same URL and Range. The exact Range is hashed
+// separately by relayRangeCacheKey; conditional headers (If-Range, If-None-Match,
+// If-Modified-Since) disable the cache entirely. Headers the relay drops —
+// cookies, authorization — cannot change the upstream response and are excluded.
+// Values are hashed, not embedded, so a cache key never carries a credential.
+func relayRangeCacheHeaderIdentity(headers http.Header) string {
+	parts := make([]string, 0, 4)
+	for _, name := range []string{headerAccept, headerUserAgent, headerReferer, headerOrigin} {
+		parts = append(parts, strings.ToLower(name)+"\x00"+headers.Get(name))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x1f")))
+	return hex.EncodeToString(sum[:])
+}
+
+// relayRangeResponseCacheability reports whether a complete, byte-bounded range
+// response may be cached, its declared body length, and the instant its
+// freshness ends. A response is reusable only when the origin did not mark it
+// non-reusable and enough of its origin-declared freshness survives. Reusable
+// requires HTTP 200/206, a positive Content-Length within the entry bound, no
+// no-store/private/no-cache directive, no max-age=0 or s-maxage=0, no Vary: *,
+// and a positive remaining freshness.
+//
+// Remaining freshness is freshnessLifetime - correctedInitialAge:
+//
+//   - freshnessLifetime is s-maxage when present, else max-age, else
+//     Expires minus Date (or minus responseReceivedAt when Date is absent),
+//     else relayRangeCacheTTL when the origin sent no freshness directive.
+//   - correctedInitialAge is the larger of the Age header plus the response
+//     delay and the apparent age (responseReceivedAt minus Date), per RFC 9111
+//     §4.2.3. See relayCorrectedInitialAge.
+//
+// When the origin sends no freshness directive the relay still caches for the
+// bounded relayRangeCacheTTL, never longer: HTTP permits heuristic freshness,
+// and FFmpeg repeats the same byte range within seconds, so a short bounded
+// window cannot serve meaningfully stale bytes while preserving the seek
+// optimization. A malformed Age, Date, Expires or max-age is treated as
+// non-reusable because freshness cannot be established. An Age, max-age or
+// s-maxage above relayMaxFreshness is likewise non-reusable, so an oversized
+// delta-seconds value is never converted (or wrapped) into a duration; the
+// derived ages and lifetimes that remain saturate at that ceiling. Because
+// relayMaxFreshness is relayRangeCacheTTL, the returned expiry is never later
+// than responseReceivedAt plus the relay's own cache lifetime.
+func relayRangeResponseCacheability(response *http.Response, requestSentAt, responseReceivedAt time.Time) (int, time.Time, bool) {
 	if response == nil {
-		return 0, false
+		return 0, time.Time{}, false
 	}
 	if response.StatusCode != http.StatusPartialContent && response.StatusCode != http.StatusOK {
-		return 0, false
+		return 0, time.Time{}, false
 	}
 	rawLength := strings.TrimSpace(response.Header.Get(headerContentLength))
 	if rawLength == "" {
-		return 0, false
+		return 0, time.Time{}, false
 	}
 	length, err := strconv.Atoi(rawLength)
 	if err != nil || length <= 0 || length > relayRangeCacheMaxEntrySize {
+		return 0, time.Time{}, false
+	}
+	directives := relayCacheControlDirectives(response.Header.Values(headerCacheControl))
+	for _, blocked := range []string{cacheControlNoStore, cacheControlPrivate, cacheControlNoCache} {
+		if _, ok := directives[blocked]; ok {
+			return 0, time.Time{}, false
+		}
+	}
+	if relayHasConflictingLifetime(response.Header.Values(headerCacheControl)) {
+		return 0, time.Time{}, false
+	}
+	for _, bound := range []string{cacheControlSMaxAge, cacheControlMaxAge} {
+		if value, ok := directives[bound]; ok {
+			seconds, ok := relayParseBoundedSeconds(value)
+			if !ok || seconds <= 0 {
+				return 0, time.Time{}, false
+			}
+		}
+	}
+	if relayVaryDisablesCaching(response.Header.Values(headerVary)) {
+		return 0, time.Time{}, false
+	}
+	lifetime, ok := relayFreshnessLifetime(directives, response.Header, responseReceivedAt)
+	if !ok || lifetime <= 0 {
+		return 0, time.Time{}, false
+	}
+	age, ok := relayCorrectedInitialAge(response.Header, requestSentAt, responseReceivedAt)
+	if !ok {
+		return 0, time.Time{}, false
+	}
+	// lifetime and age are both bounded by relayMaxFreshness, so the difference
+	// cannot underflow; saturating it keeps the expiry bounded even if a future
+	// change relaxes one of those bounds.
+	remaining := relaySaturateFreshness(lifetime - age)
+	if remaining <= 0 {
+		return 0, time.Time{}, false
+	}
+	return length, responseReceivedAt.Add(remaining), true
+}
+
+// relayParseBoundedSeconds parses a non-negative integer delta-seconds value.
+// It reports ok=false for a malformed, negative, or over-ceiling value. A huge
+// Age or max-age is refused rather than converted: time.Duration(seconds) *
+// time.Second would otherwise wrap to an arbitrary, possibly negative duration.
+func relayParseBoundedSeconds(raw string) (int64, bool) {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || seconds < 0 || seconds > relayMaxFreshnessSeconds {
 		return 0, false
 	}
-	cacheControl := strings.ToLower(response.Header.Get(headerCacheControl))
-	if strings.Contains(cacheControl, "no-store") || strings.Contains(cacheControl, "private") {
-		return 0, false
+	return seconds, true
+}
+
+// relaySaturateFreshness clamps a derived duration into [0, relayMaxFreshness].
+// A negative value (a future Date, or a clock that ran backwards) becomes zero;
+// an above-ceiling value saturates, so two of them can be added without
+// overflowing int64 nanoseconds and the resulting expiry stays bounded.
+func relaySaturateFreshness(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
 	}
-	return length, true
+	if d > relayMaxFreshness {
+		return relayMaxFreshness
+	}
+	return d
+}
+
+// relayFreshnessLifetime returns how long a response stays fresh according to
+// the origin. s-maxage wins for this shared cache; otherwise max-age; otherwise
+// Expires relative to Date; otherwise the relay's own bounded default. An
+// over-ceiling max-age/s-maxage is rejected, and an Expires delta beyond the
+// ceiling saturates to relayMaxFreshness rather than yielding a far-future
+// expiry.
+func relayFreshnessLifetime(directives map[string]string, header http.Header, receivedAt time.Time) (time.Duration, bool) {
+	for _, name := range []string{"s-maxage", "max-age"} {
+		if value, ok := directives[name]; ok {
+			seconds, ok := relayParseBoundedSeconds(value)
+			if !ok {
+				return 0, false
+			}
+			return time.Duration(seconds) * time.Second, true
+		}
+	}
+	if raw := strings.TrimSpace(header.Get(headerExpires)); raw != "" {
+		expires, err := relayHTTPTime(raw)
+		if err != nil {
+			return 0, false
+		}
+		base := receivedAt
+		if rawDate := strings.TrimSpace(header.Get(headerDate)); rawDate != "" {
+			date, err := relayHTTPTime(rawDate)
+			if err != nil {
+				return 0, false
+			}
+			base = date
+		}
+		lifetime := relaySaturateFreshness(expires.Sub(base))
+		if lifetime <= 0 {
+			return 0, false
+		}
+		return lifetime, true
+	}
+	return relayRangeCacheTTL, true
+}
+
+// relayCorrectedInitialAge returns how much of the response's freshness had
+// already elapsed when the relay received it, using the RFC 9111 §4.2.3
+// corrected-age rule. It is the larger of:
+//
+//   - apparent age: responseReceivedAt minus the origin's Date, clamped at
+//     zero and treated as zero when Date is absent. This catches an origin
+//     that backdates Date so a small Age understates how long the response has
+//     existed.
+//   - corrected Age: the Age header (zero when absent) plus the response delay
+//     (responseReceivedAt minus requestSentAt). Age alone omits the time the
+//     response spent in transit, so a response whose Age is just under its
+//     freshness lifetime is not treated as fresh for another full lifetime.
+//
+// Taking the maximum means an old Date can only make a response look staler,
+// never fresher, than Age claims. A malformed, negative, or over-ceiling Age
+// cannot establish freshness and reports ok=false. Apparent age and response
+// delay saturate at relayMaxFreshness before they are added, so a huge Date
+// skew or a huge clock delta cannot overflow int64 nanoseconds or be mistaken
+// for a small corrected age.
+func relayCorrectedInitialAge(header http.Header, requestSentAt, responseReceivedAt time.Time) (time.Duration, bool) {
+	apparentAge := time.Duration(0)
+	if raw := strings.TrimSpace(header.Get(headerDate)); raw != "" {
+		date, err := relayHTTPTime(raw)
+		if err != nil {
+			return 0, false
+		}
+		apparentAge = relaySaturateFreshness(responseReceivedAt.Sub(date))
+	}
+	ageValue := time.Duration(0)
+	for _, raw := range header.Values(headerAge) {
+		seconds, ok := relayParseBoundedSeconds(raw)
+		if !ok {
+			return 0, false
+		}
+		candidate := time.Duration(seconds) * time.Second
+		if candidate > ageValue {
+			ageValue = candidate
+		}
+	}
+	responseDelay := relaySaturateFreshness(responseReceivedAt.Sub(requestSentAt))
+	correctedAge := relaySaturateFreshness(ageValue + responseDelay)
+	if apparentAge > correctedAge {
+		return apparentAge, true
+	}
+	return correctedAge, true
+}
+
+// relayHTTPTime parses an HTTP-date tolerantly. http.ParseTime handles the
+// canonical GMT forms first; the RFC 1123 fallback also accepts other zone
+// abbreviations such as UTC, which http.ParseTime rejects. The freshness
+// lifetime (Expires versus Date) and the corrected-age apparent age both parse
+// every Date through this one function, so a Date one half accepts can never be
+// rejected by the other.
+func relayHTTPTime(raw string) (time.Time, error) {
+	if parsed, err := http.ParseTime(raw); err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC1123, raw)
+}
+
+func relayHasConflictingLifetime(values []string) bool {
+	seen := map[string]string{}
+	for _, value := range values {
+		for _, part := range splitCacheControlDirectives(value) {
+			name, raw, _ := strings.Cut(part, "=")
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name != "max-age" && name != "s-maxage" {
+				continue
+			}
+			raw = strings.Trim(strings.TrimSpace(raw), `"`)
+			if prior, ok := seen[name]; ok && prior != raw {
+				return true
+			}
+			seen[name] = raw
+		}
+	}
+	return false
+}
+
+// relayCacheControlDirectives parses Cache-Control header values into a map of
+// lowercased directive names to values. Commas inside quoted directive values
+// do not split the list. A bare directive maps to "".
+func relayCacheControlDirectives(values []string) map[string]string {
+	directives := make(map[string]string, len(values))
+	for _, value := range values {
+		for _, part := range splitCacheControlDirectives(value) {
+			name, rawValue, _ := strings.Cut(part, "=")
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name == "" {
+				continue
+			}
+			directives[name] = strings.Trim(strings.TrimSpace(rawValue), `"`)
+		}
+	}
+	return directives
+}
+
+func splitCacheControlDirectives(value string) []string {
+	parts := make([]string, 0, 4)
+	var current strings.Builder
+	inQuotes := false
+	for _, char := range value {
+		switch {
+		case char == '"':
+			inQuotes = !inQuotes
+			current.WriteRune(char)
+		case char == ',' && !inQuotes:
+			parts = append(parts, current.String())
+			current.Reset()
+		default:
+			current.WriteRune(char)
+		}
+	}
+	parts = append(parts, current.String())
+	return parts
+}
+
+// relayVaryDisablesCaching reports whether any Vary header lists the "*" token,
+// which forbids reusing a stored response for any other request.
+func relayVaryDisablesCaching(values []string) bool {
+	for _, value := range values {
+		for _, token := range strings.Split(value, ",") {
+			if strings.TrimSpace(token) == "*" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func relayCachedHeaders(response *http.Response) http.Header {
@@ -408,10 +720,12 @@ func (r *Relay) register(ctx context.Context, source string, insecure bool, head
 		return "", nil, errors.New("remote stream relay is closed")
 	}
 	r.evictLocked(now)
-	if len(r.entries) >= relayMaxEntries {
-		r.mu.Unlock()
-		return "", nil, errors.New("remote stream relay is at capacity")
-	}
+	// Bound the table by evicting the oldest registrations instead of refusing
+	// new ones: a hard capacity error would make every new virtual playback
+	// fail once the bound is reached. An evicted entry's stream gets a 404 on
+	// its next request and the client re-plans; a released entry is already
+	// gone, so the oldest remaining entries are the long-lived or leaked ones.
+	r.evictOldestLocked(relayMaxEntries - 1)
 	r.entries[token] = &relayEntry{
 		source: sourceURL, baseName: baseName, createdAt: now, insecure: insecure, headers: cloneHeaderMap(headers),
 	}
@@ -437,6 +751,41 @@ func (r *Relay) evictLocked(now time.Time) {
 	}
 }
 
+// evictOldestLocked removes the oldest entries until at most limit remain.
+// register calls it with relayMaxEntries-1 so a new registration always fits.
+// Caller holds r.mu.
+func (r *Relay) evictOldestLocked(limit int) {
+	for len(r.entries) > limit {
+		oldestToken := ""
+		var oldest time.Time
+		for token, entry := range r.entries {
+			if oldestToken == "" || entry.createdAt.Before(oldest) {
+				oldestToken, oldest = token, entry.createdAt
+			}
+		}
+		if oldestToken == "" {
+			return
+		}
+		r.deleteEntryLocked(oldestToken)
+	}
+}
+
+// entryForRequestLocked returns the live entry for a presented token. An entry
+// whose lifetime has elapsed is dropped and reported as absent, so expiry is
+// enforced when the token is presented rather than only when an unrelated
+// registration happens to run eviction. Caller holds r.mu.
+func (r *Relay) entryForRequestLocked(token string, now time.Time) (*relayEntry, bool) {
+	entry, ok := r.entries[token]
+	if !ok {
+		return nil, false
+	}
+	if now.Sub(entry.createdAt) >= relayEntryLifetime {
+		r.deleteEntryLocked(token)
+		return nil, false
+	}
+	return entry, true
+}
+
 func (r *Relay) deleteEntryLocked(token string) {
 	if _, ok := r.entries[token]; !ok {
 		return
@@ -457,7 +806,7 @@ func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	r.mu.Lock()
-	entry, ok := r.entries[token]
+	entry, ok := r.entryForRequestLocked(token, time.Now())
 	r.mu.Unlock()
 	if !ok {
 		http.NotFound(w, request)
@@ -599,7 +948,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		upstream.Header.Get("If-Range") == "" &&
 		upstream.Header.Get("If-None-Match") == "" &&
 		upstream.Header.Get("If-Modified-Since") == "" {
-		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"))
+		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"), relayRangeCacheHeaderIdentity(upstream.Header))
 		if entry, ok := r.rangeCache.get(cacheKey); ok {
 			for key, values := range entry.header {
 				for _, value := range values {
@@ -611,10 +960,15 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 			return writeErr
 		}
 	}
+	// Measure the request send time and the response receive time on the
+	// cache's clock so the entry's corrected age, its expiry and every later
+	// lookup use one time source (injectable in tests).
+	requestSentAt := r.rangeCache.clock()
 	response, err := client.Do(upstream)
 	if err != nil {
 		return errors.New("remote stream request failed")
 	}
+	responseReceivedAt := r.rangeCache.clock()
 	defer func() { _ = response.Body.Close() }()
 	// Detect upstream sources that ignore Range headers: when we ask for a
 	// byte range but get back 200 OK (full file), strip Accept-Ranges from
@@ -694,9 +1048,15 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		_, err = w.Write(rewritten)
 		return err
 	}
-	cacheLength, cacheable := relayCacheableResponse(response)
-	if cacheKey == "" {
-		cacheable = false
+	// Cache only a complete, byte-bounded range response whose origin-declared
+	// freshness still has time left after subtracting the response's own age.
+	// The expiry computed here is carried into the entry, so a hit can never
+	// outlive max-age because of when the relay happened to store the bytes.
+	var cacheLength int
+	var cacheExpiry time.Time
+	cacheable := false
+	if cacheKey != "" {
+		cacheLength, cacheExpiry, cacheable = relayRangeResponseCacheability(response, requestSentAt, responseReceivedAt)
 	}
 	var cacheBody []byte
 	if cacheable {
@@ -741,9 +1101,10 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		// disconnect or upstream error must never leave a partial entry.
 		if cacheable && len(cacheBody) == cacheLength {
 			r.rangeCache.put(cacheKey, relayRangeCacheEntry{
-				status: response.StatusCode,
-				header: relayCachedHeaders(response),
-				body:   cacheBody,
+				status:    response.StatusCode,
+				header:    relayCachedHeaders(response),
+				body:      cacheBody,
+				expiresAt: cacheExpiry,
 			})
 		}
 		return nil

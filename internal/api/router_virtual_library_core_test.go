@@ -65,7 +65,7 @@ func TestRouterWiresVirtualLibraryService(t *testing.T) {
 	}
 
 	// Verify the core service can resolve a virtual path directly
-	resolved, err := vlSvc.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	resolved, err := vlSvc.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "", false)
 	if err != nil {
 		t.Fatalf("core ResolveDetailed failed: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestRouterWiresCorePlaybackWithoutPlugin(t *testing.T) {
 		t.Fatal("expected at least one stream")
 	}
 
-	resolved, err := vlSvc.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	resolved, err := vlSvc.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "", false)
 	if err != nil {
 		t.Fatalf("core ResolveDetailed failed: %v", err)
 	}

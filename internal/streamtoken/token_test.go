@@ -59,6 +59,36 @@ func TestStartedAtSameSecondPreservesActualOrder(t *testing.T) {
 	}
 }
 
+func TestSourceFrameRateAndHeightRoundTrip(t *testing.T) {
+	token, err := Sign(Claims{
+		SessionID:       "gop",
+		SourceFrameRate: 24000.0 / 1001.0,
+		SourceHeight:    2160,
+	}, "secret", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := Verify(token, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.SourceFrameRate != 24000.0/1001.0 || claims.SourceHeight != 2160 {
+		t.Fatalf("source facts = fps %v height %d, want 24000/1001 and 2160", claims.SourceFrameRate, claims.SourceHeight)
+	}
+
+	legacyToken, err := Sign(Claims{SessionID: "legacy"}, "secret", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyClaims, err := Verify(legacyToken, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyClaims.SourceFrameRate != 0 || legacyClaims.SourceHeight != 0 {
+		t.Fatalf("legacy token invented source facts: fps %v height %d", legacyClaims.SourceFrameRate, legacyClaims.SourceHeight)
+	}
+}
+
 func TestSourceAudioChannelsRoundTripUsesDistinctClaim(t *testing.T) {
 	token, err := Sign(Claims{
 		SessionID:           "source-audio",

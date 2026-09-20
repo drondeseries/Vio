@@ -9,16 +9,21 @@ import "github.com/Silo-Server/silo-server/internal/tonemap"
 // reverse-engineering execution details from presentation fields or mutable
 // planner inputs.
 type ExecutableRecipeV3 struct {
-	Version                     int                    `json:"version"`
-	PlanID                      string                 `json:"plan_id"`
-	PlayMethod                  PlayMethod             `json:"play_method"`
-	TranscodeAudio              bool                   `json:"transcode_audio"`
-	TargetVideoCodec            string                 `json:"target_video_codec,omitempty"`
-	TargetAudioCodec            string                 `json:"target_audio_codec,omitempty"`
-	TargetAudioChannels         int                    `json:"target_audio_channels,omitempty"`
-	TargetAudioBitrateKbps      int                    `json:"target_audio_bitrate_kbps,omitempty"`
-	TargetResolution            string                 `json:"target_resolution,omitempty"`
-	TargetBitrateKbps           int                    `json:"target_bitrate_kbps,omitempty"`
+	Version                int        `json:"version"`
+	PlanID                 string     `json:"plan_id"`
+	PlayMethod             PlayMethod `json:"play_method"`
+	TranscodeAudio         bool       `json:"transcode_audio"`
+	TargetVideoCodec       string     `json:"target_video_codec,omitempty"`
+	TargetAudioCodec       string     `json:"target_audio_codec,omitempty"`
+	TargetAudioChannels    int        `json:"target_audio_channels,omitempty"`
+	TargetAudioBitrateKbps int        `json:"target_audio_bitrate_kbps,omitempty"`
+	TargetResolution       string     `json:"target_resolution,omitempty"`
+	TargetBitrateKbps      int        `json:"target_bitrate_kbps,omitempty"`
+	// SourceFrameRate and SourceHeight keep a rebuilt transcode's GOP aligned
+	// with the real source cadence and let the filter chain detect a no-op
+	// scale. Zero is the historical 30 fps / unknown-height behavior.
+	SourceFrameRate             float64                `json:"source_frame_rate,omitempty"`
+	SourceHeight                int                    `json:"source_height,omitempty"`
 	SourceVideoCodec            string                 `json:"source_video_codec,omitempty"`
 	SourceVideoProfile          string                 `json:"source_video_profile,omitempty"`
 	SourceVideoBitDepth         int                    `json:"source_video_bit_depth,omitempty"`
@@ -78,6 +83,8 @@ func FreezeExecutableRecipeV3(result PlannerResultV3) ExecutableRecipeV3 {
 		TargetAudioBitrateKbps:      result.TargetAudioBitrateKbps,
 		TargetResolution:            result.TargetResolution,
 		TargetBitrateKbps:           result.TargetBitrateKbps,
+		SourceFrameRate:             result.SourceFrameRate,
+		SourceHeight:                result.SourceHeight,
 		SourceVideoCodec:            sourceMetadata.VideoCodec,
 		SourceVideoProfile:          sourceMetadata.VideoProfile,
 		SourceVideoBitDepth:         sourceMetadata.VideoBitDepth,
@@ -165,6 +172,8 @@ func (r ExecutableRecipeV3) PlannerResult(plan *PlanV3) PlannerResultV3 {
 		TargetAudioBitrateKbps:   r.TargetAudioBitrateKbps,
 		TargetResolution:         r.TargetResolution,
 		TargetBitrateKbps:        r.TargetBitrateKbps,
+		SourceFrameRate:          r.SourceFrameRate,
+		SourceHeight:             r.SourceHeight,
 		ToneMapPolicy:            r.ToneMapPolicy,
 		ToneMapMode:              r.ToneMapMode,
 		ToneMapSourceKind:        r.ToneMapSourceKind,

@@ -409,6 +409,121 @@ func TestHandleStartPlaybackV3TriesAlternateAfterHDRTerminal(t *testing.T) {
 	}
 }
 
+// A subtitle-only refusal at start must degrade in place on the release the
+// viewer selected, with the subtitle dropped, instead of hunting another
+// version. The alternate here carries a subtitle the refusal would not have
+// blocked, so any move to it would prove the version changed for a subtitle
+// reason.
+func TestHandleStartPlaybackV3SubtitleOnlyTerminalDegradesInPlace(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.SubtitleTracks = []models.SubtitleTrack{{Index: 4, Codec: "hdmv_pgs_subtitle", Language: "eng", Title: "English"}}
+
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.SubtitleTracks = nil
+	alternate.ExternalSubtitles = []models.ExternalSubtitle{{Path: writePlaybackTestMediaFile(t, "movie.eng.srt"), Language: "eng", Format: "srt"}}
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, alternate},
+	}}
+	// Transcoding disabled makes the embedded PGS track a burn-in requirement
+	// the source cannot meet, so the subtitle policy terminalls with
+	// subtitle_conversion_unsupported before any video adaptation. The planner
+	// reads TranscodeEnabled from the config snapshot, not the settings store,
+	// so disable it on the config.
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	start := v3HandlerStartRequest()
+	start.QualityPreference = "auto"
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{Enabled: true, SupportedOnDevice: true}
+	subtitleIndex := 0
+	start.SubtitleTrackIndex = &subtitleIndex
+	start.SubtitleTrackID = playback.TrackIDV3(source.ID, "subtitle", subtitleIndex)
+
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+
+	var response playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != source.ID {
+		t.Fatalf("effective file = %d, want the mounted source %d (a subtitle reason must not move the release)",
+			response.PlaybackPlan.EffectiveMediaFileID, source.ID)
+	}
+	if response.PlaybackPlan.Subtitle.Mode != playback.SubtitleOffV3 || response.PlaybackPlan.SelectedTracks.Subtitle != nil {
+		t.Fatalf("degraded subtitle = %#v / %#v, want off with no selection", response.PlaybackPlan.Subtitle, response.PlaybackPlan.SelectedTracks.Subtitle)
+	}
+	dropped := false
+	for _, warning := range response.PlaybackPlan.DegradationWarnings {
+		if warning.Code == "subtitle_dropped_unavailable" {
+			dropped = true
+		}
+	}
+	if !dropped {
+		t.Fatalf("in-place degrade did not state the subtitle drop: %#v", response.PlaybackPlan.DegradationWarnings)
+	}
+}
+
+// A subtitle_conversion_unsupported terminal whose same-release subtitle drop
+// also fails is not subtitle-only in effect: the release's video/policy is what
+// blocks it. That case must keep the alternate-version failover rather than
+// terminalling. Here the source is HEVC on an H.264-only client with
+// transcoding disabled, so dropping the bitmap subtitle still leaves
+// transcoding_disabled; the H.264 sibling direct-plays.
+func TestHandleStartPlaybackV3SubtitleReasonWithBlockedVideoStillMovesVersion(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.CodecVideo = "hevc"
+	source.VideoTracks = []models.VideoTrack{{
+		Codec: "hevc", Profile: "main", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+	source.SubtitleTracks = []models.SubtitleTrack{{Index: 4, Codec: "hdmv_pgs_subtitle", Language: "eng", Title: "English"}}
+
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.CodecVideo = "h264"
+	alternate.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
+		FrameRate: "24000/1001", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+	alternate.SubtitleTracks = nil
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, alternate},
+	}}
+	// Transcoding disabled is what makes dropping the subtitle insufficient:
+	// the HEVC source still cannot play on this H.264-only client. The planner
+	// reads TranscodeEnabled from the config snapshot, not the settings store.
+	handler.PlaybackConfig = playbackTestConfigNoTranscode(t.TempDir())
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	start := v3HandlerStartRequest()
+	start.QualityPreference = "auto"
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{Enabled: true, SupportedOnDevice: true}
+	subtitleIndex := 0
+	start.SubtitleTrackIndex = &subtitleIndex
+	start.SubtitleTrackID = playback.TrackIDV3(source.ID, "subtitle", subtitleIndex)
+
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+
+	var response playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
+		t.Fatalf("effective file = %d, want the directly playable alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
+	}
+}
+
 func TestHandleStartPlaybackV3TriesLater4KAlternateAfterNon4KTerminal(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.CodecVideo = "hevc"
@@ -946,6 +1061,80 @@ func TestHandleStartPlaybackV3AcceptsPreDeviceDigestReplay(t *testing.T) {
 	}
 }
 
+// An idempotent start replay must never return a plan whose session is not the
+// one the durable attempt owns. Without the guard the stored StartResponse is
+// replayed verbatim, and the client later renders the transport guard
+// ("The playback plan does not belong to the session being prepared.") as a
+// replacement plan belonging to another session.
+func TestHandleStartPlaybackV3ReplayRejectsForeignPlanSession(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	startRequest := v3HandlerStartRequest()
+	body := marshalV3StartRequest(t, startRequest)
+
+	start := func() (int, playback.DecisionResponseV3) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(body)).WithContext(newAuthorizedPlaybackContext()))
+		var response playback.DecisionResponseV3
+		if rr.Code == http.StatusCreated {
+			if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return rr.Code, response
+	}
+
+	code, first := start()
+	if code != http.StatusCreated || first.PlaybackPlan == nil {
+		t.Fatalf("first start status=%d response=%#v", code, first)
+	}
+	record, err := handler.PlanStoreV3.GetAttempt(context.Background(), first.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A mixed-version or partially applied writer left the durable decision
+	// describing a different session than the attempt owns.
+	const foreignSession = "99999999-9999-4999-8999-999999999999"
+	record.StartResponse.SessionID = foreignSession
+	if record.StartResponse.PlaybackPlan != nil {
+		record.StartResponse.PlaybackPlan.SessionID = foreignSession
+	}
+	handler.PlanStoreV3.(*playback.MemoryPlanStoreV3).ReplaceAttempt(context.Background(), *record)
+
+	code, replayed := start()
+	if code != http.StatusCreated {
+		t.Fatalf("replay status = %d", code)
+	}
+	if replayed.Terminal == nil || replayed.Terminal.Reason != "session_expired" || !replayed.Terminal.Retryable {
+		t.Fatalf("foreign-session replay = %#v, want retryable session_expired terminal", replayed)
+	}
+	if replayed.PlaybackPlan != nil || replayed.SessionID == foreignSession {
+		t.Fatalf("foreign-session replay returned the foreign plan: %#v", replayed)
+	}
+}
+
+// A limit-provider blip is a transient dependency failure, not a capacity
+// limit: the replan exhaustion terminal must say so rather than claiming
+// capacity_unavailable.
+func TestClassifyVirtualReplanExhaustionLimitProviderUnavailableIsNotCapacityV3(t *testing.T) {
+	cause := errors.Join(playback.ErrLimitProviderUnavailable, errors.New("scanning user: context deadline exceeded"))
+	transportErr := classifyVirtualReplanExhaustionV3(nil, []*candidateErrorV3{{
+		Stage:   candidateStageAdmission,
+		Message: "candidate 42 replacement admission denied",
+		Err:     cause,
+	}})
+	if transportErr == nil {
+		t.Fatal("expected a transport error")
+	}
+	if transportErr.reason != "limit_provider_unavailable" || !transportErr.retryable {
+		t.Fatalf("classification = %#v, want retryable limit_provider_unavailable, not capacity_unavailable", transportErr)
+	}
+}
+
 func TestHandlePlaybackCapabilityV3AdvertisesTheFinalizedContract(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 
@@ -1317,7 +1506,7 @@ func TestPreferredAudioTrackIndexV3PropagatesSeriesPreferenceReadFailure(t *test
 		AudioTracks: []models.AudioTrack{{Codec: "aac", Language: "eng"}, {Codec: "aac", Language: "spa"}},
 	}
 
-	if _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "", file); !errors.Is(err, wantErr) {
+	if _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "", file, nil); !errors.Is(err, wantErr) {
 		t.Fatalf("preferredAudioTrackIndexV3 error = %v, want %v", err, wantErr)
 	}
 }
@@ -1331,7 +1520,7 @@ func TestPreferredAudioTrackIndexV3PropagatesCanonicalPreferenceReadFailure(t *t
 		AudioTracks: []models.AudioTrack{{Codec: "aac", Language: "eng"}, {Codec: "aac", Language: "spa"}},
 	}
 
-	if _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "living-room", file); !errors.Is(err, wantErr) {
+	if _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "living-room", file, nil); !errors.Is(err, wantErr) {
 		t.Fatalf("preferredAudioTrackIndexV3 error = %v, want %v", err, wantErr)
 	}
 }
@@ -6997,19 +7186,22 @@ func TestPrepareTransportV3ClearsRemoteTransportMarkWhenServingLocally(t *testin
 	}
 }
 
-// A burn-in requirement that only an SDR alternate can satisfy must still reach
-// the alternate-version fallback. The planner reports that refusal in terms of
-// the subtitle rather than the HDR pipeline, so a gate listing only the HDR and
-// version reasons silently retires the fallback and refuses playback outright.
-func TestTerminalAllowsAlternateFileV3CoversSubtitleForcedRefusals(t *testing.T) {
+// A subtitle-only refusal is routed to the in-place subtitle degrade before the
+// alternate-version hunt: the predicate does not treat it as a direct hunt
+// trigger. The start path re-admits the hunt only after that same-release
+// degrade also fails; the genuine video/policy reasons keep their failover.
+func TestTerminalAllowsAlternateFileV3RoutesSubtitleOnlyToInPlaceDegrade(t *testing.T) {
 	for _, reason := range []string{
 		terminalNoAlternateVersionV3,
 		terminalHDRTranscodeUnsupportedV3,
-		terminalSubtitleConversionUnsupportedV3,
+		sourceDecodeFailedReasonV3,
 	} {
 		if !terminalAllowsAlternateFileV3(&playback.TerminalV3{Reason: reason}) {
-			t.Fatalf("terminal %q must allow an alternate-version retry", reason)
+			t.Fatalf("video/policy terminal %q must allow an alternate-version retry", reason)
 		}
+	}
+	if terminalAllowsAlternateFileV3(&playback.TerminalV3{Reason: terminalSubtitleConversionUnsupportedV3}) {
+		t.Fatal("a subtitle-only refusal must not trigger an alternate-version retry; it degrades in place")
 	}
 	if terminalAllowsAlternateFileV3(&playback.TerminalV3{Reason: "client_hls_unsupported"}) {
 		t.Fatal("a client-route refusal must not trigger an alternate-version retry")
@@ -7324,15 +7516,16 @@ func TestHandleReplanPlaybackV3SkipsRehydrationOfUnchangedVirtualCandidate(t *te
 	}
 }
 
-// A replan whose pinned candidate changed must thread the session-bound
-// candidate as preferred and the failed candidate as excluded into the
-// detailed resolver, so re-ranking cannot drift to a different release or
-// re-select the failed candidate under a new row ID.
-func TestHandleReplanPlaybackV3ThreadsExcludedAndPreferredCandidateIDs(t *testing.T) {
+// A replan whose verdict does not indict the release must keep the
+// session-bound candidate as preferred and must not exclude any candidate, so
+// re-ranking cannot drift to a different release or silently swap it under the
+// same session. The catalog row's stale pick differs from the session binding;
+// it is still not excluded because the failure did not indict the release.
+func TestHandleReplanPlaybackV3KeepsPinnedCandidateForNonIndictingFailure(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.ID = 510
-	// The catalog row carries the failed candidate's result= pick; the session
-	// later binds to a different pinned release.
+	// The catalog row carries a stale result= pick; the session later binds to a
+	// different pinned release.
 	source.FilePath = "virtual://movie/replan-source-510?result=failed-cand"
 	source.VirtualOwnerInstallationID = 5
 	// Incomplete container evidence keeps the start path on the candidate
@@ -7399,10 +7592,13 @@ func TestHandleReplanPlaybackV3ThreadsExcludedAndPreferredCandidateIDs(t *testin
 		t.Fatalf("expected successful replan, got response=%#v terminal=%#v", response, response.Terminal)
 	}
 	if gotPreferred != "pinned" {
-		t.Fatalf("preferred candidate = %q, want pinned", gotPreferred)
+		t.Fatalf("preferred candidate = %q, want the session-bound pin", gotPreferred)
 	}
-	if len(gotExcluded) != 1 || gotExcluded[0] != "failed-cand" {
-		t.Fatalf("excluded candidates = %v, want [failed-cand] (the failed candidate)", gotExcluded)
+	if len(gotExcluded) != 0 {
+		t.Fatalf("excluded candidates = %v, want none for a non-indicting failure", gotExcluded)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != source.ID {
+		t.Fatalf("effective file = %d, want the unchanged session file %d", response.PlaybackPlan.EffectiveMediaFileID, source.ID)
 	}
 }
 
@@ -9230,5 +9426,261 @@ func TestPlaybackRoutingPolicySnapshotContextV3(t *testing.T) {
 	}
 	if got := handler.playbackRoutingPolicyForContextV3(context.Background()); got.DirectPlayEgress != config.PlaybackEgressAPIOnly {
 		t.Fatalf("unsnapshotted policy = %#v, want current config", got)
+	}
+}
+
+// dedupSubtitleFileV3 builds a file whose second embedded track duplicates the
+// first. The published inventory suppresses the duplicate, so the surviving deu
+// track moves from source ordinal 3 down to published ordinal 2.
+func dedupSubtitleFileV3(id int) *models.MediaFile {
+	return &models.MediaFile{
+		ID:                id,
+		ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}},
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 10, ContainerTrackID: "0", Language: "fra", Codec: "subrip"},
+			{Index: 11, ContainerTrackID: "1", Language: "fra", Codec: "subrip"}, // duplicate of the fra track, suppressed
+			// Published combined ordinal 2 resolves here (source combined
+			// ordinal 3). The plan's embedded identity carries this track's
+			// container id, so the fixture must supply it for the identity
+			// validation to exercise a legitimate deu selection.
+			{Index: 12, ContainerTrackID: "3", Language: "deu", Codec: "subrip"},
+		},
+	}
+}
+
+// legacySubtitleFileV3 is the dense pre-de-duplication shape: published and
+// source ordinals agree.
+func legacySubtitleFileV3(id int) *models.MediaFile {
+	return &models.MediaFile{
+		ID:                id,
+		ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}},
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 10, Language: "fra", Codec: "subrip"},
+			{Index: 12, Language: "deu", Codec: "subrip"},
+		},
+	}
+}
+
+func TestClassifySubtitleIndexV3MapsPublishedOrdinals(t *testing.T) {
+	dedup := dedupSubtitleFileV3(1)
+	legacy := legacySubtitleFileV3(2)
+	tests := []struct {
+		name  string
+		file  *models.MediaFile
+		index int
+		want  subtitleIndexLocationV3
+	}{
+		{"dedup external", dedup, 0, subtitleIndexLocationV3{source: playback.SubtitleSourceExternalV3, offset: 0}},
+		{"dedup embedded before the suppressed track", dedup, 1, subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: 0}},
+		{"dedup embedded after the suppressed track maps to source 2", dedup, 2, subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: 2}},
+		{"dedup downloaded follows the published own count", dedup, 3, subtitleIndexLocationV3{source: playback.SubtitleSourceDownloadedV3, offset: 0}},
+		{"legacy external", legacy, 0, subtitleIndexLocationV3{source: playback.SubtitleSourceExternalV3, offset: 0}},
+		{"legacy first embedded", legacy, 1, subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: 0}},
+		{"legacy second embedded", legacy, 2, subtitleIndexLocationV3{source: playback.SubtitleSourceEmbeddedV3, offset: 1}},
+		{"legacy downloaded", legacy, 3, subtitleIndexLocationV3{source: playback.SubtitleSourceDownloadedV3, offset: 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := classifySubtitleIndexV3(tt.file, tt.index)
+			if !ok {
+				t.Fatalf("classify(%d) = !ok", tt.index)
+			}
+			if got != tt.want {
+				t.Fatalf("classify(%d) = %#v, want %#v", tt.index, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAttachSubtitleArtifactV3ValidatesDeduplicatedEmbeddedSelection(t *testing.T) {
+	handler := &PlaybackHandler{}
+	file := dedupSubtitleFileV3(42)
+	// Published 2 names the deu track at source ordinal 3. The old
+	// selectedIndex-len(external) arithmetic would have checked source ordinal 1
+	// (the suppressed fra duplicate) and rejected the correct identity.
+	plan := &playback.PlanV3{
+		Delivery: playback.DeliveryOriginalHTTPV3,
+		Subtitle: playback.SubtitleDecisionV3{
+			Mode:      playback.SubtitleRenderV3,
+			Inventory: playback.BuildSubtitleInventoryV3(file, nil),
+			Embedded:  &playback.EmbeddedSubtitleV3{StreamIndex: 12, ContainerTrackID: "3"},
+			TrackID:   playback.TrackIDV3(file.ID, "subtitle", 2),
+		},
+	}
+	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-dedup-artifact", file, plan, 2, nil); err != nil {
+		t.Fatalf("published 2 must validate against the deu embedded track: %v", err)
+	}
+	if plan.Subtitle.Artifact != nil {
+		t.Fatal("an embedded render selection must not publish a sidecar artifact")
+	}
+
+	// The same published ordinal claiming the fra track's stream index must
+	// still be rejected: the mapping resolved the actual track, not just any
+	// in-range source slot.
+	mismatch := &playback.PlanV3{
+		Delivery: playback.DeliveryOriginalHTTPV3,
+		Subtitle: playback.SubtitleDecisionV3{
+			Mode:      playback.SubtitleRenderV3,
+			Inventory: playback.BuildSubtitleInventoryV3(file, nil),
+			Embedded:  &playback.EmbeddedSubtitleV3{StreamIndex: 10, ContainerTrackID: "0"},
+			TrackID:   playback.TrackIDV3(file.ID, "subtitle", 2),
+		},
+	}
+	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-dedup-artifact", file, mismatch, 2, nil); err == nil {
+		t.Fatal("a mismatched embedded identity was accepted")
+	}
+}
+
+func TestRemapSubtitleSelectionV3WritesTargetPublishedOrdinal(t *testing.T) {
+	t.Run("deduplicated own track", func(t *testing.T) {
+		source := dedupSubtitleFileV3(1)
+		target := dedupSubtitleFileV3(2)
+		target.SubtitleTracks[0].Index = 20
+		target.SubtitleTracks[1].Index = 21
+		target.SubtitleTracks[2].Index = 22
+		// Published 2 is the deu embedded track at source ordinal 3 on both
+		// files. A source-space read would pick the suppressed fra duplicate.
+		index := 2
+		request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(source.ID, "subtitle", index)}
+		if err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+			t.Fatalf("remap: %v", err)
+		}
+		if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 2 {
+			t.Fatalf("target published index = %v, want 2 (deu)", request.SubtitleTrackIndex)
+		}
+		if request.SubtitleTrackID != playback.TrackIDV3(target.ID, "subtitle", 2) {
+			t.Fatalf("target identity = %q, want published 2", request.SubtitleTrackID)
+		}
+	})
+
+	t.Run("deduplicated downloaded base", func(t *testing.T) {
+		source := &models.MediaFile{ID: 1, SubtitleTracks: []models.SubtitleTrack{
+			{Index: 10, Language: "fra", Codec: "subrip"},
+			{Index: 11, Language: "fra", Codec: "subrip"}, // suppressed, so own published is 1
+		}}
+		target := &models.MediaFile{ID: 2, SubtitleTracks: []models.SubtitleTrack{
+			{Index: 30, Language: "deu", Codec: "subrip"}, // own published is 1
+		}}
+		repo := downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+			source.ID: {
+				{ID: 71, MediaFileID: source.ID, Language: "fra", Format: subtitles.FormatSRT},
+				{ID: 72, MediaFileID: source.ID, Language: "deu", Format: subtitles.FormatSRT},
+			},
+			target.ID: {
+				{ID: 72, MediaFileID: target.ID, Language: "deu", Format: subtitles.FormatSRT},
+				{ID: 71, MediaFileID: target.ID, Language: "fra", Format: subtitles.FormatSRT},
+			},
+		}}
+		handler := &PlaybackHandler{SubtitleRepo: repo}
+		// Source own published is 1, so published 2 is the second downloaded row
+		// (ID 72). Target's own published base is 1, and ID 72 sits first there.
+		index := 2
+		request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(source.ID, "subtitle", index)}
+		if err := handler.remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+			t.Fatalf("remap: %v", err)
+		}
+		if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+			t.Fatalf("target published index = %v, want 1 (downloaded ID 72 after the own base)", request.SubtitleTrackIndex)
+		}
+	})
+
+	t.Run("legacy dense file keeps source ordinals", func(t *testing.T) {
+		source := legacySubtitleFileV3(1)
+		target := legacySubtitleFileV3(2)
+		index := 1
+		request := playback.StartRequestV3{SubtitleTrackIndex: &index, SubtitleTrackID: playback.TrackIDV3(source.ID, "subtitle", index)}
+		if err := (&PlaybackHandler{}).remapSubtitleSelectionV3(context.Background(), source, target, &request); err != nil {
+			t.Fatalf("remap: %v", err)
+		}
+		if request.SubtitleTrackIndex == nil || *request.SubtitleTrackIndex != 1 {
+			t.Fatalf("target index = %v, want 1 (unchanged dense ordinal)", request.SubtitleTrackIndex)
+		}
+	})
+}
+
+func TestPrepareRemoteTransportV3CarriesSourceFrameRateAndHeight(t *testing.T) {
+	var got transcodenode.TranscodeStartRequest
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/transcode/start" {
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Errorf("decode remote start: %v", err)
+			}
+			writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{SessionID: got.SessionID, Status: "started", AudioRecipeVersion: got.AudioRecipeVersion})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer node.Close()
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	recipes := &recordingRecipeCardStoreV3{}
+	handler.NodeRecipeStore = recipes
+	result := remoteHLSResultV3()
+	result.SourceFrameRate = 23.976
+	result.SourceHeight = 2160
+
+	transport, transportErr := handler.prepareRemoteTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-source-cadence", UserID: 7, ProfileID: "profile-1"},
+		v3HandlerFixtureFile(t), result,
+		nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}},
+		preparedTimelineV3{},
+		headerAuthenticatedMediaV3([]string{playback.FeatureHeaderAuthenticatedMediaV3}),
+	)
+	if transportErr != nil {
+		t.Fatalf("prepare remote transport: %v", transportErr)
+	}
+	defer transport.rollback()
+
+	if got.SourceFrameRate != 23.976 || got.SourceHeight != 2160 {
+		t.Fatalf("remote request source facts = (%v, %d), want (23.976, 2160)", got.SourceFrameRate, got.SourceHeight)
+	}
+	card, ok := recipes.cards[transport.transportID]
+	if !ok {
+		t.Fatalf("no recipe stored under transport %q", transport.transportID)
+	}
+	if card.SourceFrameRate != 23.976 || card.SourceHeight != 2160 {
+		t.Fatalf("stored recipe source facts = (%v, %d), want (23.976, 2160)", card.SourceFrameRate, card.SourceHeight)
+	}
+}
+
+func TestPrepareLocalTransportV3CarriesSourceFrameRateAndHeight(t *testing.T) {
+	file := audioOrdinalFixtureFileV3(t)
+	transcodeDir := t.TempDir()
+	argsPath := filepath.Join(t.TempDir(), "source-cadence-args.txt")
+	ffmpegPath := writePlaybackArgsRecordingFFmpegV3(t, argsPath)
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: ffmpegPath, TranscodeDir: transcodeDir, TranscodeEnabled: true, HWAccel: playback.HWAccelNone}
+	}
+	result := audioOrdinalResultV3(0)
+	result.SourceFrameRate = 23.976
+	result.SourceHeight = 2160
+	transport, transportErr := handler.prepareLocalTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-source-cadence-local", UserID: 7, ProfileID: "profile-1"},
+		file, result, preparedTimelineV3{}, mediaAuthModeV3{},
+	)
+	if transportErr != nil {
+		t.Fatalf("prepare local transport: %v (cause: %v)", transportErr, transportErr.cause)
+	}
+	defer transport.rollback()
+
+	parsed, err := url.Parse(transport.url)
+	if err != nil {
+		t.Fatalf("parse local manifest url: %v", err)
+	}
+	token := parsed.Query().Get(streamTokenParam)
+	if token == "" {
+		t.Fatalf("local manifest url carries no stream token: %q", transport.url)
+	}
+	claims, err := streamtoken.Verify(token, handler.JWTSecret)
+	if err != nil {
+		t.Fatalf("verify local stream token: %v", err)
+	}
+	if claims.SourceFrameRate != 23.976 || claims.SourceHeight != 2160 {
+		t.Fatalf("local recipe source facts = (%v, %d), want (23.976, 2160)", claims.SourceFrameRate, claims.SourceHeight)
 	}
 }

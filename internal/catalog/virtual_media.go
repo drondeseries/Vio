@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -18,9 +19,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/requestlock"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 var ErrInvalidVirtualMedia = errors.New("invalid virtual media")
+
+// ErrVirtualReconcileRefused reports that a destructive reconciliation was
+// rejected because the caller did not carry positive completeness evidence
+// for the source's membership, or because the keep set shrank beyond what a
+// complete enumeration can plausibly explain. It is distinct from a transient
+// failure: retrying without new evidence is refused again.
+var ErrVirtualReconcileRefused = errors.New("virtual reconciliation refused")
 
 const (
 	maxVirtualURIBytes             = 1024
@@ -39,7 +48,73 @@ const (
 	maxVirtualFilesPerRegistration = 4096
 	maxVirtualLanguages            = 32
 	maxVirtualLanguageBytes        = 35
+
+	// reconcileImplausibleRemovalFloor is the smallest absolute number of
+	// existing source claims whose removal can be judged implausible during a
+	// verified reconciliation. Below it the keep ratio is too noisy to tell a
+	// genuine provider removal from a truncated keep set, so a small, deliberate
+	// withdrawal is allowed. At or above it, dropping more than half of the
+	// claims is treated as evidence the enumeration was incomplete.
+	reconcileImplausibleRemovalFloor = 5
 )
+
+// virtualItemRetentionGuard is a SQL predicate fragment, correlated to the
+// candidate media_items alias `mi`, that stops a background virtual-catalog
+// sweep from deleting an item that still has user-visible state. Watch history
+// and watch progress reference content by bare ID with no foreign key, so a
+// delete silently strands Continue Watching/history rows the client then 404s
+// and refetches in a loop. Open abs sessions and unexpired protocol-v3 attempts
+// are live playback state. Embed the fragment inside the DELETE so the check and
+// the delete are one statement, rather than a separate read that a concurrent
+// insert could overtake. The last_file_id correlation only sees surviving files,
+// so the file sweep must carry the matching reference in
+// virtualFileRetentionGuard.
+const virtualItemRetentionGuard = `
+	  AND NOT EXISTS (SELECT 1 FROM user_watch_history uwh WHERE uwh.media_item_id = mi.content_id)
+	  AND NOT EXISTS (
+	      SELECT 1 FROM user_watch_progress uwp
+	      WHERE uwp.media_item_id = mi.content_id
+	         OR uwp.last_file_id IN (SELECT mf.id FROM media_files mf WHERE mf.content_id = mi.content_id)
+	  )
+	  AND NOT EXISTS (
+	      SELECT 1 FROM abs_playback_sessions aps
+	      WHERE aps.content_id = mi.content_id AND aps.closed_at IS NULL
+	  )
+	  AND NOT EXISTS (
+	      SELECT 1 FROM playback_v3_attempts pva
+	      WHERE pva.expires_at > NOW()
+	        AND (pva.effective_media_file_id IN (SELECT mf.id FROM media_files mf WHERE mf.content_id = mi.content_id)
+	          OR pva.requested_media_file_id IN (SELECT mf.id FROM media_files mf WHERE mf.content_id = mi.content_id))
+	  )`
+
+// virtualFileRetentionGuard is a SQL predicate fragment, correlated to the
+// candidate media_files alias `mf`, that stops a virtual file delete from
+// destroying live playback or the user's last-played version. playback_v3_attempts
+// has ON DELETE CASCADE foreign keys to media_files, so without this a file
+// sweep would destroy the live attempt before the item-level guard could observe
+// it. An open abs_playback_sessions row references its file with ON DELETE SET
+// NULL, so deleting the row silently strips a live session's file identity. A
+// stale candidate that is still user_watch_progress.last_file_id is retained so
+// a known-working version does not vanish when the provider re-lists with new
+// result ids — the same retention the scanner applies in
+// ReplaceVirtualCandidates. This is what makes the last_file_id case in
+// virtualItemRetentionGuard effective: the file sweep runs before the item
+// delete, so without the file-level guard the item-level subquery would already
+// be looking at a deleted row. Embedding it in the DELETE keeps the check and
+// the delete in one statement so a concurrent insert cannot race it.
+const virtualFileRetentionGuard = `
+	  AND NOT EXISTS (
+	      SELECT 1 FROM user_watch_progress uwp WHERE uwp.last_file_id = mf.id
+	  )
+	  AND NOT EXISTS (
+	      SELECT 1 FROM abs_playback_sessions aps
+	      WHERE aps.media_file_id = mf.id AND aps.closed_at IS NULL
+	  )
+	  AND NOT EXISTS (
+	      SELECT 1 FROM playback_v3_attempts pva
+	      WHERE pva.expires_at > NOW()
+	        AND (pva.effective_media_file_id = mf.id OR pva.requested_media_file_id = mf.id)
+	  )`
 
 var (
 	virtualPathSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -113,6 +188,20 @@ type VirtualMediaResult struct {
 type VirtualReconcileResult struct {
 	ItemsRemoved int
 	FilesRemoved int
+}
+
+// VirtualReconcileEvidence attests that a keep set was produced by a complete
+// enumeration of a source's membership. The zero value is not complete and
+// cannot authorize destructive reconciliation through the verified entry
+// point. FullCycle is set only by a pass that walked the caller's entire queue
+// from the front without exhausting its budget; a resumed or deadline-cut
+// pass leaves it false. SourceCount is the number of queue items the caller
+// enumerated for the source, and QueueCount is the size of the whole snapshot
+// the keep set was drawn from.
+type VirtualReconcileEvidence struct {
+	FullCycle   bool
+	SourceCount int
+	QueueCount  int
 }
 
 // VirtualMediaRegistrar owns transactional catalog registration for virtual
@@ -559,7 +648,7 @@ func syncVirtualFileSourceClaims(ctx context.Context, tx pgx.Tx, installationID 
 				  AND vmfsc.content_id=$1
 				  AND vmfsc.media_folder_id=$2
 				  AND vmfsc.file_path=mf.file_path
-			  )`, contentID, folderID, deletedPaths, installationID); err != nil {
+			  )`+virtualFileRetentionGuard, contentID, folderID, deletedPaths, installationID); err != nil {
 			return fmt.Errorf("remove stale virtual media files: %w", err)
 		}
 	}
@@ -569,7 +658,25 @@ func syncVirtualFileSourceClaims(ctx context.Context, tx pgx.Tx, installationID 
 // ReconcileVirtualMedia removes stale virtual media owned by one source.
 // Physical files and collection-linked items are preserved. Core-owned media
 // uses installationID 0; plugin-owned media uses a positive installation ID.
+//
+// This is the explicit-caller entry point: a caller that supplies keepIDs is
+// asserting its own list. The core monitor uses ReconcileVirtualMediaVerified
+// so destructive reconciliation requires a full-cycle completeness attestation.
 func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, installationID int, source string, keepIDs []string, libraryIDs []int) (VirtualReconcileResult, error) {
+	return r.reconcileVirtualMedia(ctx, installationID, source, keepIDs, libraryIDs, nil)
+}
+
+// ReconcileVirtualMediaVerified is the completeness-gated reconciliation entry
+// point used by the core virtual-library monitor. Unlike ReconcileVirtualMedia,
+// destructive reconciliation requires evidence that the keep set came from a
+// pass that enumerated the entire queue. A partial pass, a queue that lost
+// items, or a keep set that shrinks implausibly is refused and logged instead
+// of deleting live media.
+func (r *VirtualMediaRegistrar) ReconcileVirtualMediaVerified(ctx context.Context, installationID int, source string, keepIDs []string, libraryIDs []int, evidence VirtualReconcileEvidence) (VirtualReconcileResult, error) {
+	return r.reconcileVirtualMedia(ctx, installationID, source, keepIDs, libraryIDs, &evidence)
+}
+
+func (r *VirtualMediaRegistrar) reconcileVirtualMedia(ctx context.Context, installationID int, source string, keepIDs []string, libraryIDs []int, evidence *VirtualReconcileEvidence) (VirtualReconcileResult, error) {
 	var result VirtualReconcileResult
 	if r == nil || r.pool == nil {
 		return result, errors.New("virtual catalog is unavailable")
@@ -612,7 +719,34 @@ func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, insta
 			return result, fmt.Errorf("virtual reconciliation guard check: %w", err)
 		}
 		if existingCount > 0 {
-			return result, fmt.Errorf("virtual reconciliation refused: empty keep list but %d existing claims exist for source %q — monitored state may be unavailable", existingCount, source)
+			slog.ErrorContext(ctx, "virtual reconciliation refused: empty keep list",
+				"installation_id", installationID, "source", source, "existing_claims", existingCount)
+			return result, fmt.Errorf("%w: empty keep list but %d existing claims exist for source %q — monitored state may be unavailable", ErrVirtualReconcileRefused, existingCount, source)
+		}
+	}
+	if evidence != nil {
+		// Positive completeness evidence is required before anything is
+		// deleted. A keep set that merely happens to be non-empty is not
+		// evidence: a resumed pass or a queue that lost items produces a
+		// non-empty subset that would otherwise sweep live media.
+		if !evidence.FullCycle || evidence.SourceCount <= 0 || evidence.QueueCount < evidence.SourceCount {
+			slog.ErrorContext(ctx, "virtual reconciliation refused: incomplete enumeration evidence",
+				"installation_id", installationID, "source", source,
+				"full_cycle", evidence.FullCycle, "source_items", evidence.SourceCount,
+				"queue_items", evidence.QueueCount, "keep_ids", len(keepIDs))
+			return result, fmt.Errorf("%w: source %q had %d items in a %d-item queue (full cycle %t); a partial enumeration cannot authorize deletion",
+				ErrVirtualReconcileRefused, source, evidence.SourceCount, evidence.QueueCount, evidence.FullCycle)
+		}
+		existing, removable, err := virtualSourceClaimCounts(ctx, tx, installationID, source, keepIDs, libraryIDs)
+		if err != nil {
+			return result, fmt.Errorf("virtual reconciliation completeness check: %w", err)
+		}
+		if removable >= reconcileImplausibleRemovalFloor && removable*2 > existing {
+			slog.ErrorContext(ctx, "virtual reconciliation refused: keep set shrinks implausibly",
+				"installation_id", installationID, "source", source,
+				"existing_claims", existing, "removable_claims", removable, "keep_ids", len(keepIDs))
+			return result, fmt.Errorf("%w: source %q would remove %d of %d existing claims; the keep set looks truncated",
+				ErrVirtualReconcileRefused, source, removable, existing)
 		}
 	}
 	if _, err := tx.Exec(ctx, `
@@ -682,7 +816,7 @@ func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, insta
 			  AND remaining.content_id=stale.content_id
 			  AND remaining.media_folder_id=stale.media_folder_id
 			  AND remaining.file_path=stale.file_path
-		  )`)
+		  )`+virtualFileRetentionGuard)
 	if err != nil {
 		return result, fmt.Errorf("delete unclaimed virtual files: %w", err)
 	}
@@ -751,7 +885,7 @@ func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, insta
 		  AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.content_id = mi.content_id)
 		  AND NOT EXISTS (SELECT 1 FROM library_collection_items lci WHERE lci.media_item_id = mi.content_id)
 		  AND NOT EXISTS (SELECT 1 FROM virtual_media_source_claims vmsc WHERE vmsc.content_id=mi.content_id)
-		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)
+		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)`+virtualItemRetentionGuard+`
 		RETURNING mi.content_id`)
 	if err != nil {
 		return result, fmt.Errorf("delete stale virtual media: %w", err)
@@ -926,7 +1060,7 @@ func RemoveVirtualMediaInstallation(ctx context.Context, tx pgx.Tx, installation
 		  AND NOT EXISTS (
 			SELECT 1 FROM retained_virtual_files retained
 			WHERE retained.id=mf.id
-		)`)
+		)`+virtualFileRetentionGuard)
 	if err != nil {
 		return result, fmt.Errorf("delete unclaimed virtual files: %w", err)
 	}
@@ -1017,7 +1151,7 @@ func RemoveVirtualMediaInstallation(ctx context.Context, tx pgx.Tx, installation
 		        AND vmsc.owns_item_metadata
 		        AND vmsc.plugin_installation_id<>$1
 		  )
-		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)
+		  AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)`+virtualItemRetentionGuard+`
 		RETURNING mi.content_id`, installationID)
 	if err != nil {
 		return result, fmt.Errorf("delete orphaned virtual media items: %w", err)
@@ -1083,6 +1217,54 @@ func normalizeVirtualLibraryIDs(ids []int) []int {
 		return []int{}
 	}
 	return ids
+}
+
+// MissingVirtualMediaContentIDs returns the subset of contentIDs that no
+// longer has a media_items row. Monitor callers use it to evict queue entries
+// for media that was genuinely removed; a probe failure returns an error so the
+// caller can leave the queue untouched rather than treat transient trouble as
+// removal.
+func (r *VirtualMediaRegistrar) MissingVirtualMediaContentIDs(ctx context.Context, contentIDs []string) (map[string]struct{}, error) {
+	missing := make(map[string]struct{})
+	if r == nil || r.pool == nil || len(contentIDs) == 0 {
+		return missing, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT probe.id
+		FROM unnest($1::text[]) AS probe(id)
+		WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id=probe.id)`, contentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("probe missing virtual media: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan missing virtual media: %w", err)
+		}
+		missing[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate missing virtual media: %w", err)
+	}
+	return missing, nil
+}
+
+// virtualSourceClaimCounts returns the number of existing claims for a source
+// (optionally scoped to libraries) and how many of them the keep set omits.
+// keepIDs and libraryIDs must be normalized concrete slices so the array
+// predicates have their intended semantics.
+func virtualSourceClaimCounts(ctx context.Context, tx pgx.Tx, installationID int, source string, keepIDs []string, libraryIDs []int) (existing, removable int, err error) {
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)::int,
+		       COUNT(*) FILTER (WHERE NOT (content_id=ANY($3::text[])))::int
+		FROM virtual_media_source_claims
+		WHERE plugin_installation_id=$1 AND source_key=$2
+		  AND (cardinality($4::int[])=0 OR media_folder_id=ANY($4::int[]))`,
+		installationID, source, keepIDs, libraryIDs).Scan(&existing, &removable); err != nil {
+		return 0, 0, fmt.Errorf("count virtual source claims: %w", err)
+	}
+	return existing, removable, nil
 }
 
 func validateVirtualMedia(in VirtualMedia) error {
@@ -1640,14 +1822,14 @@ func adoptVirtualFileRow(ctx context.Context, tx pgx.Tx, contentID, episodeID st
 // an adoption, so superseded hashes don't linger as phantom versions.
 func dropVirtualSiblingRows(ctx context.Context, tx pgx.Tx, contentID, episodeID string, folderID, installationID, keepID int, neutralURI, editionLabel string) {
 	_, _ = tx.Exec(ctx, `
-		DELETE FROM media_files
-		WHERE content_id=$1
-		  AND COALESCE(episode_id,'') = COALESCE(NULLIF($2,''),'')
-		  AND virtual_owner_installation_id=$3
-		  AND media_folder_id=$4
-		  AND id <> $5
-		  AND regexp_replace(file_path, '[?&]result=[^&]*', '', 'g') = $6
-		  AND COALESCE(edition_raw,'') = $7`,
+		DELETE FROM media_files mf
+		WHERE mf.content_id=$1
+		  AND COALESCE(mf.episode_id,'') = COALESCE(NULLIF($2,''),'')
+		  AND mf.virtual_owner_installation_id=$3
+		  AND mf.media_folder_id=$4
+		  AND mf.id <> $5
+		  AND regexp_replace(mf.file_path, '[?&]result=[^&]*', '', 'g') = $6
+		  AND COALESCE(mf.edition_raw,'') = $7`+virtualFileRetentionGuard,
 		contentID, episodeID, installationID, folderID, keepID, neutralURI, editionLabel)
 }
 
@@ -1667,7 +1849,9 @@ func upsertVirtualFileWithMeta(ctx context.Context, tx pgx.Tx, contentID, episod
 	if audioLangs == nil {
 		audioLangs = []string{}
 	}
-	subLangs := in.SubtitleLanguages
+	// Collapse language aliases so one language never lands as two JSONB
+	// subtitle tracks, whatever order the caller supplied.
+	subLangs := stream.DedupeLanguageAliases(in.SubtitleLanguages)
 	if subLangs == nil {
 		subLangs = []string{}
 	}
@@ -1773,7 +1957,7 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 	if audioLangs == nil {
 		audioLangs = []string{}
 	}
-	subLangs := v.SubtitleLanguages
+	subLangs := stream.DedupeLanguageAliases(v.SubtitleLanguages)
 	if subLangs == nil {
 		subLangs = []string{}
 	}

@@ -18,7 +18,7 @@ func TestResolveNilServiceReturnsUnavailable(t *testing.T) {
 		t.Fatalf("Resolve: err = %v, want ErrVirtualLibraryUnavailable", err)
 	}
 
-	_, err = s.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	_, err = s.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "", false)
 	if err != virtuallibrary.ErrVirtualLibraryUnavailable {
 		t.Fatalf("ResolveDetailed: err = %v, want ErrVirtualLibraryUnavailable", err)
 	}
@@ -96,6 +96,71 @@ func TestResolvedVirtualProvenanceInference(t *testing.T) {
 	}
 }
 
+// TestResolveDetailedPinnedExcludedCandidateSubstitution pins the release-swap
+// invariant: a pinned candidate the caller excluded is only substitutable when
+// rotation was explicitly requested. A dead pin (absent from the provider list)
+// still falls back so a genuinely unavailable release recovers.
+func TestResolveDetailedPinnedExcludedCandidateSubstitution(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/manifest.json" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"org.stremio.test","resources":["stream"],"types":["movie","series"]}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"streams": [
+				{"name": "1080p", "title": "First", "url": "http://192.168.1.100:8080/stream1.mkv"},
+				{"name": "720p", "title": "Second", "url": "http://192.168.1.100:8080/stream2.mkv"}
+			]
+		}`))
+	}))
+	defer mockServer.Close()
+
+	svc := virtuallibrary.New(virtuallibrary.Config{
+		Enabled:           true,
+		ManifestURL:       mockServer.URL + "/manifest.json",
+		AllowInsecureHTTP: true,
+	}, nil, nil)
+	if svc == nil {
+		t.Fatal("expected non-nil service")
+	}
+	ctx := context.Background()
+	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
+	if err != nil || len(streams) != 2 {
+		t.Fatalf("ListStreams: count=%d err=%v, want 2", len(streams), err)
+	}
+	pinned := streams[0].ID
+	sibling := streams[1].ID
+	pinnedURI := "virtual://movie/tt100?result=" + pinned
+
+	// Excluding the pinned candidate without a rotation request must refuse
+	// rather than silently serving a different release.
+	if _, err := svc.ResolveDetailed(ctx, pinnedURI, false, []string{pinned}, "", false, false); err == nil {
+		t.Fatal("expected refusal when the pinned candidate is excluded without rotation")
+	}
+
+	// An explicit rotation request may substitute the sibling.
+	rotated, err := svc.ResolveDetailed(ctx, pinnedURI, false, []string{pinned}, "", false, true)
+	if err != nil {
+		t.Fatalf("rotation resolve: %v", err)
+	}
+	if rotated.CandidateID != sibling {
+		t.Fatalf("rotated candidate = %q, want sibling %q", rotated.CandidateID, sibling)
+	}
+
+	// A pinned id absent from the provider list is a dead release: the
+	// dead-provider fallback still substitutes even without a rotation request.
+	dead, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result=ffffffffffffffffffffffff", false, nil, "", false, false)
+	if err != nil {
+		t.Fatalf("dead-pin resolve: %v", err)
+	}
+	if dead.CandidateID == "" {
+		t.Fatal("expected a fallback candidate for a dead pin")
+	}
+}
+
 func TestResolveDetailedWithFakeProvider(t *testing.T) {
 	// Create a mock HTTP server serving a valid Stremio streams response
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +198,7 @@ func TestResolveDetailedWithFakeProvider(t *testing.T) {
 	if svcSecure == nil {
 		t.Fatal("expected non-nil service")
 	}
-	_, errSecure := svcSecure.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	_, errSecure := svcSecure.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "", false)
 	if errSecure == nil {
 		t.Fatal("expected SSRF error when AllowInsecureHTTP is false for private stream URL")
 	}
@@ -147,7 +212,7 @@ func TestResolveDetailedWithFakeProvider(t *testing.T) {
 	if svcInsecure == nil {
 		t.Fatal("expected non-nil service")
 	}
-	res, err := svcInsecure.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "")
+	res, err := svcInsecure.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "", false)
 	if err != nil {
 		t.Fatalf("ResolveDetailed failed: %v", err)
 	}

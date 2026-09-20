@@ -72,6 +72,77 @@ func TestWaitForShutdownWorkWaitsForEveryCleanup(t *testing.T) {
 	}
 }
 
+// TestAwaitShutdownFuncReturnsWhenStepCompletes pins the graceful case: an
+// explicit application-shutdown step is awaited to completion and reported as
+// success.
+func TestAwaitShutdownFuncReturnsWhenStepCompletes(t *testing.T) {
+	ran := make(chan struct{})
+	if err := awaitShutdownFunc(time.Second, func() { close(ran) }); err != nil {
+		t.Fatalf("awaitShutdownFunc error = %v, want nil", err)
+	}
+	select {
+	case <-ran:
+	default:
+		t.Fatal("shutdown step was not run")
+	}
+}
+
+// TestAwaitShutdownFuncAbandonsOnTimeout pins the forced-termination behavior:
+// a step that overruns its budget is abandoned with DeadlineExceeded rather than
+// hanging process shutdown. The abandoned goroutine may still be running; the
+// in-memory evidence it held is lost on exit and re-probed after restart.
+func TestAwaitShutdownFuncAbandonsOnTimeout(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- awaitShutdownFunc(20*time.Millisecond, func() {
+			close(started)
+			<-release
+		})
+	}()
+	<-started
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("awaitShutdownFunc error = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("awaitShutdownFunc hung instead of abandoning the overrunning step")
+	}
+}
+
+// TestRunShutdownStepsAwaitsEveryStepAndContinuesAfterATimeout pins the main
+// wiring: every registered step runs in order, and an overrunning step is
+// abandoned without preventing the later steps from running.
+func TestRunShutdownStepsAwaitsEveryStepAndContinuesAfterATimeout(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+
+	runShutdownSteps(20*time.Millisecond, []shutdownStep{
+		{name: "first", run: func() {
+			mu.Lock()
+			order = append(order, "first")
+			mu.Unlock()
+		}},
+		{name: "stuck", run: func() { <-stuck }},
+		{name: "last", run: func() {
+			mu.Lock()
+			order = append(order, "last")
+			mu.Unlock()
+		}},
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"first", "last"}; !slices.Equal(order, want) {
+		t.Fatalf("steps ran %v, want %v around the abandoned stuck step", order, want)
+	}
+}
+
 func TestRunShutdownWorkWithTimeoutUsesFreshContext(t *testing.T) {
 	called := false
 	err := runShutdownWorkWithTimeout(100*time.Millisecond, func(ctx context.Context) error {
