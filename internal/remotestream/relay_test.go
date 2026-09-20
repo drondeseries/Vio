@@ -1002,8 +1002,11 @@ func TestRelayRangeResponseCacheabilityFreshness(t *testing.T) {
 			wantOK: false,
 		},
 		{
+			// max-age stays within the freshness ceiling (relayRangeCacheTTL);
+			// an over-ceiling max-age is refused regardless of s-maxage, so a
+			// larger max-age could not be used to show precedence.
 			name:       "s-maxage wins for a shared cache",
-			header:     http.Header{"Cache-Control": {"s-maxage=30, max-age=600"}},
+			header:     http.Header{"Cache-Control": {"s-maxage=30, max-age=" + strconv.FormatInt(relayMaxFreshnessSeconds, 10)}},
 			wantOK:     true,
 			wantExpiry: receivedAt.Add(30 * time.Second),
 		},
@@ -1144,6 +1147,61 @@ func TestRelayRangeResponseCacheabilityCorrectedAge(t *testing.T) {
 				t.Fatalf("expiry = %v, want %v", expiry, tc.wantExpiry)
 			}
 		})
+	}
+}
+
+// TestRelayRangeResponseCacheabilityAcceptsUTCSuffixDate is the regression for a
+// Date ending in "UTC": http.ParseTime wants the "GMT" abbreviation, so the
+// corrected-age half used to reject a Date the freshness-lifetime half accepted,
+// collapsing cacheability. Both halves now share relayHTTPTime, so a UTC-suffix
+// Date with Expires or max-age and no Age is reusable, while a malformed Date is
+// still rejected.
+func TestRelayRangeResponseCacheabilityAcceptsUTCSuffixDate(t *testing.T) {
+	receivedAt := time.Unix(1_700_000_000, 0)
+	utcDate := receivedAt.UTC().Format(time.RFC1123)
+	cases := []struct {
+		name       string
+		header     http.Header
+		wantExpiry time.Time
+	}{
+		{
+			name:       "expires relative to a UTC-suffix date",
+			header:     http.Header{"Date": {utcDate}, "Expires": {receivedAt.Add(30 * time.Second).UTC().Format(time.RFC1123)}},
+			wantExpiry: receivedAt.Add(30 * time.Second),
+		},
+		{
+			name:       "max-age with a UTC-suffix date and no age",
+			header:     http.Header{"Date": {utcDate}, "Cache-Control": {"max-age=60"}},
+			wantExpiry: receivedAt.Add(60 * time.Second),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: http.StatusPartialContent, Header: tc.header.Clone()}
+			response.Header.Set("Content-Length", "128")
+			directives := relayCacheControlDirectives(response.Header.Values(headerCacheControl))
+			if lifetime, ok := relayFreshnessLifetime(directives, response.Header, receivedAt); !ok || lifetime <= 0 {
+				t.Fatalf("freshness-lifetime half rejected the UTC Date: ok=%v lifetime=%v", ok, lifetime)
+			}
+			if _, ok := relayCorrectedInitialAge(response.Header, receivedAt, receivedAt); !ok {
+				t.Fatal("corrected-age half rejected the UTC Date")
+			}
+			_, expiry, ok := relayRangeResponseCacheability(response, receivedAt, receivedAt)
+			if !ok {
+				t.Fatal("cacheable = false, want a UTC-suffix Date to be reusable")
+			}
+			if !expiry.Equal(tc.wantExpiry) {
+				t.Fatalf("expiry = %v, want %v", expiry, tc.wantExpiry)
+			}
+		})
+	}
+
+	malformed := &http.Response{StatusCode: http.StatusPartialContent, Header: http.Header{
+		"Date": {"not-a-date"}, "Cache-Control": {"max-age=60"},
+	}}
+	malformed.Header.Set("Content-Length", "128")
+	if _, _, ok := relayRangeResponseCacheability(malformed, receivedAt, receivedAt); ok {
+		t.Fatal("cacheable = true for a malformed Date, want rejection")
 	}
 }
 
@@ -1510,6 +1568,49 @@ func TestRelayRangeCacheReusesFreshResponseWithCorrectedAge(t *testing.T) {
 	mu.Unlock()
 	if got != 1 {
 		t.Fatalf("upstream calls = %d, want 1 (a fresh corrected age is still cached)", got)
+	}
+}
+
+// TestRelayRangeCacheRefetchesOversizedOriginFreshness is the regression for an
+// origin freshness far longer than the relay's cache contract. max-age=86400
+// exceeds the two-minute ceiling, so it is refused rather than allowed to pin an
+// entry: reopening three hours later re-fetches and serves the origin's exact
+// bytes again instead of replaying the stale cached body.
+func TestRelayRangeCacheRefetchesOversizedOriginFreshness(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	want := strings.Repeat("h", 64)
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	now := time.Unix(1_700_000_000, 0)
+	relay.rangeCache.now = func() time.Time { return now }
+	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", want)
+		response.Header.Set("Content-Range", "bytes 0-63/1000")
+		response.Header.Set("Content-Length", "64")
+		response.Header.Set("Cache-Control", "max-age=86400")
+		return response, nil
+	})}
+	relayURL, cleanup := registerRelayForTest(t, relay, "oversized-origin-freshness", "https://1.1.1.1/media.mkv")
+	defer cleanup()
+
+	first := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63")
+	if first.status != http.StatusPartialContent || first.body != want {
+		t.Fatalf("first = status %d, %d bytes; want the origin's %d-byte body", first.status, len(first.body), len(want))
+	}
+	now = now.Add(3 * time.Hour)
+	second := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63")
+	if second.status != http.StatusPartialContent || second.body != want {
+		t.Fatalf("second = status %d, %d bytes; want the origin's %d-byte body", second.status, len(second.body), len(want))
+	}
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (an over-TTL origin freshness cannot pin an entry)", got)
 	}
 }
 

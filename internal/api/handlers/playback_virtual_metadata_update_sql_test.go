@@ -145,8 +145,8 @@ func TestVirtualFileMetadataUpdateSQLShape(t *testing.T) {
 	// intentional (e.g. $16/$17 fence the sibling, verdict and CAS clauses).
 	wantCounts := map[int]int{
 		1: 1, 2: 3, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 2,
-		11: 1, 12: 2, 13: 2, 14: 1, 15: 1, 16: 4, 17: 4, 18: 6, 19: 2,
-		20: 1, 21: 1,
+		11: 1, 12: 2, 13: 2, 14: 1, 15: 1, 16: 7, 17: 7, 18: 11, 19: 4,
+		20: 2, 21: 2, 22: 1,
 	}
 	for n, want := range wantCounts {
 		if got := occurrences[n]; got != want {

@@ -879,11 +879,11 @@ type VirtualFilePersistArgs struct {
 	AdoptPath string
 	// RequireAdopt makes identity adoption a condition of success: when
 	// AdoptPath is non-empty the saver must confirm the row's file_path became
-	// AdoptPath, and must report a non-nil error (after still persisting the
-	// metadata where possible) when a uniqueness conflict, the probe_source
-	// guard, or a live failed_at verdict prevented adoption. Metadata-only
-	// evidence writers leave this false so a skipped adoption is not an error
-	// for them.
+	// AdoptPath, and must report a non-nil error when a uniqueness conflict,
+	// the probe_source guard, or a live failed_at verdict prevented adoption.
+	// The write is atomic with that fence: a refused adoption writes no track
+	// inventory or probe stamp. Metadata-only evidence writers leave this false
+	// so a skipped adoption is not an error and the metadata still lands.
 	RequireAdopt bool
 	// AllowFailedVerdict is the explicit-retry policy. When true, an active
 	// failed_at stamp on the validated identity does not block adoption; the

@@ -339,8 +339,9 @@ func TestExecVirtualFileMetadataUpdateExplicitRetryDisablesVerdictFence(t *testi
 }
 
 // TestExecVirtualFileMetadataUpdateUniquenessRetryDoesNotReportAdoption pins
-// the SQLSTATE 23505 retry: the metadata-only retry must not be reported as an
-// identity adoption when RequireAdopt is set.
+// that a uniqueness collision under RequireAdopt is refused without a
+// metadata-only retry: the retry would stamp the substitute's tracks and probe
+// evidence on a row that does not own them.
 func TestExecVirtualFileMetadataUpdateUniquenessRetryDoesNotReportAdoption(t *testing.T) {
 	const candidatePath = "virtual://movie/tt-retry?result=cand"
 	db := &fakeMetadataDB{rows: []pgx.Row{
@@ -356,10 +357,10 @@ func TestExecVirtualFileMetadataUpdateUniquenessRetryDoesNotReportAdoption(t *te
 		t.Fatalf("error = %v, want errVirtualAdoptIdentityNotPersisted", err)
 	}
 	if rows != 0 {
-		t.Fatalf("rows = %d, want 0: a metadata-only retry is not an adoption", rows)
+		t.Fatalf("rows = %d, want 0: a collision is not an adoption", rows)
 	}
-	if len(db.adoptPaths) != 2 || db.adoptPaths[0] != candidatePath || db.adoptPaths[1] != "" {
-		t.Fatalf("adopt paths = %v, want [%q, \"\"]", db.adoptPaths, candidatePath)
+	if len(db.adoptPaths) != 1 || db.adoptPaths[0] != candidatePath {
+		t.Fatalf("adopt paths = %v, want a single adoption attempt and no metadata-only retry", db.adoptPaths)
 	}
 }
 
@@ -410,8 +411,8 @@ func TestFallbackUniquenessConflictDoesNotReportAdoption(t *testing.T) {
 
 // TestVirtualFileMetadataUpdateVerdictFenceBlocksAdoption is the DB-gated proof
 // that the verdict fence is evaluated in the same statement as the adoption: a
-// failed_at committed before the write blocks adoption, while the probe
-// metadata still lands.
+// failed_at committed before the write blocks adoption, so the whole write is
+// refused and neither the probe metadata nor the stamp lands.
 func TestVirtualFileMetadataUpdateVerdictFenceBlocksAdoption(t *testing.T) {
 	pool := virtualMetadataUpdateTestPool(t)
 	ctx := context.Background()
@@ -457,22 +458,27 @@ func TestVirtualFileMetadataUpdateVerdictFenceBlocksAdoption(t *testing.T) {
 		t.Fatalf("rows = %d, want 0", rows)
 	}
 
-	var path, resolution string
-	if err := pool.QueryRow(ctx, `SELECT file_path, resolution FROM media_files WHERE id = $1`, targetID).Scan(&path, &resolution); err != nil {
+	var path string
+	var resolution, stampedAt *string
+	if err := pool.QueryRow(ctx, `SELECT file_path, resolution, probe_updated_at::text FROM media_files WHERE id = $1`, targetID).Scan(&path, &resolution, &stampedAt); err != nil {
 		t.Fatalf("read target row: %v", err)
 	}
 	if path != anchorPath {
 		t.Fatalf("final database file_path = %q, want the un-adopted %q", path, anchorPath)
 	}
-	if resolution != "2160p" {
-		t.Fatalf("resolution = %q, want the metadata to have landed despite the blocked adoption", resolution)
+	if resolution != nil {
+		t.Fatalf("resolution = %q, want no probe metadata on a refused adoption", *resolution)
+	}
+	if stampedAt != nil {
+		t.Fatalf("probe_updated_at = %q, want no probe stamp on a refused adoption", *stampedAt)
 	}
 }
 
 // TestVirtualFileMetadataUpdateUniquenessConflictDoesNotReportAdoption is the
 // DB-gated proof that a resolved identity colliding with an existing path owner
-// is not reported as an adoption: the metadata lands, file_path keeps the row's
-// own identity, and the saver returns no confirmed identity.
+// is not reported as an adoption: the whole write is refused, file_path keeps
+// the row's own identity, and neither the substitute's tracks nor its probe
+// stamp land.
 func TestVirtualFileMetadataUpdateUniquenessConflictDoesNotReportAdoption(t *testing.T) {
 	pool := virtualMetadataUpdateTestPool(t)
 	ctx := context.Background()
@@ -515,8 +521,9 @@ func TestVirtualFileMetadataUpdateUniquenessConflictDoesNotReportAdoption(t *tes
 		t.Fatalf("rows = %d, want 0", rows)
 	}
 
-	var path, resolution string
-	if err := pool.QueryRow(ctx, `SELECT file_path, resolution FROM media_files WHERE id = $1`, candidateID).Scan(&path, &resolution); err != nil {
+	var path string
+	var resolution, stampedAt *string
+	if err := pool.QueryRow(ctx, `SELECT file_path, resolution, probe_updated_at::text FROM media_files WHERE id = $1`, candidateID).Scan(&path, &resolution, &stampedAt); err != nil {
 		t.Fatalf("read candidate row: %v", err)
 	}
 	// The persisted identity is the row's own path, so the returned identity
@@ -524,7 +531,10 @@ func TestVirtualFileMetadataUpdateUniquenessConflictDoesNotReportAdoption(t *tes
 	if path != candidatePath {
 		t.Fatalf("final database file_path = %q, want the row's own identity %q", path, candidatePath)
 	}
-	if resolution != "2160p" {
-		t.Fatalf("resolution = %q, want the metadata to have landed", resolution)
+	if resolution != nil {
+		t.Fatalf("resolution = %q, want no substitute metadata on a refused adoption", *resolution)
+	}
+	if stampedAt != nil {
+		t.Fatalf("probe_updated_at = %q, want no substitute probe stamp on a refused adoption", *stampedAt)
 	}
 }

@@ -47,7 +47,7 @@ func TestSubtitleSearchHoldsSlotsUntilNonCooperativeCallbackExits(t *testing.T) 
 	serviceCancel()
 	time.Sleep(50 * time.Millisecond)
 
-	if !containsKey(h.SubtitleSearchInFlight, file.ID) {
+	if !containsKey(h.SubtitleSearchInFlight, virtualSubtitleSearchKey(file, cand)) {
 		t.Fatal("shutdown dropped the in-flight key while the callback was still running")
 	}
 	if len(gate.slots) != 1 {
@@ -62,13 +62,13 @@ func TestSubtitleSearchHoldsSlotsUntilNonCooperativeCallbackExits(t *testing.T) 
 	close(exit)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if !containsKey(h.SubtitleSearchInFlight, file.ID) && len(gate.slots) == 0 && len(slots.slots) == 0 {
+		if !containsKey(h.SubtitleSearchInFlight, virtualSubtitleSearchKey(file, cand)) && len(gate.slots) == 0 && len(slots.slots) == 0 {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("cleanup after callback exit: key=%v aggregate=%d subtitle=%d",
-		containsKey(h.SubtitleSearchInFlight, file.ID), len(gate.slots), len(slots.slots))
+		containsKey(h.SubtitleSearchInFlight, virtualSubtitleSearchKey(file, cand)), len(gate.slots), len(slots.slots))
 }
 
 func containsKey(m *sync.Map, key any) bool {

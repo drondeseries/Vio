@@ -111,7 +111,7 @@ func TestSaturatedDetachedGateShedsSubtitleSearchWithoutBlocking(t *testing.T) {
 		t.Fatal("subtitle search spawned while the gate was saturated")
 	case <-time.After(50 * time.Millisecond):
 	}
-	if _, loaded := h.SubtitleSearchInFlight.Load(file.ID); loaded {
+	if _, loaded := h.SubtitleSearchInFlight.Load(virtualSubtitleSearchKey(file, cand)); loaded {
 		t.Fatal("a shed search left its dedupe key behind")
 	}
 
@@ -161,13 +161,13 @@ func TestServiceContextCancellationStopsDetachedSubtitleSearch(t *testing.T) {
 	gate := h.detachedGate()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		_, loaded := h.SubtitleSearchInFlight.Load(file.ID)
+		_, loaded := h.SubtitleSearchInFlight.Load(virtualSubtitleSearchKey(file, cand))
 		if !loaded && len(gate.slots) == 0 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if _, loaded := h.SubtitleSearchInFlight.Load(file.ID); loaded {
+	if _, loaded := h.SubtitleSearchInFlight.Load(virtualSubtitleSearchKey(file, cand)); loaded {
 		t.Fatal("shutdown leaked the subtitle search dedupe key")
 	}
 	if got := len(gate.slots); got != 0 {

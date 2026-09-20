@@ -2196,7 +2196,11 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 				return
 			}
 		}
-		if dbFile != nil && dbFile.ID > 0 {
+		// Only a row whose path verifiably matches the candidate may be used
+		// as the probe target. A partial row (ID with a null or stale
+		// file_path) never matched the URI, so it must not receive the
+		// resolved candidate's probe evidence.
+		if dbFile != nil && virtualCandidateRowVerified(dbFile, cand.URI) {
 			probeTransient = cloneVirtualProbeTransient(*dbFile)
 		}
 		probeTransient.FilePath = cand.URI
@@ -2220,11 +2224,13 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 // converge to probed evidence instead of re-probing on every start.
 //
 // Path adoption is skipped when a sibling row (same virtual owner and library)
-// already owns the target path. Adopting it anyway would violate the
-// media_files_virtual_file_owner_key unique index and drop the probe evidence;
-// the row keeps its current path while the metadata and stamp still apply. The
-// probe_source guard is IS DISTINCT FROM so a row whose probe_source is NULL
-// (never stamped) adopts its resolved path like any other non-collection row.
+// already owns the target path, and when the candidate's own verdict is failed.
+// When RequireAdopt is requested, the whole write is atomic with that fence: the
+// $22 guard mirrors the file_path CASE in the UPDATE's WHERE, so a refused
+// adoption (sibling owner, collection row, live failed verdict) matches no row
+// and leaves the track inventory and probe stamp untouched. Metadata-only
+// writers leave $22 false and keep the previous behavior: adoption is best-effort
+// while the metadata and stamp still apply.
 //
 // Adoption is additionally fenced on the candidate's own verdict. A failed_at
 // stamp committed after the handler's last verdict read (the serve layer and
@@ -2309,6 +2315,47 @@ WHERE id = $11
   AND probe_updated_at IS NOT DISTINCT FROM $15::timestamptz
   AND virtual_owner_installation_id IS NOT DISTINCT FROM $16
   AND media_folder_id IS NOT DISTINCT FROM $17
+  -- Mirrors the file_path CASE below: when a confirmed adoption is required,
+  -- the row only matches if that adoption will actually happen, so the track
+  -- inventory and probe stamp cannot land without the identity. Keep the two
+  -- predicates in sync.
+  AND (
+    NOT $22::boolean
+    OR (
+      $18 <> ''
+      AND probe_source IS DISTINCT FROM 'virtual_collection'
+      AND NOT EXISTS (
+        SELECT 1 FROM media_files guard_sibling
+        WHERE guard_sibling.id <> media_files.id
+          AND guard_sibling.file_path = $18
+          AND guard_sibling.virtual_owner_installation_id IS NOT DISTINCT FROM $16
+          AND guard_sibling.media_folder_id IS NOT DISTINCT FROM $17
+      )
+      AND (
+        NOT $21::boolean
+        OR NOT EXISTS (
+          SELECT 1 FROM media_files guard_failed
+          WHERE guard_failed.virtual_owner_installation_id IS NOT DISTINCT FROM $16
+            AND guard_failed.media_folder_id IS NOT DISTINCT FROM $17
+            AND guard_failed.failed_at IS NOT NULL
+            AND now() <= guard_failed.failed_at + make_interval(secs => $20)
+            AND (
+              guard_failed.file_path = $18
+              OR (
+                $19 <> $18
+                AND guard_failed.file_path = $19
+                AND NOT EXISTS (
+                  SELECT 1 FROM media_files guard_exact
+                  WHERE guard_exact.file_path = $18
+                    AND guard_exact.virtual_owner_installation_id IS NOT DISTINCT FROM $16
+                    AND guard_exact.media_folder_id IS NOT DISTINCT FROM $17
+                )
+              )
+            )
+        )
+      )
+    )
+  )
 RETURNING file_path
 `
 
@@ -2345,20 +2392,22 @@ type VirtualFileMetadataUpdateResult struct {
 //     predicate is evaluated in the same statement as the write, a verdict
 //     committed after the caller's last read but before this write cannot be
 //     adopted.
-//   - RETURNING file_path reports what the row actually persisted. When
-//     RequireAdopt is set and the file_path is not the requested AdoptPath
-//     (probe_source guard, sibling guard, verdict fence, or a collection row),
-//     the update is refused rather than reported as an adoption even though the
-//     metadata and stamp landed.
+//   - When RequireAdopt is set the whole write is atomic with that fence: a
+//     refused adoption (probe_source guard, sibling guard, verdict fence, or a
+//     collection row) matches no row, so the track inventory and probe stamp
+//     are not written either. Metadata-only writers keep the previous
+//     best-effort adoption. RETURNING file_path reports what the row actually
+//     persisted when a row did match.
 //
 // Two concurrent probes can both pass the sibling guard and one still loses the
-// unique-index race (media_files_virtual_file_owner_key). When that happens
-// with a non-empty AdoptPath, retry exactly once with AdoptPath cleared so the
-// probe metadata lands on the row's current path instead of being dropped. The
-// retry keys on SQLSTATE 23505 rather than the constraint name and still
-// reports no adoption when RequireAdopt is set, because only metadata was
-// written. A nil db is a no-op so callers that run without a database stay
-// safe.
+// unique-index race (media_files_virtual_file_owner_key). For a metadata-only
+// write that happens with a non-empty AdoptPath: retry exactly once with
+// AdoptPath cleared so the probe metadata lands on the row's current path
+// instead of being dropped. The retry keys on SQLSTATE 23505 rather than the
+// constraint name. When RequireAdopt is set there is no retry at all: a
+// collision proves the identity was not adopted, and a metadata-only retry
+// would stamp the substitute's tracks on a row that does not own them. A nil db
+// is a no-op so callers that run without a database stay safe.
 //
 // QueryRow consumes the full result stream before Scan returns, so a terminal
 // database error cannot hide behind an already-read row.
@@ -2387,12 +2436,16 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 		if adoptPath != "" {
 			neutralPath = virtualPlaybackNeutralKey(adoptPath)
 		}
+		// The atomic guard only applies when the caller needs a confirmed
+		// adoption; the metadata-only retry clears adoptPath and therefore
+		// writes evidence on the row's current path as before.
+		requireAdoption := args.RequireAdopt && adoptPath != ""
 		var persistedPath string
 		err := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
 			vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
 			args.FileID, args.ExpectedFilePath, args.StampProbe,
 			args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
-			neutralPath, verdictMaxAgeSeconds, fenceVerdict,
+			neutralPath, verdictMaxAgeSeconds, fenceVerdict, requireAdoption,
 		).Scan(&persistedPath)
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No row matched the CAS fence: a stale snapshot, reported as a
@@ -2407,6 +2460,13 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	persistedPath, err := exec(args.AdoptPath)
 	if err == nil {
 		if persistedPath == "" {
+			if args.RequireAdopt && args.AdoptPath != "" {
+				// The atomic guard matched no row: the adoption was refused
+				// (sibling owner, collection row, live failed verdict) or the
+				// CAS snapshot was stale. Either way the validated identity
+				// was not adopted, and the tracks/stamp were not written.
+				return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s was not adopted", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
+			}
 			return VirtualFileMetadataUpdateResult{}, nil
 		}
 		if args.RequireAdopt && args.AdoptPath != "" && persistedPath != args.AdoptPath {
@@ -2425,6 +2485,14 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	if args.AdoptPath == "" || !errors.As(err, &pgErr) || pgErr.Code != "23505" {
 		return VirtualFileMetadataUpdateResult{}, err
 	}
+	if args.RequireAdopt {
+		// A collision is proof the validated identity was not adopted. A
+		// metadata-only retry would stamp the substitute's tracks and probe
+		// evidence on a row that does not own them, so refuse outright.
+		slog.WarnContext(ctx, "virtual probe evidence persist adoption collided with an existing path owner; refusing without writing tracks",
+			"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath, "error", err)
+		return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s collided with an existing path owner", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
+	}
 	slog.WarnContext(ctx, "virtual probe evidence persist adoption raced an existing path owner; retrying without adoption",
 		"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath, "error", err)
 	// The retry deliberately retains evidence on the current row, but it did
@@ -2437,10 +2505,6 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	if retryPath == "" {
 		// The metadata-only retry also missed the CAS fence.
 		return VirtualFileMetadataUpdateResult{}, nil
-	}
-	if args.RequireAdopt {
-		// Metadata-only retry: the validated identity was not adopted.
-		return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s collided with an existing path owner", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
 	}
 	return VirtualFileMetadataUpdateResult{
 		RowsAffected:    1,
@@ -2655,11 +2719,36 @@ func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, cand
 	return nil
 }
 
+// virtualCandidateRowVerified reports whether a catalog lookup result actually
+// owns candidateURI. A positive row ID alone proves nothing: a partial row with
+// a null or stale file_path must not be trusted as the candidate's owner, or
+// verdict checks and background probe persistence would target a row that never
+// matched the URI. A row that carries the exact candidate identity, or the
+// provider-neutral identity without a concrete pick, is verified.
+func virtualCandidateRowVerified(row *models.MediaFile, candidateURI string) bool {
+	if row == nil || row.ID <= 0 || candidateURI == "" {
+		return false
+	}
+	path := strings.TrimSpace(row.FilePath)
+	if path == "" {
+		return false
+	}
+	if sameVirtualReleaseIdentity(path, candidateURI) {
+		return true
+	}
+	// The row owns the provider-neutral identity (no concrete ?result= pick):
+	// that is the identity the neutral fallback lookup keys on. A row carrying
+	// a different concrete pick is a different release and is not verified.
+	return virtualResultCandidateID(path) == "" &&
+		virtualPlaybackNeutralKey(path) == virtualPlaybackNeutralKey(candidateURI)
+}
+
 // lookupVirtualCandidateRowDetailed resolves the catalog row that owns a
 // concrete candidate URI and distinguishes a genuine not-found from a lookup
 // failure or an incomplete row. found is false with a nil error only when no
-// configured lookup knows the candidate; a lookup error or a non-nil row
-// without an identity is returned as an error so the caller can fail closed.
+// configured lookup knows the candidate; a lookup error or a non-nil row that
+// does not verifiably own the candidate (no path, a stale path, or an ID with
+// no usable identity) is returned as an error so the caller can fail closed.
 //
 // The exact-path lookup is authoritative: when it fails with a real lookup
 // error, that error is preserved even if the provider-neutral fallback
@@ -2694,12 +2783,13 @@ func (h *PlaybackHandler) lookupVirtualCandidateRowDetailed(ctx context.Context,
 		if row == nil {
 			return nil, false
 		}
-		if row.ID > 0 {
+		if virtualCandidateRowVerified(row, candidateURI) {
 			return row, true
 		}
-		// A non-nil row without an identity cannot carry a trustworthy
+		// A non-nil row that does not verifiably own the candidate (no
+		// identity, a null path, or a stale path) cannot carry a trustworthy
 		// verdict; remember it and let the other lookup still own the
-		// candidate.
+		// candidate. A positive ID alone is not ownership.
 		if exact {
 			exactIncomplete = true
 		} else {
@@ -3200,6 +3290,22 @@ func virtualResultCandidateID(virtualPath string) string {
 	return strings.TrimSpace(parsed.Query().Get("result"))
 }
 
+// virtualSubtitleSearchKey identifies one in-flight subtitle search. It binds
+// the catalog row to the concrete candidate URI (or the resolved identity) so
+// only identical requests dedupe; distinct release candidates for the same row
+// each reach the provider. A row without a positive ID falls back to its
+// content identity.
+func virtualSubtitleSearchKey(file *models.MediaFile, cand VirtualPlaybackStream) string {
+	if file != nil && file.ID > 0 {
+		return "virtual-file:" + strconv.Itoa(file.ID) + ":" + cand.URI
+	}
+	contentID := ""
+	if file != nil {
+		contentID = file.ContentID
+	}
+	return "virtual:" + contentID + ":" + cand.URI
+}
+
 // maybeTriggerSubtitleSearch kicks off a background subtitle search when a
 // virtual stream enters playback with no embedded or external subtitle tracks.
 // Results are downloaded and associated with the file so they appear in the
@@ -3224,10 +3330,12 @@ func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 	if len(file.SubtitleTracks) > 0 || len(file.ExternalSubtitles) > 0 {
 		return
 	}
-	searchKey := any(file.ID)
-	if file.ID <= 0 {
-		searchKey = "virtual:" + file.ContentID + ":" + cand.URI
-	}
+	// The key binds the row to the concrete candidate URI, not just the file
+	// ID: two concurrent replans of the same row can carry different release
+	// candidates, and each is a distinct provider search (different bytes and
+	// subtitle languages). Keying on the file ID alone silently dropped the
+	// second legitimate search.
+	searchKey := virtualSubtitleSearchKey(file, cand)
 	// Admit before touching the dedupe map: a saturated budget must shed the
 	// search without leaving a key behind.
 	gate := h.detachedGate()
@@ -3246,9 +3354,13 @@ func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 	if h.SubtitleSearchInFlight == nil {
 		h.SubtitleSearchInFlight = &sync.Map{}
 	}
-	// Dedupe: one in-flight search per file. Rapid replays or multiple
-	// candidates resolving the same file must not hammer subtitle providers.
+	// Dedupe: one in-flight search per (row, candidate). Rapid replays or
+	// identical requests for the same candidate must not hammer subtitle
+	// providers, but a distinct candidate for the same row is a distinct
+	// search and must still reach the provider.
 	if _, loaded := h.SubtitleSearchInFlight.LoadOrStore(searchKey, struct{}{}); loaded {
+		slog.DebugContext(ctx, "virtual subtitle search skipped: identical request already in flight",
+			"component", "api", "file_id", file.ID, "candidate_uri", cand.URI)
 		slots.release()
 		gate.release()
 		return

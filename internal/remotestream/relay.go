@@ -85,14 +85,14 @@ const (
 	relayRangeCacheMaxTotalSize = 16 << 20
 
 	// relayMaxFreshness caps every duration derived from the origin's freshness
-	// headers. An Age, max-age or s-maxage above it is refused as non-cacheable,
-	// and every other derived duration (apparent age, response delay, lifetime
-	// minus corrected age) is saturated to it. That keeps an unbounded
-	// delta-seconds conversion or a pair of additions from wrapping int64
-	// nanoseconds, and keeps responseReceivedAt.Add(remaining) from producing an
-	// expiry decades in the future. A registration itself expires after
-	// relayEntryLifetime, so a longer origin freshness could never be used.
-	relayMaxFreshness = relayEntryLifetime
+	// headers at the relay's own range-cache lifetime. An Age, max-age or
+	// s-maxage above it is refused as non-cacheable, and every other derived
+	// duration (apparent age, response delay, lifetime minus corrected age) is
+	// saturated to it. That keeps an unbounded delta-seconds conversion or a
+	// pair of additions from wrapping int64 nanoseconds, and bounds
+	// responseReceivedAt.Add(remaining) to relayRangeCacheTTL: a longer origin
+	// freshness can never outlive the entry the relay is willing to serve.
+	relayMaxFreshness = relayRangeCacheTTL
 )
 
 // relayMaxFreshnessSeconds is relayMaxFreshness in whole delta-seconds, the
@@ -260,8 +260,9 @@ func relayRangeCacheHeaderIdentity(headers http.Header) string {
 // non-reusable because freshness cannot be established. An Age, max-age or
 // s-maxage above relayMaxFreshness is likewise non-reusable, so an oversized
 // delta-seconds value is never converted (or wrapped) into a duration; the
-// derived ages and lifetimes that remain saturate at that ceiling, which keeps
-// the computed expiry finite and in range.
+// derived ages and lifetimes that remain saturate at that ceiling. Because
+// relayMaxFreshness is relayRangeCacheTTL, the returned expiry is never later
+// than responseReceivedAt plus the relay's own cache lifetime.
 func relayRangeResponseCacheability(response *http.Response, requestSentAt, responseReceivedAt time.Time) (int, time.Time, bool) {
 	if response == nil {
 		return 0, time.Time{}, false
@@ -401,7 +402,7 @@ func relayFreshnessLifetime(directives map[string]string, header http.Header, re
 func relayCorrectedInitialAge(header http.Header, requestSentAt, responseReceivedAt time.Time) (time.Duration, bool) {
 	apparentAge := time.Duration(0)
 	if raw := strings.TrimSpace(header.Get(headerDate)); raw != "" {
-		date, err := http.ParseTime(raw)
+		date, err := relayHTTPTime(raw)
 		if err != nil {
 			return 0, false
 		}
@@ -426,9 +427,12 @@ func relayCorrectedInitialAge(header http.Header, requestSentAt, responseReceive
 	return correctedAge, true
 }
 
-// relayCacheControlDirectives parses Cache-Control header values into a map of
-// lowercased directive names to values. Commas inside quoted directive values
-// do not split the list. A bare directive maps to "".
+// relayHTTPTime parses an HTTP-date tolerantly. http.ParseTime handles the
+// canonical GMT forms first; the RFC 1123 fallback also accepts other zone
+// abbreviations such as UTC, which http.ParseTime rejects. The freshness
+// lifetime (Expires versus Date) and the corrected-age apparent age both parse
+// every Date through this one function, so a Date one half accepts can never be
+// rejected by the other.
 func relayHTTPTime(raw string) (time.Time, error) {
 	if parsed, err := http.ParseTime(raw); err == nil {
 		return parsed, nil
@@ -455,6 +459,9 @@ func relayHasConflictingLifetime(values []string) bool {
 	return false
 }
 
+// relayCacheControlDirectives parses Cache-Control header values into a map of
+// lowercased directive names to values. Commas inside quoted directive values
+// do not split the list. A bare directive maps to "".
 func relayCacheControlDirectives(values []string) map[string]string {
 	directives := make(map[string]string, len(values))
 	for _, value := range values {
