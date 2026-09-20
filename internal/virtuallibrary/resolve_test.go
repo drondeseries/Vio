@@ -222,6 +222,14 @@ func TestResolveDetailedWithFakeProvider(t *testing.T) {
 	if res.CandidateID == "" {
 		t.Fatal("expected non-empty candidate ID")
 	}
+	// A stream with no videoHash/GUID still carries a durable identity: the
+	// normalized release name derived from its display text.
+	if res.ProviderReleaseName == "" {
+		t.Fatal("expected a derived provider release name for a candidate with no hash/GUID")
+	}
+	if res.ProviderGUID != "" || res.ProviderVideoHash != "" {
+		t.Fatalf("unexpected provider identity: guid=%q hash=%q", res.ProviderGUID, res.ProviderVideoHash)
+	}
 
 	// Case 3: ListStreams returns streams with OwnerInstallationID = 0
 	streams, err := svcInsecure.ListStreams(context.Background(), "virtual://movie/tt100")
@@ -237,6 +245,14 @@ func TestResolveDetailedWithFakeProvider(t *testing.T) {
 		}
 		if !s.Visible {
 			t.Errorf("stream[%d].Visible = false, want true", i)
+		}
+		// The provider URL and durable identity must reach the persistence
+		// sink for every listed candidate, even with no hash/GUID.
+		if s.ProviderURL == "" {
+			t.Errorf("stream[%d].ProviderURL is empty, want the provider URL", i)
+		}
+		if s.ProviderReleaseName == "" {
+			t.Errorf("stream[%d].ProviderReleaseName is empty, want the name+size fallback", i)
 		}
 	}
 }

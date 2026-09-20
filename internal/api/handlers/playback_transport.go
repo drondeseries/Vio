@@ -349,30 +349,82 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	}
 	var res ResolvedVirtualMedia
 	var err error
-	if h.VirtualMediaDetailedResolver != nil {
-		// The intent travels with the context so the resolver can distinguish a
-		// serve-layer indictment from a display-driven same-file re-plan.
-		ctx = withVirtualCandidateRotationV3(ctx, rotationRequested)
-		// The transport serve layer re-resolves a release an existing session
-		// already serves, so it declares session-bound: a profile-removed
-		// candidate refuses instead of silently swapping the release.
-		ctx = withVirtualSessionBindingV3(ctx, true)
-		res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-			ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID,
+	// Stored-URL shortcut. A session-bound re-resolve of a pinned candidate —
+	// the remux seek anchor, a transport restart, the subtitle/font warm — may
+	// serve the row's own persisted provider URL instead of listing the
+	// provider again. The URL belongs to the exact candidate being resolved
+	// (see evaluateStoredVirtualURLCandidate for the same-row check), so it is
+	// the pinned release itself and never a substitution. Narrow by design:
+	// an explicit forceRefresh (a failover retry after this candidate failed)
+	// or an exclusion list always takes the list-and-resolve path.
+	var storedRow *models.MediaFile
+	if !forceRefresh {
+		// Read the row once. It is both the source of the stored-URL shortcut
+		// and the durable identity the same-release re-match needs when the
+		// provider renumbers its result ids. A forceRefresh is a failover retry
+		// that deliberately relists, so it does not consult the stored row.
+		if h.VirtualFileLookup != nil {
+			if row, lookupErr := h.VirtualFileLookup(ctx, virtualURI); lookupErr == nil && row != nil {
+				storedRow = row
+				ctx = virtualResolveContextWithPersistedIdentity(ctx, row)
+			}
+		}
+	}
+	var storedExpiredRow *models.MediaFile
+	storedUsable := false
+	if storedRow != nil && !forceRefresh && len(excludedCandidateIDs) == 0 {
+		usable, state := evaluateStoredVirtualURLCandidate(
+			ctx, virtualURI, storedRow,
+			h.storedVirtualURLAllowInsecure(storedRow, ownerInstallationID), time.Now(),
 		)
-	} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
-		var inputPath string
-		inputPath, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
-			ctx, virtualURI, ownerInstallationID, userID, profileID,
-		)
-		res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
-	} else {
-		var inputPath string
-		inputPath, err = resolveVirtualMediaPath(
-			ctx, h.VirtualMediaResolver, virtualURI,
-			ownerInstallationID, userID, profileID,
-		)
-		res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
+		switch state {
+		case virtualStoredURLUsable:
+			res = usable
+			storedUsable = true
+		case virtualStoredURLExpired:
+			// The row owns this candidate but its URL lapsed. Resolve afresh
+			// below, then refresh the stored value through the existing
+			// Phase-1 saver.
+			storedExpiredRow = storedRow
+		}
+	}
+	if !storedUsable {
+		if h.VirtualMediaDetailedResolver != nil {
+			// The intent travels with the context so the resolver can distinguish a
+			// serve-layer indictment from a display-driven same-file re-plan.
+			ctx = withVirtualCandidateRotationV3(ctx, rotationRequested)
+			// The transport serve layer re-resolves a release an existing session
+			// already serves, so it declares session-bound: a profile-removed
+			// candidate refuses instead of silently swapping the release.
+			ctx = withVirtualSessionBindingV3(ctx, true)
+			res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+				ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID,
+			)
+			if err == nil && res.IdentityRematched && storedRow != nil {
+				// The pinned id was absent but the same release re-identified
+				// under a new id. Adopt it through the Phase-1 CAS/fence write
+				// so the row's ?result= and durable identity move with it.
+				adoptRematchedVirtualResolution(ctx, storedRow, res, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+			} else if err == nil && storedExpiredRow != nil {
+				// Reuse the Phase-1 write path; only the requested candidate's
+				// own successful resolution is recorded (a substituted sibling
+				// is skipped inside).
+				refreshStoredVirtualResolution(ctx, storedExpiredRow, res, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+			}
+		} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
+			var inputPath string
+			inputPath, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
+				ctx, virtualURI, ownerInstallationID, userID, profileID,
+			)
+			res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
+		} else {
+			var inputPath string
+			inputPath, err = resolveVirtualMediaPath(
+				ctx, h.VirtualMediaResolver, virtualURI,
+				ownerInstallationID, userID, profileID,
+			)
+			res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
+		}
 	}
 	if err != nil {
 		slog.WarnContext(ctx, "virtual stream resolve failed",

@@ -170,10 +170,35 @@ type MediaFile struct {
 	// LastDeliveredAt is the last time this virtual candidate delivered media
 	// bytes to a client. It is the durable known-good evidence the delivery
 	// grace and the optimistic start path read; nil means never delivered.
-	LastDeliveredAt    *time.Time
-	FirstSeenScanRunID string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	LastDeliveredAt *time.Time
+	// ResolvedURL is the provider stream URL this virtual candidate last
+	// successfully resolved to. It is purely additive to the neutral
+	// `virtual://...?result=<id>` file_path, which remains the row's listing
+	// identity: a provider re-list churns result ids, so this column lets a
+	// later phase reuse the last known-good URL instead of re-listing. Empty
+	// means the row has never resolved. ResolvedURLExpiresAt is the URL's
+	// parsed expiry (see stream.ParseStreamDetails); nil when the URL carries
+	// no parseable expiry.
+	//
+	// The Provider* fields are the candidate's durable identity in the same
+	// tier order as the dedup key: video hash, then source GUID, then release
+	// name + size. They let a row be re-matched to a fresh listing after the
+	// provider rotates result ids.
+	ResolvedURL          string     `json:"-"`
+	ResolvedURLExpiresAt *time.Time `json:"-"`
+	ProviderVideoHash    string     `json:"-"`
+	ProviderGUID         string     `json:"-"`
+	ProviderReleaseName  string     `json:"-"`
+	ProviderReleaseSize  int64      `json:"-"`
+	// ProviderRequestHeaders is the request header set the provider stream URL
+	// needs (the relay forwards Referer/Origin/User-Agent from
+	// behaviorHints.proxyHeaders). It is stored alongside ResolvedURL so a
+	// header-authenticated URL is usable when served from the catalog instead
+	// of a fresh listing. Nil means the row carries no headers.
+	ProviderRequestHeaders map[string]string `json:"-"`
+	FirstSeenScanRunID     string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // MediaChapter represents a single media chapter derived from embedded file metadata.
@@ -891,4 +916,44 @@ type VirtualFilePersistArgs struct {
 	// automatic path leaves it false so a failure committed after the caller's
 	// last verdict read is still fenced out at write time.
 	AllowFailedVerdict bool
+	// ExpectedProvider* is the adopting row's current durable identity,
+	// snapshotted with the CAS fields. When AdoptPath is set, the saver compares
+	// it to the incoming Provider* identity to decide whether the adopted
+	// candidate is the same release (preserve omitted transport fields) or a
+	// different release (replace the whole transport set). It must be the row's
+	// identity, never the candidate's: comparing the candidate to itself would
+	// always report same-release. An identity tier present on only one side is
+	// not a same-release proof, so a required adoption with an unprovable match
+	// replaces rather than preserves.
+	ExpectedProviderVideoHash   string
+	ExpectedProviderGUID        string
+	ExpectedProviderReleaseName string
+	ExpectedProviderReleaseSize int64
+	// ClearProbe invalidates the row's probe evidence in the same CAS-fenced
+	// write: probe_source and probe_updated_at are set to NULL (collection-owned
+	// rows keep theirs). A caller uses it when it adopts bytes whose inventory
+	// the stored probe does not describe, so the next start re-probes and
+	// converges the row onto the real file instead of trusting stale evidence.
+	// It is independent of StampProbe: a write either stamps or clears, never
+	// both.
+	ClearProbe bool
+	// ResolvedURL is the provider stream URL a successful resolution produced
+	// for this row. When non-empty it (re)writes resolved_url and its paired
+	// expiry; when empty the stored values are preserved, so a metadata-only
+	// write cannot erase the last resolved URL. ResolvedURLExpiresAt is the
+	// URL's parsed expiry (nil when unparseable).
+	ResolvedURL          string
+	ResolvedURLExpiresAt *time.Time
+	// Provider* is the candidate's durable identity, in the same tier order
+	// as the dedup key. A non-empty value overwrites the stored one; an empty
+	// value preserves it, so a metadata-only write cannot erase identity.
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
+	ProviderReleaseSize int64
+	// ProviderRequestHeaders is the request header set the resolved URL needs.
+	// A non-nil value (re)writes provider_request_headers; a nil value
+	// preserves the stored one, so a metadata-only write cannot erase the
+	// headers a resolved URL depends on.
+	ProviderRequestHeaders map[string]string
 }

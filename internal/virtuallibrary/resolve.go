@@ -9,6 +9,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
@@ -21,6 +22,75 @@ type ResolvedVirtualStream struct {
 	CandidateID    string
 	RequestHeaders map[string]string
 	ExpiresAt      time.Time
+	// ProviderVideoHash, ProviderGUID, ProviderReleaseName and
+	// ProviderReleaseSize are the resolved candidate's durable provider
+	// identity, in the same tier order as the dedup key. They are additive
+	// evidence for the persistence path: a later phase can re-match the row
+	// after the provider rotates result ids. Any of them may be empty.
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
+	ProviderReleaseSize int64
+	// IdentityRematched is true when the requested pin's result id was absent
+	// from the fresh listing but a listed candidate carried the row's durable
+	// persisted identity. The returned candidate is then the same release
+	// re-identified under a new provider result id, not a substitution: the
+	// caller must adopt the new identity (including the new ?result= path)
+	// rather than report a release swap.
+	IdentityRematched bool
+	// CodecAudio, AudioLanguages and SubtitleLanguages are the candidate's
+	// provider-declared inventory. They are release metadata, not probe
+	// evidence, and are carried so a caller that re-binds a row to this
+	// candidate can seed a declared inventory while the probe catches up.
+	CodecAudio        string
+	AudioLanguages    []string
+	SubtitleLanguages []string
+}
+
+// PersistedCandidateIdentity is the durable identity a virtual candidate row
+// carries from persistence: the video hash, source GUID and normalized release
+// name + size. It is the caller's snapshot of the catalog row, threaded into a
+// resolve so a provider re-list that renumbered result ids can be recognized as
+// the same release instead of a dead pin.
+type PersistedCandidateIdentity struct {
+	VideoHash   string
+	GUID        string
+	ReleaseName string
+	ReleaseSize int64
+}
+
+// HasDurableIdentity reports whether any identity tier is present. A row with
+// no durable identity (a legacy row) cannot be re-matched and keeps today's
+// dead-pin behavior.
+func (p PersistedCandidateIdentity) HasDurableIdentity() bool {
+	return strings.TrimSpace(p.VideoHash) != "" ||
+		strings.TrimSpace(p.GUID) != "" ||
+		strings.TrimSpace(p.ReleaseName) != ""
+}
+
+type persistedCandidateIdentityContextKey struct{}
+
+// WithPersistedCandidateIdentity threads the catalog row's durable identity
+// into a resolve. It is a no-op for an identity with no usable tier, so a
+// legacy row cannot accidentally enable re-matching.
+func WithPersistedCandidateIdentity(ctx context.Context, identity PersistedCandidateIdentity) context.Context {
+	if ctx == nil || !identity.HasDurableIdentity() {
+		return ctx
+	}
+	return context.WithValue(ctx, persistedCandidateIdentityContextKey{}, identity)
+}
+
+// persistedCandidateIdentityFromContext returns the identity threaded by the
+// caller, or false when none is present.
+func persistedCandidateIdentityFromContext(ctx context.Context) (PersistedCandidateIdentity, bool) {
+	if ctx == nil {
+		return PersistedCandidateIdentity{}, false
+	}
+	identity, ok := ctx.Value(persistedCandidateIdentityContextKey{}).(PersistedCandidateIdentity)
+	if !ok || !identity.HasDurableIdentity() {
+		return PersistedCandidateIdentity{}, false
+	}
+	return identity, true
 }
 
 // PlaybackStream represents an available stream candidate formatted for
@@ -47,17 +117,30 @@ type PlaybackStream struct {
 	OwnerInstallationID int
 	Visible             bool
 	VisibilitySpecified bool
+	// ProviderURL, ProviderVideoHash, ProviderGUID and ProviderReleaseName
+	// carry the candidate's durable provider identity to the persistence path
+	// (ReplaceVirtualCandidates), which stores them on the candidate row.
+	// ProviderURL is not a client-facing field: it never leaves the server
+	// process and must not be serialized to a response.
+	ProviderURL         string
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
 	// Rejected marks a candidate a configured custom format rejects. It is a
 	// transient ranking signal, recomputed on every list; reject means
 	// rank-last and last-resort selectable, never a hard drop.
 	Rejected bool
 }
 
-// validateStreamURL checks structural syntax and enforces SSRF protection
-// using the central remotestream policy. When AllowInsecureHTTP is enabled,
-// it permits private and local network destinations; otherwise, loopback,
-// RFC 1918, link-local, and multicast addresses are rejected.
-func (s *Service) validateStreamURL(ctx context.Context, raw string) (string, error) {
+// ValidateProviderStreamURL checks structural syntax and enforces SSRF
+// protection using the central remotestream policy. When allowInsecure is set
+// (the virtual_library.allow_insecure_http opt-in) it permits private and
+// local network destinations; otherwise, loopback, RFC 1918, link-local, and
+// multicast addresses are rejected. It is the single validator the resolver
+// applies to a fresh provider listing, exported so a serve-layer caller that
+// re-uses a persisted provider URL re-validates it through exactly the same
+// policy rather than a parallel copy that could drift.
+func ValidateProviderStreamURL(ctx context.Context, raw string, allowInsecure bool) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", fmt.Errorf("empty provider stream URL")
@@ -65,7 +148,7 @@ func (s *Service) validateStreamURL(ctx context.Context, raw string) (string, er
 	if strings.ContainsAny(trimmed, "\x00\r\n") {
 		return "", fmt.Errorf("provider stream URL contains control characters")
 	}
-	if s.cfg.AllowInsecureHTTP {
+	if allowInsecure {
 		parsed, err := remotestream.ValidateURLSyntaxAllowNonPublic(trimmed)
 		if err != nil {
 			return "", fmt.Errorf("invalid stream URL syntax: %w", err)
@@ -77,6 +160,14 @@ func (s *Service) validateStreamURL(ctx context.Context, raw string) (string, er
 		return "", fmt.Errorf("stream URL rejected by SSRF policy: %w", err)
 	}
 	return validated.String(), nil
+}
+
+// validateStreamURL checks structural syntax and enforces SSRF protection
+// using the central remotestream policy. When AllowInsecureHTTP is enabled,
+// it permits private and local network destinations; otherwise, loopback,
+// RFC 1918, link-local, and multicast addresses are rejected.
+func (s *Service) validateStreamURL(ctx context.Context, raw string) (string, error) {
+	return ValidateProviderStreamURL(ctx, raw, s.cfg.AllowInsecureHTTP)
 }
 
 // withResultKey appends the candidate identity as ?result=, mirroring the
@@ -300,6 +391,48 @@ func (s *Service) ResolveDetailed(
 	// substituted) and would only break playback. The mismatch is logged for
 	// diagnosis.
 	sessionCandidatePresent := sessionBound && effectiveResultID != "" && candidateIDPresent(candidates, effectiveResultID)
+
+	// Same-release re-identification. A pinned result id that is absent from a
+	// fresh listing is not evidence the release is gone: providers renumber
+	// result ids per listing. When the row carries a durable identity and a
+	// listed candidate carries the same identity under the deduplication
+	// chain's precedence, treat it as the same release re-identified: bind to
+	// the new id and report IdentityRematched so the caller adopts it. A
+	// genuinely different release shares no identity tier, so the dead-pin
+	// refusal below still covers it. This only applies to a session-bound
+	// resolve that would otherwise refuse a substitution; a rotation already
+	// authorizes the ordinary fallback.
+	identityRematched := false
+	if sessionBound && !allowSubstitution && effectiveResultID != "" && !sessionCandidatePresent {
+		_, requestedExcludedEarly := excluded[requestedResultID]
+		_, keeperExcludedEarly := excluded[effectiveResultID]
+		if !requestedExcludedEarly && !keeperExcludedEarly {
+			if identity, ok := persistedCandidateIdentityFromContext(ctx); ok {
+				if matched, found := resolver.MatchCandidateByPersistedIdentity(
+					candidates, identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize,
+				); found {
+					if matchedID := stream.CandidateVariantID(matched); matchedID != "" && matchedID != effectiveResultID {
+						effectiveResultID = matchedID
+						// The matched candidate is the same release as the
+						// session's binding, now listed under a new id. Keep the
+						// preferred id in step with it and re-mark the session
+						// release resolvable: otherwise the dead-session guard
+						// below sees only the old, now-absent id and rejects a
+						// valid rematch. Substitution stays disabled — this
+						// binds to the session's own release, not to a sibling.
+						effectivePreferredID = matchedID
+						sessionReleaseResolvable = true
+						identityRematched = true
+						// The matched candidate is the session-bound release, so
+						// the profile filter must not remove it (same rule as a
+						// directly present session pin).
+						sessionCandidatePresent = true
+					}
+				}
+			}
+		}
+	}
+
 	if sessionCandidatePresent && profileActive {
 		for _, c := range candidates {
 			if stream.CandidateVariantID(c) != effectiveResultID {
@@ -410,6 +543,20 @@ func (s *Service) ResolveDetailed(
 			CandidateID:    id,
 			RequestHeaders: c.RequestHeaders,
 			ExpiresAt:      c.ExpiresAt,
+			// Durable provider identity for the persistence path. The tier
+			// order matches candidateDedupKey: hash, then GUID, then the
+			// normalized release name + size. ReleaseName is always derived
+			// (name+size is the fallback tier), so a row with no hash/GUID is
+			// still re-matchable.
+			ProviderVideoHash:   c.BehaviorHints.VideoHash,
+			ProviderGUID:        c.SourceGUID,
+			ProviderReleaseName: resolver.CandidateReleaseName(c),
+			ProviderReleaseSize: c.FileSize,
+			// The candidate's provider-declared inventory travels with the
+			// resolution so a caller can seed a declared inventory on adoption.
+			CodecAudio:        c.CodecAudio,
+			AudioLanguages:    c.AudioLanguages,
+			SubtitleLanguages: c.SubtitleLanguages,
 		}, true
 	}
 
@@ -418,6 +565,7 @@ func (s *Service) ResolveDetailed(
 	if effectiveResultID != "" && !pinBlocked {
 		for _, c := range ordered {
 			if resolved, ok := tryCandidate(c, true); ok {
+				resolved.IdentityRematched = identityRematched
 				return resolved, nil
 			}
 		}
@@ -478,6 +626,10 @@ func (s *Service) ListStreams(ctx context.Context, virtualPath string) ([]Playba
 			OwnerInstallationID: 0,
 			Visible:             true,
 			VisibilitySpecified: true,
+			ProviderURL:         c.URL,
+			ProviderVideoHash:   c.BehaviorHints.VideoHash,
+			ProviderGUID:        c.SourceGUID,
+			ProviderReleaseName: resolver.CandidateReleaseName(c),
 		})
 	}
 	return streams, nil

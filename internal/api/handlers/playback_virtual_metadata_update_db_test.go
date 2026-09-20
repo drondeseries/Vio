@@ -84,6 +84,10 @@ func runVirtualMetadataUpdate(t *testing.T, pool *pgxpool.Pool, candidateID int,
 		candidateID, expectedPath, true,
 		updatedAt, probeUpdatedAt, ownerID, folderID, adoptPath,
 		neutralPath, virtualFailedVerdictMaxAge.Seconds(), true, false,
+		"", nil, "", "", "", 0,
+		nil,
+		false, // $30 replaceIdentity: this helper exercises best-effort adoption only
+		false, // $31 clearProbe
 	)
 	if err != nil {
 		t.Fatalf("VirtualFileMetadataUpdateSQL: %v", err)
@@ -313,6 +317,79 @@ func TestVirtualMetadataUpdateRecoversEvidenceAfterTransientTimeout(t *testing.T
 			t.Fatal("probe_updated_at was not stamped after cache-only recovery")
 		}
 		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// TestVirtualFileMetadataUpdateRequestHeadersPreserveAndReplace proves the
+// adopt-path write treats request headers as part of the resolution pair: a
+// metadata-only write with no headers preserves the stored set, and a write
+// that carries headers replaces it.
+func TestVirtualFileMetadataUpdateRequestHeadersPreserveAndReplace(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	ctx := context.Background()
+	const folderID, ownerID = 994316, 7006
+	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
+
+	candidatePath := "virtual://movie/tt-db-headers?result=cand-a"
+	var candidateID int
+	var updatedAt time.Time
+	var probeUpdatedAt *time.Time
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id, probe_source, provider_request_headers)
+		VALUES('movie-db-headers', $1, $2, 'virtual', $3, 'virtual', '{"Referer":"https://keep.example/"}'::jsonb)
+		RETURNING id, updated_at, probe_updated_at`, folderID, candidatePath, ownerID,
+	).Scan(&candidateID, &updatedAt, &probeUpdatedAt); err != nil {
+		t.Fatalf("insert candidate row: %v", err)
+	}
+
+	write := func(headers map[string]string) time.Time {
+		t.Helper()
+		result, err := ExecVirtualFileMetadataUpdateResult(ctx, pool, models.VirtualFilePersistArgs{
+			FileID:                 candidateID,
+			ExpectedFilePath:       candidatePath,
+			StampProbe:             true,
+			UpdatedAt:              updatedAt,
+			ProbeUpdatedAt:         probeUpdatedAt,
+			OwnerID:                ownerID,
+			LibraryID:              folderID,
+			ProviderRequestHeaders: headers,
+		})
+		if err != nil {
+			t.Fatalf("ExecVirtualFileMetadataUpdateResult: %v", err)
+		}
+		if !result.MetadataUpdated {
+			t.Fatal("metadata write did not land")
+		}
+		var next time.Time
+		if err := pool.QueryRow(ctx, `SELECT updated_at FROM media_files WHERE id = $1`, candidateID).Scan(&next); err != nil {
+			t.Fatalf("read updated_at: %v", err)
+		}
+		return next
+	}
+
+	// A metadata-only write carries no headers and must preserve the stored set.
+	updatedAt = write(nil)
+	var preserved string
+	if err := pool.QueryRow(ctx, `SELECT provider_request_headers->>'Referer' FROM media_files WHERE id = $1`, candidateID).Scan(&preserved); err != nil {
+		t.Fatalf("read preserved headers: %v", err)
+	}
+	if preserved != "https://keep.example/" {
+		t.Fatalf("Referer = %q, want the preserved stored header", preserved)
+	}
+
+	// A write that carries headers replaces the stored set. Refresh the CAS
+	// snapshot first: the previous write advanced updated_at and stamped
+	// probe_updated_at.
+	if err := pool.QueryRow(ctx, `SELECT probe_updated_at FROM media_files WHERE id = $1`, candidateID).Scan(&probeUpdatedAt); err != nil {
+		t.Fatalf("reread probe stamp: %v", err)
+	}
+	write(map[string]string{"Referer": "https://new.example/", "Origin": "https://new.example"})
+	var replaced string
+	if err := pool.QueryRow(ctx, `SELECT provider_request_headers->>'Referer' FROM media_files WHERE id = $1`, candidateID).Scan(&replaced); err != nil {
+		t.Fatalf("read replaced headers: %v", err)
+	}
+	if replaced != "https://new.example/" {
+		t.Fatalf("Referer = %q, want the replaced header", replaced)
 	}
 }
 

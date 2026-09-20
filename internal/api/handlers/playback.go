@@ -159,6 +159,27 @@ type ResolvedVirtualMedia struct {
 	// file whose stored owner is 0 and takes precedence over the file owner
 	// when deciding whether allow_insecure_http applies.
 	OwnerID int
+	// ProviderVideoHash, ProviderGUID, ProviderReleaseName and
+	// ProviderReleaseSize are the resolved candidate's durable identity, in
+	// the same tier order as the dedup key. The persistence path stores them
+	// on the candidate row so it can be re-matched after a re-list.
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
+	ProviderReleaseSize int64
+	// IdentityRematched is true when the requested pin's result id was absent
+	// from a fresh listing but the resolver found the same durable identity
+	// under a new result id. The resolved candidate is then the same release
+	// re-identified, not a substitution, and the caller adopts the new
+	// identity instead of reporting a release swap.
+	IdentityRematched bool
+	// CodecAudio, AudioLanguages and SubtitleLanguages are the resolved
+	// candidate's provider-declared inventory. They are not probe evidence:
+	// they come from the release metadata, may be incomplete or wrong, and are
+	// only used to seed a declared inventory while the real probe catches up.
+	CodecAudio        string
+	AudioLanguages    []string
+	SubtitleLanguages []string
 }
 
 // effectiveVirtualOwner returns the first positive installation owner from the

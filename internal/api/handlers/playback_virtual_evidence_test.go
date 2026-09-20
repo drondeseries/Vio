@@ -1,8 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,6 +28,18 @@ func evidenceTask(fileID int, adoptPath string, updatedAt time.Time) *virtualEvi
 	return &virtualEvidenceTask{
 		key:       virtualEvidenceKey(args),
 		updatedAt: args.UpdatedAt,
+		args:      args,
+	}
+}
+
+// evidenceTaskForArgs builds a task from explicit persist args so a test can
+// vary exactly one key input (for example RequireAdopt) and keep the rest.
+func evidenceTaskForArgs(args models.VirtualFilePersistArgs) *virtualEvidenceTask {
+	return &virtualEvidenceTask{
+		key:       virtualEvidenceKey(args),
+		seq:       1,
+		updatedAt: args.UpdatedAt,
+		probeAt:   args.ProbeUpdatedAt,
 		args:      args,
 	}
 }
@@ -425,4 +441,221 @@ func TestEvidenceRestartStartsEmpty(t *testing.T) {
 		t.Fatalf("restarted buffer retained %d task(s), want 0", n)
 	}
 	restartCancel()
+}
+
+// TestEvidenceRetryClassification pins the pure retry policy. A deterministic
+// adoption refusal is terminal (it would fail identically on every attempt); a
+// cancellation is terminal; SQLSTATE data/integrity/syntax classes are
+// permanent; a timeout, connection or other transport fault is transient and
+// retried. Serialization failures (40001) are transient by design, so they keep
+// their bounded retry.
+func TestEvidenceRetryClassification(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"adoption refusal", errVirtualAdoptIdentityNotPersisted, false},
+		{"wrapped adoption refusal", fmt.Errorf("write: %w", errVirtualAdoptIdentityNotPersisted), false},
+		{"context canceled", context.Canceled, false},
+		{"deadline exceeded", context.DeadlineExceeded, true},
+		{"pg integrity 23", &pgconn.PgError{Code: "23505"}, false},
+		{"pg data 22", &pgconn.PgError{Code: "22001"}, false},
+		{"pg syntax 42", &pgconn.PgError{Code: "42601"}, false},
+		{"pg serialization 40001", &pgconn.PgError{Code: "40001"}, true},
+		{"pg connection 08006", &pgconn.PgError{Code: "08006"}, true},
+		{"transport", errors.New("connection reset"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := virtualEvidenceRetryable(tc.err); got != tc.want {
+				t.Fatalf("virtualEvidenceRetryable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEvidenceAdoptionRefusalIsTerminalAndNotRetried is the follow-up's core
+// assertion: a deterministic adoption refusal is attempted exactly once and the
+// single terminal log carries the file id, the candidate identity and the
+// reason. Both saver wirings are covered because the router prefers the
+// metadata saver while the legacy row-count saver is still a fallback.
+func TestEvidenceAdoptionRefusalIsTerminalAndNotRetried(t *testing.T) {
+	const (
+		fileID   = 11
+		adoptURI = "virtual://movie/tt-evidence-refused?result=sibling"
+	)
+	refusal := fmt.Errorf("%w: candidate %s collided with an existing path owner", errVirtualAdoptIdentityNotPersisted, adoptURI)
+
+	saverCases := []struct {
+		name string
+		wire func(h *PlaybackHandler, calls *int64)
+	}{
+		{
+			name: "legacy row-count saver",
+			wire: func(h *PlaybackHandler, calls *int64) {
+				h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) {
+					atomic.AddInt64(calls, 1)
+					return 0, refusal
+				}
+			},
+		},
+		{
+			name: "preferred metadata saver",
+			wire: func(h *PlaybackHandler, calls *int64) {
+				h.VirtualFileMetadataSaver = func(context.Context, models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+					atomic.AddInt64(calls, 1)
+					return VirtualFileMetadataUpdateResult{}, refusal
+				}
+			},
+		},
+	}
+	for _, tc := range saverCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			var calls int64
+			h := &PlaybackHandler{}
+			tc.wire(h, &calls)
+
+			err := h.persistVirtualEvidenceTask(evidenceTask(fileID, adoptURI, time.Now()), time.Time{})
+			if !errors.Is(err, errVirtualAdoptIdentityNotPersisted) {
+				t.Fatalf("terminal error = %v, want the adoption-refusal sentinel", err)
+			}
+			if got := atomic.LoadInt64(&calls); got != 1 {
+				t.Fatalf("saver calls = %d, want exactly 1: a deterministic adoption refusal must not retry", got)
+			}
+			logText := logs.String()
+			if !strings.Contains(logText, `"file_id":`+fmt.Sprint(fileID)) {
+				t.Fatalf("terminal log is missing the file id %d:\n%s", fileID, logText)
+			}
+			if !strings.Contains(logText, adoptURI) {
+				t.Fatalf("terminal log is missing the candidate identity %q:\n%s", adoptURI, logText)
+			}
+			if !strings.Contains(logText, `"attempts":1`) {
+				t.Fatalf("terminal log must report the single actual attempt:\n%s", logText)
+			}
+			if !strings.Contains(logText, "virtual candidate identity was not adopted") {
+				t.Fatalf("terminal log is missing the refusal reason:\n%s", logText)
+			}
+		})
+	}
+}
+
+// TestEvidenceCoalescingKeySeparatesFence pins the coalescing-key follow-up: a
+// fenced write (RequireAdopt) and a metadata-only write that share the same row,
+// expected path, adoption target and stamp do not share an evidence key, so one
+// can never coalesce into or over the other.
+func TestEvidenceCoalescingKeySeparatesFence(t *testing.T) {
+	base := models.VirtualFilePersistArgs{
+		FileID:           1,
+		OwnerID:          5,
+		ExpectedFilePath: "virtual://movie/tt-key?result=anchor",
+		AdoptPath:        "virtual://movie/tt-key?result=sibling",
+		StampProbe:       true,
+	}
+	fenced := base
+	fenced.RequireAdopt = true
+	metadataOnly := base
+	metadataOnly.RequireAdopt = false
+
+	if virtualEvidenceKey(fenced) == virtualEvidenceKey(metadataOnly) {
+		t.Fatal("a fenced write and a metadata-only write with identical row, path, target and stamp share an evidence key")
+	}
+
+	// A collection row has no adoption target: the fenced key must still differ
+	// from one that carries a concrete target.
+	noTarget := fenced
+	noTarget.AdoptPath = ""
+	if virtualEvidenceKey(noTarget) == virtualEvidenceKey(fenced) {
+		t.Fatal("a fenced write with no adoption target shares a key with one that has a target")
+	}
+}
+
+// TestEvidenceFencedWriteDoesNotCoalesceWithMetadataOnly drives the buffer: a
+// metadata-only write for the same row, path, adoption target and stamp is a
+// distinct pending task, so a fenced cross-release write can neither absorb it
+// nor be absorbed by it.
+func TestEvidenceFencedWriteDoesNotCoalesceWithMetadataOnly(t *testing.T) {
+	base := time.Now()
+	fencedArgs := models.VirtualFilePersistArgs{
+		FileID:           1,
+		OwnerID:          5,
+		ExpectedFilePath: "virtual://movie/tt-fence?result=anchor",
+		AdoptPath:        "virtual://movie/tt-fence?result=sibling",
+		StampProbe:       true,
+		RequireAdopt:     true,
+		UpdatedAt:        base,
+	}
+	metadataArgs := fencedArgs
+	metadataArgs.RequireAdopt = false
+	metadataArgs.UpdatedAt = base.Add(time.Second) // newer, so a shared key would coalesce onto it
+
+	buf := newVirtualEvidenceBuffer(4)
+	if got := buf.admit(evidenceTaskForArgs(fencedArgs)); got != virtualEvidenceAccepted {
+		t.Fatalf("fenced admit = %v, want accepted", got)
+	}
+	if got := buf.admit(evidenceTaskForArgs(metadataArgs)); got != virtualEvidenceAccepted {
+		t.Fatalf("metadata-only admit = %v, want accepted as a distinct task", got)
+	}
+	if got := buf.len(); got != 2 {
+		t.Fatalf("pending = %d, want 2: the fence must not coalesce with metadata-only", got)
+	}
+	fenced := buf.pop()
+	if fenced == nil || !fenced.args.RequireAdopt || fenced.args.AdoptPath != fencedArgs.AdoptPath {
+		t.Fatalf("popped task lost the fence: %#v", fenced)
+	}
+	metadata := buf.pop()
+	if metadata == nil || metadata.args.RequireAdopt {
+		t.Fatalf("popped metadata-only task = %#v, want the unfenced write", metadata)
+	}
+}
+
+// TestEvidenceFencedSameKeyCoalescesAndRetainsFence pins the other half: two
+// fenced writes that share the key coalesce per the existing newer-snapshot
+// rule, and the coalesced task keeps the adoption requirement and target. A
+// stale fenced write is rejected and never replaces the newer fence.
+func TestEvidenceFencedSameKeyCoalescesAndRetainsFence(t *testing.T) {
+	base := time.Now()
+	older := models.VirtualFilePersistArgs{
+		FileID:           1,
+		OwnerID:          5,
+		ExpectedFilePath: "virtual://movie/tt-fence?result=anchor",
+		AdoptPath:        "virtual://movie/tt-fence?result=sibling",
+		StampProbe:       true,
+		RequireAdopt:     true,
+		UpdatedAt:        base,
+	}
+	newer := older
+	newer.UpdatedAt = base.Add(time.Second)
+
+	buf := newVirtualEvidenceBuffer(4)
+	if got := buf.admit(evidenceTaskForArgs(older)); got != virtualEvidenceAccepted {
+		t.Fatalf("older admit = %v, want accepted", got)
+	}
+	if got := buf.admit(evidenceTaskForArgs(newer)); got != virtualEvidenceCoalesced {
+		t.Fatalf("newer admit = %v, want coalesced", got)
+	}
+	if got := buf.len(); got != 1 {
+		t.Fatalf("pending = %d, want 1 after coalescing", got)
+	}
+	// A stale fenced write for the same key is rejected, not allowed to
+	// overwrite the newer evidence or drop the fence.
+	if got := buf.admit(evidenceTaskForArgs(older)); got != virtualEvidenceRejected {
+		t.Fatalf("stale fenced admit = %v, want rejected", got)
+	}
+	coalesced := buf.pop()
+	if coalesced == nil {
+		t.Fatal("pending task disappeared after the stale rejection")
+	}
+	if !coalesced.args.RequireAdopt || coalesced.args.AdoptPath != older.AdoptPath {
+		t.Fatalf("coalesced task lost the fence: %#v", coalesced.args)
+	}
+	if !coalesced.updatedAt.Equal(newer.UpdatedAt) {
+		t.Fatalf("coalesced updated_at = %v, want the newest %v", coalesced.updatedAt, newer.UpdatedAt)
+	}
 }

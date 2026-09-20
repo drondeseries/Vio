@@ -1175,6 +1175,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 					}
 					out := make([]handlers.VirtualPlaybackStream, 0, len(streams))
 					for _, stream := range streams {
+						var providerExpiresAt *time.Time
+						if !stream.ExpiresAt.IsZero() {
+							expiresAt := stream.ExpiresAt
+							providerExpiresAt = &expiresAt
+						}
 						out = append(out, handlers.VirtualPlaybackStream{
 							ID: stream.ID, Label: stream.Label, URI: stream.URI, Resolution: stream.Resolution,
 							CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio, HasAtmos: stream.HasAtmos,
@@ -1183,7 +1188,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 							Bitrate: stream.Bitrate, FrameRate: stream.FrameRate, AudioLanguages: stream.AudioLanguages,
 							SubtitleLanguages: stream.SubtitleLanguages, OwnerInstallationID: stream.OwnerInstallationID,
 							Visible: stream.Visible, VisibilitySpecified: stream.VisibilitySpecified,
-							Rejected: stream.Rejected,
+							Rejected:            stream.Rejected,
+							ProviderURL:         stream.ProviderURL,
+							ProviderVideoHash:   stream.ProviderVideoHash,
+							ProviderGUID:        stream.ProviderGUID,
+							ProviderReleaseName: stream.ProviderReleaseName,
+							ProviderExpiresAt:   providerExpiresAt,
 						})
 					}
 					return out, nil
@@ -1200,6 +1210,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 							CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio,
 							HDR: stream.HDR, FileSize: stream.FileSize, Bitrate: stream.Bitrate,
 							AudioLanguages: stream.AudioLanguages, SubtitleLanguages: stream.SubtitleLanguages,
+							ResolvedURL:            stream.ProviderURL,
+							ResolvedURLExpiresAt:   stream.ProviderExpiresAt,
+							ProviderVideoHash:      stream.ProviderVideoHash,
+							ProviderGUID:           stream.ProviderGUID,
+							ProviderReleaseName:    stream.ProviderReleaseName,
+							ProviderReleaseSize:    stream.FileSize,
+							ProviderRequestHeaders: stream.RequestHeaders,
 						})
 					}
 					return deps.FileRepo.ReplaceVirtualCandidates(ctx, source, candidates)
@@ -1328,14 +1345,16 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// (file_path) and to still carry the failure state it observed
 			// (failed_at). The same delivered-grace rule as
 			// scanner.MarkVirtualCandidateFailed applies.
-			streamHandler.VirtualCandidateFailMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed
-			// The recovered marker clears a known-bad stamp after the candidate
-			// actually delivered media bytes. Fenced on the delivered candidate
-			// identity AND the failure state observed at transport start: a row
-			// rotated to a different candidate while the stream was being
-			// delivered, or a newer failure on the delivered candidate, is
-			// never cleared by a late delivery signal.
-			streamHandler.VirtualCandidateRecoveredMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateRecovered
+			if streamHandler != nil {
+				streamHandler.VirtualCandidateFailMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed
+				// The recovered marker clears a known-bad stamp after the candidate
+				// actually delivered media bytes. Fenced on the delivered candidate
+				// identity AND the failure state observed at transport start: a row
+				// rotated to a different candidate while the stream was being
+				// delivered, or a newer failure on the delivered candidate, is
+				// never cleared by a late delivery signal.
+				streamHandler.VirtualCandidateRecoveredMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateRecovered
+			}
 			// Repeated input demux failures from a local transcode mean the
 			// virtual candidate is bad, not that the transport should keep
 			// rebuilding. Stamp the effective row known-bad (CAS-fenced on its
@@ -1405,6 +1424,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 					return handlers.VirtualFileMetadataUpdateResult{}, nil
 				}
 				return handlers.ExecVirtualFileMetadataUpdateResult(ctx, deps.DB, args)
+			}
+			if streamHandler != nil {
+				// The serve layer refreshes an expired stored URL through the
+				// same Phase-1 saver as the transport resolve.
+				streamHandler.VirtualFileSaver = playbackHandler.VirtualFileSaver
+				streamHandler.VirtualFileMetadataSaver = playbackHandler.VirtualFileMetadataSaver
 			}
 		}
 		if deps.Config != nil {

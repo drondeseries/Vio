@@ -78,7 +78,10 @@ const fileColumns = `id, content_id, episode_id, extra_id, season_number, episod
 	multiple_pps, multiple_pps_scan_size, multiple_pps_scan_mtime,
 	probe_source, probe_updated_at, probe_version, match_attempted_at, missing_since, failed_at,
 	first_seen_scan_run_id, created_at, updated_at,
-	virtual_owner_installation_id, last_delivered_at`
+	virtual_owner_installation_id, last_delivered_at,
+	resolved_url, resolved_url_expires_at,
+	provider_video_hash, provider_guid, provider_release_name, provider_release_size,
+	provider_request_headers`
 
 const overlayFileColumns = `content_id, episode_id, media_folder_id, file_path,
 	codec_video, codec_audio, resolution, audio_channels, hdr, container,
@@ -105,7 +108,10 @@ const mfFileColumns = `mf.id, mf.content_id, mf.episode_id, mf.extra_id, mf.seas
 	mf.multiple_pps, mf.multiple_pps_scan_size, mf.multiple_pps_scan_mtime,
 	mf.probe_source, mf.probe_updated_at, mf.probe_version, mf.match_attempted_at, mf.missing_since, mf.failed_at,
 	mf.first_seen_scan_run_id, mf.created_at, mf.updated_at,
-	mf.virtual_owner_installation_id, mf.last_delivered_at`
+	mf.virtual_owner_installation_id, mf.last_delivered_at,
+	mf.resolved_url, mf.resolved_url_expires_at,
+	mf.provider_video_hash, mf.provider_guid, mf.provider_release_name, mf.provider_release_size,
+	mf.provider_request_headers`
 
 // scanMediaFile scans a single row into a *models.MediaFile.
 func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
@@ -146,6 +152,11 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	var videoTracksJSON, audioTracksJSON, subtitleTracksJSON, externalSubtitlesJSON, chaptersJSON []byte
 	var virtualOwnerInstallationID *int
 	var lastDeliveredAt *time.Time
+	var resolvedURL *string
+	var resolvedURLExpiresAt *time.Time
+	var providerVideoHash, providerGUID, providerReleaseName *string
+	var providerReleaseSize *int64
+	var providerRequestHeaders []byte
 
 	err := row.Scan(
 		&f.ID,
@@ -240,6 +251,13 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&f.UpdatedAt,
 		&virtualOwnerInstallationID,
 		&lastDeliveredAt,
+		&resolvedURL,
+		&resolvedURLExpiresAt,
+		&providerVideoHash,
+		&providerGUID,
+		&providerReleaseName,
+		&providerReleaseSize,
+		&providerRequestHeaders,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -270,6 +288,29 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	}
 	if lastDeliveredAt != nil {
 		f.LastDeliveredAt = lastDeliveredAt
+	}
+	if resolvedURL != nil {
+		f.ResolvedURL = *resolvedURL
+	}
+	if resolvedURLExpiresAt != nil {
+		f.ResolvedURLExpiresAt = resolvedURLExpiresAt
+	}
+	if providerVideoHash != nil {
+		f.ProviderVideoHash = *providerVideoHash
+	}
+	if providerGUID != nil {
+		f.ProviderGUID = *providerGUID
+	}
+	if providerReleaseName != nil {
+		f.ProviderReleaseName = *providerReleaseName
+	}
+	if providerReleaseSize != nil {
+		f.ProviderReleaseSize = *providerReleaseSize
+	}
+	if len(providerRequestHeaders) > 0 {
+		if err := json.Unmarshal(providerRequestHeaders, &f.ProviderRequestHeaders); err != nil {
+			return nil, fmt.Errorf("unmarshaling provider_request_headers: %w", err)
+		}
 	}
 	if canonicalRootPath != nil {
 		f.CanonicalRootPath = *canonicalRootPath
@@ -488,6 +529,11 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		var videoTracksJSON, audioTracksJSON, subtitleTracksJSON, externalSubtitlesJSON, chaptersJSON []byte
 		var virtualOwnerInstallationID *int
 		var lastDeliveredAt *time.Time
+		var resolvedURL *string
+		var resolvedURLExpiresAt *time.Time
+		var providerVideoHash, providerGUID, providerReleaseName *string
+		var providerReleaseSize *int64
+		var providerRequestHeaders []byte
 
 		err := rows.Scan(
 			&f.ID,
@@ -582,6 +628,13 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&f.UpdatedAt,
 			&virtualOwnerInstallationID,
 			&lastDeliveredAt,
+			&resolvedURL,
+			&resolvedURLExpiresAt,
+			&providerVideoHash,
+			&providerGUID,
+			&providerReleaseName,
+			&providerReleaseSize,
+			&providerRequestHeaders,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning media file row: %w", err)
@@ -715,6 +768,29 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		}
 		if lastDeliveredAt != nil {
 			f.LastDeliveredAt = lastDeliveredAt
+		}
+		if resolvedURL != nil {
+			f.ResolvedURL = *resolvedURL
+		}
+		if resolvedURLExpiresAt != nil {
+			f.ResolvedURLExpiresAt = resolvedURLExpiresAt
+		}
+		if providerVideoHash != nil {
+			f.ProviderVideoHash = *providerVideoHash
+		}
+		if providerGUID != nil {
+			f.ProviderGUID = *providerGUID
+		}
+		if providerReleaseName != nil {
+			f.ProviderReleaseName = *providerReleaseName
+		}
+		if providerReleaseSize != nil {
+			f.ProviderReleaseSize = *providerReleaseSize
+		}
+		if len(providerRequestHeaders) > 0 {
+			if err := json.Unmarshal(providerRequestHeaders, &f.ProviderRequestHeaders); err != nil {
+				return nil, fmt.Errorf("unmarshaling provider_request_headers: %w", err)
+			}
 		}
 		f.MarkersSource = markersSource
 		f.MarkersConfidence = markersConfidence
@@ -1205,6 +1281,24 @@ type VirtualCandidate struct {
 	Bitrate             int
 	AudioLanguages      []string
 	SubtitleLanguages   []string
+	// ResolvedURL is the candidate's provider stream URL, persisted so a later
+	// phase can reuse it. It is purely additive to URI. ResolvedURLExpiresAt
+	// is the URL's parsed expiry (nil when unparseable).
+	ResolvedURL          string
+	ResolvedURLExpiresAt *time.Time
+	// ProviderVideoHash, ProviderGUID, ProviderReleaseName and
+	// ProviderReleaseSize are the candidate's durable identity, in the same
+	// tier order as the resolver's dedup key. ProviderReleaseName is always
+	// derived when the candidate has any usable name, so every row is
+	// re-matchable by at least name+size.
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
+	ProviderReleaseSize int64
+	// ProviderRequestHeaders is the relay-forwardable header set (Referer,
+	// Origin, User-Agent) the provider URL needs. It is stored with
+	// ResolvedURL and preserved on omission, exactly like the URL.
+	ProviderRequestHeaders map[string]string
 }
 
 // ReplaceVirtualCandidates atomically replaces the just-in-time candidates
@@ -1269,6 +1363,21 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 		if err != nil {
 			return fmt.Errorf("marshal virtual candidate subtitle tracks: %w", err)
 		}
+		// The expiry belongs to the URL it was parsed from. A candidate with
+		// no URL must not carry an orphan expiry into the row; the update
+		// below clears the stored expiry whenever a new URL replaces the old
+		// one, so the pair always describes the same URL.
+		var resolvedURLExpiresAt *time.Time
+		if strings.TrimSpace(candidate.ResolvedURL) != "" {
+			resolvedURLExpiresAt = candidate.ResolvedURLExpiresAt
+		}
+		// Request headers travel with the URL they authenticate. serializeJSONB
+		// returns nil for an empty map, so a header-less candidate stores NULL
+		// and the re-list preserves any previously stored set.
+		providerRequestHeadersJSON, err := serializeJSONB(candidate.ProviderRequestHeaders)
+		if err != nil {
+			return fmt.Errorf("marshal virtual candidate request headers: %w", err)
+		}
 		var id int
 		err = tx.QueryRow(ctx, `
 			-- The provider display label is display-only metadata: it lives in
@@ -1281,11 +1390,17 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				content_id, episode_id, media_folder_id, file_path, file_size,
 				resolution, codec_video, codec_audio, hdr, container, bitrate,
 				edition_raw, release_name, release_group, audio_tracks, subtitle_tracks, probe_source,
-				probe_updated_at, virtual_owner_installation_id
+				probe_updated_at, virtual_owner_installation_id,
+				resolved_url, resolved_url_expires_at,
+				provider_video_hash, provider_guid, provider_release_name, provider_release_size,
+				provider_request_headers
 			) VALUES (
 				$1, NULLIF($2,''), $3, $4, $5,
 				NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, 'virtual',
-				NULLIF($10,0), $11, '', '', $12, $13, 'virtual', NULL, $14
+				NULLIF($10,0), $11, '', '', $12, $13, 'virtual', NULL, $14,
+				NULLIF($15,''), $16,
+				NULLIF($17,''), NULLIF($18,''), NULLIF($19,''), NULLIF($20::bigint,0),
+				$21
 			)
 			ON CONFLICT (file_path, virtual_owner_installation_id, media_folder_id)
 				WHERE virtual_owner_installation_id IS NOT NULL
@@ -1306,6 +1421,35 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				audio_tracks=EXCLUDED.audio_tracks,
 				subtitle_tracks=EXCLUDED.subtitle_tracks,
 				probe_source='virtual',
+				-- A re-list that no longer reports a provider URL must not
+				-- erase the last resolved one; only a newer successful
+				-- resolution overwrites it, and its expiry is replaced with it
+				-- so the pair always describes the same URL.
+				resolved_url = CASE
+					WHEN EXCLUDED.resolved_url IS NOT NULL THEN EXCLUDED.resolved_url
+					ELSE media_files.resolved_url
+				END,
+				resolved_url_expires_at = CASE
+					WHEN EXCLUDED.resolved_url IS NOT NULL THEN EXCLUDED.resolved_url_expires_at
+					ELSE media_files.resolved_url_expires_at
+				END,
+				-- Durable identity is preserved when a re-list omits a tier:
+				-- a release that once carried a hash keeps it until a newer
+				-- listing supplies a replacement.
+				provider_video_hash=COALESCE(EXCLUDED.provider_video_hash, media_files.provider_video_hash),
+				provider_guid=COALESCE(EXCLUDED.provider_guid, media_files.provider_guid),
+				provider_release_name=COALESCE(EXCLUDED.provider_release_name, media_files.provider_release_name),
+				provider_release_size=COALESCE(EXCLUDED.provider_release_size, media_files.provider_release_size),
+				-- Request headers belong to the stored URL. A re-list that
+				-- refreshes the URL replaces the complete header set, including
+				-- clearing it when the new URL carries none: a header-less URL
+				-- must not inherit the previous URL's credentials. A re-list
+				-- that omits the URL preserves the stored set so a
+				-- header-authenticated URL is not orphaned.
+				provider_request_headers = CASE
+					WHEN EXCLUDED.resolved_url IS NOT NULL THEN EXCLUDED.provider_request_headers
+					ELSE COALESCE(EXCLUDED.provider_request_headers, media_files.provider_request_headers)
+				END,
 				-- Registration is not a probe: preserve any existing real probe
 				-- timestamp (NULL stays NULL) so the probe repair gate can fill
 				-- real track inventory later.
@@ -1325,6 +1469,10 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			candidate.CodecAudio, candidate.HDR != "", candidate.Bitrate,
 			candidate.Label, audioTracks, subtitleTracks,
 			ownerInstallationID,
+			candidate.ResolvedURL, resolvedURLExpiresAt,
+			candidate.ProviderVideoHash, candidate.ProviderGUID,
+			candidate.ProviderReleaseName, candidate.ProviderReleaseSize,
+			providerRequestHeadersJSON,
 		).Scan(&id)
 		if err != nil {
 			return fmt.Errorf("upsert virtual candidate: %w", err)

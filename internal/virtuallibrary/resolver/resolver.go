@@ -491,6 +491,61 @@ func candidateDedupName(candidate StreamCandidate) string {
 	return ""
 }
 
+// CandidateReleaseName exposes the normalized release identity that
+// candidateDedupKey uses in its name+size tier for a caller that persists the
+// durable identity of a candidate. It is the same value the dedup collapse
+// compares, so a persisted row can be re-matched to a fresh listing whose
+// result id changed.
+func CandidateReleaseName(candidate StreamCandidate) string {
+	return candidateDedupName(candidate)
+}
+
+// PersistedDedupKey builds the dedup key a persisted candidate identity
+// represents, using the same tier precedence as candidateDedupKey: a non-empty
+// video hash, then a source GUID, then the normalized release name plus exact
+// size. It is exported so a re-match caller can compare a stored row against a
+// fresh listing without duplicating the tier rules that decide whether two
+// candidates are one release. An empty result means the identity carries no
+// usable tier and can never be re-matched.
+func PersistedDedupKey(videoHash, guid, releaseName string, releaseSize int64) string {
+	if hash := strings.ToLower(strings.TrimSpace(videoHash)); hash != "" {
+		return "vidhash:" + hash
+	}
+	if g := strings.TrimSpace(guid); g != "" {
+		return "guid:" + g
+	}
+	releaseKey := strings.TrimSpace(releaseName)
+	if releaseKey == "" {
+		return ""
+	}
+	sizeKey := "0"
+	if releaseSize > 0 {
+		sizeKey = strconv.FormatInt(releaseSize, 10)
+	}
+	return releaseKey + "\x00" + sizeKey
+}
+
+// MatchCandidateByPersistedIdentity returns the first listed candidate whose
+// dedup key equals the persisted identity's key. The comparison uses
+// candidateDedupKey, so the persisted identity is matched in exactly the tier
+// order the deduplication chain uses and a stronger tier is never satisfied by
+// a weaker one: a row with a video hash only matches a candidate with that same
+// hash, a row with a GUID only matches that GUID, and a name+size row only
+// matches a candidate with the same normalized release name and size. It
+// reports false when the persisted identity has no usable tier.
+func MatchCandidateByPersistedIdentity(candidates []StreamCandidate, videoHash, guid, releaseName string, releaseSize int64) (StreamCandidate, bool) {
+	want := PersistedDedupKey(videoHash, guid, releaseName, releaseSize)
+	if want == "" {
+		return StreamCandidate{}, false
+	}
+	for _, candidate := range candidates {
+		if candidateDedupKey(candidate) == want {
+			return candidate, true
+		}
+	}
+	return StreamCandidate{}, false
+}
+
 // urlPathBase returns the last path segment of a stream URL, or "" when the
 // URL cannot be parsed.
 func urlPathBase(rawURL string) string {

@@ -19,6 +19,38 @@ func (f *fakeDetailedResolverSource) ResolveDetailed(_ context.Context, _ string
 	return virtuallibrary.ResolvedVirtualStream{URL: "http://127.0.0.1:8080/stream", URI: "virtual://movie/1?result=one", CandidateID: "one"}, nil
 }
 
+// TestNewVirtualMediaDetailedResolverForwardsIdentityRematch proves the adapter
+// carries the same-release re-identification flag to the handler, so the caller
+// adopts the new result id instead of treating it as a substitution.
+func TestNewVirtualMediaDetailedResolverForwardsIdentityRematch(t *testing.T) {
+	source := detailedResolverSourceFunc(func(_ context.Context, _ string, _ bool, _ []string, _ string, _ bool, _ ...bool) (virtuallibrary.ResolvedVirtualStream, error) {
+		return virtuallibrary.ResolvedVirtualStream{
+			URL:               "http://127.0.0.1:8080/stream",
+			URI:               "virtual://movie/1?result=renumbered",
+			CandidateID:       "renumbered",
+			IdentityRematched: true,
+		}, nil
+	})
+	resolver := newVirtualMediaDetailedResolver(source)
+
+	resolved, err := resolver.ResolveVirtualMediaDetailed(context.Background(), "virtual://movie/1?result=old", 1, 2, "profile", false, nil, "")
+	if err != nil {
+		t.Fatalf("ResolveVirtualMediaDetailed() error = %v", err)
+	}
+	if !resolved.IdentityRematched {
+		t.Fatal("adapter dropped the same-release re-identification flag")
+	}
+	if resolved.CandidateID != "renumbered" || resolved.URI != "virtual://movie/1?result=renumbered" {
+		t.Fatalf("adapter returned %+v, want the re-identified candidate", resolved)
+	}
+}
+
+type detailedResolverSourceFunc func(context.Context, string, bool, []string, string, bool, ...bool) (virtuallibrary.ResolvedVirtualStream, error)
+
+func (f detailedResolverSourceFunc) ResolveDetailed(ctx context.Context, virtualPath string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string, sessionBound bool, allowCandidateSubstitution ...bool) (virtuallibrary.ResolvedVirtualStream, error) {
+	return f(ctx, virtualPath, forceRefresh, excludedCandidateIDs, preferredCandidateID, sessionBound, allowCandidateSubstitution...)
+}
+
 func TestNewVirtualMediaDetailedResolverForwardsIntents(t *testing.T) {
 	source := &fakeDetailedResolverSource{}
 	resolver := newVirtualMediaDetailedResolver(source)

@@ -24,6 +24,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/text/language"
@@ -878,6 +879,18 @@ type VirtualPlaybackStream struct {
 	// candidate behind every accepted one so device fit can never promote it
 	// to the front. Rejected remains last-resort selectable.
 	Rejected bool `json:"-"`
+	// ProviderURL, ProviderVideoHash, ProviderGUID and ProviderReleaseName
+	// carry the lister's durable provider identity to the persistence sink.
+	// ProviderURL is internal only and must never be serialized to a client;
+	// every field is json:"-" and the sink is the sole consumer.
+	ProviderURL         string `json:"-"`
+	ProviderVideoHash   string `json:"-"`
+	ProviderGUID        string `json:"-"`
+	ProviderReleaseName string `json:"-"`
+	// ProviderExpiresAt is the provider URL's parsed query-expiry (nil when
+	// unparseable). It is the expiry the persistence sink stores alongside
+	// ProviderURL.
+	ProviderExpiresAt *time.Time `json:"-"`
 }
 
 // Get* accessors satisfy plugins.VirtualStreamMetadata so the shared device
@@ -922,6 +935,20 @@ type resolvedVirtualPlaybackSource struct {
 	Provenance        ProbeProvenance
 	AppliedRemux      bool
 	ResolutionAssumed bool
+	// ResolvedURL is the validated provider URL the resolver returned, with
+	// its parsed expiry and the candidate's durable identity. They are
+	// additive evidence the adoption path persists on the catalog row so a
+	// later phase can reuse the URL instead of re-listing.
+	ResolvedURL          string
+	ResolvedURLExpiresAt *time.Time
+	ProviderVideoHash    string
+	ProviderGUID         string
+	ProviderReleaseName  string
+	ProviderReleaseSize  int64
+	// RequestHeaders is the relay-forwardable header set (Referer, Origin,
+	// User-Agent) the resolved URL needs. It is persisted with the URL so a
+	// header-authenticated provider stream stays usable from the catalog.
+	RequestHeaders map[string]string
 }
 
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
@@ -1234,6 +1261,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		HDR: mediaFileHDRString(file),
 	}}
 	noResult := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) == ""
+	// persistedResultURI is true when the catalog row already points at an
+	// adopted provider-neutral candidate rather than the neutral virtual path.
+	// It is computed here because the durable-resume derivation below needs it
+	// before the listing gate.
+	persistedResultURI := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) != ""
 	needsCandidateMetadata := !completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)
 	deviceCaps, hasCaps := h.requestDeviceCapabilities(r)
 	fingerprint := ""
@@ -1242,6 +1274,33 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	}
 	stickyKey := bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID, fingerprint)
 	pinnedURI := h.peekVirtualSticky(stickyKey)
+	// Durable-resume derivation. The sticky pin and best-result cache are
+	// process state and a restart loses both, but the requested row is durable:
+	// when it already owns a concrete ?result= candidate whose persisted URL is
+	// still usable, the row itself says what to serve. Re-derive the pin from
+	// the row and remember the candidate so the deferred fast path below can
+	// behave exactly as a warm pin/cache hit would instead of paying a fresh
+	// provider listing.
+	//
+	// Gated on the repeat-play fast path being unavailable for this row:
+	// complete probed evidence plus a probe stamp takes that path already, so
+	// evaluating the stored URL (which re-validates it, including DNS) would
+	// only add latency. The verdict and exclusion gates match the fast paths
+	// below, so a row this derivation skips still resolves as before.
+	persistedResumeURI := ""
+	if persistedResultURI && (needsCandidateMetadata || file.ProbeUpdatedAt == nil) && !forceRelist &&
+		len(excludedCandidateIDs) == 0 &&
+		(allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) {
+		if _, state := evaluateStoredVirtualURLCandidate(
+			coldCtx, file.FilePath, file,
+			h.storedVirtualURLAllowInsecure(file, file.VirtualOwnerInstallationID),
+			time.Now(),
+		); state == virtualStoredURLUsable {
+			persistedResumeURI = file.FilePath
+			h.pinVirtualSticky(stickyKey, persistedResumeURI)
+			pinnedURI = persistedResumeURI
+		}
+	}
 	// Check the best-result cache before listing candidates. A previous
 	// successful play of this content may have a cached result= URI that
 	// lets us skip the entire list+resolve+probe sequence on replay.
@@ -1281,8 +1340,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// sibling.
 	exclusionPending := len(excludedCandidateIDs) > 0
 	requestedRowUnusable := !allowFailed && virtualCandidateVerdictActive(file.FailedAt, time.Now())
+	// A durable-resume hit suppresses the list the same way a warm best-result
+	// cache does: the row already names the candidate to serve, so there is no
+	// candidate metadata left to fetch. It is only set for a concrete same-row
+	// candidate that carries a usable stored URL, so it cannot mask an
+	// exclusion, a forced relist, a neutral row, or a failed verdict.
 	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
-		((exclusionPending || requestedRowUnusable) && !cachedListing)) && h.VirtualPlaybackStreamLister != nil {
+		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
 		trace.listRan = true
 		listStart := time.Now()
@@ -1384,10 +1448,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
 	attemptCtx = withVirtualSessionBindingV3(attemptCtx, options.sessionBound)
 
-	// persistedResultURI is true when the catalog row already points at an
-	// adopted provider-neutral candidate rather than the neutral virtual path.
-	persistedResultURI := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) != ""
-
 	// fastPathHit records that resolveAndProbe returned the repeat-play fast
 	// path so the candidate loop can return it immediately instead of treating
 	// a deferred (ProbeSucceeded=false) pinned result as a failed candidate.
@@ -1434,6 +1494,35 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			completeVirtualVideoEvidenceV3(file) &&
 			completeVirtualAudioEvidenceV3(file) &&
 			completeVirtualContainerEvidenceV3(file) {
+			fastPathHit = true
+			trace.fastPath = true
+			transient := *file
+			transient.FilePath = cand.URI
+			transient.VirtualOwnerInstallationID = oid
+			h.pinVirtualSticky(stickyKey, cand.URI)
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
+			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			return &resolvedVirtualPlaybackSource{
+				URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
+				ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+			}, nil
+		}
+		// Durable-resume fast path. The repeat-play gate above cannot apply
+		// because the row's probe evidence is incomplete, but the row still
+		// owns a concrete candidate with an unexpired persisted URL. After a
+		// restart the in-memory pin and best-result cache are gone; the row is
+		// the only surviving state. Binding this candidate now makes the
+		// resumed session re-pin the same release the row names, and the serve
+		// relay then uses the row's stored URL (the transport stored-URL
+		// shortcut) instead of listing or resolving the provider. It never
+		// substitutes: persistedResumeURI is the row's own candidate, so this
+		// cannot change which candidate is served.
+		if deferProbe && !forceRelist && persistedResumeURI != "" && !noResult &&
+			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
+			cand.URI == persistedResumeURI {
 			fastPathHit = true
 			trace.fastPath = true
 			transient := *file
@@ -2255,6 +2344,38 @@ UPDATE media_files SET
   container        = NULLIF($7,''),
   hdr              = $8,
   bitrate          = NULLIF($9,0),
+  -- The persisted provider URL and its durable identity are additive to the
+  -- neutral ?result= file_path. A resolution with no URL (a metadata-only
+  -- write) must not erase the stored one; only a newer successful resolution
+  -- overwrites it, and its expiry is replaced with it so the pair always
+  -- describes the same URL.
+  --
+  -- A required adoption of a different release ($30) replaces the whole
+  -- transport set instead of preserving on omission: an omitted identity tier,
+  -- URL, expiry or header set belongs to the release being left behind and must
+  -- not survive attached to the new release path. For the same release a
+  -- supplied URL still replaces the URL and its header set (a refreshed URL
+  -- with no headers clears the old set rather than orphaning it), while an
+  -- omitted tier preserves the last known value.
+  resolved_url     = CASE
+    WHEN $30 OR NULLIF($23,'') IS NOT NULL THEN NULLIF($23,'')
+    ELSE resolved_url
+  END,
+  resolved_url_expires_at = CASE
+    WHEN $30 OR NULLIF($23,'') IS NOT NULL THEN $24::timestamptz
+    ELSE resolved_url_expires_at
+  END,
+  provider_video_hash     = CASE WHEN $30 THEN NULLIF($25,'') ELSE COALESCE(NULLIF($25,''), provider_video_hash) END,
+  provider_guid           = CASE WHEN $30 THEN NULLIF($26,'') ELSE COALESCE(NULLIF($26,''), provider_guid) END,
+  provider_release_name   = CASE WHEN $30 THEN NULLIF($27,'') ELSE COALESCE(NULLIF($27,''), provider_release_name) END,
+  provider_release_size   = CASE WHEN $30 THEN NULLIF($28::bigint,0) ELSE COALESCE(NULLIF($28::bigint,0), provider_release_size) END,
+  -- Request headers belong to the resolved URL. A transport replacement carries
+  -- the complete new set (NULL when the new resolution has none, which clears
+  -- the old one); without one, a metadata-only write preserves the stored set.
+  provider_request_headers = CASE
+    WHEN $30 OR NULLIF($23,'') IS NOT NULL THEN $29::jsonb
+    ELSE COALESCE($29::jsonb, provider_request_headers)
+  END,
   duration         = CASE WHEN $10 > 0 THEN $10 ELSE duration END,
   audio_channels   = COALESCE(
     (SELECT (elem->>'channels')::int
@@ -2298,13 +2419,19 @@ UPDATE media_files SET
     THEN $18
     ELSE file_path
   END,
+  -- A clear invalidates evidence the caller proved does not describe the
+  -- adopted bytes (a release swap): probe_source and probe_updated_at go
+  -- together so the row no longer looks probed and the next start re-probes.
+  -- Collection-owned rows keep their stamp, exactly like the stamp flag.
   probe_source     = CASE
     WHEN probe_source = 'virtual_collection' THEN probe_source
+    WHEN $31::boolean THEN NULL
     WHEN NOT $13::boolean THEN probe_source
     ELSE 'virtual'
   END,
   probe_updated_at = CASE
     WHEN probe_source = 'virtual_collection' THEN probe_updated_at
+    WHEN $31::boolean THEN NULL
     WHEN NOT $13::boolean THEN probe_updated_at
     ELSE GREATEST(clock_timestamp(), probe_updated_at + interval '1 microsecond')
   END,
@@ -2367,6 +2494,42 @@ type VirtualFileMetadataDB interface {
 	QueryRow(ctx context.Context, sql string, arguments ...any) pgx.Row
 }
 
+// virtualPersistAdoptionReplacesTransport reports whether a required adoption
+// moves the row to a different release, in which case the stored transport set
+// (resolved URL and expiry, durable identity tiers, request headers) must be
+// replaced rather than preserved on omission.
+//
+// The test is the durable candidate identity in the same tier precedence the
+// deduplication chain uses (video hash, then source GUID, then normalized
+// release name plus exact size). It deliberately is not the item-level neutral
+// key: virtual://movie/tt100?result=a and ?result=b share a neutral key, yet
+// they are different releases unless their identity tiers prove otherwise. A
+// tier present on only one side is not proof, so an unprovable pair replaces:
+// preserving release A's hash under release B's path is exactly the defect this
+// guards against.
+func virtualPersistAdoptionReplacesTransport(args models.VirtualFilePersistArgs, adoptPath string) bool {
+	// Adopting the path the row already carries changes no release: it is a
+	// metadata-only write that happens to pass the same AdoptPath, and the
+	// stored transport must survive. This also keeps a neutral row's own
+	// candidate pick (a path with a ?result= added to the row's own neutral
+	// path) on preserve-on-omission when neither side carries an identity.
+	if strings.TrimSpace(adoptPath) == strings.TrimSpace(args.ExpectedFilePath) {
+		return false
+	}
+	expected := resolver.PersistedDedupKey(
+		args.ExpectedProviderVideoHash, args.ExpectedProviderGUID,
+		args.ExpectedProviderReleaseName, args.ExpectedProviderReleaseSize,
+	)
+	candidate := resolver.PersistedDedupKey(
+		args.ProviderVideoHash, args.ProviderGUID,
+		args.ProviderReleaseName, args.ProviderReleaseSize,
+	)
+	if expected == "" || candidate == "" {
+		return true
+	}
+	return expected != candidate
+}
+
 // VirtualFileMetadataUpdateResult reports metadata persistence separately
 // from identity adoption. The UPDATE returns the persisted file_path, so
 // adoption is observed atomically in the same statement: it holds exactly when
@@ -2398,6 +2561,19 @@ type VirtualFileMetadataUpdateResult struct {
 //     are not written either. Metadata-only writers keep the previous
 //     best-effort adoption. RETURNING file_path reports what the row actually
 //     persisted when a row did match.
+//   - A required adoption of a different release replaces the stored transport
+//     fields (resolved URL and expiry, durable identity tiers, request headers)
+//     as a set rather than preserving on omission: an omitted tier or URL
+//     belongs to the release being left behind and must not survive attached to
+//     the new release's path. "Different release" is decided by the durable
+//     candidate identity (see virtualPersistAdoptionReplacesTransport), not the
+//     item-level neutral key, so ?result=a -> ?result=b on one item replaces.
+//     A proven same-release write keeps preserve-on-omission, while a supplied
+//     URL always replaces the URL and its header set.
+//   - ClearProbe invalidates the stored probe evidence in the same statement
+//     (probe_source and probe_updated_at to NULL) so a row whose inventory no
+//     longer describes the adopted bytes re-probes on the next start. It is
+//     independent of StampProbe.
 //
 // Two concurrent probes can both pass the sibling guard and one still loses the
 // unique-index race (media_files_virtual_file_owner_key). For a metadata-only
@@ -2418,6 +2594,17 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	vStr := string(args.VideoTracks)
 	if vStr == "" || vStr == jsonNullLiteral {
 		vStr = "[]"
+	}
+	// A nil/empty header map is passed as nil so the SQL COALESCE preserves the
+	// stored set; serializeJSONB would do the same, but marshal here so the
+	// argument shape stays a single jsonb placeholder.
+	var providerRequestHeadersJSON any
+	if len(args.ProviderRequestHeaders) > 0 {
+		encoded, marshalErr := json.Marshal(args.ProviderRequestHeaders)
+		if marshalErr != nil {
+			return VirtualFileMetadataUpdateResult{}, fmt.Errorf("marshal provider request headers: %w", marshalErr)
+		}
+		providerRequestHeadersJSON = encoded
 	}
 	aStr := string(args.AudioTracks)
 	if aStr == "" || aStr == jsonNullLiteral {
@@ -2440,12 +2627,25 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 		// adoption; the metadata-only retry clears adoptPath and therefore
 		// writes evidence on the row's current path as before.
 		requireAdoption := args.RequireAdopt && adoptPath != ""
+		// A required adoption of a different release replaces the stored
+		// transport fields as a set ($30): an omitted identity tier, URL or
+		// header set belongs to the release the row is leaving and must not
+		// survive under the new path. The release test is the durable identity,
+		// not the item-level neutral key: the ordinary replacement
+		// virtual://movie/tt100?result=a -> ?result=b shares a neutral key, so a
+		// key comparison would preserve A's fields under B. A metadata-only
+		// retry (adoptPath cleared) and a proven same-release adoption keep the
+		// preserve-on-omission behavior.
+		replaceIdentity := requireAdoption && virtualPersistAdoptionReplacesTransport(args, adoptPath)
 		var persistedPath string
 		err := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
 			vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
 			args.FileID, args.ExpectedFilePath, args.StampProbe,
 			args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
 			neutralPath, verdictMaxAgeSeconds, fenceVerdict, requireAdoption,
+			args.ResolvedURL, args.ResolvedURLExpiresAt,
+			args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
+			providerRequestHeadersJSON, replaceIdentity, args.ClearProbe,
 		).Scan(&persistedPath)
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No row matched the CAS fence: a stale snapshot, reported as a
@@ -2653,9 +2853,18 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 		StampProbe:       stampProbe,
 		UpdatedAt:        snap.UpdatedAt,
 		ProbeUpdatedAt:   snap.ProbeUpdatedAt,
-		OwnerID:          snap.OwnerID,
-		LibraryID:        snap.LibraryID,
-		AdoptPath:        adoptPath,
+		// The row's own identity, for the release-replacement gate when this
+		// write adopts a cross-release candidate path. The probe path carries no
+		// candidate identity, so an adopted cross-release write replaces the
+		// transport set (clearing the previous release's) rather than leaving
+		// its URL, expiry, identity or headers attached to the new path.
+		ExpectedProviderVideoHash:   catalogFile.ProviderVideoHash,
+		ExpectedProviderGUID:        catalogFile.ProviderGUID,
+		ExpectedProviderReleaseName: catalogFile.ProviderReleaseName,
+		ExpectedProviderReleaseSize: catalogFile.ProviderReleaseSize,
+		OwnerID:                     snap.OwnerID,
+		LibraryID:                   snap.LibraryID,
+		AdoptPath:                   adoptPath,
 		// Cross-release evidence requires a confirmed identity adoption; the
 		// atomic fence then refuses the entire write (tracks and stamp included)
 		// when a sibling owns the target path or the candidate's verdict is
@@ -3061,9 +3270,25 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					StampProbe:       true,
 					UpdatedAt:        snap.UpdatedAt,
 					ProbeUpdatedAt:   snap.ProbeUpdatedAt,
-					OwnerID:          snap.OwnerID,
-					LibraryID:        snap.LibraryID,
-					AdoptPath:        resolved.URI,
+					// The row being left is a different concrete release, so the
+					// identity gate must replace its transport set rather than
+					// preserve any omitted tier under the substitute's path.
+					ExpectedProviderVideoHash:   file.ProviderVideoHash,
+					ExpectedProviderGUID:        file.ProviderGUID,
+					ExpectedProviderReleaseName: file.ProviderReleaseName,
+					ExpectedProviderReleaseSize: file.ProviderReleaseSize,
+					OwnerID:                     snap.OwnerID,
+					LibraryID:                   snap.LibraryID,
+					AdoptPath:                   resolved.URI,
+					// Persist the provider URL and durable identity the
+					// resolution produced alongside the adopted identity.
+					ResolvedURL:            resolved.ResolvedURL,
+					ResolvedURLExpiresAt:   resolved.ResolvedURLExpiresAt,
+					ProviderVideoHash:      resolved.ProviderVideoHash,
+					ProviderGUID:           resolved.ProviderGUID,
+					ProviderReleaseName:    resolved.ProviderReleaseName,
+					ProviderReleaseSize:    resolved.ProviderReleaseSize,
+					ProviderRequestHeaders: cloneHeaderMap(resolved.RequestHeaders),
 					// The fallback reports a substitute identity to the
 					// session, so metadata alone is not enough: the saver must
 					// confirm the validated identity was actually adopted.
@@ -3146,6 +3371,9 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		return nil, err
 	}
 	var streamURL string
+	var resolvedExpiresAt *time.Time
+	var providerVideoHash, providerGUID, providerReleaseName string
+	var providerReleaseSize int64
 	if h.VirtualMediaDetailedResolver != nil {
 		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 			ctx, candidate.URI, ownerID, userID, profileID, false, nil, "",
@@ -3154,6 +3382,14 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 			return nil, err
 		}
 		streamURL = res.URL
+		if !res.ExpiresAt.IsZero() {
+			expiresAt := res.ExpiresAt
+			resolvedExpiresAt = &expiresAt
+		}
+		providerVideoHash = res.ProviderVideoHash
+		providerGUID = res.ProviderGUID
+		providerReleaseName = res.ProviderReleaseName
+		providerReleaseSize = res.ProviderReleaseSize
 		candidate.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
 		if res.URI != "" {
 			candidate.URI = res.URI
@@ -3180,7 +3416,13 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	transient := *file
 	transient.FilePath = candidate.URI
 	transient.VirtualOwnerInstallationID = ownerID
-	resolved := resolvedVirtualPlaybackSource{URL: streamURL, URI: candidate.URI, OwnerID: ownerID, File: &transient, Provenance: ProbeProvenanceDeclared}
+	resolved := resolvedVirtualPlaybackSource{
+		URL: streamURL, URI: candidate.URI, OwnerID: ownerID, File: &transient, Provenance: ProbeProvenanceDeclared,
+		ResolvedURL: streamURL, ResolvedURLExpiresAt: resolvedExpiresAt,
+		ProviderVideoHash: providerVideoHash, ProviderGUID: providerGUID,
+		ProviderReleaseName: providerReleaseName, ProviderReleaseSize: providerReleaseSize,
+		RequestHeaders: cloneHeaderMap(candidate.RequestHeaders),
+	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 		return &resolved, nil
 	}
@@ -4073,6 +4315,35 @@ func virtualDVLabel(isDV bool, profile int) string {
 		return ""
 	}
 	return "Profile " + strconv.Itoa(profile)
+}
+
+// declaredVirtualAudioTracks builds an audio inventory from a candidate's
+// provider-declared languages. It is a placeholder, not probe evidence: the
+// tags come from release metadata (e.g. a MULTi token in a filename), may be
+// invented, and carry no real container stream index. It reuses
+// mergeVirtualCandidateLanguages so the same tag filtering and deduplication
+// apply; an unrecognized or empty declaration yields no tracks rather than an
+// invented label. fallbackCodec carries the row's codec when the candidate
+// declares none, so a replacement row does not lose the audio codec.
+//
+// Subtitles are deliberately not synthesized: a synthesized SubtitleTrack
+// carries an ordinal no real stream backs, and the extractor maps it straight
+// to ffmpeg's 0:s:N, which is the phantom-stream failure this module already
+// documents. Declared subtitle languages never become embedded tracks; the
+// probe and the subtitle search own that inventory.
+func declaredVirtualAudioTracks(codecAudio string, languages []string, fallbackCodec string) []models.AudioTrack {
+	if len(languages) == 0 {
+		return nil
+	}
+	if codecAudio == "" {
+		codecAudio = fallbackCodec
+	}
+	probed := &models.MediaFile{}
+	mergeVirtualCandidateLanguages(probed, VirtualPlaybackStream{
+		CodecAudio:     codecAudio,
+		AudioLanguages: languages,
+	})
+	return probed.AudioTracks
 }
 
 // mergeVirtualCandidateLanguages appends provider-declared audio languages as
