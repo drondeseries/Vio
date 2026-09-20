@@ -515,7 +515,7 @@ func (h *PlaybackHandler) StartCompatBackgroundShutdownCleanup(ctx context.Conte
 		select {
 		case <-drained:
 		case <-timer.C:
-			slog.Warn("compat background work did not drain before shutdown timeout; proceeding with shutdown",
+			slog.WarnContext(ctx, "compat background work did not drain before shutdown timeout; proceeding with shutdown",
 				"component", "jellycompat", "drain_timeout", compatEvidenceShutdownDrainTimeout)
 		}
 	}()

@@ -48,7 +48,9 @@ const (
 const (
 	cacheControlNoStore = "no-store"
 	cacheControlPrivate = "private"
-	cacheControlNoCache = "no-cache"
+	cacheControlNoCache  = "no-cache"
+	cacheControlMaxAge   = "max-age"
+	cacheControlSMaxAge  = "s-maxage"
 )
 
 const (
@@ -284,7 +286,7 @@ func relayRangeResponseCacheability(response *http.Response, requestSentAt, resp
 	if relayHasConflictingLifetime(response.Header.Values(headerCacheControl)) {
 		return 0, time.Time{}, false
 	}
-	for _, bound := range []string{"s-maxage", "max-age"} {
+	for _, bound := range []string{cacheControlSMaxAge, cacheControlMaxAge} {
 		if value, ok := directives[bound]; ok {
 			seconds, ok := relayParseBoundedSeconds(value)
 			if !ok || seconds <= 0 {
