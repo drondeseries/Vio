@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -56,44 +58,84 @@ func TestCandidateOwnershipNeutralRowCrossRelease(t *testing.T) {
 	}
 }
 
-// TestPersistProbeEvidenceCollectionRowHasNoAdoptionTarget pins why a
-// collection-owned row cannot carry cross-release evidence: the collection sync
-// reconciles its file_path against its desired set, so the evidence path must
-// not nominate an adoption target for it. Either the write is refused before it
-// is enqueued or it carries no adoption target; both satisfy the invariant.
-func TestPersistProbeEvidenceCollectionRowHasNoAdoptionTarget(t *testing.T) {
-	var captured []models.VirtualFilePersistArgs
-	h := &PlaybackHandler{
-		VirtualFileSaver: func(context.Context, models.VirtualFilePersistArgs) (int64, error) {
-			return 0, nil
-		},
-		VirtualFileMetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
-			captured = append(captured, args)
-			return VirtualFileMetadataUpdateResult{MetadataUpdated: true}, nil
-		},
-	}
-	t.Cleanup(h.StopVirtualEvidence)
+// TestPersistProbeEvidenceCollectionRowRefusesCrossReleaseBeforeEnqueue is the
+// collection-refusal case against the real cross-release gate. A collection-owned
+// row is never rewritten (the collection sync reconciles its file_path against
+// its desired set), so a cross-release candidate has no adoption target and the
+// write must be refused before it reaches the evidence buffer and logged with
+// the file id, the candidate identity and the reason. The same row's own
+// release still gets its metadata-only enrichment, which is not cross-release
+// and still carries no adoption target.
+func TestPersistProbeEvidenceCollectionRowRefusesCrossReleaseBeforeEnqueue(t *testing.T) {
+	const (
+		collectionPath = "virtual://movie/tt-collection"
+		crossRelease   = "virtual://movie/tt-other?result=cand"
+		ownRelease     = collectionPath + "?result=cand"
+	)
 
-	catalog := &models.MediaFile{
-		ID:                         200,
-		FilePath:                   "virtual://movie/tt-collection",
-		ProbeSource:                "virtual_collection",
-		VirtualOwnerInstallationID: 5,
-		MediaFolderID:              9,
-		UpdatedAt:                  time.Now(),
-	}
-	probed := &models.MediaFile{FilePath: "virtual://movie/tt-other?result=cand", Resolution: "1080p"}
-
-	h.persistVirtualProbeEvidence(context.Background(), catalog, probed.FilePath, probed, true)
-	h.StopVirtualEvidence()
-
-	for _, args := range captured {
-		if args.AdoptPath != "" {
-			t.Fatalf("collection-row evidence nominated an adoption target: %+v", args)
+	newHandler := func(captured *[]models.VirtualFilePersistArgs) *PlaybackHandler {
+		return &PlaybackHandler{
+			VirtualFileSaver: func(context.Context, models.VirtualFilePersistArgs) (int64, error) {
+				return 0, nil
+			},
+			VirtualFileMetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+				*captured = append(*captured, args)
+				return VirtualFileMetadataUpdateResult{MetadataUpdated: true}, nil
+			},
 		}
-		if args.RequireAdopt {
-			t.Fatalf("collection-row evidence required an adoption it has no target for: %+v", args)
+	}
+	collectionRow := func() *models.MediaFile {
+		return &models.MediaFile{
+			ID:                         200,
+			FilePath:                   collectionPath,
+			ProbeSource:                "virtual_collection",
+			VirtualOwnerInstallationID: 5,
+			MediaFolderID:              9,
+			UpdatedAt:                  time.Now(),
 		}
+	}
+
+	// Cross-release: refused before enqueue, with the refusal in the log.
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	var crossCaptured []models.VirtualFilePersistArgs
+	crossHandler := newHandler(&crossCaptured)
+	t.Cleanup(crossHandler.StopVirtualEvidence)
+	probedCross := &models.MediaFile{FilePath: crossRelease, Resolution: "1080p"}
+	crossHandler.persistVirtualProbeEvidence(context.Background(), collectionRow(), crossRelease, probedCross, true)
+	crossHandler.StopVirtualEvidence()
+
+	if len(crossCaptured) != 0 {
+		t.Fatalf("cross-release collection-row evidence reached the saver: %+v", crossCaptured)
+	}
+	logText := logs.String()
+	if !strings.Contains(logText, `"reason":"cross_release_without_adopt_target"`) {
+		t.Fatalf("refusal reason was not logged:\n%s", logText)
+	}
+	if !strings.Contains(logText, crossRelease) {
+		t.Fatalf("candidate identity %q was not logged:\n%s", crossRelease, logText)
+	}
+	if !strings.Contains(logText, `"file_id":200`) {
+		t.Fatalf("file id was not logged:\n%s", logText)
+	}
+
+	// The row's own release is same-release evidence: it is admitted as
+	// metadata-only and carries no adoption target.
+	var ownCaptured []models.VirtualFilePersistArgs
+	ownHandler := newHandler(&ownCaptured)
+	t.Cleanup(ownHandler.StopVirtualEvidence)
+	probedOwn := &models.MediaFile{FilePath: ownRelease, Resolution: "1080p"}
+	ownHandler.persistVirtualProbeEvidence(context.Background(), collectionRow(), ownRelease, probedOwn, true)
+	ownHandler.StopVirtualEvidence()
+
+	if len(ownCaptured) != 1 {
+		t.Fatalf("same-release collection-row evidence saved %d times, want 1", len(ownCaptured))
+	}
+	if ownCaptured[0].AdoptPath != "" || ownCaptured[0].RequireAdopt {
+		t.Fatalf("collection-row evidence nominated an adoption target: %+v", ownCaptured[0])
 	}
 }
 
