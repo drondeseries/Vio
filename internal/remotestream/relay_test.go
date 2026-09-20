@@ -910,7 +910,10 @@ func TestRelayRangeCacheEvictsAndExpires(t *testing.T) {
 
 // TestRelayRangeResponseCacheabilityRejectsUnboundedAndNonReusable proves the
 // length/status bounds still hold and that every origin directive the review
-// called out keeps a response out of the cache.
+// called out keeps a response out of the cache. It also pins the new split
+// between validity and residency: max-age/s-maxage within the sanity ceiling but
+// longer than relayRangeCacheTTL is accepted (and clamped later), while a value
+// beyond the 30-day sanity ceiling is still refused.
 func TestRelayRangeResponseCacheabilityRejectsUnboundedAndNonReusable(t *testing.T) {
 	receivedAt := time.Unix(1_700_000_000, 0)
 	cases := []struct {
@@ -932,11 +935,13 @@ func TestRelayRangeResponseCacheabilityRejectsUnboundedAndNonReusable(t *testing
 		{"max_age_zero", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=0"}, false},
 		{"s_maxage_zero", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "s-maxage=0"}, false},
 		{"malformed_max_age", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=soon"}, false},
-		{"oversized_age_beyond_ceiling", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=60", "Age": strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)}, false},
+		{"age_beyond_sanity_ceiling", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=60", "Age": strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)}, false},
 		{"unrepresentable_age", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=60", "Age": "999999999999999999999999"}, false},
-		{"oversized_max_age", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=999999999999999999999999"}, false},
-		{"max_age_beyond_ceiling", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=" + strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)}, false},
-		{"s_maxage_beyond_ceiling", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "s-maxage=" + strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)}, false},
+		{"unrepresentable_max_age", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=999999999999999999999999"}, false},
+		{"max_age_beyond_sanity_ceiling", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=" + strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)}, false},
+		{"s_maxage_beyond_sanity_ceiling", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "s-maxage=" + strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)}, false},
+		{"max_age_above_cache_ttl_is_reusable", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=3600"}, true},
+		{"s_maxage_above_cache_ttl_is_reusable", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "s-maxage=3600"}, true},
 		{"vary_star", http.StatusPartialContent, "128", map[string]string{"Vary": "*"}, false},
 		{"vary_star_list", http.StatusPartialContent, "128", map[string]string{"Vary": "Accept, *"}, false},
 		{"vary_accept", http.StatusPartialContent, "128", map[string]string{"Vary": "Accept"}, true},
@@ -1002,9 +1007,8 @@ func TestRelayRangeResponseCacheabilityFreshness(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			// max-age stays within the freshness ceiling (relayRangeCacheTTL);
-			// an over-ceiling max-age is refused regardless of s-maxage, so a
-			// larger max-age could not be used to show precedence.
+			// s-maxage is the shared-cache freshness and wins over a larger
+			// max-age; both values only have to stay within the sanity ceiling.
 			name:       "s-maxage wins for a shared cache",
 			header:     http.Header{"Cache-Control": {"s-maxage=30, max-age=" + strconv.FormatInt(relayMaxFreshnessSeconds, 10)}},
 			wantOK:     true,
@@ -1043,18 +1047,26 @@ func TestRelayRangeResponseCacheabilityFreshness(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			name:       "max-age at the freshness ceiling is still reusable",
-			header:     http.Header{"Cache-Control": {"max-age=" + strconv.FormatInt(relayMaxFreshnessSeconds, 10)}},
+			name:       "ordinary long max-age clamps to the cache lifetime",
+			header:     http.Header{"Cache-Control": {"max-age=3600"}},
 			wantOK:     true,
-			wantExpiry: receivedAt.Add(relayMaxFreshness),
+			wantExpiry: receivedAt.Add(relayRangeCacheTTL),
 		},
 		{
-			// A far-future Expires saturates to the ceiling instead of handing
-			// the cache an expiry decades away.
-			name:       "far future expires saturates at the freshness ceiling",
+			// max-age at the sanity ceiling is still a valid response, but its
+			// residency is the relay's own cache lifetime, not 30 days.
+			name:       "max-age at the sanity ceiling clamps to the cache lifetime",
+			header:     http.Header{"Cache-Control": {"max-age=" + strconv.FormatInt(relayMaxFreshnessSeconds, 10)}},
+			wantOK:     true,
+			wantExpiry: receivedAt.Add(relayRangeCacheTTL),
+		},
+		{
+			// A far-future Expires is a valid freshness lifetime; the relay
+			// clamps how long it keeps the bytes, not whether it caches them.
+			name:       "far future expires clamps to the cache lifetime",
 			header:     http.Header{"Date": {date(0)}, "Expires": {date(100 * 365 * 24 * time.Hour)}},
 			wantOK:     true,
-			wantExpiry: receivedAt.Add(relayMaxFreshness),
+			wantExpiry: receivedAt.Add(relayRangeCacheTTL),
 		},
 		{
 			name:   "malformed age cannot establish freshness",
@@ -1207,9 +1219,9 @@ func TestRelayRangeResponseCacheabilityAcceptsUTCSuffixDate(t *testing.T) {
 
 // TestRelayRangeResponseCacheabilitySaturatesOverflowingFreshness proves the
 // arithmetic that used to be unbounded cannot mark a stale response fresh: an
-// Age or max-age/s-maxage above the ceiling, an Age that does not even fit in
-// int64, and a response delay far past every freshness lifetime are all
-// non-reusable, and no case returns a far-future expiry.
+// Age or max-age/s-maxage above the 30-day sanity ceiling, an Age that does not
+// even fit in int64, and a response delay far past every freshness lifetime are
+// all non-reusable, and no case returns a far-future expiry.
 func TestRelayRangeResponseCacheabilitySaturatesOverflowingFreshness(t *testing.T) {
 	receivedAt := time.Unix(1_700_000_000, 0)
 	beyondCeiling := strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)
@@ -1220,7 +1232,7 @@ func TestRelayRangeResponseCacheabilitySaturatesOverflowingFreshness(t *testing.
 		requestDelay time.Duration
 	}{
 		{
-			name:   "age above the ceiling",
+			name:   "age above the sanity ceiling",
 			header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {beyondCeiling}},
 		},
 		{
@@ -1228,7 +1240,7 @@ func TestRelayRangeResponseCacheabilitySaturatesOverflowingFreshness(t *testing.
 			header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {unrepresentable}},
 		},
 		{
-			name:   "max-age above the ceiling",
+			name:   "max-age above the sanity ceiling",
 			header: http.Header{"Cache-Control": {"max-age=" + beyondCeiling}},
 		},
 		{
@@ -1236,7 +1248,7 @@ func TestRelayRangeResponseCacheabilitySaturatesOverflowingFreshness(t *testing.
 			header: http.Header{"Cache-Control": {"max-age=" + unrepresentable}},
 		},
 		{
-			name:   "s-maxage above the ceiling",
+			name:   "s-maxage above the sanity ceiling",
 			header: http.Header{"Cache-Control": {"s-maxage=" + beyondCeiling}},
 		},
 		{
@@ -1245,9 +1257,9 @@ func TestRelayRangeResponseCacheabilitySaturatesOverflowingFreshness(t *testing.
 			requestDelay: 100 * 365 * 24 * time.Hour,
 		},
 		{
-			// Age sits just under the ceiling and the delay alone would overflow
-			// a naive addition; the saturated sum still exceeds max-age.
-			name:         "age near the ceiling plus an overflowing delay",
+			// Age sits exactly at the sanity ceiling and the delay alone would
+			// overflow a naive addition; the saturated sum still exceeds max-age.
+			name:         "age at the sanity ceiling plus an overflowing delay",
 			header:       http.Header{"Cache-Control": {"max-age=60"}, "Age": {strconv.FormatInt(relayMaxFreshnessSeconds, 10)}},
 			requestDelay: 100 * 365 * 24 * time.Hour,
 		},
@@ -1260,8 +1272,8 @@ func TestRelayRangeResponseCacheabilitySaturatesOverflowingFreshness(t *testing.
 			if ok {
 				t.Fatalf("cacheable = true with expiry %v, want a stale response to be non-reusable", expiry)
 			}
-			if !expiry.IsZero() && expiry.After(receivedAt.Add(relayMaxFreshness)) {
-				t.Fatalf("expiry = %v, want no expiry beyond the freshness ceiling %v", expiry, receivedAt.Add(relayMaxFreshness))
+			if !expiry.IsZero() && expiry.After(receivedAt.Add(relayRangeCacheTTL)) {
+				t.Fatalf("expiry = %v, want no expiry beyond the cache lifetime %v", expiry, receivedAt.Add(relayRangeCacheTTL))
 			}
 		})
 	}
@@ -1571,46 +1583,67 @@ func TestRelayRangeCacheReusesFreshResponseWithCorrectedAge(t *testing.T) {
 	}
 }
 
-// TestRelayRangeCacheRefetchesOversizedOriginFreshness is the regression for an
-// origin freshness far longer than the relay's cache contract. max-age=86400
-// exceeds the two-minute ceiling, so it is refused rather than allowed to pin an
-// entry: reopening three hours later re-fetches and serves the origin's exact
-// bytes again instead of replaying the stale cached body.
-func TestRelayRangeCacheRefetchesOversizedOriginFreshness(t *testing.T) {
-	var mu sync.Mutex
-	calls := 0
-	want := strings.Repeat("h", 64)
-	relay := NewRelay()
-	defer func() { _ = relay.Close(context.Background()) }()
-	now := time.Unix(1_700_000_000, 0)
-	relay.rangeCache.now = func() time.Time { return now }
-	relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		mu.Lock()
-		calls++
-		mu.Unlock()
-		response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", want)
-		response.Header.Set("Content-Range", "bytes 0-63/1000")
-		response.Header.Set("Content-Length", "64")
-		response.Header.Set("Cache-Control", "max-age=86400")
-		return response, nil
-	})}
-	relayURL, cleanup := registerRelayForTest(t, relay, "oversized-origin-freshness", "https://1.1.1.1/media.mkv")
-	defer cleanup()
+// TestRelayRangeCacheClampsLongOriginFreshness is the regression for the
+// maintainer's tradeoff fix: an origin may declare freshness far longer than the
+// relay's two-minute cache lifetime (max-age=3600, or s-maxage above it). That
+// response is valid and reusable, so instead of the old reject-over-ceiling
+// behavior it is cached with the remaining freshness clamped to
+// relayRangeCacheTTL. A lookup inside the window is a byte-exact hit; reopening
+// after the window re-fetches the origin's exact bytes rather than replaying a
+// stale entry.
+func TestRelayRangeCacheClampsLongOriginFreshness(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		cacheControl string
+	}{
+		{"max-age above the clamp", "max-age=3600"},
+		{"s-maxage above the clamp", "s-maxage=3600"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			calls := 0
+			want := strings.Repeat("h", 64)
+			relay := NewRelay()
+			defer func() { _ = relay.Close(context.Background()) }()
+			now := time.Unix(1_700_000_000, 0)
+			relay.rangeCache.now = func() time.Time { return now }
+			relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				mu.Lock()
+				calls++
+				mu.Unlock()
+				response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", want)
+				response.Header.Set("Content-Range", "bytes 0-63/1000")
+				response.Header.Set("Content-Length", "64")
+				response.Header.Set("Cache-Control", tc.cacheControl)
+				return response, nil
+			})}
+			relayURL, cleanup := registerRelayForTest(t, relay, "long-origin-freshness", "https://1.1.1.1/media.mkv")
+			defer cleanup()
 
-	first := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63")
-	if first.status != http.StatusPartialContent || first.body != want {
-		t.Fatalf("first = status %d, %d bytes; want the origin's %d-byte body", first.status, len(first.body), len(want))
-	}
-	now = now.Add(3 * time.Hour)
-	second := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63")
-	if second.status != http.StatusPartialContent || second.body != want {
-		t.Fatalf("second = status %d, %d bytes; want the origin's %d-byte body", second.status, len(second.body), len(want))
-	}
-	mu.Lock()
-	got := calls
-	mu.Unlock()
-	if got != 2 {
-		t.Fatalf("upstream calls = %d, want 2 (an over-TTL origin freshness cannot pin an entry)", got)
+			first := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63")
+			if first.status != http.StatusPartialContent || first.body != want {
+				t.Fatalf("first = status %d, %d bytes; want the origin's %d-byte body", first.status, len(first.body), len(want))
+			}
+			// Still inside the clamped two-minute residency: a byte-exact hit.
+			now = now.Add(90 * time.Second)
+			hit := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63")
+			if hit.status != http.StatusPartialContent || hit.body != want {
+				t.Fatalf("within-clamp = status %d, %d bytes; want the cached %d-byte body", hit.status, len(hit.body), len(want))
+			}
+			// Past the clamped residency: the origin is consulted again and its
+			// exact bytes are served, not the stale cached entry.
+			now = now.Add(relayRangeCacheTTL + time.Second)
+			late := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-63")
+			if late.status != http.StatusPartialContent || late.body != want {
+				t.Fatalf("past-clamp = status %d, %d bytes; want the origin's %d-byte body", late.status, len(late.body), len(want))
+			}
+			mu.Lock()
+			got := calls
+			mu.Unlock()
+			if got != 2 {
+				t.Fatalf("upstream calls = %d, want 2 (one miss, then a re-fetch after the clamped residency)", got)
+			}
+		})
 	}
 }
 
@@ -1705,21 +1738,22 @@ func TestRelayRangeCacheBypassesOriginNonReusable(t *testing.T) {
 	}
 }
 
-// TestRelayRangeCacheNeverServesOverflowingFreshness proves end to end that an
-// oversized Age or max-age/s-maxage, and a delay that alone exceeds every
-// freshness lifetime, keep the response out of the cache: both requests reach
-// the origin and each receives the full origin body, so a saturated value can
-// never be served as a fresh hit.
+// TestRelayRangeCacheNeverServesOverflowingFreshness proves end to end that a
+// genuinely absurd Age or max-age/s-maxage (beyond the 30-day sanity ceiling),
+// and a delay that alone exceeds every freshness lifetime, keep the response out
+// of the cache: both requests reach the origin and each receives the full origin
+// body, so a saturated value can never be served as a fresh hit.
 func TestRelayRangeCacheNeverServesOverflowingFreshness(t *testing.T) {
-	beyondCeiling := strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)
+	beyondSanity := strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)
 	cases := []struct {
 		name         string
 		header       map[string]string
 		clockAdvance time.Duration
 	}{
-		{"age above the ceiling", map[string]string{"Cache-Control": "max-age=60", "Age": beyondCeiling}, 0},
+		{"age above the sanity ceiling", map[string]string{"Cache-Control": "max-age=60", "Age": beyondSanity}, 0},
 		{"age that overflows int64", map[string]string{"Cache-Control": "max-age=60", "Age": "999999999999999999999999"}, 0},
-		{"max-age above the ceiling", map[string]string{"Cache-Control": "max-age=" + beyondCeiling}, 0},
+		{"max-age above the sanity ceiling", map[string]string{"Cache-Control": "max-age=" + beyondSanity}, 0},
+		{"s-maxage above the sanity ceiling", map[string]string{"Cache-Control": "s-maxage=" + beyondSanity}, 0},
 		{"s-maxage that overflows int64", map[string]string{"Cache-Control": "s-maxage=999999999999999999999999"}, 0},
 		{"huge response delay", map[string]string{"Cache-Control": "max-age=60"}, 100 * 365 * 24 * time.Hour},
 	}
