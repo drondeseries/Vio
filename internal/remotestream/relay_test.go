@@ -932,6 +932,11 @@ func TestRelayRangeResponseCacheabilityRejectsUnboundedAndNonReusable(t *testing
 		{"max_age_zero", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=0"}, false},
 		{"s_maxage_zero", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "s-maxage=0"}, false},
 		{"malformed_max_age", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=soon"}, false},
+		{"oversized_age_beyond_ceiling", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=60", "Age": strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)}, false},
+		{"unrepresentable_age", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=60", "Age": "999999999999999999999999"}, false},
+		{"oversized_max_age", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=999999999999999999999999"}, false},
+		{"max_age_beyond_ceiling", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "max-age=" + strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)}, false},
+		{"s_maxage_beyond_ceiling", http.StatusPartialContent, "128", map[string]string{"Cache-Control": "s-maxage=" + strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)}, false},
 		{"vary_star", http.StatusPartialContent, "128", map[string]string{"Vary": "*"}, false},
 		{"vary_star_list", http.StatusPartialContent, "128", map[string]string{"Vary": "Accept, *"}, false},
 		{"vary_accept", http.StatusPartialContent, "128", map[string]string{"Vary": "Accept"}, true},
@@ -1035,6 +1040,20 @@ func TestRelayRangeResponseCacheabilityFreshness(t *testing.T) {
 			wantOK: false,
 		},
 		{
+			name:       "max-age at the freshness ceiling is still reusable",
+			header:     http.Header{"Cache-Control": {"max-age=" + strconv.FormatInt(relayMaxFreshnessSeconds, 10)}},
+			wantOK:     true,
+			wantExpiry: receivedAt.Add(relayMaxFreshness),
+		},
+		{
+			// A far-future Expires saturates to the ceiling instead of handing
+			// the cache an expiry decades away.
+			name:       "far future expires saturates at the freshness ceiling",
+			header:     http.Header{"Date": {date(0)}, "Expires": {date(100 * 365 * 24 * time.Hour)}},
+			wantOK:     true,
+			wantExpiry: receivedAt.Add(relayMaxFreshness),
+		},
+		{
 			name:   "malformed age cannot establish freshness",
 			header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"not-a-number"}},
 			wantOK: false,
@@ -1123,6 +1142,68 @@ func TestRelayRangeResponseCacheabilityCorrectedAge(t *testing.T) {
 			}
 			if tc.wantOK && !expiry.Equal(tc.wantExpiry) {
 				t.Fatalf("expiry = %v, want %v", expiry, tc.wantExpiry)
+			}
+		})
+	}
+}
+
+// TestRelayRangeResponseCacheabilitySaturatesOverflowingFreshness proves the
+// arithmetic that used to be unbounded cannot mark a stale response fresh: an
+// Age or max-age/s-maxage above the ceiling, an Age that does not even fit in
+// int64, and a response delay far past every freshness lifetime are all
+// non-reusable, and no case returns a far-future expiry.
+func TestRelayRangeResponseCacheabilitySaturatesOverflowingFreshness(t *testing.T) {
+	receivedAt := time.Unix(1_700_000_000, 0)
+	beyondCeiling := strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)
+	unrepresentable := "999999999999999999999999"
+	cases := []struct {
+		name         string
+		header       http.Header
+		requestDelay time.Duration
+	}{
+		{
+			name:   "age above the ceiling",
+			header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {beyondCeiling}},
+		},
+		{
+			name:   "age that overflows int64",
+			header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {unrepresentable}},
+		},
+		{
+			name:   "max-age above the ceiling",
+			header: http.Header{"Cache-Control": {"max-age=" + beyondCeiling}},
+		},
+		{
+			name:   "max-age that overflows int64",
+			header: http.Header{"Cache-Control": {"max-age=" + unrepresentable}},
+		},
+		{
+			name:   "s-maxage above the ceiling",
+			header: http.Header{"Cache-Control": {"s-maxage=" + beyondCeiling}},
+		},
+		{
+			name:         "response delay far beyond every lifetime",
+			header:       http.Header{"Cache-Control": {"max-age=60"}},
+			requestDelay: 100 * 365 * 24 * time.Hour,
+		},
+		{
+			// Age sits just under the ceiling and the delay alone would overflow
+			// a naive addition; the saturated sum still exceeds max-age.
+			name:         "age near the ceiling plus an overflowing delay",
+			header:       http.Header{"Cache-Control": {"max-age=60"}, "Age": {strconv.FormatInt(relayMaxFreshnessSeconds, 10)}},
+			requestDelay: 100 * 365 * 24 * time.Hour,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: http.StatusPartialContent, Header: tc.header.Clone()}
+			response.Header.Set("Content-Length", "128")
+			_, expiry, ok := relayRangeResponseCacheability(response, receivedAt.Add(-tc.requestDelay), receivedAt)
+			if ok {
+				t.Fatalf("cacheable = true with expiry %v, want a stale response to be non-reusable", expiry)
+			}
+			if !expiry.IsZero() && expiry.After(receivedAt.Add(relayMaxFreshness)) {
+				t.Fatalf("expiry = %v, want no expiry beyond the freshness ceiling %v", expiry, receivedAt.Add(relayMaxFreshness))
 			}
 		})
 	}
@@ -1518,6 +1599,65 @@ func TestRelayRangeCacheBypassesOriginNonReusable(t *testing.T) {
 			mu.Unlock()
 			if got != 2 {
 				t.Fatalf("upstream calls = %d, want 2 (origin marked the response non-reusable)", got)
+			}
+		})
+	}
+}
+
+// TestRelayRangeCacheNeverServesOverflowingFreshness proves end to end that an
+// oversized Age or max-age/s-maxage, and a delay that alone exceeds every
+// freshness lifetime, keep the response out of the cache: both requests reach
+// the origin and each receives the full origin body, so a saturated value can
+// never be served as a fresh hit.
+func TestRelayRangeCacheNeverServesOverflowingFreshness(t *testing.T) {
+	beyondCeiling := strconv.FormatInt(relayMaxFreshnessSeconds+1, 10)
+	cases := []struct {
+		name         string
+		header       map[string]string
+		clockAdvance time.Duration
+	}{
+		{"age above the ceiling", map[string]string{"Cache-Control": "max-age=60", "Age": beyondCeiling}, 0},
+		{"age that overflows int64", map[string]string{"Cache-Control": "max-age=60", "Age": "999999999999999999999999"}, 0},
+		{"max-age above the ceiling", map[string]string{"Cache-Control": "max-age=" + beyondCeiling}, 0},
+		{"s-maxage that overflows int64", map[string]string{"Cache-Control": "s-maxage=999999999999999999999999"}, 0},
+		{"huge response delay", map[string]string{"Cache-Control": "max-age=60"}, 100 * 365 * 24 * time.Hour},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			calls := 0
+			want := strings.Repeat("o", 32)
+			relay := NewRelay()
+			defer func() { _ = relay.Close(context.Background()) }()
+			now := time.Unix(1_700_000_000, 0)
+			relay.rangeCache.now = func() time.Time { return now }
+			relay.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				mu.Lock()
+				calls++
+				mu.Unlock()
+				now = now.Add(tc.clockAdvance)
+				response := relayResponse(request, http.StatusPartialContent, "application/octet-stream", want)
+				response.Header.Set("Content-Range", "bytes 0-31/1000")
+				response.Header.Set("Content-Length", "32")
+				for name, value := range tc.header {
+					response.Header.Set(name, value)
+				}
+				return response, nil
+			})}
+			relayURL, cleanup := registerRelayForTest(t, relay, "overflowing-freshness", "https://1.1.1.1/media.mkv")
+			defer cleanup()
+			for attempt := 0; attempt < 2; attempt++ {
+				got := fetchRelay(t, relay, relayURL, http.MethodGet, "bytes=0-31")
+				if got.status != http.StatusPartialContent || got.body != want {
+					t.Fatalf("attempt %d = status %d, %d bytes; want the origin's %d-byte body",
+						attempt, got.status, len(got.body), len(want))
+				}
+			}
+			mu.Lock()
+			got := calls
+			mu.Unlock()
+			if got != 2 {
+				t.Fatalf("upstream calls = %d, want 2 (an overflowing freshness value is never cached)", got)
 			}
 		})
 	}

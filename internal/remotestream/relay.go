@@ -81,7 +81,21 @@ const (
 	relayRangeCacheMaxEntrySize = 512 << 10
 	relayRangeCacheMaxEntries   = 64
 	relayRangeCacheMaxTotalSize = 16 << 20
+
+	// relayMaxFreshness caps every duration derived from the origin's freshness
+	// headers. An Age, max-age or s-maxage above it is refused as non-cacheable,
+	// and every other derived duration (apparent age, response delay, lifetime
+	// minus corrected age) is saturated to it. That keeps an unbounded
+	// delta-seconds conversion or a pair of additions from wrapping int64
+	// nanoseconds, and keeps responseReceivedAt.Add(remaining) from producing an
+	// expiry decades in the future. A registration itself expires after
+	// relayEntryLifetime, so a longer origin freshness could never be used.
+	relayMaxFreshness = relayEntryLifetime
 )
+
+// relayMaxFreshnessSeconds is relayMaxFreshness in whole delta-seconds, the
+// largest value relayParseBoundedSeconds accepts.
+const relayMaxFreshnessSeconds = int64(relayMaxFreshness / time.Second)
 
 // relayRangeCacheEntry is one complete upstream range response. body is
 // immutable once stored; header holds only the media headers the relay
@@ -241,7 +255,11 @@ func relayRangeCacheHeaderIdentity(headers http.Header) string {
 // and FFmpeg repeats the same byte range within seconds, so a short bounded
 // window cannot serve meaningfully stale bytes while preserving the seek
 // optimization. A malformed Age, Date, Expires or max-age is treated as
-// non-reusable because freshness cannot be established.
+// non-reusable because freshness cannot be established. An Age, max-age or
+// s-maxage above relayMaxFreshness is likewise non-reusable, so an oversized
+// delta-seconds value is never converted (or wrapped) into a duration; the
+// derived ages and lifetimes that remain saturate at that ceiling, which keeps
+// the computed expiry finite and in range.
 func relayRangeResponseCacheability(response *http.Response, requestSentAt, responseReceivedAt time.Time) (int, time.Time, bool) {
 	if response == nil {
 		return 0, time.Time{}, false
@@ -268,8 +286,8 @@ func relayRangeResponseCacheability(response *http.Response, requestSentAt, resp
 	}
 	for _, bound := range []string{"s-maxage", "max-age"} {
 		if value, ok := directives[bound]; ok {
-			seconds, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || seconds <= 0 || seconds > int64((1<<63-1)/int64(time.Second)) {
+			seconds, ok := relayParseBoundedSeconds(value)
+			if !ok || seconds <= 0 {
 				return 0, time.Time{}, false
 			}
 		}
@@ -285,21 +303,53 @@ func relayRangeResponseCacheability(response *http.Response, requestSentAt, resp
 	if !ok {
 		return 0, time.Time{}, false
 	}
-	remaining := lifetime - age
+	// lifetime and age are both bounded by relayMaxFreshness, so the difference
+	// cannot underflow; saturating it keeps the expiry bounded even if a future
+	// change relaxes one of those bounds.
+	remaining := relaySaturateFreshness(lifetime - age)
 	if remaining <= 0 {
 		return 0, time.Time{}, false
 	}
 	return length, responseReceivedAt.Add(remaining), true
 }
 
+// relayParseBoundedSeconds parses a non-negative integer delta-seconds value.
+// It reports ok=false for a malformed, negative, or over-ceiling value. A huge
+// Age or max-age is refused rather than converted: time.Duration(seconds) *
+// time.Second would otherwise wrap to an arbitrary, possibly negative duration.
+func relayParseBoundedSeconds(raw string) (int64, bool) {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || seconds < 0 || seconds > relayMaxFreshnessSeconds {
+		return 0, false
+	}
+	return seconds, true
+}
+
+// relaySaturateFreshness clamps a derived duration into [0, relayMaxFreshness].
+// A negative value (a future Date, or a clock that ran backwards) becomes zero;
+// an above-ceiling value saturates, so two of them can be added without
+// overflowing int64 nanoseconds and the resulting expiry stays bounded.
+func relaySaturateFreshness(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	if d > relayMaxFreshness {
+		return relayMaxFreshness
+	}
+	return d
+}
+
 // relayFreshnessLifetime returns how long a response stays fresh according to
 // the origin. s-maxage wins for this shared cache; otherwise max-age; otherwise
-// Expires relative to Date; otherwise the relay's own bounded default.
+// Expires relative to Date; otherwise the relay's own bounded default. An
+// over-ceiling max-age/s-maxage is rejected, and an Expires delta beyond the
+// ceiling saturates to relayMaxFreshness rather than yielding a far-future
+// expiry.
 func relayFreshnessLifetime(directives map[string]string, header http.Header, receivedAt time.Time) (time.Duration, bool) {
 	for _, name := range []string{"s-maxage", "max-age"} {
 		if value, ok := directives[name]; ok {
-			seconds, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || seconds < 0 || seconds > (1<<63-1)/int64(time.Second) {
+			seconds, ok := relayParseBoundedSeconds(value)
+			if !ok {
 				return 0, false
 			}
 			return time.Duration(seconds) * time.Second, true
@@ -318,7 +368,7 @@ func relayFreshnessLifetime(directives map[string]string, header http.Header, re
 			}
 			base = date
 		}
-		lifetime := expires.Sub(base)
+		lifetime := relaySaturateFreshness(expires.Sub(base))
 		if lifetime <= 0 {
 			return 0, false
 		}
@@ -341,8 +391,11 @@ func relayFreshnessLifetime(directives map[string]string, header http.Header, re
 //     freshness lifetime is not treated as fresh for another full lifetime.
 //
 // Taking the maximum means an old Date can only make a response look staler,
-// never fresher, than Age claims. A malformed Age or Date cannot establish
-// freshness and reports ok=false.
+// never fresher, than Age claims. A malformed, negative, or over-ceiling Age
+// cannot establish freshness and reports ok=false. Apparent age and response
+// delay saturate at relayMaxFreshness before they are added, so a huge Date
+// skew or a huge clock delta cannot overflow int64 nanoseconds or be mistaken
+// for a small corrected age.
 func relayCorrectedInitialAge(header http.Header, requestSentAt, responseReceivedAt time.Time) (time.Duration, bool) {
 	apparentAge := time.Duration(0)
 	if raw := strings.TrimSpace(header.Get(headerDate)); raw != "" {
@@ -350,15 +403,12 @@ func relayCorrectedInitialAge(header http.Header, requestSentAt, responseReceive
 		if err != nil {
 			return 0, false
 		}
-		apparentAge = responseReceivedAt.Sub(date)
-		if apparentAge < 0 {
-			apparentAge = 0
-		}
+		apparentAge = relaySaturateFreshness(responseReceivedAt.Sub(date))
 	}
 	ageValue := time.Duration(0)
 	for _, raw := range header.Values(headerAge) {
-		seconds, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
-		if err != nil || seconds > uint64((1<<63-1)/int64(time.Second)) {
+		seconds, ok := relayParseBoundedSeconds(raw)
+		if !ok {
 			return 0, false
 		}
 		candidate := time.Duration(seconds) * time.Second
@@ -366,11 +416,8 @@ func relayCorrectedInitialAge(header http.Header, requestSentAt, responseReceive
 			ageValue = candidate
 		}
 	}
-	responseDelay := responseReceivedAt.Sub(requestSentAt)
-	if responseDelay < 0 {
-		responseDelay = 0
-	}
-	correctedAge := ageValue + responseDelay
+	responseDelay := relaySaturateFreshness(responseReceivedAt.Sub(requestSentAt))
+	correctedAge := relaySaturateFreshness(ageValue + responseDelay)
 	if apparentAge > correctedAge {
 		return apparentAge, true
 	}

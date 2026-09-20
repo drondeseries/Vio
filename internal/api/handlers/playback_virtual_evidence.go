@@ -39,11 +39,29 @@ import (
 // under an independent, bounded context. Dequeued work is therefore never
 // stranded on the canceled service context and never silently dropped: each
 // task is persisted or logged as a terminal failure, and the abandonment
-// warning counts both still-queued and still-dequeued work. Nothing is durable
-// across process death: accepted work lives only in this in-memory buffer, so a
-// crash loses every queued or in-flight write. That is safe because the loss is
-// evidence, not data — the next playback start re-probes and re-admits, and the
-// catalog keeps its last committed snapshot until then.
+// warning counts both still-queued and still-dequeued work.
+//
+// The application shutdown sequence is the primary trigger: main calls
+// PlaybackHandler.StopVirtualEvidence explicitly and waits for it under its own
+// bounded timeout (see cmd/silo). The service-context watcher started by
+// evidenceBuffer is only a safety net for callers that never wire the
+// lifecycle; it calls the same single-flight path.
+//
+// Outcomes at shutdown:
+//   - Accepted work — queued, or already admitted and dequeued by a worker — is
+//     drained within virtualEvidenceDrainGrace (5 s). A write already in flight
+//     is awaited and bounded by that same grace. The application-level wait is
+//     deliberately longer so the handler can complete rather than be cut off.
+//   - Rejected work — refused by admit because the buffer was full or the
+//     snapshot was stale, or refused after closure because shutdown won the
+//     admission race — is reported to the caller as virtualEvidenceRejected and
+//     is never queued.
+//   - Work still unfinished when the drain budget expires is abandoned with a
+//     warning. Nothing here is durable across process death: accepted evidence
+//     lives only in this in-memory buffer, so a crash or a forced termination
+//     loses every queued or in-flight write. That is safe because the loss is
+//     evidence, not data — the next playback start re-probes and re-admits, and
+//     the catalog keeps its last committed snapshot until then.
 
 const (
 	// virtualEvidenceQueueSize bounds queued (not yet executing) evidence
@@ -183,6 +201,11 @@ type virtualEvidenceBuffer struct {
 	shutdownCh chan struct{}
 	closed     bool
 	drainUntil time.Time
+	// drainGrace bounds how long a shutdown drain may spend on accepted work.
+	// It defaults to virtualEvidenceDrainGrace; it is a field so tests can
+	// exercise an already-expired budget. A zero value falls back to the
+	// default, so a negative value is the way to force an expired deadline.
+	drainGrace time.Duration
 	// inflight counts tasks popped by a worker or drainer that have not yet
 	// been persisted and released. It makes already-dequeued work explicit:
 	// shutdown awaits workers, and the abandonment warning reports it.
@@ -198,6 +221,7 @@ func newVirtualEvidenceBuffer(capacity int) *virtualEvidenceBuffer {
 		capacity:   capacity,
 		signalCh:   make(chan struct{}, 1),
 		shutdownCh: make(chan struct{}),
+		drainGrace: virtualEvidenceDrainGrace,
 	}
 }
 
@@ -298,8 +322,12 @@ func (b *virtualEvidenceBuffer) close() {
 		b.mu.Unlock()
 		return
 	}
+	grace := b.drainGrace
+	if grace == 0 {
+		grace = virtualEvidenceDrainGrace
+	}
 	b.closed = true
-	b.drainUntil = time.Now().Add(virtualEvidenceDrainGrace)
+	b.drainUntil = time.Now().Add(grace)
 	close(b.shutdownCh)
 	b.mu.Unlock()
 	b.signal()
@@ -369,7 +397,11 @@ func (h *PlaybackHandler) evidenceBuffer() *virtualEvidenceBuffer {
 		}
 		// The watcher is started inside the once, after the workers are
 		// registered, so stopVirtualEvidence always has a started pool to await.
-		// Done() is nil for context.Background, which must not leak a watcher.
+		// It is only a safety net: the application shutdown sequence calls
+		// StopVirtualEvidence directly (wired in cmd/silo), so shutdown awaits
+		// accepted work regardless of whether the service context is ever
+		// canceled. Done() is nil for context.Background, which must not leak a
+		// watcher.
 		if h.ServiceContext != nil && h.ServiceContext.Done() != nil {
 			serviceDone := h.ServiceContext.Done()
 			go func() {
@@ -381,53 +413,25 @@ func (h *PlaybackHandler) evidenceBuffer() *virtualEvidenceBuffer {
 	return h.virtualEvidenceBuffer
 }
 
-// virtualEvidenceShutdownOuterTimeout bounds the whole shutdown wait for
-// evidence workers, on top of the drain grace that bounds the drain itself.
-// Worker sleeps and write attempts are each bounded, but an outer cap keeps a
-// pathological stall from consuming the process shutdown budget. It is a var
-// so tests can shrink the wait.
-var virtualEvidenceShutdownOuterTimeout = 20 * time.Second
-
-// StartVirtualEvidenceShutdownCleanup waits for ctx (the application
-// lifecycle) before closing evidence admission, then drains accepted work
-// within bounds and closes done when finished, so the process shutdown work
-// tracker can retain it. It follows the same RegisterShutdownWork
-// done-channel contract as the transcode manager cleanup: calling it at
-// router construction must not close admission — only application
-// cancellation does. It is safe to call alongside the internal service-context
-// watcher; stopVirtualEvidence is single-flight. A stall past the outer bound
-// is logged loudly and shutdown proceeds.
-func (h *PlaybackHandler) StartVirtualEvidenceShutdownCleanup(ctx context.Context) <-chan struct{} {
-	done := make(chan struct{})
-	if h == nil || ctx == nil {
-		close(done)
-		return done
-	}
-	go func() {
-		defer close(done)
-		<-ctx.Done()
-		finished := make(chan struct{})
-		go func() {
-			defer close(finished)
-			h.stopVirtualEvidence()
-		}()
-		timer := time.NewTimer(virtualEvidenceShutdownOuterTimeout)
-		defer timer.Stop()
-		select {
-		case <-finished:
-		case <-timer.C:
-			slog.Warn("virtual evidence shutdown did not finish before the outer bound; proceeding with shutdown",
-				"component", "api", "outer_timeout", virtualEvidenceShutdownOuterTimeout)
-		}
-	}()
-	return done
+// StopVirtualEvidence is the explicit application-shutdown drain. The
+// application lifecycle calls it so shutdown waits for accepted evidence
+// instead of relying on a detached lifecycle watcher. It atomically stops
+// admission, awaits every worker (including a task one already dequeued), then
+// drains the accepted remainder under an independent bounded context. It is
+// idempotent and safe to call concurrently or during shutdown: every caller
+// blocks until the single closure/await/drain pass has completed, and a caller
+// that races the safety-net watcher observes the same terminal state. A handler
+// that never admitted evidence has nothing to drain and returns immediately.
+func (h *PlaybackHandler) StopVirtualEvidence() {
+	h.stopVirtualEvidence()
 }
 
-// stopVirtualEvidence is the single shutdown path: it atomically stops
-// admission, awaits every worker (including the task one already dequeued), then
-// drains the accepted remainder under an independent bounded context. It is
-// single-flight, so a caller racing the lifecycle watcher blocks until the one
-// closure has fully completed.
+// stopVirtualEvidence is the single shutdown path shared by the explicit
+// application call and the lifecycle watcher: it atomically stops admission,
+// awaits every worker (including the task one already dequeued), then drains the
+// accepted remainder under an independent bounded context. It is single-flight,
+// so a caller racing the lifecycle watcher blocks until the one closure has
+// fully completed.
 func (h *PlaybackHandler) stopVirtualEvidence() {
 	if h == nil || h.virtualEvidenceBuffer == nil {
 		return

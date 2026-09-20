@@ -569,10 +569,12 @@ type PlaybackHandler struct {
 	// task is still in a worker's hands, so an empty pending buffer alone is
 	// not proof that shutdown is safe.
 	virtualEvidenceWG sync.WaitGroup
-	// virtualEvidenceStopOnce makes the shutdown sequence single-flight. A
-	// caller that races the lifecycle watcher blocks until the one closure,
-	// worker await and drain have all completed, so tests and shutdown observe
-	// the same terminal state.
+	// virtualEvidenceStopOnce makes the shutdown sequence single-flight. The
+	// application shutdown sequence calls StopVirtualEvidence explicitly (wired
+	// through api.Dependencies.RegisterShutdownFunc); the service-context
+	// watcher is only a safety net. A caller that races the other blocks until
+	// the one closure, worker await and drain have all completed, so tests and
+	// shutdown observe the same terminal state.
 	virtualEvidenceStopOnce sync.Once
 
 	// subtitleSlotsOnce guards lazy construction of the dedicated subtitle

@@ -117,6 +117,12 @@ type Dependencies struct {
 	// RegisterShutdownWork retains asynchronous cleanup completion until main's
 	// graceful-shutdown deadline. Nil is valid in tests and embedded routers.
 	RegisterShutdownWork func(<-chan struct{})
+	// RegisterShutdownFunc registers a named, idempotent application-shutdown
+	// step that main invokes explicitly under its own bounded timeout, before
+	// waiting on the context-triggered RegisterShutdownWork channels. Use it for
+	// work whose drain must be awaited by shutdown rather than only triggered by
+	// service-context cancellation. Nil is valid in tests and embedded routers.
+	RegisterShutdownFunc func(name string, run func())
 
 	DB              *pgxpool.Pool
 	SecretCipher    *secret.Cipher // at-rest credential cipher (required when DB is set)
@@ -1252,6 +1258,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// cancels outstanding probes, revalidations, and searches.
 			playbackHandler.ServiceContext = deps.AppContext
 		}
+		if deps.RegisterShutdownFunc != nil {
+			// Primary trigger for evidence draining. The handler also has a
+			// service-context watcher, but that is only a safety net: this
+			// registration makes application shutdown call the drain and wait
+			// for accepted, in-memory evidence rather than firing it detached.
+			deps.RegisterShutdownFunc("virtual-evidence-drain", playbackHandler.StopVirtualEvidence)
+		}
 		if deps.VirtualLibraryService != nil {
 			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
 				return deps.VirtualLibraryService.Resolve(ctx, path)
@@ -1591,13 +1604,6 @@ func newChiRouter(deps Dependencies) chi.Router {
 			cleanupDone := playbackHandler.TranscodeManager().StartShutdownCleanup(deps.AppContext)
 			if deps.RegisterShutdownWork != nil {
 				deps.RegisterShutdownWork(cleanupDone)
-			}
-			// Accepted virtual probe evidence must drain before the process
-			// exits. Registration only records the completion channel; the
-			// cleanup waits for application cancellation first, so admission
-			// stays open during normal operation.
-			if deps.RegisterShutdownWork != nil {
-				deps.RegisterShutdownWork(playbackHandler.StartVirtualEvidenceShutdownCleanup(deps.AppContext))
 			}
 		}
 		playbackHandler.ProbeEnsurer = deps.ProbeEnsurer

@@ -1165,6 +1165,15 @@ func main() {
 	registerShutdownWork := func(done <-chan struct{}) {
 		shutdownWork = append(shutdownWork, done)
 	}
+	// shutdownSteps are explicit, bounded application-shutdown steps wired by
+	// the API layer (for example the probe-evidence drain). Unlike shutdownWork,
+	// whose tasks are triggered by app-context cancellation, main invokes each
+	// step directly during the graceful-shutdown sequence and waits for it under
+	// its own deadline.
+	var shutdownSteps []shutdownStep
+	registerShutdownFunc := func(name string, run func()) {
+		shutdownSteps = append(shutdownSteps, shutdownStep{name: name, run: run})
+	}
 	normalizedBootstrapRedisURL, bootstrapRedisURLErr := config.NormalizeRedisURL(bc.RedisURL)
 	redisBootstrapAvailable := (normalizedBootstrapRedisURL != "" && bootstrapRedisURLErr == nil) ||
 		(strings.TrimSpace(cfg.Redis.SentinelMaster) != "" && len(cfg.Redis.SentinelAddresses) > 0)
@@ -1178,6 +1187,7 @@ func main() {
 		RedisBootstrapAvailable:      redisBootstrapAvailable,
 		AppContext:                   appCtx,
 		RegisterShutdownWork:         registerShutdownWork,
+		RegisterShutdownFunc:         registerShutdownFunc,
 		StreamTelemetry:              streamTelemetryRegistry,
 		StreamTelemetryViewCache:     streamTelemetryViewCache,
 		DB:                           pool,
@@ -3625,6 +3635,15 @@ func main() {
 			slog.Error("abs compat shutdown error", "error", shutdownErr)
 		}
 	}
+	// 1b. Run explicit shutdown steps that own a bounded drain. The probe
+	// evidence queue is accepted in memory, so application shutdown calls its
+	// stop method here and waits for it, rather than relying only on the
+	// handler's detached lifecycle watcher. The handler drains within its own
+	// 5 s grace; this outer bound leaves it headroom to finish and then abandons
+	// (with a warning) instead of hanging. Anything abandoned at this point is
+	// in-memory evidence and is lost on exit; the next playback start re-probes
+	// and re-admits it.
+	runShutdownSteps(virtualEvidenceShutdownTimeout, shutdownSteps)
 	if err := runShutdownWorkWithTimeout(30*time.Second, func(cleanupCtx context.Context) error {
 		return waitForShutdownWork(cleanupCtx, shutdownWork)
 	}); err != nil {
@@ -3667,6 +3686,56 @@ func main() {
 	_ = adminJobRunner
 
 	slog.Info("server stopped")
+}
+
+// virtualEvidenceShutdownTimeout bounds the explicit application-shutdown wait
+// for the probe-evidence drain. The handler's own drain grace is 5 s, so this
+// leaves room for the worker await plus the drain to complete; a step that
+// overruns is abandoned rather than allowed to hang process shutdown.
+const virtualEvidenceShutdownTimeout = 10 * time.Second
+
+// shutdownStep is an explicit application-shutdown step registered through
+// api.Dependencies.RegisterShutdownFunc. Steps are idempotent and safe to call
+// during shutdown; main invokes each one directly under its own deadline.
+type shutdownStep struct {
+	name string
+	run  func()
+}
+
+// runShutdownSteps invokes each explicit application-shutdown step in
+// registration order, waiting at most timeout for each. A step that overruns is
+// abandoned and logged; later steps still run, so one stuck step cannot starve
+// the rest of the shutdown sequence.
+func runShutdownSteps(timeout time.Duration, steps []shutdownStep) {
+	for _, step := range steps {
+		if err := awaitShutdownFunc(timeout, step.run); err != nil {
+			slog.Error("shutdown step did not finish before deadline; abandoning in-memory work",
+				"step", step.name, "timeout", timeout, "error", err)
+		}
+	}
+}
+
+// awaitShutdownFunc runs one explicit shutdown step and waits at most timeout
+// for it to return. A step that overruns keeps running, but shutdown stops
+// waiting and reports context.DeadlineExceeded so a stuck step cannot hang the
+// process. nil is a no-op.
+func awaitShutdownFunc(timeout time.Duration, run func()) error {
+	if run == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
 }
 
 // waitForShutdownWork waits for registered cleanup tasks within the process's

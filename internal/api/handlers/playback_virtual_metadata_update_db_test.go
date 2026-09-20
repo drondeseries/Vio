@@ -74,11 +74,16 @@ func seedVirtualMetadataUpdateFolder(t *testing.T, pool *pgxpool.Pool, folderID,
 func runVirtualMetadataUpdate(t *testing.T, pool *pgxpool.Pool, candidateID int, expectedPath, adoptPath string, ownerID, folderID int, updatedAt time.Time, probeUpdatedAt *time.Time) {
 	t.Helper()
 	ctx := context.Background()
+	neutralPath := ""
+	if adoptPath != "" {
+		neutralPath = virtualPlaybackNeutralKey(adoptPath)
+	}
 	tag, err := pool.Exec(ctx, VirtualFileMetadataUpdateSQL,
 		`[]`, `[]`, `[]`,
 		"2160p", "hevc", "eac3", "mkv", true, 8000000, 5400,
 		candidateID, expectedPath, true,
 		updatedAt, probeUpdatedAt, ownerID, folderID, adoptPath,
+		neutralPath, virtualFailedVerdictMaxAge.Seconds(), true,
 	)
 	if err != nil {
 		t.Fatalf("VirtualFileMetadataUpdateSQL: %v", err)

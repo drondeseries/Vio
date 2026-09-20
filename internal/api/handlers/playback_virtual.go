@@ -1550,8 +1550,22 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		transient := *file
 		transient.FilePath = cand.URI
 		transient.VirtualOwnerInstallationID = oid
-		dbFile := h.lookupVirtualCandidateRow(attemptCtx, cand.URI, file.ContentID, file.EpisodeID, oid)
-		if dbFile != nil && dbFile.ID > 0 {
+		dbFile, dbFound, dbLookupErr := h.lookupVirtualCandidateRowDetailed(attemptCtx, cand.URI, file.ContentID, file.EpisodeID, oid)
+		if dbLookupErr != nil {
+			// Fail closed: the lookup failure (or an incomplete row) leaves the
+			// candidate's verdict unknown, so it must not be resolved or
+			// adopted. This is the same policy the fallback's shared verdict
+			// gate applies; the sentinel lets the caller's candidate loop stop
+			// rather than reinterpret the unknown verdict as a dead candidate.
+			return nil, fmt.Errorf("%w: candidate %s: %w", errVirtualCandidateVerdictUnknown, cand.URI, dbLookupErr)
+		}
+		// Enforce the supplied row's own failure stamp for its own release even
+		// when no catalog row is found yet, mirroring the shared verdict gate.
+		if !allowFailed && sameVirtualReleaseIdentity(file.FilePath, cand.URI) &&
+			virtualCandidateVerdictActive(file.FailedAt, time.Now()) {
+			return nil, fmt.Errorf("candidate %s is marked failed", cand.URI)
+		}
+		if dbFound {
 			// Auto-pick skips candidates whose catalog row is marked failed
 			// (a transport produced no bytes, or the decoder rejected the
 			// source, on a prior attempt). An explicit selection and a forced
@@ -1817,6 +1831,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			return *result, nil
 		}
 		if err != nil || result.Provenance == ProbeProvenanceFailed {
+			if err != nil && errors.Is(err, errVirtualCandidateVerdictUnknown) {
+				// The catalog could not answer for this candidate. The pin is
+				// not known-bad and a sibling is not a valid substitute while
+				// the verdict is unknowable, so stop instead of rotating.
+				return resolvedVirtualPlaybackSource{}, err
+			}
 			if candidate.URI == pinnedURI && h != nil {
 				// The pinned source stopped working; release it so the next
 				// start re-ranks candidates instead of retrying a dead URI.
@@ -2205,6 +2225,19 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 // the row keeps its current path while the metadata and stamp still apply. The
 // probe_source guard is IS DISTINCT FROM so a row whose probe_source is NULL
 // (never stamped) adopts its resolved path like any other non-collection row.
+//
+// Adoption is additionally fenced on the candidate's own verdict. A failed_at
+// stamp committed after the handler's last verdict read (the serve layer and
+// another replan both write one) must still prevent adoption, so the same
+// statement that writes the row re-checks for a live failed verdict on the
+// validated identity ($18 exact, $19 provider-neutral when no exact row owns
+// the path). The predicate matches virtualCandidateVerdictActive: a stamp is
+// live while now() <= failed_at + $20 seconds. $21 disables the fence for an
+// explicit retry (AllowFailedVerdict); it is otherwise set from RequireAdopt so
+// metadata-only writers keep their previous unconditional adoption. The
+// statement returns the persisted file_path so the saver can confirm the
+// validated identity actually landed rather than trusting a positive row count
+// (see RequireAdopt).
 const VirtualFileMetadataUpdateSQL = `
 UPDATE media_files SET
   video_tracks     = $1::jsonb,
@@ -2233,6 +2266,30 @@ UPDATE media_files SET
              AND sibling.virtual_owner_installation_id IS NOT DISTINCT FROM $16
              AND sibling.media_folder_id IS NOT DISTINCT FROM $17
          )
+         AND (
+           NOT $21::boolean
+           OR NOT EXISTS (
+             SELECT 1 FROM media_files failed
+             WHERE failed.virtual_owner_installation_id IS NOT DISTINCT FROM $16
+               AND failed.media_folder_id IS NOT DISTINCT FROM $17
+               AND failed.failed_at IS NOT NULL
+               AND now() <= failed.failed_at + make_interval(secs => $20)
+               AND (
+                 failed.file_path = $18
+                 OR (
+                   $19 <> $18
+                   AND failed.file_path = $19
+                   AND NOT EXISTS (
+                     SELECT 1 FROM media_files exact_row
+                     WHERE exact_row.file_path = $18
+                       AND exact_row.virtual_owner_installation_id IS NOT DISTINCT FROM $16
+                       AND exact_row.media_folder_id IS NOT DISTINCT FROM $17
+                   )
+                 )
+               )
+             )
+           )
+         )
     THEN $18
     ELSE file_path
   END,
@@ -2258,9 +2315,9 @@ RETURNING file_path
 
 // VirtualFileMetadataDB is the minimal database surface the shared virtual
 // metadata update needs. Both the native router wiring and the jellycompat
-// wiring pass a *pgxpool.Pool, which satisfies this interface.
+// wiring pass a *pgxpool.Pool, which satisfies this interface. RETURNING is
+// used rather than Exec so the saver can confirm the identity actually adopted.
 type VirtualFileMetadataDB interface {
-	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, arguments ...any) pgx.Row
 }
 
@@ -2281,14 +2338,28 @@ type VirtualFileMetadataUpdateResult struct {
 // and owns the adoption-race retry shared by the native and jellycompat
 // savers.
 //
-// The SQL's sibling guard keeps adoption from colliding with an existing owner
-// of the target path, but two concurrent probes can both pass it and one still
-// loses the unique-index race (media_files_virtual_file_owner_key). When that
-// happens with a non-empty AdoptPath, retry exactly once with AdoptPath cleared
-// so the probe evidence lands on the row's current path instead of being
-// dropped. The retry keys on SQLSTATE 23505 rather than the constraint name,
-// and a second failure is returned unchanged. A nil db is a no-op so callers
-// that run without a database stay safe.
+// Two things are confirmed from the single statement that writes the row:
+//
+//   - The SQL's sibling guard keeps adoption from colliding with an existing
+//     owner of the target path, and its verdict guard rejects adoption while
+//     the validated candidate carries a live failed_at stamp. Because that
+//     predicate is evaluated in the same statement as the write, a verdict
+//     committed after the caller's last read but before this write cannot be
+//     adopted.
+//   - RETURNING file_path reports what the row actually persisted. When
+//     RequireAdopt is set and the file_path is not the requested AdoptPath
+//     (probe_source guard, sibling guard, verdict fence, or a collection row),
+//     the update is refused rather than reported as an adoption even though the
+//     metadata and stamp landed.
+//
+// Two concurrent probes can both pass the sibling guard and one still loses the
+// unique-index race (media_files_virtual_file_owner_key). When that happens
+// with a non-empty AdoptPath, retry exactly once with AdoptPath cleared so the
+// probe metadata lands on the row's current path instead of being dropped. The
+// retry keys on SQLSTATE 23505 rather than the constraint name and still
+// reports no adoption when RequireAdopt is set, because only metadata was
+// written. A nil db is a no-op so callers that run without a database stay
+// safe.
 //
 // QueryRow consumes the full result stream before Scan returns, so a terminal
 // database error cannot hide behind an already-read row.
@@ -2308,28 +2379,47 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	if sStr == "" || sStr == jsonNullLiteral {
 		sStr = "[]"
 	}
-	exec := func(adoptPath string) (persistedPath string, rows int64, err error) {
-		var stored string
-		scanErr := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
+	verdictMaxAgeSeconds := virtualFailedVerdictMaxAge.Seconds()
+	// The verdict fence is only meaningful where the caller needs a confirmed
+	// adoption (RequireAdopt) and has not asked for an explicit retry.
+	fenceVerdict := args.RequireAdopt && !args.AllowFailedVerdict
+	exec := func(adoptPath string) (string, error) {
+		neutralPath := ""
+		if adoptPath != "" {
+			neutralPath = virtualPlaybackNeutralKey(adoptPath)
+		}
+		var persistedPath string
+		err := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
 			vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
 			args.FileID, args.ExpectedFilePath, args.StampProbe,
 			args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
-		).Scan(&stored)
-		if scanErr != nil {
-			if errors.Is(scanErr, pgx.ErrNoRows) {
-				// No row matched the CAS fence: nothing was written.
-				return "", 0, nil
-			}
-			return "", 0, scanErr
+			neutralPath, verdictMaxAgeSeconds, fenceVerdict,
+		).Scan(&persistedPath)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No row matched the CAS fence: a stale snapshot, reported as a
+			// zero-row miss by the caller.
+			return "", nil
 		}
-		return stored, 1, nil
+		if err != nil {
+			return "", err
+		}
+		return persistedPath, nil
 	}
-	persisted, rows, err := exec(args.AdoptPath)
+	persistedPath, err := exec(args.AdoptPath)
 	if err == nil {
+		if persistedPath == "" {
+			return VirtualFileMetadataUpdateResult{}, nil
+		}
+		if args.RequireAdopt && args.AdoptPath != "" && persistedPath != args.AdoptPath {
+			// The metadata and stamp landed, but the validated identity did
+			// not. Reporting success here would let the fallback serve a
+			// substitute the catalog row does not own.
+			return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s persisted as %q", errVirtualAdoptIdentityNotPersisted, args.AdoptPath, persistedPath)
+		}
 		return VirtualFileMetadataUpdateResult{
-			RowsAffected:    rows,
-			MetadataUpdated: rows > 0,
-			IdentityAdopted: args.AdoptPath != "" && persisted == args.AdoptPath,
+			RowsAffected:    1,
+			MetadataUpdated: true,
+			IdentityAdopted: args.AdoptPath != "" && persistedPath == args.AdoptPath,
 		}, nil
 	}
 	var pgErr *pgconn.PgError
@@ -2341,21 +2431,35 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	// The retry deliberately retains evidence on the current row, but it did
 	// not adopt the requested identity. Callers must not treat this as an
 	// adoption success (metadata-only retries are not identity proof).
-	_, retryRows, retryErr := exec("")
+	retryPath, retryErr := exec("")
+	if retryErr != nil {
+		return VirtualFileMetadataUpdateResult{}, retryErr
+	}
+	if retryPath == "" {
+		// The metadata-only retry also missed the CAS fence.
+		return VirtualFileMetadataUpdateResult{}, nil
+	}
+	if args.RequireAdopt {
+		// Metadata-only retry: the validated identity was not adopted.
+		return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s collided with an existing path owner", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
+	}
 	return VirtualFileMetadataUpdateResult{
-		RowsAffected:    retryRows,
-		MetadataUpdated: retryErr == nil && retryRows > 0,
+		RowsAffected:    1,
+		MetadataUpdated: true,
 		IdentityAdopted: false,
-	}, retryErr
+	}, nil
 }
 
 // ExecVirtualFileMetadataUpdate preserves the historical row-count contract.
 func ExecVirtualFileMetadataUpdate(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs) (int64, error) {
 	result, err := ExecVirtualFileMetadataUpdateResult(ctx, db, args)
-	if err != nil || !result.MetadataUpdated {
+	if err != nil {
 		return 0, err
 	}
-	return 1, nil
+	if !result.MetadataUpdated {
+		return 0, nil
+	}
+	return result.RowsAffected, nil
 }
 
 // virtualSnapshot captures a catalog row's identity and generation before
@@ -2483,6 +2587,28 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 // and must not be treated as eligible.
 var errVirtualCandidateVerdictIncomplete = errors.New("virtual candidate verdict lookup returned an incomplete row")
 
+// errVirtualCandidateVerdictUnknown marks a verdict decision that could not be
+// made because the catalog lookup failed or returned an incomplete row. It is
+// the fail-closed signal every candidate-selection loop watches for: a caller
+// must not resolve, substitute or adopt a candidate while its verdict is
+// unknowable, and must stop trying siblings rather than reinterpret the failure
+// as "this candidate is dead".
+var errVirtualCandidateVerdictUnknown = errors.New("virtual candidate verdict is unknown")
+
+// errVirtualAdoptIdentityNotPersisted reports that the probe metadata was
+// persisted but the validated candidate identity was not adopted onto the row.
+// A uniqueness conflict, a probe_source guard, or the verdict fence can all
+// leave file_path unchanged while the metadata UPDATE still matches one row.
+// Callers that must report a confirmed identity adoption treat this as a
+// failure; metadata-only evidence writers do not.
+var errVirtualAdoptIdentityNotPersisted = errors.New("virtual candidate identity was not adopted")
+
+// virtualAdoptionBarrier is a test seam invoked after the fallback's final
+// verdict read and before the adoption write. Tests use it to commit a
+// failed_at verdict in that window and prove the persistence-backed fence
+// rejects the adoption rather than trusting the earlier read.
+var virtualAdoptionBarrier func()
+
 // sameVirtualReleaseIdentity reports whether two virtual URIs name the same
 // release: byte-identical, or the same provider-neutral path carrying the same
 // concrete ?result= candidate id.
@@ -2518,7 +2644,7 @@ func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, cand
 	}
 	row, found, lookupErr := h.lookupVirtualCandidateRowDetailed(ctx, candidateURI, file.ContentID, file.EpisodeID, ownerID)
 	if lookupErr != nil {
-		return fmt.Errorf("candidate %s verdict is unknown: %w", candidateURI, lookupErr)
+		return fmt.Errorf("%w: candidate %s: %w", errVirtualCandidateVerdictUnknown, candidateURI, lookupErr)
 	}
 	if !found {
 		// No catalog row owns the candidate: there is no verdict to enforce.
@@ -2530,31 +2656,39 @@ func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, cand
 	return nil
 }
 
-// lookupVirtualCandidateRow resolves the catalog row that owns a concrete
-// candidate URI for callers that only need the row's metadata. It prefers an
-// exact path match and falls back to the provider-neutral path for rows stored
-// without the result= pick. It intentionally discards lookup errors because
-// metadata enrichment is best-effort; the verdict gate uses the detailed form.
-func (h *PlaybackHandler) lookupVirtualCandidateRow(ctx context.Context, candidateURI, contentID, episodeID string, ownerID int) *models.MediaFile {
-	row, _, _ := h.lookupVirtualCandidateRowDetailed(ctx, candidateURI, contentID, episodeID, ownerID)
-	return row
-}
-
 // lookupVirtualCandidateRowDetailed resolves the catalog row that owns a
 // concrete candidate URI and distinguishes a genuine not-found from a lookup
 // failure or an incomplete row. found is false with a nil error only when no
 // configured lookup knows the candidate; a lookup error or a non-nil row
 // without an identity is returned as an error so the caller can fail closed.
+//
+// The exact-path lookup is authoritative: when it fails with a real lookup
+// error, that error is preserved even if the provider-neutral fallback
+// succeeds and returns a healthy row. The candidate's exact identity is the one
+// whose verdict matters, and masking a failure to read it with a healthy
+// fallback row would let a failed candidate be treated as eligible. The
+// fallback row is still returned alongside the error so metadata-only callers
+// can enrich from it; verdict callers inspect the error first and refuse.
+//
+// A genuine not-found is the exception: a row stored under the neutral key but
+// requested with a concrete ?result= URI misses the exact lookup by design, so
+// ErrVirtualCandidateNotFound (or scanner.ErrFileNotFound) does not taint the
+// fallback row. An incomplete exact row still taints it, because that verdict
+// is unknowable rather than absent.
 func (h *PlaybackHandler) lookupVirtualCandidateRowDetailed(ctx context.Context, candidateURI, contentID, episodeID string, ownerID int) (*models.MediaFile, bool, error) {
 	if h == nil || candidateURI == "" {
 		return nil, false, nil
 	}
-	var lookupErr error
-	incomplete := false
-	consider := func(row *models.MediaFile, err error) (*models.MediaFile, bool) {
+	var exactErr, fallbackErr error
+	exactIncomplete, fallbackIncomplete := false, false
+	consider := func(row *models.MediaFile, err error, exact bool) (*models.MediaFile, bool) {
 		if err != nil {
-			if lookupErr == nil {
-				lookupErr = err
+			if exact {
+				if exactErr == nil {
+					exactErr = err
+				}
+			} else if fallbackErr == nil {
+				fallbackErr = err
 			}
 			return nil, false
 		}
@@ -2567,31 +2701,47 @@ func (h *PlaybackHandler) lookupVirtualCandidateRowDetailed(ctx context.Context,
 		// A non-nil row without an identity cannot carry a trustworthy
 		// verdict; remember it and let the other lookup still own the
 		// candidate.
-		incomplete = true
+		if exact {
+			exactIncomplete = true
+		} else {
+			fallbackIncomplete = true
+		}
 		return nil, false
 	}
 	if h.VirtualFileLookup != nil {
-		if row, found := consider(h.VirtualFileLookup(ctx, candidateURI)); found {
-			if lookupErr != nil && !isVirtualCandidateNotFound(lookupErr) {
-				return nil, false, lookupErr
-			}
+		exactRow, exactLookupErr := h.VirtualFileLookup(ctx, candidateURI)
+		if row, found := consider(exactRow, exactLookupErr, true); found {
+			// The exact identity is authoritative; the fallback is not
+			// consulted and cannot override it.
 			return row, true, nil
 		}
 	}
 	if h.VirtualCandidateFileLookup != nil {
-		if row, found := consider(h.VirtualCandidateFileLookup(ctx, virtualPlaybackNeutralKey(candidateURI), contentID, episodeID, ownerID)); found {
-			if lookupErr != nil && !isVirtualCandidateNotFound(lookupErr) {
-				return nil, false, lookupErr
+		fallbackRow, fallbackLookupErr := h.VirtualCandidateFileLookup(ctx, virtualPlaybackNeutralKey(candidateURI), contentID, episodeID, ownerID)
+		if row, found := consider(fallbackRow, fallbackLookupErr, false); found {
+			// A genuine not-found from the exact lookup is not a taint: the
+			// fallback row is the one the provider-neutral key owns. A real
+			// lookup error or an incomplete exact row still fails closed.
+			if exactErr != nil && !isVirtualCandidateNotFound(exactErr) {
+				return row, true, exactErr
+			}
+			if exactIncomplete {
+				return row, true, errVirtualCandidateVerdictIncomplete
 			}
 			return row, true, nil
 		}
 	}
-	if lookupErr != nil {
-		return nil, false, lookupErr
+	if exactErr != nil && !isVirtualCandidateNotFound(exactErr) {
+		return nil, false, exactErr
 	}
-	if incomplete {
+	if fallbackErr != nil && !isVirtualCandidateNotFound(fallbackErr) {
+		return nil, false, fallbackErr
+	}
+	if exactIncomplete || fallbackIncomplete {
 		return nil, false, errVirtualCandidateVerdictIncomplete
 	}
+	// Both lookups reported a genuine not-found (or were not configured): no
+	// catalog row owns the candidate, so there is no verdict to enforce.
 	return nil, false, nil
 }
 
@@ -2745,6 +2895,16 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 						"component", "api", "file_id", file.ID, "candidate", stream.URI)
 					return nil
 				}
+				// The verdict check that validated this candidate ran in
+				// resolveVirtualCandidateSource, before this write. A failure
+				// committed in between must still block adoption: the save
+				// below carries the validated identity and the saver fences the
+				// write against a live failed_at verdict in the same statement.
+				// The barrier hook exists so a test can commit that failure in
+				// exactly this window.
+				if virtualAdoptionBarrier != nil {
+					virtualAdoptionBarrier()
+				}
 				snap := snapshotVirtualRow(file)
 				rows, saveErr := h.VirtualFileSaver(ctx, models.VirtualFilePersistArgs{
 					FileID:           snap.FileID,
@@ -2765,8 +2925,25 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					OwnerID:          snap.OwnerID,
 					LibraryID:        snap.LibraryID,
 					AdoptPath:        resolved.URI,
+					// The fallback reports a substitute identity to the
+					// session, so metadata alone is not enough: the saver must
+					// confirm the validated identity was actually adopted.
+					RequireAdopt: true,
+					// An explicit retry deliberately re-adopts a known-bad
+					// candidate, so the verdict fence must not block it.
+					AllowFailedVerdict: elig.allowFailed,
 				})
 				if saveErr != nil {
+					if errors.Is(saveErr, errVirtualAdoptIdentityNotPersisted) {
+						// Metadata may still have landed, but the validated
+						// identity did not: reporting the substitute would
+						// serve bytes the catalog row does not own. Refuse and
+						// let the next start re-list.
+						slog.WarnContext(ctx, "virtual stale fallback: substitute identity was not adopted",
+							"component", "api", "file_id", file.ID,
+							"expected_path", file.FilePath, "adopt_path", resolved.URI, "error", saveErr)
+						return nil
+					}
 					slog.ErrorContext(ctx, "virtual stale fallback: persist failed", "component", "api", "file_id", file.ID, "error", saveErr)
 					return nil
 				}
@@ -2785,6 +2962,15 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 				}
 			}
 			return resolved
+		}
+		if errors.Is(err, errVirtualCandidateVerdictUnknown) {
+			// The catalog could not answer for this sibling. Continuing would
+			// try other siblings while the catalog is unhealthy, and treating
+			// the unknown verdict as a dead candidate could substitute one the
+			// verdict system never cleared. Fail the whole fallback closed.
+			slog.ErrorContext(ctx, "virtual stale fallback: refusing to substitute while the candidate verdict is unknown",
+				"component", "api", "candidate", stream.URI, "error", err)
+			return nil
 		}
 		slog.ErrorContext(ctx, "virtual stale fallback: candidate failed", "component", "api", "candidate", stream.URI, "error", err)
 	}
