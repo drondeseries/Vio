@@ -146,7 +146,8 @@ func TestVirtualFileMetadataUpdateSQLShape(t *testing.T) {
 	wantCounts := map[int]int{
 		1: 1, 2: 3, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 2,
 		11: 1, 12: 2, 13: 2, 14: 1, 15: 1, 16: 7, 17: 7, 18: 11, 19: 4,
-		20: 2, 21: 2, 22: 1, 23: 3, 24: 1, 25: 1, 26: 1, 27: 1, 28: 1, 29: 1,
+		20: 2, 21: 2, 22: 1, 23: 4, 24: 1, 25: 2, 26: 2, 27: 2, 28: 2, 29: 2,
+		30: 8,
 	}
 	for n, want := range wantCounts {
 		if got := occurrences[n]; got != want {

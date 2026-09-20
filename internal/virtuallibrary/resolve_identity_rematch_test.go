@@ -84,6 +84,83 @@ func TestResolveDetailedRematchesSameReleaseByIdentity(t *testing.T) {
 	}
 }
 
+// TestResolveDetailedRematchUpdatesSessionPreferredID is the regression for a
+// session-bound rematch whose caller also passes the dead preferred id: both the
+// requested result id and the session's preferred id name the old, now-absent
+// result. The rematch must move the preferred id to the re-identified candidate
+// so the dead-session guard below sees the session's own release and serves it
+// instead of refusing a valid rematch. Substitution stays disabled.
+func TestResolveDetailedRematchUpdatesSessionPreferredID(t *testing.T) {
+	server := identityRematchProvider(t)
+	svc := virtuallibrary.New(virtuallibrary.Config{
+		Enabled:           true,
+		ManifestURL:       server.URL + "/manifest.json",
+		AllowInsecureHTTP: true,
+	}, nil, nil)
+	ctx := context.Background()
+	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
+	if err != nil || len(streams) != 2 {
+		t.Fatalf("ListStreams: count=%d err=%v, want 2", len(streams), err)
+	}
+	target := streams[0]
+	identity := virtuallibrary.PersistedCandidateIdentity{
+		ReleaseName: target.ProviderReleaseName,
+		ReleaseSize: target.FileSize,
+	}
+
+	res, err := svc.ResolveDetailed(
+		virtuallibrary.WithPersistedCandidateIdentity(ctx, identity),
+		"virtual://movie/tt100?result="+absentResultID,
+		false, nil, absentResultID, true, false,
+	)
+	if err != nil {
+		t.Fatalf("a valid rematch was rejected when the caller passed the dead preferred id: %v", err)
+	}
+	if !res.IdentityRematched {
+		t.Fatal("resolver did not report the same-release re-identification")
+	}
+	if res.CandidateID != target.ID {
+		t.Fatalf("rematched candidate = %q, want %q", res.CandidateID, target.ID)
+	}
+	if !strings.Contains(res.URI, "result="+target.ID) {
+		t.Fatalf("rematched URI = %q, want the new result id", res.URI)
+	}
+}
+
+// TestResolveDetailedRematchStillRefusesDifferentRelease guards the other side
+// of the regression: a session pin that no listed candidate matches by durable
+// identity is still a dead release, even when the caller passes the preferred
+// id. Moving the preferred id only applies to a proven same-release rematch.
+func TestResolveDetailedRematchStillRefusesDifferentRelease(t *testing.T) {
+	server := identityRematchProvider(t)
+	svc := virtuallibrary.New(virtuallibrary.Config{
+		Enabled:           true,
+		ManifestURL:       server.URL + "/manifest.json",
+		AllowInsecureHTTP: true,
+	}, nil, nil)
+	streams, err := svc.ListStreams(context.Background(), "virtual://movie/tt100")
+	if err != nil || len(streams) != 2 {
+		t.Fatalf("ListStreams: count=%d err=%v, want 2", len(streams), err)
+	}
+	identity := virtuallibrary.PersistedCandidateIdentity{
+		VideoHash:   "a-hash-no-listed-candidate-carries",
+		ReleaseName: streams[0].ProviderReleaseName,
+		ReleaseSize: streams[0].FileSize,
+	}
+
+	_, err = svc.ResolveDetailed(
+		virtuallibrary.WithPersistedCandidateIdentity(context.Background(), identity),
+		"virtual://movie/tt100?result="+absentResultID,
+		false, nil, absentResultID, true, false,
+	)
+	if err == nil {
+		t.Fatal("a genuinely different release was served under the session binding")
+	}
+	if !strings.Contains(err.Error(), "no longer listed") {
+		t.Fatalf("error = %v, want the session-bound dead-pin refusal", err)
+	}
+}
+
 // TestResolveDetailedRematchRejectsSameNameDifferentSize proves a provider that
 // reuses a release name cannot be treated as the same release when the size
 // differs and there is no stronger identity tier.

@@ -28,9 +28,11 @@ import (
 // Each write carries its original CAS snapshot (updated_at, probe_updated_at,
 // owner, library) so the SQL fence rejects a write whose row has moved on. A
 // transient failure is retried with bounded exponential backoff; a permanent
-// database error, a CAS miss (rows affected zero), or exhausted retries is a
-// terminal failure that is logged and dropped. A CAS miss is never retried: a
-// newer writer already committed the row.
+// database error, a CAS miss (rows affected zero), a deterministic adoption
+// refusal (errVirtualAdoptIdentityNotPersisted), or exhausted retries is a
+// terminal failure that is logged once and dropped. Neither a CAS miss nor an
+// adoption refusal is ever retried: a newer writer already committed the row,
+// and a refusal is a property of the row's state that a retry cannot change.
 //
 // Shutdown: closure and admission share the buffer mutex, so the moment
 // shutdown begins no further admission can be accepted; a later admit is
@@ -143,7 +145,8 @@ type virtualEvidenceTask struct {
 // a different adoption target (a different release), a different stamping mode,
 // or a different adoption requirement is a distinct task so coalescing cannot
 // drop a probe stamp, write one source's evidence under another's identity, or
-// fold a fenced cross-release write into a metadata-only one.
+// fold a fenced cross-release write (RequireAdopt) into a metadata-only one
+// that shares its row, path and adoption target.
 func virtualEvidenceKey(args models.VirtualFilePersistArgs) string {
 	return fmt.Sprintf("%d\x00%d\x00%s\x00%s\x00%t\x00%t",
 		args.FileID, args.OwnerID, args.ExpectedFilePath, args.AdoptPath, args.StampProbe, args.RequireAdopt)
@@ -543,7 +546,9 @@ func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, 
 		return err == nil && rows > 0, err
 	}
 	var lastErr error
+	attempts := 0
 	for attempt := 1; attempt <= virtualEvidenceMaxAttempts; attempt++ {
+		attempts = attempt
 		deadline := h.effectiveEvidenceDeadline(drainDeadline)
 		if attempt > 1 {
 			delay := virtualEvidenceBackoff(attempt)
@@ -582,9 +587,19 @@ func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, 
 		}
 	}
 terminal:
-	slog.Error("virtual probe evidence persist terminal failure",
-		"component", "api", "file_id", task.args.FileID, "attempts", virtualEvidenceMaxAttempts,
-		"error", lastErr)
+	attrs := []any{
+		"component", "api",
+		"file_id", task.args.FileID,
+		"attempts", attempts,
+		"error", lastErr,
+	}
+	// The candidate identity is the reason an adoption refusal is deterministic:
+	// the row could not take this path. Carry it so the one terminal log
+	// identifies what was refused instead of only the file it belongs to.
+	if task.args.AdoptPath != "" {
+		attrs = append(attrs, "candidate", task.args.AdoptPath)
+	}
+	slog.Error("virtual probe evidence persist terminal failure", attrs...)
 	return lastErr
 }
 
@@ -634,14 +649,25 @@ func virtualEvidenceBackoff(attempt int) time.Duration {
 }
 
 // virtualEvidenceRetryable classifies a write error. Cancellation stops the
-// task; integrity and data/syntax-class database errors are permanent; a
-// timeout, a connection error or any other transport fault is transient and
-// worth a bounded retry.
+// task; a deterministic adoption refusal is not retried because it would fail
+// identically every time; integrity and data/syntax-class database errors are
+// permanent; a timeout, a connection error or any other transport fault is
+// transient and worth a bounded retry.
+//
+// Determinism of errVirtualAdoptIdentityNotPersisted: the target row's state
+// (a sibling owner of the candidate path, a collection-owned row with no
+// adoption target, or a live failed verdict) will not change between attempts,
+// and the caller supplied a fixed CAS snapshot. Re-running the same fenced
+// statement therefore reproduces the refusal rather than racing a fixable
+// transposition, so the three-attempt retry was pure noise and is dropped here.
 func virtualEvidenceRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, errVirtualAdoptIdentityNotPersisted) {
 		return false
 	}
 	var pgErr *pgconn.PgError

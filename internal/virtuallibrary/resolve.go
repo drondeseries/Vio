@@ -406,6 +406,15 @@ func (s *Service) ResolveDetailed(
 				); found {
 					if matchedID := stream.CandidateVariantID(matched); matchedID != "" && matchedID != effectiveResultID {
 						effectiveResultID = matchedID
+						// The matched candidate is the same release as the
+						// session's binding, now listed under a new id. Keep the
+						// preferred id in step with it and re-mark the session
+						// release resolvable: otherwise the dead-session guard
+						// below sees only the old, now-absent id and rejects a
+						// valid rematch. Substitution stays disabled — this
+						// binds to the session's own release, not to a sibling.
+						effectivePreferredID = matchedID
+						sessionReleaseResolvable = true
 						identityRematched = true
 						// The matched candidate is the session-bound release, so
 						// the profile filter must not remove it (same rule as a

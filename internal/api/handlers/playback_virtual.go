@@ -2347,18 +2347,34 @@ UPDATE media_files SET
   -- neutral ?result= file_path. A resolution with no URL (a metadata-only
   -- write) must not erase the stored one; only a newer successful resolution
   -- overwrites it, and its expiry is replaced with it so the pair always
-  -- describes the same URL. The identity tiers COALESCE so an omitted tier
-  -- preserves the last known value.
-  resolved_url     = CASE WHEN NULLIF($23,'') IS NOT NULL THEN $23 ELSE resolved_url END,
-  resolved_url_expires_at = CASE WHEN NULLIF($23,'') IS NOT NULL THEN $24::timestamptz ELSE resolved_url_expires_at END,
-  provider_video_hash     = COALESCE(NULLIF($25,''), provider_video_hash),
-  provider_guid           = COALESCE(NULLIF($26,''), provider_guid),
-  provider_release_name   = COALESCE(NULLIF($27,''), provider_release_name),
-  provider_release_size   = COALESCE(NULLIF($28::bigint,0), provider_release_size),
-  -- Request headers belong to the resolved URL. A metadata-only write carries
-  -- no header set and must preserve the stored one; only a resolution that
-  -- actually produced headers overwrites it.
-  provider_request_headers = COALESCE($29::jsonb, provider_request_headers),
+  -- describes the same URL.
+  --
+  -- A required adoption of a different release ($30) replaces the whole
+  -- transport set instead of preserving on omission: an omitted identity tier,
+  -- URL, expiry or header set belongs to the release being left behind and must
+  -- not survive attached to the new release path. For the same release a
+  -- supplied URL still replaces the URL and its header set (a refreshed URL
+  -- with no headers clears the old set rather than orphaning it), while an
+  -- omitted tier preserves the last known value.
+  resolved_url     = CASE
+    WHEN $30 OR NULLIF($23,'') IS NOT NULL THEN NULLIF($23,'')
+    ELSE resolved_url
+  END,
+  resolved_url_expires_at = CASE
+    WHEN $30 OR NULLIF($23,'') IS NOT NULL THEN $24::timestamptz
+    ELSE resolved_url_expires_at
+  END,
+  provider_video_hash     = CASE WHEN $30 THEN NULLIF($25,'') ELSE COALESCE(NULLIF($25,''), provider_video_hash) END,
+  provider_guid           = CASE WHEN $30 THEN NULLIF($26,'') ELSE COALESCE(NULLIF($26,''), provider_guid) END,
+  provider_release_name   = CASE WHEN $30 THEN NULLIF($27,'') ELSE COALESCE(NULLIF($27,''), provider_release_name) END,
+  provider_release_size   = CASE WHEN $30 THEN NULLIF($28::bigint,0) ELSE COALESCE(NULLIF($28::bigint,0), provider_release_size) END,
+  -- Request headers belong to the resolved URL. A transport replacement carries
+  -- the complete new set (NULL when the new resolution has none, which clears
+  -- the old one); without one, a metadata-only write preserves the stored set.
+  provider_request_headers = CASE
+    WHEN $30 OR NULLIF($23,'') IS NOT NULL THEN $29::jsonb
+    ELSE COALESCE($29::jsonb, provider_request_headers)
+  END,
   duration         = CASE WHEN $10 > 0 THEN $10 ELSE duration END,
   audio_channels   = COALESCE(
     (SELECT (elem->>'channels')::int
@@ -2502,6 +2518,12 @@ type VirtualFileMetadataUpdateResult struct {
 //     are not written either. Metadata-only writers keep the previous
 //     best-effort adoption. RETURNING file_path reports what the row actually
 //     persisted when a row did match.
+//   - A required adoption of a different release replaces the stored transport
+//     fields (resolved URL and expiry, durable identity tiers, request headers)
+//     as a set rather than preserving on omission: an omitted tier or URL
+//     belongs to the release being left behind and must not survive attached to
+//     the new release's path. A same-release write keeps preserve-on-omission,
+//     while a supplied URL always replaces the URL and its header set.
 //
 // Two concurrent probes can both pass the sibling guard and one still loses the
 // unique-index race (media_files_virtual_file_owner_key). For a metadata-only
@@ -2555,6 +2577,15 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 		// adoption; the metadata-only retry clears adoptPath and therefore
 		// writes evidence on the row's current path as before.
 		requireAdoption := args.RequireAdopt && adoptPath != ""
+		// A required adoption of a different release replaces the stored
+		// transport fields as a set ($30): an omitted identity tier, URL or
+		// header set belongs to the release the row is leaving and must not
+		// survive under the new path. Neutral-key equality is the release test
+		// (a neutral row adopting its own concrete pick is the same release);
+		// a metadata-only retry (adoptPath cleared) and a same-release adoption
+		// keep the preserve-on-omission behavior.
+		replaceIdentity := requireAdoption &&
+			virtualPlaybackNeutralKey(args.ExpectedFilePath) != virtualPlaybackNeutralKey(adoptPath)
 		var persistedPath string
 		err := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
 			vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
@@ -2563,7 +2594,7 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 			neutralPath, verdictMaxAgeSeconds, fenceVerdict, requireAdoption,
 			args.ResolvedURL, args.ResolvedURLExpiresAt,
 			args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
-			providerRequestHeadersJSON,
+			providerRequestHeadersJSON, replaceIdentity,
 		).Scan(&persistedPath)
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No row matched the CAS fence: a stale snapshot, reported as a

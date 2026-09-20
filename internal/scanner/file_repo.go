@@ -1440,10 +1440,16 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				provider_guid=COALESCE(EXCLUDED.provider_guid, media_files.provider_guid),
 				provider_release_name=COALESCE(EXCLUDED.provider_release_name, media_files.provider_release_name),
 				provider_release_size=COALESCE(EXCLUDED.provider_release_size, media_files.provider_release_size),
-				-- Request headers belong to the stored URL. A re-list that omits
-				-- them preserves the last set so a header-authenticated URL is
-				-- not orphaned; a newer listing with headers replaces it.
-				provider_request_headers=COALESCE(EXCLUDED.provider_request_headers, media_files.provider_request_headers),
+				-- Request headers belong to the stored URL. A re-list that
+				-- refreshes the URL replaces the complete header set, including
+				-- clearing it when the new URL carries none: a header-less URL
+				-- must not inherit the previous URL's credentials. A re-list
+				-- that omits the URL preserves the stored set so a
+				-- header-authenticated URL is not orphaned.
+				provider_request_headers = CASE
+					WHEN EXCLUDED.resolved_url IS NOT NULL THEN EXCLUDED.provider_request_headers
+					ELSE COALESCE(EXCLUDED.provider_request_headers, media_files.provider_request_headers)
+				END,
 				-- Registration is not a probe: preserve any existing real probe
 				-- timestamp (NULL stays NULL) so the probe repair gate can fill
 				-- real track inventory later.
