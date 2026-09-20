@@ -224,6 +224,11 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 	if !strings.Contains(sql, "WHEN NOT $13::boolean THEN probe_source") {
 		t.Fatalf("metadata update does not gate probe stamp on stampProbe flag: %s", sql)
 	}
+	// A clear branch must exist for a release swap: the row must stop looking
+	// probed so the next start re-probes the adopted bytes.
+	if !strings.Contains(sql, "WHEN $31::boolean THEN NULL") {
+		t.Fatalf("metadata update does not clear the probe stamp on a clear request: %s", sql)
+	}
 	// A stale background probe must not overwrite evidence committed since
 	// its snapshot: the CAS fence binds the row to the caller's snapshot.
 	if !strings.Contains(sql, "AND updated_at     = $14") {

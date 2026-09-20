@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -86,6 +87,131 @@ func TestResolveVirtualInputAdoptsRematchedIdentity(t *testing.T) {
 	}
 	if args.ProviderRequestHeaders["Referer"] != "https://provider.example/player" {
 		t.Fatalf("adopted request headers = %#v, want them persisted with the identity", args.ProviderRequestHeaders)
+	}
+}
+
+// TestAdoptRematchedResolutionReplacesInheritedTrackInventory proves the
+// rematch adoption does not carry the previous result id's inventory onto the
+// new one. The row's stored audio labels and subtitle tracks belong to the old
+// concrete candidate; the adoption writes the matched candidate's declared
+// audio languages, drops the subtitle inventory (native never synthesizes
+// embedded subtitle streams), and clears the probe stamp so the next start
+// re-probes the real bytes. The identity is still supplied as the expected row
+// identity so the same-release transport fields stay on preserve-on-omission.
+func TestAdoptRematchedResolutionReplacesInheritedTrackInventory(t *testing.T) {
+	const pinned = "virtual://movie/tt-rematch-tracks?result=cand-old"
+	const rematchedURI = "virtual://movie/tt-rematch-tracks?result=cand-new"
+	row := &models.MediaFile{
+		ID:          96,
+		FilePath:    pinned,
+		UpdatedAt:   time.Now().Add(-time.Minute),
+		VideoTracks: []models.VideoTrack{{Codec: "hevc"}},
+		AudioTracks: []models.AudioTrack{{Codec: "eac3", Language: "fr", Title: "French (France)", Channels: 6}},
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 5, Codec: "subrip", Language: "fr", Title: "French (France)"},
+		},
+		CodecAudio:                 "eac3",
+		ProviderVideoHash:          "HASH1",
+		ProviderGUID:               "GUID1",
+		VirtualOwnerInstallationID: 5,
+		MediaFolderID:              3,
+	}
+	var saved []models.VirtualFilePersistArgs
+	metaSaver := func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		saved = append(saved, args)
+		return VirtualFileMetadataUpdateResult{RowsAffected: 1, MetadataUpdated: true, IdentityAdopted: true}, nil
+	}
+	adoptRematchedVirtualResolution(context.Background(), row, ResolvedVirtualMedia{
+		URL:               "https://93.184.216.34/stream/rematched",
+		URI:               rematchedURI,
+		CandidateID:       "cand-new",
+		IdentityRematched: true,
+		ProviderVideoHash: "HASH1",
+		ProviderGUID:      "GUID1",
+		CodecAudio:        "eac3",
+		AudioLanguages:    []string{"en", "fr"},
+		SubtitleLanguages: []string{"en"},
+	}, metaSaver, nil)
+
+	if len(saved) != 1 {
+		t.Fatalf("adoption writes = %d, want exactly 1", len(saved))
+	}
+	args := saved[0]
+	if args.AdoptPath != rematchedURI || !args.RequireAdopt {
+		t.Fatalf("adoption args = %#v, want the rematched identity under the fence", args)
+	}
+	if !args.ClearProbe {
+		t.Fatal("rematch adoption did not clear the stale probe stamp")
+	}
+	if args.ExpectedProviderVideoHash != "HASH1" || args.ExpectedProviderGUID != "GUID1" {
+		t.Fatalf("expected identity = (%q, %q), want the row's own identity", args.ExpectedProviderVideoHash, args.ExpectedProviderGUID)
+	}
+	var audio []models.AudioTrack
+	if err := json.Unmarshal(args.AudioTracks, &audio); err != nil {
+		t.Fatalf("unmarshal adopted audio tracks: %v", err)
+	}
+	if len(audio) != 2 {
+		t.Fatalf("adopted audio tracks = %#v, want the matched candidate's two declared languages", audio)
+	}
+	for _, track := range audio {
+		if track.Language == "" || track.Language == "fr" && track.Title == "French (France)" {
+			t.Fatalf("adopted audio track = %#v, want declared languages, not the old row label", track)
+		}
+	}
+	var subtitle []models.SubtitleTrack
+	if err := json.Unmarshal(args.SubtitleTracks, &subtitle); err != nil {
+		t.Fatalf("unmarshal adopted subtitle tracks: %v", err)
+	}
+	if len(subtitle) != 0 {
+		t.Fatalf("adopted subtitle tracks = %#v, want the old inventory dropped", subtitle)
+	}
+}
+
+// TestRefreshStoredResolutionKeepsSameCandidateTracks proves the same-release
+// non-adoption write is unchanged: refreshing an expired stored URL for the
+// row's own candidate passes the row's inventory and probe stamp through
+// untouched. Only a concrete identity change invalidates evidence.
+func TestRefreshStoredResolutionKeepsSameCandidateTracks(t *testing.T) {
+	const candidatePath = "virtual://movie/tt-refresh-tracks?result=cand-a"
+	probeAt := time.Now().Add(-time.Hour)
+	row := &models.MediaFile{
+		ID:             97,
+		FilePath:       candidatePath,
+		UpdatedAt:      time.Now().Add(-time.Minute),
+		AudioTracks:    []models.AudioTrack{{Codec: "eac3", Language: "fr", Channels: 6}},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 5, Codec: "subrip", Language: "fr"}},
+		ProbeUpdatedAt: &probeAt,
+	}
+	var saved []models.VirtualFilePersistArgs
+	metaSaver := func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		saved = append(saved, args)
+		return VirtualFileMetadataUpdateResult{RowsAffected: 1, MetadataUpdated: true}, nil
+	}
+	refreshStoredVirtualResolution(context.Background(), row, ResolvedVirtualMedia{
+		URL:         "https://93.184.216.34/stream/refreshed",
+		URI:         candidatePath,
+		CandidateID: "cand-a",
+	}, metaSaver, nil)
+
+	if len(saved) != 1 {
+		t.Fatalf("refresh writes = %d, want exactly 1", len(saved))
+	}
+	args := saved[0]
+	if args.AdoptPath != "" {
+		t.Fatalf("refresh adopted %q, want no adoption", args.AdoptPath)
+	}
+	if args.ClearProbe {
+		t.Fatal("same-candidate refresh cleared the probe stamp")
+	}
+	var audio []models.AudioTrack
+	if err := json.Unmarshal(args.AudioTracks, &audio); err != nil {
+		t.Fatalf("unmarshal refreshed audio tracks: %v", err)
+	}
+	if len(audio) != 1 || audio[0].Language != "fr" {
+		t.Fatalf("refreshed audio tracks = %#v, want the row's own inventory preserved", audio)
+	}
+	if args.ProbeUpdatedAt == nil || !args.ProbeUpdatedAt.Equal(probeAt) {
+		t.Fatalf("probe stamp = %v, want the row's own stamp preserved", args.ProbeUpdatedAt)
 	}
 }
 

@@ -173,6 +173,13 @@ type ResolvedVirtualMedia struct {
 	// re-identified, not a substitution, and the caller adopts the new
 	// identity instead of reporting a release swap.
 	IdentityRematched bool
+	// CodecAudio, AudioLanguages and SubtitleLanguages are the resolved
+	// candidate's provider-declared inventory. They are not probe evidence:
+	// they come from the release metadata, may be incomplete or wrong, and are
+	// only used to seed a declared inventory while the real probe catches up.
+	CodecAudio        string
+	AudioLanguages    []string
+	SubtitleLanguages []string
 }
 
 // effectiveVirtualOwner returns the first positive installation owner from the

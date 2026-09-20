@@ -117,6 +117,17 @@ const (
 	virtualEvidenceResultUnknown   = "unknown"
 )
 
+// Log attribute keys shared by the evidence pipeline's terminal failure line.
+// They are named constants so the repeated literals stay out of the changed
+// lines (goconst) and every occurrence cannot drift from the others.
+const (
+	virtualEvidenceLogKeyComponent = "component"
+	virtualEvidenceLogKeyFileID    = "file_id"
+	virtualEvidenceLogKeyAttempts  = "attempts"
+	virtualEvidenceLogKeyError     = "error"
+	virtualEvidenceLogValueAPI     = "api"
+)
+
 func (a virtualEvidenceAdmission) String() string {
 	switch a {
 	case virtualEvidenceAccepted:
@@ -588,10 +599,10 @@ func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, 
 	}
 terminal:
 	attrs := []any{
-		"component", "api",
-		"file_id", task.args.FileID,
-		"attempts", attempts,
-		"error", lastErr,
+		virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI,
+		virtualEvidenceLogKeyFileID, task.args.FileID,
+		virtualEvidenceLogKeyAttempts, attempts,
+		virtualEvidenceLogKeyError, lastErr,
 	}
 	// The candidate identity is the reason an adoption refusal is deterministic:
 	// the row could not take this path. Carry it so the one terminal log

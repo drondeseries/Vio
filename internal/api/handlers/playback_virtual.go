@@ -24,6 +24,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/text/language"
@@ -2418,13 +2419,19 @@ UPDATE media_files SET
     THEN $18
     ELSE file_path
   END,
+  -- A clear invalidates evidence the caller proved does not describe the
+  -- adopted bytes (a release swap): probe_source and probe_updated_at go
+  -- together so the row no longer looks probed and the next start re-probes.
+  -- Collection-owned rows keep their stamp, exactly like the stamp flag.
   probe_source     = CASE
     WHEN probe_source = 'virtual_collection' THEN probe_source
+    WHEN $31::boolean THEN NULL
     WHEN NOT $13::boolean THEN probe_source
     ELSE 'virtual'
   END,
   probe_updated_at = CASE
     WHEN probe_source = 'virtual_collection' THEN probe_updated_at
+    WHEN $31::boolean THEN NULL
     WHEN NOT $13::boolean THEN probe_updated_at
     ELSE GREATEST(clock_timestamp(), probe_updated_at + interval '1 microsecond')
   END,
@@ -2487,6 +2494,42 @@ type VirtualFileMetadataDB interface {
 	QueryRow(ctx context.Context, sql string, arguments ...any) pgx.Row
 }
 
+// virtualPersistAdoptionReplacesTransport reports whether a required adoption
+// moves the row to a different release, in which case the stored transport set
+// (resolved URL and expiry, durable identity tiers, request headers) must be
+// replaced rather than preserved on omission.
+//
+// The test is the durable candidate identity in the same tier precedence the
+// deduplication chain uses (video hash, then source GUID, then normalized
+// release name plus exact size). It deliberately is not the item-level neutral
+// key: virtual://movie/tt100?result=a and ?result=b share a neutral key, yet
+// they are different releases unless their identity tiers prove otherwise. A
+// tier present on only one side is not proof, so an unprovable pair replaces:
+// preserving release A's hash under release B's path is exactly the defect this
+// guards against.
+func virtualPersistAdoptionReplacesTransport(args models.VirtualFilePersistArgs, adoptPath string) bool {
+	// Adopting the path the row already carries changes no release: it is a
+	// metadata-only write that happens to pass the same AdoptPath, and the
+	// stored transport must survive. This also keeps a neutral row's own
+	// candidate pick (a path with a ?result= added to the row's own neutral
+	// path) on preserve-on-omission when neither side carries an identity.
+	if strings.TrimSpace(adoptPath) == strings.TrimSpace(args.ExpectedFilePath) {
+		return false
+	}
+	expected := resolver.PersistedDedupKey(
+		args.ExpectedProviderVideoHash, args.ExpectedProviderGUID,
+		args.ExpectedProviderReleaseName, args.ExpectedProviderReleaseSize,
+	)
+	candidate := resolver.PersistedDedupKey(
+		args.ProviderVideoHash, args.ProviderGUID,
+		args.ProviderReleaseName, args.ProviderReleaseSize,
+	)
+	if expected == "" || candidate == "" {
+		return true
+	}
+	return expected != candidate
+}
+
 // VirtualFileMetadataUpdateResult reports metadata persistence separately
 // from identity adoption. The UPDATE returns the persisted file_path, so
 // adoption is observed atomically in the same statement: it holds exactly when
@@ -2522,8 +2565,15 @@ type VirtualFileMetadataUpdateResult struct {
 //     fields (resolved URL and expiry, durable identity tiers, request headers)
 //     as a set rather than preserving on omission: an omitted tier or URL
 //     belongs to the release being left behind and must not survive attached to
-//     the new release's path. A same-release write keeps preserve-on-omission,
-//     while a supplied URL always replaces the URL and its header set.
+//     the new release's path. "Different release" is decided by the durable
+//     candidate identity (see virtualPersistAdoptionReplacesTransport), not the
+//     item-level neutral key, so ?result=a -> ?result=b on one item replaces.
+//     A proven same-release write keeps preserve-on-omission, while a supplied
+//     URL always replaces the URL and its header set.
+//   - ClearProbe invalidates the stored probe evidence in the same statement
+//     (probe_source and probe_updated_at to NULL) so a row whose inventory no
+//     longer describes the adopted bytes re-probes on the next start. It is
+//     independent of StampProbe.
 //
 // Two concurrent probes can both pass the sibling guard and one still loses the
 // unique-index race (media_files_virtual_file_owner_key). For a metadata-only
@@ -2580,12 +2630,13 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 		// A required adoption of a different release replaces the stored
 		// transport fields as a set ($30): an omitted identity tier, URL or
 		// header set belongs to the release the row is leaving and must not
-		// survive under the new path. Neutral-key equality is the release test
-		// (a neutral row adopting its own concrete pick is the same release);
-		// a metadata-only retry (adoptPath cleared) and a same-release adoption
-		// keep the preserve-on-omission behavior.
-		replaceIdentity := requireAdoption &&
-			virtualPlaybackNeutralKey(args.ExpectedFilePath) != virtualPlaybackNeutralKey(adoptPath)
+		// survive under the new path. The release test is the durable identity,
+		// not the item-level neutral key: the ordinary replacement
+		// virtual://movie/tt100?result=a -> ?result=b shares a neutral key, so a
+		// key comparison would preserve A's fields under B. A metadata-only
+		// retry (adoptPath cleared) and a proven same-release adoption keep the
+		// preserve-on-omission behavior.
+		replaceIdentity := requireAdoption && virtualPersistAdoptionReplacesTransport(args, adoptPath)
 		var persistedPath string
 		err := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
 			vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
@@ -2594,7 +2645,7 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 			neutralPath, verdictMaxAgeSeconds, fenceVerdict, requireAdoption,
 			args.ResolvedURL, args.ResolvedURLExpiresAt,
 			args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
-			providerRequestHeadersJSON, replaceIdentity,
+			providerRequestHeadersJSON, replaceIdentity, args.ClearProbe,
 		).Scan(&persistedPath)
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No row matched the CAS fence: a stale snapshot, reported as a
@@ -2802,9 +2853,18 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 		StampProbe:       stampProbe,
 		UpdatedAt:        snap.UpdatedAt,
 		ProbeUpdatedAt:   snap.ProbeUpdatedAt,
-		OwnerID:          snap.OwnerID,
-		LibraryID:        snap.LibraryID,
-		AdoptPath:        adoptPath,
+		// The row's own identity, for the release-replacement gate when this
+		// write adopts a cross-release candidate path. The probe path carries no
+		// candidate identity, so an adopted cross-release write replaces the
+		// transport set (clearing the previous release's) rather than leaving
+		// its URL, expiry, identity or headers attached to the new path.
+		ExpectedProviderVideoHash:   catalogFile.ProviderVideoHash,
+		ExpectedProviderGUID:        catalogFile.ProviderGUID,
+		ExpectedProviderReleaseName: catalogFile.ProviderReleaseName,
+		ExpectedProviderReleaseSize: catalogFile.ProviderReleaseSize,
+		OwnerID:                     snap.OwnerID,
+		LibraryID:                   snap.LibraryID,
+		AdoptPath:                   adoptPath,
 		// Cross-release evidence requires a confirmed identity adoption; the
 		// atomic fence then refuses the entire write (tracks and stamp included)
 		// when a sibling owns the target path or the candidate's verdict is
@@ -3210,9 +3270,16 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					StampProbe:       true,
 					UpdatedAt:        snap.UpdatedAt,
 					ProbeUpdatedAt:   snap.ProbeUpdatedAt,
-					OwnerID:          snap.OwnerID,
-					LibraryID:        snap.LibraryID,
-					AdoptPath:        resolved.URI,
+					// The row being left is a different concrete release, so the
+					// identity gate must replace its transport set rather than
+					// preserve any omitted tier under the substitute's path.
+					ExpectedProviderVideoHash:   file.ProviderVideoHash,
+					ExpectedProviderGUID:        file.ProviderGUID,
+					ExpectedProviderReleaseName: file.ProviderReleaseName,
+					ExpectedProviderReleaseSize: file.ProviderReleaseSize,
+					OwnerID:                     snap.OwnerID,
+					LibraryID:                   snap.LibraryID,
+					AdoptPath:                   resolved.URI,
 					// Persist the provider URL and durable identity the
 					// resolution produced alongside the adopted identity.
 					ResolvedURL:            resolved.ResolvedURL,
@@ -4248,6 +4315,35 @@ func virtualDVLabel(isDV bool, profile int) string {
 		return ""
 	}
 	return "Profile " + strconv.Itoa(profile)
+}
+
+// declaredVirtualAudioTracks builds an audio inventory from a candidate's
+// provider-declared languages. It is a placeholder, not probe evidence: the
+// tags come from release metadata (e.g. a MULTi token in a filename), may be
+// invented, and carry no real container stream index. It reuses
+// mergeVirtualCandidateLanguages so the same tag filtering and deduplication
+// apply; an unrecognized or empty declaration yields no tracks rather than an
+// invented label. fallbackCodec carries the row's codec when the candidate
+// declares none, so a replacement row does not lose the audio codec.
+//
+// Subtitles are deliberately not synthesized: a synthesized SubtitleTrack
+// carries an ordinal no real stream backs, and the extractor maps it straight
+// to ffmpeg's 0:s:N, which is the phantom-stream failure this module already
+// documents. Declared subtitle languages never become embedded tracks; the
+// probe and the subtitle search own that inventory.
+func declaredVirtualAudioTracks(codecAudio string, languages []string, fallbackCodec string) []models.AudioTrack {
+	if len(languages) == 0 {
+		return nil
+	}
+	if codecAudio == "" {
+		codecAudio = fallbackCodec
+	}
+	probed := &models.MediaFile{}
+	mergeVirtualCandidateLanguages(probed, VirtualPlaybackStream{
+		CodecAudio:     codecAudio,
+		AudioLanguages: languages,
+	})
+	return probed.AudioTracks
 }
 
 // mergeVirtualCandidateLanguages appends provider-declared audio languages as

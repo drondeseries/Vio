@@ -38,6 +38,13 @@ type ResolvedVirtualStream struct {
 	// caller must adopt the new identity (including the new ?result= path)
 	// rather than report a release swap.
 	IdentityRematched bool
+	// CodecAudio, AudioLanguages and SubtitleLanguages are the candidate's
+	// provider-declared inventory. They are release metadata, not probe
+	// evidence, and are carried so a caller that re-binds a row to this
+	// candidate can seed a declared inventory while the probe catches up.
+	CodecAudio        string
+	AudioLanguages    []string
+	SubtitleLanguages []string
 }
 
 // PersistedCandidateIdentity is the durable identity a virtual candidate row
@@ -545,6 +552,11 @@ func (s *Service) ResolveDetailed(
 			ProviderGUID:        c.SourceGUID,
 			ProviderReleaseName: resolver.CandidateReleaseName(c),
 			ProviderReleaseSize: c.FileSize,
+			// The candidate's provider-declared inventory travels with the
+			// resolution so a caller can seed a declared inventory on adoption.
+			CodecAudio:        c.CodecAudio,
+			AudioLanguages:    c.AudioLanguages,
+			SubtitleLanguages: c.SubtitleLanguages,
 		}, true
 	}
 

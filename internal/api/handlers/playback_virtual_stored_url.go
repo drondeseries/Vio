@@ -167,24 +167,44 @@ func adoptRematchedVirtualResolution(
 		expiresAt = &expires
 	}
 	args := models.VirtualFilePersistArgs{
-		FileID:                 row.ID,
-		ExpectedFilePath:       row.FilePath,
-		VideoTracks:            marshalTracksJSON(sanitizeTrackSlice(row.VideoTracks)),
-		AudioTracks:            marshalTracksJSON(sanitizeTrackSlice(row.AudioTracks)),
-		SubtitleTracks:         marshalTracksJSON(sanitizeTrackSlice(row.SubtitleTracks)),
-		Resolution:             row.Resolution,
-		CodecVideo:             row.CodecVideo,
-		CodecAudio:             row.CodecAudio,
-		Container:              row.Container,
-		HDR:                    row.HDR,
-		Bitrate:                row.Bitrate,
-		Duration:               row.Duration,
-		UpdatedAt:              row.UpdatedAt,
-		ProbeUpdatedAt:         row.ProbeUpdatedAt,
-		OwnerID:                row.VirtualOwnerInstallationID,
-		LibraryID:              row.MediaFolderID,
-		AdoptPath:              adoptPath,
-		RequireAdopt:           true,
+		FileID:           row.ID,
+		ExpectedFilePath: row.FilePath,
+		VideoTracks:      marshalTracksJSON(sanitizeTrackSlice(row.VideoTracks)),
+		// A rematch binds the row to a new ?result= identity. Even when the
+		// durable identity proves the same release, the concrete file behind
+		// the new id is not guaranteed to carry the old inventory (the
+		// name+size identity tier collapses distinct muxes), and the stored
+		// probe evidence describes the previous id. Replace the audio inventory
+		// with the matched candidate's declared languages and drop the old
+		// subtitle inventory; the probe stamp is cleared below so the next
+		// start probes the real bytes and converges the row. Carrying the old
+		// release's labels here is what made the menu lie about the streams.
+		AudioTracks:    marshalTracksJSON(sanitizeTrackSlice(declaredVirtualAudioTracks(resolved.CodecAudio, resolved.AudioLanguages, row.CodecAudio))),
+		SubtitleTracks: marshalTracksJSON(sanitizeTrackSlice([]models.SubtitleTrack{})),
+		Resolution:     row.Resolution,
+		CodecVideo:     row.CodecVideo,
+		CodecAudio:     row.CodecAudio,
+		Container:      row.Container,
+		HDR:            row.HDR,
+		Bitrate:        row.Bitrate,
+		Duration:       row.Duration,
+		UpdatedAt:      row.UpdatedAt,
+		ProbeUpdatedAt: row.ProbeUpdatedAt,
+		// The identity tiers above describe the release being left; the adopted
+		// candidate's identity is compared against them to keep a proven
+		// same-release rematch on preserve-on-omission.
+		ExpectedProviderVideoHash:   row.ProviderVideoHash,
+		ExpectedProviderGUID:        row.ProviderGUID,
+		ExpectedProviderReleaseName: row.ProviderReleaseName,
+		ExpectedProviderReleaseSize: row.ProviderReleaseSize,
+		OwnerID:                     row.VirtualOwnerInstallationID,
+		LibraryID:                   row.MediaFolderID,
+		AdoptPath:                   adoptPath,
+		RequireAdopt:                true,
+		// The old probe stamp referenced the previous result= identity, so it
+		// no longer describes the row; clear it so the next start re-probes
+		// instead of trusting the declared placeholder inventory.
+		ClearProbe:             true,
 		ResolvedURL:            strings.TrimSpace(resolved.URL),
 		ResolvedURLExpiresAt:   expiresAt,
 		ProviderVideoHash:      resolved.ProviderVideoHash,

@@ -40,6 +40,9 @@ func newVirtualMediaDetailedResolver(service virtualDetailedResolverSource) hand
 			ProviderReleaseName: res.ProviderReleaseName,
 			ProviderReleaseSize: res.ProviderReleaseSize,
 			IdentityRematched:   res.IdentityRematched,
+			CodecAudio:          res.CodecAudio,
+			AudioLanguages:      res.AudioLanguages,
+			SubtitleLanguages:   res.SubtitleLanguages,
 		}, nil
 	})
 }

@@ -916,6 +916,27 @@ type VirtualFilePersistArgs struct {
 	// automatic path leaves it false so a failure committed after the caller's
 	// last verdict read is still fenced out at write time.
 	AllowFailedVerdict bool
+	// ExpectedProvider* is the adopting row's current durable identity,
+	// snapshotted with the CAS fields. When AdoptPath is set, the saver compares
+	// it to the incoming Provider* identity to decide whether the adopted
+	// candidate is the same release (preserve omitted transport fields) or a
+	// different release (replace the whole transport set). It must be the row's
+	// identity, never the candidate's: comparing the candidate to itself would
+	// always report same-release. An identity tier present on only one side is
+	// not a same-release proof, so a required adoption with an unprovable match
+	// replaces rather than preserves.
+	ExpectedProviderVideoHash   string
+	ExpectedProviderGUID        string
+	ExpectedProviderReleaseName string
+	ExpectedProviderReleaseSize int64
+	// ClearProbe invalidates the row's probe evidence in the same CAS-fenced
+	// write: probe_source and probe_updated_at are set to NULL (collection-owned
+	// rows keep theirs). A caller uses it when it adopts bytes whose inventory
+	// the stored probe does not describe, so the next start re-probes and
+	// converges the row onto the real file instead of trusting stale evidence.
+	// It is independent of StampProbe: a write either stamps or clears, never
+	// both.
+	ClearProbe bool
 	// ResolvedURL is the provider stream URL a successful resolution produced
 	// for this row. When non-empty it (re)writes resolved_url and its paired
 	// expiry; when empty the stored values are preserved, so a metadata-only
