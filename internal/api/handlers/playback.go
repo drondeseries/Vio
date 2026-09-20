@@ -2121,18 +2121,40 @@ func writePlaybackDecodeError(w http.ResponseWriter) {
 	writeError(w, http.StatusUnprocessableEntity, "decode_failed", "The media source could not be decoded.")
 }
 
+// writePlaybackSegmentError maps a segment-retrieval failure to its HTTP
+// response. A segment that is absent (ErrSegmentNotFound) or whose transcode
+// process exited before the segment materialized (ErrTranscodeFailed) is
+// terminal for this generation: it will never appear, so the client re-plans
+// instead of retrying a dead encode. A user stop that kills ffmpeg while a
+// segment request is already waiting surfaces as ErrTranscodeFailed, and a
+// stopped session is not a server defect. Both map to 404, mirroring
+// hlsSegmentErrorResponse on the Jellyfin-compatible surface. A playlist that
+// is still being produced (ErrManifestNotReady) is transient and stays
+// retryable as 503. Everything else is an unexpected server error.
+func writePlaybackSegmentError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, playback.ErrSegmentNotFound), errors.Is(err, playback.ErrTranscodeFailed):
+		writeError(w, http.StatusNotFound, "not_found", "Segment not found")
+	case errors.Is(err, playback.ErrManifestNotReady):
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode session is temporarily unavailable")
+	default:
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load segment")
+	}
+}
+
 // HandleGetTranscodeSegment handles GET /playback/transcode/{session_id}/segment/{name}.
 // Authorization follows the same negotiated legacy-versus-header-authenticated
 // rule as the manifest endpoint above.
 //
 // Errors: 404 (playback_session_not_found / not_found) when the session is
-// missing or cannot be reconstructed, or the segment does not exist; 503
-// (unavailable) while the transcode is temporarily unavailable; and — for
-// tone-map execution failures — 422 (unsupported) with an
-// X-Vio-Tone-Map-Execution-Error header of source_revision_changed or
-// source_preflight_rejected. The 422 responses are additive to the existing
-// 404 and 503 cases; the Jellyfin-compatible 415 mapping is a separate surface
-// and unchanged.
+// missing or cannot be reconstructed, or the segment does not exist, or the
+// transcode process exited before the segment materialized (including a stop
+// that killed ffmpeg mid-request); 503 (unavailable) while the transcode is
+// temporarily unavailable; and — for tone-map execution failures — 422
+// (unsupported) with an X-Vio-Tone-Map-Execution-Error header of
+// source_revision_changed or source_preflight_rejected. The 422 responses are
+// additive to the existing 404 and 503 cases; the Jellyfin-compatible 415
+// mapping is a separate surface and unchanged.
 func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "session_id")
 	requestedSegment := -1
@@ -2359,11 +2381,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		if writePlaybackToneMapExecutionError(w, err) {
 			return
 		}
-		if errors.Is(err, playback.ErrSegmentNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "Segment not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load segment")
+		writePlaybackSegmentError(w, err)
 		return
 	}
 

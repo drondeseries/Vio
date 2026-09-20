@@ -2287,7 +2287,6 @@ UPDATE media_files SET
                    )
                  )
                )
-             )
            )
          )
     THEN $18
