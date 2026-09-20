@@ -357,17 +357,34 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	// the pinned release itself and never a substitution. Narrow by design:
 	// an explicit forceRefresh (a failover retry after this candidate failed)
 	// or an exclusion list always takes the list-and-resolve path.
+	var storedRow *models.MediaFile
+	if !forceRefresh {
+		// Read the row once. It is both the source of the stored-URL shortcut
+		// and the durable identity the same-release re-match needs when the
+		// provider renumbers its result ids. A forceRefresh is a failover retry
+		// that deliberately relists, so it does not consult the stored row.
+		if h.VirtualFileLookup != nil {
+			if row, lookupErr := h.VirtualFileLookup(ctx, virtualURI); lookupErr == nil && row != nil {
+				storedRow = row
+				ctx = virtualResolveContextWithPersistedIdentity(ctx, row)
+			}
+		}
+	}
 	var storedExpiredRow *models.MediaFile
 	storedUsable := false
-	if !forceRefresh && len(excludedCandidateIDs) == 0 {
-		if usable, row, state := h.lookupStoredVirtualURLCandidate(ctx, virtualURI, ownerInstallationID); state == virtualStoredURLUsable {
+	if storedRow != nil && !forceRefresh && len(excludedCandidateIDs) == 0 {
+		usable, state := evaluateStoredVirtualURLCandidate(
+			ctx, virtualURI, storedRow,
+			h.storedVirtualURLAllowInsecure(storedRow, ownerInstallationID), time.Now(),
+		)
+		if state == virtualStoredURLUsable {
 			res = usable
 			storedUsable = true
 		} else if state == virtualStoredURLExpired {
 			// The row owns this candidate but its URL lapsed. Resolve afresh
 			// below, then refresh the stored value through the existing
 			// Phase-1 saver.
-			storedExpiredRow = row
+			storedExpiredRow = storedRow
 		}
 	}
 	if !storedUsable {
@@ -382,7 +399,12 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 				ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID,
 			)
-			if err == nil && storedExpiredRow != nil {
+			if err == nil && res.IdentityRematched && storedRow != nil {
+				// The pinned id was absent but the same release re-identified
+				// under a new id. Adopt it through the Phase-1 CAS/fence write
+				// so the row's ?result= and durable identity move with it.
+				adoptRematchedVirtualResolution(ctx, storedRow, res, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+			} else if err == nil && storedExpiredRow != nil {
 				// Reuse the Phase-1 write path; only the requested candidate's
 				// own successful resolution is recorded (a substituted sibling
 				// is skipped inside).

@@ -190,9 +190,15 @@ type MediaFile struct {
 	ProviderGUID         string     `json:"-"`
 	ProviderReleaseName  string     `json:"-"`
 	ProviderReleaseSize  int64      `json:"-"`
-	FirstSeenScanRunID   string
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// ProviderRequestHeaders is the request header set the provider stream URL
+	// needs (the relay forwards Referer/Origin/User-Agent from
+	// behaviorHints.proxyHeaders). It is stored alongside ResolvedURL so a
+	// header-authenticated URL is usable when served from the catalog instead
+	// of a fresh listing. Nil means the row carries no headers.
+	ProviderRequestHeaders map[string]string `json:"-"`
+	FirstSeenScanRunID     string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // MediaChapter represents a single media chapter derived from embedded file metadata.
@@ -924,4 +930,9 @@ type VirtualFilePersistArgs struct {
 	ProviderGUID        string
 	ProviderReleaseName string
 	ProviderReleaseSize int64
+	// ProviderRequestHeaders is the request header set the resolved URL needs.
+	// A non-nil value (re)writes provider_request_headers; a nil value
+	// preserves the stored one, so a metadata-only write cannot erase the
+	// headers a resolved URL depends on.
+	ProviderRequestHeaders map[string]string
 }

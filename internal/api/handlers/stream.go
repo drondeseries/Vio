@@ -290,6 +290,9 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 			storedExpiredRow = row
 		}
 	}
+	// The serve-layer row carries the durable identity the same-release
+	// re-match needs; a row with none (legacy) is left untouched.
+	ctx = virtualResolveContextWithPersistedIdentity(ctx, file)
 	if resolved.URL == "" {
 		if h.VirtualMediaDetailedResolver != nil {
 			// The caller declares whether excluding the candidate indicted the
@@ -302,7 +305,11 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 			resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 				ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, "",
 			)
-			if err == nil && storedExpiredRow != nil {
+			if err == nil && resolved.IdentityRematched {
+				// Same release, new provider id: adopt the new ?result= and the
+				// resolution's identity under the existing CAS/fence write.
+				adoptRematchedVirtualResolution(ctx, file, resolved, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+			} else if err == nil && storedExpiredRow != nil {
 				refreshStoredVirtualResolution(ctx, storedExpiredRow, resolved, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
 			}
 		} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {

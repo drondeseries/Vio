@@ -87,7 +87,12 @@ func evaluateStoredVirtualURLCandidate(
 		URI:         candidateURI,
 		CandidateID: candidateID,
 		OwnerID:     row.VirtualOwnerInstallationID,
-		ExpiresAt:   expiresAt,
+		// The stored URL was recorded with the headers the relay forwards
+		// (Referer/Origin/User-Agent). Serving the URL without them would break
+		// a provider that authenticates by header instead of a URL token, so
+		// they travel with the URL as a unit.
+		RequestHeaders: cloneHeaderMap(row.ProviderRequestHeaders),
+		ExpiresAt:      expiresAt,
 	}, virtualStoredURLUsable
 }
 
@@ -100,6 +105,101 @@ func (h *PlaybackHandler) storedVirtualURLAllowInsecure(row *models.MediaFile, o
 		return false
 	}
 	return h.AllowInsecureVirtual(effectiveVirtualOwner(row.VirtualOwnerInstallationID, ownerInstallationID))
+}
+
+// persistedVirtualIdentity snapshots a catalog row's durable provider identity
+// for the same-release re-match. It reports false for a legacy row whose
+// identity columns are all NULL, so those keep today's dead-pin behavior with
+// no re-match attempt.
+func persistedVirtualIdentity(row *models.MediaFile) (virtuallibrary.PersistedCandidateIdentity, bool) {
+	if row == nil {
+		return virtuallibrary.PersistedCandidateIdentity{}, false
+	}
+	identity := virtuallibrary.PersistedCandidateIdentity{
+		VideoHash:   row.ProviderVideoHash,
+		GUID:        row.ProviderGUID,
+		ReleaseName: row.ProviderReleaseName,
+		ReleaseSize: row.ProviderReleaseSize,
+	}
+	if !identity.HasDurableIdentity() {
+		return virtuallibrary.PersistedCandidateIdentity{}, false
+	}
+	return identity, true
+}
+
+// virtualResolveContextWithPersistedIdentity threads the row's durable identity
+// into a resolve so the resolver can re-identify the same release when the
+// provider renumbers result ids. A row with no durable identity is left
+// untouched, so a legacy row resolves exactly as before.
+func virtualResolveContextWithPersistedIdentity(ctx context.Context, row *models.MediaFile) context.Context {
+	identity, ok := persistedVirtualIdentity(row)
+	if !ok {
+		return ctx
+	}
+	return virtuallibrary.WithPersistedCandidateIdentity(ctx, identity)
+}
+
+// adoptRematchedVirtualResolution adopts the new result= identity the resolver
+// re-matched for the same release. It reuses the Phase-1 metadata write with
+// AdoptPath set, so rewriting file_path and persisting the resolution's URL,
+// headers and durable identity are one CAS-fenced statement: a row that rotated
+// underneath performs no write, and a live failed_at verdict still blocks the
+// adoption (the saver's fence is not bypassed). The write is best-effort: the
+// resolved URL is already in hand and serving it does not depend on the
+// adoption landing.
+func adoptRematchedVirtualResolution(
+	ctx context.Context,
+	row *models.MediaFile,
+	resolved ResolvedVirtualMedia,
+	metaSaver VirtualFileMetadataSaver,
+	saver VirtualFileSaver,
+) {
+	if row == nil || row.ID <= 0 || (metaSaver == nil && saver == nil) {
+		return
+	}
+	adoptPath := strings.TrimSpace(resolved.URI)
+	if adoptPath == "" || adoptPath == row.FilePath || virtualResultCandidateID(adoptPath) == "" {
+		return
+	}
+	var expiresAt *time.Time
+	if !resolved.ExpiresAt.IsZero() {
+		expires := resolved.ExpiresAt
+		expiresAt = &expires
+	}
+	args := models.VirtualFilePersistArgs{
+		FileID:                 row.ID,
+		ExpectedFilePath:       row.FilePath,
+		VideoTracks:            marshalTracksJSON(sanitizeTrackSlice(row.VideoTracks)),
+		AudioTracks:            marshalTracksJSON(sanitizeTrackSlice(row.AudioTracks)),
+		SubtitleTracks:         marshalTracksJSON(sanitizeTrackSlice(row.SubtitleTracks)),
+		Resolution:             row.Resolution,
+		CodecVideo:             row.CodecVideo,
+		CodecAudio:             row.CodecAudio,
+		Container:              row.Container,
+		HDR:                    row.HDR,
+		Bitrate:                row.Bitrate,
+		Duration:               row.Duration,
+		UpdatedAt:              row.UpdatedAt,
+		ProbeUpdatedAt:         row.ProbeUpdatedAt,
+		OwnerID:                row.VirtualOwnerInstallationID,
+		LibraryID:              row.MediaFolderID,
+		AdoptPath:              adoptPath,
+		RequireAdopt:           true,
+		ResolvedURL:            strings.TrimSpace(resolved.URL),
+		ResolvedURLExpiresAt:   expiresAt,
+		ProviderVideoHash:      resolved.ProviderVideoHash,
+		ProviderGUID:           resolved.ProviderGUID,
+		ProviderReleaseName:    resolved.ProviderReleaseName,
+		ProviderReleaseSize:    resolved.ProviderReleaseSize,
+		ProviderRequestHeaders: cloneHeaderMap(resolved.RequestHeaders),
+	}
+	adoptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if metaSaver != nil {
+		_, _ = metaSaver(adoptCtx, args)
+		return
+	}
+	_, _ = saver(adoptCtx, args)
 }
 
 // lookupStoredVirtualURLCandidate resolves the exact catalog row for a
@@ -229,6 +329,9 @@ func refreshStoredVirtualResolution(
 		ProviderGUID:         resolved.ProviderGUID,
 		ProviderReleaseName:  resolved.ProviderReleaseName,
 		ProviderReleaseSize:  resolved.ProviderReleaseSize,
+		// The resolution's headers are stored with its URL; the saver preserves
+		// a stored set when the resolution carries none.
+		ProviderRequestHeaders: cloneHeaderMap(resolved.RequestHeaders),
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

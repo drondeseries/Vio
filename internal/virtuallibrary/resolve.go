@@ -31,6 +31,59 @@ type ResolvedVirtualStream struct {
 	ProviderGUID        string
 	ProviderReleaseName string
 	ProviderReleaseSize int64
+	// IdentityRematched is true when the requested pin's result id was absent
+	// from the fresh listing but a listed candidate carried the row's durable
+	// persisted identity. The returned candidate is then the same release
+	// re-identified under a new provider result id, not a substitution: the
+	// caller must adopt the new identity (including the new ?result= path)
+	// rather than report a release swap.
+	IdentityRematched bool
+}
+
+// PersistedCandidateIdentity is the durable identity a virtual candidate row
+// carries from persistence: the video hash, source GUID and normalized release
+// name + size. It is the caller's snapshot of the catalog row, threaded into a
+// resolve so a provider re-list that renumbered result ids can be recognized as
+// the same release instead of a dead pin.
+type PersistedCandidateIdentity struct {
+	VideoHash   string
+	GUID        string
+	ReleaseName string
+	ReleaseSize int64
+}
+
+// HasDurableIdentity reports whether any identity tier is present. A row with
+// no durable identity (a legacy row) cannot be re-matched and keeps today's
+// dead-pin behavior.
+func (p PersistedCandidateIdentity) HasDurableIdentity() bool {
+	return strings.TrimSpace(p.VideoHash) != "" ||
+		strings.TrimSpace(p.GUID) != "" ||
+		strings.TrimSpace(p.ReleaseName) != ""
+}
+
+type persistedCandidateIdentityContextKey struct{}
+
+// WithPersistedCandidateIdentity threads the catalog row's durable identity
+// into a resolve. It is a no-op for an identity with no usable tier, so a
+// legacy row cannot accidentally enable re-matching.
+func WithPersistedCandidateIdentity(ctx context.Context, identity PersistedCandidateIdentity) context.Context {
+	if ctx == nil || !identity.HasDurableIdentity() {
+		return ctx
+	}
+	return context.WithValue(ctx, persistedCandidateIdentityContextKey{}, identity)
+}
+
+// persistedCandidateIdentityFromContext returns the identity threaded by the
+// caller, or false when none is present.
+func persistedCandidateIdentityFromContext(ctx context.Context) (PersistedCandidateIdentity, bool) {
+	if ctx == nil {
+		return PersistedCandidateIdentity{}, false
+	}
+	identity, ok := ctx.Value(persistedCandidateIdentityContextKey{}).(PersistedCandidateIdentity)
+	if !ok || !identity.HasDurableIdentity() {
+		return PersistedCandidateIdentity{}, false
+	}
+	return identity, true
 }
 
 // PlaybackStream represents an available stream candidate formatted for
@@ -331,6 +384,39 @@ func (s *Service) ResolveDetailed(
 	// substituted) and would only break playback. The mismatch is logged for
 	// diagnosis.
 	sessionCandidatePresent := sessionBound && effectiveResultID != "" && candidateIDPresent(candidates, effectiveResultID)
+
+	// Same-release re-identification. A pinned result id that is absent from a
+	// fresh listing is not evidence the release is gone: providers renumber
+	// result ids per listing. When the row carries a durable identity and a
+	// listed candidate carries the same identity under the deduplication
+	// chain's precedence, treat it as the same release re-identified: bind to
+	// the new id and report IdentityRematched so the caller adopts it. A
+	// genuinely different release shares no identity tier, so the dead-pin
+	// refusal below still covers it. This only applies to a session-bound
+	// resolve that would otherwise refuse a substitution; a rotation already
+	// authorizes the ordinary fallback.
+	identityRematched := false
+	if sessionBound && !allowSubstitution && effectiveResultID != "" && !sessionCandidatePresent {
+		_, requestedExcludedEarly := excluded[requestedResultID]
+		_, keeperExcludedEarly := excluded[effectiveResultID]
+		if !requestedExcludedEarly && !keeperExcludedEarly {
+			if identity, ok := persistedCandidateIdentityFromContext(ctx); ok {
+				if matched, found := resolver.MatchCandidateByPersistedIdentity(
+					candidates, identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize,
+				); found {
+					if matchedID := stream.CandidateVariantID(matched); matchedID != "" && matchedID != effectiveResultID {
+						effectiveResultID = matchedID
+						identityRematched = true
+						// The matched candidate is the session-bound release, so
+						// the profile filter must not remove it (same rule as a
+						// directly present session pin).
+						sessionCandidatePresent = true
+					}
+				}
+			}
+		}
+	}
+
 	if sessionCandidatePresent && profileActive {
 		for _, c := range candidates {
 			if stream.CandidateVariantID(c) != effectiveResultID {
@@ -458,6 +544,7 @@ func (s *Service) ResolveDetailed(
 	if effectiveResultID != "" && !pinBlocked {
 		for _, c := range ordered {
 			if resolved, ok := tryCandidate(c, true); ok {
+				resolved.IdentityRematched = identityRematched
 				return resolved, nil
 			}
 		}

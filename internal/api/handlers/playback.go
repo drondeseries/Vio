@@ -167,6 +167,12 @@ type ResolvedVirtualMedia struct {
 	ProviderGUID        string
 	ProviderReleaseName string
 	ProviderReleaseSize int64
+	// IdentityRematched is true when the requested pin's result id was absent
+	// from a fresh listing but the resolver found the same durable identity
+	// under a new result id. The resolved candidate is then the same release
+	// re-identified, not a substitution, and the caller adopts the new
+	// identity instead of reporting a release swap.
+	IdentityRematched bool
 }
 
 // effectiveVirtualOwner returns the first positive installation owner from the

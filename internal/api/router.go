@@ -1210,12 +1210,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 							CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio,
 							HDR: stream.HDR, FileSize: stream.FileSize, Bitrate: stream.Bitrate,
 							AudioLanguages: stream.AudioLanguages, SubtitleLanguages: stream.SubtitleLanguages,
-							ResolvedURL:          stream.ProviderURL,
-							ResolvedURLExpiresAt: stream.ProviderExpiresAt,
-							ProviderVideoHash:    stream.ProviderVideoHash,
-							ProviderGUID:         stream.ProviderGUID,
-							ProviderReleaseName:  stream.ProviderReleaseName,
-							ProviderReleaseSize:  stream.FileSize,
+							ResolvedURL:            stream.ProviderURL,
+							ResolvedURLExpiresAt:   stream.ProviderExpiresAt,
+							ProviderVideoHash:      stream.ProviderVideoHash,
+							ProviderGUID:           stream.ProviderGUID,
+							ProviderReleaseName:    stream.ProviderReleaseName,
+							ProviderReleaseSize:    stream.FileSize,
+							ProviderRequestHeaders: stream.RequestHeaders,
 						})
 					}
 					return deps.FileRepo.ReplaceVirtualCandidates(ctx, source, candidates)

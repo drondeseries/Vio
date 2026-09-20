@@ -237,6 +237,124 @@ func TestReplaceVirtualCandidatesIdentityFallsBackToNameAndSize(t *testing.T) {
 	}
 }
 
+// TestReplaceVirtualCandidatesPersistsRequestHeaders proves the candidate's
+// relay-forwardable request headers are stored alongside the resolved URL and
+// exposed on the same catalog read.
+func TestReplaceVirtualCandidatesPersistsRequestHeaders(t *testing.T) {
+	pool := virtualResolutionTestPool(t)
+	ctx := context.Background()
+	source, _, basePath := seedVirtualResolutionFixture(t, pool, "headers")
+	candidatePath := basePath + "&result=headers"
+	headers := map[string]string{
+		"Referer":    "https://provider.example/player",
+		"Origin":     "https://provider.example",
+		"User-Agent": "silo-test",
+	}
+
+	repo := NewFileRepository(pool)
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{
+		URI:                    candidatePath,
+		Label:                  "1080p",
+		FileSize:               1_000_000_000,
+		ResolvedURL:            "https://provider.example/headers.mkv?token=h",
+		ProviderRequestHeaders: headers,
+	}}); err != nil {
+		t.Fatalf("replace virtual candidates: %v", err)
+	}
+
+	file, err := repo.GetByPath(ctx, candidatePath)
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if len(file.ProviderRequestHeaders) != len(headers) {
+		t.Fatalf("ProviderRequestHeaders = %#v, want %#v", file.ProviderRequestHeaders, headers)
+	}
+	for k, want := range headers {
+		if got := file.ProviderRequestHeaders[k]; got != want {
+			t.Fatalf("ProviderRequestHeaders[%q] = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestReplaceVirtualCandidatesReListPreservesRequestHeaders proves a re-list
+// that omits the headers preserves the last stored set, exactly like the
+// resolved URL it authenticates.
+func TestReplaceVirtualCandidatesReListPreservesRequestHeaders(t *testing.T) {
+	pool := virtualResolutionTestPool(t)
+	ctx := context.Background()
+	source, _, basePath := seedVirtualResolutionFixture(t, pool, "headers-preserve")
+	candidatePath := basePath + "&result=headers-preserve"
+
+	repo := NewFileRepository(pool)
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{
+		URI:                    candidatePath,
+		Label:                  "1080p",
+		FileSize:               1_000_000_000,
+		ResolvedURL:            "https://provider.example/preserve.mkv?token=p",
+		ProviderRequestHeaders: map[string]string{"Referer": "https://provider.example/keep"},
+	}}); err != nil {
+		t.Fatalf("first replace: %v", err)
+	}
+	// The re-list carries no URL and no headers for the same listing identity.
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{
+		URI:      candidatePath,
+		Label:    "1080p",
+		FileSize: 1_000_000_000,
+	}}); err != nil {
+		t.Fatalf("re-list replace: %v", err)
+	}
+
+	file, err := repo.GetByPath(ctx, candidatePath)
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if file.ProviderRequestHeaders["Referer"] != "https://provider.example/keep" {
+		t.Fatalf("ProviderRequestHeaders = %#v, want the preserved Referer", file.ProviderRequestHeaders)
+	}
+	if file.ResolvedURL != "https://provider.example/preserve.mkv?token=p" {
+		t.Fatalf("ResolvedURL = %q, want the preserved URL", file.ResolvedURL)
+	}
+}
+
+// TestReplaceVirtualCandidatesNoHeadersStoresNull proves a provider with no
+// headers stores nothing: the column stays NULL and the read behaves as before.
+func TestReplaceVirtualCandidatesNoHeadersStoresNull(t *testing.T) {
+	pool := virtualResolutionTestPool(t)
+	ctx := context.Background()
+	source, _, basePath := seedVirtualResolutionFixture(t, pool, "headers-none")
+	candidatePath := basePath + "&result=headers-none"
+
+	repo := NewFileRepository(pool)
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{
+		URI:         candidatePath,
+		Label:       "1080p",
+		FileSize:    1_000_000_000,
+		ResolvedURL: "https://provider.example/noheaders.mkv?token=n",
+	}}); err != nil {
+		t.Fatalf("replace virtual candidates: %v", err)
+	}
+
+	var isNull bool
+	if err := pool.QueryRow(ctx, `
+		SELECT provider_request_headers IS NULL
+		FROM media_files
+		WHERE content_id=$1 AND file_path=$2`,
+		source.ContentID, candidatePath,
+	).Scan(&isNull); err != nil {
+		t.Fatalf("inspect header column: %v", err)
+	}
+	if !isNull {
+		t.Fatal("provider_request_headers is not NULL for a candidate that carried no headers")
+	}
+	file, err := repo.GetByPath(ctx, candidatePath)
+	if err != nil {
+		t.Fatalf("GetByPath: %v", err)
+	}
+	if len(file.ProviderRequestHeaders) != 0 {
+		t.Fatalf("ProviderRequestHeaders = %#v, want none", file.ProviderRequestHeaders)
+	}
+}
+
 // TestVirtualCandidateResolutionReadPath proves the catalog read the resume
 // path uses (GetByPath) exposes the persisted resolution fields on MediaFile.
 func TestVirtualCandidateResolutionReadPath(t *testing.T) {

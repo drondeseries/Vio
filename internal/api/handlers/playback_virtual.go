@@ -944,6 +944,10 @@ type resolvedVirtualPlaybackSource struct {
 	ProviderGUID         string
 	ProviderReleaseName  string
 	ProviderReleaseSize  int64
+	// RequestHeaders is the relay-forwardable header set (Referer, Origin,
+	// User-Agent) the resolved URL needs. It is persisted with the URL so a
+	// header-authenticated provider stream stays usable from the catalog.
+	RequestHeaders map[string]string
 }
 
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
@@ -2289,6 +2293,10 @@ UPDATE media_files SET
   provider_guid           = COALESCE(NULLIF($26,''), provider_guid),
   provider_release_name   = COALESCE(NULLIF($27,''), provider_release_name),
   provider_release_size   = COALESCE(NULLIF($28::bigint,0), provider_release_size),
+  -- Request headers belong to the resolved URL. A metadata-only write carries
+  -- no header set and must preserve the stored one; only a resolution that
+  -- actually produced headers overwrites it.
+  provider_request_headers = COALESCE($29::jsonb, provider_request_headers),
   duration         = CASE WHEN $10 > 0 THEN $10 ELSE duration END,
   audio_channels   = COALESCE(
     (SELECT (elem->>'channels')::int
@@ -2453,6 +2461,17 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 	if vStr == "" || vStr == jsonNullLiteral {
 		vStr = "[]"
 	}
+	// A nil/empty header map is passed as nil so the SQL COALESCE preserves the
+	// stored set; serializeJSONB would do the same, but marshal here so the
+	// argument shape stays a single jsonb placeholder.
+	var providerRequestHeadersJSON any
+	if len(args.ProviderRequestHeaders) > 0 {
+		encoded, marshalErr := json.Marshal(args.ProviderRequestHeaders)
+		if marshalErr != nil {
+			return VirtualFileMetadataUpdateResult{}, fmt.Errorf("marshal provider request headers: %w", marshalErr)
+		}
+		providerRequestHeadersJSON = encoded
+	}
 	aStr := string(args.AudioTracks)
 	if aStr == "" || aStr == jsonNullLiteral {
 		aStr = "[]"
@@ -2482,6 +2501,7 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 			neutralPath, verdictMaxAgeSeconds, fenceVerdict, requireAdoption,
 			args.ResolvedURL, args.ResolvedURLExpiresAt,
 			args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
+			providerRequestHeadersJSON,
 		).Scan(&persistedPath)
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No row matched the CAS fence: a stale snapshot, reported as a
@@ -3102,12 +3122,13 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					AdoptPath:        resolved.URI,
 					// Persist the provider URL and durable identity the
 					// resolution produced alongside the adopted identity.
-					ResolvedURL:          resolved.ResolvedURL,
-					ResolvedURLExpiresAt: resolved.ResolvedURLExpiresAt,
-					ProviderVideoHash:    resolved.ProviderVideoHash,
-					ProviderGUID:         resolved.ProviderGUID,
-					ProviderReleaseName:  resolved.ProviderReleaseName,
-					ProviderReleaseSize:  resolved.ProviderReleaseSize,
+					ResolvedURL:            resolved.ResolvedURL,
+					ResolvedURLExpiresAt:   resolved.ResolvedURLExpiresAt,
+					ProviderVideoHash:      resolved.ProviderVideoHash,
+					ProviderGUID:           resolved.ProviderGUID,
+					ProviderReleaseName:    resolved.ProviderReleaseName,
+					ProviderReleaseSize:    resolved.ProviderReleaseSize,
+					ProviderRequestHeaders: cloneHeaderMap(resolved.RequestHeaders),
 					// The fallback reports a substitute identity to the
 					// session, so metadata alone is not enough: the saver must
 					// confirm the validated identity was actually adopted.
@@ -3240,6 +3261,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		ResolvedURL: streamURL, ResolvedURLExpiresAt: resolvedExpiresAt,
 		ProviderVideoHash: providerVideoHash, ProviderGUID: providerGUID,
 		ProviderReleaseName: providerReleaseName, ProviderReleaseSize: providerReleaseSize,
+		RequestHeaders: cloneHeaderMap(candidate.RequestHeaders),
 	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 		return &resolved, nil

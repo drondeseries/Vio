@@ -39,6 +39,7 @@ func newVirtualMediaDetailedResolver(service virtualDetailedResolverSource) hand
 			ProviderGUID:        res.ProviderGUID,
 			ProviderReleaseName: res.ProviderReleaseName,
 			ProviderReleaseSize: res.ProviderReleaseSize,
+			IdentityRematched:   res.IdentityRematched,
 		}, nil
 	})
 }
