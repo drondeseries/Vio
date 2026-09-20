@@ -357,7 +357,7 @@ func TestEvidenceShutdownFinishesDequeuedWork(t *testing.T) {
 // service-context cancellation. The first attempt fails transiently, shutdown
 // cancels the service context, and the second attempt must still run under an
 // independent context and commit. This fails if drain retries observe the
-// cancelled service context.
+// canceled service context.
 func TestEvidenceShutdownRetriesAfterServiceCancel(t *testing.T) {
 	serviceCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -403,7 +403,7 @@ func TestEvidenceShutdownRetriesAfterServiceCancel(t *testing.T) {
 		t.Fatalf("attempts = %d, want 2 (the retry must survive service cancellation)", got)
 	}
 	if msg, _ := retryCtxErr.Load().(string); msg != "" {
-		t.Fatalf("retry ran under a cancelled context: %s", msg)
+		t.Fatalf("retry ran under a canceled context: %s", msg)
 	}
 }
 

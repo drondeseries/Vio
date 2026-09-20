@@ -37,7 +37,7 @@ import (
 // rejected explicitly. Shutdown then awaits every worker (including the task a
 // worker already dequeued) and only then drains the remaining accepted work
 // under an independent, bounded context. Dequeued work is therefore never
-// stranded on the cancelled service context and never silently dropped: each
+// stranded on the canceled service context and never silently dropped: each
 // task is persisted or logged as a terminal failure, and the abandonment
 // warning counts both still-queued and still-dequeued work. Nothing is durable
 // across process death: accepted work lives only in this in-memory buffer, so a
@@ -539,7 +539,7 @@ func (h *PlaybackHandler) effectiveEvidenceDeadline(fallback time.Time) time.Tim
 
 // evidenceWriteContext builds one write attempt's context. It is independent of
 // ServiceContext by design: accepted evidence must be drained at shutdown, so
-// cancelling the service must not fail an already-admitted write. The attempt is
+// canceling the service must not fail an already-admitted write. The attempt is
 // bounded by the per-attempt budget, tightened to the remaining drain grace once
 // shutdown begins.
 func (h *PlaybackHandler) evidenceWriteContext(deadline time.Time) (context.Context, context.CancelFunc) {

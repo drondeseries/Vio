@@ -10,17 +10,6 @@ import (
 	"time"
 )
 
-func cacheEntry(t *testing.T, r *Resolver, key string) candidateCacheEntry {
-	t.Helper()
-	r.cacheMu.Lock()
-	defer r.cacheMu.Unlock()
-	entry, ok := r.cache[key]
-	if !ok {
-		t.Fatalf("cache entry %q is missing", key)
-	}
-	return entry
-}
-
 func mutateCacheEntry(t *testing.T, r *Resolver, key string, mutate func(*candidateCacheEntry)) {
 	t.Helper()
 	r.cacheMu.Lock()
