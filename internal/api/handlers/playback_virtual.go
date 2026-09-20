@@ -2465,6 +2465,10 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 				// (sibling owner, collection row, live failed verdict) or the
 				// CAS snapshot was stale. Either way the validated identity
 				// was not adopted, and the tracks/stamp were not written.
+				slog.WarnContext(ctx, "virtual probe evidence persist refused: required identity adoption matched no row",
+					"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath,
+					"expected_path", args.ExpectedFilePath,
+					"reason", "sibling owner, collection row, live failed verdict, or stale snapshot")
 				return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s was not adopted", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
 			}
 			return VirtualFileMetadataUpdateResult{}, nil
@@ -2612,6 +2616,27 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 	if resolvedPath != "" && resolvedPath != catalogFile.FilePath && catalogFile.ProbeSource != "virtual_collection" {
 		adoptPath = resolvedPath
 	}
+	// Evidence for a different concrete release than this row verifiably owns
+	// must never be folded in as metadata-only enrichment: the original row
+	// would keep its own identity while acquiring the substitute's tracks and
+	// probe stamp, which is exactly how a sibling-owner collision used to leak
+	// the candidate's inventory onto the wrong row. Such a write is admitted
+	// only with RequireAdopt set, so the SQL fence accepts or refuses the whole
+	// write atomically. The same-release cases stay metadata-only: the row
+	// carries the candidate's exact identity, or the provider-neutral identity
+	// with no concrete pick (a neutral row owns every candidate in its release).
+	crossRelease := virtualProbeEvidenceRequiresAdoption(catalogFile, resolvedPath)
+	if crossRelease && adoptPath == "" {
+		// A collection-owned row is never rewritten (the collection sync would
+		// reconcile the adopted path away), so there is no adoption target to
+		// fence the write on. Refuse instead of stamping another release's
+		// inventory in place under the neutral path.
+		slog.WarnContext(ctx, "virtual probe evidence refused: candidate belongs to a different release and the row cannot adopt it",
+			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
+			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
+			"reason", "cross_release_without_adopt_target")
+		return
+	}
 	args := models.VirtualFilePersistArgs{
 		FileID:           snap.FileID,
 		ExpectedFilePath: expectedPath,
@@ -2631,6 +2656,11 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 		OwnerID:          snap.OwnerID,
 		LibraryID:        snap.LibraryID,
 		AdoptPath:        adoptPath,
+		// Cross-release evidence requires a confirmed identity adoption; the
+		// atomic fence then refuses the entire write (tracks and stamp included)
+		// when a sibling owns the target path or the candidate's verdict is
+		// live-failed. A same-release write keeps the metadata-only contract.
+		RequireAdopt: crossRelease,
 	}
 	// The evidence buffer owns the write context and retry policy; ctx is used
 	// only to tie a rejection to the caller's request. Admission is explicit so
@@ -2741,6 +2771,26 @@ func virtualCandidateRowVerified(row *models.MediaFile, candidateURI string) boo
 	// a different concrete pick is a different release and is not verified.
 	return virtualResultCandidateID(path) == "" &&
 		virtualPlaybackNeutralKey(path) == virtualPlaybackNeutralKey(candidateURI)
+}
+
+// virtualProbeEvidenceRequiresAdoption reports whether probe evidence for
+// candidateURI belongs to a different concrete release than the row it would be
+// written to. It is exactly the negation of candidate ownership, so the two
+// sides cannot drift:
+//
+//   - same-release (false): the row carries the candidate's exact release
+//     identity, or the provider-neutral identity with no concrete pick. The
+//     candidate's evidence is the row's own and stays metadata-only.
+//   - cross-release (true): a different concrete pick under the same neutral
+//     key, or a different neutral key. The row does not verifiably own those
+//     bytes, so the write must be gated on a confirmed identity adoption.
+//
+// An empty candidateURI is not evidence for any release and returns false.
+func virtualProbeEvidenceRequiresAdoption(row *models.MediaFile, candidateURI string) bool {
+	if row == nil || candidateURI == "" {
+		return false
+	}
+	return !virtualCandidateRowVerified(row, candidateURI)
 }
 
 // lookupVirtualCandidateRowDetailed resolves the catalog row that owns a

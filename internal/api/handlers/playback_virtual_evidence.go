@@ -140,12 +140,13 @@ type virtualEvidenceTask struct {
 
 // virtualEvidenceKey identifies an evidence target. Same row, same expected
 // path, same adopted source identity and same stamping semantics may coalesce;
-// a different adoption target (a different release) or a different stamping
-// mode is a distinct task so coalescing cannot drop a probe stamp or write one
-// source's evidence under another's identity.
+// a different adoption target (a different release), a different stamping mode,
+// or a different adoption requirement is a distinct task so coalescing cannot
+// drop a probe stamp, write one source's evidence under another's identity, or
+// fold a fenced cross-release write into a metadata-only one.
 func virtualEvidenceKey(args models.VirtualFilePersistArgs) string {
-	return fmt.Sprintf("%d\x00%d\x00%s\x00%s\x00%t",
-		args.FileID, args.OwnerID, args.ExpectedFilePath, args.AdoptPath, args.StampProbe)
+	return fmt.Sprintf("%d\x00%d\x00%s\x00%s\x00%t\x00%t",
+		args.FileID, args.OwnerID, args.ExpectedFilePath, args.AdoptPath, args.StampProbe, args.RequireAdopt)
 }
 
 func virtualEvidenceProbeTime(p *time.Time) time.Time {
