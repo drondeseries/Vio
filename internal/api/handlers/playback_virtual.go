@@ -1260,6 +1260,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		HDR: mediaFileHDRString(file),
 	}}
 	noResult := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) == ""
+	// persistedResultURI is true when the catalog row already points at an
+	// adopted provider-neutral candidate rather than the neutral virtual path.
+	// It is computed here because the durable-resume derivation below needs it
+	// before the listing gate.
+	persistedResultURI := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) != ""
 	needsCandidateMetadata := !completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)
 	deviceCaps, hasCaps := h.requestDeviceCapabilities(r)
 	fingerprint := ""
@@ -1268,6 +1273,33 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	}
 	stickyKey := bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID, fingerprint)
 	pinnedURI := h.peekVirtualSticky(stickyKey)
+	// Durable-resume derivation. The sticky pin and best-result cache are
+	// process state and a restart loses both, but the requested row is durable:
+	// when it already owns a concrete ?result= candidate whose persisted URL is
+	// still usable, the row itself says what to serve. Re-derive the pin from
+	// the row and remember the candidate so the deferred fast path below can
+	// behave exactly as a warm pin/cache hit would instead of paying a fresh
+	// provider listing.
+	//
+	// Gated on the repeat-play fast path being unavailable for this row:
+	// complete probed evidence plus a probe stamp takes that path already, so
+	// evaluating the stored URL (which re-validates it, including DNS) would
+	// only add latency. The verdict and exclusion gates match the fast paths
+	// below, so a row this derivation skips still resolves as before.
+	persistedResumeURI := ""
+	if persistedResultURI && (needsCandidateMetadata || file.ProbeUpdatedAt == nil) && !forceRelist &&
+		len(excludedCandidateIDs) == 0 &&
+		(allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) {
+		if _, state := evaluateStoredVirtualURLCandidate(
+			coldCtx, file.FilePath, file,
+			h.storedVirtualURLAllowInsecure(file, file.VirtualOwnerInstallationID),
+			time.Now(),
+		); state == virtualStoredURLUsable {
+			persistedResumeURI = file.FilePath
+			h.pinVirtualSticky(stickyKey, persistedResumeURI)
+			pinnedURI = persistedResumeURI
+		}
+	}
 	// Check the best-result cache before listing candidates. A previous
 	// successful play of this content may have a cached result= URI that
 	// lets us skip the entire list+resolve+probe sequence on replay.
@@ -1307,8 +1339,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// sibling.
 	exclusionPending := len(excludedCandidateIDs) > 0
 	requestedRowUnusable := !allowFailed && virtualCandidateVerdictActive(file.FailedAt, time.Now())
+	// A durable-resume hit suppresses the list the same way a warm best-result
+	// cache does: the row already names the candidate to serve, so there is no
+	// candidate metadata left to fetch. It is only set for a concrete same-row
+	// candidate that carries a usable stored URL, so it cannot mask an
+	// exclusion, a forced relist, a neutral row, or a failed verdict.
 	if (shouldListVirtualPlaybackCandidates(noResult, needsCandidateMetadata && !cachedListing, forceRelist) ||
-		((exclusionPending || requestedRowUnusable) && !cachedListing)) && h.VirtualPlaybackStreamLister != nil {
+		((exclusionPending || requestedRowUnusable) && !cachedListing)) && persistedResumeURI == "" && h.VirtualPlaybackStreamLister != nil {
 		trace.listed = true
 		trace.listRan = true
 		listStart := time.Now()
@@ -1410,10 +1447,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
 	attemptCtx = withVirtualSessionBindingV3(attemptCtx, options.sessionBound)
 
-	// persistedResultURI is true when the catalog row already points at an
-	// adopted provider-neutral candidate rather than the neutral virtual path.
-	persistedResultURI := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) != ""
-
 	// fastPathHit records that resolveAndProbe returned the repeat-play fast
 	// path so the candidate loop can return it immediately instead of treating
 	// a deferred (ProbeSucceeded=false) pinned result as a failed candidate.
@@ -1460,6 +1493,35 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			completeVirtualVideoEvidenceV3(file) &&
 			completeVirtualAudioEvidenceV3(file) &&
 			completeVirtualContainerEvidenceV3(file) {
+			fastPathHit = true
+			trace.fastPath = true
+			transient := *file
+			transient.FilePath = cand.URI
+			transient.VirtualOwnerInstallationID = oid
+			h.pinVirtualSticky(stickyKey, cand.URI)
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
+			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			return &resolvedVirtualPlaybackSource{
+				URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
+				ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+			}, nil
+		}
+		// Durable-resume fast path. The repeat-play gate above cannot apply
+		// because the row's probe evidence is incomplete, but the row still
+		// owns a concrete candidate with an unexpired persisted URL. After a
+		// restart the in-memory pin and best-result cache are gone; the row is
+		// the only surviving state. Binding this candidate now makes the
+		// resumed session re-pin the same release the row names, and the serve
+		// relay then uses the row's stored URL (the transport stored-URL
+		// shortcut) instead of listing or resolving the provider. It never
+		// substitutes: persistedResumeURI is the row's own candidate, so this
+		// cannot change which candidate is served.
+		if deferProbe && !forceRelist && persistedResumeURI != "" && !noResult &&
+			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
+			cand.URI == persistedResumeURI {
 			fastPathHit = true
 			trace.fastPath = true
 			transient := *file

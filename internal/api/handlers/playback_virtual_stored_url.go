@@ -202,32 +202,6 @@ func adoptRematchedVirtualResolution(
 	_, _ = saver(adoptCtx, args)
 }
 
-// lookupStoredVirtualURLCandidate resolves the exact catalog row for a
-// candidate URI and evaluates its persisted URL. A lookup miss, an
-// unverifiable row, or a nil lookup is reported as missing so the caller keeps
-// today's behavior.
-func (h *PlaybackHandler) lookupStoredVirtualURLCandidate(
-	ctx context.Context,
-	candidateURI string,
-	ownerInstallationID int,
-) (ResolvedVirtualMedia, *models.MediaFile, virtualStoredURLState) {
-	if h == nil || h.VirtualFileLookup == nil || virtualResultCandidateID(candidateURI) == "" {
-		return ResolvedVirtualMedia{}, nil, virtualStoredURLMissing
-	}
-	row, err := h.VirtualFileLookup(ctx, candidateURI)
-	if err != nil || row == nil {
-		return ResolvedVirtualMedia{}, nil, virtualStoredURLMissing
-	}
-	usable, state := evaluateStoredVirtualURLCandidate(
-		ctx, candidateURI, row,
-		h.storedVirtualURLAllowInsecure(row, ownerInstallationID), time.Now(),
-	)
-	if state == virtualStoredURLMissing {
-		return ResolvedVirtualMedia{}, nil, virtualStoredURLMissing
-	}
-	return usable, row, state
-}
-
 // lookupStoredVirtualURLCandidate is the serve-layer counterpart: the stream
 // handler holds the row it loaded but that row's file_path may have been bound
 // to the session's virtual source, and its stored URL belongs to the original

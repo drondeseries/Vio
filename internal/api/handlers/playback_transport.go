@@ -377,10 +377,11 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			ctx, virtualURI, storedRow,
 			h.storedVirtualURLAllowInsecure(storedRow, ownerInstallationID), time.Now(),
 		)
-		if state == virtualStoredURLUsable {
+		switch state {
+		case virtualStoredURLUsable:
 			res = usable
 			storedUsable = true
-		} else if state == virtualStoredURLExpired {
+		case virtualStoredURLExpired:
 			// The row owns this candidate but its URL lapsed. Resolve afresh
 			// below, then refresh the stored value through the existing
 			// Phase-1 saver.

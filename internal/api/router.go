@@ -1345,14 +1345,16 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// (file_path) and to still carry the failure state it observed
 			// (failed_at). The same delivered-grace rule as
 			// scanner.MarkVirtualCandidateFailed applies.
-			streamHandler.VirtualCandidateFailMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed
-			// The recovered marker clears a known-bad stamp after the candidate
-			// actually delivered media bytes. Fenced on the delivered candidate
-			// identity AND the failure state observed at transport start: a row
-			// rotated to a different candidate while the stream was being
-			// delivered, or a newer failure on the delivered candidate, is
-			// never cleared by a late delivery signal.
-			streamHandler.VirtualCandidateRecoveredMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateRecovered
+			if streamHandler != nil {
+				streamHandler.VirtualCandidateFailMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed
+				// The recovered marker clears a known-bad stamp after the candidate
+				// actually delivered media bytes. Fenced on the delivered candidate
+				// identity AND the failure state observed at transport start: a row
+				// rotated to a different candidate while the stream was being
+				// delivered, or a newer failure on the delivered candidate, is
+				// never cleared by a late delivery signal.
+				streamHandler.VirtualCandidateRecoveredMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateRecovered
+			}
 			// Repeated input demux failures from a local transcode mean the
 			// virtual candidate is bad, not that the transport should keep
 			// rebuilding. Stamp the effective row known-bad (CAS-fenced on its
