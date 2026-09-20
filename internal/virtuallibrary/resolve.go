@@ -9,6 +9,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
@@ -21,6 +22,15 @@ type ResolvedVirtualStream struct {
 	CandidateID    string
 	RequestHeaders map[string]string
 	ExpiresAt      time.Time
+	// ProviderVideoHash, ProviderGUID, ProviderReleaseName and
+	// ProviderReleaseSize are the resolved candidate's durable provider
+	// identity, in the same tier order as the dedup key. They are additive
+	// evidence for the persistence path: a later phase can re-match the row
+	// after the provider rotates result ids. Any of them may be empty.
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
+	ProviderReleaseSize int64
 }
 
 // PlaybackStream represents an available stream candidate formatted for
@@ -47,6 +57,15 @@ type PlaybackStream struct {
 	OwnerInstallationID int
 	Visible             bool
 	VisibilitySpecified bool
+	// ProviderURL, ProviderVideoHash, ProviderGUID and ProviderReleaseName
+	// carry the candidate's durable provider identity to the persistence path
+	// (ReplaceVirtualCandidates), which stores them on the candidate row.
+	// ProviderURL is not a client-facing field: it never leaves the server
+	// process and must not be serialized to a response.
+	ProviderURL         string
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
 	// Rejected marks a candidate a configured custom format rejects. It is a
 	// transient ranking signal, recomputed on every list; reject means
 	// rank-last and last-resort selectable, never a hard drop.
@@ -410,6 +429,15 @@ func (s *Service) ResolveDetailed(
 			CandidateID:    id,
 			RequestHeaders: c.RequestHeaders,
 			ExpiresAt:      c.ExpiresAt,
+			// Durable provider identity for the persistence path. The tier
+			// order matches candidateDedupKey: hash, then GUID, then the
+			// normalized release name + size. ReleaseName is always derived
+			// (name+size is the fallback tier), so a row with no hash/GUID is
+			// still re-matchable.
+			ProviderVideoHash:   c.BehaviorHints.VideoHash,
+			ProviderGUID:        c.SourceGUID,
+			ProviderReleaseName: resolver.CandidateReleaseName(c),
+			ProviderReleaseSize: c.FileSize,
 		}, true
 	}
 
@@ -478,6 +506,10 @@ func (s *Service) ListStreams(ctx context.Context, virtualPath string) ([]Playba
 			OwnerInstallationID: 0,
 			Visible:             true,
 			VisibilitySpecified: true,
+			ProviderURL:         c.URL,
+			ProviderVideoHash:   c.BehaviorHints.VideoHash,
+			ProviderGUID:        c.SourceGUID,
+			ProviderReleaseName: resolver.CandidateReleaseName(c),
 		})
 	}
 	return streams, nil

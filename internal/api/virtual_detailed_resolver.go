@@ -30,11 +30,15 @@ func newVirtualMediaDetailedResolver(service virtualDetailedResolverSource) hand
 			return handlers.ResolvedVirtualMedia{}, err
 		}
 		return handlers.ResolvedVirtualMedia{
-			URL:            res.URL,
-			URI:            res.URI,
-			CandidateID:    res.CandidateID,
-			RequestHeaders: res.RequestHeaders,
-			ExpiresAt:      res.ExpiresAt,
+			URL:                 res.URL,
+			URI:                 res.URI,
+			CandidateID:         res.CandidateID,
+			RequestHeaders:      res.RequestHeaders,
+			ExpiresAt:           res.ExpiresAt,
+			ProviderVideoHash:   res.ProviderVideoHash,
+			ProviderGUID:        res.ProviderGUID,
+			ProviderReleaseName: res.ProviderReleaseName,
+			ProviderReleaseSize: res.ProviderReleaseSize,
 		}, nil
 	})
 }

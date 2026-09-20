@@ -170,10 +170,29 @@ type MediaFile struct {
 	// LastDeliveredAt is the last time this virtual candidate delivered media
 	// bytes to a client. It is the durable known-good evidence the delivery
 	// grace and the optimistic start path read; nil means never delivered.
-	LastDeliveredAt    *time.Time
-	FirstSeenScanRunID string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	LastDeliveredAt *time.Time
+	// ResolvedURL is the provider stream URL this virtual candidate last
+	// successfully resolved to. It is purely additive to the neutral
+	// `virtual://...?result=<id>` file_path, which remains the row's listing
+	// identity: a provider re-list churns result ids, so this column lets a
+	// later phase reuse the last known-good URL instead of re-listing. Empty
+	// means the row has never resolved. ResolvedURLExpiresAt is the URL's
+	// parsed expiry (see stream.ParseStreamDetails); nil when the URL carries
+	// no parseable expiry.
+	//
+	// The Provider* fields are the candidate's durable identity in the same
+	// tier order as the dedup key: video hash, then source GUID, then release
+	// name + size. They let a row be re-matched to a fresh listing after the
+	// provider rotates result ids.
+	ResolvedURL          string     `json:"-"`
+	ResolvedURLExpiresAt *time.Time `json:"-"`
+	ProviderVideoHash    string     `json:"-"`
+	ProviderGUID         string     `json:"-"`
+	ProviderReleaseName  string     `json:"-"`
+	ProviderReleaseSize  int64      `json:"-"`
+	FirstSeenScanRunID   string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 // MediaChapter represents a single media chapter derived from embedded file metadata.
@@ -891,4 +910,18 @@ type VirtualFilePersistArgs struct {
 	// automatic path leaves it false so a failure committed after the caller's
 	// last verdict read is still fenced out at write time.
 	AllowFailedVerdict bool
+	// ResolvedURL is the provider stream URL a successful resolution produced
+	// for this row. When non-empty it (re)writes resolved_url and its paired
+	// expiry; when empty the stored values are preserved, so a metadata-only
+	// write cannot erase the last resolved URL. ResolvedURLExpiresAt is the
+	// URL's parsed expiry (nil when unparseable).
+	ResolvedURL          string
+	ResolvedURLExpiresAt *time.Time
+	// Provider* is the candidate's durable identity, in the same tier order
+	// as the dedup key. A non-empty value overwrites the stored one; an empty
+	// value preserves it, so a metadata-only write cannot erase identity.
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
+	ProviderReleaseSize int64
 }

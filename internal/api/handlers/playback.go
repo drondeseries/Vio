@@ -159,6 +159,14 @@ type ResolvedVirtualMedia struct {
 	// file whose stored owner is 0 and takes precedence over the file owner
 	// when deciding whether allow_insecure_http applies.
 	OwnerID int
+	// ProviderVideoHash, ProviderGUID, ProviderReleaseName and
+	// ProviderReleaseSize are the resolved candidate's durable identity, in
+	// the same tier order as the dedup key. The persistence path stores them
+	// on the candidate row so it can be re-matched after a re-list.
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
+	ProviderReleaseSize int64
 }
 
 // effectiveVirtualOwner returns the first positive installation owner from the

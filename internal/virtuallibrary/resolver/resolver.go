@@ -491,6 +491,15 @@ func candidateDedupName(candidate StreamCandidate) string {
 	return ""
 }
 
+// CandidateReleaseName exposes the normalized release identity that
+// candidateDedupKey uses in its name+size tier for a caller that persists the
+// durable identity of a candidate. It is the same value the dedup collapse
+// compares, so a persisted row can be re-matched to a fresh listing whose
+// result id changed.
+func CandidateReleaseName(candidate StreamCandidate) string {
+	return candidateDedupName(candidate)
+}
+
 // urlPathBase returns the last path segment of a stream URL, or "" when the
 // URL cannot be parsed.
 func urlPathBase(rawURL string) string {

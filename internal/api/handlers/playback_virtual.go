@@ -878,6 +878,18 @@ type VirtualPlaybackStream struct {
 	// candidate behind every accepted one so device fit can never promote it
 	// to the front. Rejected remains last-resort selectable.
 	Rejected bool `json:"-"`
+	// ProviderURL, ProviderVideoHash, ProviderGUID and ProviderReleaseName
+	// carry the lister's durable provider identity to the persistence sink.
+	// ProviderURL is internal only and must never be serialized to a client;
+	// every field is json:"-" and the sink is the sole consumer.
+	ProviderURL         string `json:"-"`
+	ProviderVideoHash   string `json:"-"`
+	ProviderGUID        string `json:"-"`
+	ProviderReleaseName string `json:"-"`
+	// ProviderExpiresAt is the provider URL's parsed query-expiry (nil when
+	// unparseable). It is the expiry the persistence sink stores alongside
+	// ProviderURL.
+	ProviderExpiresAt *time.Time `json:"-"`
 }
 
 // Get* accessors satisfy plugins.VirtualStreamMetadata so the shared device
@@ -922,6 +934,16 @@ type resolvedVirtualPlaybackSource struct {
 	Provenance        ProbeProvenance
 	AppliedRemux      bool
 	ResolutionAssumed bool
+	// ResolvedURL is the validated provider URL the resolver returned, with
+	// its parsed expiry and the candidate's durable identity. They are
+	// additive evidence the adoption path persists on the catalog row so a
+	// later phase can reuse the URL instead of re-listing.
+	ResolvedURL          string
+	ResolvedURLExpiresAt *time.Time
+	ProviderVideoHash    string
+	ProviderGUID         string
+	ProviderReleaseName  string
+	ProviderReleaseSize  int64
 }
 
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
@@ -2255,6 +2277,18 @@ UPDATE media_files SET
   container        = NULLIF($7,''),
   hdr              = $8,
   bitrate          = NULLIF($9,0),
+  -- The persisted provider URL and its durable identity are additive to the
+  -- neutral ?result= file_path. A resolution with no URL (a metadata-only
+  -- write) must not erase the stored one; only a newer successful resolution
+  -- overwrites it, and its expiry is replaced with it so the pair always
+  -- describes the same URL. The identity tiers COALESCE so an omitted tier
+  -- preserves the last known value.
+  resolved_url     = CASE WHEN NULLIF($23,'') IS NOT NULL THEN $23 ELSE resolved_url END,
+  resolved_url_expires_at = CASE WHEN NULLIF($23,'') IS NOT NULL THEN $24::timestamptz ELSE resolved_url_expires_at END,
+  provider_video_hash     = COALESCE(NULLIF($25,''), provider_video_hash),
+  provider_guid           = COALESCE(NULLIF($26,''), provider_guid),
+  provider_release_name   = COALESCE(NULLIF($27,''), provider_release_name),
+  provider_release_size   = COALESCE(NULLIF($28::bigint,0), provider_release_size),
   duration         = CASE WHEN $10 > 0 THEN $10 ELSE duration END,
   audio_channels   = COALESCE(
     (SELECT (elem->>'channels')::int
@@ -2446,6 +2480,8 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 			args.FileID, args.ExpectedFilePath, args.StampProbe,
 			args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
 			neutralPath, verdictMaxAgeSeconds, fenceVerdict, requireAdoption,
+			args.ResolvedURL, args.ResolvedURLExpiresAt,
+			args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
 		).Scan(&persistedPath)
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No row matched the CAS fence: a stale snapshot, reported as a
@@ -3064,6 +3100,14 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					OwnerID:          snap.OwnerID,
 					LibraryID:        snap.LibraryID,
 					AdoptPath:        resolved.URI,
+					// Persist the provider URL and durable identity the
+					// resolution produced alongside the adopted identity.
+					ResolvedURL:          resolved.ResolvedURL,
+					ResolvedURLExpiresAt: resolved.ResolvedURLExpiresAt,
+					ProviderVideoHash:    resolved.ProviderVideoHash,
+					ProviderGUID:         resolved.ProviderGUID,
+					ProviderReleaseName:  resolved.ProviderReleaseName,
+					ProviderReleaseSize:  resolved.ProviderReleaseSize,
 					// The fallback reports a substitute identity to the
 					// session, so metadata alone is not enough: the saver must
 					// confirm the validated identity was actually adopted.
@@ -3146,6 +3190,9 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		return nil, err
 	}
 	var streamURL string
+	var resolvedExpiresAt *time.Time
+	var providerVideoHash, providerGUID, providerReleaseName string
+	var providerReleaseSize int64
 	if h.VirtualMediaDetailedResolver != nil {
 		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 			ctx, candidate.URI, ownerID, userID, profileID, false, nil, "",
@@ -3154,6 +3201,14 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 			return nil, err
 		}
 		streamURL = res.URL
+		if !res.ExpiresAt.IsZero() {
+			expiresAt := res.ExpiresAt
+			resolvedExpiresAt = &expiresAt
+		}
+		providerVideoHash = res.ProviderVideoHash
+		providerGUID = res.ProviderGUID
+		providerReleaseName = res.ProviderReleaseName
+		providerReleaseSize = res.ProviderReleaseSize
 		candidate.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
 		if res.URI != "" {
 			candidate.URI = res.URI
@@ -3180,7 +3235,12 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	transient := *file
 	transient.FilePath = candidate.URI
 	transient.VirtualOwnerInstallationID = ownerID
-	resolved := resolvedVirtualPlaybackSource{URL: streamURL, URI: candidate.URI, OwnerID: ownerID, File: &transient, Provenance: ProbeProvenanceDeclared}
+	resolved := resolvedVirtualPlaybackSource{
+		URL: streamURL, URI: candidate.URI, OwnerID: ownerID, File: &transient, Provenance: ProbeProvenanceDeclared,
+		ResolvedURL: streamURL, ResolvedURLExpiresAt: resolvedExpiresAt,
+		ProviderVideoHash: providerVideoHash, ProviderGUID: providerGUID,
+		ProviderReleaseName: providerReleaseName, ProviderReleaseSize: providerReleaseSize,
+	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 		return &resolved, nil
 	}

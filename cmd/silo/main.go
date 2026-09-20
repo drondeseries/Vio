@@ -3329,11 +3329,15 @@ func main() {
 					return jellycompat.ResolvedVirtualMedia{}, err
 				}
 				return jellycompat.ResolvedVirtualMedia{
-					URL:            res.URL,
-					URI:            res.URI,
-					CandidateID:    res.CandidateID,
-					RequestHeaders: res.RequestHeaders,
-					ExpiresAt:      res.ExpiresAt,
+					URL:                 res.URL,
+					URI:                 res.URI,
+					CandidateID:         res.CandidateID,
+					RequestHeaders:      res.RequestHeaders,
+					ExpiresAt:           res.ExpiresAt,
+					ProviderVideoHash:   res.ProviderVideoHash,
+					ProviderGUID:        res.ProviderGUID,
+					ProviderReleaseName: res.ProviderReleaseName,
+					ProviderReleaseSize: res.ProviderReleaseSize,
 				}, nil
 			})
 			compatDeps.VirtualPlaybackStreamLister = jellycompat.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]jellycompat.VirtualPlaybackStream, error) {

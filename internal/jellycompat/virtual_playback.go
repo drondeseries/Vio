@@ -55,6 +55,14 @@ type ResolvedVirtualMedia struct {
 	// whose stored owner is 0 and takes precedence over the file owner for the
 	// allow_insecure_http decision.
 	OwnerID int
+	// ProviderVideoHash, ProviderGUID, ProviderReleaseName and
+	// ProviderReleaseSize are the resolved candidate's durable identity, in
+	// the same tier order as the dedup key. They mirror the native resolver
+	// shape so both surfaces can persist the same identity.
+	ProviderVideoHash   string
+	ProviderGUID        string
+	ProviderReleaseName string
+	ProviderReleaseSize int64
 }
 
 // VirtualMediaResolver resolves a provider-neutral virtual URI to a temporary

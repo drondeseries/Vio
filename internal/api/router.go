@@ -1175,6 +1175,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 					}
 					out := make([]handlers.VirtualPlaybackStream, 0, len(streams))
 					for _, stream := range streams {
+						var providerExpiresAt *time.Time
+						if !stream.ExpiresAt.IsZero() {
+							expiresAt := stream.ExpiresAt
+							providerExpiresAt = &expiresAt
+						}
 						out = append(out, handlers.VirtualPlaybackStream{
 							ID: stream.ID, Label: stream.Label, URI: stream.URI, Resolution: stream.Resolution,
 							CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio, HasAtmos: stream.HasAtmos,
@@ -1183,7 +1188,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 							Bitrate: stream.Bitrate, FrameRate: stream.FrameRate, AudioLanguages: stream.AudioLanguages,
 							SubtitleLanguages: stream.SubtitleLanguages, OwnerInstallationID: stream.OwnerInstallationID,
 							Visible: stream.Visible, VisibilitySpecified: stream.VisibilitySpecified,
-							Rejected: stream.Rejected,
+							Rejected:            stream.Rejected,
+							ProviderURL:         stream.ProviderURL,
+							ProviderVideoHash:   stream.ProviderVideoHash,
+							ProviderGUID:        stream.ProviderGUID,
+							ProviderReleaseName: stream.ProviderReleaseName,
+							ProviderExpiresAt:   providerExpiresAt,
 						})
 					}
 					return out, nil
@@ -1200,6 +1210,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 							CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio,
 							HDR: stream.HDR, FileSize: stream.FileSize, Bitrate: stream.Bitrate,
 							AudioLanguages: stream.AudioLanguages, SubtitleLanguages: stream.SubtitleLanguages,
+							ResolvedURL:          stream.ProviderURL,
+							ResolvedURLExpiresAt: stream.ProviderExpiresAt,
+							ProviderVideoHash:    stream.ProviderVideoHash,
+							ProviderGUID:         stream.ProviderGUID,
+							ProviderReleaseName:  stream.ProviderReleaseName,
+							ProviderReleaseSize:  stream.FileSize,
 						})
 					}
 					return deps.FileRepo.ReplaceVirtualCandidates(ctx, source, candidates)
