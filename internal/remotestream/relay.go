@@ -48,9 +48,9 @@ const (
 const (
 	cacheControlNoStore = "no-store"
 	cacheControlPrivate = "private"
-	cacheControlNoCache  = "no-cache"
-	cacheControlMaxAge   = "max-age"
-	cacheControlSMaxAge  = "s-maxage"
+	cacheControlNoCache = "no-cache"
+	cacheControlMaxAge  = "max-age"
+	cacheControlSMaxAge = "s-maxage"
 )
 
 const (
