@@ -101,6 +101,11 @@ type StreamHandler struct {
 	VirtualMediaResolver         VirtualMediaResolver
 	VirtualMediaRefreshResolver  VirtualMediaRefreshResolver
 	VirtualMediaDetailedResolver VirtualMediaDetailedResolver
+	// VirtualFileSaver/VirtualFileMetadataSaver persist a refreshed provider URL
+	// through the existing Phase-1 write path when a candidate's stored URL has
+	// expired. Nil disables the refresh; the resolve still lists as before.
+	VirtualFileSaver         VirtualFileSaver
+	VirtualFileMetadataSaver VirtualFileMetadataSaver
 	// RemoteStreamRelay pins the resolved provider URL to a loopback relay
 	// so ffmpeg reads through it with a stable IP.
 	RemoteStreamRelay *remotestream.Relay
@@ -271,26 +276,45 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 ) (ResolvedVirtualMedia, func(), error) {
 	resolved := ResolvedVirtualMedia{}
 	var err error
-	if h.VirtualMediaDetailedResolver != nil {
-		// The caller declares whether excluding the candidate indicted the
-		// release; a display-driven same-file re-plan never does.
-		ctx = withVirtualCandidateRotationV3(ctx, rotateCandidates)
-		// The serve layer re-resolves a release an existing session already
-		// serves, so it declares session-bound: a profile-removed candidate
-		// refuses instead of silently swapping the release.
-		ctx = withVirtualSessionBindingV3(ctx, true)
-		resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-			ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, "",
-		)
-	} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
-		resolved.URL, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
-			ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID,
-		)
-	} else {
-		resolved.URL, err = resolveVirtualMediaPath(
-			ctx, h.VirtualMediaResolver, file.FilePath,
-			file.VirtualOwnerInstallationID, userID, profileID,
-		)
+	// Stored-URL shortcut, mirroring the transport resolver: a session-bound
+	// re-resolve of a pinned candidate serves the row's own persisted URL when
+	// it is present, unexpired and passes the resolver's URL validator. The
+	// row is re-read by the exact candidate path so a row bound to a different
+	// virtual source cannot contribute its stored URL. forceRefresh (a
+	// failover retry) and an exclusion list always list afresh.
+	var storedExpiredRow *models.MediaFile
+	if !forceRefresh && len(excludedCandidateIDs) == 0 {
+		if usable, row, state := h.lookupStoredVirtualURLCandidate(ctx, file.FilePath, file.VirtualOwnerInstallationID); state == virtualStoredURLUsable {
+			resolved = usable
+		} else if state == virtualStoredURLExpired {
+			storedExpiredRow = row
+		}
+	}
+	if resolved.URL == "" {
+		if h.VirtualMediaDetailedResolver != nil {
+			// The caller declares whether excluding the candidate indicted the
+			// release; a display-driven same-file re-plan never does.
+			ctx = withVirtualCandidateRotationV3(ctx, rotateCandidates)
+			// The serve layer re-resolves a release an existing session already
+			// serves, so it declares session-bound: a profile-removed candidate
+			// refuses instead of silently swapping the release.
+			ctx = withVirtualSessionBindingV3(ctx, true)
+			resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+				ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, "",
+			)
+			if err == nil && storedExpiredRow != nil {
+				refreshStoredVirtualResolution(ctx, storedExpiredRow, resolved, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+			}
+		} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
+			resolved.URL, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
+				ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID,
+			)
+		} else {
+			resolved.URL, err = resolveVirtualMediaPath(
+				ctx, h.VirtualMediaResolver, file.FilePath,
+				file.VirtualOwnerInstallationID, userID, profileID,
+			)
+		}
 	}
 	if err != nil {
 		return ResolvedVirtualMedia{}, nil, fmt.Errorf("resolve virtual input: %w", err)

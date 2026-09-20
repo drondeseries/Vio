@@ -72,11 +72,15 @@ type PlaybackStream struct {
 	Rejected bool
 }
 
-// validateStreamURL checks structural syntax and enforces SSRF protection
-// using the central remotestream policy. When AllowInsecureHTTP is enabled,
-// it permits private and local network destinations; otherwise, loopback,
-// RFC 1918, link-local, and multicast addresses are rejected.
-func (s *Service) validateStreamURL(ctx context.Context, raw string) (string, error) {
+// ValidateProviderStreamURL checks structural syntax and enforces SSRF
+// protection using the central remotestream policy. When allowInsecure is set
+// (the virtual_library.allow_insecure_http opt-in) it permits private and
+// local network destinations; otherwise, loopback, RFC 1918, link-local, and
+// multicast addresses are rejected. It is the single validator the resolver
+// applies to a fresh provider listing, exported so a serve-layer caller that
+// re-uses a persisted provider URL re-validates it through exactly the same
+// policy rather than a parallel copy that could drift.
+func ValidateProviderStreamURL(ctx context.Context, raw string, allowInsecure bool) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", fmt.Errorf("empty provider stream URL")
@@ -84,7 +88,7 @@ func (s *Service) validateStreamURL(ctx context.Context, raw string) (string, er
 	if strings.ContainsAny(trimmed, "\x00\r\n") {
 		return "", fmt.Errorf("provider stream URL contains control characters")
 	}
-	if s.cfg.AllowInsecureHTTP {
+	if allowInsecure {
 		parsed, err := remotestream.ValidateURLSyntaxAllowNonPublic(trimmed)
 		if err != nil {
 			return "", fmt.Errorf("invalid stream URL syntax: %w", err)
@@ -96,6 +100,14 @@ func (s *Service) validateStreamURL(ctx context.Context, raw string) (string, er
 		return "", fmt.Errorf("stream URL rejected by SSRF policy: %w", err)
 	}
 	return validated.String(), nil
+}
+
+// validateStreamURL checks structural syntax and enforces SSRF protection
+// using the central remotestream policy. When AllowInsecureHTTP is enabled,
+// it permits private and local network destinations; otherwise, loopback,
+// RFC 1918, link-local, and multicast addresses are rejected.
+func (s *Service) validateStreamURL(ctx context.Context, raw string) (string, error) {
+	return ValidateProviderStreamURL(ctx, raw, s.cfg.AllowInsecureHTTP)
 }
 
 // withResultKey appends the candidate identity as ?result=, mirroring the

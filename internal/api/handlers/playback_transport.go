@@ -349,30 +349,59 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	}
 	var res ResolvedVirtualMedia
 	var err error
-	if h.VirtualMediaDetailedResolver != nil {
-		// The intent travels with the context so the resolver can distinguish a
-		// serve-layer indictment from a display-driven same-file re-plan.
-		ctx = withVirtualCandidateRotationV3(ctx, rotationRequested)
-		// The transport serve layer re-resolves a release an existing session
-		// already serves, so it declares session-bound: a profile-removed
-		// candidate refuses instead of silently swapping the release.
-		ctx = withVirtualSessionBindingV3(ctx, true)
-		res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-			ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID,
-		)
-	} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
-		var inputPath string
-		inputPath, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
-			ctx, virtualURI, ownerInstallationID, userID, profileID,
-		)
-		res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
-	} else {
-		var inputPath string
-		inputPath, err = resolveVirtualMediaPath(
-			ctx, h.VirtualMediaResolver, virtualURI,
-			ownerInstallationID, userID, profileID,
-		)
-		res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
+	// Stored-URL shortcut. A session-bound re-resolve of a pinned candidate —
+	// the remux seek anchor, a transport restart, the subtitle/font warm — may
+	// serve the row's own persisted provider URL instead of listing the
+	// provider again. The URL belongs to the exact candidate being resolved
+	// (see evaluateStoredVirtualURLCandidate for the same-row check), so it is
+	// the pinned release itself and never a substitution. Narrow by design:
+	// an explicit forceRefresh (a failover retry after this candidate failed)
+	// or an exclusion list always takes the list-and-resolve path.
+	var storedExpiredRow *models.MediaFile
+	storedUsable := false
+	if !forceRefresh && len(excludedCandidateIDs) == 0 {
+		if usable, row, state := h.lookupStoredVirtualURLCandidate(ctx, virtualURI, ownerInstallationID); state == virtualStoredURLUsable {
+			res = usable
+			storedUsable = true
+		} else if state == virtualStoredURLExpired {
+			// The row owns this candidate but its URL lapsed. Resolve afresh
+			// below, then refresh the stored value through the existing
+			// Phase-1 saver.
+			storedExpiredRow = row
+		}
+	}
+	if !storedUsable {
+		if h.VirtualMediaDetailedResolver != nil {
+			// The intent travels with the context so the resolver can distinguish a
+			// serve-layer indictment from a display-driven same-file re-plan.
+			ctx = withVirtualCandidateRotationV3(ctx, rotationRequested)
+			// The transport serve layer re-resolves a release an existing session
+			// already serves, so it declares session-bound: a profile-removed
+			// candidate refuses instead of silently swapping the release.
+			ctx = withVirtualSessionBindingV3(ctx, true)
+			res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+				ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID,
+			)
+			if err == nil && storedExpiredRow != nil {
+				// Reuse the Phase-1 write path; only the requested candidate's
+				// own successful resolution is recorded (a substituted sibling
+				// is skipped inside).
+				refreshStoredVirtualResolution(ctx, storedExpiredRow, res, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+			}
+		} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
+			var inputPath string
+			inputPath, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
+				ctx, virtualURI, ownerInstallationID, userID, profileID,
+			)
+			res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
+		} else {
+			var inputPath string
+			inputPath, err = resolveVirtualMediaPath(
+				ctx, h.VirtualMediaResolver, virtualURI,
+				ownerInstallationID, userID, profileID,
+			)
+			res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
+		}
 	}
 	if err != nil {
 		slog.WarnContext(ctx, "virtual stream resolve failed",

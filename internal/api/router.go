@@ -1422,6 +1422,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return handlers.ExecVirtualFileMetadataUpdateResult(ctx, deps.DB, args)
 			}
+			if streamHandler != nil {
+				// The serve layer refreshes an expired stored URL through the
+				// same Phase-1 saver as the transport resolve.
+				streamHandler.VirtualFileSaver = playbackHandler.VirtualFileSaver
+				streamHandler.VirtualFileMetadataSaver = playbackHandler.VirtualFileMetadataSaver
+			}
 		}
 		if deps.Config != nil {
 			ffprobePath := scanner.FFprobePathFromFFmpeg(deps.Config.Playback.FFmpegPath)
