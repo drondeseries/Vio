@@ -63,11 +63,18 @@ grep -q 'setVirtualPlayback] = useState(true)' web/src/pages/adminCollectionsSha
   && pass "virtual_playback add-flow defaults" \
   || reject "virtual_playback add-flow defaults flipped off"
 
-# 7. Image build pipeline: BuildKit frontend pruning, unshadowed Go module layer caching, Go compiler cache persistence, and single-runner manual frontend builds.
-grep -q 'FROM node:22-slim AS node-base' Dockerfile \
+# 7. Image build pipeline: BuildKit frontend pruning, unshadowed Go module layer caching, Go compiler cache persistence, single-runner manual frontend builds, and pinned base image versions (a floating tag bump silently invalidates the layer cache and the Go build cache).
+grep -Eq 'FROM node:22(\.[0-9]+){2}-slim AS node-base' Dockerfile \
   && grep -q 'COPY --from=node-base /usr/local/bin/node' Dockerfile \
   && pass "Dockerfile decoupled node-base stage" \
   || reject "Dockerfile missing decoupled node-base stage for BuildKit frontend pruning"
+
+grep -Eq '^FROM golang:1\.26\.[0-9]+ AS build$' Dockerfile \
+  && pass "build stage Go toolchain pinned" \
+  || reject "build stage golang tag not pinned to a patch release"
+grep -Eq '^FROM debian:trixie-[0-9]{8}-slim$' Dockerfile \
+  && pass "runtime stage Debian image pinned" \
+  || reject "runtime stage debian tag not pinned to a dated trixie snapshot"
 
 if grep -E -q -- '--mount=type=cache.*target=/go/pkg/mod' Dockerfile; then
   reject "Dockerfile contains --mount=type=cache targeting /go/pkg/mod (shadows Go module layer cache)"

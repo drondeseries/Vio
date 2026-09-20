@@ -19,7 +19,7 @@ that before it ships.
 | Settings secrets | Indexer keys use `SecretField` (configured indicator + clear) | `web/src/pages/admin-settings/StreamingSettings.tsx` | `StreamingSettings.test.tsx` |
 | Settings checks | `remuxdb` + `virtual_library` check kinds; safe messages | `internal/api/handlers/admin_settings_checks*.go` | `admin_settings_check_service_test.go` |
 | Monitor registrar | Library-scoped registration, episode URIs, plugin-path fallbacks | `internal/virtuallibrary/registrar.go`, `monitor/monitor.go` | virtuallibrary suites |
-| Image builds | Decoupled `node-base` stage for BuildKit frontend pruning, unshadowed Go module layer caching, persisted Go compiler cache (`buildkit-cache-dance`), and deduplicated `workflow_dispatch` frontend builds | `Dockerfile`, `.github/workflows/docker.yml` | invariant script |
+| Image builds | Decoupled `node-base` stage for BuildKit frontend pruning, unshadowed Go module layer caching, persisted Go compiler cache (`buildkit-cache-dance`), deduplicated `workflow_dispatch` frontend builds, base images pinned to patch/dated tags, and skipped image attestations | `Dockerfile`, `.github/workflows/docker.yml` | invariant script |
 
 ## Merge procedure
 
@@ -44,10 +44,14 @@ that before it ships.
      lacks `buildkit-cache-dance` to persist Go compiler caches, and duplicates
      manual frontend builds across runners. Do not let upstream merges
      overwrite Vio's optimized build pipeline. Note that `.github/workflows/docker.yml`
-     is preserved automatically via `.gitattributes` (`merge=ours`, configured by
-     `make install-hooks`), while `Dockerfile` hunks must be reviewed to keep
-     the decoupled `node-base` stage and unshadowed module layer caching. CI and
-     `make verify-fork-invariants` enforce both.
+is preserved automatically via `.gitattributes` (`merge=ours`, configured by
+      `make install-hooks`), while `Dockerfile` hunks must be reviewed to keep
+      the decoupled `node-base` stage, unshadowed module layer caching, and the
+      pinned base image versions. Floating base image tags (`node:22-slim`,
+      `golang:1.26`, `debian:trixie-slim`) bump silently and invalidate the
+      layer cache and the Go build cache, so the fork pins them to patch/dated
+      tags and bumps them as a deliberate change. CI and
+      `make verify-fork-invariants` enforce both.
 3. Merge with a merge commit so fork history stays readable. Never rebase
    pushed history.
 4. Verify before pushing: `scripts/check-fork-invariants.sh` (includes gofmt

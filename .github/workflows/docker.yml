@@ -194,6 +194,10 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
+          # Attestations are never read by the digest + manifest-merge flow, so skip
+          # generating them: cheaper builds and a smaller cache-to upload.
+          provenance: false
+          sbom: false
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}

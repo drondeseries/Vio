@@ -1,5 +1,8 @@
+# Base images are pinned to checked-in patches so an upstream bump cannot
+# silently invalidate the build/runtime layers or the Go build cache (the Go
+# cache is toolchain-version-specific). Bump them as a deliberate change.
 # Stage 1: Build frontend
-FROM node:22-slim AS node-base
+FROM node:22.23.2-slim AS node-base
 
 FROM node-base AS frontend
 RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
@@ -20,7 +23,7 @@ FROM scratch AS frontend_dist
 COPY --from=frontend /app/web/dist/. /
 
 # Stage 2: Build Go binary
-FROM golang:1.26 AS build
+FROM golang:1.26.8 AS build
 ENV CGO_ENABLED=1
 ENV GOPROXY=https://proxy.golang.org,direct
 ENV GOPRIVATE=github.com/Silo-Server/*
@@ -49,7 +52,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -o /vio ./cmd/silo/
 
 # Stage 3: Runtime
-FROM debian:trixie-slim
+FROM debian:trixie-20260918-slim
 ARG TARGETARCH
 ARG INTEL_GMMLIB_VERSION=22.10.0
 ARG INTEL_IGC_VERSION=2.34.4
