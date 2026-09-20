@@ -330,8 +330,20 @@ type PlaybackHandler struct {
 	VirtualSourceProber            VirtualSourceProber
 	VirtualSourceProberWithHeaders VirtualSourceProberWithHeaders
 	VirtualFileSaver               VirtualFileSaver
-	VirtualCandidateFileLookup     VirtualCandidateFileLookup
-	RemoteStreamRelay              RemoteStreamRelay
+	// VirtualFileMetadataSaver, when wired, is preferred over VirtualFileSaver
+	// by paths that must distinguish metadata persistence from identity
+	// adoption. Nil keeps legacy behavior.
+	VirtualFileMetadataSaver VirtualFileMetadataSaver
+	// compatBackgroundMu/WG/closed own the lifecycle of detached compat
+	// virtual evidence writes: admission is refused after Close, in-flight
+	// work is tracked, and the shutdown cleanup waits for it within a bounded
+	// drain timeout. Mirrors the native evidence lifecycle without sharing
+	// its implementation (jellycompat cannot import the handlers package).
+	compatBackgroundMu         sync.Mutex
+	compatBackgroundWG         sync.WaitGroup
+	compatBackgroundClosed     bool
+	VirtualCandidateFileLookup VirtualCandidateFileLookup
+	RemoteStreamRelay          RemoteStreamRelay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for private/local stream URLs. When
 	// nil or false, virtual streams are proxied through the strict SSRF-protected

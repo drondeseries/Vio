@@ -3388,6 +3388,17 @@ func main() {
 				}
 				return handlers.ExecVirtualFileMetadataUpdate(ctx, deps.DB, args)
 			}
+			compatDeps.VirtualFileMetadataSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (jellycompat.VirtualFileMetadataUpdateResult, error) {
+				if deps.DB == nil {
+					return jellycompat.VirtualFileMetadataUpdateResult{}, nil
+				}
+				result, err := handlers.ExecVirtualFileMetadataUpdateResult(ctx, deps.DB, args)
+				return jellycompat.VirtualFileMetadataUpdateResult{
+					RowsAffected:    result.RowsAffected,
+					MetadataUpdated: result.MetadataUpdated,
+					IdentityAdopted: result.IdentityAdopted,
+				}, err
+			}
 		}
 
 		// Wire direct dependencies when DB is available.
@@ -3458,7 +3469,11 @@ func main() {
 			if deps.FileRepo != nil {
 				compatDeps.FileResolver = deps.FileRepo
 				compatDeps.VirtualCandidateFileLookup = func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
-					return deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+					file, err := deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+					if err != nil && errors.Is(err, scanner.ErrFileNotFound) {
+						return nil, jellycompat.ErrVirtualCandidateNotFound
+					}
+					return file, err
 				}
 			}
 

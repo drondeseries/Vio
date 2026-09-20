@@ -381,6 +381,48 @@ func (h *PlaybackHandler) evidenceBuffer() *virtualEvidenceBuffer {
 	return h.virtualEvidenceBuffer
 }
 
+// virtualEvidenceShutdownOuterTimeout bounds the whole shutdown wait for
+// evidence workers, on top of the drain grace that bounds the drain itself.
+// Worker sleeps and write attempts are each bounded, but an outer cap keeps a
+// pathological stall from consuming the process shutdown budget. It is a var
+// so tests can shrink the wait.
+var virtualEvidenceShutdownOuterTimeout = 20 * time.Second
+
+// StartVirtualEvidenceShutdownCleanup waits for ctx (the application
+// lifecycle) before closing evidence admission, then drains accepted work
+// within bounds and closes done when finished, so the process shutdown work
+// tracker can retain it. It follows the same RegisterShutdownWork
+// done-channel contract as the transcode manager cleanup: calling it at
+// router construction must not close admission — only application
+// cancellation does. It is safe to call alongside the internal service-context
+// watcher; stopVirtualEvidence is single-flight. A stall past the outer bound
+// is logged loudly and shutdown proceeds.
+func (h *PlaybackHandler) StartVirtualEvidenceShutdownCleanup(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if h == nil || ctx == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		finished := make(chan struct{})
+		go func() {
+			defer close(finished)
+			h.stopVirtualEvidence()
+		}()
+		timer := time.NewTimer(virtualEvidenceShutdownOuterTimeout)
+		defer timer.Stop()
+		select {
+		case <-finished:
+		case <-timer.C:
+			slog.Warn("virtual evidence shutdown did not finish before the outer bound; proceeding with shutdown",
+				"component", "api", "outer_timeout", virtualEvidenceShutdownOuterTimeout)
+		}
+	}()
+	return done
+}
+
 // stopVirtualEvidence is the single shutdown path: it atomically stops
 // admission, awaits every worker (including the task one already dequeued), then
 // drains the accepted remainder under an independent bounded context. It is
@@ -474,10 +516,27 @@ func (h *PlaybackHandler) drainVirtualEvidence(buf *virtualEvidenceBuffer) {
 // than stranded. The return value is the write error, or errVirtualEvidenceStale
 // on a CAS miss; both are logged as terminal.
 func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, drainDeadline time.Time) error {
-	if task == nil || h.VirtualFileSaver == nil {
+	if task == nil || (h.VirtualFileMetadataSaver == nil && h.VirtualFileSaver == nil) {
 		return nil
 	}
-	saver := h.VirtualFileSaver
+	// Prefer the explicit adoption-result saver so a metadata-only write is
+	// never mistaken for identity adoption; the legacy row-count saver stays
+	// as the fallback for wirings that only provide it.
+	save := func(ctx context.Context, args models.VirtualFilePersistArgs) (updated bool, err error) {
+		if h.VirtualFileMetadataSaver != nil {
+			result, err := h.VirtualFileMetadataSaver(ctx, args)
+			if err != nil {
+				return false, err
+			}
+			if args.AdoptPath != "" && !result.IdentityAdopted {
+				slog.DebugContext(ctx, "virtual probe evidence persisted without identity adoption",
+					"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath)
+			}
+			return result.MetadataUpdated, nil
+		}
+		rows, err := h.VirtualFileSaver(ctx, args)
+		return err == nil && rows > 0, err
+	}
 	var lastErr error
 	for attempt := 1; attempt <= virtualEvidenceMaxAttempts; attempt++ {
 		deadline := h.effectiveEvidenceDeadline(drainDeadline)
@@ -503,10 +562,10 @@ func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, 
 			break
 		}
 		writeCtx, cancel := h.evidenceWriteContext(deadline)
-		rows, err := saver(writeCtx, task.args)
+		updated, err := save(writeCtx, task.args)
 		cancel()
 		if err == nil {
-			if rows == 0 {
+			if !updated {
 				lastErr = errVirtualEvidenceStale
 				goto terminal
 			}

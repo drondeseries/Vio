@@ -33,6 +33,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
+	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/settingskeys"
 	"github.com/Silo-Server/silo-server/internal/settingsresolve"
@@ -268,6 +269,12 @@ type VirtualProbeCacheLookup func(sourceURL string, file *models.MediaFile) *mod
 // rows updated (0 means the snapshot was stale — a newer write landed first).
 type VirtualFileSaver func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error)
 
+// VirtualFileMetadataSaver is VirtualFileSaver with an explicit result that
+// separates metadata persistence from identity adoption. Prefer it wherever
+// the caller must distinguish "evidence landed" from "the row adopted the
+// requested path"; the row-count contract cannot express that difference.
+type VirtualFileMetadataSaver func(ctx context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error)
+
 // VirtualPlaybackSourceProber resolves a virtual provider URL and probes the
 // stream metadata.
 
@@ -292,6 +299,12 @@ type copySeekAnchorResolver func(
 type VirtualFileLookup func(ctx context.Context, path string) (*models.MediaFile, error)
 
 type VirtualCandidateFileLookup func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error)
+
+var ErrVirtualCandidateNotFound = errors.New("virtual candidate not found")
+
+func isVirtualCandidateNotFound(err error) bool {
+	return err != nil && (errors.Is(err, ErrVirtualCandidateNotFound) || errors.Is(err, scanner.ErrFileNotFound))
+}
 
 type VirtualPlaybackPrefetchRequest struct {
 	FileIDs []int `json:"file_ids"`
@@ -446,13 +459,17 @@ type PlaybackHandler struct {
 	VirtualProbeCacheLookup                VirtualProbeCacheLookup
 	BestResultCache                        *VirtualBestResultCache
 	VirtualFileSaver                       VirtualFileSaver
-	VirtualSubtitleSearcher                SubtitleSearchTrigger
-	SubtitleSearchInFlight                 *sync.Map
-	DeviceCapabilitySource                 DeviceCapabilityProfileSource
-	RemuxDBConfig                          func(ctx context.Context) remuxdb.Config
-	RemuxDBStore                           *remuxdb.Store
-	remuxSubmitOnce                        sync.Once
-	remuxSubmitCh                          chan remuxSubmitTask
+	// VirtualFileMetadataSaver, when wired, is preferred over VirtualFileSaver
+	// by paths that must distinguish metadata persistence from identity
+	// adoption (stale fallback, evidence workers). Nil keeps legacy behavior.
+	VirtualFileMetadataSaver VirtualFileMetadataSaver
+	VirtualSubtitleSearcher  SubtitleSearchTrigger
+	SubtitleSearchInFlight   *sync.Map
+	DeviceCapabilitySource   DeviceCapabilityProfileSource
+	RemuxDBConfig            func(ctx context.Context) remuxdb.Config
+	RemuxDBStore             *remuxdb.Store
+	remuxSubmitOnce          sync.Once
+	remuxSubmitCh            chan remuxSubmitTask
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through

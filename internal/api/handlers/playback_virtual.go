@@ -24,6 +24,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/text/language"
 )
@@ -2160,10 +2161,20 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 		probeTransient := cloneVirtualProbeTransient(*file)
 		var dbFile *models.MediaFile
 		if h.VirtualFileLookup != nil {
-			dbFile, _ = h.VirtualFileLookup(bgCtx, cand.URI)
+			var lookupErr error
+			dbFile, lookupErr = h.VirtualFileLookup(bgCtx, cand.URI)
+			if lookupErr != nil && !isVirtualCandidateNotFound(lookupErr) {
+				slog.WarnContext(bgCtx, "optimistic virtual revalidation lookup failed", "component", "api", "error", lookupErr)
+				return
+			}
 		}
 		if (dbFile == nil || dbFile.ID <= 0) && h.VirtualCandidateFileLookup != nil {
-			dbFile, _ = h.VirtualCandidateFileLookup(bgCtx, virtualPlaybackNeutralKey(cand.URI), file.ContentID, file.EpisodeID, oid)
+			var lookupErr error
+			dbFile, lookupErr = h.VirtualCandidateFileLookup(bgCtx, virtualPlaybackNeutralKey(cand.URI), file.ContentID, file.EpisodeID, oid)
+			if lookupErr != nil && !isVirtualCandidateNotFound(lookupErr) {
+				slog.WarnContext(bgCtx, "optimistic virtual candidate lookup failed", "component", "api", "error", lookupErr)
+				return
+			}
 		}
 		if dbFile != nil && dbFile.ID > 0 {
 			probeTransient = cloneVirtualProbeTransient(*dbFile)
@@ -2242,6 +2253,7 @@ WHERE id = $11
   AND probe_updated_at IS NOT DISTINCT FROM $15::timestamptz
   AND virtual_owner_installation_id IS NOT DISTINCT FROM $16
   AND media_folder_id IS NOT DISTINCT FROM $17
+RETURNING file_path
 `
 
 // VirtualFileMetadataDB is the minimal database surface the shared virtual
@@ -2249,10 +2261,25 @@ WHERE id = $11
 // wiring pass a *pgxpool.Pool, which satisfies this interface.
 type VirtualFileMetadataDB interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, arguments ...any) pgx.Row
 }
 
-// ExecVirtualFileMetadataUpdate executes VirtualFileMetadataUpdateSQL and owns
-// the adoption-race retry shared by the native and jellycompat savers.
+// VirtualFileMetadataUpdateResult reports metadata persistence separately
+// from identity adoption. The UPDATE returns the persisted file_path, so
+// adoption is observed atomically in the same statement: it holds exactly when
+// a non-empty AdoptPath was requested and the row carries it afterwards. A
+// successful UPDATE is not adoption when the row is collection-owned or the
+// sibling guard retained its existing path, and callers must not infer adoption
+// from row counts.
+type VirtualFileMetadataUpdateResult struct {
+	RowsAffected    int64
+	MetadataUpdated bool
+	IdentityAdopted bool
+}
+
+// ExecVirtualFileMetadataUpdateResult executes VirtualFileMetadataUpdateSQL
+// and owns the adoption-race retry shared by the native and jellycompat
+// savers.
 //
 // The SQL's sibling guard keeps adoption from colliding with an existing owner
 // of the target path, but two concurrent probes can both pass it and one still
@@ -2262,9 +2289,12 @@ type VirtualFileMetadataDB interface {
 // dropped. The retry keys on SQLSTATE 23505 rather than the constraint name,
 // and a second failure is returned unchanged. A nil db is a no-op so callers
 // that run without a database stay safe.
-func ExecVirtualFileMetadataUpdate(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs) (int64, error) {
+//
+// QueryRow consumes the full result stream before Scan returns, so a terminal
+// database error cannot hide behind an already-read row.
+func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
 	if db == nil {
-		return 0, nil
+		return VirtualFileMetadataUpdateResult{}, nil
 	}
 	vStr := string(args.VideoTracks)
 	if vStr == "" || vStr == jsonNullLiteral {
@@ -2278,28 +2308,54 @@ func ExecVirtualFileMetadataUpdate(ctx context.Context, db VirtualFileMetadataDB
 	if sStr == "" || sStr == jsonNullLiteral {
 		sStr = "[]"
 	}
-	exec := func(adoptPath string) (int64, error) {
-		tag, err := db.Exec(ctx, VirtualFileMetadataUpdateSQL,
+	exec := func(adoptPath string) (persistedPath string, rows int64, err error) {
+		var stored string
+		scanErr := db.QueryRow(ctx, VirtualFileMetadataUpdateSQL,
 			vStr, aStr, sStr, args.Resolution, args.CodecVideo, args.CodecAudio, args.Container, args.HDR, args.Bitrate, args.Duration,
 			args.FileID, args.ExpectedFilePath, args.StampProbe,
 			args.UpdatedAt, args.ProbeUpdatedAt, args.OwnerID, args.LibraryID, adoptPath,
-		)
-		if err != nil {
-			return 0, err
+		).Scan(&stored)
+		if scanErr != nil {
+			if errors.Is(scanErr, pgx.ErrNoRows) {
+				// No row matched the CAS fence: nothing was written.
+				return "", 0, nil
+			}
+			return "", 0, scanErr
 		}
-		return tag.RowsAffected(), nil
+		return stored, 1, nil
 	}
-	rows, err := exec(args.AdoptPath)
+	persisted, rows, err := exec(args.AdoptPath)
 	if err == nil {
-		return rows, nil
+		return VirtualFileMetadataUpdateResult{
+			RowsAffected:    rows,
+			MetadataUpdated: rows > 0,
+			IdentityAdopted: args.AdoptPath != "" && persisted == args.AdoptPath,
+		}, nil
 	}
 	var pgErr *pgconn.PgError
 	if args.AdoptPath == "" || !errors.As(err, &pgErr) || pgErr.Code != "23505" {
-		return 0, err
+		return VirtualFileMetadataUpdateResult{}, err
 	}
 	slog.WarnContext(ctx, "virtual probe evidence persist adoption raced an existing path owner; retrying without adoption",
 		"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath, "error", err)
-	return exec("")
+	// The retry deliberately retains evidence on the current row, but it did
+	// not adopt the requested identity. Callers must not treat this as an
+	// adoption success (metadata-only retries are not identity proof).
+	_, retryRows, retryErr := exec("")
+	return VirtualFileMetadataUpdateResult{
+		RowsAffected:    retryRows,
+		MetadataUpdated: retryErr == nil && retryRows > 0,
+		IdentityAdopted: false,
+	}, retryErr
+}
+
+// ExecVirtualFileMetadataUpdate preserves the historical row-count contract.
+func ExecVirtualFileMetadataUpdate(ctx context.Context, db VirtualFileMetadataDB, args models.VirtualFilePersistArgs) (int64, error) {
+	result, err := ExecVirtualFileMetadataUpdateResult(ctx, db, args)
+	if err != nil || !result.MetadataUpdated {
+		return 0, err
+	}
+	return 1, nil
 }
 
 // virtualSnapshot captures a catalog row's identity and generation before
@@ -2516,11 +2572,17 @@ func (h *PlaybackHandler) lookupVirtualCandidateRowDetailed(ctx context.Context,
 	}
 	if h.VirtualFileLookup != nil {
 		if row, found := consider(h.VirtualFileLookup(ctx, candidateURI)); found {
+			if lookupErr != nil && !isVirtualCandidateNotFound(lookupErr) {
+				return nil, false, lookupErr
+			}
 			return row, true, nil
 		}
 	}
 	if h.VirtualCandidateFileLookup != nil {
 		if row, found := consider(h.VirtualCandidateFileLookup(ctx, virtualPlaybackNeutralKey(candidateURI), contentID, episodeID, ownerID)); found {
+			if lookupErr != nil && !isVirtualCandidateNotFound(lookupErr) {
+				return nil, false, lookupErr
+			}
 			return row, true, nil
 		}
 	}

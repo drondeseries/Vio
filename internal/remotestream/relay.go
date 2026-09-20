@@ -263,10 +263,13 @@ func relayRangeResponseCacheability(response *http.Response, requestSentAt, resp
 			return 0, time.Time{}, false
 		}
 	}
+	if relayHasConflictingLifetime(response.Header.Values(headerCacheControl)) {
+		return 0, time.Time{}, false
+	}
 	for _, bound := range []string{"s-maxage", "max-age"} {
 		if value, ok := directives[bound]; ok {
-			seconds, err := strconv.Atoi(value)
-			if err != nil || seconds <= 0 {
+			seconds, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || seconds <= 0 || seconds > int64((1<<63-1)/int64(time.Second)) {
 				return 0, time.Time{}, false
 			}
 		}
@@ -295,21 +298,21 @@ func relayRangeResponseCacheability(response *http.Response, requestSentAt, resp
 func relayFreshnessLifetime(directives map[string]string, header http.Header, receivedAt time.Time) (time.Duration, bool) {
 	for _, name := range []string{"s-maxage", "max-age"} {
 		if value, ok := directives[name]; ok {
-			seconds, err := strconv.Atoi(value)
-			if err != nil || seconds < 0 {
+			seconds, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || seconds < 0 || seconds > (1<<63-1)/int64(time.Second) {
 				return 0, false
 			}
 			return time.Duration(seconds) * time.Second, true
 		}
 	}
 	if raw := strings.TrimSpace(header.Get(headerExpires)); raw != "" {
-		expires, err := http.ParseTime(raw)
+		expires, err := relayHTTPTime(raw)
 		if err != nil {
 			return 0, false
 		}
 		base := receivedAt
 		if rawDate := strings.TrimSpace(header.Get(headerDate)); rawDate != "" {
-			date, err := http.ParseTime(rawDate)
+			date, err := relayHTTPTime(rawDate)
 			if err != nil {
 				return 0, false
 			}
@@ -353,12 +356,15 @@ func relayCorrectedInitialAge(header http.Header, requestSentAt, responseReceive
 		}
 	}
 	ageValue := time.Duration(0)
-	if raw := strings.TrimSpace(header.Get(headerAge)); raw != "" {
-		seconds, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || seconds < 0 {
+	for _, raw := range header.Values(headerAge) {
+		seconds, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+		if err != nil || seconds > uint64((1<<63-1)/int64(time.Second)) {
 			return 0, false
 		}
-		ageValue = time.Duration(seconds) * time.Second
+		candidate := time.Duration(seconds) * time.Second
+		if candidate > ageValue {
+			ageValue = candidate
+		}
 	}
 	responseDelay := responseReceivedAt.Sub(requestSentAt)
 	if responseDelay < 0 {
@@ -374,6 +380,32 @@ func relayCorrectedInitialAge(header http.Header, requestSentAt, responseReceive
 // relayCacheControlDirectives parses Cache-Control header values into a map of
 // lowercased directive names to values. Commas inside quoted directive values
 // do not split the list. A bare directive maps to "".
+func relayHTTPTime(raw string) (time.Time, error) {
+	if parsed, err := http.ParseTime(raw); err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC1123, raw)
+}
+
+func relayHasConflictingLifetime(values []string) bool {
+	seen := map[string]string{}
+	for _, value := range values {
+		for _, part := range splitCacheControlDirectives(value) {
+			name, raw, _ := strings.Cut(part, "=")
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name != "max-age" && name != "s-maxage" {
+				continue
+			}
+			raw = strings.Trim(strings.TrimSpace(raw), `"`)
+			if prior, ok := seen[name]; ok && prior != raw {
+				return true
+			}
+			seen[name] = raw
+		}
+	}
+	return false
+}
+
 func relayCacheControlDirectives(values []string) map[string]string {
 	directives := make(map[string]string, len(values))
 	for _, value := range values {

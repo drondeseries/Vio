@@ -1199,10 +1199,18 @@ func newChiRouter(deps Dependencies) chi.Router {
 					return deps.FileRepo.ReplaceVirtualCandidates(ctx, source, candidates)
 				}
 				playbackHandler.VirtualFileLookup = func(ctx context.Context, path string) (*models.MediaFile, error) {
-					return deps.FileRepo.GetByPath(ctx, path)
+					file, err := deps.FileRepo.GetByPath(ctx, path)
+					if err != nil && errors.Is(err, scanner.ErrFileNotFound) {
+						return nil, handlers.ErrVirtualCandidateNotFound
+					}
+					return file, err
 				}
 				playbackHandler.VirtualCandidateFileLookup = func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
-					return deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+					file, err := deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+					if err != nil && errors.Is(err, scanner.ErrFileNotFound) {
+						return nil, handlers.ErrVirtualCandidateNotFound
+					}
+					return file, err
 				}
 				playbackHandler.VirtualEpisodeFileLookup = func(ctx context.Context, episodeID string) (*models.MediaFile, error) {
 					files, err := deps.FileRepo.GetByEpisodeID(ctx, episodeID)
@@ -1378,6 +1386,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 					return 0, nil
 				}
 				return handlers.ExecVirtualFileMetadataUpdate(ctx, deps.DB, args)
+			}
+			playbackHandler.VirtualFileMetadataSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (handlers.VirtualFileMetadataUpdateResult, error) {
+				if deps.DB == nil {
+					return handlers.VirtualFileMetadataUpdateResult{}, nil
+				}
+				return handlers.ExecVirtualFileMetadataUpdateResult(ctx, deps.DB, args)
 			}
 		}
 		if deps.Config != nil {
@@ -1577,6 +1591,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 			cleanupDone := playbackHandler.TranscodeManager().StartShutdownCleanup(deps.AppContext)
 			if deps.RegisterShutdownWork != nil {
 				deps.RegisterShutdownWork(cleanupDone)
+			}
+			// Accepted virtual probe evidence must drain before the process
+			// exits. Registration only records the completion channel; the
+			// cleanup waits for application cancellation first, so admission
+			// stays open during normal operation.
+			if deps.RegisterShutdownWork != nil {
+				deps.RegisterShutdownWork(playbackHandler.StartVirtualEvidenceShutdownCleanup(deps.AppContext))
 			}
 		}
 		playbackHandler.ProbeEnsurer = deps.ProbeEnsurer

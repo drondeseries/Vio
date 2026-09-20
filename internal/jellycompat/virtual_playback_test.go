@@ -1404,7 +1404,7 @@ func TestResolveAndProbeVirtualSourceProbesUnprobedRowAndPersists(t *testing.T) 
 		// No concrete candidate row: the save must fall back to the neutral
 		// row's own id and file_path so the id+file_path fence still matches.
 		VirtualCandidateFileLookup: func(context.Context, string, string, string, int) (*models.MediaFile, error) {
-			return nil, errors.New("candidate row not found")
+			return nil, ErrVirtualCandidateNotFound
 		},
 	}
 

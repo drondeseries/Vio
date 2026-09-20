@@ -163,6 +163,13 @@ func NewRouter(deps Dependencies) chi.Router {
 	if deps.RegisterShutdownWork != nil {
 		deps.RegisterShutdownWork(cleanupDone)
 	}
+	// Detached compat virtual evidence writes must drain before the process
+	// exits. Registration only records completion; the cleanup waits for
+	// application cancellation first, so admission stays open during normal
+	// operation.
+	if deps.RegisterShutdownWork != nil {
+		deps.RegisterShutdownWork(playbackHandler.StartCompatBackgroundShutdownCleanup(deps.AppContext))
+	}
 	playbackHandler.profileRefreshRequester = deps.RecWorker
 	playbackHandler.SettingsRepo = deps.SettingsRepo
 	playbackHandler.RecipeNodeStore = deps.RecipeNodeStore
@@ -176,6 +183,7 @@ func NewRouter(deps Dependencies) chi.Router {
 	playbackHandler.VirtualSourceProber = deps.VirtualSourceProber
 	playbackHandler.VirtualSourceProberWithHeaders = deps.VirtualSourceProberWithHeaders
 	playbackHandler.VirtualFileSaver = deps.VirtualFileSaver
+	playbackHandler.VirtualFileMetadataSaver = deps.VirtualFileMetadataSaver
 	playbackHandler.VirtualCandidateFileLookup = deps.VirtualCandidateFileLookup
 	playbackHandler.RemoteStreamRelay = deps.RemoteStreamRelay
 	playbackHandler.AllowInsecureVirtual = deps.AllowInsecureVirtual
