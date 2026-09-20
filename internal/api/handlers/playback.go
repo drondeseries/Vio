@@ -547,6 +547,16 @@ type PlaybackHandler struct {
 	// playback_virtual_evidence.go.
 	virtualEvidenceOnce   sync.Once
 	virtualEvidenceBuffer *virtualEvidenceBuffer
+	// virtualEvidenceWG tracks the evidence workers so shutdown can await work
+	// they already dequeued before draining the accepted remainder. A dequeued
+	// task is still in a worker's hands, so an empty pending buffer alone is
+	// not proof that shutdown is safe.
+	virtualEvidenceWG sync.WaitGroup
+	// virtualEvidenceStopOnce makes the shutdown sequence single-flight. A
+	// caller that races the lifecycle watcher blocks until the one closure,
+	// worker await and drain have all completed, so tests and shutdown observe
+	// the same terminal state.
+	virtualEvidenceStopOnce sync.Once
 
 	// subtitleSlotsOnce guards lazy construction of the dedicated subtitle
 	// search gate. Subtitle searches can run for the full two-minute provider

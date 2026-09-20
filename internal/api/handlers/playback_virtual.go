@@ -34,7 +34,6 @@ const maxVirtualPlaybackStreams = 50
 
 const (
 	defaultMaxVirtualFailoverAttempts = 5
-	virtualStartupBudget              = 60 * time.Second
 	virtualProbeBudget                = 15 * time.Second
 	maxVirtualPlaybackPrefetchFiles   = 2
 	virtualPlaybackPrefetchBudget     = 20 * time.Second
@@ -73,6 +72,13 @@ const (
 	// allowed.
 	virtualProbeFailureMaxEntries = 4096
 )
+
+// virtualStartupBudget bounds the entire cold path: candidate listing, remux
+// matching, provider resolution, probing, retries and the stale-source
+// fallback all run under one deadline started at cold-path entry, so a slow
+// early stage leaves a later stage only the remaining budget. It is a var so
+// tests can shrink the budget and observe the single deadline.
+var virtualStartupBudget = 60 * time.Second
 
 // virtualBackgroundProbeBudget bounds a background probe. Production uses the
 // scanner's shared probe timeout so the inner probe and the caller that waits
@@ -1066,6 +1072,13 @@ type virtualResolveOptionsV3 struct {
 	// profile-removed pin refuses instead of swapping the release; a fresh
 	// selection falls through to a profile-satisfying candidate.
 	sessionBound bool
+	// sessionAnchorURI is the immutable virtual source URI the playback session
+	// is anchored to (the session manager's VirtualSourceURI). It is set only
+	// for a session-bound replan rehydration. The stale-source fallback
+	// validates the release it is about to refresh or substitute against this
+	// anchor instead of trusting the persisted catalog row's current file_path,
+	// which may have drifted while the session was serving.
+	sessionAnchorURI string
 }
 
 // virtualCandidateRotationContextKeyV3 carries the rotation intent across the
@@ -1205,6 +1218,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// return below, including the fast paths.
 	trace := &virtualResolveTrace{started: time.Now()}
 	defer trace.log(r.Context(), file)
+	// One deadline owns the entire cold path below. Listing, remux matching,
+	// provider resolution, probing, retries and the stale-source fallback all
+	// derive from this context, so an early stage that burns time cannot hand a
+	// later stage a fresh virtualStartupBudget. Detached background work
+	// deliberately re-bases off r.Context() and is not bounded by this.
+	coldCtx, coldCancel := context.WithTimeout(r.Context(), virtualStartupBudget)
+	defer coldCancel()
 	userID := apimw.GetUserID(r.Context())
 	parsed, _ := url.Parse(file.FilePath)
 	candidates := []VirtualPlaybackStream{{
@@ -1266,8 +1286,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		trace.listRan = true
 		listStart := time.Now()
 		// Candidate listing is part of the startup critical path. Keep it
-		// bounded so the first-byte SLA cannot be defeated before resolution.
-		listCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		// bounded so the first-byte SLA cannot be defeated before resolution,
+		// but derive that bound from the single cold-path deadline so listing
+		// cannot restart the budget.
+		listCtx, cancel := context.WithTimeout(coldCtx, 15*time.Second)
 		streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
 			listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID,
 		)
@@ -1346,15 +1368,18 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if needsCandidateMetadata && len(candidates) > 0 {
 		trace.remuxRan = true
 		remuxStart := time.Now()
-		remuxMatches, remuxEnabled = h.matchRemuxDBCandidates(r.Context(), file, candidates)
+		remuxMatches, remuxEnabled = h.matchRemuxDBCandidates(coldCtx, file, candidates)
 		trace.remux = time.Since(remuxStart)
 	}
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
 	}
 	trace.candidates = len(candidates)
-	attemptCtx, cancel := context.WithTimeout(r.Context(), virtualStartupBudget)
-	defer cancel()
+	// The attempt loop, its probes, its retries and the stale-source fallback
+	// run on the same cold-path deadline. Reusing coldCtx directly means they
+	// observe whatever budget listing and remux matching left, rather than a
+	// freshly restarted virtualStartupBudget.
+	attemptCtx := coldCtx
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
 	attemptCtx = withVirtualSessionBindingV3(attemptCtx, options.sessionBound)
 
@@ -1896,11 +1921,22 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// unless this request declared rotation; an unbound (fresh) start may
 	// substitute normally. allowFailed is the explicit-retry policy for a
 	// failed_at verdict and never authorizes a sibling by itself.
+	//
+	// A session-bound request anchors on the immutable session source URI, not
+	// the persisted row's file_path: the row may have been rewritten by an
+	// earlier adoption, and the fallback must validate the release against what
+	// the session is actually serving. Only when the caller supplies no anchor
+	// (a fresh/unbound resolve, or a legacy caller) does the release fall back
+	// to the row-derived identity.
+	anchoredReleaseID := virtualResultCandidateID(file.FilePath)
+	if options.sessionBound && strings.TrimSpace(options.sessionAnchorURI) != "" {
+		anchoredReleaseID = virtualResultCandidateID(options.sessionAnchorURI)
+	}
 	fallbackEligibility := virtualFallbackEligibility{
 		sessionBound:    options.sessionBound,
 		rotationAllowed: rotateCandidates,
 		allowFailed:     allowFailed,
-		releaseID:       virtualResultCandidateID(file.FilePath),
+		releaseID:       anchoredReleaseID,
 	}
 	fb := h.fallbackResolveStaleVirtualSource(attemptCtx, file, userID, profileID, fallbackEligibility)
 	trace.fallback = time.Since(fallbackStart)
@@ -2384,42 +2420,117 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 	}
 }
 
+// errVirtualCandidateVerdictIncomplete reports that a verdict lookup found a
+// row without a usable identity. It is deliberately distinct from a genuine
+// not-found: a not-found means no catalog row owns the candidate (so there is
+// no verdict to enforce), while an incomplete row means the verdict is unknown
+// and must not be treated as eligible.
+var errVirtualCandidateVerdictIncomplete = errors.New("virtual candidate verdict lookup returned an incomplete row")
+
+// sameVirtualReleaseIdentity reports whether two virtual URIs name the same
+// release: byte-identical, or the same provider-neutral path carrying the same
+// concrete ?result= candidate id.
+func sameVirtualReleaseIdentity(a, b string) bool {
+	if a == b {
+		return true
+	}
+	aID, bID := virtualResultCandidateID(a), virtualResultCandidateID(b)
+	return aID != "" && aID == bID && virtualPlaybackNeutralKey(a) == virtualPlaybackNeutralKey(b)
+}
+
 // virtualCandidateVerdictError reports a non-nil error when the concrete
 // candidate URI is owned by a catalog row whose failed_at verdict is still
 // active and the caller did not request an explicit retry. It is the single
-// verdict gate used before a fallback resolution and again before the resolved
-// identity can be adopted, so every candidate — the requested pin, a resolved
-// sibling, or a resolver-substituted release — is checked the same way.
+// verdict gate used before a fallback resolution, again on the resolved
+// identity, and once more after a probe completes, so every candidate — the
+// requested pin, a resolved sibling, or a resolver-substituted release — is
+// checked the same way.
+//
+// It fails closed. A lookup outage or an incomplete lookup result is reported
+// as an error rather than silently treated as eligible, so a candidate cannot
+// be resolved or adopted while its verdict is unknowable. The supplied row's
+// own failure stamp is enforced independently of the lookup for its own
+// release (the row may not be persisted yet); it never leaks onto a sibling.
 func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, candidateURI string, file *models.MediaFile, ownerID int, allowFailed bool) error {
 	if h == nil || file == nil || candidateURI == "" || allowFailed {
 		return nil
 	}
-	row := h.lookupVirtualCandidateRow(ctx, candidateURI, file.ContentID, file.EpisodeID, ownerID)
-	if row == nil || !virtualCandidateVerdictActive(row.FailedAt, time.Now()) {
+	now := time.Now()
+	if sameVirtualReleaseIdentity(file.FilePath, candidateURI) &&
+		virtualCandidateVerdictActive(file.FailedAt, now) {
+		return fmt.Errorf("candidate %s is marked failed", candidateURI)
+	}
+	row, found, lookupErr := h.lookupVirtualCandidateRowDetailed(ctx, candidateURI, file.ContentID, file.EpisodeID, ownerID)
+	if lookupErr != nil {
+		return fmt.Errorf("candidate %s verdict is unknown: %w", candidateURI, lookupErr)
+	}
+	if !found {
+		// No catalog row owns the candidate: there is no verdict to enforce.
 		return nil
 	}
-	return fmt.Errorf("candidate %s is marked failed", candidateURI)
+	if virtualCandidateVerdictActive(row.FailedAt, now) {
+		return fmt.Errorf("candidate %s is marked failed", candidateURI)
+	}
+	return nil
 }
 
 // lookupVirtualCandidateRow resolves the catalog row that owns a concrete
-// candidate URI. It prefers an exact path match and falls back to the
-// provider-neutral path for rows stored without the result= pick. A nil or
-// zero-id row means no catalog row owns the candidate.
+// candidate URI for callers that only need the row's metadata. It prefers an
+// exact path match and falls back to the provider-neutral path for rows stored
+// without the result= pick. It intentionally discards lookup errors because
+// metadata enrichment is best-effort; the verdict gate uses the detailed form.
 func (h *PlaybackHandler) lookupVirtualCandidateRow(ctx context.Context, candidateURI, contentID, episodeID string, ownerID int) *models.MediaFile {
+	row, _, _ := h.lookupVirtualCandidateRowDetailed(ctx, candidateURI, contentID, episodeID, ownerID)
+	return row
+}
+
+// lookupVirtualCandidateRowDetailed resolves the catalog row that owns a
+// concrete candidate URI and distinguishes a genuine not-found from a lookup
+// failure or an incomplete row. found is false with a nil error only when no
+// configured lookup knows the candidate; a lookup error or a non-nil row
+// without an identity is returned as an error so the caller can fail closed.
+func (h *PlaybackHandler) lookupVirtualCandidateRowDetailed(ctx context.Context, candidateURI, contentID, episodeID string, ownerID int) (*models.MediaFile, bool, error) {
 	if h == nil || candidateURI == "" {
-		return nil
+		return nil, false, nil
+	}
+	var lookupErr error
+	incomplete := false
+	consider := func(row *models.MediaFile, err error) (*models.MediaFile, bool) {
+		if err != nil {
+			if lookupErr == nil {
+				lookupErr = err
+			}
+			return nil, false
+		}
+		if row == nil {
+			return nil, false
+		}
+		if row.ID > 0 {
+			return row, true
+		}
+		// A non-nil row without an identity cannot carry a trustworthy
+		// verdict; remember it and let the other lookup still own the
+		// candidate.
+		incomplete = true
+		return nil, false
 	}
 	if h.VirtualFileLookup != nil {
-		if file, _ := h.VirtualFileLookup(ctx, candidateURI); file != nil && file.ID > 0 {
-			return file
+		if row, found := consider(h.VirtualFileLookup(ctx, candidateURI)); found {
+			return row, true, nil
 		}
 	}
 	if h.VirtualCandidateFileLookup != nil {
-		if file, _ := h.VirtualCandidateFileLookup(ctx, virtualPlaybackNeutralKey(candidateURI), contentID, episodeID, ownerID); file != nil && file.ID > 0 {
-			return file
+		if row, found := consider(h.VirtualCandidateFileLookup(ctx, virtualPlaybackNeutralKey(candidateURI), contentID, episodeID, ownerID)); found {
+			return row, true, nil
 		}
 	}
-	return nil
+	if lookupErr != nil {
+		return nil, false, lookupErr
+	}
+	if incomplete {
+		return nil, false, errVirtualCandidateVerdictIncomplete
+	}
+	return nil, false, nil
 }
 
 // fallbackResolveStaleVirtualSource re-lists the provider's current candidates
@@ -2446,6 +2557,19 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 	parsed, _ := url.Parse(file.FilePath)
 	if parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) == "" {
 		return nil
+	}
+	// The session anchor is immutable. A session-bound request must refresh or
+	// rotate the release the session is actually serving, not whatever the
+	// persisted catalog row's file_path has drifted to. Validate the row-derived
+	// identity against the anchor and refuse on a mismatch before listing,
+	// resolving or persisting anything, so a drift cannot be silently adopted
+	// under the session's name.
+	if elig.sessionBound && elig.releaseID != "" {
+		if got := virtualResultCandidateID(file.FilePath); got != elig.releaseID {
+			slog.ErrorContext(ctx, "virtual stale fallback: persisted row does not match the session anchor; refusing",
+				"component", "api", "file_id", file.ID, "persisted_release", got, "session_anchor_release", elig.releaseID)
+			return nil
+		}
 	}
 	if h.VirtualPlaybackStreamLister == nil {
 		return nil
@@ -2475,7 +2599,12 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 	// session candidate must not be silently replaced by a sibling release:
 	// only an explicit candidate rotation may substitute. The intent arrives
 	// as the eligibility contract, never inferred from the candidate list.
+	// When the eligibility carries a validated session anchor id it is
+	// authoritative; otherwise the row-derived id is used.
 	sessionID := virtualResultCandidateID(file.FilePath)
+	if elig.sessionBound && elig.releaseID != "" {
+		sessionID = elig.releaseID
+	}
 	if !elig.allowsSibling() {
 		if sessionID == "" {
 			// No anchored release to refresh and siblings are forbidden.
@@ -2533,17 +2662,29 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		resolved, err := h.resolveVirtualCandidateSource(ctx, file, stream, userID, profileID, elig.allowFailed)
 		if err == nil {
 			slog.InfoContext(ctx, "virtual stale fallback: resolved substitute", "component", "api", "original", file.FilePath, "substitute", stream.URI)
-			// Persist the substitute's path and probed metadata back to the
-			// catalog row in a single CAS-fenced save, replacing the stale
-			// result= URI the next start would have to re-list. The identity
-			// contract is enforced once more here: a session-bound request
-			// must never adopt a replacement it was not allowed to resolve.
+			// Persist the substitute's validated identity and probed metadata
+			// back to the catalog row in a single CAS-fenced save, replacing the
+			// stale result= URI the next start would have to re-list. The
+			// identity contract is enforced once more here: a session-bound
+			// request must never adopt a replacement it was not allowed to
+			// resolve.
 			if !elig.allowsSibling() {
 				return nil
 			}
 			if resolved.File != nil && resolved.Provenance == ProbeProvenanceVerified && h.VirtualFileSaver != nil {
+				// Persist the identity the resolver actually returned
+				// (resolved.URI), not the URI that was requested. A dedup
+				// keeper or a fresh-selection fall-through legitimately
+				// substitutes a different release, and the probed inventory
+				// belongs to the returned bytes; adopting the requested URI
+				// would pin a row that never owned that inventory.
+				if resolved.URI == "" {
+					slog.ErrorContext(ctx, "virtual stale fallback: refusing to adopt an unknown resolved identity",
+						"component", "api", "file_id", file.ID, "candidate", stream.URI)
+					return nil
+				}
 				snap := snapshotVirtualRow(file)
-				if _, saveErr := h.VirtualFileSaver(ctx, models.VirtualFilePersistArgs{
+				rows, saveErr := h.VirtualFileSaver(ctx, models.VirtualFilePersistArgs{
 					FileID:           snap.FileID,
 					ExpectedFilePath: file.FilePath,
 					VideoTracks:      marshalTracksJSON(sanitizeTrackSlice(resolved.File.VideoTracks)),
@@ -2561,9 +2702,24 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					ProbeUpdatedAt:   snap.ProbeUpdatedAt,
 					OwnerID:          snap.OwnerID,
 					LibraryID:        snap.LibraryID,
-					AdoptPath:        stream.URI,
-				}); saveErr != nil {
+					AdoptPath:        resolved.URI,
+				})
+				if saveErr != nil {
 					slog.ErrorContext(ctx, "virtual stale fallback: persist failed", "component", "api", "file_id", file.ID, "error", saveErr)
+					return nil
+				}
+				if rows == 0 {
+					// The CAS fence (file_path/updated_at/probe stamp/owner/
+					// library) rejected the write: the row changed under us
+					// after the snapshot, so the row did not adopt this
+					// substitute. Report the fallback as failed rather than
+					// serving a substitute the catalog never accepted; the
+					// caller preserves its original error and the next start
+					// re-lists.
+					slog.WarnContext(ctx, "virtual stale fallback: persist CAS miss; substitute not adopted",
+						"component", "api", "file_id", file.ID,
+						"expected_path", file.FilePath, "adopt_path", resolved.URI)
+					return nil
 				}
 			}
 			return resolved
@@ -2651,6 +2807,14 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	mergeVirtualCandidateTracks(resolved.File, candidate)
 	resolved.ProbeSucceeded = true
 	resolved.Provenance = ProbeProvenanceVerified
+	// Adoption fence. The probe can take seconds, during which the serve layer
+	// (or another replan) may record a failed verdict for the identity we are
+	// about to return and persist. The pre-resolve and post-resolve checks
+	// cannot see that verdict, so re-check once more after the probe completes
+	// and before the caller can adopt this source.
+	if err := h.virtualCandidateVerdictError(ctx, candidate.URI, file, ownerID, allowFailed); err != nil {
+		return nil, err
+	}
 	return &resolved, nil
 }
 

@@ -227,14 +227,14 @@ func relayRangeCacheHeaderIdentity(headers http.Header) string {
 // no-store/private/no-cache directive, no max-age=0 or s-maxage=0, no Vary: *,
 // and a positive remaining freshness.
 //
-// Remaining freshness is freshnessLifetime - initialAge, both measured from the
-// time the response was received:
+// Remaining freshness is freshnessLifetime - correctedInitialAge:
 //
 //   - freshnessLifetime is s-maxage when present, else max-age, else
-//     Expires minus Date (or minus receivedAt when Date is absent), else
-//     relayRangeCacheTTL when the origin sent no freshness directive.
-//   - initialAge is the Age header when present, else receivedAt minus Date,
-//     else zero.
+//     Expires minus Date (or minus responseReceivedAt when Date is absent),
+//     else relayRangeCacheTTL when the origin sent no freshness directive.
+//   - correctedInitialAge is the larger of the Age header plus the response
+//     delay and the apparent age (responseReceivedAt minus Date), per RFC 9111
+//     §4.2.3. See relayCorrectedInitialAge.
 //
 // When the origin sends no freshness directive the relay still caches for the
 // bounded relayRangeCacheTTL, never longer: HTTP permits heuristic freshness,
@@ -242,7 +242,7 @@ func relayRangeCacheHeaderIdentity(headers http.Header) string {
 // window cannot serve meaningfully stale bytes while preserving the seek
 // optimization. A malformed Age, Date, Expires or max-age is treated as
 // non-reusable because freshness cannot be established.
-func relayRangeResponseCacheability(response *http.Response, receivedAt time.Time) (int, time.Time, bool) {
+func relayRangeResponseCacheability(response *http.Response, requestSentAt, responseReceivedAt time.Time) (int, time.Time, bool) {
 	if response == nil {
 		return 0, time.Time{}, false
 	}
@@ -274,11 +274,11 @@ func relayRangeResponseCacheability(response *http.Response, receivedAt time.Tim
 	if relayVaryDisablesCaching(response.Header.Values(headerVary)) {
 		return 0, time.Time{}, false
 	}
-	lifetime, ok := relayFreshnessLifetime(directives, response.Header, receivedAt)
+	lifetime, ok := relayFreshnessLifetime(directives, response.Header, responseReceivedAt)
 	if !ok || lifetime <= 0 {
 		return 0, time.Time{}, false
 	}
-	age, ok := relayInitialResponseAge(response.Header, receivedAt)
+	age, ok := relayCorrectedInitialAge(response.Header, requestSentAt, responseReceivedAt)
 	if !ok {
 		return 0, time.Time{}, false
 	}
@@ -286,7 +286,7 @@ func relayRangeResponseCacheability(response *http.Response, receivedAt time.Tim
 	if remaining <= 0 {
 		return 0, time.Time{}, false
 	}
-	return length, receivedAt.Add(remaining), true
+	return length, responseReceivedAt.Add(remaining), true
 }
 
 // relayFreshnessLifetime returns how long a response stays fresh according to
@@ -324,29 +324,51 @@ func relayFreshnessLifetime(directives map[string]string, header http.Header, re
 	return relayRangeCacheTTL, true
 }
 
-// relayInitialResponseAge returns how much of the response's freshness had
-// already elapsed when the relay received it. The Age header is authoritative
-// when present; otherwise the gap between Date and receivedAt is used.
-func relayInitialResponseAge(header http.Header, receivedAt time.Time) (time.Duration, bool) {
-	if raw := strings.TrimSpace(header.Get(headerAge)); raw != "" {
-		seconds, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || seconds < 0 {
-			return 0, false
-		}
-		return time.Duration(seconds) * time.Second, true
-	}
+// relayCorrectedInitialAge returns how much of the response's freshness had
+// already elapsed when the relay received it, using the RFC 9111 §4.2.3
+// corrected-age rule. It is the larger of:
+//
+//   - apparent age: responseReceivedAt minus the origin's Date, clamped at
+//     zero and treated as zero when Date is absent. This catches an origin
+//     that backdates Date so a small Age understates how long the response has
+//     existed.
+//   - corrected Age: the Age header (zero when absent) plus the response delay
+//     (responseReceivedAt minus requestSentAt). Age alone omits the time the
+//     response spent in transit, so a response whose Age is just under its
+//     freshness lifetime is not treated as fresh for another full lifetime.
+//
+// Taking the maximum means an old Date can only make a response look staler,
+// never fresher, than Age claims. A malformed Age or Date cannot establish
+// freshness and reports ok=false.
+func relayCorrectedInitialAge(header http.Header, requestSentAt, responseReceivedAt time.Time) (time.Duration, bool) {
+	apparentAge := time.Duration(0)
 	if raw := strings.TrimSpace(header.Get(headerDate)); raw != "" {
 		date, err := http.ParseTime(raw)
 		if err != nil {
 			return 0, false
 		}
-		age := receivedAt.Sub(date)
-		if age < 0 {
-			age = 0
+		apparentAge = responseReceivedAt.Sub(date)
+		if apparentAge < 0 {
+			apparentAge = 0
 		}
-		return age, true
 	}
-	return 0, true
+	ageValue := time.Duration(0)
+	if raw := strings.TrimSpace(header.Get(headerAge)); raw != "" {
+		seconds, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || seconds < 0 {
+			return 0, false
+		}
+		ageValue = time.Duration(seconds) * time.Second
+	}
+	responseDelay := responseReceivedAt.Sub(requestSentAt)
+	if responseDelay < 0 {
+		responseDelay = 0
+	}
+	correctedAge := ageValue + responseDelay
+	if apparentAge > correctedAge {
+		return apparentAge, true
+	}
+	return correctedAge, true
 }
 
 // relayCacheControlDirectives parses Cache-Control header values into a map of
@@ -850,12 +872,14 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 			return writeErr
 		}
 	}
+	// Measure the request send time and the response receive time on the
+	// cache's clock so the entry's corrected age, its expiry and every later
+	// lookup use one time source (injectable in tests).
+	requestSentAt := r.rangeCache.clock()
 	response, err := client.Do(upstream)
 	if err != nil {
 		return errors.New("remote stream request failed")
 	}
-	// Measure freshness on the cache's clock so the entry's expiry and every
-	// later lookup use one time source (injectable in tests).
 	responseReceivedAt := r.rangeCache.clock()
 	defer func() { _ = response.Body.Close() }()
 	// Detect upstream sources that ignore Range headers: when we ask for a
@@ -944,7 +968,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	var cacheExpiry time.Time
 	cacheable := false
 	if cacheKey != "" {
-		cacheLength, cacheExpiry, cacheable = relayRangeResponseCacheability(response, responseReceivedAt)
+		cacheLength, cacheExpiry, cacheable = relayRangeResponseCacheability(response, requestSentAt, responseReceivedAt)
 	}
 	var cacheBody []byte
 	if cacheable {

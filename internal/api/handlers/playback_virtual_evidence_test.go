@@ -220,6 +220,193 @@ func TestEvidenceConcurrentInstancesAreSafe(t *testing.T) {
 	}
 }
 
+// TestEvidenceShutdownStopsAdmissionAndDrainsAcceptedBurst drives the real
+// worker pool while admission races shutdown. Every admitted task must be
+// persisted (nothing accepted is lost or silently left behind), the buffer must
+// end empty with no in-flight work, and admission after shutdown must be an
+// explicit rejection.
+func TestEvidenceShutdownStopsAdmissionAndDrainsAcceptedBurst(t *testing.T) {
+	var persisted sync.Map
+	h := &PlaybackHandler{
+		VirtualFileSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+			persisted.Store(args.FileID, struct{}{})
+			return 1, nil
+		},
+	}
+	buf := h.evidenceBuffer() // starts the real worker pool
+
+	const producers = 4
+	accepted := make(map[int]struct{})
+	var acceptedMu sync.Mutex
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for p := 0; p < producers; p++ {
+		wg.Add(1)
+		go func(base int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				fileID := base*1_000_000 + i + 1
+				switch h.enqueueVirtualProbeEvidence(context.Background(), models.VirtualFilePersistArgs{FileID: fileID}) {
+				case virtualEvidenceAccepted:
+					acceptedMu.Lock()
+					accepted[fileID] = struct{}{}
+					acceptedMu.Unlock()
+				}
+			}
+		}(p)
+	}
+	time.Sleep(20 * time.Millisecond) // let admission race the closure
+	close(stop)
+	wg.Wait()
+	h.stopVirtualEvidence()
+
+	if n := buf.len(); n != 0 {
+		t.Fatalf("pending after shutdown = %d, want 0", n)
+	}
+	if n := buf.inflightCount(); n != 0 {
+		t.Fatalf("in-flight after shutdown = %d, want 0", n)
+	}
+	if got := h.enqueueVirtualProbeEvidence(context.Background(), models.VirtualFilePersistArgs{FileID: 999_999_999}); got != virtualEvidenceRejected {
+		t.Fatalf("admission after shutdown = %v, want rejected", got)
+	}
+
+	acceptedMu.Lock()
+	defer acceptedMu.Unlock()
+	if len(accepted) == 0 {
+		t.Fatal("no admissions landed before shutdown; test did not exercise the race")
+	}
+	for fileID := range accepted {
+		if _, ok := persisted.Load(fileID); !ok {
+			t.Fatalf("accepted evidence for file %d was not persisted by shutdown", fileID)
+		}
+	}
+}
+
+// TestEvidenceShutdownFinishesDequeuedWork drives the real workers through a
+// deterministic shutdown: two tasks are already dequeued and blocked inside the
+// saver, a third is still queued, and shutdown must await the workers before
+// draining the remainder. All three must persist exactly once.
+func TestEvidenceShutdownFinishesDequeuedWork(t *testing.T) {
+	started := make(chan int, 8)
+	release := make(chan struct{})
+	var persistedMu sync.Mutex
+	persisted := map[int]int{}
+	h := &PlaybackHandler{
+		VirtualFileSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (int64, error) {
+			started <- args.FileID
+			<-release
+			persistedMu.Lock()
+			persisted[args.FileID]++
+			persistedMu.Unlock()
+			return 1, nil
+		},
+	}
+	h.evidenceBuffer()
+
+	base := time.Now()
+	for _, fileID := range []int{1, 2} {
+		if got := h.enqueueVirtualProbeEvidence(context.Background(), models.VirtualFilePersistArgs{FileID: fileID, UpdatedAt: base}); got != virtualEvidenceAccepted {
+			t.Fatalf("enqueue file %d = %v, want accepted", fileID, got)
+		}
+	}
+	// Both workers are now parked inside the saver with a dequeued task.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("workers did not dequeue the first two tasks")
+		}
+	}
+	// A third task is accepted but has no free worker, so it stays queued.
+	if got := h.enqueueVirtualProbeEvidence(context.Background(), models.VirtualFilePersistArgs{FileID: 3, UpdatedAt: base}); got != virtualEvidenceAccepted {
+		t.Fatalf("enqueue file 3 = %v, want accepted", got)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		h.stopVirtualEvidence()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("shutdown returned while dequeued work was still in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not complete after the in-flight work was released")
+	}
+
+	persistedMu.Lock()
+	defer persistedMu.Unlock()
+	for _, fileID := range []int{1, 2, 3} {
+		if persisted[fileID] != 1 {
+			t.Fatalf("file %d persisted %d times, want exactly 1", fileID, persisted[fileID])
+		}
+	}
+}
+
+// TestEvidenceShutdownRetriesAfterServiceCancel pins that a retry survives
+// service-context cancellation. The first attempt fails transiently, shutdown
+// cancels the service context, and the second attempt must still run under an
+// independent context and commit. This fails if drain retries observe the
+// cancelled service context.
+func TestEvidenceShutdownRetriesAfterServiceCancel(t *testing.T) {
+	serviceCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	firstAttempt := make(chan struct{})
+	var calls int64
+	var retryCtxErr atomic.Value
+	retryCtxErr.Store("not-run")
+
+	h := &PlaybackHandler{
+		ServiceContext: serviceCtx,
+		VirtualFileSaver: func(ctx context.Context, _ models.VirtualFilePersistArgs) (int64, error) {
+			switch atomic.AddInt64(&calls, 1) {
+			case 1:
+				close(firstAttempt)
+				return 0, errors.New("connection reset")
+			default:
+				if err := ctx.Err(); err != nil {
+					retryCtxErr.Store(err.Error())
+				} else {
+					retryCtxErr.Store("")
+				}
+				return 1, nil
+			}
+		},
+	}
+	h.evidenceBuffer()
+	if got := h.enqueueVirtualProbeEvidence(context.Background(), models.VirtualFilePersistArgs{FileID: 7}); got != virtualEvidenceAccepted {
+		t.Fatalf("enqueue = %v, want accepted", got)
+	}
+	select {
+	case <-firstAttempt:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first attempt never ran")
+	}
+	cancel() // shutdown cancels the service context mid-retry
+
+	// Single-flight shutdown: this blocks until the watcher's or its own
+	// closure, worker await, and drain have all finished.
+	h.stopVirtualEvidence()
+
+	if got := atomic.LoadInt64(&calls); got != 2 {
+		t.Fatalf("attempts = %d, want 2 (the retry must survive service cancellation)", got)
+	}
+	if msg, _ := retryCtxErr.Load().(string); msg != "" {
+		t.Fatalf("retry ran under a cancelled context: %s", msg)
+	}
+}
+
 // TestEvidenceRestartStartsEmpty pins the documented crash semantics: accepted
 // work lives only in memory, so a fresh handler (a restart) has no retained
 // evidence and relies on the next playback start to re-admit.

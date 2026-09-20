@@ -32,13 +32,18 @@ import (
 // terminal failure that is logged and dropped. A CAS miss is never retried: a
 // newer writer already committed the row.
 //
-// Shutdown: pending work is drained for virtualEvidenceDrainGrace after the
-// service context ends. Work still pending when the grace expires is abandoned
-// with a warning. Nothing is durable across process death: accepted work lives
-// only in this in-memory buffer, so a crash loses every queued or in-flight
-// write. That is safe because the loss is evidence, not data — the next
-// playback start re-probes and re-admits, and the catalog keeps its last
-// committed snapshot until then.
+// Shutdown: closure and admission share the buffer mutex, so the moment
+// shutdown begins no further admission can be accepted; a later admit is
+// rejected explicitly. Shutdown then awaits every worker (including the task a
+// worker already dequeued) and only then drains the remaining accepted work
+// under an independent, bounded context. Dequeued work is therefore never
+// stranded on the cancelled service context and never silently dropped: each
+// task is persisted or logged as a terminal failure, and the abandonment
+// warning counts both still-queued and still-dequeued work. Nothing is durable
+// across process death: accepted work lives only in this in-memory buffer, so a
+// crash loses every queued or in-flight write. That is safe because the loss is
+// evidence, not data — the next playback start re-probes and re-admits, and the
+// catalog keeps its last committed snapshot until then.
 
 const (
 	// virtualEvidenceQueueSize bounds queued (not yet executing) evidence
@@ -162,13 +167,26 @@ func virtualEvidenceSnapshotNewer(a, b *virtualEvidenceTask) bool {
 // coalescing index. It is deliberately not a channel: coalescing must replace
 // a pending task in place, which a channel cannot express. All methods are safe
 // for concurrent use.
+//
+// The same mutex guards both admission and closure, so "may I enqueue?" and
+// "stop accepting" cannot interleave: a task is either admitted (and therefore
+// drained) or rejected because shutdown won. shutdownCh wakes workers that are
+// parked with an empty buffer, so shutdown does not depend on the service
+// context being cancellable in tests.
 type virtualEvidenceBuffer struct {
-	mu       sync.Mutex
-	pending  []*virtualEvidenceTask
-	index    map[string]*virtualEvidenceTask
-	capacity int
-	seq      uint64
-	signalCh chan struct{}
+	mu         sync.Mutex
+	pending    []*virtualEvidenceTask
+	index      map[string]*virtualEvidenceTask
+	capacity   int
+	seq        uint64
+	signalCh   chan struct{}
+	shutdownCh chan struct{}
+	closed     bool
+	drainUntil time.Time
+	// inflight counts tasks popped by a worker or drainer that have not yet
+	// been persisted and released. It makes already-dequeued work explicit:
+	// shutdown awaits workers, and the abandonment warning reports it.
+	inflight int
 }
 
 func newVirtualEvidenceBuffer(capacity int) *virtualEvidenceBuffer {
@@ -176,9 +194,10 @@ func newVirtualEvidenceBuffer(capacity int) *virtualEvidenceBuffer {
 		capacity = virtualEvidenceQueueSize
 	}
 	return &virtualEvidenceBuffer{
-		index:    make(map[string]*virtualEvidenceTask),
-		capacity: capacity,
-		signalCh: make(chan struct{}, 1),
+		index:      make(map[string]*virtualEvidenceTask),
+		capacity:   capacity,
+		signalCh:   make(chan struct{}, 1),
+		shutdownCh: make(chan struct{}),
 	}
 }
 
@@ -206,6 +225,12 @@ func (b *virtualEvidenceBuffer) admit(t *virtualEvidenceTask) virtualEvidenceAdm
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		// Shutdown won the race for the lock: acceptance is over, so the caller
+		// gets the explicit rejected result rather than a task that no worker
+		// will ever drain.
+		return virtualEvidenceRejected
+	}
 	if existing, ok := b.index[t.key]; ok {
 		if !virtualEvidenceSnapshotNewer(t, existing) {
 			// A stale writer for an equivalent target: reject rather than let
@@ -243,7 +268,61 @@ func (b *virtualEvidenceBuffer) pop() *virtualEvidenceTask {
 	t := b.pending[0]
 	b.pending = b.pending[1:]
 	delete(b.index, t.key)
+	b.inflight++
 	return t
+}
+
+// taskFinished releases the in-flight slot for a task returned by pop. Every
+// pop must be paired with it once the task has been persisted or terminally
+// logged.
+func (b *virtualEvidenceBuffer) taskFinished() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	if b.inflight > 0 {
+		b.inflight--
+	}
+	b.mu.Unlock()
+}
+
+// close atomically stops admission and wakes the workers. It is idempotent.
+// Setting closed and closing shutdownCh under the admission mutex is what makes
+// closure and admission atomic: no admit can land after this returns.
+func (b *virtualEvidenceBuffer) close() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	b.closed = true
+	b.drainUntil = time.Now().Add(virtualEvidenceDrainGrace)
+	close(b.shutdownCh)
+	b.mu.Unlock()
+	b.signal()
+}
+
+// drainDeadline returns the wall-clock bound for draining accepted work, or the
+// zero time while the buffer is still accepting.
+func (b *virtualEvidenceBuffer) drainDeadline() time.Time {
+	if b == nil {
+		return time.Time{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.drainUntil
+}
+
+func (b *virtualEvidenceBuffer) inflightCount() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.inflight
 }
 
 func (b *virtualEvidenceBuffer) len() int {
@@ -262,8 +341,16 @@ func (b *virtualEvidenceBuffer) signalChannel() <-chan struct{} {
 	return b.signalCh
 }
 
+// shutdownChannel is closed by close, waking workers parked on an empty buffer.
+func (b *virtualEvidenceBuffer) shutdownChannel() <-chan struct{} {
+	if b == nil {
+		return nil
+	}
+	return b.shutdownCh
+}
+
 // evidenceBuffer returns the handler's evidence buffer, constructing it and
-// starting the bounded worker pool on first use.
+// starting the bounded worker pool plus the shutdown watcher on first use.
 func (h *PlaybackHandler) evidenceBuffer() *virtualEvidenceBuffer {
 	if h == nil {
 		return nil
@@ -273,11 +360,42 @@ func (h *PlaybackHandler) evidenceBuffer() *virtualEvidenceBuffer {
 			h.virtualEvidenceBuffer = newVirtualEvidenceBuffer(virtualEvidenceQueueSize)
 		}
 		buf := h.virtualEvidenceBuffer
+		h.virtualEvidenceWG.Add(virtualEvidenceWorkers)
 		for range virtualEvidenceWorkers {
-			go h.runVirtualEvidenceWorker(buf)
+			go func() {
+				defer h.virtualEvidenceWG.Done()
+				h.runVirtualEvidenceWorker(buf)
+			}()
+		}
+		// The watcher is started inside the once, after the workers are
+		// registered, so stopVirtualEvidence always has a started pool to await.
+		// Done() is nil for context.Background, which must not leak a watcher.
+		if h.ServiceContext != nil && h.ServiceContext.Done() != nil {
+			serviceDone := h.ServiceContext.Done()
+			go func() {
+				<-serviceDone
+				h.stopVirtualEvidence()
+			}()
 		}
 	})
 	return h.virtualEvidenceBuffer
+}
+
+// stopVirtualEvidence is the single shutdown path: it atomically stops
+// admission, awaits every worker (including the task one already dequeued), then
+// drains the accepted remainder under an independent bounded context. It is
+// single-flight, so a caller racing the lifecycle watcher blocks until the one
+// closure has fully completed.
+func (h *PlaybackHandler) stopVirtualEvidence() {
+	if h == nil || h.virtualEvidenceBuffer == nil {
+		return
+	}
+	h.virtualEvidenceStopOnce.Do(func() {
+		buf := h.virtualEvidenceBuffer
+		buf.close()
+		h.virtualEvidenceWG.Wait()
+		h.drainVirtualEvidence(buf)
+	})
 }
 
 // enqueueVirtualProbeEvidence admits one catalog write into the evidence
@@ -300,35 +418,40 @@ func (h *PlaybackHandler) enqueueVirtualProbeEvidence(_ context.Context, args mo
 	return buf.admit(task)
 }
 
-// runVirtualEvidenceWorker drains accepted work until the service context ends,
-// then performs a bounded drain of what is left before exiting.
+// runVirtualEvidenceWorker drains accepted work until the buffer is closed by
+// shutdown, then exits. It deliberately does not exit on the service context:
+// the watcher's stopVirtualEvidence closes the buffer first, so a worker never
+// abandons a dequeued task, and admission is already closed by the time any
+// worker returns.
 func (h *PlaybackHandler) runVirtualEvidenceWorker(buf *virtualEvidenceBuffer) {
-	var serviceDone <-chan struct{}
-	if h.ServiceContext != nil {
-		serviceDone = h.ServiceContext.Done()
-	}
 	for {
 		if task := buf.pop(); task != nil {
 			// persistVirtualEvidenceTask logs terminal failures itself, so the
 			// worker reports and drops them there and moves to the next task.
+			// taskFinished releases the explicit in-flight accounting.
 			_ = h.persistVirtualEvidenceTask(task, time.Time{})
+			buf.taskFinished()
 			continue
 		}
 		select {
 		case <-buf.signalChannel():
-		case <-serviceDone:
-			h.drainVirtualEvidence(buf)
+		case <-buf.shutdownChannel():
 			return
 		}
 	}
 }
 
-// drainVirtualEvidence persists accepted work for at most
-// virtualEvidenceDrainGrace after shutdown began, then abandons the remainder
-// with a warning. Drain writes use a context independent of the canceled
-// service context so they can still complete.
+// drainVirtualEvidence persists the accepted work left when shutdown began for
+// at most the buffer's drain deadline, then abandons the remainder with a
+// warning that accounts for both still-queued and still-dequeued work. Drain
+// writes use a context independent of the canceled service context so they can
+// still complete. It runs after the workers have exited, so anything it pops is
+// work no worker had taken.
 func (h *PlaybackHandler) drainVirtualEvidence(buf *virtualEvidenceBuffer) {
-	deadline := time.Now().Add(virtualEvidenceDrainGrace)
+	deadline := buf.drainDeadline()
+	if deadline.IsZero() {
+		deadline = time.Now().Add(virtualEvidenceDrainGrace)
+	}
 	for time.Now().Before(deadline) {
 		task := buf.pop()
 		if task == nil {
@@ -336,17 +459,20 @@ func (h *PlaybackHandler) drainVirtualEvidence(buf *virtualEvidenceBuffer) {
 		}
 		// persistVirtualEvidenceTask logs terminal failures itself.
 		_ = h.persistVirtualEvidenceTask(task, deadline)
+		buf.taskFinished()
 	}
-	if n := buf.len(); n > 0 {
+	if queued, inflight := buf.len(), buf.inflightCount(); queued > 0 || inflight > 0 {
 		slog.Warn("virtual probe evidence abandoned at shutdown",
-			"component", "api", "queued", n)
+			"component", "api", "queued", queued, "inflight", inflight)
 	}
 }
 
 // persistVirtualEvidenceTask executes one accepted write with bounded retry.
 // drainDeadline, when non-zero, bounds the whole task (including backoff) for
-// shutdown draining. The return value is the write error, or
-// errVirtualEvidenceStale on a CAS miss; both are logged as terminal.
+// shutdown draining; when the buffer has been closed its deadline takes
+// precedence, so a task dequeued just before shutdown is still drained rather
+// than stranded. The return value is the write error, or errVirtualEvidenceStale
+// on a CAS miss; both are logged as terminal.
 func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, drainDeadline time.Time) error {
 	if task == nil || h.VirtualFileSaver == nil {
 		return nil
@@ -354,10 +480,11 @@ func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, 
 	saver := h.VirtualFileSaver
 	var lastErr error
 	for attempt := 1; attempt <= virtualEvidenceMaxAttempts; attempt++ {
+		deadline := h.effectiveEvidenceDeadline(drainDeadline)
 		if attempt > 1 {
 			delay := virtualEvidenceBackoff(attempt)
-			if !drainDeadline.IsZero() {
-				remaining := time.Until(drainDeadline)
+			if !deadline.IsZero() {
+				remaining := time.Until(deadline)
 				if remaining <= 0 {
 					lastErr = context.DeadlineExceeded
 					break
@@ -366,16 +493,16 @@ func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, 
 					delay = remaining
 				}
 			}
-			timer := time.NewTimer(delay)
-			select {
-			case <-timer.C:
-			case <-h.serviceDoneChannel():
-				timer.Stop()
-				lastErr = context.Canceled
-				goto terminal
-			}
+			// Backoff is bounded (<= virtualEvidenceRetryMaxDelay) and does not
+			// abort on the service context: shutdown drains accepted work rather
+			// than dropping it.
+			time.Sleep(delay)
 		}
-		writeCtx, cancel := h.evidenceWriteContext(drainDeadline)
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			lastErr = context.DeadlineExceeded
+			break
+		}
+		writeCtx, cancel := h.evidenceWriteContext(deadline)
 		rows, err := saver(writeCtx, task.args)
 		cancel()
 		if err == nil {
@@ -397,23 +524,30 @@ terminal:
 	return lastErr
 }
 
-func (h *PlaybackHandler) serviceDoneChannel() <-chan struct{} {
-	if h == nil || h.ServiceContext == nil {
-		return nil
+// effectiveEvidenceDeadline resolves the bound for one write attempt. Once the
+// buffer has been closed its drain deadline takes precedence over the caller's
+// fallback, so a task already in a worker's hands when shutdown begins is
+// bounded by the drain grace, not just the per-attempt budget.
+func (h *PlaybackHandler) effectiveEvidenceDeadline(fallback time.Time) time.Time {
+	if h != nil && h.virtualEvidenceBuffer != nil {
+		if d := h.virtualEvidenceBuffer.drainDeadline(); !d.IsZero() {
+			return d
+		}
 	}
-	return h.ServiceContext.Done()
+	return fallback
 }
 
-// evidenceWriteContext builds one write attempt's context. Normal writes are
-// bound to the service lifecycle with the per-attempt budget; drain writes use
-// a context independent of the canceled service so shutdown can still flush.
-func (h *PlaybackHandler) evidenceWriteContext(drainDeadline time.Time) (context.Context, context.CancelFunc) {
-	if drainDeadline.IsZero() {
-		return h.virtualDetachedContext(h.ServiceContext, virtualEvidencePersistBudget)
-	}
+// evidenceWriteContext builds one write attempt's context. It is independent of
+// ServiceContext by design: accepted evidence must be drained at shutdown, so
+// cancelling the service must not fail an already-admitted write. The attempt is
+// bounded by the per-attempt budget, tightened to the remaining drain grace once
+// shutdown begins.
+func (h *PlaybackHandler) evidenceWriteContext(deadline time.Time) (context.Context, context.CancelFunc) {
 	timeout := virtualEvidencePersistBudget
-	if remaining := time.Until(drainDeadline); remaining > 0 && remaining < timeout {
-		timeout = remaining
+	if !deadline.IsZero() {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
 	}
 	return context.WithTimeout(context.Background(), timeout)
 }
