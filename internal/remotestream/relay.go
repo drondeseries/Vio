@@ -84,15 +84,18 @@ const (
 	relayRangeCacheMaxEntries   = 64
 	relayRangeCacheMaxTotalSize = 16 << 20
 
-	// relayMaxFreshness caps every duration derived from the origin's freshness
-	// headers at the relay's own range-cache lifetime. An Age, max-age or
-	// s-maxage above it is refused as non-cacheable, and every other derived
-	// duration (apparent age, response delay, lifetime minus corrected age) is
-	// saturated to it. That keeps an unbounded delta-seconds conversion or a
-	// pair of additions from wrapping int64 nanoseconds, and bounds
-	// responseReceivedAt.Add(remaining) to relayRangeCacheTTL: a longer origin
-	// freshness can never outlive the entry the relay is willing to serve.
-	relayMaxFreshness = relayRangeCacheTTL
+	// relayMaxFreshness is the widest origin-declared freshness the relay will
+	// even try to represent: 30 days. It is a sanity bound on arithmetic, not
+	// the relay's cache residency. An Age, max-age or s-maxage above it is
+	// treated as malformed and refused; every derived duration (apparent age,
+	// response delay, an Expires delta, lifetime minus corrected age) saturates
+	// to it so a delta-seconds conversion or a pair of additions cannot wrap
+	// int64 nanoseconds. It is deliberately far larger than
+	// relayRangeCacheTTL: an origin may legitimately declare hours or days of
+	// freshness and still yield a usable response. Local residency is bounded
+	// separately, by clamping the remaining freshness to relayRangeCacheTTL
+	// before the expiry is computed.
+	relayMaxFreshness = 30 * 24 * time.Hour
 )
 
 // relayMaxFreshnessSeconds is relayMaxFreshness in whole delta-seconds, the
@@ -258,10 +261,12 @@ func relayRangeCacheHeaderIdentity(headers http.Header) string {
 // window cannot serve meaningfully stale bytes while preserving the seek
 // optimization. A malformed Age, Date, Expires or max-age is treated as
 // non-reusable because freshness cannot be established. An Age, max-age or
-// s-maxage above relayMaxFreshness is likewise non-reusable, so an oversized
-// delta-seconds value is never converted (or wrapped) into a duration; the
-// derived ages and lifetimes that remain saturate at that ceiling. Because
-// relayMaxFreshness is relayRangeCacheTTL, the returned expiry is never later
+// s-maxage above relayMaxFreshness (the 30-day sanity ceiling, not the cache
+// lifetime) is likewise non-reusable, so an oversized delta-seconds value is
+// never converted (or wrapped) into a duration; the derived ages and lifetimes
+// that remain saturate at that ceiling. An origin freshness longer than
+// relayRangeCacheTTL is accepted and then clamped: the remaining freshness is
+// min(remaining, relayRangeCacheTTL), so the returned expiry is never later
 // than responseReceivedAt plus the relay's own cache lifetime.
 func relayRangeResponseCacheability(response *http.Response, requestSentAt, responseReceivedAt time.Time) (int, time.Time, bool) {
 	if response == nil {
@@ -287,6 +292,9 @@ func relayRangeResponseCacheability(response *http.Response, requestSentAt, resp
 	if relayHasConflictingLifetime(response.Header.Values(headerCacheControl)) {
 		return 0, time.Time{}, false
 	}
+	// Reject a malformed or zero max-age/s-maxage. A positive value longer than
+	// relayRangeCacheTTL is not rejected here: it is accepted and clamped to the
+	// cache lifetime when the expiry is computed.
 	for _, bound := range []string{cacheControlSMaxAge, cacheControlMaxAge} {
 		if value, ok := directives[bound]; ok {
 			seconds, ok := relayParseBoundedSeconds(value)
@@ -307,19 +315,30 @@ func relayRangeResponseCacheability(response *http.Response, requestSentAt, resp
 		return 0, time.Time{}, false
 	}
 	// lifetime and age are both bounded by relayMaxFreshness, so the difference
-	// cannot underflow; saturating it keeps the expiry bounded even if a future
-	// change relaxes one of those bounds.
+	// cannot underflow; saturating it keeps the arithmetic bounded even if a
+	// future change relaxes one of those bounds.
 	remaining := relaySaturateFreshness(lifetime - age)
 	if remaining <= 0 {
 		return 0, time.Time{}, false
+	}
+	// Clamp residency, not validity: an origin may declare hours or days of
+	// freshness, which is perfectly reusable but must not pin an entry longer
+	// than the relay promises its clients. Cap the remaining freshness at the
+	// cache lifetime instead of refusing the response.
+	if remaining > relayRangeCacheTTL {
+		remaining = relayRangeCacheTTL
 	}
 	return length, responseReceivedAt.Add(remaining), true
 }
 
 // relayParseBoundedSeconds parses a non-negative integer delta-seconds value.
-// It reports ok=false for a malformed, negative, or over-ceiling value. A huge
-// Age or max-age is refused rather than converted: time.Duration(seconds) *
-// time.Second would otherwise wrap to an arbitrary, possibly negative duration.
+// It reports ok=false for a malformed, negative, or over-ceiling value. The
+// ceiling is relayMaxFreshness (30 days), a sanity bound on arithmetic rather
+// than the relay's cache residency: a huge Age or max-age/s-maxage is refused
+// rather than converted, because time.Duration(seconds) * time.Second would
+// otherwise wrap to an arbitrary, possibly negative duration. A value inside
+// the ceiling but longer than relayRangeCacheTTL is accepted and the resulting
+// remaining freshness is later clamped to that cache lifetime.
 func relayParseBoundedSeconds(raw string) (int64, bool) {
 	seconds, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	if err != nil || seconds < 0 || seconds > relayMaxFreshnessSeconds {
@@ -331,7 +350,8 @@ func relayParseBoundedSeconds(raw string) (int64, bool) {
 // relaySaturateFreshness clamps a derived duration into [0, relayMaxFreshness].
 // A negative value (a future Date, or a clock that ran backwards) becomes zero;
 // an above-ceiling value saturates, so two of them can be added without
-// overflowing int64 nanoseconds and the resulting expiry stays bounded.
+// overflowing int64 nanoseconds. This bounds arithmetic only; the caller clamps
+// the resulting remaining freshness to relayRangeCacheTTL.
 func relaySaturateFreshness(d time.Duration) time.Duration {
 	if d < 0 {
 		return 0
@@ -347,7 +367,8 @@ func relaySaturateFreshness(d time.Duration) time.Duration {
 // Expires relative to Date; otherwise the relay's own bounded default. An
 // over-ceiling max-age/s-maxage is rejected, and an Expires delta beyond the
 // ceiling saturates to relayMaxFreshness rather than yielding a far-future
-// expiry.
+// expiry. Either way the caller clamps the resulting remaining freshness to
+// relayRangeCacheTTL.
 func relayFreshnessLifetime(directives map[string]string, header http.Header, receivedAt time.Time) (time.Duration, bool) {
 	for _, name := range []string{"s-maxage", "max-age"} {
 		if value, ok := directives[name]; ok {
