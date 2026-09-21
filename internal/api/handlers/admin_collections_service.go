@@ -443,10 +443,10 @@ func (h *LibraryCollectionHandler) importAdminTrakt(ctx context.Context, req Adm
 	var sourceURL string
 	var err error
 	if listURL != "" {
-		sourceConfig, err = buildTraktListSourceConfig(listURL, req.Limit, req.VirtualPlayback)
+		sourceConfig, err = buildTraktListSourceConfig(listURL, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 		sourceURL = listURL
 	} else {
-		sourceConfig, err = buildTraktSourceConfig(preset, mediaType, profileID, req.Limit, req.VirtualPlayback)
+		sourceConfig, err = buildTraktSourceConfig(preset, mediaType, profileID, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 		sourceURL = buildTraktSourceURL(preset, mediaType, profileID)
 	}
 	if err != nil {
@@ -571,7 +571,7 @@ func (h *LibraryCollectionHandler) QueueAdminCollectionTemplate(ctx context.Cont
 	if len(ids) == 0 {
 		return nil, apiError(400, "bad_request", "library_ids is required")
 	}
-	job, err := h.JobRepo.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeTemplateBundleApply, CreatedByUserID: actingUserID, RequestPayload: adminjob.TemplateBundleApplyRequest{BundleID: id, LibraryIDs: ids, DeleteExisting: req.DeleteExisting, Featured: toAdminJobTemplateBundleFeatured(req.Featured)}, Message: "Queued collection defaults apply"})
+	job, err := h.JobRepo.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeTemplateBundleApply, CreatedByUserID: actingUserID, RequestPayload: adminjob.TemplateBundleApplyRequest{BundleID: id, LibraryIDs: ids, DeleteExisting: req.DeleteExisting, VirtualPlayback: req.VirtualPlayback, Featured: toAdminJobTemplateBundleFeatured(req.Featured)}, Message: "Queued collection defaults apply"})
 	if err != nil {
 		return nil, err
 	}

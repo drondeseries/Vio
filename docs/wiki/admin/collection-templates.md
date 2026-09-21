@@ -145,6 +145,12 @@ The TMDB franchise placeholder template ships with `collection_id: 0` and no syn
 applying it, edit the resulting collection's source config to set a real TMDB collection ID
 before the first sync runs.
 
+Bundles keep zero-storage virtual playback on by default: the apply request's
+`virtual_playback` field defaults to on when omitted, and the gallery sends `true` unless the
+operator turns it off. Virtual playback keeps items matched outside the selected libraries as
+database-only entries that Silo Virtual Library resolves at playback time. An explicit `false`
+limits each collection to items already present in the selected libraries.
+
 ## How a single template becomes a collection
 
 Picking a `tmdb`, `trakt`, or `mdblist` template opens a confirmation drawer with:
@@ -158,6 +164,10 @@ Picking a `tmdb`, `trakt`, or `mdblist` template opens a confirmation drawer wit
 - **Poster** — use the template's default artwork or supply a custom image URL.
 - **Max Items**, **Default Sort**, **Sync Schedule**, and **Featured** — pre-filled with the
   template's defaults, all editable.
+- **Virtual Playback** — on by default. It keeps items matched outside the selected libraries as
+  zero-storage virtual entries resolved by Silo Virtual Library at playback. Turn it off to limit
+  the collection to items already present in the selected libraries; the API treats an omitted
+  `virtual_playback` field as on, so only an explicit `false` disables it.
 
 Submitting the form posts to the matching import endpoint. The backend creates the collection,
 runs the first sync, and the new shelf shows up in the collections list with its status set by
