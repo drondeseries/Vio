@@ -737,7 +737,10 @@ func (s *Service) resolveChange(ctx context.Context, change Change, stats *resol
 		target, err = s.resolver.ResolveMissingSubtree(ctx, change.SourcePath, scanTrigger)
 	case ChangeScopeFile:
 		target, err = s.resolver.Resolve(ctx, scantrigger.Request{Path: change.SourcePath, Trigger: scanTrigger})
-		if err == nil && target != nil && target.Mode != scantrigger.ModeFile {
+		// A file change resolves to the file itself or, for video, to its
+		// directory. A change that resolves to a whole library was not a file
+		// path and is dropped rather than turned into a full scan.
+		if err == nil && target != nil && target.Mode == scantrigger.ModeLibrary {
 			return nil, false
 		}
 		if isRequestError(err) {

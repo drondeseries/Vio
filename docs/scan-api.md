@@ -84,12 +84,21 @@ scan asynchronously.
 | `library_id` only | — | `library` | Full scan of all paths in the library. |
 | `path` equals a library root | directory | `library` | Full scan of that library. |
 | `path` is a subdirectory within a library | directory | `subtree` | Scans only that directory and its descendants. |
-| `path` is a media file | file | `file` | Scans only that single file. |
+| `path` is a video file inside a subdirectory | file | `subtree` | Scans the file's directory and its descendants. |
+| `path` is a video file directly under a library root | file | `file` | Scans only that single file. |
+| `path` is an audiobook, ebook, or manga file | file | `file` | Scans only that single file. |
 
 When only `path` is provided, the server resolves which library owns that path. When both are
-provided, the server verifies the path belongs to the named library. A single-file scan is
-rejected when the file's extension is not a media extension for the library's kind; matching is
+provided, the server verifies the path belongs to the named library. A file path is rejected when
+the file's extension is not a media extension for the library's kind; matching is
 case-insensitive.
+
+A video file path widens to its directory because a release rarely changes one file in isolation:
+an upgrade deletes the replaced version and rewrites sidecars (`.nfo`, posters, subtitles), and
+change publishers batch per directory, so not every event reaches the caller. Scanning the
+directory reconciles all of it. The widening stops at the library root so a flat library never
+turns one file event into a full library scan. The response `mode` reports the scan that actually
+ran.
 
 #### Response
 
@@ -387,9 +396,9 @@ runs. If two full library scans are triggered back to back, the second is droppe
 
 - **Prefer subtree scans** for automation. Scanning a show or movie folder is fast and precise —
   it picks up new files and marks removed ones without touching the rest of the library.
-- **Use file scans sparingly.** They help when you know the exact file, but a subtree scan of the
-  parent folder is usually just as fast and also catches renames, deletions, and new subtitle
-  files.
+- **Sending a file path is fine.** For video libraries the server scans the file's directory,
+  which catches the replaced version, renames, and new sidecar files alongside the file you
+  named. Sending the season or movie folder directly is equivalent.
 - **Full library scans are expensive.** Reserve these for periodic maintenance (Silo runs one
   daily at 02:00 server-local time by default). Do not trigger full scans from download
   automation.
