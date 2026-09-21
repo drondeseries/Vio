@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -262,6 +263,24 @@ func TestControlSocketReconnectResumesOnlySameOwnerAndInstallation(t *testing.T)
 		t.Fatal(err)
 	}
 	f.hello(t, second)
+	// Lane-ownership barrier. The server registers the replacement at upgrade
+	// and closes the previous connection only after the swap, so observing
+	// that close proves the replacement owns the lane before the broadcast
+	// below. The session's control-ready flag cannot provide this on a
+	// reconnect: the first connection already set it, so hello returns before
+	// the replacement's registration is guaranteed and the command can race
+	// the swap and be delivered to the old connection instead.
+	if err := first.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := first.ReadMessage(); err == nil {
+		t.Fatal("first connection still receives frames after takeover")
+	} else {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatal("first connection was not closed by the takeover")
+		}
+	}
 	command, err := playback.NewCommandEnvelope(f.session.ID, "11111111-1111-4111-8111-111111111111", playback.CommandPause, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -269,18 +288,12 @@ func TestControlSocketReconnectResumesOnlySameOwnerAndInstallation(t *testing.T)
 	if err := f.hub.Send(f.session.ID, command); err != nil {
 		t.Fatal(err)
 	}
-	if err := second.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := second.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	_, data, err := second.ReadMessage()
 	if err != nil || !strings.Contains(string(data), `"command_id":"11111111-1111-4111-8111-111111111111"`) {
 		t.Fatalf("second connection did not receive the command: %s %v", data, err)
-	}
-	if err := first.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := first.ReadMessage(); err == nil {
-		t.Fatal("first connection still receives frames after takeover")
 	}
 }
 
