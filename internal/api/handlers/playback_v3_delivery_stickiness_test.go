@@ -360,10 +360,12 @@ func TestHandleReplanPlaybackV3LastDeliveryNotDemotedOnTransportFailure(t *testi
 		t.Fatalf("first recovery expected an HLS remux, got %s (%s)", hlsPlan.Delivery, hlsPlan.DecisionReason)
 	}
 
-	// Second failure recovery hits the last remaining delivery. The demotion
-	// must be suppressed: dropping HLS would leave no route at all. The HLS
-	// copy key is already attempted, so the planner serves the same delivery
-	// through its video-encode variant instead of terminalling.
+	// Second failure recovery hits the last remaining delivery: retiring
+	// the class up front would strand the only route the planner can still
+	// serve, so the failed recipe is excluded by its attempted plan key
+	// instead. With the HLS copy key already attempted the planner serves the
+	// same class through its video-encode variant, and only a plan chosen in
+	// a different class retires the failed one.
 	second := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
 		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
 		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
@@ -379,5 +381,155 @@ func TestHandleReplanPlaybackV3LastDeliveryNotDemotedOnTransportFailure(t *testi
 	}
 	if second.PlaybackPlan.Delivery != playback.DeliveryTranscodeHLSV3 {
 		t.Fatalf("second recovery expected an HLS video transcode, got %s (%s)", second.PlaybackPlan.Delivery, second.PlaybackPlan.DecisionReason)
+	}
+}
+
+// An unchanged-selection track_change after a protected last-route recovery
+// must not resurrect the previously failed HLS remux recipe. The recovery
+// sequence leaves the HLS class eligible so the sibling transcode recipe can
+// serve it; the failed remux stays excluded only through the attempted-recipe
+// evidence the client carries, which this unchanged-intent replan must honor.
+// It extends the recovery sequence in
+// TestHandleReplanPlaybackV3LastDeliveryNotDemotedOnTransportFailure with a
+// non-decoder transport classification (http_failure) on the second recovery,
+// proving the protected transport-failure set is not decoder-specific.
+func TestHandleReplanPlaybackV3UnchangedTrackChangeKeepsFailedRemuxExcluded(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	stubCopySeekAnchorV3(handler)
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
+		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
+		{Name: playback.TransformationVideoToH264V3, RecipeVersion: playback.TransformationVideoToH264RecipeVersionV3, Available: true},
+	}))
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+
+	start := v3HandlerStartRequest()
+	start.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassOriginalHTTPV3: {
+			Enabled: true, SupportedOnDevice: true,
+			Containers:        []string{"mp4"},
+			VideoCodecs:       []string{"h264"},
+			AudioDecodeCodecs: []string{"aac"},
+			Subtitles:         playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+		},
+		playback.DeliveryClassHLSV3: {
+			Enabled: true, SupportedOnDevice: true,
+			Containers:        []string{"hls"},
+			VideoCodecs:       []string{"h264"},
+			AudioDecodeCodecs: []string{"aac"},
+			Subtitles:         playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+		},
+	}
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start: %d %s", rr.Code, rr.Body.String())
+	}
+	direct := started.PlaybackPlan
+	if direct.Delivery != playback.DeliveryOriginalHTTPV3 {
+		t.Fatalf("fixture expected a direct-play start, got %s (%s)", direct.Delivery, direct.DecisionReason)
+	}
+
+	first := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
+		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
+		ReplanRequestID: "last-route-failure-0001", FailedPlanID: direct.PlanID, PlanAttemptID: "last-route-attempt-0001",
+		PlanAttemptKey: direct.PlanAttemptKey, AttemptedPlanKeys: []string{direct.PlanAttemptKey}, AttemptCount: 1,
+		PositionSeconds: 10, SelectedTracks: direct.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "decoder_failure"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	})
+	if first.Terminal != nil || first.PlaybackPlan == nil {
+		t.Fatalf("first failure recovery: terminal=%#v plan=%v", first.Terminal, first.PlaybackPlan)
+	}
+	hlsPlan := first.PlaybackPlan
+	if hlsPlan.Delivery != playback.DeliveryRemuxHLSV3 {
+		t.Fatalf("first recovery expected an HLS remux, got %s (%s)", hlsPlan.Delivery, hlsPlan.DecisionReason)
+	}
+	second := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
+		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
+		ReplanRequestID: "last-route-failure-0002", FailedPlanID: hlsPlan.PlanID, PlanAttemptID: "last-route-attempt-0002",
+		PlanAttemptKey: hlsPlan.PlanAttemptKey, AttemptedPlanKeys: []string{direct.PlanAttemptKey, hlsPlan.PlanAttemptKey}, AttemptCount: 2,
+		PositionSeconds: 10, SelectedTracks: hlsPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "decoder_failure"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	})
+	if second.Terminal != nil || second.PlaybackPlan == nil {
+		t.Fatalf("second failure recovery must not terminal: terminal=%#v plan=%v", second.Terminal, second.PlaybackPlan)
+	}
+	if second.PlaybackPlan.Delivery != playback.DeliveryTranscodeHLSV3 {
+		t.Fatalf("second recovery expected an HLS video transcode, got %s (%s)", second.PlaybackPlan.Delivery, second.PlaybackPlan.DecisionReason)
+	}
+	trackChange := playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
+		Operation: playback.ReplanOperationTrackChangeV3, PlaybackAttemptID: start.PlaybackAttemptID,
+		ReplanRequestID: "last-route-track-0003", FailedPlanID: second.PlaybackPlan.PlanID, PlanAttemptID: "last-route-attempt-0003",
+		PlanAttemptKey: second.PlaybackPlan.PlanAttemptKey,
+		AttemptedPlanKeys: []string{
+			direct.PlanAttemptKey, hlsPlan.PlanAttemptKey,
+		},
+		AttemptCount:          3,
+		PositionSeconds:       20,
+		SelectedTracks:        second.PlaybackPlan.SelectedTracks,
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	}
+	next := postPlaybackReplanV3(t, handler, started.SessionID, trackChange)
+	if next.Terminal != nil {
+		t.Fatalf("unchanged track_change returned a terminal: %#v", next.Terminal)
+	}
+	if next.PlaybackPlan == nil {
+		t.Fatal("unchanged track_change returned no plan")
+	}
+	if next.PlaybackPlan.Delivery == playback.DeliveryRemuxHLSV3 {
+		t.Fatalf(
+			"unchanged track_change resurrected the failed HLS remux recipe: %s (%s)",
+			next.PlaybackPlan.Delivery,
+			next.PlaybackPlan.DecisionReason,
+		)
+	}
+	if next.PlaybackPlan.PlanAttemptKey == hlsPlan.PlanAttemptKey {
+		t.Fatal("unchanged track_change returned the previously failed HLS remux plan key")
+	}
+	transcode := next.PlaybackPlan
+	third := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
+		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
+		ReplanRequestID: "last-route-failure-0003", FailedPlanID: second.PlaybackPlan.PlanID, PlanAttemptID: "last-route-attempt-0003",
+		PlanAttemptKey: second.PlaybackPlan.PlanAttemptKey,
+		AttemptedPlanKeys: []string{
+			direct.PlanAttemptKey, hlsPlan.PlanAttemptKey, transcode.PlanAttemptKey,
+		},
+		AttemptCount:          3,
+		PositionSeconds:       20,
+		SelectedTracks:        second.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "http_failure"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	})
+	if third.PlaybackPlan != nil {
+		t.Fatalf(
+			"exhausted transcode recovery recycled a recipe instead of terminalling: %s (%s)",
+			third.PlaybackPlan.Delivery,
+			third.PlaybackPlan.DecisionReason,
+		)
+	}
+	if third.Terminal == nil {
+		t.Fatal("exhausted transcode recovery returned neither a plan nor a terminal")
+	}
+	if third.Terminal.Retryable {
+		t.Fatalf("exhausted transcode recovery terminal must not be retryable: %#v", third.Terminal)
+	}
+	if third.Terminal.Reason == "" {
+		t.Fatalf("exhausted transcode recovery terminal has no reason: %#v", third.Terminal)
+	}
+	if third.Terminal.Reason != "adaptation_exhausted" {
+		t.Fatalf("exhausted transcode recovery terminal has unexpected reason: %#v", third.Terminal)
 	}
 }

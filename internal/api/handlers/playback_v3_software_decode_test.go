@@ -197,14 +197,16 @@ func TestHandleReplanPlaybackV3FailureRecoveryFallsBackToSoftwareDecode(t *testi
 	}
 
 	// A second failure recovery must not loop back into software decode. The
-	// software variant is now the exhausted plan, so the delivery demotes and
-	// the hardware plan must not be reselected either.
+	// software variant is now the exhausted plan, and the hardware plan that
+	// already failed is also carried in the attempted history, so the
+	// transcode recipe pair is exhausted and the planner exhausts instead of
+	// recycling an old recipe.
 	second := recovery
 	second.ReplanRequestID = "software-decode-recovery-0002"
 	second.FailedPlanID = recovered.PlaybackPlan.PlanID
 	second.PlanAttemptID = "software-decode-attempt-0002"
 	second.PlanAttemptKey = recovered.PlaybackPlan.PlanAttemptKey
-	second.AttemptedPlanKeys = []string{recovered.PlaybackPlan.PlanAttemptKey}
+	second.AttemptedPlanKeys = []string{started.PlaybackPlan.PlanAttemptKey, recovered.PlaybackPlan.PlanAttemptKey}
 	second.AttemptCount = 2
 	second.SelectedTracks = recovered.PlaybackPlan.SelectedTracks
 	secondReplan := postPlaybackReplanV3(t, handler, started.SessionID, second)

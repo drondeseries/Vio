@@ -6224,27 +6224,22 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// virtual failure: candidate substitution is the recovery, so the delivery
 	// stays eligible until rotation exhausts.
 	virtualDecodeRotation := h.virtualCandidateRotationPendingV3(record, req)
-	// A client failure classification never retires the session's last
-	// remaining delivery. Retiring the only route turns a transient verdict
-	// into a terminal even though the planner could still serve that delivery
-	// through a sibling plan: an attempted copy plan falls through to the
-	// video-encode variant of the same class. The attempted-plan-key exclusion
-	// keeps later recoveries bounded, and a route that genuinely cannot be
-	// served exhausts through the transcode path's own attempted-key check.
-	lastRoute := deliveryDemotionRetiresLastRouteV3(&start, record.CurrentPlan.Delivery)
-	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
+	// A failure recovery never retires the abandoned delivery up front on the
+	// strength of what another delivery class advertises: an advertised class
+	// can still be unusable for this source (container, video/audio codecs,
+	// channels, HDR), and demoting would strand the session on the only route
+	// the planner can actually serve. The demotion is therefore applied below,
+	// after the planner has judged the route space: a plan in a different
+	// delivery class proves a genuine alternative exists, and a terminal with
+	// the failed delivery still enabled proves no recipe in that class can
+	// serve the source. A planner-chosen sibling recipe in the same class —
+	// an attempted HLS copy plan falling through to the video-encode variant,
+	// hardware decode to software — defers retirement while that sibling is
+	// still evaluable, and the attempted-plan-key carry keeps the failed
+	// recipe itself excluded on later unchanged-intent replans.
+	demoteDelivery := failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
 		(!decodeFailureClassificationV3(req.Failure.Classification) ||
-			(!h.softwareDecodeRetryPendingV3(record, req) && !virtualDecodeRotation)) &&
-		!lastRoute {
-		// Demote on both copies: the record (the durable attempt this replan
-		// may still terminal-persist) and the seeded start, whose payload the
-		// success commit writes back via updated.NormalizedRequest. Demoting
-		// only the record would be wiped by that write-back — the seed was
-		// copied before the demotion and the overlay re-enables the client's
-		// still-advertised claim.
-		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
-		demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
-	}
+			(!h.softwareDecodeRetryPendingV3(record, req) && !virtualDecodeRotation))
 	// User-intent operations replace the legacy audio PATCH and client-recipe
 	// transcode start. Nothing failed, so their previous route stays eligible:
 	// neither attempted-key history nor the failed-plan exclusion applies.
@@ -6741,7 +6736,14 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			}
 		}
 		attemptedKeys := []string(nil)
-		if !intentChange && !seekReanchor && !userIntentOperation {
+		// Carry the client's attempted-recipe evidence into any replan that
+		// does not change the effective selection. A later track/quality/
+		// output replan with unchanged selections must not resurrect a recipe
+		// that already failed: the user is not asking for anything new, so the
+		// failed-recipe evidence still stands. A genuine intent change clears
+		// it — the user asked for a different track/quality/output, so the
+		// previously failed recipe may now be viable.
+		if !intentChange && !seekReanchor {
 			attemptedKeys = append(attemptedKeys, req.AttemptedPlanKeys...)
 			if !containsStringExactV3(attemptedKeys, req.PlanAttemptKey) {
 				attemptedKeys = append(attemptedKeys, req.PlanAttemptKey)
@@ -6765,6 +6767,16 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					attemptedKeys = append(attemptedKeys, unmutatedKey)
 				}
 			}
+		}
+		if !seekReanchor && userIntentOperation && !intentChange {
+			// The current live plan is not failed-recipe evidence on an
+			// unchanged-intent user replan: it replans the same healthy route,
+			// so its key must stay eligible even when the client's attempted
+			// history (or the echoed plan key above) already contains it.
+			currentKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+			attemptedKeys = slices.DeleteFunc(attemptedKeys, func(key string) bool {
+				return strings.TrimSpace(key) == currentKey
+			})
 		}
 		if virtualDecodeRotation {
 			// The plan attempt key does not encode the provider result= URI, so
@@ -6963,6 +6975,25 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// attempted decode modes on any terminal so an exhausted route never
 		// reports an empty detail.
 		result.Terminal.Detail = decodeAttemptDetail
+	}
+	// Apply the failure-recovery demotion now that the planner has judged the
+	// route space. Demote on both copies: the record (the durable attempt this
+	// replan may still terminal-persist) and the seeded start, whose payload
+	// the success commit writes back via updated.NormalizedRequest. Demoting
+	// only the record would be wiped by that write-back — the seed was copied
+	// before the demotion and the overlay re-enables the client's
+	// still-advertised claim.
+	if demoteDelivery && result.Plan != nil &&
+		playback.DeliveryClassV3(result.Plan.Delivery) != playback.DeliveryClassV3(record.CurrentPlan.Delivery) {
+		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+		demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
+	} else if demoteDelivery && result.Terminal != nil {
+		// The planner ran with the failed delivery still eligible and found no
+		// route for this source at all. No untried sibling is left to protect,
+		// so retire the delivery on the durable record rather than leaving it
+		// open to loop a later replan back to the same exhausted class.
+		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+		demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
 	}
 	if forceSoftwareDecode {
 		// The software retry is a deliberate quality trade, not a silent
@@ -8832,27 +8863,6 @@ func (h *PlaybackHandler) virtualCandidateRotationPendingV3(record *playback.Att
 	ts := h.tm.GetTranscodeSession(record.SessionID)
 	if ts == nil || !ts.IsSourceRejected() {
 		return false
-	}
-	return true
-}
-
-// deliveryDemotionRetiresLastRouteV3 reports whether demoting the given
-// delivery would leave the request with no other enabled delivery. The
-// failure-recovery path consults this before retiring a route on a client
-// classification: retiring the last route removes the only delivery the
-// planner could still serve through a sibling plan.
-func deliveryDemotionRetiresLastRouteV3(request *playback.StartRequestV3, delivery playback.DeliveryV3) bool {
-	if request == nil || request.ClientPlaybackContext.Deliveries == nil {
-		return false
-	}
-	class := playback.DeliveryClassV3(delivery)
-	for otherClass, capability := range request.ClientPlaybackContext.Deliveries {
-		if otherClass == class {
-			continue
-		}
-		if capability.Enabled && capability.SupportedOnDevice {
-			return false
-		}
 	}
 	return true
 }
