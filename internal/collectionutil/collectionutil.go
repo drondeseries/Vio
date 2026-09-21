@@ -10,7 +10,6 @@ var ErrOrderedIDsMismatch = errors.New("ordered_ids does not match the current s
 const (
 	collectionSourceFetchMultiplier = 4
 	collectionSourceFetchMin        = 100
-	DefaultCollectionItemLimit      = 500
 	MaxExplicitItemLimit            = 100000
 )
 
