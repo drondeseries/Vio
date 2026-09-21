@@ -1627,7 +1627,7 @@ func virtualCandidateGroup(raw string) (string, bool) {
 // window, oldest expiry first. It feeds the bounded background refresh pass.
 //
 // Selection is deliberately narrow:
-//   - only rows that carry a signalled expiry (resolved_url_expires_at) are
+//   - only rows that carry a signaled expiry (resolved_url_expires_at) are
 //     eligible: a NULL expiry is the durable unsigned-provider case and must
 //     never be re-fetched;
 //   - already-expired rows are excluded (the pass only pre-warms a live URL);
