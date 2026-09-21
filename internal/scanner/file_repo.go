@@ -1622,6 +1622,47 @@ func virtualCandidateGroup(raw string) (string, bool) {
 	return parsed.String(), true
 }
 
+// ListVirtualCandidatesNeedingRefresh returns the virtual candidate rows whose
+// signed stored URL is approaching expiry and still inside the candidate store
+// window, oldest expiry first. It feeds the bounded background refresh pass.
+//
+// Selection is deliberately narrow:
+//   - only rows that carry a signalled expiry (resolved_url_expires_at) are
+//     eligible: a NULL expiry is the durable unsigned-provider case and must
+//     never be re-fetched;
+//   - already-expired rows are excluded (the pass only pre-warms a live URL);
+//   - rows are confined to the trust window (updated_at inside it), so a row
+//     the server no longer trusts is never touched;
+//   - a zero window or lead matches nothing, so the pass is inert when the
+//     window is disabled.
+//
+// limit caps one pass; the caller also bounds its own batch.
+func (r *FileRepository) ListVirtualCandidatesNeedingRefresh(ctx context.Context, window, lead time.Duration, limit int) ([]*models.MediaFile, error) {
+	if r == nil || r.pool == nil {
+		return nil, errors.New("file repository is not configured")
+	}
+	if window <= 0 || lead <= 0 || limit <= 0 {
+		return nil, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+fileColumns+`
+		FROM media_files
+		WHERE (container = 'virtual' OR file_path LIKE 'virtual://%')
+		  AND resolved_url IS NOT NULL
+		  AND resolved_url_expires_at IS NOT NULL
+		  AND resolved_url_expires_at > NOW()
+		  AND resolved_url_expires_at <= NOW() + make_interval(secs => $1)
+		  AND updated_at >= NOW() - make_interval(secs => $2)
+		ORDER BY resolved_url_expires_at ASC
+		LIMIT $3`,
+		lead.Seconds(), window.Seconds(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list virtual candidates needing refresh: %w", err)
+	}
+	defer rows.Close()
+	return scanMediaFiles(rows)
+}
+
 // VirtualCandidateDeliveryGrace is how long after a virtual candidate's last
 // successful delivery a later failure is forgiven (failed_at is not stamped).
 // A release that played recently should not be branded dead because the

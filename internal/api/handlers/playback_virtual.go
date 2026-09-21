@@ -1109,6 +1109,14 @@ type virtualResolveOptionsV3 struct {
 	// anchor instead of trusting the persisted catalog row's current file_path,
 	// which may have drifted while the session was serving.
 	sessionAnchorURI string
+	// explicitSelection declares that the requested row is an explicit user
+	// version pick (protocol v3 file_selection=explicit). Like a session
+	// binding, the viewer chose this exact persisted candidate, so the resolver
+	// must not substitute a sibling release for it: a delisted same-identity
+	// candidate is served from its persisted row inside the trust window and
+	// refused (never swapped) when it is not. An auto selection leaves this
+	// false and keeps the ordinary fallback/substitution behavior.
+	explicitSelection bool
 }
 
 // virtualCandidateRotationContextKeyV3 carries the rotation intent across the
@@ -1281,6 +1289,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	}
 	allowFailed := options.allowFailedCandidate
 	rotateCandidates := options.rotateCandidates
+	explicitSelection := options.explicitSelection
 	if !isVirtualPlaybackFile(file) {
 		return resolvedVirtualPlaybackSource{File: file}, nil
 	}
@@ -1342,6 +1351,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// only add latency. The verdict and exclusion gates match the fast paths
 	// below, so a row this derivation skips still resolves as before.
 	persistedResumeURI := ""
+	var persistedResumeStored ResolvedVirtualMedia
+	persistedResumeState := virtualStoredURLMissing
 	if persistedResultURI && (needsCandidateMetadata || file.ProbeUpdatedAt == nil) &&
 		len(excludedCandidateIDs) == 0 &&
 		(allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) {
@@ -1349,13 +1360,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// expired-but-trusted one does too, except under an explicit relink:
 		// then the relist is the only way to refresh a lapsed signed URL, so it
 		// proceeds. The expired URL itself is never served.
-		_, storedState := evaluateStoredVirtualURLCandidate(
+		stored, storedState := evaluateStoredVirtualURLCandidate(
 			stagingCtx, file.FilePath, file,
 			h.storedVirtualURLAllowInsecure(file, file.VirtualOwnerInstallationID),
 			time.Now(), h.virtualCandidateTrustWindow(),
 		)
+		persistedResumeState = storedState
 		trustedResume := storedState == virtualStoredURLExpiredWithinWindow && !forceRelist
 		if storedState == virtualStoredURLUsable || trustedResume {
+			persistedResumeStored = stored
 			persistedResumeURI = file.FilePath
 			h.pinVirtualSticky(stickyKey, persistedResumeURI)
 			pinnedURI = persistedResumeURI
@@ -1679,15 +1692,39 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// under the resolved identity.
 		probedCandidateID := virtualResultCandidateID(cand.URI)
 		substituted := false
-		if h.VirtualMediaDetailedResolver != nil {
+		// A persisted row the viewer is bound to (a session binding, or an
+		// explicit version pick) is served from its own stored URL when that
+		// URL is usable. Skipping the provider resolve is what lets an
+		// explicitly selected candidate the provider stopped listing still
+		// play; the probe below still runs, so an incomplete row cannot reach
+		// the planner on declared-only stale metadata. A forced relink
+		// deliberately bypasses this so the user gets a fresh URL.
+		servedPersisted := !forceRelist && persistedResumeState == virtualStoredURLUsable &&
+			persistedResumeStored.URL != "" && persistedResumeURI != "" &&
+			cand.URI == persistedResumeURI && sameVirtualReleaseIdentity(file.FilePath, cand.URI) &&
+			(options.sessionBound || explicitSelection)
+		if servedPersisted {
+			streamURL = persistedResumeStored.URL
+			cand.RequestHeaders = cloneHeaderMap(persistedResumeStored.RequestHeaders)
+			oid = effectiveVirtualOwner(persistedResumeStored.OwnerID, oid)
+			selection := "explicit"
+			if !explicitSelection {
+				selection = "session_bound"
+			}
+			slog.InfoContext(attemptCtx, "virtual playback: serving a persisted candidate from its stored URL",
+				"component", "api", "file_id", file.ID, "candidate_uri", cand.URI,
+				"candidate_id", probedCandidateID, "window_state", "usable",
+				"status", "selected_persisted", "selection", selection)
+		} else if h.VirtualMediaDetailedResolver != nil {
 			// Thread the row's durable identity and, inside the trust window,
 			// the trusted flag so a delisted same-identity candidate is not
-			// reported absent (which would let a session-bound caller rotate to
-			// a sibling under the viewer's selection). Only the row's own
-			// release is annotated: a sibling must not inherit the anchor's
-			// identity, which could rematch the resolve back to the anchor.
+			// reported absent (which would let a pinned caller rotate to a
+			// sibling under the viewer's selection). Only the row's own
+			// release is annotated, and only for a pinned resolve (a session
+			// binding or an explicit pick): an auto selection must not inherit
+			// a trust that would suppress its fallback.
 			candidateCtx := attemptCtx
-			if sameVirtualReleaseIdentity(file.FilePath, cand.URI) {
+			if sameVirtualReleaseIdentity(file.FilePath, cand.URI) && (options.sessionBound || explicitSelection) {
 				candidateCtx = virtualResolveContextWithPersistedTrust(attemptCtx, file, time.Now(), h.virtualCandidateTrustWindow())
 			}
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(

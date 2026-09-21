@@ -1420,3 +1420,87 @@ func TestReplaceVirtualCandidatesRetainsInsideStoreWindow(t *testing.T) {
 		t.Fatalf("candidate survived with the window disabled: count=%d, want 0", got)
 	}
 }
+
+// TestListVirtualCandidatesNeedingRefreshSelectsOnlySignedExpiringRows covers
+// the refresh pass's selection rule: only a row with a signed URL that expires
+// inside the lead window and is itself inside the trust window is eligible. An
+// unsigned URL (NULL expiry), an already-expired URL, a URL beyond the lead,
+// and a row outside the window are all excluded.
+func TestListVirtualCandidatesNeedingRefreshSelectsOnlySignedExpiringRows(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("virtual-refresh-select-%d", suffix)
+	var folderID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("Refresh Select %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+	})
+
+	now := time.Now()
+	rows := []struct {
+		name      string
+		result    string
+		url       *string
+		expiresAt *time.Time
+		updatedAt time.Time
+		wantHit   bool
+	}{
+		{name: "unsigned", result: "unsigned", url: ptrString("https://93.184.216.34/u"), expiresAt: nil, updatedAt: now, wantHit: false},
+		{name: "already expired", result: "expired", url: ptrString("https://93.184.216.34/e"), expiresAt: ptrTime(now.Add(-time.Hour)), updatedAt: now, wantHit: false},
+		{name: "beyond lead", result: "far", url: ptrString("https://93.184.216.34/f"), expiresAt: ptrTime(now.Add(10 * time.Hour)), updatedAt: now, wantHit: false},
+		{name: "outside window", result: "outside", url: ptrString("https://93.184.216.34/o"), expiresAt: ptrTime(now.Add(30 * time.Minute)), updatedAt: now.Add(-48 * time.Hour), wantHit: false},
+		{name: "inside", result: "inside", url: ptrString("https://93.184.216.34/i"), expiresAt: ptrTime(now.Add(30 * time.Minute)), updatedAt: now.Add(-time.Hour), wantHit: true},
+	}
+	ids := map[string]int{}
+	for _, row := range rows {
+		path := fmt.Sprintf("virtual://movie/tt-%d?result=%s", suffix, row.result)
+		var id int
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,resolved_url,resolved_url_expires_at,updated_at)
+			VALUES($1,$2,$3,0,'virtual',5,$4,$5,$6) RETURNING id`,
+			contentID, folderID, path, row.url, row.expiresAt, row.updatedAt).Scan(&id); err != nil {
+			t.Fatalf("seed %s: %v", row.name, err)
+		}
+		ids[row.name] = id
+	}
+
+	repo := NewFileRepository(pool)
+	got, err := repo.ListVirtualCandidatesNeedingRefresh(ctx, 24*time.Hour, 2*time.Hour, 50)
+	if err != nil {
+		t.Fatalf("ListVirtualCandidatesNeedingRefresh: %v", err)
+	}
+	found := map[int]bool{}
+	for _, row := range got {
+		if row.ContentID == contentID {
+			found[row.ID] = true
+		}
+	}
+	for _, row := range rows {
+		if found[ids[row.name]] != row.wantHit {
+			t.Fatalf("%s row selected=%v, want %v", row.name, found[ids[row.name]], row.wantHit)
+		}
+	}
+
+	// A disabled window matches nothing.
+	if none, err := repo.ListVirtualCandidatesNeedingRefresh(ctx, 0, 2*time.Hour, 50); err != nil || len(none) != 0 {
+		t.Fatalf("window=0 returned %d rows (err=%v), want 0", len(none), err)
+	}
+}
+
+func ptrString(v string) *string     { return &v }
+func ptrTime(v time.Time) *time.Time { return &v }
