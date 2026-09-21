@@ -21036,6 +21036,7 @@ export interface components {
        */
       effective_media_file_id: string;
       effective_recipe: components["schemas"]["EffectiveRecipeV3"];
+      effective_virtual_uri?: string;
       expires_at?: string;
       plan_attempt_key: string;
       plan_id: string;

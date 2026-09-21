@@ -155,6 +155,38 @@ func TestPlaybackDecisionV2ProjectsVirtualSourceRevision(t *testing.T) {
 	}
 }
 
+// The effective virtual URI is part of the client-visible plan shape: the v2
+// player needs it to adopt a substituted candidate in its version menu, so the
+// projection must carry it and must omit it when the plan has no resolved
+// virtual candidate.
+func TestPlaybackDecisionV2ProjectsEffectiveVirtualURI(t *testing.T) {
+	const uri = "virtual://movie/tt1234567?result=working"
+	in := playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{EffectiveVirtualURI: uri}}
+	out := playbackDecision(in)
+	if out.PlaybackPlan.EffectiveVirtualURI != uri {
+		t.Fatalf("effective virtual URI = %q, want %q", out.PlaybackPlan.EffectiveVirtualURI, uri)
+	}
+	encodedPlan, err := json.Marshal(out.PlaybackPlan)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(encodedPlan), `"effective_virtual_uri":"`+uri+`"`) {
+		t.Fatalf("projected plan did not serialize effective_virtual_uri: %s", encodedPlan)
+	}
+
+	empty := playbackDecision(playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{}})
+	if empty.PlaybackPlan.EffectiveVirtualURI != "" {
+		t.Fatalf("empty plan projected an effective virtual URI: %q", empty.PlaybackPlan.EffectiveVirtualURI)
+	}
+	encoded, err := json.Marshal(empty.PlaybackPlan)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(encoded), "effective_virtual_uri") {
+		t.Fatalf("empty plan serialized an effective virtual URI: %s", encoded)
+	}
+}
+
 type fakeSubtitleFontService func(context.Context, handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error)
 
 func (f fakeSubtitleFontService) SubtitleFonts(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error) {

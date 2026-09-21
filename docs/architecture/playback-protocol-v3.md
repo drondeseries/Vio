@@ -1454,6 +1454,10 @@ It is a UI hint and is deliberately excluded from plan identity, exactly like
 `effective_virtual_uri` and the track inventories, so adding it does not perturb
 `plan_id` or `plan_attempt_key`.
 
+The `/api/v2` playback plan projection carries `effective_virtual_uri` alongside
+`virtual_source_revision`, so a v2 client can detect a substituted virtual
+candidate and adopt it in its version menu.
+
 ---
 
 ## 10. Quality

@@ -14,6 +14,10 @@ version is available, so an absent `available` means available/unknown; `false`
 means the version is currently unavailable. `FileVersion.failed` remains the
 virtual-only "produced no bytes at stream-open" flag.
 
+On the playback side, the `/api/v2` playback plan projection carries
+`effective_virtual_uri` alongside `virtual_source_revision`, so a client can
+detect a substituted virtual candidate and adopt it in its version menu.
+
 `POST /api/v1/catalog/versions/check` batch-tests a set of media file IDs and
 stamps the durable signal. The request is:
 
