@@ -4,19 +4,44 @@
 -- that exposes opted-in personal collections in the shared library view.
 -- Preserve regular groups that already use the reserved label or slug. Their
 -- opaque IDs remain unchanged so existing collection memberships stay valid.
-UPDATE library_collection_groups collision
-SET
-    label = 'user-collections-regular-' || collision.id,
-    slug = 'user-collections-regular-' || collision.id,
-    updated_at = NOW()
-WHERE collision.kind = 'regular'
-  AND (collision.label = 'user-collections' OR collision.slug = 'user-collections')
-  AND NOT EXISTS (
-      SELECT 1
-      FROM library_collection_groups existing
-      WHERE existing.library_id = collision.library_id
-        AND existing.kind = 'user_collections'
-  );
+DO $$
+DECLARE
+    collision RECORD;
+    replacement TEXT;
+    suffix BIGINT;
+BEGIN
+    FOR collision IN
+        SELECT g.id, g.library_id
+        FROM library_collection_groups g
+        WHERE g.kind = 'regular'
+          AND (g.label = 'user-collections' OR g.slug = 'user-collections')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM library_collection_groups existing
+              WHERE existing.library_id = g.library_id
+                AND existing.kind = 'user_collections'
+          )
+        ORDER BY g.library_id, g.id
+    LOOP
+        replacement := 'user-collections-regular-' || collision.id;
+        suffix := 0;
+        WHILE EXISTS (
+            SELECT 1
+            FROM library_collection_groups existing
+            WHERE existing.library_id = collision.library_id
+              AND existing.id <> collision.id
+              AND (existing.label = replacement OR existing.slug = replacement)
+        ) LOOP
+            suffix := suffix + 1;
+            replacement := 'user-collections-regular-' || collision.id || '-' || suffix;
+        END LOOP;
+
+        UPDATE library_collection_groups
+        SET label = replacement, slug = replacement, updated_at = NOW()
+        WHERE id = collision.id;
+    END LOOP;
+END;
+$$;
 
 INSERT INTO library_collection_groups (
     library_id, label, title, sort_order, id, name, slug, kind, default_sort_mode
