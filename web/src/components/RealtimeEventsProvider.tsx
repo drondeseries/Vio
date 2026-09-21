@@ -288,12 +288,23 @@ function applyTaskUpdate(queryClient: QueryClient, task: TaskRuntimeEvent) {
       triggers: task.triggers,
       next_run_at: task.next_run_at,
     });
-    queryClient.setQueryData<TaskInfo[]>(adminKeys.tasks(), (existing) =>
-      existing?.map((entry) => (entry.key === task.key ? update(entry) : entry)),
-    );
-    queryClient.setQueryData<TaskInfo>(adminKeys.task(task.key), (existing) =>
-      existing ? update(existing) : existing,
-    );
+    const listKey = adminKeys.tasks();
+    const detailKey = adminKeys.task(task.key);
+    const tasks = queryClient.getQueryData<TaskInfo[]>(listKey);
+    const detail = queryClient.getQueryData<TaskInfo>(detailKey);
+    // Supersede older reads before patching their data. Keep initial reads when
+    // there is no cached task: runtime frames cannot supply the full v2 record.
+    if (tasks?.some((entry) => entry.key === task.key)) {
+      void queryClient.cancelQueries({ queryKey: listKey, exact: true });
+      queryClient.setQueryData(
+        listKey,
+        tasks.map((entry) => (entry.key === task.key ? update(entry) : entry)),
+      );
+    }
+    if (detail) {
+      void queryClient.cancelQueries({ queryKey: detailKey, exact: true });
+      queryClient.setQueryData(detailKey, update(detail));
+    }
     return;
   }
   void queryClient.invalidateQueries({ queryKey: adminKeys.tasks(), exact: true });

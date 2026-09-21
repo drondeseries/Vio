@@ -6,6 +6,7 @@ import {
   setProfileId,
   setProfileToken,
 } from "@/api/client";
+import { adminKeys } from "@/hooks/queries/keys";
 import { adminSessionsKey } from "@/api/v2/adminSessionsCache";
 import { createSessionRefreshScheduler } from "./realtimeSessionRefresh";
 
@@ -85,6 +86,35 @@ it("catches up after an initial HTTP read that predates the session event", asyn
   expect(load).toHaveBeenCalledTimes(2);
   finish(["latest"]);
   await vi.advanceTimersByTimeAsync(5_000);
+  state.cleanup();
+});
+
+it("catches up stats already fetching when sessions are idle", async () => {
+  const sessions = vi.fn(async () => ["latest"]);
+  const state = observeSessions(sessions);
+  let finishStats!: (count: number) => void;
+  const stats = vi.fn(
+    () =>
+      new Promise<number>((resolve) => {
+        finishStats = resolve;
+      }),
+  );
+  const key = adminKeys.stats();
+  state.client.setQueryData(key, 0);
+  const observer = new QueryObserver(state.client, { queryKey: key, queryFn: stats });
+  const unsubscribe = observer.subscribe(() => {});
+  expect(stats).toHaveBeenCalledTimes(1);
+  expect(sessions).not.toHaveBeenCalled();
+  state.scheduler.schedule();
+  expect(stats).toHaveBeenCalledTimes(1);
+  finishStats(1);
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(stats).toHaveBeenCalledTimes(2);
+  finishStats(2);
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(stats).toHaveBeenCalledTimes(2);
+  expect(state.client.getQueryData(key)).toBe(2);
+  unsubscribe();
   state.cleanup();
 });
 

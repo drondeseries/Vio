@@ -25,7 +25,9 @@ export function createSessionRefreshScheduler(
     // An initial read may already be in flight. Preserve it, then read again
     // once to include changes that arrived after that request began.
     pending =
-      refetchType === "active" && queryClient.getQueryState(queryKey)?.fetchStatus === "fetching";
+      refetchType === "active" &&
+      (queryClient.getQueryState(queryKey)?.fetchStatus === "fetching" ||
+        queryClient.getQueryState(adminKeys.stats())?.fetchStatus === "fetching");
     refreshing = true;
     const settle = () => {
       refreshing = false;
