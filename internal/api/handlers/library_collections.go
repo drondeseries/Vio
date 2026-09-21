@@ -1331,9 +1331,13 @@ func (h *LibraryCollectionHandler) ExecuteTemplateBundleApply(
 	progress func(current, total int, message string),
 ) (any, error) {
 	resp, err := h.applyTemplateBundle(ctx, req.BundleID, applyTemplateBundleRequest{
-		LibraryIDs:      req.LibraryIDs,
-		DeleteExisting:  req.DeleteExisting,
-		VirtualPlayback: req.VirtualPlayback,
+		LibraryIDs:     req.LibraryIDs,
+		DeleteExisting: req.DeleteExisting,
+		// The stored payload already carries the effective value, resolved by
+		// the producer at enqueue. Passing its address keeps applyTemplateBundle
+		// from re-running the "omitted means on" API default, which would flip
+		// legacy field-less jobs to on instead of preserving their false.
+		VirtualPlayback: &req.VirtualPlayback,
 		Featured:        fromAdminJobTemplateBundleFeatured(req.Featured),
 	}, progress)
 	if err != nil {

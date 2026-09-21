@@ -25,6 +25,10 @@ type fakeAdminCollections struct {
 	job                                                *models.AdminJob
 	syncErr                                            error
 	template                                           handlers.AdminCollectionTemplateResult
+	lastMDBList                                        handlers.AdminCollectionImportMDBList
+	lastTMDB                                           handlers.AdminCollectionImportTMDB
+	lastTrakt                                          handlers.AdminCollectionImportTrakt
+	lastApply                                          handlers.AdminCollectionTemplateApply
 }
 
 func newFakeAdminCollections() *fakeAdminCollections {
@@ -63,12 +67,24 @@ func (f *fakeAdminCollections) CreateAdminCollection(context.Context, handlers.A
 	f.creates++
 	return f.view, nil
 }
-func (f *fakeAdminCollections) ImportAdminMDBList(context.Context, handlers.AdminCollectionImportMDBList) (handlers.AdminCollectionImportResult, error) {
+func (f *fakeAdminCollections) ImportAdminMDBList(_ context.Context, cmd handlers.AdminCollectionImportMDBList) (handlers.AdminCollectionImportResult, error) {
 	f.imports++
+	f.lastMDBList = cmd
 	return handlers.AdminCollectionImportResult{Collection: f.view}, nil
 }
-func (f *fakeAdminCollections) ApplyAdminCollectionTemplate(context.Context, string, handlers.AdminCollectionTemplateApply) (handlers.AdminCollectionTemplateResult, error) {
+func (f *fakeAdminCollections) ImportAdminTMDB(_ context.Context, cmd handlers.AdminCollectionImportTMDB) (handlers.AdminCollectionImportResult, error) {
+	f.imports++
+	f.lastTMDB = cmd
+	return handlers.AdminCollectionImportResult{Collection: f.view}, nil
+}
+func (f *fakeAdminCollections) ImportAdminTrakt(_ context.Context, cmd handlers.AdminCollectionImportTrakt) (handlers.AdminCollectionImportResult, error) {
+	f.imports++
+	f.lastTrakt = cmd
+	return handlers.AdminCollectionImportResult{Collection: f.view}, nil
+}
+func (f *fakeAdminCollections) ApplyAdminCollectionTemplate(_ context.Context, _ string, cmd handlers.AdminCollectionTemplateApply) (handlers.AdminCollectionTemplateResult, error) {
 	f.applies++
+	f.lastApply = cmd
 	if f.template.BundleID != "" {
 		return f.template, nil
 	}
@@ -303,5 +319,99 @@ func TestAdminCollectionTemplateApplyKeepsEntryReason(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), want) {
 			t.Fatalf("missing %s in %s", want, rec.Body)
 		}
+	}
+}
+
+// TestAdminCollectionVirtualPlaybackHTTP covers the v2 boundary end to end:
+// an explicit false survives HTTP decode and reaches the handler command, an
+// omitted field stays nil so the handler's default-on resolution applies, and
+// null / non-boolean input is rejected before any service call.
+func TestAdminCollectionVirtualPlaybackHTTP(t *testing.T) {
+	t.Run("mdblist explicit false reaches the handler", func(t *testing.T) {
+		f := newFakeAdminCollections()
+		h := adminCollectionsTestHandler(t, f)
+		rec := do(t, h, http.MethodPost, "/api/v2/admin/collections/import/mdblist",
+			`{"library_ids":["1"],"title":"Import","url":"https://mdblist.com/lists/user/list","virtual_playback":false}`, bearer(adminToken))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("import %d %s", rec.Code, rec.Body)
+		}
+		if f.lastMDBList.VirtualPlayback == nil || *f.lastMDBList.VirtualPlayback {
+			t.Fatalf("handler virtual_playback = %v, want explicit false", f.lastMDBList.VirtualPlayback)
+		}
+	})
+
+	t.Run("mdblist omitted stays nil for the handler default", func(t *testing.T) {
+		f := newFakeAdminCollections()
+		h := adminCollectionsTestHandler(t, f)
+		rec := do(t, h, http.MethodPost, "/api/v2/admin/collections/import/mdblist",
+			`{"library_ids":["1"],"title":"Import","url":"https://mdblist.com/lists/user/list"}`, bearer(adminToken))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("import %d %s", rec.Code, rec.Body)
+		}
+		if f.lastMDBList.VirtualPlayback != nil {
+			t.Fatalf("handler virtual_playback = %v, want nil so the default applies", *f.lastMDBList.VirtualPlayback)
+		}
+	})
+
+	t.Run("template apply explicit false reaches the handler", func(t *testing.T) {
+		f := newFakeAdminCollections()
+		h := adminCollectionsTestHandler(t, f)
+		rec := do(t, h, http.MethodPost, "/api/v2/admin/collections/template-bundles/bundle/apply",
+			`{"library_ids":["1"],"virtual_playback":false}`, bearer(adminToken))
+		if rec.Code != 200 {
+			t.Fatalf("apply %d %s", rec.Code, rec.Body)
+		}
+		if f.lastApply.VirtualPlayback == nil || *f.lastApply.VirtualPlayback {
+			t.Fatalf("handler virtual_playback = %v, want explicit false", f.lastApply.VirtualPlayback)
+		}
+	})
+
+	t.Run("template apply omitted stays nil for the handler default", func(t *testing.T) {
+		f := newFakeAdminCollections()
+		h := adminCollectionsTestHandler(t, f)
+		rec := do(t, h, http.MethodPost, "/api/v2/admin/collections/template-bundles/bundle/apply",
+			`{"library_ids":["1"]}`, bearer(adminToken))
+		if rec.Code != 200 {
+			t.Fatalf("apply %d %s", rec.Code, rec.Body)
+		}
+		if f.lastApply.VirtualPlayback != nil {
+			t.Fatalf("handler virtual_playback = %v, want nil so the default applies", *f.lastApply.VirtualPlayback)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "mdblist null rejected",
+			path: "/api/v2/admin/collections/import/mdblist",
+			body: `{"library_ids":["1"],"title":"Import","url":"https://mdblist.com/lists/user/list","virtual_playback":null}`,
+		},
+		{
+			name: "mdblist non-boolean rejected",
+			path: "/api/v2/admin/collections/import/mdblist",
+			body: `{"library_ids":["1"],"title":"Import","url":"https://mdblist.com/lists/user/list","virtual_playback":"yes"}`,
+		},
+		{
+			name: "template apply null rejected",
+			path: "/api/v2/admin/collections/template-bundles/bundle/apply",
+			body: `{"library_ids":["1"],"virtual_playback":null}`,
+		},
+		{
+			name: "template apply non-boolean rejected",
+			path: "/api/v2/admin/collections/template-bundles/bundle/apply",
+			body: `{"library_ids":["1"],"virtual_playback":"yes"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeAdminCollections()
+			h := adminCollectionsTestHandler(t, f)
+			requireProblem(t, do(t, h, http.MethodPost, tc.path, tc.body, bearer(adminToken)), TypeValidationFailed)
+			if f.imports != 0 || f.applies != 0 {
+				t.Fatal("invalid virtual_playback reached the service")
+			}
+		})
 	}
 }

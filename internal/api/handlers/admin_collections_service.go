@@ -571,7 +571,11 @@ func (h *LibraryCollectionHandler) QueueAdminCollectionTemplate(ctx context.Cont
 	if len(ids) == 0 {
 		return nil, apiError(400, "bad_request", "library_ids is required")
 	}
-	job, err := h.JobRepo.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeTemplateBundleApply, CreatedByUserID: actingUserID, RequestPayload: adminjob.TemplateBundleApplyRequest{BundleID: id, LibraryIDs: ids, DeleteExisting: req.DeleteExisting, VirtualPlayback: req.VirtualPlayback, Featured: toAdminJobTemplateBundleFeatured(req.Featured)}, Message: "Queued collection defaults apply"})
+	// Resolve the omitted-field default now and persist the effective value.
+	// The stored payload must not depend on the worker binary's interpretation
+	// of an omitted field: legacy job rows without the key decode to false, so
+	// a new producer has to write an explicit true when the caller omitted it.
+	job, err := h.JobRepo.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeTemplateBundleApply, CreatedByUserID: actingUserID, RequestPayload: adminjob.TemplateBundleApplyRequest{BundleID: id, LibraryIDs: ids, DeleteExisting: req.DeleteExisting, VirtualPlayback: resolveVirtualPlayback(req.VirtualPlayback), Featured: toAdminJobTemplateBundleFeatured(req.Featured)}, Message: "Queued collection defaults apply"})
 	if err != nil {
 		return nil, err
 	}
