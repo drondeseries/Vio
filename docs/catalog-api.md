@@ -364,6 +364,9 @@ Trakt, and MDBList import endpoints and the template-bundle apply endpoint. It
 controls whether items matched outside the selected libraries are kept as
 zero-storage virtual entries that Silo Virtual Library resolves at playback.
 
+The `/api/v2` import and template-apply request bodies expose the same optional
+`virtual_playback` boolean; omitting it defaults to on, and `false` opts out.
+
 `virtual_playback` defaults to on when the field is omitted, so third-party
 clients and creates-from-template get the same behavior as the first-party
 admin UI. An explicit `false` disables it and limits the collection to items
