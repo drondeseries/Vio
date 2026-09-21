@@ -1316,3 +1316,107 @@ func TestReplaceVirtualCandidatesKeepsFailureVerdictUntilDelivery(t *testing.T) 
 		t.Fatalf("recovery did not clear/record: failed_at=%v last_delivered_at=%v", clearedAt, deliveredAt)
 	}
 }
+
+// TestReplaceVirtualCandidatesRetainsInsideStoreWindow covers the window-gated
+// retention clause. A listed candidate omitted from a re-list survives while it
+// is inside the configured candidate store window, and is swept once it falls
+// outside. With no window configured the pre-window sweep runs unchanged.
+func TestReplaceVirtualCandidatesRetainsInsideStoreWindow(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("virtual-store-window-%d", suffix)
+	basePath := fmt.Sprintf("virtual://movie/tt%d?profile=1080p", suffix)
+	stalePath := basePath + "&result=stale"
+	relistedPath := basePath + "&result=relisted"
+	latePath := basePath + "&result=late"
+
+	var folderID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("Store Window %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_item_libraries WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_items(content_id,type,title,status,genres)
+		VALUES($1,'movie','Store Window','matched','{}'::text[])`, contentID); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_item_libraries(content_id,media_folder_id)
+		VALUES($1,$2)`, contentID, folderID); err != nil {
+		t.Fatalf("seed item library: %v", err)
+	}
+
+	repo := NewFileRepository(pool)
+	source := &models.MediaFile{
+		ContentID:                  contentID,
+		MediaFolderID:              folderID,
+		FilePath:                   basePath,
+		VirtualOwnerInstallationID: 5,
+	}
+	countPath := func(path string) int {
+		t.Helper()
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM media_files WHERE content_id=$1 AND file_path=$2`, contentID, path).Scan(&count); err != nil {
+			t.Fatalf("count %q: %v", path, err)
+		}
+		return count
+	}
+	backdate := func(path string, age time.Duration) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `UPDATE media_files SET updated_at = NOW() - $3::interval WHERE content_id=$1 AND file_path=$2`, contentID, path, age.String()); err != nil {
+			t.Fatalf("backdate %q: %v", path, err)
+		}
+	}
+
+	// Seed the stale candidate, then re-list without it while it is inside a
+	// 24h window: it is retained.
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{URI: stalePath, Label: "1080p"}}); err != nil {
+		t.Fatalf("seed stale candidate: %v", err)
+	}
+	backdate(stalePath, time.Hour)
+	repo.SetVirtualCandidateStoreWindow(func() time.Duration { return 24 * time.Hour })
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{URI: relistedPath, Label: "1080p"}}); err != nil {
+		t.Fatalf("relist inside window: %v", err)
+	}
+	if got := countPath(stalePath); got != 1 {
+		t.Fatalf("candidate inside the window was swept: count=%d, want 1", got)
+	}
+
+	// Backdate it beyond the window and re-list again: now it is swept.
+	backdate(stalePath, 48*time.Hour)
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{URI: relistedPath, Label: "1080p"}}); err != nil {
+		t.Fatalf("relist beyond window: %v", err)
+	}
+	if got := countPath(stalePath); got != 0 {
+		t.Fatalf("candidate beyond the window survived: count=%d, want 0", got)
+	}
+
+	// With the window disabled, a fresh stale candidate is swept immediately.
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{URI: latePath, Label: "1080p"}}); err != nil {
+		t.Fatalf("seed disabled-window candidate: %v", err)
+	}
+	repo.SetVirtualCandidateStoreWindow(nil)
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{URI: relistedPath, Label: "1080p"}}); err != nil {
+		t.Fatalf("relist with window disabled: %v", err)
+	}
+	if got := countPath(latePath); got != 0 {
+		t.Fatalf("candidate survived with the window disabled: count=%d, want 0", got)
+	}
+}

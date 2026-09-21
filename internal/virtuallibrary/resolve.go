@@ -93,6 +93,32 @@ func persistedCandidateIdentityFromContext(ctx context.Context) (PersistedCandid
 	return identity, true
 }
 
+type persistedCandidateTrustContextKey struct{}
+
+// WithPersistedCandidateTrust marks a resolve as allowed to keep trusting the
+// persisted same-identity candidate even when the provider's current list omits
+// it. The caller sets it only when the catalog row is inside the configured
+// candidate store window (see virtual_library.candidate_store_hours). It is
+// deliberately paired with WithPersistedCandidateIdentity: without a durable
+// identity the resolver cannot prove the trusted row is the requested release,
+// so the flag has no effect.
+func WithPersistedCandidateTrust(ctx context.Context, trusted bool) context.Context {
+	if ctx == nil || !trusted {
+		return ctx
+	}
+	return context.WithValue(ctx, persistedCandidateTrustContextKey{}, true)
+}
+
+// persistedCandidateTrustFromContext reports whether the caller declared the
+// persisted candidate as trusted.
+func persistedCandidateTrustFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	trusted, _ := ctx.Value(persistedCandidateTrustContextKey{}).(bool)
+	return trusted
+}
+
 // PlaybackStream represents an available stream candidate formatted for
 // playback selection in API handlers and Jellyfin compatibility.
 type PlaybackStream struct {
@@ -267,6 +293,17 @@ func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, erro
 // driven fallback silently swap a live release.
 var ErrSessionBoundCandidateAbsent = fmt.Errorf("session-bound candidate absent from provider list")
 
+// ErrPersistedCandidateTrusted reports that a session-bound pin was absent from
+// the provider's current list, but the request declared the persisted
+// same-identity candidate as trusted (the catalog row is still inside the
+// candidate store window). It is the deliberate relaxation of the re-list-truth
+// policy: callers must NOT rotate on it, because the persisted candidate is
+// still the viewer's selection. It is distinct from
+// ErrSessionBoundCandidateAbsent precisely so the serve layer and the
+// failure-replan rehydration keep their rotation-on-absent behavior outside the
+// window.
+var ErrPersistedCandidateTrusted = fmt.Errorf("persisted virtual candidate is inside the trust window")
+
 // ResolveDetailed resolves a virtual path to a concrete stream URL through
 // the core resolver, preserving full candidate identity and selection semantics:
 //
@@ -298,7 +335,11 @@ var ErrSessionBoundCandidateAbsent = fmt.Errorf("session-bound candidate absent 
 //     allowCandidateSubstitution exactly like the original pin;
 //   - a genuinely dead pin (absent with no keeper) still falls back when
 //     substitution is allowed or the resolve is not session-bound; a
-//     session-bound dead pin with substitution disallowed is refused;
+//     session-bound dead pin with substitution disallowed is refused, and when
+//     the caller also declared the persisted same-identity candidate as trusted
+//     (WithPersistedCandidateTrust, inside the candidate store window) the
+//     refusal carries ErrPersistedCandidateTrusted instead of
+//     ErrSessionBoundCandidateAbsent so callers do not rotate to a sibling;
 //   - when substitution is refused and a preferredCandidateID names a
 //     resolvable session release, the candidate actually served must belong to
 //     that release: a present resultID for a different release is refused
@@ -517,6 +558,19 @@ func (s *Service) ResolveDetailed(
 	sessionReleasePresent := sessionReleaseResolvable ||
 		(preferredCandidateID == "" && effectiveResultID != "" && candidateIDPresent(candidates, effectiveResultID))
 	if sessionBound && !allowSubstitution && effectiveResultID != "" && !pinBlocked && !sessionReleasePresent {
+		if persistedCandidateTrustFromContext(ctx) {
+			if _, hasIdentity := persistedCandidateIdentityFromContext(ctx); hasIdentity {
+				// Same-identity preference, not substitution: the persisted row
+				// is inside its trust window and the request withheld rotation,
+				// so declaring the release absent would let a caller rotate to
+				// a sibling. Refuse with a distinct cause instead.
+				if s.logger != nil {
+					s.logger.WarnContext(ctx, "trusted persisted virtual candidate is absent from the provider list; refusing to substitute",
+						"candidate_id", effectiveResultID)
+				}
+				return ResolvedVirtualStream{}, fmt.Errorf("trusted persisted virtual candidate %q is no longer listed and candidate rotation was not requested: %w", effectiveResultID, ErrPersistedCandidateTrusted)
+			}
+		}
 		if s.logger != nil {
 			s.logger.WarnContext(ctx, "refusing to substitute a dead session-bound virtual candidate",
 				"candidate_id", effectiveResultID)

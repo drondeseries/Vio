@@ -194,6 +194,17 @@ describe("StreamingSettings", () => {
     expect(screen.getByLabelText("AltMount check interval (minutes)")).toBeInTheDocument();
   });
 
+  it("exposes the candidate trust window in the provider group", () => {
+    const form = makeForm({});
+    useSettingsFormMock.mockReturnValue(form);
+    renderPage();
+
+    const field = screen.getByLabelText("Candidate trust window (hours)");
+    expect(field).toBeInTheDocument();
+    fireEvent.change(field, { target: { value: "48" } });
+    expect(form.setValue).toHaveBeenCalledWith("virtual_library.candidate_store_hours", "48");
+  });
+
   it("shows API key fields as not configured without a clear action", () => {
     renderPage();
 

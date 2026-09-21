@@ -22,12 +22,34 @@ const (
 	// unexpired, and passes the resolver's URL validator. The caller serves
 	// it without contacting the provider.
 	virtualStoredURLUsable
+	// virtualStoredURLExpiredWithinWindow means the row owns the requested
+	// candidate and carries a stored URL whose expiry has passed, but the row
+	// is still inside the configured candidate store window. The URL is never
+	// served past its own expiry; the state tells the caller to keep preferring
+	// the persisted same-identity candidate (re-resolve and refresh it) instead
+	// of dropping the pin or substituting a sibling. It is only reachable when
+	// the window is enabled.
+	virtualStoredURLExpiredWithinWindow
 	// virtualStoredURLExpired means the row owns the requested candidate and
-	// carries a stored URL whose expiry has passed. The caller lists and
-	// resolves as before, then refreshes the stored value through the
-	// existing Phase-1 write path.
+	// carries a stored URL whose expiry has passed and the row is outside the
+	// window (or the window is disabled). The caller lists and resolves as
+	// before, then refreshes the stored value through the existing Phase-1
+	// write path.
 	virtualStoredURLExpired
 )
+
+// virtualCandidateWithinStoreWindow reports whether a virtual candidate row is
+// still inside the configured trust window. A zero or negative window disables
+// it, so the caller keeps the pre-window behavior. The row's updated_at is the
+// same timestamp the retention sweep evaluates: it is refreshed every time the
+// provider re-lists the candidate (and by a stored-URL refresh/adoption), so
+// the window measures time since the candidate was last listed or resolved.
+func virtualCandidateWithinStoreWindow(row *models.MediaFile, now time.Time, window time.Duration) bool {
+	if row == nil || window <= 0 || row.UpdatedAt.IsZero() {
+		return false
+	}
+	return !now.After(row.UpdatedAt.Add(window))
+}
 
 // evaluateStoredVirtualURLCandidate decides whether a catalog row's persisted
 // resolved_url may be served for the exact requested candidate.
@@ -45,12 +67,17 @@ const (
 // virtuallibrary.ValidateProviderStreamURL — the same validator the resolver
 // applies to a fresh listing. A URL that fails validation is never fetched;
 // the caller falls back to listing.
+// trustWindow is the configured candidate store window. Zero disables it and
+// restores the pre-window behavior. It never extends a signed URL's life: an
+// expired URL is refused regardless, and the window only decides whether the
+// caller may keep preferring the persisted same-identity candidate.
 func evaluateStoredVirtualURLCandidate(
 	ctx context.Context,
 	candidateURI string,
 	row *models.MediaFile,
 	allowInsecure bool,
 	now time.Time,
+	trustWindow time.Duration,
 ) (ResolvedVirtualMedia, virtualStoredURLState) {
 	candidateID := virtualResultCandidateID(candidateURI)
 	if candidateID == "" || row == nil || row.ID <= 0 {
@@ -68,7 +95,13 @@ func evaluateStoredVirtualURLCandidate(
 	}
 	// A nil expiry is usable: the provider declared no lifetime. A non-nil
 	// expiry at or before now is expired and must be refreshed by a resolve.
+	// Inside the trust window the caller keeps preferring this same-identity
+	// candidate; outside it (or with the window disabled) today's behavior is
+	// unchanged. The URL is never served here in either case.
 	if row.ResolvedURLExpiresAt != nil && !now.Before(*row.ResolvedURLExpiresAt) {
+		if virtualCandidateWithinStoreWindow(row, now, trustWindow) {
+			return ResolvedVirtualMedia{}, virtualStoredURLExpiredWithinWindow
+		}
 		return ResolvedVirtualMedia{}, virtualStoredURLExpired
 	}
 	validated, err := virtuallibrary.ValidateProviderStreamURL(ctx, storedURL, allowInsecure)
@@ -94,6 +127,25 @@ func evaluateStoredVirtualURLCandidate(
 		RequestHeaders: cloneHeaderMap(row.ProviderRequestHeaders),
 		ExpiresAt:      expiresAt,
 	}, virtualStoredURLUsable
+}
+
+// virtualCandidateTrustWindow reports the configured candidate store window.
+// Zero (the default when the callback is unwired) keeps the pre-window
+// behavior.
+func (h *PlaybackHandler) virtualCandidateTrustWindow() time.Duration {
+	if h == nil || h.VirtualCandidateTrustWindow == nil {
+		return 0
+	}
+	return h.VirtualCandidateTrustWindow()
+}
+
+// virtualStoredURLTrustWindow is the StreamHandler counterpart of the playback
+// handler's trust-window reader.
+func (h *StreamHandler) virtualStoredURLTrustWindow() time.Duration {
+	if h == nil || h.VirtualCandidateTrustWindow == nil {
+		return 0
+	}
+	return h.VirtualCandidateTrustWindow()
 }
 
 // storedVirtualURLAllowInsecure evaluates the allow_insecure_http opt-in for a
@@ -137,6 +189,44 @@ func virtualResolveContextWithPersistedIdentity(ctx context.Context, row *models
 		return ctx
 	}
 	return virtuallibrary.WithPersistedCandidateIdentity(ctx, identity)
+}
+
+// persistedVirtualCandidateTrusted reports whether the row carries a durable
+// identity and is inside the trust window. It is the start-path predicate for
+// preferring the persisted candidate over a re-list substitution.
+func (h *PlaybackHandler) persistedVirtualCandidateTrusted(row *models.MediaFile, now time.Time) bool {
+	if _, ok := persistedVirtualIdentity(row); !ok {
+		return false
+	}
+	return virtualCandidateWithinStoreWindow(row, now, h.virtualCandidateTrustWindow())
+}
+
+// virtualStoredURLNeedsSignedRefresh reports whether the row's stored URL is a
+// signed URL whose lifetime has already lapsed. A nil expiry is usable (never
+// needs a refresh) and a future expiry is not yet due. Only this case justifies
+// relisting to refresh the URL within the trust window.
+func virtualStoredURLNeedsSignedRefresh(row *models.MediaFile, now time.Time) bool {
+	return row != nil && row.ResolvedURLExpiresAt != nil && !now.Before(*row.ResolvedURLExpiresAt)
+}
+
+// virtualResolveContextWithPersistedTrust threads the row's durable identity
+// and, when the row is inside the trust window, marks the resolve as allowed to
+// keep trusting that persisted same-identity candidate even when the provider's
+// current list omits it. Trust requires persisted transport evidence: a row
+// with no stored URL never resolved, so there is no persisted candidate to
+// prefer and the pre-window refusal/rotation behavior is kept. A zero window or
+// a legacy row with no durable identity likewise leaves the context untouched.
+// It never authorizes a sibling: the resolver still binds only to the row's own
+// release.
+func virtualResolveContextWithPersistedTrust(ctx context.Context, row *models.MediaFile, now time.Time, window time.Duration) context.Context {
+	ctx = virtualResolveContextWithPersistedIdentity(ctx, row)
+	if row == nil || strings.TrimSpace(row.ResolvedURL) == "" {
+		return ctx
+	}
+	if _, ok := persistedVirtualIdentity(row); ok && virtualCandidateWithinStoreWindow(row, now, window) {
+		ctx = virtuallibrary.WithPersistedCandidateTrust(ctx, true)
+	}
+	return ctx
 }
 
 // adoptRematchedVirtualResolution adopts the new result= identity the resolver
@@ -249,7 +339,7 @@ func (h *StreamHandler) lookupStoredVirtualURLCandidate(
 		allowInsecure = h.AllowInsecureVirtual(effectiveVirtualOwner(row.VirtualOwnerInstallationID, ownerInstallationID))
 	}
 	usable, state := evaluateStoredVirtualURLCandidate(
-		ctx, candidateURI, row, allowInsecure, time.Now(),
+		ctx, candidateURI, row, allowInsecure, time.Now(), h.virtualStoredURLTrustWindow(),
 	)
 	if state == virtualStoredURLMissing {
 		return ResolvedVirtualMedia{}, nil, virtualStoredURLMissing

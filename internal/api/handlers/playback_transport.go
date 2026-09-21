@@ -366,7 +366,7 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 		if h.VirtualFileLookup != nil {
 			if row, lookupErr := h.VirtualFileLookup(ctx, virtualURI); lookupErr == nil && row != nil {
 				storedRow = row
-				ctx = virtualResolveContextWithPersistedIdentity(ctx, row)
+				ctx = virtualResolveContextWithPersistedTrust(ctx, row, time.Now(), h.virtualCandidateTrustWindow())
 			}
 		}
 	}
@@ -376,11 +376,17 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 		usable, state := evaluateStoredVirtualURLCandidate(
 			ctx, virtualURI, storedRow,
 			h.storedVirtualURLAllowInsecure(storedRow, ownerInstallationID), time.Now(),
+			h.virtualCandidateTrustWindow(),
 		)
 		switch state {
 		case virtualStoredURLUsable:
 			res = usable
 			storedUsable = true
+		case virtualStoredURLExpiredWithinWindow:
+			// The signed URL lapsed but the row is still trusted: resolve the
+			// same candidate afresh and refresh the stored value below. Never
+			// serve the expired URL itself.
+			storedExpiredRow = storedRow
 		case virtualStoredURLExpired:
 			// The row owns this candidate but its URL lapsed. Resolve afresh
 			// below, then refresh the stored value through the existing

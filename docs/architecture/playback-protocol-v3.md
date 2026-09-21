@@ -1458,6 +1458,39 @@ The `/api/v2` playback plan projection carries `effective_virtual_uri` alongside
 `virtual_source_revision`, so a v2 client can detect a substituted virtual
 candidate and adopt it in its version menu.
 
+### 9.2 Persisted-candidate trust window
+
+Virtual provider result ids churn between listings. The server already rematches
+the same release by its durable provider identity when the provider renumbers
+it, but a provider can also drop a candidate entirely. For a candidate the
+viewer selected, the server would otherwise refuse the replay or substitute a
+sibling.
+
+`virtual_library.candidate_store_hours` (Admin › Settings › Streaming, default
+`720`, range `0`–`8760`) bounds a deliberate relaxation of the re-list-truth
+policy: inside the window, a persisted candidate row that still matches the
+requested release identity is preferred over a fresh listing.
+
+- Retention: `ReplaceVirtualCandidates` does not sweep a listed candidate row
+  whose `updated_at` is inside the window, so the row (and its persisted
+  `resolved_url`) survives a re-list that omits it. The live-attempt and open
+  ABS-session guards are unchanged.
+- Resolution: a session-bound request with substitution withheld that cannot
+  find the persisted same-identity candidate in the provider's current list is
+  refused with a distinct trusted-cause error rather than the absent-pin
+  rotation sentinel. Callers must not rotate on that cause, so a display-driven
+  or session-bound fallback never swaps the release.
+- URL lifetime: the window never extends a signed URL. A URL past its own
+  expiry is never served; the window only allows the server to keep preferring
+  and re-deriving the same candidate while it is still persisted.
+- `0` disables the window and restores the pre-window retention and rotation
+  behavior. Rows with no durable provider identity (legacy rows) are unaffected.
+
+This is server-internal source selection: clients do not send or receive the
+window, and the `/api/v2` plan already exposes the resolved candidate through
+`effective_virtual_uri` and `virtual_source_revision`, so a substituted or
+refreshed candidate remains observable without a contract change.
+
 ---
 
 ## 10. Quality

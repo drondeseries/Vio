@@ -25,6 +25,7 @@ const PROVIDER_KEYS = [
   "virtual_library.tmdb_api_key",
   "virtual_library.allow_insecure_http",
   "virtual_library.cache_ttl_minutes",
+  "virtual_library.candidate_store_hours",
 ];
 
 const LIBRARY_KEYS = [
@@ -205,6 +206,14 @@ export default function StreamingSettings() {
             value={form.getValue("virtual_library.cache_ttl_minutes")}
             onChange={(v) => form.setValue("virtual_library.cache_ttl_minutes", v)}
             restartRequired={restartKeys.has("virtual_library.cache_ttl_minutes")}
+          />
+          <SettingField
+            label="Candidate trust window (hours)"
+            type="number"
+            description="How long a stored candidate stays trusted for replay after the provider's list drops it. 0 disables; 0–8760."
+            value={form.getValue("virtual_library.candidate_store_hours")}
+            onChange={(v) => form.setValue("virtual_library.candidate_store_hours", v)}
+            restartRequired={restartKeys.has("virtual_library.candidate_store_hours")}
           />
           <ConnectionCheckAction
             onClick={providerCheck.run}

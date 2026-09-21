@@ -36,6 +36,10 @@ var (
 // FileRepository provides CRUD operations for the media_files table.
 type FileRepository struct {
 	pool *pgxpool.Pool
+	// virtualCandidateStoreWindow reports the configured candidate store
+	// window. Zero (or nil) keeps the pre-window sweep behavior. Wired lazily
+	// from the settings store so an admin change applies without a restart.
+	virtualCandidateStoreWindow func() time.Duration
 }
 
 type fileQueryer interface {
@@ -56,6 +60,18 @@ func (r *FileRepository) Pool() *pgxpool.Pool { return r.pool }
 // NewFileRepository creates a new FileRepository backed by the given pool.
 func NewFileRepository(pool *pgxpool.Pool) *FileRepository {
 	return &FileRepository{pool: pool}
+}
+
+// SetVirtualCandidateStoreWindow wires the candidate store window reader used
+// by ReplaceVirtualCandidates to retain a listed candidate inside the window.
+// It returns the receiver so callers can chain it onto a freshly built
+// repository; a nil callback restores the pre-window sweep behavior.
+func (r *FileRepository) SetVirtualCandidateStoreWindow(window func() time.Duration) *FileRepository {
+	if r == nil {
+		return r
+	}
+	r.virtualCandidateStoreWindow = window
+	return r
 }
 
 // fileColumns is the list of columns returned by all SELECT queries.
@@ -1518,6 +1534,18 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 	}
 	rows.Close()
 	if len(stale) > 0 && len(keep) > 0 {
+		// Candidate store window. A positive window keeps a listed candidate
+		// row around even after the provider's re-list drops it, so a replay of
+		// the viewer's saved pick still finds the persisted URL instead of
+		// being refused or rotated to a sibling. The window is measured from
+		// updated_at (refreshed on every re-list upsert and on a stored-URL
+		// refresh), and zero disables it, restoring the sweep below unchanged.
+		windowSeconds := 0.0
+		if r.virtualCandidateStoreWindow != nil {
+			if window := r.virtualCandidateStoreWindow(); window > 0 {
+				windowSeconds = window.Seconds()
+			}
+		}
 		// Retention: candidate identity is a provider result id that can churn
 		// between listings, but a version a user actually played is recorded as
 		// user_watch_progress.last_file_id. Keep stale rows that are still
@@ -1541,6 +1569,10 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			DELETE FROM media_files
 			WHERE id = ANY($1::bigint[])
 			  AND last_delivered_at IS NULL
+			  -- Keep a candidate inside the candidate store window: it is still
+			  -- trusted for replay even though this listing dropped it. Zero
+			  -- seconds disables the clause (updated_at is never in the future).
+			  AND updated_at < NOW() - make_interval(secs => $2)
 			  AND NOT EXISTS (
 				SELECT 1 FROM user_watch_progress p
 				WHERE p.last_file_id = media_files.id
@@ -1568,7 +1600,7 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				SELECT 1 FROM abs_playback_sessions s
 				WHERE s.media_file_id = media_files.id
 				  AND s.closed_at IS NULL
-			  )`, stale); err != nil {
+			  )`, stale, windowSeconds); err != nil {
 			return fmt.Errorf("delete stale virtual candidates: %w", err)
 		}
 	}

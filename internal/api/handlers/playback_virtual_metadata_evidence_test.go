@@ -192,7 +192,7 @@ func TestResolveVirtualOptimisticIncompleteMetadataFallsThrough(t *testing.T) {
 func TestResolveVirtualResumeRotationClearedRowHasNoStaleURL(t *testing.T) {
 	file := withVirtualResumeVideoEvidence(virtualResumeRow("", nil))
 
-	if _, state := evaluateStoredVirtualURLCandidate(context.Background(), file.FilePath, file, true, time.Now()); state != virtualStoredURLMissing {
+	if _, state := evaluateStoredVirtualURLCandidate(context.Background(), file.FilePath, file, true, time.Now(), 0); state != virtualStoredURLMissing {
 		t.Fatalf("stored URL state = %v, want missing after a rotation cleared resolved_url", state)
 	}
 

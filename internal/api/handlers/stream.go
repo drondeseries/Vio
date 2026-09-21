@@ -114,6 +114,12 @@ type StreamHandler struct {
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for private/local stream hosts.
 	AllowInsecureVirtual func(installationID int) bool
+	// VirtualCandidateTrustWindow reports how long a persisted virtual
+	// candidate row may be trusted for replay after its last listing or
+	// resolution. A positive value keeps a delisted same-identity candidate
+	// preferred (and retained) inside the window; zero disables the window and
+	// keeps the pre-window behavior. Wired lazily from the settings store.
+	VirtualCandidateTrustWindow func() time.Duration
 	// VirtualCandidateFailMarker stamps a virtual candidate row as known-bad
 	// after a transport produced no bytes, so the auto-pick skips it on the
 	// next play while the dropdown still shows it for a manual retry. It is
@@ -316,13 +322,18 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	if !forceRefresh && len(excludedCandidateIDs) == 0 {
 		if usable, row, state := h.lookupStoredVirtualURLCandidate(ctx, file.FilePath, file.VirtualOwnerInstallationID); state == virtualStoredURLUsable {
 			resolved = usable
-		} else if state == virtualStoredURLExpired {
+		} else if state == virtualStoredURLExpiredWithinWindow || state == virtualStoredURLExpired {
+			// An expired stored URL is never served. Inside the window the
+			// refresh below is also allowed to keep the same candidate; outside
+			// it today's refresh-or-rotate behavior is unchanged.
 			storedExpiredRow = row
 		}
 	}
 	// The serve-layer row carries the durable identity the same-release
-	// re-match needs; a row with none (legacy) is left untouched.
-	ctx = virtualResolveContextWithPersistedIdentity(ctx, file)
+	// re-match needs; a row with none (legacy) is left untouched. Inside the
+	// trust window the row is also marked trusted so a delisted same-identity
+	// candidate is not reported as absent (which would rotate to a sibling).
+	ctx = virtualResolveContextWithPersistedTrust(ctx, file, time.Now(), h.virtualStoredURLTrustWindow())
 	if resolved.URL == "" {
 		if h.VirtualMediaDetailedResolver != nil {
 			// The caller declares whether excluding the candidate indicted the

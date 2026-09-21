@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEffectiveAdminSettingsUsesRuntimeDefaults(t *testing.T) {
@@ -523,6 +524,28 @@ func TestHiddenTierDefaultsAreExposed(t *testing.T) {
 		}
 		if _, err := NormalizeAdminSetting(key, value); err != nil {
 			t.Errorf("default for %q is rejected by NormalizeAdminSetting: %v", key, err)
+		}
+	}
+}
+
+// TestVirtualCandidateStoreWindowDefaultsAndBounds locks the setting's
+// default, parse, and disable semantics used by the playback and scanner
+// trust-window wiring.
+func TestVirtualCandidateStoreWindowDefaultsAndBounds(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", 720 * time.Hour},
+		{"48", 48 * time.Hour},
+		{"8760", 8760 * time.Hour},
+		{"0", 0},
+		{"-1", 0},
+		{"not a number", 0},
+	}
+	for _, tc := range cases {
+		if got := VirtualCandidateStoreWindow(tc.raw); got != tc.want {
+			t.Errorf("VirtualCandidateStoreWindow(%q) = %v, want %v", tc.raw, got, tc.want)
 		}
 	}
 }
