@@ -288,7 +288,15 @@ export function useIntroSkipPrompt({
     // outside the range, but the undo prompt must remain available.
     startPrompt("undo", introKey);
     settleSeek(onSeekRef.current(intro.end), (accepted) => {
-      if (accepted) return;
+      if (accepted) {
+        // The skip itself resolves the intro, independently of the undo clock.
+        // A seek can reload the stream (a reanchor replan lands on a segment
+        // boundary just before the target), which disables the prompt and
+        // clears the undo before it expires. Without this the re-entry looked
+        // like a fresh intro and the hook skipped again, replanning in a loop.
+        resolvedKeysRef.current.add(introKey);
+        return;
+      }
       // Nothing moved, so there is no skip to undo and "Intro skipped" would be
       // a lie. The intro stays unresolved: whatever refused the seek may not
       // refuse the next one.

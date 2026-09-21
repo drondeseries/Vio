@@ -121,6 +121,23 @@ describe("useIntroSkipPrompt", () => {
     expect(onSeek).toHaveBeenCalledTimes(1);
   });
 
+  it("does not skip again when the stream reloads before the undo expires", () => {
+    const { result, rerender } = renderPrompt({ mode: "always" });
+    rerender({ mode: "always", currentTime: 12, playing: true, enabled: true });
+    expect(onSeek).toHaveBeenCalledTimes(1);
+    expect(result.current.prompt?.label).toBe("Watch Intro");
+
+    // A reanchor replan reloads the player, which disables the prompt and
+    // lands a little before the intro end.
+    rerender({ mode: "always", currentTime: 20, playing: false, enabled: false });
+    expect(result.current.prompt).toBeNull();
+    rerender({ mode: "always", currentTime: 18, playing: true, enabled: true });
+    rerender({ mode: "always", currentTime: 19, playing: true, enabled: true });
+
+    expect(onSeek).toHaveBeenCalledTimes(1);
+    expect(result.current.prompt).toBeNull();
+  });
+
   it("ignores a short false edge and freezes after the pause grace", () => {
     const { result, rerender } = renderPrompt();
     rerender({ mode: "ask", currentTime: 12, playing: true, enabled: true });
