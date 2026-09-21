@@ -85,6 +85,7 @@ scan asynchronously.
 | `path` equals a library root | directory | `library` | Full scan of that library. |
 | `path` is a subdirectory within a library | directory | `subtree` | Scans only that directory and its descendants. |
 | `path` is a video file inside a subdirectory | file | `subtree` | Scans the file's directory and its descendants. |
+| `path` is a video file whose directory no longer exists | file | `file` | Reconciles only that single file. |
 | `path` is a video file directly under a library root | file | `file` | Scans only that single file. |
 | `path` is an audiobook, ebook, or manga file | file | `file` | Scans only that single file. |
 
@@ -97,8 +98,14 @@ A video file path widens to its directory because a release rarely changes one f
 an upgrade deletes the replaced version and rewrites sidecars (`.nfo`, posters, subtitles), and
 change publishers batch per directory, so not every event reaches the caller. Scanning the
 directory reconciles all of it. The widening stops at the library root so a flat library never
-turns one file event into a full library scan. The response `mode` reports the scan that actually
-ran.
+turns one file event into a full library scan, and it only happens when the directory still exists:
+a video reported from a directory that has already been removed keeps the exact-file scan, since
+a scan of a missing directory cannot see anything. A directory that exists but cannot be inspected
+is rejected with `400`. The response `mode` reports the scan that actually ran.
+
+A request for a scope that is already being scanned is coalesced into that run. If the run had
+already started, one follow-up scan of the same scope is queued when it finishes, so a file that
+landed after the running scan walked the directory is still picked up.
 
 #### Response
 
@@ -396,9 +403,9 @@ runs. If two full library scans are triggered back to back, the second is droppe
 
 - **Prefer subtree scans** for automation. Scanning a show or movie folder is fast and precise —
   it picks up new files and marks removed ones without touching the rest of the library.
-- **Sending a file path is fine.** For video libraries the server scans the file's directory,
-  which catches the replaced version, renames, and new sidecar files alongside the file you
-  named. Sending the season or movie folder directly is equivalent.
+- **Sending a file path is fine.** For video libraries the server scans the file's directory
+  when that directory exists, which catches the replaced version, renames, and new sidecar files
+  alongside the file you named. Sending the season or movie folder directly is equivalent.
 - **Full library scans are expensive.** Reserve these for periodic maintenance (Silo runs one
   daily at 02:00 server-local time by default). Do not trigger full scans from download
   automation.

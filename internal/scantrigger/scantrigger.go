@@ -222,7 +222,10 @@ func (r *Resolver) ResolveVanishedPath(ctx context.Context, path, trigger string
 	trigger = normalizeTrigger(trigger)
 
 	if supportsLibraryMediaFile(cleanPath, folder.Type) {
-		mode, targetPath := mediaFileTarget(cleanPath, matchedRoot, folder.Type)
+		mode, targetPath, err := mediaFileTarget(cleanPath, matchedRoot, folder.Type)
+		if err != nil {
+			return nil, err
+		}
 		return &Target{Folder: folder, Mode: mode, Path: targetPath, Trigger: trigger}, nil
 	}
 	if supportsMediaFile(cleanPath) {
@@ -312,7 +315,10 @@ func (r *Resolver) resolve(ctx context.Context, req Request, pathFolders []*mode
 	case ModeLibrary:
 		targetPath = ""
 	case ModeFile:
-		mode, targetPath = mediaFileTarget(cleanPath, matchedRoot, folder.Type)
+		mode, targetPath, err = mediaFileTarget(cleanPath, matchedRoot, folder.Type)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &Target{Folder: folder, Mode: mode, Path: targetPath, Trigger: trigger}, nil
 }
@@ -335,18 +341,29 @@ func (r *Resolver) resolve(ctx context.Context, req Request, pathFolders []*mode
 // its file). A subtree scan of a missing directory cannot see anything and
 // protects its rows instead of marking them missing, so the exact-file scan,
 // which reconciles a vanished file by path, stays the target in that case.
-func mediaFileTarget(cleanPath, matchedRoot, folderType string) (string, string) {
+// Any other failure to inspect the directory is reported rather than quietly
+// narrowed to the file: a permission error would otherwise skip the directory
+// scan and leave the replaced version and sidecars unreconciled.
+func mediaFileTarget(cleanPath, matchedRoot, folderType string) (string, string, error) {
 	if !scansVideoFiles(folderType) {
-		return ModeFile, cleanPath
+		return ModeFile, cleanPath, nil
 	}
 	dir := filepath.Dir(cleanPath)
 	if filepath.Clean(dir) == filepath.Clean(matchedRoot) {
-		return ModeFile, cleanPath
+		return ModeFile, cleanPath, nil
 	}
-	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-		return ModeFile, cleanPath
+	info, err := os.Stat(dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return ModeFile, cleanPath, nil
+	case errors.Is(err, os.ErrPermission):
+		return "", "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Permission denied for path", Reason: ReasonPathPermissionDenied}
+	case err != nil:
+		return "", "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: msgPathNotInspectable, Reason: ReasonPathNotInspectable}
+	case !info.IsDir():
+		return "", "", &RequestError{Status: http.StatusBadRequest, Code: codeBadRequest, Message: "Path must be a file or directory", Reason: ReasonPathNotFileOrDir}
 	}
-	return ModeSubtree, dir
+	return ModeSubtree, dir, nil
 }
 
 // scansVideoFiles reports whether a library kind is served by the video

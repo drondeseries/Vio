@@ -153,6 +153,44 @@ func TestResolverResolvesVanishedMediaFile(t *testing.T) {
 	}
 }
 
+func TestResolverRejectsVideoFileWhoseDirectoryCannotBeInspected(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	root := t.TempDir()
+	locked := filepath.Join(root, "Locked")
+	if err := os.Mkdir(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	movieDir := filepath.Join(locked, "Movie (2026)")
+	if err := os.Mkdir(movieDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	vanished := filepath.Join(movieDir, "Movie (2026).mkv")
+	// Removing search permission on the parent makes stat of the movie
+	// directory fail with EACCES rather than ENOENT.
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	repo := &fakeFolderRepo{folders: []*models.MediaFolder{{
+		ID:      24,
+		Name:    "Movies",
+		Type:    "movies",
+		Enabled: true,
+		Paths:   []string{root},
+	}}}
+
+	_, err := NewResolver(repo).ResolveVanishedPath(context.Background(), vanished, "autoscan")
+	var reqErr *RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("expected RequestError, got %T: %v", err, err)
+	}
+	if reqErr.Reason != ReasonPathPermissionDenied && reqErr.Reason != ReasonPathNotInspectable {
+		t.Fatalf("unexpected reason: %#v", reqErr)
+	}
+}
+
 func TestResolverResolvesVanishedVideoInVanishedDirAsExactFile(t *testing.T) {
 	root := t.TempDir()
 	// The whole movie folder is gone; a subtree scan of it could not see
