@@ -287,7 +287,7 @@ func (c *prowlarrSearchClient) searchURL() (string, error) {
 func validateProwlarrBaseURL(raw string) error {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return errors.New("Prowlarr URL is not configured")
+		return errors.New("the Prowlarr URL is not configured")
 	}
 	parsed, err := url.Parse(trimmed)
 	if err != nil {
@@ -405,7 +405,7 @@ func (c *prowlarrSearchClient) httpError(resp *http.Response, requestURL string)
 		snippet = strings.ReplaceAll(snippet, key, "[redacted]")
 		requestURL = strings.ReplaceAll(requestURL, key, "[redacted]")
 	}
-	return fmt.Errorf("Prowlarr returned HTTP %d for %s: %s", resp.StatusCode, requestURL, snippet)
+	return fmt.Errorf("prowlarr returned HTTP %d for %s: %s", resp.StatusCode, requestURL, snippet)
 }
 
 func (c *prowlarrSearchClient) search(ctx context.Context, item monitoredMedia) ([]prowlarrRelease, error) {
