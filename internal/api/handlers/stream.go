@@ -24,11 +24,13 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
 
 const (
@@ -160,6 +162,34 @@ func bindSessionVirtualSource(file *models.MediaFile, session *playback.Session)
 	bound.FilePath = session.VirtualSourceURI
 	bound.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
 	return &bound
+}
+
+// virtualSessionSourceBinder binds a live session to a provider-neutral virtual
+// candidate. *playback.SessionManager implements it; the narrow interface keeps
+// the serve-layer rotation commit optional for minimal/test managers, which
+// simply keep the binding captured at plan time.
+type virtualSessionSourceBinder interface {
+	SetVirtualSource(sessionID, virtualURI string, ownerInstallationID int) error
+}
+
+// commitRotatedVirtualSessionSource rebinds a live session to the candidate a
+// serve-layer rotation just resolved. The session id and account are unchanged:
+// only the pinned anchor moves, so the client-visible session identity survives
+// while later serves and replans bind to the live release instead of the dead
+// pin. Best-effort — a manager without SetVirtualSource keeps its prior binding,
+// and the current request already holds a valid resolved URL.
+func (h *StreamHandler) commitRotatedVirtualSessionSource(ctx context.Context, sessionID string, resolved ResolvedVirtualMedia) {
+	if h == nil || resolved.URI == "" {
+		return
+	}
+	binder, ok := h.sessionMgr.(virtualSessionSourceBinder)
+	if !ok {
+		return
+	}
+	if err := binder.SetVirtualSource(sessionID, resolved.URI, resolved.OwnerID); err != nil {
+		slog.WarnContext(ctx, "failed to rebind virtual session after candidate rotation",
+			"component", "api", "session", sessionID, "virtual_uri", resolved.URI, "error", err)
+	}
 }
 
 // bindSessionVirtualSourceWithTracks binds the session's virtual source and
@@ -473,6 +503,35 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	releaseInput := func() {}
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
+		if resolveErr != nil && errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+			// The session's pinned release is absent from the provider's current
+			// list (it renumbered or dropped the result id). Mirror the transcode
+			// startup loop: relist fresh, exclude the absent pin, and declare the
+			// exclusion a verdict so the resolver may serve a live sibling. The
+			// session identity is preserved — only the anchor rotates.
+			pinnedID := virtualResultCandidateID(file.FilePath)
+			excluded := []string(nil)
+			if pinnedID != "" {
+				excluded = []string{pinnedID}
+			}
+			rotated, rotatedCleanup, rotateErr := h.resolveVirtualInputURIExcluding(
+				r.Context(), file, session.UserID, session.ProfileID, true, excluded, true,
+			)
+			if rotateErr == nil {
+				slog.InfoContext(r.Context(), "virtual stream rotated an absent session-bound candidate",
+					"component", "api", "session", sessionID, "file_id", file.ID,
+					"status", "rotated", "old_candidate_id", pinnedID,
+					"new_candidate_id", rotated.CandidateID, "virtual_uri", rotated.URI)
+				resolved, cleanup, resolveErr = rotated, rotatedCleanup, nil
+				h.commitRotatedVirtualSessionSource(r.Context(), sessionID, rotated)
+			} else {
+				slog.WarnContext(r.Context(), "virtual stream candidate rotation failed",
+					"component", "api", "session", sessionID, "file_id", file.ID,
+					"status", "rotation_failed", "old_candidate_id", pinnedID,
+					"error", logredact.SanitizeURLError(rotateErr))
+				resolveErr = rotateErr
+			}
+		}
 		if resolveErr != nil {
 			logVirtualStreamFailure(r.Context(), sessionID, file, resolveErr)
 			// A provider resolve failure is a dependency problem, not an

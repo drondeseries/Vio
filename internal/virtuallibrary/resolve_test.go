@@ -2,6 +2,7 @@ package virtuallibrary_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -158,6 +159,40 @@ func TestResolveDetailedPinnedExcludedCandidateSubstitution(t *testing.T) {
 	}
 	if dead.CandidateID == "" {
 		t.Fatal("expected a fallback candidate for a dead pin")
+	}
+}
+
+// TestResolveDetailedAbsentSessionPinCarriesRotationSentinel proves the
+// session-bound dead-pin refusal carries ErrSessionBoundCandidateAbsent, the
+// cause the serve layer and failure-replan rehydration key their rotation retry
+// on. A plain provider failure must never be mistaken for it.
+func TestResolveDetailedAbsentSessionPinCarriesRotationSentinel(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/manifest.json" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"org.stremio.test","resources":["stream"],"types":["movie","series"]}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"streams": [
+			{"name": "1080p", "title": "First", "url": "http://192.168.1.100:8080/stream1.mkv"}
+		]}`))
+	}))
+	defer mockServer.Close()
+
+	svc := virtuallibrary.New(virtuallibrary.Config{
+		Enabled:           true,
+		ManifestURL:       mockServer.URL + "/manifest.json",
+		AllowInsecureHTTP: true,
+	}, nil, nil)
+	if svc == nil {
+		t.Fatal("expected non-nil service")
+	}
+
+	_, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result=ffffffffffffffffffffffff", false, nil, "", true, false)
+	if !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		t.Fatalf("err = %v, want ErrSessionBoundCandidateAbsent", err)
 	}
 }
 

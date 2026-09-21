@@ -6526,7 +6526,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// honor the known-bad stamp so the resolver skips it and either
 				// finds a live sibling or fails with a retryable terminal,
 				// instead of looping back onto the dead pin.
-				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), false, virtualResolveOptionsV3{allowFailedCandidate: virtualDecodeRotation, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI})
+				//
+				// An absent/renumbered session anchor is its own rotation cause:
+				// resolveRehydratedVirtualSourceV3 retries with rotation declared
+				// when the resolver reports the pinned candidate is no longer
+				// listed. Session-bound stays true; only the anchor rotates.
+				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: virtualDecodeRotation, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI})
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true

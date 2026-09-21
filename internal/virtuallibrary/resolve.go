@@ -258,6 +258,15 @@ func (s *Service) Refresh(ctx context.Context, virtualPath string) (string, erro
 	return res.URL, nil
 }
 
+// ErrSessionBoundCandidateAbsent reports that a session-bound pinned candidate
+// is absent from the provider's current list and no surviving keeper matched it,
+// so the resolver refused to serve a sibling because candidate rotation was not
+// requested. Callers that can recover by rotating (the serve layer and the
+// failure-replan rehydration) distinguish this cause from a generic provider or
+// resolve failure so a renumbered/dead anchor rotates without letting a display-
+// driven fallback silently swap a live release.
+var ErrSessionBoundCandidateAbsent = fmt.Errorf("session-bound candidate absent from provider list")
+
 // ResolveDetailed resolves a virtual path to a concrete stream URL through
 // the core resolver, preserving full candidate identity and selection semantics:
 //
@@ -512,7 +521,7 @@ func (s *Service) ResolveDetailed(
 			s.logger.WarnContext(ctx, "refusing to substitute a dead session-bound virtual candidate",
 				"candidate_id", effectiveResultID)
 		}
-		return ResolvedVirtualStream{}, fmt.Errorf("session-bound virtual candidate %q is no longer listed and candidate rotation was not requested", effectiveResultID)
+		return ResolvedVirtualStream{}, fmt.Errorf("session-bound virtual candidate %q is no longer listed and candidate rotation was not requested: %w", effectiveResultID, ErrSessionBoundCandidateAbsent)
 	}
 
 	ordered := orderCandidates(candidates, effectivePreferredID)
