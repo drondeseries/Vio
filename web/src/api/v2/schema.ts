@@ -15254,6 +15254,29 @@ export interface components {
       passthrough: boolean;
       reason?: string;
     };
+    AudioInventoryItemV3: {
+      /** Format: int64 */
+      bit_depth?: number;
+      /** Format: int64 */
+      bitrate?: number;
+      /** Format: int64 */
+      channels?: number;
+      codec?: string;
+      default: boolean;
+      embedded_title?: string;
+      /** Format: int64 */
+      index?: number;
+      language?: string;
+      languages?: string[];
+      layout?: string;
+      profile?: string;
+      /** Format: int64 */
+      sample_rate?: number;
+      /** Format: int64 */
+      selection_index: number;
+      title?: string;
+      track_id: string;
+    };
     AudioPassthroughEntryV3: {
       channel_counts?: number[];
       codec: string;
@@ -21025,6 +21048,7 @@ export interface components {
     };
     PlaybackPlan: {
       applied_quirks: components["schemas"]["AppliedQuirkV3"][];
+      audio_tracks?: components["schemas"]["AudioInventoryItemV3"][];
       available_qualities: components["schemas"]["AvailableQualityV3"][];
       claims: components["schemas"]["ValidationClaimsV3"];
       decision_reason: string;

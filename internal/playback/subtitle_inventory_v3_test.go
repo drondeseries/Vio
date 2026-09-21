@@ -446,6 +446,87 @@ func TestBuildSubtitleInventoryV3_KeepsUnknownLanguageEntriesWithSameCodec(t *te
 	}
 }
 
+// TestBuildSubtitleInventoryV3_KeepsRegionalVariantsOfOneLanguage is the live
+// regression: five embedded tracks that all canonicalize to base language "fr"
+// (fr-FR forced, fr-FR, fr-CA forced, fr-CA, and an SDH track) must all
+// publish. Before the fix the two fr-FR tracks and the two fr-CA tracks
+// collapsed to one each, so French-Canadien was missing from the client's list.
+func TestBuildSubtitleInventoryV3_KeepsRegionalVariantsOfOneLanguage(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 63,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 4, Language: "fr-FR", Codec: "subrip", Forced: true, EmbeddedTitle: "French (France) Forced"},
+			{Index: 5, Language: "fr-FR", Codec: "subrip", EmbeddedTitle: "French (France)"},
+			{Index: 6, Language: "fr-CA", Codec: "subrip", Forced: true, EmbeddedTitle: "French (Canada) Forced"},
+			{Index: 7, Language: "fr-CA", Codec: "subrip", EmbeddedTitle: "French (Canada)"},
+			{Index: 8, Language: "en", Codec: "subrip", HearingImpaired: true, EmbeddedTitle: "English (SDH)"},
+		},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 5 {
+		t.Fatalf("items = %#v, want all five embedded tracks", items)
+	}
+	wantLangs := []string{"fr-FR", "fr-FR", "fr-CA", "fr-CA", "en"}
+	wantForced := []bool{true, false, true, false, false}
+	wantHI := []bool{false, false, false, false, true}
+	for i, item := range items {
+		if item.CombinedIndex != i || item.TrackID != TrackIDV3(file.ID, "subtitle", i) {
+			t.Errorf("item %d identity = (%d, %q), want dense ordinal %d", i, item.CombinedIndex, item.TrackID, i)
+		}
+		if item.Language != wantLangs[i] || item.Forced != wantForced[i] || item.HearingImpaired != wantHI[i] {
+			t.Errorf("item %d = (%s forced=%v hi=%v), want (%s forced=%v hi=%v)",
+				i, item.Language, item.Forced, item.HearingImpaired, wantLangs[i], wantForced[i], wantHI[i])
+		}
+		if source, ok := SubtitleInventoryOwnSourceIndexV3(file, i); !ok || source != i {
+			t.Errorf("published ordinal %d source index = (%d, %v), want %d", i, source, ok, i)
+		}
+	}
+}
+
+// TestBuildSubtitleInventoryV3_CollapsesRepeatedEmbeddedTitle proves a genuine
+// duplicate still collapses: the same authored title described twice is one
+// track, while a different title in the same base language is kept.
+func TestBuildSubtitleInventoryV3_CollapsesRepeatedEmbeddedTitle(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 64,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 10, Language: "fr", Codec: "subrip", EmbeddedTitle: "French"},
+			{Index: 11, Language: "fra", Codec: "subrip", EmbeddedTitle: "French"},
+			{Index: 12, Language: "fr", Codec: "subrip", EmbeddedTitle: "French (Canada)"},
+		},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want the repeated title collapsed and the distinct title kept", items)
+	}
+	if items[1].CombinedIndex != 1 {
+		t.Fatalf("items[1] = %#v, want the distinct French track at published ordinal 1", items[1])
+	}
+}
+
+// TestBuildSubtitleInventoryV3_EmbeddedTitleDistinguishesSameLanguage proves
+// the authored title is the discriminator that keeps distinct same-language
+// tracks apart even when the probe recorded no container stream index.
+func TestBuildSubtitleInventoryV3_EmbeddedTitleDistinguishesSameLanguage(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 65,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Language: "fr", Codec: "subrip", EmbeddedTitle: "French (France)"},
+			{Language: "fr", Codec: "subrip", EmbeddedTitle: "French (Canada)"},
+		},
+	}
+
+	items := BuildSubtitleInventoryV3(file, nil)
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v, want both titled tracks kept", items)
+	}
+}
+
 func TestSubtitleInventoryItemAtV3(t *testing.T) {
 	file := &models.MediaFile{
 		ID: 9,

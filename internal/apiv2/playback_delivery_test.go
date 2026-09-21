@@ -187,6 +187,37 @@ func TestPlaybackDecisionV2ProjectsEffectiveVirtualURI(t *testing.T) {
 	}
 }
 
+// The audio inventory's canonical selection ordinal is part of the plan shape:
+// the v2 projection must carry each track's selection_index/track_id (and the
+// raw container stream index alongside it) so a client selects a track by the
+// canonical ordinal rather than the raw index.
+func TestPlaybackDecisionV2ProjectsAudioInventorySelectionOrdinal(t *testing.T) {
+	in := playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{AudioTracks: []playback.AudioInventoryItemV3{
+		{Index: 1, Language: "eng", Codec: "eac3", Channels: 6, Default: true, TrackID: playback.TrackIDV3(42, "audio", 0), SelectionIndex: 0},
+		{Index: 3, Language: "fra", Codec: "aac", Channels: 2, TrackID: playback.TrackIDV3(42, "audio", 1), SelectionIndex: 1},
+	}}}
+	out := playbackDecision(in)
+	if out.PlaybackPlan == nil || len(out.PlaybackPlan.AudioTracks) != 2 {
+		t.Fatalf("projected audio tracks = %#v, want 2", out.PlaybackPlan)
+	}
+	for i, track := range out.PlaybackPlan.AudioTracks {
+		if track.SelectionIndex != i {
+			t.Fatalf("audio[%d].selection_index = %d, want %d", i, track.SelectionIndex, i)
+		}
+		if want := playback.TrackIDV3(42, "audio", i); track.TrackID != want {
+			t.Fatalf("audio[%d].track_id = %q, want %q", i, track.TrackID, want)
+		}
+	}
+	if out.PlaybackPlan.AudioTracks[0].Index != 1 || out.PlaybackPlan.AudioTracks[1].Index != 3 {
+		t.Fatalf("raw stream indexes changed in projection: %+v", out.PlaybackPlan.AudioTracks)
+	}
+
+	empty := playbackDecision(playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{}})
+	if len(empty.PlaybackPlan.AudioTracks) != 0 {
+		t.Fatalf("empty plan projected audio tracks: %#v", empty.PlaybackPlan.AudioTracks)
+	}
+}
+
 type fakeSubtitleFontService func(context.Context, handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error)
 
 func (f fakeSubtitleFontService) SubtitleFonts(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error) {

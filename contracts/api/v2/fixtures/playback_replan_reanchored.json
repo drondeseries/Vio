@@ -142,6 +142,16 @@
         }
       ]
     },
+    "audio_tracks": [
+      {
+        "codec": "aac",
+        "layout": "stereo",
+        "channels": 2,
+        "default": false,
+        "track_id": "file:42:audio:0",
+        "selection_index": 0
+      }
+    ],
     "transformations": [],
     "applied_quirks": [],
     "runtime_corrections": [],

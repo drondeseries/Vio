@@ -2229,7 +2229,7 @@ func TestPlanAttemptKeyV3IgnoresTheAudioInventory(t *testing.T) {
 
 	before := PlanAttemptKeyV3(*result.Plan, "output-1", nil)
 	withInventory := *result.Plan
-	withInventory.AudioTracks = []models.AudioTrack{{Codec: "ac3", Channels: 6, Layout: "5.1", Language: "spa"}}
+	withInventory.AudioTracks = []AudioInventoryItemV3{{Index: 1, Codec: "ac3", Channels: 6, Layout: "5.1", Language: "spa"}}
 	if after := PlanAttemptKeyV3(withInventory, "output-1", nil); after != before {
 		t.Errorf("attempt key changed with the audio inventory attached: %q -> %q", before, after)
 	}

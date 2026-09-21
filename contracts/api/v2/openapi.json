@@ -15085,6 +15085,71 @@
         ],
         "type": "object"
       },
+      "AudioInventoryItemV3": {
+        "additionalProperties": false,
+        "properties": {
+          "bit_depth": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "bitrate": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "channels": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "codec": {
+            "type": "string"
+          },
+          "default": {
+            "type": "boolean"
+          },
+          "embedded_title": {
+            "type": "string"
+          },
+          "index": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "language": {
+            "type": "string"
+          },
+          "languages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "layout": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "sample_rate": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "selection_index": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "track_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "default",
+          "track_id",
+          "selection_index"
+        ],
+        "type": "object"
+      },
       "AudioPassthroughEntryV3": {
         "additionalProperties": false,
         "properties": {
@@ -30130,6 +30195,12 @@
           "applied_quirks": {
             "items": {
               "$ref": "#/components/schemas/AppliedQuirkV3"
+            },
+            "type": "array"
+          },
+          "audio_tracks": {
+            "items": {
+              "$ref": "#/components/schemas/AudioInventoryItemV3"
             },
             "type": "array"
           },
