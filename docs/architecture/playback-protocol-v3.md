@@ -1475,16 +1475,42 @@ requested release identity is preferred over a fresh listing.
   whose `updated_at` is inside the window, so the row (and its persisted
   `resolved_url`) survives a re-list that omits it. The live-attempt and open
   ABS-session guards are unchanged.
-- Resolution: a session-bound request with substitution withheld that cannot
-  find the persisted same-identity candidate in the provider's current list is
-  refused with a distinct trusted-cause error rather than the absent-pin
-  rotation sentinel. Callers must not rotate on that cause, so a display-driven
-  or session-bound fallback never swaps the release.
+- Resolution: a session-bound request, or an explicit version pick, with
+  substitution withheld that cannot find the persisted same-identity candidate
+  in the provider's current list is refused with a distinct trusted-cause error
+  rather than the absent-pin rotation sentinel. Callers must not rotate on that
+  cause, so a display-driven or session-bound fallback never swaps the release.
+- Explicit selection: a protocol-v3 start with `file_selection: "explicit"`
+  pins the requested `file_id`. When that row is a concrete `?result=` candidate
+  inside the window, the server serves the row's persisted URL instead of
+  re-listing — the provider resolve is skipped, but the normal probe still runs,
+  so an incomplete row is filled in rather than planned on declared-only
+  metadata. The served identity is the selected candidate, never a sibling. An
+  auto selection does not take this shortcut and keeps the ordinary
+  resolve/fallback behavior, including candidate substitution.
 - URL lifetime: the window never extends a signed URL. A URL past its own
   expiry is never served; the window only allows the server to keep preferring
-  and re-deriving the same candidate while it is still persisted.
+  and re-deriving the same candidate while it is still persisted. Outside the
+  window an explicit pick carries no trust and keeps the ordinary fallback.
 - `0` disables the window and restores the pre-window retention and rotation
   behavior. Rows with no durable provider identity (legacy rows) are unaffected.
+
+**Background URL refresh.** Signed provider URLs are pre-warmed by a bounded
+background pass so a later resume serves a live URL instead of paying a provider
+round-trip. Every 30 minutes (±1/6 jitter, and a cross-replica advisory lock so
+only one replica runs it) the pass selects at most 20 candidate rows whose
+`resolved_url_expires_at` is in the future but within 2 hours, and whose
+`updated_at` is inside the window; calls are spaced with jitter. Two hours is
+long enough to survive a few consecutive pass failures while keeping a
+multi-day URL untouched until near its end; the 20-row cap and half-hour cadence
+bound provider load. Only rows with a signalled expiry qualify — a NULL expiry
+(the durable unsigned-provider case) is never re-fetched — and an already
+expired URL is never selected. Each row is re-resolved as its exact candidate
+(session-bound and trusted, so a dropped candidate is refused, not substituted)
+and written through the existing CAS-fenced same-candidate refresh with the
+provider's fresh URL and expiry. A failed refresh is warn-and-continue and the
+row is backed off for an hour; a renumbered identity is left for the on-demand
+rematch. With the window `0` the pass is completely inert.
 
 This is server-internal source selection: clients do not send or receive the
 window, and the `/api/v2` plan already exposes the resolved candidate through

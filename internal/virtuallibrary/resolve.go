@@ -98,10 +98,13 @@ type persistedCandidateTrustContextKey struct{}
 // WithPersistedCandidateTrust marks a resolve as allowed to keep trusting the
 // persisted same-identity candidate even when the provider's current list omits
 // it. The caller sets it only when the catalog row is inside the configured
-// candidate store window (see virtual_library.candidate_store_hours). It is
-// deliberately paired with WithPersistedCandidateIdentity: without a durable
-// identity the resolver cannot prove the trusted row is the requested release,
-// so the flag has no effect.
+// candidate store window (see virtual_library.candidate_store_hours) and the
+// resolve is for a release the viewer is bound to (a session binding or an
+// explicit version pick). It is deliberately paired with
+// WithPersistedCandidateIdentity: without a durable identity the resolver
+// cannot prove the trusted row is the requested release, so the flag has no
+// effect. A trusted resolve treats the pin like a session binding — rematch by
+// identity or refuse, never substitute.
 func WithPersistedCandidateTrust(ctx context.Context, trusted bool) context.Context {
 	if ctx == nil || !trusted {
 		return ctx
@@ -117,6 +120,15 @@ func persistedCandidateTrustFromContext(ctx context.Context) bool {
 	}
 	trusted, _ := ctx.Value(persistedCandidateTrustContextKey{}).(bool)
 	return trusted
+}
+
+// PersistedCandidateTrusted reports whether a resolve was marked to keep
+// trusting a persisted same-identity candidate inside the candidate store
+// window. It is the read counterpart of WithPersistedCandidateTrust for callers
+// in other packages (playback diagnostics and tests); the flag is
+// server-internal and never client-visible.
+func PersistedCandidateTrusted(ctx context.Context) bool {
+	return persistedCandidateTrustFromContext(ctx)
 }
 
 // PlaybackStream represents an available stream candidate formatted for
@@ -334,12 +346,15 @@ var ErrPersistedCandidateTrusted = fmt.Errorf("persisted virtual candidate is in
 //     rank and reject and respects exclusions, the profile filter and
 //     allowCandidateSubstitution exactly like the original pin;
 //   - a genuinely dead pin (absent with no keeper) still falls back when
-//     substitution is allowed or the resolve is not session-bound; a
-//     session-bound dead pin with substitution disallowed is refused, and when
-//     the caller also declared the persisted same-identity candidate as trusted
+//     substitution is allowed or the resolve is not pinned; a pinned dead pin
+//     with substitution disallowed is refused, and when the caller also
+//     declared the persisted same-identity candidate as trusted
 //     (WithPersistedCandidateTrust, inside the candidate store window) the
 //     refusal carries ErrPersistedCandidateTrusted instead of
-//     ErrSessionBoundCandidateAbsent so callers do not rotate to a sibling;
+//     ErrSessionBoundCandidateAbsent so callers do not rotate to a sibling.
+//     A pinned resolve is a session binding or an explicitly selected
+//     persisted candidate; outside the window an explicit pick carries no
+//     trust and keeps the ordinary fallback;
 //   - when substitution is refused and a preferredCandidateID names a
 //     resolvable session release, the candidate actually served must belong to
 //     that release: a present resultID for a different release is refused
@@ -434,13 +449,22 @@ func (s *Service) ResolveDetailed(
 	profile := s.qualityProfileForPath(virtualPath)
 	profileActive := strings.TrimSpace(profile.Label) != ""
 
-	// A quality profile is a selection preference, not a gate on a release an
-	// existing session is already bound to. When the session's own candidate
-	// still exists in the provider list it is served even if it fails the
-	// profile: refusing would not prevent a release swap (nothing is
-	// substituted) and would only break playback. The mismatch is logged for
-	// diagnosis.
-	sessionCandidatePresent := sessionBound && effectiveResultID != "" && candidateIDPresent(candidates, effectiveResultID)
+	// pinnedRelease is the identity contract for a release the viewer is
+	// already bound to: a live session serving it (sessionBound), or an
+	// explicitly selected persisted candidate inside its trust window
+	// (WithPersistedCandidateTrust, which the caller threads only for an
+	// explicit pick or a session binding). Either must rematch by durable
+	// identity or refuse; neither may silently substitute a sibling. Outside
+	// the window an explicit pick carries no trust, so today's fallback
+	// behavior is unchanged.
+	pinnedRelease := sessionBound || persistedCandidateTrustFromContext(ctx)
+
+	// A quality profile is a selection preference, not a gate on a release the
+	// viewer is already bound to. When the pinned candidate still exists in the
+	// provider list it is served even if it fails the profile: refusing would
+	// not prevent a release swap (nothing is substituted) and would only break
+	// playback. The mismatch is logged for diagnosis.
+	sessionCandidatePresent := pinnedRelease && effectiveResultID != "" && candidateIDPresent(candidates, effectiveResultID)
 
 	// Same-release re-identification. A pinned result id that is absent from a
 	// fresh listing is not evidence the release is gone: providers renumber
@@ -449,11 +473,12 @@ func (s *Service) ResolveDetailed(
 	// chain's precedence, treat it as the same release re-identified: bind to
 	// the new id and report IdentityRematched so the caller adopts it. A
 	// genuinely different release shares no identity tier, so the dead-pin
-	// refusal below still covers it. This only applies to a session-bound
-	// resolve that would otherwise refuse a substitution; a rotation already
-	// authorizes the ordinary fallback.
+	// refusal below still covers it. This only applies to a pinned resolve
+	// (session-bound or an explicit persisted selection) that would otherwise
+	// refuse a substitution; a rotation already authorizes the ordinary
+	// fallback.
 	identityRematched := false
-	if sessionBound && !allowSubstitution && effectiveResultID != "" && !sessionCandidatePresent {
+	if pinnedRelease && !allowSubstitution && effectiveResultID != "" && !sessionCandidatePresent {
 		_, requestedExcludedEarly := excluded[requestedResultID]
 		_, keeperExcludedEarly := excluded[effectiveResultID]
 		if !requestedExcludedEarly && !keeperExcludedEarly {
@@ -547,17 +572,18 @@ func (s *Service) ResolveDetailed(
 			"session-bound virtual candidate %q does not match resolved candidate %q and candidate rotation was not requested",
 			effectivePreferredID, effectiveResultID)
 	}
-	// A session-bound pin that is absent from the provider list with no
-	// surviving keeper is a genuinely dead release. With substitution refused
-	// the ranked-alternatives loop below would serve a different release under
-	// the session binding; refuse instead. The earlier guards only cover a pin
+	// A pinned release that is absent from the provider list with no surviving
+	// keeper is a genuinely dead release. With substitution refused the
+	// ranked-alternatives loop below would serve a different release under the
+	// viewer's binding; refuse instead. The earlier guards only cover a pin
 	// whose release is still resolvable (preferred) or explicitly excluded, so
-	// without this a dead session pin silently swaps releases. When substitution
-	// is allowed (a confirmed rotation) the documented dead-pin fallback still
-	// runs, and a resolve with no session binding is unaffected.
+	// without this a dead pin silently swaps releases. When substitution is
+	// allowed (a confirmed rotation) the documented dead-pin fallback still
+	// runs, and a resolve that is neither session-bound nor trusted is
+	// unaffected.
 	sessionReleasePresent := sessionReleaseResolvable ||
 		(preferredCandidateID == "" && effectiveResultID != "" && candidateIDPresent(candidates, effectiveResultID))
-	if sessionBound && !allowSubstitution && effectiveResultID != "" && !pinBlocked && !sessionReleasePresent {
+	if pinnedRelease && !allowSubstitution && effectiveResultID != "" && !pinBlocked && !sessionReleasePresent {
 		if persistedCandidateTrustFromContext(ctx) {
 			if _, hasIdentity := persistedCandidateIdentityFromContext(ctx); hasIdentity {
 				// Same-identity preference, not substitution: the persisted row

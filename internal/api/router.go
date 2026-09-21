@@ -1449,6 +1449,26 @@ func newChiRouter(deps Dependencies) chi.Router {
 				streamHandler.VirtualFileSaver = playbackHandler.VirtualFileSaver
 				streamHandler.VirtualFileMetadataSaver = playbackHandler.VirtualFileMetadataSaver
 			}
+			// Bounded background refresh of signed candidate URLs approaching
+			// expiry, so a resume serves a live URL instead of paying a
+			// provider round-trip. Inert when the candidate store window is
+			// disabled (virtual_library.candidate_store_hours = 0).
+			if playbackHandler.VirtualMediaDetailedResolver != nil {
+				refresher := handlers.NewVirtualCandidateRefresher(
+					scanner.NewFileRepository(deps.DB).ListVirtualCandidatesNeedingRefresh,
+					playbackHandler.VirtualMediaDetailedResolver,
+					playbackHandler.VirtualFileMetadataSaver,
+					playbackHandler.VirtualFileSaver,
+					playbackHandler.VirtualCandidateTrustWindow,
+					deps.DB,
+					nil,
+				)
+				appCtx := deps.AppContext
+				if appCtx == nil {
+					appCtx = context.Background()
+				}
+				go refresher.Run(appCtx)
+			}
 		}
 		if deps.Config != nil {
 			ffprobePath := scanner.FFprobePathFromFFmpeg(deps.Config.Playback.FFmpegPath)

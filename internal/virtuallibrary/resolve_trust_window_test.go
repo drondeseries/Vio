@@ -101,3 +101,44 @@ func TestResolveDetailedTrustWindowBeyondWindowUnchanged(t *testing.T) {
 		t.Fatal("untrusted candidate must not carry the trust sentinel")
 	}
 }
+
+// TestResolveDetailedTrustedFreshSelectionRefusesSubstitution proves the trust
+// window extends the session-binding identity contract to a fresh explicit
+// selection: a trusted (in-window) pin that the provider dropped is refused
+// with the trust sentinel, not the rotation sentinel, even though sessionBound
+// is false. Callers therefore do not rotate an explicitly selected release.
+func TestResolveDetailedTrustedFreshSelectionRefusesSubstitution(t *testing.T) {
+	server := trustWindowProvider(t)
+	svc := trustWindowService(t, server.URL+"/manifest.json")
+
+	ctx := virtuallibrary.WithPersistedCandidateIdentity(context.Background(), virtuallibrary.PersistedCandidateIdentity{
+		VideoHash:   "hash-persisted",
+		ReleaseName: "Movie.2024.1080p",
+	})
+	ctx = virtuallibrary.WithPersistedCandidateTrust(ctx, true)
+
+	// sessionBound=false, substitution withheld: an explicit pick's shape.
+	_, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result=absentrelease", false, nil, "", false, false)
+	if !errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted) {
+		t.Fatalf("err = %v, want ErrPersistedCandidateTrusted", err)
+	}
+	if errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		t.Fatal("trusted fresh selection must not carry the rotation sentinel")
+	}
+}
+
+// TestResolveDetailedUntrustedFreshSelectionStillSubstitutes proves the
+// boundary: without trust (outside the window) a fresh selection keeps today's
+// ordinary substitution, so the window relaxation does not leak.
+func TestResolveDetailedUntrustedFreshSelectionStillSubstitutes(t *testing.T) {
+	server := trustWindowProvider(t)
+	svc := trustWindowService(t, server.URL+"/manifest.json")
+
+	res, err := svc.ResolveDetailed(context.Background(), "virtual://movie/tt100?result=absentrelease", false, nil, "", false, false)
+	if err != nil {
+		t.Fatalf("ResolveDetailed: %v", err)
+	}
+	if res.CandidateID == "" {
+		t.Fatal("expected the live sibling to be served without trust")
+	}
+}
