@@ -1,7 +1,10 @@
 package playback
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -356,6 +359,7 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 		RequestedMediaFileID:   input.RequestedFile.ID,
 		EffectiveMediaFileID:   file.ID,
 		EffectiveVirtualURI:    effectiveVirtualURIV3(input),
+		VirtualSourceRevision:  virtualSourceRevisionV3(input),
 		Source:                 source,
 		SubtitleFidelityPolicy: subtitlePolicyNameV3(input.Request.SubtitleFidelityPreference),
 		Timeline:               TimelineV3{SourceStartSeconds: floatOrZeroV3(input.Request.StartPosition), PlayerStartSeconds: floatOrZeroV3(input.Request.StartPosition), CanSeekAnywhere: true, SeekRestoration: "player_position"},
@@ -828,6 +832,7 @@ func planAudioOnlyV3(input PlannerInputV3, file *models.MediaFile, source Source
 		RequestedMediaFileID:   input.RequestedFile.ID,
 		EffectiveMediaFileID:   file.ID,
 		EffectiveVirtualURI:    effectiveVirtualURIV3(input),
+		VirtualSourceRevision:  virtualSourceRevisionV3(input),
 		Source:                 source,
 		SubtitleFidelityPolicy: subtitlePolicyNameV3(request.SubtitleFidelityPreference),
 		Timeline:               TimelineV3{SourceStartSeconds: floatOrZeroV3(request.StartPosition), PlayerStartSeconds: floatOrZeroV3(request.StartPosition), CanSeekAnywhere: true, SeekRestoration: "player_position"},
@@ -1669,6 +1674,46 @@ func effectiveVirtualURIV3(input PlannerInputV3) string {
 		return input.EffectiveFile.FilePath
 	}
 	return ""
+}
+
+// virtualSourceRevisionPrefix domain-separates the revision hash so it can
+// never collide with another hash of the same candidate identity.
+const virtualSourceRevisionPrefix = "silo.virtual-source-revision.v1\x00"
+
+// virtualSourceRevisionV3 returns an opaque, non-secret revision of the
+// resolved virtual source candidate. It is derived from the effective file's
+// provider-neutral candidate identity: the `?result=` fingerprint that the
+// virtual resolver already binds to the served release. Re-planning the same
+// candidate yields the same revision; resolving a different candidate yields a
+// different one. Nothing provider-secret is an input — no stream URL, token, or
+// request header — and the published value is a domain-separated SHA-256
+// truncated to 96 bits, so it is an opaque token rather than candidate data.
+// It returns "" when the effective file is not a virtual candidate or carries
+// no candidate identity (for example a neutral requested row that was planned
+// without a substitution).
+func virtualSourceRevisionV3(input PlannerInputV3) string {
+	candidateIdentity := effectiveVirtualCandidateIdentityV3(input.EffectiveFile)
+	if candidateIdentity == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(virtualSourceRevisionPrefix + candidateIdentity))
+	return hex.EncodeToString(sum[:12])
+}
+
+// effectiveVirtualCandidateIdentityV3 extracts the provider-neutral candidate
+// fingerprint from a virtual effective file. The fingerprint is the resolver's
+// `?result=` pick, which is itself an opaque hash of the candidate's stable
+// stream fields (see virtuallibrary/stream.CandidateVariantID). A row without a
+// pick has no identity to distinguish one candidate from another.
+func effectiveVirtualCandidateIdentityV3(file *models.MediaFile) string {
+	if file == nil || !strings.HasPrefix(strings.TrimSpace(file.FilePath), "virtual://") {
+		return ""
+	}
+	parsed, err := url.Parse(file.FilePath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.Query().Get("result"))
 }
 
 func finalizePlanIdentityV3(plan *PlanV3, attemptID string, outputContextID string) {

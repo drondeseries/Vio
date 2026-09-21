@@ -131,6 +131,30 @@ func TestPlaybackDecisionV2ProjectsOnlyLocalMediaURLs(t *testing.T) {
 	}
 }
 
+// The virtual source revision is part of the client-visible plan shape: the web
+// player keys subtitle source-change recovery on it, so the v2 projection must
+// carry it and must omit it when the plan has no resolved virtual candidate.
+func TestPlaybackDecisionV2ProjectsVirtualSourceRevision(t *testing.T) {
+	const revision = "0123456789abcdef01234567"
+	in := playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{VirtualSourceRevision: revision}}
+	out := playbackDecision(in)
+	if out.PlaybackPlan.VirtualSourceRevision != revision {
+		t.Fatalf("virtual source revision = %q, want %q", out.PlaybackPlan.VirtualSourceRevision, revision)
+	}
+
+	empty := playbackDecision(playback.DecisionResponseV3{PlaybackPlan: &playback.PlanV3{}})
+	if empty.PlaybackPlan.VirtualSourceRevision != "" {
+		t.Fatalf("empty plan projected a revision: %q", empty.PlaybackPlan.VirtualSourceRevision)
+	}
+	encoded, err := json.Marshal(empty.PlaybackPlan)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(encoded), "virtual_source_revision") {
+		t.Fatalf("empty plan serialized the virtual source revision: %s", encoded)
+	}
+}
+
 type fakeSubtitleFontService func(context.Context, handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error)
 
 func (f fakeSubtitleFontService) SubtitleFonts(ctx context.Context, in handlers.SubtitleFontRequest) ([]playback.SubtitleFontBundleItem, error) {

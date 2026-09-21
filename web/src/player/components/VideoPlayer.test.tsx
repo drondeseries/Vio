@@ -1530,6 +1530,50 @@ describe("VideoPlayer translation handoff", () => {
     expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
   });
 
+  it("re-arms subtitle recovery on a same-identity virtual rotation via the source revision", async () => {
+    const onRefreshSubtitles = vi.fn();
+    const stable = {
+      plan_id: "plan:rev1",
+      plan_attempt_key: "v3:rev1",
+      effective_media_file_id: 7,
+      effective_virtual_uri: "virtual://release/same.mkv",
+      virtual_source_revision: "rev-one",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      plan: fixturePlanV3(stable),
+      onRefreshSubtitles,
+    });
+
+    act(() => subtitleHooks.vttSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
+
+    // The refresh replan returns the same candidate: the revision is unchanged,
+    // so the 409 signal must stay deduped instead of restarting the cycle.
+    rerenderPlayer({
+      plan: fixturePlanV3({
+        ...stable,
+        plan_id: "plan:rev1b",
+        plan_attempt_key: "v3:rev1b",
+      }),
+    });
+    act(() => subtitleHooks.vttSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
+
+    // The release rotated to a different candidate without moving the effective
+    // media file id or the published URI: the revision re-arms recovery once.
+    rerenderPlayer({
+      plan: fixturePlanV3({
+        ...stable,
+        plan_id: "plan:rev2",
+        plan_attempt_key: "v3:rev2",
+        virtual_source_revision: "rev-two",
+      }),
+    });
+    act(() => subtitleHooks.vttSourceChanged?.());
+    act(() => subtitleHooks.assSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
+  });
+
   it("does not reload when only player_start_seconds changes (reused-transport replan)", async () => {
     const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
     try {

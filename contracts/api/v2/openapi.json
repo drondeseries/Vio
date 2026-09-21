@@ -30218,6 +30218,9 @@
               "$ref": "#/components/schemas/TransformationV3"
             },
             "type": "array"
+          },
+          "virtual_source_revision": {
+            "type": "string"
           }
         },
         "required": [

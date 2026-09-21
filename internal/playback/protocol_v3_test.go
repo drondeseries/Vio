@@ -4019,7 +4019,7 @@ func TestPlanPlaybackV3AudioInventoryComesFromTheEffectiveFile(t *testing.T) {
 // round trip when set and disappear under omitempty when the effective source
 // is not a virtual candidate.
 func TestPlanV3EffectiveVirtualURIRoundTrip(t *testing.T) {
-	plan := PlanV3{ProtocolVersion: ProtocolV3, RequestedMediaFileID: 41, EffectiveMediaFileID: 42, EffectiveVirtualURI: "virtual://movie/tt1234567?result=working"}
+	plan := PlanV3{ProtocolVersion: ProtocolV3, RequestedMediaFileID: 41, EffectiveMediaFileID: 42, EffectiveVirtualURI: "virtual://movie/tt1234567?result=working", VirtualSourceRevision: "0123456789abcdef01234567"}
 
 	encoded, err := json.Marshal(plan)
 	if err != nil {
@@ -4032,12 +4032,18 @@ func TestPlanV3EffectiveVirtualURIRoundTrip(t *testing.T) {
 	if _, ok := raw["effective_virtual_uri"]; !ok {
 		t.Fatalf("effective_virtual_uri missing from %s", encoded)
 	}
+	if _, ok := raw["virtual_source_revision"]; !ok {
+		t.Fatalf("virtual_source_revision missing from %s", encoded)
+	}
 	var decoded PlanV3
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if decoded.EffectiveVirtualURI != plan.EffectiveVirtualURI {
 		t.Fatalf("decoded URI = %q, want %q", decoded.EffectiveVirtualURI, plan.EffectiveVirtualURI)
+	}
+	if decoded.VirtualSourceRevision != plan.VirtualSourceRevision {
+		t.Fatalf("decoded revision = %q, want %q", decoded.VirtualSourceRevision, plan.VirtualSourceRevision)
 	}
 
 	empty := PlanV3{ProtocolVersion: ProtocolV3, RequestedMediaFileID: 41, EffectiveMediaFileID: 42}
@@ -4047,5 +4053,8 @@ func TestPlanV3EffectiveVirtualURIRoundTrip(t *testing.T) {
 	}
 	if bytes.Contains(encodedEmpty, []byte("effective_virtual_uri")) {
 		t.Fatalf("empty plan serialized effective_virtual_uri: %s", encodedEmpty)
+	}
+	if bytes.Contains(encodedEmpty, []byte("virtual_source_revision")) {
+		t.Fatalf("empty plan serialized virtual_source_revision: %s", encodedEmpty)
 	}
 }
