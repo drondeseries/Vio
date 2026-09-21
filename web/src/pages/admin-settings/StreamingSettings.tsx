@@ -286,9 +286,9 @@ export default function StreamingSettings() {
           dirty={anyDirty(AUTOMATION_KEYS)}
         >
           <SettingField
-            label="Prowlarr RSS URL"
-            description="Optional: Prowlarr RSS feed URL for automated release discovery."
-            hint="http://prowlarr:9696/1/api/v1/search?t=movie"
+            label="Prowlarr URL"
+            description="Optional: Prowlarr server base URL for automated release discovery. Enter the base URL only — no indexer path or query string; the API key is set below."
+            hint="http://prowlarr:9696"
             value={form.getValue("virtual_library.indexer_rss_url")}
             onChange={(v) => form.setValue("virtual_library.indexer_rss_url", v)}
             restartRequired={restartKeys.has("virtual_library.indexer_rss_url")}
