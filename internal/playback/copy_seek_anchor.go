@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"os/exec"
 	"strconv"
@@ -16,7 +17,11 @@ import (
 
 const (
 	maxConcurrentCopySeekProbes = 4
-	copySeekProbeTimeout        = 15 * time.Second
+	// CopySeekProbeTimeout is the per-attempt cap for one copy-video seek-anchor
+	// probe. It is exported so the replan retry can decide whether another
+	// attempt fits the caller's remaining budget; the probe itself is capped at
+	// the smaller of this and the caller's remaining deadline.
+	CopySeekProbeTimeout = 15 * time.Second
 
 	// copySeekAnchorCacheTTL bounds how long a resolved anchor is reused. The
 	// anchor is a property of the source bytes at a seek position, not of the
@@ -219,12 +224,31 @@ func ResolveCopySeekAnchorForSource(
 		if anchor, ok := copySeekAnchors.get(key); ok {
 			return anchor, nil
 		}
-		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), copySeekProbeTimeout)
+		budget, shortened := copySeekProbeTimeoutFor(ctx)
+		if budget <= 0 {
+			return copySeekAnchor{}, context.DeadlineExceeded
+		}
+		if shortened {
+			slog.InfoContext(ctx, "copy seek anchor probe shortened to the caller's remaining budget",
+				"component", "playback",
+				"budget", budget,
+				"cap", CopySeekProbeTimeout,
+			)
+		}
+		// WithoutCancel keeps the probe alive across a client disconnect so a
+		// completed observation can still populate the cache, but the derived
+		// deadline is the caller's remaining budget: the probe can no longer
+		// outlive the request by a full probe timeout.
+		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 		defer cancel()
 		select {
 		case copySeekProbeSlots <- struct{}{}:
 			defer func() { <-copySeekProbeSlots }()
 		case <-probeCtx.Done():
+			slog.WarnContext(ctx, "copy seek anchor probe skipped: caller budget expired before a probe slot",
+				"component", "playback",
+				"budget", budget,
+			)
 			return copySeekAnchor{}, probeCtx.Err()
 		}
 		seconds, segment, err := copySeekAnchors.probeRunner()(probeCtx, resolvedFFmpegPath, inputPath, requestedSeekSeconds, segmentDuration)
@@ -251,6 +275,33 @@ func ResolveCopySeekAnchorForSource(
 		}
 		return anchor.seconds, anchor.segment, nil
 	}
+}
+
+// copySeekProbeTimeoutFor derives one probe's timeout from the caller's
+// remaining deadline. The probe must not outlive the request by a full probe
+// timeout: a resumed session's provider re-list can consume most of the replan
+// budget, so a fixed 15s probe that ignored the caller's deadline was killed by
+// our own timeout while the caller's budget was already gone. The returned
+// budget is the smaller of CopySeekProbeTimeout and the remaining deadline;
+// shortened reports that the caller's deadline, not the probe cap, set it. A
+// non-positive budget means the caller had no time left and the probe must not
+// run. A caller with no deadline keeps the full probe cap.
+func copySeekProbeTimeoutFor(ctx context.Context) (time.Duration, bool) {
+	if ctx == nil {
+		return CopySeekProbeTimeout, false
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return CopySeekProbeTimeout, false
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0, true
+	}
+	if remaining < CopySeekProbeTimeout {
+		return remaining, true
+	}
+	return CopySeekProbeTimeout, false
 }
 
 func resolveCopySeekAnchor(

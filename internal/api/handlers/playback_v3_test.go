@@ -3414,6 +3414,70 @@ func TestPrepareTransportV3CopyAnchorFailureIsRetryable(t *testing.T) {
 	}
 }
 
+// TestPrepareTransportV3CopyAnchorRetrySkipsWithoutBudget proves a replan whose
+// remaining budget cannot fit a second full probe runs exactly one anchor probe
+// and fails fast with the retryable anchor error, instead of burning the rest of
+// the budget on a doomed attempt.
+func TestPrepareTransportV3CopyAnchorRetrySkipsWithoutBudget(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	probeCalls := 0
+	handler.copySeekAnchor = func(context.Context, string, string, float64, int) (float64, int, error) {
+		probeCalls++
+		return 0, 0, errors.New("probe failed")
+	}
+	plan := &playback.PlanV3{PlanID: "plan:copy-budget", Delivery: playback.DeliveryRemuxHLSV3, Timeline: playback.TimelineV3{SourceStartSeconds: 120}}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), time.Second)
+	defer cancel()
+	_, transportErr := handler.prepareTransportV3(
+		req.WithContext(ctx),
+		&playback.Session{ID: "session-copy-budget"},
+		&models.MediaFile{ID: 42, FilePath: "/media/movie.mkv"},
+		playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux}, mediaAuthModeV3{})
+	if probeCalls != 1 {
+		t.Fatalf("copy anchor probes = %d, want exactly 1 without retry budget", probeCalls)
+	}
+	if transportErr == nil || transportErr.reason != "transcode_start_failed" || !transportErr.retryable || transportErr.cause == nil || transportErr.cause.Error() != "probe failed" {
+		t.Fatalf("transport error = %#v, want retryable copy anchor failure", transportErr)
+	}
+}
+
+// TestPrepareTransportV3CopyAnchorRetriesWithBudget proves the bounded retry
+// still runs when the caller's remaining budget comfortably fits a second probe.
+func TestPrepareTransportV3CopyAnchorRetriesWithBudget(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-secret"
+	probeCalls := 0
+	handler.copySeekAnchor = func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		probeCalls++
+		if probeCalls == 1 {
+			return 0, 0, errors.New("transient probe failure")
+		}
+		return requested - 0.75, int((requested - 0.75) / float64(segmentDuration)), nil
+	}
+	plan := &playback.PlanV3{
+		PlanID:               "plan:copy-retry",
+		Delivery:             playback.DeliveryRemuxProgressiveV3,
+		EffectiveMediaFileID: 42,
+		Timeline:             playback.TimelineV3{SourceStartSeconds: 120, PlayerStartSeconds: 120, CanSeekAnywhere: true, SeekRestoration: "player_position"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), time.Minute)
+	defer cancel()
+	transport, transportErr := handler.prepareTransportV3(
+		req.WithContext(ctx),
+		&playback.Session{ID: "session-copy-retry", UserID: 7, ProfileID: "profile-1", MediaFileID: 42, PlayMethod: playback.PlayRemux, BasePlayMethod: playback.PlayRemux},
+		&models.MediaFile{ID: 42, FilePath: "/media/movie.mkv"},
+		playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux}, mediaAuthModeV3{})
+	if transportErr != nil {
+		t.Fatalf("prepare transport: %v", transportErr)
+	}
+	defer transport.rollback()
+	if probeCalls != 2 {
+		t.Fatalf("copy anchor probes = %d, want 2 with retry budget", probeCalls)
+	}
+}
+
 func TestPrepareTransportV3RejectsNodeMissingRequiredTransformation(t *testing.T) {
 	startHits := 0
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

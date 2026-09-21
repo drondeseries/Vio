@@ -437,3 +437,72 @@ func TestResolveCopySeekAnchorForSourceCoalescesConcurrentIdenticalProbes(t *tes
 		t.Fatalf("probe calls = %d, want 1", got)
 	}
 }
+
+// TestResolveCopySeekAnchorProbeBudgetCappedByCallerDeadline proves the probe no
+// longer ignores the caller's deadline: with less remaining than the per-probe
+// cap, the probe context is bounded by the caller's deadline.
+func TestResolveCopySeekAnchorProbeBudgetCappedByCallerDeadline(t *testing.T) {
+	var gotBudget time.Duration
+	var calls int
+	resetCopySeekAnchorCache(t, nil, func(ctx context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		calls++
+		if deadline, ok := ctx.Deadline(); ok {
+			gotBudget = time.Until(deadline)
+		}
+		return requested - 1, int((requested - 1) / float64(segmentDuration)), nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/short-budget", "http://relay/short", 120, 2); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("probe calls = %d, want 1", calls)
+	}
+	if gotBudget <= 0 || gotBudget > 3*time.Second {
+		t.Fatalf("probe budget = %s, want capped by the 3s caller deadline", gotBudget)
+	}
+	if gotBudget >= CopySeekProbeTimeout {
+		t.Fatalf("probe budget = %s, want less than the %s per-probe cap", gotBudget, CopySeekProbeTimeout)
+	}
+}
+
+// TestResolveCopySeekAnchorProbeUsesFullCapWithLargerCallerBudget proves a
+// caller with more than the probe cap still gets the full cap, not an
+// unbounded or caller-deadline-sized budget.
+func TestResolveCopySeekAnchorProbeUsesFullCapWithLargerCallerBudget(t *testing.T) {
+	var gotBudget time.Duration
+	resetCopySeekAnchorCache(t, nil, func(ctx context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
+		if deadline, ok := ctx.Deadline(); ok {
+			gotBudget = time.Until(deadline)
+		}
+		return requested, 0, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/long-budget", "http://relay/long", 120, 2); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if gotBudget < CopySeekProbeTimeout-time.Second || gotBudget > CopySeekProbeTimeout {
+		t.Fatalf("probe budget = %s, want the %s probe cap", gotBudget, CopySeekProbeTimeout)
+	}
+}
+
+// TestResolveCopySeekAnchorSkipsProbeWhenCallerBudgetExpired proves an already
+// exhausted caller budget never starts an ffmpeg probe.
+func TestResolveCopySeekAnchorSkipsProbeWhenCallerBudgetExpired(t *testing.T) {
+	var calls int32
+	resetCopySeekAnchorCache(t, nil, func(context.Context, string, string, float64, int) (float64, int, error) {
+		atomic.AddInt32(&calls, 1)
+		return 0, 0, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/expired", "http://relay/expired", 120, 2); err == nil {
+		t.Fatal("an exhausted caller budget resolved an anchor")
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("probe calls = %d, want 0 with no caller budget", got)
+	}
+}
