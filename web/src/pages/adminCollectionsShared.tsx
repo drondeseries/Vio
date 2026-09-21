@@ -968,7 +968,7 @@ export function TMDBPresetForm({
             inputMode="numeric"
             value={limit}
             onChange={(event) => setLimit(event.target.value)}
-            placeholder="Defaults to 20"
+            placeholder="Leave blank for unlimited"
           />
         </div>
 
@@ -1253,7 +1253,7 @@ export function TraktPresetForm({
             inputMode="numeric"
             value={limit}
             onChange={(event) => setLimit(event.target.value)}
-            placeholder="Defaults to 20"
+            placeholder="Leave blank for unlimited"
           />
         </div>
 
@@ -1923,7 +1923,7 @@ export function CollectionEditForm({
                 inputMode="numeric"
                 value={tmdbLimit}
                 onChange={(event) => setTmdbLimit(event.target.value)}
-                placeholder="Defaults to 20"
+                placeholder="Leave blank for unlimited"
               />
             </div>
           </div>
@@ -1976,7 +1976,7 @@ export function CollectionEditForm({
                     inputMode="numeric"
                     value={traktLimit}
                     onChange={(event) => setTraktLimit(event.target.value)}
-                    placeholder="Defaults to 20"
+                    placeholder="Leave blank for unlimited"
                   />
                 </div>
               </div>
@@ -2041,7 +2041,7 @@ export function CollectionEditForm({
                     inputMode="numeric"
                     value={traktLimit}
                     onChange={(event) => setTraktLimit(event.target.value)}
-                    placeholder="Defaults to 20"
+                    placeholder="Leave blank for unlimited"
                   />
                 </div>
               </div>

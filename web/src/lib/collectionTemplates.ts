@@ -180,7 +180,6 @@ export const TEMPLATE_STALE_TIME = 5 * 60_000;
 // Largest explicit "Max Items" value the import APIs accept. Mirrors
 // MaxExplicitItemLimit in internal/collectionutil.
 export const COLLECTION_MAX_ITEMS = 100000;
-export const COLLECTION_DEFAULT_ITEMS = 500;
 
 export function fetchCollectionTemplates(): Promise<CollectionTemplateCatalog> {
   return v2("GET /api/v2/admin/collections/templates").then(
