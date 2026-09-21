@@ -19,11 +19,13 @@ import (
 	"time"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/scanner"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -1226,6 +1228,50 @@ func clearVirtualCandidateDeclaredMetadata(file *models.MediaFile) {
 	file.SubtitleTracks = nil
 	file.ProbeSource = ""
 	file.ProbeUpdatedAt = nil
+}
+
+// resolveRehydratedVirtualSourceV3 resolves the session-bound virtual source for
+// a replan rehydration. When the pinned candidate is absent from the provider's
+// current list the resolver refuses with ErrSessionBoundCandidateAbsent; this
+// retries once with candidate rotation declared and the relist forced, so a
+// renumbered or dropped anchor rotates to a live sibling under the same session
+// binding. The retry is narrowly scoped to that cause: a generic provider or
+// resolve failure is returned unchanged, and a caller that already declared
+// rotation is never retried.
+func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
+	r *http.Request,
+	pinnedFile *models.MediaFile,
+	profileID string,
+	excludedCandidateIDs []string,
+	preferredCandidateID string,
+	qualityPreference string,
+	bandwidthCapKbps int,
+	opts virtualResolveOptionsV3,
+) (resolvedVirtualPlaybackSource, error) {
+	resolved, err := h.resolveVirtualPlaybackSource(r, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, false, opts)
+	if err == nil || opts.rotateCandidates || !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		return resolved, err
+	}
+	if len(excludedCandidateIDs) == 0 {
+		if id := virtualResultCandidateID(pinnedFile.FilePath); id != "" {
+			excludedCandidateIDs = []string{id}
+		}
+	}
+	rotatedOpts := opts
+	rotatedOpts.rotateCandidates = true
+	rotated, rotateErr := h.resolveVirtualPlaybackSource(r, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, true, rotatedOpts)
+	if rotateErr != nil {
+		slog.WarnContext(r.Context(), "virtual replan candidate rotation failed",
+			"component", "api", "session_anchor", pinnedFile.FilePath,
+			"status", "rotation_failed", "old_candidate_id", virtualResultCandidateID(pinnedFile.FilePath),
+			"error", logredact.SanitizeURLError(rotateErr))
+		return rotated, rotateErr
+	}
+	slog.InfoContext(r.Context(), "virtual replan rotated an absent session-bound candidate",
+		"component", "api", "session_anchor", pinnedFile.FilePath,
+		"status", "rotated", "old_candidate_id", virtualResultCandidateID(pinnedFile.FilePath),
+		"new_candidate_id", virtualResultCandidateID(rotated.URI), "virtual_uri", rotated.URI)
+	return rotated, nil
 }
 
 func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *models.MediaFile, profileID string, deferProbe bool, excludedCandidateIDs []string, preferredCandidateID string, qualityPreference string, bandwidthCapKbps int, forceRelist bool, opts ...virtualResolveOptionsV3) (resolvedVirtualPlaybackSource, error) {
