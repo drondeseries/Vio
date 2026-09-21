@@ -6224,9 +6224,18 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// virtual failure: candidate substitution is the recovery, so the delivery
 	// stays eligible until rotation exhausts.
 	virtualDecodeRotation := h.virtualCandidateRotationPendingV3(record, req)
+	// A client failure classification never retires the session's last
+	// remaining delivery. Retiring the only route turns a transient verdict
+	// into a terminal even though the planner could still serve that delivery
+	// through a sibling plan: an attempted copy plan falls through to the
+	// video-encode variant of the same class. The attempted-plan-key exclusion
+	// keeps later recoveries bounded, and a route that genuinely cannot be
+	// served exhausts through the transcode path's own attempted-key check.
+	lastRoute := deliveryDemotionRetiresLastRouteV3(&start, record.CurrentPlan.Delivery)
 	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) &&
 		(!decodeFailureClassificationV3(req.Failure.Classification) ||
-			(!h.softwareDecodeRetryPendingV3(record, req) && !virtualDecodeRotation)) {
+			(!h.softwareDecodeRetryPendingV3(record, req) && !virtualDecodeRotation)) &&
+		!lastRoute {
 		// Demote on both copies: the record (the durable attempt this replan
 		// may still terminal-persist) and the seeded start, whose payload the
 		// success commit writes back via updated.NormalizedRequest. Demoting
@@ -8823,6 +8832,27 @@ func (h *PlaybackHandler) virtualCandidateRotationPendingV3(record *playback.Att
 	ts := h.tm.GetTranscodeSession(record.SessionID)
 	if ts == nil || !ts.IsSourceRejected() {
 		return false
+	}
+	return true
+}
+
+// deliveryDemotionRetiresLastRouteV3 reports whether demoting the given
+// delivery would leave the request with no other enabled delivery. The
+// failure-recovery path consults this before retiring a route on a client
+// classification: retiring the last route removes the only delivery the
+// planner could still serve through a sibling plan.
+func deliveryDemotionRetiresLastRouteV3(request *playback.StartRequestV3, delivery playback.DeliveryV3) bool {
+	if request == nil || request.ClientPlaybackContext.Deliveries == nil {
+		return false
+	}
+	class := playback.DeliveryClassV3(delivery)
+	for otherClass, capability := range request.ClientPlaybackContext.Deliveries {
+		if otherClass == class {
+			continue
+		}
+		if capability.Enabled && capability.SupportedOnDevice {
+			return false
+		}
 	}
 	return true
 }
