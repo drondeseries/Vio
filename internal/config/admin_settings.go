@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	redisv9 "github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
@@ -123,6 +124,7 @@ var adminSettingDefaults = map[string]string{
 	"virtual_library.tmdb_api_key":                "",
 	"virtual_library.allow_insecure_http":         "false",
 	"virtual_library.cache_ttl_minutes":           "10",
+	"virtual_library.candidate_store_hours":       "720",
 	"virtual_library.schedule_refresh_minutes":    "360",
 	"virtual_library.monitor_file":                ".vio-virtual-library-monitored.json",
 	"virtual_library.enable_quality_profiles":     "false",
@@ -443,6 +445,9 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 1000000)
 	case "virtual_library.cache_ttl_minutes", "virtual_library.indexer_rss_check_minutes", "virtual_library.altmount_check_minutes":
 		return normalizeAdminInt(key, value, 1, 10080)
+	case "virtual_library.candidate_store_hours":
+		// 0 disables the trust window and keeps the pre-window behavior.
+		return normalizeAdminInt(key, value, 0, 8760)
 	case "virtual_library.schedule_refresh_minutes":
 		return normalizeAdminInt(key, value, 30, 10080)
 	case "virtual_library.manifest_url", "virtual_library.tmdb_api_key",
@@ -776,6 +781,23 @@ func normalizeAdminInt(key, value string, minValue, maxValue int) (string, error
 		return "", fmt.Errorf("%s must be an integer between %d and %d", key, minValue, maxValue)
 	}
 	return strconv.Itoa(parsed), nil
+}
+
+// VirtualCandidateStoreWindow parses the virtual_library.candidate_store_hours
+// setting into the duration the playback and scanner layers trust a persisted
+// virtual candidate for. An empty value uses the setting's default (a newly
+// added key has no stored row yet); a non-positive or unparseable value returns
+// zero, which disables the window and keeps the pre-window behavior.
+func VirtualCandidateStoreWindow(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = adminSettingDefaults["virtual_library.candidate_store_hours"]
+	}
+	hours, err := strconv.Atoi(raw)
+	if err != nil || hours <= 0 {
+		return 0
+	}
+	return time.Duration(hours) * time.Hour
 }
 
 func normalizeAdminInt64(key, value string, minValue, maxValue int64) (string, error) {

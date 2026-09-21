@@ -1320,6 +1320,23 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return on
 			}
+			// Candidate store window: how long a persisted virtual candidate
+			// stays trusted for replay after its last listing or resolution.
+			// 0 (the default) disables the window. Read lazily so an admin
+			// change applies without a restart.
+			virtualCandidateStoreWindow := func() time.Duration {
+				raw, err := store.Get(context.Background(), "virtual_library.candidate_store_hours")
+				if err != nil {
+					// A settings-store outage disables the window rather than
+					// guessing: the pre-window behavior is always safe.
+					return 0
+				}
+				return config.VirtualCandidateStoreWindow(raw)
+			}
+			playbackHandler.VirtualCandidateTrustWindow = virtualCandidateStoreWindow
+			if deps.FileRepo != nil {
+				deps.FileRepo.SetVirtualCandidateStoreWindow(virtualCandidateStoreWindow)
+			}
 		}
 		playbackHandler.AllowInsecureVirtual = func(installationID int) bool {
 			// SSRF posture for virtual traffic comes solely from the core
@@ -1333,6 +1350,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			streamHandler.VirtualMediaRefreshResolver = playbackHandler.VirtualMediaRefreshResolver
 			streamHandler.VirtualMediaDetailedResolver = playbackHandler.VirtualMediaDetailedResolver
 			streamHandler.AllowInsecureVirtual = playbackHandler.AllowInsecureVirtual
+			streamHandler.VirtualCandidateTrustWindow = playbackHandler.VirtualCandidateTrustWindow
 		}
 		if deps.DB != nil {
 			// Transport no-bytes failure path. The marker goes through the

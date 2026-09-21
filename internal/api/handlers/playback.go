@@ -468,6 +468,12 @@ type PlaybackHandler struct {
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for private/local stream hosts.
 	AllowInsecureVirtual func(installationID int) bool
+	// VirtualCandidateTrustWindow reports how long a persisted virtual
+	// candidate row may be trusted for replay after its last listing or
+	// resolution. A positive value keeps a delisted same-identity candidate
+	// preferred (and retained) inside the window; zero disables the window and
+	// keeps the pre-window behavior. Wired lazily from the settings store.
+	VirtualCandidateTrustWindow func() time.Duration
 	// VirtualCandidateRecoveredMarker clears a virtual candidate's known-bad
 	// stamp after an HLS/transcode delivery actually served a full segment to
 	// the client. It mirrors StreamHandler.VirtualCandidateRecoveredMarker:

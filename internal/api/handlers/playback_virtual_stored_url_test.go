@@ -3,10 +3,13 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
 
 // storedURLLookup returns the fixed row for the exact candidate path and a
@@ -27,6 +30,106 @@ func countingDetailedResolver(calls *int, resolved ResolvedVirtualMedia) Virtual
 		*calls++
 		return resolved, nil
 	})
+}
+
+// TestEvaluateStoredVirtualURLCandidateTrustWindow pins the trust-window
+// decision. A signed URL is never served past its own expiry; the window only
+// changes whether an expired same-identity row is still trusted (so the caller
+// keeps preferring it) or has fallen back to today's expired behavior. A nil
+// expiry is always usable.
+func TestEvaluateStoredVirtualURLCandidateTrustWindow(t *testing.T) {
+	const pinned = "virtual://movie/tt-trust?result=cand-a"
+	now := time.Now()
+	expired := now.Add(-time.Hour)
+	future := now.Add(time.Hour)
+	window := 720 * time.Hour
+
+	newRow := func(updatedAt time.Time, expiresAt *time.Time) *models.MediaFile {
+		return &models.MediaFile{
+			ID:                         70,
+			FilePath:                   pinned,
+			UpdatedAt:                  updatedAt,
+			ResolvedURL:                "https://93.184.216.34/stream/token=stored",
+			ResolvedURLExpiresAt:       expiresAt,
+			ProviderVideoHash:          "hash-a",
+			ProviderReleaseName:        "Movie.2024.1080p",
+			VirtualOwnerInstallationID: 5,
+		}
+	}
+
+	tests := []struct {
+		name      string
+		updatedAt time.Time
+		expiresAt *time.Time
+		window    time.Duration
+		wantState virtualStoredURLState
+		wantURL   bool
+	}{
+		{
+			name:      "nil expiry is usable regardless of window",
+			updatedAt: now.Add(-100 * 24 * time.Hour),
+			expiresAt: nil,
+			window:    window,
+			wantState: virtualStoredURLUsable,
+			wantURL:   true,
+		},
+		{
+			name:      "future expiry is usable",
+			updatedAt: now,
+			expiresAt: &future,
+			window:    window,
+			wantState: virtualStoredURLUsable,
+			wantURL:   true,
+		},
+		{
+			name:      "expired but inside the window is trusted, never served",
+			updatedAt: now.Add(-time.Hour),
+			expiresAt: &expired,
+			window:    window,
+			wantState: virtualStoredURLExpiredWithinWindow,
+			wantURL:   false,
+		},
+		{
+			name:      "expired beyond the window keeps the pre-window state",
+			updatedAt: now.Add(-60 * 24 * time.Hour),
+			expiresAt: &expired,
+			window:    window,
+			wantState: virtualStoredURLExpired,
+			wantURL:   false,
+		},
+		{
+			name:      "expired with the window disabled keeps the pre-window state",
+			updatedAt: now,
+			expiresAt: &expired,
+			window:    0,
+			wantState: virtualStoredURLExpired,
+			wantURL:   false,
+		},
+		{
+			name:      "expired row with no timestamp is outside the window",
+			updatedAt: time.Time{},
+			expiresAt: &expired,
+			window:    window,
+			wantState: virtualStoredURLExpired,
+			wantURL:   false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, state := evaluateStoredVirtualURLCandidate(
+				context.Background(), pinned, newRow(tc.updatedAt, tc.expiresAt), true, now, tc.window,
+			)
+			if state != tc.wantState {
+				t.Fatalf("state = %v, want %v", state, tc.wantState)
+			}
+			if tc.wantURL && got.URL == "" {
+				t.Fatalf("URL = empty, want the stored URL")
+			}
+			if !tc.wantURL && got.URL != "" {
+				t.Fatalf("URL = %q, want empty (an expired URL is never served)", got.URL)
+			}
+		})
+	}
 }
 
 func TestResolveVirtualInputUsesStoredURLWithoutListing(t *testing.T) {
@@ -383,6 +486,85 @@ func TestStreamResolveVirtualInputExpiredStoredURLRefreshes(t *testing.T) {
 	}
 	if saved != 1 {
 		t.Fatalf("refresh writes = %d, want 1", saved)
+	}
+}
+
+// TestFallbackServesPersistedCandidateWithinTrustWindow proves the stale-source
+// fallback prefers the session's persisted same-identity candidate over a
+// freshly listed sibling. The stored URL is the row's own, so a viewer replaying
+// a release the provider re-listed without still gets the bytes they selected,
+// and no sibling is substituted.
+func TestFallbackServesPersistedCandidateWithinTrustWindow(t *testing.T) {
+	const (
+		neutral = "virtual://movie/tt-fallback-window"
+		pinned  = neutral + "?result=cand-a"
+		sibling = neutral + "?result=cand-b"
+	)
+	row := &models.MediaFile{
+		ID:                         91,
+		ContentID:                  "tt-fallback-window",
+		FilePath:                   pinned,
+		VirtualOwnerInstallationID: 5,
+		UpdatedAt:                  time.Now(),
+		ResolvedURL:                "https://93.184.216.34/stream/token=stored",
+		ProviderVideoHash:          "hash-a",
+		ProviderReleaseName:        "Movie.2024.1080p",
+	}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.VirtualCandidateTrustWindow = func() time.Duration { return 720 * time.Hour }
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-b", URI: sibling, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac",
+		}}, nil
+	})
+	elig := virtualFallbackEligibility{sessionBound: true, rotationAllowed: false, releaseID: "cand-a"}
+
+	got := h.fallbackResolveStaleVirtualSource(context.Background(), row, 1, "profile", elig)
+	if got == nil {
+		t.Fatal("expected the persisted candidate to be served, got nil")
+	}
+	if got.URL != row.ResolvedURL || got.URI != pinned {
+		t.Fatalf("served url=%q uri=%q, want the persisted row %q %q", got.URL, got.URI, row.ResolvedURL, pinned)
+	}
+}
+
+// TestFallbackDisplayDrivenCannotSwapLiveRelease proves the display-driven
+// fallback (session-bound without rotation) never substitutes a sibling when
+// the persisted row's URL cannot be served inside the trust window. It returns
+// nil so the caller surfaces the original failure, preserving the release under
+// the viewer.
+func TestFallbackDisplayDrivenCannotSwapLiveRelease(t *testing.T) {
+	const (
+		neutral = "virtual://movie/tt-display-window"
+		pinned  = neutral + "?result=cand-a"
+		sibling = neutral + "?result=cand-b"
+	)
+	expired := time.Now().Add(-time.Hour)
+	row := &models.MediaFile{
+		ID:                         92,
+		ContentID:                  "tt-display-window",
+		FilePath:                   pinned,
+		VirtualOwnerInstallationID: 5,
+		UpdatedAt:                  time.Now(),
+		ResolvedURL:                "https://93.184.216.34/stream/token=expired",
+		ResolvedURLExpiresAt:       &expired,
+		ProviderVideoHash:          "hash-a",
+		ProviderReleaseName:        "Movie.2024.1080p",
+	}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.VirtualCandidateTrustWindow = func() time.Duration { return 720 * time.Hour }
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "cand-b", URI: sibling, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac",
+		}}, nil
+	})
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+		return ResolvedVirtualMedia{}, fmt.Errorf("trusted persisted virtual candidate %q is no longer listed and candidate rotation was not requested: %w", "cand-a", virtuallibrary.ErrPersistedCandidateTrusted)
+	})
+	elig := virtualFallbackEligibility{sessionBound: true, rotationAllowed: false, releaseID: "cand-a"}
+
+	if got := h.fallbackResolveStaleVirtualSource(context.Background(), row, 1, "profile", elig); got != nil {
+		t.Fatalf("fallback served %q, want nil (no sibling substitution)", got.URI)
 	}
 }
 
