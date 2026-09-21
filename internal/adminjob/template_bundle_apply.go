@@ -8,10 +8,15 @@ import (
 const JobTypeTemplateBundleApply = "template_bundle_apply"
 
 type TemplateBundleApplyRequest struct {
-	BundleID        string                              `json:"bundle_id"`
-	LibraryIDs      []int                               `json:"library_ids"`
-	DeleteExisting  bool                                `json:"delete_existing"`
-	VirtualPlayback bool                                `json:"virtual_playback,omitempty"`
+	BundleID       string `json:"bundle_id"`
+	LibraryIDs     []int  `json:"library_ids"`
+	DeleteExisting bool   `json:"delete_existing"`
+	// VirtualPlayback is tri-state across the job boundary: nil means the
+	// client omitted it and the apply default (on) is used; a non-nil pointer
+	// carries the client's explicit choice, including false. A *bool is needed
+	// because the payload round-trips through JSON, where a plain bool cannot
+	// tell "omitted" from "sent false".
+	VirtualPlayback *bool                               `json:"virtual_playback,omitempty"`
 	Featured        *TemplateBundleApplyFeaturedRequest `json:"featured,omitempty"`
 }
 
