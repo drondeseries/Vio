@@ -17,7 +17,7 @@ import type { components } from "@/api/v2/schema";
  */
 
 type WatchDetailV2 = components["schemas"]["WatchDetail"];
-type WatchFileVersionV2 = components["schemas"]["WatchFileVersion"];
+export type WatchFileVersionV2 = components["schemas"]["WatchFileVersion"];
 type WatchMarkerV2 = components["schemas"]["WatchMarker"];
 type WatchPlaybackVariantV2 = components["schemas"]["WatchPlaybackVariant"];
 type WatchPlaybackVariantPartV2 = components["schemas"]["WatchPlaybackVariantPart"];
@@ -38,7 +38,7 @@ function optionalMarkerFromV2(marker: WatchMarkerV2 | undefined): TimeRange | un
   return marker ? { start: marker.start_seconds, end: marker.end_seconds } : undefined;
 }
 
-function fileVersionFromV2(version: WatchFileVersionV2): FileVersion {
+export function watchFileVersionFromV2(version: WatchFileVersionV2): FileVersion {
   const {
     file_id,
     duration_seconds,
@@ -67,12 +67,17 @@ function fileVersionFromV2(version: WatchFileVersionV2): FileVersion {
   };
 }
 
+/** Converts a v2 version list at the boundary, in order. */
+export function watchFileVersionsFromV2(versions: WatchFileVersionV2[]): FileVersion[] {
+  return versions.map(watchFileVersionFromV2);
+}
+
 function variantPartFromV2(part: WatchPlaybackVariantPartV2): PlaybackVariantPart {
   return {
     part_index: part.part_index,
     default_file_id: numericId(part.default_file_id),
     total_duration: part.total_duration_seconds,
-    versions: part.versions.map(fileVersionFromV2),
+    versions: watchFileVersionsFromV2(part.versions),
   };
 }
 
@@ -108,7 +113,7 @@ export function watchDetailFromV2(detail: WatchDetailV2): WatchDetail {
     title: detail.title,
     year: detail.year,
     overview: detail.overview ?? "",
-    versions: detail.versions.map(fileVersionFromV2),
+    versions: watchFileVersionsFromV2(detail.versions),
     playback_variants: detail.playback_variants?.map(variantFromV2),
     subtitles: detail.subtitles.map((s) => ({
       source: s.source,

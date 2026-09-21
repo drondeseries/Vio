@@ -82,6 +82,7 @@ interface PlayerControlsProps {
   // Version switching
   versions?: VersionInfo[];
   onSwitchVersion?: (fileId: number) => void;
+  onRefreshVersions?: () => Promise<void>;
   // PiP
   onTogglePiP?: () => void;
   // Playback info
@@ -152,6 +153,7 @@ export function PlayerControls({
   onQualitySelect,
   versions,
   onSwitchVersion,
+  onRefreshVersions,
   onTogglePiP,
   showPlaybackInfo,
   onTogglePlaybackInfo,
@@ -341,6 +343,7 @@ export function PlayerControls({
               onSelect={onQualitySelect}
               versions={versions}
               onSwitchVersion={onSwitchVersion}
+              onRefreshVersions={onRefreshVersions}
             />
             <button
               type="button"
@@ -516,6 +519,7 @@ export function PlayerControls({
                 onSelect={onQualitySelect}
                 versions={versions}
                 onSwitchVersion={onSwitchVersion}
+                onRefreshVersions={onRefreshVersions}
               />
 
               {markerEditAvailable && onToggleMarkerEdit && (

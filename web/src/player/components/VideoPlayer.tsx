@@ -192,6 +192,8 @@ interface VideoPlayerProps {
   activeFileId?: number | null;
   chapters?: PlayerChapter[];
   onSwitchVersion?: (fileId: number, currentPosition: number) => void;
+  /** Re-lists the title's video candidates for the version menu. */
+  onRefreshVersions?: () => Promise<void>;
   subtitleUrls: PlayerSubtitleInfo[];
   initialPosition: number;
   /** `quality_change` replan for a label taken from `plan.available_qualities`. */
@@ -336,6 +338,7 @@ export function VideoPlayer({
   activeFileId,
   chapters = [],
   onSwitchVersion,
+  onRefreshVersions,
   subtitleUrls,
   initialPosition,
   onQualitySelect,
@@ -3711,6 +3714,7 @@ export function VideoPlayer({
           onSwitchVersion={
             onSwitchVersion ? (fileId) => onSwitchVersion(fileId, currentTime) : undefined
           }
+          onRefreshVersions={onRefreshVersions}
           onTogglePiP={handleTogglePiP}
           onPlayPause={handlePlayPause}
           onSeek={handlePlayerSeek}
