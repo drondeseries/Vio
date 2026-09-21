@@ -541,6 +541,7 @@ PUT /api/v2/markers/files/{file_id}	non-media
 DELETE /api/v2/markers/files/{file_id}/{segment}	non-media
 GET /api/v2/markers/items/{item_id}	non-media
 PUT /api/v2/markers/items/{item_id}	non-media
+POST /api/v2/media/{media_id}/virtual-candidates:refresh	non-media
 GET /api/v2/notifications	non-media
 GET /api/v2/notifications/capabilities	non-media
 DELETE /api/v2/notifications/discord-link	non-media
@@ -1685,6 +1686,7 @@ PUT /api/v2/markers/files/{file_id}	non-media
 DELETE /api/v2/markers/files/{file_id}/{segment}	non-media
 GET /api/v2/markers/items/{item_id}	non-media
 PUT /api/v2/markers/items/{item_id}	non-media
+POST /api/v2/media/{media_id}/virtual-candidates:refresh	non-media
 GET /api/v2/notifications	non-media
 GET /api/v2/notifications/capabilities	non-media
 DELETE /api/v2/notifications/discord-link	non-media

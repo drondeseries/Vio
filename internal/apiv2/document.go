@@ -700,6 +700,7 @@ func registerAll(reg *Registry) {
 	registerSystem(reg)
 	registerWatchlist(reg)
 	registerWatch(reg)
+	registerMediaCandidates(reg)
 	registerOpenAPIDocument(reg)
 	registerAPIDocs(reg)
 }

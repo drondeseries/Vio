@@ -258,7 +258,7 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 		"getSubtitlePreference": true, "updateSubtitlePreference": true, "deleteSubtitlePreference": true,
 		"listHistory": true, "removeHistoryEntries": true,
 		"syncProgress":  true,
-		"getWatchState": true, "markWatched": true, "unmarkWatched": true,
+		"getWatchState": true, "markWatched": true, "unmarkWatched": true, "refreshVirtualCandidates": true,
 		"cancelLibraryJob": true,
 		opListDevices:      true, opForgetDevice: true, opClearDeviceSettings: true,
 	}

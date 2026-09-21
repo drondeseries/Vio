@@ -683,6 +683,27 @@ func (s *Service) ListStreams(ctx context.Context, virtualPath string) ([]Playba
 	if err != nil {
 		return nil, err
 	}
+	return s.playbackStreamsFrom(ctx, virtualPath, candidates), nil
+}
+
+// ListStreamsFresh is ListStreams with the bounded provider cache bypassed: the
+// caller explicitly asked for a fresh provider listing (the viewer's "refresh
+// list" action). It ranks and formats the result identically, so the candidate
+// set a refresh persists matches what the version list then shows.
+func (s *Service) ListStreamsFresh(ctx context.Context, virtualPath string) ([]PlaybackStream, error) {
+	if s == nil || s.Resolver == nil {
+		return nil, ErrVirtualLibraryUnavailable
+	}
+	candidates, _, _, err := s.Resolver.GetCandidatesFresh(ctx, virtualPath)
+	if err != nil {
+		return nil, err
+	}
+	return s.playbackStreamsFrom(ctx, virtualPath, candidates), nil
+}
+
+// playbackStreamsFrom is the shared ranking and formatting step of the two
+// list entry points.
+func (s *Service) playbackStreamsFrom(ctx context.Context, virtualPath string, candidates []stream.StreamCandidate) []PlaybackStream {
 	// Rank here too: the handler's auto-pick walks ListStreams, not
 	// ResolveDetailed, so the profile/custom-format order and the rejected
 	// verdict must be carried on the stream records.
@@ -721,7 +742,7 @@ func (s *Service) ListStreams(ctx context.Context, virtualPath string) ([]Playba
 			ProviderReleaseName: resolver.CandidateReleaseName(c),
 		})
 	}
-	return streams, nil
+	return streams
 }
 
 // candidateIDPresent reports whether any candidate carries the given stable

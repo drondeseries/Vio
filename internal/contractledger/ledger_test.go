@@ -1214,6 +1214,7 @@ var mutationWithoutLegacyRow = map[string]string{
 	"uploadAdminCollectionPoster":       "V2 separates administrator poster upload from legacy multipart definition create and update; those legacy operations retain their own mappings.",
 	"uploadAdminCollectionBackdrop":     "V2 separates administrator backdrop upload from legacy multipart definition create and update; those legacy operations retain their own mappings.",
 	"uploadCollectionPoster":            "V2 separates poster upload from legacy multipart collection create and update; their legacy rows remain mapped separately.",
+	"refreshVirtualCandidates":          "V2-only explicit re-list of a virtual item's provider candidates; v1 had no endpoint for this and re-resolved on demand. The legacy watch and playback rows remain mapped separately.",
 }
 
 // retrySafetyMismatches compares every operation the v2 registry declares
