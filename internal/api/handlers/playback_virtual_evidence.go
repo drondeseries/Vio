@@ -85,6 +85,13 @@ const (
 	virtualEvidenceRetryMaxDelay  = time.Second
 	// virtualEvidenceDrainGrace bounds the shutdown drain of accepted work.
 	virtualEvidenceDrainGrace = 5 * time.Second
+	// virtualEvidenceFallbackBudget bounds the last-resort direct evidence write
+	// (and, for the detached-gate fallback, the short foreground probe) the
+	// start path performs when the bounded pool rejects the write or its
+	// detached probe gate is exhausted. Short by design: it is one bounded
+	// attempt on the request path for the foreground candidate only, not a
+	// second worker pool.
+	virtualEvidenceFallbackBudget = 2 * time.Second
 )
 
 // errVirtualEvidenceStale marks a CAS-fenced write that matched no row because
@@ -477,6 +484,39 @@ func (h *PlaybackHandler) enqueueVirtualProbeEvidence(_ context.Context, args mo
 		args:      args,
 	}
 	return buf.admit(task)
+}
+
+// persistVirtualEvidenceDirect performs one bounded synchronous evidence write,
+// bypassing the bounded worker pool. It is the last-resort fallback for the
+// foreground request's own candidate when the pool rejects the write or its
+// detached probe gate is exhausted; it never retries and is bounded by
+// virtualEvidenceFallbackBudget, so it cannot turn into a second worker pool.
+// It returns whether a row was actually updated. background/speculative callers
+// must not use it.
+func (h *PlaybackHandler) persistVirtualEvidenceDirect(ctx context.Context, args models.VirtualFilePersistArgs) bool {
+	if h == nil || args.FileID <= 0 || (h.VirtualFileMetadataSaver == nil && h.VirtualFileSaver == nil) {
+		return false
+	}
+	// The request may already be canceled; a last-resort evidence write should
+	// still land, so keep the values but drop the cancellation.
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualEvidenceFallbackBudget)
+	defer cancel()
+	if h.VirtualFileMetadataSaver != nil {
+		result, err := h.VirtualFileMetadataSaver(writeCtx, args)
+		if err != nil {
+			slog.WarnContext(ctx, "virtual probe evidence direct fallback failed",
+				"component", "api", "file_id", args.FileID, "error", err)
+			return false
+		}
+		return result.MetadataUpdated
+	}
+	rows, err := h.VirtualFileSaver(writeCtx, args)
+	if err != nil {
+		slog.WarnContext(ctx, "virtual probe evidence direct fallback failed",
+			"component", "api", "file_id", args.FileID, "error", err)
+		return false
+	}
+	return rows > 0
 }
 
 // runVirtualEvidenceWorker drains accepted work until the buffer is closed by

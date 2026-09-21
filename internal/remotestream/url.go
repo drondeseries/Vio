@@ -76,9 +76,13 @@ func (u *ValidatedURL) Addresses() []netip.Addr {
 	return append([]netip.Addr(nil), u.addresses...)
 }
 
-// ValidateURL accepts only absolute, externally reachable HTTP(S) URLs.
+// ValidateURL accepts only absolute, externally reachable HTTP(S) URLs. A
+// successful host resolution is reused from a short-lived positive cache so the
+// start path does not pay a DNS round-trip on every play; the forbidden-address
+// rejection is still evaluated on every call, from the cached addresses when
+// fresh. See resolutionCache.
 func ValidateURL(ctx context.Context, raw string) (*ValidatedURL, error) {
-	return validateURL(ctx, raw, net.DefaultResolver)
+	return validateURLWithCache(ctx, raw, net.DefaultResolver, defaultResolutionCache)
 }
 
 // ValidateURLSyntax validates the non-network parts of a remote media URL.
@@ -106,6 +110,41 @@ func validateURL(ctx context.Context, raw string, resolver ipResolver) (*Validat
 	addresses, err := resolvePublicAddresses(ctx, resolver, parsed.Hostname())
 	if err != nil {
 		return nil, err
+	}
+	return &ValidatedURL{parsed: parsed, addresses: addresses}, nil
+}
+
+// validateURLWithCache is ValidateURL with an injectable resolver and cache.
+// Only a fresh positive resolution is served from the cache; a miss always
+// re-resolves and only a successful public result is stored. The SSRF
+// rejection rule is applied to the cached addresses too, so a cache hit can
+// never skip the forbidden-address check.
+func validateURLWithCache(ctx context.Context, raw string, resolver ipResolver, cache *resolutionCache) (*ValidatedURL, error) {
+	parsed, err := validateURLSyntax(raw, false)
+	if err != nil {
+		return nil, err
+	}
+	host := parsed.Hostname()
+	// A literal address is not a DNS name: never cache it, and keep the
+	// existing direct check.
+	if _, addrErr := netip.ParseAddr(host); addrErr != nil {
+		if cached, ok := cache.lookup(host); ok {
+			for _, address := range cached {
+				if forbiddenAddress(address) {
+					return nil, errors.New("remote stream host resolves to a non-public address")
+				}
+			}
+			return &ValidatedURL{parsed: parsed, addresses: cached}, nil
+		}
+	}
+	addresses, err := resolvePublicAddresses(ctx, resolver, host)
+	if err != nil {
+		// Negative results are never cached: a transient resolver failure must
+		// not keep the host unreachable for the TTL.
+		return nil, err
+	}
+	if _, addrErr := netip.ParseAddr(host); addrErr != nil {
+		cache.store(host, addresses)
 	}
 	return &ValidatedURL{parsed: parsed, addresses: addresses}, nil
 }
