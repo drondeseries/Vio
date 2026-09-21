@@ -947,8 +947,9 @@ func completeEvidenceVirtualMovieFile(path string) *models.MediaFile {
 		Container:  "mkv",
 		CodecVideo: "h264",
 		Resolution: "1080p",
+		Bitrate:    10_000,
 		VideoTracks: []models.VideoTrack{{
-			Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24000/1001",
+			Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24000/1001", BitDepth: 8, Bitrate: 10_000,
 		}},
 		AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2}},
 	}

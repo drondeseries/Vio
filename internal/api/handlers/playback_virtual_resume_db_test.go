@@ -34,6 +34,16 @@ func TestResolveVirtualResumeFromDatabaseRow(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE media_files SET file_size = 0 WHERE id = $1`, candidateID); err != nil {
 		t.Fatalf("normalize seeded row size: %v", err)
 	}
+	// The durable-resume fast path now requires planner-grade video evidence:
+	// a stored URL alone no longer authorizes skipping resolve+probe. Seed the
+	// video fields a Phase-1 probe would have persisted.
+	if _, err := pool.Exec(ctx, `
+		UPDATE media_files
+		SET codec_video = 'h264', resolution = '1080p', bitrate = 10000,
+			video_tracks = '[{"codec":"h264","width":1920,"height":1080,"frame_rate":"24000/1001","bit_depth":8,"bitrate":10000}]'::jsonb
+		WHERE id = $1`, candidateID); err != nil {
+		t.Fatalf("seed planner-grade video evidence: %v", err)
+	}
 
 	repo := scanner.NewFileRepository(pool)
 	row, err := repo.GetByPath(ctx, candidatePath)

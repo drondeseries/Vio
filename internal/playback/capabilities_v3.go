@@ -221,6 +221,32 @@ func routeVideoMetadataCompleteV3(source SourceDescriptorV3) bool {
 		source.BitrateKbps > 0
 }
 
+// VirtualRouteVideoMetadataCompleteV3 is the row-level form of
+// routeVideoMetadataCompleteV3 for a media file that has not yet been planned.
+// The virtual playback fast paths use it so a stored-URL resume cannot skip the
+// resolve+probe the planner depends on: a row whose video fields are not
+// planner-complete must fall through to a real probe. Audio-only files have no
+// video route to validate, so they report false here and callers exempt them
+// explicitly. Frame rate is parsed through the same parseFrameRateV3 the source
+// descriptor uses, so the stored "30000/1001"-style strings stay compatible.
+func VirtualRouteVideoMetadataCompleteV3(file *models.MediaFile) bool {
+	if file == nil || file.IsAudioOnly() {
+		return false
+	}
+	return routeVideoMetadataCompleteV3(SourceDescriptorFromFileV3(file, -1))
+}
+
+// VirtualRouteVideoMetadataGapsV3 is the row-level counterpart of
+// routeVideoMetadataGapsDetailV3. It names the missing video fields in the same
+// order and wording the source_metadata_incomplete terminal uses, so a
+// fast-path skip log can be correlated with the terminal it prevents.
+func VirtualRouteVideoMetadataGapsV3(file *models.MediaFile) string {
+	if file == nil || file.IsAudioOnly() {
+		return ""
+	}
+	return routeVideoMetadataGapsDetailV3(SourceDescriptorFromFileV3(file, -1))
+}
+
 // nativeOutputHDRV3 resolves the HDR facts a native HDR/DV presentation may be
 // planned against. output.hdr_details is the authority. The device-level
 // capability is a fallback only for clients that predate the output display
