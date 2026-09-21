@@ -165,6 +165,10 @@ jobs:
 
       - name: Inject and persist Go build cache
         uses: reproducible-containers/buildkit-cache-dance@v3
+        # The inject round-trip can time out waiting for the arm64 BuildKit
+        # builder; the cache is an optimization, so retry once and otherwise
+        # degrade to a full uncached build instead of failing the image.
+        continue-on-error: true
         with:
           builder: ${{ steps.buildx.outputs.name }}
           scratch-dir: ${{ runner.temp }}/buildkit-scratch
