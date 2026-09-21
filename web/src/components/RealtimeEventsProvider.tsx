@@ -749,7 +749,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     const adminRefresh = createRealtimeQueryRefreshScheduler(
       queryClient,
       authorityActive,
-      () => allowDashboardRealtimeUpdatesRef.current,
+      (queryKey) => !isDashboardQueryKey(queryKey) || allowDashboardRealtimeUpdatesRef.current,
     );
     const refreshSessions = () => {
       if (!authority.profileId) return;

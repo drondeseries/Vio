@@ -717,6 +717,41 @@ describe("RealtimeEventsProvider", () => {
     },
   );
 
+  it("refreshes task completion while the visible dashboard is unfocused", async () => {
+    mockState.pathname = "/admin";
+    mockState.pageActivity.isFocused = false;
+    mockState.pageActivity.canPollDashboard = false;
+    const client = new QueryClient({
+      defaultOptions: { queries: { refetchOnWindowFocus: false } },
+    });
+    const task = { key: "refresh_metadata", state: "running", progress: 10 };
+    const finishedTask = { ...task, state: "idle", progress: 0 };
+    const load = vi.fn(async () => [finishedTask]);
+    client.setQueryData(adminKeys.tasks(), [task]);
+    function TaskObserver() {
+      useQuery({ queryKey: adminKeys.tasks(), queryFn: load, staleTime: Infinity });
+      return null;
+    }
+    render(
+      <QueryClientProvider client={client}>
+        <RealtimeEventsProvider>
+          <TaskObserver />
+        </RealtimeEventsProvider>
+      </QueryClientProvider>,
+    );
+    await act(async () => {});
+    await act(async () => {
+      FakeWebSocket.instances[0]!.emitMessage({
+        type: "event",
+        channel: "tasks",
+        event: "task.updated",
+        data: finishedTask,
+      });
+    });
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(client.getQueryData(adminKeys.tasks())).toEqual([finishedTask]);
+  });
+
   it("defers broad catch-up refetches until foreground playback exits", async () => {
     const queryClient = new QueryClient({
       defaultOptions: {

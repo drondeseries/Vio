@@ -7,7 +7,7 @@ const REFRESH_WINDOW_MS = 5_000;
 export function createRealtimeQueryRefreshScheduler(
   queryClient: QueryClient,
   authorityActive: () => boolean,
-  allowUpdates: () => boolean,
+  allowRefetch: (queryKey: QueryKey) => boolean,
 ) {
   const pending = new Map<string, QueryKey>();
   let timer: number | undefined;
@@ -18,7 +18,6 @@ export function createRealtimeQueryRefreshScheduler(
     if (cancelled || !authorityActive() || pending.size === 0) return;
     const queries = [...pending];
     pending.clear();
-    const refetchType = allowUpdates() ? "active" : "none";
     refreshing = true;
     const settle = () => {
       refreshing = false;
@@ -30,6 +29,7 @@ export function createRealtimeQueryRefreshScheduler(
     };
     void Promise.all(
       queries.map(([hash, queryKey]) => {
+        const refetchType = allowRefetch(queryKey) ? "active" : "none";
         // Preserve an existing read, then catch up once after it settles.
         if (
           refetchType === "active" &&
