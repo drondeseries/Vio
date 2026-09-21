@@ -127,16 +127,19 @@ type SubtitleInventoryItemV3 struct {
 // what makes the `file:{id}:subtitle:{published ordinal}` identity meaningful.
 //
 // Entries are collapsed only when they positively identify the same track: the
-// same source range, the same non-empty base language (or, for downloaded
-// rows, the same positive stable row ID), the same normalized codec, and the
-// same forced and hearing-impaired flags. An entry with an unknown language and
-// no other positive identity is never suppressed, so several unknown-language
-// tracks that merely share a codec or flags are all published. The seen-set
-// spans all three ranges, so a duplicate later in the combined list
-// de-duplicates against an earlier one. Downloaded entries key on their stable
-// row ID, so two distinct downloads in one language are both kept, and a
-// downloaded or AI subtitle is never dropped merely because an embedded track
-// shares its language (the source range differs).
+// same source range, the same non-empty base language or per-track identity
+// (an embedded track's authored title; a downloaded row's stable row ID), the
+// same normalized codec, and the same forced and hearing-impaired flags.
+// Distinct embedded tracks that share a base language but carry different
+// authored titles — fr-FR beside fr-CA, forced or not — are therefore all
+// published. An entry with an unknown language and no other positive identity
+// is never suppressed, so several unknown-language tracks that merely share a
+// codec or flags are all published. The seen-set spans all three ranges, so a
+// duplicate later in the combined list de-duplicates against an earlier one.
+// Downloaded entries key on their stable row ID, so two distinct downloads in
+// one language are both kept, and a downloaded or AI subtitle is never dropped
+// merely because an embedded track shares its language (the source range
+// differs).
 //
 // The returned items carry no URLs; use SubtitleInventoryV3 once a session
 // exists.
@@ -158,7 +161,7 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 			sub.Forced, sub.Default, sub.HearingImpaired))
 	}
 	for index, track := range file.SubtitleTracks {
-		if subtitleInventoryDuplicateV3(seen, SubtitleSourceEmbeddedV3, "", track.Codec, track.Language, track.Forced, track.HearingImpaired) {
+		if subtitleInventoryDuplicateV3(seen, SubtitleSourceEmbeddedV3, embeddedSubtitleIdentityV3(track), track.Codec, track.Language, track.Forced, track.HearingImpaired) {
 			continue
 		}
 		items = append(items, subtitleInventoryItemV3(file.ID, len(items), externalCount+index, SubtitleSourceEmbeddedV3, track.Codec,
@@ -194,12 +197,13 @@ func BuildSubtitleInventoryV3(file *models.MediaFile, additional []SubtitleInven
 // and reports whether an equivalent track was already seen.
 //
 // Suppression requires a positive identity for the track: a recognized,
-// non-empty canonical language, or (for downloaded rows) a positive stable row
-// ID, passed as identity. An entry with neither is never a de-duplication
-// candidate and is never recorded, so two tracks whose language is unknown are
-// never collapsed merely because their codec, forced flag or hearing-impaired
-// flag coincide. The key pairs that identity with the source range, normalized
-// codec and flags, so entries differing in any of those stay distinct.
+// non-empty canonical language, an embedded track's authored title, or (for
+// downloaded rows) a positive stable row ID. An entry with none of those is
+// never a de-duplication candidate and is never recorded, so two tracks whose
+// language is unknown are never collapsed merely because their codec, forced
+// flag or hearing-impaired flag coincide. The key pairs that identity with the
+// source range, normalized codec and flags, so entries differing in any of
+// those stay distinct.
 func subtitleInventoryDuplicateV3(seen map[string]struct{}, source, identity, codec, language string, forced, hearingImpaired bool) bool {
 	base := stream.CanonicalLanguageBase(language)
 	if base == "" && identity == "" {
@@ -218,6 +222,26 @@ func subtitleInventoryDuplicateV3(seen map[string]struct{}, source, identity, co
 	}
 	seen[key] = struct{}{}
 	return false
+}
+
+// embeddedSubtitleIdentityV3 returns a positive per-track discriminator for an
+// embedded container subtitle, so genuinely distinct tracks survive the
+// inventory de-duplication while the same track described twice still collapses.
+// Two French tracks whose regional codes canonicalize to the same base language
+// (for example fr-FR and fr-CA) are distinguishable by their authored title
+// when the container names them, which is the only per-track identity the
+// de-duplication can compare without re-publishing a language's aliases.
+//
+// The authored title (the raw embedded title, or the stored title when the
+// probe recorded one) is the identity. A track with no authored title carries
+// no positive identity and is never a suppression candidate beyond its base
+// language, so unknown-identity tracks are still all kept and a bare
+// language+codec+flags alias still collapses.
+func embeddedSubtitleIdentityV3(track models.SubtitleTrack) string {
+	if title := strings.TrimSpace(firstNonEmptySubtitleLabelV3(track.EmbeddedTitle, track.Title)); title != "" {
+		return "title:" + title
+	}
+	return ""
 }
 
 // SubtitleInventoryV3 returns the combined-ordinal inventory with

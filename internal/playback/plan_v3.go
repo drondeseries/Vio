@@ -369,7 +369,7 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	// Authoritative per-track audio inventory of the effective source; clients
 	// should prefer it over item metadata, which can be stale after a version
 	// fallback rehydrates a different candidate under the same catalog row.
-	base.AudioTracks = file.AudioTracks
+	base.AudioTracks = audioInventoryV3(file)
 	base.Claims.Audio.Passthrough = passthrough
 	if mkvQuirkFired {
 		appendAppliedQuirkV3(&base, *mkvQuirk, "")
@@ -823,7 +823,7 @@ func planAudioOnlyV3(input PlannerInputV3, file *models.MediaFile, source Source
 		// The audio inventory is the effective source's probed tracks, exactly
 		// as on video plans: clients render the audio menu from it rather than
 		// from item metadata that can be stale after a version fallback.
-		AudioTracks:            file.AudioTracks,
+		AudioTracks:            audioInventoryV3(file),
 		Transformations:        []TransformationV3{},
 		AppliedQuirks:          []AppliedQuirkV3{},
 		RuntimeCorrections:     []string{},
@@ -1640,6 +1640,39 @@ func selectedTracksForPlanV3(file *models.MediaFile, audioIndex int, subtitle Su
 		selected.Subtitle = &TrackIdentityV3{ID: TrackIDV3(file.ID, "subtitle", index), Index: &index}
 	}
 	return selected
+}
+
+// audioInventoryV3 builds the plan's audio inventory at its canonical selection
+// ordinals. The raw container stream index is preserved on each entry (it is
+// what the serve path and the ffmpeg mapping use), while track_id and
+// selection_index name the value a client must echo to select the track; they
+// always agree with selected_tracks.audio and the audio_track_index request
+// field. The input slice is never mutated; the catalog keeps its own tracks.
+func audioInventoryV3(file *models.MediaFile) []AudioInventoryItemV3 {
+	if file == nil || len(file.AudioTracks) == 0 {
+		return nil
+	}
+	items := make([]AudioInventoryItemV3, len(file.AudioTracks))
+	for i, track := range file.AudioTracks {
+		items[i] = AudioInventoryItemV3{
+			Index:          track.Index,
+			Title:          track.Title,
+			EmbeddedTitle:  track.EmbeddedTitle,
+			Language:       track.Language,
+			Languages:      track.Languages,
+			Codec:          track.Codec,
+			Profile:        track.Profile,
+			Layout:         track.Layout,
+			Channels:       track.Channels,
+			Bitrate:        track.Bitrate,
+			SampleRate:     track.SampleRate,
+			BitDepth:       track.BitDepth,
+			Default:        track.Default,
+			TrackID:        TrackIDV3(file.ID, "audio", i),
+			SelectionIndex: i,
+		}
+	}
+	return items
 }
 
 // audioSelectionUsesContainerDefaultV3 reports whether an untouched source

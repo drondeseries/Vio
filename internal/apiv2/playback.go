@@ -70,18 +70,23 @@ type PlaybackStartBody struct {
 	ClientPlaybackContext      playback.ClientPlaybackContextV3   `json:"client_playback_context"`
 }
 type PlaybackPlan struct {
-	ProtocolVersion        int                             `json:"protocol_version"`
-	PlanID                 string                          `json:"plan_id"`
-	PlanAttemptKey         string                          `json:"plan_attempt_key"`
-	SessionID              string                          `json:"session_id,omitempty"`
-	ExpiresAt              string                          `json:"expires_at,omitempty"`
-	Delivery               playback.DeliveryV3             `json:"delivery"`
-	Stream                 playback.StreamV3               `json:"stream"`
-	Timeline               playback.TimelineV3             `json:"timeline"`
-	SelectedTracks         playback.SelectedTracksV3       `json:"selected_tracks"`
-	EffectiveRecipe        playback.EffectiveRecipeV3      `json:"effective_recipe"`
-	Claims                 playback.ValidationClaimsV3     `json:"claims"`
-	Subtitle               playback.SubtitleDecisionV3     `json:"subtitle"`
+	ProtocolVersion int                         `json:"protocol_version"`
+	PlanID          string                      `json:"plan_id"`
+	PlanAttemptKey  string                      `json:"plan_attempt_key"`
+	SessionID       string                      `json:"session_id,omitempty"`
+	ExpiresAt       string                      `json:"expires_at,omitempty"`
+	Delivery        playback.DeliveryV3         `json:"delivery"`
+	Stream          playback.StreamV3           `json:"stream"`
+	Timeline        playback.TimelineV3         `json:"timeline"`
+	SelectedTracks  playback.SelectedTracksV3   `json:"selected_tracks"`
+	EffectiveRecipe playback.EffectiveRecipeV3  `json:"effective_recipe"`
+	Claims          playback.ValidationClaimsV3 `json:"claims"`
+	Subtitle        playback.SubtitleDecisionV3 `json:"subtitle"`
+	// AudioTracks is the effective source's audio inventory, with the canonical
+	// selection ordinal (selection_index / track_id) on each entry. It mirrors
+	// the v3 plan so a v2 client selects a track by that ordinal rather than the
+	// raw container stream index.
+	AudioTracks            []playback.AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
 	Transformations        []playback.TransformationV3     `json:"transformations"`
 	AppliedQuirks          []playback.AppliedQuirkV3       `json:"applied_quirks"`
 	RuntimeCorrections     []string                        `json:"runtime_corrections"`
@@ -479,7 +484,7 @@ func playbackDecision(in playback.DecisionResponseV3) PlaybackDecision {
 		p := in.PlaybackPlan
 		stream := p.Stream
 		stream.URL = playbackV2MediaURL(stream.URL)
-		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: p.AvailableQualities, DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, VirtualSourceRevision: p.VirtualSourceRevision, Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
+		out.PlaybackPlan = &PlaybackPlan{ProtocolVersion: p.ProtocolVersion, PlanID: p.PlanID, PlanAttemptKey: p.PlanAttemptKey, SessionID: p.SessionID, ExpiresAt: p.ExpiresAt, Delivery: p.Delivery, Stream: stream, Timeline: p.Timeline, SelectedTracks: p.SelectedTracks, EffectiveRecipe: p.EffectiveRecipe, Claims: p.Claims, Subtitle: playbackV2Subtitle(p.Subtitle), AudioTracks: p.AudioTracks, Transformations: p.Transformations, AppliedQuirks: p.AppliedQuirks, RuntimeCorrections: p.RuntimeCorrections, AvailableQualities: p.AvailableQualities, DegradationWarnings: p.DegradationWarnings, DecisionReason: p.DecisionReason, RequestedMediaFileID: ID(strconv.Itoa(p.RequestedMediaFileID)), EffectiveMediaFileID: ID(strconv.Itoa(p.EffectiveMediaFileID)), EffectiveVirtualURI: p.EffectiveVirtualURI, VirtualSourceRevision: p.VirtualSourceRevision, Source: playbackSource(p.Source), SubtitleFidelityPolicy: p.SubtitleFidelityPolicy}
 	}
 	return out
 }

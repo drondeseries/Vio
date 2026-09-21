@@ -124,7 +124,7 @@
     },
     "audio_track": {
       "type": "object",
-      "description": "One probed audio stream of the effective source, mirroring the catalog's file-version audio_tracks shape. `index` is the absolute container stream index as ffprobe reported it (video is typically stream 0, the first audio stream 1, subtitles interleaved between them) — not the track's position in the audio_tracks array, and not the audio-only FFmpeg ordinal `0:a:N` (first audio = 0). Example: in a video-first file the first audio has absolute index 1 but FFmpeg audio ordinal 0.",
+      "description": "One selectable audio stream of the effective source at its canonical selection ordinal, mirroring the catalog's file-version audio_tracks shape. `index` is the absolute container stream index as ffprobe reported it (video is typically stream 0, the first audio stream 1, subtitles interleaved between them) — not the track's position in the audio_tracks array, and not the audio-only FFmpeg ordinal `0:a:N` (first audio = 0). Example: in a video-first file the first audio has absolute index 1 but FFmpeg audio ordinal 0. Select a track with `track_id`/`selection_index`; never send `index` as the selection.",
       "properties": {
         "index": {
           "type": "integer"
@@ -167,6 +167,14 @@
         },
         "default": {
           "type": "boolean"
+        },
+        "track_id": {
+          "type": "string",
+          "description": "Canonical selection identity, file:<id>:audio:<selection_index>."
+        },
+        "selection_index": {
+          "type": "integer",
+          "description": "0-based position in the audio inventory; the value audio_track_index and the selected_tracks.audio identity carry."
         }
       },
       "additionalProperties": true

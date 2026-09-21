@@ -8,8 +8,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 const (
@@ -976,8 +974,38 @@ type PlanV3 struct {
 	// effective source, mirroring the subtitle inventory. Clients should
 	// prefer it over item metadata: after a version fallback the effective
 	// file can differ from the requested catalog row, and only this list
-	// reflects the tracks the plan actually plays.
-	AudioTracks []models.AudioTrack `json:"audio_tracks,omitempty"`
+	// reflects the tracks the plan actually plays. Select a track by echoing an
+	// entry's track_id or selection_index, never by its raw index.
+	AudioTracks []AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
+}
+
+// AudioInventoryItemV3 is one selectable audio track of the effective source at
+// its canonical selection ordinal. It mirrors SubtitleInventoryItemV3 so a
+// client selects a track by echoing track_id or selection_index instead of the
+// raw container stream index, which lives in a different domain: index is the
+// absolute ffprobe stream index (video 0, first audio 1, subtitles
+// interleaved), while selection_index is the 0-based inventory position the
+// start/replan request's audio_track_index and audio_track_id must carry.
+type AudioInventoryItemV3 struct {
+	Index         int      `json:"index,omitempty"`
+	Title         string   `json:"title,omitempty"`
+	EmbeddedTitle string   `json:"embedded_title,omitempty"`
+	Language      string   `json:"language,omitempty"`
+	Languages     []string `json:"languages,omitempty"`
+	Codec         string   `json:"codec,omitempty"`
+	Profile       string   `json:"profile,omitempty"`
+	Layout        string   `json:"layout,omitempty"`
+	Channels      int      `json:"channels,omitempty"`
+	Bitrate       int      `json:"bitrate,omitempty"`
+	SampleRate    int      `json:"sample_rate,omitempty"`
+	BitDepth      int      `json:"bit_depth,omitempty"`
+	Default       bool     `json:"default"`
+	// TrackID is the canonical selection identity, file:<id>:audio:<selection_index>.
+	TrackID string `json:"track_id"`
+	// SelectionIndex is this track's 0-based position in the inventory, the
+	// value the selected_tracks.audio identity and the audio_track_index
+	// request field use.
+	SelectionIndex int `json:"selection_index"`
 }
 
 type TerminalV3 struct {
