@@ -12509,6 +12509,8 @@ export interface components {
       sync_schedule?: string;
       title: string;
       url: string;
+      /** @description Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable. */
+      virtual_playback?: boolean;
     };
     AdminMergeInputBody: {
       into: string;
@@ -14731,6 +14733,8 @@ export interface components {
       dry_run?: boolean;
       featured?: components["schemas"]["AdminTemplateFeatured"];
       library_ids: string[];
+      /** @description Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable. */
+      virtual_playback?: boolean;
     };
     AdminTemplateCollectionEntry: {
       /**
@@ -14836,6 +14840,8 @@ export interface components {
       sync_schedule?: string;
       time_window?: string;
       title: string;
+      /** @description Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable. */
+      virtual_playback?: boolean;
     };
     AdminTopTitle: {
       media_item_id: string;
@@ -14872,6 +14878,8 @@ export interface components {
       sort_config?: unknown;
       sync_schedule?: string;
       title: string;
+      /** @description Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable. */
+      virtual_playback?: boolean;
     };
     AdminTranslateMetadataInputBody: {
       force?: boolean;

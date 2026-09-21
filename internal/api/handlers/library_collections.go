@@ -388,7 +388,7 @@ type importMDBListRequest struct {
 	Description       string          `json:"description"`
 	URL               string          `json:"url"`
 	Limit             *int            `json:"limit,omitempty"`
-	VirtualPlayback   bool            `json:"virtual_playback,omitempty"`
+	VirtualPlayback   *bool           `json:"virtual_playback,omitempty"`
 	Featured          bool            `json:"featured"`
 	SortOrder         int             `json:"sort_order,omitempty"`
 	PosterURL         string          `json:"poster_url"`
@@ -414,7 +414,7 @@ type importTMDBRequest struct {
 	TimeWindow         string          `json:"time_window"`
 	MediaType          string          `json:"media_type"`
 	Limit              *int            `json:"limit,omitempty"`
-	VirtualPlayback    bool            `json:"virtual_playback,omitempty"`
+	VirtualPlayback    *bool           `json:"virtual_playback,omitempty"`
 	Featured           bool            `json:"featured"`
 	SortOrder          int             `json:"sort_order,omitempty"`
 	PosterURL          string          `json:"poster_url"`
@@ -439,7 +439,7 @@ type importTMDBFranchiseRequest struct {
 	Description        string `json:"description"`
 	CollectionID       int    `json:"collection_id"`
 	Limit              *int   `json:"limit,omitempty"`
-	VirtualPlayback    bool   `json:"virtual_playback,omitempty"`
+	VirtualPlayback    *bool  `json:"virtual_playback,omitempty"`
 	Featured           bool   `json:"featured"`
 	SortOrder          int    `json:"sort_order,omitempty"`
 	PosterURL          string `json:"poster_url"`
@@ -466,7 +466,7 @@ type importTMDBDiscoverRequest struct {
 	MediaType          string                     `json:"media_type"`
 	Spec               importTMDBDiscoverSpecBody `json:"spec"`
 	Limit              *int                       `json:"limit,omitempty"`
-	VirtualPlayback    bool                       `json:"virtual_playback,omitempty"`
+	VirtualPlayback    *bool                      `json:"virtual_playback,omitempty"`
 	Featured           bool                       `json:"featured"`
 	SortOrder          int                        `json:"sort_order,omitempty"`
 	PosterURL          string                     `json:"poster_url"`
@@ -509,7 +509,7 @@ type importTraktRequest struct {
 	// (https://trakt.tv/users/{user}/lists/{slug}) instead of a preset.
 	ListURL           string `json:"list_url,omitempty"`
 	Limit             *int   `json:"limit,omitempty"`
-	VirtualPlayback   bool   `json:"virtual_playback,omitempty"`
+	VirtualPlayback   *bool  `json:"virtual_playback,omitempty"`
 	Featured          bool   `json:"featured"`
 	PosterURL         string `json:"poster_url"`
 	PosterSourceURL   string `json:"poster_source_url"`
@@ -529,8 +529,26 @@ type applyTemplateBundleRequest struct {
 	LibraryIDs      []int                          `json:"library_ids"`
 	DryRun          bool                           `json:"dry_run"`
 	DeleteExisting  bool                           `json:"delete_existing"`
-	VirtualPlayback bool                           `json:"virtual_playback,omitempty"`
+	VirtualPlayback *bool                          `json:"virtual_playback,omitempty"`
 	Featured        *templateBundleFeaturedRequest `json:"featured,omitempty"`
+}
+
+// resolveVirtualPlayback applies the collection-creation default for
+// virtual_playback: an omitted field (nil pointer) means "on", so a client
+// that does not know about the toggle — third-party imports and
+// creates-from-template included — gets the same zero-storage behavior as
+// the first-party UI. An explicit false is a non-nil pointer and is honored.
+//
+// The request fields are *bool rather than bool because a plain bool cannot
+// distinguish "omitted" from "sent false" once decoded. These structs are
+// request-only: nothing serializes them back out, so omitempty never drops an
+// explicit false on the wire. The stored source_config keeps its own
+// `virtual_playback,omitempty` bool, where an absent key already means false.
+func resolveVirtualPlayback(v *bool) bool {
+	if v == nil {
+		return true
+	}
+	return *v
 }
 
 type templateBundleFeaturedRequest struct {
@@ -1313,9 +1331,13 @@ func (h *LibraryCollectionHandler) ExecuteTemplateBundleApply(
 	progress func(current, total int, message string),
 ) (any, error) {
 	resp, err := h.applyTemplateBundle(ctx, req.BundleID, applyTemplateBundleRequest{
-		LibraryIDs:      req.LibraryIDs,
-		DeleteExisting:  req.DeleteExisting,
-		VirtualPlayback: req.VirtualPlayback,
+		LibraryIDs:     req.LibraryIDs,
+		DeleteExisting: req.DeleteExisting,
+		// The stored payload already carries the effective value, resolved by
+		// the producer at enqueue. Passing its address keeps applyTemplateBundle
+		// from re-running the "omitted means on" API default, which would flip
+		// legacy field-less jobs to on instead of preserving their false.
+		VirtualPlayback: &req.VirtualPlayback,
 		Featured:        fromAdminJobTemplateBundleFeatured(req.Featured),
 	}, progress)
 	if err != nil {
@@ -1538,7 +1560,7 @@ func (h *LibraryCollectionHandler) applyTemplateBundle(
 				continue
 			}
 
-			collection, err := h.createCollectionFromTemplate(ctx, bundle.ID, tmpl, library.ID, key, req.VirtualPlayback)
+			collection, err := h.createCollectionFromTemplate(ctx, bundle.ID, tmpl, library.ID, key, resolveVirtualPlayback(req.VirtualPlayback))
 			if err != nil {
 				entry.Reason = err.Error()
 				resp.Failed = append(resp.Failed, entry)
@@ -2107,7 +2129,7 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 			TimeWindow:         tmpl.TMDB.TimeWindow,
 			MediaType:          tmpl.TMDB.MediaType,
 			Limit:              limit,
-			VirtualPlayback:    virtualPlayback,
+			VirtualPlayback:    &virtualPlayback,
 			Featured:           tmpl.Featured,
 			SortOrder:          tmpl.DefaultSortOrder,
 			PosterURL:          tmpl.PosterPath,
@@ -2127,7 +2149,7 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 			Description:        tmpl.Description,
 			URL:                tmpl.MDBList.URL,
 			Limit:              limit,
-			VirtualPlayback:    virtualPlayback,
+			VirtualPlayback:    &virtualPlayback,
 			Featured:           tmpl.Featured,
 			SortOrder:          tmpl.DefaultSortOrder,
 			PosterURL:          tmpl.PosterPath,
@@ -2146,7 +2168,7 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 			Title:              tmpl.Title,
 			Description:        tmpl.Description,
 			CollectionID:       tmpl.TMDBCollection.CollectionID,
-			VirtualPlayback:    virtualPlayback,
+			VirtualPlayback:    &virtualPlayback,
 			Limit:              limit,
 			Featured:           tmpl.Featured,
 			SortOrder:          tmpl.DefaultSortOrder,
@@ -2166,7 +2188,7 @@ func (h *LibraryCollectionHandler) createCollectionFromTemplate(
 			Title:           tmpl.Title,
 			Description:     tmpl.Description,
 			MediaType:       tmpl.TMDBDiscover.MediaType,
-			VirtualPlayback: virtualPlayback,
+			VirtualPlayback: &virtualPlayback,
 			Spec: importTMDBDiscoverSpecBody{
 				WithGenres:       tmpl.TMDBDiscover.WithGenres,
 				WithoutGenres:    tmpl.TMDBDiscover.WithoutGenres,
@@ -2212,7 +2234,7 @@ func (h *LibraryCollectionHandler) createMDBListCollection(
 	if err != nil {
 		return nil, requestValidationError{err: err}
 	}
-	sourceConfig, err := buildMDBListSourceConfig(normalizedURL, req.Limit, req.VirtualPlayback)
+	sourceConfig, err := buildMDBListSourceConfig(normalizedURL, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 	if err != nil {
 		return nil, fmt.Errorf("building MDBList source config: %w", err)
 	}
@@ -2277,7 +2299,7 @@ func (h *LibraryCollectionHandler) createTMDBCollection(
 		syncSchedule = &s
 	}
 
-	sourceConfig, err := buildTMDBSourceConfig(preset, mediaType, timeWindow, req.Limit, req.VirtualPlayback)
+	sourceConfig, err := buildTMDBSourceConfig(preset, mediaType, timeWindow, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 	if err != nil {
 		return nil, fmt.Errorf("building TMDB source config: %w", err)
 	}
@@ -2351,7 +2373,7 @@ func (h *LibraryCollectionHandler) createTMDBFranchiseCollection(
 		syncSchedule = &s
 	}
 
-	sourceConfig, err := buildTMDBCollectionSourceConfig(req.CollectionID, req.Limit, req.VirtualPlayback)
+	sourceConfig, err := buildTMDBCollectionSourceConfig(req.CollectionID, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 	if err != nil {
 		return nil, fmt.Errorf("building TMDB franchise source config: %w", err)
 	}
@@ -2414,7 +2436,7 @@ func (h *LibraryCollectionHandler) createTMDBDiscoverCollection(
 		syncSchedule = &s
 	}
 
-	sourceConfig, err := buildTMDBDiscoverSourceConfig(req.MediaType, req.Spec, req.Limit, req.VirtualPlayback)
+	sourceConfig, err := buildTMDBDiscoverSourceConfig(req.MediaType, req.Spec, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
 	if err != nil {
 		return nil, fmt.Errorf("building TMDB discover source config: %w", err)
 	}

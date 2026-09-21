@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/collections/templates"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -481,5 +482,175 @@ func TestLibraryCollectionGroupResponseUsesAPIFieldNames(t *testing.T) {
 	}
 	if _, ok := group["ID"]; ok {
 		t.Fatalf("group response leaked Go field names: %#v", group)
+	}
+}
+
+// assertSourceConfigVirtualPlayback checks the effective virtual_playback value
+// of a stored source_config. The builders emit the key only when it is true
+// (the payload uses omitempty), and every catalog reader treats an absent key
+// as false, so the assertion pins both the raw key and the catalog's effective
+// reader.
+func assertSourceConfigVirtualPlayback(t *testing.T, raw json.RawMessage, want bool) {
+	t.Helper()
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal source config: %v", err)
+	}
+	_, present := payload["virtual_playback"]
+	if want && !present {
+		t.Errorf("source_config should carry virtual_playback=true: %s", raw)
+	}
+	if !want && present {
+		t.Errorf("source_config should omit virtual_playback for false: %s", raw)
+	}
+	if got := catalog.SourceEnablesVirtualPlayback(raw); got != want {
+		t.Errorf("effective virtual playback = %v, want %v (%s)", got, want, raw)
+	}
+}
+
+func TestResolveVirtualPlayback(t *testing.T) {
+	if got := resolveVirtualPlayback(nil); !got {
+		t.Errorf("omitted virtual_playback resolved to %v, want true", got)
+	}
+	if got := resolveVirtualPlayback(new(false)); got {
+		t.Errorf("explicit false virtual_playback resolved to %v, want false", got)
+	}
+	if got := resolveVirtualPlayback(new(true)); !got {
+		t.Errorf("explicit true virtual_playback resolved to %v, want true", got)
+	}
+}
+
+// TestCollectionImportVirtualPlaybackDefaults pins the API-boundary default:
+// a request that omits virtual_playback stores source_config with the flag on,
+// an explicit false stores it off, and an explicit true stores it on. Each
+// case decodes a real request body and builds through the same
+// build*SourceConfig writer the matching create*Collection handler uses.
+func TestCollectionImportVirtualPlaybackDefaults(t *testing.T) {
+	type importCase struct {
+		name  string
+		build func(field string) (json.RawMessage, error)
+	}
+	cases := []importCase{
+		{
+			name: "tmdb_preset",
+			build: func(field string) (json.RawMessage, error) {
+				var req importTMDBRequest
+				if err := json.Unmarshal([]byte(`{"preset":"popular","media_type":"movie"`+field+`}`), &req); err != nil {
+					return nil, err
+				}
+				preset, mediaType, timeWindow, err := normalizeTMDBPresetRequest(req.Preset, req.MediaType, req.TimeWindow)
+				if err != nil {
+					return nil, err
+				}
+				return buildTMDBSourceConfig(preset, mediaType, timeWindow, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
+			},
+		},
+		{
+			name: "tmdb_franchise",
+			build: func(field string) (json.RawMessage, error) {
+				var req importTMDBFranchiseRequest
+				if err := json.Unmarshal([]byte(`{"collection_id":86311`+field+`}`), &req); err != nil {
+					return nil, err
+				}
+				return buildTMDBCollectionSourceConfig(req.CollectionID, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
+			},
+		},
+		{
+			name: "tmdb_discover",
+			build: func(field string) (json.RawMessage, error) {
+				var req importTMDBDiscoverRequest
+				if err := json.Unmarshal([]byte(`{"media_type":"movie","spec":{"sort_by":"popularity.desc"}`+field+`}`), &req); err != nil {
+					return nil, err
+				}
+				return buildTMDBDiscoverSourceConfig(req.MediaType, req.Spec, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
+			},
+		},
+		{
+			name: "trakt_preset",
+			build: func(field string) (json.RawMessage, error) {
+				var req importTraktRequest
+				if err := json.Unmarshal([]byte(`{"preset":"trending","media_type":"movie"`+field+`}`), &req); err != nil {
+					return nil, err
+				}
+				return buildTraktSourceConfig("trending", "movie", "", req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
+			},
+		},
+		{
+			name: "trakt_list",
+			build: func(field string) (json.RawMessage, error) {
+				var req importTraktRequest
+				if err := json.Unmarshal([]byte(`{"list_url":"https://trakt.tv/users/user/lists/list"`+field+`}`), &req); err != nil {
+					return nil, err
+				}
+				return buildTraktListSourceConfig(req.ListURL, req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
+			},
+		},
+		{
+			name: "mdblist",
+			build: func(field string) (json.RawMessage, error) {
+				var req importMDBListRequest
+				if err := json.Unmarshal([]byte(`{"url":"https://mdblist.com/lists/user/list"`+field+`}`), &req); err != nil {
+					return nil, err
+				}
+				return buildMDBListSourceConfig("https://mdblist.com/lists/user/list", req.Limit, resolveVirtualPlayback(req.VirtualPlayback))
+			},
+		},
+	}
+	variants := []struct {
+		name  string
+		field string
+		want  bool
+	}{
+		{name: "omitted", field: "", want: true},
+		{name: "explicit_false", field: `,"virtual_playback":false`, want: false},
+		{name: "explicit_true", field: `,"virtual_playback":true`, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, variant := range variants {
+				t.Run(variant.name, func(t *testing.T) {
+					raw, err := tc.build(variant.field)
+					if err != nil {
+						t.Fatalf("build source config: %v", err)
+					}
+					assertSourceConfigVirtualPlayback(t, raw, variant.want)
+				})
+			}
+		})
+	}
+}
+
+// TestTemplateBundleApplyVirtualPlaybackDefault covers the bundle apply
+// request: the apply struct carries the tri-state pointer, the resolver maps
+// an omitted field to on, and the resolved value flows into the same builders
+// that createCollectionFromTemplate uses for every template source.
+func TestTemplateBundleApplyVirtualPlaybackDefault(t *testing.T) {
+	for _, variant := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "omitted", body: `{"library_ids":[1]}`, want: true},
+		{name: "explicit_false", body: `{"library_ids":[1],"virtual_playback":false}`, want: false},
+		{name: "explicit_true", body: `{"library_ids":[1],"virtual_playback":true}`, want: true},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
+			var req applyTemplateBundleRequest
+			if err := json.Unmarshal([]byte(variant.body), &req); err != nil {
+				t.Fatalf("decode apply request: %v", err)
+			}
+			resolved := resolveVirtualPlayback(req.VirtualPlayback)
+			if resolved != variant.want {
+				t.Fatalf("resolved virtual playback = %v, want %v", resolved, variant.want)
+			}
+			// A bundle template materializes through createCollectionFromTemplate
+			// and then the per-source builders. The TMDB preset builder is the
+			// representative writer; the default resolution is shared.
+			raw, err := buildTMDBSourceConfig("trending", "movie", "week", nil, resolved)
+			if err != nil {
+				t.Fatalf("build source config: %v", err)
+			}
+			assertSourceConfigVirtualPlayback(t, raw, variant.want)
+		})
 	}
 }
