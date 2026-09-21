@@ -63,6 +63,9 @@ type VirtualCandidatesRefreshService struct {
 // RefreshVirtualCandidates re-lists and persists the item's virtual candidates
 // and returns the retained list. It is the handler behind
 // POST /api/v2/media/{media_id}/virtual-candidates:refresh.
+// virtualURIScheme is the URI scheme of persisted virtual candidate rows.
+const virtualURIScheme = "virtual"
+
 func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) ([]catalog.FileVersion, error) {
 	if s == nil || s.ListFresh == nil || s.Persist == nil || s.Detail == nil {
 		return nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")
@@ -109,7 +112,7 @@ func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, sou
 		listCtx, source.FilePath, userID, profileID, source.VirtualOwnerInstallationID,
 	)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrVirtualRefreshProvider, err)
+		return fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, err)
 	}
 	if err := s.Persist(ctx, source, streams); err != nil {
 		return err
@@ -189,7 +192,7 @@ func virtualSourceRefreshKey(file *models.MediaFile) string {
 // URI without its result= pick. It is the identity the stored candidates share.
 func virtualCandidateGroupURI(raw string) (string, bool) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme != "virtual" || parsed.Host == "" {
+	if err != nil || parsed.Scheme != virtualURIScheme || parsed.Host == "" {
 		return "", false
 	}
 	query := parsed.Query()
