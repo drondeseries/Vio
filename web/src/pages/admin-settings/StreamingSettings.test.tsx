@@ -186,7 +186,7 @@ describe("StreamingSettings", () => {
   it("exposes Prowlarr and AltMount inputs in the automation group", () => {
     renderPage();
 
-    expect(screen.getByLabelText("Prowlarr RSS URL")).toBeInTheDocument();
+    expect(screen.getByLabelText("Prowlarr URL")).toBeInTheDocument();
     expect(screen.getByLabelText("Prowlarr API key")).toBeInTheDocument();
     expect(screen.getByLabelText("Prowlarr check interval (minutes)")).toBeInTheDocument();
     expect(screen.getByLabelText("AltMount URL")).toBeInTheDocument();

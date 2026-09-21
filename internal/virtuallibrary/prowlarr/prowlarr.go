@@ -150,6 +150,7 @@ const (
 	minSearchCheckMinutes     = 15
 	maxSearchCheckMinutes     = 10080
 	maxSearchBodyBytes        = 8 << 20
+	maxErrorBodyBytes         = 4 << 10
 	maxProwlarrIndexBytes     = 64 << 20
 	maxProwlarrIndexReleases  = 20000
 	prowlarrIndexRetention    = 14 * 24 * time.Hour
@@ -275,15 +276,71 @@ func (c *prowlarrSearchClient) searchURL() (string, error) {
 	return c.searchURLForQuery("")
 }
 
+// validateProwlarrBaseURL rejects a configured URL that cannot have
+// "/api/v1/search" appended cleanly. The setting takes Prowlarr's server base
+// URL; an indexer-scoped path (for example .../1 or .../1/api/v1/search) or a
+// query string (for example ?t=movie) makes the appended path match Prowlarr's
+// newznab proxy route, which answers 400. The URL is rejected rather than
+// silently rewritten because a reverse-proxy deployment may legitimately use a
+// path base such as http://host/prowlarr, so stripping the path would break a
+// working configuration.
+func validateProwlarrBaseURL(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return errors.New("Prowlarr URL is not configured")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("invalid Prowlarr URL %q: %w", trimmed, err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("invalid Prowlarr URL %q: expected the server base URL with a scheme, for example http://prowlarr:9696", trimmed)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" || hasIndexerPath(parsed.Path) {
+		return fmt.Errorf("invalid Prowlarr URL %q: expected the Prowlarr server base URL (for example http://prowlarr:9696) with no indexer id, /api/v1/search path, or query string", trimmed)
+	}
+	return nil
+}
+
+// hasIndexerPath reports whether the URL path is an indexer-scoped or newznab
+// proxy path rather than a plain base (or a reverse-proxy subpath). A trailing
+// numeric segment is Prowlarr's indexer id; "api", "newznab" and "torznab"
+// segments are the search/download routes the client would duplicate.
+func hasIndexerPath(p string) bool {
+	segments := strings.Split(strings.Trim(p, "/"), "/")
+	for i, segment := range segments {
+		lower := strings.ToLower(segment)
+		if lower == "" {
+			continue
+		}
+		if lower == "api" || lower == "newznab" || lower == "torznab" {
+			return true
+		}
+		if i == len(segments)-1 && isDigits(segment) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
 // searchURLForQuery builds the Prowlarr search endpoint URL without any
 // credentials in it. The API key travels in the X-Api-Key request header so
 // it can never leak through error strings or logs that embed URLs.
 func (c *prowlarrSearchClient) searchURLForQuery(query string) (string, error) {
 	c.mu.Lock()
-	raw := c.url
+	raw := strings.TrimSpace(c.url)
 	c.mu.Unlock()
-	if strings.TrimSpace(raw) == "" {
-		return "", errors.New("Prowlarr search URL is not configured")
+	if err := validateProwlarrBaseURL(raw); err != nil {
+		return "", err
 	}
 	u, err := url.Parse(raw + "/api/v1/search")
 	if err != nil {
@@ -316,6 +373,41 @@ func (c *prowlarrSearchClient) newSearchRequest(ctx context.Context, searchURL s
 	return req, nil
 }
 
+// errorSnippet reads at most maxErrorBodyBytes of a response body and marks
+// truncation. Prowlarr's 400 responses carry the reason (for example
+// "No such function (...)"), so the snippet is the point of the error.
+func errorSnippet(body io.Reader) string {
+	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes+1))
+	truncated := len(data) > maxErrorBodyBytes
+	if truncated {
+		data = data[:maxErrorBodyBytes]
+	}
+	snippet := strings.TrimSpace(string(data))
+	if snippet == "" {
+		snippet = "(empty response body)"
+	}
+	if truncated {
+		snippet += " ... (truncated)"
+	}
+	return snippet
+}
+
+// httpError describes a non-2xx Prowlarr response: status, effective request
+// URL, and a bounded body snippet. The API key travels in the X-Api-Key
+// header and is never part of requestURL, but it is redacted from both the URL
+// and the snippet defensively.
+func (c *prowlarrSearchClient) httpError(resp *http.Response, requestURL string) error {
+	snippet := errorSnippet(resp.Body)
+	c.mu.Lock()
+	key := c.apiKey
+	c.mu.Unlock()
+	if key != "" {
+		snippet = strings.ReplaceAll(snippet, key, "[redacted]")
+		requestURL = strings.ReplaceAll(requestURL, key, "[redacted]")
+	}
+	return fmt.Errorf("Prowlarr returned HTTP %d for %s: %s", resp.StatusCode, requestURL, snippet)
+}
+
 func (c *prowlarrSearchClient) search(ctx context.Context, item monitoredMedia) ([]prowlarrRelease, error) {
 	searchURL, err := c.searchURLForQuery(item.Title)
 	if err != nil {
@@ -331,7 +423,7 @@ func (c *prowlarrSearchClient) search(ctx context.Context, item monitoredMedia) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("Prowlarr search returned status %d", resp.StatusCode)
+		return nil, c.httpError(resp, searchURL)
 	}
 	releases, err := parseProwlarrSearch(io.LimitReader(resp.Body, maxSearchBodyBytes+1))
 	if err != nil {
@@ -378,7 +470,7 @@ func (c *prowlarrSearchClient) refresh(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err := fmt.Errorf("Prowlarr search returned status %d", resp.StatusCode)
+		err := c.httpError(resp, searchURL)
 		c.mu.Lock()
 		c.lastErr = err
 		c.mu.Unlock()
@@ -961,7 +1053,7 @@ func (c *prowlarrSearchClient) Validate(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("Prowlarr returned HTTP %d", resp.StatusCode)
+		return "", c.httpError(resp, searchURL)
 	}
 	releases, err := parseProwlarrSearch(io.LimitReader(resp.Body, maxSearchBodyBytes+1))
 	if err != nil {
