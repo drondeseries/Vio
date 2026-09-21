@@ -31,6 +31,19 @@ func virtualResumeRow(resolvedURL string, expiresAt *time.Time) *models.MediaFil
 	}
 }
 
+// withVirtualResumeVideoEvidence gives a resume row the planner-grade video
+// evidence the stored-URL fast paths now require. A row carrying only a stored
+// URL (no tracks) must fall through to resolve+probe instead.
+func withVirtualResumeVideoEvidence(file *models.MediaFile) *models.MediaFile {
+	file.CodecVideo = "h264"
+	file.Resolution = "1080p"
+	file.Bitrate = 10_000
+	file.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24000/1001", BitDepth: 8, Bitrate: 10_000,
+	}}
+	return file
+}
+
 // virtualResumeHandler wires a fresh (cold-cache) handler. The lister counts
 // every provider listing; the detailed resolver counts every provider resolve.
 // listed==nil makes the lister fail the test if it is ever reached, so a test
@@ -60,13 +73,14 @@ func virtualResumeStickyKey(file *models.MediaFile) string {
 }
 
 // A resume after a restart (fresh handler, cold caches) whose row still owns an
-// unexpired persisted URL must take the deferred fast path: no provider listing
-// and no provider resolve, the row's own candidate is served, and the sticky
-// pin is re-derived from the durable row instead of being lost with the old
-// process.
+// unexpired persisted URL and planner-grade video evidence must take the
+// deferred fast path: no provider listing and no provider resolve, the row's
+// own candidate is served, and the sticky pin is re-derived from the durable
+// row instead of being lost with the old process. A row without that evidence
+// is covered by TestResolveVirtualResumeIncompleteMetadataFallsThroughToProbe.
 func TestResolveVirtualResumeFromPersistedRowSkipsListingAndRepins(t *testing.T) {
 	expiresAt := time.Now().Add(3 * time.Hour)
-	file := virtualResumeRow("https://93.184.216.34/stream/token=stored", &expiresAt)
+	file := withVirtualResumeVideoEvidence(virtualResumeRow("https://93.184.216.34/stream/token=stored", &expiresAt))
 
 	listerCalls, detailedCalls := 0, 0
 	h := virtualResumeHandler(&listerCalls, &detailedCalls, nil)

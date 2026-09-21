@@ -170,9 +170,10 @@ func TestResolveSkipsProbeForAlreadyProbedVirtualRow(t *testing.T) {
 		CodecVideo:                 "h264",
 		CodecAudio:                 "aac",
 		Resolution:                 "1080p",
+		Bitrate:                    10_000,
 		ProbeUpdatedAt:             &probedAt,
 		VirtualOwnerInstallationID: 5,
-		VideoTracks:                []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24"}},
+		VideoTracks:                []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24", BitDepth: 8, Bitrate: 10_000}},
 		AudioTracks:                []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng", Default: true}},
 	}
 
@@ -464,9 +465,10 @@ func TestResolutionAssumedFlagOnlyOnBaseline(t *testing.T) {
 		Container:                  "mkv",
 		CodecVideo:                 "h264",
 		Resolution:                 "1080p",
+		Bitrate:                    10_000,
 		ProbeUpdatedAt:             timePtr(time.Now().Add(-time.Hour)),
 		VirtualOwnerInstallationID: 5,
-		VideoTracks:                []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24"}},
+		VideoTracks:                []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24", BitDepth: 8, Bitrate: 10_000}},
 		AudioTracks:                []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}},
 	}
 	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
@@ -657,9 +659,10 @@ func virtualRepeatPlayFile(path string) *models.MediaFile {
 		CodecVideo:                 "h264",
 		CodecAudio:                 "aac",
 		Resolution:                 "1080p",
+		Bitrate:                    10_000,
 		ProbeUpdatedAt:             &probedAt,
 		VirtualOwnerInstallationID: 5,
-		VideoTracks:                []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24"}},
+		VideoTracks:                []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24", BitDepth: 8, Bitrate: 10_000}},
 		AudioTracks:                []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}},
 	}
 }
@@ -880,6 +883,14 @@ func virtualOptimisticFile(path string, deliveredAt *time.Time) *models.MediaFil
 		Container:                  "virtual",
 		LastDeliveredAt:            deliveredAt,
 		VirtualOwnerInstallationID: 5,
+		// The optimistic fast path now requires planner-grade video evidence;
+		// the delivery grace alone only proves the bytes flowed once.
+		CodecVideo: "h264",
+		Resolution: "1080p",
+		Bitrate:    10_000,
+		VideoTracks: []models.VideoTrack{{
+			Codec: "h264", Width: 1920, Height: 1080, FrameRate: "24", BitDepth: 8, Bitrate: 10_000,
+		}},
 	}
 }
 

@@ -2803,7 +2803,14 @@ func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int
 			bitrate = NULL,
 			video_tracks = '[]'::jsonb,
 			audio_tracks = '[]'::jsonb,
-			subtitle_tracks = '[]'::jsonb
+			subtitle_tracks = '[]'::jsonb,
+			-- The stored URL and its expiry describe the old candidate's bytes.
+			-- Clearing them with the rest of the evidence means no URL survives
+			-- pointing at a path this row no longer describes, and the
+			-- durable-resume fast path cannot fire for the replacement until it
+			-- has been resolved and probed itself.
+			resolved_url = NULL,
+			resolved_url_expires_at = NULL
 		WHERE id = $2 AND file_path = $3`, replacementPath, fileID, expectedPath)
 	if err != nil {
 		var pgErr *pgconn.PgError

@@ -1034,19 +1034,22 @@ func TestReplaceVirtualResultPin_ResetsCandidateEvidence(t *testing.T) {
 	}
 
 	probedAt := time.Now().Add(-time.Hour).Truncate(time.Millisecond)
+	storedURLExpiry := time.Now().Add(2 * time.Hour).Truncate(time.Millisecond)
 	var fileID int
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO media_files(
 			content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,
 			probe_source,probe_updated_at,last_delivered_at,
 			resolution,codec_video,codec_audio,hdr,bitrate,
+			resolved_url,resolved_url_expires_at,
 			video_tracks,audio_tracks,subtitle_tracks)
 		VALUES($1,$2,$3,0,'mkv',5,'virtual',$4,$4,
 			'2160p','hevc','eac3',true,5000,
+			'https://93.184.216.34/stream/token=old-candidate',$5,
 			'[{"codec":"hevc","width":3840,"height":2160,"frame_rate":"23.976"}]'::jsonb,
 			'[{"codec":"eac3","channels":6,"language":"eng"}]'::jsonb,
 			'[{"codec":"srt","language":"eng"}]'::jsonb)
-		RETURNING id`, contentID, folderID, deadPath, probedAt).Scan(&fileID); err != nil {
+		RETURNING id`, contentID, folderID, deadPath, probedAt, storedURLExpiry).Scan(&fileID); err != nil {
 		t.Fatalf("seed probed pinned virtual file: %v", err)
 	}
 
@@ -1085,6 +1088,10 @@ func TestReplaceVirtualResultPin_ResetsCandidateEvidence(t *testing.T) {
 	if len(file.VideoTracks) != 0 || len(file.AudioTracks) != 0 || len(file.SubtitleTracks) != 0 {
 		t.Fatalf("track evidence survived replacement: video=%d audio=%d subtitle=%d",
 			len(file.VideoTracks), len(file.AudioTracks), len(file.SubtitleTracks))
+	}
+	if file.ResolvedURL != "" || file.ResolvedURLExpiresAt != nil {
+		t.Fatalf("stored URL for the old candidate survived replacement: url=%q expires=%v",
+			file.ResolvedURL, file.ResolvedURLExpiresAt)
 	}
 }
 

@@ -1566,24 +1566,36 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// shortcut) instead of listing or resolving the provider. It never
 		// substitutes: persistedResumeURI is the row's own candidate, so this
 		// cannot change which candidate is served.
-		if deferProbe && !forceRelist && persistedResumeURI != "" && !noResult &&
+		//
+		// It must not fire unless the row carries planner-grade video evidence:
+		// a stored URL proves where the bytes live, not that the planner can
+		// route them. Without the precondition a listing-written row with a URL
+		// but empty tracks took this path, skipped resolve+probe, and terminalled
+		// source_metadata_incomplete. The metadata gate forces the synchronous
+		// resolve+probe at the bottom of this closure to fill the row in.
+		durableResumeFastPath := deferProbe && !forceRelist && persistedResumeURI != "" && !noResult &&
 			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
-			cand.URI == persistedResumeURI {
-			fastPathHit = true
-			trace.fastPath = true
-			transient := *file
-			transient.FilePath = cand.URI
-			transient.VirtualOwnerInstallationID = oid
-			h.pinVirtualSticky(stickyKey, cand.URI)
-			mergeVirtualCandidateTracks(&transient, cand)
-			if !transient.HDR && cand.HDR != "" {
-				transient.HDR = true
+			cand.URI == persistedResumeURI
+		if durableResumeFastPath {
+			if !virtualFastPathPlannerVideoCompleteV3(file) {
+				logVirtualFastPathSkippedV3(attemptCtx, "durable_resume", file, cand.URI)
+			} else {
+				fastPathHit = true
+				trace.fastPath = true
+				transient := *file
+				transient.FilePath = cand.URI
+				transient.VirtualOwnerInstallationID = oid
+				h.pinVirtualSticky(stickyKey, cand.URI)
+				mergeVirtualCandidateTracks(&transient, cand)
+				if !transient.HDR && cand.HDR != "" {
+					transient.HDR = true
+				}
+				h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+				return &resolvedVirtualPlaybackSource{
+					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
+					ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+				}, nil
 			}
-			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			return &resolvedVirtualPlaybackSource{
-				URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
-				ProbeSucceeded: false, Provenance: ProbeProvenancePending,
-			}, nil
 		}
 		// Optimistic start within the delivery grace. When the P0 gate above
 		// cannot apply because the probe stamp is missing or the stored
@@ -1595,28 +1607,37 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// resolves and probes so the next start takes the P0 fast path. Gated
 		// on a real pinned/adopted candidate plus a configured resolver and
 		// prober; no pin or no delivery grace keeps the synchronous resolve.
-		if deferProbe && !forceRelist && !noResult &&
+		//
+		// Like durable resume, this must not fire without planner-grade video
+		// evidence: the delivery grace proves the bytes flowed once, not that
+		// the planner can route them now.
+		optimisticFastPath := deferProbe && !forceRelist && !noResult &&
 			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
 			(persistedResultURI || pinnedURI != "") &&
 			(h.VirtualMediaDetailedResolver != nil || h.VirtualPlaybackResolver != nil) &&
 			(h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) &&
-			virtualDeliveredWithinGrace(file) {
-			fastPathHit = true
-			trace.fastPath = true
-			transient := *file
-			transient.FilePath = cand.URI
-			transient.VirtualOwnerInstallationID = oid
-			h.pinVirtualSticky(stickyKey, cand.URI)
-			mergeVirtualCandidateTracks(&transient, cand)
-			if !transient.HDR && cand.HDR != "" {
-				transient.HDR = true
+			virtualDeliveredWithinGrace(file)
+		if optimisticFastPath {
+			if !virtualFastPathPlannerVideoCompleteV3(file) {
+				logVirtualFastPathSkippedV3(attemptCtx, "delivery_grace", file, cand.URI)
+			} else {
+				fastPathHit = true
+				trace.fastPath = true
+				transient := *file
+				transient.FilePath = cand.URI
+				transient.VirtualOwnerInstallationID = oid
+				h.pinVirtualSticky(stickyKey, cand.URI)
+				mergeVirtualCandidateTracks(&transient, cand)
+				if !transient.HDR && cand.HDR != "" {
+					transient.HDR = true
+				}
+				h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+				h.revalidateVirtualCandidateBackground(r.Context(), stickyKey, file, cand, oid, userID, profileID, transient.ID)
+				return &resolvedVirtualPlaybackSource{
+					URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
+					ProbeSucceeded: false, Provenance: ProbeProvenancePending,
+				}, nil
 			}
-			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			h.revalidateVirtualCandidateBackground(r.Context(), stickyKey, file, cand, oid, userID, profileID, transient.ID)
-			return &resolvedVirtualPlaybackSource{
-				URL: "", URI: cand.URI, OwnerID: oid, File: &transient,
-				ProbeSucceeded: false, Provenance: ProbeProvenancePending,
-			}, nil
 		}
 		var streamURL string
 		var resolveErr error
@@ -4093,7 +4114,13 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	if probed.Bitrate == 0 && probed.FileSize > 0 && probed.Duration > 0 {
 		probed.Bitrate = int((probed.FileSize * 8) / int64(probed.Duration) / 1000)
 	}
-	if probed.Bitrate == 0 {
+	// Only a known resolution justifies a synthesized bitrate; the fallback
+	// table is resolution-keyed. Leaving it unset for an unknown resolution
+	// keeps the planner's source_metadata_incomplete detail honest ("missing:
+	// bitrate") instead of reporting a fabricated 10000 kbps and masking the
+	// gap. mergeVirtualCandidateTracks must not manufacture evidence the probe
+	// did not provide.
+	if probed.Bitrate == 0 && hasResolution {
 		probed.Bitrate = virtualBitrateFallback(probed.Resolution)
 	}
 
@@ -4651,18 +4678,43 @@ func canSkipProbeForContainer(container string) bool {
 // detailed ffprobe video evidence the v3 planner needs to validate direct-play
 // and stream-copy remux routes (profile/level/bit-depth/dimensions/frame rate/
 // bitrate), as opposed to bare candidate codec declarations.
+//
+// It is deliberately the same predicate as the planner's
+// playback.routeVideoMetadataCompleteV3 (codec, bit depth, dimensions, a frame
+// rate that parses above zero, and a positive bitrate). Keeping the two in lock
+// step is what stops a fast path from trusting a row the planner will reject as
+// source_metadata_incomplete.
 func completeVirtualVideoEvidenceV3(file *models.MediaFile) bool {
-	if file == nil || len(file.VideoTracks) == 0 || file.VideoTracks[0].Codec == "" {
+	return playback.VirtualRouteVideoMetadataCompleteV3(file)
+}
+
+// virtualFastPathPlannerVideoCompleteV3 reports whether a virtual row may take
+// one of the stored-URL fast paths without stranding the planner on missing
+// metadata. Video rows must carry the planner-grade video evidence; audio-only
+// rows have no video route to validate and pass.
+func virtualFastPathPlannerVideoCompleteV3(file *models.MediaFile) bool {
+	if file == nil {
 		return false
 	}
-	track := file.VideoTracks[0]
-	if track.Width <= 0 || track.Height <= 0 || track.FrameRate == "" {
-		return false
+	return file.IsAudioOnly() || completeVirtualVideoEvidenceV3(file)
+}
+
+// logVirtualFastPathSkippedV3 records that a previously-trusted stored-URL fast
+// path was refused because the row lacks planner-grade video metadata. The
+// missing-field wording matches the planner's source_metadata_incomplete detail
+// so an operator can correlate the skip with the terminal it prevents.
+func logVirtualFastPathSkippedV3(ctx context.Context, fastPath string, file *models.MediaFile, candidateURI string) {
+	if file == nil {
+		return
 	}
-	if file.CodecVideo == "" || file.Resolution == "" {
-		return false
-	}
-	return true
+	slog.InfoContext(ctx, "virtual fast path skipped for incomplete planner video metadata",
+		"component", "api",
+		"status", "fast_path_skipped_incomplete_metadata",
+		"fast_path", fastPath,
+		"file_id", file.ID,
+		"content_id", file.ContentID,
+		"candidate_uri", candidateURI,
+		"missing", playback.VirtualRouteVideoMetadataGapsV3(file))
 }
 
 // completeVirtualAudioEvidenceV3 reports whether a virtual file carries the
