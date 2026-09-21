@@ -354,13 +354,15 @@ func TestFallbackRejectsPersistedRowDriftingFromSessionAnchor(t *testing.T) {
 	}
 }
 
-// --- Blocker 6: one cold-path deadline. ---
+// --- Blocker 6: one cold-path deadline, with a reserved attempt floor. ---
 
-// TestVirtualColdPathSharesSingleDeadlineAcrossStages pins that listing,
-// resolution and probing all observe the same deadline and that each later
-// stage sees a strictly smaller remaining budget, so no inner stage restarted
-// the cold-path budget.
-func TestVirtualColdPathSharesSingleDeadlineAcrossStages(t *testing.T) {
+// TestVirtualColdPathReservesAttemptBudgetBehindStaging pins that the
+// resolve/probe attempt inherits the single cold deadline (so no later stage
+// restarts the budget) while listing runs under a staged deadline that leaves
+// the attempt at least half the cold budget. The earlier single-budget form let
+// a slow listing starve the attempt; the floor restores that slack without
+// extending the overall cap.
+func TestVirtualColdPathReservesAttemptBudgetBehindStaging(t *testing.T) {
 	previousBudget := virtualStartupBudget
 	virtualStartupBudget = 3 * time.Second
 	t.Cleanup(func() { virtualStartupBudget = previousBudget })
@@ -371,13 +373,13 @@ func TestVirtualColdPathSharesSingleDeadlineAcrossStages(t *testing.T) {
 	)
 	var mu sync.Mutex
 	var listerDeadline, resolverDeadline, proberDeadline time.Time
-	var listerRemaining, resolverRemaining, proberRemaining time.Duration
+	var resolverRemaining, proberRemaining time.Duration
 
 	h := &PlaybackHandler{
 		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(ctx context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 			deadline, _ := ctx.Deadline()
 			mu.Lock()
-			listerDeadline, listerRemaining = deadline, time.Until(deadline)
+			listerDeadline = deadline
 			mu.Unlock()
 			time.Sleep(30 * time.Millisecond)
 			return []VirtualPlaybackStream{{ID: "sib", URI: siblingURI}}, nil
@@ -415,13 +417,17 @@ func TestVirtualColdPathSharesSingleDeadlineAcrossStages(t *testing.T) {
 		t.Fatalf("a cold-path stage ran without a deadline: lister=%v resolver=%v prober=%v",
 			listerDeadline, resolverDeadline, proberDeadline)
 	}
-	if !resolverDeadline.Equal(listerDeadline) || !proberDeadline.Equal(listerDeadline) {
-		t.Fatalf("stages did not share one cold deadline: lister=%v resolver=%v prober=%v",
-			listerDeadline, resolverDeadline, proberDeadline)
+	if !listerDeadline.Before(resolverDeadline) {
+		t.Fatalf("listing did not run under the staged deadline: lister=%v resolver=%v",
+			listerDeadline, resolverDeadline)
 	}
-	if resolverRemaining >= listerRemaining {
-		t.Fatalf("resolver did not inherit the consumed budget: lister remaining %v, resolver remaining %v",
-			listerRemaining, resolverRemaining)
+	if !resolverDeadline.Equal(proberDeadline) {
+		t.Fatalf("resolve and probe did not share the cold deadline: resolver=%v prober=%v",
+			resolverDeadline, proberDeadline)
+	}
+	if resolverRemaining < virtualStartupBudget/2 {
+		t.Fatalf("attempt was not reserved half the cold budget: resolver remaining %v, want >= %v",
+			resolverRemaining, virtualStartupBudget/2)
 	}
 	if proberRemaining >= resolverRemaining {
 		t.Fatalf("probe did not inherit the consumed budget: resolver remaining %v, prober remaining %v",

@@ -1299,6 +1299,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// deliberately re-bases off r.Context() and is not bounded by this.
 	coldCtx, coldCancel := context.WithTimeout(r.Context(), virtualStartupBudget)
 	defer coldCancel()
+	// Candidate selection (listing and remux matching) must not be able to
+	// consume the resolve/probe attempt's budget. It runs under a staging
+	// deadline that stops at half the cold budget, reserving the other half for
+	// the attempt loop below. The attempt still inherits coldCtx, so the single
+	// overall cap and the no-restart property are unchanged; the staging bound
+	// only guarantees that a slow early stage cannot starve a later one.
+	stagingCtx, stagingCancel := context.WithTimeout(coldCtx, virtualStartupBudget/2)
+	defer stagingCancel()
 	userID := apimw.GetUserID(r.Context())
 	parsed, _ := url.Parse(file.FilePath)
 	candidates := []VirtualPlaybackStream{{
@@ -1338,7 +1346,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		len(excludedCandidateIDs) == 0 &&
 		(allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) {
 		if _, state := evaluateStoredVirtualURLCandidate(
-			coldCtx, file.FilePath, file,
+			stagingCtx, file.FilePath, file,
 			h.storedVirtualURLAllowInsecure(file, file.VirtualOwnerInstallationID),
 			time.Now(),
 		); state == virtualStoredURLUsable {
@@ -1400,7 +1408,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// bounded so the first-byte SLA cannot be defeated before resolution,
 		// but derive that bound from the single cold-path deadline so listing
 		// cannot restart the budget.
-		listCtx, cancel := context.WithTimeout(coldCtx, 15*time.Second)
+		listCtx, cancel := context.WithTimeout(stagingCtx, 15*time.Second)
 		streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
 			listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID,
 		)
@@ -1479,7 +1487,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if needsCandidateMetadata && len(candidates) > 0 {
 		trace.remuxRan = true
 		remuxStart := time.Now()
-		remuxMatches, remuxEnabled = h.matchRemuxDBCandidates(coldCtx, file, candidates)
+		remuxMatches, remuxEnabled = h.matchRemuxDBCandidates(stagingCtx, file, candidates)
 		trace.remux = time.Since(remuxStart)
 	}
 	if len(candidates) > maxAttempts {
@@ -1489,7 +1497,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// The attempt loop, its probes, its retries and the stale-source fallback
 	// run on the same cold-path deadline. Reusing coldCtx directly means they
 	// observe whatever budget listing and remux matching left, rather than a
-	// freshly restarted virtualStartupBudget.
+	// freshly restarted virtualStartupBudget. The staging deadline above caps
+	// those early stages at half the cold budget, so the attempt is guaranteed
+	// at least that much time rather than being starved.
 	attemptCtx := coldCtx
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
 	attemptCtx = withVirtualSessionBindingV3(attemptCtx, options.sessionBound)
@@ -1882,6 +1892,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				} else {
 					slog.WarnContext(r.Context(), "virtual background probe skipped: detached worker budget exhausted",
 						"component", "api", "candidate_uri", cand.URI)
+					// This candidate is the one the foreground request will
+					// serve, so gate pressure must not leave its row unprobed
+					// and force the slow list+probe path on every later play.
+					// One bounded synchronous probe+direct write per foreground
+					// request keeps the fallback from becoming a second pool.
+					h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 				}
 			}
 			return &resolvedVirtualPlaybackSource{
@@ -2049,7 +2065,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// Persist probed audio/subtitle tracks back to the DB so
 			// the watch detail and player UI show track options on
 			// subsequent views without re-probing.
-			h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, result.Provenance == ProbeProvenanceVerified)
+			h.persistVirtualProbeEvidence(r.Context(), file, result.File.FilePath, result.File, result.Provenance == ProbeProvenanceVerified, true)
 			// The filtered candidate list is already cached device-neutrally
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
@@ -2074,7 +2090,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 		}
 		if firstResolved.Provenance == ProbeProvenanceVerified {
-			h.persistVirtualProbeEvidence(r.Context(), file, firstResolved.File.FilePath, firstResolved.File, true)
+			h.persistVirtualProbeEvidence(r.Context(), file, firstResolved.File.FilePath, firstResolved.File, true, true)
 		}
 		return *firstResolved, nil
 	}
@@ -2223,7 +2239,7 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 		probed.Duration = probeTransient.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true)
+	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true, false)
 }
 
 // recoverVirtualProbeFromCache attempts a cache-only probe for a candidate the
@@ -2257,7 +2273,7 @@ func (h *PlaybackHandler) recoverVirtualProbeFromCache(
 		probed.Duration = probeFile.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	h.persistVirtualProbeEvidence(ctx, catalogFile, probeCand.URI, probed, true)
+	h.persistVirtualProbeEvidence(ctx, catalogFile, probeCand.URI, probed, true, false)
 	return true
 }
 
@@ -2873,9 +2889,39 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, sna
 // per call. That keeps it off the aggregate detached-work gate (a burst of long
 // probes must not crowd evidence out) while still bounding memory; see
 // enqueueVirtualProbeEvidence for the overload behavior.
-func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) {
-	if h == nil || h.VirtualFileSaver == nil || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
+//
+// foreground marks the caller as the foreground request's own candidate. When
+// the bounded pool rejects that write, the candidate gets one bounded direct
+// write instead (see persistVirtualEvidenceDirect) so a saturated pool cannot
+// leave the row permanently unprobed and force the slow list+probe path on
+// every later play. Background and speculative callers pass false and are never
+// written directly, so the fallback cannot amplify load.
+func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe, foreground bool) {
+	args, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
+	if !ok {
 		return
+	}
+	// The evidence buffer owns the write context and retry policy; ctx is used
+	// only to tie a rejection to the caller's request. Admission is explicit so
+	// the caller can distinguish an accepted, a coalesced (superseded but
+	// still represented) and a rejected (buffer full) write.
+	switch h.enqueueVirtualProbeEvidence(ctx, args) {
+	case virtualEvidenceRejected:
+		slog.ErrorContext(ctx, "virtual probe evidence persist rejected: evidence buffer full",
+			"component", "api", "file_id", args.FileID, "stamp_probe", args.StampProbe, "foreground", foreground)
+		if foreground && h.persistVirtualEvidenceDirect(ctx, args) {
+			slog.InfoContext(ctx, "virtual probe evidence persisted via direct fallback after buffer rejection",
+				"component", "api", "file_id", args.FileID, "stamp_probe", args.StampProbe)
+		}
+	}
+}
+
+// virtualProbeEvidenceArgs builds the catalog write for one probe result. It
+// returns false when the write must be refused: nil inputs, a row without an id
+// or saver, or a cross-release candidate the row cannot adopt.
+func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (models.VirtualFilePersistArgs, bool) {
+	if h == nil || h.VirtualFileSaver == nil || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
+		return models.VirtualFilePersistArgs{}, false
 	}
 	snap := snapshotVirtualRow(catalogFile)
 	expectedPath := catalogFile.FilePath
@@ -2902,9 +2948,9 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
 			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
 			"reason", "cross_release_without_adopt_target")
-		return
+		return models.VirtualFilePersistArgs{}, false
 	}
-	args := models.VirtualFilePersistArgs{
+	return models.VirtualFilePersistArgs{
 		FileID:           snap.FileID,
 		ExpectedFilePath: expectedPath,
 		VideoTracks:      marshalTracksJSON(sanitizeTrackSlice(probed.VideoTracks)),
@@ -2937,15 +2983,69 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 		// when a sibling owns the target path or the candidate's verdict is
 		// live-failed. A same-release write keeps the metadata-only contract.
 		RequireAdopt: crossRelease,
+	}, true
+}
+
+// probeVirtualCandidateForegroundFallback probes the foreground request's own
+// candidate synchronously under a short budget and persists the evidence
+// directly when the detached probe gate is exhausted. Without it a gate-pressure
+// burst can leave the row unprobed for this play, and every later play pays the
+// slow list+probe path. One bounded attempt per foreground request keeps it from
+// becoming a second worker pool; background/speculative candidates never reach
+// this fallback because they simply skip the probe when the gate is full.
+func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
+	requestCtx context.Context,
+	stickyKey string,
+	catalogFile *models.MediaFile,
+	probeURL string,
+	probeTransient models.MediaFile,
+	probeCand VirtualPlaybackStream,
+	expectedRuntimeMinutes int,
+	ownerInstallationID int,
+) {
+	if h == nil || catalogFile == nil {
+		return
 	}
-	// The evidence buffer owns the write context and retry policy; ctx is used
-	// only to tie a rejection to the caller's request. Admission is explicit so
-	// the caller can distinguish an accepted, a coalesced (superseded but
-	// still represented) and a rejected (buffer full) write.
-	switch h.enqueueVirtualProbeEvidence(ctx, args) {
-	case virtualEvidenceRejected:
-		slog.ErrorContext(ctx, "virtual probe evidence persist rejected: evidence buffer full",
-			"component", "api", "file_id", args.FileID, "stamp_probe", args.StampProbe)
+	probeKey := virtualProbeFailureKey(probeCand.URI, ownerInstallationID)
+	// Keep the values but drop request cancellation: the evidence write should
+	// still land if the client has already disconnected.
+	probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(requestCtx), virtualEvidenceFallbackBudget)
+	defer probeCancel()
+	probed, probeErr := h.probeVirtualSource(probeCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
+	if probeErr != nil || probed == nil {
+		// A short-budget fallback timeout leaves the verdict unknown: do not
+		// mark the failure damper or unpin a candidate the normal probe may yet
+		// resolve. Only a definitive candidate-specific rejection counts.
+		if !virtualProbeVerdictUnknown(probeErr) {
+			virtualProbeFailures.mark(probeKey)
+		}
+		slog.WarnContext(requestCtx, "virtual foreground probe fallback failed",
+			"component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
+		return
+	}
+	if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
+		virtualProbeFailures.mark(probeKey)
+		slog.WarnContext(requestCtx, "virtual foreground probe fallback rejected: probed duration implausible",
+			"component", "api", "candidate_uri", probeCand.URI, "file_id", catalogFile.ID)
+		h.unpinVirtualSticky(stickyKey, probeCand.URI)
+		return
+	}
+	virtualProbeFailures.clear(probeKey)
+	if probeTransient.ID > 0 {
+		probed.ID = probeTransient.ID
+		probed.MediaFolderID = probeTransient.MediaFolderID
+	}
+	if probeTransient.Duration > 0 && probed.Duration <= 0 {
+		probed.Duration = probeTransient.Duration
+	}
+	mergeVirtualCandidateTracks(probed, probeCand)
+	args, ok := h.virtualProbeEvidenceArgs(requestCtx, catalogFile, probeCand.URI, probed, true)
+	if !ok {
+		return
+	}
+	if h.persistVirtualEvidenceDirect(requestCtx, args) {
+		slog.InfoContext(requestCtx, "virtual probe evidence persisted via foreground fallback after detached gate exhaustion",
+			"component", "api", "file_id", args.FileID, "candidate_uri", probeCand.URI)
 	}
 }
 

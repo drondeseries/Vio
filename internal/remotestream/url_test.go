@@ -308,6 +308,128 @@ func TestRedactURLRemovesCredentialsPathQueryAndFragment(t *testing.T) {
 	}
 }
 
+type mutableResolver struct {
+	addresses []netip.Addr
+	err       error
+	calls     int
+}
+
+func (r *mutableResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	r.calls++
+	if r.err != nil {
+		return nil, r.err
+	}
+	return append([]netip.Addr(nil), r.addresses...), nil
+}
+
+func TestValidateURLWithCacheReusesFreshResolution(t *testing.T) {
+	resolver := &mutableResolver{addresses: []netip.Addr{netip.MustParseAddr("1.1.1.1")}}
+	cache := newResolutionCache(time.Minute, 8)
+	const raw = "https://provider.example/stream?token=x"
+	for call := 0; call < 2; call++ {
+		got, err := validateURLWithCache(context.Background(), raw, resolver, cache)
+		if err != nil {
+			t.Fatalf("call %d: %v", call, err)
+		}
+		if got.String() != raw {
+			t.Fatalf("call %d: validated URL = %q, want %q", call, got.String(), raw)
+		}
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("resolver calls = %d, want 1: the second validation must be served from cache", resolver.calls)
+	}
+}
+
+func TestValidateURLWithCacheDoesNotCacheFailures(t *testing.T) {
+	resolver := &mutableResolver{err: errors.New("lookup failed")}
+	cache := newResolutionCache(time.Minute, 8)
+	for call := 0; call < 2; call++ {
+		if _, err := validateURLWithCache(context.Background(), "https://provider.example/stream", resolver, cache); err == nil {
+			t.Fatalf("call %d succeeded, want a resolution failure", call)
+		}
+	}
+	if resolver.calls != 2 {
+		t.Fatalf("resolver calls = %d, want 2: a failed resolution must not be cached", resolver.calls)
+	}
+	if cache.len() != 0 {
+		t.Fatalf("cache retained %d entries after failures, want 0", cache.len())
+	}
+}
+
+func TestValidateURLWithCacheRejectsPrivateAfterExpiry(t *testing.T) {
+	resolver := &mutableResolver{addresses: []netip.Addr{netip.MustParseAddr("1.1.1.1")}}
+	cache := newResolutionCache(time.Minute, 8)
+	base := time.Now()
+	cache.now = func() time.Time { return base }
+	const raw = "https://provider.example/stream"
+
+	if _, err := validateURLWithCache(context.Background(), raw, resolver, cache); err != nil {
+		t.Fatalf("initial validation: %v", err)
+	}
+	// The host rebinds to loopback. The fresh cache still serves the earlier
+	// public answer for the TTL, which is the accepted cost of the cache.
+	resolver.addresses = []netip.Addr{netip.MustParseAddr("127.0.0.1")}
+	if _, err := validateURLWithCache(context.Background(), raw, resolver, cache); err != nil {
+		t.Fatalf("fresh cached answer was rejected: %v", err)
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("resolver calls = %d, want 1 while the cache is fresh", resolver.calls)
+	}
+
+	// Once the entry expires the rebound private answer must be rejected.
+	base = base.Add(2 * time.Minute)
+	if _, err := validateURLWithCache(context.Background(), raw, resolver, cache); err == nil {
+		t.Fatal("private rebound address was accepted after the cache expired")
+	}
+	if resolver.calls != 2 {
+		t.Fatalf("resolver calls = %d, want 2 after expiry", resolver.calls)
+	}
+
+	// A bypassed cache (fresh instance) rejects the private answer immediately.
+	if _, err := validateURLWithCache(context.Background(), raw, resolver, newResolutionCache(time.Minute, 8)); err == nil {
+		t.Fatal("private address was accepted with a bypassed cache")
+	}
+}
+
+func TestValidateURLWithCacheRejectsForbiddenCachedAddress(t *testing.T) {
+	cache := newResolutionCache(time.Minute, 8)
+	// A poisoned cache entry must still be checked on read; the rejection rule
+	// is never skipped just because an address came from the cache.
+	cache.store("provider.example", []netip.Addr{netip.MustParseAddr("10.0.0.7")})
+	resolver := &mutableResolver{addresses: []netip.Addr{netip.MustParseAddr("1.1.1.1")}}
+	if _, err := validateURLWithCache(context.Background(), "https://provider.example/stream", resolver, cache); err == nil {
+		t.Fatal("a cached non-public address was served")
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("resolver calls = %d, want 0 on a cache hit", resolver.calls)
+	}
+}
+
+func TestResolutionCacheEvictsExpiredAndCapsSize(t *testing.T) {
+	cache := newResolutionCache(time.Minute, 4)
+	base := time.Now()
+	cache.now = func() time.Time { return base }
+	cache.store("a.example", []netip.Addr{netip.MustParseAddr("1.1.1.1")})
+	cache.store("b.example", []netip.Addr{netip.MustParseAddr("1.0.0.1")})
+	if got := cache.len(); got != 2 {
+		t.Fatalf("cache len = %d, want 2", got)
+	}
+	base = base.Add(2 * time.Minute)
+	cache.store("c.example", []netip.Addr{netip.MustParseAddr("8.8.8.8")})
+	if got := cache.len(); got != 1 {
+		t.Fatalf("cache len after expiry sweep = %d, want 1", got)
+	}
+
+	capped := newResolutionCache(time.Hour, 2)
+	capped.now = func() time.Time { return base }
+	capped.store("a.example", []netip.Addr{netip.MustParseAddr("1.1.1.1")})
+	capped.store("b.example", []netip.Addr{netip.MustParseAddr("1.0.0.1")})
+	capped.store("c.example", []netip.Addr{netip.MustParseAddr("8.8.8.8")})
+	if got := capped.len(); got != 2 {
+		t.Fatalf("capped cache len = %d, want 2", got)
+	}
+}
+
 func mustURL(t *testing.T, raw string) *url.URL {
 	t.Helper()
 	parsed, err := url.Parse(raw)
