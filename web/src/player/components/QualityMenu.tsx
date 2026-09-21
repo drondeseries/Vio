@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, Settings } from "lucide-react";
+import { Check, RefreshCw, Settings } from "lucide-react";
 import { resolveActiveQualityOptionId } from "../playback-info";
 import type { QualityOption } from "../types";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
@@ -24,7 +24,16 @@ interface QualityMenuProps {
   onSelect: (id: string) => void;
   versions?: VersionInfo[];
   onSwitchVersion?: (fileId: number) => void;
+  /**
+   * Re-lists the title's video candidates. Resolves once the new list has been
+   * applied upstream; rejecting means the list could not be refreshed and the
+   * rows already on screen stay as they are.
+   */
+  onRefreshVersions?: () => Promise<void>;
 }
+
+/** Concise failure copy shown inside the refresh row, so the list never moves. */
+export const REFRESH_VERSIONS_ERROR = "Couldn't refresh. Try again.";
 
 export function QualityMenu({
   options,
@@ -34,9 +43,26 @@ export function QualityMenu({
   onSelect,
   versions,
   onSwitchVersion,
+  onRefreshVersions,
 }: QualityMenuProps) {
   const [open, setOpen] = useState(false);
+  const [refreshingVersions, setRefreshingVersions] = useState(false);
+  const [refreshVersionsError, setRefreshVersionsError] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  const handleRefreshVersions = useCallback(async () => {
+    if (!onRefreshVersions || refreshingVersions) return;
+    setRefreshingVersions(true);
+    setRefreshVersionsError(null);
+    try {
+      await onRefreshVersions();
+    } catch {
+      // The known candidates stay rendered; only the message changes.
+      setRefreshVersionsError(REFRESH_VERSIONS_ERROR);
+    } finally {
+      setRefreshingVersions(false);
+    }
+  }, [onRefreshVersions, refreshingVersions]);
 
   const handleSelect = useCallback(
     (id: string) => {
@@ -181,6 +207,38 @@ export function QualityMenu({
                   </button>
                 );
               })}
+              {onRefreshVersions && (
+                <button
+                  ref={(el) => {
+                    menuItemsRef.current[menuItemIndex++] = el;
+                  }}
+                  role="menuitem"
+                  type="button"
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={refreshingVersions}
+                  aria-busy={refreshingVersions || undefined}
+                  onClick={() => {
+                    void handleRefreshVersions();
+                  }}
+                >
+                  {refreshingVersions ? (
+                    <span
+                      className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-white/30 border-t-white"
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5 shrink-0 text-white/50" aria-hidden="true" />
+                  )}
+                  <span className="flex min-w-0 flex-col">
+                    <span>Refresh List</span>
+                    {refreshVersionsError && (
+                      <span className="text-[11px] leading-tight text-red-400">
+                        {refreshVersionsError}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              )}
               <div className="my-1 border-t border-white/10" />
               <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
                 Quality

@@ -17,6 +17,7 @@ import {
 import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
+import { refreshVirtualCandidates } from "@/api/v2/mediaCandidates";
 import { itemKeys } from "@/hooks/queries/keys";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { useWatchTogetherRoomConnection } from "../hooks/useWatchTogetherRoomConnection";
@@ -226,6 +227,19 @@ export function WatchPage({
     },
     [session],
   );
+
+  /**
+   * Manually re-lists the title's video candidates for the version menu.
+   *
+   * The server preserves candidates already known to be working, so its answer
+   * replaces the list wholesale — but only on success. A rejected refresh
+   * throws before the state write, so the rows already on screen stay put
+   * rather than disappearing behind a failed request.
+   */
+  const handleRefreshVersions = useCallback(async () => {
+    const refreshed = await refreshVirtualCandidates(contentId);
+    setPlaybackVersions(refreshed);
+  }, [contentId]);
 
   const activePlaybackVersion = useMemo(
     () => playbackVersions.find((version) => version.file_id === session.mediaFileId),
@@ -772,6 +786,7 @@ export function WatchPage({
         activeFileId={session.mediaFileId}
         chapters={activeChapters}
         onSwitchVersion={handleSwitchVersion}
+        onRefreshVersions={handleRefreshVersions}
         subtitleUrls={playableSubtitles}
         initialPosition={session.initialPosition}
         onQualitySelect={session.changeQuality}

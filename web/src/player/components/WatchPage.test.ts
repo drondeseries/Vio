@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient } from "@tanstack/react-query";
-import { createElement } from "react";
+import { createElement, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { itemKeys } from "@/hooks/queries/keys";
@@ -19,6 +19,7 @@ const playbackSessionMock = vi.hoisted(() => vi.fn());
 const videoPlayerMock = vi.hoisted(() => vi.fn());
 const toastErrorMock = vi.hoisted(() => vi.fn());
 const fetchWatchDetailMock = vi.hoisted(() => vi.fn());
+const refreshVirtualCandidatesMock = vi.hoisted(() => vi.fn());
 const fetchQueryMock = vi.hoisted(() => vi.fn());
 // When set, `useQueryClient` hands back this real client instead of the
 // pass-through fake so a test can exercise the react-query cache itself.
@@ -29,6 +30,9 @@ vi.mock("../hooks/usePlaybackSession", () => ({
 }));
 vi.mock("@/hooks/queries/items", () => ({
   fetchWatchDetail: fetchWatchDetailMock,
+}));
+vi.mock("@/api/v2/mediaCandidates", () => ({
+  refreshVirtualCandidates: refreshVirtualCandidatesMock,
 }));
 vi.mock("./VideoPlayer", () => ({
   VideoPlayer: (props: unknown) => {
@@ -137,6 +141,7 @@ beforeEach(() => {
   videoPlayerMock.mockReset();
   toastErrorMock.mockReset();
   fetchWatchDetailMock.mockReset();
+  refreshVirtualCandidatesMock.mockReset();
   // The component reads watch detail through the shared react-query cache. The
   // fake client passes straight through to the queryFn so these tests keep
   // exercising the poll's attempt/deadline logic; the cache dedupe itself is
@@ -334,6 +339,134 @@ describe("WatchPage audio menu", () => {
 
     const props = videoPlayerMock.mock.calls[0]?.[0] as { audioTracks?: unknown[] };
     expect(props.audioTracks).toEqual(versionWithTracks.audio_tracks);
+  });
+});
+
+describe("WatchPage version list refresh", () => {
+  const firstVersion: PlayerFileVersion = { ...version, file_id: 7 };
+  const secondVersion: PlayerFileVersion = { ...version, file_id: 8 };
+
+  it("replaces the known candidates with the server's refreshed list", async () => {
+    const refreshed: PlayerFileVersion = { ...version, file_id: 9, resolution: "720p" };
+    refreshVirtualCandidatesMock.mockResolvedValueOnce([refreshed]);
+    playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 7 }));
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [firstVersion, secondVersion],
+      }),
+    );
+
+    const before = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onRefreshVersions?: () => Promise<void>;
+    };
+    expect(refreshVirtualCandidatesMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await before.onRefreshVersions?.();
+    });
+
+    expect(refreshVirtualCandidatesMock).toHaveBeenCalledTimes(1);
+    expect(refreshVirtualCandidatesMock).toHaveBeenCalledWith("content-1");
+    const after = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      versions?: PlayerFileVersion[];
+    };
+    expect(after.versions).toEqual([refreshed]);
+  });
+
+  it("keeps the known candidates when the refresh fails", async () => {
+    refreshVirtualCandidatesMock.mockRejectedValueOnce(new Error("network"));
+    playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 7 }));
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [firstVersion, secondVersion],
+      }),
+    );
+
+    const props = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onRefreshVersions?: () => Promise<void>;
+    };
+
+    await act(async () => {
+      await expect(props.onRefreshVersions?.()).rejects.toThrow("network");
+    });
+
+    const after = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      versions?: PlayerFileVersion[];
+    };
+    expect(after.versions).toEqual([firstVersion, secondVersion]);
+  });
+});
+
+describe("WatchPage version track coupling", () => {
+  const versionA: PlayerFileVersion = { ...version, file_id: 7 };
+  const versionB: PlayerFileVersion = { ...version, file_id: 8 };
+  const audioA: PlayerAudioTrack[] = [
+    { codec: "aac", channels: 2, language: "eng", default: true },
+  ];
+  const audioB: PlayerAudioTrack[] = [
+    { codec: "eac3", channels: 6, layout: "5.1", language: "spa", default: true },
+  ];
+  const subtitleA = {
+    index: 0,
+    language: "en",
+    codec: "srt",
+    label: "English",
+    source: "embedded" as const,
+    url: "/subs/a.vtt",
+  };
+  const subtitleB = {
+    index: 0,
+    language: "fr",
+    codec: "srt",
+    label: "French",
+    source: "embedded" as const,
+    url: "/subs/b.vtt",
+  };
+
+  it("updates the audio and subtitle lists when the viewer switches version", () => {
+    // A stateful harness so the switch actually moves the session to the other
+    // file, the way usePlaybackSession's replan does in production: after the
+    // switch the plan publishes the new candidate's tracks, not the old one's.
+    function Harness() {
+      const [mediaFileId, setMediaFileId] = useState(7);
+      playbackSessionMock.mockReturnValue(
+        playbackSession({
+          mediaFileId,
+          planAudioTracks: mediaFileId === 8 ? audioB : audioA,
+          subtitleUrls: [mediaFileId === 8 ? subtitleB : subtitleA],
+          switchVersion: (nextFileId: number) => setMediaFileId(nextFileId),
+        }),
+      );
+      return createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [versionA, versionB],
+      });
+    }
+
+    render(createElement(Harness));
+
+    const before = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      audioTracks?: PlayerAudioTrack[];
+      subtitleUrls?: unknown[];
+      onSwitchVersion?: (fileId: number) => void;
+    };
+    expect(before.audioTracks).toEqual(audioA);
+    expect(before.subtitleUrls).toEqual([subtitleA]);
+
+    act(() => {
+      before.onSwitchVersion?.(8);
+    });
+
+    const after = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      audioTracks?: PlayerAudioTrack[];
+      subtitleUrls?: unknown[];
+    };
+    expect(after.audioTracks).toEqual(audioB);
+    expect(after.subtitleUrls).toEqual([subtitleB]);
   });
 });
 
