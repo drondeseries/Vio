@@ -52,6 +52,12 @@ const (
 	subtitleMIMEVTTV3            = "text/vtt"
 	subtitleUnavailableReasonV3  = "subtitle_artifact_unavailable"
 	transcodeStartFailedReasonV3 = "transcode_start_failed"
+	// copySeekProbeRetryMargin is the slack a replan keeps beyond a second full
+	// copy-video seek-anchor probe before attempting it. Process startup, the
+	// probe-slot wait and result handling all sit outside the probe timeout, so
+	// a retry without this margin would spend the caller's last budget and fail
+	// with the caller deadline instead of the probe error.
+	copySeekProbeRetryMargin = 5 * time.Second
 	// trackUnavailableReasonV3 is the transport reason for an audio remap miss:
 	// the candidate's audio inventory did not bind, not its video stream, so the
 	// client may pick another track without swapping the release.
@@ -2993,6 +2999,21 @@ func (h *PlaybackHandler) validateLocalProgressiveCapabilitiesV3(ctx context.Con
 	return nil
 }
 
+// copySeekAnchorRetryFits reports whether the caller's remaining budget can
+// accommodate a second copy-video seek-anchor probe. Without an explicit
+// deadline the probe's own per-attempt cap bounds the retry, so it is allowed.
+// With a deadline, a retry only helps when more than a full probe plus the
+// scheduling margin remains; otherwise it would spend the rest of the budget
+// and surface the caller deadline instead of the probe error.
+func copySeekAnchorRetryFits(ctx context.Context) (bool, time.Duration) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true, 0
+	}
+	remaining := time.Until(deadline)
+	return remaining > playback.CopySeekProbeTimeout+copySeekProbeRetryMargin, remaining
+}
+
 func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3) (preparedTimelineV3, *transportErrorV3) {
 	if result.Plan == nil {
 		return preparedTimelineV3{}, nil
@@ -3047,23 +3068,34 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// Virtual upstreams occasionally serve a range request slowly
 			// enough to blow the anchor probe budget. One bounded retry
 			// converts most of those transient timeouts into successful
-			// seeks; when the caller's own context already expired (e.g. the
-			// 5s replan budget), retrying would only repeat the failure, so
-			// it is skipped.
+			// seeks. The retry is skipped when the caller's remaining budget
+			// cannot fit another full probe: a second attempt would consume the
+			// rest of the budget and fail with the caller deadline instead of
+			// the probe error, so failing fast on the first probe error is both
+			// cheaper and clearer. A caller with no deadline keeps the retry.
 			var err error
 			for attempt := 1; attempt <= 2; attempt++ {
 				origin, startSegment, err = probeAnchor(ctx)
-				if err == nil || ctx.Err() != nil {
+				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
 				}
-				if attempt == 1 {
-					slog.WarnContext(ctx, "copy-video seek anchor failed once; retrying",
+				if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
+					slog.WarnContext(ctx, "copy-video seek anchor retry skipped: insufficient remaining budget",
 						"component", "api",
 						"playback_session_id", session.ID,
 						"requested_seek_seconds", requested,
+						"remaining", remaining,
+						"required", playback.CopySeekProbeTimeout+copySeekProbeRetryMargin,
 						"error", err,
 					)
+					break
 				}
+				slog.WarnContext(ctx, "copy-video seek anchor failed once; retrying",
+					"component", "api",
+					"playback_session_id", session.ID,
+					"requested_seek_seconds", requested,
+					"error", err,
+				)
 			}
 			releaseAnchor()
 			if err != nil {
