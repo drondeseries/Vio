@@ -19,6 +19,9 @@ const (
 	maxProfileRegexBytes     = 1024
 	maxProfileAttributeBytes = 64
 	maxPreferredOrder        = 10000
+	// maxSortCriteria bounds one profile's sort list. Sixteen ordered keys is
+	// far past any usable UI while still bounding the per-comparison work.
+	maxSortCriteria = 16
 
 	// patternTypeToken selects word-boundary keyword matching instead of
 	// regex for a custom format (AltMount parity).
@@ -131,6 +134,15 @@ func (f *CustomFormat) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// SortCriterion is one ordered ranking key in a quality profile. Attribute
+// names a candidate field; Direction is "desc" (largest first, numeric
+// attributes) or "asc" (best/lowest rank first, ordinal attributes). An
+// absent direction uses the attribute's default.
+type SortCriterion struct {
+	Attribute string `json:"attribute"` // size|bitrate|resolution|audio_channels|bit_depth|hdr|source|score|confirmed|language
+	Direction string `json:"direction"` // desc|asc
+}
+
 type QualityProfile struct {
 	Label             string  `json:"label"`
 	Resolution        string  `json:"resolution"`
@@ -149,6 +161,10 @@ type QualityProfile struct {
 	MinSize           int64   `json:"min_size,omitempty"`
 	MaxSize           int64   `json:"max_size,omitempty"`
 	RequireMultiAudio bool    `json:"require_multi_audio,omitempty"`
+	// Sort is the ordered ranking key list, top-down. Absent (the zero value)
+	// keeps the package's default ranking, so a stored profile without it
+	// ranks exactly as it did before Sort existed.
+	Sort []SortCriterion `json:"sort,omitempty"`
 
 	include *regexp.Regexp
 	exclude *regexp.Regexp
@@ -472,6 +488,22 @@ func (q *QualityConfig) Validate() error {
 		if p.PreferredOrder < 0 || p.PreferredOrder > maxPreferredOrder {
 			return fmt.Errorf("preferred_order in profile %s must be between 0 and %d", p.Label, maxPreferredOrder)
 		}
+		if len(p.Sort) > maxSortCriteria {
+			return fmt.Errorf("profile %s has more than %d sort criteria", p.Label, maxSortCriteria)
+		}
+		for i := range p.Sort {
+			criterion := &p.Sort[i]
+			attribute := strings.ToLower(strings.TrimSpace(criterion.Attribute))
+			if !sortAttributes[attribute] {
+				return fmt.Errorf("profile %s has unknown sort attribute %q", p.Label, criterion.Attribute)
+			}
+			direction := strings.ToLower(strings.TrimSpace(criterion.Direction))
+			if direction != "" && direction != sortDirectionAsc && direction != sortDirectionDesc {
+				return fmt.Errorf("profile %s has invalid sort direction %q: must be asc or desc", p.Label, criterion.Direction)
+			}
+			criterion.Attribute = attribute
+			criterion.Direction = direction
+		}
 		lower := strings.ToLower(p.Label)
 		if seen[lower] {
 			return fmt.Errorf("duplicate profile label: %s", p.Label)
@@ -783,6 +815,158 @@ func matchKeywordOrPattern(title, pattern string) bool {
 	return false
 }
 
+// Sort attribute and direction names accepted by Validate and the ranking
+// evaluator. They are the wire vocabulary of QualityProfile.Sort.
+const (
+	sortAttributeSize          = "size"
+	sortAttributeBitrate       = "bitrate"
+	sortAttributeResolution    = "resolution"
+	sortAttributeAudioChannels = "audio_channels"
+	sortAttributeBitDepth      = "bit_depth"
+	sortAttributeHDR           = "hdr"
+	sortAttributeSource        = "source"
+	sortAttributeScore         = "score"
+	sortAttributeConfirmed     = "confirmed"
+	sortAttributeLanguage      = "language"
+
+	sortDirectionAsc  = "asc"
+	sortDirectionDesc = "desc"
+)
+
+// sortAttributes is the closed attribute set. A name outside it is a config
+// error rather than a silently ignored key.
+var sortAttributes = map[string]bool{
+	sortAttributeSize:          true,
+	sortAttributeBitrate:       true,
+	sortAttributeResolution:    true,
+	sortAttributeAudioChannels: true,
+	sortAttributeBitDepth:      true,
+	sortAttributeHDR:           true,
+	sortAttributeSource:        true,
+	sortAttributeScore:         true,
+	sortAttributeConfirmed:     true,
+	sortAttributeLanguage:      true,
+}
+
+// defaultSortCriteria reproduces the ranking tail that existed before profiles
+// could declare their own sort: confirmation, then custom-format score, then a
+// preferred-language match, resolution, source, audio channels and size. It is
+// applied whenever profile.Sort is empty so stored profiles rank exactly as
+// they always did.
+//
+// Ordinal attributes (confirmed, language, source, hdr) use ascending
+// direction because their evaluator returns a preference rank where 0 is best;
+// numeric attributes (score, resolution, audio channels, size, bitrate,
+// bit_depth) use descending direction because a larger value is better.
+var defaultSortCriteria = []SortCriterion{
+	{Attribute: sortAttributeConfirmed, Direction: sortDirectionAsc},
+	{Attribute: sortAttributeScore, Direction: sortDirectionDesc},
+	{Attribute: sortAttributeLanguage, Direction: sortDirectionAsc},
+	{Attribute: sortAttributeResolution, Direction: sortDirectionDesc},
+	{Attribute: sortAttributeSource, Direction: sortDirectionAsc},
+	{Attribute: sortAttributeAudioChannels, Direction: sortDirectionDesc},
+	{Attribute: sortAttributeSize, Direction: sortDirectionDesc},
+}
+
+// sortAttributeDefaultDirection is the direction a criterion uses when it omits
+// one: descending for the numeric attributes (largest first), ascending for the
+// ordinal attributes (best rank first).
+func sortAttributeDefaultDirection(attribute string) string {
+	switch attribute {
+	case sortAttributeSize, sortAttributeBitrate, sortAttributeResolution,
+		sortAttributeAudioChannels, sortAttributeBitDepth, sortAttributeScore:
+		return sortDirectionDesc
+	default:
+		return sortDirectionAsc
+	}
+}
+
+// sortCriterionDirection resolves a criterion's effective direction.
+func sortCriterionDirection(criterion SortCriterion) string {
+	switch direction := strings.ToLower(strings.TrimSpace(criterion.Direction)); direction {
+	case sortDirectionAsc, sortDirectionDesc:
+		return direction
+	default:
+		return sortAttributeDefaultDirection(criterion.Attribute)
+	}
+}
+
+// maxSourceScore is stream.SourceScore's best value; sourcePreferenceRank
+// inverts the score into a best-first rank for the ordinal "source" criterion.
+const maxSourceScore = 4
+
+// sourcePreferenceRank orders source types best-first (0 is best): remux,
+// bluray, web-dl, hdtv, then an unknown type. It is stream.SourceScore
+// inverted, so the ranking vocabulary and the resolver's source classification
+// cannot drift apart.
+func sourcePreferenceRank(sourceType string) int {
+	return maxSourceScore - stream.SourceScore(sourceType)
+}
+
+// hdrPreferenceRank orders HDR families best-first (0 is best): Dolby Vision,
+// HDR10+, HDR10, generic HDR, then SDR or unlabelled. Every candidate yields a
+// rank, so the criterion never reports an unknown value.
+func hdrPreferenceRank(hdr string) int {
+	switch strings.ToLower(strings.TrimSpace(hdr)) {
+	case "dv":
+		return 0
+	case hdrValueHDR10Plus:
+		return 1
+	case hdrValueHDR10:
+		return 2
+	case "hdr":
+		return 3
+	default:
+		return 4
+	}
+}
+
+// sortValueFor evaluates one sort criterion for a candidate. known is false
+// when the attribute carries no value for this candidate; an unknown value
+// sorts after every known value within the criterion and then falls through to
+// the next key.
+func sortValueFor(attribute string, c stream.StreamCandidate, p QualityProfile) (value int64, known bool) {
+	switch attribute {
+	case sortAttributeSize:
+		return c.FileSize, c.FileSize > 0
+	case sortAttributeBitrate:
+		return int64(c.Bitrate), c.Bitrate > 0
+	case sortAttributeResolution:
+		score := stream.ResolutionScore(c.Resolution)
+		return int64(score), score > 0
+	case sortAttributeAudioChannels:
+		score := stream.AudioChannelsScore(c.AudioChannels)
+		return int64(score), score > 0
+	case sortAttributeBitDepth:
+		// The classifier exposes only Is10Bit, so an 8-bit candidate and an
+		// unlabelled one both read 0. bit_depth cannot distinguish "not 10-bit"
+		// from "unknown" and is therefore always a known value (10-bit sorts
+		// ahead of everything else under the descending default).
+		if c.Is10Bit {
+			return 1, true
+		}
+		return 0, true
+	case sortAttributeScore:
+		return int64(c.QualityScore), true
+	case sortAttributeHDR:
+		return int64(hdrPreferenceRank(c.HDR)), true
+	case sortAttributeSource:
+		return int64(sourcePreferenceRank(c.SourceType)), true
+	case sortAttributeConfirmed:
+		if c.SourceConfirmed {
+			return 0, true
+		}
+		return 1, true
+	case sortAttributeLanguage:
+		rank := stream.CandidateLanguageMatchRank(c, p.Language)
+		if rank < 0 {
+			return 0, false
+		}
+		return int64(rank), true
+	}
+	return 0, false
+}
+
 // SortCandidatesForProfile ranks candidates in place: non-rejected first,
 // then profile-matching candidates, then by custom-format score, resolution,
 // source type, and original order. Ordering a profile-matching candidate ahead
@@ -834,40 +1018,33 @@ func sortCandidatesForProfile(candidates []stream.StreamCandidate, p QualityProf
 		if profileActive && scored[i].profileMatched != scored[j].profileMatched {
 			return scored[i].profileMatched
 		}
-		if c1.SourceConfirmed != c2.SourceConfirmed {
-			return c1.SourceConfirmed
+		// The ranked tail is the profile's ordered criteria, or the default
+		// tail when it declares none. Each criterion is a total key: an
+		// unknown value sorts after every known value and then falls through.
+		criteria := p.Sort
+		if len(criteria) == 0 {
+			criteria = defaultSortCriteria
 		}
-		if c1.QualityScore != c2.QualityScore {
-			return c1.QualityScore > c2.QualityScore
-		}
-		if p.Language != "" {
-			r1 := stream.CandidateLanguageMatchRank(c1, p.Language)
-			r2 := stream.CandidateLanguageMatchRank(c2, p.Language)
-			if r1 >= 0 && r2 < 0 {
-				return true
+		for _, criterion := range criteria {
+			v1, known1 := sortValueFor(criterion.Attribute, c1, p)
+			v2, known2 := sortValueFor(criterion.Attribute, c2, p)
+			if known1 != known2 {
+				return known1
 			}
-			if r2 >= 0 && r1 < 0 {
-				return false
+			if !known1 || v1 == v2 {
+				continue
 			}
-			if r1 >= 0 && r2 >= 0 && r1 != r2 {
-				return r1 < r2
+			if sortCriterionDirection(criterion) == sortDirectionAsc {
+				return v1 < v2
 			}
+			return v1 > v2
 		}
-		if r1, r2 := stream.ResolutionScore(c1.Resolution), stream.ResolutionScore(c2.Resolution); r1 != r2 {
-			return r1 > r2
+		if c1.OriginalIndex != c2.OriginalIndex {
+			return c1.OriginalIndex < c2.OriginalIndex
 		}
-		if s1, s2 := stream.SourceScore(c1.SourceType), stream.SourceScore(c2.SourceType); s1 != s2 {
-			return s1 > s2
-		}
-		if c1.AudioChannels != c2.AudioChannels {
-			if ch1, ch2 := stream.AudioChannelsScore(c1.AudioChannels), stream.AudioChannelsScore(c2.AudioChannels); ch1 != ch2 {
-				return ch1 > ch2
-			}
-		}
-		if c1.FileSize != c2.FileSize {
-			return c1.FileSize > c2.FileSize
-		}
-		return c1.OriginalIndex < c2.OriginalIndex
+		// A stable final tie-break, so two candidates that tie on every key
+		// (including a shared OriginalIndex) always order the same way.
+		return stream.CandidateVariantID(c1) < stream.CandidateVariantID(c2)
 	})
 	for idx := range scored {
 		candidates[idx] = scored[idx].candidate
