@@ -156,6 +156,8 @@ jobs:
 
       - name: Cache Go build cache
         uses: actions/cache@v4
+        # Cache-service flakiness must not fail the image build.
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/go-build-cache
           key: go-build-${{ env.PLATFORM_PAIR }}-${{ hashFiles('go.sum') }}-${{ github.run_id }}
