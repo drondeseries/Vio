@@ -146,8 +146,8 @@ const PersonalizeSettings = lazy(() => import("@/pages/settings/PersonalizeSetti
 const ConnectAppsSettings = lazy(() => import("@/pages/settings/ConnectAppsSettings"));
 const InterfaceSettings = lazy(() => import("@/pages/settings/InterfaceSettings"));
 const AccountSettings = lazy(() => import("@/pages/settings/AccountSettings"));
-const WatchTogetherJoin = lazy(() => import("@/pages/WatchTogetherJoin"));
-const WatchTogetherRoomPage = lazy(() => import("@/pages/WatchTogetherRoomPage"));
+const WatchPartyHub = lazy(() => import("@/pages/watchtogether/WatchPartyHub"));
+const WatchTogetherRoomPage = lazy(() => import("@/pages/watchtogether/WatchTogetherRoomPage"));
 const WatchRoute = lazy(() => import("@/pages/WatchRoute"));
 const ProfileCustomizeHome = lazy(() => import("@/pages/ProfileCustomizeHome"));
 
@@ -624,8 +624,10 @@ function AppRoutes() {
                           <Route path="/browse" element={<LegacyBrowseRedirect />} />
                           <Route path="/item/:id" element={<ItemDetail />} />
                           <Route path="/person/:id" element={<PersonDetail />} />
+                          <Route path="/rooms" element={<WatchPartyHub />} />
+                          {/* Invite links still carry /rooms/join?token=; keep it as the same hub. */}
+                          <Route path="/rooms/join" element={<WatchPartyHub />} />
                           <Route path="/rooms/:roomId" element={<WatchTogetherRoomPage />} />
-                          <Route path="/rooms/join" element={<WatchTogetherJoin />} />
                           <Route
                             path="/favorites"
                             element={<LegacyPersonalCatalogRedirect source="favorites" />}

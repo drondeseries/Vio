@@ -69,8 +69,11 @@ export default function Layout({ children }: LayoutProps) {
   const isRecommendationsRoute = location.pathname === "/recommendations";
   const isCalendarRoute = location.pathname === "/calendar";
   const isRequestDetailRoute = /^\/requests\/(movie|series)\//.test(location.pathname);
+  // A watch-party room owns its own full-height layout; the hub does not.
+  const isWatchPartyRoomRoute = /^\/rooms\/(?!join$)[^/]+$/.test(location.pathname);
   const needsNoPadding =
     isHomePath ||
+    isWatchPartyRoomRoute ||
     isLibraryRoute ||
     isItemRoute ||
     isRequestDetailRoute ||
