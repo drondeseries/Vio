@@ -1,6 +1,6 @@
 import { jellyfinCompatStatusKey } from "@/api/v2/jellyfinStatusCache";
 import { fetchAdminTaskJob } from "@/api/v2/adminTasks";
-import type { QueryClient } from "@tanstack/react-query";
+import type { QueryClient, QueryFilters } from "@tanstack/react-query";
 import { useQueryClient } from "@tanstack/react-query";
 import type {
   AdminJob,
@@ -42,7 +42,9 @@ import {
   userStateChangeAffectsSectionMembership,
 } from "@/components/realtimeCatalogInvalidation";
 import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
-import { createSessionRefreshScheduler } from "@/components/realtimeSessionRefresh";
+import { createRealtimeQueryRefreshScheduler } from "@/components/realtimeQueryRefresh";
+import { adminSessionsKey } from "@/api/v2/adminSessionsCache";
+import { adminStatsKey } from "@/hooks/queries/admin/stats";
 import { useAuth } from "@/hooks/useAuth";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { usePageActivity } from "@/hooks/usePageActivity";
@@ -272,46 +274,6 @@ function handleJobSideEffects(
 
   if (eventName === "job.completed" && job.job_type === "delete_library") {
     invalidateCatalogState(queryClient, { allowDashboardRefetch });
-  }
-}
-
-type TaskRuntimeEvent = Pick<TaskInfo, "key" | "state" | "progress" | "triggers" | "next_run_at">;
-
-function applyTaskUpdate(queryClient: QueryClient, task: TaskRuntimeEvent) {
-  // Runtime progress and schedule have the same meaning in both wire shapes. Keep the v2
-  // fields (including execution_scope and sanitized results) from HTTP.
-  if (task.state === "running" || task.state === "cancelling") {
-    const update = (existing: TaskInfo): TaskInfo => ({
-      ...existing,
-      state: task.state,
-      progress: task.progress,
-      triggers: task.triggers,
-      next_run_at: task.next_run_at,
-    });
-    const listKey = adminKeys.tasks();
-    const detailKey = adminKeys.task(task.key);
-    const tasks = queryClient.getQueryData<TaskInfo[]>(listKey);
-    const detail = queryClient.getQueryData<TaskInfo>(detailKey);
-    // Supersede older reads before patching their data. Keep initial reads when
-    // there is no cached task: runtime frames cannot supply the full v2 record.
-    if (tasks?.some((entry) => entry.key === task.key)) {
-      void queryClient.cancelQueries({ queryKey: listKey, exact: true });
-      queryClient.setQueryData(
-        listKey,
-        tasks.map((entry) => (entry.key === task.key ? update(entry) : entry)),
-      );
-    }
-    if (detail) {
-      void queryClient.cancelQueries({ queryKey: detailKey, exact: true });
-      queryClient.setQueryData(detailKey, update(detail));
-    }
-    return;
-  }
-  void queryClient.invalidateQueries({ queryKey: adminKeys.tasks(), exact: true });
-  void queryClient.invalidateQueries({ queryKey: adminKeys.task(task.key), exact: true });
-  if (task.state === "idle") {
-    void queryClient.invalidateQueries({ queryKey: adminKeys.taskHistory(task.key) });
-    void queryClient.invalidateQueries({ queryKey: adminKeys.taskMetrics(task.key) });
   }
 }
 
@@ -571,7 +533,11 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  function handleSnapshot(message: EventsSnapshotMessage, refreshSessions: () => void) {
+  function handleSnapshot(
+    message: EventsSnapshotMessage,
+    refreshSessions: () => void,
+    refreshQueries: (...filters: QueryFilters[]) => void,
+  ) {
     switch (message.channel) {
       case "jobs":
         if (Array.isArray(message.data)) {
@@ -587,7 +553,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
       case "tasks":
         // Reconnect must also catch up history/metrics for tasks that finished
         // while disconnected. One sweep avoids refetching each detail twice.
-        void queryClient.invalidateQueries({ queryKey: adminKeys.tasks() });
+        refreshQueries({ queryKey: adminKeys.tasks() });
         break;
       case "scans":
         hydrateScans(queryClient, (message.data as ScanRun[]) ?? []);
@@ -653,6 +619,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     message: EventsEventMessage,
     realtimeAuthority: ProfileRequestContextSnapshot | null,
     refreshSessions: () => void,
+    refreshQueries: (...filters: QueryFilters[]) => void,
   ) {
     switch (message.channel) {
       case "catalog":
@@ -685,7 +652,20 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         break;
       case "tasks":
         if (message.event === "task.updated") {
-          applyTaskUpdate(queryClient, message.data as TaskRuntimeEvent);
+          // Task frames fan out across nodes without source identity, while HTTP
+          // task execution state belongs to the serving process.
+          const task = message.data as Pick<TaskInfo, "key" | "state">;
+          const filters: QueryFilters[] = [
+            { queryKey: adminKeys.tasks(), exact: true },
+            { queryKey: adminKeys.task(task.key), exact: true },
+          ];
+          if (task.state === "idle") {
+            filters.push(
+              { queryKey: adminKeys.taskHistory(task.key) },
+              { queryKey: adminKeys.taskMetrics(task.key) },
+            );
+          }
+          refreshQueries(...filters);
         }
         break;
       case "scans":
@@ -766,11 +746,18 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
       return;
     }
     const authorityActive = () => isEventsAuthorityActive(authority);
-    const sessionRefresh = createSessionRefreshScheduler(
+    const adminRefresh = createRealtimeQueryRefreshScheduler(
       queryClient,
-      authority,
+      authorityActive,
       () => allowDashboardRealtimeUpdatesRef.current,
     );
+    const refreshSessions = () => {
+      if (!authority.profileId) return;
+      adminRefresh.schedule(
+        { queryKey: adminSessionsKey(authority), exact: true },
+        { queryKey: adminStatsKey(authority), exact: true },
+      );
+    };
     let closedByEffect = false;
     let activeSocket: WebSocket | null = null;
 
@@ -884,10 +871,10 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
             return;
           }
           case "snapshot":
-            handleSnapshot(message, sessionRefresh.schedule);
+            handleSnapshot(message, refreshSessions, adminRefresh.schedule);
             return;
           case "event":
-            handleEvent(message, authority, sessionRefresh.schedule);
+            handleEvent(message, authority, refreshSessions, adminRefresh.schedule);
             return;
           case "error":
             return;
@@ -919,7 +906,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
 
     return () => {
       closedByEffect = true;
-      sessionRefresh.cancel();
+      adminRefresh.cancel();
       clearReconnect();
       for (const [jobId, waiter] of waitersRef.current) {
         window.clearTimeout(waiter.timeoutId);

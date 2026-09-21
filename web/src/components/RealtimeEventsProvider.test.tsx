@@ -524,7 +524,44 @@ describe("RealtimeEventsProvider", () => {
     expect(load).toHaveBeenCalledTimes(3);
   });
 
-  it("updates task progress without fetching task lists, details or history", async () => {
+  it.each(["running", "cancelling"])(
+    "keeps HTTP task state when a remote node reports %s",
+    async (state) => {
+      const task = {
+        key: "refresh_metadata",
+        state: "idle",
+        progress: 0,
+        execution_scope: "process",
+      };
+      const client = new QueryClient();
+      const load = vi.fn(async () => [task]);
+      client.setQueryData(adminKeys.tasks(), [task]);
+      function TaskObserver() {
+        useQuery({ queryKey: adminKeys.tasks(), queryFn: load, staleTime: Infinity });
+        return null;
+      }
+      render(
+        <QueryClientProvider client={client}>
+          <RealtimeEventsProvider>
+            <TaskObserver />
+          </RealtimeEventsProvider>
+        </QueryClientProvider>,
+      );
+      await act(async () => {});
+      await act(async () => {
+        FakeWebSocket.instances[0]!.emitMessage({
+          type: "event",
+          channel: "tasks",
+          event: "task.updated",
+          data: { key: task.key, state, progress: 40, triggers: [] },
+        });
+      });
+      expect(client.getQueryData(adminKeys.tasks())).toEqual([task]);
+      expect(load).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("coalesces task reads and refreshes history only on completion or reconnect", async () => {
     const task: TaskInfo = {
       key: "refresh_metadata",
       name: "Refresh metadata",
@@ -536,259 +573,149 @@ describe("RealtimeEventsProvider", () => {
       triggers: [],
       execution_scope: "process",
     };
-    const queryClient = new QueryClient();
-    const list = vi.fn(async () => [task]);
-    const detail = vi.fn(async () => task);
+    let serverTask = task;
+    const client = new QueryClient();
+    const list = vi.fn(async () => [serverTask]);
+    const detail = vi.fn(async () => serverTask);
     const history = vi.fn(async () => []);
-    queryClient.setQueryData(adminKeys.tasks(), [task]);
-    queryClient.setQueryData(adminKeys.task(task.key), task);
-    queryClient.setQueryData(adminKeys.taskHistory(task.key), []);
-    function TaskObservers() {
-      useQuery({ queryKey: adminKeys.tasks(), queryFn: list, staleTime: Infinity });
-      useQuery({ queryKey: adminKeys.task(task.key), queryFn: detail, staleTime: Infinity });
-      useQuery({
-        queryKey: adminKeys.taskHistory(task.key),
-        queryFn: history,
-        staleTime: Infinity,
-      });
+    const metrics = vi.fn(async () => ({}));
+    const other = vi.fn(async () => ({ ...task, key: "other" }));
+    const queries = [
+      { queryKey: adminKeys.tasks(), queryFn: list, data: [task] },
+      { queryKey: adminKeys.task(task.key), queryFn: detail, data: task },
+      { queryKey: [...adminKeys.taskHistory(task.key), "pages"], queryFn: history, data: [] },
+      { queryKey: adminKeys.taskMetrics(task.key), queryFn: metrics, data: {} },
+      { queryKey: adminKeys.task("other"), queryFn: other, data: { ...task, key: "other" } },
+    ];
+    for (const query of queries) client.setQueryData(query.queryKey, query.data);
+    function Observer({ index }: { index: number }) {
+      const { queryKey, queryFn } = queries[index]!;
+      useQuery<unknown>({ queryKey, queryFn, staleTime: Infinity });
       return null;
     }
     render(
-      <QueryClientProvider client={queryClient}>
+      <QueryClientProvider client={client}>
         <RealtimeEventsProvider>
-          <TaskObservers />
+          {queries.map((_, index) => (
+            <Observer key={index} index={index} />
+          ))}
         </RealtimeEventsProvider>
       </QueryClientProvider>,
     );
     await act(async () => {});
-    const { execution_scope: _scope, ...legacyTask } = task;
-    for (let progress = 1; progress <= 20; progress++) {
-      await act(async () => {
-        FakeWebSocket.instances[0]!.emitMessage({
-          type: "event",
-          channel: "tasks",
-          event: "task.updated",
-          data: { ...legacyTask, state: "running", progress },
-        });
+    const emit = (state: string) =>
+      FakeWebSocket.instances[0]!.emitMessage({
+        type: "event",
+        channel: "tasks",
+        event: "task.updated",
+        data: { key: task.key, state, progress: 99, triggers: [] },
       });
-    }
-    expect(list).not.toHaveBeenCalled();
-    expect(detail).not.toHaveBeenCalled();
+    for (let i = 0; i < 20; i++)
+      await act(async () => {
+        emit("running");
+      });
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(detail).toHaveBeenCalledTimes(1);
     expect(history).not.toHaveBeenCalled();
-    expect(queryClient.getQueryData(adminKeys.tasks())).toEqual([
-      { ...task, state: "running", progress: 20 },
-    ]);
-    expect(queryClient.getQueryData(adminKeys.task(task.key))).toEqual({
+    expect(metrics).not.toHaveBeenCalled();
+    expect(other).not.toHaveBeenCalled();
+    expect(client.getQueryData(adminKeys.tasks())).toEqual([task]);
+    serverTask = {
       ...task,
       state: "running",
       progress: 20,
-    });
-    const schedule = {
       triggers: [{ type: "interval", interval_ms: 60_000 }],
       next_run_at: "2026-01-02T03:04:05Z",
     };
     await act(async () => {
-      FakeWebSocket.instances[0]!.emitMessage({
-        type: "event",
-        channel: "tasks",
-        event: "task.updated",
-        data: { ...legacyTask, ...schedule, state: "running", progress: 20 },
-      });
-    });
-    expect(queryClient.getQueryData(adminKeys.tasks())).toEqual([
-      { ...task, ...schedule, state: "running", progress: 20 },
-    ]);
-    expect(queryClient.getQueryData(adminKeys.task(task.key))).toEqual({
-      ...task,
-      ...schedule,
-      state: "running",
-      progress: 20,
-    });
-    expect(list).not.toHaveBeenCalled();
-    expect(detail).not.toHaveBeenCalled();
-    await act(async () => {
-      FakeWebSocket.instances[0]!.emitMessage({
-        type: "event",
-        channel: "tasks",
-        event: "task.updated",
-        data: legacyTask,
-      });
-    });
-    expect(list).toHaveBeenCalledTimes(1);
-    expect(detail).toHaveBeenCalledTimes(1);
-    expect(history).toHaveBeenCalledTimes(1);
-    await act(async () => {
-      FakeWebSocket.instances[0]!.emitMessage({
-        type: "snapshot",
-        channel: "tasks",
-        data: [legacyTask],
-      });
+      await vi.advanceTimersByTimeAsync(5_000);
     });
     expect(list).toHaveBeenCalledTimes(2);
     expect(detail).toHaveBeenCalledTimes(2);
+    expect(client.getQueryData(adminKeys.tasks())).toEqual([serverTask]);
+    expect(client.getQueryData(adminKeys.task(task.key))).toEqual(serverTask);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(list).toHaveBeenCalledTimes(2);
+    serverTask = task;
+    await act(async () => {
+      emit("idle");
+    });
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(detail).toHaveBeenCalledTimes(3);
+    expect(history).toHaveBeenCalledTimes(1);
+    expect(metrics).toHaveBeenCalledTimes(1);
+    expect(other).not.toHaveBeenCalled();
+    await act(async () => {
+      FakeWebSocket.instances[0]!.emitMessage({ type: "snapshot", channel: "tasks", data: [] });
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(list).toHaveBeenCalledTimes(4);
+    expect(detail).toHaveBeenCalledTimes(4);
     expect(history).toHaveBeenCalledTimes(2);
+    expect(metrics).toHaveBeenCalledTimes(2);
+    expect(other).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["running", "cancelling"])(
-    "keeps %s task events when older list and detail reads finish",
-    async (state) => {
-      const task = {
-        key: "refresh_metadata",
-        state: "idle",
-        progress: 0,
-        triggers: [],
-        execution_scope: "process",
-      };
+  it.each([false, true])(
+    "catches up a slow task read after reconnect (cached: %s)",
+    async (cached) => {
       const client = new QueryClient();
-      client.setQueryData(adminKeys.tasks(), [task]);
-      client.setQueryData(adminKeys.task(task.key), task);
-      let finishList!: (rows: (typeof task)[]) => void;
-      let finishDetail!: (row: typeof task) => void;
-      const list = vi.fn(
-        () =>
-          new Promise((resolve) => {
-            finishList = resolve;
-          }),
-      );
-      const detail = vi.fn(
-        () =>
-          new Promise((resolve) => {
-            finishDetail = resolve;
-          }),
-      );
-      function TaskObservers() {
-        useQuery({ queryKey: adminKeys.tasks(), queryFn: list });
-        useQuery({ queryKey: adminKeys.task(task.key), queryFn: detail });
+      const oldTask = { key: "refresh_metadata", state: "running", progress: 10 };
+      const finishedTask = { ...oldTask, state: "idle", progress: 0 };
+      if (cached) client.setQueryData(adminKeys.tasks(), [oldTask]);
+      let finishOld!: (rows: (typeof oldTask)[]) => void;
+      const load = vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishOld = resolve;
+            }),
+        )
+        .mockResolvedValue([finishedTask]);
+      function TaskObserver() {
+        useQuery({ queryKey: adminKeys.tasks(), queryFn: load });
         return null;
       }
       render(
         <QueryClientProvider client={client}>
           <RealtimeEventsProvider>
-            <TaskObservers />
+            <TaskObserver />
           </RealtimeEventsProvider>
         </QueryClientProvider>,
       );
       await act(async () => {});
-      const update = {
-        key: task.key,
-        state,
-        progress: 40,
-        triggers: [{ type: "interval", interval_ms: 60_000 }],
-        next_run_at: "2026-01-02T03:04:05Z",
-      };
+      expect(load).toHaveBeenCalledTimes(1);
       await act(async () => {
         FakeWebSocket.instances[0]!.emitMessage({
-          type: "event",
+          type: "snapshot",
           channel: "tasks",
-          event: "task.updated",
-          data: update,
+          data: [finishedTask],
         });
+        for (let i = 0; i < 20; i++)
+          FakeWebSocket.instances[0]!.emitMessage({
+            type: "event",
+            channel: "tasks",
+            event: "task.updated",
+            data: oldTask,
+          });
+        await vi.advanceTimersByTimeAsync(20_000);
       });
-      expect(client.getQueryData(adminKeys.tasks())).toEqual([{ ...task, ...update }]);
-      expect(client.getQueryData(adminKeys.task(task.key))).toEqual({ ...task, ...update });
+      expect(load).toHaveBeenCalledTimes(1);
       await act(async () => {
-        finishList([task]);
-        finishDetail(task);
+        finishOld([oldTask]);
+        await vi.advanceTimersByTimeAsync(5_000);
       });
-      expect(client.getQueryData(adminKeys.tasks())).toEqual([{ ...task, ...update }]);
-      expect(client.getQueryData(adminKeys.task(task.key))).toEqual({ ...task, ...update });
-      expect(list).toHaveBeenCalledTimes(1);
-      expect(detail).toHaveBeenCalledTimes(1);
+      expect(load).toHaveBeenCalledTimes(2);
+      expect(client.getQueryData(adminKeys.tasks())).toEqual([finishedTask]);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(load).toHaveBeenCalledTimes(2);
     },
   );
-
-  it("allows initial task reads to populate missing caches during progress events", async () => {
-    const task = {
-      key: "refresh_metadata",
-      state: "running",
-      progress: 10,
-      execution_scope: "process",
-    };
-    const client = new QueryClient();
-    let finishList!: (rows: (typeof task)[]) => void;
-    let finishDetail!: (row: typeof task) => void;
-    const list = vi.fn(
-      () =>
-        new Promise((resolve) => {
-          finishList = resolve;
-        }),
-    );
-    const detail = vi.fn(
-      () =>
-        new Promise((resolve) => {
-          finishDetail = resolve;
-        }),
-    );
-    function TaskObservers() {
-      useQuery({ queryKey: adminKeys.tasks(), queryFn: list });
-      useQuery({ queryKey: adminKeys.task(task.key), queryFn: detail });
-      return null;
-    }
-    render(
-      <QueryClientProvider client={client}>
-        <RealtimeEventsProvider>
-          <TaskObservers />
-        </RealtimeEventsProvider>
-      </QueryClientProvider>,
-    );
-    await act(async () => {});
-    await act(async () => {
-      FakeWebSocket.instances[0]!.emitMessage({
-        type: "event",
-        channel: "tasks",
-        event: "task.updated",
-        data: { key: task.key, state: "running", progress: 10 },
-      });
-      finishList([task]);
-      finishDetail(task);
-    });
-    expect(client.getQueryData(adminKeys.tasks())).toEqual([task]);
-    expect(client.getQueryData(adminKeys.task(task.key))).toEqual(task);
-    expect(list).toHaveBeenCalledTimes(1);
-    expect(detail).toHaveBeenCalledTimes(1);
-  });
-
-  it("replaces a task read started before reconnect so it cannot overwrite the catch-up", async () => {
-    const client = new QueryClient();
-    const oldTask = { key: "refresh_metadata", state: "running", progress: 10 };
-    const finishedTask = { ...oldTask, state: "idle", progress: 0 };
-    client.setQueryData(adminKeys.tasks(), [oldTask]);
-    let finishOld!: (rows: (typeof oldTask)[]) => void;
-    const load = vi
-      .fn()
-      .mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            finishOld = resolve;
-          }),
-      )
-      .mockResolvedValue([finishedTask]);
-    function TaskObserver() {
-      useQuery({ queryKey: adminKeys.tasks(), queryFn: load });
-      return null;
-    }
-    render(
-      <QueryClientProvider client={client}>
-        <RealtimeEventsProvider>
-          <TaskObserver />
-        </RealtimeEventsProvider>
-      </QueryClientProvider>,
-    );
-    await act(async () => {});
-    expect(load).toHaveBeenCalledTimes(1);
-    await act(async () => {
-      FakeWebSocket.instances[0]!.emitMessage({
-        type: "snapshot",
-        channel: "tasks",
-        data: [finishedTask],
-      });
-    });
-    expect(load).toHaveBeenCalledTimes(2);
-    await act(async () => {
-      finishOld([oldTask]);
-    });
-    expect(client.getQueryData(adminKeys.tasks())).toEqual([finishedTask]);
-  });
 
   it("defers broad catch-up refetches until foreground playback exits", async () => {
     const queryClient = new QueryClient({

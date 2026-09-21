@@ -2,13 +2,14 @@ import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   captureProfileRequestContext,
+  isCapturedProfileAuthorityActive,
   setAccessToken,
   setProfileId,
   setProfileToken,
 } from "@/api/client";
-import { adminKeys } from "@/hooks/queries/keys";
+import { adminStatsKey } from "@/hooks/queries/admin/stats";
 import { adminSessionsKey } from "@/api/v2/adminSessionsCache";
-import { createSessionRefreshScheduler } from "./realtimeSessionRefresh";
+import { createRealtimeQueryRefreshScheduler } from "./realtimeQueryRefresh";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -26,7 +27,19 @@ function observeSessions(load: () => Promise<string[]>) {
   const observer = new QueryObserver(client, { queryKey: key, queryFn: load, staleTime: Infinity });
   const unsubscribe = observer.subscribe(() => {});
   let allowUpdates = true;
-  const scheduler = createSessionRefreshScheduler(client, authority, () => allowUpdates);
+  const refresh = createRealtimeQueryRefreshScheduler(
+    client,
+    () => isCapturedProfileAuthorityActive(authority),
+    () => allowUpdates,
+  );
+  const scheduler = {
+    schedule: () =>
+      refresh.schedule(
+        { queryKey: key, exact: true },
+        { queryKey: adminStatsKey(authority), exact: true },
+      ),
+    cancel: refresh.cancel,
+  };
   return {
     client,
     key,
@@ -99,7 +112,7 @@ it("catches up stats already fetching when sessions are idle", async () => {
         finishStats = resolve;
       }),
   );
-  const key = adminKeys.stats();
+  const key = adminStatsKey(captureProfileRequestContext()!);
   state.client.setQueryData(key, 0);
   const observer = new QueryObserver(state.client, { queryKey: key, queryFn: stats });
   const unsubscribe = observer.subscribe(() => {});
