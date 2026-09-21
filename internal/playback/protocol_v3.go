@@ -958,7 +958,18 @@ type PlanV3 struct {
 	// neutral catalog row. UI-only: clients use it to keep the version menu in
 	// sync with the version that actually played. It is deliberately excluded
 	// from plan identity hashing, like the inventory fields above.
-	EffectiveVirtualURI    string             `json:"effective_virtual_uri,omitempty"`
+	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
+	// VirtualSourceRevision is an opaque, non-secret revision of the resolved
+	// virtual source candidate. It changes when the planner resolves a different
+	// candidate (a release rotation) and stays fixed while the same candidate is
+	// served, so clients can re-arm source-change recovery on a rotation even
+	// when the published effective_media_file_id and effective_virtual_uri are
+	// unchanged. Its input is the provider-neutral candidate identity (the
+	// `?result=` fingerprint), never a provider URL, token, or header; the value
+	// is a domain-separated SHA-256. Empty for a non-virtual source. Like
+	// EffectiveVirtualURI it is a UI hint and is deliberately excluded from plan
+	// identity hashing.
+	VirtualSourceRevision  string             `json:"virtual_source_revision,omitempty"`
 	Source                 SourceDescriptorV3 `json:"source"`
 	SubtitleFidelityPolicy string             `json:"subtitle_fidelity_policy"`
 	// AudioTracks is the authoritative per-track audio inventory of the

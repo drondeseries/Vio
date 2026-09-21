@@ -1428,6 +1428,32 @@ cross-message vectors: a server-emitted token, the exact replan echo, and the
 loop-rejection result. The generator computes the server token internally but
 does not publish its preimage.
 
+### 9.1 Virtual source revision
+
+`playback_plan.virtual_source_revision` is an opaque, non-secret revision of the
+resolved virtual source candidate. It is present only when the effective source
+is a virtual candidate the server resolved and probed; it is absent for an
+ordinary local file and for a neutral `virtual://…` row planned without a
+candidate pick.
+
+The token identifies the resolved candidate, not the requested catalog row. A
+release rotation can keep `effective_media_file_id` fixed (it is the requested
+row), so a client that keys source-change recovery on the row cannot tell that
+the release moved. The revision changes when the server resolves a different
+candidate and stays fixed while the same candidate is served; clients key their
+subtitle source generation on it so recovery re-arms once per rotation and not
+on a plan-id-only replan.
+
+It is derived from the provider-neutral candidate fingerprint the virtual
+resolver already binds to the served release (the `?result=` pick) with a
+domain-separated SHA-256 truncated to 96 bits. No provider stream URL, token,
+request header, or raw candidate payload is an input, and none is recoverable
+from the published token. Treat it as opaque; do not parse or recompute it.
+
+It is a UI hint and is deliberately excluded from plan identity, exactly like
+`effective_virtual_uri` and the track inventories, so adding it does not perturb
+`plan_id` or `plan_attempt_key`.
+
 ---
 
 ## 10. Quality

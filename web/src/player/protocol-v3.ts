@@ -602,6 +602,15 @@ export interface PlanV3 {
    * rows, so clients use this path to adopt the version actually playing.
    */
   effective_virtual_uri?: string;
+  /**
+   * Opaque, non-secret revision of the resolved virtual source candidate. It
+   * changes when the server resolves a different candidate for the same virtual
+   * row and stays fixed while the same candidate is served. Clients key
+   * source-change recovery on it because `effective_media_file_id` is the
+   * requested catalog row and does not move on a rotation. Absent for a
+   * non-virtual source and for a virtual row resolved without a candidate.
+   */
+  virtual_source_revision?: string;
   source: SourceDescriptorV3;
   subtitle_fidelity_policy: string;
   /**

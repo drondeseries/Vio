@@ -21047,6 +21047,7 @@ export interface components {
       subtitle_fidelity_policy: string;
       timeline: components["schemas"]["TimelineV3"];
       transformations: components["schemas"]["TransformationV3"][];
+      virtual_source_revision?: string;
     };
     PlaybackProgressBody: {
       /**

@@ -727,13 +727,16 @@ export function VideoPlayer({
 
   // The effective subtitle source identity. A virtual release that rotates to a
   // new concrete candidate changes this; a plan that only re-mints subtitle
-  // URLs or re-orders the inventory does not. The 409 source-change signal is
-  // deduped per generation (below and in the two subtitle hooks) so the
-  // refresh -> replan -> refetch cycle cannot restart on a new plan id.
+  // URLs or re-orders the inventory does not. The revision is part of the
+  // identity because the effective media file id is the requested catalog row
+  // and does not move on a rotation, and the v2 wire does not carry the virtual
+  // URI. The 409 source-change signal is deduped per generation (below and in
+  // the two subtitle hooks) so the refresh -> replan -> refetch cycle cannot
+  // restart on a new plan id.
   const [subtitleSourceGeneration, setSubtitleSourceGeneration] = useState(0);
   const lastSubtitleSourceIdentityRef = useRef<string | null>(null);
   useEffect(() => {
-    const identity = `${sessionId}|${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}`;
+    const identity = `${sessionId}|${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`;
     if (lastSubtitleSourceIdentityRef.current === null) {
       lastSubtitleSourceIdentityRef.current = identity;
       return;
@@ -742,7 +745,12 @@ export function VideoPlayer({
       lastSubtitleSourceIdentityRef.current = identity;
       setSubtitleSourceGeneration((generation) => generation + 1);
     }
-  }, [sessionId, plan.effective_media_file_id, plan.effective_virtual_uri]);
+  }, [
+    sessionId,
+    plan.effective_media_file_id,
+    plan.effective_virtual_uri,
+    plan.virtual_source_revision,
+  ]);
 
   const isFirefoxBrowser =
     typeof navigator !== "undefined" && isFirefoxUserAgent(navigator.userAgent);
