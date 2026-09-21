@@ -356,3 +356,21 @@ fall back to the ID when the title is absent. Personal membership pages hydrate
 titles through the existing viewer access filter; admin pages require acting
 administrator access. Membership identity, ordering and cursor revision checks
 are unchanged. Frozen v1 membership responses do not expose this field.
+
+## Collection virtual playback default
+
+Collection creation requests accept a `virtual_playback` boolean: the TMDB,
+Trakt, and MDBList import endpoints and the template-bundle apply endpoint. It
+controls whether items matched outside the selected libraries are kept as
+zero-storage virtual entries that Silo Virtual Library resolves at playback.
+
+The `/api/v2` import and template-apply request bodies expose the same optional
+`virtual_playback` boolean; omitting it defaults to on, and `false` opts out.
+
+`virtual_playback` defaults to on when the field is omitted, so third-party
+clients and creates-from-template get the same behavior as the first-party
+admin UI. An explicit `false` disables it and limits the collection to items
+present in the selected libraries; an explicit `true` keeps the default
+behavior. The default does not change the stored field's semantics: an enabled
+collection stores `virtual_playback: true`, and a disabled one omits the key,
+which every reader treats as false.

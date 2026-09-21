@@ -6754,6 +6754,10 @@
           },
           "url": {
             "type": "string"
+          },
+          "virtual_playback": {
+            "description": "Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -13036,6 +13040,10 @@
           "title": {
             "minLength": 1,
             "type": "string"
+          },
+          "virtual_playback": {
+            "description": "Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -13958,6 +13966,10 @@
             "maxItems": 1000,
             "minItems": 1,
             "type": "array"
+          },
+          "virtual_playback": {
+            "description": "Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -14310,6 +14322,10 @@
           "title": {
             "minLength": 1,
             "type": "string"
+          },
+          "virtual_playback": {
+            "description": "Keep items matched outside the selected libraries as zero-storage virtual entries. Defaults to on when omitted; send false to disable.",
+            "type": "boolean"
           }
         },
         "required": [

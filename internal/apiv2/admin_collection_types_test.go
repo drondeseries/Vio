@@ -3,6 +3,7 @@ package apiv2
 import (
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -173,5 +174,136 @@ func TestAdminCollectionUpdateCommandRejectsNullBeforeLowering(t *testing.T) {
 	}
 	if !schema.Properties["group_id"].Nullable {
 		t.Fatal("group_id clearing not declared nullable")
+	}
+}
+
+// TestAdminCollectionCommandVirtualPlaybackTriState pins the v2 boundary for
+// the additive virtual_playback field: an omitted value must stay a nil
+// pointer so the handler default (on) applies, and an explicit value must
+// survive the adapter unchanged. The handler side maps nil to true in
+// TestResolveVirtualPlayback (internal/api/handlers), so omitted resolving to
+// on is pinned on both sides of the boundary.
+func TestAdminCollectionCommandVirtualPlaybackTriState(t *testing.T) {
+	type commandCase struct {
+		name  string
+		build func(t *testing.T, field string) (*bool, *Problem)
+	}
+	cases := []commandCase{
+		{
+			name: "mdblist_import",
+			build: func(t *testing.T, field string) (*bool, *Problem) {
+				t.Helper()
+				var dto AdminMDBListImport
+				body := `{"library_ids":["1"],"title":"Import","url":"https://mdblist.com/lists/user/list"` + field + `}`
+				if err := json.Unmarshal([]byte(body), &dto); err != nil {
+					t.Fatal(err)
+				}
+				cmd, p := dto.command()
+				return cmd.VirtualPlayback, p
+			},
+		},
+		{
+			name: "tmdb_import",
+			build: func(t *testing.T, field string) (*bool, *Problem) {
+				t.Helper()
+				var dto AdminTMDBImport
+				body := `{"library_ids":["1"],"title":"Import","preset":"popular","media_type":"movie"` + field + `}`
+				if err := json.Unmarshal([]byte(body), &dto); err != nil {
+					t.Fatal(err)
+				}
+				cmd, p := dto.command()
+				return cmd.VirtualPlayback, p
+			},
+		},
+		{
+			name: "trakt_import",
+			build: func(t *testing.T, field string) (*bool, *Problem) {
+				t.Helper()
+				var dto AdminTraktImport
+				body := `{"library_ids":["1"],"title":"Import","preset":"trending","media_type":"movie"` + field + `}`
+				if err := json.Unmarshal([]byte(body), &dto); err != nil {
+					t.Fatal(err)
+				}
+				cmd, p := dto.command()
+				return cmd.VirtualPlayback, p
+			},
+		},
+		{
+			name: "template_apply",
+			build: func(t *testing.T, field string) (*bool, *Problem) {
+				t.Helper()
+				var dto AdminTemplateApply
+				body := `{"library_ids":["1"]` + field + `}`
+				if err := json.Unmarshal([]byte(body), &dto); err != nil {
+					t.Fatal(err)
+				}
+				cmd, p := dto.command()
+				return cmd.VirtualPlayback, p
+			},
+		},
+	}
+	variants := []struct {
+		name      string
+		field     string
+		wantNil   bool
+		wantValue bool
+	}{
+		{name: "omitted", field: "", wantNil: true},
+		{name: "explicit_false", field: `,"virtual_playback":false`, wantValue: false},
+		{name: "explicit_true", field: `,"virtual_playback":true`, wantValue: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, variant := range variants {
+				t.Run(variant.name, func(t *testing.T) {
+					got, p := tc.build(t, variant.field)
+					if p != nil {
+						t.Fatalf("command rejected: %v", p)
+					}
+					if variant.wantNil {
+						if got != nil {
+							t.Fatalf("omitted virtual_playback = %v, want nil so the handler default applies", *got)
+						}
+						return
+					}
+					if got == nil || *got != variant.wantValue {
+						t.Fatalf("virtual_playback = %v, want %v", got, variant.wantValue)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestAdminCollectionRequestSchemaExposesOptionalVirtualPlayback locks the
+// additive contract: virtual_playback is an optional, non-nullable boolean on
+// each of the four collection-creation request bodies.
+func TestAdminCollectionRequestSchemaExposesOptionalVirtualPlayback(t *testing.T) {
+	r := huma.NewMapRegistry("#/components/schemas/", huma.DefaultSchemaNamer)
+	for _, tc := range []struct {
+		name string
+		dto  any
+	}{
+		{"AdminMDBListImport", AdminMDBListImport{}},
+		{"AdminTMDBImport", AdminTMDBImport{}},
+		{"AdminTraktImport", AdminTraktImport{}},
+		{"AdminTemplateApply", AdminTemplateApply{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			schema := huma.SchemaFromType(r, reflect.TypeOf(tc.dto))
+			prop, ok := schema.Properties["virtual_playback"]
+			if !ok {
+				t.Fatal("virtual_playback missing from schema")
+			}
+			if prop.Type != "boolean" {
+				t.Fatalf("virtual_playback type = %q, want boolean", prop.Type)
+			}
+			if prop.Nullable {
+				t.Fatal("virtual_playback must not be nullable")
+			}
+			if slices.Contains(schema.Required, "virtual_playback") {
+				t.Fatal("virtual_playback must be optional")
+			}
+		})
 	}
 }
