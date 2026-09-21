@@ -1142,6 +1142,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 	var adminPlaybackControlHandler *handlers.AdminPlaybackControlHandler
 	var playbackCommandDispatcher *playback.CommandDispatcher
 	var streamHandler *handlers.StreamHandler
+	// virtualCandidatesRefresh is the explicit "Refresh List" service, wired to
+	// the v2 media-candidates endpoint when the core virtual library and the
+	// candidate sink are both available.
+	var virtualCandidatesRefresh *handlers.VirtualCandidatesRefreshService
 	if deps.SessionMgr != nil {
 		remoteStreamRelay := remotestream.NewRelay()
 		if deps.AppContext != nil && deps.AppContext.Done() != nil {
@@ -1173,30 +1177,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 					if err != nil {
 						return nil, err
 					}
-					out := make([]handlers.VirtualPlaybackStream, 0, len(streams))
-					for _, stream := range streams {
-						var providerExpiresAt *time.Time
-						if !stream.ExpiresAt.IsZero() {
-							expiresAt := stream.ExpiresAt
-							providerExpiresAt = &expiresAt
-						}
-						out = append(out, handlers.VirtualPlaybackStream{
-							ID: stream.ID, Label: stream.Label, URI: stream.URI, Resolution: stream.Resolution,
-							CodecVideo: stream.CodecVideo, CodecAudio: stream.CodecAudio, HasAtmos: stream.HasAtmos,
-							QualityScore: stream.QualityScore, RequestHeaders: stream.RequestHeaders,
-							HDR: stream.HDR, SourceType: stream.SourceType, FileSize: stream.FileSize, Container: stream.Container,
-							Bitrate: stream.Bitrate, FrameRate: stream.FrameRate, AudioLanguages: stream.AudioLanguages,
-							SubtitleLanguages: stream.SubtitleLanguages, OwnerInstallationID: stream.OwnerInstallationID,
-							Visible: stream.Visible, VisibilitySpecified: stream.VisibilitySpecified,
-							Rejected:            stream.Rejected,
-							ProviderURL:         stream.ProviderURL,
-							ProviderVideoHash:   stream.ProviderVideoHash,
-							ProviderGUID:        stream.ProviderGUID,
-							ProviderReleaseName: stream.ProviderReleaseName,
-							ProviderExpiresAt:   providerExpiresAt,
-						})
-					}
-					return out, nil
+					return virtualPlaybackStreamsFromCore(streams), nil
 				})
 				playbackHandler.VirtualPlaybackStreamSink = func(ctx context.Context, source *models.MediaFile, streams []handlers.VirtualPlaybackStream) error {
 					candidates := make([]scanner.VirtualCandidate, 0, len(streams))
@@ -1220,6 +1201,25 @@ func newChiRouter(deps Dependencies) chi.Router {
 						})
 					}
 					return deps.FileRepo.ReplaceVirtualCandidates(ctx, source, candidates)
+				}
+				// The explicit "Refresh List" action re-lists the provider and
+				// persists through the same sink, then answers the post-refresh
+				// watch-detail versions. It needs the items handler for the
+				// access-checked detail read.
+				if itemsHandler != nil {
+					virtualCandidatesRefresh = &handlers.VirtualCandidatesRefreshService{
+						ListFresh: handlers.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]handlers.VirtualPlaybackStream, error) {
+							streams, err := deps.VirtualLibraryService.ListStreamsFresh(ctx, path)
+							if err != nil {
+								return nil, err
+							}
+							return virtualPlaybackStreamsFromCore(streams), nil
+						}),
+						Persist:      playbackHandler.VirtualPlaybackStreamSink,
+						ContentFiles: deps.FileRepo.GetByContentID,
+						EpisodeFiles: deps.FileRepo.GetByEpisodeID,
+						Detail:       itemsHandler,
+					}
 				}
 				playbackHandler.VirtualFileLookup = func(ctx context.Context, path string) (*models.MediaFile, error) {
 					file, err := deps.FileRepo.GetByPath(ctx, path)
@@ -2700,6 +2700,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 	}
 	if itemsHandler != nil {
 		v2deps.Watch = itemsHandler
+	}
+	if virtualCandidatesRefresh != nil {
+		v2deps.VirtualCandidatesRefresh = virtualCandidatesRefresh
 	}
 	if profileHandler != nil {
 		v2deps.Profiles = profileHandler

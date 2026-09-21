@@ -270,6 +270,10 @@ type Dependencies struct {
 	// Watch answers watch detail and marks items watched
 	// (*handlers.ItemsHandler).
 	Watch WatchService
+	// VirtualCandidatesRefresh force-re-lists a virtual item's provider
+	// candidates for the media-candidates refresh endpoint. A missing service
+	// makes only that operation answer dependency_unavailable.
+	VirtualCandidatesRefresh VirtualCandidatesRefreshService
 	// Profiles applies profile updates (*handlers.ProfileHandler).
 	Profiles ProfileService
 	// Libraries answers which library identifiers exist

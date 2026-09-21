@@ -628,6 +628,7 @@ export const v2Operations = {
   "POST /api/v2/libraries/{id}/metadata-match-queue/retry": "retryMetadataMatchQueue",
   "POST /api/v2/libraries/{id}/refresh-metadata": "refreshLibraryMetadata",
   "POST /api/v2/library-jobs/{job_id}/cancel": "cancelLibraryJob",
+  "POST /api/v2/media/{media_id}/virtual-candidates:refresh": "refreshVirtualCandidates",
   "POST /api/v2/notifications/discord/link/init": "beginNotificationDiscordLink",
   "POST /api/v2/notifications/email/unsubscribe": "unsubscribeNotificationEmailOneClick",
   "POST /api/v2/notifications/push/devices": "registerPushDevice",
