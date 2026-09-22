@@ -56,6 +56,26 @@ export function formatFileSize(bytes?: number, options: FormatFileSizeOptions = 
   return `${bytes} B`;
 }
 
+// A size token as it appears in a release/provider label ("4.2 GB", "800 MB"),
+// with an optional leading separator. Provider display labels can carry one
+// because the server appends the size it parsed from the release text.
+export const RELEASE_SIZE_TOKEN = /(?:\s*[·•|]\s*)?\b\d+(?:\.\d+)?\s*(?:TB|GB|MB)\b/gi;
+
+/**
+ * Removes a size that a provider/release label already embeds, so a row does
+ * not show the same attribute twice. The structured file size is the canonical
+ * value (it is what filtering and sorting use), so it is the one kept; the
+ * label keeps its resolution, codec and group identity.
+ */
+export function stripReleaseSizeToken(releaseName: string): string {
+  if (!releaseName) return "";
+  return releaseName
+    .replace(RELEASE_SIZE_TOKEN, " ")
+    .replace(/\s*[·•|]\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function formatBitrate(kbps?: number, fallback = ""): string {
   if (!isPositive(kbps)) return fallback;
   return `${Math.round(kbps).toLocaleString()} kbps`;

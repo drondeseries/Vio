@@ -2927,14 +2927,37 @@ describe("VideoPlayer version switch UX", () => {
     expect(props.versions?.find((v) => v.fileId === 7)?.unavailable).toBe(false);
   });
 
-  it("forwards a candidate's custom-format score to the version menu", () => {
-    const scoredVersion = { ...versionB, format_score: 850 };
+  it("forwards a candidate's custom-format score and row detail to the version menu", () => {
+    const scoredVersion = {
+      ...versionB,
+      format_score: 850,
+      file_size: 50_570_000_000,
+      file_path: "virtual://movie/tt1?profile=4K%2BHDR&result=abc",
+      edition_raw: "Movie.2026.2160p.WEB-DL.50.53GB",
+      audio_tracks: [{ language: "eng" }, { language: "fra" }],
+      subtitle_tracks: [{ language: "deu" }],
+    };
     renderPlayer({ versions: [versionA, scoredVersion], activeFileId: 7 });
 
     const props = controls.current as unknown as {
-      versions?: Array<{ fileId: number; formatScore?: number }>;
+      versions?: Array<{
+        fileId: number;
+        formatScore?: number;
+        detail?: string;
+        audioLanguages?: string[];
+        subtitleLanguages?: string[];
+        profileLabel?: string | null;
+      }>;
     };
-    expect(props.versions?.find((v) => v.fileId === 99)?.formatScore).toBe(850);
+    const scored = props.versions?.find((v) => v.fileId === 99);
+    expect(scored?.formatScore).toBe(850);
+    // The label's embedded size is dropped in favour of the structured one.
+    expect(scored?.detail).toContain("47.1 GB");
+    expect(scored?.detail).not.toContain("50 53 GB");
+    expect(scored?.audioLanguages).toEqual(["English", "French"]);
+    expect(scored?.subtitleLanguages).toEqual(["German"]);
+    expect(scored?.profileLabel).toBe("4K+HDR");
+
     // A version with no server score carries no badge value.
     expect(props.versions?.find((v) => v.fileId === 7)?.formatScore).toBeUndefined();
   });

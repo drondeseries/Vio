@@ -1,13 +1,15 @@
 import { memo, useMemo, useState } from "react";
-import { Check, ChevronDown, Disc3, Layers3 } from "lucide-react";
+import { Check, ChevronDown, Disc3, Layers3, RefreshCw } from "lucide-react";
 
 import type { FileVersion, PlaybackVariant } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { QualityRankingSummary } from "@/components/streaming/QualityRankingSummary";
+import { useVersionListRefresh } from "@/hooks/useVersionListRefresh";
 import { videoRangeLabel } from "@/lib/videoRange";
 import DetailPopover from "./DetailPopover";
 import { sortPlaybackVariantsByEditionPreference } from "./versionRankingUtils";
-import { collectLanguageLabels } from "./versionFormatUtils";
+import { collectLanguageLabels, profileLabelFromFilePath } from "./versionFormatUtils";
 import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
 import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
 
@@ -18,6 +20,12 @@ interface VersionDropdownProps {
   onSelectVersion: (version: FileVersion) => void;
   /** Fired whenever a picker popover opens or closes (open=true on open). */
   onOpenChange?: (open: boolean) => void;
+  /**
+   * Re-lists the title's video candidates for the version menu. Resolves once
+   * the refreshed list has been applied to the page; rejecting keeps the rows
+   * already on screen. Omitted when the page cannot refresh.
+   */
+  onRefreshVersions?: () => Promise<void>;
 }
 
 interface EditionOption {
@@ -34,9 +42,15 @@ function VersionDropdown({
   selectedVersion,
   onSelectVersion,
   onOpenChange,
+  onRefreshVersions,
 }: VersionDropdownProps) {
   const [editionOpen, setEditionOpen] = useState(false);
   const [versionOpen, setVersionOpen] = useState(false);
+  const {
+    refreshing: refreshingVersions,
+    error: refreshVersionsError,
+    refresh: handleRefreshVersions,
+  } = useVersionListRefresh(onRefreshVersions);
 
   const handleEditionOpenChange = (open: boolean) => {
     setEditionOpen(open);
@@ -70,6 +84,15 @@ function VersionDropdown({
   const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
     activeVersions,
     activeVersion?.file_id,
+  );
+
+  // The profile the ranked candidates carry, so the ordering indicator names
+  // the same profile the server scored under.
+  const rankingProfileLabel = useMemo(
+    () =>
+      profileLabelFromFilePath(activeVersion?.file_path) ??
+      profileLabelFromFilePath(activeVersions[0]?.file_path),
+    [activeVersion, activeVersions],
   );
 
   if (!showEditionDropdown && !showVersionDropdown) {
@@ -147,12 +170,17 @@ function VersionDropdown({
           }
         >
           <div className="space-y-0.5">
+            <QualityRankingSummary
+              profileLabel={rankingProfileLabel}
+              className="px-3 pt-1.5 pb-0.5"
+            />
             {visibleVersions.map((version) => {
               const isSelected = version.file_id === activeVersion?.file_id;
               const summary = buildQualitySummary(version);
               const detail = buildDetailLine(version);
               const rangeLabel = videoRangeLabel(version);
               const unavailable = isVersionUnavailable(version);
+              const versionProfileLabel = profileLabelFromFilePath(version.file_path);
 
               return (
                 <button
@@ -183,6 +211,17 @@ function VersionDropdown({
                             className="border-amber-500/30 bg-amber-500/15 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-300"
                           >
                             Will retry on play
+                          </Badge>
+                        ) : null}
+                        {typeof version.format_score === "number" && version.format_score !== 0 ? (
+                          <Badge
+                            variant="outline"
+                            className="text-muted-foreground bg-muted/40 px-1.5 py-0 font-mono text-[10px] font-medium"
+                            title={`Format score ${version.format_score}${
+                              versionProfileLabel ? ` · ${versionProfileLabel}` : ""
+                            }`}
+                          >
+                            ★ {version.format_score}
                           </Badge>
                         ) : null}
                       </div>
@@ -235,6 +274,28 @@ function VersionDropdown({
                 {hiddenUnavailableCount === 1 ? "version" : "versions"}
               </button>
             )}
+            {onRefreshVersions ? (
+              <button
+                type="button"
+                disabled={refreshingVersions}
+                aria-busy={refreshingVersions || undefined}
+                onClick={() => handleRefreshVersions()}
+                className="text-muted-foreground hover:bg-accent/50 hover:text-foreground flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <RefreshCw
+                  className={`size-3.5 shrink-0 ${refreshingVersions ? "animate-spin" : ""}`}
+                  aria-hidden="true"
+                />
+                <span className="flex min-w-0 flex-col">
+                  <span>Refresh List</span>
+                  {refreshVersionsError ? (
+                    <span className="text-destructive text-[10px] leading-tight">
+                      {refreshVersionsError}
+                    </span>
+                  ) : null}
+                </span>
+              </button>
+            ) : null}
           </div>
         </DetailPopover>
       ) : null}

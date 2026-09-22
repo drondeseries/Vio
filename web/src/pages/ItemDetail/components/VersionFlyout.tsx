@@ -7,12 +7,12 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { formatFileSize, mapAudioLabel } from "@/lib/mediaFormat";
+import { mapAudioLabel } from "@/lib/mediaFormat";
 import { videoRangeLabel } from "@/lib/videoRange";
 import {
   collectLanguageLabels,
   extractSourceHint,
-  prettifyReleaseName,
+  formatVersionDetail,
 } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
 import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
@@ -54,51 +54,18 @@ export function buildQualitySummary(version: FileVersion): string {
   return parts.join(" · ");
 }
 
-// A size token as it appears in a release/provider label ("4.2 GB", "800 MB"),
-// with an optional leading separator. Provider display labels can carry one
-// because the server appends the size it parsed from the release text.
-const RELEASE_SIZE_TOKEN = /(?:\s*[·•|]\s*)?\b\d+(?:\.\d+)?\s*(?:TB|GB|MB)\b/gi;
-
-/**
- * Removes a size that a provider/release label already embeds, so the detail
- * line does not show the same attribute twice. The structured `file_size` is
- * the canonical value (it is what filtering and sorting use), so it is the one
- * kept; the label keeps its resolution, codec and group identity.
- */
-function stripReleaseSizeToken(releaseName: string): string {
-  if (!releaseName) return "";
-  return releaseName
-    .replace(RELEASE_SIZE_TOKEN, " ")
-    .replace(/\s*[·•|]\s*$/, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
+// The release name (provider label for virtual candidates, file stem for local
+// files) leads the line; edition_raw is the fallback for rows scanned before
+// release_name existed. Shared with the in-player version menu so both show the
+// same information and the same single size.
 export function buildDetailLine(version: FileVersion): string {
-  const parts: string[] = [];
-
-  // The release name (provider label for virtual candidates, file stem for
-  // local files) leads the line; edition_raw is the fallback for rows scanned
-  // before release_name existed.
-  const rawReleaseName = version.release_name || version.edition_raw;
-  const size = formatFileSize(version.file_size);
-  // When both the label and the structured field carry the size, show only the
-  // structured one. When file_size is unknown, the label's size is the only
-  // evidence and is kept.
-  const releaseName = prettifyReleaseName(
-    size ? stripReleaseSizeToken(rawReleaseName ?? "") : rawReleaseName,
-  );
-  if (releaseName) parts.push(releaseName);
-
-  if (size) parts.push(size);
-
-  const textToScan = [version.file_name, version.edition_raw, version.release_name]
-    .filter(Boolean)
-    .join(" ");
-  const hint = textToScan ? extractSourceHint(textToScan) : null;
-  if (hint) parts.push(hint);
-
-  return parts.join(" · ");
+  return formatVersionDetail({
+    label: version.release_name || version.edition_raw,
+    fileSize: version.file_size,
+    scanText: [version.file_name, version.edition_raw, version.release_name]
+      .filter(Boolean)
+      .join(" "),
+  });
 }
 
 export function sortByResolution(versions: FileVersion[]): FileVersion[] {

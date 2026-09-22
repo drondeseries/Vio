@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { createElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -55,11 +55,11 @@ function renderVersionMenu(
 
 function makeVersionInfo(overrides: Partial<VersionInfo> = {}): VersionInfo {
   return {
-    fileId: overrides.fileId ?? 1,
-    label: overrides.label ?? "2160p HEVC HDR",
-    formatScore: overrides.formatScore,
-    isCurrentSource: overrides.isCurrentSource ?? false,
-    isRequestedSource: overrides.isRequestedSource ?? false,
+    fileId: 1,
+    label: "2160p HEVC HDR",
+    isCurrentSource: false,
+    isRequestedSource: false,
+    ...overrides,
   };
 }
 
@@ -198,6 +198,54 @@ describe("QualityMenu version format score", () => {
     });
 
     expect(screen.getByText("★ -200")).toBeInTheDocument();
+  });
+});
+
+describe("QualityMenu version row parity with the item picker", () => {
+  it("renders audio and subtitle language badges", () => {
+    renderVersionMenu({
+      versions: [
+        makeVersionInfo({
+          fileId: 1,
+          label: "2160p HEVC",
+          audioLanguages: ["English", "French"],
+          subtitleLanguages: ["German"],
+        }),
+        makeVersionInfo({ fileId: 2, label: "1080p H264" }),
+      ],
+    });
+
+    const row = screen.getByRole("menuitem", { name: /2160p HEVC/ });
+    expect(within(row).getByText("English")).toBeInTheDocument();
+    expect(within(row).getByText("French")).toBeInTheDocument();
+    expect(within(row).getByText("German")).toBeInTheDocument();
+  });
+
+  it("renders the shared release + size detail line", () => {
+    renderVersionMenu({
+      versions: [
+        makeVersionInfo({
+          fileId: 1,
+          label: "2160p HEVC",
+          detail: "Movie 2026 2160p WEB-DL · 47.1 GB",
+        }),
+        makeVersionInfo({ fileId: 2, label: "1080p H264" }),
+      ],
+    });
+
+    expect(screen.getByText("Movie 2026 2160p WEB-DL · 47.1 GB")).toBeInTheDocument();
+  });
+
+  it("renders the ranking indicator and names the profile", () => {
+    renderVersionMenu({
+      versions: [
+        makeVersionInfo({ fileId: 1, label: "2160p HEVC", profileLabel: "4K+HDR" }),
+        makeVersionInfo({ fileId: 2, label: "1080p H264" }),
+      ],
+    });
+
+    expect(screen.getByText(/Ranking: Default ranking/)).toBeInTheDocument();
+    expect(screen.getByText(/4K\+HDR/)).toBeInTheDocument();
   });
 });
 

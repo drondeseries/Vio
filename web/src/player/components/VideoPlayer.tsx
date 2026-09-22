@@ -95,9 +95,12 @@ import {
   stopWatchTogetherPlayback,
   setWatchTogetherGuestControl,
 } from "@/lib/watchTogetherActions";
+import { videoRangeLabel } from "@/lib/videoRange";
 import {
   collectLanguageLabels,
+  formatVersionDetail,
   prettifyReleaseName,
+  profileLabelFromFilePath,
 } from "@/pages/ItemDetail/components/versionFormatUtils";
 import { toast } from "sonner";
 
@@ -713,21 +716,34 @@ export function VideoPlayer({
         // single language field when the list is absent. Labels resolve
         // through the same formatter as the item page, so raw ISO codes
         // render as "English/French" rather than "en/fr".
-        const audioLangs = collectLanguageLabels(
+        const audioLanguageLabels = collectLanguageLabels(
           (v.audio_tracks ?? []).flatMap((track) => {
             const languages = track.languages?.filter((l) => l?.trim());
             return languages && languages.length > 0 ? languages : [track.language?.trim()];
           }),
-        ).join("/");
-        const audioPart = v.codec_audio
-          ? ` ${v.codec_audio.toUpperCase()}${audioLangs ? ` ${audioLangs}` : ""}`
-          : audioLangs
-            ? ` ${audioLangs}`
-            : "";
+        );
+        const range = videoRangeLabel(v);
+        const audioPart = v.codec_audio ? ` ${v.codec_audio.toUpperCase()}` : "";
+        const releaseLabel = v.release_name ?? v.file_name;
         return {
           fileId: v.file_id,
-          label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}${audioPart}`,
-          releaseName: prettifyReleaseName(v.release_name ?? v.file_name),
+          // The same shape as the item-page picker's summary (resolution, video
+          // codec, dynamic range, audio codec); language sets move to badges so
+          // they are not shown twice.
+          label: `${v.resolution} ${v.codec_video.toUpperCase()}${range ? ` ${range}` : ""}${audioPart}`,
+          releaseName: prettifyReleaseName(releaseLabel),
+          // Same release + structured size + source hint the item-page picker
+          // shows, so the two version menus stay equal in information.
+          detail: formatVersionDetail({
+            label: releaseLabel,
+            fileSize: v.file_size,
+            scanText: [v.file_name, v.edition_raw, v.release_name].filter(Boolean).join(" "),
+          }),
+          audioLanguages: audioLanguageLabels,
+          subtitleLanguages: collectLanguageLabels(
+            (v.subtitle_tracks ?? []).map((track) => track.language ?? ""),
+          ),
+          profileLabel: profileLabelFromFilePath(v.file_path),
           formatScore: v.format_score,
           isCurrentSource: v.file_id === effectiveFileId,
           isRequestedSource:

@@ -31,7 +31,10 @@ import {
   Hand,
   Zap,
 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useDeleteMediaItem } from "@/hooks/queries/items";
+import { refreshVirtualCandidates } from "@/api/v2/mediaCandidates";
+import { catalogKeys } from "@/hooks/queries/keys";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
 import {
@@ -228,6 +231,18 @@ export default function ActionBar({
   const [addToCollectionOpen, setAddToCollectionOpen] = useState(false);
   const [markerEditorOpen, setMarkerEditorOpen] = useState(false);
   const deleteMediaItem = useDeleteMediaItem();
+  const queryClient = useQueryClient();
+  // The item-page "Refresh List": re-list the title's virtual candidates on the
+  // server (which preserves known-working rows), then re-read the item so the
+  // page's version list is replaced from the server's answer rather than a
+  // client-side merge.
+  const handleRefreshVersions = useCallback(async () => {
+    if (!contentId) return;
+    await refreshVirtualCandidates(contentId);
+    await queryClient.invalidateQueries({
+      queryKey: catalogKeys.itemDetail(contentId).slice(0, 4),
+    });
+  }, [contentId, queryClient]);
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
@@ -858,6 +873,7 @@ export default function ActionBar({
               selectedVersion={selectedVersion}
               onSelectVersion={onSelectVersion}
               onOpenChange={onVersionPickerOpenChange}
+              onRefreshVersions={contentId ? handleRefreshVersions : undefined}
             />
           )}
           {selectedVersion && (selectedVersion.audio_tracks?.length ?? 0) > 0 && (
