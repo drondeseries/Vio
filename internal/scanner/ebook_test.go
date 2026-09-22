@@ -2322,6 +2322,28 @@ func TestScrubEbookMetadataTextLeavesOrdinaryTextAlone(t *testing.T) {
 	}
 }
 
+func TestParseEbookPDFPreservesMetadataWordBoundaries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "book.pdf")
+	data := "%PDF-1.7\n1 0 obj\n<< /Title (A\nReal\tTitle) " +
+		"/Author (Ada\tWriter) /Keywords (science\rfiction) >>\nendobj\n" +
+		"trailer\n<< /Info 1 0 R >>\n%%EOF"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := parseEbookFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := parsedEbook{Title: "A Real Title", Authors: []string{"Ada Writer"}, Genres: []string{"science fiction"}}
+	if got.Title != want.Title || strings.Join(got.Authors, ",") != strings.Join(want.Authors, ",") ||
+		strings.Join(got.Genres, ",") != strings.Join(want.Genres, ",") {
+		t.Errorf("metadata = %q / %v / %v, want %q / %v / %v", got.Title, got.Authors, got.Genres, want.Title, want.Authors, want.Genres)
+	}
+	if gotKey, wantKey := ebookContentGroupKey(&got, path), ebookContentGroupKey(&want, path); gotKey != wantKey {
+		t.Errorf("content group = %q, want %q", gotKey, wantKey)
+	}
+}
+
 func TestParseEbookPDFSkipsEncryptedDocumentMetadata(t *testing.T) {
 	// Strings in an encrypted PDF are ciphertext. Storing them yields a
 	// random-looking title, so extraction is skipped entirely.

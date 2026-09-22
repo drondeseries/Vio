@@ -292,8 +292,6 @@ func ebookFileFormat(path string) string {
 func (b *parsedEbook) sanitize() {
 	b.Format = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(b.Format)), ".")
 	b.Title = scrubEbookMetadataText(b.Title)
-	// Scrub after cleaning: cleanEbookDescription collapses runs of whitespace,
-	// so removing control runes first would glue words together.
 	b.Description = scrubEbookMetadataText(cleanEbookDescription(b.Description))
 	b.Publisher = scrubEbookMetadataText(b.Publisher)
 	b.Language = scrubEbookMetadataText(b.Language)
@@ -354,13 +352,14 @@ func cleanEbookDescription(value string) string {
 // scrubEbookMetadataText removes control characters from extracted metadata.
 // Postgres rejects U+0000 anywhere in a text value and fails the whole
 // statement, and NUL is valid UTF-8, so a UTF-8 validity check does not catch
-// it. Strip every control rune rather than NUL alone: a value carrying one
-// normally carries more, and none of them belong in a title or a description.
+// it. Normalize whitespace controls to word separators, then strip the other
+// controls so they cannot reach catalog text fields.
 func scrubEbookMetadataText(value string) string {
 	if !utf8.ValidString(value) {
 		value = strings.ToValidUTF8(value, "")
 	}
 	if strings.ContainsFunc(value, unicode.IsControl) {
+		value = strings.Join(strings.Fields(value), " ")
 		value = strings.Map(func(r rune) rune {
 			if unicode.IsControl(r) {
 				return -1
