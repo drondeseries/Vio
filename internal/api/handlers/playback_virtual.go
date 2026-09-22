@@ -110,6 +110,10 @@ type virtualProbeFailureCache struct {
 	now   func() time.Time
 }
 
+// virtualCollectionProbeSource marks a collection-sourced virtual row whose
+// pin was recorded by the collection variant path rather than a per-file listing.
+const virtualCollectionProbeSource = "virtual_collection"
+
 func (c *virtualProbeFailureCache) clock() time.Time {
 	if c != nil && c.now != nil {
 		return c.now()
@@ -1637,8 +1641,18 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// caller's exclusion list or the known-bad stamp: with an exclusion
 		// pending (decode rotation) or a failed row, fall through to the
 		// resolve path, which honors both.
+		// A collection-owned variant row may carry declared/complete-looking
+		// evidence that was never produced by watching the live provider: its
+		// release can vanish while the row keeps its stamp, and taking P0 would
+		// bind the plan to the dead pin without ever re-listing. Only a row that
+		// actually delivered bytes (or a non-collection row, whose evidence
+		// comes from a real probe) may skip the provider round-trip. A never-
+		// delivered collection row falls through to the resolve path, which
+		// re-lists and can recover/rotate.
+		collectionRowNeedsDelivery := file.ProbeSource == virtualCollectionProbeSource && file.LastDeliveredAt == nil
 		if deferProbe && !forceRelist && !noResult &&
 			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
+			!collectionRowNeedsDelivery &&
 			h.VirtualMediaDetailedResolver != nil &&
 			((persistedResultURI && cand.URI == file.FilePath) || (pinnedURI != "" && cand.URI == pinnedURI)) &&
 			file.ProbeUpdatedAt != nil &&
@@ -2603,7 +2617,12 @@ UPDATE media_files SET
     audio_channels
   ),
   file_path        = CASE
-    WHEN $18 != '' AND probe_source IS DISTINCT FROM 'virtual_collection'
+    -- The final boolean in this guard is the explicit collection-variant
+    -- reconcile verdict: a collection path is otherwise never rewritten (the
+    -- collection sync owns it), but a caller that proved the pinned release
+    -- vanished from the fresh listing may re-point the row at the live
+    -- candidate selected for its profile.
+    WHEN $18 != '' AND (probe_source IS DISTINCT FROM 'virtual_collection' OR $32::boolean)
          AND NOT EXISTS (
            SELECT 1 FROM media_files sibling
            WHERE sibling.id <> media_files.id
@@ -2668,7 +2687,7 @@ WHERE id = $11
     NOT $22::boolean
     OR (
       $18 <> ''
-      AND probe_source IS DISTINCT FROM 'virtual_collection'
+      AND (probe_source IS DISTINCT FROM 'virtual_collection' OR $32::boolean)
       AND NOT EXISTS (
         SELECT 1 FROM media_files guard_sibling
         WHERE guard_sibling.id <> media_files.id
@@ -2864,6 +2883,7 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 			args.ResolvedURL, args.ResolvedURLExpiresAt,
 			args.ProviderVideoHash, args.ProviderGUID, args.ProviderReleaseName, args.ProviderReleaseSize,
 			providerRequestHeadersJSON, replaceIdentity, args.ClearProbe,
+			args.ReconcileCollectionVariant,
 		).Scan(&persistedPath)
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No row matched the CAS fence: a stale snapshot, reported as a
@@ -3061,7 +3081,7 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogF
 	snap := snapshotVirtualRow(catalogFile)
 	expectedPath := catalogFile.FilePath
 	adoptPath := ""
-	if resolvedPath != "" && resolvedPath != catalogFile.FilePath && catalogFile.ProbeSource != "virtual_collection" {
+	if resolvedPath != "" && resolvedPath != catalogFile.FilePath && catalogFile.ProbeSource != virtualCollectionProbeSource {
 		adoptPath = resolvedPath
 	}
 	// Evidence for a different concrete release than this row verifiably owns
@@ -3213,15 +3233,41 @@ var errVirtualAdoptIdentityNotPersisted = errors.New("virtual candidate identity
 // rejects the adoption rather than trusting the earlier read.
 var virtualAdoptionBarrier func()
 
+// virtualReleaseComparisonKey returns the release-identity key for a virtual
+// URI: scheme/host/path plus every query parameter except the concrete
+// "result=" pick and the quality "profile=" selection. A profile variant and
+// the provider-neutral candidate for the same release therefore compare equal,
+// while distinct result ids and distinct titles stay distinct.
+//
+// It is used only for same-release/adoption/evidence comparisons. The row's
+// stored file_path keeps its profile so the version list still distinguishes
+// quality variants; only the comparison drops it. The "result=" pick is left to
+// the caller: sameVirtualReleaseIdentity compares it explicitly, and the
+// neutral-ownership check in virtualCandidateRowVerified requires it absent.
+func virtualReleaseComparisonKey(virtualPath string) string {
+	parsed, err := url.Parse(virtualPath)
+	if err != nil {
+		return virtualPath
+	}
+	q := parsed.Query()
+	q.Del("result")
+	q.Del("profile")
+	parsed.RawQuery = q.Encode()
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
 // sameVirtualReleaseIdentity reports whether two virtual URIs name the same
-// release: byte-identical, or the same provider-neutral path carrying the same
-// concrete ?result= candidate id.
+// release: byte-identical, or the same provider-neutral path (profile
+// reconciled) carrying the same concrete ?result= candidate id. The profile is
+// a selection qualifier the provider does not know, so the same provider result
+// id under a profile variant and under the neutral key is one release.
 func sameVirtualReleaseIdentity(a, b string) bool {
 	if a == b {
 		return true
 	}
 	aID, bID := virtualResultCandidateID(a), virtualResultCandidateID(b)
-	return aID != "" && aID == bID && virtualPlaybackNeutralKey(a) == virtualPlaybackNeutralKey(b)
+	return aID != "" && aID == bID && virtualReleaseComparisonKey(a) == virtualReleaseComparisonKey(b)
 }
 
 // virtualCandidateVerdictError reports a non-nil error when the concrete
@@ -3278,8 +3324,11 @@ func virtualCandidateRowVerified(row *models.MediaFile, candidateURI string) boo
 		return true
 	}
 	// The row owns the provider-neutral identity (no concrete ?result= pick):
-	// that is the identity the neutral fallback lookup keys on. A row carrying
-	// a different concrete pick is a different release and is not verified.
+	// that is the identity the neutral fallback lookup keys on, and that lookup
+	// is profile-scoped. The profile is kept here: a 1080p neutral row must not
+	// verify a 4K candidate the neutral lookup would never return. The same
+	// release under a profile variant and the neutral key is recognized above by
+	// the shared concrete result id, where the profile is only a qualifier.
 	return virtualResultCandidateID(path) == "" &&
 		virtualPlaybackNeutralKey(path) == virtualPlaybackNeutralKey(candidateURI)
 }
@@ -3395,6 +3444,44 @@ func (h *PlaybackHandler) lookupVirtualCandidateRowDetailed(ctx context.Context,
 	return nil, false, nil
 }
 
+// collectionVariantPinVanished reports whether a collection-owned variant row's
+// pinned release is genuinely gone from the provider's fresh listing: the row
+// carries a durable identity, and neither the pinned result id nor any listed
+// candidate sharing that durable identity appears. A row without a durable
+// identity never qualifies, because a renumbered listing is then
+// indistinguishable from a vanished release and a swap would be silent. A row
+// that is not collection-owned never qualifies either: this is the one
+// ownership case whose path the collection sync otherwise keeps immutable.
+func collectionVariantPinVanished(file *models.MediaFile, streams []VirtualPlaybackStream, pinID string) bool {
+	if file == nil || file.ProbeSource != virtualCollectionProbeSource || pinID == "" {
+		return false
+	}
+	identity, ok := persistedVirtualIdentity(file)
+	if !ok {
+		return false
+	}
+	for _, stream := range streams {
+		if stream.ID == pinID || virtualResultCandidateID(stream.URI) == pinID {
+			return false
+		}
+		if streamMatchesPersistedIdentity(stream, identity) {
+			return false
+		}
+	}
+	return true
+}
+
+// streamMatchesPersistedIdentity reports whether a listed stream belongs to the
+// row's release, using the same durable-identity tier precedence as the
+// resolver's dedup key. The provider release size is not a separate field on
+// the stream record, so the candidate file size is used, exactly as the
+// listing sink stores it.
+func streamMatchesPersistedIdentity(stream VirtualPlaybackStream, identity virtuallibrary.PersistedCandidateIdentity) bool {
+	want := resolver.PersistedDedupKey(identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize)
+	got := resolver.PersistedDedupKey(stream.ProviderVideoHash, stream.ProviderGUID, stream.ProviderReleaseName, stream.FileSize)
+	return want != "" && want == got
+}
+
 // fallbackResolveStaleVirtualSource re-lists the provider's current candidates
 // and resolves the first healthy provider-neutral stream. It returns nil when
 // the original URI carried no stale result= pick, or when no substitute
@@ -3467,71 +3554,84 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 	if elig.sessionBound && elig.releaseID != "" {
 		sessionID = elig.releaseID
 	}
+	// A collection-owned variant row whose pinned release genuinely vanished
+	// from the fresh listing may reconcile to the profile's live candidate.
+	// This is the one case a session-bound request may substitute a different
+	// release without an explicit rotation: the row is the viewer's selection
+	// and its release no longer exists. A still-listed release — the same
+	// result id, or the same durable identity under a renumbered id — never
+	// qualifies, so a live release is never silently exchanged.
+	reconcileCollection := collectionVariantPinVanished(file, streams, sessionID)
 	if !elig.allowsSibling() {
-		if sessionID == "" {
+		if sessionID == "" && !reconcileCollection {
 			// No anchored release to refresh and siblings are forbidden.
 			return nil
 		}
-		// Prefer the persisted same-identity candidate: when the caller's own
-		// row still carries a usable stored URL for this exact release, serve it
-		// instead of listing again. The row's release identity was validated
-		// against the session anchor above and evaluateStoredVirtualURLCandidate
-		// re-checks it, so this is never a sibling, and a replay keeps working
-		// even when the provider's re-list no longer contains the candidate.
-		if usable, state := evaluateStoredVirtualURLCandidate(
-			ctx, file.FilePath, file,
-			h.storedVirtualURLAllowInsecure(file, file.VirtualOwnerInstallationID),
-			time.Now(), h.virtualCandidateTrustWindow(),
-		); state == virtualStoredURLUsable {
-			ownerID := effectiveVirtualOwner(usable.OwnerID, file.VirtualOwnerInstallationID)
-			transient := *file
-			transient.FilePath = usable.URI
-			transient.VirtualOwnerInstallationID = ownerID
-			var expiresAt *time.Time
-			if !usable.ExpiresAt.IsZero() {
-				expiry := usable.ExpiresAt
-				expiresAt = &expiry
+		if sessionID != "" {
+			// Prefer the persisted same-identity candidate: when the caller's
+			// own row still carries a usable stored URL for this exact release,
+			// serve it instead of listing again. The row's release identity was
+			// validated against the session anchor above and
+			// evaluateStoredVirtualURLCandidate re-checks it, so this is never a
+			// sibling, and a replay keeps working even when the provider's
+			// re-list no longer contains the candidate.
+			if usable, state := evaluateStoredVirtualURLCandidate(
+				ctx, file.FilePath, file,
+				h.storedVirtualURLAllowInsecure(file, file.VirtualOwnerInstallationID),
+				time.Now(), h.virtualCandidateTrustWindow(),
+			); state == virtualStoredURLUsable {
+				ownerID := effectiveVirtualOwner(usable.OwnerID, file.VirtualOwnerInstallationID)
+				transient := *file
+				transient.FilePath = usable.URI
+				transient.VirtualOwnerInstallationID = ownerID
+				var expiresAt *time.Time
+				if !usable.ExpiresAt.IsZero() {
+					expiry := usable.ExpiresAt
+					expiresAt = &expiry
+				}
+				slog.InfoContext(ctx, "virtual stale fallback: serving the persisted session-bound candidate",
+					"component", "api", "original", file.FilePath, "status", "persisted_candidate")
+				return &resolvedVirtualPlaybackSource{
+					URL: usable.URL, URI: usable.URI, OwnerID: ownerID, File: &transient,
+					ResolvedURL: usable.URL, ResolvedURLExpiresAt: expiresAt,
+					RequestHeaders: cloneHeaderMap(usable.RequestHeaders),
+					Provenance:     ProbeProvenanceDeclared,
+				}
 			}
-			slog.InfoContext(ctx, "virtual stale fallback: serving the persisted session-bound candidate",
-				"component", "api", "original", file.FilePath, "status", "persisted_candidate")
-			return &resolvedVirtualPlaybackSource{
-				URL: usable.URL, URI: usable.URI, OwnerID: ownerID, File: &transient,
-				ResolvedURL: usable.URL, ResolvedURLExpiresAt: expiresAt,
-				RequestHeaders: cloneHeaderMap(usable.RequestHeaders),
-				Provenance:     ProbeProvenanceDeclared,
+			sessionCandidate := VirtualPlaybackStream{
+				ID:                  sessionID,
+				URI:                 file.FilePath,
+				OwnerInstallationID: file.VirtualOwnerInstallationID,
+				Resolution:          file.Resolution,
+				CodecVideo:          file.CodecVideo,
+				CodecAudio:          file.CodecAudio,
+				HDR:                 mediaFileHDRString(file),
+			}
+			resolved, err := h.resolveVirtualCandidateSource(ctx, file, sessionCandidate, userID, profileID, elig.allowFailed)
+			switch {
+			case err == nil && (sessionID == "" || virtualResultCandidateID(resolved.URI) == sessionID):
+				// Reuse the session's own resolved URL: re-resolving the chosen
+				// candidate refreshes stale credentials without changing the
+				// bytes under the viewer.
+				slog.InfoContext(ctx, "virtual stale fallback: re-resolved the session-bound candidate",
+					"component", "api", "original", file.FilePath)
+				return resolved
+			case err == nil:
+				// The resolver returned a different result= identity (a dedup
+				// keeper or a ranked sibling); serving it would swap the release.
+				slog.WarnContext(ctx, "virtual stale fallback: refusing to substitute a different release",
+					"component", "api", "original", file.FilePath, "resolved", resolved.URI,
+					"reason", "candidate rotation was not requested")
+			default:
+				slog.WarnContext(ctx, "virtual stale fallback: refusing to substitute a different release",
+					"component", "api", "original", file.FilePath,
+					"reason", "the session-bound candidate did not resolve and candidate rotation was not requested",
+					"error", err)
 			}
 		}
-		sessionCandidate := VirtualPlaybackStream{
-			ID:                  sessionID,
-			URI:                 file.FilePath,
-			OwnerInstallationID: file.VirtualOwnerInstallationID,
-			Resolution:          file.Resolution,
-			CodecVideo:          file.CodecVideo,
-			CodecAudio:          file.CodecAudio,
-			HDR:                 mediaFileHDRString(file),
+		if !reconcileCollection {
+			return nil
 		}
-		resolved, err := h.resolveVirtualCandidateSource(ctx, file, sessionCandidate, userID, profileID, elig.allowFailed)
-		switch {
-		case err == nil && (sessionID == "" || virtualResultCandidateID(resolved.URI) == sessionID):
-			// Reuse the session's own resolved URL: re-resolving the chosen
-			// candidate refreshes stale credentials without changing the bytes
-			// under the viewer.
-			slog.InfoContext(ctx, "virtual stale fallback: re-resolved the session-bound candidate",
-				"component", "api", "original", file.FilePath)
-			return resolved
-		case err == nil:
-			// The resolver returned a different result= identity (a dedup
-			// keeper or a ranked sibling); serving it would swap the release.
-			slog.WarnContext(ctx, "virtual stale fallback: refusing to substitute a different release",
-				"component", "api", "original", file.FilePath, "resolved", resolved.URI,
-				"reason", "candidate rotation was not requested")
-		default:
-			slog.WarnContext(ctx, "virtual stale fallback: refusing to substitute a different release",
-				"component", "api", "original", file.FilePath,
-				"reason", "the session-bound candidate did not resolve and candidate rotation was not requested",
-				"error", err)
-		}
-		return nil
 	}
 
 	maxAttempts := h.maxVirtualFailoverAttempts(ctx)
@@ -3542,8 +3642,10 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		}
 		// Re-enforce the release-identity contract at the point of deciding to
 		// contact a sibling; a caller cannot reach the loop with a forbidden
-		// intent, but the check is the invariant, not the branch above.
-		if !elig.allowsSibling() {
+		// intent, but the check is the invariant, not the branch above. The one
+		// permitted exception is a collection variant whose pinned release
+		// proved absent, which carries its own recorded verdict.
+		if !elig.allowsSibling() && !reconcileCollection {
 			return nil
 		}
 		attempts++
@@ -3558,8 +3660,9 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 			// stale result= URI the next start would have to re-list. The
 			// identity contract is enforced once more here: a session-bound
 			// request must never adopt a replacement it was not allowed to
-			// resolve.
-			if !elig.allowsSibling() {
+			// resolve. A collection-variant reconcile carries its own recorded
+			// verdict, set only when the pinned release proved absent.
+			if !elig.allowsSibling() && !reconcileCollection {
 				return nil
 			}
 			if resolved.File != nil && resolved.Provenance == ProbeProvenanceVerified && h.VirtualFileSaver != nil {
@@ -3627,6 +3730,11 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					// An explicit retry deliberately re-adopts a known-bad
 					// candidate, so the verdict fence must not block it.
 					AllowFailedVerdict: elig.allowFailed,
+					// The recorded verdict that this collection-owned row's pin
+					// vanished and the fresh candidate may take its path. False
+					// for every ordinary substitution, so a collection path is
+					// otherwise immutable.
+					ReconcileCollectionVariant: reconcileCollection,
 				})
 				if saveErr != nil {
 					if errors.Is(saveErr, errVirtualAdoptIdentityNotPersisted) {

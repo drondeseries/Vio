@@ -88,6 +88,7 @@ func runVirtualMetadataUpdate(t *testing.T, pool *pgxpool.Pool, candidateID int,
 		nil,
 		false, // $30 replaceIdentity: this helper exercises best-effort adoption only
 		false, // $31 clearProbe
+		false, // $32 reconcileCollectionVariant: no collection-row reconcile
 	)
 	if err != nil {
 		t.Fatalf("VirtualFileMetadataUpdateSQL: %v", err)

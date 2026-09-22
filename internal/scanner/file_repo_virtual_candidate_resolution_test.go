@@ -393,3 +393,51 @@ func TestVirtualCandidateResolutionReadPath(t *testing.T) {
 			file.ProviderGUID, file.ProviderReleaseName, file.ProviderReleaseSize)
 	}
 }
+
+// TestReplaceVirtualCandidatesProfileVariantCarriesIdentity pins item 4: the
+// listing sink must persist the provider's durable identity for a
+// profile-suffixed variant row exactly as for a neutral one, so the
+// identity-based adoption/evidence fixes apply to variant rows too.
+func TestReplaceVirtualCandidatesProfileVariantCarriesIdentity(t *testing.T) {
+	pool := virtualResolutionTestPool(t)
+	ctx := context.Background()
+	source, _, basePath := seedVirtualResolutionFixture(t, pool, "profile-identity")
+	candidatePath := basePath + "&result=variant"
+
+	repo := NewFileRepository(pool)
+	if err := repo.ReplaceVirtualCandidates(ctx, source, []VirtualCandidate{{
+		URI:                 candidatePath,
+		Label:               "4K HDR",
+		FileSize:            12_000_000_000,
+		ProviderVideoHash:   "VARIANT-HASH",
+		ProviderGUID:        "variant-guid",
+		ProviderReleaseName: "movie.2160p.hdr",
+		ProviderReleaseSize: 12_000_000_000,
+	}}); err != nil {
+		t.Fatalf("replace profile-variant candidate: %v", err)
+	}
+
+	var path string
+	var hash, guid, name *string
+	var size *int64
+	if err := pool.QueryRow(ctx, `
+		SELECT file_path, provider_video_hash, provider_guid, provider_release_name, provider_release_size
+		FROM media_files
+		WHERE content_id=$1 AND virtual_owner_installation_id=5 AND file_path=$2`,
+		source.ContentID, candidatePath,
+	).Scan(&path, &hash, &guid, &name, &size); err != nil {
+		t.Fatalf("inspect profile-variant row: %v", err)
+	}
+	if path != candidatePath {
+		t.Fatalf("file_path = %q, want the profile variant %q", path, candidatePath)
+	}
+	if hash == nil || *hash != "VARIANT-HASH" || guid == nil || *guid != "variant-guid" {
+		t.Fatalf("identity hash=%v guid=%v, want VARIANT-HASH/variant-guid", hash, guid)
+	}
+	if name == nil || *name != "movie.2160p.hdr" {
+		t.Fatalf("provider_release_name = %v, want movie.2160p.hdr", name)
+	}
+	if size == nil || *size != 12_000_000_000 {
+		t.Fatalf("provider_release_size = %v, want 12000000000", size)
+	}
+}
