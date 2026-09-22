@@ -1844,6 +1844,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 			catalogResourceHandler.MarkVirtualFailed = deps.FileRepo.MarkVirtualCandidateFailed
 			catalogResourceHandler.ClearVirtualFailed = deps.FileRepo.ClearVirtualCandidateFailed
 		}
+		if playbackHandler != nil {
+			// The liveness check adopts a same-release rematch through the same
+			// saver the playback path uses, so a renumbered provider result id
+			// is persisted instead of re-matched on every listing.
+			catalogResourceHandler.VirtualFileMetadataSaver = playbackHandler.VirtualFileMetadataSaver
+			catalogResourceHandler.VirtualFileSaver = playbackHandler.VirtualFileSaver
+		}
 		if itemRepo != nil {
 			catalogResourceHandler.ItemAccess = itemRepo
 		}

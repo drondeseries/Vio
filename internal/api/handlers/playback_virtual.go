@@ -1282,6 +1282,68 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 	return rotated, nil
 }
 
+// resolveVirtualAnchorURIWithRotationV3 resolves the session-bound virtual
+// anchor for transport preparation (the remux seek anchor and the transport
+// input). When the resolver refuses because the pinned candidate is absent from
+// the provider's current list, it retries once with a fresh relist and rotation
+// declared, excluding the absent pin, and threads the anchor row's durable
+// identity so a renumbered same-release candidate is re-identified rather than
+// mistaken for a sibling.
+//
+// It accepts the rotated candidate only when it is the same release as the
+// anchor: the resolver reports IdentityRematched, or the candidate's durable
+// identity tier matches the row's. A genuinely different release is refused
+// with the original absent-pin cause instead of silently anchoring the
+// already-built plan on sibling bytes; the caller keeps its terminal/rotation
+// policy and no release swap happens under a plan that never replanned. This is
+// the same narrow contract the serve layer (stream.go) and the replan
+// rehydration (resolveRehydratedVirtualSourceV3) apply.
+func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
+	ctx context.Context,
+	session *playback.Session,
+	file *models.MediaFile,
+) (ResolvedVirtualMedia, func(), error) {
+	resolved, cleanup, err := h.resolveVirtualInputURI(
+		ctx, file.FilePath, file.VirtualOwnerInstallationID,
+		session.UserID, session.ProfileID, false, nil, "",
+	)
+	if err == nil || !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		return resolved, cleanup, err
+	}
+	pinnedID := virtualResultCandidateID(file.FilePath)
+	var excluded []string
+	if pinnedID != "" {
+		excluded = []string{pinnedID}
+	}
+	// Thread the durable identity explicitly: the retry relists (forceRefresh),
+	// so the stored-row lookup that normally carries the identity is bypassed. A
+	// legacy row with no identity is unchanged and the retry falls back to an
+	// ordinary rotation.
+	retryCtx := virtualResolveContextWithPersistedIdentity(ctx, file)
+	rotated, rotatedCleanup, rotateErr := h.resolveVirtualInputURI(
+		retryCtx, file.FilePath, file.VirtualOwnerInstallationID,
+		session.UserID, session.ProfileID, true, excluded, "", true,
+	)
+	if rotateErr != nil {
+		return rotated, rotatedCleanup, rotateErr
+	}
+	if !rotated.IdentityRematched && !resolvedMatchesPersistedIdentity(rotated, file) {
+		if rotatedCleanup != nil {
+			rotatedCleanup()
+		}
+		slog.WarnContext(ctx, "virtual transport anchor rotation resolved a different release; refusing a silent anchor swap",
+			"component", "api", "session_anchor", file.FilePath,
+			"status", "rotation_refused", "old_candidate_id", pinnedID,
+			"new_candidate_id", virtualResultCandidateID(rotated.URI))
+		return ResolvedVirtualMedia{}, nil, err
+	}
+	slog.InfoContext(ctx, "virtual transport anchor rotated an absent session-bound candidate",
+		"component", "api", "session_anchor", file.FilePath,
+		"status", "rotated", "old_candidate_id", pinnedID,
+		"new_candidate_id", virtualResultCandidateID(rotated.URI), "virtual_uri", rotated.URI)
+	return rotated, rotatedCleanup, nil
+}
+
 func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *models.MediaFile, profileID string, deferProbe bool, excludedCandidateIDs []string, preferredCandidateID string, qualityPreference string, bandwidthCapKbps int, forceRelist bool, opts ...virtualResolveOptionsV3) (resolvedVirtualPlaybackSource, error) {
 	options := virtualResolveOptionsV3{}
 	if len(opts) > 0 {

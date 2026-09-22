@@ -114,6 +114,13 @@ func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, sou
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, err)
 	}
+	if len(streams) == 0 {
+		// A zero-count listing is a provider hiccup, not an empty title. It must
+		// not reach ReplaceVirtualCandidates: persisting it would sweep or
+		// rewrite healthy stored candidates. Surface the same retryable provider
+		// failure the caller already understands, and leave the rows untouched.
+		return fmt.Errorf("%w: provider returned no candidates", ErrVirtualRefreshProvider)
+	}
 	if err := s.Persist(ctx, source, streams); err != nil {
 		return err
 	}

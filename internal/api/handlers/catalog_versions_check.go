@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
 
 const (
@@ -125,6 +127,12 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 	// declare it session-bound so a profile-removed pin reports ambiguous
 	// (do not stamp) instead of being substituted by a different candidate.
 	perFileCtx = withVirtualSessionBindingV3(perFileCtx, true)
+	// Thread the row's durable identity so a provider that renumbers result ids
+	// between listings re-identifies the same release instead of being read as
+	// a dead pin. Without this a volatile listing stamped every pinned row
+	// dead, which is the incident this check guards against. A legacy row with
+	// no durable identity is left untouched and stays ambiguous.
+	perFileCtx = virtualResolveContextWithPersistedIdentity(perFileCtx, file)
 	requestedCandidateID := virtualResultCandidateID(file.FilePath)
 	resolved, err := h.VirtualResolver.ResolveVirtualMediaDetailed(
 		perFileCtx, file.FilePath, file.VirtualOwnerInstallationID,
@@ -133,28 +141,38 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 	if err == nil {
 		// Strict check semantics, not playback fallback semantics: with
 		// forceRefresh=true the selection code does not substitute candidates[0]
-		// for an absent pin, and the identity verification below is the
-		// belt-and-braces guarantee. A successful resolution only counts when it
-		// actually named the requested candidate — a substituted candidate is
-		// evidence the pin is gone, not that it recovered. And listing
-		// availability is deliberately kept separate from transport health: a
-		// metadata-only check never clears an existing transport-failure stamp
-		// (failed_at), because a resolved URL is not evidence the media
-		// endpoint delivers bytes; only a real delivery does (see
-		// StreamHandler.clearVirtualCandidateRecovered).
-		if requestedCandidateID != "" && resolvedIdentityMatches(resolved, requestedCandidateID) {
+		// for an absent pin. A successful resolution counts when it named the
+		// requested candidate, or when the durable identity proves it is the
+		// same release under a renumbered result id (IdentityRematched).
+		if resolvedIdentityMatches(resolved, requestedCandidateID) || resolvedMatchesPersistedIdentity(resolved, file) {
+			// A healthy liveness observation for the same identity clears a
+			// stale failed_at so the auto-pick considers the release again.
+			h.clearVirtualCandidateIfFailed(ctx, fileID, file)
+			if resolved.IdentityRematched {
+				// Adopt the new ?result= identity through the same CAS-fenced
+				// Phase-1 write the playback path uses, so the row moves with
+				// the provider's renumbering instead of being rematched on
+				// every listing.
+				adoptRematchedVirtualResolution(
+					context.WithoutCancel(ctx), file, resolved,
+					h.VirtualFileMetadataSaver, h.VirtualFileSaver,
+				)
+			}
 			return true
 		}
 		if requestedCandidateID == "" {
 			// The row carries no concrete pin (profile-neutral row): any
-			// resolution of its identity is listing evidence, still not
-			// transport evidence — report live, never clear.
+			// resolution of its identity is listing evidence. Report live.
+			h.clearVirtualCandidateIfFailed(ctx, fileID, file)
 			return true
 		}
-		// The provider answered with a different candidate: the requested pin
-		// is gone. Stamp it (fenced) so the auto-pick skips it.
-		if h.MarkVirtualFailed != nil {
-			_ = h.MarkVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
+		// The provider answered with a different candidate and the row's
+		// durable identity does not match it: the requested release is
+		// genuinely gone. Stamp it (fenced) so the auto-pick skips it. A row
+		// with no durable identity is indistinguishable from a renumbered
+		// listing, so it is left alone (ambiguous) rather than mass-stamped.
+		if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity {
+			h.stampVirtualCandidateFailed(ctx, fileID, file)
 		}
 		return false
 	}
@@ -163,14 +181,47 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 		// gone or unusable. Stamp it so the auto-pick skips it. The stamp is
 		// fenced the same way: a candidate rotated while resolution was in
 		// flight is never mis-marked.
-		if h.MarkVirtualFailed != nil {
-			_ = h.MarkVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
-		}
+		h.stampVirtualCandidateFailed(ctx, fileID, file)
 		return false
 	}
-	// Ambiguous (provider down, timeout): do not stamp. Report the current
-	// durable signal so an outage does not mass-tag versions.
+	if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity &&
+		errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		// The provider listed, the row carries a durable identity, and the
+		// resolver still refused because no listed candidate re-identified the
+		// same release. That is a confirmed absence, not a renumbered listing:
+		// stamp it. Without identity the sentinel is ambiguous and is left
+		// alone below.
+		h.stampVirtualCandidateFailed(ctx, fileID, file)
+		return false
+	}
+	// Ambiguous (provider down, timeout, identity-less absence): do not stamp.
+	// Report the current durable signal so an outage cannot mass-tag versions.
 	return file.FailedAt == nil
+}
+
+// stampVirtualCandidateFailed applies the fenced failed_at verdict the check
+// computed. It is a no-op when no stamp callback is wired or the row already
+// carries a verdict, and the fenced write (expectedFilePath + observedFailedAt)
+// rejects a row that rotated or gained a newer verdict while resolution was in
+// flight.
+func (h *CatalogResourceHandler) stampVirtualCandidateFailed(ctx context.Context, fileID int, file *models.MediaFile) {
+	if h == nil || h.MarkVirtualFailed == nil || file == nil || file.FailedAt != nil {
+		return
+	}
+	_ = h.MarkVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
+}
+
+// clearVirtualCandidateIfFailed applies the recovery half of a healthy liveness
+// observation: a same-identity successful resolution clears a stale failed_at
+// so the release is eligible again. The clear is fenced on the same identity
+// and observed verdict as the stamp, so a concurrent rotation or newer failure
+// survives. It is a no-op when the row carries no verdict or no clear callback
+// is wired.
+func (h *CatalogResourceHandler) clearVirtualCandidateIfFailed(ctx context.Context, fileID int, file *models.MediaFile) {
+	if h == nil || h.ClearVirtualFailed == nil || file == nil || file.FailedAt == nil {
+		return
+	}
+	_ = h.ClearVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
 }
 
 // resolvedIdentityMatches reports whether the resolver's answer named the
@@ -242,13 +293,20 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 }
 
 // isVirtualCandidateDeadError classifies a resolution failure as a confirmed
-// dead pin: the provider answered but the pinned candidate is no longer
-// offered or usable. Provider-down/timeout errors do not match and are treated
-// as ambiguous. The strings are the provider-neutral error texts the plugin
-// service produces (see internal/plugins/virtual_playback.go). A joined error
-// that also carries a provider RPC failure ("request failed") is ambiguous even
-// when a fallback provider reported no matching candidate: the owner provider
-// that owns the pin may simply be down.
+// dead pin: the provider answered, listed candidates, and the pinned candidate
+// is no longer among them or is unusable. Provider-down/timeout errors do not
+// match and are treated as ambiguous. The strings are the provider-neutral
+// error texts the plugin service produces (see
+// internal/plugins/virtual_playback.go). A joined error that also carries a
+// provider RPC failure ("request failed") is ambiguous even when a fallback
+// provider reported no matching candidate: the owner provider that owns the pin
+// may simply be down.
+//
+// An EMPTY listing ("no streams available from provider") is deliberately NOT
+// classified as dead. A zero-count answer is a provider hiccup that proves
+// nothing about any specific release: the provider intermittently returns an
+// empty listing for a title whose releases are all still offered. Stamping pins
+// on it is how a 2.6 s burst marked 50 of 57 rows failed in the incident.
 func isVirtualCandidateDeadError(err error) bool {
 	if err == nil {
 		return false
@@ -256,11 +314,11 @@ func isVirtualCandidateDeadError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "request failed") ||
 		strings.Contains(msg, "resolver is not installed") ||
-		strings.Contains(msg, "load owning virtual stream provider") {
+		strings.Contains(msg, "load owning virtual stream provider") ||
+		strings.Contains(msg, "no streams available") {
 		return false
 	}
 	return strings.Contains(msg, "no matching candidate") ||
-		strings.Contains(msg, "no streams available") ||
 		strings.Contains(msg, "no usable stream")
 }
 

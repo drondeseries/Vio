@@ -19,6 +19,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/scanner"
 )
 
@@ -156,7 +157,7 @@ func TestCatalogVersionsCheckHTTP(t *testing.T) {
 		}
 	})
 
-	t.Run("live candidate reported available without clearing transport evidence", func(t *testing.T) {
+	t.Run("live candidate reported available and clears the stale stamp", func(t *testing.T) {
 		if !readFailedAt(livePinID) {
 			t.Fatal("precondition: live candidate must start stamped failed")
 		}
@@ -168,14 +169,14 @@ func TestCatalogVersionsCheckHTTP(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 			t.Fatal(err)
 		}
-		// Listing availability is true (the pinned candidate resolved), but a
-		// metadata-only check never opens media, so the transport-failure
-		// stamp survives — only a real delivery clears it.
+		// A healthy liveness observation for the requested identity is the
+		// recovery half of the liveness check: it clears the stale verdict so
+		// the auto-pick considers the release again.
 		if len(resp.Results) != 1 || resp.Results[0].FileID != livePinID || !resp.Results[0].Available {
 			t.Fatalf("unexpected results: %#v", resp.Results)
 		}
-		if !readFailedAt(livePinID) {
-			t.Fatal("metadata-only check erased transport-failure evidence")
+		if readFailedAt(livePinID) {
+			t.Fatal("a healthy liveness observation for the same identity must clear the stale stamp")
 		}
 	})
 
@@ -742,10 +743,10 @@ func TestCatalogVersionsCheckStrictCandidate(t *testing.T) {
 		}
 	})
 
-	t.Run("identity-verified success reports available without clearing", func(t *testing.T) {
+	t.Run("identity-verified success reports available and clears the stale stamp", func(t *testing.T) {
 		// The resolver genuinely names the requested candidate A. The check
-		// reports listing-availability (true) but a metadata-only resolution
-		// still never clears the transport-failure stamp.
+		// reports listing-availability (true) and clears the stale
+		// transport-failure stamp for that same identity.
 		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, pinnedPath, fileID)
 		_, router := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 			return ResolvedVirtualMedia{URL: "http://provider.test/a.mp4", URI: pinnedPath, CandidateID: "A"}, nil
@@ -755,8 +756,213 @@ func TestCatalogVersionsCheckStrictCandidate(t *testing.T) {
 			t.Fatalf("identity-verified resolution must report available: %#v", resp.Results)
 		}
 		path, failedAt := readRow()
-		if path != pinnedPath || failedAt == nil {
-			t.Fatalf("listing availability must not clear transport evidence: path=%q failed_at=%v", path, failedAt)
+		if path != pinnedPath || failedAt != nil {
+			t.Fatalf("a healthy same-identity observation must clear the stale stamp: path=%q failed_at=%v", path, failedAt)
+		}
+	})
+}
+
+// TestCatalogVersionsCheckIdentityVerdicts pins the identity-grounded verdict
+// of the liveness check: a provider that renumbers result ids must not stamp a
+// pin dead when the row carries a durable identity, a genuinely absent release
+// still stamps, a healthy same-identity observation clears a stale stamp, and a
+// row with no durable identity is left ambiguous rather than mass-stamped.
+func TestCatalogVersionsCheckIdentityVerdicts(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	pool, err := pgxpool.New(t.Context(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(t.Context(), query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix := fmt.Sprintf("versions-check-identity-%d-", time.Now().UnixNano())
+	var library int
+	if err := pool.QueryRow(t.Context(), `INSERT INTO media_folders (type,name) VALUES ('movies',$1) RETURNING id`, prefix).Scan(&library); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		if _, err := pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, library); err != nil {
+			t.Error(err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM media_items WHERE content_id LIKE $1`, prefix+"%"); err != nil {
+			t.Error(err)
+		}
+	})
+	exec(`INSERT INTO media_items (content_id,type,title,genres,default_metadata_language) VALUES ($1,'movie','Versions Check Identity','{}','en')`, prefix+"movie")
+	exec(`INSERT INTO media_item_libraries (content_id,media_folder_id) VALUES ($1,$2)`, prefix+"movie", library)
+
+	insertFile := func(result, hash, releaseName string, failedAt any) int {
+		t.Helper()
+		path := fmt.Sprintf("virtual://movie/tt%d?result=%s", time.Now().UnixNano(), result)
+		var id int
+		if err := pool.QueryRow(t.Context(), `
+			INSERT INTO media_files (content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,failed_at,provider_video_hash,provider_release_name)
+			VALUES ($1,$2,$3,1000,'virtual',7,$4,$5,$6) RETURNING id`,
+			prefix+"movie", library, path, failedAt, hash, releaseName).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	repo := scanner.NewFileRepository(pool)
+	itemRepo := catalog.NewItemRepository(pool)
+	readRow := func(fileID int) (path string, failedAt *time.Time) {
+		t.Helper()
+		if err := pool.QueryRow(t.Context(), `SELECT file_path, failed_at FROM media_files WHERE id=$1`, fileID).Scan(&path, &failedAt); err != nil {
+			t.Fatal(err)
+		}
+		return path, failedAt
+	}
+	post := func(h *CatalogResourceHandler, fileID int) versionCheckResponse {
+		t.Helper()
+		router := chi.NewRouter()
+		router.Post("/catalog/versions/check", h.HandleCheckVersions)
+		body, err := json.Marshal(map[string][]int{"file_ids": {fileID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodPost, "/catalog/versions/check", strings.NewReader(string(body)))
+		r.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, r)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp versionCheckResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	newHandler := func(resolver VirtualMediaDetailedResolver, saves *[]models.VirtualFilePersistArgs) *CatalogResourceHandler {
+		h := &CatalogResourceHandler{
+			FileResolver:       repo,
+			VirtualResolver:    resolver,
+			MarkVirtualFailed:  repo.MarkVirtualCandidateFailed,
+			ClearVirtualFailed: repo.ClearVirtualCandidateFailed,
+			ItemAccess:         itemRepo,
+			EpisodeLookup:      catalog.NewEpisodeRepository(pool),
+			ExtraLookup:        catalog.NewExtraRepository(pool),
+		}
+		if saves != nil {
+			h.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+				*saves = append(*saves, args)
+				return VirtualFileMetadataUpdateResult{IdentityAdopted: true}, nil
+			}
+		}
+		return h
+	}
+
+	t.Run("renumbered pin is rematched and adopted, not stamped", func(t *testing.T) {
+		fileID := insertFile("A", "hash-same", "Movie.2024.1080p", nil)
+		var saves []models.VirtualFilePersistArgs
+		h := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			// The provider renumbered the same release (same video hash) under a
+			// new result id and the resolver re-identified it.
+			return ResolvedVirtualMedia{
+				URL: "http://provider.test/b.mp4", URI: "virtual://movie/renumbered?result=B",
+				CandidateID: "B", IdentityRematched: true,
+				ProviderVideoHash: "hash-same", ProviderReleaseName: "Movie.2024.1080p",
+			}, nil
+		}), &saves)
+		resp := post(h, fileID)
+		if len(resp.Results) != 1 || !resp.Results[0].Available {
+			t.Fatalf("a same-identity rematch must report available: %#v", resp.Results)
+		}
+		if _, failedAt := readRow(fileID); failedAt != nil {
+			t.Fatalf("renumbered same-identity pin must not be stamped: failed_at=%v", failedAt)
+		}
+		if len(saves) != 1 {
+			t.Fatalf("adoption writes = %d, want 1", len(saves))
+		}
+		if saves[0].AdoptPath != "virtual://movie/renumbered?result=B" || !saves[0].RequireAdopt {
+			t.Fatalf("adoption args = %#v, want the renumbered id adopted under the fence", saves[0])
+		}
+	})
+
+	t.Run("genuinely absent release with identity still stamps", func(t *testing.T) {
+		fileID := insertFile("A", "hash-gone", "Movie.Gone.2024", nil)
+		h := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{}, absentSessionPinError("A")
+		}), nil)
+		resp := post(h, fileID)
+		if len(resp.Results) != 1 || resp.Results[0].Available {
+			t.Fatalf("an absent identity-bearing release must report unavailable: %#v", resp.Results)
+		}
+		if _, failedAt := readRow(fileID); failedAt == nil {
+			t.Fatal("a genuinely absent identity-bearing release must be stamped")
+		}
+	})
+
+	t.Run("healthy same-identity observation clears a stale stamp", func(t *testing.T) {
+		fileID := insertFile("A", "hash-live", "Movie.Live.2024", time.Now())
+		h := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{
+				URL: "http://provider.test/a.mp4", URI: uri, CandidateID: "A",
+				ProviderVideoHash: "hash-live", ProviderReleaseName: "Movie.Live.2024",
+			}, nil
+		}), nil)
+		resp := post(h, fileID)
+		if len(resp.Results) != 1 || !resp.Results[0].Available {
+			t.Fatalf("healthy identity must report available: %#v", resp.Results)
+		}
+		if _, failedAt := readRow(fileID); failedAt != nil {
+			t.Fatal("a healthy same-identity observation must clear the stale stamp")
+		}
+	})
+
+	t.Run("identity-less substitution is ambiguous and not stamped", func(t *testing.T) {
+		fileID := insertFile("A", "", "", nil)
+		h := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "http://provider.test/b.mp4", URI: "virtual://movie/sub?result=B", CandidateID: "B"}, nil
+		}), nil)
+		resp := post(h, fileID)
+		if len(resp.Results) != 1 || resp.Results[0].Available {
+			t.Fatalf("a substituted identity-less pin must report unavailable: %#v", resp.Results)
+		}
+		if _, failedAt := readRow(fileID); failedAt != nil {
+			t.Fatal("an identity-less substituted pin must not be mass-stamped")
+		}
+	})
+
+	t.Run("empty provider listing never stamps", func(t *testing.T) {
+		fileID := insertFile("A", "hash-empty", "Movie.Empty.2024", nil)
+		h := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			// A zero-count provider answer surfaces as this provider-neutral
+			// error; it proves nothing about the specific release.
+			return ResolvedVirtualMedia{}, errors.New("no streams available from provider")
+		}), nil)
+		resp := post(h, fileID)
+		// An empty listing is ambiguous, not a verdict: the check reports the
+		// row's current durable signal (healthy here) and must not stamp it.
+		if len(resp.Results) != 1 || !resp.Results[0].Available {
+			t.Fatalf("an empty provider listing must report the durable signal: %#v", resp.Results)
+		}
+		if _, failedAt := readRow(fileID); failedAt != nil {
+			t.Fatal("an empty provider listing must never stamp a candidate failed")
+		}
+	})
+
+	t.Run("empty provider listing does not clear an existing verdict", func(t *testing.T) {
+		fileID := insertFile("A", "hash-empty-failed", "Movie.Empty.2024", time.Now())
+		h := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{}, errors.New("no streams available from provider")
+		}), nil)
+		resp := post(h, fileID)
+		if len(resp.Results) != 1 || resp.Results[0].Available {
+			t.Fatalf("an empty provider listing must report the failed durable signal: %#v", resp.Results)
+		}
+		if _, failedAt := readRow(fileID); failedAt == nil {
+			t.Fatal("an empty provider listing must not clear an existing verdict")
 		}
 	})
 }

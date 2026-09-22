@@ -32,6 +32,13 @@ type CatalogResourceHandler struct {
 	// ClearVirtualFailed clears a virtual candidate's failed stamp after a
 	// successful resolution. Optional: without it the check never clears.
 	ClearVirtualFailed func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
+	// VirtualFileMetadataSaver and VirtualFileSaver adopt a same-release
+	// candidate the resolver re-identified under a new provider result id, via
+	// the same CAS-fenced Phase-1 write the playback path uses. Optional:
+	// without them the check still treats a rematch as live and leaves the
+	// adoption to the next playback resolve.
+	VirtualFileMetadataSaver VirtualFileMetadataSaver
+	VirtualFileSaver         VirtualFileSaver
 	// ItemAccess authorizes a file's parent item for the requesting profile
 	// before the liveness check resolves or stamps anything. Optional: without
 	// it every file is reported unavailable, indistinguishable from unknown.
