@@ -2,13 +2,35 @@
 
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { createElement } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildVersionStatusLabels,
   QualityMenu,
   REFRESH_VERSIONS_ERROR,
   type VersionInfo,
 } from "./QualityMenu";
+
+// The sort preference reads/writes the canonical settings endpoints; the menu
+// tests only exercise the display re-order, so it is mocked inert.
+const versionSortMock = vi.hoisted(() => ({
+  criteria: [] as Array<{ attribute: string; direction: string }>,
+  apply: vi.fn(),
+  reset: vi.fn(),
+}));
+vi.mock("@/hooks/useVersionSortPreference", () => ({
+  useVersionSortPreference: () => ({
+    criteria: versionSortMock.criteria,
+    apply: versionSortMock.apply,
+    reset: versionSortMock.reset,
+    loading: false,
+  }),
+}));
+
+beforeEach(() => {
+  versionSortMock.criteria = [];
+  versionSortMock.apply.mockReset();
+  versionSortMock.reset.mockReset();
+});
 
 const qualityOptions = [
   {
@@ -32,6 +54,7 @@ const qualityOptions = [
 function renderVersionMenu(
   overrides: {
     onRefreshVersions?: () => Promise<void>;
+    onSwitchVersion?: (fileId: number) => void;
     versions?: VersionInfo[];
   } = {},
 ) {
@@ -46,7 +69,7 @@ function renderVersionMenu(
         makeVersionInfo({ fileId: 1, label: "1080p H264", isCurrentSource: true }),
         makeVersionInfo({ fileId: 2, label: "2160p HEVC" }),
       ],
-      onSwitchVersion: () => {},
+      onSwitchVersion: overrides.onSwitchVersion ?? (() => {}),
       onRefreshVersions: overrides.onRefreshVersions,
     }),
   );
@@ -239,13 +262,54 @@ describe("QualityMenu version row parity with the item picker", () => {
   it("renders the ranking indicator and names the profile", () => {
     renderVersionMenu({
       versions: [
-        makeVersionInfo({ fileId: 1, label: "2160p HEVC", profileLabel: "4K+HDR" }),
+        makeVersionInfo({
+          fileId: 1,
+          label: "2160p HEVC",
+          filePath: "virtual://movie/tt1?profile=4K%2BHDR&result=abc",
+          profileLabel: "4K+HDR",
+        }),
         makeVersionInfo({ fileId: 2, label: "1080p H264" }),
       ],
     });
 
     expect(screen.getByText(/Ranking: Default ranking/)).toBeInTheDocument();
     expect(screen.getByText(/4K\+HDR/)).toBeInTheDocument();
+  });
+});
+
+describe("QualityMenu version sort preference", () => {
+  function versionRowOrder() {
+    return screen
+      .getAllByRole("menuitem")
+      .filter((row) => /HEVC|H264/.test(row.textContent ?? ""))
+      .map((row) => (row.textContent?.includes("HEVC") ? "HEVC" : "H264"));
+  }
+
+  it("re-orders the version rows for the viewer without starting playback", () => {
+    versionSortMock.criteria = [{ attribute: "size", direction: "desc" }];
+    const onSwitchVersion = vi.fn();
+    renderVersionMenu({
+      onSwitchVersion,
+      versions: [
+        makeVersionInfo({ fileId: 1, label: "2160p HEVC", sortable: { fileSize: 100 } }),
+        makeVersionInfo({ fileId: 2, label: "1080p H264", sortable: { fileSize: 300 } }),
+      ],
+    });
+
+    expect(versionRowOrder()).toEqual(["H264", "HEVC"]);
+    // Display-only: the reorder starts no playback and switches no version.
+    expect(onSwitchVersion).not.toHaveBeenCalled();
+  });
+
+  it("keeps the server's incoming order with no override", () => {
+    renderVersionMenu({
+      versions: [
+        makeVersionInfo({ fileId: 1, label: "2160p HEVC", sortable: { fileSize: 100 } }),
+        makeVersionInfo({ fileId: 2, label: "1080p H264", sortable: { fileSize: 300 } }),
+      ],
+    });
+
+    expect(versionRowOrder()).toEqual(["HEVC", "H264"]);
   });
 });
 

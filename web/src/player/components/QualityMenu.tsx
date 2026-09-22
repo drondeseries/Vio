@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, RefreshCw, Settings } from "lucide-react";
 import { QualityRankingSummary } from "@/components/streaming/QualityRankingSummary";
 import { useVersionListRefresh, REFRESH_VERSIONS_ERROR } from "@/hooks/useVersionListRefresh";
+import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
+import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
 import { resolveActiveQualityOptionId } from "../playback-info";
 import type { QualityOption } from "../types";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
+import { serverRankingFromVersions } from "@/pages/ItemDetail/components/versionFormatUtils";
 
 export interface VersionInfo {
   fileId: number;
@@ -19,6 +22,11 @@ export interface VersionInfo {
   subtitleLanguages?: string[];
   /** Quality-profile label the candidate was ranked under (`?profile=`). */
   profileLabel?: string | null;
+  /** The `?profile=`/`virtual_ranking` source for the list's ranking. */
+  filePath?: string;
+  virtualRanking?: unknown;
+  /** Payload values the display re-order compares. */
+  sortable?: VersionSortable;
   /** Custom-format score the server ranked this candidate with. Absent (or
    *  zero) for local and otherwise unscored rows, which show no badge. */
   formatScore?: number;
@@ -66,6 +74,29 @@ export function QualityMenu({
     error: refreshVersionsError,
     refresh: handleRefreshVersions,
   } = useVersionListRefresh(onRefreshVersions);
+  // The viewer's per-profile display order. It only re-orders the list below;
+  // the server's auto-pick is untouched.
+  const { criteria: userCriteria, apply: applySort, reset: resetSort } = useVersionSortPreference();
+  const serverRanking = useMemo(
+    () =>
+      serverRankingFromVersions(
+        (versions ?? []).map((version) => ({
+          file_path: version.filePath,
+          virtual_ranking: version.virtualRanking,
+        })),
+      ),
+    [versions],
+  );
+  const effectiveCriteria = userCriteria.length > 0 ? userCriteria : serverRanking.criteria;
+  const orderedVersions = useMemo(
+    () =>
+      sortVersionsByCriteria(
+        versions ?? [],
+        effectiveCriteria,
+        (version) => version.sortable ?? {},
+      ),
+    [versions, effectiveCriteria],
+  );
   const menuRef = useRef<HTMLDivElement>(null);
 
   const handleSelect = useCallback(
@@ -131,7 +162,6 @@ export function QualityMenu({
   const resolvedActiveId = resolveActiveQualityOptionId(options, activeId);
   const activeOption = options.find((option) => option.id === resolvedActiveId);
   let menuItemIndex = 0;
-  const rankingProfileLabel = versions?.find((v) => v.profileLabel)?.profileLabel ?? null;
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
@@ -168,8 +198,15 @@ export function QualityMenu({
               <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
                 Version
               </div>
-              <QualityRankingSummary profileLabel={rankingProfileLabel} className="px-3 pb-1" />
-              {versions.map((v) => {
+              <QualityRankingSummary
+                serverRanking={serverRanking}
+                userCriteria={userCriteria}
+                effectiveCriteria={effectiveCriteria}
+                onApply={applySort}
+                onReset={resetSort}
+                className="px-3 pb-1"
+              />
+              {orderedVersions.map((v) => {
                 const idx = menuItemIndex++;
                 const statusLabels = buildVersionStatusLabels(v);
                 const hasFormatScore = typeof v.formatScore === "number" && v.formatScore !== 0;

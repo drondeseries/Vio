@@ -1,11 +1,32 @@
 // @vitest-environment jsdom
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { FileVersion } from "@/api/types";
 import { REFRESH_VERSIONS_ERROR } from "@/hooks/useVersionListRefresh";
-import { resolveProfileSortCriteria } from "@/lib/qualityRanking";
 import VersionDropdown from "./VersionDropdown";
+
+// The sort preference reads/writes the canonical settings endpoints; the
+// menu tests only exercise the display re-order, so it is mocked inert.
+const versionSortMock = vi.hoisted(() => ({
+  criteria: [] as Array<{ attribute: string; direction: string }>,
+  apply: vi.fn(),
+  reset: vi.fn(),
+}));
+vi.mock("@/hooks/useVersionSortPreference", () => ({
+  useVersionSortPreference: () => ({
+    criteria: versionSortMock.criteria,
+    apply: versionSortMock.apply,
+    reset: versionSortMock.reset,
+    loading: false,
+  }),
+}));
+
+beforeEach(() => {
+  versionSortMock.criteria = [];
+  versionSortMock.apply.mockReset();
+  versionSortMock.reset.mockReset();
+});
 
 function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
   return {
@@ -120,6 +141,35 @@ describe("VersionDropdown score and size", () => {
   });
 });
 
+describe("VersionDropdown version sort preference", () => {
+  const versions = [
+    makeVersion({ file_id: 1, resolution: "2160p", file_size: 100 }),
+    makeVersion({ file_id: 2, resolution: "1080p", file_size: 300 }),
+  ];
+
+  function rowOrder(dialog: ReturnType<typeof openPicker>) {
+    return dialog
+      .getAllByRole("button")
+      .filter((button) => /2160p|1080p/.test(button.textContent ?? ""))
+      .map((button) => (button.textContent?.includes("2160p") ? "2160p" : "1080p"));
+  }
+
+  it("re-orders the displayed list for the viewer without touching selection", () => {
+    versionSortMock.criteria = [{ attribute: "size", direction: "desc" }];
+    const onSelectVersion = vi.fn();
+    const dialog = openPicker(versions, { onSelectVersion });
+
+    expect(rowOrder(dialog)).toEqual(["1080p", "2160p"]);
+    // The reorder is display-only: nothing was selected or started.
+    expect(onSelectVersion).not.toHaveBeenCalled();
+  });
+
+  it("keeps the server's incoming order with no override", () => {
+    const dialog = openPicker(versions);
+    expect(rowOrder(dialog)).toEqual(["2160p", "1080p"]);
+  });
+});
+
 describe("VersionDropdown ranking indicator", () => {
   it("names the profile the ranked candidates carry", () => {
     const dialog = openPicker([
@@ -137,34 +187,5 @@ describe("VersionDropdown ranking indicator", () => {
 
     expect(dialog.getByText(/Ranking: Default ranking/)).toBeInTheDocument();
     expect(dialog.getByText(/4K\+HDR/)).toBeInTheDocument();
-  });
-});
-
-describe("resolveProfileSortCriteria", () => {
-  const settings = {
-    "virtual_library.quality_profiles": JSON.stringify([
-      {
-        label: "4K+HDR",
-        sort: [
-          { attribute: "score", direction: "desc" },
-          { attribute: "size", direction: "desc" },
-        ],
-      },
-    ]),
-  };
-
-  it("reads the matching profile's sort list", () => {
-    expect(resolveProfileSortCriteria(settings, "4k+hdr")).toEqual([
-      { attribute: "score", direction: "desc" },
-      { attribute: "size", direction: "desc" },
-    ]);
-  });
-
-  it("falls back to no criteria for an unknown profile or missing payload", () => {
-    expect(resolveProfileSortCriteria(settings, "Unknown")).toEqual([]);
-    expect(resolveProfileSortCriteria(undefined, "4K+HDR")).toEqual([]);
-    expect(
-      resolveProfileSortCriteria({ "virtual_library.quality_profiles": "not json" }, "x"),
-    ).toEqual([]);
   });
 });

@@ -1,5 +1,7 @@
 import type { VersionAudioTrack, VersionSubtitleTrack, VersionVideoTrack } from "@/api/types";
+import { normalizeSortCriteria } from "@/components/streaming/scoringPresets";
 import { englishLanguageName, getLanguageName } from "@/lib/languageNames";
+import type { ServerVersionRanking } from "@/lib/qualityRanking";
 import {
   formatBitrate,
   formatChannels,
@@ -65,6 +67,41 @@ export function profileLabelFromFilePath(filePath?: string): string | null {
   } catch {
     return null;
   }
+}
+
+interface VirtualRankingPayload {
+  profile_label?: unknown;
+  source?: unknown;
+  criteria?: unknown;
+}
+
+/**
+ * Resolves the ranking in effect for a version list. Prefers the server's
+ * `virtual_ranking` payload (`{profile_label, source, criteria}`) when it is
+ * present; until that field lands, falls back to the profile label carried by
+ * the candidates' `?profile=` selector with the server's default order.
+ */
+export function serverRankingFromVersions(
+  versions: readonly { file_path?: string; virtual_ranking?: unknown }[],
+): ServerVersionRanking {
+  for (const version of versions) {
+    const payload = version.virtual_ranking as VirtualRankingPayload | undefined;
+    if (!payload || typeof payload !== "object") continue;
+    return {
+      profileLabel:
+        typeof payload.profile_label === "string" && payload.profile_label.trim()
+          ? payload.profile_label.trim()
+          : null,
+      criteria: normalizeSortCriteria(payload.criteria),
+      source: typeof payload.source === "string" ? payload.source : null,
+      fromPayload: true,
+    };
+  }
+  const profileLabel =
+    versions
+      .map((version) => profileLabelFromFilePath(version.file_path))
+      .find((label): label is string => Boolean(label)) ?? null;
+  return { profileLabel, criteria: [], source: null, fromPayload: false };
 }
 
 /** True for zero-storage catalog entries backed by a virtual:// provider URI. */
