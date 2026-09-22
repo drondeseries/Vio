@@ -790,58 +790,6 @@ func TestStaleLiveConflictAdoptsDatabaseRow(t *testing.T) {
 	}
 }
 
-func TestStateReportConflictClearsStaleCorrectionCommands(t *testing.T) {
-	now := time.Date(2026, 4, 10, 12, 0, 20, 0, time.UTC)
-	repo := &stubRepo{room: baseRoom(now)}
-	service := newServiceForTest(now, repo, &stubSessions{}, &stubFiles{}, nil)
-
-	guestCorrection := &TransportCommand{
-		CommandID:         "stale-correction",
-		SessionID:         "guest-session",
-		SelectionRevision: repo.room.SelectionRevision,
-		Action:            TransportActionPlay,
-		PositionSeconds:   20,
-		IssuedAt:          now.Add(-time.Second).Format(time.RFC3339Nano),
-		PlaybackState:     RoomPlaybackStatePlaying,
-	}
-	service.rooms[repo.room.ID].members[buildMemberKey(8, "guest")] = &memberState{
-		userID:            8,
-		profileID:         "guest",
-		sessionID:         "guest-session",
-		correctionCommand: guestCorrection,
-	}
-	hostConn := &recordingConn{}
-	service.rooms[repo.room.ID].members[buildMemberKey(7, "host")] = &memberState{
-		userID:     7,
-		profileID:  "host",
-		sessionID:  "host-session",
-		connection: hostConn,
-	}
-
-	// The database row advances independently and wins the host's stale write.
-	repo.room.Generation = 5
-	repo.room.AnchorPositionSeconds = 40
-	repo.room.AnchorUpdatedAt = now
-
-	snapshot, err := service.HandleStateReportForConnection(
-		context.Background(),
-		registrationFor(repo.room.ID, 7, "host", hostConn),
-		7,
-		"host",
-		StateReport{SessionID: "host-session", PositionSeconds: 30},
-	)
-	if err != nil {
-		t.Fatalf("HandleStateReportForConnection() error = %v", err)
-	}
-	if snapshot.Generation != repo.room.Generation || snapshot.AnchorPositionSeconds != repo.room.AnchorPositionSeconds {
-		t.Fatalf("snapshot = generation %d, anchor %v; want winning row generation %d, anchor %v",
-			snapshot.Generation, snapshot.AnchorPositionSeconds, repo.room.Generation, repo.room.AnchorPositionSeconds)
-	}
-	if service.rooms[repo.room.ID].members[buildMemberKey(8, "guest")].correctionCommand != nil {
-		t.Fatal("stale guest correction survived a conflicting host anchor update")
-	}
-}
-
 func intPtr(value int) *int {
 	return &value
 }

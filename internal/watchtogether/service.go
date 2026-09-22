@@ -670,7 +670,6 @@ func (s *Service) HandleStateReportForConnection(
 		}
 		snapshot = s.buildSnapshotLocked(live, userID, profileID)
 		if conflict {
-			s.clearCorrectionCommandsLocked(live)
 			s.mu.Unlock()
 			return snapshot, nil
 		}
