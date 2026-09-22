@@ -13,6 +13,117 @@ export interface CustomFormatRule {
   reject?: boolean;
 }
 
+/**
+ * Ordered sort criteria for a quality profile.
+ *
+ * The server evaluates the list top-down, so the first criterion is the primary
+ * sort and later ones break ties. An empty/absent list means the server applies
+ * its default order (confirmed, score, language, resolution, source,
+ * audio_channels, size). These literals are the wire values; the backend
+ * accepts exactly these spellings.
+ */
+export const SORT_ATTRIBUTES = [
+  "size",
+  "bitrate",
+  "resolution",
+  "audio_channels",
+  "bit_depth",
+  "hdr",
+  "source",
+  "score",
+  "confirmed",
+  "language",
+] as const;
+
+export type SortAttribute = (typeof SORT_ATTRIBUTES)[number];
+
+export const SORT_DIRECTIONS = ["desc", "asc"] as const;
+
+export type SortDirection = (typeof SORT_DIRECTIONS)[number];
+
+export interface SortCriterion {
+  attribute: SortAttribute;
+  direction: SortDirection;
+}
+
+/** Hard cap on criteria per profile, enforced by the editor. */
+export const MAX_SORT_CRITERIA = 16;
+
+/** What an "Add criterion" row starts as. */
+export const DEFAULT_SORT_CRITERION: SortCriterion = { attribute: "size", direction: "desc" };
+
+/** Long labels for the editor's attribute select. */
+export const SORT_ATTRIBUTE_LABELS: Record<SortAttribute, string> = {
+  size: "File Size",
+  bitrate: "Bitrate",
+  resolution: "Resolution",
+  audio_channels: "Audio Channels",
+  bit_depth: "Bit Depth",
+  hdr: "HDR",
+  source: "Source",
+  score: "Format Score",
+  confirmed: "Confirmed Source",
+  language: "Language",
+};
+
+/** Short labels for the read-only chips. */
+export const SORT_ATTRIBUTE_SHORT_LABELS: Record<SortAttribute, string> = {
+  size: "size",
+  bitrate: "bitrate",
+  resolution: "resolution",
+  audio_channels: "channels",
+  bit_depth: "bit depth",
+  hdr: "HDR",
+  source: "source",
+  score: "score",
+  confirmed: "confirmed",
+  language: "language",
+};
+
+export const SORT_DIRECTION_LABELS: Record<SortDirection, string> = {
+  desc: "Descending ↓",
+  asc: "Ascending ↑",
+};
+
+export const SORT_DIRECTION_SYMBOLS: Record<SortDirection, string> = {
+  desc: "↓",
+  asc: "↑",
+};
+
+/** One chip label, e.g. `size ↓`. */
+export function formatSortCriterion(criterion: SortCriterion): string {
+  return `${SORT_ATTRIBUTE_SHORT_LABELS[criterion.attribute]} ${SORT_DIRECTION_SYMBOLS[criterion.direction]}`;
+}
+
+/** All chip labels joined for a single line, e.g. `size ↓ · bitrate ↓`. */
+export function formatSortCriteriaSummary(criteria: readonly SortCriterion[]): string {
+  return criteria.map(formatSortCriterion).join(" · ");
+}
+
+/**
+ * Coerces a value parsed from the profile JSON into the criteria the editor and
+ * summary can render. Anything that is not a recognized attribute is dropped
+ * and an unrecognized direction falls back to `desc`, so an older or malformed
+ * config loads as "no criteria" (or partial criteria) instead of throwing.
+ */
+export function normalizeSortCriteria(value: unknown): SortCriterion[] {
+  if (!Array.isArray(value)) return [];
+  const criteria: SortCriterion[] = [];
+  for (const entry of value) {
+    if (criteria.length >= MAX_SORT_CRITERIA) break;
+    if (!entry || typeof entry !== "object") continue;
+    const { attribute, direction } = entry as { attribute?: unknown; direction?: unknown };
+    if (typeof attribute !== "string") continue;
+    if (!(SORT_ATTRIBUTES as readonly string[]).includes(attribute)) continue;
+    const resolvedDirection =
+      typeof direction === "string" && (SORT_DIRECTIONS as readonly string[]).includes(direction)
+        ? (direction as SortDirection)
+        : "desc";
+    criteria.push({ attribute: attribute as SortAttribute, direction: resolvedDirection });
+  }
+  return criteria;
+}
+
 export interface QualityProfileRule {
   label: string;
   resolution?: string;
@@ -31,6 +142,8 @@ export interface QualityProfileRule {
   include_regex?: string;
   exclude_regex?: string;
   preferred_order: number;
+  /** Ordered sort criteria; omitted (not empty) when the profile uses defaults. */
+  sort?: SortCriterion[];
 }
 
 export const VIO_RECOMMENDED_FORMATS: CustomFormatRule[] = [

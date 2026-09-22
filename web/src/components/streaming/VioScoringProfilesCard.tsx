@@ -27,6 +27,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 import { CustomFormatModal } from "./CustomFormatModal";
 import { QualityProfileModal } from "./QualityProfileModal";
+import { SortCriteriaSummary } from "./SortCriteriaSummary";
 import {
   type CategoryType,
   type CustomFormatRule,
@@ -703,6 +704,12 @@ export function VioScoringProfilesCard({
                               !p.exclude_regex && (
                                 <span className="text-muted-foreground">Standard</span>
                               )}
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-1">
+                            <span className="text-muted-foreground text-[10px] font-semibold tracking-wider uppercase">
+                              Sort
+                            </span>
+                            <SortCriteriaSummary criteria={p.sort} />
                           </div>
                         </td>
                         <td className="px-3 py-2.5 text-right">
