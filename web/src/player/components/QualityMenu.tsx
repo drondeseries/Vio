@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, RefreshCw, Settings } from "lucide-react";
+import { QualityRankingSummary } from "@/components/streaming/QualityRankingSummary";
+import { useVersionListRefresh, REFRESH_VERSIONS_ERROR } from "@/hooks/useVersionListRefresh";
 import { resolveActiveQualityOptionId } from "../playback-info";
 import type { QualityOption } from "../types";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
@@ -8,6 +10,15 @@ export interface VersionInfo {
   fileId: number;
   label: string;
   releaseName?: string;
+  /** Release + structured size + source hint, shared with the item-page picker.
+   *  Preferred over `releaseName` when present so both menus show the same. */
+  detail?: string;
+  /** Display-ready audio language labels ("English/French"). */
+  audioLanguages?: string[];
+  /** Display-ready subtitle language labels ("English"). */
+  subtitleLanguages?: string[];
+  /** Quality-profile label the candidate was ranked under (`?profile=`). */
+  profileLabel?: string | null;
   /** Custom-format score the server ranked this candidate with. Absent (or
    *  zero) for local and otherwise unscored rows, which show no badge. */
   formatScore?: number;
@@ -36,8 +47,7 @@ interface QualityMenuProps {
   onRefreshVersions?: () => Promise<void>;
 }
 
-/** Concise failure copy shown inside the refresh row, so the list never moves. */
-export const REFRESH_VERSIONS_ERROR = "Couldn't refresh. Try again.";
+export { REFRESH_VERSIONS_ERROR };
 
 export function QualityMenu({
   options,
@@ -51,23 +61,12 @@ export function QualityMenu({
   onRefreshVersions,
 }: QualityMenuProps) {
   const [open, setOpen] = useState(false);
-  const [refreshingVersions, setRefreshingVersions] = useState(false);
-  const [refreshVersionsError, setRefreshVersionsError] = useState<string | null>(null);
+  const {
+    refreshing: refreshingVersions,
+    error: refreshVersionsError,
+    refresh: handleRefreshVersions,
+  } = useVersionListRefresh(onRefreshVersions);
   const menuRef = useRef<HTMLDivElement>(null);
-
-  const handleRefreshVersions = useCallback(async () => {
-    if (!onRefreshVersions || refreshingVersions) return;
-    setRefreshingVersions(true);
-    setRefreshVersionsError(null);
-    try {
-      await onRefreshVersions();
-    } catch {
-      // The known candidates stay rendered; only the message changes.
-      setRefreshVersionsError(REFRESH_VERSIONS_ERROR);
-    } finally {
-      setRefreshingVersions(false);
-    }
-  }, [onRefreshVersions, refreshingVersions]);
 
   const handleSelect = useCallback(
     (id: string) => {
@@ -132,6 +131,7 @@ export function QualityMenu({
   const resolvedActiveId = resolveActiveQualityOptionId(options, activeId);
   const activeOption = options.find((option) => option.id === resolvedActiveId);
   let menuItemIndex = 0;
+  const rankingProfileLabel = versions?.find((v) => v.profileLabel)?.profileLabel ?? null;
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
@@ -168,10 +168,19 @@ export function QualityMenu({
               <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
                 Version
               </div>
+              <QualityRankingSummary profileLabel={rankingProfileLabel} className="px-3 pb-1" />
               {versions.map((v) => {
                 const idx = menuItemIndex++;
                 const statusLabels = buildVersionStatusLabels(v);
                 const hasFormatScore = typeof v.formatScore === "number" && v.formatScore !== 0;
+                const detailLine = v.detail || v.releaseName;
+                const audioLanguages = v.audioLanguages ?? [];
+                const subtitleLanguages = v.subtitleLanguages ?? [];
+                const hasBadges =
+                  hasFormatScore ||
+                  statusLabels.length > 0 ||
+                  audioLanguages.length > 0 ||
+                  subtitleLanguages.length > 0;
                 return (
                   <button
                     key={v.fileId}
@@ -191,18 +200,20 @@ export function QualityMenu({
                     <span className="flex min-w-0 items-center gap-2">
                       <span className="min-w-0">
                         <span className="block truncate">{v.label}</span>
-                        {v.releaseName && (
+                        {detailLine && (
                           <span className="block truncate text-[11px] text-white/50">
-                            {v.releaseName}
+                            {detailLine}
                           </span>
                         )}
                       </span>
-                      {(hasFormatScore || statusLabels.length > 0) && (
+                      {hasBadges && (
                         <span className="flex flex-wrap gap-1">
                           {hasFormatScore && (
                             <span
                               className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/60"
-                              title={`Format score ${v.formatScore}`}
+                              title={`Format score ${v.formatScore}${
+                                v.profileLabel ? ` · ${v.profileLabel}` : ""
+                              }`}
                             >
                               ★ {v.formatScore}
                             </span>
@@ -219,6 +230,24 @@ export function QualityMenu({
                               }`}
                             >
                               {status}
+                            </span>
+                          ))}
+                          {audioLanguages.map((language) => (
+                            <span
+                              key={`audio-${language}`}
+                              className="rounded border border-blue-500/20 bg-blue-500/10 px-1.5 py-0.5 text-[10px] leading-none text-blue-400"
+                            >
+                              <span className="mr-0.5 opacity-70">🔊</span>
+                              {language}
+                            </span>
+                          ))}
+                          {subtitleLanguages.map((language) => (
+                            <span
+                              key={`subtitle-${language}`}
+                              className="rounded border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[10px] leading-none text-amber-400"
+                            >
+                              <span className="mr-0.5 opacity-70">CC</span>
+                              {language}
                             </span>
                           ))}
                         </span>
@@ -238,7 +267,7 @@ export function QualityMenu({
                   disabled={refreshingVersions}
                   aria-busy={refreshingVersions || undefined}
                   onClick={() => {
-                    void handleRefreshVersions();
+                    handleRefreshVersions();
                   }}
                 >
                   {refreshingVersions ? (

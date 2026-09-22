@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
 import { buildMediaSpecSections, type MediaSpecSection } from "./mediaSpecSections";
+import { buildVersionFallbackTitle } from "./versionFormatUtils";
 
 interface MediaInfoDialogProps {
   open: boolean;
@@ -79,9 +80,18 @@ export default function MediaInfoDialog({
             // DialogContent unmounts when closed, so defaultValue re-targets on each open.
             <Accordion type="multiple" defaultValue={initialValue ? [initialValue] : []}>
               {sorted.map((version, index) => {
-                const summary =
-                  buildQualitySummary(version) || version.file_name || `Version ${index + 1}`;
                 const detail = buildDetailLine(version);
+                // The file-name fallback is deduped against the detail line:
+                // the structured size and a repeated year are shown once, on
+                // the detail line, which is the release/title line the version
+                // row and the release label already carry.
+                const summary =
+                  buildQualitySummary(version) ||
+                  buildVersionFallbackTitle(version.file_name, {
+                    fileSize: version.file_size,
+                    detailLine: detail,
+                  }) ||
+                  `Version ${index + 1}`;
 
                 return (
                   <AccordionItem key={version.file_id} value={String(version.file_id)}>

@@ -33,6 +33,9 @@ export interface PlayerFileVersion {
   failed?: boolean;
   edition_key?: string;
   release_name?: string;
+  /** Provider display label for a virtual candidate; the wire's release-name
+   *  fallback. Present on watch-detail rows even though it is not modelled. */
+  edition_raw?: string;
   release_group?: string;
   presentation_kind?: string;
   presentation_group_key?: string;
@@ -42,6 +45,9 @@ export interface PlayerFileVersion {
   audio_channels?: number;
   video_tracks?: PlayerVideoTrack[];
   audio_tracks?: PlayerAudioTrack[];
+  /** Per-version subtitle tracks, used only for the version menu's language
+   *  badges; playback subtitles come from the plan inventory. */
+  subtitle_tracks?: { language?: string }[];
   chapters?: PlayerChapter[];
   intro?: PlayerTimeRange | null;
   credits?: PlayerTimeRange | null;
