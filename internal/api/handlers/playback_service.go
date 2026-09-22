@@ -180,7 +180,10 @@ func (h *PlaybackHandler) PlaybackCapabilities(ctx context.Context, userID int, 
 		return view, playbackOperationError(http.StatusConflict, "capability_not_configured", "Playback installation identity is not configured")
 	}
 	view.InstallationID = h.InstallationID
-	view.Features = playbackServerFeaturesV2()
+	view.Features = append(playback.ServerFeaturesV3(), "sequenced_progress_v1", "fixed_media_file_v1", "marker_segments_v1")
+	if h.WatchTogetherAvailable {
+		view.Features = append(view.Features, "watch_party_source_fallback_v1", "watch_party_coordinator_v1")
+	}
 	view.Deliveries = []playback.DeliveryV3{playback.DeliveryOriginalHTTPV3, playback.DeliveryRemuxProgressiveV3, playback.DeliveryRemuxHLSV3}
 	if h.playbackConfig().TranscodeEnabled {
 		view.Deliveries = append(view.Deliveries, playback.DeliveryTranscodeHLSV3)
@@ -189,12 +192,6 @@ func (h *PlaybackHandler) PlaybackCapabilities(ctx context.Context, userID int, 
 	digest := sha256.Sum256(capability)
 	view.Revision = hex.EncodeToString(digest[:])
 	return view, nil
-}
-
-// playbackServerFeaturesV2 is the v3 feature set plus the v2 sequenced
-// progress/stop contract.
-func playbackServerFeaturesV2() []string {
-	return append(playback.ServerFeaturesV3(), "sequenced_progress_v1")
 }
 
 // The application pipeline still uses private request-based routing helpers.

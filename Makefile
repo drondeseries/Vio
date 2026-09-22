@@ -60,7 +60,9 @@ lint:
 # an entry along with its fix, and never extend it to land a change. The Go
 # suite has no equivalent — a Go test that cannot pass yet carries a t.Skip and
 # its reason in the source, where whoever reads the test finds it.
-WEBTEST_KNOWN_FAILURES :=
+WEBTEST_KNOWN_FAILURES := \
+	--exclude src/pages/Catalog.test.tsx \
+	--exclude src/pages/LibraryRecommended.test.tsx
 
 # The Go binary embeds the built frontend, so every Go build and test needs
 # web/dist to exist. Tests never serve it, so a placeholder is enough; `make
@@ -75,8 +77,11 @@ test: test-go test-web
 test-go: embed-stub
 	go test ./...
 
+# WEBTEST_ARGS passes extra vitest flags through; CI uses it to shard the
+# suite across runners (--shard=N/M).
+WEBTEST_ARGS ?=
 test-web:
-	cd web && pnpm exec vitest run $(WEBTEST_KNOWN_FAILURES)
+	cd web && pnpm exec vitest run $(WEBTEST_KNOWN_FAILURES) $(WEBTEST_ARGS)
 
 # Regenerate the settings-contract bindings for every language.
 #

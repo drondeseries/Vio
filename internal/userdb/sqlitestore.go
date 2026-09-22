@@ -28,6 +28,13 @@ var _ userstore.DeviceRegistry = (*SQLiteUserStore)(nil)
 var _ userstore.DeviceProfileRegistry = (*SQLiteUserStore)(nil)
 var _ userstore.WatchedBatchWriter = (*SQLiteUserStore)(nil)
 var _ userstore.NextUpStateStore = (*SQLiteUserStore)(nil)
+var _ userstore.SectionOverrideEnumerator = (*SQLiteUserStore)(nil)
+
+// ListAllSectionOverrides exposes the account-wide read capability used by
+// scheduled section maintenance.
+func (s *SQLiteUserStore) ListAllSectionOverrides(_ context.Context) ([]userstore.SectionOverride, error) {
+	return ListAllSectionOverrides(s.db)
+}
 
 // --- Profiles ---
 

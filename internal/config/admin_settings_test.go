@@ -47,6 +47,24 @@ func TestEffectiveAdminSettingsUsesRuntimeDefaults(t *testing.T) {
 	}
 }
 
+func TestEffectiveAdminSettingsMarkerDefaultsPreserveExplicitModes(t *testing.T) {
+	for _, mode := range []string{"", "off", "local", "online", "both"} {
+		t.Run("mode_"+mode, func(t *testing.T) {
+			effective := EffectiveAdminSettings(map[string]string{"markers.mode": mode})
+			want := mode
+			if want == "" {
+				want = "both"
+			}
+			if got := effective["markers.mode"]; got != want {
+				t.Fatalf("markers.mode = %q, want %q", got, want)
+			}
+			if got := effective["markers.online_storage"]; got != "stored" {
+				t.Fatalf("markers.online_storage = %q, want stored", got)
+			}
+		})
+	}
+}
+
 func TestEffectiveAdminSettingsUsesLegacyS3FallbacksBeforeDefaults(t *testing.T) {
 	effective := EffectiveAdminSettings(map[string]string{
 		"s3.operational_path_style": "false",

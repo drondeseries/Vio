@@ -1,7 +1,6 @@
 package scanner
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -22,7 +21,7 @@ func writeTestFile(t *testing.T, path string, content string) {
 
 func collectTestFilePaths(t *testing.T, root string, libraryType string) []string {
 	t.Helper()
-	files, walkFailures, err := collectLogicalFilePaths(context.Background(), []string{root}, libraryType)
+	files, walkFailures, err := collectLogicalFilePaths(t.Context(), []string{root}, libraryType, nil)
 	if err != nil {
 		t.Fatalf("collect logical paths: %v", err)
 	}
@@ -180,7 +179,7 @@ func TestAudiobookScanHonorsIgnoreFiles(t *testing.T) {
 	writeTestFile(t, filepath.Join(root, "junk", "Ignore Me.mp3"), "test")
 	writeTestFile(t, filepath.Join(root, ".siloignore"), "junk/*\nsample\n")
 
-	scans, err := collectAudiobookRootScans(context.Background(), 1, []string{root})
+	scans, err := collectAudiobookRootScans(t.Context(), 1, []string{root}, nil, true)
 	if err != nil {
 		t.Fatalf("collect audiobook root scans: %v", err)
 	}

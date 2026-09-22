@@ -543,12 +543,15 @@ type ClientPlaybackContextV3 struct {
 }
 
 type StartRequestV3 struct {
-	ProtocolVersion            int                   `json:"protocol_version"`
-	ClientFeatures             []string              `json:"client_features"`
-	FileID                     int                   `json:"file_id"`
-	ProfileID                  string                `json:"profile_id"`
-	PlaybackAttemptID          string                `json:"playback_attempt_id"`
-	QualityPreference          string                `json:"quality_preference"`
+	ProtocolVersion   int      `json:"protocol_version"`
+	ClientFeatures    []string `json:"client_features"`
+	FileID            int      `json:"file_id"`
+	ProfileID         string   `json:"profile_id"`
+	PlaybackAttemptID string   `json:"playback_attempt_id"`
+	QualityPreference string   `json:"quality_preference"`
+	// False pins the source file through start and every replan. Encoding and
+	// delivery can still adapt to the viewer without changing the timeline.
+	AllowAlternateVersions     *bool                 `json:"allow_alternate_versions,omitempty"`
 	SubtitleFidelityPreference SubtitleFidelityV3    `json:"subtitle_fidelity_preference"`
 	StartPosition              *float64              `json:"start_position,omitempty"`
 	ProgressPersistence        ProgressPersistenceV3 `json:"progress_persistence,omitempty"`
@@ -577,6 +580,10 @@ type StartRequestV3 struct {
 	BandwidthCapKbps      *int                      `json:"bandwidth_cap_kbps,omitempty"`
 	Capabilities          ClientCodecCapabilitiesV3 `json:"client_capabilities"`
 	ClientPlaybackContext ClientPlaybackContextV3   `json:"client_playback_context"`
+}
+
+func (r StartRequestV3) AllowsAlternateVersions() bool {
+	return r.AllowAlternateVersions == nil || *r.AllowAlternateVersions
 }
 
 // ProgressPersistenceV3 declares which side owns durable item resume/history.

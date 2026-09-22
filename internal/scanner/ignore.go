@@ -1,11 +1,53 @@
 package scanner
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// scanRootIgnoreRules loads the rules above a scoped folder walk, stopping at
+// its configured library root. Rules outside that root cannot affect a library.
+// A failed ancestor read makes the scope incomplete, so callers must protect it
+// from missing-file reconciliation.
+func scanRootIgnoreRules(path string, libraryRoots []string) ([]ignoreRules, bool, error) {
+	path = filepath.Clean(path)
+	root := ""
+	for _, candidate := range libraryRoots {
+		candidate = filepath.Clean(candidate)
+		if pathWithinAnyRoot(path, []string{candidate}) && len(candidate) > len(root) {
+			root = candidate
+		}
+	}
+	if root == "" || root == path {
+		return nil, false, nil
+	}
+	var parents []string
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		parents = append(parents, dir)
+		if dir == root {
+			break
+		}
+	}
+	var rules []ignoreRules
+	for i := len(parents) - 1; i >= 0; i-- {
+		dir := parents[i]
+		if ignoreRulesMatch(rules, dir) {
+			return rules, true, nil
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return nil, false, fmt.Errorf("read ignore ancestor %s: %w", dir, err)
+		}
+		if dirHasIgnoreMarker(entries) {
+			return rules, true, nil
+		}
+		rules = childIgnoreRules(rules, dir, dir, entries)
+	}
+	return rules, ignoreRulesMatch(rules, path), nil
+}
 
 // Filesystem ignore conventions honored during scans:
 //
@@ -50,7 +92,7 @@ func dirHasIgnoreMarker(entries []fs.DirEntry) bool {
 // Blank lines and `#` comments are dropped, the rest is kept verbatim.
 func parseIgnorePatterns(content string) []string {
 	var patterns []string
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -58,17 +100,6 @@ func parseIgnorePatterns(content string) []string {
 		patterns = append(patterns, line)
 	}
 	return patterns
-}
-
-// readSiloIgnoreFile reads and parses the .siloignore in dir, if any. A
-// missing file yields nil; a read failure yields nil too and lets the scan
-// continue — a broken ignore file must not abort a library walk.
-func readSiloIgnoreFile(dir string) []string {
-	content, err := os.ReadFile(filepath.Join(dir, siloIgnoreFileName))
-	if err != nil {
-		return nil
-	}
-	return parseIgnorePatterns(string(content))
 }
 
 // ignoreRulesMatch reports whether logicalPath matches any inherited rule.
@@ -92,13 +123,18 @@ func ignoreRulesMatch(rules []ignoreRules, logicalPath string) bool {
 
 // childIgnoreRules returns the rule set children of a directory inherit: the
 // inherited rules plus this directory's own .siloignore, if present. Only a
-// regular file counts as the pattern file.
+// regular file counts as the pattern file. A read failure leaves inherited
+// rules intact and lets the walk continue.
 func childIgnoreRules(inherited []ignoreRules, dirLogicalPath, dirPhysicalPath string, entries []fs.DirEntry) []ignoreRules {
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() || entry.Name() != siloIgnoreFileName {
 			continue
 		}
-		patterns := readSiloIgnoreFile(dirPhysicalPath)
+		content, err := os.ReadFile(filepath.Join(dirPhysicalPath, siloIgnoreFileName))
+		if err != nil {
+			return inherited
+		}
+		patterns := parseIgnorePatterns(string(content))
 		if len(patterns) == 0 {
 			return inherited
 		}

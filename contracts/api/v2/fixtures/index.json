@@ -942,7 +942,7 @@
     {
       "name": "admin_episode_markers_refresh",
       "operation_id": "refreshAdminEpisodeMarkers",
-      "scenario": "Marker refresh acknowledges local analysis without a durable job.",
+      "scenario": "Marker refresh acknowledges configured online or local sources.",
       "request": {
         "method": "POST",
         "path": "/api/v2/admin/items/episode-1/refresh-markers",
@@ -1782,6 +1782,128 @@
       "response_media_type": "application/json",
       "schema": "#/components/schemas/MetadataTranslationJob",
       "body_file": "admin_metadata_translation_queued.json"
+    },
+    {
+      "name": "admin_network_access_connect_accepted",
+      "operation_id": "connectNetworkAccess",
+      "scenario": "Connect on the named host is acknowledged with the state reached so far; enrollment continues and the auth URL is admin-only.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/admin/network-access/stub/connect",
+        "headers": {
+          "Authorization": "Bearer tok-admin",
+          "X-Profile-Id": "p-primary"
+        },
+        "body": "{\"hosts\":[\"api\"]}"
+      },
+      "expected_status": 202,
+      "response_headers": {
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/NetworkAccessStatus",
+      "body_file": "admin_network_access_connect_accepted.json"
+    },
+    {
+      "name": "admin_network_access_disconnect_accepted",
+      "operation_id": "disconnectNetworkAccess",
+      "scenario": "Disconnect without a body acts on every host and is acknowledged with the state reached.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/admin/network-access/stub/disconnect",
+        "headers": {
+          "Authorization": "Bearer tok-admin",
+          "X-Profile-Id": "p-primary"
+        }
+      },
+      "expected_status": 202,
+      "response_headers": {
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/NetworkAccessStatus",
+      "body_file": "admin_network_access_disconnect_accepted.json"
+    },
+    {
+      "name": "admin_network_access_status_not_found",
+      "operation_id": "getAdminNetworkAccessStatus",
+      "scenario": "A provider slug no enabled installation declares.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/admin/network-access/netbird/status",
+        "headers": {
+          "Authorization": "Bearer tok-admin",
+          "X-Profile-Id": "p-primary"
+        }
+      },
+      "expected_status": 404,
+      "response_headers": {
+        "Content-Type": "application/problem+json"
+      },
+      "response_media_type": "application/problem+json",
+      "schema": "#/components/schemas/Problem",
+      "body_file": "admin_network_access_status_not_found.json"
+    },
+    {
+      "name": "admin_network_access_status_ok",
+      "operation_id": "getAdminNetworkAccessStatus",
+      "scenario": "The provider's live state on the API host, with overlay origin and addresses.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/admin/network-access/stub/status",
+        "headers": {
+          "Authorization": "Bearer tok-admin",
+          "X-Profile-Id": "p-primary"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/NetworkAccessStatus",
+      "body_file": "admin_network_access_status_ok.json"
+    },
+    {
+      "name": "admin_network_access_status_unavailable_host",
+      "operation_id": "getAdminNetworkAccessStatus",
+      "scenario": "A host whose provider plugin is not running answers state unavailable with the supervisor's reason and no updated_at.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/admin/network-access/down/status",
+        "headers": {
+          "Authorization": "Bearer tok-admin",
+          "X-Profile-Id": "p-primary"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/NetworkAccessStatus",
+      "body_file": "admin_network_access_status_unavailable_host.json"
+    },
+    {
+      "name": "admin_network_access_unknown_host",
+      "operation_id": "connectNetworkAccess",
+      "scenario": "A host id this deployment does not run the provider on is a validation failure at body.hosts; nothing is applied.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/admin/network-access/stub/connect",
+        "headers": {
+          "Authorization": "Bearer tok-admin",
+          "X-Profile-Id": "p-primary"
+        },
+        "body": "{\"hosts\":[\"node:99\"]}"
+      },
+      "expected_status": 422,
+      "response_headers": {
+        "Content-Type": "application/problem+json"
+      },
+      "response_media_type": "application/problem+json",
+      "schema": "#/components/schemas/Problem",
+      "body_file": "admin_network_access_unknown_host.json"
     },
     {
       "name": "admin_person_refreshed",
@@ -9535,6 +9657,27 @@
       "body_file": "mark_watched_profile_header_required.json"
     },
     {
+      "name": "network_access_capabilities_ok",
+      "operation_id": "getNetworkAccessCapabilities",
+      "scenario": "An authenticated account lists the installed overlay-network providers read from plugin manifests.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/network-access/capabilities",
+        "headers": {
+          "Authorization": "Bearer tok-member"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "private, no-cache",
+        "Content-Type": "application/json",
+        "ETag": "\"1400a291b22fc7156ba4727d7eafa8a40d6654b9ee567eb9bbd470de447fd03b\""
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/NetworkAccessCapabilities",
+      "body_file": "network_access_capabilities_ok.json"
+    },
+    {
       "name": "not_acceptable",
       "operation_id": "getSystemInfo",
       "scenario": "An Accept header that admits no JSON representation.",
@@ -11289,6 +11432,44 @@
       "response_media_type": "application/json",
       "schema": "#/components/schemas/CatalogFacetMatches",
       "body_file": "search_catalog_facet_ok.json"
+    },
+    {
+      "name": "server_connections_ok",
+      "operation_id": "getServerConnections",
+      "scenario": "A signed-in client reads the addresses the deployment offers: the public URL, a connected provider with its overlay origin, and an installed provider whose plugin is not running.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/system/connections",
+        "headers": {
+          "Authorization": "Bearer tok-member"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "private, no-cache",
+        "Content-Type": "application/json",
+        "ETag": "\"251d40c6578ba4f568f974b66faed17c5fd6ea82251fdc08ebc30e12c2be477f\""
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/ServerConnectionsDocument",
+      "body_file": "server_connections_ok.json"
+    },
+    {
+      "name": "server_identity_ok",
+      "operation_id": "getServerIdentity",
+      "scenario": "Discovery before login: the deployment's stable server identity, the same at every address.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/system/identity"
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "no-cache",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/ServerIdentity",
+      "body_file": "server_identity_ok.json"
     },
     {
       "name": "set_file_markers_ok",
@@ -13104,6 +13285,26 @@
       "response_media_type": "application/json",
       "schema": "#/components/schemas/CollectionWatchProviderSummary",
       "body_file": "watch_providers_ok.json"
+    },
+    {
+      "name": "watch_together_capabilities",
+      "operation_id": "getWatchTogetherCapabilities",
+      "scenario": "An authenticated account reads which watch-together room behaviors the server supports.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/watch-together/capabilities",
+        "headers": {
+          "Authorization": "Bearer tok-member"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "private, no-cache",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/WatchTogetherCapabilities",
+      "body_file": "watch_together_capabilities.json"
     }
   ]
 }

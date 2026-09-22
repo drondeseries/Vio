@@ -9,15 +9,30 @@ import {
 } from "@/hooks/queries/sections";
 import { sectionKeys } from "@/hooks/queries/keys";
 import type { BrowseItem, SectionItem } from "@/api/types";
-import { getWatchTogetherRoomPicker, queryWatchTogetherMemberState } from "@/lib/watchTogether";
+import {
+  getWatchTogetherRoomPicker,
+  queryWatchTogetherMemberState,
+  type WatchTogetherRoomMember,
+} from "@/lib/watchTogether";
 import type { ItemMemberState } from "@/api/v2/watchTogetherMemberState";
 import { useDebounce } from "@/hooks/useDebounce";
 
 export const pickerKeys = {
-  rows: (roomId: string, memberCount: number) =>
-    ["watch-party", "picker", roomId, memberCount] as const,
-  memberState: (roomId: string, memberCount: number, ids: string[]) =>
-    ["watch-party", "member-state", roomId, memberCount, ids] as const,
+  rows: (roomId: string, members: WatchTogetherRoomMember[]) =>
+    [
+      "watch-party",
+      "picker",
+      roomId,
+      members.map((m) => `${m.user_id}:${m.profile_id}`).sort(),
+    ] as const,
+  memberState: (roomId: string, members: WatchTogetherRoomMember[], ids: string[]) =>
+    [
+      "watch-party",
+      "member-state",
+      roomId,
+      members.map((m) => `${m.user_id}:${m.profile_id}`).sort(),
+      ids,
+    ] as const,
   search: (q: string) => ["watch-party", "search", q] as const,
   recent: (scope: "movie" | "series") => ["watch-party", "recently-added", scope] as const,
 };
@@ -35,10 +50,10 @@ function isPickable<T extends { type: string }>(item: T): item is T & { type: "m
 export function usePickerRows(
   roomId: string | undefined,
   roomToken: string | null,
-  memberCount: number,
+  members: WatchTogetherRoomMember[],
 ) {
   return useQuery({
-    queryKey: pickerKeys.rows(roomId ?? "", memberCount),
+    queryKey: pickerKeys.rows(roomId ?? "", members),
     queryFn: () => getWatchTogetherRoomPicker(roomId!, roomToken!),
     enabled: !!roomId && !!roomToken,
     staleTime: 30_000,
@@ -53,7 +68,7 @@ export function usePickerRows(
 export function useMemberState(
   roomId: string | undefined,
   roomToken: string | null,
-  memberCount: number,
+  members: WatchTogetherRoomMember[],
   contentIds: string[],
 ) {
   const ids = useMemo(
@@ -63,7 +78,7 @@ export function useMemberState(
     [contentIds.join("\u0000")],
   );
   const query = useQuery({
-    queryKey: pickerKeys.memberState(roomId ?? "", memberCount, ids),
+    queryKey: pickerKeys.memberState(roomId ?? "", members, ids),
     queryFn: async () => {
       const items: ItemMemberState[] = [];
       for (let i = 0; i < ids.length; i += 200) {

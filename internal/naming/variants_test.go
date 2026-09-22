@@ -47,6 +47,34 @@ func TestParseVariantHints_BracketEditionTag(t *testing.T) {
 	}
 }
 
+func TestParseVariantHints_MultiEpisodeRangeDottedSeparator(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		path  string
+		start int
+		end   int
+	}{
+		{"two digits", "/tv/Show Name/Season 01/Show.Name.s01.e01-e02.mkv", 1, 2},
+		{"four digits", "/tv/Show Name/Season 23/Show.Name.s23.e1162-e1163.mkv", 1162, 1163},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			hints := ParseVariantHints(tt.path, "series")
+			if hints == nil {
+				t.Fatal("expected hints")
+			}
+			if got, want := hints.PresentationKind, "multi_episode"; got != want {
+				t.Fatalf("PresentationKind = %q, want %q", got, want)
+			}
+			if got, want := hints.MultiEpisodeStart, tt.start; got != want {
+				t.Fatalf("MultiEpisodeStart = %d, want %d", got, want)
+			}
+			if got, want := hints.MultiEpisodeEnd, tt.end; got != want {
+				t.Fatalf("MultiEpisodeEnd = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
 func TestParseVariantHints_ReleaseNameAndGroup(t *testing.T) {
 	hints := ParseVariantHints(
 		"/movies/Mission.Impossible.2023.2160p.Multi-AltMount.mkv",
@@ -60,6 +88,19 @@ func TestParseVariantHints_ReleaseNameAndGroup(t *testing.T) {
 	}
 	if got, want := hints.ReleaseGroup, "AltMount"; got != want {
 		t.Fatalf("ReleaseGroup = %q, want %q", got, want)
+	}
+}
+
+func TestParseVariantHints_DoesNotParseChristmasEditionTitleAsEdition(t *testing.T) {
+	hints := ParseVariantHints(
+		"/movies/The Christmas Edition (1941)/The Christmas Edition (1941) 720p HDTV x264.mkv",
+		"movies",
+	)
+	if hints == nil {
+		t.Fatal("expected hints")
+	}
+	if hints.EditionKey != "" {
+		t.Fatalf("EditionKey = %q, want empty", hints.EditionKey)
 	}
 }
 

@@ -152,8 +152,11 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * is now playing; the caller reports that back as the command's result.
    */
   invalidatePlan: (planId: string, reason: string, currentPosition: number) => Promise<boolean>;
-  /** `seek_reanchor` replan when the target lies outside the seekable window. */
-  reanchorSeek: (positionSeconds: number) => void;
+  /**
+   * `seek_reanchor` replan when the target lies outside the seekable window.
+   * Resolves with whether a plan at the new position was adopted.
+   */
+  reanchorSeek: (positionSeconds: number) => Promise<boolean>;
   /**
    * Re-reads the subtitle inventory by replanning with the selection unchanged.
    * Resolves to whether a fresh plan carrying the inventory was adopted, so a
@@ -304,6 +307,7 @@ function planToSessionState(
     replanningQuality: false,
     pendingSwitchFileId: null,
     errorTitle: null,
+    errorReason: null,
     error: null,
     errorReason: null,
     errorRetryable: false,
@@ -382,6 +386,7 @@ export function usePlaybackSession(
    *  on this start attempt. Only set when the viewer explicitly picks an
    *  unavailable version. */
   forceRelink = false,
+  allowAlternateVersions = true,
 ): UsePlaybackSessionResult {
   const config = usePlayerConfig();
   const probe = useCodecDetection();
@@ -415,6 +420,7 @@ export function usePlaybackSession(
     replanningQuality: false,
     pendingSwitchFileId: null,
     errorTitle: null,
+    errorReason: null,
     error: null,
     errorReason: null,
     errorRetryable: false,
@@ -602,6 +608,7 @@ export function usePlaybackSession(
           replanningQuality: false,
           pendingSwitchFileId: null,
           errorTitle: failure.title,
+          errorReason: decision.terminal?.reason ?? null,
           error: failure.message,
           errorReason: failure.reason ?? null,
           errorRetryable: failure.retryable ?? false,
@@ -677,6 +684,7 @@ export function usePlaybackSession(
         profileId: config.getProfileId() ?? "",
         playbackAttemptId,
         qualityPreference: qualityRef.current,
+        allowAlternateVersions,
         position,
         forceStartPosition,
         // A carried audio track (version switch) names the file-bound identity
@@ -703,7 +711,14 @@ export function usePlaybackSession(
       // carriedAudioTrackID is a per-call argument, not render-scope state, so
       // it is intentionally absent from the deps array.
     },
-    [clientCapabilities, clientPlaybackContext, config, explicitAudioTrackIndex, maxBitrateKbps],
+    [
+      allowAlternateVersions,
+      clientCapabilities,
+      clientPlaybackContext,
+      config,
+      explicitAudioTrackIndex,
+      maxBitrateKbps,
+    ],
   );
 
   const stopSession = useCallback(
@@ -821,6 +836,7 @@ export function usePlaybackSession(
         replanning: false,
         replanningQuality: false,
         errorTitle: hasExistingSession ? current.errorTitle : null,
+        errorReason: null,
         error: hasExistingSession ? current.error : null,
         errorReason: hasExistingSession ? current.errorReason : null,
         errorRetryable: hasExistingSession ? current.errorRetryable : false,
@@ -961,6 +977,7 @@ export function usePlaybackSession(
             replanningQuality: false,
             pendingSwitchFileId: null,
             errorTitle: previousState.errorTitle,
+            errorReason: previousState.errorReason,
             error: previousState.error,
             errorReason: previousState.errorReason,
             errorRetryable: previousState.errorRetryable,
@@ -1190,6 +1207,7 @@ export function usePlaybackSession(
         replanning: true,
         replanningQuality: isQualityReplan,
         errorTitle: null,
+        errorReason: null,
         error: null,
         errorReason: null,
         errorRetryable: false,
@@ -1251,6 +1269,7 @@ export function usePlaybackSession(
           replanning: false,
           replanningQuality: false,
           errorTitle: nextError.title,
+          errorReason: null,
           error: nextError.message,
           errorReason: nextError.reason ?? null,
           errorRetryable: nextError.retryable ?? false,
@@ -1452,11 +1471,11 @@ export function usePlaybackSession(
   );
 
   const reanchorSeek = useCallback(
-    (positionSeconds: number) => {
+    (positionSeconds: number): Promise<boolean> => {
       playbackPositionRef.current = positionSeconds;
       awaitingInitialPlayerPositionRef.current = false;
       reportEvent("seek_reanchor_requested");
-      void replan({ operation: "seek_reanchor", positionSeconds });
+      return replan({ operation: "seek_reanchor", positionSeconds });
     },
     [replan, reportEvent],
   );
@@ -1539,6 +1558,7 @@ export function usePlaybackSession(
 
   const switchVersion = useCallback(
     (newFileId: number, currentPosition: number) => {
+      if (!allowAlternateVersions) return;
       if (newFileId === stateRef.current.mediaFileId) return;
       if (switchingRef.current) {
         // A switch is already in flight. Remember the newest target; the
@@ -1581,7 +1601,7 @@ export function usePlaybackSession(
         }
       })();
     },
-    [loadSession],
+    [allowAlternateVersions, loadSession],
   );
 
   /**

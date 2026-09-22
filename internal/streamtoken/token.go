@@ -40,19 +40,20 @@ const (
 // (uid/pid/mfid) are lookup keys re-resolved against the authority on
 // reconstruct; they are never trusted on their own.
 type Claims struct {
-	SessionID              string `json:"sid"`
-	MediaPath              string `json:"path"`
-	PlayMethod             string `json:"method"`
-	TranscodeAudio         bool   `json:"ta,omitempty"`
-	TranscodeNode          string `json:"tnode,omitempty"`
-	TranscodeTransportID   string `json:"tid,omitempty"`
-	RoutingWorkload        string `json:"rwl,omitempty"`
-	RoutingExecution       string `json:"rex,omitempty"`
-	RoutingExecutionNodeID int    `json:"rxnid,omitzero"`
-	RoutingEgress          string `json:"reg,omitempty"`
-	RoutingEgressNodeID    int    `json:"renid,omitempty"`
-	TargetCodec            string `json:"tc,omitempty"`
-	TargetRes              string `json:"tres,omitempty"`
+	SessionID              string  `json:"sid"`
+	MediaPath              string  `json:"path"`
+	PlayMethod             string  `json:"method"`
+	TranscodeAudio         bool    `json:"ta,omitempty"`
+	TranscodeNode          string  `json:"tnode,omitempty"`
+	TranscodeTransportID   string  `json:"tid,omitempty"`
+	RoutingNetworkProvider *string `json:"rnp,omitempty"`
+	RoutingWorkload        string  `json:"rwl,omitempty"`
+	RoutingExecution       string  `json:"rex,omitempty"`
+	RoutingExecutionNodeID int     `json:"rxnid,omitzero"`
+	RoutingEgress          string  `json:"reg,omitempty"`
+	RoutingEgressNodeID    int     `json:"renid,omitempty"`
+	TargetCodec            string  `json:"tc,omitempty"`
+	TargetRes              string  `json:"tres,omitempty"`
 	// SourceFrameRate and SourceHeight let a token-carried reconstruction keep
 	// the frame-accurate GOP and detect a no-op scale. Zero decodes to the
 	// historical 30 fps / unknown-height behavior.

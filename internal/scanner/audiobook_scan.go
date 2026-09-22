@@ -39,6 +39,8 @@ type audiobookPosterPathReader interface {
 	GetPosterPath(ctx context.Context, contentID string) (string, error)
 }
 
+const audiobookMultipartKind = "multipart"
+
 const audiobookDuplicateCandidateSQL = `
 	SELECT mi.content_id, mi.title
 	FROM media_items mi
@@ -117,7 +119,7 @@ func audiobookFolderUnchanged(existing []*models.MediaFile, onDisk []audiobookDi
 // to the full reconcile path.
 //
 // Errors are returned but the worker loop treats them as "do not skip".
-func (s *Scanner) audiobookFolderShouldSkip(ctx context.Context, folder *models.MediaFolder, folderPath string) (string, bool, error) {
+func (s *Scanner) audiobookFolderShouldSkip(ctx context.Context, folder *models.MediaFolder, folderPath string, allowedPaths map[string]bool) (string, bool, error) {
 	if s.fileRepo == nil || s.itemRepo == nil {
 		return "", false, nil
 	}
@@ -132,6 +134,9 @@ func (s *Scanner) audiobookFolderShouldSkip(ctx context.Context, folder *models.
 			continue
 		}
 		full := filepath.Join(folderPath, e.Name())
+		if allowedPaths != nil && !allowedPaths[full] {
+			continue
+		}
 		info, statErr := os.Stat(full)
 		if statErr != nil {
 			return "", false, fmt.Errorf("stat %s: %w", full, statErr)
@@ -161,6 +166,18 @@ func (s *Scanner) audiobookFolderShouldSkip(ctx context.Context, folder *models.
 	}
 	if !audiobookFolderUnchanged(existing, onDisk) {
 		return "", false, nil
+	}
+	// A previous scan may have retired an ignored part without rebuilding the
+	// remaining files' presentation. Matching sizes and mtimes do not make that
+	// incomplete multipart book safe to skip.
+	for _, file := range existing {
+		if len(existing) == 1 {
+			if file.PresentationKind == audiobookMultipartKind {
+				return "", false, nil
+			}
+		} else if file.PresentationKind != audiobookMultipartKind || file.PresentationPartTotal != len(existing) {
+			return "", false, nil
+		}
 	}
 
 	contentID := existing[0].ContentID
@@ -217,7 +234,9 @@ func (r *audiobookRootScan) failed() bool {
 // walkAudiobookDirectories keeps catalog paths under the configured root while
 // following directory symlinks. Only ancestors are tracked: aliases must retain
 // their own seen paths so missing-file reconciliation does not retire them.
-func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookRootScan, ancestors map[string]bool, ignoreRulesStack []ignoreRules) error {
+// Callers filter inherited patterns before resolving or entering a directory.
+func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookRootScan, ancestors map[string]bool, ignoreRulesStack []ignoreRules, honorIgnores bool, readDir func(string) ([]os.DirEntry, error)) error {
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -238,15 +257,22 @@ func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookR
 	}
 	ancestors[canonical] = true
 	defer delete(ancestors, canonical)
-	entries, err := os.ReadDir(path)
+	entries, err := readDirectoryWithRetry(ctx, path, readDir)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		recordFailure(err)
 		return nil
 	}
-	if dirHasIgnoreMarker(entries) {
+	if honorIgnores && dirHasIgnoreMarker(entries) {
 		return nil
 	}
-	childRules := childIgnoreRules(ignoreRulesStack, path, path, entries)
+	childRules := ignoreRulesStack
+	if honorIgnores {
+		childRules = childIgnoreRules(ignoreRulesStack, path, path, entries)
+	}
+
 	directories := make([]string, 0)
 	hadAudio := false
 	for _, entry := range entries {
@@ -254,6 +280,9 @@ func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookR
 			return err
 		}
 		child := filepath.Join(path, entry.Name())
+		if ignoreRulesMatch(childRules, child) {
+			continue
+		}
 		isDir := entry.IsDir()
 		if entry.Type()&os.ModeSymlink != 0 {
 			info, err := os.Stat(child)
@@ -282,14 +311,15 @@ func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookR
 		}
 	}
 	for _, directory := range directories {
-		if err := walkAudiobookDirectories(ctx, directory, scan, ancestors, childRules); err != nil {
+		if err := walkAudiobookDirectories(ctx, directory, scan, ancestors, childRules, honorIgnores, readDir); err != nil {
+
 			return err
 		}
 	}
 	return nil
 }
 
-func collectAudiobookRootScans(ctx context.Context, folderID int, roots []string) ([]audiobookRootScan, error) {
+func collectAudiobookRootScans(ctx context.Context, folderID int, roots, libraryRoots []string, honorIgnores bool) ([]audiobookRootScan, error) {
 	scans := make([]audiobookRootScan, 0, len(roots))
 	for _, root := range roots {
 		if err := ctx.Err(); err != nil {
@@ -310,8 +340,14 @@ func collectAudiobookRootScans(ctx context.Context, folderID int, roots []string
 		case !info.IsDir():
 			scan.rootErr = fmt.Errorf("root is not a directory after symlink resolution")
 		}
-		if statErr == nil && scan.rootErr == nil {
-			walkErr := walkAudiobookDirectories(ctx, cleanRoot, &scan, make(map[string]bool), nil)
+		var rules []ignoreRules
+		var ignored bool
+		if scan.rootErr == nil && honorIgnores {
+			rules, ignored, scan.rootErr = scanRootIgnoreRules(cleanRoot, libraryRoots)
+		}
+		if scan.rootErr == nil && !ignored {
+			walkErr := walkAudiobookDirectories(ctx, cleanRoot, &scan, make(map[string]bool), rules, honorIgnores, os.ReadDir)
+
 			if walkErr != nil {
 				if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
 					return nil, walkErr
@@ -391,7 +427,7 @@ func groupAudiobookCandidates(scans []audiobookRootScan) [][]string {
 	return groups
 }
 
-func (s *Scanner) reconcileAudiobookAliases(ctx context.Context, folder *models.MediaFolder, aliases []string, skipped *int64) error {
+func (s *Scanner) reconcileAudiobookAliases(ctx context.Context, folder *models.MediaFolder, aliases []string, allowedPaths map[string]bool, skipped *int64) error {
 	// Prefer the already indexed location. Adding an alias should not churn
 	// file IDs or overwrite a filesystem-derived title on every scan.
 	if s.fileRepo != nil && len(aliases) > 1 {
@@ -411,7 +447,7 @@ func (s *Scanner) reconcileAudiobookAliases(ctx context.Context, folder *models.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := s.reconcileAudiobookFolder(ctx, folder, path, skipped); err != nil {
+		if err := s.reconcileAudiobookFolder(ctx, folder, path, allowedPaths, skipped); err != nil {
 			if !errors.Is(err, errFolderHasNoMedia) {
 				failures = append(failures, err)
 			}
@@ -434,15 +470,38 @@ func (s *Scanner) reconcileAudiobookAliases(ctx context.Context, folder *models.
 // This bypasses the per-file movie/TV pipeline because audiobooks are
 // inherently folder-scoped (one book = one item, possibly multi-file).
 func (s *Scanner) ScanAudiobookFolder(ctx context.Context, folder *models.MediaFolder, fullScan bool) error {
+	if folder == nil {
+		return fmt.Errorf("ScanAudiobookFolder: nil folder")
+	}
+	return s.scanAudiobookPaths(ctx, folder, folder.Paths, fullScan, true)
+}
+
+func (s *Scanner) scanAudiobookPaths(ctx context.Context, folder *models.MediaFolder, roots []string, fullScan, honorIgnores bool) error {
 	if s == nil || folder == nil {
 		return fmt.Errorf("ScanAudiobookFolder: nil scanner or folder")
+	}
+
+	warning, err := s.scanWarningBeforeWalk(ctx, folder.ID, fullScan)
+	if err != nil {
+		return err
 	}
 
 	// Phase 1: walk the tree to collect candidate book folders. This is
 	// I/O-light (no ffprobe), and avoids holding the worker pool open
 	// for the duration of a 240k-folder scan.
-	scans, err := collectAudiobookRootScans(ctx, folder.ID, folder.Paths)
+	scans, err := collectAudiobookRootScans(ctx, folder.ID, roots, folder.Paths, honorIgnores)
 	if err != nil {
+		return err
+	}
+	walkFailures := 0
+	for _, scan := range scans {
+		walkFailures += len(scan.walkFailures)
+		if scan.rootErr != nil {
+			walkFailures++
+		}
+	}
+	// Cleanup may replace this with a stronger empty/dead-root warning.
+	if err := s.setPartialWalkWarning(ctx, folder.ID, walkFailures, !fullScan); err != nil {
 		return err
 	}
 	candidates := groupAudiobookCandidates(scans)
@@ -460,6 +519,12 @@ func (s *Scanner) ScanAudiobookFolder(ctx context.Context, folder *models.MediaF
 		} else if len(scans) > 0 {
 			slog.WarnContext(ctx, "audiobook scan: every root walk failed; skipping missing-file reconciliation", "component", "scanner",
 				"folder_id", folder.ID)
+		}
+		if walkFailures > 0 {
+			return s.setPartialWalkWarning(ctx, folder.ID, walkFailures, true)
+		}
+		if fullScan {
+			return s.clearPartialWalkWarning(ctx, folder.ID, warning)
 		}
 		return nil
 	}
@@ -492,7 +557,7 @@ func (s *Scanner) ScanAudiobookFolder(ctx context.Context, folder *models.MediaF
 				if ctx.Err() != nil {
 					return
 				}
-				if err := s.reconcileAudiobookAliases(ctx, folder, aliases, &skipped); err != nil {
+				if err := s.reconcileAudiobookAliases(ctx, folder, aliases, seenPaths, &skipped); err != nil {
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 						cancelMu.Lock()
 						if cancelErr == nil {
@@ -564,6 +629,12 @@ func (s *Scanner) ScanAudiobookFolder(ctx context.Context, folder *models.MediaF
 	// seenPaths is known and the scan completed without cancellation.
 	if err := s.reconcileAudiobookMissingFiles(ctx, folder, reconcileRoots, seenPaths, protectedPaths, fullScan); err != nil {
 		slog.WarnContext(ctx, "audiobook scan: missing-file reconcile failed", "component", "scanner", "folder_id", folder.ID, "error", err)
+	}
+	if walkFailures > 0 {
+		return s.setPartialWalkWarning(ctx, folder.ID, walkFailures, true)
+	}
+	if fullScan {
+		return s.clearPartialWalkWarning(ctx, folder.ID, warning)
 	}
 	return nil
 }
@@ -640,8 +711,9 @@ func reportAudiobookScanProgress(ctx context.Context, folderID int, total, proce
 	})
 }
 
-func (s *Scanner) reconcileAudiobookFolder(ctx context.Context, folder *models.MediaFolder, folderPath string, skipped *int64) error {
-	_, isUnchanged, skipErr := s.audiobookFolderShouldSkip(ctx, folder, folderPath)
+func (s *Scanner) reconcileAudiobookFolder(ctx context.Context, folder *models.MediaFolder, folderPath string, allowedPaths map[string]bool, skipped *int64) error {
+	_, isUnchanged, skipErr := s.audiobookFolderShouldSkip(ctx, folder, folderPath, allowedPaths)
+
 	if skipErr != nil {
 		slog.WarnContext(ctx, "audiobook scan: skip-check failed, falling through", "component", "scanner",
 			"folder_id", folder.ID,
@@ -654,7 +726,7 @@ func (s *Scanner) reconcileAudiobookFolder(ctx context.Context, folder *models.M
 		atomic.AddInt64(skipped, 1)
 		return nil
 	}
-	parsed, err := parseAudiobookFolder(ctx, s.ffprobePath, folderPath)
+	parsed, err := parseAudiobookFolder(ctx, s.ffprobePath, folderPath, allowedPaths)
 	if err != nil {
 		if errors.Is(err, errFolderHasNoMedia) {
 			return err
@@ -1224,7 +1296,7 @@ func (s *Scanner) upsertAudiobookPresentationTx(
 			AudioChannels:      af.AudioChannels,
 		}
 		if partTotal > 1 {
-			mf.PresentationKind = "multipart"
+			mf.PresentationKind = audiobookMultipartKind
 			mf.PresentationGroupKey = contentID
 			mf.PresentationPartIndex = idx + 1
 			mf.PresentationPartTotal = partTotal

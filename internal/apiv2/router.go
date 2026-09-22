@@ -102,6 +102,14 @@ type Dependencies struct {
 	WatchTogetherPolicy             WatchTogetherPolicyService
 	WatchTogetherJoin               WatchTogetherJoinService
 	WatchTogetherSelection          WatchTogetherSelectionService
+	WatchTogetherSourceFallback     WatchTogetherSourceFallbackService
+	WatchTogetherStage              WatchTogetherStageService
+	WatchTogetherStart              WatchTogetherStartService
+	WatchTogetherStop               WatchTogetherStopService
+	WatchTogetherSelectionMode      WatchTogetherSelectionModeService
+	WatchTogetherMemberState        WatchTogetherMemberStateService
+	WatchTogetherPicker             WatchTogetherPickerService
+	WatchTogetherCapability         WatchTogetherCapabilityService
 	WatchTogetherSuggestions        WatchTogetherSuggestionService
 	AdminSectionSettingsWrite       AdminSectionSettingsWriteService
 	AdminDashboardStats             AdminDashboardStatsService
@@ -134,6 +142,9 @@ type Dependencies struct {
 	AdminLogsSocket                 AdminLogsSocketService
 	PlaybackControlSocket           PlaybackControlSocketService
 	EventsCapability                EventsCapabilityService
+	NetworkAccess                   NetworkAccessService
+	ServerIdentity                  ServerIdentityService
+	ServerConnections               ServerConnections
 	NotificationDestinationCreate   NotificationDestinationCreateService
 	AdminUnmatchedFiles             AdminUnmatchedFilesService
 	AdminCatalogImages              AdminCatalogImagesService

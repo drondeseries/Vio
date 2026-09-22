@@ -41,6 +41,7 @@ import {
 } from "@/lib/permissions";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
 import { useQualityPreference } from "@/hooks/queries/qualityPreference";
+import { useDetailWatchTogether } from "@/pages/watchtogether/DetailWatchTogether";
 
 export default function MovieContent({ item }: { item: ItemDetail & { type: "movie" } }) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
@@ -211,6 +212,19 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
     (item.playback_variants?.length ?? 0) > 0 ||
     Boolean(item.play_content_id);
   const primaryAction = resolveLeafPrimaryAction(item, "Play");
+  const watchTogether = useDetailWatchTogether({
+    item,
+    target:
+      item.versions.length > 0
+        ? {
+            content_id: item.content_id,
+            title: item.title,
+            subtitle: item.year ? String(item.year) : undefined,
+            poster_url: item.poster_url,
+            poster_thumbhash: item.poster_thumbhash,
+          }
+        : null,
+  });
   const restartHref =
     primaryAction.label === "Resume" && isPlayable
       ? `/watch/${item.content_id}?restart=1`
@@ -278,6 +292,7 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
           <MediaUserActionBar
             item={item}
             contentId={item.content_id}
+            watchTogether={watchTogether.menu}
             playHref={isPlayable ? `/watch/${item.content_id}` : undefined}
             playLabel={primaryAction.label}
             playProgress={primaryAction.progress}
@@ -425,6 +440,7 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
           initialFileId={mediaInfoFileId}
         />
       )}
+      {watchTogether.sheet}
     </div>
   );
 }

@@ -62,6 +62,9 @@ const mocks = vi.hoisted(() => {
   };
 });
 
+vi.mock("@/pages/watchtogether/DetailWatchTogether", () => ({
+  useDetailWatchTogether: () => ({ menu: undefined, sheet: null }),
+}));
 vi.mock("@/hooks/queries/episodes", () => ({
   useSeasonDetail: mocks.useSeasonDetail,
   useSeasonEpisodes: mocks.useSeasonEpisodes,

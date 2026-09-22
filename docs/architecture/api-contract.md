@@ -818,6 +818,12 @@ Clients use capability documents to decide whether a feature exists. The server 
 contract digest are for diagnostics, support, cache identity, and last-resort compatibility
 messages; they are not substitutes for feature detection.
 
+`links.identity` points at `GET /api/v2/system/identity`, the one public per-deployment value:
+a stable `server_id` every API process answers at every address. It is self-asserted and
+authorizes nothing; the signed-in `GET /api/v2/system/connections` capability document lists the
+addresses the deployment offers. Both are specified in
+[server-identity.md](server-identity.md).
+
 Every stable operation remains registered regardless of runtime provider wiring. Route presence
 means that the operation belongs to the stable contract, not that the current server is configured,
 authorized, and healthy enough to perform it. Each optional domain exposes a typed capability
@@ -1142,6 +1148,11 @@ cutover, explain how to regenerate it, and provide a post-upgrade verification c
 server must not redirect old URLs containing tokens or secrets.
 
 Jellyfin compatibility and Audiobookshelf compatibility remain entirely outside this contract.
+For release scope, Jellyfin compatibility remains in 1.0; Audiobookshelf
+compatibility stays available as a beta feature, outside 1.0 certification,
+until the consolidated Books effort replaces it.
+See [the scope decision](v1-scope.md#library-scope-books-deferred). This does
+not remove the existing implementation or change its wire protocol.
 They implement other projects' wire protocols. Playback v3's normative JSON Schemas and domain
 semantics remain authoritative for v2 playback payloads. The existing HTTP conformance matrix,
 including its legacy/draft-body `426` case, remains a bridge/v1-adapter test; v2 gets a separate

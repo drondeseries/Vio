@@ -25,6 +25,12 @@ export interface RecentRoom {
   ended?: boolean;
 }
 
+type RecentRoomIdentity = Pick<RecentRoom, "room_id" | "user_id" | "profile_id">;
+
+export function recentRoomKey(room: RecentRoomIdentity): string {
+  return JSON.stringify([room.user_id, room.profile_id, room.room_id]);
+}
+
 function readAll(): RecentRoom[] {
   try {
     const raw = localStorage.getItem(RECENT_ROOMS_KEY);
@@ -63,8 +69,14 @@ export function rememberRecentRoom(input: {
   title?: string;
 }) {
   const now = new Date().toISOString();
-  const rest = readAll().filter((entry) => entry.room_id !== input.room.room_id);
-  const previous = readAll().find((entry) => entry.room_id === input.room.room_id);
+  const key = recentRoomKey({
+    room_id: input.room.room_id,
+    user_id: input.userId,
+    profile_id: input.profileId,
+  });
+  const entries = readAll();
+  const rest = entries.filter((entry) => recentRoomKey(entry) !== key);
+  const previous = entries.find((entry) => recentRoomKey(entry) === key);
   writeAll([
     {
       room_id: input.room.room_id,
@@ -81,14 +93,16 @@ export function rememberRecentRoom(input: {
   ]);
 }
 
-export function markRecentRoomEnded(roomId: string) {
+export function markRecentRoomEnded(room: RecentRoomIdentity) {
+  const key = recentRoomKey(room);
   writeAll(
-    readAll().map((entry) => (entry.room_id === roomId ? { ...entry, ended: true } : entry)),
+    readAll().map((entry) => (recentRoomKey(entry) === key ? { ...entry, ended: true } : entry)),
   );
 }
 
-export function forgetRecentRoom(roomId: string) {
-  writeAll(readAll().filter((entry) => entry.room_id !== roomId));
+export function forgetRecentRoom(room: RecentRoomIdentity) {
+  const key = recentRoomKey(room);
+  writeAll(readAll().filter((entry) => recentRoomKey(entry) !== key));
 }
 
 /** Recent rooms for the signed-in account and profile, newest first. */

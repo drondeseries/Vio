@@ -1,8 +1,10 @@
 # Scanner ignore files
 
-Media folders honor two file-based ignore mechanisms during scans. Both are
-evaluated by every library-kind walker, so series, movie, audiobook, podcast,
-ebook, and manga libraries behave the same way.
+Media folders honor two file-based ignore mechanisms during scans. Series,
+movie, audiobook, podcast, ebook, and manga walkers apply these rules to the
+paths they discover. Existing library layouts still apply: podcast episodes
+must be directly inside a show folder, and audiobook discovery stops below a
+book folder containing audio.
 
 ## Marker files: `.ignore` and `.nomedia`
 
@@ -37,10 +39,16 @@ principles as Plex's `.plexignore`:
 - Ignored content simply never appears in walk results. Missing-file
   reconciliation then retires anything previously cataloged there, which is
   the intended outcome of adding an ignore file to an already-scanned folder.
+  Existing empty-scan confirmation and file-removal grace policies still
+  apply. An ignore marker does not authorize cleanup of an empty library.
 - Ignored entries do not count as walk failures. They never suppress
   missing-file reconciliation the way unreadable paths do.
 - An unreadable `.siloignore` is treated as absent; a broken ignore file never
   aborts a library walk.
 - An explicit single-file scan (`ScanFile`) ignores ignore files: an
   explicitly requested file is scanned even if a pattern would exclude it.
-  Ignore files apply to folder walks only.
+  For audiobooks, this rebuilds the containing book as a whole.
+- Subtree folder scans inherit markers and patterns from their configured
+  library root through the subtree's ancestors. Rules outside the configured
+  root do not apply. If an ancestor directory cannot be read, the subtree is
+  protected from missing-file reconciliation.

@@ -61,7 +61,7 @@ function CandidateBody({
   const memberState = useMemberState(
     roomId,
     roomToken,
-    members.length,
+    members,
     isSeries ? episodeIds : [card.content_id],
   );
   const handleEpisodeIds = useCallback((ids: string[]) => setEpisodeIds(ids), []);

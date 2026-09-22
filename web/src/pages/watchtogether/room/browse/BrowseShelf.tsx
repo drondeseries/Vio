@@ -64,7 +64,8 @@ export function BrowseShelf({
   verb,
   collapsible = false,
   collapsedLabel = "Browse",
-  defaultOpen = true,
+  open,
+  onOpenChange,
   onSelect,
 }: {
   roomId: string;
@@ -76,16 +77,15 @@ export function BrowseShelf({
   verb: "pick" | "suggest";
   collapsible?: boolean;
   collapsedLabel?: string;
-  defaultOpen?: boolean;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   onSelect: (selection: BrowseSelection) => void;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
   const [query, setQuery] = useState("");
   const [chip, setChip] = useState<Chip>("all");
   const expanded = !collapsible || open;
 
-  const memberCount = members.length;
-  const rows = usePickerRows(roomId, roomToken, memberCount);
+  const rows = usePickerRows(roomId, roomToken, members);
   const search = usePickerSearch(query);
   const browsing = expanded && search.q === "";
   const home = useHomeShelfSections(
@@ -137,7 +137,7 @@ export function BrowseShelf({
     return (
       <button
         type="button"
-        onClick={() => setOpen(true)}
+        onClick={() => onOpenChange(true)}
         className="surface-panel-subtle hover:border-ring/40 flex w-full items-center gap-3 rounded-xl border border-transparent px-4 py-3 text-left transition-colors"
         data-testid="browse-shelf-collapsed"
       >
@@ -192,7 +192,7 @@ export function BrowseShelf({
             type="button"
             variant="ghost"
             size="icon-sm"
-            onClick={() => setOpen(false)}
+            onClick={() => onOpenChange(false)}
             aria-label="Hide browse"
           >
             <ChevronUp className="size-4" />

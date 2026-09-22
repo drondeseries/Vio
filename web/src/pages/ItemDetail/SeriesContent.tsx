@@ -17,6 +17,7 @@ import SplitItemDialog from "@/components/SplitItemDialog";
 import PageBack from "@/components/PageBack";
 import RecommendationGrid from "@/components/RecommendationGrid";
 import DetailHero from "./DetailHero";
+import { useDetailWatchTogether } from "@/pages/watchtogether/DetailWatchTogether";
 import { useOnViewTranslation } from "@/hooks/useOnViewTranslation";
 import SeasonCarousel from "./SeasonCarousel";
 import SeasonEpisodeGrid from "./components/SeasonEpisodeGrid";
@@ -106,6 +107,53 @@ export default function SeriesContent({ item }: { item: ItemDetail & { type: "se
     return targetEpisode ? `/watch/${targetEpisode.content_id}` : undefined;
   }, [primaryAction.directHref, primaryAction.targetEpisodeNumber, primaryActionEpisodes]);
 
+  // The party's default episode is the same one the primary action would
+  // play, so the page and the sheet never disagree.
+  const nextUpEpisode = useMemo(() => {
+    if (primaryAction.directHref) {
+      const id = primaryAction.directHref.replace(/^\/watch\//, "").split("?")[0];
+      return id
+        ? {
+            content_id: id,
+            title: primaryAction.context ?? "Continue",
+            subtitle: undefined as string | undefined,
+            seasonNumber: undefined as number | undefined,
+          }
+        : null;
+    }
+    const episodes = primaryActionEpisodes?.episodes ?? [];
+    if (episodes.length === 0 || primaryAction.targetEpisodeNumber == null) return null;
+    const idx = Math.max(0, Math.min(primaryAction.targetEpisodeNumber - 1, episodes.length - 1));
+    const episode = episodes[idx];
+    return episode
+      ? {
+          content_id: episode.content_id,
+          title: episode.title,
+          subtitle: `S${episode.season_number} E${episode.episode_number}`,
+          seasonNumber: episode.season_number,
+        }
+      : null;
+  }, [
+    primaryAction.context,
+    primaryAction.directHref,
+    primaryAction.targetEpisodeNumber,
+    primaryActionEpisodes,
+  ]);
+  const watchTogether = useDetailWatchTogether({
+    item,
+    target: nextUpEpisode
+      ? {
+          content_id: nextUpEpisode.content_id,
+          title: nextUpEpisode.title,
+          subtitle: nextUpEpisode.subtitle,
+          poster_url: item.poster_url,
+          poster_thumbhash: item.poster_thumbhash,
+        }
+      : null,
+    seriesId: item.content_id,
+    initialSeasonNumber: nextUpEpisode?.seasonNumber,
+  });
+
   return (
     <div>
       <DetailHero
@@ -144,6 +192,7 @@ export default function SeriesContent({ item }: { item: ItemDetail & { type: "se
           <MediaUserActionBar
             item={item}
             contentId={item.content_id}
+            watchTogether={watchTogether.menu}
             playHref={resolvedPrimaryHref}
             playLabel={primaryAction.label}
             playLoading={primaryActionLoading}
@@ -225,6 +274,7 @@ export default function SeriesContent({ item }: { item: ItemDetail & { type: "se
           onOpenChange={setSplitOpen}
         />
       )}
+      {watchTogether.sheet}
     </div>
   );
 }

@@ -44,7 +44,7 @@ func TestBookScansLinkEarlierEditionsWhenOtherFormatArrives(t *testing.T) {
 				if out, err := exec.CommandContext(t.Context(), "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc", "-t", "0.1", "-metadata", "title="+title, "-metadata", "artist=Multiple Editions Author", filepath.Join(path, "book.m4b")).CombinedOutput(); err != nil {
 					t.Fatalf("generate audio: %v: %s", err, out)
 				}
-				if err := s.reconcileAudiobookFolder(t.Context(), audio, path, &skipped); err != nil {
+				if err := s.reconcileAudiobookFolder(t.Context(), audio, path, nil, &skipped); err != nil {
 					t.Fatal(err)
 				}
 			}

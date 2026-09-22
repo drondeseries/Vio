@@ -138,6 +138,26 @@ function buildPlaybackReturnHref(request: WatchRouteRequest): string {
   return request.returnHref ?? buildWatchItemHref(request);
 }
 
+/**
+ * Where the player goes when it leaves a Watch Together room, and the state
+ * that stops the room page from auto-entering the player again. Every exit
+ * path from the room (Exit, the video ending, episode navigation) must use
+ * it: a room that is still `playing` re-launches the player on a fresh room
+ * page mount, and a file that has just ended then ends again at once.
+ */
+function buildRoomReturnNavigation(request: WatchRouteRequest) {
+  return {
+    href: `/rooms/${request.roomId}?room_token=${request.roomToken}`,
+    state: {
+      suppressAutoStartSelection: {
+        contentId: request.contentId,
+        fileId: request.fileId,
+        libraryId: request.libraryId,
+      },
+    },
+  };
+}
+
 function buildWatchLocationState(request: WatchRouteRequest) {
   if (
     request.returnHref == null &&
@@ -649,17 +669,8 @@ export function WatchPlaybackHost() {
 
         if (activeRequest.roomId && activeRequest.roomToken) {
           exitPlayback();
-          navigate(`/rooms/${activeRequest.roomId}?room_token=${activeRequest.roomToken}`, {
-            up: true,
-            replace: true,
-            state: {
-              suppressAutoStartSelection: {
-                contentId: activeRequest.contentId,
-                fileId: activeRequest.fileId,
-                libraryId: activeRequest.libraryId,
-              },
-            },
-          });
+          const roomReturn = buildRoomReturnNavigation(activeRequest);
+          navigate(roomReturn.href, { up: true, replace: true, state: roomReturn.state });
           return;
         }
 
@@ -701,9 +712,8 @@ export function WatchPlaybackHost() {
     (nextContentId: string) => {
       if (!activeRequest) return;
       if (activeRequest.roomId && activeRequest.roomToken) {
-        navigate(`/rooms/${activeRequest.roomId}?room_token=${activeRequest.roomToken}`, {
-          replace: true,
-        });
+        const roomReturn = buildRoomReturnNavigation(activeRequest);
+        navigate(roomReturn.href, { replace: true, state: roomReturn.state });
         return;
       }
 
@@ -771,10 +781,8 @@ export function WatchPlaybackHost() {
       if (!requestKeyValue) return;
       if (activeRequest?.roomId && activeRequest.roomToken) {
         stopPlayback();
-        navigate(`/rooms/${activeRequest.roomId}?room_token=${activeRequest.roomToken}`, {
-          up: true,
-          replace: true,
-        });
+        const roomReturn = buildRoomReturnNavigation(activeRequest);
+        navigate(roomReturn.href, { up: true, replace: true, state: roomReturn.state });
         return;
       }
 

@@ -23,12 +23,12 @@ var (
 	// titleYearRe matches "Title (Year)" with optional trailing content.
 	titleYearRe = regexp.MustCompile(`^(.+?)\s*\((\d{4})\)`)
 
-	// seasonEpisodeRe matches S01E01 or s01e05 patterns in filenames. The
+	// seasonEpisodeRe matches S01E01 and separated forms such as s01.e05. The
 	// episode group consumes every consecutive digit so absolute-numbered shows
 	// (S23E1162) are read in full: a bounded group silently truncates the
 	// number, and refusing to match a longer run would drop the episodic
 	// evidence that keeps the file classified as series.
-	seasonEpisodeRe = regexp.MustCompile(`(?i)[Ss](\d{1,4})[Ee](\d+)`)
+	seasonEpisodeRe = regexp.MustCompile(`(?i)[Ss](\d{1,4})[._\- ]?[Ee](\d+)`)
 
 	// airDateRe matches daily/by-date episode names using Jellyfin-style
 	// separators: yyyy-MM-dd, yyyy.MM.dd, yyyy_MM_dd, or yyyy MM dd.

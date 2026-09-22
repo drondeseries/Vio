@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -77,6 +78,7 @@ func TestScannerEbookEnrichmentReconciliationIsBoundedAndNonFatal(t *testing.T) 
 		nil,
 		nil,
 		true,
+		catalog.ScanWarning{},
 	); err != nil {
 		t.Fatalf("reconcileEbookScan() error = %v", err)
 	}
@@ -1524,7 +1526,7 @@ func TestCollectEbookRootScansExcludesUnmountedRootFromReconciliation(t *testing
 	}
 	unmounted := filepath.Join(t.TempDir(), "gone")
 
-	scans, err := collectEbookRootScans(context.Background(), 44, []string{unmounted, healthy})
+	scans, err := collectEbookRootScans(t.Context(), 44, []string{unmounted, healthy}, nil)
 	if err != nil {
 		t.Fatalf("collectEbookRootScans: %v", err)
 	}
@@ -1554,7 +1556,7 @@ func TestCollectEbookRootScansTreatsSingleFileRootAsNonReconciling(t *testing.T)
 		t.Fatalf("write ebook: %v", err)
 	}
 
-	scans, err := collectEbookRootScans(context.Background(), 44, []string{fileRoot})
+	scans, err := collectEbookRootScans(t.Context(), 44, []string{fileRoot}, nil)
 	if err != nil {
 		t.Fatalf("collectEbookRootScans: %v", err)
 	}
@@ -1576,7 +1578,7 @@ func TestCollectEbookRootScansIncludesCompoundFB2ZipFile(t *testing.T) {
 		t.Fatalf("write ebook: %v", err)
 	}
 
-	scans, err := collectEbookRootScans(context.Background(), 44, []string{fileRoot})
+	scans, err := collectEbookRootScans(t.Context(), 44, []string{fileRoot}, nil)
 	if err != nil {
 		t.Fatalf("collectEbookRootScans: %v", err)
 	}
@@ -1605,7 +1607,7 @@ func TestCollectEbookRootScansMidWalkSubtreeErrorExcludesRoot(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
 
-	scans, err := collectEbookRootScans(context.Background(), 44, []string{root})
+	scans, err := collectEbookRootScans(t.Context(), 44, []string{root}, nil)
 	if err != nil {
 		t.Fatalf("collectEbookRootScans: %v", err)
 	}
@@ -1635,7 +1637,7 @@ func TestCollectEbookRootScansFollowsSymlinkedRoot(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	scans, err := collectEbookRootScans(context.Background(), 44, []string{link})
+	scans, err := collectEbookRootScans(t.Context(), 44, []string{link}, nil)
 	if err != nil {
 		t.Fatalf("collectEbookRootScans: %v", err)
 	}

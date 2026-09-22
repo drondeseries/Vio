@@ -1709,7 +1709,7 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /** Request local episode marker analysis; duplicate in-process work is coalesced. */
+    /** Refresh episode markers using configured sources, or explicitly rerun local intro detection. */
     post: operations["redetectAdminEpisodeIntro"];
     delete?: never;
     options?: never;
@@ -1726,7 +1726,7 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /** Request local episode marker analysis; duplicate in-process work is coalesced. */
+    /** Refresh episode markers using configured sources, or explicitly rerun local intro detection. */
     post: operations["refreshAdminEpisodeMarkers"];
     delete?: never;
     options?: never;
@@ -2172,6 +2172,57 @@ export interface paths {
     put?: never;
     /** Manage registered marker provider configuration. */
     post: operations["validateAdminMarkerProvider"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/network-access/{provider}/connect": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Ask the provider on the named hosts (every host when hosts is omitted) to bring its overlay identity up and start proxying. Answers 202 with the state each host reached within ten seconds; enrollment may continue in the background (awaiting_authorization carries the auth_url), so poll status for the final state. Repeating the request converges on one connected instance per host. Hosts not named answer their current status; an unknown host id is 422. */
+    post: operations["connectNetworkAccess"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/network-access/{provider}/disconnect": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Ask the provider on the named hosts (every host when hosts is omitted) to tear its overlay listener down and clear its desired-connected intent. Answers 202 with the state each host reached within ten seconds. Repeating the request converges on disconnected. Hosts not named answer their current status; an unknown host id is 422. */
+    post: operations["disconnectNetworkAccess"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/network-access/{provider}/status": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read the provider's live state on every host that runs it, asking each plugin instance directly with a ten-second timeout. A host whose plugin process is not running answers state unavailable with the supervisor's last error. An unknown provider slug is 404. */
+    get: operations["getAdminNetworkAccessStatus"];
+    put?: never;
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -2655,6 +2706,23 @@ export interface paths {
     put?: never;
     /** Probe one prospective configuration by starting a temporary plugin instance and running its connection check; nothing is stored. The check calls the plugin's provider and is bounded by a server timeout; never automatically retry an uncertain result. A failed check is a 200 result with success false. */
     post: operations["testAdminPluginInstallationConfig"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/plugins/installations/{id}/restart": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Stop the installation's process and, for a resident plugin (one the server supervises, such as a network access provider), start it again with a fresh failure budget; the response's runtime reports the outcome, including a launch that failed. A non-resident plugin is only stopped and launches on its next use. A disabled installation is 409. Repeating the request converges on one running process. */
+    post: operations["restartAdminPluginInstallation"];
     delete?: never;
     options?: never;
     head?: never;
@@ -7156,6 +7224,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/network-access/capabilities": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** List the installed network access providers (overlay networks such as Tailscale that reach this server without port forwarding). available when an enabled plugin declares one; not_configured otherwise. Read from plugin manifests; no plugin is launched and no health is implied. */
+    get: operations["getNetworkAccessCapabilities"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/notifications": {
     parameters: {
       query?: never;
@@ -9297,6 +9382,40 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/system/connections": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** List the addresses this deployment offers to clients: the configured public URL and each installed network access provider with its overlay origin when connected on the API host. available whenever the server identity is readable; a missing public URL is an absent endpoint, never a manufactured one. Node backend addresses, enrollment URLs and admin status are not included. */
+    get: operations["getServerConnections"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/system/identity": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read the deployment's stable server identity before login, so a client can tell whether two addresses lead to the same server. Self-asserted: pairing and credentials still go through device-login approval. */
+    get: operations["getServerIdentity"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/system/info": {
     parameters: {
       query?: never;
@@ -9622,6 +9741,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/watch-together/capabilities": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read which watch-together room behaviors this server supports. */
+    get: operations["getWatchTogetherCapabilities"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/watch-together/join": {
     parameters: {
       query?: never;
@@ -9674,6 +9810,74 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/watch-together/rooms/{room_id}/member-state": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Read what each connected room member has watched of the named content: unseen, in progress (with position) or watched, and whether it is on their watchlist. A POST-shaped read: the id set exceeds what a query string carries. Members across API servers are read; inaccessible content ids are omitted. */
+    post: operations["queryWatchTogetherMemberState"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/watch-together/rooms/{room_id}/picker": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read the rows the room picker leads with: what connected members are watching together and the union of their watchlists, resolved to cards the caller may see. Connected members across API servers are included. */
+    get: operations["getWatchTogetherRoomPicker"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/watch-together/rooms/{room_id}/playback/start": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Start the staged content for everyone as the host. The room moves to playing and waits for members to buffer, exactly as a direct selection does. An already playing room returns its current snapshot unchanged. */
+    post: operations["startWatchTogetherRoomPlayback"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/watch-together/rooms/{room_id}/playback/stop": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Stop playback for everyone as the host without ending the room. The room returns to the lobby with the same item still staged, so the host can start it again or pick something else. A room that is not playing returns its current snapshot unchanged. */
+    post: operations["stopWatchTogetherRoomPlayback"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/watch-together/rooms/{room_id}/policy": {
     parameters: {
       query?: never;
@@ -9701,6 +9905,57 @@ export interface paths {
     get?: never;
     /** Select playable content as the host in a host-pick room. An identical current resolved selection is a no-op; changing selection resets readiness and playback anchor. Never replay an uncertain selection after another selection. */
     put: operations["selectWatchTogetherRoomItem"];
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/watch-together/rooms/{room_id}/selection-mode": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    /** Switch a lobby between host picks and voting as the host. Switching drops the staged item and every member's lobby ready state; suggestions and votes are kept. Refused once the room is playing. */
+    patch: operations["updateWatchTogetherRoomSelectionMode"];
+    trace?: never;
+  };
+  "/api/v2/watch-together/rooms/{room_id}/source-fallback": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Report a playback refusal as a connected room member. Atomically replace the shared source with a lower-ranked version of the same edition and part, preserve the anchor, and reset readiness. A stale file or selection revision returns the current snapshot without changing it. */
+    post: operations["fallbackWatchTogetherSource"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/watch-together/rooms/{room_id}/staged-selection": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    /** Stage playable content in a host-pick lobby without starting it. The room stays in the lobby until the host starts playback; staging the same resolved content, file, and library again is a no-op. Refused once the room is playing. */
+    put: operations["stageWatchTogetherRoomItem"];
     post?: never;
     delete?: never;
     options?: never;
@@ -12585,6 +12840,10 @@ export interface components {
       /** Format: int64 */
       max_jobs: number | null;
       name: string;
+      /** @description Last network access provider status the node reported on its health check, keyed by provider slug. Omitted when the node reports no providers. */
+      network_access?: {
+        [key: string]: components["schemas"]["AdminNodeNetworkAccess"];
+      };
       physical_gpu_keys?: string[];
       public_url?: string;
       /** @enum {string} */
@@ -12612,6 +12871,19 @@ export interface components {
       /** @description The URL-fenced persistence call returned successfully; it may have ignored a concurrently repointed node. Not a revision receipt. */
       health_persisted: boolean;
       healthy: boolean;
+    };
+    AdminNodeNetworkAccess: {
+      /** @description Overlay DNS name of the node. */
+      hostname?: string;
+      /** @description scheme://host[:port] clients on the provider's overlay use to reach this node. Only used while state is connected. */
+      origin?: string;
+      /** @description disconnected | awaiting_authorization | connecting | connected | error */
+      state: string;
+      /**
+       * Format: date-time
+       * @description When the node last heard from the provider, on the node's clock.
+       */
+      updated_at?: string;
     };
     AdminNodeReloadOutputBody: {
       results: components["schemas"]["AdminNodeReloadResult"][];
@@ -12973,6 +13245,8 @@ export interface components {
        */
       routing_execution_node_id?: string;
       routing_execution_node_name?: string;
+      /** @description Access network selected for playback: empty means default; absent means unknown; otherwise the validated provider identifier. */
+      routing_network_provider?: string;
       routing_workload?: string;
       /** Format: int64 */
       season_number?: number;
@@ -13028,6 +13302,7 @@ export interface components {
       effective_play_method: boolean;
       effective_play_method_values: string[];
       is_jellyfin_client: boolean;
+      network_access_route: boolean;
       node_observations: boolean;
       node_routing: boolean;
       /** @description Opaque revision of this document */
@@ -13309,6 +13584,7 @@ export interface components {
       repository_id?: string;
       repository_name?: string;
       routes: components["schemas"]["PluginRoute"][];
+      runtime: components["schemas"]["AdminPluginRuntime"];
       /** @enum {string} */
       source_kind: "silo" | "vio" | "approved_community" | "external";
       task_bindings: components["schemas"]["AdminPluginTaskBinding"][];
@@ -13386,6 +13662,32 @@ export interface components {
       display_name?: string;
       enabled?: boolean;
       url?: string;
+    };
+    AdminPluginRuntime: {
+      /** @description Why the process last stopped or failed to start */
+      last_error?: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      last_started_at?: string;
+      /**
+       * Format: date-time
+       * @description Scheduled automatic restart while in backoff
+       */
+      next_restart_at?: string;
+      /** @description True when the server supervises this plugin's process */
+      resident: boolean;
+      /**
+       * Format: int64
+       * @description Automatic restarts since the plugin last ran stably or was restarted by an administrator
+       */
+      restart_count: number;
+      /**
+       * @description Process state; backoff and failed occur only for resident plugins
+       * @enum {string}
+       */
+      state: "stopped" | "starting" | "running" | "backoff" | "failed";
     };
     AdminPluginTaskBinding: {
       capability_id: string;
@@ -17454,6 +17756,8 @@ export interface components {
       intro?: components["schemas"]["DownloadMarker"];
       /** Format: int64 */
       manifest_version: number;
+      /** @description All effective marker occurrences in source-time order; empty, never null */
+      marker_segments: components["schemas"]["MarkerOccurrence"][];
       /**
        * @description Opaque identifier
        * @example 1
@@ -18174,6 +18478,8 @@ export interface components {
        */
       file_id: string;
       intro: components["schemas"]["MarkerSegment"];
+      /** @description All effective marker occurrences in source-time order; empty, never null */
+      marker_segments: components["schemas"]["MarkerOccurrence"][];
       preview: components["schemas"]["MarkerSegment"];
       recap: components["schemas"]["MarkerSegment"];
     };
@@ -19459,6 +19765,14 @@ export interface components {
       /** Format: double */
       start: number;
     };
+    MarkerOccurrence: {
+      /** Format: double */
+      end_seconds: number;
+      /** @enum {string} */
+      kind: "intro" | "credits" | "recap" | "preview";
+      /** Format: double */
+      start_seconds: number;
+    };
     MarkerSegment: {
       algorithm?: string;
       /** Format: double */
@@ -20046,6 +20360,75 @@ export interface components {
        * @example true
        */
       present: boolean;
+    };
+    NetworkAccessCapabilities: {
+      /** @description Whether the current principal may use the capability */
+      allowed: boolean;
+      providers: components["schemas"]["NetworkAccessProviderSummary"][];
+      /** @description Opaque revision of this document */
+      revision: string;
+      /**
+       * @description Support and configuration state, not health
+       * @enum {string}
+       */
+      state: "available" | "disabled" | "not_configured" | "unsupported";
+    };
+    NetworkAccessCommand: {
+      /** @description Host ids to act on (api, node:<id>); omitted means every host */
+      hosts?: string[];
+    };
+    NetworkAccessHostRef: {
+      /** @description api for the API server; node:<id> for a proxy node */
+      id: string;
+      /** @description Server name for the API host; node name for a proxy */
+      name: string;
+      /** @enum {string} */
+      role: "api" | "proxy";
+    };
+    NetworkAccessHostStatus: {
+      /** @description Overlay IP addresses */
+      addresses: string[];
+      /** @description Interactive enrollment URL, only while awaiting_authorization; admin-only, never logged */
+      auth_url?: string;
+      error?: string;
+      host: components["schemas"]["NetworkAccessHostRef"];
+      /** @description Overlay DNS name */
+      hostname?: string;
+      /** @description scheme://host[:port] clients reach the API listener at over the overlay */
+      origin?: string;
+      provider_version?: string;
+      /** @description the provider's own state string when it is not one of the published states */
+      raw_state?: string;
+      /**
+       * @description Published host state; provider states outside this vocabulary map to error
+       * @enum {string}
+       */
+      state:
+        | "disconnected"
+        | "awaiting_authorization"
+        | "connecting"
+        | "connected"
+        | "error"
+        | "unavailable";
+      /**
+       * Format: date-time
+       * @description When the host last heard from the provider; absent while unavailable
+       */
+      updated_at?: string;
+    };
+    NetworkAccessProviderSummary: {
+      display_name: string;
+      /**
+       * @description Plugin installation declaring network_access_provider.v1
+       * @example 1
+       */
+      installation_id: string;
+      /** @description Stable provider slug used in the admin routes, e.g. tailscale */
+      provider: string;
+    };
+    NetworkAccessStatus: {
+      hosts: components["schemas"]["NetworkAccessHostStatus"][];
+      provider: string;
     };
     NodeHWAccel: {
       error?: string;
@@ -21564,6 +21947,8 @@ export interface components {
       width?: number;
     };
     PlaybackStartBody: {
+      /** @description False keeps the requested source file for this attempt, including quality changes and failure recovery. Omitted or true allows alternate versions. */
+      allow_alternate_versions?: boolean;
       audio_track_id?: string;
       /** Format: int64 */
       audio_track_index?: number;
@@ -23328,6 +23713,22 @@ export interface components {
        */
       updated_at: string;
     };
+    ServerAccessPathDefault: {
+      /**
+       * @description The public URL, LAN or a reverse proxy
+       * @enum {string}
+       */
+      kind: "default";
+    };
+    ServerAccessPathProvider: {
+      /**
+       * @description An overlay origin
+       * @enum {string}
+       */
+      kind: "provider";
+      /** @description Provider slug the request came through */
+      provider: string;
+    };
     ServerCollectionLibrary: {
       collections: components["schemas"]["LibraryCollectionCard"][];
       /**
@@ -23341,6 +23742,68 @@ export interface components {
     };
     ServerCollectionsOutputBody: {
       libraries: components["schemas"]["ServerCollectionLibrary"][];
+    };
+    ServerConnectionsDocument: {
+      /** @description Whether the current principal may use the capability */
+      allowed: boolean;
+      /** @description How this request reached the server */
+      current:
+        | components["schemas"]["ServerAccessPathDefault"]
+        | components["schemas"]["ServerAccessPathProvider"];
+      /** @description Addresses the deployment offers, public first then providers in slug order; empty when no public URL is configured and no provider is installed. Reachability is the client's to test. */
+      endpoints: (
+        | components["schemas"]["ServerEndpointPublic"]
+        | components["schemas"]["ServerEndpointProvider"]
+      )[];
+      /** @description Opaque revision of this document */
+      revision: string;
+      /** @description The same identity getServerIdentity reports */
+      server_id: string;
+      /**
+       * @description Support and configuration state, not health
+       * @enum {string}
+       */
+      state: "available" | "disabled" | "not_configured" | "unsupported";
+    };
+    ServerEndpointProvider: {
+      /** @description Provider display name from its manifest, for setup help on the receiving device */
+      display_name: string;
+      /**
+       * @description A network access provider's overlay origin on the API host
+       * @enum {string}
+       */
+      kind: "provider";
+      /** @description Provider slug (e.g. tailscale) */
+      provider: string;
+      /**
+       * @description Provider state on the API host; only connected carries a url
+       * @enum {string}
+       */
+      state:
+        | "disconnected"
+        | "awaiting_authorization"
+        | "connecting"
+        | "connected"
+        | "error"
+        | "unavailable";
+      /** @description scheme://host[:port] clients reach the API at over the overlay; present only while connected */
+      url?: string;
+    };
+    ServerEndpointPublic: {
+      /**
+       * @description server.public_url as configured
+       * @enum {string}
+       */
+      kind: "public";
+      /** @description scheme://host[:port] clients reach the API at */
+      url: string;
+    };
+    ServerIdentity: {
+      /**
+       * @description Stable identity of this deployment, the same at every address and on every API process; minted once and kept across restarts, hostname changes and database restores. Public and self-asserted: never authorize on it alone.
+       * @example 3f2a9d5e-6b1c-4c7e-9a0d-2f4b8c1e7a35
+       */
+      server_id: string;
     };
     SettingConstraint: {
       /**
@@ -24125,6 +24588,11 @@ export interface components {
        */
       capabilities: string;
       /**
+       * @description Path of the public server identity document (getServerIdentity)
+       * @example /api/v2/system/identity
+       */
+      identity: string;
+      /**
        * @description Path of the committed OpenAPI artifact
        * @example /api/v2/openapi.json
        */
@@ -24777,6 +25245,8 @@ export interface components {
       file_size: number;
       hdr: boolean;
       intro?: components["schemas"]["WatchMarker"];
+      /** @description All effective marker occurrences for this file in source-time order; empty, never null */
+      marker_segments: components["schemas"]["MarkerOccurrence"][];
       /** Format: int64 */
       multi_episode_end?: number;
       /** Format: int64 */
@@ -25103,15 +25573,120 @@ export interface components {
       resolution?: string;
       title?: string;
     };
+    WatchTogetherCapabilities: {
+      /** @description Whether the current principal may use the capability */
+      allowed: boolean;
+      /** @description Displaced v2 room sockets receive a terminal connection_replaced message before closing */
+      connection_replaced: boolean;
+      /** @description Members mark themselves ready in the lobby over the room socket */
+      lobby_ready: boolean;
+      /** Format: int64 */
+      max_member_state_ids: number;
+      /** @description Member watch state and picker rows are computed server-side */
+      member_state: boolean;
+      picker: boolean;
+      /** @description Opaque revision of this document */
+      revision: string;
+      /** @description The host may switch a lobby between host picks and voting */
+      selection_mode_switch: boolean;
+      socket_protocol: string;
+      /** @description Lobbies stage an item and the host starts it explicitly */
+      staged_selection: boolean;
+      /**
+       * @description Support and configuration state, not health
+       * @enum {string}
+       */
+      state: "available" | "disabled" | "not_configured" | "unsupported";
+      /** @description The host may stop playback and return the room to the lobby without ending it */
+      stop_playback: boolean;
+      /** @description The host may promote any suggestion in a vote room, not only the leader */
+      vote_host_override: boolean;
+    };
     WatchTogetherCreateInputBody: {
       /** Format: uuid */
       room_id: string;
       /** @enum {string} */
       selection_mode: "host_pick" | "vote";
     };
+    WatchTogetherItemMemberState: {
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      content_id: string;
+      members: components["schemas"]["WatchTogetherMemberWatchState"][];
+    };
     WatchTogetherJoinInputBody: {
       code?: string;
       join_token?: string;
+    };
+    WatchTogetherMemberState: {
+      /** @description One entry per distinct accessible requested content id, in request order */
+      items: components["schemas"]["WatchTogetherItemMemberState"][];
+      /** @description Connected room members across API servers, host first */
+      members: components["schemas"]["WatchTogetherRoomMember"][];
+    };
+    WatchTogetherMemberStateInputBody: {
+      content_ids: string[];
+    };
+    WatchTogetherMemberWatchState: {
+      /** Format: double */
+      duration_seconds?: number;
+      on_watchlist: boolean;
+      /** Format: double */
+      position_seconds?: number;
+      profile_id: string;
+      /** @enum {string} */
+      state: "unseen" | "in_progress" | "watched";
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      user_id: string;
+    };
+    WatchTogetherPicker: {
+      /** @description Items two or more connected members are mid-way through, most shared first */
+      continue_together: components["schemas"]["WatchTogetherPickerEntry"][];
+      members: components["schemas"]["WatchTogetherRoomMember"][];
+      /** @description Items on any connected member's watchlist, most shared first */
+      watchlist_union: components["schemas"]["WatchTogetherPickerEntry"][];
+    };
+    WatchTogetherPickerEntry: {
+      item: components["schemas"]["CatalogItem"];
+      /** @description Members the row applies to */
+      members: components["schemas"]["WatchTogetherPickerMember"][];
+      /** @description For a series: the episode most members would play next */
+      next_up?: components["schemas"]["WatchTogetherPickerNextUp"];
+    };
+    WatchTogetherPickerMember: {
+      display_name: string;
+      /** Format: double */
+      duration_seconds?: number;
+      /** Format: double */
+      position_seconds?: number;
+      profile_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      user_id: string;
+    };
+    WatchTogetherPickerNextUp: {
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      content_id: string;
+      /** Format: int64 */
+      episode_number: number;
+      /**
+       * Format: int64
+       * @description Members whose next episode this is
+       */
+      member_count: number;
+      /** Format: int64 */
+      season_number: number;
+      title?: string;
     };
     WatchTogetherPolicyInputBody: {
       /** @enum {string} */
@@ -25120,8 +25695,12 @@ export interface components {
     WatchTogetherRoomMember: {
       connected: boolean;
       display_name: string;
+      is_buffering?: boolean;
       is_host: boolean;
+      is_ready?: boolean;
       is_self: boolean;
+      is_syncing?: boolean;
+      lobby_ready: boolean;
       profile_id: string;
       /**
        * @description Opaque identifier
@@ -25188,6 +25767,42 @@ export interface components {
       self_role: "host" | "guest";
     };
     WatchTogetherSelectionInputBody: {
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      content_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      file_id?: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      library_id?: string;
+    };
+    WatchTogetherSelectionModeInputBody: {
+      /** @enum {string} */
+      selection_mode: "host_pick" | "vote";
+    };
+    WatchTogetherSourceFallbackInputBody: {
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      failed_file_id: string;
+      /** @enum {string} */
+      reason:
+        | "no_alternate_version"
+        | "hdr_transcode_unsupported"
+        | "subtitle_conversion_unsupported"
+        | "transcoding_disabled";
+      /** Format: int64 */
+      selection_revision: number;
+    };
+    WatchTogetherStageInputBody: {
       /**
        * @description Opaque identifier
        * @example 1
@@ -46347,6 +46962,392 @@ export interface operations {
       };
     };
   };
+  connectNetworkAccess: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        provider: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["NetworkAccessCommand"];
+      };
+    };
+    responses: {
+      /** @description Accepted */
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["NetworkAccessStatus"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  disconnectNetworkAccess: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        provider: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["NetworkAccessCommand"];
+      };
+    };
+    responses: {
+      /** @description Accepted */
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["NetworkAccessStatus"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getAdminNetworkAccessStatus: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        provider: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["NetworkAccessStatus"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   listAdminNodeSessions: {
     parameters: {
       query?: {
@@ -50702,6 +51703,124 @@ export interface operations {
       };
       /** @description Unsupported Media Type */
       415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  restartAdminPluginInstallation: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminPluginInstallation"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
         headers: {
           [name: string]: unknown;
         };
@@ -91098,6 +92217,116 @@ export interface operations {
       };
     };
   };
+  getNetworkAccessCapabilities: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["NetworkAccessCapabilities"];
+        };
+      };
+      /** @description The representation named by If-None-Match is current; no body. */
+      304: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   listNotifications: {
     parameters: {
       query?: {
@@ -109335,6 +110564,182 @@ export interface operations {
       };
     };
   };
+  getServerConnections: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ServerConnectionsDocument"];
+        };
+      };
+      /** @description The representation named by If-None-Match is current; no body. */
+      304: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getServerIdentity: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ServerIdentity"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   getSystemInfo: {
     parameters: {
       query?: never;
@@ -111590,6 +112995,116 @@ export interface operations {
       };
     };
   };
+  getWatchTogetherCapabilities: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WatchTogetherCapabilities"];
+        };
+      };
+      /** @description The representation named by If-None-Match is current; no body. */
+      304: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   joinWatchTogetherRoom: {
     parameters: {
       query?: never;
@@ -112115,6 +113630,509 @@ export interface operations {
       };
     };
   };
+  queryWatchTogetherMemberState: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+        "X-Room-Token"?: string;
+      };
+      path: {
+        room_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["WatchTogetherMemberStateInputBody"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WatchTogetherMemberState"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getWatchTogetherRoomPicker: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+        "X-Room-Token"?: string;
+      };
+      path: {
+        room_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WatchTogetherPicker"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  startWatchTogetherRoomPlayback: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        room_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WatchTogetherRoomReadOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  stopWatchTogetherRoomPlayback: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        room_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WatchTogetherRoomReadOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   updateWatchTogetherRoomPolicy: {
     parameters: {
       query?: never;
@@ -112280,6 +114298,451 @@ export interface operations {
     requestBody: {
       content: {
         "application/json": components["schemas"]["WatchTogetherSelectionInputBody"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WatchTogetherRoomReadOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  updateWatchTogetherRoomSelectionMode: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        room_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["WatchTogetherSelectionModeInputBody"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WatchTogetherRoomReadOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  fallbackWatchTogetherSource: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+        "X-Room-Token"?: string;
+      };
+      path: {
+        room_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["WatchTogetherSourceFallbackInputBody"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["WatchTogetherRoomReadOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  stageWatchTogetherRoomItem: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        room_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["WatchTogetherStageInputBody"];
       };
     };
     responses: {

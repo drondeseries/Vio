@@ -23,6 +23,7 @@ import {
 import {
   forgetRecentRoom,
   markRecentRoomEnded,
+  recentRoomKey,
   rememberRecentRoom,
   useRecentRooms,
   type RecentRoom,
@@ -62,7 +63,7 @@ const howItWorks = [
   },
 ] as const;
 
-type RecentStatus = "checking" | "live" | "ended" | "gone";
+type RecentStatus = "checking" | "live" | "unknown" | "ended" | "gone";
 
 /** HTTP status of a failed room read, from either client error shape. */
 function roomReadStatus(error: unknown): number | null {
@@ -252,34 +253,38 @@ export default function WatchPartyHub() {
     if (!authority) return;
     const active = () => mountedRef.current && isCapturedProfileAuthorityActive(authority);
     for (const entry of recent) {
-      if (entry.ended || checkedRef.current.has(entry.room_id)) continue;
-      checkedRef.current.add(entry.room_id);
-      setStatuses((current) => ({ ...current, [entry.room_id]: "checking" }));
+      if (entry.user_id !== userId || entry.profile_id !== authority.profileId) continue;
+      const key = recentRoomKey(entry);
+      if (entry.ended || checkedRef.current.has(key)) continue;
+      checkedRef.current.add(key);
+      setStatuses((current) => ({ ...current, [key]: "checking" }));
       void getWatchTogetherRoom(entry.room_id, entry.token, authority)
         .then((response) => {
           if (!active()) return;
           const live = response.room.phase !== "ended";
-          setStatuses((current) => ({ ...current, [entry.room_id]: live ? "live" : "ended" }));
-          if (!live) markRecentRoomEnded(entry.room_id);
+          setStatuses((current) => ({ ...current, [key]: live ? "live" : "ended" }));
+          if (!live) markRecentRoomEnded(entry);
         })
         .catch((readError: unknown) => {
           if (!active()) return;
           const status = roomReadStatus(readError);
           if (status === 403) {
-            forgetRecentRoom(entry.room_id);
-            setStatuses((current) => ({ ...current, [entry.room_id]: "gone" }));
+            forgetRecentRoom(entry);
+            setStatuses((current) => ({ ...current, [key]: "gone" }));
             return;
           }
           if (status === 404 || status === 409 || status === 410) {
-            markRecentRoomEnded(entry.room_id);
+            markRecentRoomEnded(entry);
+            setStatuses((current) => ({ ...current, [key]: "ended" }));
+            return;
           }
-          setStatuses((current) => ({ ...current, [entry.room_id]: "ended" }));
+          setStatuses((current) => ({ ...current, [key]: "unknown" }));
         });
     }
-  }, [recent]);
+  }, [recent, userId]);
 
   const visibleRecent = useMemo(
-    () => recent.filter((entry) => statuses[entry.room_id] !== "gone"),
+    () => recent.filter((entry) => statuses[recentRoomKey(entry)] !== "gone"),
     [recent, statuses],
   );
 
@@ -478,9 +483,9 @@ export default function WatchPartyHub() {
           <ul className="flex flex-col gap-2">
             {visibleRecent.map((entry) => (
               <RecentRoomRow
-                key={entry.room_id}
+                key={recentRoomKey(entry)}
                 entry={entry}
-                status={statuses[entry.room_id] ?? (entry.ended ? "ended" : "checking")}
+                status={statuses[recentRoomKey(entry)] ?? (entry.ended ? "ended" : "checking")}
                 onRejoin={() => navigate(roomHref(entry.room_id, entry.token))}
               />
             ))}
@@ -538,6 +543,8 @@ function RecentRoomRow({
             </span>
           ) : status === "checking" ? (
             "Checking…"
+          ) : status === "unknown" ? (
+            "Status unavailable"
           ) : (
             "Ended"
           )}
@@ -547,7 +554,7 @@ function RecentRoomRow({
           <span className="font-mono tracking-[0.15em]">{entry.code}</span>
         </div>
       </div>
-      {live ? (
+      {live || status === "unknown" ? (
         <Button type="button" size="sm" onClick={onRejoin}>
           Rejoin
         </Button>

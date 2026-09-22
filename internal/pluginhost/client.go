@@ -21,6 +21,8 @@ var (
 
 type Client struct {
 	installationID int
+	startSeq       uint64
+	ingressToken   string
 	manifest       *pluginv1.PluginManifest
 	rpc            *sdkruntime.Client
 	capabilities   map[string]*pluginv1.CapabilityDescriptor
@@ -28,6 +30,8 @@ type Client struct {
 	mu        sync.RWMutex
 	unhealthy bool
 }
+
+func (c *Client) StartSeq() uint64 { return c.startSeq }
 
 type MetadataProviderClient struct {
 	client  pluginv1.MetadataProviderClient
@@ -90,9 +94,7 @@ type WatchSyncProviderClient struct {
 	timeout             time.Duration
 }
 
-func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.PluginManifest) *Client {
-	manifestClone := &pluginv1.PluginManifest{}
-	proto.Merge(manifestClone, manifest)
+func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.PluginManifest, startSeq uint64) *Client {
 	capabilities := make(map[string]*pluginv1.CapabilityDescriptor, len(manifest.GetCapabilities()))
 	for _, capability := range manifest.GetCapabilities() {
 		capabilities[capabilityKey(capability.GetType(), capability.GetId())] = capability
@@ -100,7 +102,8 @@ func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.Pl
 
 	return &Client{
 		installationID: installationID,
-		manifest:       manifestClone,
+		startSeq:       startSeq,
+		manifest:       proto.Clone(manifest).(*pluginv1.PluginManifest),
 		rpc:            rpc,
 		capabilities:   capabilities,
 	}
@@ -259,6 +262,7 @@ func (c *Client) WatchSyncProvider(capabilityID string) (*WatchSyncProviderClien
 		timeout:             DefaultWatchSyncTimeout,
 	}, nil
 }
+
 func (c *Client) markUnhealthy() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

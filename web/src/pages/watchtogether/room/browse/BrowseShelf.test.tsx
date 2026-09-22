@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useState } from "react";
 import type { RoomPickerResponse } from "@/api/v2/watchTogetherPicker";
 import type { RoomMemberStateResponse } from "@/api/v2/watchTogetherMemberState";
 import type { EpisodeListItem } from "@/api/types";
@@ -131,6 +132,7 @@ vi.mock("@/hooks/queries/episodes", () => ({
           episode_count: 4,
           poster_url: "",
           poster_thumbhash: "",
+          user_data: { watched_count: 3, unplayed_count: 1, in_progress_count: 1 },
         },
       ],
     },
@@ -255,8 +257,9 @@ const client = () => new QueryClient({ defaultOptions: { queries: { retry: false
 
 function renderShelf(over: Partial<React.ComponentProps<typeof BrowseShelf>> = {}) {
   const onSelect = vi.fn<(s: BrowseSelection) => void>();
-  render(
-    <QueryClientProvider client={client()}>
+  function Shelf() {
+    const [open, setOpen] = useState(over.open ?? true);
+    return (
       <BrowseShelf
         roomId="room"
         roomToken="proof"
@@ -264,7 +267,14 @@ function renderShelf(over: Partial<React.ComponentProps<typeof BrowseShelf>> = {
         verb="pick"
         onSelect={onSelect}
         {...over}
+        open={open}
+        onOpenChange={setOpen}
       />
+    );
+  }
+  render(
+    <QueryClientProvider client={client()}>
+      <Shelf />
     </QueryClientProvider>,
   );
   return onSelect;
@@ -345,9 +355,23 @@ describe("BrowseShelf", () => {
   });
 
   it("folds to one line when collapsible and reopens on click", () => {
-    renderShelf({ collapsible: true, defaultOpen: false, collapsedLabel: "Change what's up next" });
+    renderShelf({ collapsible: true, open: false, collapsedLabel: "Change what's up next" });
     fireEvent.click(screen.getByTestId("browse-shelf-collapsed"));
     expect(screen.getByRole("textbox", { name: "Search movies and series" })).toBeInTheDocument();
+  });
+
+  it("preserves search and filters while folding and reopening", () => {
+    renderShelf({ collapsible: true });
+    fireEvent.change(screen.getByRole("textbox", { name: "Search movies and series" }), {
+      target: { value: "arrival" },
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Movies" }));
+    fireEvent.click(screen.getByRole("button", { name: "Hide browse" }));
+    fireEvent.click(screen.getByTestId("browse-shelf-collapsed"));
+    expect(screen.getByRole("textbox", { name: "Search movies and series" })).toHaveValue(
+      "arrival",
+    );
+    expect(screen.getByRole("tab", { name: "Movies" })).toHaveAttribute("aria-selected", "true");
   });
 });
 
@@ -377,6 +401,7 @@ describe("CandidateStage", () => {
       { verb: "suggest" },
     );
     await screen.findByText("Episode 4");
+    expect(screen.getByText("You · 3 of 4 watched")).toBeInTheDocument();
     await waitFor(() => expect(data.memberStateCalls.length).toBeGreaterThan(0));
     await screen.findByText(/next up for 2 of you/i);
     const suggestButtons = await screen.findAllByRole("button", { name: "Suggest" });

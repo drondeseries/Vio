@@ -85,6 +85,8 @@ func (h *fakeVirtualPluginHost) Stop(int) error { return nil }
 
 func (h *fakeVirtualPluginHost) Shutdown(context.Context) error { return nil }
 
+func (h *fakeVirtualPluginHost) NextStartSeq() uint64 { return 0 }
+
 func TestListVirtualPlaybackStreamsRoutesOwnerThenExplicitFallback(t *testing.T) {
 	service, calls := newVirtualPlaybackTestService(t,
 		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {

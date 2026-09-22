@@ -115,6 +115,8 @@ type ItemsHandler struct {
 	UserRepo                 *auth.UserRepository
 	DeviceProfileReader      plugins.DeviceCapabilityProfileSource
 	AccessGroups             access.GroupPolicyProvider // optional; resolves inherited library access when no scope is in context
+	MarkerPopulation         MarkerPopulationService
+	MarkerFileResolver       FilePathResolver
 }
 
 // NewItemsHandler creates a new ItemsHandler.

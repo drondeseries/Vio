@@ -1,16 +1,17 @@
 import { Check } from "lucide-react";
 import type { WatchTogetherRoomSnapshot } from "@/lib/watchTogether";
 import { MemberAvatar } from "../MemberAvatar";
-import { memberKey, memberTints, readyCount } from "../members";
+import { memberKey, memberTints, guestReadyCount } from "../members";
 
 export function ReadyCheckRow({ room }: { room: WatchTogetherRoomSnapshot }) {
-  const members = room.members ?? [];
-  const tints = memberTints(members);
-  const { ready, total } = readyCount(room);
+  const members = room.members?.filter((member) => !member.is_host) ?? [];
+  const tints = memberTints(room.members);
+  const { ready, total } = guestReadyCount(room);
+  if (total === 0) return null;
   return (
     <div className="surface-panel-subtle flex flex-wrap items-center gap-4 rounded-xl px-4 py-3">
       <div>
-        <div className="text-sm font-semibold">Ready check</div>
+        <div className="text-sm font-semibold">Guest ready check</div>
         <div className="text-muted-foreground text-xs">
           {ready} of {total} ready
         </div>

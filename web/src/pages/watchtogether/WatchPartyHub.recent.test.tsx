@@ -74,6 +74,24 @@ afterEach(() => {
 });
 
 describe("WatchPartyHub recent parties", () => {
+  it.each(["network", "server"])(
+    "keeps Rejoin available when the status check has a %s failure",
+    async (failure) => {
+      remember();
+      vi.stubGlobal(
+        "fetch",
+        failure === "network"
+          ? vi.fn().mockRejectedValue(new TypeError("Network unavailable"))
+          : vi.fn().mockResolvedValue(json({ type: "internal_error", status: 500 }, 500)),
+      );
+      render(<WatchPartyHub />);
+      expect(await screen.findByText("Status unavailable")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Rejoin" })).toBeInTheDocument();
+      expect(screen.queryByText("Ended")).toBeNull();
+      expect(JSON.parse(localStorage.getItem(RECENT_ROOMS_KEY)!)[0].ended).not.toBe(true);
+    },
+  );
+
   it("verifies a remembered room and offers Rejoin when it is still live", async () => {
     remember();
     let resolve!: (r: Response) => void;

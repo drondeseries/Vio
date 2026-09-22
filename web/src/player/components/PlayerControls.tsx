@@ -81,6 +81,7 @@ interface PlayerControlsProps {
   onQualitySelect: (id: string) => void;
   // Version switching
   versions?: VersionInfo[];
+  versionLocked?: boolean;
   onSwitchVersion?: (fileId: number) => void;
   onRefreshVersions?: () => Promise<void>;
   // PiP
@@ -152,6 +153,7 @@ export function PlayerControls({
   qualityError,
   onQualitySelect,
   versions,
+  versionLocked,
   onSwitchVersion,
   onRefreshVersions,
   onTogglePiP,
@@ -342,6 +344,7 @@ export function PlayerControls({
               error={qualityError}
               onSelect={onQualitySelect}
               versions={versions}
+              versionLocked={versionLocked}
               onSwitchVersion={onSwitchVersion}
               onRefreshVersions={onRefreshVersions}
             />
@@ -518,6 +521,7 @@ export function PlayerControls({
                 error={qualityError}
                 onSelect={onQualitySelect}
                 versions={versions}
+                versionLocked={versionLocked}
                 onSwitchVersion={onSwitchVersion}
                 onRefreshVersions={onRefreshVersions}
               />

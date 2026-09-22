@@ -51,11 +51,19 @@ func (a *PluginResolverAdapter) MarkerProviderClient(ctx context.Context, instal
 	return a.inner.MarkerProviderClient(ctx, installationID, capabilityID)
 }
 
+func (a *PluginResolverAdapter) RefreshMarkerRuntime(installationID int) error {
+	if refresher, ok := a.inner.(interface{ RefreshMarkerRuntime(int) error }); ok {
+		return refresher.RefreshMarkerRuntime(installationID)
+	}
+	return nil
+}
+
 type PluginProviderOptions struct {
 	InstallationID      int
 	CapabilityID        string
 	DisplayName         string
 	PluginID            string
+	CacheRevision       string
 	RequiredExternalIDs []string
 }
 
@@ -66,6 +74,7 @@ type PluginProvider struct {
 	capabilityID        string
 	displayName         string
 	pluginID            string
+	cacheRevision       string
 	requiredExternalIDs []string
 	clientFactory       pluginMarkerClientFactory
 }
@@ -99,6 +108,7 @@ func NewPluginProviderWithClientFactory(opts PluginProviderOptions, clientFactor
 		capabilityID:        strings.TrimSpace(opts.CapabilityID),
 		displayName:         displayName,
 		pluginID:            strings.TrimSpace(opts.PluginID),
+		cacheRevision:       opts.CacheRevision,
 		requiredExternalIDs: requiredIDs,
 		clientFactory:       clientFactory,
 	}, nil
@@ -113,6 +123,15 @@ func (p *PluginProvider) ID() string {
 		return ""
 	}
 	return PluginProviderID(p.installationID, p.capabilityID)
+}
+
+// CacheRevision identifies the plugin version and configuration behind cached
+// lookups. It contains configuration timestamps, never configuration values.
+func (p *PluginProvider) CacheRevision() string {
+	if p == nil {
+		return ""
+	}
+	return p.cacheRevision
 }
 
 func (p *PluginProvider) ProviderDescription() ProviderDescriptor {
@@ -310,13 +329,13 @@ func itemTypeName(kind ItemKind) string {
 func markerKindName(kind MarkerKind) string {
 	switch kind {
 	case MarkerKindIntro:
-		return "intro"
+		return models.MarkerSegmentIntro
 	case MarkerKindCredits:
-		return "credits"
+		return models.MarkerSegmentCredits
 	case MarkerKindRecap:
-		return "recap"
+		return models.MarkerSegmentRecap
 	case MarkerKindPreview:
-		return "preview"
+		return models.MarkerSegmentPreview
 	default:
 		return ""
 	}
@@ -324,13 +343,13 @@ func markerKindName(kind MarkerKind) string {
 
 func markerKindFromName(name string) (MarkerKind, bool) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "intro":
+	case models.MarkerSegmentIntro:
 		return MarkerKindIntro, true
-	case "credits":
+	case models.MarkerSegmentCredits:
 		return MarkerKindCredits, true
-	case "recap":
+	case models.MarkerSegmentRecap:
 		return MarkerKindRecap, true
-	case "preview":
+	case models.MarkerSegmentPreview:
 		return MarkerKindPreview, true
 	default:
 		return 0, false

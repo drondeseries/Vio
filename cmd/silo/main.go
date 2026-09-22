@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -74,6 +75,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/metadata"
+	"github.com/Silo-Server/silo-server/internal/netaccess"
 
 	// Built-in metadata providers self-register into the metadata package's
 	// builtin registry on import; buildProviders resolves their seeded chain
@@ -1025,6 +1027,7 @@ func main() {
 
 		var handler http.Handler
 		var shutdownStandalone func(context.Context) error
+		var standaloneHooks standaloneServerHooks
 		if mode == "proxy" {
 			srv := proxy.NewServer(watcher, tracker)
 			proxyIPResolver, resolverErr := clientIPResolverFromConfig(watcher.Config())
@@ -1034,6 +1037,13 @@ func main() {
 			registerClientIPConfigReload(watcher, proxyIPResolver)
 			srv.SetClientIPResolver(proxyIPResolver)
 			srv.SetStreamTelemetry(streamTelemetryRegistry)
+			// Network access providers run on this proxy too, one instance per
+			// node with its own overlay identity; see newProxyPluginHost.
+			proxyPlugins := newProxyPluginHost(appCtx, pool, dataCipher, eventBus, watcher, nodeName, cfg.Server.Listen, resolvePluginCacheDir())
+			srv.SetIngressTokens(proxyPlugins.broker.Registry)
+			srv.SetNetworkAccessStatus(proxyPlugins.broker.Status)
+			srv.SetNetworkAccessProviderHost(proxyPlugins.service)
+			standaloneHooks = proxyPlugins.hooks()
 			// Serve header-authenticated sessions: the recipe comes from the
 			// shared grant store central wrote at plan time, and the caller's
 			// own access token is re-checked against the live login session in
@@ -1087,7 +1097,7 @@ func main() {
 
 		_ = operationalWriter
 		_ = opsRepo
-		startStandaloneServer(cfg.Server.Listen, handler, appCancel, shutdownStandalone)
+		startStandaloneServer(cfg.Server.Listen, handler, appCancel, shutdownStandalone, standaloneHooks)
 		return
 	}
 
@@ -1246,22 +1256,21 @@ func main() {
 	if deps.DB != nil {
 		markerRegistry := markers.NewRegistry(slog.Default())
 		markerProviderConfig := markers.NewProviderConfigStore(deps.DB)
+		markerRegistry.UseConfigStore(markerProviderConfig)
 		if err := markerProviderConfig.Reload(appCtx); err != nil {
-			slog.Warn("load marker provider config failed; falling back to registration-order fetch",
+			slog.Warn("load marker provider config failed; online fetching remains disabled until settings load",
 				"error", err)
-		} else {
-			markerRegistry.UseConfigStore(markerProviderConfig)
-			if deps.EventBus != nil {
-				if err := deps.EventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
-					if event.Type != cache.EventMarkerProviderConfigChanged {
-						return
-					}
-					if err := markerProviderConfig.Reload(appCtx); err != nil {
-						slog.Warn("reload marker provider config failed", "provider", event.Payload, "error", err)
-					}
-				}); err != nil {
-					slog.Warn("subscribe marker provider config reload failed", "error", err)
+		}
+		if deps.EventBus != nil {
+			if err := deps.EventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
+				if event.Type != cache.EventMarkerProviderConfigChanged {
+					return
 				}
+				if err := markerProviderConfig.Reload(appCtx); err != nil {
+					slog.Warn("reload marker provider config failed", "provider", event.Payload, "error", err)
+				}
+			}); err != nil {
+				slog.Warn("subscribe marker provider config reload failed", "error", err)
 			}
 		}
 		deps.MarkerProviderConfig = markerProviderConfig
@@ -1432,6 +1441,7 @@ func main() {
 	var pluginService *plugins.Service
 	var pluginInstallationStore *plugins.InstallationStore
 	var pluginRuntimeConfigStore *plugins.RuntimeConfigStore
+	var refreshMarkerProviders func(context.Context) error
 	var pluginHTTPProxy *plugins.HTTPProxy
 	var virtualRegistrar *catalog.VirtualMediaRegistrar
 	var vlSvc *virtuallibrary.Service
@@ -1439,12 +1449,56 @@ func main() {
 	var requestVirtualMetadataRefresh func(context.Context, string) error
 	pluginAutoUpdateDone := make(chan struct{})
 	var pluginAutoUpdater *plugins.AutoUpdateService
+	// Network access providers: ingress tokens issued per plugin start and the
+	// providers' last reported status. Shared by the plugin host (issue,
+	// revoke, status pushes) and all three listeners (token validation).
+	networkAccess := netaccess.NewBroker()
+	deps.NetworkAccess = networkAccess
 	if deps.DB != nil {
 		pluginCacheDir := resolvePluginCacheDir()
 		repositoryStore := plugins.NewRepositoryStore(deps.DB)
 		installationStore := plugins.NewInstallationStore(deps.DB)
 		virtualRegistrar = catalog.NewVirtualMediaRegistrar(deps.DB)
 		runtimeConfigStore := plugins.NewRuntimeConfigStore(deps.DB, deps.SecretCipher)
+		// This process is the api host: its resident plugins keep their
+		// per-instance state (overlay node keys) under the "api" scope.
+		instanceStateStore := plugins.NewInstanceStateStore(deps.DB, deps.SecretCipher).ForScope(plugins.HostScopeAPI)
+		hostInfo := func(ctx context.Context) (pluginhost.HostInfo, error) {
+			live := configWatcher.Config()
+			if live == nil {
+				live = cfg
+			}
+			name, _ := settingsRepo.Get(ctx, branding.KeyServerName)
+			if strings.TrimSpace(name) == "" {
+				name, _ = os.Hostname()
+			}
+			info := pluginhost.HostInfo{
+				PublicBaseURL:       live.Server.PublicURL,
+				PluginContentPrefix: plugins.ContentPrefix,
+				Role:                pluginhost.HostRoleAPI,
+				Name:                name,
+				Listeners: []pluginhost.HostListener{{
+					Name:        pluginhost.ListenerAPI,
+					Address:     pluginhost.LoopbackDialAddress(live.Server.Listen),
+					DefaultPort: pluginhost.DefaultPortAPI,
+				}},
+			}
+			if live.JellyfinCompat.Enabled && live.JellyfinCompat.Listen != "" {
+				info.Listeners = append(info.Listeners, pluginhost.HostListener{
+					Name:        pluginhost.ListenerJellyfin,
+					Address:     pluginhost.LoopbackDialAddress(live.JellyfinCompat.Listen),
+					DefaultPort: pluginhost.DefaultPortJellyfin,
+				})
+			}
+			if absCompatEnabled && live.AudiobookshelfCompat.Listen != "" {
+				info.Listeners = append(info.Listeners, pluginhost.HostListener{
+					Name:        pluginhost.ListenerABS,
+					Address:     pluginhost.LoopbackDialAddress(live.AudiobookshelfCompat.Listen),
+					DefaultPort: pluginhost.DefaultPortABS,
+				})
+			}
+			return info, nil
+		}
 		catalogService := plugins.NewCatalogService(repositoryStore, plugins.CatalogServiceOptions{
 			SiloAPIVersion: plugins.DefaultSiloAPIVersion,
 		})
@@ -1557,6 +1611,9 @@ func main() {
 					return runtimeConfigStore.PutGlobalConfig(ctx, installationID, key, value)
 				},
 			),
+			HostInfo:      hostInfo,
+			InstanceState: instanceStateStore,
+			NetworkAccess: networkAccess,
 			Logger: hclog.New(&hclog.LoggerOptions{
 				Name:   "plugin-host",
 				Level:  hclog.Info,
@@ -1571,6 +1628,10 @@ func main() {
 			installer,
 			plugins.NewHostAdapter(pluginHost),
 		)
+		// Crashes of resident plugins (network access providers) reach the
+		// supervisor through the host's exit watcher so they restart with
+		// backoff instead of waiting for the next lazy RPC.
+		pluginHost.SetExitHandler(pluginService.HandleResidentExit)
 		if watchProviderRegistry != nil {
 			reloadWatchProviders := func(ctx context.Context) {
 				if err := reloadWatchSyncPluginProviders(ctx, watchProviderRegistry, installationStore, pluginService, watchProviderRepo); err != nil {
@@ -1582,16 +1643,51 @@ func main() {
 		}
 		if deps.MarkerRegistry != nil && deps.MarkerProviderConfig != nil {
 			markerPluginResolver := markers.NewPluginResolverAdapter(pluginService)
+			var refreshMu sync.Mutex
+			var loadedRevision string
+			refreshMarkerProviders = func(ctx context.Context) (err error) {
+				refreshMu.Lock()
+				defer refreshMu.Unlock()
+				reloading := false
+				defer func() {
+					if err != nil {
+						if reloading || ctx.Err() == nil {
+							loadedRevision = ""
+						}
+						if ctx.Err() == nil {
+							_ = deps.MarkerRegistry.SetProviders(nil)
+						}
+					}
+				}()
+				for range 3 {
+					revision, err := deps.MarkerProviderConfig.RuntimeRevision(ctx)
+					if err != nil {
+						return err
+					}
+					if revision == loadedRevision {
+						return nil
+					}
+					reloading = true
+					if err := deps.MarkerProviderConfig.Reload(ctx); err != nil {
+						return err
+					}
+					if err := reloadMarkerPluginProviders(ctx, deps.MarkerRegistry, deps.MarkerProviderConfig,
+						installationStore, runtimeConfigStore, settingsRepo, markerPluginResolver); err != nil {
+						return err
+					}
+					current, err := deps.MarkerProviderConfig.RuntimeRevision(ctx)
+					if err != nil {
+						return err
+					}
+					if current == revision {
+						loadedRevision = revision
+						return nil
+					}
+				}
+				return fmt.Errorf("marker provider configuration changed repeatedly during reload")
+			}
 			pluginService.AddLifecycleHook(func(ctx context.Context) {
-				if err := reloadMarkerPluginProviders(
-					ctx,
-					deps.MarkerRegistry,
-					deps.MarkerProviderConfig,
-					installationStore,
-					runtimeConfigStore,
-					settingsRepo,
-					markerPluginResolver,
-				); err != nil {
+				if err := refreshMarkerProviders(ctx); err != nil {
 					slog.WarnContext(ctx, "reload marker plugin providers failed", "component", "app", "error", err)
 				}
 			})
@@ -1628,6 +1724,13 @@ func main() {
 			pluginHTTPProxy = pluginHTTPProxy.WithUserThemeLookup(plugins.NewPgUserThemeLookup(deps.DB))
 			pluginHTTPProxy = pluginHTTPProxy.WithUserIdentityLookup(plugins.NewPgUserIdentityLookup(deps.DB))
 		}
+		// The admin network access reads name this process as the "api" host
+		// and refresh the shared status cache with what the provider answers.
+		pluginService.SetNetworkAccessHostInfo(hostInfo)
+		pluginService.SetNetworkAccessStatusSink(networkAccess)
+		// Proxy nodes run the same resident installations; every lifecycle
+		// change here is announced so they reconcile at once.
+		pluginService.PublishLifecycleChanges(eventBus)
 		deps.PluginService = pluginService
 		deps.PluginHTTPProxy = pluginHTTPProxy
 		defer func() {
@@ -2189,6 +2292,39 @@ func main() {
 	}
 	deps.SessionMgr = sessionMgr
 	deps.PlaybackRealtimeHub = playback.NewRealtimeHub()
+	deps.MarkerUpdateNotifier = playback.NewMarkerUpdateNotifier(sessionMgr, deps.PlaybackRealtimeHub)
+	if deps.EventBus != nil {
+		publish := func(ctx context.Context, payload string) error {
+			return deps.EventBus.Publish(ctx, cache.ChannelPlayback, cache.Event{Type: cache.EventMarkersUpdated, Payload: payload})
+		}
+		subscribe := func(ctx context.Context, handler func(string)) error {
+			return deps.EventBus.Subscribe(ctx, cache.ChannelPlayback, func(event cache.Event) {
+				if event.Type == cache.EventMarkersUpdated {
+					handler(event.Payload)
+				}
+			})
+		}
+		if err := deps.MarkerUpdateNotifier.UseEventBus(appCtx, publish, subscribe); err != nil {
+			slog.Warn("subscribe marker updates failed", "error", err)
+		}
+	}
+
+	if deps.DB != nil && deps.FileRepo != nil && deps.MarkerRegistry != nil {
+		deps.MarkerPopulation = markers.NewPopulationService(markers.PopulationOptions{
+			RefreshProviders: refreshMarkerProviders,
+			Registry:         deps.MarkerRegistry,
+			Resolver:         deps.MarkerResolver,
+			Settings:         settingsRepo,
+			Store:            markers.NewPopulationStore(deps.DB),
+			LoadFile:         deps.FileRepo.GetByID,
+			Write: func(ctx context.Context, file *models.MediaFile, result markers.Result) (bool, error) {
+				update := scanner.MarkerUpdateFromPayload(markers.BuildUpdatePayload(result))
+				update.ExpectedFile = file
+				return deps.FileRepo.UpsertMarkers(ctx, file.ID, update)
+			},
+			Notify: deps.MarkerUpdateNotifier.MarkersUpdated,
+		})
+	}
 	if chapterThumbService != nil {
 		chapterThumbnailResolver := deps.ArtworkResolver
 		chapterThumbnailURLs := playback.ChapterThumbnailURLResolver(func(ctx context.Context, key string, ttl time.Duration) (string, error) {
@@ -2685,7 +2821,7 @@ func main() {
 		// and the TMDB fetcher. The Trakt fetcher needs settingsRepo and is
 		// propagated onto deps.TrendingRefresher later in router.go.
 		trendingRefresher = sections.NewTrendingRefresher(
-			sectionRepo,
+			sections.NewTrendingDemandLister(sectionRepo, auth.NewUserRepository(deps.DB), userStoreProvider),
 			sections.NewTrendingSnapshotRepository(pool),
 			catalog.NewItemRepository(deps.DB),
 			collectionService.TMDBCollections,
@@ -2740,6 +2876,9 @@ func main() {
 		taskMgr.Register(tasks.NewCatalogSearchEventRetentionTask(catalog.NewSearchIndexEventRepository(deps.DB)))
 		if deps.IntroAnalyzer != nil {
 			taskMgr.Register(tasks.NewDetectIntroMarkersTask(deps.IntroAnalyzer, settingsRepo))
+		}
+		if deps.MarkerPopulation != nil {
+			taskMgr.Register(tasks.NewSyncMarkersTask(deps.MarkerPopulation))
 		}
 		if deps.MarkerContributionService != nil && deps.MarkerProviderConfig != nil && deps.MarkerContributionStore != nil && deps.FileRepo != nil {
 			taskMgr.Register(tasks.NewContributeMarkersTask(
@@ -3289,6 +3428,7 @@ func main() {
 			DB:                   deps.DB,
 			SecretCipher:         dataCipher,
 			ClientIPResolver:     ipResolver,
+			IngressTokens:        networkAccess.Registry,
 			StreamTelemetry:      streamTelemetryRegistry,
 			NodePlanner:          deps.NodePlanner,
 			JWTSecret:            cfg.Auth.JWTSecret,
@@ -3448,6 +3588,9 @@ func main() {
 			compatDeps.DetailSvc = detailSvc
 			compatDeps.FolderRepo = folderRepo
 			compatDeps.SessionMgr = sessionMgr
+			if deps.MarkerPopulation != nil {
+				compatDeps.MarkerPopulation = deps.MarkerPopulation
+			}
 			compatDeps.UserStoreProvider = userStoreProvider
 			compatDeps.WatchCompletionObserver = deps.WatchCompletionObserver
 			compatDeps.SettingsRepo = settingsRepo
@@ -3553,7 +3696,7 @@ func main() {
 	var absSrv *http.Server
 	if (mode == "integrated" || mode == "api") && deps.ABSHandler != nil && cfg.AudiobookshelfCompat.Listen != "" {
 		absSrv = newAudiobookshelfListener(cfg.AudiobookshelfCompat.Listen, deps.ABSHandler,
-			apiv2.NewArtworkHandler(deps.Artwork, deps.ArtworkSigner, deps.ArtworkRepair), ipResolver)
+			apiv2.NewArtworkHandler(deps.Artwork, deps.ArtworkSigner, deps.ArtworkRepair), ipResolver, networkAccess.Registry)
 	}
 
 	// Run non-critical startup work in the background so it doesn't delay the
@@ -3581,12 +3724,25 @@ func main() {
 	}
 
 	errCh := make(chan error, 3)
-	go func() {
-		slog.Info("HTTP server listening", "addr", cfg.Server.Listen)
-		if listenErr := srv.ListenAndServe(); listenErr != nil && listenErr != http.ErrServerClosed {
-			errCh <- fmt.Errorf("HTTP server error: %w", listenErr)
+	// Bind before serving so resident plugins, which reverse-proxy to this
+	// listener, are only started once it exists.
+	apiListener, apiListenErr := net.Listen("tcp", cfg.Server.Listen)
+	if apiListenErr != nil {
+		errCh <- fmt.Errorf("HTTP server listen: %w", apiListenErr)
+	} else {
+		go func() {
+			slog.Info("HTTP server listening", "addr", cfg.Server.Listen)
+			if serveErr := srv.Serve(apiListener); serveErr != nil && serveErr != http.ErrServerClosed {
+				errCh <- fmt.Errorf("HTTP server error: %w", serveErr)
+			}
+		}()
+		if pluginService != nil {
+			pluginService.StartResidents(appCtx)
+			if mode == "api" {
+				warnOnMultipleAPIReplicas(appCtx, cache.NewAPIReplicaPresence(apiRedisClient, nodeID), pluginService)
+			}
 		}
-	}()
+	}
 	if compatSrv != nil {
 		go func() {
 			slog.Info("Jellyfin compat server listening", "addr", compatSrv.Addr)
@@ -3624,6 +3780,16 @@ func main() {
 	slog.Info("beginning graceful shutdown")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
+
+	// 0. Stop resident plugins first: their overlay listeners front the HTTP
+	// servers, so ingress goes away before the servers drain.
+	if pluginService != nil {
+		residentCtx, residentCancel := context.WithTimeout(shutdownCtx, 10*time.Second)
+		if stopErr := pluginService.StopResidents(residentCtx); stopErr != nil {
+			slog.Error("resident plugin shutdown error", "error", stopErr)
+		}
+		residentCancel()
+	}
 
 	// 1. Stop accepting new requests.
 	if shutdownErr := srv.Shutdown(shutdownCtx); shutdownErr != nil {
@@ -3769,9 +3935,18 @@ func runShutdownWorkWithTimeout(timeout time.Duration, work func(context.Context
 	return work(ctx)
 }
 
+// standaloneServerHooks lets a standalone mode run work that must bracket the
+// listener's lifetime: afterListen runs once the address is bound (resident
+// plugins reverse-proxy to it, so they start only then), beforeDrain runs
+// before the HTTP server drains (their overlay ingress goes away first).
+type standaloneServerHooks struct {
+	afterListen func()
+	beforeDrain func(context.Context)
+}
+
 // startStandaloneServer runs a standalone HTTP server for proxy/transcode modes.
 // It listens on the given address, handles graceful shutdown on SIGTERM/SIGINT.
-func startStandaloneServer(addr string, handler http.Handler, appCancel context.CancelFunc, shutdownWork func(context.Context) error) {
+func startStandaloneServer(addr string, handler http.Handler, appCancel context.CancelFunc, shutdownWork func(context.Context) error, hooks standaloneServerHooks) {
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      handler,
@@ -3781,12 +3956,22 @@ func startStandaloneServer(addr string, handler http.Handler, appCancel context.
 	}
 
 	errCh := make(chan error, 1)
-	go func() {
-		slog.Info("HTTP server listening", "addr", addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- fmt.Errorf("HTTP server error: %w", err)
+	// Bind before serving so the after-listen hook runs against a listener
+	// that exists.
+	listener, listenErr := net.Listen("tcp", addr)
+	if listenErr != nil {
+		errCh <- fmt.Errorf("HTTP server listen: %w", listenErr)
+	} else {
+		go func() {
+			slog.Info("HTTP server listening", "addr", addr)
+			if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("HTTP server error: %w", err)
+			}
+		}()
+		if hooks.afterListen != nil {
+			hooks.afterListen()
 		}
-	}()
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -3802,6 +3987,11 @@ func startStandaloneServer(addr string, handler http.Handler, appCancel context.
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if hooks.beforeDrain != nil {
+		drainCtx, drainCancel := context.WithTimeout(shutdownCtx, 10*time.Second)
+		hooks.beforeDrain(drainCtx)
+		drainCancel()
+	}
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("HTTP shutdown error", "error", err)
 	}
@@ -4221,6 +4411,13 @@ func reloadMarkerPluginProviders(
 	if registry == nil {
 		return nil
 	}
+	previous := make(map[string]string)
+	for _, provider := range registry.Providers() {
+		if revisioned, ok := provider.(interface{ CacheRevision() string }); ok {
+			previous[provider.ID()] = revisioned.CacheRevision()
+		}
+	}
+	refreshedRuntimes := make(map[int]bool)
 	var providers []markers.Provider
 	if store == nil || resolver == nil {
 		return registry.SetProviders(providers)
@@ -4240,6 +4437,13 @@ func reloadMarkerPluginProviders(
 		return installations[i].ID < installations[j].ID
 	})
 
+	var configErr error
+	failClosed := func(err error) {
+		configErr = err
+		// A later reload error must not leave providers using an unknown
+		// configuration revision. Healthy providers are restored below.
+		_ = registry.SetProviders(nil)
+	}
 	nextPriority := 1000
 	for _, installation := range installations {
 		if installation == nil {
@@ -4272,11 +4476,39 @@ func reloadMarkerPluginProviders(
 				return fmt.Errorf("decode marker provider capability %d/%s: %w", installation.ID, capability.ID, err)
 			}
 			metadataMap := markerCapabilityMetadata(descriptor)
+			if err := copyLegacyIntroDBPluginConfig(ctx, runtimeConfigs, legacySettings, installation, capability); err != nil {
+				failClosed(err)
+				continue
+			}
+			var configRevisions []string
+			if runtimeConfigs != nil {
+				configs, err := runtimeConfigs.ListGlobalConfigs(ctx, installation.ID)
+				if err != nil {
+					failClosed(fmt.Errorf("list marker plugin configuration for installation %d: %w", installation.ID, err))
+					continue
+				}
+				for _, config := range configs {
+					if config != nil {
+						configRevisions = append(configRevisions, fmt.Sprintf("%q:%s", config.Key, config.UpdatedAt.UTC().Format(time.RFC3339Nano)))
+					}
+				}
+			}
+			sort.Strings(configRevisions)
+			cacheRevision := fmt.Sprintf("%q\n%s", installation.Version, strings.Join(configRevisions, "\n"))
+			providerID := markers.PluginProviderID(installation.ID, capability.ID)
+			if previous[providerID] != cacheRevision && !refreshedRuntimes[installation.ID] {
+				if err := resolver.RefreshMarkerRuntime(installation.ID); err != nil {
+					failClosed(fmt.Errorf("refresh marker plugin runtime %d: %w", installation.ID, err))
+					continue
+				}
+				refreshedRuntimes[installation.ID] = true
+			}
 			provider, err := markers.NewPluginProvider(markers.PluginProviderOptions{
 				InstallationID:      installation.ID,
 				CapabilityID:        capability.ID,
 				DisplayName:         firstNonEmptyMarkerText(descriptor.GetDisplayName(), capability.ID),
 				PluginID:            installation.PluginID,
+				CacheRevision:       cacheRevision,
 				RequiredExternalIDs: markers.PluginRequiredExternalIDsFromMetadata(metadataMap),
 			}, resolver)
 			if err != nil {
@@ -4305,12 +4537,14 @@ func reloadMarkerPluginProviders(
 					return err
 				}
 			}
-			if err := copyLegacyIntroDBPluginConfig(ctx, runtimeConfigs, legacySettings, installation, capability); err != nil {
-				return err
-			}
 		}
 	}
-	return registry.SetProviders(providers)
+	// Replace the registry even when configuration reads failed, so a provider
+	// cannot continue serving cached lookups with an unknown credential revision.
+	if err := registry.SetProviders(providers); err != nil {
+		return err
+	}
+	return configErr
 }
 
 func legacyIntroDBProviderConfig(

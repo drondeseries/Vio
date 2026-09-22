@@ -1,4 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
+import { ApiClientError } from "@/api/client";
+import { V2ProblemError, V2TransportError } from "@/api/v2/request";
 import { getWatchTogetherRoom } from "@/lib/watchTogether";
 import { markRecentRoomEnded, useRecentRooms, type RecentRoom } from "./useRecentRooms";
 
@@ -37,7 +39,7 @@ export function useLiveRoomPresence(): LiveRoomPresence | null {
       try {
         const response = await getWatchTogetherRoom(candidate.room_id, candidate.token);
         if (response.room.phase === "ended") {
-          markRecentRoomEnded(candidate.room_id);
+          markRecentRoomEnded(candidate);
           return null;
         }
         return {
@@ -48,13 +50,22 @@ export function useLiveRoomPresence(): LiveRoomPresence | null {
           phase: response.room.phase,
           selection_mode: response.room.selection_mode,
         } satisfies LiveRoomPresence;
-      } catch {
-        markRecentRoomEnded(candidate.room_id);
-        return null;
+      } catch (error) {
+        if (
+          (error instanceof ApiClientError ||
+            error instanceof V2ProblemError ||
+            error instanceof V2TransportError) &&
+          [404, 409, 410].includes(error.status)
+        ) {
+          markRecentRoomEnded(candidate);
+          return null;
+        }
+        throw error;
       }
     },
     enabled: candidate !== null,
     staleTime: 60_000,
+    refetchInterval: 60_000,
     retry: false,
   });
   return candidate ? (query.data ?? null) : null;

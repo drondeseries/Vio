@@ -49,9 +49,9 @@ func NewContributeMarkersTask(service ContributionRunner, config AutoContributeC
 }
 
 func (t *ContributeMarkersTask) Key() string  { return "contribute_markers" }
-func (t *ContributeMarkersTask) Name() string { return "Contribute Markers" }
+func (t *ContributeMarkersTask) Name() string { return "Share intro markers" }
 func (t *ContributeMarkersTask) Description() string {
-	return "Submits high-confidence local intro markers to enabled contribution providers"
+	return "Sends eligible intros detected on this server to providers with automatic sharing enabled."
 }
 func (t *ContributeMarkersTask) Category() taskmanager.TaskCategory {
 	return taskmanager.TaskCategoryLibrary

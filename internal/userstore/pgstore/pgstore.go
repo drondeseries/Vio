@@ -21,6 +21,7 @@ var _ userstore.UserStore = (*PostgresUserStore)(nil)
 var _ userstore.DeviceRegistry = (*PostgresUserStore)(nil)
 var _ userstore.WatchedBatchWriter = (*PostgresUserStore)(nil)
 var _ userstore.NextUpStateStore = (*PostgresUserStore)(nil)
+var _ userstore.SectionOverrideEnumerator = (*PostgresUserStore)(nil)
 
 // newStore creates a PostgresUserStore scoped to a user.
 func newStore(pool *pgxpool.Pool, userID int) *PostgresUserStore {

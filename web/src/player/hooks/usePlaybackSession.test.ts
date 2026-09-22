@@ -99,6 +99,17 @@ const replanBase = {
 };
 
 describe("buildStartRequestV3", () => {
+  it("pins the room source without changing the requested streaming quality", () => {
+    expect(
+      buildStartRequestV3({
+        ...startBase,
+        allowAlternateVersions: false,
+        qualityPreference: "720p",
+      }),
+    ).toMatchObject({ allow_alternate_versions: false, quality_preference: "720p" });
+    expect(buildStartRequestV3(startBase)).not.toHaveProperty("allow_alternate_versions");
+  });
+
   // Feature tokens are promises the server enforces, so a surface advertises
   // only what it implements: the base set alone unless the caller names more.
   it("advertises only the surface's own features", () => {
@@ -1017,7 +1028,9 @@ describe("usePlaybackSession output capability changes", () => {
     });
     await waitFor(() => expect(replanBodies).toHaveLength(1));
     act(() => setHDR(false));
-    act(() => result.current.reanchorSeek(555));
+    act(() => {
+      void result.current.reanchorSeek(555);
+    });
     expect(replanBodies).toHaveLength(1);
 
     await act(async () => {
@@ -1463,6 +1476,7 @@ describe("usePlaybackSession version switches", () => {
     await waitFor(() => {
       expect(result.current.plan).toBeNull();
       expect(result.current.error).toBe("The next item has no playable route.");
+      expect(result.current.errorReason).toBe("no_playable_route");
     });
     expect(result.current.streamUrl).toBeNull();
     expect(result.current.sessionId).toBeNull();
@@ -1806,9 +1820,9 @@ describe("usePlaybackSession replans", () => {
     await waitFor(() => expect(replanBodies).toHaveLength(1));
 
     act(() => {
-      result.current.reanchorSeek(300);
+      void result.current.reanchorSeek(300);
       result.current.recoverFromFailure({ classification: "decoder_error" }, 450);
-      result.current.reanchorSeek(600);
+      void result.current.reanchorSeek(600);
     });
     expect(replanBodies).toHaveLength(1);
 
@@ -1901,8 +1915,8 @@ describe("usePlaybackSession replans", () => {
     await waitFor(() => expect(replanBodies).toHaveLength(1));
 
     act(() => {
-      result.current.reanchorSeek(300);
-      result.current.reanchorSeek(450);
+      void result.current.reanchorSeek(300);
+      void result.current.reanchorSeek(450);
     });
     expect(replanBodies).toHaveLength(1);
 

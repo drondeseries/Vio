@@ -74,11 +74,7 @@ export function spoilerRisk(
   return null;
 }
 
-/**
- * One line on where the room is with this series, from the together row's
- * per-member positions when we have them. "Nathan and Maya are mid-way
- * through; Theo hasn't started."
- */
+/** The current profile's progress, separate from the room's episode dots. */
 function seasonProgressLabel(season: Season) {
   const u = season.user_data;
   if (!u) return null;
@@ -290,7 +286,7 @@ export function SeriesDrilldown({
                 </span>
                 {progress ? (
                   <span className={`text-[10px] ${active ? "text-background/70" : ""}`}>
-                    {progress}
+                    You · {progress}
                   </span>
                 ) : null}
               </button>

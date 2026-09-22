@@ -6,7 +6,6 @@ import type {
   WatchTogetherSuggestion,
 } from "@/lib/watchTogether";
 import { InviteBar } from "./InviteBar";
-import { ReadyCheckRow } from "./ReadyCheckRow";
 import { StagedHero } from "./StagedHero";
 import { rankSuggestions, SuggestionList } from "./SuggestionList";
 
@@ -88,7 +87,6 @@ export function VotingStage({
           </p>
         </div>
       )}
-      <ReadyCheckRow room={room} />
       <section className="surface-panel-subtle rounded-xl px-3 py-3">
         <div className="flex items-center justify-between px-2 pb-2">
           <h3 className="text-muted-foreground text-[11px] font-semibold tracking-[0.18em] uppercase">

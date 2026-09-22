@@ -104,6 +104,7 @@ type MediaFile struct {
 	RecapEnd                     *float64
 	PreviewStart                 *float64
 	PreviewEnd                   *float64
+	MarkerSegments               []MarkerSegment // JSONB; legacy bounds expose the first occurrence per kind
 	MarkersSource                *string
 	MarkersConfidence            *float64
 	IntroMarkersSource           *string

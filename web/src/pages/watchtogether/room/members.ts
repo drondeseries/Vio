@@ -61,8 +61,8 @@ export function hostMember(room: WatchTogetherRoomSnapshot | null) {
   return room?.members?.find((member) => member.is_host) ?? null;
 }
 
-export function readyCount(room: WatchTogetherRoomSnapshot | null) {
-  const members = room?.members ?? [];
+export function guestReadyCount(room: WatchTogetherRoomSnapshot | null) {
+  const members = room?.members?.filter((member) => !member.is_host) ?? [];
   return {
     ready: members.filter((member) => member.lobby_ready).length,
     total: members.length,

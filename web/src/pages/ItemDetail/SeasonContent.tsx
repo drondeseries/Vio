@@ -15,6 +15,7 @@ import EditMetadataDialog from "@/components/EditMetadataDialog";
 import PageBack from "@/components/PageBack";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import DetailHero from "./DetailHero";
+import { useDetailWatchTogether } from "@/pages/watchtogether/DetailWatchTogether";
 import MetadataBadges from "./components/MetadataBadges";
 import WatchedActionBar from "./components/WatchedActionBar";
 import DetailBreadcrumb from "./components/DetailBreadcrumb";
@@ -63,6 +64,23 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
   const seriesTitle = item.series_title ?? "Series";
   const seriesId = item.series_id;
   const firstEpisode = episodes[0];
+  const playableEpisodes = episodes.filter((episode) => (episode.files?.length ?? 0) > 0);
+  const firstUnwatched =
+    playableEpisodes.find((episode) => !episode.user_data?.played) ?? playableEpisodes[0];
+  const watchTogether = useDetailWatchTogether({
+    item,
+    target: firstUnwatched
+      ? {
+          content_id: firstUnwatched.content_id,
+          title: firstUnwatched.title,
+          subtitle: `S${firstUnwatched.season_number} E${firstUnwatched.episode_number}`,
+          poster_url: item.poster_url,
+          poster_thumbhash: item.poster_thumbhash,
+        }
+      : null,
+    seriesId: item.series_id,
+    initialSeasonNumber: item.season_number ?? undefined,
+  });
   const episodeLinkState: EpisodeNavigationState = {
     parentSeasonHref: `/item/${item.content_id}`,
     parentSeasonLabel: label,
@@ -123,6 +141,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
           <WatchedActionBar
             item={item}
             contentId={item.content_id}
+            watchTogether={watchTogether.menu}
             playHref={firstEpisode ? `/watch/${firstEpisode.content_id}` : undefined}
             playLabel="Play First Episode"
             onRefresh={
@@ -173,6 +192,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
       {canCurateMetadata && (
         <EditMetadataDialog item={item} open={editOpen} onOpenChange={setEditOpen} />
       )}
+      {watchTogether.sheet}
     </div>
   );
 }

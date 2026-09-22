@@ -27,6 +27,9 @@ import {
   RotateCcw,
   Tags,
   Trash2,
+  UsersRound,
+  Hand,
+  Zap,
 } from "lucide-react";
 import { useDeleteMediaItem } from "@/hooks/queries/items";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
@@ -85,8 +88,16 @@ function DetailOverflowMenuItem({
   );
 }
 
+/** The Watch Together group in the overflow menu. */
+export interface ActionBarWatchTogether {
+  onStartParty: () => void;
+  /** Present when this browser is in a live room. */
+  liveRoom?: { code: string; onSuggest: () => void; onPlay?: () => void };
+}
+
 export interface ActionBarProps {
   contentId?: string;
+  watchTogether?: ActionBarWatchTogether;
   playHref?: string;
   playLabel?: string;
   playLoading?: boolean;
@@ -149,6 +160,7 @@ export interface ActionBarProps {
 
 export default function ActionBar({
   contentId,
+  watchTogether,
   playHref,
   playLabel = "Play",
   playLoading = false,
@@ -456,7 +468,11 @@ export default function ActionBar({
     showMarkerEditor,
   );
   const hasOverflowMenuItems =
-    hasOverflowActions || hasAdminActions || hasMetadataActions || Boolean(contentId);
+    hasOverflowActions ||
+    hasAdminActions ||
+    hasMetadataActions ||
+    Boolean(contentId) ||
+    Boolean(watchTogether);
 
   const formattedResumeTime = formatPlaybackTime(resumePositionSeconds ?? 0);
   const percentComplete =
@@ -637,6 +653,46 @@ export default function ActionBar({
                   <Captions className="size-4" />
                   Search Subtitles
                 </DetailOverflowMenuItem>
+              )}
+              {watchTogether && (
+                <>
+                  <div role="separator" className="bg-border -mx-1 my-1 h-px" />
+                  <div
+                    role="presentation"
+                    className="text-muted-foreground flex items-center gap-1.5 px-2 pt-1 pb-0.5 text-[10px] font-semibold tracking-[0.16em] uppercase"
+                  >
+                    {watchTogether.liveRoom ? (
+                      <span aria-hidden="true" className="size-1.5 rounded-full bg-emerald-400" />
+                    ) : null}
+                    Watch Together
+                    {watchTogether.liveRoom ? ` · ${watchTogether.liveRoom.code} is live` : ""}
+                  </div>
+                  <DetailOverflowMenuItem
+                    closeMenu={closeOverflowMenu}
+                    onAction={watchTogether.onStartParty}
+                  >
+                    <UsersRound className="size-4" />
+                    Start a party with this
+                  </DetailOverflowMenuItem>
+                  {watchTogether.liveRoom && (
+                    <DetailOverflowMenuItem
+                      closeMenu={closeOverflowMenu}
+                      onAction={watchTogether.liveRoom.onSuggest}
+                    >
+                      <Hand className="size-4" />
+                      Suggest to {watchTogether.liveRoom.code}
+                    </DetailOverflowMenuItem>
+                  )}
+                  {watchTogether.liveRoom?.onPlay && (
+                    <DetailOverflowMenuItem
+                      closeMenu={closeOverflowMenu}
+                      onAction={watchTogether.liveRoom.onPlay}
+                    >
+                      <Zap className="size-4" />
+                      Play in {watchTogether.liveRoom.code}
+                    </DetailOverflowMenuItem>
+                  )}
+                </>
               )}
               {(hasAdminActions || hasMetadataActions) && (
                 <>

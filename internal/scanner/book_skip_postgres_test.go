@@ -167,7 +167,7 @@ func TestUnchangedBooksDoNotQueryLiteraryWorks(t *testing.T) {
 			if kind == "ebooks" {
 				err = s.reconcileEbookFile(ctx, folder, paths[0], &skipped, newEbookGroupLocks())
 			} else {
-				err = s.reconcileAudiobookFolder(ctx, folder, paths[0], &skipped)
+				err = s.reconcileAudiobookFolder(ctx, folder, paths[0], nil, &skipped)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -209,7 +209,7 @@ func TestBookScansLinkLaterFormat(t *testing.T) {
 			scanEbook := func() error {
 				return s.reconcileEbookFile(t.Context(), ebookFolder, ebookPath, &skipped, newEbookGroupLocks())
 			}
-			scanAudio := func() error { return s.reconcileAudiobookFolder(t.Context(), audioFolder, audioPath, &skipped) }
+			scanAudio := func() error { return s.reconcileAudiobookFolder(t.Context(), audioFolder, audioPath, nil, &skipped) }
 			first, second := scanAudio, scanEbook
 			firstFolder := audioFolder
 			if ebookFirst {
@@ -246,7 +246,7 @@ func TestBookScansLinkLaterFormat(t *testing.T) {
 			if err := s.reconcileEbookFile(ctx, ebookFolder, ebookPath, &skipped, newEbookGroupLocks()); err != nil {
 				t.Fatal(err)
 			}
-			if err := s.reconcileAudiobookFolder(ctx, audioFolder, audioPath, &skipped); err != nil {
+			if err := s.reconcileAudiobookFolder(ctx, audioFolder, audioPath, nil, &skipped); err != nil {
 				t.Fatal(err)
 			}
 			if skipped != 2 || counts.literary != 0 {

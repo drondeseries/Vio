@@ -136,6 +136,21 @@ func TestRoomSocketV2AdmissionAndCallbacks(t *testing.T) {
 			break
 		}
 	}
+	if err = conn.WriteJSON(map[string]any{"type": "lobby_ready", "ready": true}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, body, err = conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), `"type":"snapshot"`) {
+			if !strings.Contains(string(body), `"lobby_ready":true`) {
+				t.Fatalf("lobby ready not reflected: %s", body)
+			}
+			break
+		}
+	}
 	again, replay, err := dialer.DialContext(t.Context(), endpoint, nil)
 	if again != nil {
 		_ = again.Close()
@@ -185,6 +200,56 @@ func TestRoomSocketV2ClosesOnRevocationAndExpiry(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRoomSocketV2ReplacementArrivesBeforeClose(t *testing.T) {
+	h, _, _ := roomSocketHandler(t)
+	server := roomSocketServer(t, h)
+	connect := func() *websocket.Conn {
+		t.Helper()
+		ticket := roomSocketSeed(t, h, time.Now().Add(time.Minute), time.Now().Add(time.Minute))
+		dialer := websocket.Dialer{Subprotocols: []string{watchtogether.RoomSocketProtocol, eventsTicketProtocolPrefix + ticket}}
+		conn, resp, err := dialer.DialContext(t.Context(), "ws"+strings.TrimPrefix(server.URL, "http")+"/rooms/room/ws", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		t.Cleanup(func() { _ = conn.Close() })
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		return conn
+	}
+	readType := func(conn *websocket.Conn, want string) map[string]any {
+		t.Helper()
+		for {
+			var frame map[string]any
+			if err := conn.ReadJSON(&frame); err != nil {
+				t.Fatalf("read %s: %v", want, err)
+			}
+			if frame["type"] == want {
+				return frame
+			}
+		}
+	}
+	old := connect()
+	readType(old, "snapshot")
+	winner := connect()
+	readType(winner, "snapshot")
+	terminal := readType(old, "connection_replaced")
+	if terminal["reason"] != "This profile joined the Watch Party on another device." {
+		t.Fatalf("terminal reason: %+v", terminal)
+	}
+	if _, _, err := old.ReadMessage(); err == nil {
+		t.Fatal("displaced socket remained open")
+	}
+	// A stale disconnect cannot take authority away from the winning socket.
+	if err := winner.WriteJSON(map[string]any{"type": "lobby_ready", "ready": true}); err != nil {
+		t.Fatal(err)
+	}
+	frame := readType(winner, "snapshot")
+	encoded, err := json.Marshal(frame)
+	if err != nil || !strings.Contains(string(encoded), `"lobby_ready":true`) {
+		t.Fatalf("winner lost authority: %s %v", encoded, err)
 	}
 }
 func TestRoomSocketV2MalformedBeforeConsume(t *testing.T) {

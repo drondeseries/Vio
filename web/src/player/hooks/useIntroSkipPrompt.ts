@@ -294,6 +294,8 @@ export function useIntroSkipPrompt({
         // boundary just before the target), which disables the prompt and
         // clears the undo before it expires. Without this the re-entry looked
         // like a fresh intro and the hook skipped again, replanning in a loop.
+        // A reanchor reports asynchronously, so this waits for the replan to
+        // land rather than for the request to be sent.
         resolvedKeysRef.current.add(introKey);
         return;
       }

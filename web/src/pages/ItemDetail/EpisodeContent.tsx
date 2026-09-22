@@ -18,6 +18,7 @@ import MediaLocations from "@/components/MediaLocations";
 import PageBack from "@/components/PageBack";
 import EpisodeCarousel from "./components/EpisodeCarousel";
 import DetailHero from "./DetailHero";
+import { useDetailWatchTogether } from "@/pages/watchtogether/DetailWatchTogether";
 import MetadataBadges from "./components/MetadataBadges";
 import QualityBadges from "./components/QualityBadges";
 import ScoreRow from "./components/ScoreRow";
@@ -206,6 +207,24 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
     (item.playback_variants?.length ?? 0) > 0 ||
     Boolean(item.play_content_id);
   const primaryAction = resolveLeafPrimaryAction(item, "Play Episode");
+  const watchTogether = useDetailWatchTogether({
+    item,
+    target:
+      item.versions && item.versions.length > 0
+        ? {
+            content_id: item.content_id,
+            title: item.title,
+            subtitle:
+              item.season_number != null && item.episode_number != null
+                ? `S${item.season_number} E${item.episode_number}`
+                : undefined,
+            poster_url: item.poster_url,
+            poster_thumbhash: item.poster_thumbhash,
+          }
+        : null,
+    seriesId: item.series_id,
+    initialSeasonNumber: item.season_number ?? undefined,
+  });
   const restartHref =
     primaryAction.label === "Resume" && isPlayable
       ? `/watch/${item.content_id}?restart=1`
@@ -320,6 +339,7 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
           <WatchedActionBar
             item={item}
             contentId={item.content_id}
+            watchTogether={watchTogether.menu}
             playHref={isPlayable ? `/watch/${item.content_id}` : undefined}
             playLabel={primaryAction.label}
             playProgress={primaryAction.progress}
@@ -457,6 +477,7 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
           initialFileId={mediaInfoFileId}
         />
       )}
+      {watchTogether.sheet}
     </div>
   );
 }

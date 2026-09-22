@@ -1622,6 +1622,22 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     }
   }
 
+  /* Row actions that appear on hover. On a touch screen there is no hover, so
+     the action stays visible; a fine pointer hides it until the row is hovered
+     or the control is focused. Usage: a `group/row` wrapper and
+     `.pointer-reveal` on the control. */
+  @media (any-hover: hover) and (any-pointer: fine) {
+    .pointer-reveal {
+      opacity: 0;
+      transition: opacity var(--duration-fast) var(--ease-default);
+    }
+    .group\/row:hover .pointer-reveal,
+    .group\/row:focus-within .pointer-reveal,
+    .pointer-reveal:focus-visible {
+      opacity: 1;
+    }
+  }
+
   /* A long press on a card opens the action sheet, so the browser's own image
      and link callout has to stay out of the way. Text selection is only
      disabled for coarse primary pointers: a mouse user can still select a

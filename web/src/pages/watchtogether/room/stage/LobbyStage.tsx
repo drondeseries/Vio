@@ -9,7 +9,7 @@ import { SuggestionList } from "./SuggestionList";
 import { InviteBar } from "./InviteBar";
 import { ReadyCheckRow } from "./ReadyCheckRow";
 import { StagedHero } from "./StagedHero";
-import { hostMember, readyCount, selfMember } from "../members";
+import { hostMember, guestReadyCount, selfMember } from "../members";
 
 /** The empty lobby: the host's two moves, or what guests can do meanwhile. */
 export function LobbyEmptyStage({
@@ -64,10 +64,9 @@ export function LobbyStagedStage({
   onSetPolicy: (policy: GuestControlPolicy) => void;
 }) {
   const contentId = room.selected_content_id!;
-  const { ready, total } = readyCount(room);
+  const { ready, total } = guestReadyCount(room);
   const host = hostMember(room)?.display_name ?? "The host";
   const self = selfMember(room);
-  const guests = total - 1;
   return (
     <div className="flex flex-col gap-4">
       <StagedHero
@@ -76,7 +75,7 @@ export function LobbyStagedStage({
         eyebrow={isHost ? "Up next" : `Up next · ${host} queued this`}
         caption={
           isHost
-            ? guests > 0
+            ? total > 0
               ? `${ready} of ${total} ready`
               : "Waiting for a guest to join"
             : `Starts when ${host} presses play · ${ready} of ${total} ready`
@@ -86,7 +85,7 @@ export function LobbyStagedStage({
           <>
             <Button type="button" onClick={onStart} disabled={busy} className="gap-2">
               <Play className="size-3.5" />
-              {guests > 0 ? `Start for everyone · ${ready}/${total} ready` : "Start alone anyway"}
+              {total > 0 ? `Start for everyone · ${ready}/${total} ready` : "Start alone anyway"}
             </Button>
             <Button type="button" variant="outline" onClick={onChange} disabled={busy}>
               Change

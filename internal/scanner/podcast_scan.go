@@ -53,14 +53,8 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 		if dirHasIgnoreMarker(entries) {
 			continue
 		}
-		var rootIgnoreRules []ignoreRules
-		for _, entry := range entries {
-			if entry.Type().IsRegular() && entry.Name() == siloIgnoreFileName {
-				if patterns := readSiloIgnoreFile(root); len(patterns) > 0 {
-					rootIgnoreRules = append(rootIgnoreRules, ignoreRules{basePath: root, patterns: patterns})
-				}
-			}
-		}
+		rootIgnoreRules := childIgnoreRules(nil, root, root, entries)
+
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				continue

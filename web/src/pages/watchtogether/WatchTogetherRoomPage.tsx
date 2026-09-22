@@ -92,6 +92,8 @@ export default function WatchTogetherRoomPage() {
   const [searchParams] = useSearchParams();
   const roomToken = searchParams.get("room_token");
   const auth = useOptionalAuth();
+  const userId = auth?.user?.id;
+  const profileId = auth?.profile?.id;
   const playbackController = useWatchPlaybackController();
   const activePlaybackRequest = playbackController.state.request;
   // While the player is in the foreground for this same room it owns the
@@ -140,8 +142,14 @@ export default function WatchTogetherRoomPage() {
     });
   }, [room, roomToken, auth?.user, auth?.profile, stagedDetail.data]);
   useEffect(() => {
-    if (roomId && connection.closedReason) markRecentRoomEnded(roomId);
-  }, [roomId, connection.closedReason]);
+    if (roomId && connection.closedReason && userId != null && profileId) {
+      markRecentRoomEnded({
+        room_id: roomId,
+        user_id: userId,
+        profile_id: profileId,
+      });
+    }
+  }, [roomId, connection.closedReason, userId, profileId]);
 
   // Auto-start: when the room starts playing a new selection, enter the
   // player. Keyed on the selection revision so a lobby restage never fires.
@@ -154,18 +162,14 @@ export default function WatchTogetherRoomPage() {
       (location.state as WatchTogetherRoomLocationState | null)?.suppressAutoStartSelection ?? null;
   }, [location.state]);
   useEffect(() => {
-    if (!room || !roomId || !roomToken) return;
+    if (!room || !roomId || !roomToken || connection.replacementReason) return;
     const suppressed = suppressAutoStartSelectionRef.current;
     if (suppressed) {
       suppressAutoStartSelectionRef.current = null;
-      const same =
-        room.selected_content_id === suppressed.contentId &&
-        (room.selected_file_id ?? null) === (suppressed.fileId ?? null) &&
-        (room.selected_library_id ?? null) === (suppressed.libraryId ?? null);
-      if (same) {
-        lastAutoStartRevisionRef.current = room.selection_revision;
-        return;
-      }
+      // Exit must reach the room even if the host started another selection
+      // before this first snapshot arrived. Follow subsequent starts normally.
+      lastAutoStartRevisionRef.current = room.selection_revision;
+      return;
     }
     if (room.phase !== "playing" || !room.selected_content_id) return;
     if (lastAutoStartRevisionRef.current === room.selection_revision) return;
@@ -178,7 +182,7 @@ export default function WatchTogetherRoomPage() {
       roomToken,
       restart: true,
     });
-  }, [playbackController, room, roomId, roomToken]);
+  }, [connection.replacementReason, playbackController, room, roomId, roomToken]);
 
   // Vote mode from a detail page: the sheet could not suggest before the
   // room existed, so it hands the item over and the room suggests it once,
@@ -188,7 +192,15 @@ export default function WatchTogetherRoomPage() {
   );
   useEffect(() => {
     const first = suggestFirstRef.current;
-    if (!first || !room || !roomId || !roomToken || room.selection_mode !== "vote") return;
+    if (
+      !first ||
+      !room ||
+      !roomId ||
+      !roomToken ||
+      room.selection_mode !== "vote" ||
+      connection.replacementReason
+    )
+      return;
     suggestFirstRef.current = null;
     const draft = captureSuggestionDraft(roomId, roomToken, {
       content_id: first.content_id,
@@ -231,13 +243,12 @@ export default function WatchTogetherRoomPage() {
   }, [phaseKey]);
   const stageRef = useRef<HTMLDivElement | null>(null);
   // A staged lobby and a playing room fold the shelf to one line so the ready
-  // check or the now-playing card owns the screen; "Change" reopens it. The
-  // key remounts the shelf when that default flips so it takes effect.
+  // check or the now-playing card owns the screen; "Change" reopens it.
+  // The shelf stays mounted so folding preserves the viewer's search and filters.
   // Guests keep browsing in a staged lobby: suggesting is what they do while
   // the host decides.
   const shelfCollapsible = (staged && !isVote && isHost) || isPlaying;
   const [shelfOpen, setShelfOpen] = useState(false);
-  const shelfKey = `${shelfCollapsible}:${shelfOpen}`;
   useEffect(() => {
     if (!shelfCollapsible) setShelfOpen(false);
   }, [shelfCollapsible]);
@@ -361,6 +372,21 @@ export default function WatchTogetherRoomPage() {
       </RoomTerminalState>
     );
   }
+  if (connection.replacementReason) {
+    return (
+      <RoomTerminalState
+        title="Watch Party joined on another device"
+        description={connection.replacementReason}
+      >
+        <Button type="button" onClick={connection.rejoinRoom}>
+          Rejoin Watch Party
+        </Button>
+        <Button type="button" variant="outline" onClick={() => navigate("/rooms")}>
+          Back to Watch Party
+        </Button>
+      </RoomTerminalState>
+    );
+  }
 
   return (
     <div className="flex h-[100dvh] min-h-[32rem] flex-col">
@@ -461,7 +487,6 @@ export default function WatchTogetherRoomPage() {
                   )}
                 </div>
                 <BrowseShelf
-                  key={shelfKey}
                   roomId={roomId}
                   roomToken={roomToken}
                   members={room.members ?? []}
@@ -473,7 +498,8 @@ export default function WatchTogetherRoomPage() {
                   collapsedLabel={
                     isPlaying ? "Suggest something for after" : "Change what's up next"
                   }
-                  defaultOpen={!shelfCollapsible || shelfOpen}
+                  open={shelfOpen}
+                  onOpenChange={setShelfOpen}
                   onSelect={selectCandidate}
                 />
               </>

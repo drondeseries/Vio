@@ -10,7 +10,10 @@ import (
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/hashicorp/go-hclog"
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/events"
@@ -122,6 +125,67 @@ type RuntimeHostServer struct {
 	configSetter     GlobalConfigSetter
 	virtualCatalog   VirtualCatalogRegistrar
 	installationID   int
+
+	hostInfo      HostInfoFunc
+	instanceState InstanceStateStore
+	networkAccess NetworkAccessBroker
+	// ingressToken is the token issued to this process instance; pushes are
+	// accepted only while it is current.
+	ingressToken string
+	// provider is the network_access_provider.v1 slug from the plugin's
+	// manifest; empty for plugins that are not providers.
+	provider string
+	logger   hclog.Logger
+}
+
+// RuntimeHostOptions configures a RuntimeHostServer for one plugin instance.
+type RuntimeHostOptions struct {
+	Publisher          EventPublisher
+	Libraries          LibraryLister
+	Catalog            CatalogPresenceLookup
+	InstalledPlugins   InstalledPluginLister
+	GlobalConfigSetter GlobalConfigSetter
+	HostInfo           HostInfoFunc
+	InstanceState      InstanceStateStore
+	NetworkAccess      NetworkAccessBroker
+	// VirtualCatalog owns virtual media registration requested by plugins
+	// (fork: virtual-library traffic resolves through core; plugins register
+	// into the catalog via this host-owned registrar, never via dispatch).
+	VirtualCatalog VirtualCatalogRegistrar
+	Logger         hclog.Logger
+	// EventRatePerSec caps PublishEvent; <= 0 takes DefaultPublishEventRatePerSec.
+	EventRatePerSec int
+
+	PluginID       string
+	InstallationID int
+	// NetworkAccessProvider is the provider slug the manifest declares, or
+	// empty. Only providers may push network access status.
+	NetworkAccessProvider string
+	// IngressToken is the token issued to this process instance. Status
+	// pushes are accepted only while it is still the installation's current
+	// token.
+	IngressToken string
+}
+
+// NewRuntimeHostServerWithOptions builds the server the host binds for one
+// plugin instance.
+func NewRuntimeHostServerWithOptions(opts RuntimeHostOptions) *RuntimeHostServer {
+	s := NewRuntimeHostServerWithRate(opts.Publisher, opts.Libraries, opts.PluginID, opts.EventRatePerSec)
+	s.catalog = opts.Catalog
+	s.installedPlugins = opts.InstalledPlugins
+	s.configSetter = opts.GlobalConfigSetter
+	s.installationID = opts.InstallationID
+	s.hostInfo = opts.HostInfo
+	s.instanceState = opts.InstanceState
+	s.networkAccess = opts.NetworkAccess
+	s.virtualCatalog = opts.VirtualCatalog
+	s.provider = opts.NetworkAccessProvider
+	s.ingressToken = opts.IngressToken
+	s.logger = opts.Logger
+	if s.logger == nil {
+		s.logger = hclog.NewNullLogger()
+	}
+	return s
 }
 
 // NewRuntimeHostServer constructs a RuntimeHostServer bound to the given
@@ -492,4 +556,42 @@ func (s *RuntimeHostServer) CheckMediaPresence(ctx context.Context, req *pluginv
 		})
 	}
 	return resp, nil
+}
+
+// GetHostInfo reports the hosting process: public and loopback base URLs.
+// NOTE (fork, stripped for SDK): the pinned plugin SDK predates the
+// HostRole/HostName/NodeId/Listeners/IngressToken response fields, so only
+// the base URLs are reported until the SDK is updated.
+func (s *RuntimeHostServer) GetHostInfo(ctx context.Context, _ *pluginv1.GetHostInfoRequest) (*pluginv1.GetHostInfoResponse, error) {
+	if s.hostInfo == nil {
+		return nil, status.Error(codes.Unimplemented, "host info is not configured")
+	}
+	info, err := s.hostInfo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("host info: %w", err)
+	}
+	resp := &pluginv1.GetHostInfoResponse{
+		PublicBaseUrl: strings.TrimRight(info.PublicBaseURL, "/"),
+	}
+	if resp.PublicBaseUrl != "" && info.PluginContentPrefix != "" && s.installationID > 0 {
+		resp.PluginProxyBaseUrl = resp.PublicBaseUrl + info.PluginContentPrefix + "/plugins/" + strconv.Itoa(s.installationID)
+	}
+	for _, listener := range info.Listeners {
+		if listener.Name == ListenerAPI && listener.Address != "" {
+			resp.InternalBaseUrl = "http://" + listener.Address
+		}
+	}
+	return resp, nil
+}
+
+func instanceStateError(err error) error {
+	switch {
+	case errors.Is(err, ErrInstanceStateKeyTooLong), errors.Is(err, ErrInstanceStateValueTooLarge):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, ErrInstanceStateTooManyKeys):
+		return status.Error(codes.ResourceExhausted, err.Error())
+	case errors.Is(err, ErrInstanceStateUnavailable):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	return fmt.Errorf("instance state: %w", err)
 }
