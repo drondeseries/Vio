@@ -22,10 +22,31 @@ vi.mock("@/hooks/useVersionSortPreference", () => ({
   }),
 }));
 
+// The picker reads the watch detail (lazily, when it opens) for the score and
+// the server ranking. Mock it so the tests need no QueryClientProvider and can
+// still drive the payload.
+const watchDetailMock = vi.hoisted(() => ({
+  current: undefined as unknown,
+  lastOptions: undefined as unknown,
+}));
+vi.mock("@/hooks/queries/items", () => ({
+  useWatchDetail: (
+    _id: string | undefined,
+    _fileId?: number,
+    _libraryId?: number,
+    options?: { enabled?: boolean },
+  ) => {
+    watchDetailMock.lastOptions = options;
+    return { data: watchDetailMock.current, isLoading: false };
+  },
+}));
+
 beforeEach(() => {
   versionSortMock.criteria = [];
   versionSortMock.apply.mockReset();
   versionSortMock.reset.mockReset();
+  watchDetailMock.current = undefined;
+  watchDetailMock.lastOptions = undefined;
 });
 
 function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
@@ -167,6 +188,130 @@ describe("VersionDropdown version sort preference", () => {
   it("keeps the server's incoming order with no override", () => {
     const dialog = openPicker(versions);
     expect(rowOrder(dialog)).toEqual(["2160p", "1080p"]);
+  });
+});
+
+describe("VersionDropdown rich row content", () => {
+  it("renders the quality summary, languages, size and range like the player menu", () => {
+    const dialog = openPicker([
+      makeVersion({
+        file_id: 1,
+        resolution: "2160p",
+        codec_video: "hevc",
+        codec_audio: "eac3",
+        hdr: true,
+        edition_raw: "Movie.2026.2160p.WEB-DL.DDP5.1.Atmos.H.265-GRP",
+        file_size: 50_570_000_000,
+        audio_tracks: [{ language: "eng" }, { language: "fra" }],
+        subtitle_tracks: [{ language: "deu" }],
+      }),
+      makeVersion({ file_id: 2, resolution: "1080p" }),
+    ]);
+
+    expect(dialog.getByText(/2160p · WEB-DL · HEVC/)).toBeInTheDocument();
+    expect(dialog.getByText("English")).toBeInTheDocument();
+    expect(dialog.getByText("French")).toBeInTheDocument();
+    expect(dialog.getByText("German")).toBeInTheDocument();
+    expect(dialog.getByText(/47\.1 GB/)).toBeInTheDocument();
+    expect(dialog.getByText("HDR")).toBeInTheDocument();
+  });
+
+  it("shows the custom-format score from the watch detail when the picker opens", () => {
+    watchDetailMock.current = { versions: [{ file_id: 2, format_score: 850 }] };
+    const dialog = openPicker(
+      [
+        makeVersion({ file_id: 1, resolution: "2160p" }),
+        makeVersion({ file_id: 2, resolution: "1080p", file_size: 300 }),
+      ],
+      { contentId: "movie-1" },
+    );
+
+    expect(watchDetailMock.lastOptions).toEqual({ enabled: true });
+    expect(dialog.getByText("★ 850")).toBeInTheDocument();
+  });
+
+  it("does not read the watch detail until the picker opens", () => {
+    const versions = [
+      makeVersion({ file_id: 1, resolution: "2160p" }),
+      makeVersion({ file_id: 2, resolution: "1080p" }),
+    ];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+        contentId="movie-1"
+      />,
+    );
+    expect(watchDetailMock.lastOptions).toEqual({ enabled: false });
+
+    fireEvent.click(screen.getByRole("button", { name: /Version/ }));
+    expect(watchDetailMock.lastOptions).toEqual({ enabled: true });
+  });
+
+  it("takes the ranking from the watch payload's virtual_ranking", () => {
+    watchDetailMock.current = {
+      versions: [],
+      virtual_ranking: {
+        profile_label: "4K+HDR",
+        source: "profile",
+        criteria: [{ attribute: "score", direction: "desc" }],
+      },
+    };
+    const dialog = openPicker(
+      [
+        makeVersion({ file_id: 1, resolution: "2160p" }),
+        makeVersion({ file_id: 2, resolution: "1080p" }),
+      ],
+      { contentId: "movie-1" },
+    );
+
+    expect(dialog.getByText(/Ranking: score ↓/)).toBeInTheDocument();
+    expect(dialog.getByText(/4K\+HDR/)).toBeInTheDocument();
+  });
+});
+
+describe("VersionDropdown raw provider ids", () => {
+  it("never renders a virtual URI, result token or tt id as a row label", () => {
+    const dialog = openPicker([
+      makeVersion({
+        file_id: 1,
+        resolution: "2160p",
+        codec_video: "hevc",
+        container: "virtual",
+        file_path: "virtual://movie/tt123?result=abc",
+        file_name: "tt123?result=abc",
+        edition_raw: "virtual://movie/tt123?result=abc",
+        file_size: 10_000_000_000,
+      }),
+      makeVersion({ file_id: 2, resolution: "1080p" }),
+    ]);
+
+    const text = document.body.textContent ?? "";
+    expect(text).not.toMatch(/tt\d{5,}/);
+    expect(text).not.toMatch(/result=/);
+    expect(text).not.toMatch(/virtual:\/\//);
+    // The row's identity falls back to its quality summary.
+    expect(dialog.getByText(/2160p · HEVC/)).toBeInTheDocument();
+  });
+
+  it("falls back to a neutral name when a version has no meaningful label", () => {
+    const dialog = openPicker([
+      makeVersion({
+        file_id: 1,
+        resolution: "",
+        codec_video: "",
+        codec_audio: "",
+        container: "virtual",
+        file_path: "virtual://movie/tt456?result=xyz",
+        file_name: "tt456?result=xyz",
+        edition_raw: "",
+      }),
+      makeVersion({ file_id: 2, resolution: "1080p" }),
+    ]);
+
+    expect(dialog.queryByText(/tt456/)).not.toBeInTheDocument();
+    expect(dialog.getByText("Video version")).toBeInTheDocument();
   });
 });
 

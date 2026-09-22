@@ -7,6 +7,12 @@ import VersionDropdown from "./VersionDropdown";
 import VersionFlyoutItems from "./VersionFlyout";
 import { useVersionVisibility } from "./versionAvailability";
 
+// The picker reads the watch detail lazily when it opens (score/ranking); these
+// tests mount it bare, so the query is stubbed.
+vi.mock("@/hooks/queries/items", () => ({
+  useWatchDetail: () => ({ data: undefined, isLoading: false }),
+}));
+
 vi.mock("@/components/ui/dropdown-menu", () => ({
   DropdownMenuLabel: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   DropdownMenuSeparator: () => <div />,

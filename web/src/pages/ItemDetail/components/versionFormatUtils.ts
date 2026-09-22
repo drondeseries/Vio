@@ -120,6 +120,23 @@ export function prettifyReleaseName(releaseName?: string): string {
 }
 
 /**
+ * Removes catalog/provider plumbing that must never be a user-visible label: a
+ * `virtual://…` URI, a `?result=`/`?results=` provider picker token, and a bare
+ * `tt######` external id. A version row's identity is its release name and
+ * quality summary, not the internal handle the store keys it by.
+ */
+export function sanitizeVersionLabel(text?: string): string {
+  if (!text) return "";
+  return text
+    .replace(/\bvirtual:\/\/\S+/gi, " ")
+    .replace(/\bresults?=[^\s&·|]+/gi, " ")
+    .replace(/\btt\d{5,}\b/gi, " ")
+    .replace(/[?&]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
  * The release/size line a version row shows, shared by the item-page picker and
  * the in-player version menu so both carry the same information.
  *
@@ -179,9 +196,10 @@ export function buildVersionFallbackTitle(
   fileName: string | undefined,
   { fileSize, detailLine }: { fileSize?: number; detailLine?: string },
 ): string {
-  if (!fileName) return "";
+  const sanitized = sanitizeVersionLabel(fileName);
+  if (!sanitized) return "";
   const hasStructuredSize = formatFileSize(fileSize).length > 0;
-  let label = hasStructuredSize ? stripReleaseSizeToken(fileName) : fileName;
+  let label = hasStructuredSize ? stripReleaseSizeToken(sanitized) : sanitized;
   const duplicateYears = releaseYears(detailLine);
   if (duplicateYears.length > 0) {
     label = stripYears(label, duplicateYears);

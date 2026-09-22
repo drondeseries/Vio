@@ -13,6 +13,7 @@ import {
   collectLanguageLabels,
   extractSourceHint,
   formatVersionDetail,
+  sanitizeVersionLabel,
 } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
 import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
@@ -47,7 +48,9 @@ export function buildQualitySummary(version: FileVersion): string {
   // Audio languages are now rendered as badges in the UI.
   // const audioLangs = audioLanguageSummary(version.audio_tracks);
   // if (audioLangs) parts.push(audioLangs);
-  if (parts.length === 0 && version.container) {
+  // "virtual" is internal plumbing, not a user-facing codec; leaving it out
+  // lets the row fall back to its release identity instead of a bare "VIRTUAL".
+  if (parts.length === 0 && version.container && version.container.toLowerCase() !== "virtual") {
     parts.push(version.container.toUpperCase());
   }
 
@@ -60,7 +63,7 @@ export function buildQualitySummary(version: FileVersion): string {
 // same information and the same single size.
 export function buildDetailLine(version: FileVersion): string {
   return formatVersionDetail({
-    label: version.release_name || version.edition_raw,
+    label: sanitizeVersionLabel(version.release_name || version.edition_raw),
     fileSize: version.file_size,
     scanText: [version.file_name, version.edition_raw, version.release_name]
       .filter(Boolean)

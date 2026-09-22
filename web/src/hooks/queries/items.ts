@@ -50,11 +50,16 @@ export async function fetchWatchDetail(
   return watchDetailFromV2(detail);
 }
 
-export function useWatchDetail(id: string | undefined, fileId?: number, libraryId?: number) {
+export function useWatchDetail(
+  id: string | undefined,
+  fileId?: number,
+  libraryId?: number,
+  options?: { enabled?: boolean },
+) {
   return useQuery({
     queryKey: itemKeys.watchDetail(id!, fileId, libraryId),
     queryFn: () => fetchWatchDetail(id!, fileId, libraryId),
-    enabled: !!id,
+    enabled: (options?.enabled ?? true) && !!id,
     // Player navigation remounts this query (detail -> player -> back). A short
     // freshness window lets the inventory poll, chapter refresh, and realtime
     // reconcile reach share one payload instead of each issuing its own
