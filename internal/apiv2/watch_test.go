@@ -42,9 +42,18 @@ func (f *fakeWatch) WatchDetail(_ context.Context, userID int, profileID, conten
 		return nil, &handlers.APIError{Status: http.StatusBadRequest, Code: "invalid_watch_target", Message: "Content is not directly playable"}
 	case "movie:heat-1995":
 		three := 3
+		ranking := &catalogpkg.VirtualRanking{
+			ProfileLabel: "4K HDR",
+			Source:       catalogpkg.VirtualRankingSourceProfile,
+			Criteria: []catalogpkg.VirtualRankingCriterion{
+				{Attribute: "score", Direction: "desc"},
+				{Attribute: "resolution", Direction: "desc"},
+			},
+		}
 		detail := &catalogpkg.WatchDetail{
 			ContentID: contentID, Type: "movie", Title: "Heat", Year: 1995,
 			EffectiveSubtitleLanguage: "eng", HasEffectiveSubtitleLang: true,
+			VirtualRanking: ranking,
 			Versions: []catalogpkg.FileVersion{{
 				FileID: 42, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "eac3", Container: "mkv", FileSize: 1024, Duration: 10200, Bitrate: 8000000,
 				AddedAt:     time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
@@ -53,7 +62,7 @@ func (f *fakeWatch) WatchDetail(_ context.Context, userID int, profileID, conten
 				Chapters:    []catalogpkg.VersionChapter{{Index: 1, Title: "Opening", StartSeconds: 0, EndSeconds: 300, Source: "embedded"}},
 				Intro:       &catalogpkg.Marker{Start: 0, End: 90},
 			}},
-			PlaybackVariants: []catalogpkg.PlaybackVariant{{VariantID: "v1", PartCount: 1, DefaultFileID: 42, Parts: []catalogpkg.PlaybackVariantPart{{PartIndex: 0, DefaultFileID: 42}}}},
+			PlaybackVariants: []catalogpkg.PlaybackVariant{{VariantID: "v1", PartCount: 1, DefaultFileID: 42, VirtualRanking: ranking, Parts: []catalogpkg.PlaybackVariantPart{{PartIndex: 0, DefaultFileID: 42}}}},
 			Subtitles:        []catalogpkg.SubtitleInfo{{Source: "embedded", Language: "eng"}},
 			Credits:          &catalogpkg.Marker{Start: 10000, End: 10200},
 		}
@@ -106,6 +115,23 @@ func TestGetWatchState(t *testing.T) {
 	}
 	if variant := body["playback_variants"].([]any)[0].(map[string]any); variant["default_file_id"] != "42" || variant["parts"].([]any)[0].(map[string]any)["versions"] == nil {
 		t.Fatalf("variant = %v", variant)
+	}
+	// The virtual ranking is projected at the item level and on the variant,
+	// with the profile label and the ordered criteria.
+	ranking, ok := body["virtual_ranking"].(map[string]any)
+	if !ok {
+		t.Fatalf("virtual_ranking missing: %s", rec.Body.String())
+	}
+	if ranking["profile_label"] != "4K HDR" || ranking["source"] != "profile" {
+		t.Fatalf("item virtual_ranking = %v", ranking)
+	}
+	criteria := ranking["criteria"].([]any)
+	if len(criteria) != 2 || criteria[0].(map[string]any)["attribute"] != "score" || criteria[0].(map[string]any)["direction"] != "desc" {
+		t.Fatalf("item virtual_ranking criteria = %v", criteria)
+	}
+	variantRanking := body["playback_variants"].([]any)[0].(map[string]any)["virtual_ranking"].(map[string]any)
+	if variantRanking["profile_label"] != "4K HDR" {
+		t.Fatalf("variant virtual_ranking = %v", variantRanking)
 	}
 	if ud := body["user_data"].(map[string]any); ud["last_file_id"] != "3" || ud["position_seconds"].(float64) != 1325.5 || ud["played"] != false {
 		t.Fatalf("user_data = %v", ud)
@@ -200,5 +226,41 @@ func TestGetWatchStatePreservesDevicePreferenceContext(t *testing.T) {
 		if filter.DeviceID != tc.want {
 			t.Fatalf("device context = %q, want %q", filter.DeviceID, tc.want)
 		}
+	}
+}
+
+// TestWatchVirtualRankingMapping pins the wire projection directly: a
+// profile-derived ranking carries the label and its criteria, the built-in
+// default carries no label but the default keys, and local content (nil)
+// omits the object entirely.
+func TestWatchVirtualRankingMapping(t *testing.T) {
+	profile := watchVirtualRankingOf(&catalogpkg.VirtualRanking{
+		ProfileLabel: "4K HDR",
+		Source:       catalogpkg.VirtualRankingSourceProfile,
+		Criteria: []catalogpkg.VirtualRankingCriterion{
+			{Attribute: "score", Direction: "desc"},
+			{Attribute: "resolution", Direction: "desc"},
+		},
+	})
+	if profile == nil || profile.ProfileLabel != "4K HDR" || profile.Source != "profile" {
+		t.Fatalf("profile ranking = %+v", profile)
+	}
+	if len(profile.Criteria) != 2 || profile.Criteria[1].Attribute != "resolution" || profile.Criteria[1].Direction != "desc" {
+		t.Fatalf("profile criteria = %+v", profile.Criteria)
+	}
+
+	defaultRanking := watchVirtualRankingOf(&catalogpkg.VirtualRanking{
+		Source:   catalogpkg.VirtualRankingSourceDefault,
+		Criteria: []catalogpkg.VirtualRankingCriterion{{Attribute: "score", Direction: "desc"}},
+	})
+	if defaultRanking == nil || defaultRanking.ProfileLabel != "" || defaultRanking.Source != "default" {
+		t.Fatalf("default ranking = %+v", defaultRanking)
+	}
+	if defaultRanking.Criteria == nil || len(defaultRanking.Criteria) != 1 {
+		t.Fatalf("default criteria = %+v", defaultRanking.Criteria)
+	}
+
+	if got := watchVirtualRankingOf(nil); got != nil {
+		t.Fatalf("nil ranking mapped to %+v, want nil", got)
 	}
 }

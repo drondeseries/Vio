@@ -80,6 +80,37 @@ type ChapterThumbnailQueuer interface {
 // provider miss, or an unscored candidate leaves the version without a score.
 type VirtualCandidateScoreSource func(ctx context.Context, contentID string, files []*models.MediaFile) map[int]int
 
+// VirtualRanking source values reported on the wire. A profile-scoped selector
+// names the profile that produced the order; the default is the built-in order
+// used when no profile applies.
+const (
+	VirtualRankingSourceProfile = "profile"
+	VirtualRankingSourceDefault = "default"
+)
+
+// VirtualRankingCriterion is one ordered ranking key behind a virtual listing.
+type VirtualRankingCriterion struct {
+	Attribute string
+	Direction string
+}
+
+// VirtualRanking describes the ranking that produced a virtual listing's
+// candidate order: the selected profile label (empty for the built-in default),
+// where the criteria came from, and the ordered keys. It is a read-only
+// projection of the ranking the resolver applied.
+type VirtualRanking struct {
+	ProfileLabel string
+	Source       string
+	Criteria     []VirtualRankingCriterion
+}
+
+// VirtualRankingSource returns the ranking that produced each virtual file's
+// listing, keyed by media-file ID. It is injected for the same reason as
+// VirtualCandidateScoreSource: the virtual library service imports catalog, so
+// the dependency cannot point the other way. A nil source, a local file, or a
+// file outside a virtual listing yields no entry.
+type VirtualRankingSource func(ctx context.Context, contentID string, files []*models.MediaFile) map[int]VirtualRanking
+
 // ImageResolver resolves image paths (potentially plugin-prefixed) to usable URLs.
 type ImageResolver interface {
 	// ResolveImageURL resolves a single image path. Plugin-prefixed paths (e.g.,
@@ -523,6 +554,9 @@ type PlaybackVariant struct {
 	TotalDuration        int                   `json:"total_duration,omitempty"`
 	DefaultFileID        int                   `json:"default_file_id,omitempty"`
 	Parts                []PlaybackVariantPart `json:"parts"`
+	// VirtualRanking is the ranking that produced this variant's version
+	// order. Absent for local content and when no ranking source is wired.
+	VirtualRanking *VirtualRanking `json:"virtual_ranking,omitempty"`
 }
 
 // PlaybackVariantPart contains the interchangeable versions for one ordered part.
@@ -608,6 +642,7 @@ type WatchDetail struct {
 	HasEffectiveShowForcedSubtitles bool                              `json:"-"`
 	Versions                        []FileVersion                     `json:"versions"`
 	PlaybackVariants                []PlaybackVariant                 `json:"playback_variants,omitempty"`
+	VirtualRanking                  *VirtualRanking                   `json:"virtual_ranking,omitempty"`
 	Subtitles                       []SubtitleInfo                    `json:"subtitles"`
 	Intro                           *Marker                           `json:"intro,omitempty"`
 	Credits                         *Marker                           `json:"credits,omitempty"`
@@ -742,6 +777,9 @@ type DetailService struct {
 	// virtualScoreSource computes the custom-format score per virtual candidate
 	// file. Nil disables scoring; see SetVirtualCandidateScoreSource.
 	virtualScoreSource VirtualCandidateScoreSource
+	// virtualRankingSource exposes the ranking that produced each virtual
+	// listing. Nil disables the projection; see SetVirtualRankingSource.
+	virtualRankingSource VirtualRankingSource
 
 	// watchPrepareMu guards watchPrepared, the per-content memo that keeps a
 	// repeated watch-detail fetch of unchanged files from re-running the
@@ -825,6 +863,13 @@ func (s *DetailService) SetFolderRepository(repo interface {
 // simply carries no score.
 func (s *DetailService) SetVirtualCandidateScoreSource(source VirtualCandidateScoreSource) {
 	s.virtualScoreSource = source
+}
+
+// SetVirtualRankingSource wires the virtual ranking shown on a watch response
+// (item level and per playback variant). It is optional; without it no ranking
+// is projected.
+func (s *DetailService) SetVirtualRankingSource(source VirtualRankingSource) {
+	s.virtualRankingSource = source
 }
 
 // SetRootClaimRepository wires in the root claim repo for series folder path lookups.
@@ -3130,7 +3175,7 @@ func (s *DetailService) newWatchDetail(
 		audioPreferenceContentID,
 	)
 	s.attachVirtualCandidateScores(ctx, contentID, versions, files)
-	return &WatchDetail{
+	detail := &WatchDetail{
 		ContentID:        contentID,
 		Type:             contentType,
 		Title:            title,
@@ -3143,6 +3188,8 @@ func (s *DetailService) newWatchDetail(
 		Recap:            recap,
 		Preview:          preview,
 	}
+	s.attachVirtualRanking(ctx, contentID, detail, files)
+	return detail
 }
 
 // attachVirtualCandidateScores stamps each virtual candidate version with the
@@ -3167,6 +3214,50 @@ func (s *DetailService) attachVirtualCandidateScores(
 			versions[i].FormatScore = intPtr(score)
 		}
 	}
+}
+
+// attachVirtualRanking stamps the ranking that produced the item's virtual
+// version order on the detail and on each playback variant, keyed by the
+// versions' media-file IDs. Local content and an unwired source leave both
+// absent, matching the omitempty wire contract.
+func (s *DetailService) attachVirtualRanking(
+	ctx context.Context,
+	contentID string,
+	detail *WatchDetail,
+	files []*models.MediaFile,
+) {
+	if s.virtualRankingSource == nil || detail == nil || len(detail.Versions) == 0 {
+		return
+	}
+	rankings := s.virtualRankingSource(ctx, contentID, files)
+	if len(rankings) == 0 {
+		return
+	}
+	if ranking, ok := virtualRankingForVersions(rankings, detail.Versions); ok {
+		detail.VirtualRanking = ranking
+	}
+	for i := range detail.PlaybackVariants {
+		for p := range detail.PlaybackVariants[i].Parts {
+			ranking, ok := virtualRankingForVersions(rankings, detail.PlaybackVariants[i].Parts[p].Versions)
+			if !ok {
+				continue
+			}
+			detail.PlaybackVariants[i].VirtualRanking = ranking
+			break
+		}
+	}
+}
+
+// virtualRankingForVersions returns the ranking of the first version that has
+// one. Versions of one listing share a ranking, so the first is representative.
+func virtualRankingForVersions(rankings map[int]VirtualRanking, versions []FileVersion) (*VirtualRanking, bool) {
+	for i := range versions {
+		if ranking, ok := rankings[versions[i].FileID]; ok {
+			out := ranking
+			return &out, true
+		}
+	}
+	return nil, false
 }
 
 // effectiveSubtitleDefaults resolves the subtitle preferences that apply to one
