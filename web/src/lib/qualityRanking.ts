@@ -18,6 +18,79 @@ export const VERSION_SORT_ATTRIBUTES = [
   "score",
 ] as const satisfies readonly SortAttribute[];
 
+/** A one-tap named ordering for the version list. */
+export interface VersionSortPreset {
+  id: string;
+  label: string;
+  /** Tooltip/secondary copy; also what the report explains. */
+  description: string;
+  /**
+   * The criteria this preset applies. Empty means "no override": the list keeps
+   * the server/profile ranking (the reset affordance).
+   */
+  criteria: SortCriterion[];
+}
+
+/**
+ * The presets shown in the version-list header. They cover the choices a
+ * viewer actually makes (best quality, largest file, highest bitrate) without
+ * exposing the full attribute editor; "Custom…" in the control reveals that
+ * editor for anyone who wants to fine-tune.
+ */
+export const VERSION_SORT_PRESETS: readonly VersionSortPreset[] = [
+  {
+    id: "profile",
+    label: "Profile default",
+    description: "Use the selected profile's order",
+    criteria: [],
+  },
+  {
+    id: "quality",
+    label: "Quality first",
+    description: "Format score, then resolution, then size",
+    criteria: [
+      { attribute: "score", direction: "desc" },
+      { attribute: "resolution", direction: "desc" },
+      { attribute: "size", direction: "desc" },
+    ],
+  },
+  {
+    id: "biggest",
+    label: "Biggest first",
+    description: "Largest file, then highest bitrate",
+    criteria: [
+      { attribute: "size", direction: "desc" },
+      { attribute: "bitrate", direction: "desc" },
+    ],
+  },
+  {
+    id: "bitrate",
+    label: "Bitrate first",
+    description: "Highest bitrate, then largest file",
+    criteria: [
+      { attribute: "bitrate", direction: "desc" },
+      { attribute: "size", direction: "desc" },
+    ],
+  },
+];
+
+function criteriaKey(criteria: readonly SortCriterion[]): string {
+  return criteria.map((criterion) => `${criterion.attribute}:${criterion.direction}`).join("|");
+}
+
+/**
+ * Which preset a stored order corresponds to, or "custom" when it matches none
+ * (including a stored order equal to the profile default, which is "profile").
+ */
+export function matchVersionSortPreset(criteria: readonly SortCriterion[]): string {
+  if (criteria.length === 0) return "profile";
+  const wanted = criteriaKey(criteria);
+  const match = VERSION_SORT_PRESETS.find(
+    (preset) => preset.criteria.length > 0 && criteriaKey(preset.criteria) === wanted,
+  );
+  return match?.id ?? "custom";
+}
+
 /** The server's ranking for a version list, as the payload describes it. */
 export interface ServerVersionRanking {
   /** The quality-profile label the server ranked under, when it names one. */

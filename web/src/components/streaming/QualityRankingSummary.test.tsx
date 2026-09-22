@@ -1,25 +1,9 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { ServerVersionRanking } from "@/lib/qualityRanking";
+import { VERSION_SORT_PRESETS, type ServerVersionRanking } from "@/lib/qualityRanking";
 import { QualityRankingSummary } from "./QualityRankingSummary";
-
-// Radix Popover reads element sizes via ResizeObserver and opens through
-// pointer capture, neither of which jsdom implements.
-class ResizeObserverStub {
-  observe() {}
-  unobserve() {}
-  disconnect() {}
-}
-if (typeof globalThis.ResizeObserver === "undefined") {
-  (globalThis as unknown as { ResizeObserver: typeof ResizeObserverStub }).ResizeObserver =
-    ResizeObserverStub;
-}
-if (typeof window !== "undefined" && !window.HTMLElement.prototype.hasPointerCapture) {
-  window.HTMLElement.prototype.hasPointerCapture = () => false;
-  window.HTMLElement.prototype.scrollIntoView = () => {};
-}
 
 const serverRanking: ServerVersionRanking = {
   profileLabel: "4K+HDR",
@@ -44,26 +28,104 @@ function renderControl(overrides: Partial<Parameters<typeof QualityRankingSummar
   return { onApply, onReset };
 }
 
-function openPopover() {
-  fireEvent.click(screen.getByRole("button", { name: "Version ranking" }));
+function presetCriteria(id: string) {
+  return VERSION_SORT_PRESETS.find((preset) => preset.id === id)?.criteria ?? [];
 }
 
-describe("QualityRankingSummary control", () => {
-  it("shows the server ranking by default", () => {
+describe("QualityRankingSummary presets", () => {
+  it("renders the presets with the profile default highlighted and no popover", () => {
     renderControl();
 
-    const trigger = screen.getByRole("button", { name: "Version ranking" });
-    expect(trigger).toHaveTextContent("Ranking: Default ranking");
-    expect(trigger).toHaveTextContent("4K+HDR");
-  });
-
-  it("opens a popover that lists only the payload-supported attributes", () => {
-    renderControl();
-    openPopover();
-
+    const group = screen.getByRole("group", { name: "Version order" });
+    expect(within(group).getByRole("button", { name: "Profile default" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    for (const label of ["Quality first", "Biggest first", "Bitrate first", "Custom…"]) {
+      expect(within(group).getByRole("button", { name: label })).toBeInTheDocument();
+    }
+    expect(screen.getByText(/Ranking: Default ranking/)).toBeInTheDocument();
+    expect(screen.getByText(/4K\+HDR/)).toBeInTheDocument();
     expect(
       screen.getByText("Applies to this list only — playback selection is unchanged."),
     ).toBeInTheDocument();
+    // The access is inline; no blocky popup.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("renders the same controls in the player's dark tone", () => {
+    renderControl({ tone: "dark" });
+
+    expect(screen.getByRole("group", { name: "Version order" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Profile default" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(
+      screen.getByText("Applies to this list only — playback selection is unchanged."),
+    ).toBeInTheDocument();
+  });
+
+  it("applies a named preset in one tap", () => {
+    const { onApply } = renderControl();
+
+    fireEvent.click(screen.getByRole("button", { name: "Biggest first" }));
+
+    expect(onApply).toHaveBeenCalledWith([
+      { attribute: "size", direction: "desc" },
+      { attribute: "bitrate", direction: "desc" },
+    ]);
+  });
+
+  it("keeps the profile default as the reset affordance", () => {
+    const criteria = presetCriteria("biggest");
+    const { onReset } = renderControl({ userCriteria: criteria, effectiveCriteria: criteria });
+
+    fireEvent.click(screen.getByRole("button", { name: "Profile default" }));
+
+    expect(onReset).toHaveBeenCalledTimes(1);
+  });
+
+  it("highlights the preset a stored order matches", () => {
+    const quality = presetCriteria("quality");
+    renderControl({ userCriteria: quality, effectiveCriteria: quality });
+
+    expect(screen.getByRole("button", { name: "Quality first" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "Profile default" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: "Custom…" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("marks a non-preset order as Custom and reveals the fine-tuner inline", () => {
+    const criteria = [{ attribute: "hdr" as const, direction: "asc" as const }];
+    renderControl({ userCriteria: criteria, effectiveCriteria: criteria });
+
+    const custom = screen.getByRole("button", { name: "Custom…" });
+    expect(custom).toHaveAttribute("aria-pressed", "true");
+    expect(custom).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(custom);
+    expect(screen.getByRole("button", { name: "Custom…" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});
+
+describe("QualityRankingSummary custom fine-tuner", () => {
+  it("lists only the payload-supported attributes", () => {
+    renderControl();
+    fireEvent.click(screen.getByRole("button", { name: "Custom…" }));
+
     for (const label of [
       "File Size",
       "Bitrate",
@@ -75,43 +137,37 @@ describe("QualityRankingSummary control", () => {
     ]) {
       expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
-    // Internal ranking signals are not offered.
     for (const excluded of ["Source", "Language", "Confirmed Source"]) {
       expect(screen.queryByRole("button", { name: excluded })).not.toBeInTheDocument();
     }
   });
 
-  it("applies an attribute as the sort criterion when picked", () => {
+  it("appends a picked attribute as a descending criterion", () => {
     const { onApply } = renderControl();
-    openPopover();
+    fireEvent.click(screen.getByRole("button", { name: "Custom…" }));
 
     fireEvent.click(screen.getByRole("button", { name: "File Size" }));
-    expect(onApply).toHaveBeenCalledWith([{ attribute: "size", direction: "desc" }]);
+
+    expect(onApply).toHaveBeenLastCalledWith([{ attribute: "size", direction: "desc" }]);
   });
 
   it("toggles the direction of an active criterion", () => {
     const criteria = [{ attribute: "size" as const, direction: "desc" as const }];
-    const { onApply } = renderControl({ effectiveCriteria: criteria, userCriteria: criteria });
-    openPopover();
+    const { onApply } = renderControl({ userCriteria: criteria, effectiveCriteria: criteria });
+    fireEvent.click(screen.getByRole("button", { name: "Custom…" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Direction for File Size" }));
-    expect(onApply).toHaveBeenCalledWith([{ attribute: "size", direction: "asc" }]);
+
+    expect(onApply).toHaveBeenLastCalledWith([{ attribute: "size", direction: "asc" }]);
   });
 
-  it("marks a user override and resets it back to the profile default", () => {
-    const criteria = [{ attribute: "size" as const, direction: "desc" as const }];
-    const { onReset } = renderControl({ effectiveCriteria: criteria, userCriteria: criteria });
+  it("resets from inside the fine-tuner when a custom order is active", () => {
+    const criteria = [{ attribute: "hdr" as const, direction: "asc" as const }];
+    const { onReset } = renderControl({ userCriteria: criteria, effectiveCriteria: criteria });
+    fireEvent.click(screen.getByRole("button", { name: "Custom…" }));
 
-    expect(screen.getByRole("button", { name: "Version ranking" })).toHaveTextContent("Custom");
-    openPopover();
     fireEvent.click(screen.getByRole("button", { name: "Reset to profile default" }));
+
     expect(onReset).toHaveBeenCalledTimes(1);
-  });
-
-  it("disables reset when there is no override", () => {
-    renderControl();
-    openPopover();
-
-    expect(screen.getByRole("button", { name: "Reset to profile default" })).toBeDisabled();
   });
 });

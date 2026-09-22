@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import { serverRankingFromVersions } from "@/pages/ItemDetail/components/versionFormatUtils";
 import {
+  matchVersionSortPreset,
   sortVersionsByCriteria,
   VERSION_SORT_ATTRIBUTES,
+  VERSION_SORT_PRESETS,
   versionSortableFromFile,
   type VersionSortSource,
 } from "./qualityRanking";
@@ -36,6 +38,36 @@ describe("VERSION_SORT_ATTRIBUTES", () => {
     expect(VERSION_SORT_ATTRIBUTES).not.toContain("source");
     expect(VERSION_SORT_ATTRIBUTES).not.toContain("language");
     expect(VERSION_SORT_ATTRIBUTES).not.toContain("confirmed");
+  });
+});
+
+describe("VERSION_SORT_PRESETS", () => {
+  it("offers the named presets plus the profile-default reset", () => {
+    expect(VERSION_SORT_PRESETS.map((preset) => preset.id)).toEqual([
+      "profile",
+      "quality",
+      "biggest",
+      "bitrate",
+    ]);
+    // The profile default is the reset: no override.
+    expect(VERSION_SORT_PRESETS.find((preset) => preset.id === "profile")?.criteria).toEqual([]);
+    // Every preset only uses offered attributes.
+    for (const preset of VERSION_SORT_PRESETS) {
+      for (const criterion of preset.criteria) {
+        expect(VERSION_SORT_ATTRIBUTES).toContain(criterion.attribute);
+      }
+    }
+  });
+
+  it("matches a stored order to its preset, or Custom", () => {
+    expect(matchVersionSortPreset([])).toBe("profile");
+    expect(
+      matchVersionSortPreset([
+        { attribute: "size", direction: "desc" },
+        { attribute: "bitrate", direction: "desc" },
+      ]),
+    ).toBe("biggest");
+    expect(matchVersionSortPreset([{ attribute: "hdr", direction: "asc" }])).toBe("custom");
   });
 });
 
