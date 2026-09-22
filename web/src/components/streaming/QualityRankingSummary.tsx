@@ -1,69 +1,131 @@
-import { useMemo } from "react";
+import { ChevronDown } from "lucide-react";
 
-import { useAdminServerSettings } from "@/hooks/queries/admin/settings";
-import { useOptionalAuth } from "@/hooks/useAuth";
-import { isActingAdmin } from "@/lib/permissions";
-import { resolveProfileSortCriteria } from "@/lib/qualityRanking";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { VERSION_SORT_ATTRIBUTES, type ServerVersionRanking } from "@/lib/qualityRanking";
 import { cn } from "@/lib/utils";
 
-import { formatSortCriteriaSummary, type SortCriterion } from "./scoringPresets";
+import {
+  formatSortCriteriaSummary,
+  SORT_ATTRIBUTE_LABELS,
+  SORT_DIRECTION_SYMBOLS,
+  type SortAttribute,
+  type SortCriterion,
+} from "./scoringPresets";
 
 interface QualityRankingSummaryProps {
-  /** The `?profile=` label the ranked candidates carry, when there is one. */
-  profileLabel?: string | null;
+  /** The server/profile ranking shown when the viewer has no override. */
+  serverRanking: ServerVersionRanking;
+  /** The viewer's override; empty means "use the server ranking". */
+  userCriteria: SortCriterion[];
+  /** `userCriteria` when set, otherwise the server criteria — what the menu applies. */
+  effectiveCriteria: SortCriterion[];
+  onApply: (criteria: SortCriterion[]) => void;
+  onReset: () => void;
   className?: string;
-}
-
-function RankingLine({
-  criteria,
-  profileLabel,
-  className,
-}: {
-  criteria: SortCriterion[];
-  profileLabel?: string | null;
-  className?: string;
-}) {
-  const summary = formatSortCriteriaSummary(criteria);
-  return (
-    <p
-      className={cn("text-muted-foreground text-[11px]", className)}
-      title={profileLabel ? `Quality profile: ${profileLabel}` : undefined}
-    >
-      Ranking: {summary || "Default ranking"}
-      {profileLabel ? <span className="opacity-70"> · {profileLabel}</span> : null}
-    </p>
-  );
-}
-
-function AdminRankingSummary({
-  profileLabel,
-  className,
-}: {
-  profileLabel?: string | null;
-  className?: string;
-}) {
-  const { data: settings } = useAdminServerSettings();
-  const criteria = useMemo(
-    () => resolveProfileSortCriteria(settings, profileLabel),
-    [settings, profileLabel],
-  );
-  return <RankingLine criteria={criteria} profileLabel={profileLabel} className={className} />;
 }
 
 /**
- * One-line indicator of the ordering currently in effect for a version list,
- * derived from the active quality profile's sort criteria. The profile JSON is
- * only readable by an admin account, so a non-admin (or a title with no
- * `?profile=` selector) shows the default-order hint rather than a guessed
- * order.
+ * The "Ranking: …" line, now an interactive control. It shows the ordering in
+ * effect for the version list and opens a small popover of the attributes the
+ * delivered payload can sort by. This is display-only: it re-orders the list
+ * the viewer sees and never changes what plays automatically.
  */
-export function QualityRankingSummary({ profileLabel, className }: QualityRankingSummaryProps) {
-  // Read the auth context directly (not useIsActingAdmin) so this can render
-  // with no providers — the player and picker tests mount it bare — and so the
-  // admin-settings query is never issued for a non-admin.
-  const auth = useOptionalAuth();
-  if (!isActingAdmin(auth?.user, auth?.profile)) {
-    return <RankingLine criteria={[]} profileLabel={profileLabel} className={className} />;
-  }
-  return <AdminRankingSummary profileLabel={profileLabel} className={className} />;
+export function QualityRankingSummary({
+  serverRanking,
+  userCriteria,
+  effectiveCriteria,
+  onApply,
+  onReset,
+  className,
+}: QualityRankingSummaryProps) {
+  const summary = formatSortCriteriaSummary(effectiveCriteria);
+  const custom = userCriteria.length > 0;
+
+  const toggleAttribute = (attribute: SortAttribute) => {
+    const active = effectiveCriteria.some((criterion) => criterion.attribute === attribute);
+    const next = effectiveCriteria.filter((criterion) => criterion.attribute !== attribute);
+    if (!active) next.push({ attribute, direction: "desc" });
+    onApply(next);
+  };
+
+  const toggleDirection = (attribute: SortAttribute) => {
+    onApply(
+      effectiveCriteria.map((criterion) =>
+        criterion.attribute === attribute
+          ? { ...criterion, direction: criterion.direction === "desc" ? "asc" : "desc" }
+          : criterion,
+      ),
+    );
+  };
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label="Version ranking"
+          className={cn(
+            "text-muted-foreground hover:text-foreground flex w-full items-center gap-1 text-left text-[11px]",
+            className,
+          )}
+        >
+          <span className="truncate">
+            Ranking: {summary || "Default ranking"}
+            {serverRanking.profileLabel ? (
+              <span className="opacity-70"> · {serverRanking.profileLabel}</span>
+            ) : null}
+            {custom ? <span className="opacity-70"> · Custom</span> : null}
+          </span>
+          <ChevronDown className="size-3 shrink-0 opacity-60" aria-hidden="true" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-72 p-3">
+        <p className="text-muted-foreground text-[11px]">
+          Applies to this list only — playback selection is unchanged.
+        </p>
+        <div className="mt-2 space-y-1">
+          {VERSION_SORT_ATTRIBUTES.map((attribute) => {
+            const active = effectiveCriteria.find((criterion) => criterion.attribute === attribute);
+            return (
+              <div key={attribute} className="flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  aria-pressed={Boolean(active)}
+                  onClick={() => toggleAttribute(attribute)}
+                  className={cn(
+                    "flex-1 rounded px-2 py-1 text-left text-xs",
+                    active
+                      ? "bg-accent text-accent-foreground font-medium"
+                      : "text-muted-foreground hover:bg-accent/50",
+                  )}
+                >
+                  {SORT_ATTRIBUTE_LABELS[attribute]}
+                </button>
+                {active ? (
+                  <button
+                    type="button"
+                    onClick={() => toggleDirection(attribute)}
+                    aria-label={`Direction for ${SORT_ATTRIBUTE_LABELS[attribute]}`}
+                    className="hover:bg-accent flex size-6 items-center justify-center rounded text-xs"
+                  >
+                    {SORT_DIRECTION_SYMBOLS[active.direction]}
+                  </button>
+                ) : (
+                  <span className="text-muted-foreground/40 w-6 text-center text-xs">·</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={onReset}
+          disabled={!custom}
+          className="text-muted-foreground hover:text-foreground mt-2 w-full rounded px-2 py-1 text-left text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Reset to profile default
+        </button>
+      </PopoverContent>
+    </Popover>
+  );
 }

@@ -95,6 +95,7 @@ import {
   stopWatchTogetherPlayback,
   setWatchTogetherGuestControl,
 } from "@/lib/watchTogetherActions";
+import { versionSortableFromFile } from "@/lib/qualityRanking";
 import { videoRangeLabel } from "@/lib/videoRange";
 import {
   collectLanguageLabels,
@@ -744,6 +745,9 @@ export function VideoPlayer({
             (v.subtitle_tracks ?? []).map((track) => track.language ?? ""),
           ),
           profileLabel: profileLabelFromFilePath(v.file_path),
+          filePath: v.file_path,
+          virtualRanking: (v as { virtual_ranking?: unknown }).virtual_ranking,
+          sortable: versionSortableFromFile(v),
           formatScore: v.format_score,
           isCurrentSource: v.file_id === effectiveFileId,
           isRequestedSource:

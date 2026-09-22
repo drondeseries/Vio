@@ -6,10 +6,16 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { QualityRankingSummary } from "@/components/streaming/QualityRankingSummary";
 import { useVersionListRefresh } from "@/hooks/useVersionListRefresh";
+import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
+import { sortVersionsByCriteria, versionSortableFromFile } from "@/lib/qualityRanking";
 import { videoRangeLabel } from "@/lib/videoRange";
 import DetailPopover from "./DetailPopover";
 import { sortPlaybackVariantsByEditionPreference } from "./versionRankingUtils";
-import { collectLanguageLabels, profileLabelFromFilePath } from "./versionFormatUtils";
+import {
+  collectLanguageLabels,
+  profileLabelFromFilePath,
+  serverRankingFromVersions,
+} from "./versionFormatUtils";
 import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
 import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
 
@@ -81,18 +87,19 @@ function VersionDropdown({
     selectedVersion ?? selectedEdition?.defaultVersion ?? activeVersions[0] ?? null;
   const showVersionDropdown = activeVersions.length > 1;
 
-  const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
-    activeVersions,
-    activeVersion?.file_id,
+  // The viewer's per-profile display order. It only re-orders the list below;
+  // the server's auto-pick is untouched.
+  const { criteria: userCriteria, apply: applySort, reset: resetSort } = useVersionSortPreference();
+  const serverRanking = useMemo(() => serverRankingFromVersions(activeVersions), [activeVersions]);
+  const effectiveCriteria = userCriteria.length > 0 ? userCriteria : serverRanking.criteria;
+  const orderedVersions = useMemo(
+    () => sortVersionsByCriteria(activeVersions, effectiveCriteria, versionSortableFromFile),
+    [activeVersions, effectiveCriteria],
   );
 
-  // The profile the ranked candidates carry, so the ordering indicator names
-  // the same profile the server scored under.
-  const rankingProfileLabel = useMemo(
-    () =>
-      profileLabelFromFilePath(activeVersion?.file_path) ??
-      profileLabelFromFilePath(activeVersions[0]?.file_path),
-    [activeVersion, activeVersions],
+  const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
+    orderedVersions,
+    activeVersion?.file_id,
   );
 
   if (!showEditionDropdown && !showVersionDropdown) {
@@ -171,7 +178,11 @@ function VersionDropdown({
         >
           <div className="space-y-0.5">
             <QualityRankingSummary
-              profileLabel={rankingProfileLabel}
+              serverRanking={serverRanking}
+              userCriteria={userCriteria}
+              effectiveCriteria={effectiveCriteria}
+              onApply={applySort}
+              onReset={resetSort}
               className="px-3 pt-1.5 pb-0.5"
             />
             {visibleVersions.map((version) => {
