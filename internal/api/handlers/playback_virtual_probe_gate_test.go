@@ -240,8 +240,10 @@ func TestVirtualFileMetadataUpdatePersistsProbeStamp(t *testing.T) {
 	}
 	// Path adoption must be refused on collection-owned rows. IS DISTINCT FROM
 	// makes rows with a NULL probe_source (never stamped) adopt like any other
-	// non-collection source instead of the guard evaluating to NULL.
-	if !strings.Contains(sql, "WHEN $18 != '' AND probe_source IS DISTINCT FROM 'virtual_collection'") {
+	// non-collection source instead of the guard evaluating to NULL. The only
+	// exception is the explicit collection-variant reconcile verdict ($32),
+	// which a caller sets only after proving the pinned release vanished.
+	if !strings.Contains(sql, "WHEN $18 != '' AND (probe_source IS DISTINCT FROM 'virtual_collection' OR $32::boolean)") {
 		t.Fatalf("metadata update does not guard path adoption: %s", sql)
 	}
 	// Adoption must also be refused when a sibling row (same virtual owner and
