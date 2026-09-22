@@ -57,7 +57,7 @@ type copySeekAnchor struct {
 
 // ErrTransientProvider marks an ffmpeg failure whose cause is the upstream
 // provider answering an HTTP 5xx, as opposed to the source bytes being
-// undecodable or the request being cancelled. Callers retry it with a bounded
+// undecodable or the request being canceled. Callers retry it with a bounded
 // backoff instead of treating the candidate as dead or hammering the provider.
 var ErrTransientProvider = errors.New("transient provider error")
 
