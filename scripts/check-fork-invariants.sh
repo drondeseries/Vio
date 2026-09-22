@@ -98,13 +98,19 @@ grep -q 'frontend-dist-' .github/workflows/docker.yml \
   && pass "docker workflow deduplicated manual frontend builds" \
   || reject "docker workflow missing deduplicated manual frontend build artifact handoff"
 
-if [ -f .gitattributes ] && grep -q 'merge=ours' .gitattributes; then
-  driver="$(git config merge.ours.driver 2>/dev/null || true)"
-  if [ "$driver" = "true" ]; then
-    pass "git merge.ours.driver configured for .gitattributes"
-  else
-    reject "git merge.ours.driver not configured (run: make install-hooks)"
-  fi
+if grep -q '^\.github/workflows/docker\.yml merge=ours' .gitattributes 2>/dev/null; then
+  pass "docker.yml merge=ours preserved in .gitattributes"
+else
+  reject "docker.yml merge=ours entry missing from .gitattributes"
+fi
+# The merge driver itself is per-clone setup (see `make install-hooks`), not
+# committed content: fresh CI checkouts never have it. Report, don't fail —
+# verification must stay read-only and green on a clean clone.
+driver="$(git config merge.ours.driver 2>/dev/null || true)"
+if [ "$driver" = "true" ]; then
+  pass "git merge.ours.driver configured for .gitattributes"
+else
+  echo "warn  - git merge.ours.driver not configured (run: make install-hooks)"
 fi
 
 if [ "$fail" -ne 0 ]; then
