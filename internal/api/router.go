@@ -1451,6 +1451,11 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// delivered on a retry therefore re-enters the auto-pick without
 			// waiting for a provider re-list.
 			playbackHandler.VirtualCandidateRecoveredMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateRecovered
+			// A successful same-identity re-resolve of a failed row clears the
+			// stale verdict through the same fenced clear the versions check
+			// uses, so the next replay is fast again instead of re-resolving on
+			// every start.
+			playbackHandler.VirtualCandidateClearFailedMarker = scanner.NewFileRepository(deps.DB).ClearVirtualCandidateFailed
 			playbackHandler.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
 				if deps.DB == nil {
 					return 0, nil
