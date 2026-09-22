@@ -3,6 +3,7 @@ package playback
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -52,6 +53,47 @@ var (
 type copySeekAnchor struct {
 	seconds float64
 	segment int
+}
+
+// ErrTransientProvider marks an ffmpeg failure whose cause is the upstream
+// provider answering an HTTP 5xx, as opposed to the source bytes being
+// undecodable or the request being canceled. Callers retry it with a bounded
+// backoff instead of treating the candidate as dead or hammering the provider.
+var ErrTransientProvider = errors.New("transient provider error")
+
+// IsTransientProviderError reports whether err is (or wraps) a transient
+// provider failure, so a retry path can back off before re-probing the same
+// candidate.
+func IsTransientProviderError(err error) bool {
+	return errors.Is(err, ErrTransientProvider)
+}
+
+// upstream5xxMarkers are the ffmpeg stderr fragments that mean the upstream
+// answered 5xx. ffmpeg's HTTP protocol logs "Server returned 5XX Server Error
+// reply" (and the concrete 5xx codes) before "Error opening input file"; the
+// status-class phrase is the stable part. Only 5xx counts here: 4xx is a
+// configuration/authentication problem the provider will keep refusing, so a
+// retry would not help and it is left as an ordinary failure.
+var upstream5xxMarkers = []string{
+	"Server returned 5XX",
+	"Server returned 500",
+	"Server returned 501",
+	"Server returned 502",
+	"Server returned 503",
+	"Server returned 504",
+	"Server returned 505",
+}
+
+// transientProviderCause wraps the command error with ErrTransientProvider when
+// the probe's stderr tail names an upstream 5xx. The original error is kept so
+// the exit status and message still reach the caller.
+func transientProviderCause(err error, stderrTail string) error {
+	for _, marker := range upstream5xxMarkers {
+		if strings.Contains(stderrTail, marker) {
+			return fmt.Errorf("%w: %w", ErrTransientProvider, err)
+		}
+	}
+	return err
 }
 
 // anchorProbeRunner runs the FFmpeg observation that produces an anchor. It is
@@ -334,10 +376,15 @@ func resolveCopySeekAnchor(
 	cmd.Stdout = &stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
-		if tail := truncateStderr(stderr.String()); tail != "" {
-			return 0, 0, fmt.Errorf("resolve copy seek anchor: ffmpeg failed: %w (stderr: %s)", err, tail)
+		tail := truncateStderr(stderr.String())
+		// Classify the full tail, not the truncated message: an upstream 5xx is
+		// a transient provider failure a caller should back off and retry, while
+		// a decoder/stream error is not.
+		cause := transientProviderCause(err, stderr.String())
+		if tail != "" {
+			return 0, 0, fmt.Errorf("resolve copy seek anchor: ffmpeg failed: %w (stderr: %s)", cause, tail)
 		}
-		return 0, 0, fmt.Errorf("resolve copy seek anchor: ffmpeg failed: %w", err)
+		return 0, 0, fmt.Errorf("resolve copy seek anchor: ffmpeg failed: %w", cause)
 	}
 
 	timeBaseNumerator, timeBaseDenominator := int64(0), int64(0)

@@ -506,3 +506,38 @@ func TestResolveCopySeekAnchorSkipsProbeWhenCallerBudgetExpired(t *testing.T) {
 		t.Fatalf("probe calls = %d, want 0 with no caller budget", got)
 	}
 }
+
+// TestTransientProviderCauseClassifiesUpstream5xx pins the provider-error
+// classifier: an ffmpeg failure whose stderr names an upstream 5xx is a
+// transient provider error a caller should back off and retry, while a decoder
+// rejection or a 4xx configuration refusal is not. The underlying command error
+// stays in the chain.
+func TestTransientProviderCauseClassifiesUpstream5xx(t *testing.T) {
+	base := errors.New("exit status 8")
+	cases := []struct {
+		name string
+		tail string
+		want bool
+	}{
+		{
+			name: "server returned 5XX",
+			tail: "[http @ 0x1] HTTP error 500 Internal Server Error\n[http @ 0x1] Server returned 5XX Server Error reply",
+			want: true,
+		},
+		{name: "server returned 503", tail: "Server returned 503 Service Unavailable", want: true},
+		{name: "decoder rejection", tail: "Error submitting packet to decoder: Invalid data", want: false},
+		{name: "4xx is not transient", tail: "Server returned 404 Not Found", want: false},
+		{name: "empty tail", tail: "", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transientProviderCause(base, tc.tail)
+			if IsTransientProviderError(got) != tc.want {
+				t.Fatalf("IsTransientProviderError = %v, want %v (err %v)", IsTransientProviderError(got), tc.want, got)
+			}
+			if !errors.Is(got, base) {
+				t.Fatalf("classification dropped the underlying error: %v", got)
+			}
+		})
+	}
+}

@@ -59,6 +59,17 @@ const (
 	// a retry without this margin would spend the caller's last budget and fail
 	// with the caller deadline instead of the probe error.
 	copySeekProbeRetryMargin = 5 * time.Second
+	// copySeekAnchorTransientBackoff is the bounded pause before re-probing the
+	// same candidate after an upstream 5xx. The provider is already failing, so
+	// an immediate second probe hammers it; the pause is short enough to still
+	// fit a resumed session's seek budget.
+	copySeekAnchorTransientBackoff = 750 * time.Millisecond
+	// maxVirtualTransientTransportAlternates bounds how many compatible
+	// alternates one start may try after a transport failure whose cause is a
+	// transient provider error (upstream 5xx). A failing upstream should not be
+	// hammered once per alternate; one alternate keeps a chance to recover on a
+	// different release without churning the whole list.
+	maxVirtualTransientTransportAlternates = 1
 	// trackUnavailableReasonV3 is the transport reason for an audio remap miss:
 	// the candidate's audio inventory did not bind, not its video stream, so the
 	// client may pick another track without swapping the release.
@@ -2178,7 +2189,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// fold an audio reason back into the video transport reason.
 		if statusErr.reason == transcodeStartFailedReasonV3 && !audioOnlyTransportReasonV3(statusErr.reason) && isVirtualPlaybackFile(requestedFile) && req.FileSelection != playback.FileSelectionExplicitV3 {
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
-			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder); alternateErr == nil && len(alternates) > 0 {
+			// A transient provider (upstream 5xx) failure caps the alternates
+			// tried in this start so the failing upstream is not hammered once
+			// per alternate; a generic transport failure keeps the full list.
+			if alternates, alternateErr := h.virtualTransportAlternatesV3(r.Context(), requestedFile, alternateOrder, playback.IsTransientProviderError(statusErr.cause)); alternateErr == nil && len(alternates) > 0 {
 				for _, altCandidate := range alternates {
 					alternate, err := h.prepareVirtualAlternateFileV3(r, altCandidate, profileID)
 					if err != nil || alternate == nil {
@@ -3024,6 +3038,34 @@ func copySeekAnchorRetryFits(ctx context.Context) (bool, time.Duration) {
 	return remaining > playback.CopySeekProbeTimeout+copySeekProbeRetryMargin, remaining
 }
 
+// waitCopySeekAnchorBackoff pauses before re-probing a candidate after a
+// transient provider (upstream 5xx) failure. It returns false when the wait or
+// its result cannot fit the caller's remaining budget, so the retry is skipped
+// instead of started without time to finish. remaining is the value already
+// returned by copySeekAnchorRetryFits; 0 means the caller had no deadline.
+func (h *PlaybackHandler) waitCopySeekAnchorBackoff(ctx context.Context, remaining time.Duration) bool {
+	d := copySeekAnchorTransientBackoff
+	if remaining > 0 {
+		if room := remaining - (playback.CopySeekProbeTimeout + copySeekProbeRetryMargin); room < d {
+			d = room
+		}
+	}
+	if d <= 0 {
+		return false
+	}
+	if h != nil && h.copySeekAnchorBackoff != nil {
+		return h.copySeekAnchorBackoff(ctx, d)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3) (preparedTimelineV3, *transportErrorV3) {
 	if result.Plan == nil {
 		return preparedTimelineV3{}, nil
@@ -3085,13 +3127,18 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// rest of the budget and fail with the caller deadline instead of
 			// the probe error, so failing fast on the first probe error is both
 			// cheaper and clearer. A caller with no deadline keeps the retry.
+			//
+			// An upstream 5xx is a transient provider failure: it is retried the
+			// same way, but only after a short bounded backoff, so a provider
+			// that is already failing is not hammered by an immediate re-probe.
 			var err error
 			for attempt := 1; attempt <= 2; attempt++ {
 				origin, startSegment, err = probeAnchor(ctx)
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
 				}
-				if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
+				fits, remaining := copySeekAnchorRetryFits(ctx)
+				if !fits {
 					slog.WarnContext(ctx, "copy-video seek anchor retry skipped: insufficient remaining budget",
 						"component", "api",
 						"playback_session_id", session.ID,
@@ -3101,6 +3148,24 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 						"error", err,
 					)
 					break
+				}
+				if playback.IsTransientProviderError(err) {
+					if !h.waitCopySeekAnchorBackoff(ctx, remaining) {
+						slog.WarnContext(ctx, "copy-video seek anchor retry skipped: no budget for the provider backoff",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"error", err,
+						)
+						break
+					}
+					slog.WarnContext(ctx, "copy-video seek anchor failed once on a transient provider error; backing off before retry",
+						"component", "api",
+						"playback_session_id", session.ID,
+						"requested_seek_seconds", requested,
+						"error", err,
+					)
+					continue
 				}
 				slog.WarnContext(ctx, "copy-video seek anchor failed once; retrying",
 					"component", "api",
