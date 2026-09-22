@@ -60,7 +60,7 @@ describe("ActionBar watch together group", () => {
     const onStartParty = vi.fn();
     const onSuggest = vi.fn();
     const onPlay = vi.fn();
-    const view = render(
+    const view = renderWithProviders(
       <MemoryRouter>
         <ActionBar contentId="movie-1" watchTogether={{ onStartParty }} />
       </MemoryRouter>,
@@ -72,7 +72,7 @@ describe("ActionBar watch together group", () => {
     expect(screen.queryByRole("menuitem", { name: /Suggest to/ })).toBeNull();
     view.unmount();
 
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <ActionBar
           contentId="movie-1"
