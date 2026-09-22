@@ -102,10 +102,8 @@ if [ -f .gitattributes ] && grep -q 'merge=ours' .gitattributes; then
   driver="$(git config merge.ours.driver 2>/dev/null || true)"
   if [ "$driver" = "true" ]; then
     pass "git merge.ours.driver configured for .gitattributes"
-  elif git config merge.ours.driver true 2>/dev/null; then
-    pass "git merge.ours.driver configured for .gitattributes"
   else
-    reject "git merge.ours.driver not configured (run: git config merge.ours.driver true)"
+    reject "git merge.ours.driver not configured (run: make install-hooks)"
   fi
 fi
 
