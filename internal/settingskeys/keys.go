@@ -9,7 +9,7 @@
 package settingskeys
 
 // Revision is the manifest revision these bindings were generated from.
-const Revision = 9
+const Revision = 10
 
 // Setting keys, one constant per definition.
 const (
@@ -57,6 +57,8 @@ const (
 	PlaybackSubtitleLanguage = "playback.subtitle_language"
 	// Subtitles
 	PlaybackSubtitleMode = "playback.subtitle_mode"
+	// Version order
+	PlaybackVersionSort = "playback.version_sort"
 	// Audio sync offset
 	PlayerAudioSyncMs = "player.audio_sync_ms"
 	// Dolby Vision
@@ -157,6 +159,7 @@ var Remote = []string{
 	PlaybackSubtitleAppearance,
 	PlaybackSubtitleLanguage,
 	PlaybackSubtitleMode,
+	PlaybackVersionSort,
 	PlayerAudioSyncMs,
 	PlayerDolbyVisionEnabled,
 	PlayerDvProfile7Hdr10Fallback,

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silo-server.dev/contracts/settings/v1/schemas/version-sort.json",
+  "title": "Version sort order",
+  "description": "An ordered list of version-sort criteria. The server never evaluates this list; it is a viewer preference the watch payload's version list applies client-side, so the attribute set is limited to the fields that payload carries. An empty list and an absent value both mean no override: the version list keeps the ranking the selected quality profile already returns.",
+  "type": "array",
+  "maxItems": 16,
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["attribute", "direction"],
+    "properties": {
+      "attribute": {
+        "description": "Version attribute to sort by, in descending priority order. Only the attributes the watch payload exposes are allowed; server-only ranking keys such as source, confirmed and language are not accepted here.",
+        "enum": [
+          "size",
+          "bitrate",
+          "resolution",
+          "audio_channels",
+          "bit_depth",
+          "hdr",
+          "score"
+        ]
+      },
+      "direction": {
+        "description": "desc puts larger or better values first; asc puts smaller or worse values first.",
+        "enum": ["desc", "asc"]
+      }
+    }
+  }
+}
