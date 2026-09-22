@@ -40,6 +40,7 @@ type WatchDetail struct {
 	Overview                        string                  `json:"overview,omitempty"`
 	Versions                        []WatchFileVersion      `json:"versions" doc:"Every playable file of the item; empty, never null"`
 	PlaybackVariants                []WatchPlaybackVariant  `json:"playback_variants,omitempty" doc:"Logical watch choices, each spanning one or more ordered parts"`
+	VirtualRanking                  *WatchVirtualRanking    `json:"virtual_ranking,omitempty" doc:"The ranking that produced the virtual versions' order; absent for local content"`
 	Subtitles                       []WatchSubtitle         `json:"subtitles" doc:"Empty, never null"`
 	Intro                           *WatchMarker            `json:"intro,omitempty"`
 	Credits                         *WatchMarker            `json:"credits,omitempty"`
@@ -189,6 +190,21 @@ type WatchPlaybackVariant struct {
 	TotalDurationSeconds int                        `json:"total_duration_seconds,omitempty"`
 	DefaultFileID        ID                         `json:"default_file_id,omitempty"`
 	Parts                []WatchPlaybackVariantPart `json:"parts" doc:"Ordered; empty, never null"`
+	VirtualRanking       *WatchVirtualRanking       `json:"virtual_ranking,omitempty" doc:"The ranking that produced this variant's version order; absent for local content"`
+}
+
+// WatchVirtualRanking describes the ranking that produced a virtual item's
+// version order, so any viewer can see which profile and keys ordered it.
+type WatchVirtualRanking struct {
+	ProfileLabel string               `json:"profile_label,omitempty" doc:"The quality profile label that produced the ranking; absent for the built-in default order" example:"4K HDR"`
+	Source       string               `json:"source" enum:"profile,default" doc:"profile when a configured profile's selector drove the order, default for the built-in order"`
+	Criteria     []WatchSortCriterion `json:"criteria" doc:"Ordered ranking keys, top-down; empty, never null"`
+}
+
+// WatchSortCriterion is one ordered ranking key behind a virtual version list.
+type WatchSortCriterion struct {
+	Attribute string `json:"attribute" doc:"The candidate attribute the key orders" example:"score"`
+	Direction string `json:"direction" enum:"asc,desc" doc:"desc for a largest-first numeric key, asc for a best-first ordinal key" example:"desc"`
 }
 
 // WatchPlaybackVariantPart holds the interchangeable versions of one part.
@@ -348,6 +364,7 @@ func watchDetailOf(d *catalogpkg.WatchDetail) WatchDetail {
 		Overview:                   d.Overview,
 		Versions:                   watchVersionsOf(d.Versions),
 		PlaybackVariants:           watchVariantsOf(d.PlaybackVariants),
+		VirtualRanking:             watchVirtualRankingOf(d.VirtualRanking),
 		Subtitles:                  make([]WatchSubtitle, 0, len(d.Subtitles)),
 		Intro:                      watchMarkerOf(d.Intro),
 		Credits:                    watchMarkerOf(d.Credits),
@@ -465,6 +482,28 @@ func watchVariantsOf(vs []catalogpkg.PlaybackVariant) []WatchPlaybackVariant {
 			VariantID: v.VariantID, EditionRaw: v.EditionRaw, EditionKey: v.EditionKey, PresentationKind: v.PresentationKind,
 			PresentationGroupKey: v.PresentationGroupKey, PartCount: v.PartCount, TotalDurationSeconds: v.TotalDuration,
 			DefaultFileID: optionalIDOfInt(v.DefaultFileID), Parts: parts,
+			VirtualRanking: watchVirtualRankingOf(v.VirtualRanking),
+		})
+	}
+	return out
+}
+
+// watchVirtualRankingOf maps the catalog ranking projection onto the wire type.
+// A nil projection (local content, no ranking source) stays nil so the
+// virtual_ranking member is omitted.
+func watchVirtualRankingOf(r *catalogpkg.VirtualRanking) *WatchVirtualRanking {
+	if r == nil {
+		return nil
+	}
+	out := &WatchVirtualRanking{
+		ProfileLabel: r.ProfileLabel,
+		Source:       r.Source,
+		Criteria:     make([]WatchSortCriterion, 0, len(r.Criteria)),
+	}
+	for _, criterion := range r.Criteria {
+		out.Criteria = append(out.Criteria, WatchSortCriterion{
+			Attribute: criterion.Attribute,
+			Direction: criterion.Direction,
 		})
 	}
 	return out

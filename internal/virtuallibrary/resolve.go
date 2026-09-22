@@ -248,6 +248,39 @@ func (s *Service) qualityProfileForPath(virtualPath string) quality.QualityProfi
 	return quality.QualityProfile{}
 }
 
+// Ranking source values reported by RankingForPath.
+const (
+	VirtualRankingSourceProfile = "profile"
+	VirtualRankingSourceDefault = "default"
+)
+
+// VirtualRanking is the ranking the resolver applies to a virtual listing: the
+// quality profile selected by the path's ?profile= label (empty when none
+// applies) and the ordered sort criteria actually used. It is config-derived
+// and read-only: resolving it performs no provider or database work.
+type VirtualRanking struct {
+	ProfileLabel string
+	Source       string
+	Criteria     []quality.SortCriterion
+}
+
+// RankingForPath resolves the ranking for a virtual path. A path whose
+// ?profile= selector names a configured profile reports that profile's label
+// and its own sort criteria; otherwise it reports the built-in default order.
+// It is the read-only counterpart of the ranking applied during resolution.
+func (s *Service) RankingForPath(virtualPath string) VirtualRanking {
+	profile := s.qualityProfileForPath(virtualPath)
+	ranking := VirtualRanking{
+		Source:   VirtualRankingSourceDefault,
+		Criteria: quality.EffectiveSortCriteria(profile),
+	}
+	if label := strings.TrimSpace(profile.Label); label != "" {
+		ranking.ProfileLabel = label
+		ranking.Source = VirtualRankingSourceProfile
+	}
+	return ranking
+}
+
 // rankCandidatesForVirtualPath is the single ranking step shared by
 // ListStreams and ResolveDetailed. It scores custom formats, records the
 // rejected verdict on each candidate, and orders accepted before rejected,

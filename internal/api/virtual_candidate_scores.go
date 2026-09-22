@@ -8,6 +8,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
 )
 
 // virtualCandidateLister is the slice of *virtuallibrary.Service the score
@@ -64,6 +65,65 @@ func virtualCandidateScoreSource(service virtualCandidateLister) catalog.Virtual
 		}
 		return scores
 	}
+}
+
+// virtualRankingResolver is the slice of *virtuallibrary.Service the ranking
+// adapter uses. It resolves the ranking from configuration alone, so no
+// provider round-trip is needed.
+type virtualRankingResolver interface {
+	RankingForPath(virtualPath string) virtuallibrary.VirtualRanking
+}
+
+// virtualCandidateRankingSource adapts the virtual library's per-listing
+// ranking to the catalog's ranking port. A listing's ranking is derived from
+// the candidate URIs' profile selector, so every file of one listing shares it
+// and the projection stays profile-scoped per variant row. Local files and
+// non-virtual paths yield no entry.
+func virtualCandidateRankingSource(service virtualRankingResolver) catalog.VirtualRankingSource {
+	if service == nil {
+		return nil
+	}
+	return func(_ context.Context, _ string, files []*models.MediaFile) map[int]catalog.VirtualRanking {
+		ranked := make(map[int]catalog.VirtualRanking, len(files))
+		byListing := make(map[string]catalog.VirtualRanking)
+		for _, file := range files {
+			if file == nil || !strings.HasPrefix(file.FilePath, "virtual://") {
+				continue
+			}
+			neutral := virtualNeutralSourcePath([]*models.MediaFile{file})
+			if neutral == "" {
+				continue
+			}
+			ranking, ok := byListing[neutral]
+			if !ok {
+				view := service.RankingForPath(neutral)
+				ranking = catalog.VirtualRanking{
+					ProfileLabel: view.ProfileLabel,
+					Source:       view.Source,
+					Criteria:     virtualRankingCriteria(view.Criteria),
+				}
+				byListing[neutral] = ranking
+			}
+			ranked[file.ID] = ranking
+		}
+		if len(ranked) == 0 {
+			return nil
+		}
+		return ranked
+	}
+}
+
+// virtualRankingCriteria maps the virtual library's sort criteria to the
+// catalog's wire-neutral projection.
+func virtualRankingCriteria(criteria []quality.SortCriterion) []catalog.VirtualRankingCriterion {
+	out := make([]catalog.VirtualRankingCriterion, 0, len(criteria))
+	for _, criterion := range criteria {
+		out = append(out, catalog.VirtualRankingCriterion{
+			Attribute: criterion.Attribute,
+			Direction: criterion.Direction,
+		})
+	}
+	return out
 }
 
 // virtualNeutralSourcePath returns the shared virtual listing path of a

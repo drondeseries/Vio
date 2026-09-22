@@ -868,6 +868,17 @@ var defaultSortCriteria = []SortCriterion{
 	{Attribute: sortAttributeSize, Direction: sortDirectionDesc},
 }
 
+// EffectiveSortCriteria returns the ordered ranking keys a profile applies: its
+// own Sort when set, else the package's built-in default order. The result is a
+// copy the caller may retain; it is the read-only projection of
+// sortCandidatesForProfile's key list.
+func EffectiveSortCriteria(p QualityProfile) []SortCriterion {
+	if len(p.Sort) > 0 {
+		return append([]SortCriterion(nil), p.Sort...)
+	}
+	return append([]SortCriterion(nil), defaultSortCriteria...)
+}
+
 // sortAttributeDefaultDirection is the direction a criterion uses when it omits
 // one: descending for the numeric attributes (largest first), ascending for the
 // ordinal attributes (best rank first).

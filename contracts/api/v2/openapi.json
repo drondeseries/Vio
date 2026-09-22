@@ -39460,6 +39460,10 @@
             },
             "type": "array"
           },
+          "virtual_ranking": {
+            "$ref": "#/components/schemas/WatchVirtualRanking",
+            "description": "The ranking that produced the virtual versions' order; absent for local content"
+          },
           "year": {
             "examples": [
               1995
@@ -39712,6 +39716,10 @@
           },
           "variant_id": {
             "type": "string"
+          },
+          "virtual_ranking": {
+            "$ref": "#/components/schemas/WatchVirtualRanking",
+            "description": "The ranking that produced this variant's version order; absent for local content"
           }
         },
         "required": [
@@ -40322,6 +40330,34 @@
           "unplayed_count",
           "in_progress_count",
           "played"
+        ],
+        "type": "object"
+      },
+      "WatchSortCriterion": {
+        "additionalProperties": false,
+        "properties": {
+          "attribute": {
+            "description": "The candidate attribute the key orders",
+            "examples": [
+              "score"
+            ],
+            "type": "string"
+          },
+          "direction": {
+            "description": "desc for a largest-first numeric key, asc for a best-first ordinal key",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "examples": [
+              "desc"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "attribute",
+          "direction"
         ],
         "type": "object"
       },
@@ -42072,6 +42108,38 @@
           "dv_config_present",
           "dv_bl_compat_id_present",
           "interlaced"
+        ],
+        "type": "object"
+      },
+      "WatchVirtualRanking": {
+        "additionalProperties": false,
+        "properties": {
+          "criteria": {
+            "description": "Ordered ranking keys, top-down; empty, never null",
+            "items": {
+              "$ref": "#/components/schemas/WatchSortCriterion"
+            },
+            "type": "array"
+          },
+          "profile_label": {
+            "description": "The quality profile label that produced the ranking; absent for the built-in default order",
+            "examples": [
+              "4K HDR"
+            ],
+            "type": "string"
+          },
+          "source": {
+            "description": "profile when a configured profile's selector drove the order, default for the built-in order",
+            "enum": [
+              "profile",
+              "default"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "criteria"
         ],
         "type": "object"
       },

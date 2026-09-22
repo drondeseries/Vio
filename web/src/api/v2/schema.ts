@@ -25193,6 +25193,8 @@ export interface components {
       user_data?: components["schemas"]["WatchUserData"];
       /** @description Every playable file of the item; empty, never null */
       versions: components["schemas"]["WatchFileVersion"][];
+      /** @description The ranking that produced the virtual versions' order; absent for local content */
+      virtual_ranking?: components["schemas"]["WatchVirtualRanking"];
       /**
        * Format: int64
        * @example 1995
@@ -25317,6 +25319,8 @@ export interface components {
       /** Format: int64 */
       total_duration_seconds?: number;
       variant_id: string;
+      /** @description The ranking that produced this variant's version order; absent for local content */
+      virtual_ranking?: components["schemas"]["WatchVirtualRanking"];
     };
     WatchPlaybackVariantPart: {
       /**
@@ -25541,6 +25545,19 @@ export interface components {
       unplayed_count: number;
       /** Format: int64 */
       watched_count: number;
+    };
+    WatchSortCriterion: {
+      /**
+       * @description The candidate attribute the key orders
+       * @example score
+       */
+      attribute: string;
+      /**
+       * @description desc for a largest-first numeric key, asc for a best-first ordinal key
+       * @example desc
+       * @enum {string}
+       */
+      direction: "asc" | "desc";
     };
     WatchSubtitle: {
       codec?: string;
@@ -26231,6 +26248,20 @@ export interface components {
       video_range_type?: string;
       /** Format: int64 */
       width?: number;
+    };
+    WatchVirtualRanking: {
+      /** @description Ordered ranking keys, top-down; empty, never null */
+      criteria: components["schemas"]["WatchSortCriterion"][];
+      /**
+       * @description The quality profile label that produced the ranking; absent for the built-in default order
+       * @example 4K HDR
+       */
+      profile_label?: string;
+      /**
+       * @description profile when a configured profile's selector drove the order, default for the built-in order
+       * @enum {string}
+       */
+      source: "profile" | "default";
     };
     WebhookConnection: {
       account_discovery_available: boolean;
