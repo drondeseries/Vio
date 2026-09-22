@@ -98,6 +98,34 @@ describe("buildWatchRouteRequest", () => {
 });
 
 describe("buildWatchPageProps", () => {
+  it("forwards the watch detail's virtual ranking to the player", () => {
+    const virtualRanking = {
+      profile_label: "4K HDR",
+      source: "profile" as const,
+      criteria: [
+        { attribute: "score", direction: "desc" as const },
+        { attribute: "resolution", direction: "desc" as const },
+      ],
+    };
+    const props = buildWatchPageProps({
+      request: makeRequest(),
+      item: makeWatchDetail({ virtual_ranking: virtualRanking }),
+      currentProfile: profile,
+    });
+
+    expect(props.virtualRanking).toEqual(virtualRanking);
+  });
+
+  it("leaves the virtual ranking absent for local content", () => {
+    const props = buildWatchPageProps({
+      request: makeRequest(),
+      item: makeWatchDetail(),
+      currentProfile: profile,
+    });
+
+    expect(props.virtualRanking).toBeUndefined();
+  });
+
   it("prefers effective subtitle defaults from watch detail over raw profile values", () => {
     const props = buildWatchPageProps({
       request: makeRequest(),

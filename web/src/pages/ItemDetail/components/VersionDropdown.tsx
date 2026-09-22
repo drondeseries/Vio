@@ -90,6 +90,10 @@ function VersionDropdown({
   // The viewer's per-profile display order. It only re-orders the list below;
   // the server's auto-pick is untouched.
   const { criteria: userCriteria, apply: applySort, reset: resetSort } = useVersionSortPreference();
+  // The catalog item detail this picker reads carries no virtual_ranking (the
+  // server publishes it only on the v2 watch detail), so this falls back to the
+  // candidates' `?profile=` label with the default order. The in-player menu
+  // reads the real ranking from the watch detail.
   const serverRanking = useMemo(() => serverRankingFromVersions(activeVersions), [activeVersions]);
   const effectiveCriteria = userCriteria.length > 0 ? userCriteria : serverRanking.criteria;
   const orderedVersions = useMemo(
