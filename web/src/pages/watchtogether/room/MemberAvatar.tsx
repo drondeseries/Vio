@@ -9,16 +9,20 @@ export function MemberAvatar({
   size = "default",
   className,
   title,
+  solid = false,
 }: {
   name: string;
   tint?: MemberTint;
   size?: "sm" | "default" | "lg";
   className?: string;
   title?: string;
+  solid?: boolean;
 }) {
   return (
     <Avatar size={size} className={className} title={title ?? name}>
-      <AvatarFallback className={cn("font-semibold", tint.bg, tint.text)}>
+      <AvatarFallback
+        className={cn("font-semibold", solid ? [tint.solidBg, "text-white"] : [tint.bg, tint.text])}
+      >
         {memberInitials(name)}
       </AvatarFallback>
     </Avatar>

@@ -299,7 +299,10 @@ describe("BrowseShelf", () => {
     const onSelect = renderShelf();
     await screen.findByText("Continue watching together");
     expect(screen.getByText("On your watchlists")).toBeInTheDocument();
-    expect(screen.getByText(/S2 E4 · Nathan, Maya/)).toBeInTheDocument();
+    expect(screen.getByText("S2 E4")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Severance" })).toHaveAccessibleDescription(
+      "Nathan, Maya",
+    );
     fireEvent.click(screen.getByRole("button", { name: "Severance" }));
     expect(onSelect).toHaveBeenCalledWith({
       card: expect.objectContaining({ content_id: "severance", type: "series" }),

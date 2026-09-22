@@ -6,14 +6,29 @@ import type { WatchTogetherRoomMember, WatchTogetherRoomSnapshot } from "@/lib/w
  * and the picker's per-episode dots so "who" stays learnable across surfaces.
  */
 export const MEMBER_TINTS = [
-  { bg: "bg-indigo-500/25", text: "text-indigo-200", dot: "bg-indigo-400" },
-  { bg: "bg-rose-500/25", text: "text-rose-200", dot: "bg-rose-400" },
-  { bg: "bg-teal-500/25", text: "text-teal-200", dot: "bg-teal-400" },
-  { bg: "bg-amber-500/25", text: "text-amber-200", dot: "bg-amber-400" },
-  { bg: "bg-violet-500/25", text: "text-violet-200", dot: "bg-violet-400" },
-  { bg: "bg-sky-500/25", text: "text-sky-200", dot: "bg-sky-400" },
-  { bg: "bg-lime-500/25", text: "text-lime-200", dot: "bg-lime-400" },
-  { bg: "bg-orange-500/25", text: "text-orange-200", dot: "bg-orange-400" },
+  {
+    bg: "bg-indigo-500/25",
+    solidBg: "bg-indigo-700",
+    text: "text-indigo-200",
+    dot: "bg-indigo-400",
+  },
+  { bg: "bg-rose-500/25", solidBg: "bg-rose-700", text: "text-rose-200", dot: "bg-rose-400" },
+  { bg: "bg-teal-500/25", solidBg: "bg-teal-700", text: "text-teal-200", dot: "bg-teal-400" },
+  { bg: "bg-amber-500/25", solidBg: "bg-amber-700", text: "text-amber-200", dot: "bg-amber-400" },
+  {
+    bg: "bg-violet-500/25",
+    solidBg: "bg-violet-700",
+    text: "text-violet-200",
+    dot: "bg-violet-400",
+  },
+  { bg: "bg-sky-500/25", solidBg: "bg-sky-700", text: "text-sky-200", dot: "bg-sky-400" },
+  { bg: "bg-lime-500/25", solidBg: "bg-lime-700", text: "text-lime-200", dot: "bg-lime-400" },
+  {
+    bg: "bg-orange-500/25",
+    solidBg: "bg-orange-700",
+    text: "text-orange-200",
+    dot: "bg-orange-400",
+  },
 ] as const;
 
 export type MemberTint = (typeof MEMBER_TINTS)[number];

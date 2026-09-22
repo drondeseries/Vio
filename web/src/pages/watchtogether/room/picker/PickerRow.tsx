@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import MediaCarousel from "@/components/MediaCarousel";
 import { decodeThumbhash } from "@/lib/thumbhash";
@@ -6,6 +6,7 @@ import type { PickerEntry } from "@/api/v2/watchTogetherPicker";
 import type { WatchTogetherRoomMember } from "@/lib/watchTogether";
 import { MemberAvatar } from "../MemberAvatar";
 import { memberTints, type MemberTint } from "../members";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 /** The subset of a catalog card the picker needs; both search and picker rows fit it. */
 export interface PickerCard {
@@ -36,13 +37,16 @@ export function PosterTile({
   selected?: boolean;
 }) {
   const [loaded, setLoaded] = useState(false);
+  const memberDescriptionId = useId();
+  const memberNames = who?.map((member) => member.display_name).join(", ");
   const thumbhash = card.poster_thumbhash ? decodeThumbhash(card.poster_thumbhash) : "";
-  return (
+  const tile = (
     <button
       type="button"
       onClick={onClick}
-      className="group/tile w-28 shrink-0 text-left sm:w-32"
+      className="group/tile focus-visible:outline-ring w-28 shrink-0 rounded-lg text-left focus-visible:outline-2 focus-visible:outline-offset-4 sm:w-32"
       aria-label={card.title}
+      aria-describedby={memberNames ? memberDescriptionId : undefined}
     >
       <div
         className={`media-card-image relative aspect-[2/3] transition-all ${
@@ -71,17 +75,28 @@ export function PosterTile({
           </span>
         ) : null}
         {who && who.length > 0 ? (
-          <span className="absolute top-1.5 left-1.5 flex -space-x-1.5">
-            {who.slice(0, 4).map((m) => (
-              <MemberAvatar
-                key={`${m.user_id}:${m.profile_id}`}
-                name={m.display_name}
-                tint={tints?.get(`${m.user_id}:${m.profile_id}`)}
-                size="sm"
-                className="ring-background size-5 ring-1"
-              />
-            ))}
-          </span>
+          <>
+            <span id={memberDescriptionId} className="sr-only">
+              {memberNames}
+            </span>
+            <span
+              aria-hidden="true"
+              className="absolute top-2 left-2 flex items-center gap-1 rounded-full border border-white/20 bg-zinc-900 p-0.5 shadow-md"
+            >
+              {who.slice(0, 2).map((member) => (
+                <MemberAvatar
+                  key={`${member.user_id}:${member.profile_id}`}
+                  name={member.display_name}
+                  tint={tints?.get(`${member.user_id}:${member.profile_id}`)}
+                  solid
+                  size="sm"
+                />
+              ))}
+              {who.length > 2 ? (
+                <span className="pr-1 text-[11px] font-semibold text-white">+{who.length - 2}</span>
+              ) : null}
+            </span>
+          </>
         ) : null}
         {progress !== undefined ? (
           <span className="absolute inset-x-0 bottom-0 h-1 bg-black/40">
@@ -100,14 +115,25 @@ export function PosterTile({
       </div>
     </button>
   );
+  return memberNames ? (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>{tile}</TooltipTrigger>
+        <TooltipContent side="bottom" className="max-w-64 break-words">
+          {memberNames}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  ) : (
+    tile
+  );
 }
 
 function pickerCaption(entry: PickerEntry) {
-  const names = entry.members.map((m) => m.display_name);
   if (entry.next_up) {
-    return `S${entry.next_up.season_number} E${entry.next_up.episode_number} · ${names.join(", ")}`;
+    return `S${entry.next_up.season_number} E${entry.next_up.episode_number}`;
   }
-  return names.join(", ");
+  return undefined;
 }
 
 function groupProgress(entry: PickerEntry) {
