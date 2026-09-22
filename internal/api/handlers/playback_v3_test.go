@@ -3518,6 +3518,86 @@ func TestPrepareTransportV3CopyAnchorRetriesWithBudget(t *testing.T) {
 	}
 }
 
+// TestPrepareTransportV3CopyAnchorTransientProviderBacksOffBeforeRetry pins the
+// live upstream-5xx fix: a transient provider failure is still retried (the
+// terminal stays the retryable transcode_start_failed when both probes fail),
+// but only after a bounded backoff rather than an immediate re-probe, so a
+// provider that is already failing is not hammered.
+func TestPrepareTransportV3CopyAnchorTransientProviderBacksOffBeforeRetry(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	probeCalls := 0
+	handler.copySeekAnchor = func(context.Context, string, string, float64, int) (float64, int, error) {
+		probeCalls++
+		return 0, 0, fmt.Errorf("%w: exit status 8 (stderr: Server returned 5XX Server Error reply)", playback.ErrTransientProvider)
+	}
+	var backoffs []time.Duration
+	handler.copySeekAnchorBackoff = func(_ context.Context, d time.Duration) bool {
+		backoffs = append(backoffs, d)
+		return true
+	}
+	plan := &playback.PlanV3{PlanID: "plan:copy-transient", Delivery: playback.DeliveryRemuxHLSV3, Timeline: playback.TimelineV3{SourceStartSeconds: 120}}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), time.Minute)
+	defer cancel()
+	_, transportErr := handler.prepareTransportV3(
+		req.WithContext(ctx),
+		&playback.Session{ID: "session-copy-transient"},
+		&models.MediaFile{ID: 42, FilePath: "/media/movie.mkv"},
+		playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux}, mediaAuthModeV3{})
+
+	if probeCalls != 2 {
+		t.Fatalf("copy anchor probes = %d, want 2 (one retry)", probeCalls)
+	}
+	if len(backoffs) != 1 {
+		t.Fatalf("backoffs = %d, want exactly 1 before the retry", len(backoffs))
+	}
+	if backoffs[0] <= 0 || backoffs[0] > copySeekAnchorTransientBackoff {
+		t.Fatalf("backoff = %v, want a positive bounded pause <= %v", backoffs[0], copySeekAnchorTransientBackoff)
+	}
+	if transportErr == nil || transportErr.reason != "transcode_start_failed" || !transportErr.retryable || transportErr.cause == nil {
+		t.Fatalf("transport error = %#v, want the retryable transcode_start_failed terminal", transportErr)
+	}
+	if !playback.IsTransientProviderError(transportErr.cause) {
+		t.Fatalf("terminal cause = %v, want the transient provider classification", transportErr.cause)
+	}
+}
+
+// TestPrepareTransportV3CopyAnchorGenericFailureDoesNotBackOff pins that the
+// backoff is scoped to the transient provider classification: a genuine probe
+// failure keeps today's immediate single retry with no pause.
+func TestPrepareTransportV3CopyAnchorGenericFailureDoesNotBackOff(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	probeCalls := 0
+	handler.copySeekAnchor = func(context.Context, string, string, float64, int) (float64, int, error) {
+		probeCalls++
+		return 0, 0, errors.New("probe failed")
+	}
+	backoffCalls := 0
+	handler.copySeekAnchorBackoff = func(context.Context, time.Duration) bool {
+		backoffCalls++
+		return true
+	}
+	plan := &playback.PlanV3{PlanID: "plan:copy-generic", Delivery: playback.DeliveryRemuxHLSV3, Timeline: playback.TimelineV3{SourceStartSeconds: 120}}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), time.Minute)
+	defer cancel()
+	_, transportErr := handler.prepareTransportV3(
+		req.WithContext(ctx),
+		&playback.Session{ID: "session-copy-generic"},
+		&models.MediaFile{ID: 42, FilePath: "/media/movie.mkv"},
+		playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux}, mediaAuthModeV3{})
+
+	if probeCalls != 2 {
+		t.Fatalf("copy anchor probes = %d, want 2 (the existing immediate retry)", probeCalls)
+	}
+	if backoffCalls != 0 {
+		t.Fatalf("backoffs = %d, want 0 for a non-transient failure", backoffCalls)
+	}
+	if transportErr == nil || transportErr.reason != "transcode_start_failed" || !transportErr.retryable {
+		t.Fatalf("transport error = %#v, want the retryable terminal unchanged", transportErr)
+	}
+}
+
 func TestPrepareTransportV3RejectsNodeMissingRequiredTransformation(t *testing.T) {
 	startHits := 0
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

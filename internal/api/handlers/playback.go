@@ -516,6 +516,10 @@ type PlaybackHandler struct {
 	PlaybackConfig func() config.PlaybackConfig
 	FFmpegLogSink  playback.FFmpegLogSink
 	copySeekAnchor copySeekAnchorResolver
+	// copySeekAnchorBackoff is a test seam for the bounded pause before
+	// retrying the same candidate after a transient provider (upstream 5xx)
+	// anchor failure. Nil uses the real timer wait.
+	copySeekAnchorBackoff func(ctx context.Context, d time.Duration) bool
 	// beforeIdentityLifecycleLockV3 is a test seam for proving that identity
 	// route authority remains unpublished until the shared lifecycle boundary.
 	beforeIdentityLifecycleLockV3 func()
@@ -2774,6 +2778,28 @@ func (h *PlaybackHandler) findAlternateFiles(ctx context.Context, source *models
 	})
 
 	return candidates, nil
+}
+
+// virtualTransportAlternatesV3 lists the compatible alternates once for a
+// transport-failure fallback and bounds how many a transient provider failure
+// may try. The list is fetched once per start; the bound applies only when the
+// failure cause is an upstream 5xx, so a provider that is already failing is
+// not hammered once per alternate. A non-transient transport failure keeps
+// trying every alternate, preserving the existing recovery breadth.
+func (h *PlaybackHandler) virtualTransportAlternatesV3(
+	ctx context.Context,
+	source *models.MediaFile,
+	order alternateOrdering,
+	transient bool,
+) ([]*models.MediaFile, error) {
+	alternates, err := h.findAlternateFiles(ctx, source, order)
+	if err != nil || len(alternates) == 0 {
+		return nil, err
+	}
+	if transient && len(alternates) > maxVirtualTransientTransportAlternates {
+		return alternates[:maxVirtualTransientTransportAlternates], nil
+	}
+	return alternates, nil
 }
 
 // clampEncodedTargetResolution clamps targetResolution so it never exceeds sourceResolution for encoded video targets.

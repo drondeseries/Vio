@@ -1838,3 +1838,63 @@ func TestFindAlternateFilesDefaultOrderPreservesLegacy(t *testing.T) {
 		t.Fatalf("absent capability = %+v, want the conservative zero ordering", absent)
 	}
 }
+
+// countingFileVersionFetcher counts how many times the alternate list is
+// fetched, so a test can prove one start lists once.
+type countingFileVersionFetcher struct {
+	byContent map[string][]*models.MediaFile
+	calls     int
+}
+
+func (f *countingFileVersionFetcher) GetByContentID(_ context.Context, id string) ([]*models.MediaFile, error) {
+	f.calls++
+	return f.byContent[id], nil
+}
+
+func (f *countingFileVersionFetcher) GetByEpisodeID(_ context.Context, id string) ([]*models.MediaFile, error) {
+	f.calls++
+	return nil, nil
+}
+
+// TestVirtualTransportAlternatesListsOnceAndBoundsTransient proves the
+// transport-failure fallback fetches the alternate list exactly once per start
+// and, when the failure is a transient provider error (upstream 5xx), tries only
+// the bounded cap instead of churning every alternate through the failing
+// upstream. A non-transient failure keeps the full list.
+func TestVirtualTransportAlternatesListsOnceAndBoundsTransient(t *testing.T) {
+	source := &models.MediaFile{ID: 1, ContentID: "movie-bound", Resolution: "2160p"}
+	fetcher := &countingFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		"movie-bound": {
+			source,
+			{ID: 2, ContentID: "movie-bound", Resolution: "2160p", Bitrate: 40_000_000},
+			{ID: 3, ContentID: "movie-bound", Resolution: "1080p", Bitrate: 10_000_000},
+			{ID: 4, ContentID: "movie-bound", Resolution: "1080p", Bitrate: 8_000_000},
+			{ID: 5, ContentID: "movie-bound", Resolution: "720p", Bitrate: 3_000_000},
+		},
+	}}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.FileVersionFetcher = fetcher
+
+	transient, err := handler.virtualTransportAlternatesV3(context.Background(), source, alternateOrdering{}, true)
+	if err != nil {
+		t.Fatalf("transient alternates: %v", err)
+	}
+	if fetcher.calls != 1 {
+		t.Fatalf("list fetches = %d, want exactly 1", fetcher.calls)
+	}
+	if len(transient) != maxVirtualTransientTransportAlternates {
+		t.Fatalf("transient alternates = %d, want the cap %d", len(transient), maxVirtualTransientTransportAlternates)
+	}
+
+	fetcher.calls = 0
+	all, err := handler.virtualTransportAlternatesV3(context.Background(), source, alternateOrdering{}, false)
+	if err != nil {
+		t.Fatalf("generic alternates: %v", err)
+	}
+	if fetcher.calls != 1 {
+		t.Fatalf("list fetches = %d, want exactly 1", fetcher.calls)
+	}
+	if len(all) != 4 {
+		t.Fatalf("generic alternates = %d, want all 4 siblings", len(all))
+	}
+}

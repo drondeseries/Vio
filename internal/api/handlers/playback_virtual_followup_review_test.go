@@ -336,3 +336,72 @@ func TestVirtualFileMetadataUpdateRequireAdoptSuccessWritesEverything(t *testing
 		t.Fatal("probe_updated_at was not stamped on a confirmed adoption")
 	}
 }
+
+// TestVerdictLookupAcceptsRotatedConcreteRow pins the live rehydration
+// regression: the provider rotates a release's ?result= id, so the exact lookup
+// misses by design and the provider-neutral lookup returns the same release's
+// row still carrying the old concrete pick. That row owns the release, so its
+// verdict must be readable; treating the rotated concrete pick as an incomplete
+// row hard-failed rehydration (4 warning-loop retries) for a row that exists.
+func TestVerdictLookupAcceptsRotatedConcreteRow(t *testing.T) {
+	const (
+		candidate = "virtual://movie/tt-rotated?result=newpick"
+		stale     = "virtual://movie/tt-rotated?result=oldpick"
+	)
+	file := &models.MediaFile{ID: 7, ContentID: "movie-tt-rotated", FilePath: candidate}
+
+	h := &PlaybackHandler{
+		VirtualFileLookup: func(context.Context, string) (*models.MediaFile, error) {
+			return nil, ErrVirtualCandidateNotFound
+		},
+		VirtualCandidateFileLookup: func(context.Context, string, string, string, int) (*models.MediaFile, error) {
+			return &models.MediaFile{ID: 77, FilePath: stale}, nil
+		},
+	}
+	row, found, err := h.lookupVirtualCandidateRowDetailed(context.Background(), candidate, file.ContentID, file.EpisodeID, 5)
+	if err != nil {
+		t.Fatalf("rotated concrete row treated as incomplete: %v", err)
+	}
+	if !found || row == nil || row.ID != 77 {
+		t.Fatalf("row = %#v found=%v, want the rotated row id 77", row, found)
+	}
+	if err := h.virtualCandidateVerdictError(context.Background(), candidate, file, 5, false); err != nil {
+		t.Fatalf("rotated concrete row refused the verdict gate: %v", err)
+	}
+
+	// The rotation relaxation is not a blanket acceptance: a live failed_at on
+	// the same rotated row still refuses.
+	failedAt := time.Now()
+	failed := &PlaybackHandler{
+		VirtualFileLookup: func(context.Context, string) (*models.MediaFile, error) {
+			return nil, ErrVirtualCandidateNotFound
+		},
+		VirtualCandidateFileLookup: func(context.Context, string, string, string, int) (*models.MediaFile, error) {
+			return &models.MediaFile{ID: 77, FilePath: stale, FailedAt: &failedAt}, nil
+		},
+	}
+	if err := failed.virtualCandidateVerdictError(context.Background(), candidate, file, 5, false); err == nil {
+		t.Fatal("a genuinely failed rotated row was accepted")
+	}
+}
+
+// TestVerdictLookupStillRejectsDifferentProfileVariant pins that the rotation
+// relaxation keeps the profile: the provider-neutral key retains ?profile=, so
+// a row for another profile variant is a different release and stays
+// incomplete rather than owning the candidate's verdict.
+func TestVerdictLookupStillRejectsDifferentProfileVariant(t *testing.T) {
+	const candidate = "virtual://movie/tt-profile?profile=4k&result=newpick"
+	file := &models.MediaFile{ID: 7, ContentID: "movie-tt-profile", FilePath: candidate}
+
+	h := &PlaybackHandler{
+		VirtualFileLookup: func(context.Context, string) (*models.MediaFile, error) {
+			return nil, ErrVirtualCandidateNotFound
+		},
+		VirtualCandidateFileLookup: func(context.Context, string, string, string, int) (*models.MediaFile, error) {
+			return &models.MediaFile{ID: 88, FilePath: "virtual://movie/tt-profile?profile=1080p&result=oldpick"}, nil
+		},
+	}
+	if _, _, err := h.lookupVirtualCandidateRowDetailed(context.Background(), candidate, file.ContentID, file.EpisodeID, 5); !errors.Is(err, errVirtualCandidateVerdictIncomplete) {
+		t.Fatalf("different profile variant error = %v, want errVirtualCandidateVerdictIncomplete", err)
+	}
+}
