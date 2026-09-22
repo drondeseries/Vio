@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -165,8 +166,8 @@ func TestEffectiveReadStillRejectsUnknownKey(t *testing.T) {
 	if err == nil {
 		t.Fatal("unknown key was accepted")
 	}
-	apiErr, ok := err.(*APIError)
-	if !ok || apiErr.Status != 404 || apiErr.Field != settingFieldKeys {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 404 || apiErr.Field != settingFieldKeys {
 		t.Fatalf("unknown key error = %#v", err)
 	}
 	if !strings.Contains(apiErr.Message, "no.such.setting") {
