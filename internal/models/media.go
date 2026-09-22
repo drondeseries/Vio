@@ -962,4 +962,14 @@ type VirtualFilePersistArgs struct {
 	// preserves the stored one, so a metadata-only write cannot erase the
 	// headers a resolved URL depends on.
 	ProviderRequestHeaders map[string]string
+	// ReconcileCollectionVariant is the recorded verdict that a collection-owned
+	// variant row's pinned release has genuinely vanished from the provider's
+	// fresh listing and the row may be re-pointed at the profile's live
+	// candidate. Collection-owned paths are otherwise immutable (the collection
+	// sync owns them), so this must be set only by a caller that listed the
+	// provider, matched the pinned result id AND durable identity against the
+	// fresh set, and found neither. With it set, the path-adoption guard admits
+	// the collection row so the adoption can land atomically with the probed
+	// evidence; without it a collection path is never rewritten.
+	ReconcileCollectionVariant bool
 }
