@@ -204,6 +204,7 @@ export function QualityMenu({
                 effectiveCriteria={effectiveCriteria}
                 onApply={applySort}
                 onReset={resetSort}
+                tone="dark"
                 className="px-3 pb-1"
               />
               {orderedVersions.map((v) => {
