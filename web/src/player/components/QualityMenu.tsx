@@ -8,6 +8,9 @@ export interface VersionInfo {
   fileId: number;
   label: string;
   releaseName?: string;
+  /** Custom-format score the server ranked this candidate with. Absent (or
+   *  zero) for local and otherwise unscored rows, which show no badge. */
+  formatScore?: number;
   isCurrentSource: boolean;
   isRequestedSource: boolean;
   failed?: boolean;
@@ -168,6 +171,7 @@ export function QualityMenu({
               {versions.map((v) => {
                 const idx = menuItemIndex++;
                 const statusLabels = buildVersionStatusLabels(v);
+                const hasFormatScore = typeof v.formatScore === "number" && v.formatScore !== 0;
                 return (
                   <button
                     key={v.fileId}
@@ -193,8 +197,16 @@ export function QualityMenu({
                           </span>
                         )}
                       </span>
-                      {statusLabels.length > 0 && (
+                      {(hasFormatScore || statusLabels.length > 0) && (
                         <span className="flex flex-wrap gap-1">
+                          {hasFormatScore && (
+                            <span
+                              className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/60"
+                              title={`Format score ${v.formatScore}`}
+                            >
+                              ★ {v.formatScore}
+                            </span>
+                          )}
                           {statusLabels.map((status) => (
                             <span
                               key={status}

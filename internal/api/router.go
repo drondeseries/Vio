@@ -774,6 +774,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		detailSvc.SetLiteraryWorkLinker(literaryService)
 		detailSvc.SetProbeEnsurer(deps.ProbeEnsurer)
 		detailSvc.SetChapterThumbnailQueuer(deps.ChapterThumbnailQueuer)
+		detailSvc.SetVirtualCandidateScoreSource(virtualCandidateScoreSource(deps.VirtualLibraryService))
 		if deps.ImageResolver != nil {
 			detailSvc.SetImageResolver(deps.ImageResolver)
 		}

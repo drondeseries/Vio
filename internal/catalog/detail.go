@@ -73,6 +73,13 @@ type ChapterThumbnailQueuer interface {
 	QueuePriorityFileAtPosition(ctx context.Context, fileID int, targetSeconds float64)
 }
 
+// VirtualCandidateScoreSource returns the custom-format score the virtual
+// ranking assigned to each candidate file, keyed by media-file ID. The scorer
+// is injected rather than imported because the virtual library service imports
+// catalog, so the dependency cannot point the other way. A nil source, a
+// provider miss, or an unscored candidate leaves the version without a score.
+type VirtualCandidateScoreSource func(ctx context.Context, contentID string, files []*models.MediaFile) map[int]int
+
 // ImageResolver resolves image paths (potentially plugin-prefixed) to usable URLs.
 type ImageResolver interface {
 	// ResolveImageURL resolves a single image path. Plugin-prefixed paths (e.g.,
@@ -462,7 +469,12 @@ type FileVersion struct {
 	// NULL), a local file when it is not marked missing (missing_since is
 	// NULL). Omitted when the version is available, so an absent field means
 	// available/unknown; false means the version is currently unavailable.
-	Available      *bool                  `json:"available,omitempty"`
+	Available *bool `json:"available,omitempty"`
+	// FormatScore is the custom-format score the virtual ranking assigned to a
+	// virtual candidate under the active quality profile. Absent for local
+	// files and when no ranking ran, so an unscored row shows nothing. It is a
+	// display-only hint and is never used for ordering here.
+	FormatScore    *int                   `json:"format_score,omitempty"`
 	VideoTracks    []models.VideoTrack    `json:"video_tracks,omitempty"`
 	AudioTracks    []models.AudioTrack    `json:"audio_tracks,omitempty"`
 	SubtitleTracks []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
@@ -727,6 +739,9 @@ type DetailService struct {
 	probeEnsurer      PlaybackProbeEnsurer
 	copySafetyRacer   CopySafetyRacer
 	chapterThumbs     ChapterThumbnailQueuer
+	// virtualScoreSource computes the custom-format score per virtual candidate
+	// file. Nil disables scoring; see SetVirtualCandidateScoreSource.
+	virtualScoreSource VirtualCandidateScoreSource
 
 	// watchPrepareMu guards watchPrepared, the per-content memo that keeps a
 	// repeated watch-detail fetch of unchanged files from re-running the
@@ -803,6 +818,13 @@ func (s *DetailService) SetFolderRepository(repo interface {
 	GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
 }) {
 	s.folderRepo = repo
+}
+
+// SetVirtualCandidateScoreSource wires the custom-format scores shown on a
+// watch response's virtual versions. It is optional; without it every version
+// simply carries no score.
+func (s *DetailService) SetVirtualCandidateScoreSource(source VirtualCandidateScoreSource) {
+	s.virtualScoreSource = source
 }
 
 // SetRootClaimRepository wires in the root claim repo for series folder path lookups.
@@ -3107,6 +3129,7 @@ func (s *DetailService) newWatchDetail(
 		filter,
 		audioPreferenceContentID,
 	)
+	s.attachVirtualCandidateScores(ctx, contentID, versions, files)
 	return &WatchDetail{
 		ContentID:        contentID,
 		Type:             contentType,
@@ -3119,6 +3142,30 @@ func (s *DetailService) newWatchDetail(
 		Credits:          credits,
 		Recap:            recap,
 		Preview:          preview,
+	}
+}
+
+// attachVirtualCandidateScores stamps each virtual candidate version with the
+// custom-format score the virtual ranking assigned it, keyed by media-file ID.
+// Local files and unscored candidates keep a nil score, and a scorer miss
+// leaves the version unannotated rather than failing the watch response.
+func (s *DetailService) attachVirtualCandidateScores(
+	ctx context.Context,
+	contentID string,
+	versions []FileVersion,
+	files []*models.MediaFile,
+) {
+	if s.virtualScoreSource == nil || len(versions) == 0 {
+		return
+	}
+	scores := s.virtualScoreSource(ctx, contentID, files)
+	if len(scores) == 0 {
+		return
+	}
+	for i := range versions {
+		if score, ok := scores[versions[i].FileID]; ok {
+			versions[i].FormatScore = intPtr(score)
+		}
 	}
 }
 

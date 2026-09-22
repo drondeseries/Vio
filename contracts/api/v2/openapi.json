@@ -39568,6 +39568,11 @@
             "format": "int64",
             "type": "integer"
           },
+          "format_score": {
+            "description": "Custom-format score the virtual ranking assigned this candidate; absent when the row is unscored (local files, no ranking)",
+            "format": "int64",
+            "type": "integer"
+          },
           "hdr": {
             "type": "boolean"
           },
