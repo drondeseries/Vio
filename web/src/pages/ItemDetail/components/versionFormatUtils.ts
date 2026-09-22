@@ -112,6 +112,47 @@ export function formatVersionDetail({
   return parts.join(" · ");
 }
 
+// Four-digit years, excluding a "1920x1080"-style resolution token. Used only
+// to detect a year that would otherwise repeat in the same row.
+const YEAR_TOKEN = /\b((?:19|20)\d{2})\b(?!x)/g;
+
+function releaseYears(text?: string): string[] {
+  if (!text) return [];
+  return [...new Set(text.match(YEAR_TOKEN) ?? [])];
+}
+
+function stripYears(text: string, years: readonly string[]): string {
+  if (!text || years.length === 0) return text;
+  let out = text;
+  for (const year of years) {
+    out = out.replace(new RegExp(`[._\\- ]*\\b${year}\\b[._\\- ]*`, "g"), " ");
+  }
+  return out.replace(/\s{2,}/g, " ").trim();
+}
+
+/**
+ * The fallback title the Media Info dialog shows when a version has no quality
+ * summary. It is the file name with the parts that already appear on the
+ * detail line removed: the embedded size when the structured `fileSize` is
+ * known, and a year that is also on the detail line. When the file name holds
+ * the only size evidence, it is kept verbatim (and left unprettified so a
+ * decimal size like "9.31GB" is not mangled by the dot-to-space prettifier).
+ */
+export function buildVersionFallbackTitle(
+  fileName: string | undefined,
+  { fileSize, detailLine }: { fileSize?: number; detailLine?: string },
+): string {
+  if (!fileName) return "";
+  const hasStructuredSize = formatFileSize(fileSize).length > 0;
+  let label = hasStructuredSize ? stripReleaseSizeToken(fileName) : fileName;
+  const duplicateYears = releaseYears(detailLine);
+  if (duplicateYears.length > 0) {
+    label = stripYears(label, duplicateYears);
+  }
+  const stillHasSize = /\b\d+(?:\.\d+)?\s*(?:TB|GB|MB)\b/i.test(label);
+  return stillHasSize ? label.trim() : prettifyReleaseName(label);
+}
+
 export function formatPageCount(pages?: number): string {
   if (!pages || pages <= 0) return "";
   return `${pages.toLocaleString()} ${pages === 1 ? "page" : "pages"}`;
