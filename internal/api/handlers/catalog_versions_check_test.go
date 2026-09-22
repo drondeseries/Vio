@@ -869,7 +869,7 @@ func TestCatalogVersionsCheckIdentityVerdicts(t *testing.T) {
 			// The provider renumbered the same release (same video hash) under a
 			// new result id and the resolver re-identified it.
 			return ResolvedVirtualMedia{
-				URL: "http://provider.test/b.mp4", URI: fmt.Sprintf("virtual://movie/renumbered?result=B"),
+				URL: "http://provider.test/b.mp4", URI: "virtual://movie/renumbered?result=B",
 				CandidateID: "B", IdentityRematched: true,
 				ProviderVideoHash: "hash-same", ProviderReleaseName: "Movie.2024.1080p",
 			}, nil
