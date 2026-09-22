@@ -6285,7 +6285,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			nextQuality, _ := playback.NormalizeQualityV3(req.QualityPreference)
 			intentChange = nextQuality != start.QualityPreference
 		case outputChange:
-			intentChange = true
+			intentChange = req.ClientPlaybackContext.Output.OutputContextID != record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID
 		default:
 			switch req.Failure.Classification {
 			case "quality_changed":
@@ -6768,6 +6768,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				}
 			}
 		}
+		if intentChange && !seekReanchor && userIntentOperation {
+			clearFailedRecipeEvidenceV3(&record.NormalizedRequest)
+			clearFailedRecipeEvidenceV3(&start)
+		}
 		if !seekReanchor && userIntentOperation && !intentChange {
 			// The current live plan is not failed-recipe evidence on an
 			// unchanged-intent user replan: it replans the same healthy route,
@@ -6777,6 +6781,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			attemptedKeys = slices.DeleteFunc(attemptedKeys, func(key string) bool {
 				return strings.TrimSpace(key) == currentKey
 			})
+			// The server retains failed-recipe evidence on the durable delivery
+			// entry, so an unchanged-intent replan that omits earlier history
+			// still cannot resurrect a recipe this attempt already failed.
+			attemptedKeys = append(attemptedKeys, excludedRecipeKeysV3(record.NormalizedRequest, playback.DeliveryClassV3(record.CurrentPlan.Delivery), currentKey)...)
 		}
 		if virtualDecodeRotation {
 			// The plan attempt key does not encode the provider result= URI, so
@@ -6983,15 +6991,26 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// only the record would be wiped by that write-back — the seed was copied
 	// before the demotion and the overlay re-enables the client's
 	// still-advertised claim.
+	failedDeliveryClass := playback.DeliveryClassV3(record.CurrentPlan.Delivery)
+	failedRecipeKey := playback.PlanAttemptKeyV3(record.CurrentPlan, record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID, req.LocalMutations)
 	if demoteDelivery && result.Plan != nil &&
-		playback.DeliveryClassV3(result.Plan.Delivery) != playback.DeliveryClassV3(record.CurrentPlan.Delivery) {
+		playback.DeliveryClassV3(result.Plan.Delivery) != failedDeliveryClass {
 		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
 		demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
-	} else if demoteDelivery && result.Terminal != nil {
+	} else if demoteDelivery && result.Plan != nil {
+		// Same-class sibling recovery: the failed recipe stays excluded on
+		// later unchanged-intent replans via the durable delivery entry, while
+		// the class itself remains eligible for the sibling.
+		recordFailedRecipeV3(&record.NormalizedRequest, failedDeliveryClass, failedRecipeKey)
+		recordFailedRecipeV3(&start, failedDeliveryClass, failedRecipeKey)
+	} else if demoteDelivery && result.Terminal != nil && !result.Terminal.Retryable {
 		// The planner ran with the failed delivery still eligible and found no
 		// route for this source at all. No untried sibling is left to protect,
 		// so retire the delivery on the durable record rather than leaving it
-		// open to loop a later replan back to the same exhausted class.
+		// open to loop a later replan back to the same exhausted class. A
+		// retryable terminal names a transient dependency (tone-map discovery,
+		// settings, capacity), not planner exhaustion, so the delivery stays
+		// eligible for the retry instead of being retired permanently.
 		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
 		demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
 	}
@@ -8907,6 +8926,77 @@ const degradationSoftwareDecodeFallbackV3 = "software_decode_fallback"
 // recovery). The client cannot advertise itself back into a route the server
 // demoted: the demotion is server-side evidence, so it must survive the
 // client capability overlay every replan performs.
+
+// recordFailedRecipeV3 stores one failed plan key on the durable delivery
+// entry. Bounded to maxFailedRecipeKeysV3 entries so the durable payload
+// cannot grow without limit; the oldest key is evicted first. The evidence is
+// scoped by intent: a genuine track, quality, or output change clears it (see
+// clearFailedRecipeEvidenceV3), while an unchanged refresh keeps it.
+func recordFailedRecipeV3(request *playback.StartRequestV3, delivery string, key string) {
+	if request == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	if request.ClientPlaybackContext.Deliveries == nil {
+		request.ClientPlaybackContext.Deliveries = make(map[string]playback.DeliveryCapabilityV3)
+	}
+	capability := request.ClientPlaybackContext.Deliveries[delivery]
+	for _, existing := range capability.ExcludedPlanKeys {
+		if strings.TrimSpace(existing) == key {
+			return
+		}
+	}
+	capability.ExcludedPlanKeys = append(capability.ExcludedPlanKeys, key)
+	if len(capability.ExcludedPlanKeys) > maxFailedRecipeKeysV3 {
+		capability.ExcludedPlanKeys = append([]string(nil), capability.ExcludedPlanKeys[len(capability.ExcludedPlanKeys)-maxFailedRecipeKeysV3:]...)
+	}
+	request.ClientPlaybackContext.Deliveries[delivery] = capability
+}
+
+// clearFailedRecipeEvidenceV3 drops the retained failed-recipe keys for every
+// delivery when the replan carries a genuine intent change: the user asked for
+// a different track, quality, or output, so a previously failed recipe may be
+// viable again.
+func clearFailedRecipeEvidenceV3(request *playback.StartRequestV3) {
+	if request == nil || request.ClientPlaybackContext.Deliveries == nil {
+		return
+	}
+	for class, capability := range request.ClientPlaybackContext.Deliveries {
+		if len(capability.ExcludedPlanKeys) == 0 {
+			continue
+		}
+		capability.ExcludedPlanKeys = nil
+		request.ClientPlaybackContext.Deliveries[class] = capability
+	}
+}
+
+// excludedRecipeKeysV3 returns the durable failed-recipe keys for one delivery
+// class, minus the live plan key which is healthy evidence, not failure.
+func excludedRecipeKeysV3(durable playback.StartRequestV3, class string, liveKey string) []string {
+	capability, ok := durable.ClientPlaybackContext.Deliveries[class]
+	if !ok {
+		return nil
+	}
+	liveKey = strings.TrimSpace(liveKey)
+	var keys []string
+	for _, key := range capability.ExcludedPlanKeys {
+		key = strings.TrimSpace(key)
+		if key == "" || key == liveKey {
+			continue
+		}
+		if !containsStringExactV3(keys, key) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// maxFailedRecipeKeysV3 bounds the retained failed-recipe keys per delivery.
+const maxFailedRecipeKeysV3 = 16
+
 func demotedDeliveryClassesV3(durable playback.StartRequestV3) []string {
 	var demoted []string
 	for class, capability := range durable.ClientPlaybackContext.Deliveries {

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -385,14 +386,12 @@ func TestHandleReplanPlaybackV3LastDeliveryNotDemotedOnTransportFailure(t *testi
 }
 
 // An unchanged-selection track_change after a protected last-route recovery
-// must not resurrect the previously failed HLS remux recipe. The recovery
-// sequence leaves the HLS class eligible so the sibling transcode recipe can
-// serve it; the failed remux stays excluded only through the attempted-recipe
-// evidence the client carries, which this unchanged-intent replan must honor.
-// It extends the recovery sequence in
-// TestHandleReplanPlaybackV3LastDeliveryNotDemotedOnTransportFailure with a
-// non-decoder transport classification (http_failure) on the second recovery,
-// proving the protected transport-failure set is not decoder-specific.
+// must not resurrect the previously failed HLS remux recipe, even when the
+// replan omits earlier history and carries only the live transcode key. The
+// recovery sequence leaves the HLS class eligible so the sibling transcode
+// recipe can serve it; the failed remux stays excluded through the
+// server-retained recipe evidence on the durable delivery entry, which this
+// unchanged-intent replan must honor.
 func TestHandleReplanPlaybackV3UnchangedTrackChangeKeepsFailedRemuxExcluded(t *testing.T) {
 	file := v3HandlerFixtureFile(t)
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
@@ -472,7 +471,7 @@ func TestHandleReplanPlaybackV3UnchangedTrackChangeKeepsFailedRemuxExcluded(t *t
 		ReplanRequestID: "last-route-track-0003", FailedPlanID: second.PlaybackPlan.PlanID, PlanAttemptID: "last-route-attempt-0003",
 		PlanAttemptKey: second.PlaybackPlan.PlanAttemptKey,
 		AttemptedPlanKeys: []string{
-			direct.PlanAttemptKey, hlsPlan.PlanAttemptKey,
+			second.PlaybackPlan.PlanAttemptKey,
 		},
 		AttemptCount:          3,
 		PositionSeconds:       20,
@@ -531,5 +530,24 @@ func TestHandleReplanPlaybackV3UnchangedTrackChangeKeepsFailedRemuxExcluded(t *t
 	}
 	if third.Terminal.Reason != "adaptation_exhausted" {
 		t.Fatalf("exhausted transcode recovery terminal has unexpected reason: %#v", third.Terminal)
+	}
+}
+
+// A retryable planner terminal must not permanently retire the failed
+// delivery: tone-map discovery and settings outages surface as retryable
+// transcode_start_failed, a transient dependency rather than planner
+// exhaustion, so the delivery stays eligible and the retry can recover.
+func TestRetryablePlannerTerminalLeavesFailedDeliveryEligible(t *testing.T) {
+	for _, reason := range []string{
+		playback.TerminalHDRTranscodeUnsupportedV3,
+		terminalSubtitleConversionUnsupportedV3,
+	} {
+		result := retryIncompleteToneMapPlanningV3(
+			playback.PlannerResultV3{Terminal: &playback.TerminalV3{Reason: reason}},
+			context.DeadlineExceeded,
+		)
+		if result.Terminal == nil || result.Terminal.Reason != transcodeStartFailedReasonV3 || !result.Terminal.Retryable {
+			t.Fatalf("terminal for %q = %#v, want retryable %q", reason, result.Terminal, transcodeStartFailedReasonV3)
+		}
 	}
 }

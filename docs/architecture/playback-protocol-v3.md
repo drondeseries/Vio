@@ -895,12 +895,17 @@ something else.
 
 **Intent operations behave differently from failure recovery.**
 `track_change`, `quality_change`, and `output_change` keep the previous route
-eligible because nothing established that its recipe failed: neither attempted-
-key history nor the failed-plan exclusion applies. The first two replace what
-were separate v2 endpoints (an audio PATCH and a client-posted transcode start).
-A client may therefore be handed back a plan it has already tried — that is
-correct here, and a client must not treat a repeated `plan_attempt_key` as a
-loop.
+eligible because nothing established that its recipe failed. Client-supplied
+attempted-key history does not apply to a genuine intent change. But when the
+request does not change the effective selection — same tracks, same quality
+rung, same output route — the server still honors the failed-recipe evidence
+it retained from this attempt's earlier failure recoveries: a recipe that
+already failed stays excluded even if the replan omits earlier
+`attempted_plan_keys`. The first two operations replace what were separate v2
+endpoints (an audio PATCH and a client-posted transcode start). A client may
+otherwise be handed back a plan it has already tried — that is correct on a
+genuine intent change, and a client must not treat a repeated
+`plan_attempt_key` as a loop.
 
 When such an operation actually changes something — the request's tracks,
 quality, or output capabilities differ from what the session currently has —

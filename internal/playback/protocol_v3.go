@@ -514,6 +514,7 @@ type DeliveryCapabilityV3 struct {
 	Enabled                bool                           `json:"enabled"`
 	SupportedOnDevice      bool                           `json:"supported_on_device"`
 	FailureReason          string                         `json:"failure_reason,omitempty"`
+	ExcludedPlanKeys       []string                       `json:"excluded_plan_keys,omitempty"`
 	Containers             []string                       `json:"containers"`
 	VideoCodecs            []string                       `json:"video_codecs"`
 	AudioDecodeCodecs      []string                       `json:"audio_decode_codecs"`
@@ -1494,6 +1495,7 @@ func cloneDeliveryCapabilityV3(delivery DeliveryCapabilityV3) DeliveryCapability
 		maxChannels := *delivery.MaxChannels
 		delivery.MaxChannels = &maxChannels
 	}
+	delivery.ExcludedPlanKeys = append([]string(nil), delivery.ExcludedPlanKeys...)
 	delivery.Transformations = append([]TransformationV3(nil), delivery.Transformations...)
 	for i := range delivery.Transformations {
 		delivery.Transformations[i].ValidatedClaims = append([]string(nil), delivery.Transformations[i].ValidatedClaims...)
