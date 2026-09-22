@@ -281,6 +281,77 @@ func virtualCandidateVerdictActive(failedAt *time.Time, now time.Time) bool {
 	return !now.After(failedAt.Add(virtualFailedVerdictMaxAge))
 }
 
+// virtualP0ProbeStalenessBound is how old a pinned row's probe evidence may be
+// before the P0 repeat-play fast path revalidates against the provider instead
+// of serving the pin blind. It is a fixed multiple of the background candidate
+// refresh cadence (virtualCandidateRefreshInterval): 24 ticks, twelve hours,
+// spans a normal viewing day, so a same-day replay keeps the fast path while a
+// provider re-list that dropped the pinned release is re-checked within the
+// same day. It is deliberately a fixed constant rather than the candidate store
+// window: that window defaults to 720h, which would leave a vanished pin
+// effectively unvalidated for a month. No new setting is introduced.
+const virtualP0ProbeStalenessBound = 24 * virtualCandidateRefreshInterval
+
+// p0PinSuspectReason classifies why the P0 repeat-play fast path must not bind
+// the pinned row blind. An empty result means the row is fresh and eligible.
+// A nil row is always suspect (there is nothing to bind).
+func p0PinSuspectReason(file *models.MediaFile, now time.Time) string {
+	if file == nil {
+		return "missing_row"
+	}
+	if virtualCandidateVerdictActive(file.FailedAt, now) {
+		return "failed_verdict"
+	}
+	if file.ProbeUpdatedAt != nil && now.Sub(*file.ProbeUpdatedAt) > virtualP0ProbeStalenessBound {
+		return "stale_probe"
+	}
+	return ""
+}
+
+// p0PinSuspect reports whether the pinned row needs a provider revalidation
+// before the P0 fast path may serve it. See p0PinSuspectReason.
+func p0PinSuspect(file *models.MediaFile, now time.Time) bool {
+	return p0PinSuspectReason(file, now) != ""
+}
+
+// logVirtualP0SuspectSkippedV3 records that a row which otherwise qualified for
+// the P0 repeat-play fast path was revalidated instead, because its verdict was
+// active or its probe evidence was stale. Distinct from the incomplete-metadata
+// skip so deployments can see why a replay cost a provider round-trip.
+func logVirtualP0SuspectSkippedV3(ctx context.Context, file *models.MediaFile, candidateURI, reason string) {
+	if file == nil {
+		return
+	}
+	slog.InfoContext(ctx, "virtual repeat-play fast path skipped: pinned row needs revalidation",
+		"component", "api",
+		"status", "fast_path_skipped_suspect_pin",
+		"reason", reason,
+		"file_id", file.ID,
+		"content_id", file.ContentID,
+		"candidate_uri", candidateURI,
+	)
+}
+
+// clearVirtualCandidateVerdict clears the row's stale failed_at after a
+// successful same-identity re-resolve. The write is fenced on the row identity
+// and the verdict observed before the resolve, so a concurrent rotation or a
+// newer failure is never cleared. Best-effort: a clear failure does not fail
+// the playback that already resolved, it only leaves the row slow next replay.
+func (h *PlaybackHandler) clearVirtualCandidateVerdict(ctx context.Context, file *models.MediaFile, resolvedURI string) {
+	if h == nil || h.VirtualCandidateClearFailedMarker == nil || file == nil || file.FailedAt == nil {
+		return
+	}
+	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := h.VirtualCandidateClearFailedMarker(clearCtx, file.ID, file.FilePath, file.FailedAt); err != nil {
+		slog.WarnContext(ctx, "virtual candidate verdict clear failed",
+			"component", "api", "file_id", file.ID, "candidate_uri", resolvedURI, "error", err)
+		return
+	}
+	slog.InfoContext(ctx, "virtual candidate verdict cleared after a successful same-identity re-resolve",
+		"component", "api", "status", "verdict_cleared", "file_id", file.ID, "candidate_uri", resolvedURI)
+}
+
 // virtualFallbackEligibility is the explicit release-identity contract for the
 // stale-source fallback. The caller builds it from the resolve intent and the
 // anchored release so the fallback never infers session binding or rotation
@@ -1650,15 +1721,29 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// delivered collection row falls through to the resolve path, which
 		// re-lists and can recover/rotate.
 		collectionRowNeedsDelivery := file.ProbeSource == virtualCollectionProbeSource && file.LastDeliveredAt == nil
-		if deferProbe && !forceRelist && !noResult &&
-			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
+		p0Qualified := deferProbe && !forceRelist && !noResult &&
+			len(excludedCandidateIDs) == 0 &&
 			!collectionRowNeedsDelivery &&
 			h.VirtualMediaDetailedResolver != nil &&
 			((persistedResultURI && cand.URI == file.FilePath) || (pinnedURI != "" && cand.URI == pinnedURI)) &&
 			file.ProbeUpdatedAt != nil &&
 			completeVirtualVideoEvidenceV3(file) &&
 			completeVirtualAudioEvidenceV3(file) &&
-			completeVirtualContainerEvidenceV3(file) {
+			completeVirtualContainerEvidenceV3(file)
+		// Pre-validation gate. A row whose verdict damper is active, or whose
+		// probe evidence has aged past the staleness bound, must not skip the
+		// provider round-trip: it falls through to the normal resolve, which
+		// re-lists, rematches by durable identity, adopts or rotates, and can
+		// recover the row. This also covers an explicit retry (allowFailed) of a
+		// failed row, which previously still took P0 and served the dead pin.
+		// A fresh, non-failed row is untouched and keeps the fast path with no
+		// extra provider call.
+		p0Reason := p0PinSuspectReason(file, time.Now())
+		p0Suspect := p0Qualified && p0Reason != ""
+		if p0Suspect {
+			logVirtualP0SuspectSkippedV3(attemptCtx, file, cand.URI, p0Reason)
+		}
+		if p0Qualified && p0Reason == "" {
 			fastPathHit = true
 			trace.fastPath = true
 			transient := *file
@@ -1895,6 +1980,20 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid
 		}
+		// Recovery coherence. A row the pre-validation gate sent down the
+		// resolve path (active verdict or stale probe) that still resolves to
+		// its own release is healthy again: clear the stale verdict through the
+		// same fenced clear the versions check uses, so the next replay is
+		// eligible for the P0 fast path instead of re-resolving on every start.
+		// A substituted sibling carries its own verdict and is never cleared
+		// here. A persisted row served straight from its stored URL never
+		// contacted the provider, so it is not liveness evidence either. The
+		// clear is fenced on the row's identity and observed verdict, so a
+		// rotation or a newer failure survives it.
+		if !servedPersisted && sameVirtualReleaseIdentity(file.FilePath, cand.URI) &&
+			virtualCandidateVerdictActive(file.FailedAt, time.Now()) {
+			h.clearVirtualCandidateVerdict(attemptCtx, file, cand.URI)
+		}
 		if substituted && (dbFile == nil || dbFile.ID <= 0) {
 			// No catalog row for the resolved candidate: do not carry the
 			// probed candidate's declared metadata onto it. The forced probe
@@ -1933,6 +2032,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// rather than the probed candidate's resolution, codecs or tracks.
 			skipProbe = false
 			storedProbeMissing = true
+		}
+		if p0Suspect && (h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) {
+			// The P0 gate refused this row as suspect (active verdict or stale
+			// probe). A URL re-resolve alone leaves probe_updated_at unchanged,
+			// so without a fresh probe the row would be suspect on every later
+			// replay and never return to the fast path. Force the real probe so
+			// the persisted evidence and its stamp advance once validated.
+			skipProbe = false
 		}
 		if !skipProbe && cand.CodecVideo != "" && cand.Resolution != "" && cand.CodecAudio != "" && canSkipProbeForContainer(cand.Container) {
 			mergeVirtualCandidateTracks(&transient, cand)
@@ -1980,6 +2087,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// The probed candidate's declared metadata is gone, so the deferred
 			// declared-metadata path cannot be trusted; probe the resolved URL
 			// synchronously and serve the bytes' real metadata.
+			allowDefer = false
+		}
+		if p0Suspect && (h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) {
+			// Validate a suspect row synchronously so the refreshed probe stamp
+			// is persisted before the response. A deferred probe would leave the
+			// row suspect for the next start until the background write lands.
 			allowDefer = false
 		}
 		if allowDefer {

@@ -483,7 +483,16 @@ type PlaybackHandler struct {
 	// the write is fenced on the delivered candidate identity and the failure
 	// state observed before the delivering request, so a rotation or a newer
 	// failure is never cleared. Nil disables the clear.
-	VirtualCandidateRecoveredMarker        func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error
+	VirtualCandidateRecoveredMarker func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error
+	// VirtualCandidateClearFailedMarker clears a virtual candidate's failed_at
+	// verdict after a successful same-identity re-resolve that the explicit
+	// retry (allowFailedCandidate) or stale-pin fall-through let through, so the
+	// next replay is eligible for the P0 repeat-play fast path again. It is the
+	// playback-path counterpart of CatalogResourceHandler.ClearVirtualFailed
+	// (the versions-check liveness recovery) and is fenced on the same identity
+	// and observed verdict, so a rotation or a newer failure survives it. Nil
+	// disables the clear.
+	VirtualCandidateClearFailedMarker      func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
 	VirtualPlaybackSourceProber            VirtualPlaybackSourceProber
 	VirtualPlaybackSourceProberWithHeaders VirtualPlaybackSourceProberWithHeaders
 	VirtualProbeCacheLookup                VirtualProbeCacheLookup
