@@ -1774,6 +1774,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// re-resolve the same request with each rejected provider candidate
 	// excluded, after requestedFile has been replaced by a resolved candidate.
 	catalogRequestedFile := requestedFile
+	// virtualDecision accumulates the virtual-source facts the plan log names.
+	// It stays zero for a local source, and the log only reads it when the
+	// plan carries a virtual candidate URI.
+	virtualDecision := virtualPlanDecisionV3{}
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve and
 	// probe them through the virtual provider before the generic probe repair
 	// path, which only understands local/HTTP media files.
@@ -1814,6 +1818,8 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// Do NOT mutate req.FileID here: the original caller-supplied file ID
 		// must survive into the attempt record for idempotent replay.
 		resolutionWasAssumed = resolved.ResolutionAssumed
+		virtualDecision.candidateRank = resolved.CandidateRank
+		virtualDecision.candidateCount = resolved.CandidateCount
 	} else {
 		requestedFile = h.ensurePlaybackProbe(r.Context(), requestedFile)
 	}
@@ -1848,7 +1854,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		}
 	}
 	if req.AudioTrackID == "" && req.AudioTrackIndex == nil {
-		audioIndex, err = h.preferredAudioTrackIndexV3(r.Context(), userID, profileID, deviceID, requestedFile, playback.AudioTrackPlayableFuncV3(req))
+		audioIndex, virtualDecision.preferredAudioLanguage, err = h.preferredAudioTrackIndexV3(r.Context(), userID, profileID, deviceID, requestedFile, playback.AudioTrackPlayableFuncV3(req))
 		if err != nil {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the saved audio preference")
 		}
@@ -2149,7 +2155,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// remux/transcode ffmpeg is started lazily by StreamHandler on the first
 	// request, so no transport spawn or manifest wait is included here. The
 	// mark only covers an eager local HLS/transcode startup for HLS deliveries.
-	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, result, clientInfo)
+	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, virtualDecision, result, clientInfo)
 	timings.mark("session_transport_commit")
 	if statusErr != nil {
 		// A decoder-rejected source is a candidate failure, not a route failure:
@@ -2179,7 +2185,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		if statusErr.reason == transcodeStartFailedReasonV3 && !audioOnlyTransportReasonV3(statusErr.reason) && isVirtualPlaybackFile(requestedFile) && req.FileSelection != playback.FileSelectionExplicitV3 {
 			alternateOrder := alternateOrderingForClient(req.Capabilities)
 			if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile, alternateOrder); alternateErr == nil && len(alternates) > 0 {
-				for _, altCandidate := range alternates {
+				for alternateRank, altCandidate := range alternates {
 					alternate, err := h.prepareVirtualAlternateFileV3(r, altCandidate, profileID)
 					if err != nil || alternate == nil {
 						continue
@@ -2205,7 +2211,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 						clampPlannerTargetResolution(&alternateResult, alternate)
 						if alternateResult.Terminal == nil {
 							slog.WarnContext(r.Context(), "virtual playback transport failed; retrying compatible alternate", "component", "playback", "requested_file_id", requestedFile.ID, "alternate_file_id", alternate.ID, "alternate_order_4k_first", alternateOrder.Prefer4K, "error", statusErr.cause)
-							if alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r, userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateResult, clientInfo); alternateStatusErr == nil {
+							alternateDecision := virtualDecision
+							alternateDecision.candidateRank = alternateRank
+							alternateDecision.candidateCount = len(alternates)
+							if alternateResponse, alternateStatusErr := h.startPlannedPlaybackV3(r, userID, profileID, alternateRequest, requestDigests, requestedFile, alternate, alternateAudio, alternateDecision, alternateResult, clientInfo); alternateStatusErr == nil {
 								return alternateResponse, nil
 							}
 						}
@@ -2352,7 +2361,7 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 		if planResult.Terminal != nil || planResult.Plan == nil {
 			return playback.DecisionResponseV3{}, false
 		}
-		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, &resolvedFile, &resolvedFile, audioIndex, planResult, clientInfo)
+		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, &resolvedFile, &resolvedFile, audioIndex, virtualPlanDecisionV3{candidateRank: resolved.CandidateRank, candidateCount: resolved.CandidateCount}, planResult, clientInfo)
 		if statusErr == nil {
 			return response, true
 		}
@@ -2466,7 +2475,71 @@ func appendStartWarningsV3(result *playback.PlannerResultV3, warnings []playback
 }
 
 // startPlannedPlaybackV3 creates a session and transport for an accepted plan.
-func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, result playback.PlannerResultV3, clientInfo playback.ClientInfo) (playback.DecisionResponseV3, *transportErrorV3) {
+// virtualPlanDecisionV3 carries the virtual-source decision facts the plan
+// log names: the resolved playback.audio_language that steered audio
+// selection, and the selected candidate's rank in the ranked list the resolver
+// considered. The zero value means "not a ranked virtual resolve"; the log
+// omits the rank fields then rather than printing a misleading 0.
+type virtualPlanDecisionV3 struct {
+	preferredAudioLanguage string
+	candidateRank          int
+	candidateCount         int
+}
+
+// selectedAudioTrackLogFieldsV3 names the audio track a plan will play: its
+// language, codec and selection ordinal, read from the plan's authoritative
+// audio inventory. An out-of-range or absent inventory yields empty strings
+// and the passed-in ordinal, so a missing track reads as unset rather than
+// as a bogus language.
+func selectedAudioTrackLogFieldsV3(result playback.PlannerResultV3, audioIndex int) (language, codec string, ordinal int) {
+	if result.Plan == nil {
+		return "", "", audioIndex
+	}
+	ordinal = audioIndex
+	if selected := result.Plan.SelectedTracks.Audio; selected != nil && selected.Index != nil {
+		ordinal = *selected.Index
+	}
+	if ordinal < 0 || ordinal >= len(result.Plan.AudioTracks) {
+		return "", "", ordinal
+	}
+	track := result.Plan.AudioTracks[ordinal]
+	language = strings.TrimSpace(track.Language)
+	if language == "" && len(track.Languages) > 0 {
+		language = strings.Join(track.Languages, "/")
+	}
+	return language, strings.TrimSpace(track.Codec), ordinal
+}
+
+// virtualPlanDecisionAttrsV3 is the virtual-source part of the plan-decision
+// line: the selected candidate, its rank in the considered list, the audio
+// track the plan will play, and the resolved playback.audio_language that
+// steered it. A non-virtual plan yields no attributes. The rank is omitted
+// until a ranked candidate count is known, and absent preferences render as
+// empty strings, so a missing value is never printed as a misleading zero.
+func virtualPlanDecisionAttrsV3(result playback.PlannerResultV3, audioIndex int, decision virtualPlanDecisionV3) []any {
+	uri := ""
+	if result.Plan != nil {
+		uri = result.Plan.EffectiveVirtualURI
+	}
+	if uri == "" {
+		return nil
+	}
+	audioLanguage, audioCodec, audioOrdinal := selectedAudioTrackLogFieldsV3(result, audioIndex)
+	attrs := []any{
+		"candidate_uri", uri,
+		"candidate_count", decision.candidateCount,
+		"preferred_audio_language", decision.preferredAudioLanguage,
+		"audio_track_language", audioLanguage,
+		"audio_track_codec", audioCodec,
+		"audio_track_index", audioOrdinal,
+	}
+	if decision.candidateCount > 0 {
+		attrs = append(attrs, "candidate_rank", decision.candidateRank)
+	}
+	return attrs
+}
+
+func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, virtualDecision virtualPlanDecisionV3, result playback.PlannerResultV3, clientInfo playback.ClientInfo) (playback.DecisionResponseV3, *transportErrorV3) {
 	if result.Plan == nil {
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "The server produced no playback plan."}
 	}
@@ -2518,7 +2591,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	}
 	// One line per final plan decision so route selection is reconstructible
 	// from server logs.
-	slog.InfoContext(r.Context(), "playback plan decided", append([]any{
+	planDecisionAttrs := []any{
 		logComponentKey, playbackLogValueV3,
 		requestIDLogKeyV3, chimw.GetReqID(r.Context()),
 		"outcome", "plan",
@@ -2533,7 +2606,14 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		"target_bitrate_kbps", result.TargetBitrateKbps,
 		"quality_preference", req.QualityPreference,
 		bandwidthEstimateLogKeyV3, intOrZeroHandlerV3(req.BandwidthEstimateKbps),
-	}, clientInfo.LogAttrs()...)...)
+	}
+	// Virtual playback gets the candidate and language decision on the same
+	// line: which provider candidate was selected, where it ranked in the
+	// considered list, the audio track the plan will play, and the resolved
+	// playback.audio_language that steered it. Without these a cold playback
+	// that ignored the configured language was unattributable.
+	planDecisionAttrs = append(planDecisionAttrs, virtualPlanDecisionAttrsV3(result, audioIndex, virtualDecision)...)
+	slog.InfoContext(r.Context(), "playback plan decided", append(planDecisionAttrs, clientInfo.LogAttrs()...)...)
 	applyTransportToneMapModeV3(&result, transport)
 	frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)
 	if frozenErr != nil {
@@ -4086,14 +4166,14 @@ func (h *PlaybackHandler) multipartResumeFileV3(ctx context.Context, file *model
 //
 // The client sends a track identity only when the viewer picked one. Defaulting
 // to ordinal zero instead would silently play the first track on the reel.
-func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID int, profileID, deviceID string, file *models.MediaFile, playable func(models.AudioTrack) bool) (int, error) {
+func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID int, profileID, deviceID string, file *models.MediaFile, playable func(models.AudioTrack) bool) (int, string, error) {
 	if file == nil || len(file.AudioTracks) == 0 || h.StoreProvider == nil {
-		return 0, nil
+		return 0, "", nil
 	}
 	store, err := h.StoreProvider.ForUser(ctx, userID)
 	if err != nil {
 		slog.ErrorContext(ctx, "protocol v3 start: audio preference store lookup failed", "component", "api", "user_id", userID, "error", err)
-		return 0, err
+		return 0, "", err
 	}
 	seriesID := h.resolveSeriesID(ctx, file)
 	var seriesPref *playback.AudioTrackPreference
@@ -4101,7 +4181,7 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		stored, prefErr := store.GetAudioPreference(ctx, profileID, seriesID)
 		if prefErr != nil {
 			slog.ErrorContext(ctx, "protocol v3 start: series audio preference lookup failed", "component", "api", "profile_id", profileID, "series_id", seriesID, "error", prefErr)
-			return 0, prefErr
+			return 0, "", prefErr
 		}
 		if stored != nil {
 			seriesPref = &playback.AudioTrackPreference{AudioTrackIndex: stored.AudioTrackIndex, AudioLanguage: stored.AudioLanguage, TrackSignature: stored.TrackSignature}
@@ -4117,7 +4197,7 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 	}
 	preferredLang, err := resolvedPlaybackAudioLanguage(ctx, store, rc)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if preferredLang == playback.OriginalLanguageSentinel {
 		preferredLang = h.resolveOriginalLanguage(ctx, file)
@@ -4138,7 +4218,7 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		// settings own the language and its scope precedence.
 		seriesPref.AudioLanguage = preferredLang
 	}
-	return normalizeAudioTrackIndex(file, playback.SelectAudioTrackPreferringPlayable(file.AudioTracks, preferredLang, seriesPref, playable)), nil
+	return normalizeAudioTrackIndex(file, playback.SelectAudioTrackPreferringPlayable(file.AudioTracks, preferredLang, seriesPref, playable)), preferredLang, nil
 }
 
 // resumePositionV3 answers what an omitted `start_position` means: resume where

@@ -742,10 +742,32 @@ func (h *SettingValuesHandler) setNavigationShortcut(
 // Batched deliberately: a client opening a settings screen needs every key at
 // once, and a season view needs several keys across many series. One store read
 // serves all of it.
+// normalizeEffectiveKeys drops empty and whitespace-only key entries. A client
+// that serializes an empty key list as `?keys=` sends one empty element; that
+// means "no keys named", not an unknown setting, and must resolve like an
+// omitted list rather than fail with "No setting named  exists". v1's
+// parseSettingKeys filtered the same way. A non-empty key is left untouched so
+// an unknown one is still rejected by its exact name.
+func normalizeEffectiveKeys(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(raw))
+	for _, key := range raw {
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	return keys
+}
+
 func (h *SettingValuesHandler) resolveEffective(
 	ctx context.Context, store userstore.UserStore, q EffectiveSettingsQuery,
 ) ([]effectiveSettingValueResponse, *APIError) {
-	keys := q.Keys
+	keys := normalizeEffectiveKeys(q.Keys)
 	if len(keys) == 0 {
 		// No keys named means every remote definition, which is what a settings
 		// screen wants and saves clients enumerating the manifest themselves.
@@ -807,19 +829,14 @@ func (h *SettingValuesHandler) resolveEffective(
 			"Too many library_ids/series_ids in one request; resolve in smaller batches")
 	}
 
-	// A device-aware key resolved without a device identity would silently
-	// skip every stored device override and pass the profile fallback off as
-	// the effective value — a plausible wrong answer. Fail closed instead:
-	// the write path already requires the header for device overrides.
-	if rc.DeviceID == "" {
-		for _, key := range keys {
-			if def, ok := h.contract.Lookup(key); ok &&
-				def.AllowsScope(settingscontract.ScopeProfileDevice) {
-				return nil, fieldError(settingFieldDeviceHeader,
-					"X-Vio-Device-Id header is required to resolve "+key)
-			}
-		}
-	}
+	// A read names the profile (and optionally a device). An absent device
+	// identity is not an error: the resolver skips profile_device candidates
+	// and answers the profile/account/default layer, and the response's
+	// `source` field says which layer won. Failing the read closed left a
+	// viewer that cannot send a device header — a playback client reading the
+	// owner's audio-language default — with no effective values at all, so the
+	// client silently fell back to its own default. A client that wants device
+	// resolution still sends X-Vio-Device-Id and gets it.
 
 	resolved, err := h.resolver.Resolve(ctx, store, rc, keys, h.constraintsFor(ctx))
 	if err != nil {
@@ -834,7 +851,7 @@ func (h *SettingValuesHandler) resolveEffective(
 func (h *SettingValuesHandler) resolveEffectiveContexts(
 	ctx context.Context, store userstore.UserStore, q EffectiveSettingsQuery, requested []effectiveContextRequest,
 ) ([]effectiveContextResponse, *APIError) {
-	keys := q.Keys
+	keys := normalizeEffectiveKeys(q.Keys)
 	if len(keys) == 0 {
 		return nil, fieldError(settingFieldKeys, "keys must contain at least one setting")
 	}
@@ -857,13 +874,9 @@ func (h *SettingValuesHandler) resolveEffectiveContexts(
 	if apiErr != nil {
 		return nil, apiErr
 	}
-	if deviceID == "" {
-		for _, key := range keys {
-			if def, exists := h.contract.Lookup(key); exists && def.AllowsScope(settingscontract.ScopeProfileDevice) {
-				return nil, fieldError(settingFieldDeviceHeader, "X-Vio-Device-Id header is required to resolve "+key)
-			}
-		}
-	}
+	// An absent device identity resolves the profile/account/default layers;
+	// see resolveEffective. The response's `source` names the winning layer,
+	// so a client can tell that no device override applied.
 
 	seen := make(map[string]struct{}, len(requested))
 	contexts := make([]settingsresolve.Context, 0, len(requested))

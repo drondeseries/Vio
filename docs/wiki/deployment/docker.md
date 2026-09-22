@@ -448,6 +448,7 @@ default. Database-size classification uses
 
 | Variable | Default | Description |
 | --- | ---: | --- |
+| `POSTGRES_TUNE` | `auto` | `auto`/`on` enable tuning; `off`/`manual` disable it. `manual` means you tuned PostgreSQL yourself and Silo leaves it alone. |
 | `POSTGRES_TUNE_PROFILE` | `oltp` | Tuning profile; only `oltp` is currently supported. |
 | `POSTGRES_TUNE_MEMORY` | `auto` | Server or container RAM, such as `8GB` or `32GB`; explicit values are used as-is. |
 | `POSTGRES_TUNE_MEMORY_BUDGET_PERCENT` | `75` | Percentage of auto-detected RAM used for PostgreSQL recommendations. |

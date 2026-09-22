@@ -1026,6 +1026,14 @@ type resolvedVirtualPlaybackSource struct {
 	// User-Agent) the resolved URL needs. It is persisted with the URL so a
 	// header-authenticated provider stream stays usable from the catalog.
 	RequestHeaders map[string]string
+	// CandidateRank is the 0-based position of the selected candidate in the
+	// ranked candidate list this resolve considered, or -1 when the resolve
+	// took a path that did not rank (a stored-URL fast path with no list).
+	// CandidateCount is that list's length. They feed the plan-decision log so
+	// a deployment question ("which candidate did it pick, and out of how
+	// many?") is answerable without a second resolve.
+	CandidateRank  int
+	CandidateCount int
 }
 
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
@@ -2256,6 +2264,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if result == nil {
 				return resolvedVirtualPlaybackSource{}, errors.New("virtual playback fast path returned no source")
 			}
+			result.CandidateRank = i
+			result.CandidateCount = len(candidates)
 			return *result, nil
 		}
 		if err != nil || result.Provenance == ProbeProvenanceFailed {
@@ -2296,6 +2306,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// to the finalization block below so they still get the runtime
 		// check, evidence persist, and sticky pin.
 		if result.Provenance == ProbeProvenancePending {
+			result.CandidateRank = i
+			result.CandidateCount = len(candidates)
 			return *result, nil
 		}
 		if result.Provenance == ProbeProvenanceVerified || (!result.AppliedRemux && !result.ResolutionAssumed && h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
@@ -2333,10 +2345,14 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// round-trip and re-rank for the requesting device. Pin this URI
 			// as sticky so rotation cannot churn future sessions.
 			h.pinVirtualSticky(stickyKey, candidate.URI)
+			result.CandidateRank = i
+			result.CandidateCount = len(candidates)
 			return *result, nil
 		}
 		if firstResolved == nil {
 			copy := *result
+			copy.CandidateRank = i
+			copy.CandidateCount = len(candidates)
 			firstResolved = &copy
 		}
 	}
