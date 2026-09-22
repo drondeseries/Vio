@@ -1041,10 +1041,6 @@ export function VideoPlayer({
   useEffect(() => {
     if (!replanError || replanning) return;
 
-    setPendingSeekTime(null);
-    const video = videoRef.current;
-    if (video) setCurrentTime(toMediaTime(video.currentTime, timelineOffsetRef.current));
-
     const failureKey = `${sessionId}:${plan.plan_attempt_key}`;
     if (reportedPlanFailureKeyRef.current === failureKey) {
       reportedPlanFailureKeyRef.current = null;
@@ -2301,6 +2297,9 @@ export function VideoPlayer({
       // where `waiting` fired but `canplay`/`playing` never followed.
       markPlaybackStarted();
       clearBuffering();
+      if (roomSyncWaiting && watchTogetherSync.attachedSessionId === sessionId) {
+        watchTogetherSync.reportReady();
+      }
     };
     const onSeeked = () => {
       const resolved = resolvePendingSeekTime(
