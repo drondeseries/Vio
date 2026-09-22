@@ -61,6 +61,7 @@ import type {
   PlayerSubtitleTrackSignature,
   PlayerTimeRange,
   PlayerMarkerSegment,
+  PlayerVirtualRanking,
   MarkerDraft,
   MarkerKind,
   MarkerRegionView,
@@ -214,6 +215,8 @@ interface VideoPlayerProps {
   sessionId: string;
   selectedVersion?: PlayerFileVersion;
   versions?: PlayerFileVersion[];
+  /** The ranking the server applied to the version list, forwarded to the menu. */
+  virtualRanking?: PlayerVirtualRanking;
   activeFileId?: number | null;
   chapters?: PlayerChapter[];
   onSwitchVersion?: (fileId: number, currentPosition: number) => void;
@@ -372,6 +375,7 @@ export function VideoPlayer({
   sessionId,
   selectedVersion,
   versions = [],
+  virtualRanking,
   activeFileId,
   chapters = [],
   onSwitchVersion,
@@ -746,7 +750,10 @@ export function VideoPlayer({
           ),
           profileLabel: profileLabelFromFilePath(v.file_path),
           filePath: v.file_path,
-          virtualRanking: (v as { virtual_ranking?: unknown }).virtual_ranking,
+          // The server publishes the ranking on the watch detail, not per file.
+          // Prefer the detail-level block and keep reading any per-version block
+          // for forward compatibility.
+          virtualRanking: virtualRanking ?? (v as { virtual_ranking?: unknown }).virtual_ranking,
           sortable: versionSortableFromFile(v),
           formatScore: v.format_score,
           isCurrentSource: v.file_id === effectiveFileId,
@@ -761,7 +768,7 @@ export function VideoPlayer({
           unavailable: (v as PlayerFileVersion & { available?: boolean }).available === false,
         };
       }),
-    [versions, effectiveFileId, plan.requested_media_file_id, pendingSwitchFileId],
+    [versions, virtualRanking, effectiveFileId, plan.requested_media_file_id, pendingSwitchFileId],
   );
 
   // Any stream restart (transcode restart on seek, quality/audio switch,

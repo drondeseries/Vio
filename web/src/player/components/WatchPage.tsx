@@ -201,6 +201,7 @@ function WatchPagePlayer({
   libraryId,
   versions,
   playbackVariants = [],
+  virtualRanking,
   subtitles,
   initialPosition,
   forceInitialPosition,
@@ -927,6 +928,7 @@ function WatchPagePlayer({
         sessionId={session.sessionId}
         selectedVersion={selectedVersion}
         versions={playbackVersions}
+        virtualRanking={virtualRanking}
         activeFileId={session.mediaFileId}
         chapters={activeChapters}
         onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}

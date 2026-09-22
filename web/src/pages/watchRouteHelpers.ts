@@ -416,6 +416,7 @@ export function buildWatchPageProps({
     libraryId: request.libraryId,
     versions: item.versions,
     playbackVariants: item.playback_variants ?? [],
+    virtualRanking: item.virtual_ranking,
     subtitles,
     initialPosition,
     forceInitialPosition: request.restart,

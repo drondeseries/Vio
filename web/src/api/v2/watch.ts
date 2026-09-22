@@ -82,12 +82,13 @@ function variantPartFromV2(part: WatchPlaybackVariantPartV2): PlaybackVariantPar
 }
 
 function variantFromV2(variant: WatchPlaybackVariantV2): PlaybackVariant {
-  const { default_file_id, total_duration_seconds, parts, ...rest } = variant;
+  const { default_file_id, total_duration_seconds, parts, virtual_ranking, ...rest } = variant;
   return {
     ...rest,
     default_file_id: numericId(default_file_id),
     total_duration: total_duration_seconds,
     parts: parts.map(variantPartFromV2),
+    virtual_ranking,
   };
 }
 
@@ -115,6 +116,7 @@ export function watchDetailFromV2(detail: WatchDetailV2): WatchDetail {
     overview: detail.overview ?? "",
     versions: watchFileVersionsFromV2(detail.versions),
     playback_variants: detail.playback_variants?.map(variantFromV2),
+    virtual_ranking: detail.virtual_ranking,
     subtitles: detail.subtitles.map((s) => ({
       source: s.source,
       language: s.language,

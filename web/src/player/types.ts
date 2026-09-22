@@ -56,6 +56,17 @@ export interface PlayerFileVersion {
   marker_segments?: PlayerMarkerSegment[];
 }
 
+/**
+ * The ranking the server applied to a virtual item's version order. The watch
+ * detail carries it; the version menu scans the version list for it, so the
+ * player forwards the detail-level block rather than storing it per file.
+ */
+export interface PlayerVirtualRanking {
+  profile_label?: string;
+  source?: "profile" | "default";
+  criteria?: { attribute: string; direction: "asc" | "desc" }[];
+}
+
 export interface PlayerPlaybackVariantPart {
   part_index: number;
   default_file_id?: number;
@@ -273,6 +284,12 @@ export interface WatchPageProps {
   libraryId?: number;
   versions: PlayerFileVersion[];
   playbackVariants?: PlayerPlaybackVariant[];
+  /**
+   * The ranking the server applied to the version list, from the watch detail.
+   * Absent for local content, where the version menu keeps its `?profile=`
+   * label fallback.
+   */
+  virtualRanking?: PlayerVirtualRanking;
   subtitles: PlayerSubtitleInfo[];
   initialPosition?: number;
   forceInitialPosition?: boolean;

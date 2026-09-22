@@ -870,6 +870,20 @@ export interface AudiobookGroup {
 }
 
 // Item Detail
+/**
+ * The ranking the server applied to a virtual item's version order. The v2
+ * watch payload carries it on the watch detail (and on each playback variant),
+ * not on individual file versions.
+ */
+export interface VirtualRanking {
+  /** The quality-profile label that produced the order; absent for the built-in default. */
+  profile_label?: string;
+  /** "profile" when a configured profile drove the order, "default" otherwise. */
+  source?: "profile" | "default";
+  /** Ordered ranking keys, top-down. */
+  criteria?: { attribute: string; direction: "asc" | "desc" }[];
+}
+
 export interface FileVersion {
   file_id: number;
   file_name?: string;
@@ -940,6 +954,8 @@ export interface PlaybackVariant {
   total_duration?: number;
   default_file_id?: number;
   parts: PlaybackVariantPart[];
+  /** The ranking that produced this variant's version order; absent for local content. */
+  virtual_ranking?: VirtualRanking;
 }
 
 export interface VersionChapter {
@@ -1222,6 +1238,8 @@ export interface WatchDetail {
   overview: string;
   versions: FileVersion[];
   playback_variants?: PlaybackVariant[];
+  /** The ranking that produced the virtual versions' order; absent for local content. */
+  virtual_ranking?: VirtualRanking;
   subtitles: SubtitleInfo[];
   intro: TimeRange | null;
   credits: TimeRange | null;

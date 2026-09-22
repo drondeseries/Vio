@@ -39,4 +39,23 @@ describe("watchDetailFromV2", () => {
     expect(detail.user_data?.last_file_id).toBe(3);
     expect(detail.effective_subtitle_language).toBe("eng");
   });
+
+  it("carries the server's virtual ranking onto the detail and its variants", () => {
+    const fixture = v2Fixture<"GET /api/v2/watch/{id}">(
+      getWatchStateOk as components["schemas"]["WatchDetail"],
+    );
+    const detail = watchDetailFromV2(fixture);
+
+    // The block lives on the detail (not on individual file versions); the
+    // version-list control reads it through the detail-level ranking.
+    expect(detail.virtual_ranking).toEqual({
+      profile_label: "4K HDR",
+      source: "profile",
+      criteria: [
+        { attribute: "score", direction: "desc" },
+        { attribute: "resolution", direction: "desc" },
+      ],
+    });
+    expect(detail.playback_variants?.[0]?.virtual_ranking).toEqual(detail.virtual_ranking);
+  });
 });

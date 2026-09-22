@@ -277,6 +277,49 @@ describe("QualityMenu version row parity with the item picker", () => {
   });
 });
 
+describe("QualityMenu server virtual ranking", () => {
+  it("renders the server payload's criteria and profile label when present", () => {
+    renderVersionMenu({
+      versions: [
+        makeVersionInfo({
+          fileId: 1,
+          label: "2160p HEVC",
+          virtualRanking: {
+            profile_label: "4K HDR",
+            source: "profile",
+            criteria: [
+              { attribute: "score", direction: "desc" },
+              { attribute: "resolution", direction: "desc" },
+            ],
+          },
+        }),
+        makeVersionInfo({ fileId: 2, label: "1080p H264" }),
+      ],
+    });
+
+    expect(screen.getByText(/Ranking: score ↓ · resolution ↓/)).toBeInTheDocument();
+    expect(screen.getByText(/4K HDR/)).toBeInTheDocument();
+  });
+
+  it("falls back to the profile label and default order without the block", () => {
+    renderVersionMenu({
+      versions: [
+        makeVersionInfo({
+          fileId: 1,
+          label: "2160p HEVC",
+          filePath: "virtual://movie/tt1?profile=4K%2BHDR&result=abc",
+          profileLabel: "4K+HDR",
+        }),
+        makeVersionInfo({ fileId: 2, label: "1080p H264" }),
+      ],
+    });
+
+    expect(screen.getByText(/Ranking: Default ranking/)).toBeInTheDocument();
+    expect(screen.getByText(/4K\+HDR/)).toBeInTheDocument();
+    expect(screen.queryByText(/Ranking: score/)).not.toBeInTheDocument();
+  });
+});
+
 describe("QualityMenu version sort preference", () => {
   function versionRowOrder() {
     return screen
