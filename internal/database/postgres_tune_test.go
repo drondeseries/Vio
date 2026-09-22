@@ -172,3 +172,33 @@ func TestParsePostgresTuneByteSizeRequiresUnit(t *testing.T) {
 		t.Fatal("expected bare memory value to be rejected")
 	}
 }
+
+// TestPostgresTuneManualDisablesWithoutError pins that an operator who states
+// they tuned PostgreSQL themselves is honored rather than warned about: the
+// manual/self/custom spellings disable tuning exactly like off, with no error.
+func TestPostgresTuneManualDisablesWithoutError(t *testing.T) {
+	for _, mode := range []string{"manual", "self", "custom", "off"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("POSTGRES_TUNE", mode)
+			t.Setenv("POSTGRES_TUNE_MEMORY", "8GB")
+			t.Setenv("POSTGRES_TUNE_CPUS", "4")
+
+			opts, err := LoadPostgresTuneOptionsFromEnv(20)
+			if err != nil {
+				t.Fatalf("POSTGRES_TUNE=%s: %v", mode, err)
+			}
+			if opts.Enabled {
+				t.Fatalf("POSTGRES_TUNE=%s enabled tuning, want disabled", mode)
+			}
+		})
+	}
+}
+
+// TestPostgresTuneUnknownModeStillErrors keeps the permissive disabled set from
+// swallowing a genuinely invalid value: a typo must still be refused.
+func TestPostgresTuneUnknownModeStillErrors(t *testing.T) {
+	t.Setenv("POSTGRES_TUNE", "manual-ish")
+	if _, err := LoadPostgresTuneOptionsFromEnv(20); err == nil {
+		t.Fatal("an unknown POSTGRES_TUNE value was accepted")
+	}
+}

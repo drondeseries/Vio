@@ -1095,10 +1095,14 @@ func TestEffectiveRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
-// TestEffectiveRequiresDeviceIdentityForDeviceAwareKeys: resolving a
-// device-capable key without a device identity would silently skip stored
-// device overrides and pass the profile fallback off as effective.
-func TestEffectiveRequiresDeviceIdentityForDeviceAwareKeys(t *testing.T) {
+// TestEffectiveResolvesDeviceAwareKeysWithoutDeviceIdentity: an effective read
+// that names no device resolves the layers it can. A device-capable key is not
+// an error without the device header; the resolver skips profile_device
+// candidates, the response's source names the winning profile/account/default
+// row, and a client that wants device resolution still sends the header. This
+// replaced a fail-closed 400 that left playback clients which cannot send a
+// device header with no effective values at all.
+func TestEffectiveResolvesDeviceAwareKeysWithoutDeviceIdentity(t *testing.T) {
 	handler, _ := newValuesTestHandler(t)
 
 	effective := func(query string) *httptest.ResponseRecorder {
@@ -1109,17 +1113,18 @@ func TestEffectiveRequiresDeviceIdentityForDeviceAwareKeys(t *testing.T) {
 		return rec
 	}
 
-	// playback.subtitle_language allows profile_device, so it needs the header.
-	if rec := effective("keys=playback.subtitle_language"); rec.Code != http.StatusBadRequest {
-		t.Errorf("device-aware key without a device id = %d, want 400: %s",
+	// playback.subtitle_language allows profile_device: without a device
+	// identity it resolves the non-device layers instead of refusing.
+	if rec := effective("keys=playback.subtitle_language"); rec.Code != http.StatusOK {
+		t.Errorf("device-aware key without a device id = %d, want 200: %s",
 			rec.Code, rec.Body.String())
 	}
-	// The no-keys form resolves every remote definition, which includes
-	// device-aware ones.
-	if rec := effective(""); rec.Code != http.StatusBadRequest {
-		t.Errorf("all-keys request without a device id = %d, want 400", rec.Code)
+	// The no-keys form resolves every remote definition, device-aware included.
+	if rec := effective(""); rec.Code != http.StatusOK {
+		t.Errorf("all-keys request without a device id = %d, want 200: %s",
+			rec.Code, rec.Body.String())
 	}
-	// ui.custom_css is profile-only: no device identity needed.
+	// ui.custom_css is profile-only: it never needed a device identity.
 	if rec := effective("keys=ui.custom_css"); rec.Code != http.StatusOK {
 		t.Errorf("profile-only key without a device id = %d, want 200: %s",
 			rec.Code, rec.Body.String())

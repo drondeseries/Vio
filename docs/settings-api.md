@@ -916,8 +916,11 @@ another validated document.
   in one store read. Use it for grids or lists rather than issuing one request
   per item.
 
-An effective request must include the device header when any requested
-definition permits an exact-device override. The family header is optional for
+An effective read resolves the layers the request names. The device header is
+optional: absence skips the exact-device layer and the response's `source` and
+`source_context` name the profile, account or default row that won, so a client
+can tell that no device override applied. Send `X-Vio-Device-Id` when the
+device's own override should participate. The family header is also optional for
 backward compatibility: absence skips the `profile_client` layer, while a
 non-empty invalid family is rejected. First-party clients should send their
 family so like-device preferences participate in resolution. Each response
