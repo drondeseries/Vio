@@ -872,6 +872,7 @@ export default function ActionBar({
               playbackVariants={playbackVariants}
               selectedVersion={selectedVersion}
               onSelectVersion={onSelectVersion}
+              contentId={contentId}
               onOpenChange={onVersionPickerOpenChange}
               onRefreshVersions={contentId ? handleRefreshVersions : undefined}
             />

@@ -5,6 +5,7 @@ import type { FileVersion, PlaybackVariant } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { QualityRankingSummary } from "@/components/streaming/QualityRankingSummary";
+import { useWatchDetail } from "@/hooks/queries/items";
 import { useVersionListRefresh } from "@/hooks/useVersionListRefresh";
 import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, versionSortableFromFile } from "@/lib/qualityRanking";
@@ -24,6 +25,12 @@ interface VersionDropdownProps {
   playbackVariants?: PlaybackVariant[];
   selectedVersion: FileVersion | null;
   onSelectVersion: (version: FileVersion) => void;
+  /**
+   * The item content id. When present, opening the picker reads the watch
+   * detail so rows carry the custom-format score and the real server ranking,
+   * exactly as the in-player menu does. Omitted in isolated tests.
+   */
+  contentId?: string;
   /** Fired whenever a picker popover opens or closes (open=true on open). */
   onOpenChange?: (open: boolean) => void;
   /**
@@ -47,6 +54,7 @@ function VersionDropdown({
   playbackVariants,
   selectedVersion,
   onSelectVersion,
+  contentId,
   onOpenChange,
   onRefreshVersions,
 }: VersionDropdownProps) {
@@ -90,19 +98,50 @@ function VersionDropdown({
   // The viewer's per-profile display order. It only re-orders the list below;
   // the server's auto-pick is untouched.
   const { criteria: userCriteria, apply: applySort, reset: resetSort } = useVersionSortPreference();
-  // The catalog item detail this picker reads carries no virtual_ranking (the
-  // server publishes it only on the v2 watch detail), so this falls back to the
-  // candidates' `?profile=` label with the default order. The in-player menu
-  // reads the real ranking from the watch detail.
-  const serverRanking = useMemo(() => serverRankingFromVersions(activeVersions), [activeVersions]);
+  // The catalog item detail carries neither the custom-format score nor the
+  // virtual ranking; both live on the watch detail. Read it lazily when the
+  // picker opens (the same query the player uses) and merge by file id, so the
+  // rows show the score and the ranking the server actually applied.
+  const { data: watch } = useWatchDetail(contentId, undefined, undefined, {
+    enabled: versionOpen && !!contentId,
+  });
+  const serverRanking = useMemo(
+    () =>
+      serverRankingFromVersions(
+        activeVersions.map((version) => ({
+          file_path: version.file_path,
+          virtual_ranking: watch?.virtual_ranking,
+        })),
+      ),
+    [activeVersions, watch],
+  );
   const effectiveCriteria = userCriteria.length > 0 ? userCriteria : serverRanking.criteria;
   const orderedVersions = useMemo(
     () => sortVersionsByCriteria(activeVersions, effectiveCriteria, versionSortableFromFile),
     [activeVersions, effectiveCriteria],
   );
+  const scoreByFileId = useMemo(() => {
+    const scores = new Map<number, number>();
+    for (const version of watch?.versions ?? []) {
+      if (version.format_score != null) {
+        scores.set(version.file_id, version.format_score);
+      }
+    }
+    return scores;
+  }, [watch]);
+  const renderedVersions = useMemo(
+    () =>
+      orderedVersions.map((version) => {
+        const score = scoreByFileId.get(version.file_id);
+        return score != null && version.format_score == null
+          ? { ...version, format_score: score }
+          : version;
+      }),
+    [orderedVersions, scoreByFileId],
+  );
 
   const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
-    orderedVersions,
+    renderedVersions,
     activeVersion?.file_id,
   );
 
@@ -212,9 +251,7 @@ function VersionDropdown({
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                       <div className="flex items-center gap-2">
-                        <span className="text-sm font-medium">
-                          {summary || `Version ${version.file_id}`}
-                        </span>
+                        <span className="text-sm font-medium">{summary || "Video version"}</span>
                         {rangeLabel ? (
                           <Badge variant="secondary" className="px-1.5 py-0 text-[10px] uppercase">
                             {rangeLabel}
@@ -321,7 +358,7 @@ function VersionDropdown({
 export default memo(VersionDropdown);
 
 function buildVersionTriggerSummary(version: FileVersion): string {
-  return buildQualitySummary(version) || buildDetailLine(version) || `Version ${version.file_id}`;
+  return buildQualitySummary(version) || buildDetailLine(version) || "Video version";
 }
 
 function buildEditionOptions(
