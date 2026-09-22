@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -243,5 +244,185 @@ func TestResolveRehydratedVirtualSourceDoesNotRotateProviderError(t *testing.T) 
 	}
 	if calls != 1 {
 		t.Fatalf("resolver calls = %d, want exactly 1 (no retry for a provider error)", calls)
+	}
+}
+
+// TestResolveVirtualAnchorURIRotatesAbsentSessionPin proves the transport
+// anchor resolve gains the same absent-pin rotation retry the serve layer and
+// the replan rehydration already have: the first session-bound resolve refuses
+// with ErrSessionBoundCandidateAbsent, the retry relists with rotation declared
+// and the absent pin excluded, and a same-release (identity-rematched) candidate
+// is accepted.
+func TestResolveVirtualAnchorURIRotatesAbsentSessionPin(t *testing.T) {
+	const (
+		neutralURI = "virtual://movie/tt-anchor-rotate"
+		pinnedURI  = neutralURI + "?result=pinned"
+		siblingURI = neutralURI + "?result=sibling"
+	)
+	file := &models.MediaFile{
+		ID: 7, ContentID: "movie-anchor-rotate", FilePath: pinnedURI,
+		VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+	}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	var rotates, refreshes []bool
+	var excluded [][]string
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, uri string, _ int, _ int, _ string, forceRefresh bool, excludedCandidateIDs []string, _ string) (ResolvedVirtualMedia, error) {
+		rotates = append(rotates, VirtualCandidateRotationAllowed(ctx))
+		refreshes = append(refreshes, forceRefresh)
+		excluded = append(excluded, append([]string(nil), excludedCandidateIDs...))
+		if !VirtualCandidateRotationAllowed(ctx) {
+			return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+		}
+		return ResolvedVirtualMedia{
+			URL: "http://127.0.0.1:9/sibling", URI: siblingURI, CandidateID: "sibling",
+			IdentityRematched: true, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+		}, nil
+	})
+	session := &playback.Session{ID: "anchor-rotate", UserID: 1, ProfileID: "profile-1"}
+
+	resolved, cleanup, err := h.resolveVirtualAnchorURIWithRotationV3(context.Background(), session, file)
+	if err != nil {
+		t.Fatalf("resolveVirtualAnchorURIWithRotationV3: %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if got := virtualResultCandidateID(resolved.URI); got != "sibling" {
+		t.Fatalf("resolved anchor = %q, want the rotated same-release sibling", got)
+	}
+	if len(rotates) != 2 || rotates[0] || !rotates[1] {
+		t.Fatalf("rotation intents = %v, want exactly [false true]", rotates)
+	}
+	if len(refreshes) != 2 || !refreshes[1] {
+		t.Fatalf("relist intents = %v, want the retry to force a fresh listing", refreshes)
+	}
+	if !containsStringExactV3(excluded[1], "pinned") {
+		t.Fatalf("retry exclusions = %v, want the absent pin excluded", excluded[1])
+	}
+}
+
+// TestResolveVirtualAnchorURIDoesNotRotateDisplayRefusal proves the anchor retry
+// is scoped to the absent-pin sentinel: a display-driven pinned-candidate
+// refusal is never retried, so a live release is not silently swapped.
+func TestResolveVirtualAnchorURIDoesNotRotateDisplayRefusal(t *testing.T) {
+	const pinnedURI = "virtual://movie/tt-anchor-display?result=pinned"
+	file := &models.MediaFile{ID: 8, ContentID: "movie-anchor-display", FilePath: pinnedURI, VirtualOwnerInstallationID: 5}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	var calls int
+	displayErr := errors.New(`pinned virtual candidate "pinned" is excluded and candidate rotation was not requested`)
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+		calls++
+		return ResolvedVirtualMedia{}, displayErr
+	})
+	session := &playback.Session{ID: "anchor-display", UserID: 1, ProfileID: "profile-1"}
+
+	_, _, err := h.resolveVirtualAnchorURIWithRotationV3(context.Background(), session, file)
+	if !errors.Is(err, displayErr) {
+		t.Fatalf("err = %v, want the original display-driven refusal", err)
+	}
+	if calls != 1 {
+		t.Fatalf("resolver calls = %d, want exactly 1 (a display-driven refusal is never retried)", calls)
+	}
+}
+
+// TestResolveVirtualAnchorURIWithoutLiveCandidateFails proves an absent pin with
+// no same-release candidate still fails retryably: the retry runs once, finds
+// nothing it may silently anchor on, and returns the absent-pin cause.
+func TestResolveVirtualAnchorURIWithoutLiveCandidateFails(t *testing.T) {
+	const pinnedURI = "virtual://movie/tt-anchor-gone?result=pinned"
+	file := &models.MediaFile{ID: 9, ContentID: "movie-anchor-gone", FilePath: pinnedURI, VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a"}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	var calls int
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+		calls++
+		return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+	})
+	session := &playback.Session{ID: "anchor-gone", UserID: 1, ProfileID: "profile-1"}
+
+	_, _, err := h.resolveVirtualAnchorURIWithRotationV3(context.Background(), session, file)
+	if !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		t.Fatalf("err = %v, want the retryable absent-pin cause", err)
+	}
+	if calls != 2 {
+		t.Fatalf("resolver calls = %d, want exactly 2 (one bounded retry)", calls)
+	}
+}
+
+// TestResolveVirtualAnchorURIRefusesDifferentRelease proves the retry never
+// silently anchors the already-built plan on a sibling release: when the rotated
+// candidate is not the same release, the original absent-pin cause is returned.
+func TestResolveVirtualAnchorURIRefusesDifferentRelease(t *testing.T) {
+	const (
+		neutralURI = "virtual://movie/tt-anchor-swap"
+		pinnedURI  = neutralURI + "?result=pinned"
+		siblingURI = neutralURI + "?result=sibling"
+	)
+	file := &models.MediaFile{ID: 10, ContentID: "movie-anchor-swap", FilePath: pinnedURI, VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024"}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		if !VirtualCandidateRotationAllowed(ctx) {
+			return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+		}
+		// A different release: no identity rematch and no matching identity.
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/sibling", URI: siblingURI, CandidateID: "sibling", ProviderVideoHash: "hash-b"}, nil
+	})
+	session := &playback.Session{ID: "anchor-swap", UserID: 1, ProfileID: "profile-1"}
+
+	_, _, err := h.resolveVirtualAnchorURIWithRotationV3(context.Background(), session, file)
+	if !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		t.Fatalf("err = %v, want the absent-pin cause, not a silent sibling anchor", err)
+	}
+}
+
+// TestPrepareTransportTimelineRotatesAbsentSessionPin proves the transport
+// planner's remux seek anchor now recovers from an absent session pin: the
+// anchor resolve rotates to a same-release candidate instead of returning the
+// "Failed to resolve remux seek position." terminal.
+func TestPrepareTransportTimelineRotatesAbsentSessionPin(t *testing.T) {
+	const (
+		neutralURI = "virtual://movie/tt-timeline-rotate"
+		pinnedURI  = neutralURI + "?result=pinned"
+		siblingURI = neutralURI + "?result=sibling"
+	)
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.RemoteStreamRelay = remotestream.NewRelay()
+	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
+	var calls int
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		calls++
+		if !VirtualCandidateRotationAllowed(ctx) {
+			return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+		}
+		return ResolvedVirtualMedia{
+			URL: "http://127.0.0.1:9/sibling.mp4", URI: siblingURI, CandidateID: "sibling",
+			IdentityRematched: true, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+		}, nil
+	})
+	probed := false
+	handler.copySeekAnchor = func(_ context.Context, _ string, inputPath string, requested float64, _ int) (float64, int, error) {
+		probed = true
+		if inputPath == "" || strings.HasPrefix(inputPath, "virtual://") {
+			t.Fatalf("copy anchor probed a virtual URI %q, want the rotated relay URL", inputPath)
+		}
+		return requested - 0.5, 0, nil
+	}
+	file := &models.MediaFile{ID: 11, ContentID: "movie-timeline-rotate", FilePath: pinnedURI, VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024"}
+	session := &playback.Session{ID: "timeline-rotate", UserID: 1, ProfileID: "profile-1"}
+	plan := &playback.PlanV3{
+		PlanID:   "plan:timeline-rotate",
+		Delivery: playback.DeliveryRemuxProgressiveV3,
+		Timeline: playback.TimelineV3{SourceStartSeconds: 30, PlayerStartSeconds: 30},
+	}
+
+	timeline, timelineErr := handler.prepareTransportTimelineV3(context.Background(), session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if timelineErr != nil {
+		t.Fatalf("prepareTransportTimelineV3: %v", timelineErr)
+	}
+	if !probed || !timeline.copySeekAnchorResolved {
+		t.Fatalf("timeline = %#v probed=%v, want a resolved copy anchor", timeline, probed)
+	}
+	if calls != 2 {
+		t.Fatalf("resolver calls = %d, want exactly 2 (session-bound then rotation)", calls)
 	}
 }

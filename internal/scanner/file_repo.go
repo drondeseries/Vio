@@ -1328,6 +1328,15 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 	if source == nil || source.ContentID == "" {
 		return errors.New("virtual candidate source is required")
 	}
+	if len(candidates) == 0 {
+		// An empty listing is a provider hiccup, not a statement that the title
+		// lost every release. It must not rewrite, sweep, or otherwise touch the
+		// persisted candidate state: a provider that intermittently returns a
+		// zero-count answer would otherwise erase a healthy version list. The
+		// provider failure is surfaced by the caller, and the next non-empty
+		// listing replaces the rows as usual.
+		return nil
+	}
 	if source.VirtualOwnerInstallationID <= 0 {
 		for _, candidate := range candidates {
 			if candidate.OwnerInstallationID > 0 {

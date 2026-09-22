@@ -7,6 +7,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 // virtualStoredURLState reports what a virtual candidate row's persisted
@@ -179,6 +180,23 @@ func persistedVirtualIdentity(row *models.MediaFile) (virtuallibrary.PersistedCa
 	return identity, true
 }
 
+// resolvedMatchesPersistedIdentity reports whether a resolved candidate is the
+// same release as the catalog row, judged by the durable identity tiers in the
+// same precedence the deduplication chain uses (video hash, then source GUID,
+// then normalized release name plus exact size). It is the read-side companion
+// of resolver.PersistedDedupKey: a row or a resolution with no usable tier can
+// never match, so an identity-less row is never treated as confirmed by a
+// merely-rotated listing.
+func resolvedMatchesPersistedIdentity(resolved ResolvedVirtualMedia, row *models.MediaFile) bool {
+	identity, ok := persistedVirtualIdentity(row)
+	if !ok {
+		return false
+	}
+	want := resolver.PersistedDedupKey(identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize)
+	got := resolver.PersistedDedupKey(resolved.ProviderVideoHash, resolved.ProviderGUID, resolved.ProviderReleaseName, resolved.ProviderReleaseSize)
+	return want != "" && want == got
+}
+
 // virtualResolveContextWithPersistedIdentity threads the row's durable identity
 // into a resolve so the resolver can re-identify the same release when the
 // provider renumbers result ids. A row with no durable identity is left
@@ -212,18 +230,28 @@ func virtualStoredURLNeedsSignedRefresh(row *models.MediaFile, now time.Time) bo
 // virtualResolveContextWithPersistedTrust threads the row's durable identity
 // and, when the row is inside the trust window, marks the resolve as allowed to
 // keep trusting that persisted same-identity candidate even when the provider's
-// current list omits it. Trust requires persisted transport evidence: a row
-// with no stored URL never resolved, so there is no persisted candidate to
-// prefer and the pre-window refusal/rotation behavior is kept. A zero window or
-// a legacy row with no durable identity likewise leaves the context untouched.
-// It never authorizes a sibling: the resolver still binds only to the row's own
-// release.
+// current list omits it. Trust requires durable identity plus transport
+// evidence: a stored resolved_url means the row resolved at least once, and a
+// last_delivered_at means it actually delivered bytes. A row that delivered
+// before persisted URLs existed carries no URL but does carry a delivery stamp,
+// so it can still be trusted: the resolver re-identifies the same candidate by
+// its durable identity instead of by a stored URL, and never serves a sibling.
+// A row with no identity, no URL and no delivery stamp has no persisted
+// candidate to prefer and keeps the pre-window refusal/rotation behavior. A zero
+// window likewise leaves the context untouched.
 func virtualResolveContextWithPersistedTrust(ctx context.Context, row *models.MediaFile, now time.Time, window time.Duration) context.Context {
 	ctx = virtualResolveContextWithPersistedIdentity(ctx, row)
-	if row == nil || strings.TrimSpace(row.ResolvedURL) == "" {
+	if row == nil {
 		return ctx
 	}
-	if _, ok := persistedVirtualIdentity(row); ok && virtualCandidateWithinStoreWindow(row, now, window) {
+	if _, ok := persistedVirtualIdentity(row); !ok {
+		return ctx
+	}
+	if strings.TrimSpace(row.ResolvedURL) == "" && row.LastDeliveredAt == nil {
+		// No transport evidence at all: never resolved and never delivered.
+		return ctx
+	}
+	if virtualCandidateWithinStoreWindow(row, now, window) {
 		ctx = virtuallibrary.WithPersistedCandidateTrust(ctx, true)
 	}
 	return ctx

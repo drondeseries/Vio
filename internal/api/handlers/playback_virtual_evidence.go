@@ -650,6 +650,13 @@ terminal:
 	if task.args.AdoptPath != "" {
 		attrs = append(attrs, "candidate", task.args.AdoptPath)
 	}
+	if errors.Is(lastErr, errVirtualEvidenceStale) {
+		// A CAS miss is the expected outcome when a newer snapshot (a re-list, a
+		// migration, another probe) lands first. It is not an error condition, so
+		// it must not page an operator as one.
+		slog.Debug("virtual probe evidence persist skipped: superseded by a newer snapshot", attrs...)
+		return lastErr
+	}
 	slog.Error("virtual probe evidence persist terminal failure", attrs...)
 	return lastErr
 }

@@ -596,3 +596,127 @@ func TestResolveVirtualInputStoredURLLookupErrorFallsBack(t *testing.T) {
 		t.Fatalf("resolved URL = %q, want the freshly listed URL", res.URL)
 	}
 }
+
+// TestVirtualResolveContextTrustsDeliveredURLLessRow pins the URL-less trust
+// path: a row that delivered bytes (last_delivered_at) and carries a durable
+// identity is trusted inside the window even though it never persisted a
+// resolved_url. The resolver then re-identifies the same release by identity
+// instead of by URL.
+func TestVirtualResolveContextTrustsDeliveredURLLessRow(t *testing.T) {
+	const pinned = "virtual://movie/tt-urlless?result=cand-a"
+	now := time.Now()
+	window := 720 * time.Hour
+	row := &models.MediaFile{
+		ID:                  101,
+		FilePath:            pinned,
+		UpdatedAt:           now,
+		LastDeliveredAt:     &now,
+		ProviderVideoHash:   "hash-a",
+		ProviderReleaseName: "Movie.2024.1080p",
+	}
+	ctx := virtualResolveContextWithPersistedTrust(context.Background(), row, now, window)
+	if !virtuallibrary.PersistedCandidateTrusted(ctx) {
+		t.Fatal("a delivered URL-less row with identity inside the window must be trusted")
+	}
+}
+
+// TestVirtualResolveContextRejectsURLLessRowWithoutIdentity proves trust still
+// requires the row's own durable identity: a URL-less row with no identity is
+// never trusted, so no sibling can be pinned to it.
+func TestVirtualResolveContextRejectsURLLessRowWithoutIdentity(t *testing.T) {
+	const pinned = "virtual://movie/tt-urlless-noid?result=cand-a"
+	now := time.Now()
+	row := &models.MediaFile{
+		ID:              102,
+		FilePath:        pinned,
+		UpdatedAt:       now,
+		LastDeliveredAt: &now,
+	}
+	ctx := virtualResolveContextWithPersistedTrust(context.Background(), row, now, 720*time.Hour)
+	if virtuallibrary.PersistedCandidateTrusted(ctx) {
+		t.Fatal("a URL-less row without identity must never be trusted")
+	}
+}
+
+// TestVirtualResolveContextURLLessRowOutsideWindowNotTrusted proves the window
+// still gates the URL-less path: the old refusal/rotation behavior applies once
+// the row is outside it.
+func TestVirtualResolveContextURLLessRowOutsideWindowNotTrusted(t *testing.T) {
+	const pinned = "virtual://movie/tt-urlless-old?result=cand-a"
+	now := time.Now()
+	delivered := now.Add(-60 * 24 * time.Hour)
+	row := &models.MediaFile{
+		ID:                103,
+		FilePath:          pinned,
+		UpdatedAt:         delivered,
+		LastDeliveredAt:   &delivered,
+		ProviderVideoHash: "hash-a",
+	}
+	ctx := virtualResolveContextWithPersistedTrust(context.Background(), row, now, 720*time.Hour)
+	if virtuallibrary.PersistedCandidateTrusted(ctx) {
+		t.Fatal("a URL-less row outside the trust window must not be trusted")
+	}
+}
+
+// TestResolveVirtualInputURLLessDeliveredRowCarriesTrust proves the handler
+// boundary: resolving a URL-less delivered row inside the window marks the
+// resolve trusted, so the resolver refuses a sibling instead of swapping the
+// release. Outside the window the same resolve carries no trust and the
+// ordinary rotation behavior holds.
+func TestResolveVirtualInputURLLessDeliveredRowCarriesTrust(t *testing.T) {
+	const pinned = "virtual://movie/tt-urlless-resolve?result=cand-a"
+	now := time.Now()
+	row := &models.MediaFile{
+		ID:                  104,
+		FilePath:            pinned,
+		UpdatedAt:           now,
+		LastDeliveredAt:     &now,
+		ProviderVideoHash:   "hash-a",
+		ProviderReleaseName: "Movie.2024.1080p",
+	}
+	var sawTrust []bool
+	sibling := ResolvedVirtualMedia{
+		URL: "https://93.184.216.34/stream/token=sibling",
+		URI: "virtual://movie/tt-urlless-resolve?result=cand-b", CandidateID: "cand-b",
+	}
+	resolver := VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		trusted := virtuallibrary.PersistedCandidateTrusted(ctx)
+		sawTrust = append(sawTrust, trusted)
+		if trusted {
+			return ResolvedVirtualMedia{}, fmt.Errorf("trusted persisted virtual candidate %q is no longer listed: %w", "cand-a", virtuallibrary.ErrPersistedCandidateTrusted)
+		}
+		return sibling, nil
+	})
+
+	h := &PlaybackHandler{
+		VirtualFileLookup:            storedURLLookup(row),
+		VirtualMediaDetailedResolver: resolver,
+		VirtualCandidateTrustWindow:  func() time.Duration { return 720 * time.Hour },
+	}
+	if _, _, err := h.resolveVirtualInputURI(context.Background(), pinned, 5, 1, "profile", false, nil, ""); err == nil {
+		t.Fatal("a trusted URL-less delivered row must refuse a sibling substitution")
+	}
+	if len(sawTrust) != 1 || !sawTrust[0] {
+		t.Fatalf("inside the window the resolve trust flag = %v, want [true]", sawTrust)
+	}
+
+	// Outside the window the same row resolves through the ordinary path: no
+	// trust is threaded and the resolver may rotate.
+	oldRow := *row
+	oldRow.UpdatedAt = now.Add(-60 * 24 * time.Hour)
+	oldRow.LastDeliveredAt = &oldRow.UpdatedAt
+	h.VirtualFileLookup = storedURLLookup(&oldRow)
+	res, cleanup, err := h.resolveVirtualInputURI(context.Background(), pinned, 5, 1, "profile", false, nil, "")
+	if err != nil {
+		t.Fatalf("outside the window resolve error: %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if res.CandidateID != "cand-b" {
+		t.Fatalf("outside the window resolved candidate = %q, want the ordinary sibling", res.CandidateID)
+	}
+	if len(sawTrust) != 2 || sawTrust[1] {
+		t.Fatalf("outside the window the resolve trust flag = %v, want [true false]", sawTrust)
+	}
+}

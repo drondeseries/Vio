@@ -3042,10 +3042,12 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			anchorInput := file.FilePath
 			releaseAnchor := func() {}
 			if isVirtualPlaybackFile(file) && h.RemoteStreamRelay != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil) {
-				res, cleanup, resolveErr := h.resolveVirtualInputURI(
-					ctx, file.FilePath, file.VirtualOwnerInstallationID,
-					session.UserID, session.ProfileID, false, nil, "",
-				)
+				// Route the anchor through the same absent-pin rotation policy as
+				// the serve layer and the replan rehydration: a provider that
+				// renumbered its result ids must not terminal a remux seek when a
+				// same-identity candidate is still listed. A different release is
+				// refused rather than silently anchored.
+				res, cleanup, resolveErr := h.resolveVirtualAnchorURIWithRotationV3(ctx, session, file)
 				if resolveErr != nil {
 					return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: resolveErr}
 				}

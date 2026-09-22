@@ -185,6 +185,36 @@ func TestVirtualCandidatesRefreshServiceProviderFailureIsRetryable(t *testing.T)
 	}
 }
 
+// TestVirtualCandidatesRefreshServiceEmptyListingIsRetryable proves a
+// zero-count provider answer is treated as a retryable provider failure and
+// never reaches the persistence sink: an empty listing must not overwrite or
+// sweep the stored candidate state.
+func TestVirtualCandidatesRefreshServiceEmptyListingIsRetryable(t *testing.T) {
+	source := refreshTestSource(7, "movie:x", "virtual://movie/x")
+	persisted := 0
+	svc := &VirtualCandidatesRefreshService{
+		ListFresh: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{}, nil
+		}),
+		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			persisted++
+			return nil
+		},
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Detail: &fakeRefreshDetail{detail: refreshTestDetail()},
+	}
+	_, err := svc.RefreshVirtualCandidates(context.Background(), 1, "p", "movie:x", catalog.AccessFilter{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable {
+		t.Fatalf("err = %v, want a retryable 503 APIError for an empty listing", err)
+	}
+	if persisted != 0 {
+		t.Fatalf("persist calls = %d, want 0 on an empty listing", persisted)
+	}
+}
+
 // TestVirtualCandidatesRefreshServiceCoalescesConcurrentCalls proves two
 // concurrent refreshes of one title share a single provider re-list instead of
 // storming the provider.
