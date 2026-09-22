@@ -1950,6 +1950,18 @@ describe("VideoPlayer version switch UX", () => {
     expect(props.versions?.find((v) => v.fileId === 7)?.unavailable).toBe(false);
   });
 
+  it("forwards a candidate's custom-format score to the version menu", () => {
+    const scoredVersion = { ...versionB, format_score: 850 };
+    renderPlayer({ versions: [versionA, scoredVersion], activeFileId: 7 });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{ fileId: number; formatScore?: number }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 99)?.formatScore).toBe(850);
+    // A version with no server score carries no badge value.
+    expect(props.versions?.find((v) => v.fileId === 7)?.formatScore).toBeUndefined();
+  });
+
   it("shows the quality ellipsis only for quality replans, not track changes", async () => {
     const { rerenderPlayer } = renderPlayer({});
 

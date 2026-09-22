@@ -57,6 +57,7 @@ function makeVersionInfo(overrides: Partial<VersionInfo> = {}): VersionInfo {
   return {
     fileId: overrides.fileId ?? 1,
     label: overrides.label ?? "2160p HEVC HDR",
+    formatScore: overrides.formatScore,
     isCurrentSource: overrides.isCurrentSource ?? false,
     isRequestedSource: overrides.isRequestedSource ?? false,
   };
@@ -130,6 +131,41 @@ describe("QualityMenu", () => {
       "aria-current",
       "true",
     );
+  });
+});
+
+describe("QualityMenu version format score", () => {
+  it("shows the score badge when the server ranked the candidate", () => {
+    renderVersionMenu({
+      versions: [
+        makeVersionInfo({ fileId: 1, label: "1080p H264", formatScore: 850 }),
+        makeVersionInfo({ fileId: 2, label: "2160p HEVC" }),
+      ],
+    });
+
+    expect(screen.getByText("★ 850")).toBeInTheDocument();
+  });
+
+  it("shows no badge for an unscored or zero-scored version", () => {
+    renderVersionMenu({
+      versions: [
+        makeVersionInfo({ fileId: 1, label: "1080p H264" }),
+        makeVersionInfo({ fileId: 2, label: "2160p HEVC", formatScore: 0 }),
+      ],
+    });
+
+    expect(screen.queryByText(/★/)).not.toBeInTheDocument();
+  });
+
+  it("keeps a negative score visible so a demoted candidate is not mistaken for unscored", () => {
+    renderVersionMenu({
+      versions: [
+        makeVersionInfo({ fileId: 1, label: "1080p H264", formatScore: -200 }),
+        makeVersionInfo({ fileId: 2, label: "2160p HEVC" }),
+      ],
+    });
+
+    expect(screen.getByText("★ -200")).toBeInTheDocument();
   });
 });
 

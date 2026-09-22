@@ -692,6 +692,7 @@ export function VideoPlayer({
           fileId: v.file_id,
           label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}${audioPart}`,
           releaseName: prettifyReleaseName(v.release_name ?? v.file_name),
+          formatScore: v.format_score,
           isCurrentSource: v.file_id === effectiveFileId,
           isRequestedSource:
             (v.file_id === pendingSwitchFileId && v.file_id !== effectiveFileId) ||

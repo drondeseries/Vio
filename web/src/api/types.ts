@@ -882,6 +882,9 @@ export interface FileVersion {
   file_size: number;
   duration: number;
   bitrate: number;
+  /** Custom-format score the server's virtual ranking assigned this candidate.
+   *  Absent for local files and elsewhere unscored rows. */
+  format_score?: number;
   /** Liveness for virtual versions. Absent means available/unknown; false
    *  means the version is currently unavailable (e.g. the provider no longer
    *  serves it). Populated by the catalog versions/check endpoint. */
