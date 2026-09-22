@@ -3462,6 +3462,29 @@ func virtualCandidateRowVerified(row *models.MediaFile, candidateURI string) boo
 		virtualPlaybackNeutralKey(path) == virtualPlaybackNeutralKey(candidateURI)
 }
 
+// virtualCandidateRowOwnsNeutral reports whether a row returned by the
+// provider-neutral lookup owns candidateURI's release. Unlike
+// virtualCandidateRowVerified, it accepts a row that still carries a concrete
+// ?result= pick: the provider rotates result ids for the same release, and the
+// neutral lookup deliberately matches with result= stripped so that rotation is
+// the same release. Its verdict still applies. The profile stays part of the
+// neutral key, so a different profile variant remains a different release and
+// is never accepted here.
+//
+// Only the fallback lookup may use this: the exact-path lookup is keyed on the
+// concrete URI and a row it returns with a different path is genuinely
+// untrustworthy, not a rotation.
+func virtualCandidateRowOwnsNeutral(row *models.MediaFile, candidateURI string) bool {
+	if row == nil || row.ID <= 0 || candidateURI == "" {
+		return false
+	}
+	path := strings.TrimSpace(row.FilePath)
+	if path == "" {
+		return false
+	}
+	return virtualPlaybackNeutralKey(path) == virtualPlaybackNeutralKey(candidateURI)
+}
+
 // virtualProbeEvidenceRequiresAdoption reports whether probe evidence for
 // candidateURI belongs to a different concrete release than the row it would be
 // written to. It is exactly the negation of candidate ownership, so the two
@@ -3522,7 +3545,16 @@ func (h *PlaybackHandler) lookupVirtualCandidateRowDetailed(ctx context.Context,
 		if row == nil {
 			return nil, false
 		}
-		if virtualCandidateRowVerified(row, candidateURI) {
+		verified := virtualCandidateRowVerified(row, candidateURI)
+		if !verified && !exact {
+			// The provider-neutral lookup matches the release with result=
+			// stripped, so a stored row that still carries a different concrete
+			// ?result= pick is a provider rotation of the same release, not an
+			// incomplete row. Its verdict owns the candidate; treating it as
+			// incomplete hard-failed rehydration for a row that exists.
+			verified = virtualCandidateRowOwnsNeutral(row, candidateURI)
+		}
+		if verified {
 			return row, true
 		}
 		// A non-nil row that does not verifiably own the candidate (no
