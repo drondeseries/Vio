@@ -674,7 +674,6 @@ function WatchPagePlayer({
       return;
     }
 
-    const activeFileId = session.mediaFileId;
     let cancelled = false;
     // Same key as the mounted `useWatchDetail` query so reconnecting does not
     // issue a second fetch of the payload that query already holds.
