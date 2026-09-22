@@ -213,11 +213,13 @@ func parseEbookPDF(path string) (parsedEbook, error) {
 	if err != nil {
 		return book, err
 	}
-	// Strings in an encrypted PDF are ciphertext. Decrypting them needs the
-	// document key, so the only honest options are to skip extraction or to
-	// store random bytes as the title; the filename is a better title than
-	// ciphertext.
-	if pdfTrailerDeclaresEncryption(head) || pdfTrailerDeclaresEncryption(tail) {
+	stat, err := file.Stat()
+	if err != nil {
+		return book, err
+	}
+	// Embedded metadata is optional. If the trailer cannot establish that
+	// strings are unencrypted, let the caller use sidecar/path metadata.
+	if encrypted, err := pdfDocumentEncrypted(file, stat.Size()); err != nil || encrypted {
 		return book, nil
 	}
 	info := parsePDFInfoFields(head)
@@ -921,60 +923,6 @@ func parsePDFInfoFields(data []byte) map[string]string {
 		}
 	}
 	return fields
-}
-
-// pdfTrailerDeclaresEncryption reports whether the window contains a trailer
-// "/Encrypt n g R" reference. It insists on the indirect-reference shape rather
-// than the bare name so that "/Encrypt"-shaped bytes inside a compressed stream
-// do not cost an unencrypted file its metadata.
-func pdfTrailerDeclaresEncryption(data []byte) bool {
-	token := []byte("/Encrypt")
-	for offset := 0; offset < len(data); {
-		idx := bytes.Index(data[offset:], token)
-		if idx < 0 {
-			return false
-		}
-		idx += offset
-		offset = idx + len(token)
-		rest := data[offset:]
-		if len(rest) == 0 || !isPDFTokenDelimiter(rest[0]) {
-			continue
-		}
-		if pdfStartsWithIndirectReference(rest) {
-			return true
-		}
-	}
-	return false
-}
-
-// pdfStartsWithIndirectReference reports whether data begins with whitespace
-// followed by "n g R".
-func pdfStartsWithIndirectReference(data []byte) bool {
-	readNumber := func(b []byte) ([]byte, bool) {
-		b = bytes.TrimLeft(b, pdfWhitespace)
-		digits := 0
-		for digits < len(b) && b[digits] >= '0' && b[digits] <= '9' {
-			digits++
-		}
-		if digits == 0 {
-			return nil, false
-		}
-		return b[digits:], true
-	}
-	rest, ok := readNumber(data)
-	if !ok {
-		return false
-	}
-	if rest, ok = readNumber(rest); !ok {
-		return false
-	}
-	rest = bytes.TrimLeft(rest, pdfWhitespace)
-	if len(rest) == 0 || rest[0] != 'R' {
-		return false
-	}
-	// "R" must be its own token: "9 0 R2" is not an indirect reference, and
-	// accepting it would cost an unencrypted file its metadata.
-	return len(rest) == 1 || isPDFTokenDelimiter(rest[1])
 }
 
 // pdfInfoValueLooksBinary reports whether a decoded Info value carries control
