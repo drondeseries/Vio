@@ -3,7 +3,7 @@ import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Library } from "@/api/types";
-import StreamingSettings from "./StreamingSettings";
+import StreamingSettings, { prowlarrURLFeedback } from "./StreamingSettings";
 
 class ResizeObserverStub {
   observe() {}
@@ -244,5 +244,91 @@ describe("StreamingSettings", () => {
       "virtual_library.indexer_api_key",
       "new-prowlarr-key",
     );
+  });
+
+  describe("Prowlarr base URL feedback", () => {
+    it("mirrors the server's base-URL rules", () => {
+      expect(prowlarrURLFeedback("")).toBeNull();
+      expect(prowlarrURLFeedback("   ")).toBeNull();
+      expect(prowlarrURLFeedback("http://prowlarr:9696")).toEqual({
+        tone: "ok",
+        message: "Base URL looks good",
+      });
+      expect(prowlarrURLFeedback("https://prowlarr.example.com")).toEqual({
+        tone: "ok",
+        message: "Base URL looks good",
+      });
+      // A reverse-proxy subpath is a legitimate base and stays green.
+      expect(prowlarrURLFeedback("http://host/prowlarr")).toEqual({
+        tone: "ok",
+        message: "Base URL looks good",
+      });
+
+      for (const bad of [
+        "http://prowlarr:9696/1/api/v1/search?t=movie",
+        "http://prowlarr:9696/1",
+        "http://prowlarr:9696/1/",
+        "http://prowlarr:9696/api/v1/search",
+        "http://prowlarr:9696/newznab",
+        "http://prowlarr:9696?t=movie",
+      ]) {
+        expect(prowlarrURLFeedback(bad)).toEqual({
+          tone: "warn",
+          message: "Enter the base URL only — no indexer path or query string",
+        });
+      }
+
+      for (const bad of ["prowlarr:9696", "localhost:9696", "//prowlarr:9696"]) {
+        expect(prowlarrURLFeedback(bad)).toEqual({
+          tone: "warn",
+          message: "Enter the full base URL, including http:// or https://",
+        });
+      }
+    });
+
+    it("shows the green OK feedback for a clean base URL", () => {
+      useSettingsFormMock.mockReturnValue(
+        makeForm({ "virtual_library.indexer_rss_url": "http://prowlarr:9696" }),
+      );
+      renderPage();
+
+      const ok = screen.getByText("Base URL looks good");
+      expect(ok).toHaveClass("text-green-600");
+      expect(
+        screen.queryByText("Enter the base URL only — no indexer path or query string"),
+      ).not.toBeInTheDocument();
+    });
+
+    it("shows the reason and no OK for an indexer-path or query URL", () => {
+      useSettingsFormMock.mockReturnValue(
+        makeForm({
+          "virtual_library.indexer_rss_url": "http://prowlarr:9696/1/api/v1/search?t=movie",
+        }),
+      );
+      renderPage();
+
+      const warn = screen.getByText("Enter the base URL only — no indexer path or query string");
+      expect(warn).toHaveClass("text-amber-600");
+      expect(screen.queryByText("Base URL looks good")).not.toBeInTheDocument();
+    });
+
+    it("uses the base-URL label, description, and hint", () => {
+      useSettingsFormMock.mockReturnValue(makeForm({ "virtual_library.indexer_rss_url": "" }));
+      renderPage();
+
+      const field = screen.getByLabelText("Prowlarr URL");
+      expect(field).toHaveAttribute("placeholder", "http://prowlarr:9696");
+      expect(screen.getByText(/Prowlarr server base URL/)).toBeInTheDocument();
+      expect(
+        screen.getByText(/base URL only — no indexer path or query string/i),
+      ).toBeInTheDocument();
+      expect(screen.queryByLabelText("Prowlarr RSS URL")).not.toBeInTheDocument();
+      expect(screen.queryByText(/RSS feed URL/i)).not.toBeInTheDocument();
+      // The feedback row stays hidden while the field is empty.
+      expect(screen.queryByText("Base URL looks good")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("Enter the base URL only — no indexer path or query string"),
+      ).not.toBeInTheDocument();
+    });
   });
 });
