@@ -110,6 +110,10 @@ type virtualProbeFailureCache struct {
 	now   func() time.Time
 }
 
+// virtualCollectionProbeSource marks a collection-sourced virtual row whose
+// pin was recorded by the collection variant path rather than a per-file listing.
+const virtualCollectionProbeSource = "virtual_collection"
+
 func (c *virtualProbeFailureCache) clock() time.Time {
 	if c != nil && c.now != nil {
 		return c.now()
@@ -1645,7 +1649,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// comes from a real probe) may skip the provider round-trip. A never-
 		// delivered collection row falls through to the resolve path, which
 		// re-lists and can recover/rotate.
-		collectionRowNeedsDelivery := file.ProbeSource == "virtual_collection" && file.LastDeliveredAt == nil
+		collectionRowNeedsDelivery := file.ProbeSource == virtualCollectionProbeSource && file.LastDeliveredAt == nil
 		if deferProbe && !forceRelist && !noResult &&
 			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
 			!collectionRowNeedsDelivery &&
@@ -3077,7 +3081,7 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogF
 	snap := snapshotVirtualRow(catalogFile)
 	expectedPath := catalogFile.FilePath
 	adoptPath := ""
-	if resolvedPath != "" && resolvedPath != catalogFile.FilePath && catalogFile.ProbeSource != "virtual_collection" {
+	if resolvedPath != "" && resolvedPath != catalogFile.FilePath && catalogFile.ProbeSource != virtualCollectionProbeSource {
 		adoptPath = resolvedPath
 	}
 	// Evidence for a different concrete release than this row verifiably owns
@@ -3449,7 +3453,7 @@ func (h *PlaybackHandler) lookupVirtualCandidateRowDetailed(ctx context.Context,
 // that is not collection-owned never qualifies either: this is the one
 // ownership case whose path the collection sync otherwise keeps immutable.
 func collectionVariantPinVanished(file *models.MediaFile, streams []VirtualPlaybackStream, pinID string) bool {
-	if file == nil || file.ProbeSource != "virtual_collection" || pinID == "" {
+	if file == nil || file.ProbeSource != virtualCollectionProbeSource || pinID == "" {
 		return false
 	}
 	identity, ok := persistedVirtualIdentity(file)
