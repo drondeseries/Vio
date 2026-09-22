@@ -98,7 +98,7 @@ grep -q 'frontend-dist-' .github/workflows/docker.yml \
   && pass "docker workflow deduplicated manual frontend builds" \
   || reject "docker workflow missing deduplicated manual frontend build artifact handoff"
 
-if grep -q '^\.github/workflows/docker\.yml merge=ours' .gitattributes 2>/dev/null; then
+if grep -q '^\.github/workflows/docker\.yml merge=ours$' .gitattributes 2>/dev/null; then
   pass "docker.yml merge=ours preserved in .gitattributes"
 else
   reject "docker.yml merge=ours entry missing from .gitattributes"
