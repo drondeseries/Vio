@@ -25243,6 +25243,11 @@ export interface components {
        * @description Bytes
        */
       file_size: number;
+      /**
+       * Format: int64
+       * @description Custom-format score the virtual ranking assigned this candidate; absent when the row is unscored (local files, no ranking)
+       */
+      format_score?: number;
       hdr: boolean;
       intro?: components["schemas"]["WatchMarker"];
       /** @description All effective marker occurrences for this file in source-time order; empty, never null */

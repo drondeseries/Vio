@@ -205,6 +205,27 @@ describe("buildDetailLine", () => {
     });
     expect(buildDetailLine(version)).toBe("Movie 2023 1080p WEB-DL x264-GRP · WEB-DL");
   });
+
+  it("shows the provider label's embedded size only once when file_size is known", () => {
+    const version = makeVersion({
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=abc123",
+      edition_raw: "Disclosure Day 2160p DV HDR10 TrueHD MULTI · 45.2 GB",
+      file_size: 45 * 1024 ** 3,
+    });
+    // The structured file_size is kept; the label's parsed copy is dropped.
+    expect(buildDetailLine(version)).toBe("Disclosure Day 2160p DV HDR10 TrueHD MULTI · 45.0 GB");
+  });
+
+  it("keeps the provider label's size when file_size is unknown", () => {
+    const version = makeVersion({
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=abc123",
+      edition_raw: "Disclosure Day 2160p · 45 GB",
+      file_size: 0,
+    });
+    expect(buildDetailLine(version)).toBe("Disclosure Day 2160p · 45 GB");
+  });
 });
 
 describe("sortByResolution", () => {

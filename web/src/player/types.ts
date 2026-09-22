@@ -27,6 +27,9 @@ export interface PlayerFileVersion {
   file_size: number;
   duration: number;
   bitrate: number;
+  /** Custom-format score the server ranked this candidate with; absent when
+   *  the version is unscored (a local file, or no ranking ran). */
+  format_score?: number;
   failed?: boolean;
   edition_key?: string;
   release_name?: string;
