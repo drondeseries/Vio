@@ -208,3 +208,91 @@ func TestResolveVirtualTimingFlagsFastPathWithoutRanStages(t *testing.T) {
 		}
 	}
 }
+
+// A resolve that outlives its budget must trip the verdict: the trace
+// reports budget_exceeded=true with the budget it ran under, so an overrun
+// names its stages instead of silently passing. The 15s listing backstop is
+// deliberately larger than the test budget, so the listing here burns past
+// the 120ms cold deadline while still inside its own cap: elapsed must exceed
+// the budget even though no stage was canceled mid-flight.
+func TestResolveVirtualTimingFlagsBudgetExceededOnStalledListing(t *testing.T) {
+	previousBudget := virtualStartupBudget
+	virtualStartupBudget = 120 * time.Millisecond
+	t.Cleanup(func() { virtualStartupBudget = previousBudget })
+
+	uri := "virtual://movie/tt-trace-budget"
+	file := &models.MediaFile{
+		ID:                         991,
+		ContentID:                  "movie-trace-budget",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	detailedCalls, legacyCalls := 0, 0
+	h := virtualRepeatPlayHandler(&detailedCalls, &legacyCalls)
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(
+		func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			// Burns past the cold budget while ignoring cancellation: the
+			// resolve still completes (slowly), so the verdict measures the
+			// overrun instead of the cancellation.
+			time.Sleep(300 * time.Millisecond)
+			return []VirtualPlaybackStream{{
+				URI: uri + "?result=cand-1", Resolution: "1080p",
+				CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+			}}, nil
+		})
+
+	entry := captureVirtualResolveTiming(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		_, _ = h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+	})
+
+	if entry["budget_exceeded"] != true {
+		t.Fatalf("budget_exceeded = %#v, want true for a resolve that outlived its budget", entry["budget_exceeded"])
+	}
+	if entry["budget_ms"] != float64(120) {
+		t.Fatalf("budget_ms = %#v, want 120", entry["budget_ms"])
+	}
+	if entry["list_ran"] != true {
+		t.Fatalf("list_ran = %#v, want true (the slow stage)", entry["list_ran"])
+	}
+	if elapsed, _ := entry["elapsed_ms"].(float64); elapsed < 120 {
+		t.Fatalf("elapsed_ms = %#v, want >= 120 for the overrun", entry["elapsed_ms"])
+	}
+}
+
+// A healthy cold start stays inside the budget: budget_exceeded=false and the
+// elapsed time fits the budget it ran under.
+func TestResolveVirtualTimingBudgetHoldsOnHealthyStart(t *testing.T) {
+	uri := "virtual://movie/tt-trace-budget-ok"
+	file := &models.MediaFile{
+		ID:                         992,
+		ContentID:                  "movie-trace-budget-ok",
+		FilePath:                   uri,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	detailedCalls, legacyCalls := 0, 0
+	h := virtualRepeatPlayHandler(&detailedCalls, &legacyCalls)
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(
+		func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{{
+				URI: uri + "?result=cand-1", Resolution: "1080p",
+				CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+			}}, nil
+		})
+
+	entry := captureVirtualResolveTiming(t, func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+		if _, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false); err != nil {
+			t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+		}
+	})
+
+	if entry["budget_exceeded"] != false {
+		t.Fatalf("budget_exceeded = %#v, want false for a healthy start", entry["budget_exceeded"])
+	}
+	if _, present := entry["budget_ms"]; !present {
+		t.Fatal("budget_ms missing: every trace must name the budget it ran under")
+	}
+}
