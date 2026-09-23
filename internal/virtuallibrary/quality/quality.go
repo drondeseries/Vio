@@ -617,7 +617,11 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	if maxSize > 0 && c.FileSize > maxSize {
 		return false
 	}
-	if p.RequireMultiAudio && !c.IsMultiAudio && !c.IsDualAudio && len(c.AudioLanguages) <= 1 {
+	// RequireMultiAudio accepts a candidate with two distinct parsed audio
+	// languages, an explicit MULTI/DUAL marker, or (fallback) two raw list
+	// entries the parser could not identify: unrecognized languages must not
+	// fail the gate purely for being unparseable.
+	if p.RequireMultiAudio && !stream.CandidateHasDistinctAudioLanguages(c, 2) && !c.IsMultiAudio && !c.IsDualAudio && len(c.AudioLanguages) <= 1 {
 		return false
 	}
 	if p.Language != "" && !stream.CandidateHasLanguage(c, p.Language) {

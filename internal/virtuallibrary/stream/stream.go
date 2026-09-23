@@ -28,7 +28,20 @@ var (
 	audioChannelsPattern = regexp.MustCompile(`(?i)\b(?:7\.1(?:\.4)?|5\.1(?:\.2)?|2\.0|1\.0)\b`)
 	tenBitPattern        = regexp.MustCompile(`(?i)\b(?:10[ ._-]?bit|hi10p?)\b`)
 	imaxPattern          = regexp.MustCompile(`(?i)\bimax(?:[ ._-]enhanced)?\b`)
-	multiPattern         = regexp.MustCompile(`(?i)\b(?:multi(?:[ ._-]*(?:audio|lang|language|subs|sub))?|multilingual)\b`)
+	// multiAudioPattern matches audio-MULTI markers: MULTI or DUAL with an
+	// explicit audio qualifier (audio, lang, language), the standalone
+	// MULTILINGUAL word, or a bare MULTI. Go's regexp has no lookahead, so
+	// the SUBS exclusion lives in the match guard below (multiSubsSpan):
+	// MULTI SUBS / MULTISUBS advertises subtitle tracks, never audio
+	// (setting IsMultiAudio for it lets single-audio releases pass
+	// MULTI-audio profiles).
+	multiAudioPattern = regexp.MustCompile(`(?i)\b(?:multilingual|dual[ ._-]*audio|multi(?:[ ._-]*(?:audio|lang|language))?)\b`)
+	// multiSubsSpan matches the subtitle spans a bare MULTI must not be read
+	// from: MULTI SUBS / MULTI-SUB / MULTISUBS (and the bare SUBS/SUB words
+	// themselves, so "MULTI … SUBS" with other tokens between still counts
+	// as a subtitle span). Stripping these before the audio test leaves only
+	// the audio-context MULTI markers behind.
+	multiSubsSpanPattern = regexp.MustCompile(`(?i)\bmulti[ ._-]*subs?\b|\bmultisubs?\b|\bsubs?\b`)
 	dualPattern          = regexp.MustCompile(`(?i)\bdual[ ._-]*audio\b`)
 	releaseGroupPattern  = regexp.MustCompile(`(?i)-([a-zA-Z0-9]+)(?:\[.*?\])?$`)
 	regionalLangPattern  = regexp.MustCompile(`(?i)\b(pt-br|es-419|zh-hans|zh-hant|zh-tw|en-us|en-gb|fr-ca)\b`)
@@ -475,6 +488,12 @@ func ParseStreamMetadata(s *StreamCandidate) {
 		}
 	}
 
+	// Regional spans are masked before the bare-code pass: in "es-419" the
+	// "-" is a word boundary, so a naive bare scan would also emit "SPA"
+	// (from "es") and let the wrong regional variant gain bare-language
+	// rank. Masking keeps exactly one token per span — the regional code —
+	// so es-419 yields ES-419 only, pt-BR yields PT-BR only.
+	maskedText := regionalLangPattern.ReplaceAllString(cleanText, " ")
 	seen := map[string]bool{}
 	for _, match := range regionalLangPattern.FindAllString(cleanText, -1) {
 		if code := canonicalAudioLanguage(match); code != "" && !seen[code] {
@@ -482,24 +501,29 @@ func ParseStreamMetadata(s *StreamCandidate) {
 			s.AudioLanguages = append(s.AudioLanguages, code)
 		}
 	}
-	for _, match := range fullNameLangPattern.FindAllString(cleanText, -1) {
+	for _, match := range fullNameLangPattern.FindAllString(maskedText, -1) {
 		if code := canonicalAudioLanguage(match); code != "" && !seen[code] {
 			seen[code] = true
 			s.AudioLanguages = append(s.AudioLanguages, code)
 		}
 	}
-	for _, match := range languagePattern.FindAllString(strings.ToLower(cleanText), -1) {
+	for _, match := range languagePattern.FindAllString(strings.ToLower(maskedText), -1) {
 		if code := canonicalAudioLanguage(match); code != "" && !seen[code] {
 			seen[code] = true
 			s.AudioLanguages = append(s.AudioLanguages, code)
 		}
 	}
 
-	// multiPattern alone: the removed `strings.Contains(name, "multi")`
+	// multiAudioPattern alone: the removed `strings.Contains(name, "multi")`
 	// fallback matched titles like "Multiplicity" and "The Multiverse" and
 	// advertised them as multi-audio releases. A bare word "multi" still
-	// matches through the pattern's word boundary.
-	if multiPattern.MatchString(text) {
+	// matches through the pattern's word boundary — but only outside a
+	// subtitle span: strip the SUBS spans first, then test what remains, so
+	// "PT-BR.MULTI.TrueHD" (audio MULTI, no SUBS anywhere) keeps the flag
+	// while "MULTI.SUBS" (the MULTI sits inside a subtitle span) does not.
+	// Explicit audio qualifiers (MULTI.AUDIO, DUAL.AUDIO, MULTILINGUAL) match
+	// on the stripped text the same way they match the raw text.
+	if multiAudioPattern.MatchString(multiSubsSpanPattern.ReplaceAllString(text, " ")) {
 		s.IsMultiAudio = true
 	}
 	if dualPattern.MatchString(text) {
@@ -748,6 +772,27 @@ func CandidateLanguageMatchRank(candidate StreamCandidate, preferred string) int
 		return 3
 	}
 	return -1
+}
+
+// CandidateHasDistinctAudioLanguages reports whether the candidate carries
+// at least n distinct audio languages by base language (so es-419 beside a
+// bare "es" alias counts once, not twice). It is the alias-proof gate for
+// RequireMultiAudio: the flag alone is a release-text claim, and the raw
+// list length counts aliases.
+func CandidateHasDistinctAudioLanguages(candidate StreamCandidate, n int) bool {
+	if n <= 0 {
+		return true
+	}
+	seen := make(map[string]struct{}, len(candidate.AudioLanguages))
+	for _, language := range candidate.AudioLanguages {
+		if base := CanonicalLanguageBase(language); base != "" {
+			seen[base] = struct{}{}
+			if len(seen) >= n {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // CandidateHasLanguage reports whether candidate carries or supports the preferred language.

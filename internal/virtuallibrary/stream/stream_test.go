@@ -262,10 +262,69 @@ func TestIsMultiAudioRequiresMultiPattern(t *testing.T) {
 		t.Fatal("a real MULTI release was not parsed as multi-audio")
 	}
 
+	// MULTI SUBS advertises subtitles, never audio: it must not set the
+	// audio flag, or single-audio releases pass MULTI-audio profiles.
+	for _, name := range []string{
+		"Movie.2024.1080p.WEB-DL.MULTI.SUBS",
+		"Movie.2024.1080p.WEB-DL.MULTISUBS",
+		"Movie.2024.1080p.WEB-DL.MULTI-SUB",
+	} {
+		subs := &StreamCandidate{Name: name}
+		ParseStreamMetadata(subs)
+		if subs.IsMultiAudio {
+			t.Fatalf("%q set IsMultiAudio for a subtitle marker", name)
+		}
+	}
+
 	dual := &StreamCandidate{Name: "Movie.2024.Dual.Audio.1080p.WEB-DL"}
 	ParseStreamMetadata(dual)
 	if !dual.IsMultiAudio || !dual.IsDualAudio {
 		t.Fatal("a dual-audio release was not parsed as multi/dual audio")
+	}
+}
+
+// TestParseStreamMetadataRegionalMasking pins the regional-span masking: a
+// regional code must not also emit its bare base (es-419 must not yield SPA
+// from the "es" fragment, pt-BR must not yield POR), or the wrong regional
+// variant gains bare-language rank and aliases inflate distinct counts.
+func TestParseStreamMetadataRegionalMasking(t *testing.T) {
+	es419 := &StreamCandidate{Name: "Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-ES-419-GROUP"}
+	ParseStreamMetadata(es419)
+	if len(es419.AudioLanguages) != 1 || es419.AudioLanguages[0] != "ES-419" {
+		t.Fatalf("es-419 languages = %v, want [ES-419] only", es419.AudioLanguages)
+	}
+
+	ptbr := &StreamCandidate{Name: "Movie.2024.1080p.WEB-DL.DDP5.1-PT-BR-GROUP"}
+	ParseStreamMetadata(ptbr)
+	if len(ptbr.AudioLanguages) != 1 || ptbr.AudioLanguages[0] != "PT-BR" {
+		t.Fatalf("pt-BR languages = %v, want [PT-BR] only", ptbr.AudioLanguages)
+	}
+
+	zh := &StreamCandidate{Name: "Movie.2024.1080p.WEB-DL.ZH-HANS-GROUP"}
+	ParseStreamMetadata(zh)
+	if len(zh.AudioLanguages) != 1 || zh.AudioLanguages[0] != "ZH-HANS" {
+		t.Fatalf("zh-hans languages = %v, want [ZH-HANS] only", zh.AudioLanguages)
+	}
+}
+
+// TestCandidateHasDistinctAudioLanguages pins the alias-proof MULTI gate: a
+// regional code beside its bare base counts once, while two true languages
+// count twice.
+func TestCandidateHasDistinctAudioLanguages(t *testing.T) {
+	aliased := StreamCandidate{AudioLanguages: []string{"ES-419", "SPA"}}
+	if CandidateHasDistinctAudioLanguages(aliased, 2) {
+		t.Fatalf("aliased %v counted as 2 distinct languages", aliased.AudioLanguages)
+	}
+	if !CandidateHasDistinctAudioLanguages(aliased, 1) {
+		t.Fatalf("aliased %v counted as 0 languages", aliased.AudioLanguages)
+	}
+	multi := StreamCandidate{AudioLanguages: []string{"ENG", "SPA"}}
+	if !CandidateHasDistinctAudioLanguages(multi, 2) {
+		t.Fatalf("distinct %v not counted as 2 languages", multi.AudioLanguages)
+	}
+	single := StreamCandidate{AudioLanguages: []string{"ENG"}}
+	if CandidateHasDistinctAudioLanguages(single, 2) {
+		t.Fatalf("single %v counted as 2 languages", single.AudioLanguages)
 	}
 }
 
