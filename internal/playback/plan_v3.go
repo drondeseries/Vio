@@ -579,7 +579,14 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 			// HLS transcode node can, and vice versa.
 			audioConvertOK := progressiveAudioConvertOK ||
 				hlsDeliveryOK && input.hlsRemuxRegistry().Available(TransformationAudioToAACV3)
-			if !audioConvertOK {
+			// A missing AAC toolchain is the cause only when an eligible remux
+			// delivery actually needs the conversion. Both conversion flags
+			// above are set whenever audio adaptation is required, so the guard
+			// is just "does any remux delivery remain available": when neither
+			// delivery exists the failure is delivery exhaustion, and falling
+			// through reports that real cause instead of a misleading encoder
+			// verdict.
+			if !audioConvertOK && (deliveryAvailableV3(input.Request, DeliveryClassProgressiveV3) || hlsDeliveryOK) {
 				return terminalPlannerResultV3(TerminalAudioConversionUnsupportedV3, "The required validated AAC conversion toolchain is unavailable.", true)
 			}
 		}

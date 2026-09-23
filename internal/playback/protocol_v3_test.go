@@ -3836,6 +3836,39 @@ func TestPlanPlaybackV3VideoRemuxWithNilRegistryReturnsAudioConversionTerminal(t
 	}
 }
 
+// When no remux delivery remains available the audio-conversion terminal must
+// not blame a missing AAC toolchain: exhaustion of the delivery classes is the
+// real cause, and the planner reports it as adaptation_unavailable even with an
+// eligible AAC executor. The old gate fired on the combined availability check
+// without consulting either registry, so delivery exhaustion and a missing
+// encoder were indistinguishable.
+func TestPlanPlaybackV3VideoRemuxWithoutAnyDeliveryReportsAdaptationUnavailable(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.CodecAudio = "vorbis"
+	file.VideoTracks[0].VideoRange = "SDR"
+	file.VideoTracks[0].VideoRangeType = "SDR"
+	file.AudioTracks[0] = models.AudioTrack{Codec: "vorbis", Channels: 2, Layout: "stereo"}
+
+	req := validStartRequestV3()
+	req.Capabilities.VideoEvidence = EvidenceDeclaredV3
+	req.Capabilities.AudioEvidence = EvidenceDeclaredV3
+	req.Capabilities.CodecsAudio = []string{"aac", "vorbis"}
+	delete(req.ClientPlaybackContext.Deliveries, DeliveryClassOriginalHTTPV3)
+	delete(req.ClientPlaybackContext.Deliveries, DeliveryClassProgressiveV3)
+	delete(req.ClientPlaybackContext.Deliveries, DeliveryClassHLSV3)
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3(),
+	})
+	if result.Terminal == nil || result.Terminal.Reason == TerminalAudioConversionUnsupportedV3 || result.Terminal.Retryable {
+		t.Fatalf("result = %s, want a non-retryable adaptation terminal rather than an AAC toolchain verdict", ExplainPlannerResultV3(result))
+	}
+	if result.Terminal.Reason != "adaptation_unavailable" {
+		t.Fatalf("terminal reason = %q, want %q", result.Terminal.Reason, "adaptation_unavailable")
+	}
+}
+
 func TestPlanPlaybackV3VideoRemuxUsesCurrentAACRecipeForHLSFallback(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.CodecAudio = "opus"
