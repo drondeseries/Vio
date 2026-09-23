@@ -392,7 +392,7 @@ func (h *PlaybackHandler) probeVirtualFallbackSource(ctx context.Context, resolv
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, virtualProbeBudget)
 	defer cancel()
-	probeFile := models.MediaFile{Container: "virtual"}
+	probeFile := models.MediaFile{Container: virtualURIScheme}
 	if file != nil {
 		probeFile.ContentID = file.ContentID
 		probeFile.MediaFolderID = file.MediaFolderID
