@@ -405,7 +405,9 @@ func TestReadAheadBudgetReleasedWhenConsumerAbandons(t *testing.T) {
 	budget = newReadAheadBudget(capacity)
 	body = &progressReader{r: newPatternReader(int64(remoteBodyChunkSize) * (remoteBodyBufferChunks + 8))}
 	ctx, cancel = context.WithCancel(context.Background())
-	chunks = pumpRemoteBody(ctx, body, budget)
+	// The returned channel is intentionally dropped: nobody receives in this
+	// scenario, so the pump's own exit drain has to clear the pool.
+	pumpRemoteBody(ctx, body, budget)
 	waitForReaderBytes(t, body, int64(remoteBodyChunkSize)*(remoteBodyBufferChunks+1))
 	cancel()
 	waitForBudgetZero(t, budget, 5*time.Second)
