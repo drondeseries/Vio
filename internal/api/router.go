@@ -126,6 +126,11 @@ type Dependencies struct {
 	// work whose drain must be awaited by shutdown rather than only triggered by
 	// service-context cancellation. Nil is valid in tests and embedded routers.
 	RegisterShutdownFunc func(name string, run func())
+	// OnVirtualRefreshExecutor receives the router-built asynchronous virtual
+	// candidates refresh executor so main can install it on the admin job
+	// runner, which is constructed after the router. Nil is valid in tests and
+	// embedded routers.
+	OnVirtualRefreshExecutor func(adminjob.VirtualCandidatesRefreshExecutor)
 
 	DB              *pgxpool.Pool
 	SecretCipher    *secret.Cipher // at-rest credential cipher (required when DB is set)
@@ -1171,6 +1176,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 	// the v2 media-candidates endpoint when the core virtual library and the
 	// candidate sink are both available.
 	var virtualCandidatesRefresh *handlers.VirtualCandidatesRefreshService
+	var virtualIndexerReleases *handlers.VirtualIndexerReleaseService
+	var virtualRefreshExecutor *handlers.VirtualCandidatesRefreshExecutor
+	var virtualRefreshJobs *handlers.VirtualCandidatesRefreshJobService
 	if deps.SessionMgr != nil {
 		remoteStreamRelay := remotestream.NewRelay()
 		if deps.AppContext != nil && deps.AppContext.Done() != nil {
@@ -1244,6 +1252,34 @@ func newChiRouter(deps Dependencies) chi.Router {
 						ContentFiles: deps.FileRepo.GetByContentID,
 						EpisodeFiles: deps.FileRepo.GetByEpisodeID,
 						Detail:       itemsHandler,
+					}
+					// The indexer-release read/request surface and the async
+					// refresh executor share the store the service owns.
+					if store := deps.VirtualLibraryService.IndexerReleases(); store != nil {
+						virtualIndexerReleases = &handlers.VirtualIndexerReleaseService{
+							Store: store,
+							Enqueue: handlers.VirtualIndexerReleaseEnqueue(func(ctx context.Context, downloadURL, name string) (string, error) {
+								return deps.VirtualLibraryService.EnqueueIndexerRelease(ctx, downloadURL, name)
+							}),
+							Detail:       itemsHandler,
+							ContentFiles: deps.FileRepo.GetByContentID,
+							EpisodeFiles: deps.FileRepo.GetByEpisodeID,
+						}
+						virtualRefreshExecutor = &handlers.VirtualCandidatesRefreshExecutor{
+							Refresh:  virtualCandidatesRefresh,
+							Store:    store,
+							Searcher: deps.VirtualLibraryService,
+							Enricher: playbackHandler,
+							Events:   deps.RealtimeHub,
+						}
+						virtualRefreshJobs = &handlers.VirtualCandidatesRefreshJobService{
+							Detail:       itemsHandler,
+							Items:        itemRepo,
+							Episodes:     episodeRepo,
+							ContentFiles: deps.FileRepo.GetByContentID,
+							EpisodeFiles: deps.FileRepo.GetByEpisodeID,
+							Jobs:         adminjob.NewRepository(deps.DB),
+						}
 					}
 				}
 				playbackHandler.VirtualFileLookup = func(ctx context.Context, path string) (*models.MediaFile, error) {
@@ -2801,8 +2837,18 @@ func newChiRouter(deps Dependencies) chi.Router {
 	if itemsHandler != nil {
 		v2deps.Watch = itemsHandler
 	}
-	if virtualCandidatesRefresh != nil {
-		v2deps.VirtualCandidatesRefresh = virtualCandidatesRefresh
+	if virtualRefreshJobs != nil {
+		v2deps.VirtualCandidatesRefresh = virtualRefreshJobs
+	}
+	if virtualIndexerReleases != nil {
+		v2deps.VirtualReleaseRequest = virtualIndexerReleases
+		v2deps.IndexerReleases = virtualIndexerReleases
+	}
+	if deps.VirtualLibraryService != nil {
+		v2deps.VirtualLibraryStatus = deps.VirtualLibraryService
+	}
+	if virtualRefreshExecutor != nil && deps.OnVirtualRefreshExecutor != nil {
+		deps.OnVirtualRefreshExecutor(virtualRefreshExecutor)
 	}
 	if profileHandler != nil {
 		v2deps.Profiles = profileHandler

@@ -14,9 +14,21 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/monitor"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/prowlarr"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
+
+// MonitoredMedia aliases the Prowlarr monitored-title shape so callers that
+// drive an on-demand indexer search need not import the subpackage.
+type MonitoredMedia = prowlarr.MonitoredMedia
+
+// VirtualEpisode aliases the Prowlarr episode shape.
+type VirtualEpisode = prowlarr.VirtualEpisode
+
+// SearchItem aliases one Prowlarr search result.
+type SearchItem = prowlarr.SearchItem
 
 // Service is the core virtual-library service: Stremio stream resolution plus
 // request monitoring, wired directly into the server without a plugin
@@ -33,6 +45,11 @@ import (
 type Service struct {
 	Resolver *resolver.Resolver
 	Monitor  *monitor.Monitor
+
+	// indexerReleases persists the Prowlarr releases offered for a title the
+	// provider does not have yet. It is nil when the registrar (and therefore
+	// the pool) is unavailable, so callers must nil-check.
+	indexerReleases *IndexerReleaseStore
 
 	cfg    Config
 	logger *slog.Logger
@@ -233,7 +250,61 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 	if store := m.ReleaseStore(); store != nil {
 		r.SetReleaseGate(store)
 	}
-	return &Service{Resolver: r, Monitor: m, cfg: cfg, logger: logger}
+	service := &Service{Resolver: r, Monitor: m, cfg: cfg, logger: logger}
+	if pool := registrarPool(registrar); pool != nil {
+		service.indexerReleases = NewIndexerReleaseStore(pool)
+	}
+	return service
+}
+
+// IndexerReleases returns the persisted indexer-release store, or nil when the
+// service was built without a database pool.
+func (s *Service) IndexerReleases() *IndexerReleaseStore {
+	if s == nil {
+		return nil
+	}
+	return s.indexerReleases
+}
+
+// SearchMonitoredReleases performs an on-demand indexer search for one
+// monitored title (movie or episode) and returns the matching releases. It
+// delegates to the monitor's configured Prowlarr client and is a no-op when
+// Prowlarr is unwired, so callers can treat an empty result as "no indexer".
+func (s *Service) SearchMonitoredReleases(ctx context.Context, item MonitoredMedia, episode *VirtualEpisode) ([]SearchItem, error) {
+	if s == nil || s.Monitor == nil {
+		return nil, ErrVirtualLibraryUnavailable
+	}
+	return s.Monitor.SearchMonitoredReleases(ctx, item, episode, s.cfg.Quality)
+}
+
+// EnqueueIndexerRelease hands a release's stored download URL to the provider.
+// It delegates to the monitor's configured AltMount client; a nil or
+// unconfigured client fails closed rather than silently dropping the request.
+func (s *Service) EnqueueIndexerRelease(ctx context.Context, downloadURL, name string) (string, error) {
+	if s == nil || s.Monitor == nil {
+		return "", ErrVirtualLibraryUnavailable
+	}
+	return s.Monitor.EnqueueRelease(ctx, downloadURL, name)
+}
+
+// ClassifyProviderCandidates applies the provider's completion classification
+// to a candidate list. It exposes the monitor's classifier so the refresh job
+// can build a dedup set that includes badge-confirmed and cached streams.
+func (s *Service) ClassifyProviderCandidates(candidates []stream.StreamCandidate) {
+	if s == nil || s.Monitor == nil {
+		return
+	}
+	s.Monitor.ClassifyCandidates(candidates)
+}
+
+// IndexerCapabilities reports whether the on-demand indexer search (Prowlarr)
+// and the provider enqueue (AltMount) are configured. Both are read-only
+// wiring probes; neither performs a network call.
+func (s *Service) IndexerCapabilities() (indexerSearch bool, indexerRequest bool) {
+	if s == nil || s.Monitor == nil {
+		return false, false
+	}
+	return s.Monitor.ProwlarrConfigured(), s.Monitor.AltmountConfigured()
 }
 
 // ValidateConfig checks that the service configuration is internally consistent

@@ -58,6 +58,7 @@ type Runner struct {
 	templateBundleApply        templateBundleApplyExecutor
 	storageTransition          storageTransitionExecutor
 	storageTransitionCommitted func(context.Context) error
+	virtualRefresh             VirtualCandidatesRefreshExecutor
 	realtimeHub                *notifications.Hub
 	pollInterval               time.Duration
 	cleanupInterval            time.Duration
@@ -219,6 +220,7 @@ func (r *Runner) runNext() {
 		JobTypeDeleteLibrary,
 		JobTypeTemplateBundleApply,
 		JobTypeStorageTransition,
+		JobTypeVirtualCandidatesRefresh,
 	})
 	cancel()
 	if err != nil {
@@ -248,6 +250,7 @@ func (r *Runner) runNext() {
 		itemRefresh: r.itemRefresh, libraryRefresh: r.libraryRefresh, libraryDelete: r.libraryDelete,
 		imageCacheCleanup: r.imageCacheCleanup, templateBundleApply: r.templateBundleApply, storageTransition: r.storageTransition,
 		storageTransitionCommitted: r.storageTransitionCommitted,
+		virtualRefresh:             r.virtualRefresh,
 		realtimeHub:                r.realtimeHub, heartbeatInterval: r.heartbeatInterval, retention: r.retention, cancelRegistry: r.cancelRegistry,
 		storageRestart: r.storageRestart, stop: r.stop,
 	}
@@ -303,6 +306,8 @@ func (r *Runner) runNext() {
 		r.executeImageCacheCleanup(job)
 	case JobTypeStorageTransition:
 		r.executeStorageTransition(job)
+	case JobTypeVirtualCandidatesRefresh:
+		r.executeVirtualCandidatesRefresh(job)
 	default:
 		r.failJob(job.ID, 0, 0, "Admin job failed", "unsupported admin job type")
 	}
@@ -1110,6 +1115,62 @@ func (r *Runner) executeItemRefresh(job *models.AdminJob) {
 		ProgressTotal:   progressTotal,
 	}); err != nil {
 		slog.Warn("admin jobs: failed to complete item refresh", "job_id", job.ID, "error", err)
+		return
+	}
+	r.publishJobByID(ctx, notifications.TypeJobCompleted, job.ID)
+}
+
+// executeVirtualCandidatesRefresh runs the asynchronous "Refresh List"
+// pipeline. Unlike the item refresh, a provider or indexer hiccup is not fatal:
+// the executor owns the degradation (altmount-only results survive an indexer
+// search failure), so any error it returns is a genuine pipeline failure.
+func (r *Runner) executeVirtualCandidatesRefresh(job *models.AdminJob) {
+	if r.virtualRefresh == nil {
+		r.failJob(job.ID, 0, 0, "Virtual candidates refresh failed", "virtual candidates refresh executor is not configured")
+		return
+	}
+
+	var req VirtualCandidatesRefreshRequest
+	if len(job.RequestPayload) > 0 {
+		if err := json.Unmarshal(job.RequestPayload, &req); err != nil {
+			r.failJob(job.ID, 0, 0, "Virtual candidates refresh failed", fmt.Sprintf("invalid virtual candidates refresh payload: %v", err))
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.executionContext(), virtualCandidatesRefreshTimeout)
+	defer cancel()
+
+	heartbeatStop := make(chan struct{})
+	go r.heartbeatLoop(ctx, job.ID, heartbeatStop)
+	defer close(heartbeatStop)
+
+	progress := func(current, total int, message string) {
+		if err := r.repo.UpdateProgress(ctx, job.ID, current, total, message); err != nil {
+			slog.Warn("admin jobs: failed to update virtual candidates refresh progress", "job_id", job.ID, "error", err)
+			return
+		}
+		r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
+	}
+
+	result, err := r.virtualRefresh.Execute(ctx, req, progress)
+	if err != nil {
+		msg := err.Error()
+		if ctx.Err() != nil {
+			msg = fmt.Sprintf("timed out after %s: %s", virtualCandidatesRefreshTimeout, msg)
+		}
+		r.failJob(job.ID, 0, 0, "Virtual candidates refresh failed", msg)
+		return
+	}
+
+	if err := r.repo.Complete(ctx, job.ID, CompleteJobInput{
+		ResultPayload:   result,
+		Message:         "Virtual candidates refreshed",
+		ProgressCurrent: 1,
+		ProgressTotal:   1,
+		ExpiresAt:       time.Now().UTC().Add(r.retention),
+	}); err != nil {
+		slog.Warn("admin jobs: failed to complete virtual candidates refresh", "job_id", job.ID, "error", err)
 		return
 	}
 	r.publishJobByID(ctx, notifications.TypeJobCompleted, job.ID)

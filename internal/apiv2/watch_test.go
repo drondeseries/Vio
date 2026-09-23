@@ -160,6 +160,77 @@ func TestGetWatchState(t *testing.T) {
 	}
 }
 
+// fakeIndexerReleases is the optional watch-detail seam.
+type fakeIndexerReleases struct {
+	calls     int
+	contentID string
+	views     []handlers.IndexerReleaseView
+	err       error
+}
+
+func (f *fakeIndexerReleases) IndexerReleasesForWatch(_ context.Context, contentID string) ([]handlers.IndexerReleaseView, error) {
+	f.calls++
+	f.contentID = contentID
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.views, nil
+}
+
+// TestGetWatchStateMergesIndexerReleases pins the additive merge: the rows
+// appear with their parsed metadata, the release id is the opaque row id, and
+// an absent seam leaves an empty (never null) array.
+func TestGetWatchStateMergesIndexerReleases(t *testing.T) {
+	published := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	score := 9
+	seam := &fakeIndexerReleases{views: []handlers.IndexerReleaseView{{
+		ReleaseID: "17", Title: "Heat 1995 2160p WEB-DL x265-GRP", Resolution: "2160p",
+		CodecVideo: "hevc", CodecAudio: "eac3", HDR: true, SizeBytes: 8_000_000_000,
+		Indexer: "idx", PublishedAt: &published, FormatScore: &score, Protocol: "usenet",
+		DownloadState: "not_downloaded",
+	}}}
+	deps := watchDeps(&fakeWatch{})
+	deps.IndexerReleases = seam
+	h := newTestHandler(t, deps)
+	owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
+
+	rec := do(t, h, http.MethodGet, "/api/v2/watch/movie:heat-1995", "", owner)
+	if rec.Code != 200 {
+		t.Fatal(rec.Body.String())
+	}
+	var body struct {
+		IndexerReleases []map[string]any `json:"indexer_releases"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.IndexerReleases) != 1 {
+		t.Fatalf("indexer_releases = %v", body.IndexerReleases)
+	}
+	row := body.IndexerReleases[0]
+	if row["release_id"] != "17" || row["download_state"] != "not_downloaded" || row["protocol"] != "usenet" {
+		t.Fatalf("row = %v", row)
+	}
+	if row["published_at"] != "2026-02-03T04:05:06.000Z" || row["size_bytes"].(float64) != 8_000_000_000 {
+		t.Fatalf("row = %v", row)
+	}
+	if seam.calls != 1 || seam.contentID != "movie:heat-1995" {
+		t.Fatalf("seam calls = %+v", seam)
+	}
+
+	// With no seam the array is present and empty, never null.
+	plain := do(t, newTestHandler(t, watchDeps(&fakeWatch{})), http.MethodGet, "/api/v2/watch/movie:heat-1995", "", owner)
+	var empty struct {
+		IndexerReleases []map[string]any `json:"indexer_releases"`
+	}
+	if err := json.Unmarshal(plain.Body.Bytes(), &empty); err != nil {
+		t.Fatal(err)
+	}
+	if empty.IndexerReleases == nil || len(empty.IndexerReleases) != 0 {
+		t.Fatalf("empty indexer_releases = %#v", empty.IndexerReleases)
+	}
+}
+
 func TestGetWatchStateRejects(t *testing.T) {
 	h := newTestHandler(t, watchDeps(&fakeWatch{}))
 	owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")

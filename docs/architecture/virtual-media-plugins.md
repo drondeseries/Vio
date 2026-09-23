@@ -35,6 +35,26 @@ owns persistence, indexing, metadata refresh, authorization, and playback.
 
 The resolver runs at playback time so signed upstream URLs are not persisted.
 
+## Indexer-only releases
+
+A title can exist at the indexers before the provider has downloaded it. The
+"Refresh List" flow (`POST /api/v2/media/{media_id}/virtual-candidates:refresh`)
+lists the provider candidates, searches Prowlarr for matching usenet releases
+the provider does not already list, and persists them in
+`virtual_indexer_releases` (one scope per content id, episode id, and media
+folder). The watch detail exposes them additively as `indexer_releases`, and a
+user can request one on the provider
+(`POST /api/v2/media/{media_id}/virtual-releases/{release_id}:request`).
+
+The stored `download_url` is server-internal: the request endpoint resolves the
+row by its opaque id, uses the stored URL, and never accepts or returns a URL,
+so the surface cannot be turned into an SSRF primitive. `MarkIndexerReleaseQueued`
+is the domain identity that makes a repeated request idempotent. The refresh is
+a durable `adminjob` job owned by the requesting user; the provider re-list is
+the only fatal stage, while the indexer search and candidate probing degrade to
+warnings. A completed refresh publishes `catalog.item.changed` with
+`change: "versions_updated"` so clients invalidate the version list.
+
 ## Administrator setup
 
 In Vio, Stremio virtual streaming is built directly into core (`internal/virtuallibrary`),

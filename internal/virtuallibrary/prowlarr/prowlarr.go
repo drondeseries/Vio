@@ -38,6 +38,68 @@ type SearchClient = prowlarrSearchClient
 // SearchItem is one result from Prowlarr's /api/v1/search endpoint.
 type SearchItem = prowlarrRelease
 
+// QualityScore returns the custom-format score the sort assigned the release.
+// Callers that got the release from SearchMonitoredReleases read the score the
+// sort already computed; an unprepared release parses locally so the value is
+// never silently zero on a direct caller.
+func (r prowlarrRelease) QualityScore() int {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.QualityScore
+	}
+	return r.parsedCandidate.QualityScore
+}
+
+// DisplayResolution returns the parsed resolution of the release title.
+func (r prowlarrRelease) DisplayResolution() string {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.Resolution
+	}
+	return r.parsedCandidate.Resolution
+}
+
+// HDR returns the parsed HDR label of the release title, empty when none.
+func (r prowlarrRelease) HDR() string {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.HDR
+	}
+	return r.parsedCandidate.HDR
+}
+
+// CodecVideo returns the parsed video codec of the release title.
+func (r prowlarrRelease) CodecVideo() string {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.CodecVideo
+	}
+	return r.parsedCandidate.CodecVideo
+}
+
+// CodecAudio returns the parsed audio codec of the release title.
+func (r prowlarrRelease) CodecAudio() string {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.CodecAudio
+	}
+	return r.parsedCandidate.CodecAudio
+}
+
+// NormalizedTitle returns the title reduced to a comparable identity.
+func (r prowlarrRelease) NormalizedTitle() string {
+	if r.normalizedTitle != "" {
+		return r.normalizedTitle
+	}
+	title, _ := normalizeReleaseTitle(r.Title)
+	return title
+}
+
 // MonitoredMedia aliases the monitored catalog item matched against Prowlarr.
 type MonitoredMedia = monitoredMedia
 

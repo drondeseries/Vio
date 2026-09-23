@@ -92,7 +92,8 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 		// own cancellation while waiting via the select below.
 		workCtx := context.WithoutCancel(ctx)
 		refreshCh := s.flight.DoChan(key, func() (any, error) {
-			return nil, s.refreshSource(workCtx, source, userID, profileID)
+			_, err := s.refreshSource(workCtx, source, userID, profileID)
+			return nil, err
 		})
 		var refreshRes singleflight.Result
 		select {
@@ -120,10 +121,73 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 	return detail.Versions, nil
 }
 
-// refreshSource force-lists one virtual source group and persists the result.
-func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, source *models.MediaFile, userID int, profileID string) error {
+// RefreshSources force-lists and persists every virtual source of the item
+// without a watch-detail read. It is the asynchronous job's provider step: the
+// caller already enforced access when it accepted the job. A nil/empty source
+// set returns an error so the job fails rather than silently doing nothing.
+//
+// It returns the union of the freshly listed provider streams so the job can
+// dedup the indexer search against the releases the provider already has and
+// target enrichment at the candidates that were just persisted.
+func (s *VirtualCandidatesRefreshService) RefreshSources(ctx context.Context, contentID string, userID int, profileID string) ([]*models.MediaFile, []VirtualPlaybackStream, error) {
+	if s == nil || s.ListFresh == nil || s.Persist == nil {
+		return nil, nil, apiError(http.StatusServiceUnavailable, "unavailable", "Virtual candidate refresh is unavailable")
+	}
+	sources, err := s.virtualSources(ctx, contentID)
+	if err != nil {
+		return nil, nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to load virtual candidates")
+	}
+	if len(sources) == 0 {
+		return nil, nil, apiError(http.StatusUnprocessableEntity, "validation_failed", "The item has no virtual candidates to refresh.")
+	}
+	var streams []VirtualPlaybackStream
+	for _, source := range sources {
+		key := virtualSourceRefreshKey(source)
+		// Do not bind the shared work to the caller's context: a client
+		// disconnect (or a job cancellation during a coalesced call) must not
+		// cancel a provider re-list another caller is waiting on. The shared
+		// work runs detached with its own timeout applied inside refreshSource.
+		workCtx := context.WithoutCancel(ctx)
+		refreshCh := s.flight.DoChan(key, func() (any, error) {
+			fresh, err := s.refreshSource(workCtx, source, userID, profileID)
+			if err != nil {
+				return nil, err
+			}
+			return fresh, nil
+		})
+		var refreshRes singleflight.Result
+		select {
+		case <-ctx.Done():
+			// This waiter is going away; the shared work continues for the
+			// other waiters under its detached context. Report the waiter's
+			// cancellation, not the work's outcome.
+			return nil, nil, apiError(http.StatusServiceUnavailable, "unavailable", "The refresh was interrupted; try again.")
+		case refreshRes = <-refreshCh:
+		}
+		if refreshRes.Err != nil {
+			if errors.Is(refreshRes.Err, ErrVirtualRefreshProvider) {
+				// The job treats a provider re-list failure as fatal: the
+				// version list cannot be trusted if the provider was not
+				// reachable, and the executor documents this degradation.
+				return nil, nil, apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached; try again.")
+			}
+			return nil, nil, refreshRes.Err
+		}
+		// Singleflight delivers the shared value to the winner and to every
+		// coalesced waiter alike, so the caller appends the same listing it
+		// would have produced alone.
+		if fresh, ok := refreshRes.Val.([]VirtualPlaybackStream); ok {
+			streams = append(streams, fresh...)
+		}
+	}
+	return sources, streams, nil
+}
+
+// refreshSource force-lists one virtual source group and persists the result,
+// returning the persisted streams so the caller can reuse the listing.
+func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, source *models.MediaFile, userID int, profileID string) ([]VirtualPlaybackStream, error) {
 	if source == nil {
-		return nil
+		return nil, nil
 	}
 	listCtx, cancel := context.WithTimeout(ctx, virtualCandidatesRefreshTimeout)
 	defer cancel()
@@ -131,23 +195,23 @@ func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, sou
 		listCtx, source.FilePath, userID, profileID, source.VirtualOwnerInstallationID,
 	)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, err)
+		return nil, fmt.Errorf("%w: %w", ErrVirtualRefreshProvider, err)
 	}
 	if len(streams) == 0 {
 		// A zero-count listing is a provider hiccup, not an empty title. It must
 		// not reach ReplaceVirtualCandidates: persisting it would sweep or
 		// rewrite healthy stored candidates. Surface the same retryable provider
 		// failure the caller already understands, and leave the rows untouched.
-		return fmt.Errorf("%w: provider returned no candidates", ErrVirtualRefreshProvider)
+		return nil, fmt.Errorf("%w: provider returned no candidates", ErrVirtualRefreshProvider)
 	}
 	// Persist under the listing timeout, not the detached caller context: the
 	// database write must not outlive the provider budget that bounds this
 	// refresh. (The detached work context only shields the re-list from a
 	// waiter disconnect; it must not make persistence unbounded.)
 	if err := s.Persist(listCtx, source, streams); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return streams, nil
 }
 
 // virtualSources groups the item's virtual media files into one source row per

@@ -9,6 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
 // IndexerReleaseTTLDefault bounds how long a listed release survives without a
@@ -18,10 +20,15 @@ import (
 // immediately-expired row.
 const IndexerReleaseTTLDefault = 24 * time.Hour
 
-// maxIndexerReleasesPerContent caps how many live releases one title keeps.
+// MaxIndexerReleasesPerContent caps how many live releases one title keeps.
 // Ranking mirrors the display order, so the retained set is the best-scored,
-// then newest/largest releases.
-const maxIndexerReleasesPerContent = 25
+// then newest/largest releases. The refresh job caps its batch to this before
+// the upsert, so the per-title work is bounded even when an indexer returns
+// hundreds of matches.
+const MaxIndexerReleasesPerContent = 25
+
+// maxIndexerReleasesPerContent is the internal spelling used by the store's SQL.
+const maxIndexerReleasesPerContent = MaxIndexerReleasesPerContent
 
 // maxIndexerReleasesListed bounds a single List call. Upsert keeps at most
 // maxIndexerReleasesPerContent non-queued rows plus any queued rows (the cap
@@ -63,6 +70,29 @@ type IndexerRelease struct {
 	EnqueueState   string
 	NZOID          string
 	ExpireAt       time.Time
+}
+
+// IndexerReleaseMeta is the display metadata derived from a release's title.
+// The stored row carries the raw title; resolution, codecs and HDR are parsed
+// on read so the wire projection matches the stream parser every other virtual
+// surface uses.
+type IndexerReleaseMeta struct {
+	Resolution string
+	CodecVideo string
+	CodecAudio string
+	HDR        bool
+}
+
+// Meta parses the release title into its display metadata.
+func (r IndexerRelease) Meta() IndexerReleaseMeta {
+	candidate := stream.StreamCandidate{Name: r.Title, Title: r.Title}
+	stream.ParseStreamDetails(&candidate)
+	return IndexerReleaseMeta{
+		Resolution: candidate.Resolution,
+		CodecVideo: candidate.CodecVideo,
+		CodecAudio: candidate.CodecAudio,
+		HDR:        candidate.HDR != "",
+	}
 }
 
 // IndexerReleaseStore persists the Prowlarr releases offered for a virtual
@@ -198,6 +228,43 @@ func (s *IndexerReleaseStore) UpsertIndexerReleases(ctx context.Context, scope I
 		return fmt.Errorf("commit indexer release upsert: %w", err)
 	}
 	return nil
+}
+
+// GetIndexerRelease returns one live release by its row id, scoped to the
+// content (and episode) and media folder. It is the write path's lookup: a
+// request names a release the client saw on this exact item, so a row from
+// another title or library must never resolve. A missing or expired row returns
+// ErrIndexerReleaseNotFound.
+func (s *IndexerReleaseStore) GetIndexerRelease(ctx context.Context, scope IndexerReleaseScope, id int64) (IndexerRelease, error) {
+	if s == nil || s.pool == nil {
+		return IndexerRelease{}, errors.New("indexer release store is not configured")
+	}
+	where, args := scopeWhere(scope)
+	args = append(args, id, scope.MediaFolderID)
+	var release IndexerRelease
+	var nzoID *string
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, guid, title, normalized_name, protocol, indexer, indexer_id,
+		       size_bytes, format_score, published_at, download_url,
+		       enqueue_state, nzo_id, expire_at
+		FROM virtual_indexer_releases
+		WHERE `+where+` AND id = $3 AND media_folder_id = $4 AND expire_at > now()
+	`, args...).Scan(
+		&release.ID, &release.GUID, &release.Title, &release.NormalizedName,
+		&release.Protocol, &release.Indexer, &release.IndexerID, &release.SizeBytes,
+		&release.FormatScore, &release.PublishedAt, &release.DownloadURL,
+		&release.EnqueueState, &nzoID, &release.ExpireAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return IndexerRelease{}, ErrIndexerReleaseNotFound
+		}
+		return IndexerRelease{}, fmt.Errorf("get indexer release: %w", err)
+	}
+	if nzoID != nil {
+		release.NZOID = *nzoID
+	}
+	return release, nil
 }
 
 // ListIndexerReleases returns the live releases for the scope, best-scored

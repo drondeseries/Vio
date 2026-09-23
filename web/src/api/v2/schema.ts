@@ -5079,6 +5079,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/capabilities/virtual-library": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Discover whether indexer search and provider release requests are available. */
+    get: operations["getVirtualLibraryCapabilities"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/catalog": {
     parameters: {
       query?: never;
@@ -7318,8 +7335,25 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    /** Force a fresh provider re-list for a virtual item's version candidates and return the retained list. */
+    /** Queue an asynchronous provider re-list of a virtual item's version candidates and answer the job to wait on. */
     post: operations["refreshVirtualCandidates"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/media/{media_id}/virtual-releases/{release_id}:request": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Request a release that exists on the indexers on the provider. The stored download URL is used server-side and is never returned. */
+    post: operations["requestVirtualRelease"];
     delete?: never;
     options?: never;
     head?: never;
@@ -15082,6 +15116,7 @@ export interface components {
        */
       finished_at?: string;
       id: string;
+      indexer_releases?: components["schemas"]["WatchIndexerRelease"][];
       item_result?: components["schemas"]["AdminTaskJobItemResult"];
       kind: string;
       /**
@@ -25429,9 +25464,28 @@ export interface components {
       /** Format: int64 */
       width?: number;
     };
-    VirtualCandidatesRefresh: {
-      /** @description Every retained virtual candidate of the item; empty, never null */
-      versions: components["schemas"]["WatchFileVersion"][];
+    VirtualLibraryCapabilities: {
+      /** @description Whether the current principal may use the capability */
+      allowed: boolean;
+      indexer_request: boolean;
+      indexer_search: boolean;
+      /** @description Opaque revision of this document */
+      revision: string;
+      /**
+       * @description Support and configuration state, not health
+       * @enum {string}
+       */
+      state: "available" | "disabled" | "not_configured" | "unsupported";
+    };
+    VirtualReleaseRequest: {
+      message?: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      release_id: string;
+      /** @enum {string} */
+      state: "queued" | "failed";
     };
     WatchAudioTrack: {
       /** Format: int64 */
@@ -25482,6 +25536,8 @@ export interface components {
       effective_version_resolution?: string;
       /** Format: int64 */
       episode_number?: number;
+      /** @description Releases that exist on the indexers but are not downloaded on the provider; empty, never null */
+      indexer_releases: components["schemas"]["WatchIndexerRelease"][];
       intro?: components["schemas"]["WatchMarker"];
       overview?: string;
       /** @description Logical watch choices, each spanning one or more ordered parts */
@@ -25583,6 +25639,38 @@ export interface components {
       resolution: string;
       subtitle_tracks?: components["schemas"]["WatchSubtitleTrack"][];
       video_tracks?: components["schemas"]["WatchVideoTrack"][];
+    };
+    WatchIndexerRelease: {
+      codec_audio?: string;
+      codec_video?: string;
+      /**
+       * @description Whether the release has been requested on the provider
+       * @enum {string}
+       */
+      download_state: "not_downloaded" | "queued" | "failed";
+      /**
+       * Format: int64
+       * @description Custom-format score the ranking assigned; absent when unscored
+       */
+      format_score?: number;
+      hdr?: boolean;
+      indexer?: string;
+      /** @description usenet or torrent */
+      protocol?: string;
+      /**
+       * Format: date-time
+       * @description When the indexer published the release
+       */
+      published_at?: string;
+      /** @description Opaque server id used to request this release */
+      release_id: string;
+      resolution?: string;
+      /**
+       * Format: int64
+       * @description Bytes
+       */
+      size_bytes?: number;
+      title: string;
     };
     WatchlistCollection: {
       /** @description The page's items; empty, never null */
@@ -72619,6 +72707,138 @@ export interface operations {
       };
     };
   };
+  getVirtualLibraryCapabilities: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+        /** @description Optional. When present, it must name a profile of the authenticated account. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["VirtualLibraryCapabilities"];
+        };
+      };
+      /** @description The representation named by If-None-Match is current; no body. */
+      304: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   listCatalogItems: {
     parameters: {
       query?: {
@@ -93167,13 +93387,126 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description Accepted */
+      202: {
+        headers: {
+          Location?: string;
+          "Retry-After"?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminTaskJob"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  requestVirtualRelease: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name a profile of the authenticated account. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description A movie or episode whose indexer release to request */
+        media_id: string;
+        /** @description The opaque release id read from the watch detail's indexer_releases */
+        release_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
       /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
         };
         content: {
-          "application/json": components["schemas"]["VirtualCandidatesRefresh"];
+          "application/json": components["schemas"]["VirtualReleaseRequest"];
         };
       };
       /** @description Bad Request */
