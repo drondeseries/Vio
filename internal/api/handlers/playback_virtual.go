@@ -1077,6 +1077,16 @@ type virtualResolveTrace struct {
 	fallback    time.Duration
 	fallbackRan bool
 
+	// budgetMS is the cold-path budget in milliseconds the trace ran under
+	// (virtualStartupBudget at trace start). budgetExceeded is set when the
+	// wall-clock resolve time passed it: with every stage deriving from the
+	// single cold deadline, an overrun means the deadline was not honored
+	// end to end, and the line tells exactly which stages consumed it.
+	budgetMS      int64
+	budgetRan     bool
+	budgetExceed  bool
+	budgetElapsed time.Duration
+
 	fastPath   bool
 	cached     bool
 	listed     bool
@@ -1094,16 +1104,40 @@ func (t *virtualResolveTrace) totalMS() int64 {
 		t.fallback.Milliseconds()
 }
 
+// finishBudget records the trace's budget verdict at log time: the elapsed
+// wall time against the budget captured at trace start. Called once, from
+// the deferred log, so cancellation paths report the same verdict as
+// success paths.
+func (t *virtualResolveTrace) finishBudget() {
+	if t == nil || t.budgetRan {
+		return
+	}
+	t.budgetRan = true
+	t.budgetElapsed = time.Since(t.started)
+	t.budgetExceed = t.budgetMS > 0 && t.budgetElapsed > time.Duration(t.budgetMS)*time.Millisecond
+}
+
 // fields returns the timing shape in a stable order. It is split out from log
 // so tests can assert the "ran" verdict per stage without capturing the logger.
+// elapsed_ms reuses the frozen budget verdict's elapsed value (finishBudget
+// runs first in log), so the reported elapsed and the exceeded verdict can
+// never disagree near the boundary.
 func (t *virtualResolveTrace) fields() []any {
+	elapsedMS := t.budgetElapsed.Milliseconds()
+	if !t.budgetRan {
+		elapsedMS = time.Since(t.started).Milliseconds()
+	}
 	attrs := []any{
-		"elapsed_ms", time.Since(t.started).Milliseconds(),
+		"elapsed_ms", elapsedMS,
 		"total_ms", t.totalMS(), //nolint:goconst // log attribute key/value, kept inline for readability.
 		"candidates", t.candidates, //nolint:goconst // log attribute key/value, kept inline for readability.
 		"cache_hit", t.cached,
 		"listed", t.listed,
 		"fast_path", t.fastPath,
+	}
+	if t.budgetRan {
+		attrs = append(attrs, "budget_ms", t.budgetMS)
+		attrs = append(attrs, "budget_exceeded", t.budgetExceed)
 	}
 	for _, stage := range [...]struct {
 		name string
@@ -1128,6 +1162,7 @@ func (t *virtualResolveTrace) log(ctx context.Context, file *models.MediaFile) {
 	if t == nil || file == nil {
 		return
 	}
+	t.finishBudget()
 	attrs := []any{logComponentKey, "api", "content_id", file.ContentID} //nolint:goconst // log attribute key/value, kept inline for readability.
 	attrs = append(attrs, t.fields()...)
 	slog.InfoContext(ctx, "virtual resolve timing", attrs...)
@@ -1444,7 +1479,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// Split file_load_probe into its provider phases so a cold-start
 	// attribution is measured, not guessed. The deferred log runs on every
 	// return below, including the fast paths.
-	trace := &virtualResolveTrace{started: time.Now()}
+	trace := &virtualResolveTrace{started: time.Now(), budgetMS: virtualStartupBudget.Milliseconds()}
 	defer trace.log(r.Context(), file)
 	// One deadline owns the entire cold path below. Listing, remux matching,
 	// provider resolution, probing, retries and the stale-source fallback all
@@ -1576,7 +1611,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// Candidate listing is part of the startup critical path. Keep it
 		// bounded so the first-byte SLA cannot be defeated before resolution,
 		// but derive that bound from the single cold-path deadline so listing
-		// cannot restart the budget.
+		// cannot restart the budget. The 15s cap is a backstop for a staging
+		// budget larger than that; the staging deadline always wins when it
+		// is smaller.
 		listCtx, cancel := context.WithTimeout(stagingCtx, 15*time.Second)
 		streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
 			listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID,
