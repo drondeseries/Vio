@@ -1,9 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ParsedCue } from "../utils/parseVTT";
-import {
-  matchSubtitleTrackAcrossVersions,
-  resolveSubtitleAutoSelect,
-} from "../utils/subtitleSort";
+import { matchSubtitleTrackAcrossVersions, resolveSubtitleAutoSelect } from "../utils/subtitleSort";
 import type HlsType from "hls.js";
 import { PlayerControls, SKIP_BACK_SECONDS, SKIP_FORWARD_SECONDS } from "./PlayerControls";
 import { PlaybackInfoOverlay } from "./PlaybackInfoOverlay";
@@ -2962,7 +2959,11 @@ export function VideoPlayer({
       lastSubtitleIndexRef.current = plan.selected_tracks.subtitle?.index ?? null;
       return;
     }
-    if (subtitleSelectionWasManualOffRef.current || activeSubtitleIndex === null || activeSubtitleIndex === LIVE_SUBTITLE_INDEX) {
+    if (
+      subtitleSelectionWasManualOffRef.current ||
+      activeSubtitleIndex === null ||
+      activeSubtitleIndex === LIVE_SUBTITLE_INDEX
+    ) {
       // Reconcile the remembered toggle-restoration index by identity so toggling On
       // after a version switch restores the equivalent language, not a stale ordinal.
       const rememberedIndex = lastSubtitleIndexRef.current;

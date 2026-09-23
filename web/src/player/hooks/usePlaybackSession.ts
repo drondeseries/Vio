@@ -983,7 +983,9 @@ export function usePlaybackSession(
           : [];
         const requestedTrack =
           targetSubtitleIndex !== undefined ? orderedTargetTracks[targetSubtitleIndex] : undefined;
-        const requestedIsBitmap = requestedTrack?.codec ? isBitmapCodec(requestedTrack.codec) : false;
+        const requestedIsBitmap = requestedTrack?.codec
+          ? isBitmapCodec(requestedTrack.codec)
+          : false;
         const hasBitmapSubtitle =
           requestedIsBitmap ||
           (carriedSubtitleTrackIndex === undefined &&
