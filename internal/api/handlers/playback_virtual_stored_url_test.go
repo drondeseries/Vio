@@ -393,6 +393,65 @@ func TestResolveVirtualInputRefreshSkipsSubstitutedCandidate(t *testing.T) {
 	}
 }
 
+// TestResolveVirtualInputForceRefreshKeepsDurableIdentity proves a forced
+// refresh bypasses cached transport but not identity: the provider renumbered
+// the same release under a new result id, the resolver re-matches it by the
+// row's durable identity, and the new id is adopted — instead of failing
+// same-release recovery because the forced path skipped the identity lookup.
+func TestResolveVirtualInputForceRefreshKeepsDurableIdentity(t *testing.T) {
+	const pinned = "virtual://movie/tt-renumber?result=cand-old"
+	const rematchedURI = "virtual://movie/tt-renumber?result=cand-new"
+	expiresAt := time.Now().Add(2 * time.Hour)
+	row := &models.MediaFile{
+		ID:                         78,
+		FilePath:                   pinned,
+		VirtualOwnerInstallationID: 5,
+		MediaFolderID:              3,
+		ResolvedURL:                "https://93.184.216.34/stream/token=stored",
+		ResolvedURLExpiresAt:       &expiresAt,
+		ProviderVideoHash:          "HASH1",
+		ProviderReleaseName:        "Movie.2024.1080p",
+		ProviderReleaseSize:        8_000_000_000,
+		UpdatedAt:                  time.Now().Add(-time.Minute),
+	}
+	resolver := VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		if _, ok := virtuallibrary.PersistedCandidateIdentityFromContext(ctx); !ok {
+			return ResolvedVirtualMedia{}, errors.New("durable identity missing on forced refresh")
+		}
+		return ResolvedVirtualMedia{
+			URL: "https://93.184.216.34/stream/token=rematched", URI: rematchedURI, CandidateID: "cand-new",
+			IdentityRematched: true, ProviderVideoHash: "HASH1",
+			ProviderReleaseName: "Movie.2024.1080p", ProviderReleaseSize: 8_000_000_000,
+		}, nil
+	})
+	h := &PlaybackHandler{
+		VirtualFileLookup:            storedURLLookup(row),
+		VirtualMediaDetailedResolver: resolver,
+	}
+	var saved []models.VirtualFilePersistArgs
+	h.VirtualFileMetadataSaver = func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+		saved = append(saved, args)
+		return VirtualFileMetadataUpdateResult{RowsAffected: 1, MetadataUpdated: true, IdentityAdopted: true}, nil
+	}
+
+	res, cleanup, err := h.resolveVirtualInputURI(context.Background(), pinned, 5, 1, "profile", true, nil, "")
+	if err != nil {
+		t.Fatalf("resolveVirtualInputURI error: %v", err)
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if res.URL != "https://93.184.216.34/stream/token=rematched" {
+		t.Fatalf("resolved URL = %q, want the re-matched release URL", res.URL)
+	}
+	if res.CandidateID != "cand-new" {
+		t.Fatalf("candidate id = %q, want the re-identified candidate", res.CandidateID)
+	}
+	if len(saved) != 1 || saved[0].AdoptPath != rematchedURI {
+		t.Fatalf("adoption writes = %#v, want exactly 1 adopting %q", saved, rematchedURI)
+	}
+}
+
 // storedURLStreamFileResolver is a serve-layer file resolver that supports the
 // exact-path lookup the stored-URL shortcut uses.
 type storedURLStreamFileResolver struct {

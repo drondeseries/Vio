@@ -93,6 +93,13 @@ func persistedCandidateIdentityFromContext(ctx context.Context) (PersistedCandid
 	return identity, true
 }
 
+// PersistedCandidateIdentityFromContext is the exported read counterpart for
+// handler tests that assert the durable identity reaches the resolver. The
+// identity itself is server-internal and never client-visible.
+func PersistedCandidateIdentityFromContext(ctx context.Context) (PersistedCandidateIdentity, bool) {
+	return persistedCandidateIdentityFromContext(ctx)
+}
+
 type persistedCandidateTrustContextKey struct{}
 
 // WithPersistedCandidateTrust marks a resolve as allowed to keep trusting the

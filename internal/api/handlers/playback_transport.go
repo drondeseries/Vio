@@ -358,16 +358,17 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	// an explicit forceRefresh (a failover retry after this candidate failed)
 	// or an exclusion list always takes the list-and-resolve path.
 	var storedRow *models.MediaFile
-	if !forceRefresh {
-		// Read the row once. It is both the source of the stored-URL shortcut
-		// and the durable identity the same-release re-match needs when the
-		// provider renumbers its result ids. A forceRefresh is a failover retry
-		// that deliberately relists, so it does not consult the stored row.
-		if h.VirtualFileLookup != nil {
-			if row, lookupErr := h.VirtualFileLookup(ctx, virtualURI); lookupErr == nil && row != nil {
-				storedRow = row
-				ctx = virtualResolveContextWithPersistedTrust(ctx, row, time.Now(), h.virtualCandidateTrustWindow())
-			}
+	// Read the row once. It is both the source of the stored-URL shortcut
+	// and the durable identity the same-release re-match needs when the
+	// provider renumbers its result ids. On a forced refresh the stored URL
+	// is never served (the shortcut below requires !forceRefresh), but the
+	// durable identity is still threaded: force-refresh bypasses cached
+	// transport, not identity, so a harmless provider renumbering still
+	// re-matches the same release instead of failing same-release recovery.
+	if h.VirtualFileLookup != nil {
+		if row, lookupErr := h.VirtualFileLookup(ctx, virtualURI); lookupErr == nil && row != nil {
+			storedRow = row
+			ctx = virtualResolveContextWithPersistedTrust(ctx, row, time.Now(), h.virtualCandidateTrustWindow())
 		}
 	}
 	var storedExpiredRow *models.MediaFile
@@ -410,6 +411,8 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 				// The pinned id was absent but the same release re-identified
 				// under a new id. Adopt it through the Phase-1 CAS/fence write
 				// so the row's ?result= and durable identity move with it.
+				// storedRow is always loaded (see above), so this covers a
+				// forced refresh too — not only the stored-URL shortcut path.
 				adoptRematchedVirtualResolution(ctx, storedRow, res, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
 			} else if err == nil && storedExpiredRow != nil {
 				// Reuse the Phase-1 write path; only the requested candidate's

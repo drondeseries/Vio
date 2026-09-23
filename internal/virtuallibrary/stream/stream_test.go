@@ -1,6 +1,11 @@
 package stream
 
-import "testing"
+import (
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
 
 // TestCanonicalLanguageBaseFoldsAliases pins the de-duplication key: a
 // regional/script code, its bare ISO base, the bibliographic 3-letter variant
@@ -261,5 +266,48 @@ func TestIsMultiAudioRequiresMultiPattern(t *testing.T) {
 	ParseStreamMetadata(dual)
 	if !dual.IsMultiAudio || !dual.IsDualAudio {
 		t.Fatal("a dual-audio release was not parsed as multi/dual audio")
+	}
+}
+
+// TestParseURLExpirationPreservesPastExpiry pins the absent/invalid/expired
+// distinction: an expired-at-ingestion signed URL must parse to its past
+// expiry (so the stored row reads expired and refreshes), never to zero
+// (which downstream treats as no-expiry, i.e. usable forever). Future,
+// absent, and malformed params keep their prior meaning.
+func TestParseURLExpirationPreservesPastExpiry(t *testing.T) {
+	past := time.Now().Add(-time.Hour).Unix()
+	future := time.Now().Add(3 * time.Hour).Unix()
+
+	expired := &StreamCandidate{URL: "https://cdn.example/stream?expires=" + strconv.FormatInt(past, 10)}
+	ParseStreamMetadata(expired)
+	if expired.ExpiresAt.IsZero() {
+		t.Fatal("expired-at-ingestion URL parsed to zero expiry, want its past expiry")
+	}
+	if !expired.ExpiresAt.Before(time.Now()) {
+		t.Fatalf("expired URL expiry = %v, want a past time", expired.ExpiresAt)
+	}
+
+	fresh := &StreamCandidate{URL: "https://cdn.example/stream?expires=" + strconv.FormatInt(future, 10)}
+	ParseStreamMetadata(fresh)
+	if fresh.ExpiresAt.IsZero() || !fresh.ExpiresAt.After(time.Now()) {
+		t.Fatalf("future URL expiry = %v, want a future time", fresh.ExpiresAt)
+	}
+
+	plain := &StreamCandidate{URL: "https://cdn.example/stream/token=abc"}
+	ParseStreamMetadata(plain)
+	if !plain.ExpiresAt.IsZero() {
+		t.Fatalf("expiry-less URL expiry = %v, want zero (absent)", plain.ExpiresAt)
+	}
+
+	amzPast := &StreamCandidate{URL: "https://s3.example/key?X-Amz-Expires=3600&X-Amz-Date=" + time.Now().Add(-2*time.Hour).UTC().Format("20060102T150405Z")}
+	ParseStreamMetadata(amzPast)
+	if amzPast.ExpiresAt.IsZero() {
+		t.Fatal("lapsed SigV4 URL parsed to zero expiry, want its past expiry")
+	}
+	if !amzPast.ExpiresAt.Before(time.Now()) {
+		t.Fatalf("lapsed SigV4 expiry = %v, want a past time", amzPast.ExpiresAt)
+	}
+	if !strings.Contains(amzPast.URL, "X-Amz-Expires") {
+		t.Fatal("test setup lost the SigV4 param")
 	}
 }
