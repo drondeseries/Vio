@@ -564,6 +564,9 @@ type Relay struct {
 	insecureClient *http.Client
 	sealKey        [32]byte
 	rangeCache     *relayRangeCache
+	// readAhead bounds the aggregate read-ahead bytes queued across every
+	// active stream on this relay. See relayReadAheadBudgetBytes.
+	readAhead *readAheadBudget
 }
 
 type relayEntry struct {
@@ -598,6 +601,7 @@ func NewRelay() *Relay {
 	relay := &Relay{
 		entries:    make(map[string]*relayEntry),
 		rangeCache: newRelayRangeCache(),
+		readAhead:  newReadAheadBudget(relayReadAheadBudgetBytes),
 		client: &http.Client{
 			Transport:     transport,
 			CheckRedirect: checkRedirect,
@@ -1031,7 +1035,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	// lifetime extends beyond this request.
 	pumpCtx, cancelPump := context.WithCancel(request.Context())
 	defer cancelPump()
-	bodyChunks := pumpRemoteBody(pumpCtx, response.Body)
+	bodyChunks := pumpRemoteBody(pumpCtx, response.Body, r.readAhead)
 	first, err := nextRemoteBodyChunk(request.Context(), bodyChunks, remoteFirstByteTimeout)
 	if err != nil {
 		return err
@@ -1141,19 +1145,54 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 type remoteBodyChunk struct {
 	data []byte
 	err  error
+	// budget and reservedBytes record the aggregate read-ahead reservation this
+	// chunk holds. Ownership passes to whoever receives the chunk; release
+	// returns the bytes to the pool. A released chunk is a no-op, so the
+	// producer's abort path and the consumer's receive path cannot
+	// double-release.
+	budget        *readAheadBudget
+	reservedBytes int
 }
 
-func pumpRemoteBody(ctx context.Context, body io.Reader) <-chan remoteBodyChunk {
+// release returns the chunk's read-ahead reservation to the relay pool.
+func (c remoteBodyChunk) release() {
+	if c.budget != nil && c.reservedBytes > 0 {
+		c.budget.release(c.reservedBytes)
+	}
+}
+
+func pumpRemoteBody(ctx context.Context, body io.Reader, budget *readAheadBudget) <-chan remoteBodyChunk {
 	chunks := make(chan remoteBodyChunk, remoteBodyBufferChunks)
 	go func() {
 		defer close(chunks)
 		for {
+			// Reserve a whole chunk before reading, so an exhausted aggregate
+			// pool applies backpressure before the upstream read rather than
+			// after a chunk is already occupying memory. A cancelled acquire
+			// returns without holding anything.
+			if err := budget.acquire(ctx, remoteBodyChunkSize); err != nil {
+				return
+			}
 			buffer := make([]byte, remoteBodyChunkSize)
 			n, err := body.Read(buffer)
-			chunk := remoteBodyChunk{data: buffer[:n], err: err}
+			if n == 0 && err == nil {
+				// io.Reader permits (0, nil); return the whole reservation and
+				// try again rather than publishing an empty chunk.
+				budget.release(remoteBodyChunkSize)
+				continue
+			}
+			// The chunk occupies only the bytes read; give the rest of the
+			// reservation back before it is queued.
+			if unused := remoteBodyChunkSize - n; unused > 0 {
+				budget.release(unused)
+			}
+			chunk := remoteBodyChunk{data: buffer[:n], err: err, budget: budget, reservedBytes: n}
 			select {
 			case chunks <- chunk:
+				// Ownership of `n` transfers to the consumer, which returns it
+				// once the chunk leaves the queue.
 			case <-ctx.Done():
+				chunk.release()
 				return
 			}
 			if err != nil {
@@ -1176,6 +1215,10 @@ func nextRemoteBodyChunk(ctx context.Context, chunks <-chan remoteBodyChunk, tim
 		if !ok {
 			return remoteBodyChunk{err: io.EOF}, nil
 		}
+		// The consumer now owns the chunk: return its read-ahead reservation so
+		// the aggregate pool can serve other streams while this chunk is
+		// written downstream. The bytes themselves stay alive in the chunk.
+		chunk.release()
 		if len(chunk.data) == 0 && chunk.err != nil && !errors.Is(chunk.err, io.EOF) {
 			return remoteBodyChunk{}, errors.New("read remote media stream")
 		}
