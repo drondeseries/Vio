@@ -93,17 +93,15 @@ describe("startVirtualCandidatesRefresh", () => {
       sessionResult(new Response("", { status: 202, headers: { Location: "/somewhere/else" } })),
     );
 
-    await expect(startVirtualCandidatesRefresh("content-1")).rejects.toThrow(
-      "not acknowledged",
-    );
+    await expect(startVirtualCandidatesRefresh("content-1")).rejects.toThrow("not acknowledged");
   });
 });
 
 describe("adminJobIdFromLocation", () => {
   it("accepts an absolute URL and strips any query or fragment", () => {
-    expect(
-      adminJobIdFromLocation("https://silo.example/api/v2/admin/jobs/job-1?x=1#frag"),
-    ).toBe("job-1");
+    expect(adminJobIdFromLocation("https://silo.example/api/v2/admin/jobs/job-1?x=1#frag")).toBe(
+      "job-1",
+    );
   });
 
   it("rejects a location that is not an admin job", () => {

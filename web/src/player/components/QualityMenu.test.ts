@@ -543,8 +543,6 @@ describe("QualityMenu indexer releases", () => {
       await Promise.resolve();
     });
     expect(screen.queryByText("Not downloaded")).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("menuitem", { name: /Request Movie/ }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /Request Movie/ })).not.toBeInTheDocument();
   });
 });
