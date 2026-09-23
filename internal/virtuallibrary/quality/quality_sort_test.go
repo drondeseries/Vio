@@ -420,3 +420,89 @@ func names(candidates []stream.StreamCandidate) []string {
 	}
 	return out
 }
+
+// TestSortOrdersLanguagePrecedenceExactBareVariantMulti proves the comparator
+// honors the full rank chain end to end: under a fr-CA preference the exact
+// candidate beats bare French, which beats the fr-BE variant, which beats a
+// MULTi-flagged release with no French evidence, which beats an unrelated
+// language. All other keys are tied so language alone decides.
+func TestSortOrdersLanguagePrecedenceExactBareVariantMulti(t *testing.T) {
+	profile := QualityProfile{Label: "fr", Language: "fr-CA"}
+	make := func(name string, langs []string, multi bool, index int) stream.StreamCandidate {
+		return stream.StreamCandidate{
+			Name: name, OriginalIndex: index, SourceConfirmed: true,
+			AudioLanguages: langs, IsMultiAudio: multi,
+			Resolution: "1080p", SourceType: "web-dl", AudioChannels: "5.1", FileSize: 1000,
+		}
+	}
+	candidates := []stream.StreamCandidate{
+		make("wrong-lang", []string{"eng"}, false, 0),
+		make("multi-flag", nil, true, 1),
+		make("variant", []string{"FR-BE"}, false, 2),
+		make("bare", []string{"FRA"}, false, 3),
+		make("exact", []string{"FR-CA"}, false, 4),
+	}
+	SortCandidatesForProfile(candidates, profile, nil)
+	want := []string{"exact", "bare", "variant", "multi-flag", "wrong-lang"}
+	if got := names(candidates); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("language order = %v, want %v", got, want)
+	}
+}
+
+// TestSortOrdersMultilingualMemberByLanguageNotFlag proves MULTi membership
+// ranks by the carried language, not the flag fallback: a MULTi-flagged
+// candidate whose list contains bare French sorts with the French cohort
+// (ahead of a variant), while a flag-only MULTi release sorts behind it.
+func TestSortOrdersMultilingualMemberByLanguageNotFlag(t *testing.T) {
+	profile := QualityProfile{Label: "fr", Language: "fr"}
+	make := func(name string, langs []string, multi bool, index int) stream.StreamCandidate {
+		return stream.StreamCandidate{
+			Name: name, OriginalIndex: index, SourceConfirmed: true,
+			AudioLanguages: langs, IsMultiAudio: multi,
+			Resolution: "1080p", SourceType: "web-dl", AudioChannels: "5.1", FileSize: 1000,
+		}
+	}
+	candidates := []stream.StreamCandidate{
+		make("multi-flag-only", nil, true, 0),
+		make("variant", []string{"FR-CA"}, false, 1),
+		make("multi-member", []string{"ENG", "FRE"}, true, 2),
+	}
+	SortCandidatesForProfile(candidates, profile, nil)
+	want := []string{"multi-member", "variant", "multi-flag-only"}
+	if got := names(candidates); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("member order = %v, want %v", got, want)
+	}
+}
+
+// TestSortEndToEndFromReleaseNames proves the connected parser-to-ranking
+// path: raw Stremio-style release names go through ParseStreamDetails, and
+// the sort orders the parsed candidates by the profile language. An exact
+// PT-BR release beats the bare-Portuguese one, which beats the PT-PT
+// variant, with all other keys tied so language alone decides.
+func TestSortEndToEndFromReleaseNames(t *testing.T) {
+	profile := QualityProfile{Label: "pt", Language: "pt-BR"}
+	releaseNames := []string{
+		"Show.S01E01.1080p.WEB-DL.PT-PT.H.264-GROUP",
+		"Show.S01E01.1080p.WEB-DL.POR.H.264-GROUP",
+		"Show.S01E01.1080p.WEB-DL.PT-BR.H.264-GROUP",
+	}
+	candidates := make([]stream.StreamCandidate, len(releaseNames))
+	for i, name := range releaseNames {
+		candidates[i] = stream.StreamCandidate{Name: name, OriginalIndex: i}
+		stream.ParseStreamDetails(&candidates[i])
+	}
+	for i, c := range candidates {
+		if len(c.AudioLanguages) != 1 {
+			t.Fatalf("candidate %d (%q) languages = %v, want exactly one regional/bare span", i, releaseNames[i], c.AudioLanguages)
+		}
+	}
+	SortCandidatesForProfile(candidates, profile, nil)
+	want := []string{
+		"Show.S01E01.1080p.WEB-DL.PT-BR.H.264-GROUP",
+		"Show.S01E01.1080p.WEB-DL.POR.H.264-GROUP",
+		"Show.S01E01.1080p.WEB-DL.PT-PT.H.264-GROUP",
+	}
+	if got := names(candidates); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("parsed order = %v, want %v", got, want)
+	}
+}

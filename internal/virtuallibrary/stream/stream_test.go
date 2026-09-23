@@ -370,3 +370,145 @@ func TestParseURLExpirationPreservesPastExpiry(t *testing.T) {
 		t.Fatal("test setup lost the SigV4 param")
 	}
 }
+
+// TestParseStreamMetadataCastilianAndEuropeanPortuguese pins the two regional
+// spans the bare-code pass would otherwise misread: ES-ES must stay regional
+// (not collapse to bare SPA), and PT-PT must stay regional (not bare POR).
+// Both feed exact/bare/regional precedence downstream, so a wrong span here
+// promotes the wrong regional variant to bare-language rank.
+func TestParseStreamMetadataCastilianAndEuropeanPortuguese(t *testing.T) {
+	eses := &StreamCandidate{Name: "Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-ES-ES-GROUP"}
+	ParseStreamMetadata(eses)
+	if len(eses.AudioLanguages) != 1 || eses.AudioLanguages[0] != "ES-ES" {
+		t.Fatalf("es-ES languages = %v, want [ES-ES] only", eses.AudioLanguages)
+	}
+
+	ptpt := &StreamCandidate{Name: "Movie.2024.1080p.WEB-DL.DDP5.1-PT-PT-GROUP"}
+	ParseStreamMetadata(ptpt)
+	if len(ptpt.AudioLanguages) != 1 || ptpt.AudioLanguages[0] != "PT-PT" {
+		t.Fatalf("pt-PT languages = %v, want [PT-PT] only", ptpt.AudioLanguages)
+	}
+}
+
+// TestParseStreamMetadataChineseScripts pins both script spans: simplified
+// (ZH-HANS) and traditional (ZH-HANT/ZH-TW). A bare ZHO must never shadow a
+// script match, or zh-Hans vs zh-Hant precedence collapses to a bare tie.
+func TestParseStreamMetadataChineseScripts(t *testing.T) {
+	hans := &StreamCandidate{Name: "Movie.2024.1080p.WEB-DL.ZH-HANS-GROUP"}
+	ParseStreamMetadata(hans)
+	if len(hans.AudioLanguages) != 1 || hans.AudioLanguages[0] != "ZH-HANS" {
+		t.Fatalf("zh-hans languages = %v, want [ZH-HANS] only", hans.AudioLanguages)
+	}
+
+	hant := &StreamCandidate{Name: "Movie.2024.1080p.WEB-DL.ZH-HANT-GROUP"}
+	ParseStreamMetadata(hant)
+	if len(hant.AudioLanguages) != 1 || hant.AudioLanguages[0] != "ZH-HANT" {
+		t.Fatalf("zh-hant languages = %v, want [ZH-HANT] only", hant.AudioLanguages)
+	}
+
+	tw := &StreamCandidate{Name: "Movie.2024.1080p.WEB-DL.ZH-TW-GROUP"}
+	ParseStreamMetadata(tw)
+	if len(tw.AudioLanguages) != 1 || tw.AudioLanguages[0] != "ZH-HANT" {
+		t.Fatalf("zh-tw languages = %v, want [ZH-HANT] only", tw.AudioLanguages)
+	}
+}
+
+// TestParseStreamDetailsDottedSeparators pins separator-tolerant technical
+// hints: release dots read as spaces, so "H.264" must resolve the video codec
+// and "DDP5.1" (channel count glued to the codec token) must resolve 5.1.
+// Both gate the final pick after language precedence, so a dotted release
+// must not lose on codec or channels to an identical spaced one.
+func TestParseStreamDetailsDottedSeparators(t *testing.T) {
+	dotted := &StreamCandidate{Name: "Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GROUP"}
+	ParseStreamDetails(dotted)
+	if dotted.CodecVideo != "h264" {
+		t.Fatalf("dotted codec = %q, want h264", dotted.CodecVideo)
+	}
+	if dotted.AudioChannels != "5.1" {
+		t.Fatalf("dotted channels = %q, want 5.1", dotted.AudioChannels)
+	}
+
+	spaced := &StreamCandidate{Name: "Movie 2024 1080p WEB-DL DDP 5.1 H264 GROUP"}
+	ParseStreamDetails(spaced)
+	if spaced.CodecVideo != dotted.CodecVideo || spaced.AudioChannels != dotted.AudioChannels {
+		t.Fatalf("dotted (%q/%q) != spaced (%q/%q)", dotted.CodecVideo, dotted.AudioChannels, spaced.CodecVideo, spaced.AudioChannels)
+	}
+
+	// Negative: a longer numeric token must not match as a channel count.
+	// "5.10" is not 5.1, and "5.1080p" is a glued resolution, not channels.
+	for _, name := range []string{
+		"Movie.2024.WEB-DL.DDP5.10-GROUP",
+		"Movie.2024.WEB-DL.5.1080p-GROUP",
+	} {
+		s := &StreamCandidate{Name: name}
+		ParseStreamDetails(s)
+		if s.AudioChannels != "" {
+			t.Fatalf("%q channels = %q, want empty (no channel token present)", name, s.AudioChannels)
+		}
+	}
+}
+
+// TestCandidateLanguageMatchRankPrecedence pins the full chain the issue
+// scopes: exact (0) beats bare (1) beats regional variant (2) beats MULTi
+// flag (3), through both ranking and final selection. A French preference
+// must order an exact fr-CA candidate ahead of a bare fr one, ahead of a
+// fr-BE variant, ahead of a MULTi-flagged release with no French evidence.
+func TestCandidateLanguageMatchRankPrecedence(t *testing.T) {
+	preferred := "fr-CA"
+	exact := StreamCandidate{AudioLanguages: []string{"FR-CA"}}
+	bare := StreamCandidate{AudioLanguages: []string{"FRA"}}
+	variant := StreamCandidate{AudioLanguages: []string{"FR-BE"}}
+	multi := StreamCandidate{IsMultiAudio: true}
+	if got := CandidateLanguageMatchRank(exact, preferred); got != 0 {
+		t.Fatalf("exact rank = %d, want 0", got)
+	}
+	if got := CandidateLanguageMatchRank(bare, preferred); got != 1 {
+		t.Fatalf("bare rank = %d, want 1", got)
+	}
+	if got := CandidateLanguageMatchRank(variant, preferred); got != 2 {
+		t.Fatalf("variant rank = %d, want 2", got)
+	}
+	if got := CandidateLanguageMatchRank(multi, preferred); got != 3 {
+		t.Fatalf("multi rank = %d, want 3", got)
+	}
+	if got := CandidateLanguageMatchRank(StreamCandidate{AudioLanguages: []string{"ENG"}}, preferred); got != -1 {
+		t.Fatalf("unrelated rank = %d, want -1", got)
+	}
+}
+
+// TestCandidateLanguageMatchRankMultilingualMembership pins MULTi membership
+// through ranking: a candidate whose parsed list carries the preferred
+// language ranks by that language (exact here: canonical FRE coincides with
+// bare fr), not by the MULTi fallback (3). The flag alone only ranks when no
+// list entry matches.
+func TestCandidateLanguageMatchRankMultilingualMembership(t *testing.T) {
+	member := StreamCandidate{AudioLanguages: []string{"ENG", "FRE"}, IsMultiAudio: true}
+	if got := CandidateLanguageMatchRank(member, "fr"); got != 0 {
+		t.Fatalf("member rank = %d, want 0 (canonical membership, not the MULTI fallback)", got)
+	}
+	if !CandidateHasLanguage(member, "fr") {
+		t.Fatal("member with French in its list reports no French")
+	}
+	flagOnly := StreamCandidate{IsMultiAudio: true}
+	if got := CandidateLanguageMatchRank(flagOnly, "fr"); got != 3 {
+		t.Fatalf("flag-only rank = %d, want 3", got)
+	}
+}
+
+// TestCandidateLanguageMatchRankAliases proves aliasing never promotes: the
+// regional FR-CA folds to the same base as fr, so it ranks exact (0) against
+// fr-CA and variant (2) against bare fr, while ES-419 beside SPA counts once
+// downstream (see TestCandidateHasDistinctAudioLanguages).
+func TestCandidateLanguageMatchRankAliases(t *testing.T) {
+	bare := StreamCandidate{AudioLanguages: []string{"FRA"}}
+	if got := CandidateLanguageMatchRank(bare, "fr"); got != 0 {
+		t.Fatalf("bare FRA vs bare fr rank = %d, want 0 (canonical forms coincide)", got)
+	}
+	regional := StreamCandidate{AudioLanguages: []string{"FR-CA"}}
+	if got := CandidateLanguageMatchRank(regional, "fr-CA"); got != 0 {
+		t.Fatalf("regional exact rank = %d, want 0", got)
+	}
+	if got := CandidateLanguageMatchRank(regional, "fr"); got != 2 {
+		t.Fatalf("regional vs bare rank = %d, want 2 (variant, never bare)", got)
+	}
+}

@@ -17,17 +17,27 @@ import (
 var streamSizePattern = regexp.MustCompile(`(?i)\b\d+(?:\.\d+)?\s*(?:TB|GB|MB)\b`)
 var languagePattern = regexp.MustCompile(`(?i)\b(?:eng|en|fra|fre|fr|deu|ger|de|ita|es|spa|jpn|kor|zho|chi|por|rus|ara)\b`)
 var (
-	dolbyVisionPattern   = regexp.MustCompile(`(?i)(?:\bdolby[ ._-]*vision\b|\bdv\b)`)
-	atmosPattern         = regexp.MustCompile(`(?i)\batmos\b`)
-	trueHDPattern        = regexp.MustCompile(`(?i)(?:\btrue[ ._-]*hd\b|\bthd\b)`)
-	dtsHDPattern         = regexp.MustCompile(`(?i)\bdts[ ._-]*hd\b`)
-	dtsPattern           = regexp.MustCompile(`(?i)\bdts\b`)
-	eac3Pattern          = regexp.MustCompile(`(?i)(?:\be[ ._-]*ac[ ._-]*3\b|\bdd\+)`)
-	ac3Pattern           = regexp.MustCompile(`(?i)(?:\bac[ ._-]*3\b|\bdd\b)`)
-	aacPattern           = regexp.MustCompile(`(?i)\baac\b`)
-	audioChannelsPattern = regexp.MustCompile(`(?i)\b(?:7\.1(?:\.4)?|5\.1(?:\.2)?|2\.0|1\.0)\b`)
-	tenBitPattern        = regexp.MustCompile(`(?i)\b(?:10[ ._-]?bit|hi10p?)\b`)
-	imaxPattern          = regexp.MustCompile(`(?i)\bimax(?:[ ._-]enhanced)?\b`)
+	dolbyVisionPattern = regexp.MustCompile(`(?i)(?:\bdolby[ ._-]*vision\b|\bdv\b)`)
+	atmosPattern       = regexp.MustCompile(`(?i)\batmos\b`)
+	trueHDPattern      = regexp.MustCompile(`(?i)(?:\btrue[ ._-]*hd\b|\bthd\b)`)
+	dtsHDPattern       = regexp.MustCompile(`(?i)\bdts[ ._-]*hd\b`)
+	dtsPattern         = regexp.MustCompile(`(?i)\bdts\b`)
+	eac3Pattern        = regexp.MustCompile(`(?i)(?:\be[ ._-]*ac[ ._-]*3\b|\bdd\+)`)
+	ac3Pattern         = regexp.MustCompile(`(?i)(?:\bac[ ._-]*3\b|\bdd\b)`)
+	aacPattern         = regexp.MustCompile(`(?i)\baac\b`)
+	// audioChannelsPattern tolerates a channel count glued to a codec token
+	// ("DDP5.1", "DD+5.1"): \b fails between two word chars (P→5), so the
+	// leading edge is "start or a non-digit" and the count is group 1. The
+	// trailing edge rejects numeric continuations ("5.10", "5.1080p") while
+	// still allowing separator continuations ("5.1Ch", "5.1.2", ".5.1.").
+	audioChannelsPattern = regexp.MustCompile(`(?i)(?:^|[^0-9])(7\.1(?:\.4)?|5\.1(?:\.2)?|2\.0|1\.0)(?:[^0-9]|$)`)
+	// hevcPattern/h264Pattern tolerate dotted separators ("H.264", "X.265"):
+	// release names use dots as spaces, so a plain Contains misses them.
+	hevcPattern   = regexp.MustCompile(`(?i)(?:hevc|h[ ._-]*265|x[ ._-]*265)`)
+	h264Pattern   = regexp.MustCompile(`(?i)(?:h[ ._-]*264|x[ ._-]*264|avc)`)
+	av1Pattern    = regexp.MustCompile(`(?i)\bav1\b`)
+	tenBitPattern = regexp.MustCompile(`(?i)\b(?:10[ ._-]?bit|hi10p?)\b`)
+	imaxPattern   = regexp.MustCompile(`(?i)\bimax(?:[ ._-]enhanced)?\b`)
 	// multiAudioPattern matches audio-MULTI markers: MULTI or DUAL with an
 	// explicit audio qualifier (audio, lang, language), the standalone
 	// MULTILINGUAL word, or a bare MULTI. Go's regexp has no lookahead, so
@@ -44,8 +54,12 @@ var (
 	multiSubsSpanPattern = regexp.MustCompile(`(?i)\bmulti[ ._-]*subs?\b|\bmultisubs?\b|\bsubs?\b`)
 	dualPattern          = regexp.MustCompile(`(?i)\bdual[ ._-]*audio\b`)
 	releaseGroupPattern  = regexp.MustCompile(`(?i)-([a-zA-Z0-9]+)(?:\[.*?\])?$`)
-	regionalLangPattern  = regexp.MustCompile(`(?i)\b(pt-br|es-419|zh-hans|zh-hant|zh-tw|en-us|en-gb|fr-ca)\b`)
-	fullNameLangPattern  = regexp.MustCompile(`(?i)\b(english|french|german|spanish|italian|japanese|korean|russian|chinese|portuguese|hindi|arabic|dutch|polish|swedish|norwegian|danish|finnish|turkish|ukrainian)\b`)
+	// regionalLangPattern covers the release-name regional/script forms the
+	// parser observes in the wild. Regional spans are masked before the
+	// bare-code pass (see ParseStreamMetadata), so adding a span here can only
+	// move that language from bare to regional — never duplicate it.
+	regionalLangPattern = regexp.MustCompile(`(?i)\b(pt-br|pt-pt|es-419|es-es|zh-hans|zh-hant|zh-tw|en-us|en-gb|fr-ca)\b`)
+	fullNameLangPattern = regexp.MustCompile(`(?i)\b(english|french|german|spanish|italian|japanese|korean|russian|chinese|portuguese|hindi|arabic|dutch|polish|swedish|norwegian|danish|finnish|turkish|ukrainian)\b`)
 )
 
 // subtitlePattern matches subtitle-track markers in release metadata: common
@@ -161,12 +175,13 @@ func parseStreamDetailsWithTitle(s *StreamCandidate, itemTitle string) {
 		s.Resolution = "480p"
 	}
 
-	// Codec Video
-	if strings.Contains(fullText, "hevc") || strings.Contains(fullText, "h265") || strings.Contains(fullText, "x265") {
+	// Codec Video (separator-tolerant: release dots read as spaces, so plain
+	// Contains misses "H.264"/"X.265").
+	if hevcPattern.MatchString(fullText) {
 		s.CodecVideo = "hevc"
-	} else if strings.Contains(fullText, "h264") || strings.Contains(fullText, "x264") || strings.Contains(fullText, "avc") {
+	} else if h264Pattern.MatchString(fullText) {
 		s.CodecVideo = "h264"
-	} else if strings.Contains(fullText, "av1") {
+	} else if av1Pattern.MatchString(fullText) {
 		s.CodecVideo = "av1"
 	}
 
@@ -203,15 +218,16 @@ func parseStreamDetailsWithTitle(s *StreamCandidate, itemTitle string) {
 		s.AudioTags = append(s.AudioTags, "atmos")
 	}
 
-	// Audio Channels
-	if ch := audioChannelsPattern.FindString(fullText); ch != "" {
-		lowerCh := strings.ToLower(ch)
-		if strings.HasPrefix(lowerCh, "7.1") {
+	// Audio Channels (group 1 carries the bare count: the leading boundary
+	// char is not part of the match value, so "DDP5.1" still yields "5.1").
+	if match := audioChannelsPattern.FindStringSubmatch(fullText); len(match) > 1 && match[1] != "" {
+		ch := strings.ToLower(match[1])
+		if strings.HasPrefix(ch, "7.1") {
 			s.AudioChannels = "7.1"
-		} else if strings.HasPrefix(lowerCh, "5.1") {
+		} else if strings.HasPrefix(ch, "5.1") {
 			s.AudioChannels = "5.1"
 		} else {
-			s.AudioChannels = lowerCh
+			s.AudioChannels = ch
 		}
 	}
 
@@ -336,8 +352,12 @@ func canonicalAudioLanguage(token string) string {
 		return "POR"
 	case "pt-br", "brazilian portuguese":
 		return "PT-BR"
+	case "pt-pt", "european portuguese":
+		return "PT-PT"
 	case "es-419":
 		return "ES-419"
+	case "es-es", "castilian":
+		return "ES-ES"
 	case "zh-hans", "simplified chinese":
 		return "ZH-HANS"
 	case "zh-hant", "zh-tw", "traditional chinese":

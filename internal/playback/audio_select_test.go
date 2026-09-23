@@ -101,6 +101,46 @@ func TestSelectAudioTrack_PrefersExactRegionalTag(t *testing.T) {
 	}
 }
 
+// TestSelectAudioTrack_RegionalPrecedenceExactBareVariant proves the final
+// selection honors the same exact > bare > variant chain the candidate ranker
+// uses: a fr-CA preference picks the exact track over a bare French one, the
+// bare one over a fr-BE variant, and never a same-menu unrelated language.
+func TestSelectAudioTrack_RegionalPrecedenceExactBareVariant(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "en", Codec: "aac", Channels: 2},
+		{Language: "fr-BE", Codec: "aac", Channels: 2},
+		{Language: "fr", Codec: "aac", Channels: 2},
+		{Language: "fr-CA", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "fr-CA", nil); got != 3 {
+		t.Fatalf("SelectAudioTrack(fr-CA) = %d, want exact track 3", got)
+	}
+	withoutExact := []models.AudioTrack{tracks[0], tracks[1], tracks[2]}
+	if got := playback.SelectAudioTrack(withoutExact, "fr-CA", nil); got != 2 {
+		t.Fatalf("SelectAudioTrack(fr-CA) without exact = %d, want bare track 2", got)
+	}
+	withoutBare := []models.AudioTrack{tracks[0], tracks[1]}
+	if got := playback.SelectAudioTrack(withoutBare, "fr-CA", nil); got != 1 {
+		t.Fatalf("SelectAudioTrack(fr-CA) variant-only = %d, want variant track 1", got)
+	}
+}
+
+// TestSelectAudioTrack_ChineseScripts proves script variants are distinct
+// selections, not interchangeable Chinese: a zh-Hans preference picks the
+// simplified track over traditional, and vice versa.
+func TestSelectAudioTrack_ChineseScripts(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "zh-Hant", Codec: "aac", Channels: 2},
+		{Language: "zh-Hans", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "zh-Hans", nil); got != 1 {
+		t.Fatalf("SelectAudioTrack(zh-Hans) = %d, want simplified track 1", got)
+	}
+	if got := playback.SelectAudioTrack(tracks, "zh-Hant", nil); got != 0 {
+		t.Fatalf("SelectAudioTrack(zh-Hant) = %d, want traditional track 0", got)
+	}
+}
+
 func TestSelectAudioTrack_MULTiLanguageList(t *testing.T) {
 	multi := []models.AudioTrack{
 		{Language: "en", Languages: []string{"en", "fr", "de"}, Codec: "eac3", Channels: 6, Default: true},
