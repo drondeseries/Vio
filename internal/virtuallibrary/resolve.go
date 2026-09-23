@@ -691,8 +691,12 @@ func (s *Service) ResolveDetailed(
 
 	// The explicit pin is tried first even when rank or a custom-format reject
 	// would place it last: a pin overrides rank and reject.
+	pinTried := false
 	if effectiveResultID != "" && !pinBlocked {
 		for _, c := range ordered {
+			if id := stream.CandidateVariantID(c); id == effectiveResultID {
+				pinTried = true
+			}
 			if resolved, ok := tryCandidate(c, true); ok {
 				resolved.IdentityRematched = identityRematched
 				return resolved, nil
@@ -701,7 +705,20 @@ func (s *Service) ResolveDetailed(
 	}
 	// Ranked alternatives. A session preferredCandidateID is already promoted
 	// to the front by orderCandidates; a dead pin, or a blocked pin whose
-	// substitution was requested, resolves here.
+	// substitution was requested, resolves here. When substitution is refused
+	// for a pinned resolve, the pin's own validation failure is the answer:
+	// entering the alternatives loop would serve a different release under
+	// the viewer's binding (the failure that brought us here is about the
+	// pinned candidate, not an invitation to pick a sibling). A pinned
+	// request always names a release the viewer is bound to — whether or not
+	// the session/trust context is also set — so the gate keys on the pin
+	// being tried, not on pinnedRelease.
+	if effectiveResultID != "" && !allowSubstitution && pinTried {
+		if lastErr != nil {
+			return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q failed URL validation and candidate rotation was not requested: %w", effectiveResultID, lastErr)
+		}
+		return ResolvedVirtualStream{}, fmt.Errorf("pinned virtual candidate %q is unavailable and candidate rotation was not requested", effectiveResultID)
+	}
 	for _, c := range ordered {
 		if resolved, ok := tryCandidate(c, false); ok {
 			return resolved, nil
