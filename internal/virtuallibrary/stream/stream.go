@@ -579,7 +579,9 @@ func parseURLExpiration(rawURL string) time.Time {
 	}
 	q := parsed.Query()
 
-	// 1. AWS SigV4 signed URLs: X-Amz-Expires (duration in seconds) + X-Amz-Date
+	// 1. AWS SigV4 signed URLs: X-Amz-Expires (duration in seconds) + X-Amz-Date.
+	// A parseable expiry is always preserved, even when already past: dropping
+	// it to zero would make an expired URL look like it never expires.
 	amzExpires := strings.TrimSpace(q.Get("X-Amz-Expires"))
 	if amzExpires == "" {
 		amzExpires = strings.TrimSpace(q.Get("x-amz-expires"))
@@ -598,16 +600,15 @@ func parseURLExpiration(rawURL string) time.Time {
 					baseTime = t.UTC()
 				}
 				if !baseTime.IsZero() {
-					t := baseTime.Add(time.Duration(durSec) * time.Second)
-					if t.After(time.Now()) {
-						return t.Add(-15 * time.Second)
-					}
+					return baseTime.Add(time.Duration(durSec) * time.Second).Add(-15 * time.Second)
 				}
 			}
 		}
 	}
 
-	// 2. Absolute Unix timestamp expiration params
+	// 2. Absolute Unix timestamp expiration params. Same rule: a parseable
+	// timestamp is preserved even when past, so callers can distinguish
+	// expired (past time) from absent/invalid (zero time).
 	for _, key := range []string{"expires", "expire", "exp", "Expires"} {
 		val := strings.TrimSpace(q.Get(key))
 		if val == "" {
@@ -615,10 +616,7 @@ func parseURLExpiration(rawURL string) time.Time {
 		}
 		if sec, err := strconv.ParseInt(val, 10, 64); err == nil && sec > 0 {
 			if sec > 1000000000 { // unix timestamp
-				t := time.Unix(sec, 0).UTC()
-				if t.After(time.Now()) {
-					return t.Add(-15 * time.Second) // safety margin
-				}
+				return time.Unix(sec, 0).UTC().Add(-15 * time.Second) // safety margin
 			}
 		}
 	}
