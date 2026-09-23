@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -1711,16 +1712,18 @@ func effectiveVirtualURIV3(input PlannerInputV3) string {
 
 // virtualSourceRevisionPrefix domain-separates the revision hash so it can
 // never collide with another hash of the same candidate identity.
-const virtualSourceRevisionPrefix = "silo.virtual-source-revision.v1\x00"
+const virtualSourceRevisionPrefix = "silo.virtual-source-revision.v2\x00"
 
 // virtualSourceRevisionV3 returns an opaque, non-secret revision of the
-// resolved virtual source candidate. It is derived from the effective file's
-// provider-neutral candidate identity: the `?result=` fingerprint that the
-// virtual resolver already binds to the served release. Re-planning the same
-// candidate yields the same revision; resolving a different candidate yields a
-// different one. Nothing provider-secret is an input — no stream URL, token, or
-// request header — and the published value is a domain-separated SHA-256
-// truncated to 96 bits, so it is an opaque token rather than candidate data.
+// resolved virtual source candidate. It names the media generation: the
+// `?result=` candidate pick plus the track-evidence generation that describes
+// the bytes behind it (probe stamp, version, and a canonical fingerprint of
+// every audio/subtitle/video track — never a provider URL, token, header, or
+// refresh timestamp). Re-planning the same candidate with unchanged evidence
+// yields the same revision; resolving a different candidate — or repairing the
+// inventory under the same candidate id — yields a different one. Clients key
+// source-change recovery on it, so a corrected inventory re-arms exactly like
+// a rotation while a signed-URL renewal alone stays silent.
 // It returns "" when the effective file is not a virtual candidate or carries
 // no candidate identity (for example a neutral requested row that was planned
 // without a substitution).
@@ -1729,8 +1732,95 @@ func virtualSourceRevisionV3(input PlannerInputV3) string {
 	if candidateIdentity == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(virtualSourceRevisionPrefix + candidateIdentity))
+	sum := sha256.Sum256([]byte(virtualSourceRevisionPrefix + candidateIdentity + "\x00" + virtualSourceEvidenceGenerationV3(input.EffectiveFile)))
 	return hex.EncodeToString(sum[:12])
+}
+
+// virtualSourceEvidenceGenerationV3 folds the effective file's track-evidence
+// generation into the source revision. A rematch adoption clears the probe
+// stamp and rewrites the declared track inventory under the same `?result=`
+// id (see adoptRematchedVirtualResolution), so the candidate identity alone
+// cannot tell a corrected inventory from a stale one. The generation carries
+// only stable, provider-neutral evidence: the probe timestamp (unix seconds,
+// so sub-second DB rounding cannot flap the hash), the probe schema version,
+// and a canonical fingerprint of every track that moves the plan — audio
+// codec/layout/languages, subtitle language/codec/codec-equivalence/flags,
+// video codec/profile/range/bit-depth/dimensions. Signed-URL renewals, refresh
+// timestamps, and provider credentials are deliberately excluded.
+func virtualSourceEvidenceGenerationV3(file *models.MediaFile) string {
+	if file == nil {
+		return ""
+	}
+	var b strings.Builder
+	if file.ProbeUpdatedAt != nil && !file.ProbeUpdatedAt.IsZero() {
+		b.WriteString(strconv.FormatInt(file.ProbeUpdatedAt.UTC().Unix(), 10))
+	}
+	b.WriteString("\x00")
+	b.WriteString(strconv.Itoa(file.ProbeVersion))
+	b.WriteString("\x00")
+	for _, vt := range file.VideoTracks {
+		b.WriteString(strings.ToLower(strings.TrimSpace(vt.Codec)))
+		b.WriteString("\x00")
+		b.WriteString(strings.ToLower(strings.TrimSpace(vt.Profile)))
+		b.WriteString("\x00")
+		b.WriteString(strings.ToLower(strings.TrimSpace(vt.VideoRange)))
+		b.WriteString("\x00")
+		b.WriteString(strings.ToLower(strings.TrimSpace(vt.VideoRangeType)))
+		b.WriteString("\x00")
+		b.WriteString(strconv.Itoa(vt.BitDepth))
+		b.WriteString("\x00")
+		b.WriteString(strconv.Itoa(vt.Width))
+		b.WriteString("x")
+		b.WriteString(strconv.Itoa(vt.Height))
+		b.WriteString("\x00")
+	}
+	for _, at := range file.AudioTracks {
+		b.WriteString(strings.ToLower(strings.TrimSpace(at.Codec)))
+		b.WriteString("\x00")
+		b.WriteString(strings.ToLower(strings.TrimSpace(at.Layout)))
+		b.WriteString("\x00")
+		b.WriteString(strconv.Itoa(at.Channels))
+		b.WriteString("\x00")
+		b.WriteString(strings.ToLower(strings.TrimSpace(at.Language)))
+		b.WriteString("\x00")
+		langs := append([]string(nil), at.Languages...)
+		sort.Strings(langs)
+		b.WriteString(strings.ToLower(strings.TrimSpace(strings.Join(langs, ","))))
+		b.WriteString("\x00")
+		b.WriteString(strconv.Itoa(at.Index))
+		b.WriteString("\x00")
+	}
+	for _, st := range file.SubtitleTracks {
+		b.WriteString(strings.ToLower(strings.TrimSpace(st.Language)))
+		b.WriteString("\x00")
+		b.WriteString(normalizeCodecV3(st.Codec))
+		b.WriteString("\x00")
+		b.WriteString(strings.ToLower(strings.TrimSpace(st.Title)))
+		b.WriteString("\x00")
+		b.WriteString(strings.ToLower(strings.TrimSpace(st.EmbeddedTitle)))
+		b.WriteString("\x00")
+		b.WriteString(path.Base(strings.TrimSpace(st.FileName)))
+		b.WriteString("\x00")
+		b.WriteString(strconv.FormatBool(st.Forced))
+		b.WriteString("\x00")
+		b.WriteString(strconv.FormatBool(st.HearingImpaired))
+		b.WriteString("\x00")
+		b.WriteString(strconv.Itoa(st.Index))
+		b.WriteString("\x00")
+	}
+	for _, es := range file.ExternalSubtitles {
+		b.WriteString(strings.ToLower(strings.TrimSpace(es.Language)))
+		b.WriteString("\x00")
+		b.WriteString(normalizeCodecV3(es.Format))
+		b.WriteString("\x00")
+		b.WriteString(path.Base(strings.TrimSpace(es.Path)))
+		b.WriteString("\x00")
+		b.WriteString(strconv.FormatBool(es.Forced))
+		b.WriteString("\x00")
+		b.WriteString(strconv.FormatBool(es.HearingImpaired))
+		b.WriteString("\x00")
+	}
+	return b.String()
 }
 
 // effectiveVirtualCandidateIdentityV3 extracts the provider-neutral candidate

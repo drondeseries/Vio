@@ -1436,19 +1436,23 @@ is a virtual candidate the server resolved and probed; it is absent for an
 ordinary local file and for a neutral `virtual://…` row planned without a
 candidate pick.
 
-The token identifies the resolved candidate, not the requested catalog row. A
+The token identifies the resolved media generation, not the requested catalog row. A
 release rotation can keep `effective_media_file_id` fixed (it is the requested
 row), so a client that keys source-change recovery on the row cannot tell that
 the release moved. The revision changes when the server resolves a different
-candidate and stays fixed while the same candidate is served; clients key their
-subtitle source generation on it so recovery re-arms once per rotation and not
-on a plan-id-only replan.
+candidate and when the track evidence is repaired under the same candidate id;
+it stays fixed while the same generation is served. Clients key their
+subtitle source generation on it so recovery re-arms once per rotation or
+inventory repair and not on a plan-id-only replan.
 
 It is derived from the provider-neutral candidate fingerprint the virtual
-resolver already binds to the served release (the `?result=` pick) with a
+resolver already binds to the served release (the `?result=` pick) plus a
+canonical fingerprint of the track evidence (probe stamp, probe version, and
+every playback-relevant track field) with a
 domain-separated SHA-256 truncated to 96 bits. No provider stream URL, token,
 request header, or raw candidate payload is an input, and none is recoverable
-from the published token. Treat it as opaque; do not parse or recompute it.
+from the published token. A signed-URL renewal alone does not move the
+revision. Treat it as opaque; do not parse or recompute it.
 
 It is a UI hint and is deliberately excluded from plan identity, exactly like
 `effective_virtual_uri` and the track inventories, so adding it does not perturb

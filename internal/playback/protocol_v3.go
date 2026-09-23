@@ -965,15 +965,17 @@ type PlanV3 struct {
 	// from plan identity hashing, like the inventory fields above.
 	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
 	// VirtualSourceRevision is an opaque, non-secret revision of the resolved
-	// virtual source candidate. It changes when the planner resolves a different
-	// candidate (a release rotation) and stays fixed while the same candidate is
-	// served, so clients can re-arm source-change recovery on a rotation even
-	// when the published effective_media_file_id and effective_virtual_uri are
-	// unchanged. Its input is the provider-neutral candidate identity (the
-	// `?result=` fingerprint), never a provider URL, token, or header; the value
-	// is a domain-separated SHA-256. Empty for a non-virtual source. Like
-	// EffectiveVirtualURI it is a UI hint and is deliberately excluded from plan
-	// identity hashing.
+	// virtual source media generation. It changes when the planner resolves a
+	// different candidate (a release rotation) and when the track evidence is
+	// repaired under the same candidate, and stays fixed while the same
+	// generation is served, so clients can re-arm source-change recovery on a
+	// rotation even when the published effective_media_file_id and
+	// effective_virtual_uri are unchanged. Its inputs are the provider-neutral
+	// candidate identity (the `?result=` fingerprint) plus the evidence
+	// generation (probe stamp, probe version, canonical track fingerprint) — never a provider
+	// URL, token, or header; the value is a domain-separated SHA-256. Empty
+	// for a non-virtual source. Like EffectiveVirtualURI it is a UI hint and
+	// is deliberately excluded from plan identity hashing.
 	VirtualSourceRevision  string             `json:"virtual_source_revision,omitempty"`
 	Source                 SourceDescriptorV3 `json:"source"`
 	SubtitleFidelityPolicy string             `json:"subtitle_fidelity_policy"`

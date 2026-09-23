@@ -241,3 +241,50 @@ func TestPlanPlaybackV3AudioOnlyExposesVirtualSourceRevision(t *testing.T) {
 		t.Fatal("audio-only virtual plan omitted the virtual source revision")
 	}
 }
+
+// A repaired inventory under the same candidate id must move the revision: a
+// rematch adoption rewrites the declared tracks and clears the probe stamp
+// while the ?result= pick stays put, and the client must re-arm recovery for
+// the corrected generation.
+func TestPlanPlaybackV3VirtualSourceRevisionTracksEvidenceRepair(t *testing.T) {
+	requested := &models.MediaFile{ID: 41, ContentID: "movie-tt1234567", Container: "mkv", FilePath: "virtual://movie/tt1234567"}
+
+	before := virtualCandidatePlanV3(t, requested, "candidate-a")
+
+	// Same track counts, same probe version, no probe stamp: only the
+	// playback-relevant track fields move (subtitle language, audio codec).
+	// The repaired file keeps the fixture's aac audio claim viable so the
+	// plan still routes: the revision must move on track-field changes alone.
+	repaired := detailedFixtureFileV3()
+	repaired.FilePath = "virtual://movie/tt1234567?result=candidate-a"
+	repaired.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Layout: "stereo", Language: "eng", Languages: []string{"eng"}}}
+	repaired.SubtitleTracks = []models.SubtitleTrack{{Index: 2, Language: "fre", Codec: "srt"}}
+	req := validStartRequestV3()
+	req.FileID = requested.ID
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
+	req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+	repairResult := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: requested, EffectiveFile: repaired, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+	})
+	if repairResult.Plan == nil {
+		t.Fatalf("result = %#v, want a plan", repairResult)
+	}
+	if repairResult.Plan.VirtualSourceRevision == before.VirtualSourceRevision {
+		t.Fatalf("repaired inventory kept revision %q", repairResult.Plan.VirtualSourceRevision)
+	}
+}
+
+// The revision must survive a signed-URL renewal: only the media generation
+// is an input, never the provider URL or refresh timestamps, so a re-resolve
+// that changes nothing about the candidate or its evidence is silent.
+func TestPlanPlaybackV3VirtualSourceRevisionIgnoresURLRenewal(t *testing.T) {
+	requested := &models.MediaFile{ID: 41, ContentID: "movie-tt1234567", Container: "mkv", FilePath: "virtual://movie/tt1234567"}
+
+	first := virtualCandidatePlanV3(t, requested, "candidate-a")
+	stable := virtualCandidatePlanV3(t, requested, "candidate-a")
+
+	if stable.VirtualSourceRevision != first.VirtualSourceRevision {
+		t.Fatalf("URL-equivalent replan moved revision: %q -> %q", first.VirtualSourceRevision, stable.VirtualSourceRevision)
+	}
+}
