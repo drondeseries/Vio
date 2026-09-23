@@ -9666,7 +9666,11 @@ func dedupSubtitleFileV3(id int) *models.MediaFile {
 		ExternalSubtitles: []models.ExternalSubtitle{{Language: "eng", Format: "srt"}},
 		SubtitleTracks: []models.SubtitleTrack{
 			{Index: 10, ContainerTrackID: "0", Language: "fra", Codec: "subrip"},
-			{Index: 11, ContainerTrackID: "1", Language: "fra", Codec: "subrip"}, // duplicate of the fra track, suppressed
+			// The same stream described twice under two spellings: same
+			// container index, bare base retelling the regional spelling.
+			// Different stream indexes would be different physical tracks
+			// and must both publish.
+			{Index: 10, ContainerTrackID: "0", Language: "fre", Codec: "subrip"}, // duplicate of the fra track, suppressed
 			// Published combined ordinal 2 resolves here (source combined
 			// ordinal 3). The plan's embedded identity carries this track's
 			// container id, so the fixture must supply it for the identity
@@ -9763,8 +9767,11 @@ func TestRemapSubtitleSelectionV3WritesTargetPublishedOrdinal(t *testing.T) {
 	t.Run("deduplicated own track", func(t *testing.T) {
 		source := dedupSubtitleFileV3(1)
 		target := dedupSubtitleFileV3(2)
+		// Renumber the target's streams (keeping the duplicate pair on one
+		// shared index): the remap must follow the deu identity, not the
+		// source ordinals.
 		target.SubtitleTracks[0].Index = 20
-		target.SubtitleTracks[1].Index = 21
+		target.SubtitleTracks[1].Index = 20
 		target.SubtitleTracks[2].Index = 22
 		// Published 2 is the deu embedded track at source ordinal 3 on both
 		// files. A source-space read would pick the suppressed fra duplicate.
@@ -9784,7 +9791,7 @@ func TestRemapSubtitleSelectionV3WritesTargetPublishedOrdinal(t *testing.T) {
 	t.Run("deduplicated downloaded base", func(t *testing.T) {
 		source := &models.MediaFile{ID: 1, SubtitleTracks: []models.SubtitleTrack{
 			{Index: 10, Language: "fra", Codec: "subrip"},
-			{Index: 11, Language: "fra", Codec: "subrip"}, // suppressed, so own published is 1
+			{Index: 10, Language: "fre", Codec: "subrip"}, // suppressed, so own published is 1
 		}}
 		target := &models.MediaFile{ID: 2, SubtitleTracks: []models.SubtitleTrack{
 			{Index: 30, Language: "deu", Codec: "subrip"}, // own published is 1
