@@ -11,6 +11,6 @@ export function normalizeSubtitleMode(mode: string | null | undefined): Subtitle
     case "always":
       return mode;
     default:
-      return "auto";
+      return "off";
   }
 }

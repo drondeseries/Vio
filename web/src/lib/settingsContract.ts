@@ -9,7 +9,7 @@
  */
 
 export const SETTINGS_API_VERSION = 1;
-export const SETTINGS_REVISION = 10;
+export const SETTINGS_REVISION = 11;
 
 export interface SettingSuggestedOption {
   value: string;
@@ -735,7 +735,7 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     scopes: ["profile", "profile_device", "profile_library", "profile_series"],
     scopeIntroducedIn: [1, 1, 1, 1],
     resolutionOrder: ["profile_series", "profile_library", "profile_device", "profile", "default"],
-    defaultValue: "auto",
+    defaultValue: "off",
     label: "Subtitles",
     description: "When Silo should turn subtitles on.",
     category: "playback",

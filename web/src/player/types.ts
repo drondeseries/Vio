@@ -9,6 +9,18 @@ export type SubtitleMode = "off" | "auto" | "always";
 /** What the player does when it enters a detected intro. */
 export type IntroSkipMode = "never" | "ask" | "always";
 
+export interface PlayerVersionSubtitleTrack {
+  index?: number;
+  language?: string;
+  codec?: string;
+  title?: string;
+  embedded_title?: string;
+  forced?: boolean;
+  hearing_impaired?: boolean;
+  external?: boolean;
+  file_name?: string;
+}
+
 /** A file version available for playback. */
 export interface PlayerFileVersion {
   file_id: number;
@@ -45,9 +57,8 @@ export interface PlayerFileVersion {
   audio_channels?: number;
   video_tracks?: PlayerVideoTrack[];
   audio_tracks?: PlayerAudioTrack[];
-  /** Per-version subtitle tracks, used only for the version menu's language
-   *  badges; playback subtitles come from the plan inventory. */
-  subtitle_tracks?: { language?: string }[];
+  /** Per-version subtitle tracks */
+  subtitle_tracks?: PlayerVersionSubtitleTrack[];
   chapters?: PlayerChapter[];
   intro?: PlayerTimeRange | null;
   credits?: PlayerTimeRange | null;

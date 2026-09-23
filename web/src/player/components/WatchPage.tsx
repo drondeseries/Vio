@@ -343,6 +343,14 @@ function WatchPagePlayer({
     });
   }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
+  const activeVersion = useMemo(
+    () =>
+      resolveEffectiveVersion(playbackVersions, session) ??
+      (fileId ? playbackVersions.find((v) => v.file_id === fileId) : undefined) ??
+      playbackVersions[0],
+    [fileId, playbackVersions, session],
+  );
+
   // The plan's audio inventory is authoritative for the effective source after
   // a version fallback; item metadata can be stale. Fall back to the version's
   // probed tracks only when the plan publishes none (old plans, audiobooks).
@@ -350,12 +358,41 @@ function WatchPagePlayer({
     () =>
       session.planAudioTracks.length > 0
         ? session.planAudioTracks
-        : (playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? []),
-    [playbackVersions, session.mediaFileId, session.planAudioTracks],
+        : (activeVersion?.audio_tracks ?? []),
+    [activeVersion, session.planAudioTracks],
   );
+
+  const versionSubtitles = useMemo(() => {
+    if (activeVersion?.subtitle_tracks !== undefined) {
+      if (activeVersion.subtitle_tracks.length === 0) {
+        return [];
+      }
+      const orderedTracks = [
+        ...activeVersion.subtitle_tracks.filter((track) => track.external),
+        ...activeVersion.subtitle_tracks.filter((track) => !track.external),
+      ];
+      return orderedTracks.map((track, index) => ({
+        index,
+        language: track.language?.trim() || "unknown",
+        codec: track.codec,
+        label:
+          track.title?.trim() ||
+          track.embedded_title?.trim() ||
+          track.file_name?.trim() ||
+          track.language?.trim() ||
+          `Subtitle ${index + 1}`,
+        source: track.external ? ("external" as const) : ("embedded" as const),
+        forced: track.forced,
+        hearing_impaired: track.hearing_impaired,
+        url: "",
+      }));
+    }
+    return subtitles;
+  }, [activeVersion, subtitles]);
+
   const playableSubtitles = useMemo(
-    () => resolvePlayableSubtitles(session.subtitleUrls, subtitles),
-    [session.subtitleUrls, subtitles],
+    () => resolvePlayableSubtitles(session.subtitleUrls, versionSubtitles),
+    [session.subtitleUrls, versionSubtitles],
   );
 
   const handleSwitchVersion = useCallback(
@@ -902,7 +939,7 @@ function WatchPagePlayer({
     session.durationSeconds ??
     playbackVersions.find((v) => v.file_id === session.mediaFileId)?.duration ??
     playbackVersions[0]?.duration;
-  const selectedVersion = resolveEffectiveVersion(playbackVersions, session) ?? playbackVersions[0];
+  const selectedVersion = activeVersion;
   const activeChapters =
     (playbackVersions.find((v) => v.file_id === session.mediaFileId) ?? selectedVersion)
       ?.chapters ?? [];
@@ -913,6 +950,7 @@ function WatchPagePlayer({
       {switchingIndicator}
       {versionSwapNotice}
       <VideoPlayer
+        contentId={contentId}
         title={title}
         year={year}
         streamUrl={session.streamUrl}
@@ -925,6 +963,7 @@ function WatchPagePlayer({
         pendingSwitchFileId={session.pendingSwitchFileId}
         replanError={fallingBack ? null : session.error}
         replanErrorTitle={session.errorTitle}
+        initialSubtitleError={session.initialSubtitleError}
         sessionId={session.sessionId}
         selectedVersion={selectedVersion}
         versions={playbackVersions}

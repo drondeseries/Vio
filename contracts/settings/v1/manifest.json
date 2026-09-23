@@ -1,6 +1,6 @@
 {
   "api_version": 1,
-  "revision": 10,
+  "revision": 11,
   "option_sets": {
     "playback_audio_languages": {
       "type": "language_tag",
@@ -238,12 +238,12 @@
           { "value": "off", "label": "Off" }
         ]
       },
-      "default_value": "auto",
+      "default_value": "off",
       "category": "playback",
       "label": "Subtitles",
       "description": "When Silo should turn subtitles on.",
       "recommended_control": "select",
-      "notes": "The legacy empty string means unset, not a fourth mode. Migration maps \"\" to no stored row so it resolves to the next scope."
+      "notes": "Revision 11 changed default_value from auto to off to prevent startup playback stalls and delayed extraction. The legacy empty string means unset, not a fourth mode. Migration maps \"\" to no stored row so it resolves to the next scope."
     },
     {
       "key": "playback.show_forced_subtitles",

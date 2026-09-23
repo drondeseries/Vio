@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ParsedCue } from "../utils/parseVTT";
-import { resolveSubtitleAutoSelect } from "../utils/subtitleSort";
+import {
+  matchSubtitleTrackAcrossVersions,
+  resolveSubtitleAutoSelect,
+} from "../utils/subtitleSort";
 import type HlsType from "hls.js";
 import { PlayerControls, SKIP_BACK_SECONDS, SKIP_FORWARD_SECONDS } from "./PlayerControls";
 import { PlaybackInfoOverlay } from "./PlaybackInfoOverlay";
@@ -161,26 +164,8 @@ function isTimeBuffered(video: HTMLVideoElement, nativeSeconds: number): boolean
   return false;
 }
 
-/**
- * Matches a subtitle track by identity — the fields that describe the same
- * underlying track across two files' inventories. Used to carry a manual
- * subtitle selection across a version switch, where the raw combined ordinal
- * can name a *different* language track in the new file.
- */
-function sameSubtitleTrackIdentity(a: PlayerSubtitleInfo, b: PlayerSubtitleInfo): boolean {
-  return (
-    normalizeSubtitleIdentity(a.language) === normalizeSubtitleIdentity(b.language) &&
-    normalizeSubtitleIdentity(a.codec) === normalizeSubtitleIdentity(b.codec) &&
-    Boolean(a.forced) === Boolean(b.forced) &&
-    Boolean(a.hearing_impaired) === Boolean(b.hearing_impaired)
-  );
-}
-
-function normalizeSubtitleIdentity(value: string | undefined | null): string {
-  return (value ?? "").trim().toLowerCase();
-}
-
 interface VideoPlayerProps {
+  contentId?: string;
   title: string;
   year?: number;
   streamUrl: string;
@@ -212,6 +197,8 @@ interface VideoPlayerProps {
   replanError?: string | null;
   /** Title for the replan error, used when surfacing the refusal as a toast. */
   replanErrorTitle?: string | null;
+  /** Server-described initial subtitle refusal error, if the start fell back to subtitles-off. */
+  initialSubtitleError?: string | null;
   sessionId: string;
   selectedVersion?: PlayerFileVersion;
   versions?: PlayerFileVersion[];
@@ -360,6 +347,7 @@ function readStringPayload(
 }
 
 export function VideoPlayer({
+  contentId,
   title,
   year,
   streamUrl,
@@ -372,6 +360,7 @@ export function VideoPlayer({
   pendingSwitchFileId = null,
   replanError = null,
   replanErrorTitle = null,
+  initialSubtitleError = null,
   sessionId,
   selectedVersion,
   versions = [],
@@ -487,16 +476,23 @@ export function VideoPlayer({
   const [activeSubtitleIndex, setActiveSubtitleIndex] = useState<number | null>(
     () => plan.selected_tracks.subtitle?.index ?? null,
   );
+  const [activeSubtitleSourceKey, setActiveSubtitleSourceKey] = useState<string>(
+    () =>
+      `${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`,
+  );
   const lastSubtitleIndexRef = useRef<number | null>(null);
   const subtitleSelectionWasManualRef = useRef(false);
+  const subtitleSelectionWasManualOffRef = useRef(false);
+  const consumedInitialSubtitleErrorKeyRef = useRef<string | null>(null);
+  const lastContentIdRef = useRef(contentId);
   // Previous effective media file and subtitle inventory, so a version switch
   // can remap a manual subtitle selection to the equivalent track in the new
-  // file's inventory by identity rather than by raw index. The virtual URI is
-  // part of the identity because the server collapses a neutral virtual row to
-  // a concrete candidate while keeping `effective_media_file_id` unchanged, so
-  // a candidate rotation under the same id is only visible in the URI.
+  // file's inventory by identity rather than by raw index. The virtual URI and
+  // virtual source revision are part of the identity because candidate rotation
+  // or track evidence repair can change the inventory under the same file ID.
   const lastEffectiveMediaFileIdRef = useRef<number | null>(null);
   const lastEffectiveVirtualUriRef = useRef<string | null>(null);
+  const lastVirtualSourceRevisionRef = useRef<string | null>(null);
   const lastSubtitleTracksRef = useRef<PlayerSubtitleInfo[]>([]);
   // Staged identity remap from a version switch, applied by the auto-select
   // effect before any selection logic runs against the new inventory.
@@ -1369,11 +1365,13 @@ export function VideoPlayer({
   const toggleCaptions = useCallback(() => {
     subtitleSelectionWasManualRef.current = true;
     if (activeSubtitleIndex !== null) {
+      subtitleSelectionWasManualOffRef.current = true;
       lastSubtitleIndexRef.current = activeSubtitleIndex;
       setActiveSubtitleIndex(null);
       onSubtitleChanged?.(null);
     } else {
       const restoredIndex = lastSubtitleIndexRef.current;
+      subtitleSelectionWasManualOffRef.current = restoredIndex === null;
       setActiveSubtitleIndex(restoredIndex);
       onSubtitleChanged?.(restoredIndex);
     }
@@ -1382,6 +1380,7 @@ export function VideoPlayer({
   const handleSubtitleSelect = useCallback(
     (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => {
       subtitleSelectionWasManualRef.current = true;
+      subtitleSelectionWasManualOffRef.current = index === null;
       setActiveSubtitleIndex(index);
       // The in-progress live translation track is synthetic (a sentinel index
       // that exists only in memory); never persist it as the saved preference or
@@ -2814,6 +2813,20 @@ export function VideoPlayer({
 
   const requestedSubtitleTrackChangeRef = useRef<string | null>(null);
   useEffect(() => {
+    // Hold outbound requests until selection has reconciled with the plan's effective source identity.
+    const currentSourceKey = `${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`;
+    if (activeSubtitleSourceKey !== currentSourceKey) {
+      return;
+    }
+    // Hold outbound requests while a newly observed refusal is awaiting reconciliation to Off.
+    const currentRefusalKey = initialSubtitleError
+      ? `${sessionId}|${plan.plan_attempt_key}|${initialSubtitleError}`
+      : null;
+    const isUnreconciledRefusal =
+      initialSubtitleError && consumedInitialSubtitleErrorKeyRef.current !== currentRefusalKey;
+    if (isUnreconciledRefusal) {
+      return;
+    }
     // Live AI cues belong to the client overlay, not the server inventory.
     // Leave the current plan alone until a real downloaded track is ready.
     if (activeSubtitleIndex === LIVE_SUBTITLE_INDEX) {
@@ -2855,6 +2868,8 @@ export function VideoPlayer({
   }, [
     activeSubtitleIdentity,
     activeSubtitleIndex,
+    activeSubtitleSourceKey,
+    initialSubtitleError,
     onSubtitleTrackChange,
     planSelectedSubtitleIdentity,
     subtitleSourceGeneration,
@@ -2872,6 +2887,7 @@ export function VideoPlayer({
   useEffect(() => {
     if (requestedSubtitleTrackChangeRef.current && replanError && !replanning) {
       subtitleSelectionWasManualRef.current = true;
+      subtitleSelectionWasManualOffRef.current = false;
       setActiveSubtitleIndex(plan.selected_tracks.subtitle?.index ?? null);
       requestedSubtitleTrackChangeRef.current = null;
       toast.error(replanErrorTitle ?? "That subtitle track can't be used", {
@@ -2880,77 +2896,162 @@ export function VideoPlayer({
     }
   }, [plan.selected_tracks.subtitle?.index, replanError, replanErrorTitle, replanning]);
 
+  // When a start or version switch falls back to subtitles-off after a subtitle-bearing
+  // start was refused, pin selection Off so manual remapping does not re-request the dropped subtitle.
+  useEffect(() => {
+    if (initialSubtitleError) {
+      consumedInitialSubtitleErrorKeyRef.current = `${sessionId}|${plan.plan_attempt_key}|${initialSubtitleError}`;
+      subtitleRemapRef.current = null;
+      subtitleSelectionWasManualRef.current = false;
+      subtitleSelectionWasManualOffRef.current = true;
+      setActiveSubtitleIndex(null);
+      lastSubtitleTracksRef.current = effectiveSubtitleTracks;
+    }
+  }, [initialSubtitleError, plan.plan_attempt_key, sessionId]);
+
   // -- Carry a manual subtitle selection across a version switch by identity --
   // A version switch mints a new session and a new subtitle inventory, and the
   // combined ordinal is only meaningful within one file's inventory: the same
   // numeric index can name a *different* language track in the new file. When
   // the effective media file changes and the selection was manual, remap it to
   // the equivalent track in the new inventory (language + codec + forced +
-  // hearing_impaired), falling back to the raw index only if no identity match
-  // exists, and to auto-select if nothing matches at all. Auto-selected
-  // subtitles are left alone — the auto-select effect re-runs against the new
-  // inventory on its own.
+  // hearing_impaired), resolving to off if no identity match exists.
   //
   // This runs *before* the sessionId-clearing effect below so the manual flag
   // survives the session change long enough to be remapped; the remap is
   // staged in a ref and applied by the auto-select effect.
   useEffect(() => {
+    // A content change owns selection reset; never stage a cross-title remap.
+    if (contentId && lastContentIdRef.current && lastContentIdRef.current !== contentId) {
+      lastEffectiveMediaFileIdRef.current = plan.effective_media_file_id;
+      lastEffectiveVirtualUriRef.current = plan.effective_virtual_uri ?? null;
+      lastVirtualSourceRevisionRef.current = plan.virtual_source_revision ?? null;
+      lastSubtitleTracksRef.current = effectiveSubtitleTracks;
+      setActiveSubtitleSourceKey(
+        `${plan.effective_media_file_id}|${plan.effective_virtual_uri ?? ""}|${plan.virtual_source_revision ?? ""}`,
+      );
+      return;
+    }
     const effectiveFileId = plan.effective_media_file_id;
     const effectiveVirtualUri = plan.effective_virtual_uri ?? null;
+    const virtualRevision = plan.virtual_source_revision ?? null;
     const previousFileId = lastEffectiveMediaFileIdRef.current;
     const previousVirtualUri = lastEffectiveVirtualUriRef.current;
+    const previousVirtualRevision = lastVirtualSourceRevisionRef.current;
     lastEffectiveMediaFileIdRef.current = effectiveFileId;
     lastEffectiveVirtualUriRef.current = effectiveVirtualUri;
+    lastVirtualSourceRevisionRef.current = virtualRevision;
     const previousTracks = lastSubtitleTracksRef.current;
     lastSubtitleTracksRef.current = effectiveSubtitleTracks;
 
+    const currentSourceKey = `${effectiveFileId}|${effectiveVirtualUri ?? ""}|${virtualRevision ?? ""}`;
     if (
       previousFileId === null ||
-      (previousFileId === effectiveFileId && previousVirtualUri === effectiveVirtualUri)
+      (previousFileId === effectiveFileId &&
+        previousVirtualUri === effectiveVirtualUri &&
+        previousVirtualRevision === virtualRevision)
     ) {
+      if (activeSubtitleSourceKey !== currentSourceKey) {
+        setActiveSubtitleSourceKey(currentSourceKey);
+      }
       return;
     }
+    setActiveSubtitleSourceKey(currentSourceKey);
     if (!subtitleSelectionWasManualRef.current) {
+      setActiveSubtitleIndex(plan.selected_tracks.subtitle?.index ?? null);
+      lastSubtitleIndexRef.current = plan.selected_tracks.subtitle?.index ?? null;
       return;
     }
-    if (activeSubtitleIndex === null || activeSubtitleIndex === LIVE_SUBTITLE_INDEX) {
+    if (subtitleSelectionWasManualOffRef.current || activeSubtitleIndex === null || activeSubtitleIndex === LIVE_SUBTITLE_INDEX) {
+      // Reconcile the remembered toggle-restoration index by identity so toggling On
+      // after a version switch restores the equivalent language, not a stale ordinal.
+      const rememberedIndex = lastSubtitleIndexRef.current;
+      if (rememberedIndex !== null) {
+        const rememberedTrack = previousTracks.find((track) => track.index === rememberedIndex);
+        if (rememberedTrack) {
+          const rememberedMatch = matchSubtitleTrackAcrossVersions(
+            effectiveSubtitleTracks,
+            rememberedTrack,
+          );
+          if (rememberedMatch?.index !== undefined && rememberedMatch.index >= 0) {
+            lastSubtitleIndexRef.current = rememberedMatch.index;
+          } else {
+            lastSubtitleIndexRef.current = null;
+          }
+        } else {
+          lastSubtitleIndexRef.current = null;
+        }
+      }
+      setActiveSubtitleIndex(null);
       return;
     }
 
     const previousTrack = previousTracks.find((track) => track.index === activeSubtitleIndex);
     if (!previousTrack) {
+      setActiveSubtitleIndex(plan.selected_tracks.subtitle?.index ?? null);
+      lastSubtitleIndexRef.current = plan.selected_tracks.subtitle?.index ?? null;
+      subtitleSelectionWasManualRef.current = false;
       return;
     }
 
-    // Prefer the identity match; fall back to the raw index (the same ordinal
-    // in the new inventory) only when no equivalent track exists.
-    const identityMatch = effectiveSubtitleTracks.find((track) =>
-      sameSubtitleTrackIdentity(track, previousTrack),
-    );
-    const remappedIndex = identityMatch?.index ?? activeSubtitleIndex;
-    const remappedTrack = effectiveSubtitleTracks.find((track) => track.index === remappedIndex);
-    if (remappedTrack) {
+    // Match the previous track by identity in the new inventory using the shared matcher.
+    const match = matchSubtitleTrackAcrossVersions(effectiveSubtitleTracks, previousTrack);
+    const remappedIndex = match?.index ?? null;
+    if (remappedIndex !== null) {
       subtitleRemapRef.current = remappedIndex;
+      setActiveSubtitleIndex(remappedIndex);
+      lastSubtitleIndexRef.current = remappedIndex;
+      subtitleSelectionWasManualOffRef.current = false;
     } else {
-      // Nothing matches in the new inventory: reset to auto-select.
-      subtitleSelectionWasManualRef.current = false;
+      // Nothing matches in the new inventory: resolve to off and preserve manual Off
+      // so auto-selection does not immediately re-enable an unwanted language, and
+      // invalidate the remembered restoration index so toggle-on cannot restore the
+      // old ordinal against an unrelated track.
+      setActiveSubtitleIndex(null);
+      lastSubtitleIndexRef.current = null;
+      subtitleSelectionWasManualRef.current = true;
+      subtitleSelectionWasManualOffRef.current = true;
     }
   }, [
     activeSubtitleIndex,
+    activeSubtitleSourceKey,
     effectiveSubtitleTracks,
     plan.effective_media_file_id,
     plan.effective_virtual_uri,
+    plan.virtual_source_revision,
+    plan.selected_tracks.subtitle?.index,
   ]);
 
   // A refusal pin belongs only to the session that rejected the automatic
   // selection. Clear it before the auto-selection effect evaluates a new
   // session so the viewer's persisted subtitle mode applies to the next title.
   useEffect(() => {
-    subtitleSelectionWasManualRef.current = false;
+    if (subtitleRemapRef.current === null && !subtitleSelectionWasManualOffRef.current) {
+      subtitleSelectionWasManualRef.current = false;
+    }
   }, [sessionId]);
+
+  useEffect(() => {
+    if (contentId && lastContentIdRef.current && lastContentIdRef.current !== contentId) {
+      if (!initialSubtitleError) {
+        subtitleSelectionWasManualRef.current = false;
+        subtitleSelectionWasManualOffRef.current = false;
+      }
+      subtitleRemapRef.current = null;
+      lastSubtitleIndexRef.current = null;
+      lastEffectiveMediaFileIdRef.current = null;
+      lastEffectiveVirtualUriRef.current = null;
+      lastVirtualSourceRevisionRef.current = null;
+    }
+    lastContentIdRef.current = contentId;
+  }, [contentId, initialSubtitleError]);
 
   // -- Auto-select subtitle track based on mode --
   useEffect(() => {
+    if (subtitleSelectionWasManualOffRef.current) {
+      setActiveSubtitleIndex(null);
+      return;
+    }
     // Apply a staged identity remap from a version switch first, so the manual
     // selection lands on the equivalent track before any auto-selection logic
     // runs against the new inventory.

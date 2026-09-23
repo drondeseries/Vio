@@ -545,8 +545,8 @@ func TestListProfilesFallsBackToContractDefaults(t *testing.T) {
 	if got.SubtitleLanguage != "" {
 		t.Errorf("subtitle_language = %q, want the contract default \"\"", got.SubtitleLanguage)
 	}
-	if got.SubtitleMode != "auto" {
-		t.Errorf("subtitle_mode = %q, want the contract default %q", got.SubtitleMode, "auto")
+	if got.SubtitleMode != "off" {
+		t.Errorf("subtitle_mode = %q, want the contract default %q", got.SubtitleMode, "off")
 	}
 	if !got.ShowForcedSubtitles {
 		t.Error("show_forced_subtitles = false, want the contract default true")

@@ -20,6 +20,8 @@ import { reportSessionRouteEventV2 } from "../route-events-v2";
 import { replanV2 } from "../lifecycle-v2";
 import { buildPlayerStreamUrl } from "../stream-url";
 import { randomUUID } from "@/lib/uuid";
+import { matchSubtitleTrackAcrossVersions } from "../utils/subtitleSort";
+import { isBitmapCodec } from "../utils/subtitleCodecs";
 import {
   FEATURE_OUTPUT_CHANGE_V3,
   MAX_ATTEMPT_COUNT_V3,
@@ -242,6 +244,50 @@ function mapSubtitleInventory(
  * the spec forbids substituting the playback engine's reported duration, which
  * on an HLS copy remux is only the length produced so far.
  */
+function resolveCarriedSubtitleIndexAcrossVersions(
+  outgoingPlan: PlanV3 | null,
+  targetFileId: number,
+  versions: PlayerFileVersion[],
+): number | null {
+  if (!outgoingPlan) {
+    return null;
+  }
+  const outgoingIndex = outgoingPlan.selected_tracks.subtitle?.index;
+  if (outgoingIndex == null || outgoingIndex < 0) {
+    return null;
+  }
+  const outgoingTrack = outgoingPlan.subtitle.inventory.find(
+    (item) => item.combined_index === outgoingIndex,
+  );
+  if (!outgoingTrack) {
+    return null;
+  }
+  const targetVersion = versions.find((v) => v.file_id === targetFileId);
+  if (!targetVersion?.subtitle_tracks || targetVersion.subtitle_tracks.length === 0) {
+    return null;
+  }
+  const orderedTargetTracks = [
+    ...targetVersion.subtitle_tracks.filter((t) => t.external),
+    ...targetVersion.subtitle_tracks.filter((t) => !t.external),
+  ];
+  const candidates = orderedTargetTracks.map((t, idx) => ({
+    index: idx,
+    language: t.language?.trim() || "unknown",
+    codec: t.codec,
+    forced: t.forced,
+    hearing_impaired: t.hearing_impaired,
+    source: t.external ? "external" : "embedded",
+    label:
+      t.title?.trim() ||
+      t.embedded_title?.trim() ||
+      t.file_name?.trim() ||
+      t.language?.trim() ||
+      `Subtitle ${idx + 1}`,
+  }));
+  const match = matchSubtitleTrackAcrossVersions(candidates, outgoingTrack);
+  return match?.index ?? null;
+}
+
 // Temporary client-side heuristic for A/V transport equivalence.
 // TODO: replace with a server-authoritative transport_generation on PlanV3
 // that bumps only when the A/V bytes change, so sidecar-only replans never
@@ -788,6 +834,7 @@ export function usePlaybackSession(
       replacementErrorMessage,
       initialErrorMessage,
       carriedAudioTrackId,
+      carriedSubtitleTrackIndex,
       fileSelection,
       forceRelink,
     }: {
@@ -801,6 +848,10 @@ export function usePlaybackSession(
       // start (a version switch). The server remaps it by family to the new
       // file instead of dropping the viewer's selection.
       carriedAudioTrackId?: string | null;
+      // Subtitle track selection carried across a version switch. Null means
+      // subtitles were explicitly off on the outgoing plan and must stay off;
+      // undefined leaves the start to initialSubtitleTrackIndexByFileId.
+      carriedSubtitleTrackIndex?: number | null;
       /** How the requested file was chosen; `explicit` forbids silent
        * server-side version substitution. */
       fileSelection?: "auto" | "explicit";
@@ -895,12 +946,17 @@ export function usePlaybackSession(
           carriedAudioTrackId: carriedAudioTrackId ?? null,
         };
 
+        const targetSubtitleIndex =
+          carriedSubtitleTrackIndex !== undefined
+            ? (carriedSubtitleTrackIndex ?? undefined)
+            : initialSubtitleTrackIndexByFileId?.[selectedFileId];
+
         const decision = await requestStart(
           selectedFileId,
           position,
           forceStartPosition,
           playbackAttemptId,
-          initialSubtitleTrackIndexByFileId?.[selectedFileId],
+          targetSubtitleIndex,
           carriedAudioTrackId ?? null,
           fileSelection ?? "auto",
           forceRelink,
@@ -918,8 +974,21 @@ export function usePlaybackSession(
 
         let decisionToAdopt = decision;
         let initialSubtitleFailure: PlaybackSessionErrorState | null = null;
-        const bitmapSubtitleTrackIndex = initialBitmapSubtitleTrackIndexByFileId?.[selectedFileId];
-        if (!decision.playback_plan && bitmapSubtitleTrackIndex !== undefined) {
+        const targetVersion = versions.find((v) => v.file_id === selectedFileId);
+        const orderedTargetTracks = targetVersion?.subtitle_tracks
+          ? [
+              ...targetVersion.subtitle_tracks.filter((t) => t.external),
+              ...targetVersion.subtitle_tracks.filter((t) => !t.external),
+            ]
+          : [];
+        const requestedTrack =
+          targetSubtitleIndex !== undefined ? orderedTargetTracks[targetSubtitleIndex] : undefined;
+        const requestedIsBitmap = requestedTrack?.codec ? isBitmapCodec(requestedTrack.codec) : false;
+        const hasBitmapSubtitle =
+          requestedIsBitmap ||
+          (carriedSubtitleTrackIndex === undefined &&
+            initialBitmapSubtitleTrackIndexByFileId?.[selectedFileId] !== undefined);
+        if (!decision.playback_plan && hasBitmapSubtitle) {
           initialSubtitleFailure = describeDecisionWithoutPlan(decision);
           if (decision.session_id) {
             void stopSession(decision.session_id).catch(() => {
@@ -1580,6 +1649,11 @@ export function usePlaybackSession(
             // server remaps the file-bound identity by track family onto the
             // new file instead of dropping it and auto-picking.
             carriedAudioTrackId: planRef.current?.selected_tracks.audio?.id ?? null,
+            carriedSubtitleTrackIndex: resolveCarriedSubtitleIndexAcrossVersions(
+              planRef.current,
+              newFileId,
+              versions,
+            ),
             // A version switch is always an explicit user action: the server
             // must not silently substitute yet another version.
             fileSelection: "explicit",

@@ -298,23 +298,51 @@ export function buildWatchPageProps({
     item.effective_subtitle_language !== undefined
       ? item.effective_subtitle_language
       : currentProfile?.subtitle_language || null;
-  const baseSubtitleMode = (item.effective_subtitle_mode ??
-    currentProfile?.subtitle_mode ??
-    "auto") as SubtitleMode;
+  const baseSubtitleMode = (item.effective_subtitle_mode ||
+    currentProfile?.subtitle_mode ||
+    "off") as SubtitleMode;
   const showForcedSubtitles =
-    item.effective_show_forced_subtitles ?? currentProfile?.show_forced_subtitles ?? true;
+    request.prePlaySubtitleMode === "off"
+      ? false
+      : (item.effective_show_forced_subtitles ?? currentProfile?.show_forced_subtitles ?? true);
   const profileLanguage = currentProfile?.language || null;
 
-  const subtitles: PlayerSubtitleInfo[] = item.subtitles.map((subtitle, index) => ({
-    index,
-    language: subtitle.language,
-    codec: subtitle.codec,
-    label: subtitle.title || subtitle.language,
-    source: subtitle.source === "external" ? "external" : "embedded",
-    forced: subtitle.forced,
-    hearing_impaired: subtitle.hearing_impaired,
-    url: "",
-  }));
+  const requestedVersion =
+    (request.fileId ? item.versions.find((v) => v.file_id === request.fileId) : undefined) ??
+    item.versions[0];
+  const orderedVersionTracks = requestedVersion?.subtitle_tracks
+    ? [
+        ...requestedVersion.subtitle_tracks.filter((t) => t.external),
+        ...requestedVersion.subtitle_tracks.filter((t) => !t.external),
+      ]
+    : [];
+  const subtitles: PlayerSubtitleInfo[] =
+    requestedVersion?.subtitle_tracks !== undefined
+      ? orderedVersionTracks.map((subtitle, index) => ({
+          index,
+          language: subtitle.language?.trim() || "unknown",
+          codec: subtitle.codec,
+          label:
+            subtitle.title?.trim() ||
+            subtitle.embedded_title?.trim() ||
+            subtitle.file_name?.trim() ||
+            subtitle.language?.trim() ||
+            `Subtitle ${index + 1}`,
+          source: subtitle.external ? ("external" as const) : ("embedded" as const),
+          forced: subtitle.forced,
+          hearing_impaired: subtitle.hearing_impaired,
+          url: "",
+        }))
+      : item.subtitles.map((subtitle, index) => ({
+          index,
+          language: subtitle.language,
+          codec: subtitle.codec,
+          label: subtitle.title || subtitle.language,
+          source: subtitle.source === "external" ? "external" : "embedded",
+          forced: subtitle.forced,
+          hearing_impaired: subtitle.hearing_impaired,
+          url: "",
+        }));
   const preferredSubtitleTrackSignature: PlayerSubtitleTrackSignature | null =
     item.effective_subtitle_track_signature
       ? {

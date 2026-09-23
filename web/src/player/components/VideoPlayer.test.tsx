@@ -30,7 +30,7 @@ const controls = vi.hoisted(() => ({
     isFullscreen?: boolean;
     onFullscreenToggle?: () => void;
     onSubtitleJobAccepted?: (jobId: string) => void;
-    onSubtitleSelect?: (index: number) => void;
+    onSubtitleSelect?: (index: number | null) => void;
   },
 }));
 const playerV2Mock = vi.hoisted(() => vi.fn());
@@ -68,7 +68,14 @@ vi.mock("../hooks/usePlaybackRealtime", () => ({
 vi.mock("../hooks/useWatchProgress", () => ({
   useWatchProgress: () => vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("../hooks/useKeyboardShortcuts", () => ({ useKeyboardShortcuts: vi.fn() }));
+const keyboardShortcuts = vi.hoisted(() => ({
+  toggleCaptions: null as (() => void) | null,
+}));
+vi.mock("../hooks/useKeyboardShortcuts", () => ({
+  useKeyboardShortcuts: (...args: unknown[]) => {
+    keyboardShortcuts.toggleCaptions = (args[4] as () => void) ?? null;
+  },
+}));
 vi.mock("../hooks/useRemuxSeeking", () => ({
   useRemuxSeeking: () => ({ handleSeek: playerSeek }),
 }));
@@ -3047,7 +3054,7 @@ describe("VideoPlayer version switch UX", () => {
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
   });
 
-  it("falls back to the raw index when no identity match exists in the new inventory", async () => {
+  it("resolves to off when no identity match exists in the new inventory", async () => {
     const englishTrack: PlayerSubtitleInfo = {
       index: 0,
       media_file_id: 7,
@@ -3077,7 +3084,7 @@ describe("VideoPlayer version switch UX", () => {
       effective_media_file_id: 99,
     });
     // The new file has a German track at index 0 — no identity match for the
-    // English selection, so the raw index 0 is kept.
+    // English selection, so subtitles resolve to null (off).
     const germanInNewFile: PlayerSubtitleInfo = {
       index: 0,
       media_file_id: 99,
@@ -3094,7 +3101,7 @@ describe("VideoPlayer version switch UX", () => {
       subtitleUrls: [germanInNewFile],
     });
 
-    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
   });
 
   it("resets to auto-select when neither identity nor raw index matches", async () => {
@@ -3149,6 +3156,421 @@ describe("VideoPlayer version switch UX", () => {
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
   });
 
+  it("preserves manual Off when a manual track selection has no match on the target version", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    const frenchTrack: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:1",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "external",
+      url: "/stream/session-1/subtitles/1.vtt",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [frenchTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+      onSubtitleTrackChange,
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+
+    const nextPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-version-english-only",
+      plan_attempt_key: "v3:switched-version-english-only",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    const englishOnlyInNewFile: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-99/subtitles/0.vtt",
+    };
+    onSubtitleTrackChange.mockClear();
+
+    rerenderPlayer({
+      plan: nextPlan,
+      planRevision: 2,
+      subtitleUrls: [englishOnlyInNewFile],
+    });
+
+    // Subtitles must remain Off because French has no match on the target version,
+    // and auto-selection must NOT re-enable English even though subtitleMode="always" and preferred="en".
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+  });
+
+  it("pins selection Off and dispatches no subtitle request when version switch falls back from a refused subtitle start", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    const bitmapTrackA: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "pgs",
+      label: "English PGS",
+      source: "embedded",
+      url: "",
+      burn_in_only: true,
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [bitmapTrackA],
+      subtitleMode: "off",
+      onSubtitleTrackChange,
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(0);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    onSubtitleTrackChange.mockClear();
+
+    // Version switch start failed with the bitmap subtitle and fell back to subtitles-off plan.
+    const fallbackPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-fallback-off",
+      plan_attempt_key: "v3:switched-fallback-off",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    const bitmapTrackB: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:0",
+      language: "en",
+      codec: "pgs",
+      label: "English PGS",
+      source: "embedded",
+      url: "",
+      burn_in_only: true,
+    };
+    rerenderPlayer({
+      plan: fallbackPlan,
+      planRevision: 2,
+      subtitleUrls: [bitmapTrackB],
+      initialSubtitleError: "The selected subtitle could not be rendered.",
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+
+    // Viewer manually selects the track again on the fallback session
+    act(() => {
+      controls.current?.onSubtitleSelect?.(0);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    await waitFor(() => expect(onSubtitleTrackChange).toHaveBeenCalledTimes(1));
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(0, expect.anything());
+    onSubtitleTrackChange.mockClear();
+
+    // Another version switch encounters the identical refusal text on a new plan attempt
+    const secondFallbackPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-fallback-off-2",
+      plan_attempt_key: "v3:switched-fallback-off-2",
+      requested_media_file_id: 101,
+      effective_media_file_id: 101,
+    });
+    const bitmapTrackC: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 101,
+      track_id: "file:101:subtitle:0",
+      language: "en",
+      codec: "pgs",
+      label: "English PGS",
+      source: "embedded",
+      url: "",
+      burn_in_only: true,
+    };
+    rerenderPlayer({
+      plan: secondFallbackPlan,
+      planRevision: 3,
+      subtitleUrls: [bitmapTrackC],
+      initialSubtitleError: "The selected subtitle could not be rendered.",
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+  });
+
+  it("pins selection Off and dispatches zero requests when a refusal arrives on the same source identity", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    const bitmapTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "pgs",
+      label: "English PGS",
+      source: "embedded",
+      url: "",
+      burn_in_only: true,
+    };
+    const { rerenderPlayer } = renderPlayer({
+      plan: directPlan,
+      subtitleUrls: [bitmapTrack],
+      subtitleMode: "off",
+      onSubtitleTrackChange,
+    });
+
+    // Manually select track
+    act(() => {
+      controls.current?.onSubtitleSelect?.(0);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    onSubtitleTrackChange.mockClear();
+
+    // Re-start / replan on the SAME source identity with an initialSubtitleError fallback
+    const sameSourceFallbackPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:same-source-fallback",
+      plan_attempt_key: "v3:same-source-fallback",
+      session_id: "session-same-source-fallback",
+    });
+
+    rerenderPlayer({
+      sessionId: "session-same-source-fallback",
+      plan: sameSourceFallbackPlan,
+      planRevision: 2,
+      subtitleUrls: [bitmapTrack],
+      initialSubtitleError: "The selected subtitle could not be rendered.",
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+    // Zero outbound requests must be dispatched for the dropped subtitle!
+    expect(onSubtitleTrackChange).not.toHaveBeenCalled();
+  });
+
+  it("synchronizes manual Off flag when subtitles are toggled", async () => {
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      displayMode: "foreground",
+      subtitleUrls: [englishTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    // Subtitles start selected
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    // Toggle subtitles off via keyboard / captions button
+    act(() => {
+      keyboardShortcuts.toggleCaptions?.();
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+
+    // Toggle subtitles back on restores the remembered track
+    act(() => {
+      keyboardShortcuts.toggleCaptions?.();
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    // Toggle subtitles off again before switching versions
+    act(() => {
+      keyboardShortcuts.toggleCaptions?.();
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+
+    // Switch version to new plan with English track
+    const nextPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-version-toggle",
+      plan_attempt_key: "v3:switched-version-toggle",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    const englishInNewFile: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-99/subtitles/0.vtt",
+    };
+    rerenderPlayer({
+      plan: nextPlan,
+      planRevision: 2,
+      subtitleUrls: [englishInNewFile],
+    });
+
+    // Subtitles must remain off after toggling off, not overridden by auto-select
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+
+    // Toggle back on after version switch restores equivalent English track, not stale ordinal
+    act(() => {
+      keyboardShortcuts.toggleCaptions?.();
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+  });
+
+  it("remaps subtitle selection when virtual_source_revision changes under the same file ID and URI", async () => {
+    const onSubtitleTrackChange = vi.fn();
+    const virtualRow = {
+      ...versionA,
+      file_id: 100,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=pinned",
+    };
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 100,
+      track_id: "file:100:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "embedded",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const frenchTrack: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 100,
+      track_id: "file:100:subtitle:1",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "embedded",
+      url: "/stream/session-1/subtitles/1.vtt",
+    };
+    const initialPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:rev-1",
+      plan_attempt_key: "v3:rev-1",
+      requested_media_file_id: 100,
+      effective_media_file_id: 100,
+      effective_virtual_uri: virtualRow.file_path,
+      virtual_source_revision: "rev-1",
+    });
+    const { rerenderPlayer } = renderPlayer({
+      plan: initialPlan,
+      versions: [virtualRow],
+      activeFileId: 100,
+      subtitleUrls: [englishTrack, frenchTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+      onSubtitleTrackChange,
+    });
+
+    // The viewer manually picks French (index 1).
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+    onSubtitleTrackChange.mockClear();
+
+    // Re-probed candidate updates tracks evidence: file_id and URI are identical, but virtual_source_revision changes.
+    // French is now index 0, English is now index 1.
+    const reorderedPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:rev-2",
+      plan_attempt_key: "v3:rev-2",
+      requested_media_file_id: 100,
+      effective_media_file_id: 100,
+      effective_virtual_uri: virtualRow.file_path,
+      virtual_source_revision: "rev-2",
+    });
+    const frenchInRev2: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 100,
+      track_id: "file:100:subtitle:0",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "embedded",
+      url: "/stream/session-100/subtitles/0.vtt",
+    };
+    const englishInRev2: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 100,
+      track_id: "file:100:subtitle:1",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "embedded",
+      url: "/stream/session-100/subtitles/1.vtt",
+    };
+    rerenderPlayer({
+      plan: reorderedPlan,
+      planRevision: 2,
+      subtitleUrls: [frenchInRev2, englishInRev2],
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    // Stale outgoing index (1, which is English in rev-2) must never be dispatched!
+    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything());
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(0, expect.anything());
+  });
+
+  it("preserves manual Off selection across version changes even when auto-select would pick a track", async () => {
+    const englishTrackA: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [englishTrackA],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(null);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+
+    const nextPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-version-off",
+      plan_attempt_key: "v3:switched-version-off",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    const englishTrackB: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-99/subtitles/0.vtt",
+    };
+    rerenderPlayer({
+      plan: nextPlan,
+      planRevision: 2,
+      subtitleUrls: [englishTrackB],
+    });
+
+    // Subtitles must remain off despite subtitleMode="always" and matching English track on new file.
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
+  });
+
   it("remaps a manual subtitle selection when the effective virtual URI rotates under the same id", async () => {
     const virtualRow = {
       ...versionA,
@@ -3194,6 +3616,7 @@ describe("VideoPlayer version switch UX", () => {
       effective_media_file_id: 100,
       effective_virtual_uri: candidateA.file_path,
     });
+    const onSubtitleTrackChange = vi.fn();
     const { rerenderPlayer } = renderPlayer({
       plan: initialPlan,
       versions: [virtualRow, candidateA],
@@ -3201,6 +3624,7 @@ describe("VideoPlayer version switch UX", () => {
       subtitleUrls: [englishTrack, frenchTrack],
       subtitleMode: "always",
       preferredSubtitleLanguage: "en",
+      onSubtitleTrackChange,
     });
 
     // The viewer manually picks French (index 1).
@@ -3208,6 +3632,7 @@ describe("VideoPlayer version switch UX", () => {
       controls.current?.onSubtitleSelect?.(1);
     });
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+    onSubtitleTrackChange.mockClear();
 
     // The collapsed id stays 100; only the concrete candidate rotates. The new
     // candidate's inventory reorders tracks so the raw index would silently
@@ -3247,6 +3672,9 @@ describe("VideoPlayer version switch UX", () => {
     });
 
     await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+    // Must never dispatch the stale outgoing index (1, which is English in new candidate).
+    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1, expect.anything());
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(0, expect.anything());
   });
 
   it("selects descriptor-identical track_id-less subtitles independently", async () => {

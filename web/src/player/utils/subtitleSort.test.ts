@@ -4,6 +4,7 @@ import {
   sortSubtitlesBySource,
   findPreferredSubtitleIndex,
   resolveSubtitleAutoSelect,
+  matchSubtitleTrackAcrossVersions,
 } from "./subtitleSort";
 import type { PlayerSubtitleInfo, SubtitleMode } from "../types";
 
@@ -536,5 +537,49 @@ describe("bitmap (PGS) codec deprioritization", () => {
         showForcedSubtitles: true,
       }),
     ).toBe(1);
+  });
+});
+
+describe("matchSubtitleTrackAcrossVersions", () => {
+  it("prefers exact language tag over regional variant", () => {
+    const candidates = [
+      makeSub({ index: 0, language: "pt-PT", codec: "srt" }),
+      makeSub({ index: 1, language: "pt-BR", codec: "srt" }),
+    ];
+    const preferred = makeSub({ language: "pt-BR", codec: "srt" });
+    const match = matchSubtitleTrackAcrossVersions(candidates, preferred);
+    expect(match?.index).toBe(1);
+  });
+
+  it("strictly enforces forced and hearing-impaired flags", () => {
+    const candidates = [
+      makeSub({ index: 0, language: "en", codec: "srt", forced: false }),
+      makeSub({ index: 1, language: "en", codec: "srt", forced: true }),
+    ];
+    const preferredForced = makeSub({ language: "en", codec: "srt", forced: true });
+    expect(matchSubtitleTrackAcrossVersions(candidates, preferredForced)?.index).toBe(1);
+
+    const candidatesHI = [
+      makeSub({ index: 0, language: "en", codec: "srt", hearing_impaired: true }),
+      makeSub({ index: 1, language: "en", codec: "srt", hearing_impaired: false }),
+    ];
+    const preferredHI = makeSub({ language: "en", codec: "srt", hearing_impaired: true });
+    expect(matchSubtitleTrackAcrossVersions(candidatesHI, preferredHI)?.index).toBe(0);
+  });
+
+  it("breaks ties with matching codec and source", () => {
+    const candidates = [
+      makeSub({ index: 0, language: "en", codec: "ass", source: "embedded" }),
+      makeSub({ index: 1, language: "en", codec: "srt", source: "external" }),
+    ];
+    const preferred = makeSub({ language: "en", codec: "srt", source: "external" });
+    expect(matchSubtitleTrackAcrossVersions(candidates, preferred)?.index).toBe(1);
+  });
+
+  it("returns null when no language matches", () => {
+    const candidates = [makeSub({ index: 0, language: "de", codec: "srt" })];
+    const preferred = makeSub({ language: "en", codec: "srt" });
+    expect(matchSubtitleTrackAcrossVersions(candidates, preferred)).toBeNull();
+    expect(matchSubtitleTrackAcrossVersions(candidates, null)).toBeNull();
   });
 });

@@ -49,6 +49,56 @@ function languageMatchRank(candidate: string | undefined | null, preferred: stri
   return candidateTag.includes("-") ? 2 : 1;
 }
 
+export interface SubtitleTrackCandidate {
+  index?: number;
+  language?: string | null;
+  codec?: string | null;
+  forced?: boolean;
+  hearing_impaired?: boolean;
+  label?: string | null;
+  source?: string | null;
+}
+
+export function matchSubtitleTrackAcrossVersions<T extends SubtitleTrackCandidate>(
+  candidates: T[],
+  preferred: SubtitleTrackCandidate | null | undefined,
+): T | null {
+  if (!preferred || candidates.length === 0) return null;
+  const preferredLang = (preferred.language ?? "").trim();
+  if (!preferredLang) return null;
+
+  let bestMatch: T | null = null;
+  let bestRank = 3;
+  let bestScore = -1;
+
+  for (const candidate of candidates) {
+    if (Boolean(candidate.forced) !== Boolean(preferred.forced)) continue;
+    if (Boolean(candidate.hearing_impaired) !== Boolean(preferred.hearing_impaired)) continue;
+
+    const rank = languageMatchRank(candidate.language, preferredLang);
+    if (rank < 0 || rank > bestRank) continue;
+
+    let score = 0;
+    const prefCodec = (preferred.codec ?? "").trim().toLowerCase();
+    const candCodec = (candidate.codec ?? "").trim().toLowerCase();
+    if (prefCodec && candCodec && prefCodec === candCodec) score += 2;
+    const prefSource = (preferred.source ?? "").trim().toLowerCase();
+    const candSource = (candidate.source ?? "").trim().toLowerCase();
+    if (prefSource && candSource && prefSource === candSource) score += 1;
+    const prefLabel = (preferred.label ?? "").trim().toLowerCase();
+    const candLabel = (candidate.label ?? "").trim().toLowerCase();
+    if (prefLabel && candLabel && prefLabel === candLabel) score += 1;
+
+    if (rank < bestRank || (rank === bestRank && score > bestScore)) {
+      bestRank = rank;
+      bestScore = score;
+      bestMatch = candidate;
+    }
+  }
+
+  return bestMatch;
+}
+
 function subtitleTrackMatchesSignature(
   track: PlayerSubtitleInfo,
   signature: PlayerSubtitleTrackSignature | null,
