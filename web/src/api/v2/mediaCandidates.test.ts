@@ -9,9 +9,15 @@ vi.mock("@/api/client", () => ({
 }));
 
 import {
-  refreshVirtualCandidates,
+  adminJobIdFromLocation,
+  awaitVirtualCandidatesRefresh,
+  DEFAULT_REFRESH_RETRY_AFTER_MS,
+  requestVirtualRelease,
+  startVirtualCandidatesRefresh,
   virtualCandidatesRefreshPath,
+  virtualReleaseRequestPath,
   VIRTUAL_CANDIDATES_REFRESH_PATH,
+  VIRTUAL_RELEASE_REQUEST_PATH,
 } from "./mediaCandidates";
 
 function sessionResult(res: Response) {
@@ -24,19 +30,6 @@ function jsonResponse(body: unknown, status = 200) {
     headers: { "Content-Type": "application/json" },
   });
 }
-
-const candidate = {
-  file_id: "9",
-  resolution: "720p",
-  codec_video: "h264",
-  codec_audio: "aac",
-  hdr: false,
-  container: "mp4",
-  file_size: 1234,
-  bitrate: 5_000_000,
-  duration_seconds: 120,
-  added_at: "2026-01-02T03:04:05.000Z",
-};
 
 beforeEach(() => {
   mocks.fetchWithSession.mockReset();
@@ -53,39 +46,146 @@ describe("virtualCandidatesRefreshPath", () => {
   });
 });
 
-describe("refreshVirtualCandidates", () => {
-  it("POSTs the refresh and returns the server's candidate list", async () => {
+describe("startVirtualCandidatesRefresh", () => {
+  it("POSTs the refresh and reads the accepted job from the Location header", async () => {
     mocks.fetchWithSession.mockResolvedValue(
-      sessionResult(jsonResponse({ versions: [candidate] })),
+      sessionResult(
+        new Response("", {
+          status: 202,
+          headers: {
+            Location: "/api/v2/admin/jobs/job-7",
+            "Retry-After": "5",
+          },
+        }),
+      ),
     );
 
-    const versions = await refreshVirtualCandidates("content-1");
+    const accepted = await startVirtualCandidatesRefresh("content-1");
 
     expect(mocks.fetchWithSession).toHaveBeenCalledTimes(1);
     const [url, init] = mocks.fetchWithSession.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/v2/media/content-1/virtual-candidates:refresh");
     expect(init.method).toBe("POST");
-    expect(versions).toEqual([
-      expect.objectContaining({
-        file_id: 9,
-        resolution: "720p",
-        duration: 120,
-        file_size: 1234,
-      }),
-    ]);
+    expect(accepted).toEqual({ jobId: "job-7", retryAfterMs: 5000 });
   });
 
-  it("throws on a non-2xx answer so the caller keeps its list", async () => {
+  it("falls back to the documented retry delay when the header is absent", async () => {
+    mocks.fetchWithSession.mockResolvedValue(
+      sessionResult(
+        new Response("", { status: 202, headers: { Location: "/api/v2/admin/jobs/job-7" } }),
+      ),
+    );
+
+    await expect(startVirtualCandidatesRefresh("content-1")).resolves.toEqual({
+      jobId: "job-7",
+      retryAfterMs: DEFAULT_REFRESH_RETRY_AFTER_MS,
+    });
+  });
+
+  it("rejects a non-2xx answer so the caller keeps its list", async () => {
     mocks.fetchWithSession.mockResolvedValue(sessionResult(new Response("", { status: 503 })));
 
-    await expect(refreshVirtualCandidates("content-1")).rejects.toThrow("503");
+    await expect(startVirtualCandidatesRefresh("content-1")).rejects.toThrow("503");
   });
 
-  it("throws when the payload is not a version list", async () => {
-    mocks.fetchWithSession.mockResolvedValue(sessionResult(jsonResponse({})));
-
-    await expect(refreshVirtualCandidates("content-1")).rejects.toThrow(
-      "not in the expected shape",
+  it("rejects an accepted answer without a usable job location", async () => {
+    mocks.fetchWithSession.mockResolvedValue(
+      sessionResult(new Response("", { status: 202, headers: { Location: "/somewhere/else" } })),
     );
+
+    await expect(startVirtualCandidatesRefresh("content-1")).rejects.toThrow(
+      "not acknowledged",
+    );
+  });
+});
+
+describe("adminJobIdFromLocation", () => {
+  it("accepts an absolute URL and strips any query or fragment", () => {
+    expect(
+      adminJobIdFromLocation("https://silo.example/api/v2/admin/jobs/job-1?x=1#frag"),
+    ).toBe("job-1");
+  });
+
+  it("rejects a location that is not an admin job", () => {
+    expect(adminJobIdFromLocation("/api/v2/media/movie:heat-1995")).toBeNull();
+    expect(adminJobIdFromLocation(null)).toBeNull();
+    expect(adminJobIdFromLocation("")).toBeNull();
+  });
+});
+
+describe("awaitVirtualCandidatesRefresh", () => {
+  it("waits on the accepted job before resolving", async () => {
+    mocks.fetchWithSession.mockResolvedValue(
+      sessionResult(
+        new Response("", { status: 202, headers: { Location: "/api/v2/admin/jobs/job-7" } }),
+      ),
+    );
+    const awaitAdminJob = vi.fn().mockResolvedValue({ id: "job-7", status: "completed" });
+
+    await awaitVirtualCandidatesRefresh("content-1", awaitAdminJob);
+
+    expect(awaitAdminJob).toHaveBeenCalledWith("job-7");
+  });
+
+  it("does not wait when the acceptance request fails", async () => {
+    mocks.fetchWithSession.mockResolvedValue(sessionResult(new Response("", { status: 503 })));
+    const awaitAdminJob = vi.fn();
+
+    await expect(awaitVirtualCandidatesRefresh("content-1", awaitAdminJob)).rejects.toThrow("503");
+    expect(awaitAdminJob).not.toHaveBeenCalled();
+  });
+});
+
+describe("virtualReleaseRequestPath", () => {
+  it("fills and encodes both path parameters", () => {
+    expect(virtualReleaseRequestPath("content 1", "rel/2")).toBe(
+      "/api/v2/media/content%201/virtual-releases/rel%2F2:request",
+    );
+    expect(VIRTUAL_RELEASE_REQUEST_PATH).toBe(
+      "/api/v2/media/{media_id}/virtual-releases/{release_id}:request",
+    );
+  });
+});
+
+describe("requestVirtualRelease", () => {
+  it("POSTs the request and returns the queued state", async () => {
+    mocks.fetchWithSession.mockResolvedValue(
+      sessionResult(jsonResponse({ release_id: "rel-1", state: "queued" })),
+    );
+
+    const result = await requestVirtualRelease("content-1", "rel-1");
+
+    const [url, init] = mocks.fetchWithSession.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v2/media/content-1/virtual-releases/rel-1:request");
+    expect(init.method).toBe("POST");
+    expect(result).toEqual({ release_id: "rel-1", state: "queued", message: undefined });
+  });
+
+  it("carries a failure message through", async () => {
+    mocks.fetchWithSession.mockResolvedValue(
+      sessionResult(jsonResponse({ release_id: "rel-1", state: "failed", message: "no provider" })),
+    );
+
+    await expect(requestVirtualRelease("content-1", "rel-1")).resolves.toEqual({
+      release_id: "rel-1",
+      state: "failed",
+      message: "no provider",
+    });
+  });
+
+  it("treats an unknown state as a failure so the row stays retryable", async () => {
+    mocks.fetchWithSession.mockResolvedValue(
+      sessionResult(jsonResponse({ release_id: "rel-1", state: "mystery" })),
+    );
+
+    await expect(requestVirtualRelease("content-1", "rel-1")).resolves.toEqual(
+      expect.objectContaining({ state: "failed" }),
+    );
+  });
+
+  it("rejects on a non-2xx answer", async () => {
+    mocks.fetchWithSession.mockResolvedValue(sessionResult(new Response("", { status: 500 })));
+
+    await expect(requestVirtualRelease("content-1", "rel-1")).rejects.toThrow("500");
   });
 });

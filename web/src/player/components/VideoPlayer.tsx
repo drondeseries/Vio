@@ -64,6 +64,7 @@ import type {
   PlayerTimeRange,
   PlayerMarkerSegment,
   PlayerVirtualRanking,
+  PlayerIndexerRelease,
   MarkerDraft,
   MarkerKind,
   MarkerRegionView,
@@ -211,6 +212,10 @@ interface VideoPlayerProps {
   sessionId: string;
   selectedVersion?: PlayerFileVersion;
   versions?: PlayerFileVersion[];
+  /** Releases on the indexers that are not downloaded on the provider yet. */
+  indexerReleases?: PlayerIndexerRelease[];
+  /** The item id, so the menu can request an indexer release. */
+  contentId?: string;
   /** The ranking the server applied to the version list, forwarded to the menu. */
   virtualRanking?: PlayerVirtualRanking;
   activeFileId?: number | null;
@@ -400,6 +405,8 @@ export function VideoPlayer({
   sessionId,
   selectedVersion,
   versions = [],
+  indexerReleases = [],
+  contentId,
   virtualRanking,
   activeFileId,
   chapters = [],
@@ -4456,7 +4463,9 @@ export function VideoPlayer({
           qualityError={replanError}
           onQualitySelect={handleQualitySelect}
           versionLocked={!!watchTogetherRoomId}
-          versions={versions.length > 1 ? versionStatus : undefined}
+          versions={versions.length > 1 || indexerReleases.length > 0 ? versionStatus : undefined}
+          indexerReleases={indexerReleases}
+          contentId={contentId}
           onSwitchVersion={
             onSwitchVersion && !watchTogetherRoomId
               ? (fileId) => onSwitchVersion(fileId, currentTime)

@@ -19,7 +19,8 @@ const playbackSessionMock = vi.hoisted(() => vi.fn());
 const videoPlayerMock = vi.hoisted(() => vi.fn());
 const toastErrorMock = vi.hoisted(() => vi.fn());
 const fetchWatchDetailMock = vi.hoisted(() => vi.fn());
-const refreshVirtualCandidatesMock = vi.hoisted(() => vi.fn());
+const awaitVirtualCandidatesRefreshMock = vi.hoisted(() => vi.fn());
+const awaitAdminJobMock = vi.hoisted(() => vi.fn());
 const fetchQueryMock = vi.hoisted(() => vi.fn());
 // When set, `useQueryClient` hands back this real client instead of the
 // pass-through fake so a test can exercise the react-query cache itself.
@@ -36,7 +37,10 @@ vi.mock("@/hooks/queries/items", () => ({
   fetchWatchDetail: fetchWatchDetailMock,
 }));
 vi.mock("@/api/v2/mediaCandidates", () => ({
-  refreshVirtualCandidates: refreshVirtualCandidatesMock,
+  awaitVirtualCandidatesRefresh: awaitVirtualCandidatesRefreshMock,
+}));
+vi.mock("@/components/realtimeEventsContext", () => ({
+  useRealtimeEvents: () => ({ awaitAdminJob: awaitAdminJobMock }),
 }));
 vi.mock("./VideoPlayer", () => ({
   VideoPlayer: (props: unknown) => {
@@ -156,7 +160,8 @@ beforeEach(() => {
   videoPlayerMock.mockReset();
   toastErrorMock.mockReset();
   fetchWatchDetailMock.mockReset();
-  refreshVirtualCandidatesMock.mockReset();
+  awaitVirtualCandidatesRefreshMock.mockReset();
+  awaitAdminJobMock.mockReset().mockResolvedValue({ id: "job-1", status: "completed" });
   // The component reads watch detail through the shared react-query cache. The
   // fake client passes straight through to the queryFn so these tests keep
   // exercising the poll's attempt/deadline logic; the cache dedupe itself is
@@ -458,9 +463,14 @@ describe("WatchPage version list refresh", () => {
   const firstVersion: PlayerFileVersion = { ...version, file_id: 7 };
   const secondVersion: PlayerFileVersion = { ...version, file_id: 8 };
 
-  it("replaces the known candidates with the server's refreshed list", async () => {
+  it("waits on the refresh job then re-reads the server's list", async () => {
     const refreshed: PlayerFileVersion = { ...version, file_id: 9, resolution: "720p" };
-    refreshVirtualCandidatesMock.mockResolvedValueOnce([refreshed]);
+    awaitVirtualCandidatesRefreshMock.mockResolvedValueOnce(undefined);
+    fetchWatchDetailMock.mockResolvedValueOnce({
+      content_id: "content-1",
+      versions: [refreshed],
+      indexer_releases: [],
+    });
     playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 7 }));
 
     render(
@@ -473,22 +483,57 @@ describe("WatchPage version list refresh", () => {
     const before = videoPlayerMock.mock.calls.at(-1)?.[0] as {
       onRefreshVersions?: () => Promise<void>;
     };
-    expect(refreshVirtualCandidatesMock).not.toHaveBeenCalled();
+    expect(awaitVirtualCandidatesRefreshMock).not.toHaveBeenCalled();
 
     await act(async () => {
       await before.onRefreshVersions?.();
     });
 
-    expect(refreshVirtualCandidatesMock).toHaveBeenCalledTimes(1);
-    expect(refreshVirtualCandidatesMock).toHaveBeenCalledWith("content-1");
+    // The async flow is awaited with the realtime job helper, then the list is
+    // re-read from the watch detail.
+    expect(awaitVirtualCandidatesRefreshMock).toHaveBeenCalledTimes(1);
+    expect(awaitVirtualCandidatesRefreshMock).toHaveBeenCalledWith("content-1", awaitAdminJobMock);
     const after = videoPlayerMock.mock.calls.at(-1)?.[0] as {
       versions?: PlayerFileVersion[];
     };
     expect(after.versions).toEqual([refreshed]);
   });
 
+  it("forwards the refreshed indexer releases to the menu", async () => {
+    awaitVirtualCandidatesRefreshMock.mockResolvedValueOnce(undefined);
+    fetchWatchDetailMock.mockResolvedValueOnce({
+      content_id: "content-1",
+      versions: [firstVersion],
+      indexer_releases: [
+        { release_id: "rel-1", title: "Movie 2026 2160p", download_state: "not_downloaded" },
+      ],
+    });
+    playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 7 }));
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [firstVersion, secondVersion],
+      }),
+    );
+
+    const before = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onRefreshVersions?: () => Promise<void>;
+    };
+    await act(async () => {
+      await before.onRefreshVersions?.();
+    });
+
+    const after = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      indexerReleases?: unknown[];
+    };
+    expect(after.indexerReleases).toEqual([
+      { release_id: "rel-1", title: "Movie 2026 2160p", download_state: "not_downloaded" },
+    ]);
+  });
+
   it("keeps the known candidates when the refresh fails", async () => {
-    refreshVirtualCandidatesMock.mockRejectedValueOnce(new Error("network"));
+    awaitVirtualCandidatesRefreshMock.mockRejectedValueOnce(new Error("network"));
     playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 7 }));
 
     render(
@@ -506,6 +551,8 @@ describe("WatchPage version list refresh", () => {
       await expect(props.onRefreshVersions?.()).rejects.toThrow("network");
     });
 
+    // The re-read never runs behind a failed job; the known rows stay.
+    expect(fetchWatchDetailMock).not.toHaveBeenCalled();
     const after = videoPlayerMock.mock.calls.at(-1)?.[0] as {
       versions?: PlayerFileVersion[];
     };

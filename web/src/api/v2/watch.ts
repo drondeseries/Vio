@@ -7,6 +7,7 @@ import type {
   WatchDetail,
 } from "@/api/types";
 import type { components } from "@/api/v2/schema";
+import { indexerReleasesFromWire } from "./indexerReleases";
 
 /**
  * The watch detail as the player still models it. v2 renders file ids as
@@ -117,6 +118,11 @@ export function watchDetailFromV2(detail: WatchDetailV2): WatchDetail {
     versions: watchFileVersionsFromV2(detail.versions),
     playback_variants: detail.playback_variants?.map(variantFromV2),
     virtual_ranking: detail.virtual_ranking,
+    // Additive: absent from the committed contract until the backend lands, so
+    // it is read structurally and normalized at this boundary.
+    indexer_releases: indexerReleasesFromWire(
+      (detail as { indexer_releases?: unknown }).indexer_releases,
+    ),
     subtitles: detail.subtitles.map((s) => ({
       source: s.source,
       language: s.language,
