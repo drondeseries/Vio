@@ -1146,15 +1146,18 @@ type remoteBodyChunk struct {
 	data []byte
 	err  error
 	// budget and reservedBytes record the aggregate read-ahead reservation this
-	// chunk holds. Ownership passes to whoever receives the chunk; release
-	// returns the bytes to the pool. A released chunk is a no-op, so the
-	// producer's abort path and the consumer's receive path cannot
-	// double-release.
+	// chunk holds while it sits in the channel: the queue *is* the read-ahead,
+	// so the pool must count a queued chunk until it is dequeued. The chunk is
+	// received exactly once, by the consumer or by the pump's exit drain, and
+	// that single receiver calls release. A released chunk is a no-op, so a
+	// stray double call cannot corrupt the pool.
 	budget        *readAheadBudget
 	reservedBytes int
 }
 
-// release returns the chunk's read-ahead reservation to the relay pool.
+// release returns the chunk's read-ahead reservation to the relay pool. Called
+// by the chunk's single receiver: the consumer on dequeue, or the pump's drain
+// for a chunk no consumer ever received. Exactly one of the two runs per chunk.
 func (c remoteBodyChunk) release() {
 	if c.budget != nil && c.reservedBytes > 0 {
 		c.budget.release(c.reservedBytes)
@@ -1164,7 +1167,34 @@ func (c remoteBodyChunk) release() {
 func pumpRemoteBody(ctx context.Context, body io.Reader, budget *readAheadBudget) <-chan remoteBodyChunk {
 	chunks := make(chan remoteBodyChunk, remoteBodyBufferChunks)
 	go func() {
-		defer close(chunks)
+		// The queue is the read-ahead, so a chunk holds its reservation for as
+		// long as it sits in the channel. Ownership of that reservation passes
+		// with the chunk value: the consumer releases it on dequeue, or, for a
+		// chunk no consumer ever receives, this drain releases it on exit. A
+		// chunk value is received by exactly one receiver, so release stays
+		// exactly-once and no path double-releases.
+		//
+		// Exit invariant: this goroutine leaves zero reservations behind on
+		// every return path. The drain below is the leak fix — an abandoned
+		// stream (client abort, first-byte timeout, HLS-branch return, upstream
+		// read error) leaves its buffered chunks unreceived, and without the
+		// drain those reservations would strand in the shared pool until every
+		// acquire blocked. A closed buffered channel still yields its buffered
+		// values, so ranging it releases every leftover.
+		//
+		// The drain waits for ctx.Done before ranging. On a graceful end the
+		// consumer is still draining the buffered tail, and a plain range would
+		// compete with it for channel values and steal chunks out of a healthy
+		// stream. ctx is canceled by the caller once the consumer has stopped
+		// (the relay cancels the pump scope on every handler return), so this
+		// wait makes the drain observe only leftovers, never a live receive.
+		defer func() {
+			close(chunks)
+			<-ctx.Done()
+			for leftover := range chunks {
+				leftover.release()
+			}
+		}()
 		for {
 			// Reserve a whole chunk before reading, so an exhausted aggregate
 			// pool applies backpressure before the upstream read rather than
@@ -1189,9 +1219,11 @@ func pumpRemoteBody(ctx context.Context, body io.Reader, budget *readAheadBudget
 			chunk := remoteBodyChunk{data: buffer[:n], err: err, budget: budget, reservedBytes: n}
 			select {
 			case chunks <- chunk:
-				// Ownership of `n` transfers to the consumer, which returns it
-				// once the chunk leaves the queue.
+				// The chunk stays reserved while queued; its receiver releases
+				// it. Ownership leaves the pump with the send.
 			case <-ctx.Done():
+				// The chunk was never delivered, so the pump still owns and
+				// returns its reservation.
 				chunk.release()
 				return
 			}
@@ -1215,9 +1247,11 @@ func nextRemoteBodyChunk(ctx context.Context, chunks <-chan remoteBodyChunk, tim
 		if !ok {
 			return remoteBodyChunk{err: io.EOF}, nil
 		}
-		// The consumer now owns the chunk: return its read-ahead reservation so
-		// the aggregate pool can serve other streams while this chunk is
-		// written downstream. The bytes themselves stay alive in the chunk.
+		// The consumer is the chunk's receiver, so it returns the queued
+		// read-ahead reservation now that the bytes are no longer in the queue.
+		// The timeout and cancellation paths above are pure receive attempts
+		// that received nothing; they own no chunk and must not release. A
+		// chunk the pump's exit drain receives instead is released there.
 		chunk.release()
 		if len(chunk.data) == 0 && chunk.err != nil && !errors.Is(chunk.err, io.EOF) {
 			return remoteBodyChunk{}, errors.New("read remote media stream")
