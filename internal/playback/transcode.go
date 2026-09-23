@@ -2266,6 +2266,18 @@ func (s *TranscodeSession) GetManifest() ([]byte, error) {
 // expires. It keeps the initial request open long enough for FFmpeg to write
 // the first safe playback window instead of forcing the client to race a 503.
 func (s *TranscodeSession) WaitForManifest(timeout time.Duration) ([]byte, error) {
+	return s.WaitForManifestContext(context.Background(), timeout)
+}
+
+// WaitForManifestContext is WaitForManifest with an owner deadline: the wait
+// ends at whichever comes first — the per-wait timeout or the context's end.
+// Transport startup passes its single startup context here so a slow provider
+// resolve leaves the manifest wait only the remainder of the budget instead of
+// a fresh full timeout. A nil ctx behaves like WaitForManifest.
+func (s *TranscodeSession) WaitForManifestContext(ctx context.Context, timeout time.Duration) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	deadline := time.After(timeout)
 	for {
 		manifest, err := s.GetManifest()
@@ -2277,6 +2289,8 @@ func (s *TranscodeSession) WaitForManifest(timeout time.Duration) ([]byte, error
 		}
 
 		select {
+		case <-ctx.Done():
+			return nil, s.manifestTimeoutError(timeout)
 		case <-deadline:
 			return nil, s.manifestTimeoutError(timeout)
 		case <-time.After(100 * time.Millisecond):

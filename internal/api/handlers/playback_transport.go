@@ -182,7 +182,13 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		return res.URL, cleanup, err
 	}
 	var lastErr error
-	startupCtx, startupCancel := context.WithTimeout(context.WithoutCancel(ctx), virtualStartupBudget)
+	// One deadline owns the whole transport startup: provider resolution,
+	// transcode session start, and manifest readiness all observe the
+	// remainder of this single budget. A slow resolve must not hand a fresh
+	// timeout to the manifest wait, or the advertised cold-start budget stops
+	// being an end-to-end bound. startupCtx derives from the caller's ctx (not
+	// a detached background context) so cancellation still propagates.
+	startupCtx, startupCancel := context.WithTimeout(ctx, virtualStartupBudget)
 	defer startupCancel()
 	maxAttempts := h.maxVirtualFailoverAttempts(ctx)
 	if sessionVirtualURI != "" {
@@ -236,7 +242,14 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			}
 			continue
 		}
-		transcodeCtx, transcodeCancel := context.WithCancel(context.Background())
+		// The session's process lifetime stays independent of the startup
+		// deadline: transcodeCtx derives from a detached context so the
+		// deferred startupCancel below cannot kill a ready session's FFmpeg.
+		// Startup bounding happens in two places that never touch process
+		// lifetime: resolveVirtualInputURI runs under startupCtx, and the
+		// manifest wait below observes startupCtx as an owner deadline while
+		// the session itself runs on transcodeCtx.
+		transcodeCtx, transcodeCancel := context.WithCancel(context.WithoutCancel(ctx))
 		timer := time.AfterFunc(4*time.Hour, transcodeCancel)
 		cleanupWithCancel := func() {
 			timer.Stop()
@@ -250,7 +263,12 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		attemptOpts.InputCleanup = cleanupWithCancel
 		session, startErr := h.startTranscodeSession(transcodeCtx, attemptOpts)
 		if startErr == nil {
-			if _, readyErr := session.WaitForManifest(playback.ManifestStartupTimeout); readyErr == nil {
+			// The manifest wait observes the startup deadline as an owner
+			// bound: it ends at whichever comes first — the historical
+			// per-wait timeout or whatever the resolve stages left of the
+			// single startup budget. The session keeps running on
+			// transcodeCtx regardless; only this wait is bounded.
+			if _, readyErr := session.WaitForManifestContext(startupCtx, playback.ManifestStartupTimeout); readyErr == nil {
 				winningURI := resolvedMedia.URI
 				if winningURI == "" || winningURI == neutralPath {
 					if resolvedMedia.CandidateID != "" {

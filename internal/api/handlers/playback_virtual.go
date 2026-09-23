@@ -1822,10 +1822,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		//
 		// Like durable resume, this must not fire without planner-grade video
 		// evidence: the delivery grace proves the bytes flowed once, not that
-		// the planner can route them now.
+		// the planner can route them now. And like the P0 gate above, it must
+		// fire only for the exact candidate the row names: the grace proves a
+		// sibling's bytes flowed, not this candidate's.
 		optimisticFastPath := deferProbe && !forceRelist && !noResult &&
 			len(excludedCandidateIDs) == 0 && (allowFailed || !virtualCandidateVerdictActive(file.FailedAt, time.Now())) &&
 			(persistedResultURI || pinnedURI != "") &&
+			cand.URI == fastPathEvidenceOwnerURI(file, persistedResultURI, pinnedURI) &&
 			(h.VirtualMediaDetailedResolver != nil || h.VirtualPlaybackResolver != nil) &&
 			(h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) &&
 			virtualDeliveredWithinGrace(file)
@@ -2425,6 +2428,19 @@ func virtualDeliveredWithinGrace(file *models.MediaFile) bool {
 		return false
 	}
 	return time.Since(*file.LastDeliveredAt) < scanner.VirtualCandidateDeliveryGrace
+}
+
+// fastPathEvidenceOwnerURI names the one candidate the row's persisted evidence
+// belongs to: the row's own ?result= pick when it names a concrete candidate,
+// else the in-memory sticky pin. Every fast path that copies the row's probed
+// inventory onto a candidate must require cand.URI to equal this owner — the
+// delivery grace proves the owner's bytes flowed, never a freshly ranked
+// sibling's. Empty means no owner (neutral row, no pin): no fast path may fire.
+func fastPathEvidenceOwnerURI(file *models.MediaFile, persistedResultURI bool, pinnedURI string) string {
+	if file != nil && persistedResultURI && strings.TrimSpace(file.FilePath) != "" {
+		return file.FilePath
+	}
+	return strings.TrimSpace(pinnedURI)
 }
 
 // cloneVirtualProbeTransient copies a MediaFile with its track slices
