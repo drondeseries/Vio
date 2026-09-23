@@ -261,6 +261,27 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		attemptOpts := opts
 		attemptOpts.InputPath = resolvedMedia.URL
 		attemptOpts.InputCleanup = cleanupWithCancel
+		// A cross-release fallback serves different bytes than the plan was
+		// built for: the plan's audio/subtitle ordinals name the pinned
+		// release's inventory, not the sibling's. Reset the per-release
+		// selections to the container default so the client starts from a
+		// valid track instead of an ordinal that means something else (or
+		// nothing) on the replacement. Source facts derived from the pinned
+		// release's probe are cleared the same way: the replacement's real
+		// facts arrive with its own session, and carrying the old ones would
+		// misroute transcode decisions. The first attempt (the pinned
+		// release itself) keeps the plan's selections untouched. Burn-in is
+		// cleared with the subtitle ordinal: a burned track index from the
+		// old release must not composite an unrelated stream.
+		if attempt > 0 {
+			attemptOpts.AudioTrackIndex = -1
+			attemptOpts.SubtitleTrackIndex = -1
+			attemptOpts.SubtitleBurnIn = false
+			attemptOpts.SourceVideoCodec = ""
+			attemptOpts.SourceVideoProfile = ""
+			attemptOpts.SourceVideoBitDepth = 0
+			attemptOpts.SourceAudioChannels = 0
+		}
 		session, startErr := h.startTranscodeSession(transcodeCtx, attemptOpts)
 		if startErr == nil {
 			// The manifest wait observes the startup deadline as an owner

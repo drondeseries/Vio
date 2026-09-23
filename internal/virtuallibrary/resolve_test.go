@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -159,6 +160,71 @@ func TestResolveDetailedPinnedExcludedCandidateSubstitution(t *testing.T) {
 	}
 	if dead.CandidateID == "" {
 		t.Fatal("expected a fallback candidate for a dead pin")
+	}
+}
+
+// TestResolveDetailedPinnedURLValidationFailureRefusesWithoutRotation proves
+// the #96 invariant: when the pinned candidate is present but fails URL
+// validation (unsafe URL) and substitution is refused, the resolve returns
+// the pin's validation failure — it never enters the ranked-alternatives
+// loop and serves a sibling under the viewer's binding. A provider outage
+// (all URLs unsafe) is a plain provider failure, never a rotation sentinel.
+func TestResolveDetailedPinnedURLValidationFailureRefusesWithoutRotation(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/manifest.json" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"org.stremio.test","resources":["stream"],"types":["movie","series"]}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"streams": [
+				{"name": "1080p", "title": "Pinned", "url": "http://user:pass@192.168.1.100:8080/stream1.mkv"},
+				{"name": "720p", "title": "Sibling", "url": "http://192.168.1.100:8080/stream2.mkv"}
+			]
+		}`))
+	}))
+	defer mockServer.Close()
+
+	svc := virtuallibrary.New(virtuallibrary.Config{
+		Enabled:           true,
+		ManifestURL:       mockServer.URL + "/manifest.json",
+		AllowInsecureHTTP: true,
+	}, nil, nil)
+	if svc == nil {
+		t.Fatal("expected non-nil service")
+	}
+	ctx := context.Background()
+	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
+	if err != nil || len(streams) != 2 {
+		t.Fatalf("ListStreams: count=%d err=%v, want 2", len(streams), err)
+	}
+	// The pinned candidate's URL fails structural validation (control
+	// character) while the sibling stays valid: with substitution refused the
+	// resolve must return the pin's validation failure, never the sibling.
+	// Credentials are used instead of an SSRF split because
+	// AllowInsecureHTTP permits every literal test address, while the
+	// structural no-credentials rule always applies.
+	pinnedURI := "virtual://movie/tt100?result=" + streams[0].ID
+	siblingID := streams[1].ID
+	resolved, err := svc.ResolveDetailed(ctx, pinnedURI, false, nil, "", false, false)
+	if err == nil {
+		t.Fatalf("expected the pinned validation failure, got sibling %q", resolved.CandidateID)
+	}
+	if got := err.Error(); !strings.Contains(got, "rotation was not requested") {
+		t.Fatalf("err = %q, want the no-rotation refusal for the pinned candidate", got)
+	}
+	if resolved.CandidateID == siblingID {
+		t.Fatalf("served sibling %q under the pinned binding", siblingID)
+	}
+	// With rotation explicitly requested the sibling resolves.
+	rotated, err := svc.ResolveDetailed(ctx, pinnedURI, false, nil, "", false, true)
+	if err != nil {
+		t.Fatalf("rotation resolve: %v", err)
+	}
+	if rotated.CandidateID != siblingID {
+		t.Fatalf("rotated candidate = %q, want sibling %q", rotated.CandidateID, siblingID)
 	}
 }
 
