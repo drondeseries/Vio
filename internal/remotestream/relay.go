@@ -69,9 +69,14 @@ const (
 	// upstream pump and the client writer. The channel already provides full
 	// backpressure (the producer blocks when the client stalls, closing the
 	// upstream TCP window), so this buffer only absorbs throughput jitter.
-	// 64 chunks ≈ 16 MiB per active stream — enough smoothing without letting
-	// many slow clients pin hundreds of megabytes of resident memory.
-	remoteBodyBufferChunks = 64
+	// 16 chunks of 256 KiB ≈ 4 MiB per active stream, quartered from 64
+	// (≈16 MiB): 1000 stalled streams hold ~4 GiB of queued payload instead
+	// of ~16 GiB. Jitter coverage at this depth depends on bitrate (≈8s at
+	// 4 Mbit/s); aggregate use still scales with concurrency, and the figure
+	// counts queued payload only. This is a first step, not the aggregate
+	// budget (#103 tracks validating slow-consumer throughput and total
+	// memory, and a possible cross-stream cap).
+	remoteBodyBufferChunks = 16
 
 	// relayRangeCache* bound the in-memory cache of complete, small upstream
 	// range responses. FFmpeg re-reads a container's index/seek tables from the
