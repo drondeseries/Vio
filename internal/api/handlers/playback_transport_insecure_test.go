@@ -534,6 +534,133 @@ func TestVirtualTranscodeCrossReleaseFallbackResetsPerReleaseOpts(t *testing.T) 
 	}
 }
 
+// TestVirtualTranscodeCrossReleaseFallbackProbesReplacement is the #118
+// probe-then-start regression: the fallback attempt builds its session on the
+// replacement's probed facts, not the pinned release's. The replacement
+// probes as hevc/main-10/10-bit with 6 audio channels; the session opts must
+// carry those facts even though the pinned plan said h264/8-bit/stereo.
+func TestVirtualTranscodeCrossReleaseFallbackProbesReplacement(t *testing.T) {
+	tempDir := t.TempDir()
+	fileRes := &fakePinFileResolver{file: &models.MediaFile{
+		ID:                         10,
+		ContentID:                  "content-fallback-probe",
+		FilePath:                   "virtual://series/tt1/1/1?result=broken",
+		VirtualOwnerInstallationID: 5,
+	}}
+	var attemptOpts []playback.TranscodeOpts
+	h := &PlaybackHandler{
+		fileResolver: fileRes,
+		sessionMgr:   playback.NewSessionManager(0, 0),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
+			if len(excluded) == 0 {
+				return ResolvedVirtualMedia{URL: "http://localhost:8080/broken.mp4", URI: uri, CandidateID: "broken"}, nil
+			}
+			return ResolvedVirtualMedia{URL: "http://localhost:8080/live.mp4", URI: "virtual://series/tt1/1/1?result=live", CandidateID: "live"}, nil
+		}),
+		VirtualPlaybackSourceProber: func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+			f.CodecVideo = "hevc"
+			f.VideoTracks = []models.VideoTrack{{Codec: "hevc", Profile: "main 10", Width: 3840, Height: 2160, BitDepth: 10, VideoRange: "HDR", VideoRangeType: "HDR10"}}
+			f.AudioTracks = []models.AudioTrack{{Codec: "eac3", Channels: 6, Language: "eng"}}
+			f.CodecAudio = "eac3"
+			return f, nil
+		},
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			attemptOpts = append(attemptOpts, opts)
+			if strings.Contains(opts.InputPath, "broken.mp4") {
+				return nil, errors.New("manifest startup failed")
+			}
+			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
+	}
+
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), playback.TranscodeOpts{
+		MediaFileID:                      10,
+		InputPath:                        "virtual://series/tt1/1/1?result=broken",
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "fallback-probe-facts",
+		OutputDir:                        tempDir,
+		AudioTrackIndex:                  3,
+		SourceVideoCodec:                 "h264",
+		SourceVideoBitDepth:              8,
+		SourceAudioChannels:              2,
+	})
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+	if len(attemptOpts) != 2 {
+		t.Fatalf("transcode attempts = %d, want 2 (pinned + fallback)", len(attemptOpts))
+	}
+	fallback := attemptOpts[1]
+	if fallback.SourceVideoCodec != "hevc" {
+		t.Fatalf("fallback video codec = %q, want the replacement's probed hevc, not the pinned h264", fallback.SourceVideoCodec)
+	}
+	if fallback.SourceVideoBitDepth != 10 {
+		t.Fatalf("fallback video depth = %d, want the replacement's probed 10-bit", fallback.SourceVideoBitDepth)
+	}
+	if fallback.SourceAudioChannels != 6 {
+		t.Fatalf("fallback audio channels = %d, want the replacement's probed 6", fallback.SourceAudioChannels)
+	}
+	if fallback.AudioTrackIndex != -1 || fallback.SubtitleTrackIndex != -1 {
+		t.Fatalf("fallback kept pinned ordinals: audio=%d subtitle=%d, want -1/-1",
+			fallback.AudioTrackIndex, fallback.SubtitleTrackIndex)
+	}
+}
+
+// TestVirtualTranscodeCrossReleaseFallbackProbeFailureStillStarts is the
+// non-wedging half: when the replacement probe fails, the fallback proceeds
+// on reset-to-default opts (the pre-#118 behavior) instead of failing
+// startup.
+func TestVirtualTranscodeCrossReleaseFallbackProbeFailureStillStarts(t *testing.T) {
+	tempDir := t.TempDir()
+	fileRes := &fakePinFileResolver{file: &models.MediaFile{
+		ID:                         10,
+		ContentID:                  "content-fallback-probe-fail",
+		FilePath:                   "virtual://series/tt1/1/1?result=broken",
+		VirtualOwnerInstallationID: 5,
+	}}
+	var attemptOpts []playback.TranscodeOpts
+	h := &PlaybackHandler{
+		fileResolver: fileRes,
+		sessionMgr:   playback.NewSessionManager(0, 0),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
+			if len(excluded) == 0 {
+				return ResolvedVirtualMedia{URL: "http://localhost:8080/broken.mp4", URI: uri, CandidateID: "broken"}, nil
+			}
+			return ResolvedVirtualMedia{URL: "http://localhost:8080/live.mp4", URI: "virtual://series/tt1/1/1?result=live", CandidateID: "live"}, nil
+		}),
+		VirtualPlaybackSourceProber: func(_ context.Context, _ string, _ *models.MediaFile) (*models.MediaFile, error) {
+			return nil, errors.New("probe failed")
+		},
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			attemptOpts = append(attemptOpts, opts)
+			if strings.Contains(opts.InputPath, "broken.mp4") {
+				return nil, errors.New("manifest startup failed")
+			}
+			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
+	}
+
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), playback.TranscodeOpts{
+		MediaFileID:                      10,
+		InputPath:                        "virtual://series/tt1/1/1?result=broken",
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "fallback-probe-fail",
+		OutputDir:                        tempDir,
+		SourceVideoCodec:                 "h264",
+	})
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+	if len(attemptOpts) != 2 {
+		t.Fatalf("transcode attempts = %d, want 2", len(attemptOpts))
+	}
+	if fallback := attemptOpts[1]; fallback.SourceVideoCodec != "" {
+		t.Fatalf("fallback video codec = %q, want empty reset-to-default after probe failure", fallback.SourceVideoCodec)
+	}
+}
+
 func TestVirtualTranscodeManifestFailureEvictsExactCandidate(t *testing.T) {
 	tempDir := t.TempDir()
 	cache := NewVirtualBestResultCache(time.Minute, 10)

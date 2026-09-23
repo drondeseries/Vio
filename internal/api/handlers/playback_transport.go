@@ -263,16 +263,17 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		attemptOpts.InputCleanup = cleanupWithCancel
 		// A cross-release fallback serves different bytes than the plan was
 		// built for: the plan's audio/subtitle ordinals name the pinned
-		// release's inventory, not the sibling's. Reset the per-release
-		// selections to the container default so the client starts from a
-		// valid track instead of an ordinal that means something else (or
-		// nothing) on the replacement. Source facts derived from the pinned
-		// release's probe are cleared the same way: the replacement's real
-		// facts arrive with its own session, and carrying the old ones would
-		// misroute transcode decisions. The first attempt (the pinned
-		// release itself) keeps the plan's selections untouched. Burn-in is
-		// cleared with the subtitle ordinal: a burned track index from the
-		// old release must not composite an unrelated stream.
+		// release's inventory, not the sibling's. Probe-then-start: the
+		// replacement is probed synchronously under the remaining startup
+		// budget, and the session is built on the probed facts — source
+		// codecs, audio layout/channels, HDR range — instead of the pinned
+		// release's. Selections reset to the container default (audio and
+		// subtitle -1, no burn-in): the client starts from a valid track on
+		// the replacement rather than an ordinal that means something else
+		// (or nothing) there. The first attempt (the pinned release itself)
+		// keeps the plan's selections untouched. A probe failure does not
+		// fail the fallback: the attempt proceeds on reset-to-default opts
+		// (the pre-#118 behavior) so a slow prober cannot wedge startup.
 		if attempt > 0 {
 			attemptOpts.AudioTrackIndex = -1
 			attemptOpts.SubtitleTrackIndex = -1
@@ -281,6 +282,12 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			attemptOpts.SourceVideoProfile = ""
 			attemptOpts.SourceVideoBitDepth = 0
 			attemptOpts.SourceAudioChannels = 0
+			if probedFacts := h.probeVirtualFallbackSource(startupCtx, resolvedMedia, file); probedFacts != nil {
+				attemptOpts.SourceVideoCodec = probedFacts.CodecVideo
+				attemptOpts.SourceVideoProfile = virtualFallbackVideoProfile(probedFacts)
+				attemptOpts.SourceVideoBitDepth = virtualFallbackVideoBitDepth(probedFacts)
+				attemptOpts.SourceAudioChannels = virtualFallbackAudioChannels(probedFacts)
+			}
 		}
 		session, startErr := h.startTranscodeSession(transcodeCtx, attemptOpts)
 		if startErr == nil {
@@ -364,6 +371,74 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 }
 
 // resolveVirtualInputURI resolves a virtual input for a transport start. The
+// probeVirtualFallbackSource probes the replacement candidate of a
+// cross-release fallback synchronously under the remaining startup budget and
+// returns its observed facts, merged with (never overwritten by) the
+// candidate's declared metadata. Nil means "proceed on reset-to-default
+// opts": no prober wired, budget exhausted, or probe failed — none of which
+// may wedge the fallback. The caller copies source codec/profile/depth and
+// audio channels from the result; track selections stay at the container
+// default (the replacement's own inventory arrives with its session/plan,
+// and adopting the pinned release's ordinals would misaddress it).
+func (h *PlaybackHandler) probeVirtualFallbackSource(ctx context.Context, resolved ResolvedVirtualMedia, file *models.MediaFile) *models.MediaFile {
+	if h == nil || (h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
+		return nil
+	}
+	if strings.TrimSpace(resolved.URL) == "" {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, virtualProbeBudget)
+	defer cancel()
+	probeFile := models.MediaFile{Container: "virtual"}
+	if file != nil {
+		probeFile.ContentID = file.ContentID
+		probeFile.MediaFolderID = file.MediaFolderID
+		probeFile.VirtualOwnerInstallationID = file.VirtualOwnerInstallationID
+	}
+	probed, err := h.probeVirtualSource(probeCtx, resolved.URL, &probeFile, resolved.RequestHeaders)
+	if err != nil || probed == nil {
+		return nil
+	}
+	probeCand := VirtualPlaybackStream{
+		URI:               resolved.URI,
+		CodecAudio:        resolved.CodecAudio,
+		AudioLanguages:    resolved.AudioLanguages,
+		SubtitleLanguages: resolved.SubtitleLanguages,
+	}
+	mergeVirtualCandidateTracks(probed, probeCand)
+	return probed
+}
+
+// virtualFallbackVideoProfile returns the probed primary video profile for
+// fallback session facts, or "" when the probe recorded none.
+func virtualFallbackVideoProfile(probed *models.MediaFile) string {
+	if probed == nil || len(probed.VideoTracks) == 0 {
+		return ""
+	}
+	return probed.VideoTracks[0].Profile
+}
+
+// virtualFallbackVideoBitDepth returns the probed primary video bit depth,
+// or 0 when unknown.
+func virtualFallbackVideoBitDepth(probed *models.MediaFile) int {
+	if probed == nil || len(probed.VideoTracks) == 0 {
+		return 0
+	}
+	return probed.VideoTracks[0].BitDepth
+}
+
+// virtualFallbackAudioChannels returns the probed first audio track's channel
+// count, or 0 when the probe recorded none.
+func virtualFallbackAudioChannels(probed *models.MediaFile) int {
+	if probed == nil || len(probed.AudioTracks) == 0 {
+		return 0
+	}
+	return probed.AudioTracks[0].Channels
+}
+
 // final rotateCandidates argument is the caller's explicit declaration that
 // excluding a candidate is a verdict against that release, which authorizes
 // serving a sibling. It defaults to false, so an exclusion on its own never
