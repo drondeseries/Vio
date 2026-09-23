@@ -417,8 +417,10 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			} else if err == nil && storedExpiredRow != nil {
 				// Reuse the Phase-1 write path; only the requested candidate's
 				// own successful resolution is recorded (a substituted sibling
-				// is skipped inside).
-				refreshStoredVirtualResolution(ctx, storedExpiredRow, res, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+				// is skipped inside). The result is intentionally ignored here:
+				// the serve path already holds the resolved URL, so persistence
+				// is best-effort cache hygiene, not the request's outcome.
+				_, _ = refreshStoredVirtualResolution(ctx, storedExpiredRow, res, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
 			}
 		} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
 			var inputPath string

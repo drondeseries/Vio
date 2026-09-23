@@ -264,3 +264,83 @@ func TestVirtualCandidatesRefreshServiceCoalescesConcurrentCalls(t *testing.T) {
 		t.Fatalf("provider list calls = %d, want 1 (coalesced)", got)
 	}
 }
+
+// TestVirtualCandidatesRefreshServiceWaiterCancelDoesNotAbortSharedWork proves
+// a waiter that disconnects does not cancel the shared provider re-list. The
+// proof is channel-synced, not timing: the provider mock blocks until
+// released, the cancel lands while it is blocked, and the test then waits for
+// the background persist to land. If the shared work were bound to the waiter
+// (the old bug), the persist would never run and the wait times out.
+func TestVirtualCandidatesRefreshServiceWaiterCancelDoesNotAbortSharedWork(t *testing.T) {
+	source := refreshTestSource(8, "movie:y", "virtual://movie/y")
+	var listCalls int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	persisted := make(chan struct{})
+	var enteredOnce, persistedOnce sync.Once
+	svc := &VirtualCandidatesRefreshService{
+		ListFresh: VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			atomic.AddInt32(&listCalls, 1)
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+			return []VirtualPlaybackStream{{ID: "a", URI: path + "?result=a"}}, nil
+		}),
+		Persist: func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error {
+			persistedOnce.Do(func() { close(persisted) })
+			return nil
+		},
+		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) {
+			return []*models.MediaFile{source}, nil
+		},
+		Detail: &fakeRefreshDetail{detail: refreshTestDetail()},
+	}
+
+	// One waiter joins the shared refresh; entered proves the provider call
+	// is running inside the singleflight registration.
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancelErr := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, err := svc.RefreshVirtualCandidates(cancelCtx, 1, "p", "movie:y", catalog.AccessFilter{})
+		cancelErr <- err
+	}()
+	<-started
+	<-entered
+	// The waiter disconnects while the provider is blocked. It must observe
+	// its own interruption, while the shared work continues detached. Bound
+	// the wait: with the old blocking behavior this receive would hang
+	// forever instead of reaching any later timeout.
+	cancel()
+	select {
+	case err := <-cancelErr:
+		if err == nil {
+			t.Fatal("canceled waiter got nil error, want an interruption error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("canceled waiter never returned: shared work is bound to the waiter context")
+	}
+	close(release)
+	select {
+	case <-persisted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shared provider work was aborted by the waiter cancel: persist never ran")
+	}
+
+	// A fresh waiter afterwards gets a good list — the cancel neither aborted
+	// the first wave nor poisoned the shared state. No provider-call assertion
+	// here: singleflight forgets completed calls, so a fresh waiter may join
+	// the first wave (1 call) or start its own (2 calls) depending on timing,
+	// and either is correct.
+	if _, err := svc.RefreshVirtualCandidates(context.Background(), 1, "p", "movie:y", catalog.AccessFilter{}); err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	if got := atomic.LoadInt32(&listCalls); got < 1 || got > 2 {
+		t.Fatalf("provider list calls = %d, want 1 or 2 (join or fresh wave)", got)
+	}
+}

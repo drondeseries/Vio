@@ -84,15 +84,34 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 	}
 	for _, source := range sources {
 		key := virtualSourceRefreshKey(source)
-		_, refreshErr, _ := s.flight.Do(key, func() (any, error) {
-			return nil, s.refreshSource(ctx, source, userID, profileID)
+		// Do not bind the shared work to the first caller's context: a client
+		// disconnect must not cancel the provider re-list (or strand a
+		// coalesced waiter on a canceled context). The shared work runs under
+		// the request context detached from cancellation (but with its own
+		// timeout, applied inside refreshSource); waiters still observe their
+		// own cancellation while waiting via the select below.
+		workCtx := context.WithoutCancel(ctx)
+		refreshCh := s.flight.DoChan(key, func() (any, error) {
+			return nil, s.refreshSource(workCtx, source, userID, profileID)
 		})
-		if refreshErr != nil {
-			if errors.Is(refreshErr, ErrVirtualRefreshProvider) {
+		var refreshRes singleflight.Result
+		select {
+		case <-ctx.Done():
+			// This waiter is going away; the shared work continues for the
+			// other waiters under its detached context. Report the waiter's
+			// cancellation, not the work's outcome.
+			return nil, apiError(http.StatusServiceUnavailable, "unavailable", "The refresh was interrupted; try again.")
+		case refreshRes = <-refreshCh:
+		}
+		if refreshRes.Err != nil {
+			if errors.Is(refreshRes.Err, ErrVirtualRefreshProvider) {
 				return nil, apiError(http.StatusServiceUnavailable, "unavailable", "The provider could not be reached; try again.")
 			}
 			return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to refresh virtual candidates")
 		}
+		// A coalesced waiter reuses the winner's persistence; nothing more to
+		// do for this source.
+		_ = refreshRes.Shared
 	}
 	detail, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter)
 	if err != nil {
@@ -121,7 +140,11 @@ func (s *VirtualCandidatesRefreshService) refreshSource(ctx context.Context, sou
 		// failure the caller already understands, and leave the rows untouched.
 		return fmt.Errorf("%w: provider returned no candidates", ErrVirtualRefreshProvider)
 	}
-	if err := s.Persist(ctx, source, streams); err != nil {
+	// Persist under the listing timeout, not the detached caller context: the
+	// database write must not outlive the provider budget that bounds this
+	// refresh. (The detached work context only shields the re-list from a
+	// waiter disconnect; it must not make persistence unbounded.)
+	if err := s.Persist(listCtx, source, streams); err != nil {
 		return err
 	}
 	return nil
