@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -214,7 +215,11 @@ func TestReadAheadBudgetSingleStreamWithTightPool(t *testing.T) {
 	budget := newReadAheadBudget(remoteBodyChunkSize)
 	body := newPatternReader(int64(remoteBodyChunkSize) * chunks)
 
-	chunksCh := pumpRemoteBody(context.Background(), body, budget)
+	// The pump's exit drain waits for its ctx to be canceled before releasing
+	// leftovers, so callers always cancel (the relay does this per request).
+	pumpCtx, cancelPump := context.WithCancel(context.Background())
+	defer cancelPump()
+	chunksCh := pumpRemoteBody(pumpCtx, body, budget)
 	var received int64
 	var got int
 	for {
@@ -255,7 +260,9 @@ func TestPumpRemoteBodyZeroByteReadReturnsReservation(t *testing.T) {
 	budget := newReadAheadBudget(remoteBodyChunkSize)
 	body := &zeroThenDataReader{data: []byte("hello remote stream")}
 
-	chunksCh := pumpRemoteBody(context.Background(), body, budget)
+	pumpCtx, cancelPump := context.WithCancel(context.Background())
+	defer cancelPump()
+	chunksCh := pumpRemoteBody(pumpCtx, body, budget)
 	done := make(chan struct{})
 	var received []byte
 	go func() {
@@ -303,6 +310,232 @@ func (r *zeroThenDataReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// progressReader wraps a source and records how many bytes it has served. The
+// budget tests poll it to wait on observable pump progress instead of sleeping.
+type progressReader struct {
+	r     io.Reader
+	bytes atomic.Int64
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.bytes.Add(int64(n))
+	return n, err
+}
+
+func (p *progressReader) read() int64 { return p.bytes.Load() }
+
+// waitForReaderBytes blocks until the pump has read at least want bytes from the
+// source, failing the test if that never happens.
+func waitForReaderBytes(t *testing.T, r *progressReader, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := r.read(); got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pump read %d bytes, want at least %d", r.read(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitForBudgetUsed blocks until the pool has at least want bytes reserved.
+func waitForBudgetUsed(t *testing.T, budget *readAheadBudget, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if budget.used() >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("budget used %d never reached %d within %s", budget.used(), want, timeout)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitForBudgetZero blocks until every reservation has been returned. It is the
+// observable drain signal for an abandoned stream.
+func waitForBudgetZero(t *testing.T, budget *readAheadBudget, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if budget.used() == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("budget used %d never returned to 0 within %s (stranded reservation)", budget.used(), timeout)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestReadAheadBudgetReleasedWhenConsumerAbandons reproduces the prod leak: a
+// pump fills its buffered channel and parks on the next send, then the stream is
+// abandoned (client abort / first-byte timeout / HLS-branch return / upstream
+// error). Queued chunks hold their reservations, so an abandoned stream must be
+// cleared by the pump's own exit drain once its context is canceled; otherwise
+// the reservations strand. Neither scenario drains the channel itself — only the
+// pump can retire the leftovers — so both fail without the drain.
+func TestReadAheadBudgetReleasedWhenConsumerAbandons(t *testing.T) {
+	// Capacity exceeds the per-stream buffer, so the channel genuinely fills.
+	capacity := (remoteBodyBufferChunks + 4) * remoteBodyChunkSize
+
+	// Scenario A: a consumer receives the first chunk, then abandons. The
+	// consumer release is exercised by that one receive; the pump's drain must
+	// release every chunk still queued.
+	budget := newReadAheadBudget(capacity)
+	body := &progressReader{r: newPatternReader(int64(remoteBodyChunkSize) * (remoteBodyBufferChunks + 8))}
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks := pumpRemoteBody(ctx, body, budget)
+	waitForReaderBytes(t, body, int64(remoteBodyChunkSize)*(remoteBodyBufferChunks+1))
+	if _, err := nextRemoteBodyChunk(context.Background(), chunks, 5*time.Second); err != nil {
+		t.Fatalf("consumer receive: %v", err)
+	}
+	cancel()
+	waitForBudgetZero(t, budget, 5*time.Second)
+	t.Logf("scenario A after abandonment: capacity=%d used=%d peak=%d",
+		capacity, budget.used(), budget.peak())
+	acquireBudgetCapacity(t, budget, capacity)
+
+	// Scenario B: nobody receives at all. The pump's own exit drain must clear
+	// the pool after cancel; no consumer cooperation is involved.
+	budget = newReadAheadBudget(capacity)
+	body = &progressReader{r: newPatternReader(int64(remoteBodyChunkSize) * (remoteBodyBufferChunks + 8))}
+	ctx, cancel = context.WithCancel(context.Background())
+	chunks = pumpRemoteBody(ctx, body, budget)
+	waitForReaderBytes(t, body, int64(remoteBodyChunkSize)*(remoteBodyBufferChunks+1))
+	cancel()
+	waitForBudgetZero(t, budget, 5*time.Second)
+	if got := budget.used(); got != 0 {
+		t.Fatalf("budget used after nobody received = %d, want 0 (stranded reservation)", got)
+	}
+	t.Logf("scenario B after abandonment with no receiver: capacity=%d used=%d peak=%d",
+		capacity, budget.used(), budget.peak())
+	acquireBudgetCapacity(t, budget, capacity)
+}
+
+// acquireBudgetCapacity reserves the whole pool to prove it is free, then
+// returns it.
+func acquireBudgetCapacity(t *testing.T, budget *readAheadBudget, capacity int) {
+	t.Helper()
+	acquireCtx, acquireCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer acquireCancel()
+	if err := budget.acquire(acquireCtx, capacity); err != nil {
+		t.Fatalf("fresh acquire of full capacity after abandonment failed: %v", err)
+	}
+	budget.release(capacity)
+	if got := budget.used(); got != 0 {
+		t.Fatalf("budget used after releasing the fresh acquire = %d, want 0", got)
+	}
+}
+
+// TestReadAheadBudgetSurvivesRepeatedAbortedStreams runs many abandon-and-cancel
+// lifecycles against one shared pool. This is the prod failure inverted: dozens
+// of aborted starts used to strand their reservations until the 64 MiB pool was
+// exhausted and every acquire blocked forever. After every lifecycle the pool
+// must read zero used and still hand out its full capacity.
+func TestReadAheadBudgetSurvivesRepeatedAbortedStreams(t *testing.T) {
+	capacity := (remoteBodyBufferChunks + 4) * remoteBodyChunkSize
+	budget := newReadAheadBudget(capacity)
+	const lifecycles = 50
+
+	for i := 0; i < lifecycles; i++ {
+		body := &progressReader{r: newPatternReader(int64(remoteBodyChunkSize) * (remoteBodyBufferChunks + 8))}
+		ctx, cancel := context.WithCancel(context.Background())
+		pumpRemoteBody(ctx, body, budget)
+
+		waitForReaderBytes(t, body, int64(remoteBodyChunkSize)*(remoteBodyBufferChunks+1))
+		// Abandon without receiving: only the pump's drain can return the
+		// queued reservations, which is exactly the prod failure mode.
+		cancel()
+
+		waitForBudgetZero(t, budget, 5*time.Second)
+		if got := budget.used(); got != 0 {
+			t.Fatalf("lifecycle %d: budget used = %d, want 0 (stranded reservation)", i, got)
+		}
+		if got := budget.peak(); got > budget.capacity() {
+			t.Fatalf("lifecycle %d: peak %d exceeded capacity %d", i, got, budget.capacity())
+		}
+	}
+	t.Logf("after %d aborted streams: capacity=%d used=%d peak=%d", lifecycles, budget.capacity(), budget.used(), budget.peak())
+
+	acquireCtx, acquireCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer acquireCancel()
+	if err := budget.acquire(acquireCtx, capacity); err != nil {
+		t.Fatalf("pool exhausted after %d aborted streams: %v", lifecycles, err)
+	}
+	budget.release(capacity)
+	if got := budget.used(); got != 0 {
+		t.Fatalf("budget used after final release = %d, want 0", got)
+	}
+}
+
+// TestReadAheadBudgetBoundsQueuedReadAhead is the accounting assertion the
+// release-at-send design silently broke. A chunk queued in a stream's buffer
+// must hold its reservation, so the aggregate pool bounds the sum of every
+// stream's queued read-ahead rather than only each stream's momentarily
+// in-flight read. With no consumers and a small pool, the pumps must be stopped
+// from reading more than the pool holds: if a queued chunk dropped its
+// reservation, each stalled stream could fill its 16-chunk buffer with nothing
+// counted, and the total read would run to streams x buffer instead of the cap.
+func TestReadAheadBudgetBoundsQueuedReadAhead(t *testing.T) {
+	const streams = 4
+	capacity := 8 * remoteBodyChunkSize
+	budget := newReadAheadBudget(capacity)
+
+	bodies := make([]*progressReader, streams)
+	cancels := make([]context.CancelFunc, streams)
+	// Each source is far larger than the buffer so only the pool can stop the
+	// pumps, not end-of-stream.
+	for i := range bodies {
+		bodies[i] = &progressReader{r: newPatternReader(int64(remoteBodyChunkSize) * 4 * remoteBodyBufferChunks)}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancels[i] = cancel
+		// The channel is intentionally dropped: no consumer receives, so the
+		// pumps block on send once the pool is exhausted.
+		_ = pumpRemoteBody(ctx, bodies[i], budget)
+	}
+
+	// The pool must actually fill: with queued chunks holding reservations, a
+	// pool smaller than streams x buffer is exhausted. Under release-at-send
+	// only in-flight reads are counted (at most one chunk per stream), so used
+	// would top out at `streams` chunks and never reach the 8-chunk cap.
+	waitForBudgetUsed(t, budget, capacity, 5*time.Second)
+
+	var totalRead int64
+	for _, body := range bodies {
+		totalRead += body.read()
+	}
+	if used := budget.used(); used > capacity {
+		t.Fatalf("used %d exceeded capacity %d", used, capacity)
+	}
+	// The reservation for a read exists before the read runs, so total bytes
+	// read can never exceed what the pool ever held. Allow one in-flight chunk
+	// per stream of slack for reads that completed against a reservation about
+	// to be counted; the point is the order of magnitude: the broken design
+	// reaches streams x full buffer (~64 chunks) here, the pool holds 8.
+	upperBound := int64(capacity + streams*remoteBodyChunkSize)
+	if totalRead > upperBound {
+		t.Fatalf("aggregate read-ahead read %d bytes, want <= %d (capacity %d); the pool is not bounding queued read-ahead",
+			totalRead, upperBound, capacity)
+	}
+	t.Logf("bounds: streams=%d capacity=%d used=%d total_read=%d upper_bound=%d",
+		streams, capacity, budget.used(), totalRead, upperBound)
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	// Only the pump's exit drain retires the queued chunks now; no consumer
+	// receives, so this is the abandonment path clearing the pool.
+	waitForBudgetZero(t, budget, 5*time.Second)
+	if got := budget.used(); got != 0 {
+		t.Fatalf("budget used after cancel+drain = %d, want 0", got)
+	}
+}
+
 // TestRelayAggregateReadAheadBudgetUnderLoad drives many concurrent slow
 // consumers through the relay against a fast in-memory source. It validates the
 // aggregate cap: the read-ahead pool's peak never exceeds its capacity, which
@@ -315,7 +548,9 @@ func TestRelayAggregateReadAheadBudgetUnderLoad(t *testing.T) {
 		streams    = 64
 		testBudget = 2 << 20 // 2 MiB, 8 chunks: far below streams*perStreamReadAhead
 		// Twelve chunks per response: enough that every stream cycles the pool
-		// several times.
+		// several times. All pumps also reserve a chunk before their first read,
+		// so the aggregate demand exceeds the cap from the start and the pool is
+		// driven to its full capacity under contention.
 		sourceBytes = int64(remoteBodyChunkSize) * 12
 		delay       = 250 * time.Microsecond
 	)

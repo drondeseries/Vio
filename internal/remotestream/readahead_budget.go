@@ -22,13 +22,18 @@ import (
 const relayReadAheadBudgetBytes = 64 << 20
 
 // readAheadBudget is a byte-weighted semaphore shared by every stream on one
-// relay. A producer reserves a chunk's worth before it reads from the upstream,
-// and the consumer returns the bytes it actually received once the chunk is
-// handed off. When the pool is exhausted an acquire blocks, which stops the
-// upstream read and lets TCP backpressure reach the provider instead of
-// buffering more locally. Cancellation unblocks the waiter and returns its
-// reservation. It never drops bytes: a reserved chunk is either handed to the
-// consumer or released on abort.
+// relay. A producer reserves a chunk's worth before it reads from the upstream
+// and holds that reservation for as long as the chunk sits queued for the
+// consumer; the queue is the read-ahead, so a thousand stalled streams hold the
+// pool's worth of queued payload rather than a buffer's worth each. The
+// consumer returns the reservation when it dequeues the chunk, and the producer
+// returns it on abort if the chunk was never delivered. When the pool is
+// exhausted an acquire blocks, which stops the upstream read and lets TCP
+// backpressure reach the provider instead of buffering more locally.
+// Cancellation unblocks the waiter and returns its reservation. It never drops
+// bytes and never strands them: a reserved chunk is released exactly once, by
+// its single receiver (the consumer) or by the producer on abort or on the
+// exit drain for an abandoned stream.
 type readAheadBudget struct {
 	sem           *semaphore.Weighted
 	capacityBytes int
