@@ -4,7 +4,9 @@ import { Check, ChevronDown, Disc3, Layers3, RefreshCw } from "lucide-react";
 import type { FileVersion, PlaybackVariant } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { IndexerReleaseList } from "@/components/streaming/IndexerReleaseList";
 import { QualityRankingSummary } from "@/components/streaming/QualityRankingSummary";
+import { useIndexerReleaseRequests, useVirtualLibraryCapability } from "@/hooks/useIndexerReleases";
 import { useWatchDetail } from "@/hooks/queries/items";
 import { useVersionListRefresh } from "@/hooks/useVersionListRefresh";
 import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
@@ -93,7 +95,6 @@ function VersionDropdown({
   const activeVersions = selectedEdition?.versions ?? sorted;
   const activeVersion =
     selectedVersion ?? selectedEdition?.defaultVersion ?? activeVersions[0] ?? null;
-  const showVersionDropdown = activeVersions.length > 1;
 
   // The viewer's per-profile display order. It only re-orders the list below;
   // the server's auto-pick is untouched.
@@ -105,6 +106,15 @@ function VersionDropdown({
   const { data: watch } = useWatchDetail(contentId, undefined, undefined, {
     enabled: versionOpen && !!contentId,
   });
+  // Indexer releases are read from the same watch detail the picker already
+  // loads for the score/ranking. They are gated on the server's capability so a
+  // server that cannot request releases shows no indexer UI at all.
+  const { indexerRequest } = useVirtualLibraryCapability({ enabled: !!contentId });
+  const indexerRequests = useIndexerReleaseRequests(contentId);
+  const indexerReleases = indexerRequest ? (watch?.indexer_releases ?? []) : [];
+  // A title with nothing but indexer releases still gets the picker, so the
+  // viewer can request one even before any playable version exists.
+  const showVersionDropdown = activeVersions.length > 1 || indexerReleases.length > 0;
   const serverRanking = useMemo(
     () =>
       serverRankingFromVersions(
@@ -325,6 +335,14 @@ function VersionDropdown({
                 Show {hiddenUnavailableCount} unavailable{" "}
                 {hiddenUnavailableCount === 1 ? "version" : "versions"}
               </button>
+            )}
+            {/* Releases that exist on the indexers but are not downloaded on
+                the provider. Kept below the playable rows and visually
+                secondary (no play affordance). */}
+            {indexerReleases.length > 0 && (
+              <div className="border-border/60 mt-0.5 border-t pt-0.5">
+                <IndexerReleaseList releases={indexerReleases} requests={indexerRequests} />
+              </div>
             )}
             {onRefreshVersions ? (
               <button

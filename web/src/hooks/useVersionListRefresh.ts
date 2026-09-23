@@ -17,6 +17,11 @@ export interface VersionListRefreshState {
  * the item-page version picker and the in-player version menu so both behave
  * identically: one request at a time, the list is never cleared, and a failure
  * surfaces a concise inline message.
+ *
+ * `onRefresh` owns the whole refresh: it starts the asynchronous job, waits for
+ * it to finish, and applies the new list. The hook holds `refreshing` for the
+ * lifetime of that promise, so the control stays disabled until the job is
+ * done rather than only until the acceptance request returns.
  */
 export function useVersionListRefresh(onRefresh?: () => Promise<void>): VersionListRefreshState {
   const [refreshing, setRefreshing] = useState(false);

@@ -927,6 +927,36 @@ export interface FileVersion {
   marker_segments?: MarkerOccurrence[];
 }
 
+/**
+ * Whether an indexer release has been requested on the provider yet.
+ *
+ * `not_downloaded` means it exists on the indexers but not on the provider.
+ * `queued` means a request was accepted and the provider is fetching it.
+ * `failed` means the last request did not succeed and may be retried.
+ */
+export type IndexerReleaseDownloadState = "not_downloaded" | "queued" | "failed";
+
+/**
+ * One release that exists on the indexers but is not downloaded on the
+ * provider. Carried additively on the watch detail below the playable
+ * versions; absent or empty means there is nothing to request.
+ */
+export interface WatchIndexerRelease {
+  release_id: string;
+  title: string;
+  resolution?: string;
+  codec_video?: string;
+  codec_audio?: string;
+  hdr?: boolean;
+  size_bytes?: number;
+  indexer?: string;
+  /** RFC 3339 instant the indexer published the release. */
+  published_at?: string;
+  format_score?: number;
+  protocol?: string;
+  download_state: IndexerReleaseDownloadState;
+}
+
 // Batched liveness check for virtual versions (POST /catalog/versions/check).
 export interface VersionLivenessResult {
   file_id: number;
@@ -1240,6 +1270,8 @@ export interface WatchDetail {
   playback_variants?: PlaybackVariant[];
   /** The ranking that produced the virtual versions' order; absent for local content. */
   virtual_ranking?: VirtualRanking;
+  /** Indexer releases not yet downloaded on the provider; absent or empty, never null. */
+  indexer_releases?: WatchIndexerRelease[];
   subtitles: SubtitleInfo[];
   intro: TimeRange | null;
   credits: TimeRange | null;

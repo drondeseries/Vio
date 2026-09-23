@@ -416,6 +416,9 @@ export function buildWatchPageProps({
     libraryId: request.libraryId,
     versions: item.versions,
     playbackVariants: item.playback_variants ?? [],
+    // Omitted (rather than a fresh `[]`) when the detail carries none: a new
+    // array identity on every render would loop the player's sync effect.
+    ...(item.indexer_releases?.length ? { indexerReleases: item.indexer_releases } : {}),
     virtualRanking: item.virtual_ranking,
     subtitles,
     initialPosition,
