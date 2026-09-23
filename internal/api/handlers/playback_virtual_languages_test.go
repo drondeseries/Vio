@@ -171,13 +171,17 @@ func TestMergeVirtualCandidateTracksDoesNotInferDVFromGenericHDR(t *testing.T) {
 }
 
 func TestMergeVirtualCandidateTracksRepairsStaleSDRRange(t *testing.T) {
+	// A stale SDR range string on a row whose probe never described a range
+	// is repairable: the candidate's HDR label fills the missing range. This
+	// is the fill path, not an overwrite — see
+	// TestMergeVirtualCandidateTracksKeepsObservedSDRRange for the observed
+	// case, which must stay SDR.
 	probed := &models.MediaFile{
 		HDR:        true,
 		Resolution: "2160p",
 		CodecVideo: "hevc",
 		VideoTracks: []models.VideoTrack{{
-			VideoRange:     "SDR",
-			VideoRangeType: "SDR",
+			VideoRange: "SDR",
 		}},
 	}
 
@@ -188,6 +192,291 @@ func TestMergeVirtualCandidateTracksRepairsStaleSDRRange(t *testing.T) {
 	}
 	if got := probed.VideoTracks[0].VideoRangeType; got != "HDR10" {
 		t.Fatalf("video range type = %q, want HDR10", got)
+	}
+}
+
+// TestMergeVirtualCandidateTracksKeepsObservedSDRRange is the #97 regression:
+// a probed SDR/8-bit track keeps its range, depth, profile, and DV fields
+// even when the release text advertises HDR and Dolby Vision. Declarations
+// may add what the probe missed, never replace what it found — otherwise the
+// persisted misinformation drives wrong direct-play, DV, and tone-map routes.
+func TestMergeVirtualCandidateTracksKeepsObservedSDRRange(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "h264",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "h264", Profile: "High", Level: 41,
+			Width: 1920, Height: 1080, BitDepth: 8,
+			VideoRange: "SDR", VideoRangeType: "SDR",
+		}},
+		AudioTracks: []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "hevc", CodecAudio: "eac3",
+		HDR: "Dolby Vision Profile 8",
+	})
+
+	vt := probed.VideoTracks[0]
+	if vt.VideoRange != "SDR" || vt.VideoRangeType != "SDR" {
+		t.Fatalf("observed range overwritten: %#v", vt)
+	}
+	if vt.Codec != "h264" || vt.Profile != "High" || vt.BitDepth != 8 {
+		t.Fatalf("observed track fields overwritten: %#v", vt)
+	}
+	if vt.DVProfile != 0 || vt.DolbyVision != "" || vt.DVConfigPresent {
+		t.Fatalf("DV fields synthesized onto an observed SDR track: %#v", vt)
+	}
+	if got := probed.AudioTracks[0].Codec; got != "aac" {
+		t.Fatalf("observed audio codec overwritten: got %q, want aac", got)
+	}
+}
+
+// TestMergeVirtualCandidateTracksKeepsLaterObservedSDRRange is the per-track
+// half: protection is evaluated per track, never from the first track. Track
+// 0 is empty (no range, no depth — repaintable), track 1 is a corroborated
+// SDR/8-bit track. A DV declaration repaints track 0 but must not touch
+// track 1's range, depth, or DV fields.
+func TestMergeVirtualCandidateTracksKeepsLaterObservedSDRRange(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "h264",
+		VideoTracks: []models.VideoTrack{
+			{},
+			{
+				Codec: "h264", Profile: "High", Level: 41,
+				Width: 1920, Height: 1080, BitDepth: 8,
+				VideoRange: "SDR", VideoRangeType: "SDR",
+			},
+		},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "h264",
+		HDR: "Dolby Vision Profile 8",
+	})
+
+	vt := probed.VideoTracks[1]
+	if vt.VideoRange != "SDR" || vt.VideoRangeType != "SDR" {
+		t.Fatalf("later observed range repainted: %#v", vt)
+	}
+	if vt.BitDepth != 8 || vt.DVProfile != 0 || vt.DolbyVision != "" {
+		t.Fatalf("later observed fields overwritten: %#v", vt)
+	}
+}
+
+// TestMergeVirtualCandidateTracksKeepsDepthOnlyObservedRange is the depth
+// half: an empty range string with an observed 8-bit depth is observed
+// evidence. A DV declaration must not flip its depth to 10-bit or paint DV
+// fields onto it.
+func TestMergeVirtualCandidateTracksKeepsDepthOnlyObservedRange(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "h264",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "h264", Width: 1920, Height: 1080, BitDepth: 8,
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "h264",
+		HDR: "Dolby Vision Profile 8",
+	})
+
+	vt := probed.VideoTracks[0]
+	if vt.BitDepth != 8 {
+		t.Fatalf("observed depth overwritten: %#v", vt)
+	}
+	if vt.DVProfile != 0 || vt.DolbyVision != "" || vt.DVConfigPresent {
+		t.Fatalf("DV fields synthesized onto a depth-observed track: %#v", vt)
+	}
+}
+
+// TestMergeVirtualCandidateTracksKeepsObservedRangeType is the range-type
+// half: an empty range string with an observed HLG range type is observed
+// subtype evidence. A DV declaration must not overwrite the type with DOVI.
+func TestMergeVirtualCandidateTracksKeepsObservedRangeType(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "h264",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "h264", Width: 1920, Height: 1080,
+			VideoRangeType: "HLG",
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "h264",
+		HDR: "Dolby Vision Profile 8",
+	})
+
+	vt := probed.VideoTracks[0]
+	if vt.VideoRangeType != "HLG" {
+		t.Fatalf("observed range type overwritten: %#v", vt)
+	}
+	if vt.VideoRange == "DolbyVision" || vt.DVProfile != 0 {
+		t.Fatalf("DV painted over observed HLG subtype: %#v", vt)
+	}
+}
+
+// TestMergeVirtualCandidateTracksAllObservedKeepsHDRFlagFalse pins the
+// flag-tracks invariant the other #97 tests imply: when every probed track
+// keeps its observed SDR range, the top-level HDR flag stays false with the
+// tracks — no contradictory flag-HDR/tracks-SDR metadata.
+func TestMergeVirtualCandidateTracksAllObservedKeepsHDRFlagFalse(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "h264",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "h264", Profile: "High", Level: 41,
+			Width: 1920, Height: 1080, BitDepth: 8,
+			VideoRange: "SDR", VideoRangeType: "SDR",
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "1080p", CodecVideo: "hevc",
+		HDR: "Dolby Vision Profile 8",
+	})
+
+	if probed.HDR {
+		t.Fatalf("top-level HDR flag flipped while every track kept SDR: flag=%v tracks=%#v", probed.HDR, probed.VideoTracks)
+	}
+}
+
+// TestMergeVirtualCandidateTracksBareSDRGainsHDRCoherently is the enrichment
+// half the preservation tests mirror: a bare SDR track (no depth, no type,
+// no DV) repainted by an HDR declaration gains the full coherent set —
+// range, type, 10-bit depth, and HDR profile — never a partial mix (e.g. DV
+// fields with an SDR range, or an HDR range with 8-bit depth).
+func TestMergeVirtualCandidateTracksBareSDRGainsHDRCoherently(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "2160p",
+		CodecVideo: "hevc",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc",
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "2160p", CodecVideo: "hevc", HDR: "true",
+	})
+
+	vt := probed.VideoTracks[0]
+	if vt.VideoRange != "HDR" || vt.VideoRangeType != "HDR10" {
+		t.Fatalf("bare track not repainted: %#v", vt)
+	}
+	if vt.BitDepth != 10 {
+		t.Fatalf("repainted HDR track depth = %d, want 10", vt.BitDepth)
+	}
+	if vt.DVProfile != 0 || vt.DolbyVision != "" {
+		t.Fatalf("generic HDR invented DV fields: %#v", vt)
+	}
+}
+
+// TestMergeVirtualCandidateTracksBareEmptyGainsDVCoherently is the DV twin:
+// a fully empty track repainted by a DV declaration gains range, type, depth,
+// and DV fields as one coherent set.
+func TestMergeVirtualCandidateTracksBareEmptyGainsDVCoherently(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "2160p",
+		CodecVideo: "hevc",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc",
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "2160p", CodecVideo: "hevc", HDR: "Dolby Vision Profile 8",
+	})
+
+	vt := probed.VideoTracks[0]
+	if vt.VideoRange != "DolbyVision" || vt.VideoRangeType != "DOVI" {
+		t.Fatalf("bare track not repainted to DV: %#v", vt)
+	}
+	if vt.BitDepth != 10 || vt.DVProfile != 8 || vt.DolbyVision == "" {
+		t.Fatalf("DV repaint incoherent: %#v", vt)
+	}
+	if !probed.HDR {
+		t.Fatal("top-level HDR flag not set for a repainted DV track")
+	}
+}
+
+// TestMergeVirtualCandidateTracksLowercaseSDRRepaintsCoherently pins the
+// guard normalization: a bare lowercase "sdr" range repaints under a DV
+// declaration exactly like "SDR" — fields and range move together, never a
+// partial mix.
+func TestMergeVirtualCandidateTracksLowercaseSDRRepaintsCoherently(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "2160p",
+		CodecVideo: "hevc",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", VideoRange: "sdr",
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "2160p", CodecVideo: "hevc", HDR: "Dolby Vision Profile 8",
+	})
+
+	vt := probed.VideoTracks[0]
+	if vt.VideoRange != "DolbyVision" || vt.VideoRangeType != "DOVI" {
+		t.Fatalf("lowercase sdr not repainted: %#v", vt)
+	}
+	if vt.DVProfile != 8 || vt.DolbyVision == "" || vt.BitDepth != 10 {
+		t.Fatalf("DV repaint incoherent: %#v", vt)
+	}
+}
+
+// TestMergeVirtualCandidateTracksWhitespaceRangeRepaintsCoherently pins the
+// empty-range normalization: a whitespace-only range string repaints under a
+// DV declaration exactly like "" — fields and range move together, never DV
+// fields with a blank range.
+func TestMergeVirtualCandidateTracksWhitespaceRangeRepaintsCoherently(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "2160p",
+		CodecVideo: "hevc",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", VideoRange: "   ",
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{
+		Resolution: "2160p", CodecVideo: "hevc", HDR: "Dolby Vision Profile 8",
+	})
+
+	vt := probed.VideoTracks[0]
+	if vt.VideoRange != "DolbyVision" || vt.VideoRangeType != "DOVI" {
+		t.Fatalf("whitespace range not repainted: %#v", vt)
+	}
+	if vt.DVProfile != 8 || vt.DolbyVision == "" || vt.BitDepth != 10 {
+		t.Fatalf("DV repaint incoherent: %#v", vt)
+	}
+}
+
+// the profile-default half: a probed track with no range string gets its
+// profile/level/depth from the codec default (hevc → main 10/10-bit), and the
+// empty range string is repaintable — but with no candidate HDR/DV label to
+// repaint from, no HDR10/DV strings are invented. The profile default is a
+// gap-fill, not an overwrite: it fires only for empty fields.
+func TestMergeVirtualCandidateTracksKeepsObservedHDRFlagWithoutRangeStrings(t *testing.T) {
+	probed := &models.MediaFile{
+		HDR:        true,
+		Resolution: "2160p",
+		CodecVideo: "hevc",
+		VideoTracks: []models.VideoTrack{{
+			Codec: "hevc", Width: 3840, Height: 2160,
+		}},
+	}
+
+	mergeVirtualCandidateTracks(probed, VirtualPlaybackStream{Resolution: "2160p", CodecVideo: "hevc"})
+
+	vt := probed.VideoTracks[0]
+	if !probed.HDR {
+		t.Fatal("observed HDR flag cleared")
+	}
+	if vt.VideoRange == "DolbyVision" || vt.DVProfile != 0 || vt.DolbyVision != "" {
+		t.Fatalf("DV strings invented from nothing: %#v", vt)
 	}
 }
 

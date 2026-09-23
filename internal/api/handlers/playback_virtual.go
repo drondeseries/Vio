@@ -4635,6 +4635,13 @@ func applyRemuxDBEvidence(file *models.MediaFile, matched map[string]remuxdb.Evi
 // language tags, codecs, or dimensions on remote streams (especially HLS
 // and DASH), so candidate metadata fills the gaps so virtual files appear
 // as close to local files as possible.
+//
+// Observed evidence is never overwritten: every fill below fires only when
+// the probed field is empty/zero. A probed SDR/8-bit video track keeps its
+// range, depth, profile, and DV fields even when the release text advertises
+// HDR or Dolby Vision; a probed codec, language set, or container keeps its
+// values even when the candidate declares different ones. Declarations may
+// add what the probe missed, never replace what it found.
 func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlaybackStream) {
 	if probed == nil {
 		return
@@ -4656,9 +4663,6 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	// and the final CodecVideo/CodecAudio assignment happens there exactly
 	// once so merge stays idempotent.
 	hasResolution := probed.Resolution != ""
-	if !probed.HDR && candidate.HDR != "" {
-		probed.HDR = true
-	}
 	if probed.Container == "" || strings.EqualFold(probed.Container, "virtual") {
 		if candidate.Container != "" && !strings.EqualFold(candidate.Container, "virtual") {
 			probed.Container = candidate.Container
@@ -4725,6 +4729,15 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	}
 	isDV, dvProfile := virtualDVMetadata(candidate.HDR)
 	isHDR := probed.HDR || candidate.HDR != ""
+	// The top-level HDR flag is observed evidence, not a declaration pad: it
+	// flips from the candidate's label only when the declaration describes
+	// tracks the merge will actually repaint. Flipping it while every probed
+	// track keeps SDR would leave contradictory metadata (flag HDR, tracks
+	// SDR) for the planner to trip over.
+	if !probed.HDR && virtualCandidateDeclaresHDRForObservedTracks(probed, isHDR, isDV) {
+		probed.HDR = true
+		isHDR = true
+	}
 	defaultProfile, defaultLevel, defaultBitDepth := defaultVirtualVideoProfileAndLevel(videoCodec, isHDR, isDV, probed.Resolution)
 	if len(probed.VideoTracks) == 0 && probed.Resolution != "" {
 		videoRange := "SDR"
@@ -4765,6 +4778,36 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		if probed.VideoTracks[i].Codec == "" {
 			probed.VideoTracks[i].Codec = videoCodec
 		}
+		// Eligibility is frozen from the probe's original track, before this
+		// pass fills anything: declaration-derived fills below (depth,
+		// DVProfile, range strings) must not flip the verdict mid-track, or
+		// a bare SDR track acquires DV fields while keeping SDR (and vice
+		// versa, an empty-range track gains depth and then keeps the depth
+		// from blocking its own range assignment).
+		repaintable := virtualTrackRangeRepaintable(probed.VideoTracks[i])
+		if !repaintable {
+			// The probe corroborated this track's range (per-track
+			// evaluation — never the first track's): keep it. The candidate
+			// may still fill dimensional gaps (width/height/frame-rate) via
+			// the `<= 0`/`== ""` guards below, which never overwrite — but no
+			// profile, level, bit depth, DV field, or range string is
+			// recomputed from the candidate's HDR/DV labels. A bare range
+			// string with no supporting evidence stays repaintable (the
+			// stale-SDR repair below), so only corroborated ranges take this
+			// branch. Flipping a probed range here is what persisted
+			// misinformation that drove wrong direct-play, DV, and tone-map
+			// routes.
+			if probed.VideoTracks[i].Width <= 0 {
+				probed.VideoTracks[i].Width = resolutionWidth(probed.Resolution)
+			}
+			if probed.VideoTracks[i].Height <= 0 {
+				probed.VideoTracks[i].Height = resolutionHeight(probed.Resolution)
+			}
+			if probed.VideoTracks[i].FrameRate == "" {
+				probed.VideoTracks[i].FrameRate = defaultVirtualFrameRate(candidate.FrameRate)
+			}
+			continue
+		}
 		trackProf, trackLvl, trackDepth := defaultVirtualVideoProfileAndLevel(probed.VideoTracks[i].Codec, isHDR, isDV, probed.Resolution)
 		if probed.VideoTracks[i].Profile == "" {
 			probed.VideoTracks[i].Profile = trackProf
@@ -4801,7 +4844,9 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 			if probed.VideoTracks[i].DolbyVision == "" {
 				probed.VideoTracks[i].DolbyVision = virtualDVLabel(true, profile)
 			}
-			if probed.VideoTracks[i].VideoRange == "" || probed.VideoTracks[i].VideoRange == "SDR" {
+			if repaintable &&
+				(strings.TrimSpace(probed.VideoTracks[i].VideoRange) == "" ||
+					strings.EqualFold(strings.TrimSpace(probed.VideoTracks[i].VideoRange), "sdr")) {
 				probed.VideoTracks[i].VideoRange = "DolbyVision"
 				probed.VideoTracks[i].VideoRangeType = "DOVI"
 			}
@@ -4811,15 +4856,27 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 				probed.VideoTracks[i].DVBLCompatID = 1
 				probed.VideoTracks[i].DVBLPresent = true
 			}
-		} else if isHDR && (probed.VideoTracks[i].VideoRange == "" ||
-			strings.EqualFold(probed.VideoTracks[i].VideoRange, "sdr") ||
-			strings.EqualFold(probed.VideoTracks[i].VideoRangeType, "sdr")) {
+		} else if isHDR && repaintable &&
+			(strings.TrimSpace(probed.VideoTracks[i].VideoRange) == "" ||
+				strings.EqualFold(strings.TrimSpace(probed.VideoTracks[i].VideoRange), "sdr")) {
+			probed.VideoTracks[i].VideoRange = "HDR"
+			probed.VideoTracks[i].VideoRangeType = "HDR10"
+		} else if isHDR && repaintable && probed.VideoTracks[i].VideoRange == "SDR" && probed.VideoTracks[i].VideoRangeType == "" {
+			// A stale SDR range string the probe left without a type (the
+			// pre-type era wrote range-only rows): repaint it. A corroborated
+			// range never reaches here because repaintable was frozen false
+			// above. (Subsumed by the sdr branch when the type mirror has
+			// already copied range→type; kept explicit for the exact stale
+			// shape.)
 			probed.VideoTracks[i].VideoRange = "HDR"
 			probed.VideoTracks[i].VideoRangeType = "HDR10"
 		}
 		if probed.VideoTracks[i].VideoRange == "" && !probed.HDR {
 			probed.VideoTracks[i].VideoRange = "SDR"
 			probed.VideoTracks[i].VideoRangeType = "SDR"
+		}
+		if probed.VideoTracks[i].VideoRangeType == "" && probed.VideoTracks[i].VideoRange != "" {
+			probed.VideoTracks[i].VideoRangeType = probed.VideoTracks[i].VideoRange
 		}
 	}
 
@@ -4861,6 +4918,57 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 			probed.AudioTracks[0].Default = true
 		}
 	}
+}
+
+// virtualCandidateDeclaresHDRForObservedTracks reports whether the
+// candidate's HDR/DV labels describe tracks the merge will actually repaint.
+// The top-level HDR flag follows the tracks: when every probed track keeps
+// its observed SDR range (none repaintable), the flag must not flip from the
+// declaration alone, or the file carries contradictory metadata (flag HDR,
+// tracks SDR). With no probed tracks (synthesis path) or at least one
+// repaintable track, the declaration applies as before. Callers compute
+// isHDR/isDV first and pass them in so the flag decision sees the same
+// declaration parse the repaint path uses.
+func virtualCandidateDeclaresHDRForObservedTracks(probed *models.MediaFile, isHDR, isDV bool) bool {
+	if !isHDR && !isDV {
+		return false
+	}
+	if len(probed.VideoTracks) == 0 {
+		return true
+	}
+	for _, track := range probed.VideoTracks {
+		if virtualTrackRangeRepaintable(track) {
+			return true
+		}
+	}
+	return false
+}
+
+// virtualTrackRangeRepaintable reports whether a probed track's range may be
+// repainted from the candidate's HDR/DV labels. Only a range the probe never
+// corroborated is repaintable: an empty range pair, or a bare "SDR" range
+// with no other observed range evidence on that same track (no depth, no
+// HDR-range profile, no DV fields, no HDR10Plus, no non-SDR range type). A
+// stale SDR string left by an older probe with no supporting evidence is
+// repairable; an SDR string the probe corroborated (8-bit depth alone counts
+// — depth is observed evidence even with an empty range string) is observed
+// and kept, as is any track carrying a non-SDR range type (HLG, DOVI,
+// HDR10): the type is observed subtype evidence even when the range string
+// itself is empty. Evaluation is per track: one track's corroboration never
+// protects (or exposes) another.
+func virtualTrackRangeRepaintable(track models.VideoTrack) bool {
+	if track.BitDepth != 0 || track.DVProfile != 0 || track.DolbyVision != "" ||
+		track.DVConfigPresent || track.DVBLPresent || track.HDR10Plus {
+		return false
+	}
+	if rangeType := strings.TrimSpace(track.VideoRangeType); rangeType != "" &&
+		!strings.EqualFold(rangeType, "sdr") {
+		return false
+	}
+	if strings.TrimSpace(track.VideoRange) == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(track.VideoRange), "sdr")
 }
 
 func defaultVirtualVideoProfileAndLevel(codec string, isHDR, isDV bool, res string) (string, int, int) {
