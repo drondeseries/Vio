@@ -192,7 +192,6 @@ func TestRefreshStoredResolutionKeepsSameCandidateTracks(t *testing.T) {
 		URI:         candidatePath,
 		CandidateID: "cand-a",
 	}, metaSaver, nil)
-
 	if len(saved) != 1 {
 		t.Fatalf("refresh writes = %d, want exactly 1", len(saved))
 	}

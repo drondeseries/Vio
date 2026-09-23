@@ -383,27 +383,64 @@ func (h *StreamHandler) lookupStoredVirtualURLCandidate(
 // track inventory. The write is fenced on the row snapshot (CAS), so a row
 // that rotated underneath is left untouched.
 //
+// refreshStoredVirtualResolutionResult reports what a stored-URL persistence
+// attempt did. Callers that count "refreshed rows" must only count Persisted;
+// a skipped resolution (sibling, empty URL, unwired saver) is neither a
+// success nor a failure and must not trip the failure cooldown.
+type refreshStoredVirtualResolutionResult int
+
+const (
+	// refreshStoredVirtualResolutionSkipped means no write was attempted: the
+	// resolution did not belong to this row (sibling, empty URL) or no saver
+	// is wired. The row is left untouched and the pass moves on.
+	refreshStoredVirtualResolutionSkipped refreshStoredVirtualResolutionResult = iota
+	// refreshStoredVirtualResolutionPersisted means the CAS-fenced write ran.
+	// consult the returned update result for whether the row actually moved:
+	// RowsAffected 0 means a concurrent write won the race, not a failure.
+	refreshStoredVirtualResolutionPersisted
+)
+
 // Only the requested candidate's row is refreshed. A substituted resolution
 // names a different release and must not deposit its URL on this row.
+//
+// refreshStoredVirtualResolution keeps the legacy fire-and-forget contract for
+// the serve paths (transport, stream): the URL is already in hand there, so
+// persistence is best-effort cache hygiene and its outcome must not fail the
+// request. The background refresher uses refreshStoredVirtualResolutionWithError
+// so its success accounting and failure cooldown reflect real outcomes.
 func refreshStoredVirtualResolution(
 	ctx context.Context,
 	row *models.MediaFile,
 	resolved ResolvedVirtualMedia,
 	metaSaver VirtualFileMetadataSaver,
 	saver VirtualFileSaver,
-) {
+) (refreshStoredVirtualResolutionResult, VirtualFileMetadataUpdateResult) {
+	outcome, result, _ := refreshStoredVirtualResolutionWithError(ctx, row, resolved, metaSaver, saver)
+	return outcome, result
+}
+
+// refreshStoredVirtualResolutionWithError is the accounting variant: same skip
+// rules, but a persistence failure is returned so the caller can count no
+// success and cool the row down.
+func refreshStoredVirtualResolutionWithError(
+	ctx context.Context,
+	row *models.MediaFile,
+	resolved ResolvedVirtualMedia,
+	metaSaver VirtualFileMetadataSaver,
+	saver VirtualFileSaver,
+) (refreshStoredVirtualResolutionResult, VirtualFileMetadataUpdateResult, error) {
 	if row == nil || row.ID <= 0 {
-		return
+		return refreshStoredVirtualResolutionSkipped, VirtualFileMetadataUpdateResult{}, nil
 	}
 	if metaSaver == nil && saver == nil {
-		return
+		return refreshStoredVirtualResolutionSkipped, VirtualFileMetadataUpdateResult{}, nil
 	}
 	if strings.TrimSpace(resolved.URL) == "" {
-		return
+		return refreshStoredVirtualResolutionSkipped, VirtualFileMetadataUpdateResult{}, nil
 	}
 	candidateID := virtualResultCandidateID(row.FilePath)
 	if candidateID == "" {
-		return
+		return refreshStoredVirtualResolutionSkipped, VirtualFileMetadataUpdateResult{}, nil
 	}
 	resolvedID := resolved.CandidateID
 	if resolvedID == "" {
@@ -411,7 +448,7 @@ func refreshStoredVirtualResolution(
 	}
 	if resolvedID != candidateID {
 		// The resolver served a sibling. Its URL does not belong to this row.
-		return
+		return refreshStoredVirtualResolutionSkipped, VirtualFileMetadataUpdateResult{}, nil
 	}
 	var expiresAt *time.Time
 	if !resolved.ExpiresAt.IsZero() {
@@ -448,8 +485,15 @@ func refreshStoredVirtualResolution(
 	refreshCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if metaSaver != nil {
-		_, _ = metaSaver(refreshCtx, args)
-		return
+		result, err := metaSaver(refreshCtx, args)
+		if err != nil {
+			return refreshStoredVirtualResolutionPersisted, VirtualFileMetadataUpdateResult{}, err
+		}
+		return refreshStoredVirtualResolutionPersisted, result, nil
 	}
-	_, _ = saver(refreshCtx, args)
+	rows, err := saver(refreshCtx, args)
+	if err != nil {
+		return refreshStoredVirtualResolutionPersisted, VirtualFileMetadataUpdateResult{}, err
+	}
+	return refreshStoredVirtualResolutionPersisted, VirtualFileMetadataUpdateResult{RowsAffected: rows, MetadataUpdated: rows > 0}, nil
 }

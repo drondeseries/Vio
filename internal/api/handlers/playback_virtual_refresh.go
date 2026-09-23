@@ -204,6 +204,13 @@ func (r *VirtualCandidateRefresher) RunOnce(ctx context.Context) int {
 		r.logger().WarnContext(ctx, "virtual candidate refresh: list failed", "component", "api", "error", err)
 		return 0
 	}
+	// The batch cap is enforced in SQL (the List limit arg) and re-enforced
+	// here for List implementations that ignore it. Cooldown filtering happens
+	// after this cap — see the loop below — so a batch saturated with
+	// cooling-down rows skips them cheaply instead of starving fresher rows.
+	// (Supplying extra headroom beyond the cap so the pass can skip past
+	// cooled-down rows lives in the List query; the in-memory cap stays as the
+	// backstop for sources that return more than asked.)
 	if len(rows) > r.refreshBatch() {
 		rows = rows[:r.refreshBatch()]
 	}
@@ -253,8 +260,11 @@ func (r *VirtualCandidateRefresher) spacingFor() time.Duration {
 // refreshOne resolves the row's exact candidate and records the fresh URL and
 // expiry through the existing CAS-fenced Phase-1 write. It never adopts a
 // sibling or a renumbered identity: the refresher only refreshes what the row
-// already names. It reports whether a write happened, so the pass count reflects
-// actual refreshes and a handled-but-skipped row is not retried in a tight loop.
+// already names. Only a write the CAS fence accepted counts as refreshed.
+// Anything else is neither: a skipped row (empty URL, rematch, sibling,
+// unwired saver) and a lost CAS race (RowsAffected 0 — a concurrent write won)
+// return (false, nil) with no cooldown. Only a resolver error or a persistence
+// error trips the failure cooldown.
 func (r *VirtualCandidateRefresher) refreshOne(ctx context.Context, row *models.MediaFile, window time.Duration) (bool, error) {
 	candidateID := virtualResultCandidateID(row.FilePath)
 	if candidateID == "" {
@@ -273,7 +283,9 @@ func (r *VirtualCandidateRefresher) refreshOne(ctx context.Context, row *models.
 		return false, err
 	}
 	if strings.TrimSpace(res.URL) == "" {
-		return false, fmt.Errorf("resolver returned an empty URL")
+		// No URL to persist: a provider hiccup the next pass retries, not a
+		// row failure. Skip without tripping the cooldown.
+		return false, nil
 	}
 	if res.IdentityRematched {
 		// The provider renumbered the same release. Adopting the new path is
@@ -281,7 +293,23 @@ func (r *VirtualCandidateRefresher) refreshOne(ctx context.Context, row *models.
 		// exact candidate id, so leave the row untouched.
 		return false, nil
 	}
-	refreshStoredVirtualResolution(ctx, row, res, r.MetadataSaver, r.Saver)
+	outcome, update, persistErr := refreshStoredVirtualResolutionWithError(ctx, row, res, r.MetadataSaver, r.Saver)
+	if outcome == refreshStoredVirtualResolutionSkipped {
+		// The resolution did not belong to this row (or no saver is wired):
+		// nothing was attempted, so it is neither a refresh nor a failure.
+		return false, nil
+	}
+	if persistErr != nil {
+		// The write was attempted but failed: surface it so the pass counts
+		// no success and the row trips the failure cooldown.
+		return false, fmt.Errorf("persist refreshed virtual candidate: %w", persistErr)
+	}
+	if update.RowsAffected == 0 {
+		// The CAS fence matched no row: a concurrent write (serve-path
+		// refresh, rematch adoption, re-list) won the race and the bytes are
+		// already fresh. Nothing to count and nothing to cool down.
+		return false, nil
+	}
 	r.logger().InfoContext(ctx, "virtual candidate URL refreshed",
 		"component", "api", "file_id", row.ID, "candidate_uri", row.FilePath,
 		"candidate_id", candidateID, "status", "refreshed")

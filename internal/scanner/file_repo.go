@@ -1650,6 +1650,14 @@ func virtualCandidateGroup(raw string) (string, bool) {
 //     window is disabled.
 //
 // limit caps one pass; the caller also bounds its own batch.
+//
+// Cooldown ordering note: the refresher holds its per-row failure cooldown in
+// memory (it is deliberately not durable — a restart clears it and the next
+// pass retries), so this query cannot exclude cooling-down rows itself. The
+// caller filters them after the cap. When every row in the batch is cooling
+// down the pass cheaply skips them; rows beyond the cap wait for the next
+// pass. The per-row cooldown (an hour) is shorter than the pass's lead window
+// (two hours), so a skipped row becomes eligible again before its URL lapses.
 func (r *FileRepository) ListVirtualCandidatesNeedingRefresh(ctx context.Context, window, lead time.Duration, limit int) ([]*models.MediaFile, error) {
 	if r == nil || r.pool == nil {
 		return nil, errors.New("file repository is not configured")

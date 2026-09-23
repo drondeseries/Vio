@@ -81,7 +81,7 @@ func TestVirtualCandidateRefresherRefreshesExpiringRowsViaCAS(t *testing.T) {
 		Resolver: resolver,
 		MetadataSaver: func(_ context.Context, args models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
 			saved = append(saved, args)
-			return VirtualFileMetadataUpdateResult{}, nil
+			return VirtualFileMetadataUpdateResult{RowsAffected: 1, MetadataUpdated: true}, nil
 		},
 		Window: func() time.Duration { return 720 * time.Hour },
 	}
@@ -138,7 +138,7 @@ func TestVirtualCandidateRefresherFailureIsRateLimited(t *testing.T) {
 		Resolver: resolver,
 		MetadataSaver: func(_ context.Context, _ models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
 			writes++
-			return VirtualFileMetadataUpdateResult{}, nil
+			return VirtualFileMetadataUpdateResult{RowsAffected: 1, MetadataUpdated: true}, nil
 		},
 		Window: func() time.Duration { return 720 * time.Hour },
 	}
@@ -178,7 +178,7 @@ func TestVirtualCandidateRefresherBatchCap(t *testing.T) {
 			return ResolvedVirtualMedia{URL: "https://93.184.216.34/stream/token=new", URI: path, CandidateID: id}, nil
 		}),
 		MetadataSaver: func(_ context.Context, _ models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
-			return VirtualFileMetadataUpdateResult{}, nil
+			return VirtualFileMetadataUpdateResult{RowsAffected: 1, MetadataUpdated: true}, nil
 		},
 		Window: func() time.Duration { return 720 * time.Hour },
 		batch:  2,
@@ -218,5 +218,123 @@ func TestVirtualCandidateRefresherSkipsRenumberedCandidate(t *testing.T) {
 	}
 	if writes != 0 {
 		t.Fatalf("CAS writes = %d, want 0 for a renumbered candidate", writes)
+	}
+}
+
+// TestVirtualCandidateRefresherSaverErrorCoolsDown proves a persistence failure
+// is reported as a refresh error (not a silent success): the row trips the
+// failure cooldown and the pass count stays 0.
+func TestVirtualCandidateRefresherSaverErrorCoolsDown(t *testing.T) {
+	rows := []*models.MediaFile{refreshRow(941, "cand-a")}
+	saverErr := errors.New("cassandra is having a day")
+	r := &VirtualCandidateRefresher{
+		List: func(context.Context, time.Duration, time.Duration, int) ([]*models.MediaFile, error) {
+			return rows, nil
+		},
+		Resolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, path string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			id := virtualResultCandidateID(path)
+			return ResolvedVirtualMedia{
+				URL: "https://93.184.216.34/stream/token=new-" + id, URI: path, CandidateID: id,
+				ExpiresAt: time.Now().Add(6 * time.Hour),
+			}, nil
+		}),
+		MetadataSaver: func(_ context.Context, _ models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			return VirtualFileMetadataUpdateResult{}, saverErr
+		},
+		Window: func() time.Duration { return 720 * time.Hour },
+	}
+
+	if got := r.RunOnce(context.Background()); got != 0 {
+		t.Fatalf("refreshed = %d, want 0 when persistence fails", got)
+	}
+	if !r.rateLimited(941, time.Now()) {
+		t.Fatal("failed row is not cooling down after a saver error")
+	}
+}
+
+// TestVirtualCandidateRefresherSiblingSkipIsNotAFailure proves a resolution
+// that does not belong to the row (sibling) is skipped without tripping the
+// failure cooldown: nothing was attempted, so the row must not be backed off.
+func TestVirtualCandidateRefresherSiblingSkipIsNotAFailure(t *testing.T) {
+	rows := []*models.MediaFile{refreshRow(951, "cand-a")}
+	r := &VirtualCandidateRefresher{
+		List: func(context.Context, time.Duration, time.Duration, int) ([]*models.MediaFile, error) {
+			return rows, nil
+		},
+		Resolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{
+				URL: "https://93.184.216.34/stream/token=sibling", URI: "virtual://movie/tt-refresh?result=cand-b", CandidateID: "cand-b",
+			}, nil
+		}),
+		MetadataSaver: func(_ context.Context, _ models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			t.Fatal("saver must not run for a sibling resolution")
+			return VirtualFileMetadataUpdateResult{}, nil
+		},
+		Window: func() time.Duration { return 720 * time.Hour },
+	}
+
+	if got := r.RunOnce(context.Background()); got != 0 {
+		t.Fatalf("refreshed = %d, want 0 for a skipped sibling", got)
+	}
+	if r.rateLimited(951, time.Now()) {
+		t.Fatal("skipped row is cooling down, want no backoff when nothing was attempted")
+	}
+}
+
+// TestVirtualCandidateRefresherLostCASRaceIsNeither proves a write the CAS
+// fence rejected (RowsAffected 0 — a concurrent serve-path refresh, rematch
+// adoption, or re-list won) is neither counted nor cooled down: the bytes are
+// already fresh, so there is nothing to retry.
+func TestVirtualCandidateRefresherLostCASRaceIsNeither(t *testing.T) {
+	rows := []*models.MediaFile{refreshRow(961, "cand-a")}
+	r := &VirtualCandidateRefresher{
+		List: func(context.Context, time.Duration, time.Duration, int) ([]*models.MediaFile, error) {
+			return rows, nil
+		},
+		Resolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, path string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			id := virtualResultCandidateID(path)
+			return ResolvedVirtualMedia{
+				URL: "https://93.184.216.34/stream/token=new-" + id, URI: path, CandidateID: id,
+				ExpiresAt: time.Now().Add(6 * time.Hour),
+			}, nil
+		}),
+		MetadataSaver: func(_ context.Context, _ models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			return VirtualFileMetadataUpdateResult{RowsAffected: 0}, nil
+		},
+		Window: func() time.Duration { return 720 * time.Hour },
+	}
+
+	if got := r.RunOnce(context.Background()); got != 0 {
+		t.Fatalf("refreshed = %d, want 0 for a lost CAS race", got)
+	}
+	if r.rateLimited(961, time.Now()) {
+		t.Fatal("row is cooling down after a lost CAS race, want no backoff when the bytes are already fresh")
+	}
+}
+
+// TestVirtualCandidateRefresherEmptyURLSkipsWithoutCooldown proves an empty
+// provider URL is a skip, not a row failure: the next pass retries it without
+// waiting out the cooldown.
+func TestVirtualCandidateRefresherEmptyURLSkipsWithoutCooldown(t *testing.T) {
+	rows := []*models.MediaFile{refreshRow(971, "cand-a")}
+	r := &VirtualCandidateRefresher{
+		List: func(context.Context, time.Duration, time.Duration, int) ([]*models.MediaFile, error) {
+			return rows, nil
+		},
+		Resolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, path string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URI: path, CandidateID: virtualResultCandidateID(path)}, nil
+		}),
+		MetadataSaver: func(_ context.Context, _ models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			t.Fatal("saver must not run for an empty URL")
+			return VirtualFileMetadataUpdateResult{}, nil
+		},
+		Window: func() time.Duration { return 720 * time.Hour },
+	}
+
+	if got := r.RunOnce(context.Background()); got != 0 {
+		t.Fatalf("refreshed = %d, want 0 for an empty URL", got)
+	}
+	if r.rateLimited(971, time.Now()) {
+		t.Fatal("row is cooling down after an empty URL, want no backoff for a provider hiccup")
 	}
 }

@@ -351,7 +351,9 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 				// resolution's identity under the existing CAS/fence write.
 				adoptRematchedVirtualResolution(ctx, file, resolved, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
 			} else if err == nil && storedExpiredRow != nil {
-				refreshStoredVirtualResolution(ctx, storedExpiredRow, resolved, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+				// Same best-effort contract as the transport resolver: the URL
+				// is already in hand, so persistence must not fail the serve.
+				_, _ = refreshStoredVirtualResolution(ctx, storedExpiredRow, resolved, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
 			}
 		} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
 			resolved.URL, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
