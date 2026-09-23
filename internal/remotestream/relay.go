@@ -1168,7 +1168,7 @@ func pumpRemoteBody(ctx context.Context, body io.Reader, budget *readAheadBudget
 		for {
 			// Reserve a whole chunk before reading, so an exhausted aggregate
 			// pool applies backpressure before the upstream read rather than
-			// after a chunk is already occupying memory. A cancelled acquire
+			// after a chunk is already occupying memory. A canceled acquire
 			// returns without holding anything.
 			if err := budget.acquire(ctx, remoteBodyChunkSize); err != nil {
 				return

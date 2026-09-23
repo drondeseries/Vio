@@ -192,13 +192,13 @@ func TestReadAheadBudgetCancellationUnblocksWaiterWithoutLeak(t *testing.T) {
 			t.Fatalf("waiter error = %v, want context.Canceled", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("cancelled waiter never returned")
+		t.Fatal("canceled waiter never returned")
 	}
 	if got, want := b.used(), remoteBodyChunkSize; got != want {
-		t.Fatalf("used after cancelled waiter = %d, want only the holder's %d", got, want)
+		t.Fatalf("used after canceled waiter = %d, want only the holder's %d", got, want)
 	}
 
-	// The holder's release drains the pool exactly; the cancelled waiter left
+	// The holder's release drains the pool exactly; the canceled waiter left
 	// no reservation behind.
 	b.release(remoteBodyChunkSize)
 	if got := b.used(); got != 0 {
