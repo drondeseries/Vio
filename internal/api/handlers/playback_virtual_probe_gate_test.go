@@ -1071,6 +1071,37 @@ func TestResolveVirtualOptimisticOnlyOnDeferredStart(t *testing.T) {
 	}
 }
 
+// The delivery grace proves the evidence owner's bytes flowed — never a
+// freshly ranked sibling's. A candidate list that re-ranks a different release
+// to the iterated position must not inherit the row's probed inventory through
+// the optimistic gate; it resolves synchronously instead.
+func TestResolveVirtualOptimisticRequiresExactEvidenceOwner(t *testing.T) {
+	deliveredAt := time.Now().Add(-time.Hour)
+	uri := "virtual://movie/tt-optimistic?result=cand-1"
+	file := virtualOptimisticFile(uri, &deliveredAt)
+	// A neutral-row start (no ?result= on the row) whose sticky pin names a
+	// different release than the row evidence would otherwise let the gate
+	// bind cand-2 with cand-1's inventory. The gate must refuse: the grace
+	// proves cand-1's bytes flowed, not cand-2's.
+	neutral := *file
+	neutral.FilePath = "virtual://movie/tt-optimistic"
+	neutral.LastDeliveredAt = &deliveredAt
+	var detailedCalls int32
+	h := virtualOptimisticGateHandler(&detailedCalls)
+	h.pinVirtualSticky(
+		bestResultCacheKey(neutral.ContentID, virtualPlaybackNeutralKey(neutral.FilePath), neutral.VirtualOwnerInstallationID, ""),
+		"virtual://movie/tt-optimistic?result=cand-2",
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	if _, err := h.resolveVirtualPlaybackSource(req, &neutral, "profile-1", true, nil, "", "", 0, false); err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if got := atomic.LoadInt32(&detailedCalls); got != 1 {
+		t.Fatalf("detailed resolver called %d times, want 1 synchronous resolve for a non-owner candidate", got)
+	}
+}
+
 // resolveVirtualDamperFile builds a virtual row pointing at one provider
 // candidate under a shared neutral path.
 func resolveVirtualDamperFile(owner int, id int, uri string) *models.MediaFile {
