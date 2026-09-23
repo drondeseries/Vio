@@ -109,10 +109,9 @@ func (s *VirtualCandidatesRefreshService) RefreshVirtualCandidates(ctx context.C
 			}
 			return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to refresh virtual candidates")
 		}
-		if refreshRes.Shared {
-			// A coalesced waiter reuses the winner's persistence; nothing more
-			// to do for this source.
-		}
+		// A coalesced waiter reuses the winner's persistence; nothing more to
+		// do for this source.
+		_ = refreshRes.Shared
 	}
 	detail, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter)
 	if err != nil {
