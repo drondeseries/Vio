@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -131,6 +132,45 @@ func TestScopedWalksInheritIgnoreRules(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestSubtreeScanUnderSkippedLibraryRootKeepsCatalog pins the guard that
+// keeps a skipped library root out of subtree reconciliation. A subtree scan
+// there walks nothing; without the guard it marks the subtree missing (and,
+// with trash emptying on, deletes it) outside the full scan's empty-root guard.
+func TestSubtreeScanUnderSkippedLibraryRootKeepsCatalog(t *testing.T) {
+	pool := newDeadRootTestPool(t)
+	for _, marker := range []string{".ignore", ".nomedia"} {
+		t.Run(marker, func(t *testing.T) {
+			ctx := t.Context()
+			root := t.TempDir()
+			episode := filepath.Join(root, "Show", "Season 01", "Episode 01.mkv")
+			writeTestFile(t, episode, "media")
+			writeTestFile(t, filepath.Join(root, marker), "")
+			folderID := seedDeadRootTestFolder(t, pool, "series", "Skipped root subtree "+marker)
+			var fileID int
+			if err := pool.QueryRow(ctx,
+				`INSERT INTO media_files (media_folder_id, file_path, file_size) VALUES ($1, $2, 1024) RETURNING id`,
+				folderID, episode,
+			).Scan(&fileID); err != nil {
+				t.Fatalf("seed media file: %v", err)
+			}
+			folder := &models.MediaFolder{ID: folderID, Type: "series", Paths: []string{root}, Enabled: true}
+			s := NewScanner(NewFileRepository(pool), "definitely-missing-ffprobe", nil, 1, true, 0)
+			for _, scope := range []string{filepath.Dir(episode), root} {
+				if _, err := s.ScanSubtree(ctx, folder, scope); err != nil {
+					t.Fatalf("ScanSubtree(%s): %v", scope, err)
+				}
+			}
+			var missingSince *time.Time
+			if err := pool.QueryRow(ctx, `SELECT missing_since FROM media_files WHERE id = $1`, fileID).Scan(&missingSince); err != nil {
+				t.Fatalf("load media file (deleted?): %v", err)
+			}
+			if missingSince != nil {
+				t.Fatalf("missing_since = %v, want the row left for a full library scan", missingSince)
+			}
+		})
 	}
 }
 

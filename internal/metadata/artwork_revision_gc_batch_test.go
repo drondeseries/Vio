@@ -17,7 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Silo-Server/silo-server/internal/artworkstore"
+	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 )
@@ -243,9 +243,9 @@ func TestArtworkRevisionGCRunHealsReferencePublishedDuringDelete(t *testing.T) {
 	}
 }
 
-// newArtworkDeleteStore returns an S3 artwork store whose batch deletes answer
-// every requested key with the given error code.
-func newArtworkDeleteStore(t *testing.T, code string) *artworkstore.S3 {
+// newArtworkDeleteStore returns a blobstore S3 artwork store whose batch deletes
+// answer every requested key with the given error code.
+func newArtworkDeleteStore(t *testing.T, code string) *blobstore.S3 {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !r.URL.Query().Has("delete") {
@@ -276,7 +276,7 @@ func newArtworkDeleteStore(t *testing.T, code string) *artworkstore.S3 {
 		_ = xml.NewEncoder(w).Encode(response)
 	}))
 	t.Cleanup(server.Close)
-	return artworkstore.NewS3(s3client.NewClient(s3client.BucketConfig{
+	return blobstore.NewS3(s3client.NewClient(s3client.BucketConfig{
 		Endpoint: server.URL, Bucket: "artwork", PathStyle: true, AccessKey: "test", SecretKey: "test",
 	}))
 }

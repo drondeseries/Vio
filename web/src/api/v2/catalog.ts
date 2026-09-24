@@ -382,7 +382,7 @@ export function mangaFilesFromV2(files: MangaFilesV2): MangaSeriesFiles {
 }
 
 export function personFromV2(person: PersonV2): Person {
-  return { ...person, id: Number(person.id) };
+  return { ...person };
 }
 
 export function catalogFiltersFromV2(filters: CatalogFiltersV2): CatalogFiltersResponse {

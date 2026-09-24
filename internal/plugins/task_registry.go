@@ -93,14 +93,7 @@ func (r *TaskRegistry) Tasks(ctx context.Context) ([]taskmanager.Task, error) {
 				continue
 			}
 
-			name := installation.PluginID + " / " + capability.ID
-			description := "Runs plugin scheduled task " + capability.ID
-			if displayName, ok := capability.Metadata["display_name"].(string); ok && strings.TrimSpace(displayName) != "" {
-				name = displayName
-			}
-			if descriptionText, ok := capability.Metadata["description"].(string); ok && strings.TrimSpace(descriptionText) != "" {
-				description = descriptionText
-			}
+			name, description := pluginTaskPresentation(installation.PluginID, capability)
 			task := &pluginTask{
 				installationID: installation.ID,
 				capabilityID:   capability.ID,
@@ -168,7 +161,20 @@ func (t *pluginTask) Execute(ctx context.Context, progress taskmanager.ProgressR
 	return nil
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
+// pluginTaskPresentation prefers the display name and description the plugin
+// manifest declares for the capability, falling back to its identifiers.
+func pluginTaskPresentation(pluginID string, capability *Capability) (string, string) {
+	name := pluginID + " / " + capability.ID
+	description := "Runs plugin scheduled task " + capability.ID
+	if displayName, _ := capability.Metadata["display_name"].(string); strings.TrimSpace(displayName) != "" {
+		name = strings.TrimSpace(displayName) + " (" + pluginID + ")"
+	}
+	if text, _ := capability.Metadata["description"].(string); strings.TrimSpace(text) != "" {
+		description = strings.TrimSpace(text)
+	}
+	return name, description
+}
+
 func taskBindingKey(installationID int, capabilityID string) string {
 	return fmt.Sprintf("%d/%s", installationID, capabilityID)
 }

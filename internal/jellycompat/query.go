@@ -26,6 +26,14 @@ type itemsQuery struct {
 	specificCollectionIDs  []string
 	itemTypes              []string
 	genreName              string
+	genres                 []string
+	years                  []int
+	recursive              bool
+	disableImages          bool
+	disableUserData        bool
+	enableImageTypes       map[string]bool
+	seasonNumber           *int
+	totalOverride          *int
 	isFavorite             bool
 	isResumable            bool
 	hasItemTypeFilter      bool // true when IncludeItemTypes or ExcludeItemTypes was present in the request
@@ -40,6 +48,10 @@ type itemsQuery struct {
 	isPlayed               *bool // nil = not specified
 	imageTypeLimit         *int  // nil = not specified
 	requireBackdrop        bool  // true when ImageTypes includes Backdrop (filter, not just a hint)
+	audioLanguages         []string
+	subtitleLanguages      []string
+	hasRootFilter          bool // a Jellyfin 12 HasFilters parameter was sent; see jellyfinRootFilterParams
+	unmatchedIDFilter      bool // GenreIds or PersonIds was sent but no value names a genre or person
 	mediaTypes             []string
 	mediaTypesSet          map[string]bool
 	mediaTypesExplicit     bool
@@ -59,9 +71,29 @@ func parseItemsQuery(r *http.Request, codec *ResourceIDCodec) itemsQuery {
 		namePrefix:             strings.TrimSpace(firstNonEmpty(q.Get("NameStartsWith"), q.Get("StartsWith"))),
 		maxOfficialRating:      strings.TrimSpace(q.Get("MaxOfficialRating")),
 		sort:                   mapSortBy(q.Get("SortBy")),
+		recursive:              parseBool(q.Get("Recursive"), false),
+		disableImages:          !parseBool(q.Get("EnableImages"), true),
+		disableUserData:        !parseBool(q.Get("EnableUserData"), true),
 		order:                  mapSortOrder(q.Get("SortOrder")),
 	}
 
+	result.genres = splitNonemptyGenres(q.Get("Genres"))
+	for year := range strings.SplitSeq(q.Get("Years"), ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(year)); err == nil && n > 0 {
+			result.years = append(result.years, n)
+		}
+	}
+	if raw := q.Get("Season"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			result.seasonNumber = new(n)
+		}
+	}
+	if raw := q.Get("EnableImageTypes"); raw != "" {
+		result.enableImageTypes = map[string]bool{}
+		for kind := range strings.SplitSeq(raw, ",") {
+			result.enableImageTypes[strings.ToLower(strings.TrimSpace(kind))] = true
+		}
+	}
 	if parentID := strings.TrimSpace(q.Get("ParentId")); parentID != "" {
 		if libraryID, err := codec.DecodeIntID(EncodedIDLibrary, parentID); err == nil {
 			result.parentLibraryID = int(libraryID)
@@ -89,13 +121,15 @@ func parseItemsQuery(r *http.Request, codec *ResourceIDCodec) itemsQuery {
 		}
 	}
 	if genreIDs := strings.TrimSpace(firstNonEmpty(q.Get("GenreIds"), q.Get("GenreItems"))); genreIDs != "" {
+		matched := false
 		for part := range strings.SplitSeq(genreIDs, ",") {
 			decoded, err := codec.DecodeStringID(EncodedIDGenre, strings.TrimSpace(part))
 			if err == nil && decoded != "" {
-				result.genreName = decoded
-				break
+				result.genres = append(result.genres, decoded)
+				matched = true
 			}
 		}
+		result.unmatchedIDFilter = !matched
 	}
 
 	if personIDs := strings.TrimSpace(q.Get("PersonIds")); personIDs != "" {
@@ -108,6 +142,9 @@ func parseItemsQuery(r *http.Request, codec *ResourceIDCodec) itemsQuery {
 				result.personID = decoded
 				break
 			}
+		}
+		if result.personID == 0 {
+			result.unmatchedIDFilter = true
 		}
 	}
 
@@ -124,9 +161,22 @@ func parseItemsQuery(r *http.Request, codec *ResourceIDCodec) itemsQuery {
 	if len(result.itemTypes) > 0 {
 		result.itemType = result.itemTypes[0]
 	}
+	// Jellyfin 12 language filters. As upstream, HasSubtitles=false asks for
+	// items without subtitles, which makes a subtitle-language list moot.
+	result.audioLanguages = splitCommaValues(q.Values("AudioLanguages"))
+	if !strings.EqualFold(strings.TrimSpace(q.Get("HasSubtitles")), "false") {
+		result.subtitleLanguages = splitCommaValues(q.Values("SubtitleLanguages"))
+	}
+	result.hasRootFilter = hasAnyNonEmptyParam(q, jellyfinRootFilterParams)
 	result.isFavorite = hasFilter(q.Get("Filters"), "IsFavorite") || parseBool(q.Get("IsFavorite"), false)
 	result.isResumable = hasFilter(q.Get("Filters"), "IsResumable")
 
+	if hasFilter(q.Get("Filters"), "IsPlayed") {
+		result.isPlayed = new(true)
+	}
+	if hasFilter(q.Get("Filters"), "IsUnplayed") {
+		result.isPlayed = new(false)
+	}
 	// IsPlayed filter.
 	if isPlayedRaw := q.Get("IsPlayed"); isPlayedRaw != "" {
 		val := strings.EqualFold(isPlayedRaw, "true") || isPlayedRaw == "1"
@@ -227,6 +277,25 @@ func buildLatestBrowseParams(query itemsQuery) url.Values {
 
 func buildBrowseParams(query itemsQuery) url.Values {
 	params := url.Values{}
+	if query.isPlayed != nil || query.isFavorite || query.isResumable {
+		params.Set("compose_state", "true")
+	}
+	if len(query.genres) > 0 {
+		params.Set("genres", strings.Join(query.genres, "|"))
+	}
+	if len(query.years) > 0 {
+		values := make([]string, len(query.years))
+		for i, year := range query.years {
+			values[i] = strconv.Itoa(year)
+		}
+		params.Set("years", strings.Join(values, ","))
+	}
+	if query.searchTerm != "" {
+		params.Set("search_term", query.searchTerm)
+	}
+	if len(query.specificIDs) > 0 {
+		params.Set("content_ids", strings.Join(query.specificIDs, ","))
+	}
 	params.Set("limit", strconv.Itoa(query.limit))
 	params.Set("offset", strconv.Itoa(query.startIndex))
 	if len(query.itemTypes) > 0 {
@@ -248,6 +317,12 @@ func buildBrowseParams(query itemsQuery) url.Values {
 		params.Set("order", query.order)
 	}
 	params.Set("include_total", strconv.FormatBool(query.enableTotalRecordCount))
+	if query.isFavorite {
+		params.Set("is_favorite", "true")
+	}
+	if query.isResumable {
+		params.Set("is_resumable", "true")
+	}
 	if query.personID > 0 {
 		params.Set("person_id", strconv.FormatInt(query.personID, 10))
 	}
@@ -264,7 +339,63 @@ func buildBrowseParams(query itemsQuery) url.Values {
 	if query.requireBackdrop {
 		params.Set("require_backdrop", "true")
 	}
+	if len(query.audioLanguages) > 0 {
+		params.Set("audio_languages", strings.Join(query.audioLanguages, ","))
+	}
+	if len(query.subtitleLanguages) > 0 {
+		params.Set("subtitle_languages", strings.Join(query.subtitleLanguages, ","))
+	}
 	return params
+}
+
+// jellyfinRootFilterParams are the GET /Items parameters that set a field of
+// Jellyfin 12's InternalItemsQuery.HasFilters. From 12.0 a user-root request
+// carrying any of them searches the libraries recursively instead of listing
+// them, even when Recursive is absent, so Silo must not fall back to the
+// library views even for filters it cannot apply. LocationTypes and
+// ExcludeLocationTypes are deliberately left out: Silo has no virtual items,
+// and older clients send ExcludeLocationTypes=Virtual on their library-list
+// request.
+//
+//nolint:goconst // Jellyfin GET /Items parameter names, listed verbatim.
+var jellyfinRootFilterParams = []string{
+	"IncludeItemTypes", "ExcludeItemTypes", "MediaTypes", "VideoTypes", "ImageTypes",
+	"Genres", "GenreIds", "Years", "Tags", "OfficialRatings", "Studios", "StudioIds",
+	"Artists", "ArtistIds", "AlbumArtistIds", "ContributingArtistIds", "ExcludeArtistIds",
+	"Albums", "AlbumIds", "Person", "PersonIds", "PersonTypes", "SeriesStatus",
+	"ExcludeItemIds", "AudioLanguages", "SubtitleLanguages", "Filters",
+	"IsFavorite", "IsPlayed", "IsMissing", "IsUnaired", "Is3D", "IsHd", "Is4K", "IsLocked",
+	"IsPlaceHolder", "IsMovie", "IsSports", "IsKids", "IsNews", "IsSeries",
+	"HasImdbId", "HasTmdbId", "HasTvdbId", "HasOverview", "HasOfficialRating",
+	"HasParentalRating", "HasThemeSong", "HasThemeVideo", "HasSubtitles",
+	"HasSpecialFeature", "HasTrailer", "MinCriticRating", "MinCommunityRating",
+	"MinOfficialRating", "IndexNumber", "ParentIndexNumber", "MinWidth", "MinHeight",
+	"MaxWidth", "MaxHeight", "MinPremiereDate", "MaxPremiereDate", "MinDateLastSaved",
+	"MinDateLastSavedForUser", "AdjacentTo", "NameStartsWith", "NameStartsWithOrGreater",
+	"NameLessThan", "SearchTerm",
+}
+
+func hasAnyNonEmptyParam(q caseInsensitiveQuery, keys []string) bool {
+	for _, key := range keys {
+		if hasNonEmptyValues(q.Values(key)) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitCommaValues flattens repeated and comma-delimited query values into
+// trimmed, non-empty entries.
+func splitCommaValues(values []string) []string {
+	var out []string
+	for _, raw := range values {
+		for part := range strings.SplitSeq(raw, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
 }
 
 func favoriteItemsNeedBrowseFilters(query itemsQuery) bool {
@@ -486,12 +617,7 @@ func parseRequestedFields(raw string) map[string]bool {
 // mediasources is listed because BrowseRepository does not yet project
 // per-file media metadata. When the LATERAL JOIN against media_files lands
 // (catalog SQL performance overhaul plan §3.2 part b), it can be removed.
-var fieldsRequiringDetail = map[string]struct{}{
-	"people":       {},
-	"chapters":     {},
-	"mediastreams": {},
-	"mediasources": {},
-}
+var fieldsRequiringDetail = parseRequestedFields("RemoteTrailers,ProviderIds,People,Chapters,MediaStreams,MediaSources")
 
 // fieldsServedByList enumerates Fields values that mapping.go's itemFromList
 // can populate — gated by `if allFields || fields[X]` blocks. Anything outside
@@ -613,4 +739,10 @@ func (q caseInsensitiveQuery) Values(key string) []string {
 		return q.raw[orig]
 	}
 	return nil
+}
+
+// hasIntersectingFilters selects catalog predicate composition before specialized
+// rails can discard filters. Unfiltered rails keep their episode-aware semantics.
+func (q itemsQuery) hasIntersectingFilters() bool {
+	return len(q.genres) > 0 || len(q.years) > 0 || q.genreName != "" || q.personID > 0 || q.requireBackdrop || len(q.audioLanguages) > 0 || len(q.subtitleLanguages) > 0 || q.maxOfficialRating != "" || q.namePrefix != "" || (q.searchTerm != "" && (q.isFavorite || q.isPlayed != nil || q.isResumable || q.sortExplicit)) || (q.isFavorite && (q.isPlayed != nil || q.isResumable)) || (q.isResumable && q.isPlayed != nil)
 }

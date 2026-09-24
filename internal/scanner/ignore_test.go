@@ -52,15 +52,167 @@ func assertFilePaths(t *testing.T, got []string, root string, wantRel []string) 
 func TestIgnoreMarkerFilesSkipEntireDirectory(t *testing.T) {
 	t.Parallel()
 
-	for _, marker := range []string{".ignore", ".nomedia"} {
+	// .nomedia is a marker whatever it holds; .ignore is one only when it has
+	// no valid pattern, as in Jellyfin.
+	markers := []struct{ name, content string }{
+		{".nomedia", ""},
+		{".nomedia", "Hidden.mkv\n"},
+		{".ignore", ""},
+		{".ignore", "  \n\t\n"},
+		{".ignore", "# only a comment\n"},
+		{".ignore", "[\n"},
+	}
+	for _, marker := range markers {
 		root := t.TempDir()
 		writeTestFile(t, filepath.Join(root, "Movie.mkv"), "test")
 		writeTestFile(t, filepath.Join(root, "Ignored", "Hidden.mkv"), "test")
-		writeTestFile(t, filepath.Join(root, "Ignored", marker), "")
+		writeTestFile(t, filepath.Join(root, "Ignored", marker.name), marker.content)
 		writeTestFile(t, filepath.Join(root, "Kept", "Episode 01.mkv"), "test")
 
 		files := collectTestFilePaths(t, root, "series")
 		assertFilePaths(t, files, root, []string{"Movie.mkv", "Kept/Episode 01.mkv"})
+	}
+}
+
+// TestIgnoreFilePatternsAtLibraryRootSkipOnlyMatches reproduces a production
+// layout: every library root holds an .ignore listing download and recycle
+// folders. Only those folders may be skipped, never the root's media, for a
+// full walk or a scoped walk beneath the root.
+func TestIgnoreFilePatternsAtLibraryRootSkipOnlyMatches(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, ".ignore"), ".recyclebin\n.downloads\n.inbound\nincoming\n")
+	writeTestFile(t, filepath.Join(root, "Show", "Season 01", "Episode 01.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Show", "incoming", "Episode 02.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "incoming", "Other", "Episode 01.mkv"), "test")
+
+	files := collectTestFilePaths(t, root, "series")
+	assertFilePaths(t, files, root, []string{"Show/Season 01/Episode 01.mkv"})
+
+	scope := filepath.Join(root, "Show", "Season 01")
+	files, walkFailures, err := collectLogicalFilePaths(t.Context(), []string{scope}, "series", []string{root})
+	if err != nil || len(walkFailures) != 0 {
+		t.Fatalf("scoped walk: %v, failures: %v", err, walkFailures)
+	}
+	assertFilePaths(t, files, root, []string{"Show/Season 01/Episode 01.mkv"})
+	if libraryRootSkipped(root) {
+		t.Fatal("a root .ignore with patterns must not skip the root")
+	}
+}
+
+func TestIgnoreFileGitignoreSemantics(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		content string
+		path    string
+		isDir   bool
+		want    bool
+	}{
+		{"incoming", "incoming", true, true},
+		{"incoming", "Show/incoming", true, true},
+		{"incoming", "Show/incoming.mkv", false, false},
+		{"*.nfo", "Show/Season 01/a.nfo", false, true},
+		{"/Season 01", "Season 01", true, true},
+		{"/Season 01", "Show/Season 01", true, false},
+		{"Show/Season 01", "Show/Season 01", true, true},
+		{"Show/Season 01", "Other/Show/Season 01", true, false},
+		{"Extras/", "Show/Extras", true, true},
+		{"Extras/", "Show/Extras", false, false},
+		{"**/sample.mkv", "sample.mkv", false, true},
+		{"**/sample.mkv", "a/b/sample.mkv", false, true},
+		{"Show/**", "Show", true, false},
+		{"Show/**", "Show/a/b.mkv", false, true},
+		{"a/**/b.mkv", "a/b.mkv", false, true},
+		{"a/**/b.mkv", "a/x/y/b.mkv", false, true},
+		{"a/**/b.mkv", "c/b.mkv", false, false},
+		{"*.mkv\n!keep.mkv", "drop.mkv", false, true},
+		{"*.mkv\n!keep.mkv", "keep.mkv", false, false},
+		{"!keep.mkv\n*.mkv", "keep.mkv", false, true},
+		{"\\#hash.mkv", "#hash.mkv", false, true},
+		{"[\n*.nfo", "a.nfo", false, true},
+		{"[!a]*.mkv", "b.mkv", false, true},
+		{"[!a]*.mkv", "a.mkv", false, false},
+		{"[^a]*.mkv", "a.mkv", false, false},
+		{"Season [[:digit:]]", "Season 1", true, true},
+		{"Season [[:digit:]]", "Season X", true, false},
+		{"[[:upper:][:digit:]]*.nfo", "7.nfo", false, true},
+		{"[[:upper:][:digit:]]*.nfo", "a.nfo", false, false},
+		{"[[:punct:]]*.mkv", "#tmp.mkv", false, true},
+		{"[]x].nfo", "].nfo", false, true},
+		{"[a-].nfo", "-.nfo", false, true},
+		{"[-a].nfo", "-.nfo", false, true},
+		{"[[:bogus:]].nfo\n*.txt", "x.nfo", false, false},
+	}
+	for _, tc := range cases {
+		rules := []ignoreRules{{basePath: "/lib", gitPatterns: parseGitIgnorePatterns(tc.content)}}
+		if got := ignoreRulesMatch(rules, filepath.Join("/lib", tc.path), tc.isDir); got != tc.want {
+			t.Errorf("pattern %q, path %q (dir=%v): ignored = %v, want %v", tc.content, tc.path, tc.isDir, got, tc.want)
+		}
+	}
+}
+
+func TestParseGitIgnorePatternsDropsMalformedBrackets(t *testing.T) {
+	t.Parallel()
+
+	for _, content := range []string{"[[:bogus:]].nfo", "[abc", "[[:digit:].nfo", "foo\\"} {
+		if patterns := parseGitIgnorePatterns(content); len(patterns) != 0 {
+			t.Errorf("parseGitIgnorePatterns(%q) = %+v, want no valid pattern", content, patterns)
+		}
+	}
+}
+
+func TestNestedIgnoreFileCanReincludeParentMatches(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, ".ignore"), "*.mkv\n")
+	writeTestFile(t, filepath.Join(root, "Show", ".ignore"), "!keep.mkv\n")
+	writeTestFile(t, filepath.Join(root, "keep.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Show", "keep.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, "Show", "drop.mkv"), "test")
+
+	files := collectTestFilePaths(t, root, "series")
+	assertFilePaths(t, files, root, []string{"Show/keep.mkv"})
+}
+
+func TestIgnoreFileDirectoryPatternMatchesSymlinkedDirectory(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	target := t.TempDir()
+	writeTestFile(t, filepath.Join(target, "Episode 01.mkv"), "test")
+	if err := os.Symlink(target, filepath.Join(root, "Linked")); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+	writeTestFile(t, filepath.Join(root, "Movie.mkv"), "test")
+	writeTestFile(t, filepath.Join(root, ".ignore"), "Linked/\n")
+
+	files := collectTestFilePaths(t, root, "series")
+	assertFilePaths(t, files, root, []string{"Movie.mkv"})
+}
+
+func TestLibraryRootSkipped(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		setup func(root string)
+		want  bool
+	}{
+		{"no ignore files", func(string) {}, false},
+		{"empty .ignore", func(root string) { writeTestFile(t, filepath.Join(root, ".ignore"), "") }, true},
+		{".ignore with patterns", func(root string) { writeTestFile(t, filepath.Join(root, ".ignore"), ".downloads\n") }, false},
+		{".nomedia", func(root string) { writeTestFile(t, filepath.Join(root, ".nomedia"), "") }, true},
+		{".ignore directory", func(root string) { writeTestFile(t, filepath.Join(root, ".ignore", "x"), "") }, false},
+	}
+	for _, tc := range cases {
+		root := t.TempDir()
+		tc.setup(root)
+		if got := libraryRootSkipped(root); got != tc.want {
+			t.Errorf("%s: libraryRootSkipped = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

@@ -9,14 +9,13 @@ export const KEYBOARD_SKIP_SECONDS = 10;
 /**
  * Registers keyboard shortcuts for the video player.
  * Space/K = play/pause, F = fullscreen, M = mute, C = toggle captions,
- * P = picture-in-picture, ArrowLeft/Right = seek ±KEYBOARD_SKIP_SECONDS,
- * ArrowUp/Down = volume ±5%.
+ * P = picture-in-picture, ArrowLeft/Right = skip by the profile's intervals, ArrowUp/Down = volume ±5%.
  */
 export function useKeyboardShortcuts(
   videoRef: React.RefObject<HTMLVideoElement | null>,
   containerRef: React.RefObject<HTMLElement | null>,
   handlePlayPause: () => void,
-  handleSeek: (time: number) => void,
+  skip: { back: () => void; forward: () => void },
   toggleCaptions: () => void,
   togglePiP?: () => void,
   enabled = true,
@@ -97,12 +96,12 @@ export function useKeyboardShortcuts(
 
         case "ArrowLeft":
           e.preventDefault();
-          handleSeek(Math.max(0, video.currentTime - KEYBOARD_SKIP_SECONDS));
+          skip.back();
           break;
 
         case "ArrowRight":
           e.preventDefault();
-          handleSeek(Math.min(video.duration || 0, video.currentTime + KEYBOARD_SKIP_SECONDS));
+          skip.forward();
           break;
 
         case "ArrowUp":
@@ -119,5 +118,5 @@ export function useKeyboardShortcuts(
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [containerRef, enabled, handlePlayPause, handleSeek, toggleCaptions, togglePiP, videoRef]);
+  }, [containerRef, enabled, handlePlayPause, skip, toggleCaptions, togglePiP, videoRef]);
 }

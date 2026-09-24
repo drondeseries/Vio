@@ -113,6 +113,7 @@ type Dependencies struct {
 	WatchScrobbler         PlaybackWatchScrobbler
 	StableIdentityResolver watchsync.ScrobbleIdentityResolver
 	AccessFilterFn         AccessFilterResolver
+	PlaybackScopeResolver  ScopeResolver
 	NodePlanner            nodepool.SessionPlanner
 	JWTSecret              string
 	Recommender            recommendations.Recommender
@@ -140,9 +141,8 @@ type Dependencies struct {
 	AllowInsecureVirtual func(installationID int) bool
 
 	// Subtitle support (optional)
-	SubtitleRepo subtitles.Repository // optional; downloaded subtitle support
-	S3Client     subtitles.S3Client   // optional
-	S3Bucket     string               // optional
+	SubtitleRepo  subtitles.Repository // optional; downloaded subtitle support
+	SubtitleBlobs subtitles.BlobStore  // optional; backs downloaded subtitle reads
 }
 
 // CurrentConfig returns the live config when hot reload is wired, falling
@@ -209,7 +209,7 @@ func (s *Server) SessionStore() *SessionStore {
 func (s *Server) StartBackgroundTasks(ctx context.Context) <-chan struct{} {
 	if s.deps.DB != nil {
 		repo := NewSessionRepository(s.deps.DB, s.deps.SecretCipher)
-		StartSessionCleanupWithPlaybackStore(ctx, repo, s.deps.PlaybackStore, 1*time.Hour)
+		StartSessionCleanupWithPlaybackStore(ctx, repo, s.deps.PlaybackStore, s.deps.DeviceProfiles, 1*time.Hour)
 	}
 	return StartTerminalScrobbleRecovery(ctx, s.deps.PlaybackStore, s.deps.WatchScrobbler, 30*time.Second)
 }

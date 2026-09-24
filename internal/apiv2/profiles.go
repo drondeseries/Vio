@@ -390,7 +390,7 @@ type PlaybackSession struct {
 	RequestedVideoResolution string  `json:"requested_video_resolution" doc:"Empty when the client did not ask for one" example:""`
 	VideoDecision            string  `json:"video_decision" doc:"Empty when unknown" example:"copy"`
 	AudioDecision            string  `json:"audio_decision" doc:"Empty when unknown" example:"copy"`
-	EffectivePlayMethod      string  `json:"effective_play_method" doc:"Bucketed method: direct, remux, transcode or audio; empty when unknown" example:"direct"`
+	EffectivePlayMethod      string  `json:"effective_play_method" doc:"Bucketed method: direct, remux, direct_stream or transcode; empty when unknown" example:"direct"`
 	IsJellyfinClient         bool    `json:"is_jellyfin_client" example:"false"`
 	RoutingWorkload          string  `json:"routing_workload" doc:"Empty when routing is unresolved" example:""`
 	RoutingExecution         string  `json:"routing_execution" doc:"Empty when routing is unresolved" example:""`
@@ -467,7 +467,7 @@ func playbackSessionOf(v handlers.PlaybackSessionView) PlaybackSession {
 		SourceVideoResolution: v.SourceVideoResolution, SourceAudioCodec: v.SourceAudioCodec, SourceAudioChannels: v.SourceAudioChannels,
 		SourceAudioLanguage: v.SourceAudioLanguage, SourceAudioTitle: v.SourceAudioTitle, SourceAudioLayout: v.SourceAudioLayout,
 		RequestedVideoCodec: v.RequestedVideoCodec, RequestedVideoResolution: v.RequestedVideoResolution,
-		VideoDecision: v.VideoDecision, AudioDecision: v.AudioDecision, EffectivePlayMethod: v.EffectivePlayMethod,
+		VideoDecision: v.VideoDecision, AudioDecision: v.AudioDecision, EffectivePlayMethod: nativeEffectivePlayMethod(v.EffectivePlayMethod),
 		IsJellyfinClient: v.IsJellyfinClient,
 		RoutingWorkload:  v.RoutingWorkload, RoutingExecution: v.RoutingExecution, RoutingExecutionNodeID: idOfIntPtr(v.RoutingExecutionNodeID),
 		RoutingExecutionNodeName: v.RoutingExecutionNodeName, RoutingEgress: v.RoutingEgress, RoutingEgressNodeID: idOfIntPtr(v.RoutingEgressNodeID),

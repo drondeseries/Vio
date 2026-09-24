@@ -17,7 +17,7 @@ import (
 )
 
 const fontProbeJSON = `cat <<'JSON'
-{"streams":[{"index":2,"codec_name":"ttf","codec_type":"attachment","tags":{"filename":"MyFont.ttf","mimetype":"font/ttf"}}]}
+{"streams":[{"index":2,"codec_name":"ttf","codec_type":"attachment","extradata_size":4,"tags":{"filename":"MyFont.ttf","mimetype":"font/ttf"}}]}
 JSON
 `
 
@@ -40,8 +40,8 @@ func fontProbeScript(probeLog, gatePath string, gate bool, fail bool) string {
 }
 
 func fontFFmpegDumpScript(dumpLog string) string {
-	return "#!/bin/sh\necho dump >> '" + dumpLog + "'\nprev=\"\"\nfor a in \"$@\"; do\n" +
-		"  case \"$prev\" in\n    -dump_attachment:*) printf 'FONT' > \"$a\" ;;\n  esac\n  prev=\"$a\"\ndone\n"
+	return "#!/bin/sh\necho dump >> '" + dumpLog + "'\nfor a in \"$@\"; do\n" +
+		"  case \"$a\" in\n    -dump_attachment:*) printf 'FONT' ;;\n  esac\ndone\n"
 }
 
 // setFontBundleClientWait temporarily overrides the handler's client-facing

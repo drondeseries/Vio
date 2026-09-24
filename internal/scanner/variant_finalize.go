@@ -48,7 +48,7 @@ func (s *Scanner) FinalizeVariantsByPathPrefix(
 		if ownerKey == "" {
 			continue
 		}
-		hints := naming.ParseVariantHints(file.FilePath, folder.Type)
+		hints := naming.ParseVariantHints(file.FilePath, folder.Type, folder.Paths...)
 		if file.EditionSource == "import" && file.EditionKey != "" {
 			hints = &naming.VariantHints{
 				EditionRaw:            file.EditionRaw,
@@ -89,9 +89,8 @@ func (s *Scanner) FinalizeVariantsByPathPrefix(
 			continue
 		}
 
-		hints := naming.ParseVariantHints(file.FilePath, folder.Type)
-		importOverride := file.EditionSource == "import" && file.EditionKey != ""
-		if importOverride {
+		hints := naming.ParseVariantHints(file.FilePath, folder.Type, folder.Paths...)
+		if file.EditionSource == "import" && file.EditionKey != "" {
 			hints = &naming.VariantHints{
 				EditionRaw:            file.EditionRaw,
 				EditionKey:            file.EditionKey,
@@ -136,8 +135,9 @@ func (s *Scanner) FinalizeVariantsByPathPrefix(
 		// Release name/group come from the filename itself. The import override
 		// pins only the edition fields, so re-parse a fresh hints value for the
 		// release fields to keep the override struct untouched.
+		importOverride := file.EditionSource == "import" && file.EditionKey != ""
 		if importOverride {
-			if releaseHints := naming.ParseVariantHints(file.FilePath, folder.Type); releaseHints != nil {
+			if releaseHints := naming.ParseVariantHints(file.FilePath, folder.Type, folder.Paths...); releaseHints != nil {
 				updated.ReleaseName = releaseHints.ReleaseName
 				updated.ReleaseGroup = releaseHints.ReleaseGroup
 			}

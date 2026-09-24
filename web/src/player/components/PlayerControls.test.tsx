@@ -21,6 +21,8 @@ function renderControls(
       volume={1}
       muted={false}
       isFullscreen={false}
+      videoFit="contain"
+      onVideoFitToggle={vi.fn()}
       subtitleTracks={[]}
       activeSubtitleIndex={null}
       onSubtitleSelect={vi.fn()}
@@ -46,6 +48,8 @@ function renderControls(
       onTogglePlaybackInfo={vi.fn()}
       onPlayPause={vi.fn()}
       onSeek={vi.fn()}
+      onSkip={{ back: vi.fn(), forward: vi.fn() }}
+      skipSeconds={{ back: 10, forward: 30 }}
       onVolumeChange={vi.fn()}
       onMutedChange={vi.fn()}
       onFullscreenToggle={vi.fn()}
@@ -147,15 +151,43 @@ describe("PlayerControls", () => {
     expect(screen.getByRole("button", { name: "Edit markers" })).toBeInTheDocument();
   });
 
-  it("uses a 30s jump for both on-screen skip buttons", () => {
-    const onSeek = vi.fn();
-    renderControls(false, { currentTime: 100, duration: 300, onSeek });
+  it("toggles between Fit and Fill from the desktop utility rail", () => {
+    const onVideoFitToggle = vi.fn();
+    const { unmount } = renderControls(false, { onVideoFitToggle });
 
-    fireEvent.click(screen.getByRole("button", { name: "Back 30 seconds" }));
-    expect(onSeek).toHaveBeenCalledWith(70);
+    const fill = screen.getByRole("button", { name: "Fill screen" });
+    expect(fill).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(fill);
+    expect(onVideoFitToggle).toHaveBeenCalledOnce();
 
-    fireEvent.click(screen.getByRole("button", { name: "Forward 30 seconds" }));
-    expect(onSeek).toHaveBeenCalledWith(130);
+    unmount();
+    renderControls(false, { videoFit: "cover" });
+    expect(screen.getByRole("button", { name: "Fill screen" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("toggles video fit from the compact overflow menu", () => {
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1024);
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          callback([], {} as ResizeObserver);
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const onVideoFitToggle = vi.fn();
+    renderControls(false, { videoFit: "cover", onVideoFitToggle });
+
+    fireEvent.click(screen.getByRole("button", { name: "More player options" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fill screen" }));
+
+    expect(onVideoFitToggle).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("menu")).toBeNull();
   });
 
   it("uses the mobile transport and hides hardware-volume controls on coarse pointers", () => {

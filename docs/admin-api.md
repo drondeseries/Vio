@@ -138,6 +138,27 @@ host's currently pinned SDK. The SDK helper still needs a published release
 before downstream plugins can pin it. Plugin adoption and queue retry dispatch,
 web UI, Apple and Android client controls remain follow-up work. Jellyfin has no
 admin override endpoint; it sees the shared catalog materialization results.
+## Task schedules
+
+`PUT /api/v2/admin/tasks/{key}/triggers` replaces the complete schedule using
+`{"triggers":[...]}` and the captured `If-Match` validator. Saving an empty
+array disables automatic runs; the task can still be run manually. Added,
+edited, and removed triggers survive server restarts and upgrades, including
+an explicitly empty schedule. Tasks marked `manual_only` reject nonempty arrays.
+
+Startup persists defaults only when no schedule exists, using the same revision
+guard as administrator edits. An edit saved while defaults are being resolved
+takes precedence. Default providers are consulted only for unsaved schedules.
+If startup cannot load or initialize a schedule, automatic runs for that task
+remain idle and the server logs the error. Saving its triggers again or
+restarting after storage recovers reloads scheduling. Other running server
+processes reload schedule changes on restart.
+
+The existing schedule-revision migration retains trigger rows. Servers from
+before that migration did not distinguish a new task from a cleared schedule,
+so administrators must clear previously restored triggers again after upgrading
+all instances. Saving Autoscan settings separately replaces the Autoscan poll
+task's triggers with its configured poll interval.
 
 ## Branding assets
 
@@ -203,7 +224,7 @@ Some settings are only read at startup. Two routes carry that contract:
 | `restart_required_reasons` | string[] | Every distinct reason since boot, first-seen order. Settings saves record one `setting:<key>` entry per restart-required key, so a client can scope a pending restart to the subsystem it belongs to. |
 | `restart_mark_count` | int | Increments on every restart-required save. Because the boolean latches, this counter is the only signal that a **new** requirement arrived — the admin UI re-arms its dismissed restart banner on it. |
 | `restart_requested`, `restart_requested_at` | bool, RFC3339 string | An in-app restart was requested, and when. |
-| `artwork_storage` | object | `backend` is the resolved artwork backend of this process (`local` or `s3`); `locked` is true once artwork has been stored and `artwork.storage_backend` can no longer change. |
+| `artwork_storage` | object | `backend` is the resolved artwork backend of this process (`local` or `s3`); `locked` is true once the assets storage identity has been recorded and its location can no longer change directly. `/api/v2` also reports `status_known`, true only when the settings read succeeded, and `private_locked`, true when a configured private bucket is recorded at startup, even if empty, or when the assets location is locked. Clients must treat `status_known: false` as an unknown lock state. |
 
 ## Playback node routing
 
@@ -266,11 +287,37 @@ or reverse proxy access. This records the prepared route, not a live measurement
 of every media request or an inference from the client's IP address. Provider
 display names come from `/api/v2/network-access/capabilities`.
 
+`stream_location` on each v2 admin session row reports `local` or `remote` using
+the same trusted client-IP and provider-path classification as the bitrate
+policy. Private, loopback, and link-local clients on the default path are local;
+provider paths and public or unknown client addresses are remote. The web
+Activity panel shows this separately from the access-network badge.
+`GET /api/v2/admin/sessions/capabilities` advertises `stream_location` for client
+feature detection. The displayed location is fixed at playback negotiation,
+even if a later media request arrives over another network path.
+
 The web activity views show that network alongside the named execution and egress
 nodes. API egress is labeled "API server"; its reporting identity remains in the
 tooltip. Native and Jellyfin-compatible playback both populate the route, including
 session recovery. This additive admin observation does not change Apple, Android,
 or Jellyfin playback contracts; those clients need no changes to report it.
+
+`effective_play_method` is the server's whole-session classification:
+`direct` (Direct Play), `remux` (copied audio and video in a streaming
+container), `direct_stream` (copied video with converted audio), or `transcode`
+(converted video). Unknown decisions omit the field, and the capability's
+`effective_play_method_values` lists the vocabulary. The frozen `/api/v1`
+bridge keeps reporting its alpha `audio` value instead of `direct_stream`.
+Per-stream Copy means no re-encoding; it does not promise byte-identical packets
+after a permitted bitstream transformation.
+
+`output_format: true` on the same capability response advertises optional
+`output_container` and `output_protocol` fields on v2 session rows. The serving
+transport reports the container (`fmp4`, `mpegts`, or the source container for
+Direct Play) separately from the protocol (`hls` or `http`). An older node can
+omit both; clients then show the output as unknown rather than inferring it
+from `play_method`, the source container, or the video codec. The frozen
+`/api/v1` bridge does not carry these fields.
 
 `silo_playback_routing_decisions_total` counts routing outcomes with bounded
 `workload`, `execution`, `egress`, `outcome`, and `reason` labels. It never
@@ -1580,7 +1627,9 @@ The personal projection always reports `cancelable: false`: this surface has no 
 command. Existing administrator cancellation can appear as nonterminal `canceling`
 until the worker acknowledges it, then terminal `cancelled`. Both personal and admin
 monitors replace persisted diagnostic errors, warnings, and unmatched reasons with safe
-summaries. Run credentials and private dispatch metadata never appear in these responses.
+summaries. Known diagnostics map to a fixed summary of their cause, such as an item with
+no provider ID or a show missing from the library; anything else reads as a generic
+summary. Run credentials and private dispatch metadata never appear in these responses.
 
 New queued personal imports survive server restart. Source changes invalidate captured
 configuration without retargeting the import; stale running executions fail without replay.

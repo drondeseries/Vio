@@ -80,18 +80,37 @@ type PlaybackSession struct {
 
 // PlaybackMediaSource stores one negotiated stream source within a compat play session.
 type PlaybackMediaSource struct {
-	ID                   string
-	FileID               int
-	Version              catalog.FileVersion
-	SupportsDirectPlay   bool
-	SupportsDirectStream bool
-	SupportsTranscoding  bool
+	ServerBitrateCapKbps int
+	StreamLocation       string // bitrate-policy classification fixed by PlaybackInfo
+	// SiloSeekReanchor opts into source-time copy-HLS startup for clients that
+	// renegotiate seeks outside the produced playlist window.
+	SiloSeekReanchor         bool
+	SubtitleBurnIn           bool
+	SubtitleExternalDelivery bool
+	SubtitleDeliveryFormat   string
+	SubtitleTrackIndex       int
+	SubtitleCodec            string
+	CanBurnSubtitle          bool
+	TargetBitrateKbps        int
+	TargetResolution         string
+	TargetAudioChannels      int
+	ID                       string
+	FileID                   int
+	Version                  catalog.FileVersion
+	SupportsDirectPlay       bool
+	SupportsDirectStream     bool
+	SupportsTranscoding      bool
 	// HLSRemux selects HLS with video copy. TranscodeAudio remains the
 	// independent audio-encode decision, so a compatible audio codec can stay
 	// bit-for-bit copied. HLSRemuxMPEGTS overrides the normal fMP4 packaging for
 	// clients whose Dolby Vision decoder requires MPEG-TS.
-	HLSRemux                    bool
-	HLSRemuxMPEGTS              bool
+	HLSRemux       bool
+	HLSRemuxMPEGTS bool
+	// DOVIVariant marks a copy remux of Dolby Vision without a compatible base
+	// layer (HEVC profile 5, AV1 profile 10) for a client whose device profile
+	// explicitly lists DOVI. As in Jellyfin 12, the fMP4 master playlist then
+	// offers a dvh1/dav1 variant ahead of the hvc1 fallback.
+	DOVIVariant                 bool
 	HLSRemuxAudioStreamIndexes  []int
 	TranscodeAudio              bool
 	DefaultAudioStreamIndex     *int
@@ -103,10 +122,21 @@ type PlaybackMediaSource struct {
 	// during PlaybackInfo. The temporary provider URL is resolved just in time.
 	VirtualSourceURI                 string
 	VirtualSourceOwnerInstallationID int
+	// SubtitleDeliveries preserves client delivery capabilities for tracks that
+	// may be enabled later. The scalar fields above retain the selected track's
+	// delivery for sessions read by older binaries during a rolling update.
+	SubtitleDeliveries map[int]PlaybackSubtitleDelivery
 
 	// preservedJSON carries fields written by a newer binary through this
 	// binary's durable read-modify-write cycle. See playback_sessions_json.go.
 	preservedJSON map[string]json.RawMessage
+}
+
+// PlaybackSubtitleDelivery stores a text track's negotiated external format and
+// whether delivery must be external even when playing the original media file.
+type PlaybackSubtitleDelivery struct {
+	Format   string
+	External bool
 }
 
 // CompatPlaybackStore persists compat playback negotiation sessions (the

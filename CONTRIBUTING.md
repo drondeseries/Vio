@@ -8,14 +8,22 @@ external contributors alike.
 ## Before you start
 
 > [!IMPORTANT]
-> Open an issue or discussion before implementing features, API or behavior
-> changes, schema migrations, large refactors, or anything else that changes
-> product scope. Documentation, typo fixes, and narrow bug fixes can go straight
-> to a pull request.
+> An open issue is not required before a pull request. State the problem in the
+> pull request itself: what breaks or is missing, who it affects, and why this
+> change is the right answer. Link an issue when one already covers the work.
 
 Silo is pre-1.0 and moves quickly. Coordinating first avoids duplicate work,
 conflicts with changes already in flight, and proposals outside scope. Read the relevant
-`docs/architecture/` material before proposing a capability.
+`docs/architecture/` material before proposing a capability. For features, API or
+behavior changes, schema migrations, large refactors, or anything else that changes
+product scope, opening an issue or discussion first is still the cheapest way to learn
+that the work is already in flight or outside scope. That is a judgment call, not a
+gate; the risk of a rejected pull request is yours. Read [Project non-goals](docs/non-goals.md)
+and the relevant `docs/architecture/` material before proposing a capability.
+
+An open issue is not an unclaimed one. Before implementing someone else's issue,
+read its comments and linked pull requests to see whether the author is already
+working on it, and say you are picking it up.
 
 Durable architecture and contracts live under `docs/architecture/`.
 Implementation plans and working notes belong in the issue or pull request, not
@@ -77,7 +85,7 @@ make embed-stub
 go build ./...
 gofmt -l .                      # must print nothing
 go vet ./...
-golangci-lint run --new-from-merge-base="origin/main" ./...
+make lint-changed                   # BASE_REF=origin/<pr-base> when not main
 make test-go
 
 # Web
@@ -109,8 +117,11 @@ stale artifact or fixture tree.
 
 `make lint` runs `golangci-lint` over the whole tree and reports inherited
 findings the repository does not pass yet; CI only gates the lines your branch
-changed, which is what the `--new-from-merge-base` form checks. Do not add to
-the inherited findings.
+changed. `make lint-changed` checks exactly those lines, and it analyzes only
+the packages your branch touched, so it takes seconds where a cold run over
+`./...` takes minutes of every core. Do not add to the inherited findings.
+Never pass `--allow-parallel-runners`: concurrent runs queue behind one
+another on purpose.
 
 Summarize the relevant commands and results in the pull request. Name required
 checks that were skipped or failed, and include short output excerpts only when
@@ -127,11 +138,11 @@ template or issue form.
 ## Open the pull request
 
 Use a [Conventional Commit](https://www.conventionalcommits.org/) title and fill
-in the pull request template. Link the issue or scope item for non-trivial
-work; write `Related issue: N/A — narrow fix` only when no prior coordination
-was needed. Keep the commit history intentional and the diff limited to the
-stated problem. Keep the description proportional to the change; omit session
-history, full logs, and private report links. Follow the
+in the pull request template. Link an issue or scope item when one covers the
+work; write `Related issue: N/A` when none does. Either way, the Problem section
+has to stand on its own. Keep the commit history intentional and the diff
+limited to the stated problem. Keep the description proportional to the change;
+omit session history, full logs, and private report links. Follow the
 [public-content and media rules](AGENTS.md#pull-requests). Screenshots and recordings
 are not routine PR requirements; attach them only when explicitly requested.
 

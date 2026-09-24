@@ -93,7 +93,7 @@ func newSubtitleUploadRequest(t *testing.T, mediaFileID int, language, filename 
 
 func TestHandleUploadSuccess(t *testing.T) {
 	repo := newMockSubtitleRepoForHandler()
-	manager := subtitles.NewManager(repo, newMockS3ClientForHandler(), "test-bucket")
+	manager := subtitles.NewManager(repo, newMockBlobStoreForHandler())
 	handler := NewSubtitleSearchHandler(manager, repo, stubSubtitleMediaResolver{})
 	handler.FileAuthorizer = &MediaFileAuthorizer{
 		FileResolver: stubMediaFileResolver{
@@ -123,7 +123,7 @@ func TestHandleUploadSuccess(t *testing.T) {
 
 func TestHandleUploadUnauthorizedMediaFile(t *testing.T) {
 	repo := newMockSubtitleRepoForHandler()
-	manager := subtitles.NewManager(repo, newMockS3ClientForHandler(), "test-bucket")
+	manager := subtitles.NewManager(repo, newMockBlobStoreForHandler())
 	handler := NewSubtitleSearchHandler(manager, repo, stubSubtitleMediaResolver{})
 	handler.FileAuthorizer = &MediaFileAuthorizer{
 		FileResolver: stubMediaFileResolver{err: scanner.ErrFileNotFound},
@@ -141,7 +141,7 @@ func TestHandleUploadUnauthorizedMediaFile(t *testing.T) {
 
 func TestHandleUploadRejectsBadExtension(t *testing.T) {
 	repo := newMockSubtitleRepoForHandler()
-	manager := subtitles.NewManager(repo, newMockS3ClientForHandler(), "test-bucket")
+	manager := subtitles.NewManager(repo, newMockBlobStoreForHandler())
 	handler := NewSubtitleSearchHandler(manager, repo, stubSubtitleMediaResolver{})
 	handler.FileAuthorizer = &MediaFileAuthorizer{
 		FileResolver: stubMediaFileResolver{
@@ -161,7 +161,7 @@ func TestHandleUploadRejectsBadExtension(t *testing.T) {
 
 func TestHandleUploadRejectsOversizedBody(t *testing.T) {
 	repo := newMockSubtitleRepoForHandler()
-	manager := subtitles.NewManager(repo, newMockS3ClientForHandler(), "test-bucket")
+	manager := subtitles.NewManager(repo, newMockBlobStoreForHandler())
 	handler := NewSubtitleSearchHandler(manager, repo, stubSubtitleMediaResolver{})
 	handler.FileAuthorizer = &MediaFileAuthorizer{
 		FileResolver: stubMediaFileResolver{
@@ -187,7 +187,7 @@ func TestHandleUploadRejectsOversizedBody(t *testing.T) {
 
 func TestHandleDetectLanguageRejectsOversizedBody(t *testing.T) {
 	repo := newMockSubtitleRepoForHandler()
-	manager := subtitles.NewManager(repo, newMockS3ClientForHandler(), "test-bucket")
+	manager := subtitles.NewManager(repo, newMockBlobStoreForHandler())
 	handler := NewSubtitleSearchHandler(manager, repo, stubSubtitleMediaResolver{})
 
 	var body bytes.Buffer
@@ -220,7 +220,7 @@ func TestHandleDeleteRequiresAccessToMediaFile(t *testing.T) {
 		MediaFileID: 42,
 		Provider:    subtitles.ProviderUpload,
 	}
-	manager := subtitles.NewManager(repo, newMockS3ClientForHandler(), "test-bucket")
+	manager := subtitles.NewManager(repo, newMockBlobStoreForHandler())
 	handler := NewSubtitleSearchHandler(manager, repo, stubSubtitleMediaResolver{})
 	handler.FileAuthorizer = &MediaFileAuthorizer{
 		FileResolver: stubMediaFileResolver{err: scanner.ErrFileNotFound},
@@ -279,7 +279,7 @@ func decodeProviderStatus(t *testing.T, rr *httptest.ResponseRecorder) struct {
 
 func TestHandleProviderStatusWithoutProviders(t *testing.T) {
 	repo := newMockSubtitleRepoForHandler()
-	manager := subtitles.NewManager(repo, newMockS3ClientForHandler(), "test-bucket")
+	manager := subtitles.NewManager(repo, newMockBlobStoreForHandler())
 	handler := NewSubtitleSearchHandler(manager, repo, stubSubtitleMediaResolver{})
 
 	rr := httptest.NewRecorder()
@@ -301,7 +301,7 @@ func TestHandleProviderStatusWithoutProviders(t *testing.T) {
 
 func TestHandleProviderStatusWithProviders(t *testing.T) {
 	repo := newMockSubtitleRepoForHandler()
-	manager := subtitles.NewManager(repo, newMockS3ClientForHandler(), "test-bucket")
+	manager := subtitles.NewManager(repo, newMockBlobStoreForHandler())
 	manager.RegisterProvider(stubSubtitleProvider{name: "subdl"})
 	manager.RegisterProvider(stubSubtitleProvider{name: "opensubtitles"})
 	handler := NewSubtitleSearchHandler(manager, repo, stubSubtitleMediaResolver{})
@@ -441,21 +441,21 @@ func (m *handlerMockSubtitleRepo) UpsertProviderConfig(context.Context, *subtitl
 	return nil
 }
 
-type handlerMockS3Client struct{}
+type handlerMockBlobStore struct{}
 
-func newMockS3ClientForHandler() *handlerMockS3Client {
-	return &handlerMockS3Client{}
+func newMockBlobStoreForHandler() *handlerMockBlobStore {
+	return &handlerMockBlobStore{}
 }
 
-func (handlerMockS3Client) PutObject(context.Context, string, string, []byte) error {
+func (handlerMockBlobStore) Put(context.Context, string, []byte) error {
 	return nil
 }
 
-func (handlerMockS3Client) GetObject(context.Context, string, string) ([]byte, error) {
+func (handlerMockBlobStore) Get(context.Context, string) ([]byte, error) {
 	return nil, nil
 }
 
-func (handlerMockS3Client) DeleteObject(context.Context, string, string) error {
+func (handlerMockBlobStore) Delete(context.Context, string) error {
 	return nil
 }
 

@@ -198,6 +198,45 @@ describe("Layout mobile profile", () => {
   });
 });
 
+describe("Layout sidebar collapse", () => {
+  it("stays collapsed from item to person and back, then expands on Home", () => {
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) =>
+      window.setTimeout(() => callback(performance.now()), 16),
+    );
+    setRoute("/item/movie-1", "item");
+    const view = renderLayout();
+
+    for (const [pathname, key, collapsed] of [
+      ["/person/1", "person", true],
+      ["/item/movie-1", "item-back", true],
+      ["/", "home-back", false],
+    ] as const) {
+      setRoute(pathname, key);
+      view.rerender(
+        <MemoryRouter>
+          <Layout>
+            <Harness />
+          </Layout>
+        </MemoryRouter>,
+      );
+      act(() => vi.advanceTimersByTime(16));
+
+      expect(document.documentElement.hasAttribute("data-sidebar-collapsed")).toBe(collapsed);
+      expect(screen.getByTestId("sidebar-surface").hasAttribute("data-collapsed")).toBe(collapsed);
+      expect(screen.getByRole("main")).toHaveClass(collapsed ? "lg:ml-16" : "lg:ml-[260px]");
+    }
+  });
+
+  it("starts collapsed when opening a person page directly", () => {
+    setRoute("/person/1", "person");
+    renderLayout();
+
+    expect(screen.getByTestId("sidebar-surface")).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByRole("main")).toHaveClass("lg:ml-16");
+    expect(screen.getByRole("status", { name: "details-ready" })).toHaveTextContent("true");
+  });
+});
+
 describe("Layout item navigation", () => {
   it("declines interception on an item route, for a non-item href, and below lg", () => {
     const view = renderLayout();

@@ -240,7 +240,7 @@ func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookR
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if ignoreRulesMatch(ignoreRulesStack, path) {
+	if ignoreRulesMatch(ignoreRulesStack, path, true) {
 		return nil
 	}
 	recordFailure := func(err error) {
@@ -265,12 +265,13 @@ func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookR
 		recordFailure(err)
 		return nil
 	}
-	if honorIgnores && dirHasIgnoreMarker(entries) {
-		return nil
-	}
 	childRules := ignoreRulesStack
 	if honorIgnores {
-		childRules = childIgnoreRules(ignoreRulesStack, path, path, entries)
+		var skip bool
+		childRules, skip = dirIgnoreRules(ignoreRulesStack, path, path, entries)
+		if skip {
+			return nil
+		}
 	}
 
 	directories := make([]string, 0)
@@ -280,7 +281,7 @@ func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookR
 			return err
 		}
 		child := filepath.Join(path, entry.Name())
-		if ignoreRulesMatch(childRules, child) {
+		if ignoreRulesMatch(childRules, child, entry.IsDir()) {
 			continue
 		}
 		isDir := entry.IsDir()
@@ -292,11 +293,15 @@ func walkAudiobookDirectories(ctx context.Context, path string, scan *audiobookR
 				continue
 			}
 			isDir = info.IsDir()
+			// Directory-only patterns apply once the link resolves to a directory.
+			if isDir && ignoreRulesMatch(childRules, child, true) {
+				continue
+			}
 		}
 		if isDir {
 			directories = append(directories, child)
 		} else if SupportsAudioFile(entry.Name()) {
-			if ignoreRulesMatch(childRules, child) {
+			if ignoreRulesMatch(childRules, child, false) {
 				continue
 			}
 			scan.seenPaths[child] = true

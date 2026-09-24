@@ -56,6 +56,7 @@ export default function Layout({ children }: LayoutProps) {
   const isHomePath = location.pathname === "/";
   const isLibraryRoute = location.pathname.startsWith("/library/");
   const isItemRoute = location.pathname.startsWith("/item/");
+  const isPersonRoute = location.pathname.startsWith("/person/");
   const itemRouteLocation = `${location.pathname}${location.search}`;
   // Breakpoint changes naturally cause other layout renders; navigation only
   // needs the viewport value at the moment it is attempted.
@@ -84,7 +85,7 @@ export default function Layout({ children }: LayoutProps) {
   // Cold item routes commit a lightweight shell while the sidebar collapses.
   // A detail already cached before navigation skips that gate and renders on
   // the destination's first frame.
-  const isDetailImmersion = isItemRoute;
+  const isDetailImmersion = isItemRoute || isPersonRoute;
   const targetDetailImmersion = isDetailImmersion;
   const visualDetailImmersion = useImmediateSidebarCollapse(targetDetailImmersion);
   const {
@@ -217,7 +218,9 @@ export default function Layout({ children }: LayoutProps) {
     // `main-content`. app.css holds the root view-transition group still while
     // it is set, so the frozen sidebar snapshot cannot cross-fade over the live
     // collapse — and the routes rendered outside this shell keep the default
-    // root transition, which is the only thing they have to animate.
+    // root transition, which is the only thing they have to animate. It also
+    // gates `--app-sidebar-offset`: the sidebar only exists while this shell is
+    // mounted, so out-of-tree chrome must not reserve room for it elsewhere.
     root.dataset.appShell = "true";
     if (isHomePath) {
       root.dataset.homeRoute = "true";

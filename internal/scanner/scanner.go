@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/artworkstore"
+	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/librarykind"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -152,7 +152,7 @@ type Scanner struct {
 	episodeRepo          *catalog.EpisodeRepository
 	extraRepo            *catalog.ExtraRepository
 	ffprobePath          string
-	artworkStore         artworkstore.Store // artwork backend (may be nil)
+	artworkStore         blobstore.Store // artwork backend (may be nil)
 	imageCacher          scannerImageCacher
 	// workers is atomic so admin settings changes can resize the per-scan
 	// worker pool while a scan is running (applies to the next scan).
@@ -234,7 +234,7 @@ type SeriesQueueSyncer interface {
 }
 
 // NewScanner creates a new Scanner with the given dependencies.
-func NewScanner(fileRepo *FileRepository, ffprobePath string, artworkStore artworkstore.Store, workers int, emptyTrashAfterScan bool, fileRemovalGrace time.Duration) *Scanner {
+func NewScanner(fileRepo *FileRepository, ffprobePath string, artworkStore blobstore.Store, workers int, emptyTrashAfterScan bool, fileRemovalGrace time.Duration) *Scanner {
 	if workers < 1 {
 		workers = 8
 	}
@@ -357,6 +357,17 @@ func (s *Scanner) ScanFolder(ctx context.Context, folder *models.MediaFolder) (*
 // files that live beneath that subtree.
 func (s *Scanner) ScanSubtree(ctx context.Context, folder *models.MediaFolder, subtreePath string) (*ScanResult, error) {
 	cleanSubtree := filepath.Clean(subtreePath)
+	// A subtree scan under a skipped library root would walk nothing and
+	// retire the subtree piece by piece, bypassing the empty-root guard. Only
+	// a full library scan decides what happens to a skipped root's catalog.
+	if root := scopeLibraryRoot(cleanSubtree, folder.Paths); root != "" && libraryRootSkipped(root) {
+		slog.InfoContext(ctx, "scanner: library root is skipped by its ignore files; leaving subtree to a full library scan", "component", "scanner",
+			"folder_id", folder.ID,
+			"root", root,
+			"scope", cleanSubtree,
+		)
+		return &ScanResult{}, nil
+	}
 	watchCtx, stopWatch := s.watchFolderContext(ctx, folder.ID)
 	defer stopWatch()
 	if librarykind.IsAudiobook(folder.Type) {
@@ -602,7 +613,7 @@ func walkLogicalTree(
 	if isIgnoredDirectoryPath(logicalPath) {
 		return nil
 	}
-	if ignoreRulesMatch(ignoreRulesStack, logicalPath) {
+	if ignoreRulesMatch(ignoreRulesStack, logicalPath, true) {
 		return nil
 	}
 	if mode == walkModeMovie && shouldSkipMovieSupplementalDir(logicalPath) {
@@ -619,10 +630,10 @@ func walkLogicalTree(
 		return nil
 	}
 
-	if dirHasIgnoreMarker(entries) {
+	childRules, skip := dirIgnoreRules(ignoreRulesStack, logicalPath, physicalPath, entries)
+	if skip {
 		return nil
 	}
-	childRules := childIgnoreRules(ignoreRulesStack, logicalPath, physicalPath, entries)
 	for _, entry := range entries {
 		if ctx != nil {
 			if err := ctx.Err(); err != nil {
@@ -632,7 +643,7 @@ func walkLogicalTree(
 
 		logicalChild := filepath.Join(logicalPath, entry.Name())
 		physicalChild := filepath.Join(physicalPath, entry.Name())
-		if ignoreRulesMatch(childRules, logicalChild) {
+		if ignoreRulesMatch(childRules, logicalChild, entry.IsDir()) {
 			continue
 		}
 
@@ -650,6 +661,10 @@ func walkLogicalTree(
 				continue
 			}
 			if targetInfo.IsDir() {
+				// Directory-only patterns apply once the link resolves to a directory.
+				if ignoreRulesMatch(childRules, logicalChild, true) {
+					continue
+				}
 				if err := walkLogicalTree(ctx, logicalChild, resolved, mode, visitedPhysicalDirs, childRules, filePaths, walkFailures, readDir); err != nil {
 
 					return err
@@ -817,7 +832,7 @@ func (s *Scanner) scanPaths(
 	if err != nil {
 		return nil, fmt.Errorf("loading root overrides: %w", err)
 	}
-	rootInference := inferRootAssignments(primaryPaths, folder.Type, folder.ID, rootOverrides)
+	rootInference := inferRootAssignments(primaryPaths, folder.Type, folder.ID, rootOverrides, folder.Paths...)
 	identityOverrides, err := s.loadIdentityOverrides(ctx, folder.ID)
 	if err != nil {
 		return nil, fmt.Errorf("loading identity overrides: %w", err)
@@ -1736,7 +1751,7 @@ func (s *Scanner) scanScope(
 	if err != nil {
 		return nil, fmt.Errorf("loading root overrides: %w", err)
 	}
-	rootInference := inferRootAssignments(primaryPaths, folder.Type, folder.ID, rootOverrides)
+	rootInference := inferRootAssignments(primaryPaths, folder.Type, folder.ID, rootOverrides, folder.Paths...)
 	identityOverrides, err := s.loadIdentityOverrides(ctx, folder.ID)
 	if err != nil {
 		return nil, fmt.Errorf("loading identity overrides: %w", err)
@@ -2676,7 +2691,7 @@ func (s *Scanner) ScanFile(ctx context.Context, filePath string, folder *models.
 	if err != nil {
 		return fmt.Errorf("loading item statuses for file: %w", err)
 	}
-	observation, ok := ObserveRoot(filePath, folder.Type)
+	observation, ok := ObserveRoot(filePath, folder.Type, folder.Paths...)
 	if ok {
 		cleared, clearErr := s.clearLegacyLinksForUnmatchableRoots(ctx, folder.ID, []RootObservation{observation})
 		if clearErr != nil {
@@ -2697,7 +2712,7 @@ func (s *Scanner) ScanFile(ctx context.Context, filePath string, folder *models.
 	if err != nil {
 		return fmt.Errorf("loading root overrides for file: %w", err)
 	}
-	rootInference := inferRootAssignments([]string{filePath}, folder.Type, folder.ID, rootOverrides)
+	rootInference := inferRootAssignments([]string{filePath}, folder.Type, folder.ID, rootOverrides, folder.Paths...)
 	s.logRootInferenceDisagreements(rootInference.Assignments)
 
 	identityOverrides, err := s.loadIdentityOverrides(ctx, folder.ID)
@@ -3171,7 +3186,7 @@ func populateScanIdentity(
 ) {
 	if assignment.RootPath != "" {
 		mf.CanonicalRootPath = filepath.Clean(assignment.RootPath)
-	} else if root, ok := naming.DetectCanonicalRoot(filePath, folderType); ok {
+	} else if root, ok := naming.DetectCanonicalRoot(filePath, folderType, assignment.LibraryRootPath); ok {
 		mf.CanonicalRootPath = filepath.Clean(root.RootPath)
 	}
 	mf.ObservedRootPath = filepath.Clean(groupAssignment.ObservedRootPath)
@@ -3182,14 +3197,13 @@ func populateScanIdentity(
 	mf.BaseType = groupAssignment.BaseType
 	mf.IdentityConfidence = groupAssignment.Confidence
 	mf.IdentityJSON = append([]byte(nil), groupAssignment.EvidenceJSON...)
-	if filenameHints := naming.ParseFilename(filePath, folderType); filenameHints != nil &&
+	if filenameHints := naming.ParseFilename(filePath, folderType, assignment.LibraryRootPath); filenameHints != nil &&
 		filenameHints.Type == "series" && filenameHints.EpisodeNum > 0 {
 		mf.SeasonNumber = filenameHints.SeasonNum
 		mf.EpisodeNumber = filenameHints.EpisodeNum
 	}
-	variantHints := naming.ParseVariantHints(filePath, folderType)
-	importVariantOverride := existing != nil && existing.EditionSource == "import" && existing.EditionKey != ""
-	if importVariantOverride {
+	variantHints := naming.ParseVariantHints(filePath, folderType, assignment.LibraryRootPath)
+	if existing != nil && existing.EditionSource == "import" && existing.EditionKey != "" {
 		variantHints = &naming.VariantHints{
 			EditionRaw:            existing.EditionRaw,
 			EditionKey:            existing.EditionKey,
@@ -3217,8 +3231,9 @@ func populateScanIdentity(
 	// pins only the edition fields, so re-parse a fresh hints value for the
 	// release fields to keep the override struct untouched.
 	releaseHints := variantHints
+	importVariantOverride := existing != nil && existing.EditionSource == "import" && existing.EditionKey != ""
 	if importVariantOverride {
-		releaseHints = naming.ParseVariantHints(filePath, folderType)
+		releaseHints = naming.ParseVariantHints(filePath, folderType, assignment.LibraryRootPath)
 	}
 	if releaseHints != nil {
 		mf.ReleaseName = releaseHints.ReleaseName
@@ -3841,7 +3856,7 @@ func scanStateRootAssignmentChanged(existing *scanStateFile, assignment fileRoot
 	}
 	expectedRoot := assignment.RootPath
 	if expectedRoot == "" {
-		if root, ok := naming.DetectCanonicalRoot(existing.FilePath, libraryType); ok {
+		if root, ok := naming.DetectCanonicalRoot(existing.FilePath, libraryType, assignment.LibraryRootPath); ok {
 			expectedRoot = filepath.Clean(root.RootPath)
 		}
 	}
@@ -3849,7 +3864,7 @@ func scanStateRootAssignmentChanged(existing *scanStateFile, assignment fileRoot
 		return true
 	}
 
-	hints := naming.ParseVariantHints(existing.FilePath, libraryType)
+	hints := naming.ParseVariantHints(existing.FilePath, libraryType, assignment.LibraryRootPath)
 	if existing.EditionSource == "import" && existing.EditionKey != "" {
 		hints = &naming.VariantHints{
 			EditionRaw:            existing.EditionRaw,
@@ -3911,7 +3926,7 @@ func rootAssignmentChanged(existing *models.MediaFile, assignment fileRootAssign
 	}
 	expectedRoot := assignment.RootPath
 	if expectedRoot == "" {
-		if root, ok := naming.DetectCanonicalRoot(existing.FilePath, libraryType); ok {
+		if root, ok := naming.DetectCanonicalRoot(existing.FilePath, libraryType, assignment.LibraryRootPath); ok {
 			expectedRoot = filepath.Clean(root.RootPath)
 		}
 	}
@@ -3919,7 +3934,7 @@ func rootAssignmentChanged(existing *models.MediaFile, assignment fileRootAssign
 		return true
 	}
 
-	hints := naming.ParseVariantHints(existing.FilePath, libraryType)
+	hints := naming.ParseVariantHints(existing.FilePath, libraryType, assignment.LibraryRootPath)
 	if existing.EditionSource == "import" && existing.EditionKey != "" {
 		hints = &naming.VariantHints{
 			EditionRaw:            existing.EditionRaw,

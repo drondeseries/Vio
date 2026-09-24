@@ -243,7 +243,7 @@ export default function SeriesContent({ item }: { item: ItemDetail & { type: "se
         {item.cast && item.cast.length > 0 && (
           <div>
             <h2 className="mb-5 text-xl font-semibold tracking-tight">Cast</h2>
-            <CastCarousel cast={item.cast} />
+            <CastCarousel cast={item.cast} prefetchPeople />
           </div>
         )}
         {item.crew && item.crew.length > 0 && <CrewList crew={item.crew} />}

@@ -65,7 +65,7 @@ grep -q 'setVirtualPlayback] = useState(true)' web/src/pages/adminCollectionsSha
 
 # 7. Image build pipeline: BuildKit frontend pruning, unshadowed Go module layer caching, Go compiler cache persistence, single-runner manual frontend builds, and pinned base image versions (a floating tag bump silently invalidates the layer cache and the Go build cache).
 grep -Eq 'FROM node:22(\.[0-9]+){2}-slim AS node-base' Dockerfile \
-  && grep -q 'COPY --from=node-base /usr/local/bin/node' Dockerfile \
+  && grep -Eq 'COPY --from=(node-base|jellyfin_web_node) /usr/local/bin/node' Dockerfile \
   && pass "Dockerfile decoupled node-base stage" \
   || reject "Dockerfile missing decoupled node-base stage for BuildKit frontend pruning"
 

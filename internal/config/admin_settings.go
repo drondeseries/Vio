@@ -60,6 +60,10 @@ const (
 // edited through the administrator settings API.
 const ArtworkStorageReconcileCheckpointKey = "s3.public_storage_reconcile_checkpoint"
 
+// StorageTransitionTargetKey holds the machine-managed staged transition and
+// its post-restart recovery status.
+const StorageTransitionTargetKey = "storage.transition.target"
+
 // ArtworkStorageSweepCheckpointKey is the machine-managed cursor for the
 // artwork storage sweep, kept out of the administrator settings API for the
 // same reason as the reconcile checkpoint.
@@ -826,7 +830,7 @@ func normalizeAdminDuration(key, value string) (string, error) {
 }
 
 // ValidateArtworkStorageSettings rejects an explicit S3 artwork backend with
-// no public bucket to back it. artworkstore.Open fails on that combination, so
+// no public bucket to back it. blobstore.Open fails on that combination, so
 // accepting it here would only surface as a fatal restart.
 func ValidateArtworkStorageSettings(effective map[string]string) error {
 	if strings.ToLower(strings.TrimSpace(effective["artwork.storage_backend"])) != "s3" {

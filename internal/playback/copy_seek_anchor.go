@@ -208,7 +208,8 @@ func (c *copySeekAnchorCache) probeRunner() anchorProbeRunner {
 // Matroska pre-roll at an exact keyframe boundary, while FFmpeg stream copy
 // emits that preceding packet. Running FFmpeg with the transport's real seek
 // and timestamp policy observes the packet the HLS muxer will actually receive
-// without decoding or writing media output.
+// without decoding or writing media output. start_at_zero matches the transport
+// and makes the returned origin relative to the source start, not raw input PTS.
 func ResolveCopySeekAnchor(
 	ctx context.Context,
 	ffmpegPath string,
@@ -366,6 +367,7 @@ func resolveCopySeekAnchor(
 		"-map", "0:V:0",
 		"-c:v", "copy",
 		"-copyts",
+		"-start_at_zero",
 		"-avoid_negative_ts", "disabled",
 		"-frames:v", "1",
 		"-f", "framecrc",

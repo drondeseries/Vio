@@ -20,6 +20,8 @@ import {
   policyStateFromUser,
   policyUpdateFields,
 } from "@/components/UserPolicyFields";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { AdminUserImpersonationDialog } from "@/components/AdminUserImpersonationDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -53,6 +55,7 @@ import {
   ChevronDown,
   ChevronUp,
   History,
+  UserRound,
   Plus,
   Pencil,
   Trash2,
@@ -114,6 +117,7 @@ function AdminUsersPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<AdminUserEditor | null>(null);
   const [confirmDeleteUser, setConfirmDeleteUser] = useState<AdminUserEditor | null>(null);
+  const [impersonatingUser, setImpersonatingUser] = useState<AdminUser | null>(null);
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(25);
@@ -198,6 +202,14 @@ function AdminUsersPage() {
           initialEditor={confirmDeleteUser}
           onClose={() => setConfirmDeleteUser(null)}
           onDeleted={() => setConfirmDeleteUser(null)}
+        />
+      )}
+      {impersonatingUser && (
+        <AdminUserImpersonationDialog
+          user={impersonatingUser}
+          returnPath="/admin/users"
+          onClose={() => setImpersonatingUser(null)}
+          onError={setActionError}
         />
       )}
       {actionError && <p role="alert">{actionError}</p>}
@@ -355,7 +367,7 @@ function AdminUsersPage() {
                   >
                     Last Active
                   </SortableUserHead>
-                  <TableHead className="w-24">Actions</TableHead>
+                  <TableHead className="w-32">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -382,36 +394,69 @@ function AdminUsersPage() {
                       {formatRelativeTime(u.last_active_at, "Never")}
                     </TableCell>
                     <TableCell>
-                      <div className="flex gap-1">
-                        <Button asChild variant="ghost" size="icon" className="h-7 w-7">
-                          <Link
-                            to={`/admin/history?user_id=${u.id}`}
-                            aria-label={`View ${u.username} playback history`}
-                          >
-                            <History className="h-3 w-3" aria-hidden="true" />
-                          </Link>
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7"
-                          aria-label={`Edit ${u.username}`}
-                          onClick={() => {
-                            void loadEditor(u);
-                          }}
-                        >
-                          <Pencil className="h-3 w-3" aria-hidden="true" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7"
-                          aria-label={`Delete ${u.username}`}
-                          onClick={() => handleDelete(u)}
-                        >
-                          <Trash2 className="h-3 w-3" aria-hidden="true" />
-                        </Button>
-                      </div>
+                      <TooltipProvider delayDuration={0}>
+                        <div className="flex gap-1">
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button asChild variant="ghost" size="icon" className="h-7 w-7">
+                                <Link
+                                  to={`/admin/history?user_id=${u.id}`}
+                                  aria-label={`View ${u.username} playback history`}
+                                >
+                                  <History className="h-3 w-3" aria-hidden="true" />
+                                </Link>
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>View playback history</TooltipContent>
+                          </Tooltip>
+                          {available && u.role !== "admin" && u.enabled && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7"
+                                  aria-label={`View as user: ${u.username}`}
+                                  onClick={() => setImpersonatingUser(u)}
+                                >
+                                  <UserRound className="h-3 w-3" aria-hidden="true" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>View as user</TooltipContent>
+                            </Tooltip>
+                          )}
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7"
+                                aria-label={`Edit ${u.username}`}
+                                onClick={() => {
+                                  void loadEditor(u);
+                                }}
+                              >
+                                <Pencil className="h-3 w-3" aria-hidden="true" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Edit user</TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7"
+                                aria-label={`Delete ${u.username}`}
+                                onClick={() => handleDelete(u)}
+                              >
+                                <Trash2 className="h-3 w-3" aria-hidden="true" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Delete user</TooltipContent>
+                          </Tooltip>
+                        </div>
+                      </TooltipProvider>
                     </TableCell>
                   </TableRow>
                 ))}

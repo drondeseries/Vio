@@ -9,34 +9,38 @@ function renderShortcuts() {
   const video = { currentTime: 100, duration: 300, volume: 1, muted: false } as HTMLVideoElement;
   const videoRef = { current: video };
   const containerRef = { current: null };
-  const handleSeek = vi.fn();
-  renderHook(() =>
-    useKeyboardShortcuts(videoRef, containerRef, vi.fn(), handleSeek, vi.fn(), undefined),
-  );
-  return { handleSeek, video };
+  const skip = { back: vi.fn(), forward: vi.fn() };
+  renderHook(() => useKeyboardShortcuts(videoRef, containerRef, vi.fn(), skip, vi.fn(), undefined));
+  return { skip, video };
 }
 
 describe("useKeyboardShortcuts", () => {
-  it("nudges the keyboard arrow seek by 10s", () => {
+  it("delegates arrow keys to the profile skip intervals", () => {
     expect(KEYBOARD_SKIP_SECONDS).toBe(10);
 
-    const { handleSeek } = renderShortcuts();
+    const { skip } = renderShortcuts();
 
     fireEvent.keyDown(document, { key: "ArrowLeft" });
-    expect(handleSeek).toHaveBeenLastCalledWith(90);
+    expect(skip.back).toHaveBeenCalledTimes(1);
 
     fireEvent.keyDown(document, { key: "ArrowRight" });
-    expect(handleSeek).toHaveBeenLastCalledWith(110);
+    expect(skip.forward).toHaveBeenCalledTimes(1);
   });
 
-  it("clamps the arrow seek to the media bounds", () => {
+  it("toggles captions on C", () => {
+    const toggleCaptions = vi.fn();
     const video = { currentTime: 5, duration: 300, volume: 1, muted: false } as HTMLVideoElement;
-    const handleSeek = vi.fn();
     renderHook(() =>
-      useKeyboardShortcuts({ current: video }, { current: null }, vi.fn(), handleSeek, vi.fn()),
+      useKeyboardShortcuts(
+        { current: video },
+        { current: null },
+        vi.fn(),
+        { back: vi.fn(), forward: vi.fn() },
+        toggleCaptions,
+      ),
     );
 
-    fireEvent.keyDown(document, { key: "ArrowLeft" });
-    expect(handleSeek).toHaveBeenLastCalledWith(0);
+    fireEvent.keyDown(document, { key: "c" });
+    expect(toggleCaptions).toHaveBeenCalledTimes(1);
   });
 });

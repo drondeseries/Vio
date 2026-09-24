@@ -179,7 +179,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
         {item.cast && item.cast.length > 0 && (
           <div className="mt-10">
             <h2 className="mb-4 text-xl font-semibold tracking-tight">Cast</h2>
-            <CastCarousel cast={item.cast} />
+            <CastCarousel cast={item.cast} prefetchPeople />
           </div>
         )}
 

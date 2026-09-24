@@ -87,16 +87,15 @@ func listPodcastShowAudioFiles(folderPath string, inheritedRules []ignoreRules) 
 		}
 		return nil, fmt.Errorf("read podcast folder %s: %w", folderPath, err)
 	}
-	if dirHasIgnoreMarker(entries) {
-		// A .ignore/.nomedia marker means the show folder (and its contents)
-		// are ignored; treat it as an empty show so the caller skips instead
-		// of failing.
-		return nil, fmt.Errorf("podcast show %s: %w", folderPath, errFolderHasNoMedia)
-	}
 	// basePath is folderPath itself: show-local patterns match episode
 	// filenames relative to the show folder, and inherited root rules match
 	// nested paths such as Show/file.mp3.
-	rules := childIgnoreRules(inheritedRules, folderPath, folderPath, entries)
+	rules, skip := dirIgnoreRules(inheritedRules, folderPath, folderPath, entries)
+	if skip {
+		// A skipped show folder (and its contents) is ignored; treat it as an
+		// empty show so the caller skips instead of failing.
+		return nil, fmt.Errorf("podcast show %s: %w", folderPath, errFolderHasNoMedia)
+	}
 	var audioFiles []string
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -104,7 +103,7 @@ func listPodcastShowAudioFiles(folderPath string, inheritedRules []ignoreRules) 
 		}
 		if SupportsAudioFile(entry.Name()) {
 			audioPath := filepath.Join(folderPath, entry.Name())
-			if ignoreRulesMatch(rules, audioPath) {
+			if ignoreRulesMatch(rules, audioPath, false) {
 				continue
 			}
 			audioFiles = append(audioFiles, audioPath)

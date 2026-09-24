@@ -43,6 +43,8 @@ const adminUser: AdminUser = {
   max_playback_quality: null,
   max_streams: null,
   max_transcodes: null,
+  max_remote_stream_bitrate_kbps: null,
+  max_local_stream_bitrate_kbps: null,
   transcode_allowed: null,
   audio_transcode_allowed: null,
   max_profiles: 4,
@@ -54,6 +56,8 @@ const adminUser: AdminUser = {
     max_playback_quality: "",
     max_streams: 0,
     max_transcodes: 0,
+    max_remote_stream_bitrate_kbps: 0,
+    max_local_stream_bitrate_kbps: 0,
     transcode_allowed: true,
     audio_transcode_allowed: true,
     download_allowed: true,
@@ -130,6 +134,8 @@ vi.mock("@/hooks/queries/admin/accessGroups", () => ({
         audio_transcode_allowed: true,
         max_streams: 0,
         max_transcodes: 0,
+        max_remote_stream_bitrate_kbps: 0,
+        max_local_stream_bitrate_kbps: 0,
         allowed_permissions: null,
         requests_allowed: true,
         member_count: 0,
@@ -148,6 +154,8 @@ vi.mock("@/hooks/queries/admin/accessGroups", () => ({
         audio_transcode_allowed: true,
         max_streams: 1,
         max_transcodes: 0,
+        max_remote_stream_bitrate_kbps: 0,
+        max_local_stream_bitrate_kbps: 0,
         allowed_permissions: [],
         requests_allowed: false,
         member_count: 0,
@@ -410,8 +418,8 @@ describe("AdminUserDetail inherit hints", () => {
     renderUserDetail();
 
     await openLimitsTab(user);
-    // Ungrouped: the no-group layer leaves both ceilings uncapped.
-    expect(screen.getAllByText("Inherited: Unlimited")).toHaveLength(2);
+    // Ungrouped: the no-group layer leaves all four ceilings uncapped.
+    expect(screen.getAllByText("Inherited: Unlimited")).toHaveLength(4);
 
     await selectGuestsGroup(user);
     // The access tab's hints follow the picker straight away.
@@ -423,7 +431,7 @@ describe("AdminUserDetail inherit hints", () => {
     // effective_policy resolved against the account's saved group.
     await user.click(screen.getByRole("tab", { name: "Limits" }));
     expect(screen.getByText("Inherited: 1")).toBeInTheDocument();
-    expect(screen.getAllByText("Inherited: Unlimited")).toHaveLength(1);
+    expect(screen.getAllByText("Inherited: Unlimited")).toHaveLength(3);
   });
 
   it("seeds a limit override from the inherited value, not from unlimited", async () => {
@@ -555,9 +563,9 @@ it("does not install an impersonation session after the captured profile changes
       }),
   );
   renderUserDetail();
-  await user.click(screen.getByRole("button", { name: "Impersonate" }));
+  await user.click(screen.getByRole("button", { name: "View as user" }));
   await user.click(
-    within(screen.getByRole("alertdialog")).getByRole("button", { name: "Impersonate" }),
+    within(screen.getByRole("alertdialog")).getByRole("button", { name: "View as user" }),
   );
   const captured = mocks.impersonate.mock.calls[0]![0].profileContext;
   setProfileId("different-profile");
@@ -565,4 +573,13 @@ it("does not install an impersonation session after the captured profile changes
   await screen.findByText(/account or server changed/);
   expect(mocks.beginImpersonation).not.toHaveBeenCalled();
   expect(mocks.impersonate).toHaveBeenCalledTimes(1);
+});
+
+it.each([
+  { role: "admin" as const, enabled: true },
+  { role: "user" as const, enabled: false },
+])("keeps View as user disabled for an ineligible account: %o", (eligibility) => {
+  mocks.user = { ...adminUser, ...eligibility };
+  renderUserDetail();
+  expect(screen.getByRole("button", { name: "View as user" })).toBeDisabled();
 });

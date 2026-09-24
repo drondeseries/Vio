@@ -666,7 +666,7 @@ export default function ActionBar({
               {onSearchSubtitles && (
                 <DetailOverflowMenuItem closeMenu={closeOverflowMenu} onAction={onSearchSubtitles}>
                   <Captions className="size-4" />
-                  Search Subtitles
+                  Add Subtitles
                 </DetailOverflowMenuItem>
               )}
               {watchTogether && (

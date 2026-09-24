@@ -50,10 +50,10 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 		// its files are not in seenPaths, so their catalog rows are marked
 		// missing and retired instead of being protected forever.
 		reconcileRoots = append(reconcileRoots, root)
-		if dirHasIgnoreMarker(entries) {
+		rootIgnoreRules, skip := dirIgnoreRules(nil, root, root, entries)
+		if skip {
 			continue
 		}
-		rootIgnoreRules := childIgnoreRules(nil, root, root, entries)
 
 		for _, entry := range entries {
 			if !entry.IsDir() {
@@ -63,7 +63,7 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if ignoreRulesMatch(rootIgnoreRules, subPath) {
+			if ignoreRulesMatch(rootIgnoreRules, subPath, true) {
 				continue
 			}
 			attempted++

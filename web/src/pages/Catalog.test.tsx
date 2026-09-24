@@ -14,6 +14,7 @@ const mockUseCatalogFilters = vi.fn();
 const mockItemGrid = vi.fn();
 const mockUseCanRequest = vi.fn();
 const mockUseRequestSearch = vi.fn();
+const mockUsePersonSearch = vi.fn();
 
 vi.mock("react-router", async () => {
   const actual = await vi.importActual<typeof import("react-router")>("react-router");
@@ -43,6 +44,10 @@ vi.mock("@/hooks/queries/catalog", () => ({
   useCatalogWindow: (...args: unknown[]) => mockUseCatalogWindow(...args),
   useCatalogFilters: (...args: unknown[]) => mockUseCatalogFilters(...args),
   useCatalogMetadataFilters: (...args: unknown[]) => mockUseCatalogFilters(...args),
+}));
+
+vi.mock("@/hooks/queries/people", () => ({
+  usePersonSearch: (...args: unknown[]) => mockUsePersonSearch(...args),
 }));
 
 vi.mock("@/hooks/useCanRequest", () => ({
@@ -199,6 +204,8 @@ describe("Catalog page", () => {
     mockItemGrid.mockReset();
     mockUseCanRequest.mockReset();
     mockUseRequestSearch.mockReset();
+    mockUsePersonSearch.mockReset();
+    mockUsePersonSearch.mockReturnValue({ data: [], isLoading: false, isError: false });
     mockUseCanRequest.mockReturnValue({
       discoveryEnabled: false,
       isResolving: false,
@@ -220,6 +227,68 @@ describe("Catalog page", () => {
       data: { genres: ["Drama"], content_ratings: ["R"] },
       isLoading: false,
     });
+  });
+
+  it("offers actor and director results with exact person links when no titles match", () => {
+    mockUseCatalogWindow.mockReturnValue({
+      data: { totalItems: 0, pages: new Map() },
+      isLoading: false,
+      isError: false,
+    });
+    mockUsePersonSearch.mockReturnValue({
+      data: [
+        { id: "137101642343383042", name: "Tom Hanks", photo_url: "/actor.jpg" },
+        { id: "137101697843200002", name: "Christopher Nolan" },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+
+    const markup = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    expect(markup).toContain("People");
+    expect(markup).toContain('href="/person/137101642343383042"');
+    expect(markup).toContain('href="/person/137101697843200002"');
+    expect(markup).toContain("Tom Hanks");
+    expect(markup).toContain("Christopher Nolan");
+    expect(markup).toContain('src="/actor.jpg"');
+    expect(markup).toContain(">CN<");
+    expect(mockItemGrid).not.toHaveBeenCalled();
+  });
+
+  it("keeps title results visible when people search fails and offers a retry", async () => {
+    const userEvent = (await import("@testing-library/user-event")).default;
+    const refetch = vi.fn();
+    mockUsePersonSearch.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      refetch,
+    });
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <App />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText("Could not load people results.")).toBeDefined();
+    expect(mockItemGrid).toHaveBeenCalledWith(expect.objectContaining({ totalItems: 1 }));
+    await userEvent.click(screen.getByRole("button", { name: "Retry people search" }));
+    expect(refetch).toHaveBeenCalledOnce();
+  });
+
+  it("does not search people when browsing a personal list", () => {
+    appInitialEntries = ["/catalog?source=favorites"];
+    const markup = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <App />
+      </QueryClientProvider>,
+    );
+    expect(mockUsePersonSearch).toHaveBeenCalledWith("", 20, false, undefined);
+    expect(markup).not.toContain('aria-label="People"');
   });
 
   it("renders catalog results from the new API route", () => {
@@ -725,6 +794,7 @@ describe("Catalog page", () => {
       }),
       expect.anything(),
     );
+    expect(mockUsePersonSearch).toHaveBeenCalledWith("heat", 20, true, "video");
   });
 
   it("uses approximate totals for interactive query searches", () => {
@@ -760,6 +830,17 @@ describe("Catalog page", () => {
       }),
       expect.anything(),
     );
+    expect(mockUsePersonSearch).toHaveBeenCalledWith("heat", 20, true, undefined);
+  });
+
+  it.each(["movie", "series", "audiobook"])("scopes people to the explicit %s search", (scope) => {
+    appInitialEntries = [`/catalog?source=query&q=heat&type=${scope}`];
+    renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <App />
+      </QueryClientProvider>,
+    );
+    expect(mockUsePersonSearch).toHaveBeenCalledWith("heat", 20, true, scope);
   });
 
   it("renders the search scope chips on query results", () => {

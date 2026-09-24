@@ -165,7 +165,9 @@ export const compatKeys = {
 
 export const personKeys = {
   all: ["people"] as const,
-  search: (query: string, limit = 20) => ["people", "search", query, limit] as const,
+  searchCapabilities: () => ["people", "search-capabilities"] as const,
+  search: (query: string, limit = 20, mediaScope?: string) =>
+    ["people", "search", query, limit, mediaScope ?? "all"] as const,
   detail: (id: string) => ["people", "detail", id] as const,
   catalog: (
     id: string,
@@ -297,6 +299,7 @@ export const ratingKeys = {
 export const subtitleKeys = {
   all: ["subtitles"] as const,
   downloaded: (mediaFileId: number) => ["subtitles", "downloaded", mediaFileId] as const,
+  providerStatus: () => ["subtitles", "provider-status"] as const,
 };
 
 export const recKeys = {
@@ -453,6 +456,8 @@ export const adminKeys = {
     ["admin", "historyImportAdminRuns", "detail", id] as const,
   activeScans: () => ["admin", "activeScans"] as const,
   tasks: () => ["admin", "tasks"] as const,
+  // Under tasks() so every task-list invalidation also refreshes it.
+  tasksIncludingHidden: () => ["admin", "tasks", { includeHidden: true }] as const,
   task: (key: string) => ["admin", "tasks", key] as const,
   taskHistory: (key: string) => ["admin", "tasks", key, "history"] as const,
   taskMetrics: (key: string) => ["admin", "tasks", key, "metrics"] as const,

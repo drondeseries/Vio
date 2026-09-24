@@ -2,7 +2,6 @@ import { AdminUserDeleteDialog } from "@/components/AdminUserDeleteDialog";
 import {
   adminUserScope,
   captureAdminUserAuthority,
-  requireAdminUserAuthority,
   getAdminUser,
   type AdminUserEditor,
 } from "@/api/v2/adminUsers";
@@ -17,7 +16,6 @@ import {
   useAdminUser,
   useUpdateUser,
   useAdminUserCapabilities,
-  useImpersonateUser,
   useAdminUserDeviceSettings,
   useAdminUserSettings,
   useDeleteAdminUserDeviceSetting,
@@ -63,6 +61,7 @@ import {
 } from "@/components/ui/select";
 import { ArrowUpRight, ChevronRight, Pencil, RotateCcw, Settings2, UserCircle } from "lucide-react";
 import { useNavigate } from "react-router";
+import { AdminUserImpersonationDialog } from "@/components/AdminUserImpersonationDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { useAuth } from "@/hooks/useAuth";
 import { formatPlaybackQualityPreset } from "@/lib/playback-quality";
@@ -94,6 +93,8 @@ import {
   formatDateTime as formatDateTimePreferred,
 } from "@/lib/datetime";
 
+import { formatDecisionLabel } from "./adminActivityPresentation";
+
 export default function AdminUserDetail() {
   useAuth();
   const { id } = useParams<{ id: string }>();
@@ -103,7 +104,6 @@ function AdminUserDetailPage() {
   const { id } = useParams<{ id: string }>();
   const userId = Number(id);
   const navigate = useNavigate();
-  const { beginImpersonation } = useAuth();
   const { data: user, isLoading, error } = useAdminUser(userId);
   const [editOpen, setEditOpen] = useState(false);
   const [deleteEditor, setDeleteEditor] = useState<AdminUserEditor | null>(null);
@@ -115,7 +115,6 @@ function AdminUserDetailPage() {
   const capabilities = useAdminUserCapabilities();
   const available = capabilities.data?.available === true;
   const [confirmImpersonateOpen, setConfirmImpersonateOpen] = useState(false);
-  const impersonateMutation = useImpersonateUser();
 
   if (isLoading) return <div className="page-shell py-8">Loading user...</div>;
   if (error || !user)
@@ -180,9 +179,9 @@ function AdminUserDetailPage() {
             size="sm"
             className="flex-1 sm:flex-none"
             onClick={() => setConfirmImpersonateOpen(true)}
-            disabled={!available || impersonationDisabled || impersonateMutation.isPending}
+            disabled={!available || impersonationDisabled}
           >
-            Impersonate
+            View as user
           </Button>
           <Dialog
             open={editOpen}
@@ -258,36 +257,14 @@ function AdminUserDetailPage() {
           <IPHistoryTab userId={userId} />
         </TabsContent>
       </Tabs>
-      <ConfirmDialog
-        open={confirmImpersonateOpen}
-        onOpenChange={(open) => {
-          if (!open && !busy.current) setConfirmImpersonateOpen(false);
-        }}
-        title="Impersonate user"
-        description={`Continue as "${user.username}"? Admin access will be removed until you end impersonation.`}
-        confirmLabel="Impersonate"
-        isPending={impersonateMutation.isPending}
-        onConfirm={() => {
-          if (busy.current || !available) return;
-          busy.current = true;
-          setActionError("");
-          void impersonateMutation
-            .mutateAsync({ id: user.id, profileContext: authority })
-            .then((result) => {
-              requireAdminUserAuthority(result.profileContext);
-              beginImpersonation(result.session, `/admin/users/${user.id}`);
-              impersonateMutation.reset();
-              setConfirmImpersonateOpen(false);
-              navigate("/profiles");
-            })
-            .catch((err: unknown) => {
-              setActionError(err instanceof Error ? err.message : "Failed to start impersonation");
-            })
-            .finally(() => {
-              busy.current = false;
-            });
-        }}
-      />
+      {confirmImpersonateOpen && (
+        <AdminUserImpersonationDialog
+          user={user}
+          returnPath={`/admin/users/${user.id}`}
+          onClose={() => setConfirmImpersonateOpen(false)}
+          onError={setActionError}
+        />
+      )}
       {deleteEditor && (
         <AdminUserDeleteDialog
           initialEditor={deleteEditor}
@@ -387,6 +364,24 @@ function OverviewTab({ user }: { user: AdminUser }) {
                 : effective.max_transcodes === 0
                   ? "Unlimited"
                   : String(effective.max_transcodes)) + overridden(user.max_transcodes !== null)
+            }
+          />
+          <DetailRow
+            label="Max remote stream bitrate"
+            value={
+              (effective.max_remote_stream_bitrate_kbps === 0
+                ? "Unlimited"
+                : `${effective.max_remote_stream_bitrate_kbps} kbps`) +
+              overridden(user.max_remote_stream_bitrate_kbps !== null)
+            }
+          />
+          <DetailRow
+            label="Max local stream bitrate"
+            value={
+              (effective.max_local_stream_bitrate_kbps === 0
+                ? "Unlimited"
+                : `${effective.max_local_stream_bitrate_kbps} kbps`) +
+              overridden(user.max_local_stream_bitrate_kbps !== null)
             }
           />
           <DetailRow
@@ -539,7 +534,7 @@ function WatchHistoryTab({ userId }: { userId: number }) {
                   </Link>
                 </TableCell>
                 <TableCell>
-                  <Badge variant="secondary">{row.play_method}</Badge>
+                  <Badge variant="secondary">{formatDecisionLabel(row.play_method)}</Badge>
                 </TableCell>
                 <TableCell>
                   <div>{formatDuration(row.watched_seconds)}</div>

@@ -33,3 +33,13 @@ type S3Client interface {
 	GetObject(ctx context.Context, bucket, key string) ([]byte, error)
 	DeleteObject(ctx context.Context, bucket, key string) error
 }
+
+// BlobStore is the object storage the subtitle system needs. Subtitle objects
+// are always read through the server, never by a redirect to storage, so this
+// is key-only: no bucket, no signed URLs. blobstore.NewByteStore adapts either
+// backend to it.
+type BlobStore interface {
+	Put(ctx context.Context, key string, data []byte) error
+	Get(ctx context.Context, key string) ([]byte, error)
+	Delete(ctx context.Context, key string) error
+}

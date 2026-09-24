@@ -16,6 +16,8 @@ GET /Items/Filters2	non-media
 GET /Items/Latest	non-media
 GET /Items/Suggestions	non-media
 GET /Items/{id}	non-media
+GET /Items/{id}/Ancestors	non-media
+GET /Items/{id}/Collections	non-media
 GET /Items/{id}/Download	media	transfer	viewer_egress	false	true
 HEAD /Items/{id}/Download	media	transfer	viewer_egress	false	true
 GET /Items/{id}/Images/{imageType}	non-media
@@ -28,7 +30,9 @@ GET /Items/{id}/Similar	non-media
 GET /Items/{id}/SpecialFeatures	non-media
 GET /Items/{id}/ThemeMedia	non-media
 GET /Items/{id}/ThemeSongs	non-media
+GET /Items/{id}/ThemeVideos	non-media
 GET /Library/VirtualFolders	non-media
+GET /Localization/Cultures	non-media
 GET /MediaSegments/{id}	non-media
 GET /Movies/Recommendations	non-media
 GET /Movies/{id}/Similar	non-media
@@ -41,6 +45,7 @@ POST /Sessions/Capabilities	non-media
 POST /Sessions/Capabilities/Full	non-media
 POST /Sessions/Logout	non-media
 POST /Sessions/Playing	non-media
+POST /Sessions/Playing/Ping	non-media
 POST /Sessions/Playing/Progress	non-media
 POST /Sessions/Playing/Stopped	non-media
 GET /Shows/NextUp	non-media
@@ -61,12 +66,14 @@ GET /UserImage	non-media
 HEAD /UserImage	non-media
 GET /UserItems/Resume	non-media
 GET /UserItems/{itemId}/UserData	non-media
+POST /UserItems/{itemId}/UserData	non-media
 DELETE /UserPlayedItems/{itemId}	non-media
 POST /UserPlayedItems/{itemId}	non-media
 GET /UserViews	non-media
 GET /UserViews/GroupingOptions	non-media
 GET /Users	non-media
 POST /Users/AuthenticateByName	non-media
+POST /Users/Configuration	non-media
 GET /Users/Me	non-media
 GET /Users/Public	non-media
 GET /Users/{id}	non-media
@@ -74,6 +81,7 @@ GET /Users/{id}/Images/Primary	non-media
 HEAD /Users/{id}/Images/Primary	non-media
 GET /Users/{id}/Items	non-media
 GET /Users/{id}/Items/Latest	non-media
+POST /Users/{userId}/Configuration	non-media
 DELETE /Users/{userId}/FavoriteItems/{itemId}	non-media
 POST /Users/{userId}/FavoriteItems/{itemId}	non-media
 GET /Users/{userId}/Items/Resume	non-media
@@ -85,6 +93,7 @@ POST /Users/{userId}/Items/{id}/PlaybackInfo	non-media
 GET /Users/{userId}/Items/{id}/SpecialFeatures	non-media
 GET /Users/{userId}/Items/{id}/ThemeMedia	non-media
 GET /Users/{userId}/Items/{id}/ThemeSongs	non-media
+GET /Users/{userId}/Items/{id}/ThemeVideos	non-media
 GET /Users/{userId}/Items/{itemId}/UserData	non-media
 POST /Users/{userId}/Items/{itemId}/UserData	non-media
 DELETE /Users/{userId}/PlayedItems/{itemId}	non-media
@@ -111,8 +120,9 @@ GET /Videos/{id}/stream	media	playback	viewer_egress	true	true
 HEAD /Videos/{id}/stream	media	playback	viewer_egress	true	true
 GET /Videos/{id}/stream.{container}	media	playback	viewer_egress	true	true
 HEAD /Videos/{id}/stream.{container}	media	playback	viewer_egress	true	true
+GET /Videos/{id}/{routeMediaSourceId}/Attachments/{routeIndex}	media	playback	viewer_egress	true	true
 GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/stream.{routeFormat}	media	playback	viewer_egress	true	true
-GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeDeliveryIndex}/stream.{routeFormat}	media	playback	viewer_egress	true	true
+GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/stream.{routeFormat}	media	playback	viewer_egress	true	true
 GET /api/v2/artwork/*	non-media
 HEAD /api/v2/artwork/*	non-media
 GET /socket	non-media
@@ -144,6 +154,8 @@ GET /Items/Filters2	non-media
 GET /Items/Latest	non-media
 GET /Items/Suggestions	non-media
 GET /Items/{id}	non-media
+GET /Items/{id}/Ancestors	non-media
+GET /Items/{id}/Collections	non-media
 GET /Items/{id}/Download	media	transfer	viewer_egress	false	true
 HEAD /Items/{id}/Download	media	transfer	viewer_egress	false	true
 GET /Items/{id}/Images/{imageType}	non-media
@@ -156,7 +168,9 @@ GET /Items/{id}/Similar	non-media
 GET /Items/{id}/SpecialFeatures	non-media
 GET /Items/{id}/ThemeMedia	non-media
 GET /Items/{id}/ThemeSongs	non-media
+GET /Items/{id}/ThemeVideos	non-media
 GET /Library/VirtualFolders	non-media
+GET /Localization/Cultures	non-media
 GET /MediaSegments/{id}	non-media
 GET /Movies/Recommendations	non-media
 GET /Movies/{id}/Similar	non-media
@@ -169,6 +183,7 @@ POST /Sessions/Capabilities	non-media
 POST /Sessions/Capabilities/Full	non-media
 POST /Sessions/Logout	non-media
 POST /Sessions/Playing	non-media
+POST /Sessions/Playing/Ping	non-media
 POST /Sessions/Playing/Progress	non-media
 POST /Sessions/Playing/Stopped	non-media
 GET /Shows/NextUp	non-media
@@ -189,12 +204,14 @@ GET /UserImage	non-media
 HEAD /UserImage	non-media
 GET /UserItems/Resume	non-media
 GET /UserItems/{itemId}/UserData	non-media
+POST /UserItems/{itemId}/UserData	non-media
 DELETE /UserPlayedItems/{itemId}	non-media
 POST /UserPlayedItems/{itemId}	non-media
 GET /UserViews	non-media
 GET /UserViews/GroupingOptions	non-media
 GET /Users	non-media
 POST /Users/AuthenticateByName	non-media
+POST /Users/Configuration	non-media
 GET /Users/Me	non-media
 GET /Users/Public	non-media
 GET /Users/{id}	non-media
@@ -202,6 +219,7 @@ GET /Users/{id}/Images/Primary	non-media
 HEAD /Users/{id}/Images/Primary	non-media
 GET /Users/{id}/Items	non-media
 GET /Users/{id}/Items/Latest	non-media
+POST /Users/{userId}/Configuration	non-media
 DELETE /Users/{userId}/FavoriteItems/{itemId}	non-media
 POST /Users/{userId}/FavoriteItems/{itemId}	non-media
 GET /Users/{userId}/Items/Resume	non-media
@@ -213,6 +231,7 @@ POST /Users/{userId}/Items/{id}/PlaybackInfo	non-media
 GET /Users/{userId}/Items/{id}/SpecialFeatures	non-media
 GET /Users/{userId}/Items/{id}/ThemeMedia	non-media
 GET /Users/{userId}/Items/{id}/ThemeSongs	non-media
+GET /Users/{userId}/Items/{id}/ThemeVideos	non-media
 GET /Users/{userId}/Items/{itemId}/UserData	non-media
 POST /Users/{userId}/Items/{itemId}/UserData	non-media
 DELETE /Users/{userId}/PlayedItems/{itemId}	non-media
@@ -239,8 +258,9 @@ GET /Videos/{id}/stream	media	playback	viewer_egress	true	true
 HEAD /Videos/{id}/stream	media	playback	viewer_egress	true	true
 GET /Videos/{id}/stream.{container}	media	playback	viewer_egress	true	true
 HEAD /Videos/{id}/stream.{container}	media	playback	viewer_egress	true	true
+GET /Videos/{id}/{routeMediaSourceId}/Attachments/{routeIndex}	media	playback	viewer_egress	true	true
 GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/stream.{routeFormat}	media	playback	viewer_egress	true	true
-GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeDeliveryIndex}/stream.{routeFormat}	media	playback	viewer_egress	true	true
+GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/stream.{routeFormat}	media	playback	viewer_egress	true	true
 GET /api/v2/artwork/*	non-media
 HEAD /api/v2/artwork/*	non-media
 GET /socket	non-media

@@ -9,7 +9,7 @@
 package settingskeys
 
 // Revision is the manifest revision these bindings were generated from.
-const Revision = 11
+const Revision = 12
 
 // Setting keys, one constant per definition.
 const (
@@ -61,6 +61,10 @@ const (
 	PlaybackVersionSort = "playback.version_sort"
 	// Audio sync offset
 	PlayerAudioSyncMs = "player.audio_sync_ms"
+	// Audiobook rewind interval
+	PlayerAudiobookSkipBackSeconds = "player.audiobook_skip_back_seconds"
+	// Audiobook fast-forward interval
+	PlayerAudiobookSkipForwardSeconds = "player.audiobook_skip_forward_seconds"
 	// Dolby Vision
 	PlayerDolbyVisionEnabled = "player.dolby_vision_enabled"
 	// Dolby Vision Profile 7 fallback
@@ -87,6 +91,10 @@ const (
 	PlayerSubtitleSyncMs = "player.subtitle_sync_ms"
 	// Video sizing
 	PlayerVideoGravity = "player.video_gravity"
+	// Video rewind interval
+	PlayerVideoSkipBackSeconds = "player.video_skip_back_seconds"
+	// Video fast-forward interval
+	PlayerVideoSkipForwardSeconds = "player.video_skip_forward_seconds"
 	// RemuxDB base URL
 	RemuxdbBaseUrl = "remuxdb.base_url"
 	// RemuxDB stream metadata
@@ -161,6 +169,8 @@ var Remote = []string{
 	PlaybackSubtitleMode,
 	PlaybackVersionSort,
 	PlayerAudioSyncMs,
+	PlayerAudiobookSkipBackSeconds,
+	PlayerAudiobookSkipForwardSeconds,
 	PlayerDolbyVisionEnabled,
 	PlayerDvProfile7Hdr10Fallback,
 	PlayerHdrEnabled,
@@ -171,6 +181,8 @@ var Remote = []string{
 	PlayerSleepTimerDefaultMinutes,
 	PlayerSubtitleSyncMs,
 	PlayerVideoGravity,
+	PlayerVideoSkipBackSeconds,
+	PlayerVideoSkipForwardSeconds,
 	RemuxdbBaseUrl,
 	RemuxdbEnabled,
 	RemuxdbSubmitEnabled,

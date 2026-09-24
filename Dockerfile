@@ -1,6 +1,12 @@
 # Base images are pinned to checked-in patches so an upstream bump cannot
 # silently invalidate the build/runtime layers or the Go build cache (the Go
 # cache is toolchain-version-specific). Bump them as a deliberate change.
+# Node.js for the runtime Jellyfin Web installer, which builds upstream
+# jellyfin-web in the container. Jellyfin Web 12.x requires Node.js >=24,
+# independent of the Silo frontend toolchain. The installer runs the npm
+# release each Jellyfin Web version declares in engines.npm.
+FROM node:24-slim AS jellyfin_web_node
+
 # Stage 1: Build frontend
 FROM node:22.23.2-slim AS node-base
 
@@ -85,8 +91,8 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
       rm -rf "${runtime_dir}" /var/lib/apt/lists/*; \
     fi
 RUN mkdir -p /tmp/vio-transcode /var/lib/vio/artwork /var/lib/vio/compat/jellyfin-web
-COPY --from=node-base /usr/local/bin/node /usr/local/bin/node
-COPY --from=node-base /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+COPY --from=jellyfin_web_node /usr/local/bin/node /usr/local/bin/node
+COPY --from=jellyfin_web_node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 COPY --from=build /vio /usr/local/bin/vio

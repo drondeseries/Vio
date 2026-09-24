@@ -19,6 +19,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -26,7 +27,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/Silo-Server/silo-server/internal/telemetry"
 )
@@ -40,6 +43,8 @@ const (
 	URLAuthPublic          = "public"           // unsigned public URLs via custom domain
 	URLAuthCloudflareToken = "cloudflare_token" // Cloudflare WAF token authentication
 )
+
+const mutationFenceWeight int64 = 1 << 30
 
 // streamUploadPartSize bounds per-upload memory for unsized streaming uploads.
 // S3-compatible backends require parts of at least 5 MiB (except the last).
@@ -82,6 +87,7 @@ type Client struct {
 	tokenSecret    string
 	tokenParam     string
 	tokenTTL       int
+	mutations      *semaphore.Weighted
 }
 
 // ObjectInfo describes an object stored in S3.
@@ -145,6 +151,7 @@ func NewClient(cfg BucketConfig) *Client {
 		tokenSecret:    cfg.TokenSecret,
 		tokenParam:     tokenParam,
 		tokenTTL:       tokenTTL,
+		mutations:      semaphore.NewWeighted(mutationFenceWeight),
 	}
 }
 
@@ -210,6 +217,10 @@ func (c *Client) GetObjectStreamInfo(ctx context.Context, bucket, key string) (i
 // PutObject uploads data to the given key, inferring Content-Type from the
 // file extension so that CDNs and browsers serve files with the correct MIME type.
 func (c *Client) PutObject(ctx context.Context, bucket, key string, data []byte) error {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
 	body := newBytesReadSeeker(data)
 	objectKey := c.prefixedKey(key)
 
@@ -240,6 +251,10 @@ func (c *Client) PutObject(ctx context.Context, bucket, key string, data []byte)
 // known Content-Length, which backends like Cloudflare R2 require (a plain
 // PutObject with an unsized stream is rejected with 411 MissingContentLength).
 func (c *Client) PutObjectStream(ctx context.Context, bucket, key string, r io.Reader, contentType string) error {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
 	objectKey := c.prefixedKey(key)
 
 	input := &s3.PutObjectInput{
@@ -266,6 +281,10 @@ func (c *Client) PutObjectStream(ctx context.Context, bucket, key string, r io.R
 
 // MakeObjectPublic updates the object ACL to allow anonymous reads.
 func (c *Client) MakeObjectPublic(ctx context.Context, bucket, key string) error {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
 	objectKey := c.prefixedKey(key)
 	_, err := c.s3Client.PutObjectAcl(ctx, &s3.PutObjectAclInput{
 		Bucket: aws.String(bucket),
@@ -280,6 +299,10 @@ func (c *Client) MakeObjectPublic(ctx context.Context, bucket, key string) error
 
 // UploadFile uploads the file at path to the given key and returns the size in bytes.
 func (c *Client) UploadFile(ctx context.Context, bucket, key, path, contentType string) (int64, error) {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return 0, err
+	}
+	defer c.mutations.Release(1)
 	file, err := os.Open(path)
 	if err != nil {
 		return 0, fmt.Errorf("opening upload file %s: %w", path, err)
@@ -562,7 +585,21 @@ func objectSHA256(data []byte) string {
 }
 
 // DeleteObject deletes the object at the given key.
+// BeginMutationFence waits for active object mutations and blocks new ones
+// until the returned function is called. Reads and presigning remain available.
+func (c *Client) BeginMutationFence(ctx context.Context) (func(), error) {
+	if err := c.mutations.Acquire(ctx, mutationFenceWeight); err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() { once.Do(func() { c.mutations.Release(mutationFenceWeight) }) }, nil
+}
+
 func (c *Client) DeleteObject(ctx context.Context, bucket, key string) error {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.mutations.Release(1)
 	objectKey := c.prefixedKey(key)
 	_, err := c.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(bucket),
@@ -578,30 +615,9 @@ func (c *Client) DeleteObject(ctx context.Context, bucket, key string) error {
 // DeletePrefix deletes all objects matching the given prefix using batch
 // DeleteObjects (up to 1000 keys per request). Returns the number of objects
 // deleted. Falls back to individual deletes if batch is not supported.
-func (c *Client) DeletePrefix(ctx context.Context, bucket, prefix string) (int, error) {
-	keys, err := c.ListObjects(ctx, bucket, prefix)
-	if err != nil {
-		return 0, err
-	}
-	if len(keys) == 0 {
-		return 0, nil
-	}
-	return c.DeleteObjects(ctx, bucket, keys)
-}
-
-// DeleteObjects deletes the given keys in batches of up to 1000 (the S3 API
-// limit). Returns the number of objects that are no longer present after the
-// call: successfully deleted plus already absent. Object deletion is
-// idempotent, so an already-absent key has reached the desired end state and
-// is not a failure. Genuine per-object or per-batch failures (permissions,
-// throttling, transport, and similar) are reported as an error carrying the
-// number of keys that could not be deleted.
-func (c *Client) DeleteObjects(ctx context.Context, bucket string, keys []string) (int, error) {
+func (c *Client) deleteObjects(ctx context.Context, bucket string, keys []string) (int, error) {
 	const batchSize = 1000
-	handled := 0
-	failed := 0
-	absent := 0
-	firstFailure := ""
+	deleted := 0
 
 	for i := 0; i < len(keys); i += batchSize {
 		end := i + batchSize
@@ -625,58 +641,81 @@ func (c *Client) DeleteObjects(ctx context.Context, bucket string, keys []string
 		if err != nil {
 			// Fall back to individual deletes if batch is not supported.
 			for _, key := range batch {
-				delErr := c.DeleteObject(ctx, bucket, key)
-				if delErr == nil {
-					handled++
+				if delErr := c.deleteObject(ctx, bucket, key); delErr != nil {
+					slog.WarnContext(ctx, "s3 DeleteObjects fallback: failed to delete", "component", "s3client", "key", key, "error", delErr)
 					continue
 				}
-				if isNotFoundErr(delErr) {
-					handled++
-					absent++
-					continue
-				}
-				failed++
-				if firstFailure == "" {
-					firstFailure = fmt.Sprintf("%s: %v", key, delErr)
-				}
-				slog.WarnContext(ctx, "s3 DeleteObjects fallback: failed to delete", "component", "s3client", "key", key, "error", delErr)
+				deleted++
 			}
 			continue
 		}
 
-		handled += len(batch)
+		deleted += len(batch)
 		if out != nil {
 			for _, e := range out.Errors {
-				if isNotFoundDeleteCode(aws.ToString(e.Code)) {
-					// Already gone: the caller's intent is satisfied.
-					absent++
+				if isMissingObjectCode(aws.ToString(e.Code)) {
 					continue
 				}
-				handled--
-				failed++
-				if firstFailure == "" {
-					firstFailure = fmt.Sprintf("%s: %s: %s",
-						aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
-				}
+				deleted--
 				slog.WarnContext(ctx, "s3 DeleteObjects: partial failure", "component", "s3client",
 					"key", aws.ToString(e.Key), "code", aws.ToString(e.Code), "message", aws.ToString(e.Message))
 			}
 		}
 	}
 
-	if absent > 0 {
-		slog.DebugContext(ctx, "s3 DeleteObjects: objects were already absent", "component", "s3client", "count", absent)
-	}
-	if failed > 0 {
-		return handled, fmt.Errorf("s3 DeleteObjects: %d of %d objects failed to delete (first: %s)",
-			failed, len(keys), firstFailure)
-	}
-	return handled, nil
+	return deleted, nil
 }
 
-// isNotFoundDeleteCode reports whether a batch-delete per-object error code
-// means the object was already absent. Deletion is idempotent, so an absent
-// object is not a failure for the caller.
+func (c *Client) deleteObject(ctx context.Context, bucket, key string) error {
+	objectKey := c.prefixedKey(key)
+	_, err := c.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(objectKey),
+	})
+	if err != nil {
+		if apiErr, ok := errors.AsType[smithy.APIError](err); ok && isMissingObjectCode(apiErr.ErrorCode()) {
+			return nil
+		}
+		return fmt.Errorf("s3 DeleteObject %s/%s: %w", bucket, key, err)
+	}
+
+	return nil
+}
+
+func (c *Client) DeletePrefix(ctx context.Context, bucket, prefix string) (int, error) {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return 0, err
+	}
+	defer c.mutations.Release(1)
+	keys, err := c.ListObjects(ctx, bucket, prefix)
+	if err != nil {
+		return 0, err
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	return c.DeleteObjects(ctx, bucket, keys)
+}
+
+// DeleteObjects deletes the given keys in batches of up to 1000 (the S3 API
+// limit). Returns the number of objects that are no longer present after the
+// call: successfully deleted plus already absent. Object deletion is
+// idempotent, so an already-absent key has reached the desired end state and
+// is not a failure. Genuine per-object or per-batch failures (permissions,
+// throttling, transport, and similar) are reported as an error carrying the
+// number of keys that could not be deleted.
+func (c *Client) DeleteObjects(ctx context.Context, bucket string, keys []string) (int, error) {
+	if err := c.mutations.Acquire(ctx, 1); err != nil {
+		return 0, err
+	}
+	defer c.mutations.Release(1)
+	return c.deleteObjects(ctx, bucket, keys)
+}
+
+func isMissingObjectCode(code string) bool {
+	return code == "NoSuchKey" || code == "NotFound"
+}
+
 func isNotFoundDeleteCode(code string) bool {
 	switch strings.ToLower(strings.TrimSpace(code)) {
 	case "nosuchkey", "notfound":

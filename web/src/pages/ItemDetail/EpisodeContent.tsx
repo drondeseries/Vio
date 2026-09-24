@@ -447,7 +447,7 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
         {item.cast && item.cast.length > 0 && (
           <div>
             <h2 className="mb-5 text-xl font-semibold tracking-tight">Cast</h2>
-            <CastCarousel cast={item.cast} />
+            <CastCarousel cast={item.cast} prefetchPeople />
           </div>
         )}
 
