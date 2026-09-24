@@ -38,12 +38,6 @@ func recordingEventCount(bus *recordingEventBus, needles ...string) int {
 	return count
 }
 
-func recordingEventLen(bus *recordingEventBus) int {
-	bus.mu.Lock()
-	defer bus.mu.Unlock()
-	return len(bus.events)
-}
-
 func recordingEventPayloads(bus *recordingEventBus) []string {
 	bus.mu.Lock()
 	defer bus.mu.Unlock()

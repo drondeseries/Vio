@@ -1,3 +1,11 @@
 {
-  "approvals": []
+  "approvals": [
+    {
+      "operation_id": "refreshVirtualCandidates",
+      "change_id": "response-success-status-removed",
+      "fingerprint": "75c07dda6c05d36de2060b9ca3880028238516523dbe3c5557a8786ba3bd8eaf",
+      "reason": "Refresh List becomes an asynchronous job: the operation now answers 202 Accepted with the admin job to poll instead of 200 with the synchronous version list, so a large provider re-list no longer holds the request. The web client ships in the same pre-lock change and no v2 client is published yet.",
+      "approved_in": "#126"
+    }
+  ]
 }

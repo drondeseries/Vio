@@ -25,6 +25,11 @@ const (
 	// virtualEnrichmentBudget bounds the whole probe pass. Every new candidate
 	// is attempted before the job completes unless this deadline fires first.
 	virtualEnrichmentBudget = 4 * time.Minute
+	// contentIDKey is the shared log/serialization key for a content id. It is
+	// also the JSON field name every catalog event carries.
+	contentIDKey = "content_id"
+	// episodeIDKey is the shared log/serialization key for an episode id.
+	episodeIDKey = "episode_id"
 )
 
 // VirtualCandidatesRefreshJobService accepts the asynchronous "Refresh List":
@@ -168,7 +173,6 @@ type VirtualCandidatesRefreshExecutor struct {
 	Logger *slog.Logger
 
 	searchBudget time.Duration
-	enrichBudget time.Duration
 }
 
 // Execute runs the pipeline. It returns an error only for a non-degradable
@@ -219,7 +223,7 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 
 	report(4, 4, "Refresh complete")
 	logger.InfoContext(ctx, "virtual candidates refresh complete",
-		"component", "api", "content_id", req.ContentID, "episode_id", req.EpisodeID,
+		"component", "api", contentIDKey, req.ContentID, episodeIDKey, req.EpisodeID,
 		"provider_candidates", result.ProviderCandidates, "indexer_releases", result.IndexerReleases,
 		"indexer_search_ok", result.IndexerSearchOK, "enriched", result.Enriched)
 	return result, nil
@@ -240,7 +244,7 @@ func (e *VirtualCandidatesRefreshExecutor) searchIndexerReleases(ctx context.Con
 	defer cancel()
 	item := virtuallibrary.MonitoredMedia{
 		Key:       req.ContentID,
-		MediaType: "movie",
+		MediaType: trailerItemTypeMovie,
 		Title:     req.Title,
 		Year:      req.Year,
 		IMDbID:    req.IMDbID,
@@ -249,13 +253,13 @@ func (e *VirtualCandidatesRefreshExecutor) searchIndexerReleases(ctx context.Con
 	}
 	var episode *virtuallibrary.VirtualEpisode
 	if req.SeasonNumber > 0 && req.EpisodeNumber > 0 {
-		item.MediaType = "series"
+		item.MediaType = trailerItemTypeSeries
 		episode = &virtuallibrary.VirtualEpisode{Season: req.SeasonNumber, Episode: req.EpisodeNumber}
 	}
 	releases, err := e.Searcher.SearchMonitoredReleases(searchCtx, item, episode)
 	if err != nil {
 		e.logger().WarnContext(ctx, "virtual candidates refresh: indexer search failed; continuing altmount-only",
-			"component", "api", "content_id", req.ContentID, "error", err)
+			"component", "api", contentIDKey, req.ContentID, "error", err)
 		return nil, false
 	}
 	return releases, true
@@ -345,7 +349,7 @@ func indexerReleaseRow(release virtuallibrary.SearchItem) virtuallibrary.Indexer
 		IndexerID:      release.IndexerID,
 		SizeBytes:      release.Size,
 		DownloadURL:    release.DownloadURL,
-		EnqueueState:   "not_downloaded",
+		EnqueueState:   virtuallibrary.IndexerReleaseStateNotDownloaded,
 		ExpireAt:       time.Now().Add(virtuallibrary.IndexerReleaseTTLDefault),
 	}
 	score := release.QualityScore()
@@ -374,7 +378,7 @@ func indexerReleaseResults(rows []virtuallibrary.IndexerRelease) []adminjob.Inde
 			PublishedAt:   row.PublishedAt,
 			FormatScore:   row.FormatScore,
 			Protocol:      row.Protocol,
-			DownloadState: "not_downloaded",
+			DownloadState: virtuallibrary.IndexerReleaseStateNotDownloaded,
 		})
 	}
 	return out
@@ -389,11 +393,11 @@ func (e *VirtualCandidatesRefreshExecutor) publishVersionsUpdated(ctx context.Co
 		return
 	}
 	if err := hub.PublishJSON(ctx, events.ChannelCatalog, "catalog.item.changed", map[string]any{
-		"content_id": contentID,
+		contentIDKey: contentID,
 		"change":     "versions_updated",
 	}, events.PublishOptions{}); err != nil {
 		e.logger().WarnContext(ctx, "virtual candidates refresh: failed to publish versions_updated",
-			"component", "api", "content_id", contentID, "error", err)
+			"component", "api", contentIDKey, contentID, "error", err)
 	}
 }
 

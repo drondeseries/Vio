@@ -209,7 +209,7 @@ func (s *Monitor) SearchMonitoredReleases(ctx context.Context, item MonitoredMed
 	}
 	client := s.monitor.configuredProwlarr()
 	if client == nil || client.URL() == "" {
-		return nil, errors.New("Prowlarr is not configured")
+		return nil, errors.New("prowlarr is not configured")
 	}
 	return client.SearchMonitoredReleases(ctx, item, episode, qc)
 }

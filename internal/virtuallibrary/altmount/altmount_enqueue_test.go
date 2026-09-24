@@ -103,7 +103,7 @@ func TestEnqueueNon2xxIsError(t *testing.T) {
 
 func TestEnqueueTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Hold until the request context is cancelled by the client's deadline.
+		// Hold until the request context is canceled by the client's deadline.
 		<-r.Context().Done()
 	}))
 	defer srv.Close()

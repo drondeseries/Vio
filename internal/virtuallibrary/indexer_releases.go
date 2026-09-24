@@ -41,6 +41,17 @@ const maxIndexerReleasesListed = 2 * maxIndexerReleasesPerContent
 // they must not enqueue against a release that is no longer listed.
 var ErrIndexerReleaseNotFound = errors.New("indexer release not found")
 
+// The enqueue states a persisted release can carry. A row starts as
+// not-downloaded listing state; a successful request moves it to queued and a
+// provider error marks it failed so the client may retry. The store persists
+// these values and the HTTP layer projects them unchanged, so the database and
+// the wire share one spelling.
+const (
+	IndexerReleaseStateQueued        = "queued"
+	IndexerReleaseStateFailed        = "failed"
+	IndexerReleaseStateNotDownloaded = "not_downloaded"
+)
+
 // IndexerReleaseScope identifies the catalog title (and, for series, the
 // episode) a batch of releases belongs to. EpisodeID is empty for movies.
 type IndexerReleaseScope struct {
@@ -124,10 +135,10 @@ func nullableText(value string) any {
 
 func normalizeEnqueueState(state string) string {
 	switch strings.TrimSpace(state) {
-	case "queued", "failed":
+	case IndexerReleaseStateQueued, IndexerReleaseStateFailed:
 		return strings.TrimSpace(state)
 	default:
-		return "not_downloaded"
+		return IndexerReleaseStateNotDownloaded
 	}
 }
 
@@ -148,7 +159,7 @@ func (s *IndexerReleaseStore) UpsertIndexerReleases(ctx context.Context, scope I
 	if err != nil {
 		return fmt.Errorf("begin indexer release upsert: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	now := time.Now()
 	for i := range releases {
@@ -345,7 +356,7 @@ func (s *IndexerReleaseStore) MarkIndexerReleaseQueued(ctx context.Context, scop
 	if err != nil {
 		return "", false, fmt.Errorf("read indexer release for queue: %w", err)
 	}
-	if state == "queued" {
+	if state == IndexerReleaseStateQueued {
 		return existing, true, nil
 	}
 	// The row exists but is not queued and the guarded UPDATE matched nothing:

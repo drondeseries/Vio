@@ -276,7 +276,7 @@ func (c *altmountStateClient) Enqueue(ctx context.Context, downloadURL, name str
 		// download URL and key); report only that the request failed.
 		return "", errors.New("AltMount enqueue request failed")
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("AltMount enqueue returned status %d: %s", resp.StatusCode, c.redactedSnippet(resp.Body, downloadURL))
 	}

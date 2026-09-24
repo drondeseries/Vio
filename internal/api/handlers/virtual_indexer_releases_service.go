@@ -162,8 +162,8 @@ func (s *VirtualIndexerReleaseService) RequestIndexerRelease(ctx context.Context
 	if err != nil {
 		return IndexerReleaseRequestResult{}, err
 	}
-	if release.EnqueueState == "queued" {
-		return IndexerReleaseRequestResult{ReleaseID: idOfIndexerRelease(release.ID), State: "queued"}, nil
+	if release.EnqueueState == virtuallibrary.IndexerReleaseStateQueued {
+		return IndexerReleaseRequestResult{ReleaseID: idOfIndexerRelease(release.ID), State: virtuallibrary.IndexerReleaseStateQueued}, nil
 	}
 	nzoID, err := s.Enqueue(ctx, release.DownloadURL, release.Title)
 	if err != nil {
@@ -172,7 +172,7 @@ func (s *VirtualIndexerReleaseService) RequestIndexerRelease(ctx context.Context
 		if markErr := s.Store.MarkIndexerReleaseFailed(ctx, scope, release.GUID, "enqueue failed"); markErr != nil {
 			_ = markErr
 		}
-		return IndexerReleaseRequestResult{ReleaseID: idOfIndexerRelease(release.ID), State: "failed", Message: "The provider could not queue this release; try again."}, nil
+		return IndexerReleaseRequestResult{ReleaseID: idOfIndexerRelease(release.ID), State: virtuallibrary.IndexerReleaseStateFailed, Message: "The provider could not queue this release; try again."}, nil
 	}
 	if _, _, err := s.Store.MarkIndexerReleaseQueued(ctx, scope, release.GUID, nzoID); err != nil {
 		if errors.Is(err, virtuallibrary.ErrIndexerReleaseNotFound) {
@@ -180,7 +180,7 @@ func (s *VirtualIndexerReleaseService) RequestIndexerRelease(ctx context.Context
 		}
 		return IndexerReleaseRequestResult{}, apiError(http.StatusInternalServerError, "internal_error", "Failed to record the release request")
 	}
-	return IndexerReleaseRequestResult{ReleaseID: idOfIndexerRelease(release.ID), State: "queued"}, nil
+	return IndexerReleaseRequestResult{ReleaseID: idOfIndexerRelease(release.ID), State: virtuallibrary.IndexerReleaseStateQueued}, nil
 }
 
 // findRelease resolves the stored row by id, scoped to the item's content id
@@ -235,10 +235,10 @@ func indexerReleaseViewOf(release virtuallibrary.IndexerRelease) IndexerReleaseV
 
 func normalizeIndexerDownloadState(state string) string {
 	switch strings.TrimSpace(state) {
-	case "queued", "failed":
+	case virtuallibrary.IndexerReleaseStateQueued, virtuallibrary.IndexerReleaseStateFailed:
 		return strings.TrimSpace(state)
 	default:
-		return "not_downloaded"
+		return virtuallibrary.IndexerReleaseStateNotDownloaded
 	}
 }
 

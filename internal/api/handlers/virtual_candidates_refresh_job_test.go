@@ -38,8 +38,9 @@ type fakeCandidateEnricher struct {
 	result  int
 }
 
-func (f *fakeCandidateEnricher) EnrichVirtualCandidates(context.Context, string, string, int, string, []VirtualPlaybackStream) int {
+func (f *fakeCandidateEnricher) EnrichVirtualCandidates(_ context.Context, _, _ string, _ int, _ string, streams []VirtualPlaybackStream) int {
 	f.calls++
+	f.streams = len(streams)
 	return f.result
 }
 
