@@ -105,7 +105,7 @@ func AudioLayoutsEqual(a, b []models.AudioTrack) bool {
 		if at.Index != bt.Index ||
 			normalizeCodecV3(at.Codec) != normalizeCodecV3(bt.Codec) ||
 			lang.Canonical(at.Language) != lang.Canonical(bt.Language) ||
-			strings.ToLower(strings.TrimSpace(at.Layout)) != strings.ToLower(strings.TrimSpace(bt.Layout)) ||
+			!strings.EqualFold(strings.TrimSpace(at.Layout), strings.TrimSpace(bt.Layout)) ||
 			at.Channels != bt.Channels ||
 			at.Profile != bt.Profile ||
 			!stringSlicesEqualFold(at.Languages, bt.Languages) {

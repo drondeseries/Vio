@@ -65,11 +65,11 @@ func (h *StreamHandler) resolveSubtitleEditionSwitch(
 	case playback.SubtitleSourceExternalV3:
 		wanted := namedFile.ExternalSubtitles[location.offset]
 		for candidateIndex, candidate := range effectiveFile.ExternalSubtitles {
-			if candidate.Path != wanted.Path &&
-				!(strings.EqualFold(candidate.Language, wanted.Language) &&
-					strings.EqualFold(candidate.Format, wanted.Format) &&
-					candidate.Forced == wanted.Forced &&
-					candidate.HearingImpaired == wanted.HearingImpaired) {
+			equivalent := strings.EqualFold(candidate.Language, wanted.Language) &&
+				strings.EqualFold(candidate.Format, wanted.Format) &&
+				candidate.Forced == wanted.Forced &&
+				candidate.HearingImpaired == wanted.HearingImpaired
+			if candidate.Path != wanted.Path && !equivalent {
 				continue
 			}
 			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(effectiveFile, candidateIndex); mapped {
