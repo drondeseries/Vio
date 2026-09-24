@@ -6,18 +6,24 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
-// CoreInsecureAllowed is the core-side opt-in reader for the SSRF dispatch.
-// It reports whether virtual_library.allow_insecure_http is enabled. It is a
-// func field (not an import) so the plugins package never depends on the
-// settings store: wiring sets it, and nil stays fail-closed (false).
+// CoreInsecureAllowed is the core-side opt-in reader for the HTTP-manifest
+// dispatch. It reports whether virtual_library.allow_insecure_http is enabled.
+// It is a func field (not an import) so the plugins package never depends on
+// the settings store: wiring sets it, and nil stays fail-closed (false).
 //
 // Phase 4 must set this at wiring from the live settings repo.
 var CoreInsecureAllowed func(ctx context.Context) bool
 
+// CorePrivateStreamsAllowed is the core-side opt-in reader for private
+// stream destinations. It reports whether
+// virtual_library.allow_private_streams is enabled. Wiring sets it from the
+// live settings repo; nil stays fail-closed (false).
+var CorePrivateStreamsAllowed func(ctx context.Context) bool
+
 // CoreVirtualInsecureAllowed reads the core virtual_library.allow_insecure_http
-// opt-in through the wired CoreInsecureAllowed callback. A nil callback fails
-// closed (false), the same posture as InstallationAllowsInsecure for unknown
-// installations.
+// opt-in (HTTP manifests on private/local hosts) through the wired
+// CoreInsecureAllowed callback. A nil callback fails closed (false), the same
+// posture as InstallationAllowsInsecure for unknown installations.
 func CoreVirtualInsecureAllowed(ctx context.Context) bool {
 	if CoreInsecureAllowed == nil {
 		return false
@@ -28,11 +34,25 @@ func CoreVirtualInsecureAllowed(ctx context.Context) bool {
 	return CoreInsecureAllowed(ctx)
 }
 
-// coreProvenanceInsecure resolves the SSRF posture for core-provenance virtual
-// rows: the plugin installation config is irrelevant, so only the core
-// virtual_library.allow_insecure_http setting applies. Unknown or inconsistent
-// provenance fails closed (false): a core row that does not positively carry
-// Provenance "core" never inherits the core opt-in.
+// CoreVirtualPrivateStreamsAllowed reads the core
+// virtual_library.allow_private_streams opt-in (private stream destinations)
+// through the wired CorePrivateStreamsAllowed callback. A nil callback fails
+// closed (false).
+func CoreVirtualPrivateStreamsAllowed(ctx context.Context) bool {
+	if CorePrivateStreamsAllowed == nil {
+		return false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return CorePrivateStreamsAllowed(ctx)
+}
+
+// coreProvenanceInsecure resolves the HTTP-manifest posture for
+// core-provenance virtual rows: the plugin installation config is irrelevant,
+// so only the core virtual_library.allow_insecure_http setting applies.
+// Unknown or inconsistent provenance fails closed (false): a core row that
+// does not positively carry Provenance "core" never inherits the core opt-in.
 func coreProvenanceInsecure(ctx context.Context, provenance models.VirtualProvenance) bool {
 	if provenance != models.VirtualProvenanceCore {
 		return false
@@ -40,8 +60,19 @@ func coreProvenanceInsecure(ctx context.Context, provenance models.VirtualProven
 	return CoreVirtualInsecureAllowed(ctx)
 }
 
-// AllowInsecureForProvenance dispatches the SSRF allow-insecure decision by
-// explicit provenance. Core-provenance rows read
+// coreProvenancePrivateStreams resolves the private stream destination posture
+// for core-provenance virtual rows: only the core
+// virtual_library.allow_private_streams setting applies. Unknown or
+// inconsistent provenance fails closed (false).
+func coreProvenancePrivateStreams(ctx context.Context, provenance models.VirtualProvenance) bool {
+	if provenance != models.VirtualProvenanceCore {
+		return false
+	}
+	return CoreVirtualPrivateStreamsAllowed(ctx)
+}
+
+// AllowInsecureForProvenance dispatches the HTTP-manifest allow-insecure
+// decision by explicit provenance. Core-provenance rows read
 // virtual_library.allow_insecure_http through the wired CoreInsecureAllowed
 // callback (nil-safe: nil fails closed); every other provenance (plugin,
 // legacy "", local, or anything unexpected) falls back to the existing
@@ -57,8 +88,18 @@ func (s *Service) AllowInsecureForProvenance(ctx context.Context, provenance mod
 	return s.InstallationAllowsInsecure(ctx, installationID)
 }
 
+func (s *Service) AllowPrivateStreamsForProvenance(ctx context.Context, provenance models.VirtualProvenance, installationID int) bool {
+	if provenance == models.VirtualProvenanceCore || (provenance == "" && installationID <= 0) {
+		return coreProvenancePrivateStreams(ctx, models.VirtualProvenanceCore)
+	}
+	return false
+}
+
 // ResolveVirtualPlaybackDetailedForProvenance resolves through the standard
-// installation dispatch, but computes AllowInsecure from explicit provenance
+
+// ResolveVirtualPlaybackDetailedForProvenance resolves through the standard
+// installation dispatch, computing AllowInsecure (HTTP manifests) and
+// AllowPrivateStreams (private stream destinations) from explicit provenance
 // instead of unconditionally consulting the plugin installation config. This
 // is the core-path entry point retiring
 // com.drondeseries.vio-virtual-library: core rows must not depend on a plugin
@@ -80,5 +121,6 @@ func (s *Service) ResolveVirtualPlaybackDetailedForProvenance(
 		OwnerInstallationID: ownerInstallationID,
 		AllowFallback:       allowFallback,
 		AllowInsecure:       s.AllowInsecureForProvenance(ctx, provenance, ownerInstallationID),
+		AllowPrivateStreams: s.AllowPrivateStreamsForProvenance(ctx, provenance, ownerInstallationID),
 	}, forceRefresh, excludedCandidateIDs, preferredCandidateID)
 }

@@ -266,7 +266,7 @@ func TestHandleStream_VirtualDirectPlayUsesPinnedRelayPathAndHeaders(t *testing.
 	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, ownerInstallationID, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
 		if uri != file.FilePath || ownerInstallationID != 7 || userID != 1 || profileID != "profile-1" || forceRefresh || len(excludedCandidateIDs) != 0 || preferredCandidateID != "" {
 			t.Fatalf("unexpected resolver arguments: uri=%q owner=%d user=%d profile=%q refresh=%v excluded=%v preferred=%q", uri, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID)
@@ -382,7 +382,7 @@ func TestHandleStream_VirtualDirectPlayRelay502ReturnsStructuredJSON(t *testing.
 	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 		return ResolvedVirtualMedia{
 			URL: upstream.URL + "/provider/stream.mp4",
@@ -440,7 +440,7 @@ func TestHandleStream_VirtualDirectPlayRetriesWithForcedRefresh(t *testing.T) {
 	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 
 	refreshCalls := 0
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
@@ -498,7 +498,7 @@ func TestHandleStream_VirtualDirectPlayRefreshRejectsMismatchedCandidateID(t *te
 	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 
 	var rotationFlags []bool
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
@@ -586,7 +586,7 @@ func TestHandleStream_VirtualDirectPlayIndictingRetryServesSibling(t *testing.T)
 	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 
 	var rotationFlags []bool
 	var excludedSeen [][]string
@@ -676,7 +676,7 @@ func TestHandleStream_VirtualRemuxIndictingRetryServesSibling(t *testing.T) {
 	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 	handler.PlaybackConfig = func() config.PlaybackConfig {
 		return config.PlaybackConfig{FFmpegPath: ffmpeg}
 	}
@@ -760,7 +760,7 @@ func TestHandleStream_VirtualDirectPlaySurvivesServerWriteTimeout(t *testing.T) 
 	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 		return ResolvedVirtualMedia{URL: upstream.URL + "/video.mp4"}, nil
 	})

@@ -125,11 +125,45 @@ describe("StreamingSettings", () => {
       "/admin/virtual-library",
     );
     expect(screen.getByRole("group", { name: "Stremio provider" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Network access" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "Virtual libraries" })).toBeInTheDocument();
     expect(
       screen.getByRole("group", { name: "Automation & Indexers (Prowlarr & AltMount)" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "Quality" })).toBeInTheDocument();
+  });
+
+  it("renders both network permission toggles with independent labels", () => {
+    renderPage();
+
+    expect(screen.getByLabelText("Allow HTTP for local manifests")).toBeInTheDocument();
+    expect(screen.getByLabelText("Allow private network streams")).toBeInTheDocument();
+  });
+
+  it("shows the private-network warning only when private streams are enabled", () => {
+    useSettingsFormMock.mockReturnValue(
+      makeForm({ "virtual_library.allow_private_streams": "false" }),
+    );
+    const { rerender } = renderPage();
+    expect(screen.queryByText("Private network access")).not.toBeInTheDocument();
+
+    useSettingsFormMock.mockReturnValue(
+      makeForm({ "virtual_library.allow_private_streams": "true" }),
+    );
+    rerender(
+      <MemoryRouter>
+        <StreamingSettings />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Private network access")).toBeInTheDocument();
+  });
+
+  it("registers both network keys with the settings form", () => {
+    renderPage();
+
+    const opts = useSettingsFormMock.mock.calls[0]?.[0] as { keys: string[] };
+    expect(opts.keys).toContain("virtual_library.allow_insecure_http");
+    expect(opts.keys).toContain("virtual_library.allow_private_streams");
   });
 
   it("renders library dropdown selects with existing library names", () => {

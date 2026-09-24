@@ -44,9 +44,10 @@ const absentResultID = "ffffffffffffffffffffffff"
 func TestResolveDetailedRematchesSameReleaseByIdentity(t *testing.T) {
 	server := identityRematchProvider(t)
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       server.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         server.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	ctx := context.Background()
 	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
@@ -93,9 +94,10 @@ func TestResolveDetailedRematchesSameReleaseByIdentity(t *testing.T) {
 func TestResolveDetailedRematchUpdatesSessionPreferredID(t *testing.T) {
 	server := identityRematchProvider(t)
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       server.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         server.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	ctx := context.Background()
 	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
@@ -134,9 +136,10 @@ func TestResolveDetailedRematchUpdatesSessionPreferredID(t *testing.T) {
 func TestResolveDetailedRematchStillRefusesDifferentRelease(t *testing.T) {
 	server := identityRematchProvider(t)
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       server.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         server.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	streams, err := svc.ListStreams(context.Background(), "virtual://movie/tt100")
 	if err != nil || len(streams) != 2 {
@@ -167,9 +170,10 @@ func TestResolveDetailedRematchStillRefusesDifferentRelease(t *testing.T) {
 func TestResolveDetailedRematchRejectsSameNameDifferentSize(t *testing.T) {
 	server := identityRematchProvider(t)
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       server.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         server.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	ctx := context.Background()
 	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
@@ -200,9 +204,10 @@ func TestResolveDetailedRematchRejectsSameNameDifferentSize(t *testing.T) {
 func TestResolveDetailedRematchRejectsStrongerTierMismatch(t *testing.T) {
 	server := identityRematchProvider(t)
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       server.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         server.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	ctx := context.Background()
 	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
@@ -230,9 +235,10 @@ func TestResolveDetailedRematchRejectsStrongerTierMismatch(t *testing.T) {
 func TestResolveDetailedLegacyRowStaysRefused(t *testing.T) {
 	server := identityRematchProvider(t)
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       server.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         server.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 
 	_, err := svc.ResolveDetailed(

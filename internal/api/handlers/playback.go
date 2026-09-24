@@ -158,7 +158,7 @@ type ResolvedVirtualMedia struct {
 	// OwnerID is the plugin installation that served the candidate, stamped
 	// by the provider resolver. It is the runtime inheritance for a virtual
 	// file whose stored owner is 0 and takes precedence over the file owner
-	// when deciding whether allow_insecure_http applies.
+	// when deciding whether allow_private_streams applies.
 	OwnerID int
 	// ProviderVideoHash, ProviderGUID, ProviderReleaseName and
 	// ProviderReleaseSize are the resolved candidate's durable identity, in
@@ -469,8 +469,13 @@ type PlaybackHandler struct {
 	VirtualMediaDetailedResolver VirtualMediaDetailedResolver
 	RemoteStreamRelay            *remotestream.Relay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
-	// explicitly enabled allow_insecure_http for private/local stream hosts.
+	// explicitly enabled allow_insecure_http for HTTP manifests on
+	// private/local provider hosts.
 	AllowInsecureVirtual func(installationID int) bool
+	// AllowPrivateStreams reports whether the core
+	// virtual_library.allow_private_streams opt-in permits virtual streams
+	// from private/local network destinations.
+	AllowPrivateStreams func(installationID int) bool
 	// VirtualCandidateTrustWindow reports how long a persisted virtual
 	// candidate row may be trusted for replay after its last listing or
 	// resolution. A positive value keeps a delisted same-identity candidate

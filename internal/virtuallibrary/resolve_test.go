@@ -121,9 +121,10 @@ func TestResolveDetailedPinnedExcludedCandidateSubstitution(t *testing.T) {
 	defer mockServer.Close()
 
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       mockServer.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         mockServer.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	if svc == nil {
 		t.Fatal("expected non-nil service")
@@ -188,9 +189,10 @@ func TestResolveDetailedPinnedURLValidationFailureRefusesWithoutRotation(t *test
 	defer mockServer.Close()
 
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       mockServer.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         mockServer.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	if svc == nil {
 		t.Fatal("expected non-nil service")
@@ -204,7 +206,7 @@ func TestResolveDetailedPinnedURLValidationFailureRefusesWithoutRotation(t *test
 	// character) while the sibling stays valid: with substitution refused the
 	// resolve must return the pin's validation failure, never the sibling.
 	// Credentials are used instead of an SSRF split because
-	// AllowInsecureHTTP permits every literal test address, while the
+	// AllowPrivateStreams permits every literal test address, while the
 	// structural no-credentials rule always applies.
 	pinnedURI := "virtual://movie/tt100?result=" + streams[0].ID
 	siblingID := streams[1].ID
@@ -248,9 +250,10 @@ func TestResolveDetailedAbsentSessionPinCarriesRotationSentinel(t *testing.T) {
 	defer mockServer.Close()
 
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       mockServer.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         mockServer.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	if svc == nil {
 		t.Fatal("expected non-nil service")
@@ -290,25 +293,35 @@ func TestResolveDetailedWithFakeProvider(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
-	// Case 1: AllowInsecureHTTP = false. Private IPs rejected by SSRF validation.
+	// Case 1: AllowPrivateStreams = false. Private IPs rejected by SSRF validation.
+	// The HTTP manifest opt-in is still on: only stream destinations are strict.
+	// This is the key new security property: manifest HTTP works WITHOUT
+	// private-stream access.
 	svcSecure := virtuallibrary.New(virtuallibrary.Config{
 		Enabled:           true,
 		ManifestURL:       mockServer.URL + "/manifest.json",
-		AllowInsecureHTTP: false,
+		AllowInsecureHTTP: true,
 	}, nil, nil)
 	if svcSecure == nil {
 		t.Fatal("expected non-nil service")
 	}
+	// The manifest over HTTP must validate even without private streams: the
+	// manifest comes from the mock server (a private test host) and the
+	// manifest-HTTP opt-in is on.
+	if err := svcSecure.Validate(context.Background()); err != nil {
+		t.Fatalf("HTTP manifest rejected with allow_insecure_http on: %v", err)
+	}
 	_, errSecure := svcSecure.ResolveDetailed(context.Background(), "virtual://movie/tt100", false, nil, "", false)
 	if errSecure == nil {
-		t.Fatal("expected SSRF error when AllowInsecureHTTP is false for private stream URL")
+		t.Fatal("expected SSRF error when AllowPrivateStreams is false for private stream URL")
 	}
 
-	// Case 2: AllowInsecureHTTP = true. Private IP streams allowed.
+	// Case 2: AllowPrivateStreams = true. Private IP streams allowed.
 	svcInsecure := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       mockServer.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         mockServer.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	if svcInsecure == nil {
 		t.Fatal("expected non-nil service")
@@ -347,13 +360,25 @@ func TestResolveDetailedWithFakeProvider(t *testing.T) {
 		if !s.Visible {
 			t.Errorf("stream[%d].Visible = false, want true", i)
 		}
-		// The provider URL and durable identity must reach the persistence
-		// sink for every listed candidate, even with no hash/GUID.
 		if s.ProviderURL == "" {
 			t.Errorf("stream[%d].ProviderURL is empty, want the provider URL", i)
 		}
 		if s.ProviderReleaseName == "" {
 			t.Errorf("stream[%d].ProviderReleaseName is empty, want the name+size fallback", i)
 		}
+	}
+
+	// Case 4: AllowPrivateStreams = true alone does NOT permit an HTTP
+	// manifest. The manifest-HTTP opt-in is independent.
+	svcManifestStrict := virtuallibrary.New(virtuallibrary.Config{
+		Enabled:             true,
+		ManifestURL:         mockServer.URL + "/manifest.json",
+		AllowPrivateStreams: true,
+	}, nil, nil)
+	if svcManifestStrict == nil {
+		t.Fatal("expected non-nil service")
+	}
+	if err := svcManifestStrict.Validate(context.Background()); err == nil {
+		t.Fatal("expected HTTP manifest rejection when allow_insecure_http is off, even with allow_private_streams on")
 	}
 }

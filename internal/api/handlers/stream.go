@@ -112,8 +112,13 @@ type StreamHandler struct {
 	// so ffmpeg reads through it with a stable IP.
 	RemoteStreamRelay *remotestream.Relay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
-	// explicitly enabled allow_insecure_http for private/local stream hosts.
+	// explicitly enabled allow_insecure_http for HTTP manifests on
+	// private/local provider hosts.
 	AllowInsecureVirtual func(installationID int) bool
+	// AllowPrivateStreams reports whether the core
+	// virtual_library.allow_private_streams opt-in permits virtual streams
+	// from private/local network destinations.
+	AllowPrivateStreams func(installationID int) bool
 	// VirtualCandidateTrustWindow reports how long a persisted virtual
 	// candidate row may be trusted for replay after its last listing or
 	// resolution. A positive value keeps a delisted same-identity candidate
@@ -435,7 +440,7 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	var relayURL string
 	var cleanup func()
 	ownerID := effectiveVirtualOwner(resolved.OwnerID, file.VirtualOwnerInstallationID)
-	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(ownerID) {
+	if h.AllowPrivateStreams != nil && h.AllowPrivateStreams(ownerID) {
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterInsecureWithHeaders(ctx, resolved.URL, resolved.RequestHeaders)
 	} else {
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterWithHeaders(ctx, resolved.URL, resolved.RequestHeaders)

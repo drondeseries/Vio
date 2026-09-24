@@ -94,8 +94,8 @@ func ValidateURLSyntax(raw string) (*url.URL, error) {
 
 // ValidateURLSyntaxAllowNonPublic validates the structure of a remote media
 // URL without rejecting private, loopback, link-local, or reserved addresses.
-// Use only when the plugin admin has explicitly enabled allow_insecure_http so
-// the provider may legitimately return private/local stream URLs. Structural
+// Use only when the admin has explicitly enabled allow_private_streams so the
+// provider may legitimately return private/local stream URLs. Structural
 // safety checks (absolute HTTP(S), no credentials, no control characters)
 // always apply.
 func ValidateURLSyntaxAllowNonPublic(raw string) (*url.URL, error) {

@@ -53,7 +53,7 @@ func TestHandleStreamRotatesAbsentSessionPin(t *testing.T) {
 	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 
 	var calls int
 	var gotRotate []bool
@@ -385,7 +385,7 @@ func TestPrepareTransportTimelineRotatesAbsentSessionPin(t *testing.T) {
 		siblingURI = neutralURI + "?result=sibling"
 	)
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
 	var calls int

@@ -382,10 +382,10 @@ func TestVirtualPlaybackResolvesPrivateHostWithInsecureOptIn(t *testing.T) {
 		t.Fatalf("private candidate listing = %+v, %v", streams, err)
 	}
 	resolved, err := service.ResolveVirtualPlaybackWithRouting(
-		context.Background(), streams[0].URI, 0, "", VirtualPlaybackRouting{OwnerInstallationID: 101, AllowInsecure: true},
+		context.Background(), streams[0].URI, 0, "", VirtualPlaybackRouting{OwnerInstallationID: 101, AllowPrivateStreams: true},
 	)
 	if err != nil {
-		t.Fatalf("private host rejected with allow_insecure_http opt-in: %v", err)
+		t.Fatalf("private host rejected with allow_private_streams opt-in: %v", err)
 	}
 	if resolved != private {
 		t.Fatalf("resolved URL = %q, want %q", resolved, private)

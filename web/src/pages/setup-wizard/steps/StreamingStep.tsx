@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Loader2, Sparkles } from "lucide-react";
+import { AlertTriangle, Loader2, Sparkles } from "lucide-react";
 
 import {
   ConnectionCheckAction,
@@ -20,6 +20,7 @@ const STREAMING_KEYS = [
   "virtual_library.movie_library_id",
   "virtual_library.series_library_id",
   "virtual_library.allow_insecure_http",
+  "virtual_library.allow_private_streams",
   "virtual_library.cache_ttl_minutes",
   "virtual_library.tmdb_api_key",
   "virtual_library.enable_quality_profiles",
@@ -203,14 +204,39 @@ export function StreamingStep() {
               onChange={(v) => form.setValue("virtual_library.tmdb_api_key", v)}
             />
             <SettingField
-              label="Allow local HTTP"
+              label="Allow HTTP for local manifests"
               type="toggle"
-              description="Permit http:// manifests on localhost and private networks."
+              description="Permits http:// manifest URLs on private/local networks only. HTTPS remains required for public hosts."
               value={
                 form.getValue("virtual_library.allow_insecure_http") === "true" ? "true" : "false"
               }
               onChange={(v) => form.setValue("virtual_library.allow_insecure_http", v)}
             />
+            <SettingField
+              label="Allow private network streams"
+              type="toggle"
+              description="Lets virtual-stream playback contact non-public addresses (localhost, LAN, link-local)."
+              value={
+                form.getValue("virtual_library.allow_private_streams") === "true"
+                  ? "true"
+                  : "false"
+              }
+              onChange={(v) => form.setValue("virtual_library.allow_private_streams", v)}
+            />
+            {form.getValue("virtual_library.allow_private_streams") === "true" && (
+              <div className="settings-field-note my-3 flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+                <div className="text-[13px] leading-relaxed">
+                  <p className="font-medium text-amber-500">Private network access</p>
+                  <p className="text-muted-foreground mt-1">
+                    When enabled, virtual-stream playback may contact non-public addresses
+                    including localhost and link-local services. A compromised provider can
+                    cause Silo to request internal services. TLS certificate checks remain
+                    enabled.
+                  </p>
+                </div>
+              </div>
+            )}
 
             <div className="pt-4">
               <VioScoringProfilesCard form={form} defaultExpanded={false} />

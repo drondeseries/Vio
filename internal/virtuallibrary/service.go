@@ -79,6 +79,7 @@ type Config struct {
 	SeriesLibraryID        int
 	TMDBAPIKey             string
 	AllowInsecureHTTP      bool
+	AllowPrivateStreams    bool
 	CacheTTLMinutes        int
 	ScheduleRefreshMinutes int
 	MonitorFile            string
@@ -129,6 +130,7 @@ func ConfigFromSettings(m map[string]string) Config {
 		SeriesLibraryID:        intOr(m, "virtual_library.series_library_id", 2),
 		TMDBAPIKey:             m["virtual_library.tmdb_api_key"],
 		AllowInsecureHTTP:      boolOr(m, "virtual_library.allow_insecure_http", false),
+		AllowPrivateStreams:    boolOr(m, "virtual_library.allow_private_streams", false),
 		CacheTTLMinutes:        intOr(m, "virtual_library.cache_ttl_minutes", 10),
 		ScheduleRefreshMinutes: intOr(m, "virtual_library.schedule_refresh_minutes", 360),
 		MonitorFile:            stringOr(m, "virtual_library.monitor_file", ".vio-virtual-library-monitored.json"),

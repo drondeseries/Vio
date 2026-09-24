@@ -70,3 +70,37 @@ func TestCoreVirtualInsecureAllowedNilFailsClosed(t *testing.T) {
 		t.Fatal("nil ctx with nil callback must fail closed")
 	}
 }
+
+func TestAllowPrivateStreamsForProvenance(t *testing.T) {
+	old := CorePrivateStreamsAllowed
+	defer func() { CorePrivateStreamsAllowed = old }()
+
+	svc := provenanceTestService(nil)
+
+	CorePrivateStreamsAllowed = func(context.Context) bool { return true }
+	if !svc.AllowPrivateStreamsForProvenance(context.Background(), models.VirtualProvenanceCore, 7) {
+		t.Fatal("core provenance with opt-in must allow private streams")
+	}
+
+	for _, p := range []models.VirtualProvenance{models.VirtualProvenancePlugin, models.VirtualProvenanceLocal, "bogus"} {
+		if svc.AllowPrivateStreamsForProvenance(context.Background(), p, 7) {
+			t.Fatalf("provenance %q must never inherit the core private-streams opt-in", p)
+		}
+	}
+
+	CorePrivateStreamsAllowed = func(context.Context) bool { return false }
+	if svc.AllowPrivateStreamsForProvenance(context.Background(), models.VirtualProvenanceCore, 7) {
+		t.Fatal("core provenance with opt-out must fail closed")
+	}
+
+	CorePrivateStreamsAllowed = nil
+	if svc.AllowPrivateStreamsForProvenance(context.Background(), models.VirtualProvenanceCore, 7) {
+		t.Fatal("nil callback must fail closed")
+	}
+	if CoreVirtualPrivateStreamsAllowed(context.Background()) {
+		t.Fatal("nil CorePrivateStreamsAllowed must fail closed")
+	}
+	if CoreVirtualPrivateStreamsAllowed(nil) {
+		t.Fatal("nil ctx with nil callback must fail closed")
+	}
+}

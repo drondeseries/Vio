@@ -19,9 +19,10 @@ func validateProviderStreamURL(ctx context.Context, raw string) (string, error) 
 }
 
 // validateProviderStreamURLSyntax validates the structural safety of a
-// provider stream URL without requiring it to resolve to a public address. It
-// is used only when the plugin admin has explicitly enabled allow_insecure_http
-// and the provider may legitimately return private/local stream URLs.
+// provider stream URL without requiring it to resolve to a public address.
+// It is used only when the admin has explicitly enabled
+// allow_private_streams and the provider may legitimately return
+// private/local stream URLs.
 func validateProviderStreamURLSyntax(raw string) (string, error) {
 	parsed, err := remotestream.ValidateURLSyntaxAllowNonPublic(raw)
 	if err != nil {

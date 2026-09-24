@@ -53,7 +53,7 @@ type ResolvedVirtualMedia struct {
 	// OwnerID is the plugin installation that served the candidate, stamped by
 	// the provider resolver. It is the runtime inheritance for a virtual file
 	// whose stored owner is 0 and takes precedence over the file owner for the
-	// allow_insecure_http decision.
+	// allow_private_streams decision.
 	OwnerID int
 	// ProviderVideoHash, ProviderGUID, ProviderReleaseName and
 	// ProviderReleaseSize are the resolved candidate's durable identity, in
@@ -1270,7 +1270,7 @@ func (h *PlaybackHandler) registerVirtualInputForIdentity(ctx context.Context, u
 	if h.RemoteStreamRelay == nil {
 		return "", nil, errors.New("remote stream relay is not configured")
 	}
-	insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(effectiveVirtualOwner(resolved.OwnerID, source.VirtualSourceOwnerInstallationID))
+	insecure := h.AllowPrivateStreams != nil && h.AllowPrivateStreams(effectiveVirtualOwner(resolved.OwnerID, source.VirtualSourceOwnerInstallationID))
 	relayURL, cleanup, err := registerRemoteStreamInputWithHeaders(ctx, h.RemoteStreamRelay, resolved.URL, resolved.RequestHeaders, insecure)
 	if err != nil {
 		return "", nil, err
@@ -1309,10 +1309,11 @@ func (h *PlaybackHandler) serveVirtualDirect(w http.ResponseWriter, r *http.Requ
 }
 
 // proxyVirtualStream routes the resolved URL through the strict SSRF-protected
-// proxy, or through the insecure proxy when the owning plugin installation has
-// explicitly enabled allow_insecure_http for private/local hosts.
+// proxy, or through the insecure proxy when the core
+// virtual_library.allow_private_streams opt-in permits private/local stream
+// destinations.
 func (h *PlaybackHandler) proxyVirtualStream(w http.ResponseWriter, r *http.Request, source PlaybackMediaSource, resolved ResolvedVirtualMedia) error {
-	insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(effectiveVirtualOwner(resolved.OwnerID, source.VirtualSourceOwnerInstallationID))
+	insecure := h.AllowPrivateStreams != nil && h.AllowPrivateStreams(effectiveVirtualOwner(resolved.OwnerID, source.VirtualSourceOwnerInstallationID))
 	if hp, ok := h.RemoteStreamRelay.(headerRemoteStreamProxy); ok {
 		if insecure {
 			return hp.ProxyInsecureWithHeaders(w, r, resolved.URL, resolved.RequestHeaders)

@@ -375,10 +375,14 @@ type PlaybackHandler struct {
 	VirtualCandidateFileLookup VirtualCandidateFileLookup
 	RemoteStreamRelay          RemoteStreamRelay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
-	// explicitly enabled allow_insecure_http for private/local stream URLs. When
-	// nil or false, virtual streams are proxied through the strict SSRF-protected
-	// relay path.
+	// explicitly enabled allow_insecure_http for HTTP manifests on
+	// private/local provider hosts.
 	AllowInsecureVirtual func(installationID int) bool
+	// AllowPrivateStreams reports whether the core
+	// virtual_library.allow_private_streams opt-in permits virtual streams
+	// from private/local network destinations. When nil or false, virtual
+	// streams are proxied through the strict SSRF-protected relay path.
+	AllowPrivateStreams func(installationID int) bool
 	// compatAutoTranscodePipeline is a test seam for the hw_accel=auto
 	// fallback pipeline; nil uses playback.NewAutoTranscodePipeline.
 	compatAutoTranscodePipeline func(context.Context, playback.TranscodeOpts) *playback.AutoTranscodePipeline
@@ -1249,7 +1253,7 @@ func NewPlaybackHandler(
 				return "", nil, err
 			}
 		}
-		insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(effectiveOwner)
+		insecure := h.AllowPrivateStreams != nil && h.AllowPrivateStreams(effectiveOwner)
 		relayURL, cleanup, err := registerRemoteStreamInputWithHeaders(ctx, h.RemoteStreamRelay, resolved, headers, insecure)
 		if err != nil {
 			return "", nil, err
