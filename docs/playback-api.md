@@ -40,6 +40,68 @@ capabilities. A different value is `409 installation_changed`: refresh
 capabilities and start a new attempt. There is no admission step and no
 per-account enrollment.
 
+## Indexer releases
+
+V2 watch detail carries an additive `indexer_releases` array alongside
+`versions`: releases that exist on the configured indexers but are not
+downloaded on the provider yet. The array is always present and empty when
+there is nothing to request. Each entry is
+`{release_id, title, resolution?, codec_video?, codec_audio?, hdr?,
+size_bytes?, indexer?, published_at?, format_score?, protocol?, download_state}`.
+
+`release_id` is an opaque server row id; it is never the release GUID or the
+download URL. `download_state` is `not_downloaded`, `queued`, or `failed`.
+`published_at` is an RFC 3339 instant. The array is empty for local content,
+for servers with no indexer configured, and for `/api/v1` and jellycompat,
+which do not carry it.
+
+`POST /api/v2/media/{media_id}/virtual-releases/{release_id}:request` requests
+one release on the provider. The server resolves the stored row scoped to the
+item's content id (and episode id where applicable) and media folder, re-checks
+the caller's access through the same path the watch detail uses, and hands the
+server-stored `download_url` to the provider. The request accepts no URL and
+never echoes one; the download URL is never serialized or logged. The response
+is `200 {release_id, state, message?}`, where `state` is `queued` or `failed`.
+It is idempotent (`domain_identity`): an already-queued release returns
+`queued` without a second enqueue, and a provider refusal records `failed` so
+the row stays retryable. An unknown or foreign release id is `404`; a
+malformed id is `422`; an unconfigured provider is `503`.
+
+`GET /api/v2/capabilities/virtual-library` is the feature-detection document:
+`{revision, state, indexer_search, indexer_request}`. `state` is `available`
+when either path is wired and `not_configured` otherwise. `indexer_search`
+reports whether Prowlarr search is configured and `indexer_request` whether
+provider enqueue is configured; clients that cannot request releases must not
+offer the action.
+
+### Refresh List
+
+`POST /api/v2/media/{media_id}/virtual-candidates:refresh` is asynchronous. It
+answers `202 Accepted` with `Location: /api/v2/admin/jobs/{id}` and
+`Retry-After: 5`; clients poll `GET /api/v2/admin/jobs/{id}` until the job is
+terminal, then re-read the watch detail. One active job exists per title (a
+partial unique index on `(job_type, request_payload->>'content_id')`); a
+concurrent refresh returns the existing job. The job is owned by the requesting
+user, and a non-administrator can read their own job status (and only their
+own). The pipeline runs, in order:
+
+1. re-list and persist the provider candidates; a failure here fails the job;
+2. an on-demand indexer search under its own short budget; a failure, timeout,
+   or oversized answer is warned and the job continues with the provider-only
+   result;
+3. filter to usenet releases the provider does not already list (the dedup set
+   includes badge-confirmed and cached streams), cap the batch, and persist
+   them;
+4. probe the newly persisted candidates so their subtitle and audio tracks are
+   present; best effort and bounded, every new candidate is attempted before
+   the job completes and the count is recorded;
+5. publish `catalog.item.changed` with `{content_id, change: "versions_updated"}`
+   on the catalog channel so every client invalidates the version list.
+
+The completed job result carries the retained `indexer_releases` list in the
+same wire shape the watch detail uses. The synchronous behavior this endpoint
+previously had is gone; there is no second endpoint.
+
 ## Marker ranges
 
 V2 watch detail includes `marker_segments` on each file version, including

@@ -82,6 +82,10 @@ type AdminTaskJob struct {
 	DownloadExpiresAt       *Instant                             `json:"download_expires_at,omitempty"`
 	PublicURL               string                               `json:"public_url,omitempty"`
 	PublicLinkSupported     bool                                 `json:"public_link_supported" doc:"Whether this server can mint a shareable seven-day link. False when exports are stored locally, because only storage-side presigning produces a URL usable off this server."`
+	// IndexerReleases is the retained indexer-release list a virtual candidates
+	// refresh produced, in the same wire shape the watch detail carries. Absent
+	// for every other job kind.
+	IndexerReleases []WatchIndexerRelease `json:"indexer_releases,omitempty"`
 }
 type AdminTaskJobsInput struct {
 	Kind   string `query:"kind"`
@@ -174,6 +178,32 @@ func (reg *Registry) adminTaskJobOf(ctx context.Context, job *models.AdminJob, a
 			out.ItemResult = &safe
 		}
 	}
+	// A completed virtual candidates refresh carries the retained release list
+	// in the same watch-detail shape, so the owner (an ordinary viewer who
+	// triggered the refresh) sees what the next detail read will return.
+	if job.JobType == adminjob.JobTypeVirtualCandidatesRefresh && job.Status == adminjob.StatusCompleted {
+		var result adminjob.VirtualCandidatesRefreshResult
+		if json.Unmarshal(job.ResultPayload, &result) == nil && len(result.Releases) > 0 {
+			releases := make([]WatchIndexerRelease, 0, len(result.Releases))
+			for _, release := range result.Releases {
+				releases = append(releases, WatchIndexerRelease{
+					ReleaseID:     release.ReleaseID,
+					Title:         release.Title,
+					Resolution:    release.Resolution,
+					CodecVideo:    release.CodecVideo,
+					CodecAudio:    release.CodecAudio,
+					HDR:           release.HDR,
+					SizeBytes:     release.SizeBytes,
+					Indexer:       release.Indexer,
+					PublishedAt:   instantPtr(release.PublishedAt),
+					FormatScore:   release.FormatScore,
+					Protocol:      release.Protocol,
+					DownloadState: release.DownloadState,
+				})
+			}
+			out.IndexerReleases = releases
+		}
+	}
 	if !admin {
 		return out
 	}
@@ -248,7 +278,11 @@ func (reg *Registry) getAdminTaskJob(ctx context.Context, in *AdminTaskJobInput)
 	}
 	claims := claimsFrom(ctx)
 	admin := claims != nil && claims.Role == models.RoleAdmin
-	if !admin && (claims == nil || job.JobType != adminjob.JobTypeItemRefresh || job.CreatedByUserID != claims.UserID) {
+	// An item refresh and a virtual candidates refresh are owner-readable: the
+	// viewer who triggered the work may poll its status without administrator
+	// authority. Every other job kind is administrator-only.
+	ownerReadable := job.JobType == adminjob.JobTypeItemRefresh || job.JobType == adminjob.JobTypeVirtualCandidatesRefresh
+	if !admin && (claims == nil || !ownerReadable || job.CreatedByUserID != claims.UserID) {
 		return nil, NewProblem(TypeNotFound, "Job not found")
 	}
 	out := &AdminTaskJobOutput{Body: reg.adminTaskJobOf(ctx, job, admin)}

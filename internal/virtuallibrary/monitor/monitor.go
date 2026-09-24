@@ -200,6 +200,49 @@ func (s *Monitor) ConfigureAltmount(baseURL, apiKey string, intervalMinutes int,
 	return s.monitor.configureAltmount(baseURL, apiKey, intervalMinutes, indexFile)
 }
 
+// SearchMonitoredReleases performs an on-demand Prowlarr search for one
+// monitored title. It returns an error when Prowlarr is unwired so the caller
+// can degrade to an altmount-only result instead of treating it as no match.
+func (s *Monitor) SearchMonitoredReleases(ctx context.Context, item MonitoredMedia, episode *VirtualEpisode, qc quality.QualityConfig) ([]prowlarr.SearchItem, error) {
+	if s == nil || s.monitor == nil {
+		return nil, errors.New("virtual library monitor is not configured")
+	}
+	client := s.monitor.configuredProwlarr()
+	if client == nil || client.URL() == "" {
+		return nil, errors.New("prowlarr is not configured")
+	}
+	return client.SearchMonitoredReleases(ctx, item, episode, qc)
+}
+
+// EnqueueRelease hands one release's download URL to the configured AltMount
+// client. A nil or unconfigured client fails closed.
+func (s *Monitor) EnqueueRelease(ctx context.Context, downloadURL, name string) (string, error) {
+	if s == nil || s.monitor == nil {
+		return "", errors.New("virtual library monitor is not configured")
+	}
+	return s.monitor.configuredAltmount().Enqueue(ctx, downloadURL, name)
+}
+
+// ProwlarrConfigured reports whether a Prowlarr search client is wired with a
+// base URL.
+func (s *Monitor) ProwlarrConfigured() bool {
+	if s == nil || s.monitor == nil {
+		return false
+	}
+	client := s.monitor.configuredProwlarr()
+	return client != nil && client.URL() != ""
+}
+
+// AltmountConfigured reports whether an AltMount client is wired with a base
+// URL.
+func (s *Monitor) AltmountConfigured() bool {
+	if s == nil || s.monitor == nil {
+		return false
+	}
+	client := s.monitor.configuredAltmount()
+	return client != nil && client.URL() != ""
+}
+
 var (
 	tmdbBaseURL      = "https://api.themoviedb.org/3"
 	cinemetaBaseURL  = "https://v3-cinemeta.strem.io"
@@ -359,6 +402,28 @@ func (m *mediaMonitor) prowlarrClient() *prowlarrSearchClient {
 		return m.prowlarr
 	}
 	return prowlarr.NewSearchClient(nil)
+}
+
+// configuredProwlarr returns the configured client, or nil when none is wired.
+// Unlike prowlarrClient it does not allocate an empty placeholder, so a caller
+// that must degrade on "not configured" can tell the difference.
+func (m *mediaMonitor) configuredProwlarr() *prowlarrSearchClient {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.prowlarr
+}
+
+// configuredAltmount returns the configured client, or nil when none is wired.
+func (m *mediaMonitor) configuredAltmount() *altmountStateClient {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.altmount
 }
 
 func (m *mediaMonitor) markRegistered(key string) {

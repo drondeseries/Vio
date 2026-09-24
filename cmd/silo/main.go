@@ -3415,6 +3415,14 @@ func main() {
 		}
 	}
 
+	// The router builds the asynchronous virtual candidates refresh executor
+	// from services it composes; main owns the admin job runner (started after
+	// the router), so the executor is handed back here for installation.
+	var virtualRefreshExecutor adminjob.VirtualCandidatesRefreshExecutor
+	deps.OnVirtualRefreshExecutor = func(executor adminjob.VirtualCandidatesRefreshExecutor) {
+		virtualRefreshExecutor = executor
+	}
+
 	router := api.NewRouter(deps)
 
 	// Step 8: Build the handler the primary port serves — the API router and
@@ -3499,6 +3507,7 @@ func main() {
 			templateBundleApplyExecutor,
 			deps.RealtimeHub,
 		)
+		adminJobRunner.SetVirtualRefreshExecutor(virtualRefreshExecutor)
 		adminJobRunner.SetCancelRegistry(adminJobCancelRegistry)
 		adminJobRunner.SetStorageTransitionExecutor(storageTransitionSvc)
 		adminJobRunner.SetStorageTransitionCommitted(deps.RequestServerRestart)

@@ -4,6 +4,7 @@ import { playerV2Origin } from "../player-v2";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { PlayerFileVersion, PlayerPlaybackStateChange, WatchPageProps } from "../types";
+import type { PlayerIndexerRelease } from "../types";
 import type { PlaybackRealtimeEventEnvelope } from "../realtime-protocol";
 import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
@@ -20,8 +21,12 @@ import {
 import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
-import { refreshVirtualCandidates } from "@/api/v2/mediaCandidates";
+import {
+  awaitVirtualCandidatesRefresh,
+  cancelVirtualCandidatesRefresh,
+} from "@/api/v2/mediaCandidates";
 import { itemKeys } from "@/hooks/queries/keys";
+import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { useWatchTogetherRoomConnection } from "../hooks/useWatchTogetherRoomConnection";
 import { toast } from "sonner";
@@ -192,6 +197,10 @@ function WatchPartyPlaybackGate(props: WatchPageProps) {
   );
 }
 
+// Stable empty reference: a fresh `[]` default would give the indexer-release
+// sync effect a new identity on every render and loop it.
+const EMPTY_INDEXER_RELEASES: PlayerIndexerRelease[] = [];
+
 function WatchPagePlayer({
   contentId,
   title,
@@ -201,6 +210,7 @@ function WatchPagePlayer({
   libraryId,
   versions,
   playbackVariants = [],
+  indexerReleases = EMPTY_INDEXER_RELEASES,
   virtualRanking,
   subtitles,
   initialPosition,
@@ -244,6 +254,7 @@ function WatchPagePlayer({
   const handledSelectionRevisionRef = useRef<number | null>(null);
   const playbackPositionRef = useRef(initialPosition ?? 0);
   const [playbackVersions, setPlaybackVersions] = useState(versions);
+  const [indexerReleaseRows, setIndexerReleaseRows] = useState(indexerReleases);
   const [versionSwapNoticeDismissed, setVersionSwapNoticeDismissed] = useState(false);
   const [realtimeConnectionState, setRealtimeConnectionState] = useState<
     "disconnected" | "connecting" | "connected"
@@ -256,6 +267,10 @@ function WatchPagePlayer({
   useEffect(() => {
     setPlaybackVersions(versions);
   }, [versions]);
+
+  useEffect(() => {
+    setIndexerReleaseRows(indexerReleases);
+  }, [indexerReleases]);
 
   const session = usePlaybackSession(
     playbackRequestKey ??
@@ -406,14 +421,28 @@ function WatchPagePlayer({
   /**
    * Manually re-lists the title's video candidates for the version menu.
    *
-   * The server preserves candidates already known to be working, so its answer
-   * replaces the list wholesale — but only on success. A rejected refresh
-   * throws before the state write, so the rows already on screen stay put
-   * rather than disappearing behind a failed request.
+   * The re-list is asynchronous: the endpoint accepts the work and returns an
+   * admin job, which is waited on to a terminal state before the server's
+   * answer is read back. The caller's refresh control stays locked for the
+   * whole flow. A rejected refresh throws before any state write, so the rows
+   * already on screen stay put rather than disappearing behind a failed
+   * request. A second press of the locked control cancels the job instead.
    */
+  const { awaitAdminJob } = useRealtimeEvents();
   const handleRefreshVersions = useCallback(async () => {
-    const refreshed = await refreshVirtualCandidates(contentId);
-    setPlaybackVersions(refreshed);
+    await awaitVirtualCandidatesRefresh(contentId, awaitAdminJob);
+    // Re-read the watch detail so the version list and the indexer releases
+    // both come from the server's answer rather than a client-side merge.
+    const detail = await queryClient.fetchQuery({
+      queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
+      queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
+      staleTime: 0,
+    });
+    setPlaybackVersions(detail.versions);
+    setIndexerReleaseRows(detail.indexer_releases ?? []);
+  }, [awaitAdminJob, contentId, fileId, libraryId, queryClient]);
+  const handleCancelRefresh = useCallback(async () => {
+    await cancelVirtualCandidatesRefresh(contentId);
   }, [contentId]);
 
   const activePlaybackVersion = useMemo(
@@ -968,11 +997,13 @@ function WatchPagePlayer({
         sessionId={session.sessionId}
         selectedVersion={selectedVersion}
         versions={playbackVersions}
+        indexerReleases={indexerReleaseRows}
         virtualRanking={virtualRanking}
         activeFileId={session.mediaFileId}
         chapters={activeChapters}
         onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}
         onRefreshVersions={handleRefreshVersions}
+        onCancelRefresh={handleCancelRefresh}
         subtitleUrls={playableSubtitles}
         initialPosition={session.initialPosition}
         onQualitySelect={session.changeQuality}

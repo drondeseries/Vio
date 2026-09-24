@@ -26,6 +26,9 @@ const (
 	maxAltmountBodyBytes        = 32 << 20
 	maxAltmountStateBytes       = 16 << 20
 	maxAltmountHistorySlots     = 50000
+	// maxErrorBodyBytes bounds the response snippet attached to an enqueue
+	// error, mirroring the Prowlarr client's error budget.
+	maxErrorBodyBytes = 4 << 10
 	// altmountStateRetention bounds how long a completed/failed release keeps
 	// influencing playback preference. The underlying NZB and its storage are
 	// normally gone well before this, so it is a safety cap, not a policy knob.
@@ -214,6 +217,128 @@ func (c *altmountStateClient) historyURL() (string, error) {
 	q.Set("limit", "10000")
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// Enqueue hands one release's download URL to AltMount's SABnzbd-compatible
+// addurl endpoint and returns the nzo_id AltMount assigns. It is the package's
+// only write: the state client is otherwise read-only.
+//
+// The URL and the SABnzbd API key are secrets and are never part of any
+// returned error or log line. A status:false response or an empty nzo_ids list
+// is a failure, reported with a redacted body snippet so the operator can see
+// why the provider refused without the release URL leaking.
+//
+// The request runs under the caller's ctx bounded by an internal 15s cap, so a
+// hung AltMount cannot outlive the request lifetime. It reuses the shared
+// restricted-redirect client (cross-origin redirects are rejected) so a
+// compromised provider cannot redirect the internal download URL elsewhere.
+func (c *altmountStateClient) Enqueue(ctx context.Context, downloadURL, name string) (string, error) {
+	downloadURL = strings.TrimSpace(downloadURL)
+	if downloadURL == "" {
+		return "", errors.New("AltMount enqueue requires a download URL")
+	}
+	c.mu.Lock()
+	raw := c.url
+	key := c.apiKey
+	c.mu.Unlock()
+	if strings.TrimSpace(raw) == "" {
+		return "", errors.New("AltMount URL is not configured")
+	}
+	u, err := url.Parse(altmountSABnzbdBase(raw))
+	if err != nil {
+		return "", fmt.Errorf("invalid AltMount URL: %w", err)
+	}
+	q := u.Query()
+	q.Set("mode", "addurl")
+	q.Set("name", downloadURL)
+	if nzbName := strings.TrimSpace(name); nzbName != "" {
+		q.Set("nzbname", nzbName)
+	}
+	q.Set("output", "json")
+	if key != "" {
+		q.Set("apikey", key)
+	}
+	u.RawQuery = q.Encode()
+
+	enqueueCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(enqueueCtx, http.MethodPost, u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	if key != "" {
+		req.Header.Set("X-Api-Key", key)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		// The transport error may embed the request URL (which carries the
+		// download URL and key); report only that the request failed.
+		return "", errors.New("AltMount enqueue request failed")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("AltMount enqueue returned status %d: %s", resp.StatusCode, c.redactedSnippet(resp.Body, downloadURL))
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAltmountBodyBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read AltMount enqueue response: %w", err)
+	}
+	if int64(len(body)) > maxAltmountBodyBytes {
+		return "", fmt.Errorf("AltMount enqueue response exceeds %d bytes", maxAltmountBodyBytes)
+	}
+	var payload struct {
+		Status bool     `json:"status"`
+		NzoIDs []string `json:"nzo_ids"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("decode AltMount enqueue response: %w", err)
+	}
+	if !payload.Status || len(payload.NzoIDs) == 0 || strings.TrimSpace(payload.NzoIDs[0]) == "" {
+		return "", fmt.Errorf("AltMount rejected the enqueue: %s", c.redactEnqueueBody(body, downloadURL))
+	}
+	return strings.TrimSpace(payload.NzoIDs[0]), nil
+}
+
+// redactedSnippet reads a bounded response body for an error message and
+// strips the configured API key and the submitted download URL. It never
+// includes the request URL.
+func (c *altmountStateClient) redactedSnippet(body io.Reader, downloadURL string) string {
+	c.mu.Lock()
+	key := c.apiKey
+	c.mu.Unlock()
+	data, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes+1))
+	if len(data) > maxErrorBodyBytes {
+		data = data[:maxErrorBodyBytes]
+	}
+	snippet := strings.TrimSpace(string(data))
+	if snippet == "" {
+		snippet = "(empty response body)"
+	}
+	return redactAltmountSecret(snippet, key, downloadURL)
+}
+
+// redactEnqueueBody trims a SABnzbd JSON failure body and strips the API key
+// and submitted download URL (a provider may echo the URL in its error).
+func (c *altmountStateClient) redactEnqueueBody(body []byte, downloadURL string) string {
+	c.mu.Lock()
+	key := c.apiKey
+	c.mu.Unlock()
+	snippet := strings.TrimSpace(string(body))
+	if snippet == "" {
+		snippet = "(empty response body)"
+	}
+	return redactAltmountSecret(snippet, key, downloadURL)
+}
+
+func redactAltmountSecret(value, key, downloadURL string) string {
+	if key != "" {
+		value = strings.ReplaceAll(value, key, "[redacted]")
+	}
+	if downloadURL != "" {
+		value = strings.ReplaceAll(value, downloadURL, "[redacted]")
+	}
+	return value
 }
 
 // Refresh performs a history fetch now and persists the merged snapshot.

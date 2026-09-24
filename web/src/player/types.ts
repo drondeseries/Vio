@@ -81,6 +81,26 @@ export interface PlayerVirtualRanking {
   criteria?: { attribute: string; direction: "asc" | "desc" }[];
 }
 
+/**
+ * A release that exists on the indexers but is not downloaded on the provider.
+ * Carried additively on the watch detail below the playable versions; the
+ * in-player version menu renders these as "needs a fetch" rows.
+ */
+export interface PlayerIndexerRelease {
+  release_id: string;
+  title: string;
+  resolution?: string;
+  codec_video?: string;
+  codec_audio?: string;
+  hdr?: boolean;
+  size_bytes?: number;
+  indexer?: string;
+  published_at?: string;
+  format_score?: number;
+  protocol?: string;
+  download_state: "not_downloaded" | "queued" | "failed";
+}
+
 export interface PlayerPlaybackVariantPart {
   part_index: number;
   default_file_id?: number;
@@ -300,6 +320,11 @@ export interface WatchPageProps {
   libraryId?: number;
   versions: PlayerFileVersion[];
   playbackVariants?: PlayerPlaybackVariant[];
+  /**
+   * Releases that exist on the indexers but are not downloaded on the provider.
+   * Shown below the playable versions in the version menu; empty hides the UI.
+   */
+  indexerReleases?: PlayerIndexerRelease[];
   /**
    * The ranking the server applied to the version list, from the watch detail.
    * Absent for local content, where the version menu keeps its `?profile=`

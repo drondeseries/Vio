@@ -92,6 +92,13 @@ func (f *fakeAdminTasks) GetAdminTaskJob(_ context.Context, id string) (*models.
 	if id == "missing" {
 		return nil, adminjob.ErrJobNotFound
 	}
+	if id == "virtual" {
+		return &models.AdminJob{ID: id, JobType: adminjob.JobTypeVirtualCandidatesRefresh, CreatedByUserID: 1, Status: adminjob.StatusCompleted, RequestedAt: fixedTime(),
+			ResultPayload: []byte(`{"content_id":"movie:heat-1995","indexer_releases":1,"releases":[{"release_id":"17","title":"Heat 1995 2160p WEB-DL x265-GRP","resolution":"2160p","codec_video":"hevc","size_bytes":8000000000,"indexer":"idx","protocol":"usenet","download_state":"not_downloaded"}]}`)}, nil
+	}
+	if id == "virtual-foreign" {
+		return &models.AdminJob{ID: id, JobType: adminjob.JobTypeVirtualCandidatesRefresh, CreatedByUserID: 2, Status: adminjob.StatusQueued, RequestedAt: fixedTime()}, nil
+	}
 	return &models.AdminJob{ID: id, JobType: adminjob.JobTypeItemRefresh, CreatedByUserID: 1, Status: adminjob.StatusCompleted, RequestedAt: fixedTime(), RequestPayload: []byte(`{"scan_path":"private"}`), ResultPayload: []byte(`{"requested_content_id":"item","refresh_content_id":"item","detail_content_id":"detail","scan_path":"private","scan_result":{"New":3},"artwork_cache_warning":"private cache failure"}`)}, nil
 }
 func (f *fakeAdminTasks) AdminTaskJobDownload(context.Context, *models.AdminJob) (string, *time.Time) {
@@ -357,6 +364,29 @@ func TestAdminJobOwnerReadIsSafe(t *testing.T) {
 		t.Fatalf("owner projection: %d %s", response.Code, response.Body)
 	}
 	requireProblem(t, do(t, h, "GET", Prefix+"/admin/jobs/missing", "", bearer(memberToken)), TypeNotFound)
+}
+
+// TestVirtualRefreshJobOwnerReadableAndResult proves a viewer who triggered a
+// virtual candidates refresh may read their own job, sees the retained
+// indexer-release list, and cannot read another account's job.
+func TestVirtualRefreshJobOwnerReadableAndResult(t *testing.T) {
+	f := newFakeAdminTasks()
+	h := adminTasksTestHandler(t, f)
+
+	response := do(t, h, "GET", Prefix+"/admin/jobs/virtual", "", bearer(memberToken))
+	if response.Code != 200 {
+		t.Fatalf("owner read: %d %s", response.Code, response.Body)
+	}
+	if !strings.Contains(response.Body.String(), `"indexer_releases"`) || !strings.Contains(response.Body.String(), `"release_id":"17"`) {
+		t.Fatalf("indexer releases missing: %s", response.Body)
+	}
+	// The stored download URL is never projected.
+	if strings.Contains(response.Body.String(), "indexer.example") {
+		t.Fatalf("release URL leaked: %s", response.Body)
+	}
+
+	// Another account cannot read the job: the owner rule is identity-bound.
+	requireProblem(t, do(t, h, "GET", Prefix+"/admin/jobs/virtual-foreign", "", bearer(memberToken)), TypeNotFound)
 }
 
 func TestAdminTaskScheduleRejectsNestedNullWithoutWrites(t *testing.T) {

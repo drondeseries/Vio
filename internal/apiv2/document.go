@@ -714,6 +714,7 @@ func registerAll(reg *Registry) {
 	registerWatchlist(reg)
 	registerWatch(reg)
 	registerMediaCandidates(reg)
+	registerVirtualLibraryCapabilities(reg)
 	registerOpenAPIDocument(reg)
 	registerAPIDocs(reg)
 }

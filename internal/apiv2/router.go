@@ -284,10 +284,21 @@ type Dependencies struct {
 	// Watch answers watch detail and marks items watched
 	// (*handlers.ItemsHandler).
 	Watch WatchService
-	// VirtualCandidatesRefresh force-re-lists a virtual item's provider
-	// candidates for the media-candidates refresh endpoint. A missing service
-	// makes only that operation answer dependency_unavailable.
+	// VirtualCandidatesRefresh queues the asynchronous re-list of a virtual
+	// item's provider candidates. A missing service makes only that operation
+	// answer dependency_unavailable.
 	VirtualCandidatesRefresh VirtualCandidatesRefreshService
+	// VirtualReleaseRequest requests one stored indexer release on the
+	// provider. A missing service makes only that operation answer
+	// dependency_unavailable.
+	VirtualReleaseRequest VirtualReleaseRequestService
+	// IndexerReleases is the optional seam that merges the persisted indexer
+	// releases into the watch detail. A nil seam leaves indexer_releases empty
+	// and does not change any other member.
+	IndexerReleases IndexerReleaseProvider
+	// VirtualLibraryStatus reports whether the indexer search and provider
+	// enqueue paths are wired for the capability document.
+	VirtualLibraryStatus VirtualLibraryStatusService
 	// Profiles applies profile updates (*handlers.ProfileHandler).
 	Profiles ProfileService
 	// Libraries answers which library identifiers exist

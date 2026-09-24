@@ -9,6 +9,8 @@ import {
   REFRESH_VERSIONS_ERROR,
   type VersionInfo,
 } from "./QualityMenu";
+import type { PlayerIndexerRelease } from "../types";
+import { REQUEST_RELEASE_ERROR } from "@/hooks/useIndexerReleases";
 
 // The sort preference reads/writes the canonical settings endpoints; the menu
 // tests only exercise the display re-order, so it is mocked inert.
@@ -26,10 +28,27 @@ vi.mock("@/hooks/useVersionSortPreference", () => ({
   }),
 }));
 
+// The indexer UI is gated on the server capability and the Request action POSTs
+// its own endpoint. Mock both so the tests drive the real hooks end to end.
+const capabilityMock = vi.hoisted(() => vi.fn());
+const requestReleaseMock = vi.hoisted(() => vi.fn());
+vi.mock("@/api/v2/virtualLibrary", () => ({
+  fetchVirtualLibraryCapability: capabilityMock,
+}));
+vi.mock("@/api/v2/mediaCandidates", () => ({
+  requestVirtualRelease: requestReleaseMock,
+}));
+
 beforeEach(() => {
   versionSortMock.criteria = [];
   versionSortMock.apply.mockReset();
   versionSortMock.reset.mockReset();
+  capabilityMock.mockReset().mockResolvedValue({
+    state: "available",
+    indexer_search: true,
+    indexer_request: true,
+  });
+  requestReleaseMock.mockReset();
 });
 
 const qualityOptions = [
@@ -54,8 +73,11 @@ const qualityOptions = [
 function renderVersionMenu(
   overrides: {
     onRefreshVersions?: () => Promise<void>;
+    onCancelRefresh?: () => Promise<void> | void;
     onSwitchVersion?: (fileId: number) => void;
     versions?: VersionInfo[];
+    indexerReleases?: PlayerIndexerRelease[];
+    contentId?: string;
   } = {},
 ) {
   render(
@@ -69,8 +91,11 @@ function renderVersionMenu(
         makeVersionInfo({ fileId: 1, label: "1080p H264", isCurrentSource: true }),
         makeVersionInfo({ fileId: 2, label: "2160p HEVC" }),
       ],
+      indexerReleases: overrides.indexerReleases,
+      contentId: overrides.contentId ?? "content-1",
       onSwitchVersion: overrides.onSwitchVersion ?? (() => {}),
       onRefreshVersions: overrides.onRefreshVersions,
+      onCancelRefresh: overrides.onCancelRefresh,
     }),
   );
   fireEvent.click(screen.getByRole("button", { name: "Quality" }));
@@ -404,6 +429,54 @@ describe("QualityMenu version list refresh", () => {
     expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
   });
 
+  it("keeps the row locked for the whole async job, not just acceptance", async () => {
+    let finishJob: () => void = () => {};
+    const onRefreshVersions = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishJob = resolve;
+        }),
+    );
+    renderVersionMenu({ onRefreshVersions });
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Refresh List/ }));
+    // Locked while the job runs; the control is never left enabled mid-job.
+    expect(screen.getByRole("menuitem", { name: /Refresh List/ })).toBeDisabled();
+
+    await act(async () => {
+      finishJob();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
+  });
+
+  it("cancels on a second press while running and unlocks the row", async () => {
+    let finishJob: (() => void) | undefined;
+    const onRefreshVersions = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          finishJob = () => reject(new Error("Job cancelled"));
+        }),
+    );
+    const onCancelRefresh = vi.fn().mockResolvedValue(undefined);
+    renderVersionMenu({ onRefreshVersions, onCancelRefresh });
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Refresh List/ }));
+    const running = screen.getByRole("menuitem", { name: /Cancel refresh/ });
+    expect(running).not.toBeDisabled();
+    expect(running).toHaveAttribute("aria-busy", "true");
+
+    fireEvent.click(running);
+    expect(onCancelRefresh).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      finishJob?.();
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(REFRESH_VERSIONS_ERROR)).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
+  });
+
   it("keeps the version rows and shows an inline message when a refresh fails", async () => {
     const onRefreshVersions = vi.fn().mockRejectedValue(new Error("network"));
     renderVersionMenu({ onRefreshVersions });
@@ -415,5 +488,90 @@ describe("QualityMenu version list refresh", () => {
     expect(screen.getByRole("menuitem", { name: /1080p H264/ })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /2160p HEVC/ })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
+  });
+});
+
+describe("QualityMenu indexer releases", () => {
+  const release = (overrides: Partial<PlayerIndexerRelease> = {}): PlayerIndexerRelease => ({
+    release_id: "rel-1",
+    title: "Movie.2026.2160p.WEB-DL.DDP5.1",
+    download_state: "not_downloaded",
+    ...overrides,
+  });
+
+  it("renders indexer rows below the playable versions with a Not downloaded badge", async () => {
+    renderVersionMenu({
+      contentId: "content-1",
+      indexerReleases: [
+        release({ resolution: "2160p", codec_video: "hevc", size_bytes: 5_000_000_000 }),
+      ],
+    });
+
+    expect(await screen.findByText("Not downloaded")).toBeInTheDocument();
+    expect(screen.getByText(/2160p · HEVC/)).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /Request Movie/ })).toBeInTheDocument();
+
+    // The indexer row comes after the playable version rows.
+    const items = screen.getAllByRole("menuitem");
+    const playable = items.findIndex((row) => /1080p H264|2160p HEVC/.test(row.textContent ?? ""));
+    const indexer = items.findIndex((row) => /Not downloaded/.test(row.textContent ?? ""));
+    expect(indexer).toBeGreaterThan(playable);
+  });
+
+  it("posts the Request to the release endpoint and flips the row to Requested", async () => {
+    let resolveRequest: (value: { release_id: string; state: "queued" }) => void = () => {};
+    requestReleaseMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRequest = resolve;
+        }),
+    );
+    renderVersionMenu({ contentId: "content-1", indexerReleases: [release()] });
+
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Request Movie/ }));
+    expect(requestReleaseMock).toHaveBeenCalledWith("content-1", "rel-1");
+    expect(screen.getByRole("menuitem", { name: /Request Movie/ })).toBeDisabled();
+
+    await act(async () => {
+      resolveRequest({ release_id: "rel-1", state: "queued" });
+      await Promise.resolve();
+    });
+
+    const row = screen.getByRole("menuitem", { name: /Requested Movie/ });
+    expect(row).toBeDisabled();
+    expect(within(row).getByText("Requested")).toBeInTheDocument();
+  });
+
+  it("keeps the row retryable when the request fails", async () => {
+    requestReleaseMock.mockRejectedValueOnce(new Error("network"));
+    renderVersionMenu({ contentId: "content-1", indexerReleases: [release()] });
+
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Request Movie/ }));
+
+    expect(await screen.findByText(REQUEST_RELEASE_ERROR)).toBeInTheDocument();
+    const retry = screen.getByRole("menuitem", { name: /Request Movie/ });
+    expect(retry).not.toBeDisabled();
+    expect(retry).toHaveTextContent("Retry");
+  });
+
+  it("renders nothing new when no indexer releases are present", async () => {
+    renderVersionMenu({ indexerReleases: [] });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("Not downloaded")).not.toBeInTheDocument();
+  });
+
+  it("hides the indexer UI when the server capability is off", async () => {
+    capabilityMock.mockResolvedValue({ state: "available", indexer_request: false });
+    renderVersionMenu({ contentId: "content-1", indexerReleases: [release()] });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("Not downloaded")).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /Request Movie/ })).not.toBeInTheDocument();
   });
 });

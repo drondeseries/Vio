@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, RefreshCw, Settings } from "lucide-react";
+import { IndexerReleaseList } from "@/components/streaming/IndexerReleaseList";
 import { QualityRankingSummary } from "@/components/streaming/QualityRankingSummary";
+import { useIndexerReleaseRequests, useVirtualLibraryCapability } from "@/hooks/useIndexerReleases";
 import { useVersionListRefresh, REFRESH_VERSIONS_ERROR } from "@/hooks/useVersionListRefresh";
 import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
 import { resolveActiveQualityOptionId } from "../playback-info";
-import type { QualityOption } from "../types";
+import type { PlayerIndexerRelease, QualityOption } from "../types";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
 import { serverRankingFromVersions } from "@/pages/ItemDetail/components/versionFormatUtils";
 
@@ -45,6 +47,10 @@ interface QualityMenuProps {
   error: string | null;
   onSelect: (id: string) => void;
   versions?: VersionInfo[];
+  /** Releases on the indexers that are not downloaded on the provider yet. */
+  indexerReleases?: PlayerIndexerRelease[];
+  /** The item id, so the menu can request an indexer release. */
+  contentId?: string;
   versionLocked?: boolean;
   onSwitchVersion?: (fileId: number) => void;
   /**
@@ -53,6 +59,12 @@ interface QualityMenuProps {
    * rows already on screen stay as they are.
    */
   onRefreshVersions?: () => Promise<void>;
+  /**
+   * Cancels the refresh started by `onRefreshVersions` when the row is pressed
+   * again while the job is still running. Omitted when the surface cannot
+   * cancel.
+   */
+  onCancelRefresh?: () => Promise<void> | void;
 }
 
 export { REFRESH_VERSIONS_ERROR };
@@ -64,16 +76,25 @@ export function QualityMenu({
   error,
   onSelect,
   versions,
+  indexerReleases = [],
+  contentId,
   versionLocked,
   onSwitchVersion,
   onRefreshVersions,
+  onCancelRefresh,
 }: QualityMenuProps) {
   const [open, setOpen] = useState(false);
   const {
     refreshing: refreshingVersions,
+    cancelable: cancelableVersions,
     error: refreshVersionsError,
     refresh: handleRefreshVersions,
-  } = useVersionListRefresh(onRefreshVersions);
+  } = useVersionListRefresh(onRefreshVersions, onCancelRefresh);
+  // Indexer releases are gated on the server's capability so a server that
+  // cannot request releases shows no indexer UI.
+  const { indexerRequest } = useVirtualLibraryCapability({ enabled: !!contentId });
+  const indexerRequests = useIndexerReleaseRequests(contentId);
+  const visibleIndexerReleases = indexerRequest ? indexerReleases : [];
   // The viewer's per-profile display order. It only re-orders the list below;
   // the server's auto-pick is untouched.
   const { criteria: userCriteria, apply: applySort, reset: resetSort } = useVersionSortPreference();
@@ -192,146 +213,171 @@ export function QualityMenu({
               below.
             </p>
           )}
-          {/* Version switching (multiple file versions) */}
-          {!versionLocked && versions && versions.length > 1 && onSwitchVersion && (
-            <>
-              <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
-                Version
-              </div>
-              <QualityRankingSummary
-                serverRanking={serverRanking}
-                userCriteria={userCriteria}
-                effectiveCriteria={effectiveCriteria}
-                onApply={applySort}
-                onReset={resetSort}
-                tone="dark"
-                className="px-3 pb-1"
-              />
-              {orderedVersions.map((v) => {
-                const idx = menuItemIndex++;
-                const statusLabels = buildVersionStatusLabels(v);
-                const hasFormatScore = typeof v.formatScore === "number" && v.formatScore !== 0;
-                const detailLine = v.detail || v.releaseName;
-                const audioLanguages = v.audioLanguages ?? [];
-                const subtitleLanguages = v.subtitleLanguages ?? [];
-                const hasBadges =
-                  hasFormatScore ||
-                  statusLabels.length > 0 ||
-                  audioLanguages.length > 0 ||
-                  subtitleLanguages.length > 0;
-                return (
+          {/* Version switching (multiple file versions) and indexer releases */}
+          {!versionLocked &&
+            ((versions && versions.length > 1 && onSwitchVersion) ||
+              visibleIndexerReleases.length > 0) && (
+              <>
+                <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
+                  Version
+                </div>
+                {versions && versions.length > 1 && onSwitchVersion && (
+                  <>
+                    <QualityRankingSummary
+                      serverRanking={serverRanking}
+                      userCriteria={userCriteria}
+                      effectiveCriteria={effectiveCriteria}
+                      onApply={applySort}
+                      onReset={resetSort}
+                      tone="dark"
+                      className="px-3 pb-1"
+                    />
+                    {orderedVersions.map((v) => {
+                      const idx = menuItemIndex++;
+                      const statusLabels = buildVersionStatusLabels(v);
+                      const hasFormatScore =
+                        typeof v.formatScore === "number" && v.formatScore !== 0;
+                      const detailLine = v.detail || v.releaseName;
+                      const audioLanguages = v.audioLanguages ?? [];
+                      const subtitleLanguages = v.subtitleLanguages ?? [];
+                      const hasBadges =
+                        hasFormatScore ||
+                        statusLabels.length > 0 ||
+                        audioLanguages.length > 0 ||
+                        subtitleLanguages.length > 0;
+                      return (
+                        <button
+                          key={v.fileId}
+                          ref={(el) => {
+                            menuItemsRef.current[idx] = el;
+                          }}
+                          role="menuitem"
+                          type="button"
+                          className={`flex w-full px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
+                            v.isCurrentSource ? "text-white" : "text-white/70"
+                          }`}
+                          onClick={() => {
+                            onSwitchVersion(v.fileId);
+                            setOpen(false);
+                          }}
+                        >
+                          <span className="flex min-w-0 items-center gap-2">
+                            <span className="min-w-0">
+                              <span className="block truncate">{v.label}</span>
+                              {detailLine && (
+                                <span className="block truncate text-[11px] text-white/50">
+                                  {detailLine}
+                                </span>
+                              )}
+                            </span>
+                            {hasBadges && (
+                              <span className="flex flex-wrap gap-1">
+                                {hasFormatScore && (
+                                  <span
+                                    className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/60"
+                                    title={`Format score ${v.formatScore}${
+                                      v.profileLabel ? ` · ${v.profileLabel}` : ""
+                                    }`}
+                                  >
+                                    ★ {v.formatScore}
+                                  </span>
+                                )}
+                                {statusLabels.map((status) => (
+                                  <span
+                                    key={status}
+                                    className={`rounded border border-white/15 px-1.5 py-0.5 text-[10px] leading-none ${
+                                      status === "Failed"
+                                        ? "border-red-500/30 bg-red-500/20 text-red-400"
+                                        : status === "Will retry on play"
+                                          ? "border-amber-500/30 bg-amber-500/15 text-amber-400"
+                                          : "bg-white/10 text-white/70"
+                                    }`}
+                                  >
+                                    {status}
+                                  </span>
+                                ))}
+                                {audioLanguages.map((language) => (
+                                  <span
+                                    key={`audio-${language}`}
+                                    className="rounded border border-blue-500/20 bg-blue-500/10 px-1.5 py-0.5 text-[10px] leading-none text-blue-400"
+                                  >
+                                    <span className="mr-0.5 opacity-70">🔊</span>
+                                    {language}
+                                  </span>
+                                ))}
+                                {subtitleLanguages.map((language) => (
+                                  <span
+                                    key={`subtitle-${language}`}
+                                    className="rounded border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[10px] leading-none text-amber-400"
+                                  >
+                                    <span className="mr-0.5 opacity-70">CC</span>
+                                    {language}
+                                  </span>
+                                ))}
+                              </span>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </>
+                )}
+                {/* Releases that exist on the indexers but are not downloaded
+                    on the provider, below the playable versions. */}
+                {visibleIndexerReleases.length > 0 && (
+                  <IndexerReleaseList
+                    releases={visibleIndexerReleases}
+                    requests={indexerRequests}
+                    tone="dark"
+                    rowRole="menuitem"
+                    className="border-t border-white/10 pt-0.5"
+                  />
+                )}
+                {onRefreshVersions && (
                   <button
-                    key={v.fileId}
                     ref={(el) => {
-                      menuItemsRef.current[idx] = el;
+                      menuItemsRef.current[menuItemIndex++] = el;
                     }}
                     role="menuitem"
                     type="button"
-                    className={`flex w-full px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
-                      v.isCurrentSource ? "text-white" : "text-white/70"
-                    }`}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                    disabled={refreshingVersions && !cancelableVersions}
+                    aria-busy={refreshingVersions || undefined}
                     onClick={() => {
-                      onSwitchVersion(v.fileId);
-                      setOpen(false);
+                      handleRefreshVersions();
                     }}
                   >
-                    <span className="flex min-w-0 items-center gap-2">
-                      <span className="min-w-0">
-                        <span className="block truncate">{v.label}</span>
-                        {detailLine && (
-                          <span className="block truncate text-[11px] text-white/50">
-                            {detailLine}
-                          </span>
-                        )}
+                    {refreshingVersions ? (
+                      <span
+                        className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-white/30 border-t-white"
+                        aria-hidden="true"
+                      />
+                    ) : (
+                      <RefreshCw
+                        className="h-3.5 w-3.5 shrink-0 text-white/50"
+                        aria-hidden="true"
+                      />
+                    )}
+                    <span className="flex min-w-0 flex-col">
+                      <span>
+                        {refreshingVersions && cancelableVersions
+                          ? "Cancel refresh"
+                          : "Refresh List"}
                       </span>
-                      {hasBadges && (
-                        <span className="flex flex-wrap gap-1">
-                          {hasFormatScore && (
-                            <span
-                              className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/60"
-                              title={`Format score ${v.formatScore}${
-                                v.profileLabel ? ` · ${v.profileLabel}` : ""
-                              }`}
-                            >
-                              ★ {v.formatScore}
-                            </span>
-                          )}
-                          {statusLabels.map((status) => (
-                            <span
-                              key={status}
-                              className={`rounded border border-white/15 px-1.5 py-0.5 text-[10px] leading-none ${
-                                status === "Failed"
-                                  ? "border-red-500/30 bg-red-500/20 text-red-400"
-                                  : status === "Will retry on play"
-                                    ? "border-amber-500/30 bg-amber-500/15 text-amber-400"
-                                    : "bg-white/10 text-white/70"
-                              }`}
-                            >
-                              {status}
-                            </span>
-                          ))}
-                          {audioLanguages.map((language) => (
-                            <span
-                              key={`audio-${language}`}
-                              className="rounded border border-blue-500/20 bg-blue-500/10 px-1.5 py-0.5 text-[10px] leading-none text-blue-400"
-                            >
-                              <span className="mr-0.5 opacity-70">🔊</span>
-                              {language}
-                            </span>
-                          ))}
-                          {subtitleLanguages.map((language) => (
-                            <span
-                              key={`subtitle-${language}`}
-                              className="rounded border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[10px] leading-none text-amber-400"
-                            >
-                              <span className="mr-0.5 opacity-70">CC</span>
-                              {language}
-                            </span>
-                          ))}
+                      {refreshVersionsError && (
+                        <span className="text-[11px] leading-tight text-red-400">
+                          {refreshVersionsError}
                         </span>
                       )}
                     </span>
                   </button>
-                );
-              })}
-              {onRefreshVersions && (
-                <button
-                  ref={(el) => {
-                    menuItemsRef.current[menuItemIndex++] = el;
-                  }}
-                  role="menuitem"
-                  type="button"
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
-                  disabled={refreshingVersions}
-                  aria-busy={refreshingVersions || undefined}
-                  onClick={() => {
-                    handleRefreshVersions();
-                  }}
-                >
-                  {refreshingVersions ? (
-                    <span
-                      className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-white/30 border-t-white"
-                      aria-hidden="true"
-                    />
-                  ) : (
-                    <RefreshCw className="h-3.5 w-3.5 shrink-0 text-white/50" aria-hidden="true" />
-                  )}
-                  <span className="flex min-w-0 flex-col">
-                    <span>Refresh List</span>
-                    {refreshVersionsError && (
-                      <span className="text-[11px] leading-tight text-red-400">
-                        {refreshVersionsError}
-                      </span>
-                    )}
-                  </span>
-                </button>
-              )}
-              <div className="my-1 border-t border-white/10" />
-              <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
-                Quality
-              </div>
-            </>
-          )}
+                )}
+                <div className="my-1 border-t border-white/10" />
+                <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
+                  Quality
+                </div>
+              </>
+            )}
           {options.map((opt) => {
             const idx = menuItemIndex++;
             return (

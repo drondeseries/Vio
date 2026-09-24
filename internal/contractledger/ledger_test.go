@@ -1225,6 +1225,8 @@ var mutationWithoutLegacyRow = map[string]string{
 	"stopWatchTogetherRoomPlayback":        "V2-only stop that keeps the room: v1 only ends a room. A room that is not playing answers with its current snapshot, so repeating the call cannot disturb the lobby it produced.",
 	"updateWatchTogetherRoomSelectionMode": "V2-only lobby mode switch: v1 fixes selection_mode at creation. Repeating the same mode is a no-op; the switch drops the staged item, which is the documented meaning of the value rather than a side effect of retrying.",
 	"queryWatchTogetherMemberState":        "V2-only POST-shaped read: the content id set (up to 200) exceeds what a query string carries. It changes no state; repeating it returns the current classification.", "refreshVirtualCandidates": "V2-only explicit re-list of a virtual item's provider candidates; v1 had no endpoint for this and re-resolved on demand. The legacy watch and playback rows remain mapped separately.",
+	"requestVirtualRelease":          "V2-only request of an indexer release on the provider; v1 had no indexer-release surface. domain_identity: the persisted release row is the identity, so a duplicate request for an already-queued release returns the same queued state without a second enqueue.",
+	"cancelVirtualCandidatesRefresh": "V2-only owner cancellation of the managed virtual-candidates refresh job; v1 had no such endpoint. The job state machine makes repeated cancellation requests converge on the same terminal canceled state.",
 }
 
 // retrySafetyMismatches compares every operation the v2 registry declares

@@ -25,7 +25,11 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	StatusCancelled = "canceled"
+	// StatusCancelled is the durable status value. It matches the
+	// admin_jobs_status_check constraint (migration 178) and the literals the
+	// cancel-on-completion paths write in Complete and Fail; a different
+	// spelling would violate the constraint and lose the cancellation.
+	StatusCancelled = "cancelled" //nolint:misspell // Persisted DB enum value (migration 178).
 )
 
 var (
@@ -233,6 +237,64 @@ func (r *Repository) GetByID(ctx context.Context, id string) (*models.AdminJob, 
 	return scanAdminJob(r.pool.QueryRow(ctx,
 		`SELECT `+adminJobColumns+` FROM admin_jobs WHERE id = $1`,
 		id,
+	))
+}
+
+// CreateVirtualCandidatesRefresh persists one Refresh List job for a title.
+// A unique index (job_type, request_payload->>'content_id') enforces one active
+// job per title; a duplicate returns ActiveJobConflictError carrying the
+// already-active job so the caller can answer it like a coalesced command.
+func (r *Repository) CreateVirtualCandidatesRefresh(ctx context.Context, createdByUserID int, req VirtualCandidatesRefreshRequest, message string) (*models.AdminJob, error) {
+	payload, err := marshalPayload(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling virtual candidates refresh payload: %w", err)
+	}
+
+	id, err := idgen.NextID()
+	if err != nil {
+		return nil, fmt.Errorf("generate job id: %w", err)
+	}
+	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
+		INSERT INTO admin_jobs (
+			id, job_type, status, created_by_user_id, request_payload, message
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING `+adminJobColumns,
+		id,
+		JobTypeVirtualCandidatesRefresh,
+		StatusQueued,
+		createdByUserID,
+		payload,
+		message,
+	))
+	if err == nil {
+		return job, nil
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		activeJob, lookupErr := r.GetActiveVirtualRefreshByContentID(ctx, req.ContentID)
+		if lookupErr != nil && !errors.Is(lookupErr, ErrJobNotFound) {
+			return nil, lookupErr
+		}
+		return nil, &ActiveJobConflictError{Job: activeJob}
+	}
+
+	return nil, fmt.Errorf("creating virtual candidates refresh job: %w", err)
+}
+
+func (r *Repository) GetActiveVirtualRefreshByContentID(ctx context.Context, contentID string) (*models.AdminJob, error) {
+	return scanAdminJob(r.pool.QueryRow(ctx, `
+		SELECT `+adminJobColumns+`
+		FROM admin_jobs
+		WHERE job_type = $1
+		  AND status IN ($2, $3)
+		  AND request_payload->>'content_id' = $4
+		ORDER BY requested_at ASC
+		LIMIT 1`,
+		JobTypeVirtualCandidatesRefresh,
+		StatusQueued,
+		StatusRunning,
+		contentID,
 	))
 }
 
@@ -759,13 +821,28 @@ func (r *Repository) withClaim(job *models.AdminJob) *Repository {
 	return &Repository{pool: r.pool, claim: new(job.ClaimGeneration)}
 }
 
+// cancellableJobTypes are the managed background job kinds the cancellation
+// command accepts. Each has a runner path that observes CancelRequested and a
+// durable terminal transition, so setting the intent is enough for a queued job
+// and a running one alike.
+var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh}
+
+func isCancellableJobType(jobType string) bool {
+	for _, candidate := range cancellableJobTypes {
+		if jobType == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 // RequestCancellation durably coalesces intent. A queued job is still claimed by
 // the ordinary runner, which acknowledges cancellation without executing it.
 func (r *Repository) RequestCancellation(ctx context.Context, id string) (*models.AdminJob, error) {
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `UPDATE admin_jobs
  SET cancel_requested = true, updated_at = CASE WHEN cancel_requested THEN updated_at ELSE NOW() END
  WHERE id = $1 AND job_type = ANY($2) AND status IN ('queued', 'running')
-	 RETURNING `+adminJobColumns, id, []string{JobTypeLibraryRefresh, JobTypeStorageTransition}))
+	 RETURNING `+adminJobColumns, id, cancellableJobTypes))
 	if err == nil {
 		return job, nil
 	}
@@ -776,7 +853,7 @@ func (r *Repository) RequestCancellation(ctx context.Context, id string) (*model
 	if err != nil {
 		return nil, err
 	}
-	if (job.JobType == JobTypeLibraryRefresh || job.JobType == JobTypeStorageTransition) && job.Status == StatusCancelled {
+	if isCancellableJobType(job.JobType) && job.Status == StatusCancelled {
 		return job, nil
 	}
 	return nil, ErrJobNotCancellable

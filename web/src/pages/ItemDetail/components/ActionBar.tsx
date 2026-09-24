@@ -33,8 +33,12 @@ import {
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDeleteMediaItem } from "@/hooks/queries/items";
-import { refreshVirtualCandidates } from "@/api/v2/mediaCandidates";
-import { catalogKeys } from "@/hooks/queries/keys";
+import {
+  awaitVirtualCandidatesRefresh,
+  cancelVirtualCandidatesRefresh,
+} from "@/api/v2/mediaCandidates";
+import { catalogKeys, itemKeys } from "@/hooks/queries/keys";
+import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
 import {
@@ -232,17 +236,28 @@ export default function ActionBar({
   const [markerEditorOpen, setMarkerEditorOpen] = useState(false);
   const deleteMediaItem = useDeleteMediaItem();
   const queryClient = useQueryClient();
-  // The item-page "Refresh List": re-list the title's virtual candidates on the
-  // server (which preserves known-working rows), then re-read the item so the
-  // page's version list is replaced from the server's answer rather than a
-  // client-side merge.
+  const { awaitAdminJob } = useRealtimeEvents();
+  // The item-page "Refresh List": start the async re-list job, wait for it to
+  // finish, then re-read the item and the watch detail so both the page's
+  // version list and the picker's indexer rows are replaced from the server's
+  // answer rather than a client-side merge. The refresh control stays locked
+  // for this whole flow; a second press cancels the job and unlocks it.
   const handleRefreshVersions = useCallback(async () => {
     if (!contentId) return;
-    await refreshVirtualCandidates(contentId);
-    await queryClient.invalidateQueries({
-      queryKey: catalogKeys.itemDetail(contentId).slice(0, 4),
-    });
-  }, [contentId, queryClient]);
+    await awaitVirtualCandidatesRefresh(contentId, awaitAdminJob);
+    await Promise.all([
+      queryClient.invalidateQueries({
+        queryKey: catalogKeys.itemDetail(contentId).slice(0, 4),
+      }),
+      queryClient.invalidateQueries({
+        queryKey: itemKeys.watchDetail(contentId),
+      }),
+    ]);
+  }, [awaitAdminJob, contentId, queryClient]);
+  const handleCancelRefresh = useCallback(async () => {
+    if (!contentId) return;
+    await cancelVirtualCandidatesRefresh(contentId);
+  }, [contentId]);
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
@@ -875,6 +890,7 @@ export default function ActionBar({
               contentId={contentId}
               onOpenChange={onVersionPickerOpenChange}
               onRefreshVersions={contentId ? handleRefreshVersions : undefined}
+              onCancelRefresh={contentId ? handleCancelRefresh : undefined}
             />
           )}
           {selectedVersion && (selectedVersion.audio_tracks?.length ?? 0) > 0 && (

@@ -265,6 +265,8 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 		"listHistory": true, "removeHistoryEntries": true,
 		"syncProgress":  true,
 		"getWatchState": true, "markWatched": true, "unmarkWatched": true, "refreshVirtualCandidates": true,
+		"cancelVirtualCandidatesRefresh": true,
+		"requestVirtualRelease":          true, "getVirtualLibraryCapabilities": true,
 		"cancelLibraryJob": true,
 		opListDevices:      true, opForgetDevice: true, opClearDeviceSettings: true,
 	}

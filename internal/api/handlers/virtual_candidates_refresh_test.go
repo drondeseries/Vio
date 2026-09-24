@@ -59,11 +59,7 @@ func TestVirtualCandidatesRefreshServiceRefreshesAndReturnsList(t *testing.T) {
 	var listPaths []string
 	var persistedSource *models.MediaFile
 	var persistedStreams []VirtualPlaybackStream
-	post := &catalog.WatchDetail{Versions: []catalog.FileVersion{{
-		FileID: 9, Resolution: "2160p", CodecVideo: "hevc", CodecAudio: "eac3", Container: "mkv",
-		AddedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
-	}}}
-	detail := &fakeRefreshDetail{detail: refreshTestDetail(), post: post}
+	detail := &fakeRefreshDetail{detail: refreshTestDetail()}
 	svc := &VirtualCandidatesRefreshService{
 		ListFresh: VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 			listPaths = append(listPaths, path)
@@ -85,9 +81,9 @@ func TestVirtualCandidatesRefreshServiceRefreshesAndReturnsList(t *testing.T) {
 		Detail: detail,
 	}
 
-	versions, err := svc.RefreshVirtualCandidates(context.Background(), 1, "p-owner", "movie:x", catalog.AccessFilter{})
+	_, streams, err := refreshSources(svc, "movie:x", 1, "p-owner")
 	if err != nil {
-		t.Fatalf("RefreshVirtualCandidates: %v", err)
+		t.Fatalf("RefreshSources: %v", err)
 	}
 	if len(listPaths) != 1 || listPaths[0] != "virtual://movie/x" {
 		t.Fatalf("listed paths = %v, want the neutral source", listPaths)
@@ -98,12 +94,23 @@ func TestVirtualCandidatesRefreshServiceRefreshesAndReturnsList(t *testing.T) {
 	if len(persistedStreams) != 1 || persistedStreams[0].URI != "virtual://movie/x?result=new" {
 		t.Fatalf("persisted streams = %+v", persistedStreams)
 	}
-	if len(versions) != 1 || versions[0].FileID != 9 {
-		t.Fatalf("versions = %+v, want the post-refresh list", versions)
+	if len(streams) != 1 || streams[0].URI != "virtual://movie/x?result=new" {
+		t.Fatalf("returned streams = %+v, want the freshly listed set", streams)
 	}
-	if detail.calls != 2 {
-		t.Fatalf("detail reads = %d, want the pre- and post-refresh reads", detail.calls)
+	// RefreshSources does not read the detail: access was enforced when the job
+	// was accepted.
+	if detail.calls != 0 {
+		t.Fatalf("detail reads = %d, want 0", detail.calls)
 	}
+}
+
+// refreshSources drives the job's provider step for a test.
+func refreshSources(svc *VirtualCandidatesRefreshService, contentID string, userID int, profileID string) ([]*models.MediaFile, []VirtualPlaybackStream, error) {
+	return svc.RefreshSources(context.Background(), contentID, userID, profileID)
+}
+
+func refreshSourcesCtx(svc *VirtualCandidatesRefreshService, ctx context.Context, contentID string, userID int, profileID string) ([]*models.MediaFile, []VirtualPlaybackStream, error) {
+	return svc.RefreshSources(ctx, contentID, userID, profileID)
 }
 
 // TestVirtualCandidatesRefreshServiceEpisodeSource proves an episode content id
@@ -130,7 +137,7 @@ func TestVirtualCandidatesRefreshServiceEpisodeSource(t *testing.T) {
 		},
 		Detail: &fakeRefreshDetail{detail: refreshTestDetail()},
 	}
-	if _, err := svc.RefreshVirtualCandidates(context.Background(), 1, "p", "episode:y:1:2", catalog.AccessFilter{}); err != nil {
+	if _, _, err := refreshSources(svc, "episode:y:1:2", 1, "p"); err != nil {
 		t.Fatalf("RefreshVirtualCandidates: %v", err)
 	}
 	if listed != "virtual://series/y/1/2" || persisted != 1 {
@@ -150,7 +157,7 @@ func TestVirtualCandidatesRefreshServiceNonVirtualIsClientError(t *testing.T) {
 		ContentFiles: func(context.Context, string) ([]*models.MediaFile, error) { return nil, nil },
 		Detail:       &fakeRefreshDetail{detail: refreshTestDetail()},
 	}
-	_, err := svc.RefreshVirtualCandidates(context.Background(), 1, "p", "movie:local", catalog.AccessFilter{})
+	_, _, err := refreshSources(svc, "movie:local", 1, "p")
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
 		t.Fatalf("err = %v, want a 422 APIError", err)
@@ -175,7 +182,7 @@ func TestVirtualCandidatesRefreshServiceProviderFailureIsRetryable(t *testing.T)
 		},
 		Detail: &fakeRefreshDetail{detail: refreshTestDetail()},
 	}
-	_, err := svc.RefreshVirtualCandidates(context.Background(), 1, "p", "movie:x", catalog.AccessFilter{})
+	_, _, err := refreshSources(svc, "movie:x", 1, "p")
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable {
 		t.Fatalf("err = %v, want a 503 APIError", err)
@@ -205,7 +212,7 @@ func TestVirtualCandidatesRefreshServiceEmptyListingIsRetryable(t *testing.T) {
 		},
 		Detail: &fakeRefreshDetail{detail: refreshTestDetail()},
 	}
-	_, err := svc.RefreshVirtualCandidates(context.Background(), 1, "p", "movie:x", catalog.AccessFilter{})
+	_, _, err := refreshSources(svc, "movie:x", 1, "p")
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable {
 		t.Fatalf("err = %v, want a retryable 503 APIError for an empty listing", err)
@@ -245,7 +252,7 @@ func TestVirtualCandidatesRefreshServiceCoalescesConcurrentCalls(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = svc.RefreshVirtualCandidates(context.Background(), 1, "p", "movie:x", catalog.AccessFilter{})
+			_, _, errs[i] = refreshSources(svc, "movie:x", 1, "p")
 		}(i)
 	}
 	// Wait until the first caller is inside the provider list, then give the
@@ -307,7 +314,7 @@ func TestVirtualCandidatesRefreshServiceWaiterCancelDoesNotAbortSharedWork(t *te
 	started := make(chan struct{})
 	go func() {
 		close(started)
-		_, err := svc.RefreshVirtualCandidates(cancelCtx, 1, "p", "movie:y", catalog.AccessFilter{})
+		_, _, err := refreshSourcesCtx(svc, cancelCtx, "movie:y", 1, "p")
 		cancelErr <- err
 	}()
 	<-started
@@ -337,7 +344,7 @@ func TestVirtualCandidatesRefreshServiceWaiterCancelDoesNotAbortSharedWork(t *te
 	// here: singleflight forgets completed calls, so a fresh waiter may join
 	// the first wave (1 call) or start its own (2 calls) depending on timing,
 	// and either is correct.
-	if _, err := svc.RefreshVirtualCandidates(context.Background(), 1, "p", "movie:y", catalog.AccessFilter{}); err != nil {
+	if _, _, err := refreshSources(svc, "movie:y", 1, "p"); err != nil {
 		t.Fatalf("second refresh: %v", err)
 	}
 	if got := atomic.LoadInt32(&listCalls); got < 1 || got > 2 {

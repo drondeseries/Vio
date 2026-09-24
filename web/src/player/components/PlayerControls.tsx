@@ -28,6 +28,7 @@ import type {
   MarkerRegionView,
   PlayerAudioTrack,
   PlayerChapter,
+  PlayerIndexerRelease,
   PlayerSubtitleInfo,
   QualityOption,
   VideoFitMode,
@@ -89,9 +90,14 @@ interface PlayerControlsProps {
   onQualitySelect: (id: string) => void;
   // Version switching
   versions?: VersionInfo[];
+  /** Releases on the indexers that are not downloaded on the provider yet. */
+  indexerReleases?: PlayerIndexerRelease[];
+  /** The item id, so the menu can request an indexer release. */
+  contentId?: string;
   versionLocked?: boolean;
   onSwitchVersion?: (fileId: number) => void;
   onRefreshVersions?: () => Promise<void>;
+  onCancelRefresh?: () => Promise<void> | void;
   // PiP
   onTogglePiP?: () => void;
   // Playback info
@@ -157,9 +163,12 @@ export function PlayerControls({
   qualityError,
   onQualitySelect,
   versions,
+  indexerReleases,
+  contentId,
   versionLocked,
   onSwitchVersion,
   onRefreshVersions,
+  onCancelRefresh,
   onTogglePiP,
   showPlaybackInfo,
   onTogglePlaybackInfo,
@@ -347,9 +356,12 @@ export function PlayerControls({
               error={qualityError}
               onSelect={onQualitySelect}
               versions={versions}
+              indexerReleases={indexerReleases}
+              contentId={contentId}
               versionLocked={versionLocked}
               onSwitchVersion={onSwitchVersion}
               onRefreshVersions={onRefreshVersions}
+              onCancelRefresh={onCancelRefresh}
             />
             <button
               type="button"
@@ -524,9 +536,12 @@ export function PlayerControls({
                 error={qualityError}
                 onSelect={onQualitySelect}
                 versions={versions}
+                indexerReleases={indexerReleases}
+                contentId={contentId}
                 versionLocked={versionLocked}
                 onSwitchVersion={onSwitchVersion}
                 onRefreshVersions={onRefreshVersions}
+                onCancelRefresh={onCancelRefresh}
               />
 
               {markerEditAvailable && onToggleMarkerEdit && (

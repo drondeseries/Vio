@@ -38,6 +38,68 @@ type SearchClient = prowlarrSearchClient
 // SearchItem is one result from Prowlarr's /api/v1/search endpoint.
 type SearchItem = prowlarrRelease
 
+// QualityScore returns the custom-format score the sort assigned the release.
+// Callers that got the release from SearchMonitoredReleases read the score the
+// sort already computed; an unprepared release parses locally so the value is
+// never silently zero on a direct caller.
+func (r prowlarrRelease) QualityScore() int {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.QualityScore
+	}
+	return r.parsedCandidate.QualityScore
+}
+
+// DisplayResolution returns the parsed resolution of the release title.
+func (r prowlarrRelease) DisplayResolution() string {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.Resolution
+	}
+	return r.parsedCandidate.Resolution
+}
+
+// HDR returns the parsed HDR label of the release title, empty when none.
+func (r prowlarrRelease) HDR() string {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.HDR
+	}
+	return r.parsedCandidate.HDR
+}
+
+// CodecVideo returns the parsed video codec of the release title.
+func (r prowlarrRelease) CodecVideo() string {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.CodecVideo
+	}
+	return r.parsedCandidate.CodecVideo
+}
+
+// CodecAudio returns the parsed audio codec of the release title.
+func (r prowlarrRelease) CodecAudio() string {
+	if r.parsedCandidate == nil {
+		candidate := StreamCandidate{Name: r.Title, Title: r.Title, URL: r.DownloadURL}
+		parseStreamDetails(&candidate)
+		return candidate.CodecAudio
+	}
+	return r.parsedCandidate.CodecAudio
+}
+
+// NormalizedTitle returns the title reduced to a comparable identity.
+func (r prowlarrRelease) NormalizedTitle() string {
+	if r.normalizedTitle != "" {
+		return r.normalizedTitle
+	}
+	title, _ := normalizeReleaseTitle(r.Title)
+	return title
+}
+
 // MonitoredMedia aliases the monitored catalog item matched against Prowlarr.
 type MonitoredMedia = monitoredMedia
 
@@ -160,16 +222,20 @@ var searchHTTPClient = newRestrictedRedirectHTTPClient(20 * time.Second)
 
 // prowlarrRelease is one result from Prowlarr's /api/v1/search endpoint.
 type prowlarrRelease struct {
-	GUID            string              `json:"guid"`
-	Title           string              `json:"title"`
-	Size            int64               `json:"size"`
-	Indexer         string              `json:"indexer"`
-	IndexerID       int                 `json:"indexerId"`
-	IMDbID          int64               `json:"imdbId"`
-	TMDBID          int64               `json:"tmdbId"`
-	TVDBID          int64               `json:"tvdbId"`
-	PublishDate     string              `json:"publishDate"`
-	DownloadURL     string              `json:"downloadUrl"`
+	GUID        string `json:"guid"`
+	Title       string `json:"title"`
+	Size        int64  `json:"size"`
+	Indexer     string `json:"indexer"`
+	IndexerID   int    `json:"indexerId"`
+	IMDbID      int64  `json:"imdbId"`
+	TMDBID      int64  `json:"tmdbId"`
+	TVDBID      int64  `json:"tvdbId"`
+	PublishDate string `json:"publishDate"`
+	DownloadURL string `json:"downloadUrl"`
+	// Protocol is Prowlarr's release protocol: "usenet" or "torrent". Prowlarr
+	// serializes it under the JSON key "protocol". Callers that can only enqueue
+	// usenet releases filter on this so a torrent result is never offered.
+	Protocol        string              `json:"protocol"`
 	parsedCandidate *StreamCandidate    `json:"-"`
 	episodeKeys     []episodeReleaseKey `json:"-"`
 	normalizedTitle string              `json:"-"`
@@ -750,6 +816,33 @@ func prowlarrReleaseConfirmsCandidate(release prowlarrRelease, candidate StreamC
 	return releaseSizesMatch(release.Size, candidate.FileSize)
 }
 
+// IndexerReleaseMatchesProvider reports whether a provider release (as named
+// and sized by AltMount) is the same posting as a Prowlarr search result. It is
+// the strict dedup used by the virtual-library release listing, which must not
+// offer a release the provider already has.
+//
+// Deliberately stricter than prowlarrReleaseConfirmsCandidate: only exact
+// release-name identity counts, corroborated by a size match when both sizes
+// are known. The looser title+year fallback is intentionally excluded, because
+// it exists to reorder playback candidates (where a wrong confirmation only
+// changes preference), not to hide releases from a user (where a wrong match
+// silently drops a release they could have requested). When the names cannot be
+// reduced to an exact key, the releases are treated as different.
+func IndexerReleaseMatchesProvider(release SearchItem, providerReleaseName string, providerSize int64) bool {
+	releaseKeyValue := releaseNameKey(release.Title)
+	providerKey := releaseNameKey(providerReleaseName)
+	if releaseKeyValue == "" || providerKey == "" {
+		return false
+	}
+	if releaseKeyValue != providerKey {
+		return false
+	}
+	// Exact name identity is the signal; size is corroboration. An unknown size
+	// on either side does not reject (releaseSizesMatch treats <=0 as unknown),
+	// so a provider that omits sizes still dedups by name.
+	return releaseSizesMatch(release.Size, providerSize)
+}
+
 // ClassifyCandidates sets SourceConfirmed on each candidate whose release the
 // cached Prowlarr snapshot already carries. This is the fallback signal used
 // when AltMount is not configured. The snapshot is a durable, operator-visible
@@ -797,6 +890,39 @@ func (c *prowlarrSearchClient) SearchItem(ctx context.Context, item monitoredMed
 	return c.search(ctx, item)
 }
 
+// SearchMonitoredReleases performs an on-demand Prowlarr search for one
+// monitored title and returns only the releases that match it, normalized and
+// sorted for display. It is the per-title lookup the virtual-library "Refresh
+// List" uses; unlike RefreshIfStale it hits Prowlarr every call and is not
+// governed by the cached RSS interval.
+//
+// A non-nil episode narrows the match to that episode's release keys, so a
+// series search does not offer another episode's releases. Quality filtering
+// follows the same helpers as the cached Match paths so an operator's profile
+// settings mean the same thing here. The caller owns the timeout (the client's
+// shared HTTP client still bounds a single request at 20s).
+func (c *prowlarrSearchClient) SearchMonitoredReleases(ctx context.Context, item monitoredMedia, episode *virtualEpisode, quality QualityConfig) ([]prowlarrRelease, error) {
+	releases, err := c.search(ctx, item)
+	if err != nil {
+		return nil, err
+	}
+	matched := make([]prowlarrRelease, 0, len(releases))
+	for i := range releases {
+		release := releases[i]
+		var ok bool
+		if episode != nil {
+			ok = releaseMatchesEpisodeWithQuality(&release, item, *episode, quality)
+		} else {
+			ok = releaseMatchesMonitoredWithQuality(&release, item, quality)
+		}
+		if ok {
+			matched = append(matched, release)
+		}
+	}
+	sortProwlarrReleases(matched, quality.CustomFormats)
+	return matched, nil
+}
+
 func (c *prowlarrSearchClient) MatchEpisodeWithQuality(item monitoredMedia, episode virtualEpisode, quality QualityConfig) bool {
 	c.mu.Lock()
 	if c.url == "" {
@@ -805,6 +931,22 @@ func (c *prowlarrSearchClient) MatchEpisodeWithQuality(item monitoredMedia, epis
 	}
 	releases := append([]prowlarrRelease(nil), c.releases...)
 	c.mu.Unlock()
+	for i := range releases {
+		if releaseMatchesEpisodeWithQuality(&releases[i], item, episode, quality) {
+			return true
+		}
+	}
+	return false
+}
+
+// releaseMatchesEpisodeWithQuality reports whether one Prowlarr release is the
+// given episode of the monitored series, honoring the operator's quality
+// profile. It is the per-release form shared by the cached MatchEpisodeWithQuality
+// and the on-demand SearchMonitoredReleases, so both apply identical rules.
+func releaseMatchesEpisodeWithQuality(release *prowlarrRelease, item monitoredMedia, episode virtualEpisode, quality QualityConfig) bool {
+	if release == nil {
+		return false
+	}
 	wantTitle, _ := normalizeReleaseTitle(item.Title)
 	if wantTitle == "" {
 		return false
@@ -812,32 +954,38 @@ func (c *prowlarrSearchClient) MatchEpisodeWithQuality(item monitoredMedia, epis
 	wantIMDb, _ := strconv.ParseInt(strings.TrimPrefix(strings.TrimSpace(item.IMDbID), "tt"), 10, 64)
 	wantTMDB, _ := strconv.ParseInt(item.TMDBID, 10, 64)
 	wantTVDB, _ := strconv.ParseInt(item.TVDBID, 10, 64)
-	for i := range releases {
-		release := &releases[i]
-		if quality.EnableProfiles && !releaseMatchesQuality(release, quality.Profiles) {
-			continue
-		}
-		if len(quality.CustomFormats) > 0 {
-			if release.parsedCandidate == nil {
-				prepareProwlarrRelease(release)
-			}
-			if release.parsedCandidate != nil {
-				if _, rejected := customFormatScore(*release.parsedCandidate, quality.CustomFormats); rejected {
-					continue
-				}
-			}
-		}
-		if wantIMDb > 0 && release.IMDbID > 0 && wantIMDb != release.IMDbID || wantTMDB > 0 && release.TMDBID > 0 && wantTMDB != release.TMDBID || wantTVDB > 0 && release.TVDBID > 0 && wantTVDB != release.TVDBID {
-			continue
-		}
-		if release.normalizedTitle == "" {
+	if quality.EnableProfiles && !releaseMatchesQuality(release, quality.Profiles) {
+		return false
+	}
+	if len(quality.CustomFormats) > 0 {
+		if release.parsedCandidate == nil {
 			prepareProwlarrRelease(release)
 		}
-		if (strings.Contains(release.normalizedTitle, wantTitle) || strings.Contains(wantTitle, release.normalizedTitle)) && hasEpisodeReleaseKey(release.episodeKeys, episode.Season, episode.Episode) {
-			return true
+		if release.parsedCandidate != nil {
+			if _, rejected := customFormatScore(*release.parsedCandidate, quality.CustomFormats); rejected {
+				return false
+			}
 		}
 	}
-	return false
+	if wantIMDb > 0 && release.IMDbID > 0 && wantIMDb != release.IMDbID || wantTMDB > 0 && release.TMDBID > 0 && wantTMDB != release.TMDBID || wantTVDB > 0 && release.TVDBID > 0 && wantTVDB != release.TVDBID {
+		return false
+	}
+	if release.normalizedTitle == "" {
+		prepareProwlarrRelease(release)
+	}
+	return (strings.Contains(release.normalizedTitle, wantTitle) || strings.Contains(wantTitle, release.normalizedTitle)) &&
+		hasEpisodeReleaseKey(release.episodeKeys, episode.Season, episode.Episode)
+}
+
+// releaseMatchesMonitoredWithQuality is the per-release form of
+// matchProwlarrReleasesWithQuality, used to filter an on-demand search to the
+// monitored title. Keeping both on the same predicate means the on-demand path
+// accepts exactly the releases the cached Match path would.
+func releaseMatchesMonitoredWithQuality(release *prowlarrRelease, item monitoredMedia, quality QualityConfig) bool {
+	if release == nil {
+		return false
+	}
+	return matchProwlarrReleasesWithQuality([]prowlarrRelease{*release}, item, quality)
 }
 
 func containsEpisodeReleaseKey(title string, season, episode int) bool {

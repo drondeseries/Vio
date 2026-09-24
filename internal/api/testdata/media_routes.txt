@@ -381,6 +381,7 @@ GET /api/v2/capabilities/downloads	non-media
 GET /api/v2/capabilities/ebooks	non-media
 GET /api/v2/capabilities/metadata-ai	non-media
 GET /api/v2/capabilities/trailers	non-media
+GET /api/v2/capabilities/virtual-library	non-media
 GET /api/v2/catalog	non-media
 GET /api/v2/catalog/audiobook-groups	non-media
 GET /api/v2/catalog/filters	non-media
@@ -552,6 +553,8 @@ DELETE /api/v2/markers/files/{file_id}/{segment}	non-media
 GET /api/v2/markers/items/{item_id}	non-media
 PUT /api/v2/markers/items/{item_id}	non-media
 POST /api/v2/media/{media_id}/virtual-candidates:refresh	non-media
+POST /api/v2/media/{media_id}/virtual-candidates:refresh/cancel	non-media
+POST /api/v2/media/{media_id}/virtual-releases/{release_id}:request	non-media
 GET /api/v2/network-access/capabilities	non-media
 GET /api/v2/notifications	non-media
 GET /api/v2/notifications/capabilities	non-media
@@ -1547,6 +1550,7 @@ GET /api/v2/capabilities/downloads	non-media
 GET /api/v2/capabilities/ebooks	non-media
 GET /api/v2/capabilities/metadata-ai	non-media
 GET /api/v2/capabilities/trailers	non-media
+GET /api/v2/capabilities/virtual-library	non-media
 GET /api/v2/catalog	non-media
 GET /api/v2/catalog/audiobook-groups	non-media
 GET /api/v2/catalog/filters	non-media
@@ -1718,6 +1722,8 @@ DELETE /api/v2/markers/files/{file_id}/{segment}	non-media
 GET /api/v2/markers/items/{item_id}	non-media
 PUT /api/v2/markers/items/{item_id}	non-media
 POST /api/v2/media/{media_id}/virtual-candidates:refresh	non-media
+POST /api/v2/media/{media_id}/virtual-candidates:refresh/cancel	non-media
+POST /api/v2/media/{media_id}/virtual-releases/{release_id}:request	non-media
 GET /api/v2/network-access/capabilities	non-media
 GET /api/v2/notifications	non-media
 GET /api/v2/notifications/capabilities	non-media

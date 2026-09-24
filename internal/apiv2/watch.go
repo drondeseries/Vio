@@ -41,6 +41,7 @@ type WatchDetail struct {
 	Versions                        []WatchFileVersion      `json:"versions" doc:"Every playable file of the item; empty, never null"`
 	PlaybackVariants                []WatchPlaybackVariant  `json:"playback_variants,omitempty" doc:"Logical watch choices, each spanning one or more ordered parts"`
 	VirtualRanking                  *WatchVirtualRanking    `json:"virtual_ranking,omitempty" doc:"The ranking that produced the virtual versions' order; absent for local content"`
+	IndexerReleases                 []WatchIndexerRelease   `json:"indexer_releases" doc:"Releases that exist on the indexers but are not downloaded on the provider; empty, never null"`
 	Subtitles                       []WatchSubtitle         `json:"subtitles" doc:"Empty, never null"`
 	Intro                           *WatchMarker            `json:"intro,omitempty"`
 	Credits                         *WatchMarker            `json:"credits,omitempty"`
@@ -193,6 +194,32 @@ type WatchPlaybackVariant struct {
 	VirtualRanking       *WatchVirtualRanking       `json:"virtual_ranking,omitempty" doc:"The ranking that produced this variant's version order; absent for local content"`
 }
 
+// WatchIndexerRelease is one release that exists on the indexers but is not
+// downloaded on the provider yet. It is additive below the playable versions;
+// an empty list means there is nothing to request. release_id is an opaque
+// server row id, never the release GUID or download URL.
+type WatchIndexerRelease struct {
+	ReleaseID     string   `json:"release_id" doc:"Opaque server id used to request this release"`
+	Title         string   `json:"title"`
+	Resolution    string   `json:"resolution,omitempty"`
+	CodecVideo    string   `json:"codec_video,omitempty"`
+	CodecAudio    string   `json:"codec_audio,omitempty"`
+	HDR           bool     `json:"hdr,omitempty"`
+	SizeBytes     int64    `json:"size_bytes,omitempty" doc:"Bytes"`
+	Indexer       string   `json:"indexer,omitempty"`
+	PublishedAt   *Instant `json:"published_at,omitempty" doc:"When the indexer published the release"`
+	FormatScore   *int     `json:"format_score,omitempty" doc:"Custom-format score the ranking assigned; absent when unscored"`
+	Protocol      string   `json:"protocol,omitempty" doc:"usenet or torrent"`
+	DownloadState string   `json:"download_state" enum:"not_downloaded,queued,failed" doc:"Whether the release has been requested on the provider"`
+}
+
+// IndexerReleaseProvider supplies the persisted indexer releases for a watch
+// detail read. It is an optional dependency seam: a nil provider (or one
+// without this method) leaves the list empty and changes nothing else.
+type IndexerReleaseProvider interface {
+	IndexerReleasesForWatch(ctx context.Context, contentID string) ([]handlers.IndexerReleaseView, error)
+}
+
 // WatchVirtualRanking describes the ranking that produced a virtual item's
 // version order, so any viewer can see which profile and keys ordered it.
 type WatchVirtualRanking struct {
@@ -333,7 +360,45 @@ func (reg *Registry) getWatchState(ctx context.Context, in *WatchDetailInput) (*
 		}
 		return nil, serviceProblem(err)
 	}
-	return &WatchDetailOutput{Body: watchDetailOf(detail)}, nil
+	body := watchDetailOf(detail)
+	body.IndexerReleases = reg.indexerReleasesFor(ctx, string(in.ID))
+	return &WatchDetailOutput{Body: body}, nil
+}
+
+// indexerReleasesFor reads the persisted indexer releases for the item through
+// the optional seam. A nil or failing provider yields an empty (never null)
+// list so the watch detail is unaffected when the feature is unwired.
+func (reg *Registry) indexerReleasesFor(ctx context.Context, contentID string) []WatchIndexerRelease {
+	provider := reg.deps.IndexerReleases
+	if provider == nil {
+		return []WatchIndexerRelease{}
+	}
+	views, err := provider.IndexerReleasesForWatch(ctx, contentID)
+	if err != nil {
+		return []WatchIndexerRelease{}
+	}
+	return watchIndexerReleasesOf(views)
+}
+
+func watchIndexerReleasesOf(views []handlers.IndexerReleaseView) []WatchIndexerRelease {
+	out := make([]WatchIndexerRelease, 0, len(views))
+	for _, view := range views {
+		out = append(out, WatchIndexerRelease{
+			ReleaseID:     view.ReleaseID,
+			Title:         view.Title,
+			Resolution:    view.Resolution,
+			CodecVideo:    view.CodecVideo,
+			CodecAudio:    view.CodecAudio,
+			HDR:           view.HDR,
+			SizeBytes:     view.SizeBytes,
+			Indexer:       view.Indexer,
+			PublishedAt:   instantPtr(view.PublishedAt),
+			FormatScore:   view.FormatScore,
+			Protocol:      view.Protocol,
+			DownloadState: view.DownloadState,
+		})
+	}
+	return out
 }
 
 // setWatched runs the same command as v1 POST/DELETE /watched/{id}.
