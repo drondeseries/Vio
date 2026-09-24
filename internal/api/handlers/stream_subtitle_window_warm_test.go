@@ -525,8 +525,11 @@ func TestVirtualTextWindowWarmResolveTimeoutReleasesSlot(t *testing.T) {
 // A virtual PGS (.sup) response commits 200 before ffmpeg spawns, so a drift
 // probe that cannot establish the live layout must fail closed with a
 // retryable error rather than let an unvalidated extraction commit a possibly
-// truncated track. Text/ASS keeps its post-spawn map-error net and proceeds.
-func TestVirtualSubtitleProbeFailureFailsClosedForPGS(t *testing.T) {
+// truncated track. Text/ASS fails closed the same way: the URL names a
+// plan-time ordinal whose validity depended on the release the probe was
+// supposed to confirm, and a same-ordinal different-language rotation would
+// never trip the post-spawn map net.
+func TestVirtualSubtitleProbeFailureFailsClosed(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
 	}
@@ -551,7 +554,7 @@ func TestVirtualSubtitleProbeFailureFailsClosedForPGS(t *testing.T) {
 		}
 	})
 
-	t.Run("text_still_proceeds", func(t *testing.T) {
+	t.Run("text_fails_closed", func(t *testing.T) {
 		dir := t.TempDir()
 		argsLog := filepath.Join(dir, "ffmpeg.args")
 		handler, session, file, _ := newVirtualSubtitleWindowFixture(t, dir,
@@ -561,8 +564,11 @@ func TestVirtualSubtitleProbeFailureFailsClosedForPGS(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/subtitle", nil)
 		handler.streamEmbeddedSubtitle(rec, req, file, 0, session, true)
-		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "WEBVTT") {
-			t.Fatalf("text probe failure = %d %q, want 200 with the post-spawn net", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("text probe failure = %d %q, want retryable 503 (never serve a drifted ordinal unverified)", rec.Code, rec.Body.String())
+		}
+		if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+			t.Fatalf("ffmpeg spawned after a failed text drift probe: %v", err)
 		}
 	})
 }

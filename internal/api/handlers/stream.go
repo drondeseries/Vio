@@ -2193,10 +2193,10 @@ func implicitVirtualWindowStart(session *playback.Session) float64 {
 // source cannot satisfy the requested representation — rotation to a different
 // subtitle class, or an ambiguous or absent match — and the caller must answer
 // with a clean retryable 4xx before ffmpeg spawns or headers commit. A non-nil
-// probeErr is not evidence of rotation; text/ASS callers deliberately proceed
-// on the plan ordinal (a genuine rotation still surfaces via the post-spawn map
-// error), while a PGS caller must fail closed because its .sup response commits
-// 200 before ffmpeg spawns. Virtual inputs are request-local probe state; the
+// probeErr means the live layout could not be established: the caller must fail
+// closed for every codec, because serving the plan ordinal unverified can emit
+// the wrong release's track and a same-ordinal rotation never trips the
+// post-spawn map net. Virtual inputs are request-local probe state; the
 // session's published evidence is never rewritten.
 func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, session *playback.Session, opts *playback.StreamExtractOpts) (bool, error) {
 	if session == nil || opts == nil || strings.TrimSpace(opts.InputPath) == "" {
@@ -2205,14 +2205,12 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 	liveTracks, err := playback.ProbeSubtitleLayout(ctx, h.ffmpegPath(), opts.InputPath)
 	if err != nil {
 		// A probe failure (context canceled, relay timeout, transient upstream
-		// error) is not evidence that the pinned source rotated. Serve the
-		// planned ordinal rather than forcing a replan: a genuine rotation is
-		// still caught for text/ASS by the post-spawn map-error safety net, and
-		// treating a probe failure as a rotation produced a churn loop when the
-		// relay itself was what timed out. Only a probe that SUCCEEDS and
-		// positively reports a different layout warrants a 409. The error is
-		// returned so a bitmap caller can fail closed instead of committing a
-		// possibly-truncated .sup.
+		// error) is not evidence that the pinned source rotated, but without
+		// the live layout there is nothing to validate the plan ordinal
+		// against. The caller fails closed with a retryable response; a client
+		// falls back to subtitles-off, which the server already treats as
+		// legitimate. The error is returned so the caller can distinguish it
+		// from a positive mismatch.
 		slog.WarnContext(ctx, "virtual subtitle layout probe failed", "component", "api",
 			"track_codec", requestedTrack.Codec,
 			"error", err)
