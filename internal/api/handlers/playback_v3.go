@@ -5183,6 +5183,12 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		RoutingEgressNodeURL:      transport.routingEgressURL,
 		RequireMediaAuthorization: mode.headerAuth,
 		MediaAuthorizationSet:     true,
+		// A v3 stream state is a complete snapshot that owns the virtual-source
+		// binding outright: it may move the binding to a different candidate and
+		// must be able to clear carried evidence when the new effective file is
+		// not virtual. Legacy partial updates leave these unset.
+		VirtualSourceSet:          true,
+		VirtualSourceOwnershipSet: true,
 		ClientIP:                  clientip.FromContext(ctx),
 		ClientName:                session.ClientName,
 		ClientVersion:             session.ClientVersion,
@@ -5227,13 +5233,17 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 	// re-reading a mutable catalog path. The subtitle inventories travel with
 	// it: candidate rotation re-probes the catalog row and can overwrite its
 	// tracks between planning and a later subtitle fetch, and the serve path
-	// must extract from the same evidence the plan promised.
+	// must extract from the same evidence the plan promised. The evidence URI
+	// and the source revision anchor that evidence to the exact candidate, so
+	// the serve path can discard it when the bound candidate has moved.
 	if isVirtualPlaybackFile(file) && strings.HasPrefix(file.FilePath, "virtual://") {
 		state.VirtualSourceURI = file.FilePath
-		state.VirtualSourceSet = true
 		state.VirtualSourceOwnerInstallationID = effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
+		state.VirtualSourceRevision = planVirtualSourceRevisionV3(result)
 		state.VirtualSubtitleTracks = file.SubtitleTracks
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
+		state.VirtualAudioTracks = file.AudioTracks
+		state.VirtualSubtitleEvidenceURI = file.FilePath
 		state.VirtualSubtitleEvidenceSet = true
 	}
 	return state
@@ -6165,7 +6175,13 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	attemptedKeys []string,
 ) (*candidateEvaluationV3, *candidateErrorV3) {
 	candidateStart := baseStart
-	if err := remapAudioSelectionV3(sourceFile, candidateFile, &candidateStart); err != nil {
+	// A carried selection was minted against the plan-time inventory. Use the
+	// session's captured evidence as the remap source for a virtual session:
+	// the loaded candidate row may have been re-probed in place (same id,
+	// different release), in which case source==target by id but the ordinal
+	// still names the previous release's track.
+	remapSource := h.replanRemapSourceV3(sourceFile, session)
+	if err := remapAudioSelectionV3(remapSource, candidateFile, &candidateStart); err != nil {
 		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio remap failed", candidateFile.ID), Err: err}
 	}
 	candidateAudioIndex, err := resolveV3AudioIndex(candidateFile, candidateStart.AudioTrackID, candidateStart.AudioTrackIndex)
@@ -6174,7 +6190,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	}
 	var candidateResult playback.PlannerResultV3
 	var candidateToneMapErr error
-	if err := h.remapSubtitleSelectionV3(r.Context(), sourceFile, candidateFile, &candidateStart); err != nil {
+	if err := h.remapSubtitleSelectionV3(r.Context(), remapSource, candidateFile, &candidateStart); err != nil {
 		candidateResult = playback.PlannerResultV3{Terminal: &playback.TerminalV3{
 			Reason:    terminalSubtitleUnavailableInVersionV3,
 			Message:   "The selected subtitle track is unavailable in the fallback media version.",
@@ -7006,6 +7022,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 	} else {
 		effectiveFile = currentEffectiveFile
+		// A replan's carried selection was minted against the plan-time
+		// inventory, which the session still holds as virtual evidence. When
+		// the catalog row was re-probed in place (same id, different release)
+		// the freshly loaded effective file's tracks no longer describe what
+		// the ordinal names, so remap from the evidence rather than the row.
+		remapSource := h.replanRemapSourceV3(currentEffectiveFile, session)
 		currentEffectiveStart := start
 		if intentChange && !trackChange {
 			// Prefer returning to the requested edition, but a quality/output/track
@@ -7016,16 +7038,22 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			if !isVirtualPlaybackFile(currentEffectiveFile) && requestedEditionResolved && preflightPlaybackFile(r.Context(), requestedFile, h.MissingMarker, h.EventsHub) == nil {
 				effectiveFile = requestedFile
 			}
-			// Track identities only need remapping when the effective edition
-			// actually changes. Remapping within the same file would degrade an
-			// exact selection to a best-match lookup — e.g. moving a listener
-			// from an eng/ac3 commentary track to the identically-shaped main
-			// track on a quality change.
-			if currentEffectiveFile.ID != effectiveFile.ID {
+			// Track identities only need remapping when the effective inventory
+			// actually changes. Remapping within an unchanged inventory would
+			// degrade an exact selection to a best-match lookup — e.g. moving a
+			// listener from an eng/ac3 commentary track to the identically-shaped
+			// main track on a quality change. A same-row candidate rotation keeps
+			// the id but replaces the tracks, so the guard is the union of an id
+			// change (a real edition switch, which always remaps), an inventory
+			// fingerprint change under a fixed id, and a recorded candidate
+			// rotation (a moved revision) whose tracks happen to compare equal.
+			if currentEffectiveFile.ID != effectiveFile.ID ||
+				!sameMediaInventoryV3(remapSource, effectiveFile) ||
+				virtualCandidateRotationRecordedV3(session, currentEffectiveFile) {
 				candidateStart := start
-				remapErr := remapAudioSelectionV3(currentEffectiveFile, effectiveFile, &candidateStart)
+				remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
 				if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
-					remapErr = h.remapSubtitleSelectionV3(r.Context(), currentEffectiveFile, effectiveFile, &candidateStart)
+					remapErr = h.remapSubtitleSelectionV3(r.Context(), remapSource, effectiveFile, &candidateStart)
 				}
 				if remapErr != nil && outputChange {
 					// An output refresh may make the requested edition viable again,
@@ -8841,12 +8869,98 @@ func remapAudioIndexV3(source, target *models.MediaFile, index int) int {
 	return playback.MatchAudioTrackAcrossVersions(source.AudioTracks, target.AudioTracks, index)
 }
 
+// sameSubtitleInventoryV3 reports whether two files describe the same subtitle
+// inventory (externals then embedded, including the container track indices the
+// combined ordinal is derived from). A same-row virtual candidate rotation
+// replaces a catalog row's probed tracks in place, so id equality alone would
+// treat a genuinely new release as unchanged and carry a stale ordinal onto it.
+func sameSubtitleInventoryV3(a, b *models.MediaFile) bool {
+	return playback.SubtitleLayoutsEqualIncludingExternal(
+		a.SubtitleTracks, a.ExternalSubtitles, b.SubtitleTracks, b.ExternalSubtitles)
+}
+
+// sameMediaInventoryV3 reports whether two files carry identical audio and
+// subtitle inventories. It is the "did the effective tracks actually move"
+// predicate for a replan: a same-row candidate rotation keeps the file id but
+// replaces the probed tracks, so id equality is not a sufficient no-op guard.
+func sameMediaInventoryV3(a, b *models.MediaFile) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return sameSubtitleInventoryV3(a, b) && playback.AudioLayoutsEqual(a.AudioTracks, b.AudioTracks)
+}
+
+// replanRemapSourceV3 returns the file whose inventory a carried selection was
+// minted against. For a virtual session the plan-time evidence is the source of
+// truth: the loaded catalog row may have been re-probed in place (same id,
+// different release) after the selection was made, so only the session's
+// captured audio and subtitle inventories describe what the carried ordinal
+// actually names. The evidence is used regardless of which candidate it is
+// anchored to — unlike serving, where a provenance mismatch means the evidence
+// must be discarded, a remap needs exactly the inventory the ordinal was minted
+// against. When no evidence is carried, or the effective file is not virtual,
+// the loaded row is used.
+func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, session *playback.Session) *models.MediaFile {
+	if effectiveFile == nil || session == nil || !session.VirtualSubtitleEvidenceSet {
+		return effectiveFile
+	}
+	if !isVirtualPlaybackFile(effectiveFile) {
+		return effectiveFile
+	}
+	if len(session.VirtualAudioTracks) == 0 && len(session.VirtualSubtitleTracks) == 0 && len(session.VirtualExternalSubtitles) == 0 {
+		return effectiveFile
+	}
+	evidence := *effectiveFile
+	evidence.AudioTracks = session.VirtualAudioTracks
+	evidence.SubtitleTracks = session.VirtualSubtitleTracks
+	evidence.ExternalSubtitles = session.VirtualExternalSubtitles
+	return &evidence
+}
+
+// virtualCandidateRotationRecordedV3 reports whether the session recorded a
+// virtual candidate move that no plan has re-probed yet. A binding move leaves
+// the carried subtitle evidence anchored at the previous candidate
+// (VirtualSubtitleEvidenceURI) while clearing VirtualSourceRevision (see
+// SetVirtualSource); the loaded effective row still names a virtual candidate.
+// In that window the row's inventory may look identical to what the plan
+// carried — a provider can rotate to a release with the same track shapes — so
+// id/inventory comparison alone must not treat the selection as unchanged. This
+// is the signal the fingerprint cannot provide; it fires only on a recorded
+// rotation, so an ordinary same-file replan is unaffected.
+func virtualCandidateRotationRecordedV3(session *playback.Session, effectiveFile *models.MediaFile) bool {
+	if session == nil || effectiveFile == nil || !isVirtualPlaybackFile(effectiveFile) {
+		return false
+	}
+	if session.VirtualSourceRevision != "" || session.VirtualSourceURI == "" {
+		return false
+	}
+	return session.VirtualSubtitleEvidenceSet && !virtualEvidenceMatchesBoundFile(effectiveFile, session)
+}
+
+// planVirtualSourceRevisionV3 returns the opaque virtual-source revision the
+// plan published, or "" when the plan carries none.
+func planVirtualSourceRevisionV3(result playback.PlannerResultV3) string {
+	if result.Plan == nil {
+		return ""
+	}
+	return result.Plan.VirtualSourceRevision
+}
+
 // remapAudioSelectionV3 rebinds the request's audio selection when the
 // effective media file changes. ID-only selections are equally file-bound:
 // the stale ID would be rejected against the new file's track list
 // downstream, so derive the source index from it and remap like any other.
+//
+// Identity alone is not enough. A virtual candidate rotation can re-probe the
+// same catalog row in place (same id, different underlying release), so the
+// guard also compares the audio inventory fingerprint: when it differs, the
+// carried ordinal names a different track and must be remapped by
+// codec/language family exactly like an edition switch.
 func remapAudioSelectionV3(source, target *models.MediaFile, request *playback.StartRequestV3) error {
-	if request == nil || source == nil || target == nil || source.ID == target.ID {
+	if request == nil || source == nil || target == nil {
+		return nil
+	}
+	if source.ID == target.ID && playback.AudioLayoutsEqual(source.AudioTracks, target.AudioTracks) {
 		return nil
 	}
 	if request.AudioTrackIndex == nil {
@@ -8909,7 +9023,16 @@ func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carrie
 var errSubtitleUnavailableInTargetV3 = errors.New("no equivalent subtitle track in the target file version")
 
 func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, target *models.MediaFile, request *playback.StartRequestV3) error {
-	if request == nil || source == nil || target == nil || source.ID == target.ID {
+	if request == nil || source == nil || target == nil {
+		return nil
+	}
+	// A same-id pairing is only a no-op when the subtitle inventory is
+	// unchanged. A virtual candidate rotation re-probes the catalog row in
+	// place (same id, different release), so a fingerprint match — not id
+	// equality — decides whether the carried ordinal still names the same
+	// track. When the inventory differs, the selection remaps by
+	// language/format/forced/HI exactly like an edition switch.
+	if source.ID == target.ID && sameSubtitleInventoryV3(source, target) {
 		return nil
 	}
 	// A virtual parent row (virtual://movie/ttNNNN with no result= param) is a

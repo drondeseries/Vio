@@ -206,22 +206,42 @@ func (h *StreamHandler) commitRotatedVirtualSessionSource(ctx context.Context, s
 // tracks after this session planned against a specific release. Pinned
 // subtitle URLs name plan-time ordinals/stream indices, so the extraction
 // must use the evidence the plan promised, not whatever the row holds now.
+//
+// Carried evidence is only trustworthy while it still belongs to the candidate
+// actually being served. A serve-layer rotation can move the session binding
+// without moving the catalog row's subtitle inventory, and the planner can
+// replan onto a different file; in both cases the carried inventory describes
+// the previous release, so applying it would silently serve the wrong tracks.
+// The evidence URI records the candidate it was captured for: when the bound
+// file no longer names that candidate, the evidence is discarded and the bound
+// file's own catalog tracks are served instead.
 func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaFile, session *playback.Session, resolver FilePathResolver) *models.MediaFile {
 	bound := bindSessionVirtualSource(file, session)
 	if bound == nil || !isVirtualPlaybackFile(bound) {
 		return bound
 	}
 
-	if len(session.VirtualSubtitleTracks) > 0 || len(session.VirtualExternalSubtitles) > 0 {
+	hasEvidence := len(session.VirtualSubtitleTracks) > 0 || len(session.VirtualExternalSubtitles) > 0
+	if hasEvidence && !virtualEvidenceMatchesBoundFile(bound, session) {
+		slog.WarnContext(ctx, "virtual session track evidence belongs to a different candidate; using the bound file's tracks",
+			"component", "api",
+			"session", session.ID,
+			"file_id", file.ID,
+			"evidence_uri", session.VirtualSubtitleEvidenceURI,
+			"file_path", bound.FilePath)
+		hasEvidence = false
+	}
+	if hasEvidence {
 		boundCopy := *bound
 		boundCopy.SubtitleTracks = session.VirtualSubtitleTracks
 		boundCopy.ExternalSubtitles = session.VirtualExternalSubtitles
 		return &boundCopy
 	}
 
-	// No session evidence (e.g. a reconstructed session): fall back to the
-	// live candidate row when the bound file only carries provider-declared
-	// placeholders, mirroring the historical behavior.
+	// No applicable session evidence (reconstructed session, or evidence for a
+	// previous candidate): fall back to the live candidate row when the bound
+	// file only carries provider-declared placeholders, mirroring the
+	// historical behavior.
 	if resolver == nil || hasUsableSubtitleTracks(bound) {
 		return bound
 	}
@@ -247,6 +267,44 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	}
 
 	return bound
+}
+
+// virtualEvidenceMatchesBoundFile reports whether the session's carried virtual
+// subtitle evidence was captured for the candidate the bound file names. The
+// evidence URI is authoritative when present. Sessions created before that field
+// existed fall back to the plan-time binding: evidence captured while the file
+// path matched the session's virtual URI still belongs to the bound file.
+func virtualEvidenceMatchesBoundFile(bound *models.MediaFile, session *playback.Session) bool {
+	if session == nil || bound == nil {
+		return false
+	}
+	evidenceURI := strings.TrimSpace(session.VirtualSubtitleEvidenceURI)
+	if evidenceURI == "" {
+		// Legacy sessions predate the provenance field. The only binding the
+		// evidence had was the session's virtual URI, so it still matches when
+		// the bound file names that same candidate.
+		return session.VirtualSourceURI != "" && sameVirtualCandidate(session.VirtualSourceURI, bound.FilePath)
+	}
+	return sameVirtualCandidate(evidenceURI, bound.FilePath)
+}
+
+// sameVirtualCandidate reports whether two provider-neutral virtual paths name
+// the same candidate. Exact equality is sufficient across the codebase; the
+// result-id comparison additionally tolerates a URI whose non-result query
+// parameters were re-encoded (`withVirtualResultKey` preserves the rest).
+func sameVirtualCandidate(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == b {
+		return true
+	}
+	if a == "" || b == "" {
+		return false
+	}
+	aID, bID := virtualResultCandidateID(a), virtualResultCandidateID(b)
+	if aID == "" || bID == "" || aID != bID {
+		return false
+	}
+	return virtualPlaybackNeutralKey(a) == virtualPlaybackNeutralKey(b)
 }
 
 // hasUsableSubtitleTracks reports whether a file carries embedded subtitle
@@ -906,26 +964,25 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Capture the catalog row's subtitle layout before the session overlay. A
-	// virtual release can rotate between planning and extraction: the row is
-	// re-probed against the current candidate while this session's URLs still
-	// name the layout captured at plan time. When the two diverge, extraction
-	// must verify the live source (and possibly re-map the plan ordinal) before
-	// spawning ffmpeg, because the ordinal is only valid against the pinned
-	// release's actual layout.
-	rowSubs := file.SubtitleTracks
-	driftSuspected := isVirtualPlaybackFile(file) &&
-		session.VirtualSourceURI != "" &&
-		session.VirtualSubtitleEvidenceSet &&
-		!playback.SubtitleLayoutsEqual(rowSubs, session.VirtualSubtitleTracks)
+	// Capture the catalog row's full subtitle layout before the session
+	// overlay. A virtual release can rotate between planning and extraction:
+	// the row is re-probed against the current candidate while this session's
+	// URLs still name the layout captured at plan time. When the two diverge,
+	// extraction must verify the live source (and possibly re-map the plan
+	// ordinal) before spawning ffmpeg, because the ordinal is only valid
+	// against the pinned release's actual layout. External subtitles are part
+	// of that ordinal space (they precede the embedded segment), so the
+	// comparison covers them too.
+	rowEmbedded := file.SubtitleTracks
+	rowExternal := file.ExternalSubtitles
 
-	// Bind to the session's planned virtual URI when available: the catalog
-	// row's path is mutable (candidate rotation, stale pin removal), but the
-	// session captured the exact URI that was resolved and probed during
-	// planning. Extracting from a different row would silently switch the
-	// source under an in-flight play.
-	file = bindSessionVirtualSourceWithTracks(r.Context(), file, session, h.fileResolver)
-	trackIndex, err = subtitleRouteIndex(file, trackIndex, r.URL.Query())
+	// Resolve the source file this request actually serves from. A subtitle
+	// URL may name the session's requested (old) edition after an edition
+	// switch moved the effective file; such a request is foreign, and its
+	// ordinal must be re-mapped onto the effective inventory rather than
+	// interpreted against a version no longer playing. Virtual sources bind to
+	// the session's planned candidate at the same time.
+	file, trackIndex, err = h.resolveSubtitleSourceRequest(r.Context(), file, session, trackIndex, r.URL.Query())
 	if err != nil {
 		if errors.Is(err, errSubtitleIdentityInvalid) {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
@@ -934,6 +991,21 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	// driftSuspected means the layout this request's plan-time ordinal was
+	// minted against may differ from the release now being served, so the
+	// pre-spawn live-layout probe must run before ffmpeg is spawned. It is
+	// true when the mutable catalog row no longer matches the plan-time
+	// evidence, and also when the carried evidence provably belongs to a
+	// different candidate than the session is bound to (the serve layer
+	// rotated without updating the evidence) — in that case the plan ordinal
+	// is untrustworthy against every candidate on hand.
+	evidenceTrusted := session.VirtualSubtitleEvidenceSet && virtualEvidenceMatchesBoundFile(file, session)
+	driftSuspected := isVirtualPlaybackFile(file) &&
+		session.VirtualSourceURI != "" &&
+		session.VirtualSubtitleEvidenceSet &&
+		(!evidenceTrusted || !playback.SubtitleLayoutsEqualIncludingExternal(
+			rowEmbedded, rowExternal, session.VirtualSubtitleTracks, session.VirtualExternalSubtitles))
 
 	// trackIndex is a combined ordinal, resolved through the same three
 	// consecutive ranges playback.BuildSubtitleInventoryV3 assigns them from:
@@ -1207,24 +1279,24 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	if err != nil || file == nil {
 		return nil, apiError(http.StatusNotFound, "not_found", "Media file not found")
 	}
+
+	trackIndex, _, err := playback.ParseSubtitleTrackParam(in.Track)
+	if err != nil {
+		return nil, apiError(http.StatusBadRequest, "bad_request", "Invalid subtitle track index")
+	}
+	file, trackIndex, err = h.resolveSubtitleSourceRequest(ctx, file, session, trackIndex, in.Query)
+	if err != nil {
+		if errors.Is(err, errSubtitleIdentityInvalid) {
+			return nil, apiError(http.StatusBadRequest, "bad_request", err.Error())
+		}
+		return nil, apiError(http.StatusNotFound, "not_found", err.Error())
+	}
 	if err := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(ctx, session)
 			return nil, apiError(http.StatusNotFound, "not_found", "Source media file is missing")
 		}
 		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
-	}
-
-	trackIndex, _, err := playback.ParseSubtitleTrackParam(in.Track)
-	if err != nil {
-		return nil, apiError(http.StatusBadRequest, "bad_request", "Invalid subtitle track index")
-	}
-	trackIndex, err = subtitleRouteIndex(file, trackIndex, in.Query)
-	if err != nil {
-		if errors.Is(err, errSubtitleIdentityInvalid) {
-			return nil, apiError(http.StatusBadRequest, "bad_request", err.Error())
-		}
-		return nil, apiError(http.StatusNotFound, "not_found", err.Error())
 	}
 
 	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
@@ -1289,14 +1361,6 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusNotFound, "not_found", "Media file not found")
 		return
 	}
-	file = bindSessionVirtualSourceWithTracks(r.Context(), file, session, h.fileResolver)
-	if err := preflightPlaybackFile(r.Context(), file, h.MissingMarker, h.EventsHub); err != nil {
-		if isPlaybackFileMissing(err) {
-			h.abortPlaybackSession(r.Context(), session)
-		}
-		writePlaybackFilePreflightError(w, err)
-		return
-	}
 
 	trackParam := chi.URLParam(r, "track")
 	trackIndex, _, err := playback.ParseSubtitleTrackParam(trackParam)
@@ -1304,13 +1368,23 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid subtitle track index")
 		return
 	}
-	trackIndex, err = subtitleRouteIndex(file, trackIndex, r.URL.Query())
+	// Resolve the file/ordinal actually served: re-map an edition-switch
+	// request that names the old edition, then bind the session's planned
+	// virtual candidate so the same release the plan probed is extracted.
+	file, trackIndex, err = h.resolveSubtitleSourceRequest(r.Context(), file, session, trackIndex, r.URL.Query())
 	if err != nil {
 		if errors.Is(err, errSubtitleIdentityInvalid) {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		} else {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		}
+		return
+	}
+	if err := preflightPlaybackFile(r.Context(), file, h.MissingMarker, h.EventsHub); err != nil {
+		if isPlaybackFileMissing(err) {
+			h.abortPlaybackSession(r.Context(), session)
+		}
+		writePlaybackFilePreflightError(w, err)
 		return
 	}
 
@@ -1746,16 +1820,23 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// turn the validated artifact into an unvalidated source extract.
 			opts.PinnedTextArtifact = &artifact
 		} else {
-			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts)
+			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
 			if !proceed {
 				writeSubtitleSourceChanged(w)
 				return
 			}
-			if probeErr != nil && playback.IsPGS(track.Codec) {
-				// PGS (.sup) commits 200 before ffmpeg spawns, so a probe that
-				// could not establish the live layout must fail closed here,
-				// before any header write, with a retryable error. Text/ASS
-				// keeps its post-spawn map-error safety net instead.
+			if probeErr != nil {
+				// The live layout could not be established (probe error, relay
+				// timeout, transient upstream failure). Serving the plan ordinal
+				// unverified can silently emit the wrong release's track: the
+				// URL names a plan-time ordinal whose validity depended on the
+				// release the probe was supposed to confirm. PGS already failed
+				// closed here because its .sup commits 200 before ffmpeg spawns.
+				// Text/ASS now does the same rather than trusting a post-spawn map
+				// error that a same-ordinal different-language rotation would
+				// never raise. A retryable error lets the client fall back to
+				// subtitles-off, which the server already treats as legitimate.
+				clearSubtitleCoverageHeaders(w.Header())
 				writeSubtitleSourceUnavailable(w)
 				return
 			}
@@ -1786,12 +1867,16 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// pin, validate the live layout, and retry rather than stream an
 		// unvalidated source extract.
 		opts.PinnedTextArtifact = nil
-		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts)
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
 		if !proceed {
 			writeSubtitleSourceChanged(w)
 			return
 		}
-		if probeErr != nil && playback.IsPGS(track.Codec) {
+		if probeErr != nil {
+			// The committed artifact is gone and the live layout cannot be
+			// established: fail closed rather than stream an unverified
+			// extraction. This is the same retryable response PGS uses.
+			clearSubtitleCoverageHeaders(w.Header())
 			writeSubtitleSourceUnavailable(w)
 			return
 		}
@@ -1825,12 +1910,17 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// relay URL once — no second resolve — and re-map; a source that still
 		// cannot satisfy the requested representation gets a clean retryable 4xx
 		// instead of a 500.
-		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts)
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
 		if !proceed {
 			writeSubtitleSourceChanged(w)
 			return
 		}
-		if probeErr != nil && playback.IsPGS(opts.SourceCodec) {
+		if probeErr != nil {
+			// A map error already proved the plan ordinal names no live stream;
+			// if the re-probe then cannot establish the layout either, there is
+			// no verified ordinal to retry with. Fail closed rather than re-spawn
+			// the same unverified extraction.
+			clearSubtitleCoverageHeaders(w.Header())
 			writeSubtitleSourceUnavailable(w)
 			return
 		}
@@ -2096,42 +2186,40 @@ func implicitVirtualWindowStart(session *playback.Session) float64 {
 }
 
 // verifyVirtualSubtitleLayout probes the live relay input once and, when its
-// subtitle layout drifted from the plan-time evidence this session captured,
-// re-maps the extract options onto a same-class live track. It reports whether
-// extraction may proceed, plus the probe error when the probe itself could not
-// run. proceed=false means a successful probe positively found that the live
-// source cannot satisfy the requested representation — rotation to a different
-// subtitle class, or an ambiguous or absent match — and the caller must answer
-// with a clean retryable 4xx before ffmpeg spawns or headers commit. A non-nil
-// probeErr is not evidence of rotation; text/ASS callers deliberately proceed
-// on the plan ordinal (a genuine rotation still surfaces via the post-spawn map
-// error), while a PGS caller must fail closed because its .sup response commits
-// 200 before ffmpeg spawns. Virtual inputs are request-local probe state; the
-// session's published evidence is never rewritten.
-func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, session *playback.Session, opts *playback.StreamExtractOpts) (bool, error) {
-	if session == nil || opts == nil || strings.TrimSpace(opts.InputPath) == "" {
+// subtitle layout drifted from the layout this request's ordinal was resolved
+// against (expected), re-maps the extract options onto a same-class live track.
+// It reports whether extraction may proceed, plus the probe error when the
+// probe itself could not run. proceed=false means a successful probe positively
+// found that the live source cannot satisfy the requested representation —
+// rotation to a different subtitle class, or an ambiguous or absent match — and
+// the caller must answer with a clean retryable 4xx before ffmpeg spawns or
+// headers commit. A non-nil probeErr means the live layout could not be
+// established: the caller must fail closed for every codec, because serving the
+// plan ordinal unverified can emit the wrong release's track and a
+// same-ordinal rotation never trips the post-spawn map net. Virtual inputs are
+// request-local probe state; the session's published evidence is never
+// rewritten.
+func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, expected []models.SubtitleTrack, opts *playback.StreamExtractOpts) (bool, error) {
+	if opts == nil || strings.TrimSpace(opts.InputPath) == "" {
 		return true, nil
 	}
 	liveTracks, err := playback.ProbeSubtitleLayout(ctx, h.ffmpegPath(), opts.InputPath)
 	if err != nil {
 		// A probe failure (context canceled, relay timeout, transient upstream
-		// error) is not evidence that the pinned source rotated. Serve the
-		// planned ordinal rather than forcing a replan: a genuine rotation is
-		// still caught for text/ASS by the post-spawn map-error safety net, and
-		// treating a probe failure as a rotation produced a churn loop when the
-		// relay itself was what timed out. Only a probe that SUCCEEDS and
-		// positively reports a different layout warrants a 409. The error is
-		// returned so a bitmap caller can fail closed instead of committing a
-		// possibly-truncated .sup.
+		// error) is not evidence that the pinned source rotated, but without
+		// the live layout there is nothing to validate the plan ordinal
+		// against. The caller fails closed with a retryable response; a client
+		// falls back to subtitles-off, which the server already treats as
+		// legitimate. The error is returned so the caller can distinguish it
+		// from a positive mismatch.
 		slog.WarnContext(ctx, "virtual subtitle layout probe failed", "component", "api",
 			"track_codec", requestedTrack.Codec,
 			"error", err)
 		return true, err
 	}
-	if playback.SubtitleLayoutsEqual(liveTracks, session.VirtualSubtitleTracks) {
-		// The pinned release is unchanged — the catalog row was re-probed
-		// against a different candidate. The plan ordinal already names the
-		// live layout.
+	if playback.SubtitleLayoutsEqual(liveTracks, expected) {
+		// The release the ordinal was resolved against is unchanged. The plan
+		// ordinal already names the live layout.
 		return true, nil
 	}
 	liveOrdinal, liveTrack, matched := playback.MatchEmbeddedSubtitleTrack(requestedTrack, liveTracks)

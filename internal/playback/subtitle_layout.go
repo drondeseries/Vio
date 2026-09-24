@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,94 @@ func SubtitleLayoutsEqual(a, b []models.SubtitleTrack) bool {
 			at.Default != bt.Default ||
 			at.HearingImpaired != bt.HearingImpaired ||
 			canonicalSubtitleContainerTrackID(at.ContainerTrackID) != canonicalSubtitleContainerTrackID(bt.ContainerTrackID) {
+			return false
+		}
+	}
+	return true
+}
+
+// ExternalSubtitleLayoutsEqual reports whether two sidecar subtitle layouts are
+// identical on every attribute the extraction path depends on: path, language,
+// format, forced/default, and hearing-impaired. A release rotation replaces the
+// sidecar set the same way it replaces embedded tracks, so drift detection must
+// compare externals too or a rotated sidecar layout is served on the previous
+// release's ordinal.
+func ExternalSubtitleLayoutsEqual(a, b []models.ExternalSubtitle) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		at, bt := a[i], b[i]
+		if at.Path != bt.Path ||
+			lang.Canonical(at.Language) != lang.Canonical(bt.Language) ||
+			normalizeCodecV3(at.Format) != normalizeCodecV3(bt.Format) ||
+			at.Forced != bt.Forced ||
+			at.Default != bt.Default ||
+			at.HearingImpaired != bt.HearingImpaired {
+			return false
+		}
+	}
+	return true
+}
+
+// SubtitleLayoutsEqualIncludingExternal compares the full combined subtitle
+// inventory (externals then embedded) of two sources. It is the drift check the
+// serve path uses: the published combined ordinal ranges over both segments, so
+// a change confined to the sidecar set changes the meaning of every embedded
+// ordinal after it.
+func SubtitleLayoutsEqualIncludingExternal(
+	aEmbedded []models.SubtitleTrack, aExternal []models.ExternalSubtitle,
+	bEmbedded []models.SubtitleTrack, bExternal []models.ExternalSubtitle,
+) bool {
+	return SubtitleLayoutsEqual(aEmbedded, bEmbedded) && ExternalSubtitleLayoutsEqual(aExternal, bExternal)
+}
+
+// AudioLayoutsEqual reports whether two audio inventories are identical on
+// every attribute the selection and extraction path depends on: container
+// index, codec, language/languages, layout, and channel count. A same-row
+// virtual candidate rotation replaces the row's probed tracks without moving
+// the row id, so callers compare this fingerprint instead of id equality to
+// decide whether a carried selection still names the same track.
+func AudioLayoutsEqual(a, b []models.AudioTrack) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		at, bt := a[i], b[i]
+		if at.Index != bt.Index ||
+			normalizeCodecV3(at.Codec) != normalizeCodecV3(bt.Codec) ||
+			lang.Canonical(at.Language) != lang.Canonical(bt.Language) ||
+			!strings.EqualFold(strings.TrimSpace(at.Layout), strings.TrimSpace(bt.Layout)) ||
+			at.Channels != bt.Channels ||
+			at.Profile != bt.Profile ||
+			!stringSlicesEqualFold(at.Languages, bt.Languages) {
+			return false
+		}
+	}
+	return true
+}
+
+// stringSlicesEqualFold compares two string slices order-independently by
+// canonical lowercase form, so a MULTI/DUAL track's language list changes are
+// detected regardless of the order the provider reports them in.
+func stringSlicesEqualFold(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	canonical := func(in []string) []string {
+		out := make([]string, 0, len(in))
+		for _, value := range in {
+			value = strings.ToLower(strings.TrimSpace(value))
+			if value != "" {
+				out = append(out, value)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+	ca, cb := canonical(a), canonical(b)
+	for i := range ca {
+		if ca[i] != cb[i] {
 			return false
 		}
 	}

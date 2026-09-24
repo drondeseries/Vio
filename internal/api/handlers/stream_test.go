@@ -1806,13 +1806,13 @@ func virtualLayoutHandler(ffprobePath string) *StreamHandler {
 	return handler
 }
 
-// A drift probe that fails to run (context canceled, relay timeout) is not
-// evidence that the pinned source rotated. verifyVirtualSubtitleLayout reports
-// the failure alongside "proceed" so the caller decides: text/ASS proceeds with
-// the planned ordinal and lets the post-spawn map net catch a genuine rotation,
-// while a PGS caller fails closed because its .sup commits 200 before ffmpeg
-// spawns. A positive mismatch is the only signal that warrants a replan.
-func TestVerifyVirtualSubtitleLayoutProbeFailureProceedsWithPlan(t *testing.T) {
+// A drift probe that fails to run (context canceled, relay timeout) cannot
+// establish the live layout, so verifyVirtualSubtitleLayout reports the failure
+// alongside "proceed" and every caller fails closed: serving the plan ordinal
+// unverified can emit the wrong release's track, and a same-ordinal
+// different-language rotation never trips the post-spawn map net. A positive
+// mismatch is the only signal that warrants a replan.
+func TestVerifyVirtualSubtitleLayoutProbeFailureFailsClosed(t *testing.T) {
 	for _, codec := range []string{"ass", "hdmv_pgs_subtitle"} {
 		t.Run(codec, func(t *testing.T) {
 			handler := virtualLayoutHandler(writeFakeFFprobe(t, "exit 1"))
@@ -1827,12 +1827,12 @@ func TestVerifyVirtualSubtitleLayoutProbeFailureProceedsWithPlan(t *testing.T) {
 			}
 			requested := models.SubtitleTrack{Index: 3, Codec: codec}
 
-			proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts)
+			proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session.VirtualSubtitleTracks, opts)
 			if !proceed {
-				t.Fatal("probe failure must serve the planned ordinal, not force a replan")
+				t.Fatal("a probe failure is not a positive mismatch; proceed is reported so the caller can fail closed")
 			}
 			if probeErr == nil {
-				t.Fatal("probe failure must be reported so a bitmap caller can fail closed")
+				t.Fatal("probe failure must be reported so the caller fails closed")
 			}
 			if opts.TrackIndex != 3 || opts.SourceCodec != codec {
 				t.Fatalf("plan ordinal/codec must be preserved: %+v", opts)
@@ -1857,7 +1857,7 @@ func TestVerifyVirtualSubtitleLayoutPositiveMismatchForcesReplan(t *testing.T) {
 	}
 	requested := models.SubtitleTrack{Index: 0, Codec: "ass", Language: "eng"}
 
-	proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts)
+	proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session.VirtualSubtitleTracks, opts)
 	if proceed || probeErr != nil {
 		t.Fatal("a positively different live layout must force a 409 replan")
 	}
