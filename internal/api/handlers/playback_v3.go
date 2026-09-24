@@ -6175,7 +6175,13 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	attemptedKeys []string,
 ) (*candidateEvaluationV3, *candidateErrorV3) {
 	candidateStart := baseStart
-	if err := remapAudioSelectionV3(sourceFile, candidateFile, &candidateStart); err != nil {
+	// A carried selection was minted against the plan-time inventory. Use the
+	// session's captured evidence as the remap source for a virtual session:
+	// the loaded candidate row may have been re-probed in place (same id,
+	// different release), in which case source==target by id but the ordinal
+	// still names the previous release's track.
+	remapSource := h.replanRemapSourceV3(sourceFile, session)
+	if err := remapAudioSelectionV3(remapSource, candidateFile, &candidateStart); err != nil {
 		return nil, &candidateErrorV3{Stage: candidateStageAudioRemap, Message: fmt.Sprintf("candidate %d audio remap failed", candidateFile.ID), Err: err}
 	}
 	candidateAudioIndex, err := resolveV3AudioIndex(candidateFile, candidateStart.AudioTrackID, candidateStart.AudioTrackIndex)
@@ -6184,7 +6190,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	}
 	var candidateResult playback.PlannerResultV3
 	var candidateToneMapErr error
-	if err := h.remapSubtitleSelectionV3(r.Context(), sourceFile, candidateFile, &candidateStart); err != nil {
+	if err := h.remapSubtitleSelectionV3(r.Context(), remapSource, candidateFile, &candidateStart); err != nil {
 		candidateResult = playback.PlannerResultV3{Terminal: &playback.TerminalV3{
 			Reason:    terminalSubtitleUnavailableInVersionV3,
 			Message:   "The selected subtitle track is unavailable in the fallback media version.",
@@ -8882,22 +8888,20 @@ func sameMediaInventoryV3(a, b *models.MediaFile) bool {
 }
 
 // replanRemapSourceV3 returns the file whose inventory a carried selection was
-// minted against. For a virtual session the plan-time evidence is authoritative:
-// the loaded catalog row may have been re-probed in place (same id, different
-// release) after the selection was made, so the session's captured audio and
-// subtitle inventories are the only record of what the ordinals name. When the
-// evidence is missing, older than the row (repaired inventory), or the file is
-// not virtual, the loaded row is used.
+// minted against. For a virtual session the plan-time evidence is the source of
+// truth: the loaded catalog row may have been re-probed in place (same id,
+// different release) after the selection was made, so only the session's
+// captured audio and subtitle inventories describe what the carried ordinal
+// actually names. The evidence is used regardless of which candidate it is
+// anchored to — unlike serving, where a provenance mismatch means the evidence
+// must be discarded, a remap needs exactly the inventory the ordinal was minted
+// against. When no evidence is carried, or the effective file is not virtual,
+// the loaded row is used.
 func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, session *playback.Session) *models.MediaFile {
 	if effectiveFile == nil || session == nil || !session.VirtualSubtitleEvidenceSet {
 		return effectiveFile
 	}
 	if !isVirtualPlaybackFile(effectiveFile) {
-		return effectiveFile
-	}
-	// Only substitute evidence that describes the same candidate the effective
-	// file names; otherwise the row is the better (if imperfect) source.
-	if !virtualEvidenceMatchesBoundFile(effectiveFile, session) {
 		return effectiveFile
 	}
 	if len(session.VirtualAudioTracks) == 0 && len(session.VirtualSubtitleTracks) == 0 && len(session.VirtualExternalSubtitles) == 0 {

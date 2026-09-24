@@ -175,9 +175,11 @@ func TestReplanRemapSourceFallsBackToLoadedRow(t *testing.T) {
 	}
 }
 
-// Evidence anchored at a different candidate must not override the loaded row's
-// inventory: it does not describe what is playing.
-func TestReplanRemapSourceIgnoresForeignCandidateEvidence(t *testing.T) {
+// Evidence anchored at a different candidate is still the inventory a carried
+// ordinal was minted against, so a remap must use it as the source even though
+// serving would discard it. This is the key asymmetry: serving needs matching
+// provenance, remapping needs the original inventory.
+func TestReplanRemapSourceUsesEvidenceAcrossCandidates(t *testing.T) {
 	row := &models.MediaFile{ID: 7, FilePath: "virtual://movie/tt?result=b",
 		AudioTracks: []models.AudioTrack{{Codec: "aac", Language: "eng"}}}
 	session := &playback.Session{
@@ -187,8 +189,28 @@ func TestReplanRemapSourceIgnoresForeignCandidateEvidence(t *testing.T) {
 		VirtualAudioTracks:         []models.AudioTrack{{Codec: "aac", Language: "fra"}},
 	}
 	handler := &PlaybackHandler{}
+	source := handler.replanRemapSourceV3(row, session)
+	if source == row {
+		t.Fatal("a remap must use the plan-time evidence, not the reloaded row")
+	}
+	if len(source.AudioTracks) != 1 || source.AudioTracks[0].Language != "fra" {
+		t.Fatalf("remap source audio = %+v, want the plan-time French inventory", source.AudioTracks)
+	}
+}
+
+// A non-virtual effective file after a virtual plan is not remapped from the
+// session's virtual evidence.
+func TestReplanRemapSourceIgnoresEvidenceForLocalFile(t *testing.T) {
+	row := &models.MediaFile{ID: 7, FilePath: "/media/local.mkv",
+		AudioTracks: []models.AudioTrack{{Codec: "aac", Language: "eng"}}}
+	session := &playback.Session{
+		VirtualSourceURI:           "virtual://movie/tt?result=a",
+		VirtualSubtitleEvidenceSet: true,
+		VirtualAudioTracks:         []models.AudioTrack{{Codec: "aac", Language: "fra"}},
+	}
+	handler := &PlaybackHandler{}
 	if got := handler.replanRemapSourceV3(row, session); got != row {
-		t.Fatalf("foreign evidence overrode the loaded row: %+v", got.AudioTracks)
+		t.Fatalf("local file remapped from virtual evidence: %+v", got.AudioTracks)
 	}
 }
 func TestRemapSubtitleSelectionSameRowUnchangedIsNoop(t *testing.T) {
