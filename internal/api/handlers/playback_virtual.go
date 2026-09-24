@@ -4142,6 +4142,20 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 		return &resolved, nil
 	}
+	// Probe-cache-first, same seam the shared resolve uses: a version-switch or
+	// provider-churn candidate that already has a completed probe needs no
+	// second synchronous ffprobe. The cache key strips the provider query, so a
+	// renumbered ?result= or rotated credential still hits the same release's
+	// cached bytes evidence.
+	if cached := h.virtualProbeFromCache(ctx, file, streamURL, transient, candidate, ownerID); cached != nil {
+		resolved.File = cached
+		resolved.ProbeSucceeded = true
+		resolved.Provenance = ProbeProvenanceVerified
+		if err := h.virtualCandidateVerdictError(ctx, candidate.URI, file, ownerID, allowFailed); err != nil {
+			return nil, err
+		}
+		return &resolved, nil
+	}
 	probeCtx, probeCancel := context.WithTimeout(ctx, virtualProbeBudget)
 	probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &transient, candidate.RequestHeaders)
 	probeCancel()
