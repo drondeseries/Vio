@@ -56,7 +56,7 @@ func registerDownloadCreation(reg *Registry) {
 	op := Operation{Operation: humaOp(http.MethodPost, Prefix+"/downloads", "createDownloads", "downloads", "Create one download or one bounded series/season page using shared preparation and registration. Do not automatically replay uncertain creation; reconcile the registry first."), Class: ClassProfileScoped, ServiceBacked: true, DemoRestricted: true, RetrySafety: RetrySafetyNonRetryable}
 	op.DefaultStatus = http.StatusAccepted
 	op.MaxBodyBytes = 256 << 10
-	op.Errors = []int{409, 429, 501}
+	op.Errors = []int{409, 422, 429, 501}
 	Register(reg, op, func(ctx context.Context, in *DownloadCreateInput) (*DownloadCreateOutput, error) {
 		return reg.createDownloads(ctx, cursors, in)
 	})
@@ -102,6 +102,9 @@ func (reg *Registry) createDownloads(ctx context.Context, cursors *Cursors, in *
 	}
 	if body.Caps != nil {
 		req.Caps = *body.Caps
+		if err := req.Caps.NormalizeAndValidateVideoDecode(); err != nil {
+			return nil, NewProblem(TypeValidationFailed, err.Error())
+		}
 	}
 	if len(body.ExpectedEntries) > 100 {
 		return nil, NewProblem(TypeMalformedRequest, "At most 100 episode revision guards are allowed.")

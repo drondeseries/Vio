@@ -563,6 +563,26 @@ describe("QualityMenu indexer releases", () => {
     expect(screen.queryByText("Not downloaded")).not.toBeInTheDocument();
   });
 
+  it("includes indexer rows in the menu's arrow-key roving focus", async () => {
+    renderVersionMenu({
+      contentId: "content-1",
+      indexerReleases: [release()],
+    });
+    const indexerRow = await screen.findByRole("menuitem", { name: /Request Movie/ });
+    // The second version row is the last registered item before the indexer
+    // rows; Arrow Down from it steps onto the first indexer row.
+    const lastVersionRow = screen.getByRole("menuitem", { name: /2160p HEVC/ });
+
+    lastVersionRow.focus();
+    expect(lastVersionRow).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "ArrowDown" });
+    expect(indexerRow).toHaveFocus();
+
+    // Arrow Down again leaves the indexer row for the next registered item.
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "ArrowDown" });
+    expect(indexerRow).not.toHaveFocus();
+  });
+
   it("hides the indexer UI when the server capability is off", async () => {
     capabilityMock.mockResolvedValue({ state: "available", indexer_request: false });
     renderVersionMenu({ contentId: "content-1", indexerReleases: [release()] });

@@ -970,6 +970,10 @@ paths themselves appear only here, behind admin auth.
 Returns the merged stream-telemetry view beside the two legacy live-session
 projections an admin reads today, plus the diff between them.
 
+The same projection answers on the pre-1.0 bridge at
+`GET /api/v1/admin/stream-telemetry/parity`; that legacy route exists only for
+the bridge window and retires with the rest of `/api/v1`.
+
 It is a diagnostic: it compares and does not cut over. No existing admin read has
 been repointed onto telemetry, and nothing here blocks, throttles or ends a
 session. Design: [`docs/design/2026-08-17-stream-telemetry.md`](design/2026-08-17-stream-telemetry.md).
@@ -2303,7 +2307,9 @@ Plugin installation/runtime compatibility remains a separate gate.
 ### Stream telemetry parity in v2
 
 `GET /api/v2/admin/stream-telemetry/parity` compares the cached global telemetry
-view with bounded PostgreSQL and Redis legacy session reads. It requires an acting
+view with bounded PostgreSQL and Redis legacy session reads. The pre-1.0 bridge
+serves the same projection at `GET /api/v1/admin/stream-telemetry/parity`. It
+requires an acting
 administrator. A missing comparison service returns503; disabled telemetry returns
 200 with enabled:false and a reason. An unbuilt view and unavailable legacy source
 remain distinct from an empty successful comparison. No publisher, session storage,

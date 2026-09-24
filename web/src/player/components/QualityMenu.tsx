@@ -149,6 +149,12 @@ export function QualityMenu({
 
   const menuItemsRef = useRef<(HTMLButtonElement | null)[]>([]);
 
+  // Stable so React does not detach the indexer rows' refs (writing `null` into
+  // the roving-focus list) on every re-render.
+  const registerIndexerRow = useCallback((index: number, el: HTMLButtonElement | null) => {
+    menuItemsRef.current[index] = el;
+  }, []);
+
   const handleMenuKeyDown = useCallback((e: React.KeyboardEvent) => {
     const items = menuItemsRef.current.filter(Boolean) as HTMLButtonElement[];
     if (items.length === 0) return;
@@ -182,7 +188,22 @@ export function QualityMenu({
 
   const resolvedActiveId = resolveActiveQualityOptionId(options, activeId);
   const activeOption = options.find((option) => option.id === resolvedActiveId);
-  let menuItemIndex = 0;
+  // Explicit roving-focus slots per group. Mixing a render-time counter with the
+  // refresh row's commit-time `ref` increment let one overwrite another; naming
+  // each group's start removes the ambiguity. Indexer rows are selectable menu
+  // items and get slots between the version rows and the refresh action so
+  // Arrow Up/Down follow visual order.
+  const versionRowsRendered =
+    !versionLocked && Boolean(versions && versions.length > 1 && onSwitchVersion);
+  const indexerRowsRendered = !versionLocked && visibleIndexerReleases.length > 0;
+  // Mirrors the render condition of the Version/Quality header block: the
+  // refresh action lives inside it, so it renders only when this is true.
+  const menuBlockRendered = versionRowsRendered || indexerRowsRendered;
+  const versionRowStart = 0;
+  const indexerRowStart = versionRowsRendered ? orderedVersions.length : 0;
+  const refreshRowIndex =
+    indexerRowStart + (indexerRowsRendered ? visibleIndexerReleases.length : 0);
+  const qualityRowStart = menuBlockRendered ? refreshRowIndex + (onRefreshVersions ? 1 : 0) : 0;
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
@@ -232,8 +253,8 @@ export function QualityMenu({
                       tone="dark"
                       className="px-3 pb-1"
                     />
-                    {orderedVersions.map((v) => {
-                      const idx = menuItemIndex++;
+                    {orderedVersions.map((v, versionIndex) => {
+                      const idx = versionRowStart + versionIndex;
                       const statusLabels = buildVersionStatusLabels(v);
                       const hasFormatScore =
                         typeof v.formatScore === "number" && v.formatScore !== 0;
@@ -323,20 +344,23 @@ export function QualityMenu({
                   </>
                 )}
                 {/* Releases that exist on the indexers but are not downloaded
-                    on the provider, below the playable versions. */}
+                    on the provider, below the playable versions. Registered in
+                    the menu's roving-focus list so Arrow keys reach them. */}
                 {visibleIndexerReleases.length > 0 && (
                   <IndexerReleaseList
                     releases={visibleIndexerReleases}
                     requests={indexerRequests}
                     tone="dark"
                     rowRole="menuitem"
+                    registerRow={registerIndexerRow}
+                    rowIndexStart={indexerRowStart}
                     className="border-t border-white/10 pt-0.5"
                   />
                 )}
                 {onRefreshVersions && (
                   <button
                     ref={(el) => {
-                      menuItemsRef.current[menuItemIndex++] = el;
+                      menuItemsRef.current[refreshRowIndex] = el;
                     }}
                     role="menuitem"
                     type="button"
@@ -378,8 +402,8 @@ export function QualityMenu({
                 </div>
               </>
             )}
-          {options.map((opt) => {
-            const idx = menuItemIndex++;
+          {options.map((opt, optionIndex) => {
+            const idx = qualityRowStart + optionIndex;
             return (
               <button
                 key={opt.id}

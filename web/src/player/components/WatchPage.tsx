@@ -14,6 +14,7 @@ import {
   resolvePlayableSubtitles,
 } from "../utils/playableSubtitles";
 import { patchVersionMarkers, resolveActiveVersionMarkers } from "../utils/watchPageMarkers";
+import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
 import {
   buildSubtitleChoiceRequests,
   sendSubtitleChoiceRequest,
@@ -383,25 +384,9 @@ function WatchPagePlayer({
       if (activeVersion.subtitle_tracks.length === 0) {
         return [];
       }
-      const orderedTracks = [
-        ...activeVersion.subtitle_tracks.filter((track) => track.external),
-        ...activeVersion.subtitle_tracks.filter((track) => !track.external),
-      ];
-      return orderedTracks.map((track, index) => ({
-        index,
-        language: track.language?.trim() || "unknown",
-        codec: track.codec,
-        label:
-          track.title?.trim() ||
-          track.embedded_title?.trim() ||
-          track.file_name?.trim() ||
-          track.language?.trim() ||
-          `Subtitle ${index + 1}`,
-        source: track.external ? ("external" as const) : ("embedded" as const),
-        forced: track.forced,
-        hearing_impaired: track.hearing_impaired,
-        url: "",
-      }));
+      // Shared ordinal derivation; see subtitleInventory.ts. Keeps this
+      // fallback's indexes aligned with the plan's published inventory.
+      return buildPublishedSubtitleTracks(activeVersion.subtitle_tracks);
     }
     return subtitles;
   }, [activeVersion, subtitles]);

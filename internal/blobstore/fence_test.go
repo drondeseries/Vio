@@ -7,6 +7,67 @@ import (
 	"testing/synctest"
 )
 
+func TestMutationFenceReportsFencedState(t *testing.T) {
+	base, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		store := WithMutationFence(base)
+		reporter, ok := store.(MutationFenceReporter)
+		if !ok {
+			t.Fatal("fenced store does not implement MutationFenceReporter")
+		}
+		if reporter.MutationsFenced() {
+			t.Fatal("new store reports fenced before any fence is taken")
+		}
+		release, err := store.(MutationFencer).BeginMutationFence(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reporter.MutationsFenced() {
+			t.Fatal("held fence not reported by MutationsFenced")
+		}
+		release()
+		if reporter.MutationsFenced() {
+			t.Fatal("released fence still reported by MutationsFenced")
+		}
+		// A release is idempotent and must not flip the state back on.
+		release()
+		if reporter.MutationsFenced() {
+			t.Fatal("repeated release left the store fenced")
+		}
+	})
+}
+
+func TestFencedStoresAggregatesFencedState(t *testing.T) {
+	first, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fencedFirst := WithMutationFence(first)
+	fencedSecond := WithMutationFence(second)
+	if FencedStores(fencedFirst, fencedSecond, nil) {
+		t.Fatal("unfenced stores reported as fenced")
+	}
+	release, err := fencedSecond.(MutationFencer).BeginMutationFence(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if !FencedStores(fencedFirst, fencedSecond, nil) {
+		t.Fatal("a held fence was not reported by FencedStores")
+	}
+	// A nil store and a store without fence support are both ignored.
+	if FencedStores(nil, first, fencedSecond) != true {
+		t.Fatal("FencedStores with a nil and un-fenced store should still see the fenced one")
+	}
+}
+
 func TestMutationFenceWaitsForRelease(t *testing.T) {
 	base, err := NewFilesystem(t.TempDir())
 	if err != nil {

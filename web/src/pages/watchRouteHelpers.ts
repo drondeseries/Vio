@@ -12,6 +12,7 @@ import type {
 } from "@/player";
 import { resolveVersionAudioLanguage } from "@/player/utils/effectiveAudioLanguage";
 import { isBitmapCodec } from "@/player/utils/subtitleCodecs";
+import { buildPublishedSubtitleTracks } from "@/player/utils/subtitleInventory";
 import { resolveSubtitleAutoSelect } from "@/player/utils/subtitleSort";
 
 export interface WatchRouteRequest {
@@ -225,27 +226,11 @@ function buildInitialSubtitleTrackIndexes({
   }
 
   for (const version of item.versions) {
-    // Playback v3 assigns dense combined ordinals with sidecars first and
-    // embedded tracks second. Catalog stream indexes are not those ordinals.
-    const orderedTracks = [
-      ...(version.subtitle_tracks ?? []).filter((track) => track.external),
-      ...(version.subtitle_tracks ?? []).filter((track) => !track.external),
-    ];
-    const tracks: PlayerSubtitleInfo[] = orderedTracks.map((track, index) => ({
-      index,
-      language: track.language?.trim() || "unknown",
-      codec: track.codec,
-      label:
-        track.title?.trim() ||
-        track.embedded_title?.trim() ||
-        track.file_name?.trim() ||
-        track.language?.trim() ||
-        `Subtitle ${index + 1}`,
-      source: track.external ? "external" : "embedded",
-      forced: track.forced,
-      hearing_impaired: track.hearing_impaired,
-      url: "",
-    }));
+    // The helper mirrors the server's BuildSubtitleInventoryV3 so `index` is the
+    // published dense combined ordinal, not the track's position in the wire
+    // array. Downloadless versions still resolve because the helper assigns the
+    // same ordinals the server will.
+    const tracks = buildPublishedSubtitleTracks(version.subtitle_tracks);
     const selectedAudioTrackIndex =
       audioTrackIndex ??
       version.effective_audio_track_index ??
@@ -311,29 +296,12 @@ export function buildWatchPageProps({
   const requestedVersion =
     (request.fileId ? item.versions.find((v) => v.file_id === request.fileId) : undefined) ??
     item.versions[0];
-  const orderedVersionTracks = requestedVersion?.subtitle_tracks
-    ? [
-        ...requestedVersion.subtitle_tracks.filter((t) => t.external),
-        ...requestedVersion.subtitle_tracks.filter((t) => !t.external),
-      ]
-    : [];
+  // One shared derivation for every ordinal the client computes; see
+  // subtitleInventory.ts. Watch detail carries the file's own tracks, so the
+  // published ordinals match the server's for the same inventory.
   const subtitles: PlayerSubtitleInfo[] =
     requestedVersion?.subtitle_tracks !== undefined
-      ? orderedVersionTracks.map((subtitle, index) => ({
-          index,
-          language: subtitle.language?.trim() || "unknown",
-          codec: subtitle.codec,
-          label:
-            subtitle.title?.trim() ||
-            subtitle.embedded_title?.trim() ||
-            subtitle.file_name?.trim() ||
-            subtitle.language?.trim() ||
-            `Subtitle ${index + 1}`,
-          source: subtitle.external ? ("external" as const) : ("embedded" as const),
-          forced: subtitle.forced,
-          hearing_impaired: subtitle.hearing_impaired,
-          url: "",
-        }))
+      ? buildPublishedSubtitleTracks(requestedVersion.subtitle_tracks)
       : item.subtitles.map((subtitle, index) => ({
           index,
           language: subtitle.language,

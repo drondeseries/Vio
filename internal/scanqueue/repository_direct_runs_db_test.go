@@ -244,6 +244,59 @@ func TestCreateOnRunningScopeOwesFollowUpEnqueuedOnComplete(t *testing.T) {
 	}
 }
 
+// TestMarkCancelledPersistsCanceledStatus pins the DB/wire alignment bug: the
+// repository writes StatusCancelled ("canceled") while migration 085 constrained
+// scan_runs.status to the legacy single-L spelling, so the UPDATE failed its
+// CHECK and no run was ever canceled. The widened constraint
+// (20260924140423) accepts both spellings; this asserts the persisted value
+// round-trips through a real Postgres.
+func TestMarkCancelledPersistsCanceledStatus(t *testing.T) {
+	ctx, _, repo, folderID := openDirectRunTestRepository(t)
+	runID := createDirectRunTestRow(t, ctx, repo, folderID, "/cancel", "manual")
+	if _, err := repo.Start(ctx, runID); err != nil {
+		t.Fatalf("start scan run: %v", err)
+	}
+
+	canceled, ok, err := repo.MarkCancelled(ctx, runID)
+	if err != nil {
+		t.Fatalf("MarkCancelled: %v", err)
+	}
+	if !ok || canceled.Status != StatusCancelled {
+		t.Fatalf("MarkCancelled = %#v, ok=%v; want StatusCancelled=%q persisted", canceled, ok, StatusCancelled)
+	}
+
+	reloaded, err := repo.GetByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("reload canceled run: %v", err)
+	}
+	if reloaded.Status != StatusCancelled {
+		t.Fatalf("persisted status = %q, want %q", reloaded.Status, StatusCancelled)
+	}
+}
+
+// TestCancelAcceptedByLibraryPersistsCanceledStatus covers the second writer:
+// the bulk library cancel had the same CHECK failure as MarkCancelled.
+func TestCancelAcceptedByLibraryPersistsCanceledStatus(t *testing.T) {
+	ctx, _, repo, folderID := openDirectRunTestRepository(t)
+	runID := createDirectRunTestRow(t, ctx, repo, folderID, "/bulk-cancel", "manual")
+
+	canceled, err := repo.CancelAcceptedByLibrary(ctx, folderID)
+	if err != nil {
+		t.Fatalf("CancelAcceptedByLibrary: %v", err)
+	}
+	if len(canceled) != 1 || canceled[0].ID != runID || canceled[0].Status != StatusCancelled {
+		t.Fatalf("canceled = %#v, want the accepted run %q with status %q", canceled, runID, StatusCancelled)
+	}
+
+	reloaded, err := repo.GetByID(ctx, runID)
+	if err != nil {
+		t.Fatalf("reload canceled run: %v", err)
+	}
+	if reloaded.Status != StatusCancelled {
+		t.Fatalf("persisted status = %q, want %q", reloaded.Status, StatusCancelled)
+	}
+}
+
 func TestCreateOnRunningScopeIgnoresDirectAdminTriggers(t *testing.T) {
 	ctx, _, repo, folderID := openDirectRunTestRepository(t)
 	runID := createDirectRunTestRow(t, ctx, repo, folderID, "/show/s01", "autoscan")

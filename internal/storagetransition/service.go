@@ -286,6 +286,29 @@ type Service struct {
 	memoryMu                sync.Mutex
 	memoryObjects           map[string]objectCheckpoint
 	memoryCursors           map[string]prefixCursor
+	// fenceMu guards the post-commit fence watchdog state.
+	fenceMu sync.Mutex
+	// fenceWatchdogStarted ensures only one watchdog runs per service.
+	fenceWatchdogStarted bool
+	// fenceWatchdogStop ends the watchdog in tests.
+	fenceWatchdogStop chan struct{}
+	// fenceWatchdogInterval is how often the watchdog re-logs while the source
+	// fences stay held. Zero keeps the production default.
+	fenceWatchdogInterval time.Duration
+	// fenceCommittedAt is when the fences were retained, for the watchdog's
+	// held-for duration.
+	fenceCommittedAt time.Time
+}
+
+// FencedForRestart reports whether this process currently holds a source
+// mutation fence that only a restart releases: a transition committed and the
+// process is still running. Writes to those stores are stalled, so operators
+// need a signal distinct from an ordinary storage outage.
+func (s *Service) FencedForRestart() bool {
+	if s == nil {
+		return false
+	}
+	return blobstore.FencedStores(s.source, s.private)
 }
 
 // SetNodeAdmission connects the transition to the API process's storage
@@ -971,6 +994,7 @@ func (s *Service) ExecuteStorageTransition(ctx context.Context, req adminjob.Sto
 	// and releasing them here would reopen a window for writes to land in the old
 	// stores after their final copy but before shutdown.
 	fenceCommitted = true
+	s.startFenceWatchdog(commitUnknown)
 	if !commitUnknown {
 		phase = transitionPhaseRestartPending
 		report(result.CopiedObjects, result.CopiedObjects, "Storage transition committed; restart required")
@@ -978,6 +1002,77 @@ func (s *Service) ExecuteStorageTransition(ctx context.Context, req adminjob.Sto
 	result.Phase = transitionPhaseRestartPending
 	result.VerifiedObjects = result.CopiedObjects
 	return result, nil
+}
+
+// fenceWatchdogDefaultInterval is how often the post-commit watchdog re-logs
+// while the retained mutation fences keep source writes stalled.
+const fenceWatchdogDefaultInterval = 5 * time.Minute
+
+// startFenceWatchdog logs loudly, on an interval, for as long as this process
+// holds the retained post-commit mutation fences. The fences deliberately stay
+// held until restart; if the host restart callback refuses, every write through
+// those stores blocks forever with no other signal, so this is the only
+// operational warning an administrator gets.
+func (s *Service) startFenceWatchdog(commitUnknown bool) {
+	if s == nil {
+		return
+	}
+	s.fenceMu.Lock()
+	defer s.fenceMu.Unlock()
+	if s.fenceWatchdogStarted {
+		return
+	}
+	s.fenceWatchdogStarted = true
+	s.fenceCommittedAt = time.Now()
+	interval := s.fenceWatchdogInterval
+	if interval <= 0 {
+		interval = fenceWatchdogDefaultInterval
+	}
+	stop := s.fenceWatchdogStop
+	if stop == nil {
+		stop = make(chan struct{})
+		s.fenceWatchdogStop = stop
+	}
+	startedAt := s.fenceCommittedAt
+	go s.runFenceWatchdog(stop, interval, startedAt, commitUnknown)
+}
+
+// runFenceWatchdog re-logs while the process holds retained fences. It returns
+// as soon as the fences are released (a restart callback did fire, or a later
+// release ended the wait) or the service is stopped.
+func (s *Service) runFenceWatchdog(stop <-chan struct{}, interval time.Duration, startedAt time.Time, commitUnknown bool) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if !s.FencedForRestart() {
+				return
+			}
+			slog.Warn("storage transition: source writes remain fenced pending restart",
+				"component", "storage_transition",
+				"commit_unknown", commitUnknown,
+				"fenced_for", time.Since(startedAt).Round(time.Second).String(),
+				"hint", "restart Silo to release the storage transition write fence; if the host restart callback is unavailable, restart the process manually")
+		}
+	}
+}
+
+// StopFenceWatchdog ends the post-commit watchdog. Tests call it to avoid a
+// leaked goroutine; production relies on process exit.
+func (s *Service) StopFenceWatchdog() {
+	if s == nil {
+		return
+	}
+	s.fenceMu.Lock()
+	defer s.fenceMu.Unlock()
+	if s.fenceWatchdogStop != nil {
+		close(s.fenceWatchdogStop)
+		s.fenceWatchdogStop = nil
+	}
+	s.fenceWatchdogStarted = false
 }
 
 type copyPass struct {

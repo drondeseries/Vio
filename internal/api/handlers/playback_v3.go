@@ -4462,14 +4462,28 @@ func (h *PlaybackHandler) newAutoTranscodePipelineV3(ctx context.Context, opts p
 	return playback.NewAutoTranscodePipeline(ctx, opts)
 }
 
+// localAutoStartupBudgetV3 bounds a local hw_accel=auto readiness-gated start.
+// The remote path budgets TranscodeStartReadyMaxDuration + 5s for the same
+// fallback; the local path runs runTranscodeStartup in-process, where each of
+// the MaxAutoTranscodeStartupAttempts paths may consume its own
+// ManifestStartupTimeout. A variable so tests can shrink it.
+var localAutoStartupBudgetV3 = time.Duration(playback.MaxAutoTranscodeStartupAttempts)*playback.ManifestStartupTimeout + 5*time.Second
+
 // startReadyAutoLocalPlaybackTransportV3 walks an enabled hw_accel=auto
 // pipeline until one path produces its first manifest. Failed attempts are
 // closed by the pipeline loop, so the failure carries the same cleanup
 // guarantee as startReadyLocalPlaybackTransportV3.
+//
+// The whole walk is bounded by one explicit budget (maxAttempts × per-attempt
+// timeout + margin), mirroring remotePlaybackTransportTimeout on the remote
+// path. Without it the walk runs under the bare request context, so 3 × 30s of
+// fallback could outlive the handler's own deadline and surface as a canceled
+// request instead of a classified readiness failure.
 func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Context, pipeline *playback.AutoTranscodePipeline) (*playback.TranscodeSession, *localTransportStartupFailureV3) {
 	startedAt := time.Now()
 	attempts := 0
 	ts, err := playback.StartReadyTranscode(ctx, pipeline, playback.TranscodeStartup{
+		Budget: localAutoStartupBudgetV3,
 		Start: func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
 			attempts++
 			return h.startLocalPlaybackTransport(ctx, opts)
