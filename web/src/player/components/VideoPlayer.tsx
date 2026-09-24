@@ -68,6 +68,7 @@ import type {
   MarkerDraft,
   MarkerKind,
   MarkerRegionView,
+  PlaybackStartTrigger,
   SeriesContext,
   SubtitleMode,
   VideoFitMode,
@@ -264,7 +265,7 @@ interface VideoPlayerProps {
   onMarkersEdited?: (fileId: number, markers: MarkerDraft) => void;
   duration?: number;
   seriesContext?: SeriesContext;
-  onNavigateEpisode?: (contentId: string) => void;
+  onNavigateEpisode?: (contentId: string, trigger: PlaybackStartTrigger) => void;
   /** The session's current quality preference, as the server normalized it. */
   qualityPreference: string;
   onRefreshSubtitles?: (currentPosition: number) => void;
@@ -284,6 +285,8 @@ interface VideoPlayerProps {
   autoEnterPictureInPicture?: boolean;
   onPlaybackStateChange?: (state: PlayerPlaybackStateChange) => void;
   onPlaybackTransportReady?: (transport: PlayerPlaybackTransport | null) => void;
+  /** Called each time a newly loaded transport shows its first frame. */
+  onFirstFrame?: () => void;
   onReturnFromPostRoll?: () => void;
   onRealtimeEvent?: (event: PlaybackRealtimeEventEnvelope) => void;
   onRealtimeConnectionStateChange?: (state: "disconnected" | "connecting" | "connected") => void;
@@ -452,6 +455,7 @@ export function VideoPlayer({
   autoEnterPictureInPicture = false,
   onPlaybackStateChange,
   onPlaybackTransportReady,
+  onFirstFrame,
   onReturnFromPostRoll,
   onRealtimeEvent,
   onRealtimeConnectionStateChange,
@@ -1816,6 +1820,19 @@ export function VideoPlayer({
     onEndedRef.current = onEnded;
   }, [onEnded]);
 
+  const onFirstFrameRef = useRef(onFirstFrame);
+  useEffect(() => {
+    onFirstFrameRef.current = onFirstFrame;
+  }, [onFirstFrame]);
+
+  // Every transport starts out awaiting its first frame, and the flag clears
+  // on the event that proves a frame is on screen: `playing`, a `timeupdate`,
+  // the seek that lands the start position, or a deliberately paused start.
+  // The loading overlay goes with it, so this is when the viewer sees video.
+  useEffect(() => {
+    if (!awaitingFirstFrame) onFirstFrameRef.current?.();
+  }, [awaitingFirstFrame]);
+
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !onPictureInPictureChange) return;
@@ -1874,8 +1891,8 @@ export function VideoPlayer({
 
   // -- Next episode auto-play --
   const handleNavigate = useCallback(
-    (contentId: string) => {
-      onNavigateEpisode?.(contentId);
+    (contentId: string, trigger: PlaybackStartTrigger) => {
+      onNavigateEpisode?.(contentId, trigger);
     },
     [onNavigateEpisode],
   );
@@ -1915,7 +1932,7 @@ export function VideoPlayer({
     return seriesContext.episodes[idx - 1] ?? null;
   })();
   const goToPrevEpisode = useCallback(() => {
-    if (prevEpisodeRef) handleNavigate(prevEpisodeRef.contentId);
+    if (prevEpisodeRef) handleNavigate(prevEpisodeRef.contentId, "viewer");
   }, [prevEpisodeRef, handleNavigate]);
 
   // Title strip copy passed into the floating HUD.
@@ -2467,6 +2484,14 @@ export function VideoPlayer({
       hlsStartupGuardRef.current?.markPlaybackStarted();
       setAwaitingFirstFrame(false);
     };
+    // `timeupdate` and `seeked` prove a frame is on screen only once the
+    // loaded source has data for the current position. Tearing a transport
+    // down (`removeAttribute("src")` and `load()`) resets the position and
+    // queues a `timeupdate` at HAVE_NOTHING. That task can run after the next
+    // transport sets `awaitingFirstFrame` but before React renders it, so
+    // counting it would cancel the render: no loading overlay, a startup
+    // guard marked started, and the new transport's first frame never seen.
+    const hasCurrentFrame = () => video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
     const onTimeUpdate = () => {
       const nextTime = toMediaTime(video.currentTime, timelineOffsetRef.current);
       const resolved = resolvePendingSeekTime(nextTime, pendingSeekTime);
@@ -2498,7 +2523,7 @@ export function VideoPlayer({
       // timeupdate is the most reliable signal that frames are rendering.
       // Also clears any stale buffering state from HLS segment transitions
       // where `waiting` fired but `canplay`/`playing` never followed.
-      markPlaybackStarted();
+      if (hasCurrentFrame()) markPlaybackStarted();
       clearBuffering();
       if (roomReadinessPending && watchTogetherSync.attachedSessionId === sessionId) {
         watchTogetherSync.reportReady();
@@ -2519,7 +2544,7 @@ export function VideoPlayer({
         watchTogetherSync.reportReady();
       }
       if (resolved.pendingSeekTime !== null) return;
-      markPlaybackStarted();
+      if (hasCurrentFrame()) markPlaybackStarted();
       clearBuffering();
     };
     const onDurationChange = () => {

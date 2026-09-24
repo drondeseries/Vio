@@ -107,7 +107,7 @@ the document is always the full one:
 }
 ```
 
-The fifteen feature strings above are the full set this server version advertises:
+The fifteen feature strings above are the full set this server version advertises on `/api/v1`. `/api/v2` advertises them plus `subrip_sidecar_v1`:
 
 | Feature | What it promises |
 | --- | --- |
@@ -126,8 +126,9 @@ The fifteen feature strings above are the full set this server version advertise
 | `software_video_decode_v1` | Exact/platform-attested clients may qualify bounded `video_decode[]` entries with `hardware: false` for direct/original delivery; without the opt-in those evidence tiers remain hardware-only (§3) |
 | `plan_invalidated_v1` | The client can be told mid-session that the plan it is playing was withdrawn, over the realtime `plan_invalidated` command, and replans off it. A session that did not negotiate it is stopped instead (§6.1) |
 | `plan_source_duration_v1` | `source.duration_seconds` is populated when known, so its absence means *unknown* rather than *unsupported* (§5) |
+| `subrip_sidecar_v1` | `/api/v2` only. An opted-in client that parses SubRip itself receives external and downloaded SRT tracks as the original `.srt` file instead of the WebVTT conversion (§8) |
 
-That last one is the reason feature detection is a list and not a version
+`plan_source_duration_v1` is the reason feature detection is a list and not a version
 number: without it, a client cannot tell a server that never sends the runtime
 apart from a server that knows this particular file's runtime is genuinely
 unknown, and both look like an absent field.
@@ -1021,7 +1022,7 @@ seek is not an authority boundary for replacing the client's declared abilities
 mid-session.
 
 **Attempt-sticky features.** `client_features` is otherwise refreshed by any
-replan that sends it, but three entries are fixed by the start negotiation and a
+replan that sends it, but four entries are fixed by the start negotiation and a
 replan can neither add nor drop them:
 
 | Feature | Why it is fixed |
@@ -1029,6 +1030,7 @@ replan can neither add nor drop them:
 | `header_authenticated_media_v1` | It selects the media security contract. A signed URL from an earlier plan stays usable until its recipe expires, so a mid-attempt switch would leave two contracts alive for one session (§4.1) |
 | `authorized_media_origins_v1` | It selects which origins may serve the attempt's media. A plan that already handed out a proxy origin outlives the replan that would revoke it, so the client would be left holding a URL it no longer trusts (§4.1) |
 | `software_video_decode_v1` | It widens the direct-play evidence tiers. Dropping it converts a direct route into a transcode and persists that downgrade into the durable request |
+| `subrip_sidecar_v1` | It picks the representation of every SRT sidecar URL. A mid-attempt switch would publish one track under two URLs (§8) |
 
 The server silently restores the negotiated state of each, whatever the replan
 sends — including an explicit list that omits one, which is otherwise a valid
@@ -1274,6 +1276,15 @@ every value is truncated to 256 characters.
 `network_metered`, `network_validated`, `bandwidth_estimate_kbps`,
 `link_downstream_kbps`, `target_source_position_seconds`, `reason`.
 
+On a `first_frame` event, `first_frame_ms` is the whole milliseconds from the
+viewer's request to play (the tap, or the in-player action that started the
+attempt) to the first frame on screen. A client that cannot time the request
+omits the key and still sends the event. A start the viewer did not ask for,
+such as a Watch Party selection or an autoplay countdown, has no request to
+time, so it omits the key too. The server derives
+`silo_playback_first_frame_seconds` from it; see
+[observability](observability.md#client-experience-and-plugin-coordination).
+
 ---
 
 ## 8. Track identity and the subtitle ordinal space
@@ -1359,6 +1370,8 @@ their own query parameters; see §4.2 for the per-route-family contract.
 
 The sidecar URL suffix is part of the representation contract, not decoration.
 The artifact `format` and `mime_type` describe served bytes, independently of the source codec. SRT, SubRip, and mov_text sources served as VTT therefore report `format: "vtt"` and `mime_type: "text/vtt"`. Artifact timestamps are absolute original-media time, with `timing_origin_seconds: 0` even when the video transport resumes from a nonzero source position.
+
+A client that sends `subrip_sidecar_v1` in `client_features` to `/api/v2` receives external and downloaded SRT tracks as the original file instead: the inventory URL is `.srt` with `original=1`, a `render` artifact uses that URL and reports `format: "srt"` and `mime_type: "application/x-subrip"`, and the bytes are the SRT exactly as stored. A `convert` artifact stays WebVTT at `.vtt`. Embedded SRT tracks keep their existing representation. A `.srt` request without `original=1`, and any request on the frozen `/api/v1` route, keeps the historical WebVTT response. `/api/v1` neither advertises nor negotiates the feature. The feature is attempt-sticky (§6). Realtime subtitle events publish the same representation as the session's current plan, and every replan, including a seek reanchor, keeps the representation the current plan published, even when the attempt started on a server that did not know the feature.
 
 An embedded `hdmv_pgs_subtitle`/PGS sidecar is lossless binary PGS at a `.sup`
 URL with `application/octet-stream`; cached full-track responses support `HEAD`

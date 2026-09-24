@@ -6279,7 +6279,10 @@ export interface paths {
     /** Page the calling device's series monitors, including paused monitors. */
     get: operations["listDownloadSubscriptions"];
     put?: never;
-    /** Create a monitor or return the existing monitor without changing it. Sync explicitly after receipt; do not automatically resend an uncertain create. */
+    /**
+     * Create a monitor or return the device's existing monitor for the series.
+     * @description An existing monitor keeps its options and forgets the episodes deleted under it, so the next sync can register them again. Sync explicitly after receipt; do not automatically resend an uncertain create.
+     */
     post: operations["createDownloadSubscription"];
     delete?: never;
     options?: never;
@@ -16296,6 +16299,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       backdrop_thumbhash?: string;
       /** @description Presigned, short-lived */
       backdrop_url?: string;
@@ -16414,6 +16429,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       /** @description Calendar date, YYYY-MM-DD */
       air_date?: string;
       air_time?: string;
@@ -17400,11 +17427,13 @@ export interface components {
     };
     ConnectionUpdate: {
       export_favorites_enabled?: boolean;
+      export_ratings_enabled?: boolean;
       export_unwatched_enabled?: boolean;
       export_watched_enabled?: boolean;
       export_watchlist_enabled?: boolean;
       import_favorites_enabled?: boolean;
       import_progress_enabled?: boolean;
+      import_ratings_enabled?: boolean;
       import_watched_enabled?: boolean;
       import_watchlist_enabled?: boolean;
       scrobble_enabled?: boolean;
@@ -18935,6 +18964,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       backdrop_thumbhash?: string;
       /** @description Presigned, short-lived */
       backdrop_url?: string;
@@ -25766,11 +25807,13 @@ export interface components {
     };
     WatchProviderCapabilities: {
       export_favorites: boolean;
+      export_ratings: boolean;
       export_unwatched: boolean;
       export_watched: boolean;
       export_watchlist: boolean;
       import_favorites: boolean;
       import_progress: boolean;
+      import_ratings: boolean;
       import_watched: boolean;
       import_watchlist: boolean;
       provides_watchlist_order: boolean;
@@ -25786,11 +25829,13 @@ export interface components {
       credentials_configured: boolean;
       display_name: string;
       export_favorites_enabled: boolean;
+      export_ratings_enabled: boolean;
       export_unwatched_enabled: boolean;
       export_watched_enabled: boolean;
       export_watchlist_enabled: boolean;
       import_favorites_enabled: boolean;
       import_progress_enabled: boolean;
+      import_ratings_enabled: boolean;
       import_watched_enabled: boolean;
       import_watchlist_enabled: boolean;
       last_error?: string;
@@ -25854,11 +25899,15 @@ export interface components {
     };
     WatchProviderSettings: {
       export_favorites_enabled: boolean;
+      /** @description Send the profile's star ratings to the provider (stars times two) and clear removed ones. */
+      export_ratings_enabled: boolean;
       export_unwatched_enabled: boolean;
       export_watched_enabled: boolean;
       export_watchlist_enabled: boolean;
       import_favorites_enabled: boolean;
       import_progress_enabled: boolean;
+      /** @description Import the provider's movie and series ratings as stars (1-2 is 1 star, 9-10 is 5 stars). */
+      import_ratings_enabled: boolean;
       import_watched_enabled: boolean;
       import_watchlist_enabled: boolean;
       scrobble_enabled: boolean;
@@ -25910,6 +25959,10 @@ export interface components {
       /** Format: int64 */
       inbound_progress_imported: number;
       /** Format: int64 */
+      inbound_ratings_found: number;
+      /** Format: int64 */
+      inbound_ratings_imported: number;
+      /** Format: int64 */
       inbound_watched_found: number;
       /** Format: int64 */
       inbound_watched_imported: number;
@@ -25923,6 +25976,16 @@ export interface components {
       outbound_favorites_sent: number;
       /** Format: int64 */
       outbound_found: number;
+      /**
+       * Format: int64
+       * @description Movie and series ratings the profile holds.
+       */
+      outbound_ratings_found: number;
+      /**
+       * Format: int64
+       * @description Ratings set or cleared on the provider.
+       */
+      outbound_ratings_sent: number;
       /** Format: int64 */
       outbound_sent: number;
       /** Format: int64 */
@@ -26339,6 +26402,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       backdrop_thumbhash?: string;
       /** @description Presigned, short-lived */
       backdrop_url?: string;
@@ -26486,6 +26561,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       backdrop_thumbhash?: string;
       /** @description Presigned, short-lived */
       backdrop_url?: string;
@@ -46735,7 +46822,7 @@ export interface operations {
         user_id?: number;
       };
       header: {
-        /** @description Browser origin must match the configured public origin. */
+        /** @description Browser origin must match the configured public origin, the request origin, or a connected network access overlay origin. */
         Origin?: string;
         /** @description Offer silo.admin-logs.v2 followed by silo.ticket.<single-use-ticket>. */
         "Sec-WebSocket-Protocol": string;
@@ -85833,7 +85920,7 @@ export interface operations {
         channels?: string;
       };
       header: {
-        /** @description Browser origin must match the configured public origin. */
+        /** @description Browser origin must match the configured public origin, the request origin, or a connected network access overlay origin. */
         Origin?: string;
         /** @description Offer silo.events.v2 followed by silo.ticket.<single-use-ticket>. */
         "Sec-WebSocket-Protocol": string;
@@ -99306,7 +99393,7 @@ export interface operations {
     parameters: {
       query?: never;
       header: {
-        /** @description Browser origin must match the configured public origin. */
+        /** @description Browser origin must match the configured public origin, the request origin, or a connected network access overlay origin. */
         Origin?: string;
         /** @description Offer silo.playback-control.v2 followed by silo.ticket.<single-use-ticket>. */
         "Sec-WebSocket-Protocol": string;
@@ -109018,6 +109105,8 @@ export interface operations {
         duration?: number;
         /** @description Source media file the inventory URL names; must be the plan's effective or requested file. */
         file_id?: string;
+        /** @description 1 on a .srt URL published under subrip_sidecar_v1: serve the stored SRT bytes instead of the WebVTT conversion. */
+        original?: string;
         /** @description Seek position in seconds for windowed text extraction. */
         position?: number;
         /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
@@ -109035,7 +109124,7 @@ export interface operations {
       };
       path: {
         session_id: string;
-        /** @description Combined subtitle ordinal from the plan inventory, optionally suffixed with the sidecar extension (.vtt, .ass, .sup) the inventory URL carries. */
+        /** @description Combined subtitle ordinal from the plan inventory, optionally suffixed with the sidecar extension (.vtt, .ass, .sup, .srt) the inventory URL carries. */
         track: string;
       };
       cookie?: never;
@@ -109166,6 +109255,8 @@ export interface operations {
         duration?: number;
         /** @description Source media file the inventory URL names; must be the plan's effective or requested file. */
         file_id?: string;
+        /** @description 1 on a .srt URL published under subrip_sidecar_v1: serve the stored SRT bytes instead of the WebVTT conversion. */
+        original?: string;
         /** @description Seek position in seconds for windowed text extraction. */
         position?: number;
         /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
@@ -109183,7 +109274,7 @@ export interface operations {
       };
       path: {
         session_id: string;
-        /** @description Combined subtitle ordinal from the plan inventory, optionally suffixed with the sidecar extension (.vtt, .ass, .sup) the inventory URL carries. */
+        /** @description Combined subtitle ordinal from the plan inventory, optionally suffixed with the sidecar extension (.vtt, .ass, .sup, .srt) the inventory URL carries. */
         track: string;
       };
       cookie?: never;
@@ -117155,7 +117246,7 @@ export interface operations {
     parameters: {
       query?: never;
       header: {
-        /** @description Browser origin must match configured public origin. */
+        /** @description Browser origin must match the configured public origin, the request origin, or a connected network access overlay origin. */
         Origin?: string;
         /** @description Offer silo.room.v2 followed by silo.ticket.<single-use-ticket>. */
         "Sec-WebSocket-Protocol": string;

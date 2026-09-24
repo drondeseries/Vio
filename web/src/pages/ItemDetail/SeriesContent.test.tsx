@@ -27,7 +27,6 @@ const mocks = vi.hoisted(() => {
     useWatchedStateMutation: vi.fn(),
     useSeasons: vi.fn(),
     useItemEpisodes: vi.fn(),
-    useContinueWatching: vi.fn(),
     useSimilarItems: vi.fn(),
     useSetRating: vi.fn(),
     useDeleteRating: vi.fn(),
@@ -68,10 +67,6 @@ vi.mock("@/hooks/queries/items", () => ({
 vi.mock("@/hooks/queries/episodes", () => ({
   useSeasons: mocks.useSeasons,
   useItemEpisodes: mocks.useItemEpisodes,
-}));
-
-vi.mock("@/hooks/queries/progress", () => ({
-  useContinueWatching: mocks.useContinueWatching,
 }));
 
 vi.mock("@/hooks/queries/recommendations", () => ({
@@ -200,7 +195,6 @@ describe("SeriesContent", () => {
     mocks.useItemEpisodes.mockReturnValue({
       data: { episodes: [{ content_id: "episode-1" }] },
     });
-    mocks.useContinueWatching.mockReturnValue({ items: [] });
     mocks.useSimilarItems.mockReturnValue({ data: undefined, isLoading: false });
     mocks.useSetRating.mockReturnValue({ mutate: mocks.setRatingMutate });
     mocks.useDeleteRating.mockReturnValue({ mutate: mocks.deleteRatingMutate });
