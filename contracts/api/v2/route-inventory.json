@@ -39,7 +39,7 @@
       "id": "api",
       "entrypoint": "internal/api.NewRouter",
       "description": "Main Vio API listener: the /api/v1 namespace and the routes mounted beside it.",
-      "route_count": 714
+      "route_count": 715
     },
     {
       "id": "api_v2",
@@ -61,8 +61,8 @@
     }
   ],
   "totals": {
-    "routes": 879,
-    "conditional_routes": 703,
+    "routes": 880,
+    "conditional_routes": 704,
     "streaming_routes": 42,
     "websocket_routes": 4
   },
@@ -12474,6 +12474,40 @@
       "route_group": "/api/v1/admin",
       "handler": "(*internal/api/handlers.AdminHandler).HandleGetTopActivity",
       "handler_expr": "adminHandler.HandleGetTopActivity",
+      "handler_kind": "method",
+      "handler_resolved": true,
+      "middleware_chain": 9,
+      "auth_class": "acting_admin",
+      "auth_traits": [
+        "acting_admin",
+        "authenticated",
+        "demo_guarded",
+        "rate_limited",
+        "viewer_access"
+      ],
+      "conditions": [
+        "authMiddleware != nil",
+        "adminHandler != nil"
+      ],
+      "conditional": true,
+      "request_kind": "none",
+      "response_media_kind": "json",
+      "delegates_to": "",
+      "streams": false,
+      "upgrades_websocket": false,
+      "method_origin": "explicit",
+      "success_statuses": null,
+      "error_codes": null,
+      "source_file": "internal/api/router.go"
+    },
+    {
+      "listener": "api",
+      "namespace": "api_v1",
+      "method": "GET",
+      "path": "/api/v1/admin/stream-telemetry/parity",
+      "route_group": "/api/v1/admin",
+      "handler": "(*internal/api/handlers.StreamTelemetryParityHandler).HandleGetStreamTelemetryParity",
+      "handler_expr": "(&handlers.StreamTelemetryParityHandler{ Registry: deps.StreamTelemetry, ViewCache: deps.StreamTelemetryViewCache, Pool: deps.DB, Redis: deps.RedisClient, }).HandleGetStreamTelemetryParity",
       "handler_kind": "method",
       "handler_resolved": true,
       "middleware_chain": 9,

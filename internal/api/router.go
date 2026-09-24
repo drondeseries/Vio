@@ -4359,6 +4359,16 @@ func newChiRouter(deps Dependencies) chi.Router {
 							}
 
 							r.Get("/sessions", adminHandler.HandleListSessions)
+							// P0d parity projection: the merged telemetry view beside
+							// both legacy live-session projections and their diff. It
+							// compares only — the repoint is the separate retirement
+							// change, which this endpoint exists to give evidence for.
+							r.Get("/stream-telemetry/parity", (&handlers.StreamTelemetryParityHandler{
+								Registry:  deps.StreamTelemetry,
+								ViewCache: deps.StreamTelemetryViewCache,
+								Pool:      deps.DB,
+								Redis:     deps.RedisClient,
+							}).HandleGetStreamTelemetryParity)
 							r.Get("/sessions/capabilities", adminHandler.HandleGetSessionsCapabilities)
 							r.Get("/playback-routing/capabilities", adminHandler.HandleGetPlaybackRoutingCapabilities)
 							r.Get("/playback-history", adminHandler.HandleListPlaybackHistory)
