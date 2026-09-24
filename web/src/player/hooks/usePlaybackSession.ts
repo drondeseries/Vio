@@ -21,6 +21,7 @@ import { replanV2 } from "../lifecycle-v2";
 import { buildPlayerStreamUrl } from "../stream-url";
 import { randomUUID } from "@/lib/uuid";
 import { matchSubtitleTrackAcrossVersions } from "../utils/subtitleSort";
+import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
 import { isBitmapCodec } from "../utils/subtitleCodecs";
 import {
   FEATURE_OUTPUT_CHANGE_V3,
@@ -266,24 +267,9 @@ function resolveCarriedSubtitleIndexAcrossVersions(
   if (!targetVersion?.subtitle_tracks || targetVersion.subtitle_tracks.length === 0) {
     return null;
   }
-  const orderedTargetTracks = [
-    ...targetVersion.subtitle_tracks.filter((t) => t.external),
-    ...targetVersion.subtitle_tracks.filter((t) => !t.external),
-  ];
-  const candidates = orderedTargetTracks.map((t, idx) => ({
-    index: idx,
-    language: t.language?.trim() || "unknown",
-    codec: t.codec,
-    forced: t.forced,
-    hearing_impaired: t.hearing_impaired,
-    source: t.external ? "external" : "embedded",
-    label:
-      t.title?.trim() ||
-      t.embedded_title?.trim() ||
-      t.file_name?.trim() ||
-      t.language?.trim() ||
-      `Subtitle ${idx + 1}`,
-  }));
+  // Shared ordinal derivation so the carried index names the same track the
+  // server publishes in the target version's inventory; see subtitleInventory.ts.
+  const candidates = buildPublishedSubtitleTracks(targetVersion.subtitle_tracks);
   const match = matchSubtitleTrackAcrossVersions(candidates, outgoingTrack);
   return match?.index ?? null;
 }
@@ -975,14 +961,14 @@ export function usePlaybackSession(
         let decisionToAdopt = decision;
         let initialSubtitleFailure: PlaybackSessionErrorState | null = null;
         const targetVersion = versions.find((v) => v.file_id === selectedFileId);
-        const orderedTargetTracks = targetVersion?.subtitle_tracks
-          ? [
-              ...targetVersion.subtitle_tracks.filter((t) => t.external),
-              ...targetVersion.subtitle_tracks.filter((t) => !t.external),
-            ]
-          : [];
+        // Shared ordinal derivation; `targetSubtitleIndex` is the server's
+        // published index, so look it up on the same mapping. See
+        // subtitleInventory.ts.
+        const targetTracks = buildPublishedSubtitleTracks(targetVersion?.subtitle_tracks);
         const requestedTrack =
-          targetSubtitleIndex !== undefined ? orderedTargetTracks[targetSubtitleIndex] : undefined;
+          targetSubtitleIndex !== undefined
+            ? targetTracks.find((track) => track.index === targetSubtitleIndex)
+            : undefined;
         const requestedIsBitmap = requestedTrack?.codec
           ? isBitmapCodec(requestedTrack.codec)
           : false;
