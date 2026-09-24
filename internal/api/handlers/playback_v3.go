@@ -1885,7 +1885,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		}
 	}
 	if req.AudioTrackID == "" && req.AudioTrackIndex == nil {
-		audioIndex, virtualDecision.preferredAudioLanguage, err = h.preferredAudioTrackIndexV3(r.Context(), userID, profileID, deviceID, requestedFile, playback.AudioTrackPlayableFuncV3(req))
+		audioIndex, virtualDecision.preferredAudioLanguage, err = h.preferredAudioTrackIndexV3(r.Context(), userID, profileID, deviceID, requestedFile)
 		if err != nil {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the saved audio preference")
 		}
@@ -4253,7 +4253,7 @@ func (h *PlaybackHandler) multipartResumeFileV3(ctx context.Context, file *model
 //
 // The client sends a track identity only when the viewer picked one. Defaulting
 // to ordinal zero instead would silently play the first track on the reel.
-func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID int, profileID, deviceID string, file *models.MediaFile, playable func(models.AudioTrack) bool) (int, string, error) {
+func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID int, profileID, deviceID string, file *models.MediaFile) (int, string, error) {
 	if file == nil || len(file.AudioTracks) == 0 || h.StoreProvider == nil {
 		return 0, "", nil
 	}
@@ -4305,7 +4305,7 @@ func (h *PlaybackHandler) preferredAudioTrackIndexV3(ctx context.Context, userID
 		// settings own the language and its scope precedence.
 		seriesPref.AudioLanguage = preferredLang
 	}
-	return normalizeAudioTrackIndex(file, playback.SelectAudioTrackPreferringPlayable(file.AudioTracks, preferredLang, seriesPref, playable)), preferredLang, nil
+	return normalizeAudioTrackIndex(file, playback.SelectAudioTrack(file.AudioTracks, preferredLang, seriesPref)), preferredLang, nil
 }
 
 // resumePositionV3 answers what an omitted `start_position` means: resume where
