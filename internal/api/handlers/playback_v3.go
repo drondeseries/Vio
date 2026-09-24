@@ -101,6 +101,9 @@ const (
 	// sourceDecodeFailedReasonV3, shared by the start terminal and the replan
 	// paths so they cannot drift.
 	sourceDecodeFailedMessageV3 = "The selected media source could not be decoded."
+	// transportStartupReadyV3 is the "outcome" of a transport startup whose
+	// first manifest became ready.
+	transportStartupReadyV3 = "ready"
 	// Failed capability fetches are memoized briefly so an unreachable node
 	// costs one timeout per window instead of one per planning request.
 	v3NodeCapabilityErrorTTL = 15 * time.Second
@@ -4445,9 +4448,59 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 		"spawn_ms", spawnFinishedAt.Sub(startedAt).Milliseconds(),
 		"manifest_wait_ms", time.Since(spawnFinishedAt).Milliseconds(),
 		"total_ms", time.Since(startedAt).Milliseconds(),
-		"outcome", "ready",
+		"outcome", transportStartupReadyV3,
 	)
 	return ts, nil
+}
+
+// newAutoTranscodePipelineV3 prepares the hw_accel=auto fallback order for a
+// local start. The pipeline is disabled for every other request.
+func (h *PlaybackHandler) newAutoTranscodePipelineV3(ctx context.Context, opts playback.TranscodeOpts) *playback.AutoTranscodePipeline {
+	if h.autoTranscodePipelineV3 != nil {
+		return h.autoTranscodePipelineV3(ctx, opts)
+	}
+	return playback.NewAutoTranscodePipeline(ctx, opts)
+}
+
+// startReadyAutoLocalPlaybackTransportV3 walks an enabled hw_accel=auto
+// pipeline until one path produces its first manifest. Failed attempts are
+// closed by the pipeline loop, so the failure carries the same cleanup
+// guarantee as startReadyLocalPlaybackTransportV3.
+func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Context, pipeline *playback.AutoTranscodePipeline) (*playback.TranscodeSession, *localTransportStartupFailureV3) {
+	startedAt := time.Now()
+	attempts := 0
+	ts, err := playback.StartReadyTranscode(ctx, pipeline, playback.TranscodeStartup{
+		Start: func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			attempts++
+			return h.startLocalPlaybackTransport(ctx, opts)
+		},
+	})
+	outcome := transportStartupReadyV3
+	var failure *localTransportStartupFailureV3
+	var startupErr *playback.TranscodeStartupError
+	switch {
+	case err == nil:
+	case errors.As(err, &startupErr):
+		outcome = "readiness_failed"
+		failure = &localTransportStartupFailureV3{
+			cause:        startupErr.Err,
+			wasRunning:   startupErr.WasRunning,
+			failedDevice: startupErr.FailedDevice,
+		}
+	default:
+		outcome = "spawn_failed"
+		failure = &localTransportStartupFailureV3{cause: err, failedToStart: true}
+	}
+	slog.InfoContext(ctx, "playback transport startup timing",
+		logComponentKey, playbackLogValueV3,
+		requestIDLogKeyV3, chimw.GetReqID(ctx),
+		"transport", "local",
+		"session", pipeline.Current().SessionID,
+		"attempts", attempts,
+		"total_ms", time.Since(startedAt).Milliseconds(),
+		"outcome", outcome,
+	)
+	return ts, failure
 }
 
 // prepareLocalTransportV3 starts a local HLS generation for the selected plan.
@@ -4533,7 +4586,23 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 		opts.ToneMapFilter = playback.ResolveToneMapFilterV3(opts.ToneMapFilter, opts.ToneMapMode, opts.HWAccel, result.ToneMapVPPEnabled)
 	}
 	usedToneMapFallback := false
-	ts, startupFailure := h.startReadyLocalPlaybackTransportV3(r.Context(), opts)
+	var ts *playback.TranscodeSession
+	var startupFailure *localTransportStartupFailureV3
+	if autoPipeline := h.newAutoTranscodePipelineV3(r.Context(), opts); autoPipeline.Enabled() {
+		// hw_accel=auto walks GPU decode and encode, CPU decode with GPU
+		// encode, then software, so the legacy retry below never applies. An
+		// enabled pipeline never carries a tone-map recipe.
+		ts, startupFailure = h.startReadyAutoLocalPlaybackTransportV3(r.Context(), autoPipeline)
+		if startupFailure != nil {
+			unlock()
+			if startupFailure.failedToStart {
+				return preparedTransportV3{}, toneMapExecutionTransportErrorV3(startupFailure.cause, "Failed to start the playback transport.")
+			}
+			return preparedTransportV3{}, manifestStartupTransportErrorV3(startupFailure.wasRunning, startupFailure.cause)
+		}
+	} else {
+		ts, startupFailure = h.startReadyLocalPlaybackTransportV3(r.Context(), opts)
+	}
 	if startupFailure != nil && startupFailure.failedToStart {
 		if softwareOpts, eligible := h.softwareToneMapRetryOptsV3(r.Context(), opts, result.FrozenSourceMetadata != nil); eligible {
 			slog.WarnContext(r.Context(), "hardware tone-map failed to start; retrying once in software",
@@ -4797,7 +4866,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	}
 	remoteStartAt := time.Now()
 	nodeResp, status, err := h.startRemotePlaybackTransport(r.Context(), node.URL, req)
-	remoteOutcome := "ready"
+	remoteOutcome := transportStartupReadyV3
 	if err != nil || status != http.StatusAccepted {
 		remoteOutcome = playbackRemoteOutcomeFailedV3
 	}
@@ -4966,13 +5035,15 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 // remote transcode. It is what a proxy relays from (grant) or a client carries
 // (signed token), and what a restarted node reconstructs from, so it must
 // reflect the parameters the node accepted rather than the ones requested: the
-// node reports the hardware acceleration it actually used.
+// node reports the hardware acceleration it actually used, and whether it
+// decoded video on the CPU. Software decode is the request's value OR the
+// node's, so an older node that omits the field keeps the requested value.
 //
 // toneMapFilter is the resolved FFmpeg filter for the confirmed executor; it is
 // not part of the node's request/response contract, so the caller supplies it.
 func remoteTranscodeRecipeCardV3(session *playback.Session, file *models.MediaFile, nodeURL, transportID string, req transcodenode.TranscodeStartRequest, nodeResp transcodenode.TranscodeStartResponse, toneMapFilter string) playback.RecipeCard {
 	hw := firstNonEmptyHandlerV3(strings.TrimSpace(nodeResp.HWAccel), strings.TrimSpace(req.HWAccel))
-	card := playback.NewRecipeCard(session.UserID, session.ProfileID, file.ID, nodeURL, playback.TranscodeOpts{InputPath: req.InputPath, SessionID: session.ID, TranscodeTransportID: transportID, SourceVideoCodec: req.SourceVideoCodec, SourceVideoProfile: req.SourceVideoProfile, SourceVideoBitDepth: req.SourceVideoBitDepth, SourceAudioChannels: req.SourceAudioChannels, SourceFrameRate: req.SourceFrameRate, SourceHeight: req.SourceHeight, SoftwareVideoDecode: req.SoftwareVideoDecode, ToneMapPolicy: req.ToneMapPolicy, ToneMapMode: req.ToneMapMode, ToneMapSourceKind: req.ToneMapSourceKind, ToneMapFilter: toneMapFilter, ToneMapRecipeVersion: req.ToneMapRecipeVersion, ToneMapPreflightRequired: req.ToneMapPreflightRequired, ToneMapSourceRevision: req.ToneMapSourceRevision, VideoBitstreamFilter: req.VideoBitstreamFilter, VideoSampleEntry: req.VideoSampleEntry, SeekSeconds: req.SeekSeconds, StreamOriginSeconds: req.StreamOriginSeconds, CopySeekAnchorResolved: req.CopySeekAnchorResolved, StartSegmentNumber: req.StartSegmentNumber, TargetResolution: req.TargetResolution, TargetCodecVideo: req.TargetCodecVideo, TargetCodecAudio: req.TargetCodecAudio, TargetAudioChannels: req.TargetAudioChannels, TargetAudioBitrateKbps: req.TargetAudioBitrateKbps, TargetBitrateKbps: req.TargetBitrateKbps, SegmentDuration: req.SegmentDuration, HWAccel: hw, AudioTrackIndex: req.AudioTrackIndex, SubtitleTrackIndex: req.SubtitleTrackIndex, SubtitleBurnIn: req.SubtitleBurnIn, SubtitleCodec: req.SubtitleCodec, TotalDuration: req.TotalDuration, ThrottleSeconds: req.ThrottleSeconds})
+	card := playback.NewRecipeCard(session.UserID, session.ProfileID, file.ID, nodeURL, playback.TranscodeOpts{InputPath: req.InputPath, SessionID: session.ID, TranscodeTransportID: transportID, SourceVideoCodec: req.SourceVideoCodec, SourceVideoProfile: req.SourceVideoProfile, SourceVideoBitDepth: req.SourceVideoBitDepth, SourceAudioChannels: req.SourceAudioChannels, SourceFrameRate: req.SourceFrameRate, SourceHeight: req.SourceHeight, SoftwareVideoDecode: req.SoftwareVideoDecode || nodeResp.SoftwareVideoDecode, ToneMapPolicy: req.ToneMapPolicy, ToneMapMode: req.ToneMapMode, ToneMapSourceKind: req.ToneMapSourceKind, ToneMapFilter: toneMapFilter, ToneMapRecipeVersion: req.ToneMapRecipeVersion, ToneMapPreflightRequired: req.ToneMapPreflightRequired, ToneMapSourceRevision: req.ToneMapSourceRevision, VideoBitstreamFilter: req.VideoBitstreamFilter, VideoSampleEntry: req.VideoSampleEntry, SeekSeconds: req.SeekSeconds, StreamOriginSeconds: req.StreamOriginSeconds, CopySeekAnchorResolved: req.CopySeekAnchorResolved, StartSegmentNumber: req.StartSegmentNumber, TargetResolution: req.TargetResolution, TargetCodecVideo: req.TargetCodecVideo, TargetCodecAudio: req.TargetCodecAudio, TargetAudioChannels: req.TargetAudioChannels, TargetAudioBitrateKbps: req.TargetAudioBitrateKbps, TargetBitrateKbps: req.TargetBitrateKbps, SegmentDuration: req.SegmentDuration, HWAccel: hw, AudioTrackIndex: req.AudioTrackIndex, SubtitleTrackIndex: req.SubtitleTrackIndex, SubtitleBurnIn: req.SubtitleBurnIn, SubtitleCodec: req.SubtitleCodec, TotalDuration: req.TotalDuration, ThrottleSeconds: req.ThrottleSeconds})
 	card.ToneMapDVConfigPresent = req.ToneMapDVConfigPresent
 	card.ToneMapDVBLCompatIDPresent = req.ToneMapDVBLCompatIDPresent
 	card.ToneMapDVBLPresent = req.ToneMapDVBLPresent

@@ -520,6 +520,9 @@ type PlaybackHandler struct {
 	// retrying the same candidate after a transient provider (upstream 5xx)
 	// anchor failure. Nil uses the real timer wait.
 	copySeekAnchorBackoff func(ctx context.Context, d time.Duration) bool
+	// autoTranscodePipelineV3 is a test seam for the hw_accel=auto fallback
+	// pipeline; nil uses playback.NewAutoTranscodePipeline.
+	autoTranscodePipelineV3 func(context.Context, playback.TranscodeOpts) *playback.AutoTranscodePipeline
 	// beforeIdentityLifecycleLockV3 is a test seam for proving that identity
 	// route authority remains unpublished until the shared lifecycle boundary.
 	beforeIdentityLifecycleLockV3 func()

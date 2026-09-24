@@ -647,6 +647,11 @@ func (h *PlaybackHandler) remotePlaybackTransportTimeout(nodeURL string, request
 		SubtitleTrackIndex: request.SubtitleTrackIndex,
 	})
 	if request.ToneMapMode == "" {
+		if request.RequireReady && remoteAutoFallbackPossibleV3(request) {
+			// The node answers only after its first manifest, which under
+			// hw_accel=auto can follow an early exit on each safer path.
+			return transcodenode.TranscodeStartReadyMaxDuration + 5*time.Second
+		}
 		return readinessBudget + 5*time.Second
 	}
 	timeout := h.remoteToneMapProbeTimeoutV3(nodeURL) + readinessBudget
@@ -657,6 +662,15 @@ func (h *PlaybackHandler) remotePlaybackTransportTimeout(nodeURL string, request
 		timeout += readinessBudget
 	}
 	return timeout
+}
+
+// remoteAutoFallbackPossibleV3 reports whether a node may walk the hw_accel=auto
+// fallback for this start: a video transcode dispatched as auto. The node
+// resolves auto against its live hardware, so the budget follows the request
+// rather than a stored capability report that may be missing or stale.
+func remoteAutoFallbackPossibleV3(request transcodenode.TranscodeStartRequest) bool {
+	return strings.EqualFold(strings.TrimSpace(request.HWAccel), "auto") &&
+		!strings.EqualFold(strings.TrimSpace(request.TargetCodecVideo), "copy")
 }
 
 func fetchRemoteTranscodeCapabilities(ctx context.Context, nodeURL, jwtSecret string) (playback.HWAccelInfo, error) {
