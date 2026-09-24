@@ -7037,9 +7037,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// degrade an exact selection to a best-match lookup — e.g. moving a
 			// listener from an eng/ac3 commentary track to the identically-shaped
 			// main track on a quality change. A same-row candidate rotation keeps
-			// the id but replaces the tracks, so the comparison is an inventory
-			// fingerprint, not id equality.
-			if !sameMediaInventoryV3(remapSource, effectiveFile) {
+			// the id but replaces the tracks, so the guard is the union of an id
+			// change (a real edition switch, which always remaps) and an
+			// inventory fingerprint change under a fixed id.
+			if currentEffectiveFile.ID != effectiveFile.ID || !sameMediaInventoryV3(remapSource, effectiveFile) {
 				candidateStart := start
 				remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
 				if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
