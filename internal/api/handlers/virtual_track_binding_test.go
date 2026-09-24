@@ -213,6 +213,56 @@ func TestReplanRemapSourceIgnoresEvidenceForLocalFile(t *testing.T) {
 		t.Fatalf("local file remapped from virtual evidence: %+v", got.AudioTracks)
 	}
 }
+
+// A recorded rotation (binding moved, revision cleared until a plan re-probes)
+// must force a remap even when the reloaded row's inventory compares equal to
+// the plan-time evidence.
+func TestVirtualCandidateRotationRecordedDetectsRecordedMove(t *testing.T) {
+	uri := "virtual://movie/tt-row?result=candidate-b"
+	// The reloaded row's tracks happen to look identical to the plan-time ones.
+	tracks := []models.AudioTrack{{Codec: "aac", Language: "eng", Channels: 2}}
+	row := &models.MediaFile{ID: 7, FilePath: uri, AudioTracks: tracks}
+	session := &playback.Session{
+		VirtualSourceURI:           uri,
+		VirtualSourceRevision:      "", // a binding move cleared it
+		VirtualSubtitleEvidenceSet: true,
+		VirtualSubtitleEvidenceURI: "virtual://movie/tt-row?result=candidate-a",
+		VirtualAudioTracks:         append([]models.AudioTrack(nil), tracks...),
+	}
+	if !virtualCandidateRotationRecordedV3(session, row) {
+		t.Fatal("a recorded candidate move was not detected")
+	}
+
+	// Once the planner re-probes, the revision is set and the guard stops firing.
+	session.VirtualSourceRevision = "rev-b"
+	session.VirtualSubtitleEvidenceURI = uri
+	if virtualCandidateRotationRecordedV3(session, row) {
+		t.Fatal("a re-probed candidate was still treated as a recorded rotation")
+	}
+
+	// A non-virtual effective file has no candidate rotation to record.
+	local := &models.MediaFile{ID: 7, FilePath: "/media/local.mkv"}
+	if virtualCandidateRotationRecordedV3(session, local) {
+		t.Fatal("a local file reported a virtual candidate rotation")
+	}
+}
+
+// A replan that merely re-plans the same candidate (evidence anchored at the
+// bound file, revision set) does not force a remap.
+func TestVirtualCandidateRotationRecordedIgnoresSameCandidate(t *testing.T) {
+	uri := "virtual://movie/tt-row?result=candidate-a"
+	row := &models.MediaFile{ID: 7, FilePath: uri}
+	session := &playback.Session{
+		VirtualSourceURI:           uri,
+		VirtualSourceRevision:      "rev-a",
+		VirtualSubtitleEvidenceSet: true,
+		VirtualSubtitleEvidenceURI: uri,
+	}
+	if virtualCandidateRotationRecordedV3(session, row) {
+		t.Fatal("an unchanged candidate was treated as a recorded rotation")
+	}
+}
+
 func TestRemapSubtitleSelectionSameRowUnchangedIsNoop(t *testing.T) {
 	tracks := []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "fra"}}
 	source := &models.MediaFile{ID: 7, SubtitleTracks: tracks}
