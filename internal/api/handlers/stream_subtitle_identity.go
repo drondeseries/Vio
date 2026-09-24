@@ -106,12 +106,17 @@ func (h *StreamHandler) resolveSubtitleEditionSwitch(
 }
 
 // resolveSubtitleSourceRequest resolves the media file and combined ordinal a
-// subtitle request serves from. It first handles an edition switch: when the
-// request names the session's requested (old) edition while a different
-// effective file is playing, the ordinal is re-mapped onto the effective
-// inventory (see resolveSubtitleEditionSwitch). Otherwise it binds the
-// session's planned virtual candidate and resolves any pinned identity against
-// the bound file.
+// subtitle request serves from. It first binds the session's planned virtual
+// candidate, then handles two ordinal-space mismatches:
+//
+//   - After an edition switch the session's effective file differs from the
+//     requested edition. A request naming the requested (old) edition must not
+//     interpret its ordinal against that stale inventory.
+//   - After a provider candidate rotation the catalog row was re-probed in
+//     place (same id, different release). The bound file is the new candidate,
+//     but the request's ordinal was minted against the plan-time evidence the
+//     session carried. The ordinal must be re-mapped from that evidence onto
+//     the bound file rather than interpreted against the new inventory.
 func (h *StreamHandler) resolveSubtitleSourceRequest(
 	ctx context.Context,
 	namedFile *models.MediaFile,
@@ -137,12 +142,49 @@ func (h *StreamHandler) resolveSubtitleSourceRequest(
 		}
 		return resolvedFile, resolvedIndex, nil
 	}
-	file := bindSessionVirtualSourceWithTracks(ctx, namedFile, session, h.fileResolver)
-	resolvedIndex, err := subtitleRouteIndex(file, index, query)
+
+	bound := bindSessionVirtualSourceWithTracks(ctx, namedFile, session, h.fileResolver)
+	// A virtual session whose carried evidence names a different candidate than
+	// the bound file: the request's ordinal (and any container-index pin) was
+	// minted against that evidence's inventory. Resolve it there first, then
+	// translate the evidence-local ordinal onto the bound release by
+	// language/class instead of serving the bound release at a stale ordinal.
+	if isVirtualPlaybackFile(bound) && session.VirtualSubtitleEvidenceSet &&
+		!virtualEvidenceMatchesBoundFile(bound, session) {
+		if evidence := virtualEvidenceFileV3(bound, session); evidence != nil {
+			evidenceIndex, evidenceErr := subtitleRouteIndex(evidence, index, query)
+			if evidenceErr != nil {
+				return nil, 0, evidenceErr
+			}
+			resolvedFile, resolvedIndex, switchErr := h.resolveSubtitleEditionSwitch(ctx, evidence, bound, evidenceIndex, nil)
+			if switchErr != nil {
+				return nil, 0, switchErr
+			}
+			return resolvedFile, resolvedIndex, nil
+		}
+	}
+	resolvedIndex, err := subtitleRouteIndex(bound, index, query)
 	if err != nil {
 		return nil, 0, err
 	}
-	return file, resolvedIndex, nil
+	return bound, resolvedIndex, nil
+}
+
+// virtualEvidenceFileV3 builds the file whose inventory the session's carried
+// subtitle evidence describes, sharing the bound file's identity/path. It is
+// the remap source for a rotated candidate; nil when no evidence is carried.
+func virtualEvidenceFileV3(bound *models.MediaFile, session *playback.Session) *models.MediaFile {
+	if bound == nil || session == nil || !session.VirtualSubtitleEvidenceSet {
+		return nil
+	}
+	if len(session.VirtualSubtitleTracks) == 0 && len(session.VirtualExternalSubtitles) == 0 {
+		return nil
+	}
+	evidence := *bound
+	evidence.SubtitleTracks = session.VirtualSubtitleTracks
+	evidence.ExternalSubtitles = session.VirtualExternalSubtitles
+	evidence.AudioTracks = session.VirtualAudioTracks
+	return &evidence
 }
 
 // hasSubtitleIdentityPin reports whether the request carries one of the stable

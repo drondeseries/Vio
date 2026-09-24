@@ -92,14 +92,15 @@ func TestVirtualProdSequenceServesRotatedCandidateInventory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read ffmpeg args: %v", err)
 	}
-	// Candidate B's ordinal 0 is the English subrip track at container index 4.
-	// The old release's carried layout put French at ordinal 0 (index 1), which
-	// is what the bug served.
-	if !strings.Contains(string(args), "-map 0:s:0") {
-		t.Fatalf("extraction did not map the rotated candidate's ordinal 0: %s", args)
+	// The carried ordinal 0 named the French track in candidate A. Candidate B
+	// carries French at ordinal 1 (container index 7), so the request must be
+	// remapped to that track — never served at the stale ordinal 0, which in B
+	// is a different language (English at container index 4).
+	if !strings.Contains(string(args), "-map 0:s:1") {
+		t.Fatalf("extraction did not remap the French selection onto the rotated candidate: %s", args)
 	}
-	if strings.Contains(string(args), "0:s:1") {
-		t.Fatalf("extraction mapped a stale ordinal from the previous release: %s", args)
+	if strings.Contains(string(args), "-map 0:s:0") {
+		t.Fatalf("extraction served the stale ordinal against the rotated candidate: %s", args)
 	}
 }
 
