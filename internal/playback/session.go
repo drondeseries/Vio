@@ -1196,7 +1196,6 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 	if state.VirtualSourceOwnershipSet || state.VirtualSourceSet {
 		s.VirtualSourceURI = state.VirtualSourceURI
 		s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
-		s.VirtualSourceRevision = state.VirtualSourceRevision
 		if state.VirtualSubtitleEvidenceSet {
 			s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
 			s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
@@ -1204,16 +1203,20 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
 			s.VirtualSubtitleEvidenceSet = true
 		} else if state.VirtualSourceOwnershipSet {
-			// A full v3 snapshot owns the evidence outright. When the new
-			// effective file is not virtual (or the caller carries no
-			// evidence), stale evidence from the previous candidate must be
+			// A full v3 snapshot owns the binding and its evidence outright.
+			// When the new effective file is not virtual (or the caller carries
+			// no evidence), stale evidence from the previous candidate must be
 			// cleared or the serve path would keep applying another release's
-			// subtitle inventory.
+			// subtitle inventory. Legacy partial updates only ever overwrite
+			// when they carry evidence, so they keep their historical shape.
 			s.VirtualSubtitleTracks = nil
 			s.VirtualExternalSubtitles = nil
 			s.VirtualAudioTracks = nil
 			s.VirtualSubtitleEvidenceURI = ""
 			s.VirtualSubtitleEvidenceSet = false
+		}
+		if state.VirtualSourceOwnershipSet {
+			s.VirtualSourceRevision = state.VirtualSourceRevision
 		}
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex

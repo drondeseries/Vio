@@ -1820,7 +1820,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			// turn the validated artifact into an unvalidated source extract.
 			opts.PinnedTextArtifact = &artifact
 		} else {
-			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts)
+			proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
 			if !proceed {
 				writeSubtitleSourceChanged(w)
 				return
@@ -1867,7 +1867,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// pin, validate the live layout, and retry rather than stream an
 		// unvalidated source extract.
 		opts.PinnedTextArtifact = nil
-		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts)
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
 		if !proceed {
 			writeSubtitleSourceChanged(w)
 			return
@@ -1910,7 +1910,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		// relay URL once — no second resolve — and re-map; a source that still
 		// cannot satisfy the requested representation gets a clean retryable 4xx
 		// instead of a 500.
-		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts)
+		proceed, probeErr := h.verifyVirtualSubtitleLayout(r.Context(), track, file.SubtitleTracks, &opts)
 		if !proceed {
 			writeSubtitleSourceChanged(w)
 			return
@@ -2186,20 +2186,21 @@ func implicitVirtualWindowStart(session *playback.Session) float64 {
 }
 
 // verifyVirtualSubtitleLayout probes the live relay input once and, when its
-// subtitle layout drifted from the plan-time evidence this session captured,
-// re-maps the extract options onto a same-class live track. It reports whether
-// extraction may proceed, plus the probe error when the probe itself could not
-// run. proceed=false means a successful probe positively found that the live
-// source cannot satisfy the requested representation — rotation to a different
-// subtitle class, or an ambiguous or absent match — and the caller must answer
-// with a clean retryable 4xx before ffmpeg spawns or headers commit. A non-nil
-// probeErr means the live layout could not be established: the caller must fail
-// closed for every codec, because serving the plan ordinal unverified can emit
-// the wrong release's track and a same-ordinal rotation never trips the
-// post-spawn map net. Virtual inputs are request-local probe state; the
-// session's published evidence is never rewritten.
-func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, session *playback.Session, opts *playback.StreamExtractOpts) (bool, error) {
-	if session == nil || opts == nil || strings.TrimSpace(opts.InputPath) == "" {
+// subtitle layout drifted from the layout this request's ordinal was resolved
+// against (expected), re-maps the extract options onto a same-class live track.
+// It reports whether extraction may proceed, plus the probe error when the
+// probe itself could not run. proceed=false means a successful probe positively
+// found that the live source cannot satisfy the requested representation —
+// rotation to a different subtitle class, or an ambiguous or absent match — and
+// the caller must answer with a clean retryable 4xx before ffmpeg spawns or
+// headers commit. A non-nil probeErr means the live layout could not be
+// established: the caller must fail closed for every codec, because serving the
+// plan ordinal unverified can emit the wrong release's track and a
+// same-ordinal rotation never trips the post-spawn map net. Virtual inputs are
+// request-local probe state; the session's published evidence is never
+// rewritten.
+func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, expected []models.SubtitleTrack, opts *playback.StreamExtractOpts) (bool, error) {
+	if opts == nil || strings.TrimSpace(opts.InputPath) == "" {
 		return true, nil
 	}
 	liveTracks, err := playback.ProbeSubtitleLayout(ctx, h.ffmpegPath(), opts.InputPath)
@@ -2216,10 +2217,9 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 			"error", err)
 		return true, err
 	}
-	if playback.SubtitleLayoutsEqual(liveTracks, session.VirtualSubtitleTracks) {
-		// The pinned release is unchanged — the catalog row was re-probed
-		// against a different candidate. The plan ordinal already names the
-		// live layout.
+	if playback.SubtitleLayoutsEqual(liveTracks, expected) {
+		// The release the ordinal was resolved against is unchanged. The plan
+		// ordinal already names the live layout.
 		return true, nil
 	}
 	liveOrdinal, liveTrack, matched := playback.MatchEmbeddedSubtitleTrack(requestedTrack, liveTracks)

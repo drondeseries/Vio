@@ -1827,7 +1827,7 @@ func TestVerifyVirtualSubtitleLayoutProbeFailureFailsClosed(t *testing.T) {
 			}
 			requested := models.SubtitleTrack{Index: 3, Codec: codec}
 
-			proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts)
+			proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session.VirtualSubtitleTracks, opts)
 			if !proceed {
 				t.Fatal("a probe failure is not a positive mismatch; proceed is reported so the caller can fail closed")
 			}
@@ -1857,7 +1857,7 @@ func TestVerifyVirtualSubtitleLayoutPositiveMismatchForcesReplan(t *testing.T) {
 	}
 	requested := models.SubtitleTrack{Index: 0, Codec: "ass", Language: "eng"}
 
-	proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session, opts)
+	proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session.VirtualSubtitleTracks, opts)
 	if proceed || probeErr != nil {
 		t.Fatal("a positively different live layout must force a 409 replan")
 	}
