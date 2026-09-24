@@ -59,7 +59,13 @@ const AUTOMATION_KEYS = [
   "virtual_library.altmount_check_minutes",
 ];
 
-const ALL_KEYS = [...PROVIDER_KEYS, ...NETWORK_KEYS, ...LIBRARY_KEYS, ...QUALITY_KEYS, ...AUTOMATION_KEYS];
+const ALL_KEYS = [
+  ...PROVIDER_KEYS,
+  ...NETWORK_KEYS,
+  ...LIBRARY_KEYS,
+  ...QUALITY_KEYS,
+  ...AUTOMATION_KEYS,
+];
 
 /** Feedback shown under the Prowlarr URL field. */
 export interface ProwlarrURLFeedback {
@@ -307,10 +313,9 @@ export default function StreamingSettings() {
               <div className="text-[13px] leading-relaxed">
                 <p className="font-medium text-amber-500">Private network access</p>
                 <p className="text-muted-foreground mt-1">
-                  When enabled, virtual-stream playback may contact non-public addresses
-                  including localhost and link-local services. A compromised provider can
-                  cause Silo to request internal services. TLS certificate checks remain
-                  enabled.
+                  When enabled, virtual-stream playback may contact non-public addresses including
+                  localhost and link-local services. A compromised provider can cause Silo to
+                  request internal services. TLS certificate checks remain enabled.
                 </p>
               </div>
             </div>

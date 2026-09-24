@@ -217,9 +217,7 @@ export function StreamingStep() {
               type="toggle"
               description="Lets virtual-stream playback contact non-public addresses (localhost, LAN, link-local)."
               value={
-                form.getValue("virtual_library.allow_private_streams") === "true"
-                  ? "true"
-                  : "false"
+                form.getValue("virtual_library.allow_private_streams") === "true" ? "true" : "false"
               }
               onChange={(v) => form.setValue("virtual_library.allow_private_streams", v)}
             />
@@ -229,10 +227,9 @@ export function StreamingStep() {
                 <div className="text-[13px] leading-relaxed">
                   <p className="font-medium text-amber-500">Private network access</p>
                   <p className="text-muted-foreground mt-1">
-                    When enabled, virtual-stream playback may contact non-public addresses
-                    including localhost and link-local services. A compromised provider can
-                    cause Silo to request internal services. TLS certificate checks remain
-                    enabled.
+                    When enabled, virtual-stream playback may contact non-public addresses including
+                    localhost and link-local services. A compromised provider can cause Silo to
+                    request internal services. TLS certificate checks remain enabled.
                   </p>
                 </div>
               </div>
