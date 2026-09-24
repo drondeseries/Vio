@@ -97,7 +97,7 @@ func main() {
 	slog.Info("backfill: loaded skipped roots", "folder_id", folderID, "count", len(skipped))
 
 	// Group by canonical root.
-	groups := GroupByCanonicalRoot(skipped, libraryType)
+	groups := GroupByCanonicalRoot(skipped, libraryType, folder.Paths...)
 	slog.Info("backfill: grouped into canonical roots", "group_count", len(groups))
 
 	var (
@@ -224,10 +224,12 @@ type CanonicalRootGroup struct {
 }
 
 // GroupByCanonicalRoot re-derives the canonical root for each skipped root
-// using the current naming rules and groups them. Skipped roots whose sample
-// file path cannot be resolved to a canonical root are placed under the
+// using the current naming rules and groups them. libraryRoots are the
+// library's configured roots; the root-aware parser needs them so directories
+// above the library are not read as part of media identity. Skipped roots whose
+// sample file path cannot be resolved to a canonical root are placed under the
 // skipped root path itself as a fallback.
-func GroupByCanonicalRoot(skipped []*models.SkippedMediaRoot, libraryType string) []CanonicalRootGroup {
+func GroupByCanonicalRoot(skipped []*models.SkippedMediaRoot, libraryType string, libraryRoots ...string) []CanonicalRootGroup {
 	type groupKey struct {
 		root     string
 		rootType string
@@ -247,7 +249,7 @@ func GroupByCanonicalRoot(skipped []*models.SkippedMediaRoot, libraryType string
 			probe = sr.RootPath + "/sample.mkv"
 		}
 
-		if cr, ok := naming.DetectCanonicalRoot(probe, libraryType); ok {
+		if cr, ok := naming.DetectCanonicalRoot(probe, libraryType, libraryRoots...); ok {
 			canonRoot = cr.RootPath
 			rootType = cr.Type
 		} else {
