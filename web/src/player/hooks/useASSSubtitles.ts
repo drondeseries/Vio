@@ -261,13 +261,13 @@ export function useASSSubtitles(
     // Infinity once the whole-track fallback is in use, so boundary refresh
     // never schedules.
     let usingWholeTrack = false;
-    let windowStart = Math.max(
+    const windowStart = Math.max(
       0,
       (video.readyState > 0 ? video.currentTime : 0) +
         sourceOriginRef.current -
         ASS_WINDOW_LEAD_SECONDS,
     );
-    let windowEnd = windowStart + ASS_WINDOW_DURATION_SECONDS;
+    const windowEnd = windowStart + ASS_WINDOW_DURATION_SECONDS;
     // Consecutive windowed failures since the last successful window, shared by
     // the initial load and boundary refreshes so the 3→1→terminal budget is one
     // finite policy. `terminal` latches after the whole-track fallback fails:

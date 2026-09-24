@@ -17,7 +17,7 @@ const (
 	RunStatusRunning   = "running"
 	RunStatusCompleted = "completed"
 	RunStatusFailed    = "failed"
-	RunStatusCancelled = "canceled"
+	RunStatusCancelled = "cancelled" //nolint:misspell // Postgres enum value and upstream canonical spelling.
 
 	KindMovie   = "movie"
 	KindSeries  = "series"
