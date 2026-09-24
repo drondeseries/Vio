@@ -61,9 +61,26 @@ type Session struct {
 	// inventories captured at plan time. A virtual catalog row is mutable
 	// (candidate rotation re-probes it), so the serve paths must extract from
 	// the same evidence the plan promised, not whatever the row holds now.
-	VirtualSubtitleTracks      []models.SubtitleTrack
-	VirtualExternalSubtitles   []models.ExternalSubtitle
+	VirtualSubtitleTracks    []models.SubtitleTrack
+	VirtualExternalSubtitles []models.ExternalSubtitle
+	// VirtualAudioTracks is the audio inventory captured alongside the
+	// subtitle evidence. A same-row rotation (same catalog row id, different
+	// underlying release) replaces the row's tracks without moving the row id,
+	// so the selection remap needs the plan-time audio inventory to compare
+	// against and remap from.
+	VirtualAudioTracks []models.AudioTrack
+	// VirtualSubtitleEvidenceURI names the provider-neutral candidate the
+	// evidence above was captured for. It is the provenance anchor: evidence
+	// may only be applied to a file bound to the same candidate, and a
+	// rotation must move or clear it together with the evidence.
+	VirtualSubtitleEvidenceURI string
 	VirtualSubtitleEvidenceSet bool
+	// VirtualSourceRevision is the opaque media-generation revision the planner
+	// published for this session's virtual candidate (PlanV3.VirtualSourceRevision).
+	// It changes on a candidate rotation even when the catalog row id and the
+	// provider-neutral effective URI stay fixed, so it is the rotation signal
+	// for the same-row case where a track inventory fingerprint is impractical.
+	VirtualSourceRevision string
 
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
 	// only a route (media requests must present an authenticated user) from
@@ -174,9 +191,21 @@ type SessionStreamState struct {
 	VirtualSourceURI                 string
 	VirtualSourceOwnerInstallationID int
 	VirtualSourceSet                 bool
-	VirtualSubtitleTracks            []models.SubtitleTrack
-	VirtualExternalSubtitles         []models.ExternalSubtitle
-	VirtualSubtitleEvidenceSet       bool
+	// VirtualSourceOwnershipSet marks a complete v3 stream snapshot that owns
+	// the virtual-source binding and its carried evidence outright. When set,
+	// the state application replaces the binding even for a non-virtual
+	// effective file (clearing evidence), instead of the legacy partial-update
+	// behavior that only ever overwrites.
+	VirtualSourceOwnershipSet bool
+	VirtualSourceRevision     string
+	VirtualSubtitleTracks     []models.SubtitleTrack
+	VirtualExternalSubtitles  []models.ExternalSubtitle
+	VirtualAudioTracks        []models.AudioTrack
+	// VirtualSubtitleEvidenceURI names the provider-neutral candidate the
+	// carried evidence belongs to. It is the provenance anchor for the serve
+	// path: evidence may only be applied to a file bound to the same candidate.
+	VirtualSubtitleEvidenceURI string
+	VirtualSubtitleEvidenceSet bool
 
 	// Byte-affecting transcode recipe fields preserved so an offloaded restart
 	// (e.g. audio switch) can rebuild the exact same stream. SubtitleTrackIndex
@@ -1164,13 +1193,27 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		s.RoutingEgressNodeID = state.RoutingEgressNodeID
 		s.RoutingEgressNodeURL = state.RoutingEgressNodeURL
 	}
-	if state.VirtualSourceSet {
+	if state.VirtualSourceOwnershipSet || state.VirtualSourceSet {
 		s.VirtualSourceURI = state.VirtualSourceURI
 		s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
+		s.VirtualSourceRevision = state.VirtualSourceRevision
 		if state.VirtualSubtitleEvidenceSet {
 			s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
 			s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
+			s.VirtualAudioTracks = state.VirtualAudioTracks
+			s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
 			s.VirtualSubtitleEvidenceSet = true
+		} else if state.VirtualSourceOwnershipSet {
+			// A full v3 snapshot owns the evidence outright. When the new
+			// effective file is not virtual (or the caller carries no
+			// evidence), stale evidence from the previous candidate must be
+			// cleared or the serve path would keep applying another release's
+			// subtitle inventory.
+			s.VirtualSubtitleTracks = nil
+			s.VirtualExternalSubtitles = nil
+			s.VirtualAudioTracks = nil
+			s.VirtualSubtitleEvidenceURI = ""
+			s.VirtualSubtitleEvidenceSet = false
 		}
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
@@ -1225,8 +1268,12 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		VirtualSourceURI:                 s.VirtualSourceURI,
 		VirtualSourceOwnerInstallationID: s.VirtualSourceOwnerInstallationID,
 		VirtualSourceSet:                 true,
+		VirtualSourceOwnershipSet:        true,
+		VirtualSourceRevision:            s.VirtualSourceRevision,
 		VirtualSubtitleTracks:            s.VirtualSubtitleTracks,
 		VirtualExternalSubtitles:         s.VirtualExternalSubtitles,
+		VirtualAudioTracks:               s.VirtualAudioTracks,
+		VirtualSubtitleEvidenceURI:       s.VirtualSubtitleEvidenceURI,
 		VirtualSubtitleEvidenceSet:       s.VirtualSubtitleEvidenceSet,
 		SubtitleTrackIndex:               s.SubtitleTrackIndex,
 		SubtitleBurnIn:                   s.SubtitleBurnIn,
@@ -1271,10 +1318,19 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.RequireMediaAuthorization = state.RequireMediaAuthorization
 	s.VirtualSourceURI = state.VirtualSourceURI
 	s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
+	s.VirtualSourceRevision = state.VirtualSourceRevision
 	if state.VirtualSubtitleEvidenceSet {
 		s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
 		s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
+		s.VirtualAudioTracks = state.VirtualAudioTracks
+		s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
 		s.VirtualSubtitleEvidenceSet = true
+	} else {
+		s.VirtualSubtitleTracks = nil
+		s.VirtualExternalSubtitles = nil
+		s.VirtualAudioTracks = nil
+		s.VirtualSubtitleEvidenceURI = ""
+		s.VirtualSubtitleEvidenceSet = false
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
@@ -1284,6 +1340,14 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 // SetVirtualSource binds a live session to the provider-neutral candidate that
 // was successfully resolved during planning. The caller must pass only the
 // canonical virtual URI; provider URLs are never retained in session state.
+//
+// A binding move is a candidate change: the carried subtitle evidence still
+// names the previous candidate's track layout, so it is deliberately left in
+// place but no longer matches the new binding. The serve path detects that
+// provenance mismatch, discards the evidence, and re-remaps against the live
+// layout instead of applying the stale inventory to the new release. The
+// planner overwrites the evidence through UpdateStreamState once it has probed
+// the new candidate.
 func (m *SessionManager) SetVirtualSource(sessionID, virtualURI string, ownerInstallationID int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1292,7 +1356,13 @@ func (m *SessionManager) SetVirtualSource(sessionID, virtualURI string, ownerIns
 	if !ok {
 		return ErrSessionNotFound
 	}
-	s.VirtualSourceURI = strings.TrimSpace(virtualURI)
+	trimmed := strings.TrimSpace(virtualURI)
+	if trimmed != strings.TrimSpace(s.VirtualSourceURI) {
+		// The evidence provenance anchor stays at the old candidate, which is
+		// what makes the mismatch detectable downstream.
+		s.VirtualSourceRevision = ""
+	}
+	s.VirtualSourceURI = trimmed
 	s.VirtualSourceOwnerInstallationID = ownerInstallationID
 	s.streamRevision++
 	m.touchSessionLocked(s)
