@@ -64,7 +64,7 @@ func TestVirtualProdSequenceServesRotatedCandidateInventory(t *testing.T) {
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	t.Cleanup(func() { _ = handler.RemoteStreamRelay.Close(context.Background()) })
 	t.Cleanup(handler.waitForBackgroundSubtitleWarms)
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 		return ResolvedVirtualMedia{URL: upstream.URL + "/video.mkv"}, nil
 	})
@@ -134,7 +134,7 @@ func TestVirtualProdSequenceFailsClosedWhenLayoutUnverifiable(t *testing.T) {
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	t.Cleanup(func() { _ = handler.RemoteStreamRelay.Close(context.Background()) })
 	t.Cleanup(handler.waitForBackgroundSubtitleWarms)
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 		return ResolvedVirtualMedia{URL: upstream.URL + "/video.mkv"}, nil
 	})

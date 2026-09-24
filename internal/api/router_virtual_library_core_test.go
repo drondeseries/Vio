@@ -34,9 +34,10 @@ func newCoreTestProvider(t *testing.T) (*httptest.Server, *virtuallibrary.Servic
 	t.Cleanup(mockServer.Close)
 
 	vlSvc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       mockServer.URL + "/manifest.json",
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         mockServer.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	if vlSvc == nil {
 		t.Fatal("expected non-nil virtuallibrary.Service")

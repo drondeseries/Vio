@@ -100,7 +100,7 @@ func TestAllowPrivateStreamsForProvenance(t *testing.T) {
 	if CoreVirtualPrivateStreamsAllowed(context.Background()) {
 		t.Fatal("nil CorePrivateStreamsAllowed must fail closed")
 	}
-	if CoreVirtualPrivateStreamsAllowed(nil) {
-		t.Fatal("nil ctx with nil callback must fail closed")
+	if CoreVirtualPrivateStreamsAllowed(context.TODO()) {
+		t.Fatal("TODO ctx with nil callback must fail closed")
 	}
 }
