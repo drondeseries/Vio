@@ -165,23 +165,26 @@ describes the effective sort rather than the (possibly empty) requested one.
 
 `GET /api/v2/collections/capabilities` (`getCollectionCapabilities`) returns a
 `CollectionCapabilities` document whose `sort_preference_kinds` lists the
-`collection_kind` values this server accepts, and `admin_item_materialize`:
+`collection_kind` values this server accepts:
 
 ```json
 {
-  "sort_preference_kinds": ["library", "user", "watchlist", "favorites"],
-  "admin_item_materialize": true
+  "sort_preference_kinds": ["library", "user", "watchlist", "favorites"]
 }
 ```
 
 Check it before saving a Watchlist or Favorites preference. The
 `collection_sort_preferences` boolean reports only that saved preferences exist at
 all, so it cannot be used to detect the personal-list kinds. When
-`sort_preference_kinds` is absent, assume `library` and `user` only.
-`admin_item_materialize` indicates support for
-`POST /api/v2/admin/collections/{id}/materialize/{item_id}` to repair or
-materialize virtual placeholder files for a collection item. The document supports
-`If-None-Match` and returns `304` when the caller's copy is current.
+`sort_preference_kinds` is absent, assume `library` and `user` only. The
+document supports `If-None-Match` and returns `304` when the caller's copy is
+current.
+
+Virtual-item materialization is a bridge-era admin repair path, not part of the
+v2 collections contract. It is advertised by `admin_item_materialize` on
+`GET /api/v1/collections/capabilities` and served by
+`POST /api/v1/admin/collections/{id}/materialize/{item_id}`. See
+[Admin item materialization](#admin-item-materialization).
 
 ## Library-scoped version lists
 
@@ -330,11 +333,11 @@ Redis failure returns `dependency_unavailable`. Restarting performs a new search
 
 ## Admin item materialization
 
-`POST /api/v2/admin/collections/{id}/materialize/{item_id}`
+`POST /api/v1/admin/collections/{id}/materialize/{item_id}`
 
-Requires administrator authentication. Idempotently establishes or repairs
-virtual playback files, profile variants, and released episodes for a
-collection item.
+This is a bridge-era admin repair path with no v2 port. Requires administrator
+authentication. Idempotently establishes or repairs virtual playback files,
+profile variants, and released episodes for a collection item.
 
 `files_created` and `files_existing` count distinct virtual file identities
 across the base item and released episode variants for this operation. A file
