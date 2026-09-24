@@ -8191,7 +8191,7 @@ func TestPrepareTransportV3VirtualRemuxResolvesCopyAnchorThroughRelay(t *testing
 	relay := remotestream.NewRelay()
 	defer func() { _ = relay.Close(context.Background()) }()
 	handler.RemoteStreamRelay = relay
-	handler.AllowInsecureVirtual = func(installationID int) bool { return installationID == 5 }
+	handler.AllowPrivateStreams = func(installationID int) bool { return installationID == 5 }
 	handler.VirtualMediaResolver = VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
 		return "http://provider.example/stream/virtual.mkv", nil
 	})

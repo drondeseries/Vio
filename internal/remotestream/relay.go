@@ -911,8 +911,9 @@ func (r *Relay) ProxyWithHeaders(w http.ResponseWriter, request *http.Request, s
 }
 
 // ProxyInsecure is like Proxy but skips the public-address DNS validation.
-// Use only when the admin has explicitly enabled allow_insecure_http for a
-// plugin — otherwise local and private IP stream URLs are rejected by Proxy.
+// Use only when the admin has explicitly enabled allow_private_streams for
+// core virtual streams — otherwise local and private IP stream URLs are
+// rejected by Proxy.
 func (r *Relay) ProxyInsecure(w http.ResponseWriter, request *http.Request, source string) error {
 	return r.ProxyInsecureWithHeaders(w, request, source, nil)
 }
@@ -935,7 +936,7 @@ func (r *Relay) ProxyInsecureWithHeaders(w http.ResponseWriter, request *http.Re
 
 // insecureHTTPClient lazily builds an HTTP client whose transport and redirect
 // handling allow private/local hosts. It is used only by ProxyInsecure, which
-// requires an explicit allow_insecure_http opt-in.
+// requires an explicit allow_private_streams opt-in.
 func (r *Relay) insecureHTTPClient() *http.Client {
 	r.mu.Lock()
 	defer r.mu.Unlock()

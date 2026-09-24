@@ -33,7 +33,7 @@ func newSafeTransport(resolver ipResolver, dialer contextDialer) *http.Transport
 
 // NewInsecureTransport returns a transport that pins the resolved IP of every
 // new connection without rejecting private, loopback, link-local, or reserved
-// addresses. It exists only so the allow_insecure_http admin opt-in can
+// addresses. It exists only so the allow_private_streams admin opt-in can
 // actually reach private-host stream URLs; every other path must use
 // NewSafeTransport.
 func NewInsecureTransport() *http.Transport {

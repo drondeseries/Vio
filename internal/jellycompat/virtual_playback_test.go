@@ -223,7 +223,7 @@ func TestServeVirtualDirectRoutesInsecureOptInThroughProxyInsecure(t *testing.T)
 	relay := &recordingCompatRelay{body: "media"}
 	h := &PlaybackHandler{
 		RemoteStreamRelay: relay,
-		AllowInsecureVirtual: func(installationID int) bool {
+		AllowPrivateStreams: func(installationID int) bool {
 			return installationID == 3
 		},
 		VirtualMediaResolver: VirtualMediaResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string) (string, error) {

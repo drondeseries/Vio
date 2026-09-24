@@ -149,15 +149,15 @@ func (h *StreamHandler) virtualStoredURLTrustWindow() time.Duration {
 	return h.VirtualCandidateTrustWindow()
 }
 
-// storedVirtualURLAllowInsecure evaluates the allow_insecure_http opt-in for a
-// row, mirroring the resolver's decision for provider URLs. virtual_library.
-// allow_insecure_http is a server-wide setting, so the owner only selects the
-// callback; a nil callback keeps the strict SSRF policy.
+// storedVirtualURLAllowInsecure evaluates the allow_private_streams opt-in for
+// a row, mirroring the resolver's decision for provider URLs. virtual_library.
+// allow_private_streams is a server-wide setting, so the owner only selects
+// the callback; a nil callback keeps the strict SSRF policy.
 func (h *PlaybackHandler) storedVirtualURLAllowInsecure(row *models.MediaFile, ownerInstallationID int) bool {
-	if h == nil || h.AllowInsecureVirtual == nil || row == nil {
+	if h == nil || h.AllowPrivateStreams == nil || row == nil {
 		return false
 	}
-	return h.AllowInsecureVirtual(effectiveVirtualOwner(row.VirtualOwnerInstallationID, ownerInstallationID))
+	return h.AllowPrivateStreams(effectiveVirtualOwner(row.VirtualOwnerInstallationID, ownerInstallationID))
 }
 
 // persistedVirtualIdentity snapshots a catalog row's durable provider identity
@@ -363,8 +363,8 @@ func (h *StreamHandler) lookupStoredVirtualURLCandidate(
 		return ResolvedVirtualMedia{}, nil, virtualStoredURLMissing
 	}
 	allowInsecure := false
-	if h.AllowInsecureVirtual != nil {
-		allowInsecure = h.AllowInsecureVirtual(effectiveVirtualOwner(row.VirtualOwnerInstallationID, ownerInstallationID))
+	if h.AllowPrivateStreams != nil {
+		allowInsecure = h.AllowPrivateStreams(effectiveVirtualOwner(row.VirtualOwnerInstallationID, ownerInstallationID))
 	}
 	usable, state := evaluateStoredVirtualURLCandidate(
 		ctx, candidateURI, row, allowInsecure, time.Now(), h.virtualStoredURLTrustWindow(),

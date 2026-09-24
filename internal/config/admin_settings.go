@@ -128,6 +128,7 @@ var adminSettingDefaults = map[string]string{
 	"virtual_library.series_library_id":           "2",
 	"virtual_library.tmdb_api_key":                "",
 	"virtual_library.allow_insecure_http":         "false",
+	"virtual_library.allow_private_streams":       "false",
 	"virtual_library.cache_ttl_minutes":           "10",
 	"virtual_library.candidate_store_hours":       "720",
 	"virtual_library.schedule_refresh_minutes":    "360",
@@ -414,6 +415,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		"s3.public_path_style", "s3.private_path_style", "s3.user_db_path_style",
 		"remuxdb.enabled", "remuxdb.submit_enabled",
 		"virtual_library.enabled", "virtual_library.allow_insecure_http",
+		"virtual_library.allow_private_streams",
 		"virtual_library.enable_quality_profiles",
 		"virtual_library.single_stream_with_failover",
 		"virtual_library.fallback_to_any_stream":

@@ -136,9 +136,13 @@ type Dependencies struct {
 	VirtualCandidateFileLookup     VirtualCandidateFileLookup
 	RemoteStreamRelay              RemoteStreamRelay
 	// AllowInsecureVirtual reports whether a plugin installation has explicitly
-	// enabled allow_insecure_http for private/local stream URLs. When nil or
-	// false, virtual streams use the strict SSRF-protected relay path.
+	// enabled allow_insecure_http for HTTP manifests on private/local hosts.
 	AllowInsecureVirtual func(installationID int) bool
+	// AllowPrivateStreams reports whether the core
+	// virtual_library.allow_private_streams opt-in permits virtual streams
+	// from private/local network destinations. When nil or false, virtual
+	// streams use the strict SSRF-protected relay path.
+	AllowPrivateStreams func(installationID int) bool
 
 	// Subtitle support (optional)
 	SubtitleRepo  subtitles.Repository // optional; downloaded subtitle support

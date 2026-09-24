@@ -552,7 +552,7 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	var relayURL string
 	var cleanup func()
 	effectiveOwner := effectiveVirtualOwner(res.OwnerID, ownerInstallationID)
-	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(effectiveOwner) {
+	if h.AllowPrivateStreams != nil && h.AllowPrivateStreams(effectiveOwner) {
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterInsecureWithHeaders(ctx, res.URL, res.RequestHeaders)
 	} else {
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterWithHeaders(ctx, res.URL, res.RequestHeaders)

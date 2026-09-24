@@ -34,9 +34,10 @@ func trustWindowProvider(t *testing.T) *httptest.Server {
 func trustWindowService(t *testing.T, manifestURL string) *virtuallibrary.Service {
 	t.Helper()
 	svc := virtuallibrary.New(virtuallibrary.Config{
-		Enabled:           true,
-		ManifestURL:       manifestURL,
-		AllowInsecureHTTP: true,
+		Enabled:             true,
+		ManifestURL:         manifestURL,
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
 	}, nil, nil)
 	if svc == nil {
 		t.Fatal("expected non-nil service")

@@ -72,7 +72,8 @@ type virtualVariantsCacheEntry struct {
 type VirtualPlaybackRouting struct {
 	OwnerInstallationID int
 	AllowFallback       bool
-	AllowInsecure       bool // skip SSRF validation when plugin allows local URLs
+	AllowInsecure       bool // allow HTTP manifests when plugin allows local URLs
+	AllowPrivateStreams bool // skip SSRF validation when core allows private stream destinations
 }
 
 // VirtualPlaybackVariant is a provider-neutral profile placeholder returned
@@ -192,7 +193,7 @@ type ResolvedVirtualStream struct {
 	// It is the runtime inheritance for a virtual file row whose stored owner
 	// is 0: the catalog treats owner 0 as "inherit from the parent item", and
 	// the provider that answers is that owner. Callers use it to make the
-	// allow_insecure_http decision for the provider that served the stream.
+	// allow_private_streams decision for the provider that served the stream.
 	OwnerID int
 }
 
@@ -298,11 +299,14 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 	if ownerID <= 0 {
 		ownerID = routing.OwnerInstallationID
 	}
-	if providerInstallationID > 0 && !routing.AllowInsecure {
-		// Only ever widen the opt-in with the serving provider's own config;
-		// an explicit caller opt-in (already computed for the owner) is never
-		// downgraded by a provider whose config cannot be read.
-		routing.AllowInsecure = s.InstallationAllowsInsecure(ctx, providerInstallationID)
+	if providerInstallationID > 0 && (!routing.AllowInsecure || !routing.AllowPrivateStreams) {
+		// Only ever widen the opt-ins with the serving provider's own
+		// config; an explicit caller opt-in (already computed for the owner)
+		// is never downgraded by a provider whose config cannot be read.
+		if insecure := s.InstallationAllowsInsecure(ctx, providerInstallationID); insecure {
+			routing.AllowInsecure = true
+			routing.AllowPrivateStreams = true
+		}
 	}
 	candidatesToTry := result.GetCandidates()
 	if selection.resultID != "" || selection.profile != "" {
@@ -320,7 +324,7 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 		raw := candidate.GetTemporaryUri()
 		var validated string
 		var validateErr error
-		if routing.AllowInsecure {
+		if routing.AllowPrivateStreams {
 			validated, validateErr = validateProviderStreamURLSyntax(raw)
 		} else {
 			validated, validateErr = validateProviderStreamURL(ctx, raw)
@@ -357,7 +361,7 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 			raw := candidate.GetTemporaryUri()
 			var validated string
 			var validateErr error
-			if routing.AllowInsecure {
+			if routing.AllowPrivateStreams {
 				validated, validateErr = validateProviderStreamURLSyntax(raw)
 			} else {
 				validated, validateErr = validateProviderStreamURL(ctx, raw)

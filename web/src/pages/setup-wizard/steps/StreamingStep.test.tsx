@@ -149,4 +149,29 @@ describe("StreamingStep", () => {
       });
     });
   });
+
+  it("renders both network permission toggles", () => {
+    render(<StreamingStep />);
+
+    expect(screen.getByLabelText("Allow HTTP for local manifests")).toBeInTheDocument();
+    expect(screen.getByLabelText("Allow private network streams")).toBeInTheDocument();
+  });
+
+  it("shows the private-network warning only when enabled", () => {
+    mockStep({ "virtual_library.allow_private_streams": "false" });
+    const { rerender } = render(<StreamingStep />);
+    expect(screen.queryByText("Private network access")).not.toBeInTheDocument();
+
+    mockStep({ "virtual_library.allow_private_streams": "true" });
+    rerender(<StreamingStep />);
+    expect(screen.getByText("Private network access")).toBeInTheDocument();
+  });
+
+  it("registers the private-streams key with the settings form", () => {
+    render(<StreamingStep />);
+
+    const opts = useSettingsFormMock.mock.calls[0]?.[0] as { keys: string[] };
+    expect(opts.keys).toContain("virtual_library.allow_insecure_http");
+    expect(opts.keys).toContain("virtual_library.allow_private_streams");
+  });
 });

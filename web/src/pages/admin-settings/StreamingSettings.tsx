@@ -1,7 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useMemo, useState } from "react";
 import { Link } from "react-router";
-import { ArrowRight, Loader2, Sparkles } from "lucide-react";
+import { AlertTriangle, ArrowRight, Loader2, Sparkles } from "lucide-react";
 
 import {
   ConnectionCheckAction,
@@ -24,9 +24,13 @@ const PROVIDER_KEYS = [
   "virtual_library.enabled",
   "virtual_library.manifest_url",
   "virtual_library.tmdb_api_key",
-  "virtual_library.allow_insecure_http",
   "virtual_library.cache_ttl_minutes",
   "virtual_library.candidate_store_hours",
+];
+
+const NETWORK_KEYS = [
+  "virtual_library.allow_insecure_http",
+  "virtual_library.allow_private_streams",
 ];
 
 const LIBRARY_KEYS = [
@@ -55,7 +59,13 @@ const AUTOMATION_KEYS = [
   "virtual_library.altmount_check_minutes",
 ];
 
-const ALL_KEYS = [...PROVIDER_KEYS, ...LIBRARY_KEYS, ...QUALITY_KEYS, ...AUTOMATION_KEYS];
+const ALL_KEYS = [
+  ...PROVIDER_KEYS,
+  ...NETWORK_KEYS,
+  ...LIBRARY_KEYS,
+  ...QUALITY_KEYS,
+  ...AUTOMATION_KEYS,
+];
 
 /** Feedback shown under the Prowlarr URL field. */
 export interface ProwlarrURLFeedback {
@@ -121,7 +131,10 @@ export default function StreamingSettings() {
   const createLibrary = useCreateLibrary();
   const [creatingLibs, setCreatingLibs] = useState(false);
 
-  const providerCheck = useConnectionCheck("virtual_library", form, PROVIDER_KEYS);
+  const providerCheck = useConnectionCheck("virtual_library", form, [
+    ...PROVIDER_KEYS,
+    "virtual_library.allow_insecure_http",
+  ]);
 
   const anyDirty = (keys: string[]) => keys.some((key) => form.isDirty(key));
 
@@ -254,14 +267,6 @@ export default function StreamingSettings() {
             restartRequired={restartKeys.has("virtual_library.tmdb_api_key")}
           />
           <SettingField
-            label="Allow local HTTP"
-            type="toggle"
-            description="Permit http:// manifests on localhost and private networks."
-            value={form.getValue("virtual_library.allow_insecure_http") || "false"}
-            onChange={(v) => form.setValue("virtual_library.allow_insecure_http", v)}
-            restartRequired={restartKeys.has("virtual_library.allow_insecure_http")}
-          />
-          <SettingField
             label="Cache TTL (minutes)"
             type="number"
             description="How long provider candidates are reused before re-fetching. 1–10080."
@@ -283,6 +288,38 @@ export default function StreamingSettings() {
             isPending={providerCheck.isPending}
             disabled={!form.getValue("virtual_library.manifest_url")}
           />
+        </FieldGroup>
+
+        <FieldGroup label="Network access" dirty={anyDirty(NETWORK_KEYS)}>
+          <SettingField
+            label="Allow HTTP for local manifests"
+            type="toggle"
+            description="Permits http:// manifest URLs on private/local networks only. HTTPS remains required for public hosts."
+            value={form.getValue("virtual_library.allow_insecure_http") || "false"}
+            onChange={(v) => form.setValue("virtual_library.allow_insecure_http", v)}
+            restartRequired={restartKeys.has("virtual_library.allow_insecure_http")}
+          />
+          <SettingField
+            label="Allow private network streams"
+            type="toggle"
+            description="Lets virtual-stream playback contact non-public addresses (localhost, LAN, link-local)."
+            value={form.getValue("virtual_library.allow_private_streams") || "false"}
+            onChange={(v) => form.setValue("virtual_library.allow_private_streams", v)}
+            restartRequired={restartKeys.has("virtual_library.allow_private_streams")}
+          />
+          {form.getValue("virtual_library.allow_private_streams") === "true" && (
+            <div className="settings-field-note my-3 flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+              <div className="text-[13px] leading-relaxed">
+                <p className="font-medium text-amber-500">Private network access</p>
+                <p className="text-muted-foreground mt-1">
+                  When enabled, virtual-stream playback may contact non-public addresses including
+                  localhost and link-local services. A compromised provider can cause Silo to
+                  request internal services. TLS certificate checks remain enabled.
+                </p>
+              </div>
+            </div>
+          )}
         </FieldGroup>
 
         <FieldGroup label="Virtual libraries" dirty={anyDirty(LIBRARY_KEYS)}>

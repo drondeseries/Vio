@@ -2802,7 +2802,7 @@ func main() {
 			// Hard cutover: core Variants replaces the plugin closure.
 			// Plugin-owned catalog rows keep their owner IDs; new variants
 			// carry core provenance (OwnerInstallationID 0 + Provenance core)
-			// and the SSRF dispatch reads virtual_library.allow_insecure_http.
+			// and the SSRF dispatch reads virtual_library.allow_private_streams.
 			collectionService.VirtualVariants = vlSvc.VirtualVariants()
 			deps.VirtualLibraryService = vlSvc
 			deps.VirtualLibraryVariants = vlSvc.VirtualVariants()
@@ -3634,10 +3634,16 @@ func main() {
 				return out, nil
 			})
 			compatDeps.AllowInsecureVirtual = func(installationID int) bool {
-				// SSRF posture for virtual traffic comes solely from the core
-				// virtual_library.allow_insecure_http opt-in: resolution is
-				// core-only, so per-installation plugin config no longer applies.
+				// HTTP-manifest posture for virtual traffic comes solely from
+				// the core virtual_library.allow_insecure_http opt-in:
+				// resolution is core-only, so per-installation plugin config
+				// no longer applies.
 				return plugins.CoreVirtualInsecureAllowed(context.Background())
+			}
+			compatDeps.AllowPrivateStreams = func(installationID int) bool {
+				// Private stream destination posture comes solely from the
+				// core virtual_library.allow_private_streams opt-in.
+				return plugins.CoreVirtualPrivateStreamsAllowed(context.Background())
 			}
 			ffprobePath := scanner.FFprobePathFromFFmpeg(cfg.Playback.FFmpegPath)
 			virtualProbeCache := scanner.NewVirtualProbeCache(10*time.Minute, 256)
@@ -3646,7 +3652,7 @@ func main() {
 					var relayURL string
 					var cleanup func()
 					var err error
-					insecure := plugins.CoreVirtualInsecureAllowed(probeCtx)
+					insecure := plugins.CoreVirtualPrivateStreamsAllowed(probeCtx)
 					if insecure {
 						relayURL, cleanup, err = virtualRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
 					} else {

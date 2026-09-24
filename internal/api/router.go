@@ -1382,6 +1382,23 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				return on
 			}
+			// Private stream destination posture for virtual traffic. Read
+			// lazily from the settings store so an admin change to
+			// virtual_library.allow_private_streams applies without restart.
+			plugins.CorePrivateStreamsAllowed = func(ctx context.Context) bool {
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				raw, err := store.Get(ctx, "virtual_library.allow_private_streams")
+				if err != nil || raw == "" {
+					return false
+				}
+				on, err := strconv.ParseBool(strings.TrimSpace(raw))
+				if err != nil {
+					return false
+				}
+				return on
+			}
 			// Candidate store window: how long a persisted virtual candidate
 			// stays trusted for replay after its last listing or resolution.
 			// 0 (the default) disables the window. Read lazily so an admin
@@ -1401,10 +1418,16 @@ func newChiRouter(deps Dependencies) chi.Router {
 			}
 		}
 		playbackHandler.AllowInsecureVirtual = func(installationID int) bool {
-			// SSRF posture for virtual traffic comes solely from the core
-			// virtual_library.allow_insecure_http opt-in: resolution is
+			// HTTP-manifest posture for virtual traffic comes solely from the
+			// core virtual_library.allow_insecure_http opt-in: resolution is
 			// core-only, so per-installation plugin config no longer applies.
 			return plugins.CoreVirtualInsecureAllowed(context.Background())
+		}
+		playbackHandler.AllowPrivateStreams = func(installationID int) bool {
+			// Private stream destination posture comes solely from the core
+			// virtual_library.allow_private_streams opt-in: resolution is
+			// core-only, so per-installation plugin config no longer applies.
+			return plugins.CoreVirtualPrivateStreamsAllowed(context.Background())
 		}
 		if streamHandler != nil {
 			streamHandler.RemoteStreamRelay = remoteStreamRelay
@@ -1412,6 +1435,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			streamHandler.VirtualMediaRefreshResolver = playbackHandler.VirtualMediaRefreshResolver
 			streamHandler.VirtualMediaDetailedResolver = playbackHandler.VirtualMediaDetailedResolver
 			streamHandler.AllowInsecureVirtual = playbackHandler.AllowInsecureVirtual
+			streamHandler.AllowPrivateStreams = playbackHandler.AllowPrivateStreams
 			streamHandler.VirtualCandidateTrustWindow = playbackHandler.VirtualCandidateTrustWindow
 		}
 		if deps.DB != nil {
@@ -1545,12 +1569,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 					// Keep ffprobe behind the same pinned-IP relay as playback. A
 					// direct provider URL would let ffprobe resolve DNS independently
 					// of the server's SSRF policy. The core
-					// virtual_library.allow_insecure_http opt-in governs all
-					// virtual traffic now that resolution is core-only.
+					// virtual_library.allow_private_streams opt-in governs
+					// probe destinations now that resolution is core-only.
 					var relayURL string
 					var release func()
 					var relayErr error
-					insecureProbe := plugins.CoreVirtualInsecureAllowed(context.Background())
+					insecureProbe := plugins.CoreVirtualPrivateStreamsAllowed(context.Background())
 					if insecureProbe {
 						relayURL, release, relayErr = remoteStreamRelay.RegisterInsecureWithHeaders(probeCtx, probeURL, headers)
 					} else {
@@ -1697,10 +1721,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 				}
 				var relayURL string
 				var cleanup func()
-				// SSRF posture for virtual traffic comes solely from the core
-				// virtual_library.allow_insecure_http opt-in now that
-				// resolution is core-only.
-				insecure := plugins.CoreVirtualInsecureAllowed(context.Background())
+				// Private stream destination posture for virtual traffic comes
+				// solely from the core virtual_library.allow_private_streams
+				// opt-in now that resolution is core-only.
+				insecure := plugins.CoreVirtualPrivateStreamsAllowed(context.Background())
 				if insecure {
 					relayURL, cleanup, err = remoteStreamRelay.RegisterInsecureWithHeaders(ctx, resolved, headers)
 				} else {

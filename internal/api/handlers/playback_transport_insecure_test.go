@@ -27,7 +27,7 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 	}
 
 	t.Run("opt-in off rejects private host", func(t *testing.T) {
-		h.AllowInsecureVirtual = nil
+		h.AllowPrivateStreams = nil
 		res, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 5, 1, "profile", false, nil, "")
 		if err == nil {
 			cleanup()
@@ -36,7 +36,7 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 	})
 
 	t.Run("opt-in on accepts private host", func(t *testing.T) {
-		h.AllowInsecureVirtual = func(installationID int) bool { return installationID == 5 }
+		h.AllowPrivateStreams = func(installationID int) bool { return installationID == 5 }
 		res, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 5, 1, "profile", false, nil, "")
 		if err != nil {
 			t.Fatalf("expected private host to be accepted with allow_insecure_http: %v", err)
@@ -48,7 +48,7 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 	})
 
 	t.Run("opt-in on for other installation stays strict", func(t *testing.T) {
-		h.AllowInsecureVirtual = func(installationID int) bool { return installationID == 5 }
+		h.AllowPrivateStreams = func(installationID int) bool { return installationID == 5 }
 		if _, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 7, 1, "profile", false, nil, ""); err == nil {
 			cleanup()
 			t.Fatal("expected private host to be rejected for an installation without the opt-in")
@@ -62,7 +62,7 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 		h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 			return ResolvedVirtualMedia{URL: "http://altmount:8080/stremio/test/play", OwnerID: 8}, nil
 		})
-		h.AllowInsecureVirtual = func(installationID int) bool { return installationID == 8 }
+		h.AllowPrivateStreams = func(installationID int) bool { return installationID == 8 }
 		res, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 0, 1, "profile", false, nil, "")
 		if err != nil {
 			t.Fatalf("expected resolved owner 8 to authorize the private host: %v", err)
@@ -80,18 +80,18 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 		h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 			return ResolvedVirtualMedia{URL: "http://altmount:8080/stremio/test/play", OwnerID: 0}, nil
 		})
-		h.AllowInsecureVirtual = func(installationID int) bool { return installationID == 8 }
+		h.AllowPrivateStreams = func(installationID int) bool { return installationID == 8 }
 		if _, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 0, 1, "profile", false, nil, ""); err == nil {
 			cleanup()
 			t.Fatal("expected private host to be rejected when no owner is resolved")
 		}
 	})
 
-	t.Run("core owner authorizes private host when AllowInsecureVirtual authorizes id 0", func(t *testing.T) {
+	t.Run("core owner authorizes private host when AllowPrivateStreams authorizes id 0", func(t *testing.T) {
 		h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 			return ResolvedVirtualMedia{URL: "http://altmount:8080/stremio/test/play", OwnerID: 0}, nil
 		})
-		h.AllowInsecureVirtual = func(installationID int) bool { return installationID <= 0 }
+		h.AllowPrivateStreams = func(installationID int) bool { return installationID <= 0 }
 		res, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 0, 1, "profile", false, nil, "")
 		if err != nil {
 			t.Fatalf("expected core owner to authorize private host: %v", err)
@@ -971,8 +971,8 @@ func TestVirtualInputRelayForwardsHeaders(t *testing.T) {
 	defer func() { _ = relay.Close(context.Background()) }()
 
 	h := &PlaybackHandler{
-		RemoteStreamRelay:    relay,
-		AllowInsecureVirtual: func(id int) bool { return true },
+		RemoteStreamRelay:   relay,
+		AllowPrivateStreams: func(id int) bool { return true },
 		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
 			return ResolvedVirtualMedia{
 				URL:            "http://stream.example/media.mp4",

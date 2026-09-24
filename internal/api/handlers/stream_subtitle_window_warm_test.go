@@ -37,7 +37,7 @@ func newVirtualSubtitleWindowFixture(t *testing.T, dir, ffmpegScript string) (*S
 	handler.SubtitleCache = playback.NewSubtitleCache(func() string { return dir })
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	t.Cleanup(func() { _ = handler.RemoteStreamRelay.Close(context.Background()) })
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 		return ResolvedVirtualMedia{URL: upstream.URL + "/video.mkv"}, nil
 	})
@@ -625,7 +625,7 @@ func TestHandleSubtitleFontsKeepsRelayForDetachedFlight(t *testing.T) {
 	handler.SubtitleCache = playback.NewSubtitleCache(func() string { return dir })
 	handler.RemoteStreamRelay = remotestream.NewRelay()
 	t.Cleanup(func() { _ = handler.RemoteStreamRelay.Close(context.Background()) })
-	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.AllowPrivateStreams = func(int) bool { return true }
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
 		return ResolvedVirtualMedia{URL: upstream.URL + "/video.mkv"}, nil
 	})

@@ -90,7 +90,7 @@ func TestValidateURLSyntaxRejectsUnsafeStructureWithoutDNS(t *testing.T) {
 }
 
 func TestValidateURLSyntaxAllowNonPublic(t *testing.T) {
-	// The allow_insecure_http opt-in must accept private/local/numeric hosts.
+	// The allow_private_streams opt-in must accept private/local/numeric hosts.
 	for _, raw := range []string{
 		"http://10.0.0.7/stream",
 		"http://192.168.1.5/video.mp4",

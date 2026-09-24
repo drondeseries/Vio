@@ -75,6 +75,7 @@ func newProviderService(t *testing.T, logger *slog.Logger, cfg virtuallibrary.Co
 	cfg.Enabled = true
 	cfg.ManifestURL = server.URL + "/manifest.json"
 	cfg.AllowInsecureHTTP = true
+	cfg.AllowPrivateStreams = true
 	svc := virtuallibrary.New(cfg, nil, logger)
 	if svc == nil {
 		t.Fatal("service is nil")
