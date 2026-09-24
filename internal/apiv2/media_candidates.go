@@ -2,6 +2,7 @@ package apiv2
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -11,14 +12,17 @@ import (
 )
 
 const (
-	opRefreshVirtualCandidates = "refreshVirtualCandidates"
-	opRequestVirtualRelease    = "requestVirtualRelease"
+	opRefreshVirtualCandidates       = "refreshVirtualCandidates"
+	opCancelVirtualCandidatesRefresh = "cancelVirtualCandidatesRefresh"
+	opRequestVirtualRelease          = "requestVirtualRelease"
 )
 
 // VirtualCandidatesRefreshService accepts the asynchronous re-list and answers
-// the durable job to wait on.
+// the durable job to wait on, and cancels that re-list when the owner presses
+// the locked control a second time.
 type VirtualCandidatesRefreshService interface {
 	CreateRefreshJob(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) (*models.AdminJob, error)
+	CancelRefreshJob(ctx context.Context, userID int, profileID, contentID string, filter catalogpkg.AccessFilter) (*models.AdminJob, error)
 }
 
 // VirtualReleaseRequestService requests one stored indexer release on the
@@ -65,6 +69,20 @@ func registerMediaCandidates(reg *Registry) {
 		RetrySafety: RetrySafetyCoalescing,
 	}, reg.refreshVirtualCandidates)
 
+	cancel := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-candidates:refresh/cancel", opCancelVirtualCandidatesRefresh, "watch",
+		"Cancel the caller's in-flight refresh of a virtual item's version candidates. Cancellation is non-destructive to already-persisted candidates and leaves the automatic re-listing intervals untouched.")
+	cancel.DefaultStatus = http.StatusOK
+	cancel.Errors = []int{http.StatusConflict, http.StatusForbidden}
+	Register(reg, Operation{
+		Operation:       cancel,
+		Class:           ClassProfileScoped,
+		ProfileOptional: true,
+		ServiceBacked:   true,
+		// The job state machine makes repeated cancellation requests converge
+		// on the same terminal canceled state.
+		RetrySafety: RetrySafetyCoalescing,
+	}, reg.cancelVirtualCandidatesRefresh)
+
 	request := humaOp(http.MethodPost, Prefix+"/media/{media_id}/virtual-releases/{release_id}:request", opRequestVirtualRelease, "watch",
 		"Request a release that exists on the indexers on the provider. The stored download URL is used server-side and is never returned.")
 	request.DefaultStatus = http.StatusOK
@@ -103,6 +121,33 @@ func (reg *Registry) refreshVirtualCandidates(ctx context.Context, in *VirtualCa
 		Body:       reg.adminTaskJobOf(ctx, job, claims.Role == models.RoleAdmin),
 	}
 	return out, nil
+}
+
+func (reg *Registry) cancelVirtualCandidatesRefresh(ctx context.Context, in *VirtualCandidatesRefreshInput) (*AdminCatalogJobAcceptedOutput, error) {
+	if reg.deps.VirtualCandidatesRefresh == nil || reg.deps.Watch == nil {
+		return nil, unavailable("virtual candidates refresh")
+	}
+	claims := claimsFrom(ctx)
+	if claims == nil {
+		return nil, NewProblem(TypeAuthenticationRequired, "Authentication is required.")
+	}
+	filter, err := reg.deps.Watch.ContextAccessFilter(ctx, handlers.AccessFilterOptions{})
+	if err != nil {
+		return nil, NewProblem(TypeInternalError, "An unexpected error occurred.")
+	}
+	job, err := reg.deps.VirtualCandidatesRefresh.CancelRefreshJob(ctx, claims.UserID, profileFrom(ctx), string(in.MediaID), filter)
+	if err != nil {
+		var apiErr *handlers.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "not_cancellable" {
+			return nil, NewProblem(TypeJobNotCancelable, apiErr.Message)
+		}
+		return nil, serviceProblem(err)
+	}
+	return &AdminCatalogJobAcceptedOutput{
+		Location:   Prefix + "/admin/jobs/" + job.ID,
+		RetryAfter: "5",
+		Body:       reg.adminTaskJobOf(ctx, job, claims.Role == models.RoleAdmin),
+	}, nil
 }
 
 func (reg *Registry) requestVirtualRelease(ctx context.Context, in *VirtualReleaseRequestInput) (*VirtualReleaseRequestOutput, error) {

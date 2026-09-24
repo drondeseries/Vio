@@ -1141,6 +1141,28 @@ func (r *Runner) executeVirtualCandidatesRefresh(job *models.AdminJob) {
 	ctx, cancel := context.WithTimeout(r.executionContext(), virtualCandidatesRefreshTimeout)
 	defer cancel()
 
+	// A running refresh is cancellable from the API: the registry bridges the
+	// command to this context, and the polling goroutine covers a cancellation
+	// that arrives through the durable row on another node.
+	go func() {
+		ticker := time.NewTicker(r.heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				current, err := r.repo.GetByID(ctx, job.ID)
+				if err == nil && (current.CancelRequested || current.ClaimGeneration != job.ClaimGeneration) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	unregisterCancel := r.cancelRegistry.Register(job.ID, cancel)
+	defer unregisterCancel()
+
 	heartbeatStop := make(chan struct{})
 	go r.heartbeatLoop(ctx, job.ID, heartbeatStop)
 	defer close(heartbeatStop)
@@ -1155,6 +1177,10 @@ func (r *Runner) executeVirtualCandidatesRefresh(job *models.AdminJob) {
 
 	result, err := r.virtualRefresh.Execute(ctx, req, progress)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			r.cancelJob(job.ID, 0, 0, "Virtual candidates refresh canceled")
+			return
+		}
 		msg := err.Error()
 		if ctx.Err() != nil {
 			msg = fmt.Sprintf("timed out after %s: %s", virtualCandidatesRefreshTimeout, msg)

@@ -25,7 +25,11 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	StatusCancelled = "canceled"
+	// StatusCancelled is the durable status value. It matches the
+	// admin_jobs_status_check constraint (migration 178) and the literals the
+	// cancel-on-completion paths write in Complete and Fail; a different
+	// spelling would violate the constraint and lose the cancellation.
+	StatusCancelled = "cancelled" //nolint:misspell // Persisted DB enum value (migration 178).
 )
 
 var (
@@ -817,13 +821,28 @@ func (r *Repository) withClaim(job *models.AdminJob) *Repository {
 	return &Repository{pool: r.pool, claim: new(job.ClaimGeneration)}
 }
 
+// cancellableJobTypes are the managed background job kinds the cancellation
+// command accepts. Each has a runner path that observes CancelRequested and a
+// durable terminal transition, so setting the intent is enough for a queued job
+// and a running one alike.
+var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh}
+
+func isCancellableJobType(jobType string) bool {
+	for _, candidate := range cancellableJobTypes {
+		if jobType == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 // RequestCancellation durably coalesces intent. A queued job is still claimed by
 // the ordinary runner, which acknowledges cancellation without executing it.
 func (r *Repository) RequestCancellation(ctx context.Context, id string) (*models.AdminJob, error) {
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `UPDATE admin_jobs
  SET cancel_requested = true, updated_at = CASE WHEN cancel_requested THEN updated_at ELSE NOW() END
  WHERE id = $1 AND job_type = ANY($2) AND status IN ('queued', 'running')
-	 RETURNING `+adminJobColumns, id, []string{JobTypeLibraryRefresh, JobTypeStorageTransition}))
+	 RETURNING `+adminJobColumns, id, cancellableJobTypes))
 	if err == nil {
 		return job, nil
 	}
@@ -834,7 +853,7 @@ func (r *Repository) RequestCancellation(ctx context.Context, id string) (*model
 	if err != nil {
 		return nil, err
 	}
-	if (job.JobType == JobTypeLibraryRefresh || job.JobType == JobTypeStorageTransition) && job.Status == StatusCancelled {
+	if isCancellableJobType(job.JobType) && job.Status == StatusCancelled {
 		return job, nil
 	}
 	return nil, ErrJobNotCancellable

@@ -24,6 +24,34 @@ export function virtualCandidatesRefreshPath(mediaId: string): string {
 /** Every accepted admin job lives under this prefix in the `Location` header. */
 export const VIRTUAL_CANDIDATES_JOB_PREFIX = "/api/v2/admin/jobs/";
 
+/**
+ * Cancels the caller's in-flight refresh of a title. The server resolves the
+ * active job by media id and authorizes it to the job owner, so no job id is
+ * needed. Cancellation is non-destructive: candidates already persisted stay,
+ * and the automatic re-listing intervals are untouched.
+ */
+export const VIRTUAL_CANDIDATES_CANCEL_PATH =
+  "/api/v2/media/{media_id}/virtual-candidates:refresh/cancel";
+
+export function virtualCandidatesCancelPath(mediaId: string): string {
+  return VIRTUAL_CANDIDATES_CANCEL_PATH.replace("{media_id}", encodeURIComponent(mediaId));
+}
+
+/**
+ * Stops the refresh the caller started for a title. The first press starts a
+ * job and locks the control; a second press calls this to cancel that job and
+ * release the lock.
+ */
+export async function cancelVirtualCandidatesRefresh(mediaId: string): Promise<void> {
+  const { res } = await fetchWithSession(virtualCandidatesCancelPath(mediaId), {
+    method: "POST",
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) {
+    throw new Error(`Canceling the refresh failed (${res.status}).`);
+  }
+}
+
 /** The documented `Retry-After` fallback when the server does not send one. */
 export const DEFAULT_REFRESH_RETRY_AFTER_MS = 5_000;
 

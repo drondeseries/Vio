@@ -15,7 +15,8 @@ import (
 )
 
 // fakeVirtualCandidatesRefresh is the async refresh seam: it records the
-// resolved identity and answers a queued job or a fixed error.
+// resolved identity and answers a queued job or a fixed error. cancelJob is the
+// job the cancel command returns; cancelErr a fixed cancel error.
 type fakeVirtualCandidatesRefresh struct {
 	calls     int
 	userID    int
@@ -23,6 +24,8 @@ type fakeVirtualCandidatesRefresh struct {
 	contentID string
 	job       *models.AdminJob
 	err       error
+	cancelJob *models.AdminJob
+	cancelErr error
 }
 
 func (f *fakeVirtualCandidatesRefresh) CreateRefreshJob(_ context.Context, userID int, profileID, contentID string, _ catalogpkg.AccessFilter) (*models.AdminJob, error) {
@@ -38,6 +41,19 @@ func (f *fakeVirtualCandidatesRefresh) CreateRefreshJob(_ context.Context, userI
 	}
 	return &models.AdminJob{
 		ID: "job-1", JobType: adminjob.JobTypeVirtualCandidatesRefresh, Status: adminjob.StatusQueued,
+		CreatedByUserID: userID, RequestedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+	}, nil
+}
+
+func (f *fakeVirtualCandidatesRefresh) CancelRefreshJob(_ context.Context, userID int, profileID, contentID string, _ catalogpkg.AccessFilter) (*models.AdminJob, error) {
+	if f.cancelErr != nil {
+		return nil, f.cancelErr
+	}
+	if f.cancelJob != nil {
+		return f.cancelJob, nil
+	}
+	return &models.AdminJob{
+		ID: "job-1", JobType: adminjob.JobTypeVirtualCandidatesRefresh, Status: adminjob.StatusCancelled,
 		CreatedByUserID: userID, RequestedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 	}, nil
 }
@@ -147,6 +163,46 @@ func TestRefreshVirtualCandidatesIsProfileOptional(t *testing.T) {
 	if refresh.profileID != "" {
 		t.Fatalf("profile id = %q, want empty", refresh.profileID)
 	}
+}
+
+// TestCancelVirtualCandidatesRefresh covers the owner-authorized cancel command:
+// the second press cancels the in-flight job and answers it, while a foreign
+// job is refused with a forbidden problem.
+func TestCancelVirtualCandidatesRefresh(t *testing.T) {
+	owner := with(bearer(memberToken), "X-Profile-Id", "p-owner")
+
+	refresh := &fakeVirtualCandidatesRefresh{cancelJob: &models.AdminJob{
+		ID: "job-9", JobType: adminjob.JobTypeVirtualCandidatesRefresh, Status: adminjob.StatusCancelled,
+		CreatedByUserID: 1, RequestedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+	}}
+	h := newTestHandler(t, mediaCandidatesDeps(refresh))
+	rec := do(t, h, http.MethodPost, "/api/v2/media/movie:heat-1995/virtual-candidates:refresh/cancel", "", owner)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		ID    string `json:"id"`
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ID != "job-9" || body.State != "canceled" {
+		t.Fatalf("body = %+v", body)
+	}
+
+	// Authentication is required before the service runs.
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/media/movie:heat-1995/virtual-candidates:refresh/cancel", "", nil), TypeAuthenticationRequired)
+
+	// A foreign job is a forbidden problem, not a silent cancellation.
+	refresh = &fakeVirtualCandidatesRefresh{cancelErr: &handlers.APIError{Status: http.StatusForbidden, Code: "forbidden", Message: "This refresh belongs to another account"}}
+	h = newTestHandler(t, mediaCandidatesDeps(refresh))
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/media/movie:heat-1995/virtual-candidates:refresh/cancel", "", owner), TypePermissionDenied)
+
+	// Nothing to cancel is a conflict problem.
+	refresh = &fakeVirtualCandidatesRefresh{cancelErr: &handlers.APIError{Status: http.StatusConflict, Code: "not_cancellable", Message: "There is no refresh to cancel"}}
+	h = newTestHandler(t, mediaCandidatesDeps(refresh))
+	requireProblem(t, do(t, h, http.MethodPost, "/api/v2/media/movie:heat-1995/virtual-candidates:refresh/cancel", "", owner), TypeJobNotCancelable)
 }
 
 func releaseRequestDeps(request *fakeVirtualReleaseRequest) Dependencies {

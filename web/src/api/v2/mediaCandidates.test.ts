@@ -11,11 +11,14 @@ vi.mock("@/api/client", () => ({
 import {
   adminJobIdFromLocation,
   awaitVirtualCandidatesRefresh,
+  cancelVirtualCandidatesRefresh,
   DEFAULT_REFRESH_RETRY_AFTER_MS,
   requestVirtualRelease,
   startVirtualCandidatesRefresh,
+  virtualCandidatesCancelPath,
   virtualCandidatesRefreshPath,
   virtualReleaseRequestPath,
+  VIRTUAL_CANDIDATES_CANCEL_PATH,
   VIRTUAL_CANDIDATES_REFRESH_PATH,
   VIRTUAL_RELEASE_REQUEST_PATH,
 } from "./mediaCandidates";
@@ -43,6 +46,30 @@ describe("virtualCandidatesRefreshPath", () => {
     expect(VIRTUAL_CANDIDATES_REFRESH_PATH).toBe(
       "/api/v2/media/{media_id}/virtual-candidates:refresh",
     );
+    expect(virtualCandidatesCancelPath("content 1/2")).toBe(
+      "/api/v2/media/content%201%2F2/virtual-candidates:refresh/cancel",
+    );
+    expect(VIRTUAL_CANDIDATES_CANCEL_PATH).toBe(
+      "/api/v2/media/{media_id}/virtual-candidates:refresh/cancel",
+    );
+  });
+});
+
+describe("cancelVirtualCandidatesRefresh", () => {
+  it("POSTs the cancel for the title and resolves on success", async () => {
+    mocks.fetchWithSession.mockResolvedValue(sessionResult(new Response("", { status: 200 })));
+
+    await expect(cancelVirtualCandidatesRefresh("movie:heat-1995")).resolves.toBeUndefined();
+
+    const [url, init] = mocks.fetchWithSession.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v2/media/movie%3Aheat-1995/virtual-candidates:refresh/cancel");
+    expect(init.method).toBe("POST");
+  });
+
+  it("rejects when the server refuses the cancellation", async () => {
+    mocks.fetchWithSession.mockResolvedValue(sessionResult(new Response("", { status: 409 })));
+
+    await expect(cancelVirtualCandidatesRefresh("movie:heat-1995")).rejects.toThrow("409");
   });
 });
 

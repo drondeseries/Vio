@@ -59,6 +59,12 @@ interface QualityMenuProps {
    * rows already on screen stay as they are.
    */
   onRefreshVersions?: () => Promise<void>;
+  /**
+   * Cancels the refresh started by `onRefreshVersions` when the row is pressed
+   * again while the job is still running. Omitted when the surface cannot
+   * cancel.
+   */
+  onCancelRefresh?: () => Promise<void> | void;
 }
 
 export { REFRESH_VERSIONS_ERROR };
@@ -75,13 +81,15 @@ export function QualityMenu({
   versionLocked,
   onSwitchVersion,
   onRefreshVersions,
+  onCancelRefresh,
 }: QualityMenuProps) {
   const [open, setOpen] = useState(false);
   const {
     refreshing: refreshingVersions,
+    cancelable: cancelableVersions,
     error: refreshVersionsError,
     refresh: handleRefreshVersions,
-  } = useVersionListRefresh(onRefreshVersions);
+  } = useVersionListRefresh(onRefreshVersions, onCancelRefresh);
   // Indexer releases are gated on the server's capability so a server that
   // cannot request releases shows no indexer UI.
   const { indexerRequest } = useVirtualLibraryCapability({ enabled: !!contentId });
@@ -333,7 +341,7 @@ export function QualityMenu({
                     role="menuitem"
                     type="button"
                     className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
-                    disabled={refreshingVersions}
+                    disabled={refreshingVersions && !cancelableVersions}
                     aria-busy={refreshingVersions || undefined}
                     onClick={() => {
                       handleRefreshVersions();
@@ -351,7 +359,11 @@ export function QualityMenu({
                       />
                     )}
                     <span className="flex min-w-0 flex-col">
-                      <span>Refresh List</span>
+                      <span>
+                        {refreshingVersions && cancelableVersions
+                          ? "Cancel refresh"
+                          : "Refresh List"}
+                      </span>
                       {refreshVersionsError && (
                         <span className="text-[11px] leading-tight text-red-400">
                           {refreshVersionsError}

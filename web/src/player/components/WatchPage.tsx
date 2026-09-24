@@ -21,7 +21,10 @@ import {
 import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
-import { awaitVirtualCandidatesRefresh } from "@/api/v2/mediaCandidates";
+import {
+  awaitVirtualCandidatesRefresh,
+  cancelVirtualCandidatesRefresh,
+} from "@/api/v2/mediaCandidates";
 import { itemKeys } from "@/hooks/queries/keys";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
@@ -423,7 +426,7 @@ function WatchPagePlayer({
    * answer is read back. The caller's refresh control stays locked for the
    * whole flow. A rejected refresh throws before any state write, so the rows
    * already on screen stay put rather than disappearing behind a failed
-   * request.
+   * request. A second press of the locked control cancels the job instead.
    */
   const { awaitAdminJob } = useRealtimeEvents();
   const handleRefreshVersions = useCallback(async () => {
@@ -438,6 +441,9 @@ function WatchPagePlayer({
     setPlaybackVersions(detail.versions);
     setIndexerReleaseRows(detail.indexer_releases ?? []);
   }, [awaitAdminJob, contentId, fileId, libraryId, queryClient]);
+  const handleCancelRefresh = useCallback(async () => {
+    await cancelVirtualCandidatesRefresh(contentId);
+  }, [contentId]);
 
   const activePlaybackVersion = useMemo(
     () => playbackVersions.find((version) => version.file_id === session.mediaFileId),
@@ -998,6 +1004,7 @@ function WatchPagePlayer({
         chapters={activeChapters}
         onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}
         onRefreshVersions={handleRefreshVersions}
+        onCancelRefresh={handleCancelRefresh}
         subtitleUrls={playableSubtitles}
         initialPosition={session.initialPosition}
         onQualitySelect={session.changeQuality}

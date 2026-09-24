@@ -41,6 +41,12 @@ interface VersionDropdownProps {
    * already on screen. Omitted when the page cannot refresh.
    */
   onRefreshVersions?: () => Promise<void>;
+  /**
+   * Cancels the refresh started by `onRefreshVersions` when the control is
+   * pressed a second time while the job is still running. Omitted when the
+   * surface cannot cancel.
+   */
+  onCancelRefresh?: () => Promise<void> | void;
 }
 
 interface EditionOption {
@@ -59,14 +65,16 @@ function VersionDropdown({
   contentId,
   onOpenChange,
   onRefreshVersions,
+  onCancelRefresh,
 }: VersionDropdownProps) {
   const [editionOpen, setEditionOpen] = useState(false);
   const [versionOpen, setVersionOpen] = useState(false);
   const {
     refreshing: refreshingVersions,
+    cancelable: cancelableVersions,
     error: refreshVersionsError,
     refresh: handleRefreshVersions,
-  } = useVersionListRefresh(onRefreshVersions);
+  } = useVersionListRefresh(onRefreshVersions, onCancelRefresh);
 
   const handleEditionOpenChange = (open: boolean) => {
     setEditionOpen(open);
@@ -347,7 +355,7 @@ function VersionDropdown({
             {onRefreshVersions ? (
               <button
                 type="button"
-                disabled={refreshingVersions}
+                disabled={refreshingVersions && !cancelableVersions}
                 aria-busy={refreshingVersions || undefined}
                 onClick={() => handleRefreshVersions()}
                 className="text-muted-foreground hover:bg-accent/50 hover:text-foreground flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60"
@@ -357,7 +365,9 @@ function VersionDropdown({
                   aria-hidden="true"
                 />
                 <span className="flex min-w-0 flex-col">
-                  <span>Refresh List</span>
+                  <span>
+                    {refreshingVersions && cancelableVersions ? "Cancel refresh" : "Refresh List"}
+                  </span>
                   {refreshVersionsError ? (
                     <span className="text-destructive text-[10px] leading-tight">
                       {refreshVersionsError}

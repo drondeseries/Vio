@@ -377,3 +377,73 @@ func TestVirtualCandidatesRefreshEndToEndCarriesTracksIndexerReleasesAndEvent(t 
 		t.Fatalf("a refresh after completion reused the completed job %s; lock was not released", job1.ID)
 	}
 }
+
+// TestVirtualCandidatesRefreshCancelOnSecondPress is the cancel-on-second-press
+// proof against real repositories: a queued refresh is canceled by the owner,
+// the unique active-job lock is released, and a non-owning account is refused
+// with the existing coalescing answer.
+func TestVirtualCandidatesRefreshCancelOnSecondPress(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	ctx := t.Context()
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("movie-refresh-cancel-%d", suffix)
+	var ownerID int
+	if err := pool.QueryRow(ctx, `INSERT INTO users(username, role, enabled) VALUES($1,'user',true) RETURNING id`, fmt.Sprintf("refresh-cancel-owner-%d", suffix)).Scan(&ownerID); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	var otherID int
+	if err := pool.QueryRow(ctx, `INSERT INTO users(username, role, enabled) VALUES($1,'user',true) RETURNING id`, fmt.Sprintf("refresh-cancel-other-%d", suffix)).Scan(&otherID); err != nil {
+		t.Fatalf("seed other: %v", err)
+	}
+	t.Cleanup(func() {
+		b := context.Background()
+		_, _ = pool.Exec(b, `DELETE FROM admin_jobs WHERE created_by_user_id = ANY($1)`, []int{ownerID, otherID})
+		_, _ = pool.Exec(b, `DELETE FROM users WHERE id = ANY($1)`, []int{ownerID, otherID})
+	})
+
+	jobs := adminjob.NewRepository(pool)
+	svc := &VirtualCandidatesRefreshJobService{
+		Detail:         &fakeIndexerReleaseDetail{},
+		ContentFiles:   func(context.Context, string) ([]*models.MediaFile, error) { return nil, nil },
+		EpisodeFiles:   func(context.Context, string) ([]*models.MediaFile, error) { return nil, nil },
+		Jobs:           jobs,
+		CancelRegistry: adminjob.NewCancelRegistry(),
+	}
+
+	started, err := svc.CreateRefreshJob(ctx, ownerID, "", contentID, catalog.AccessFilter{})
+	if err != nil {
+		t.Fatalf("start refresh: %v", err)
+	}
+	if started.Status != adminjob.StatusQueued {
+		t.Fatalf("started status = %q, want queued", started.Status)
+	}
+
+	// The owner's second press cancels the queued job instead of coalescing.
+	canceled, err := svc.CancelRefreshJob(ctx, ownerID, "", contentID, catalog.AccessFilter{})
+	if err != nil {
+		t.Fatalf("cancel refresh: %v", err)
+	}
+	if canceled.ID != started.ID || canceled.Status != adminjob.StatusCancelled {
+		t.Fatalf("canceled = %+v, want the started job canceled", canceled)
+	}
+
+	// The lock is released: a new refresh after cancellation starts.
+	restarted, err := svc.CreateRefreshJob(ctx, ownerID, "", contentID, catalog.AccessFilter{})
+	if err != nil {
+		t.Fatalf("restart after cancel: %v", err)
+	}
+	if restarted.ID == started.ID {
+		t.Fatalf("a refresh after cancellation reused the canceled job %s", started.ID)
+	}
+
+	// A non-owning account cannot cancel the owner's refresh; it keeps the
+	// refusal semantics and leaves the job active for the owner.
+	if _, err := svc.CancelRefreshJob(ctx, otherID, "", contentID, catalog.AccessFilter{}); err == nil {
+		t.Fatal("a non-owning account canceled another account's refresh")
+	}
+	active, err := jobs.GetByID(ctx, restarted.ID)
+	if err != nil || active.Status == adminjob.StatusCancelled {
+		t.Fatalf("owner's refresh = %+v %v, want still active", active, err)
+	}
+}

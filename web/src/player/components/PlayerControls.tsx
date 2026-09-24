@@ -97,6 +97,7 @@ interface PlayerControlsProps {
   versionLocked?: boolean;
   onSwitchVersion?: (fileId: number) => void;
   onRefreshVersions?: () => Promise<void>;
+  onCancelRefresh?: () => Promise<void> | void;
   // PiP
   onTogglePiP?: () => void;
   // Playback info
@@ -167,6 +168,7 @@ export function PlayerControls({
   versionLocked,
   onSwitchVersion,
   onRefreshVersions,
+  onCancelRefresh,
   onTogglePiP,
   showPlaybackInfo,
   onTogglePlaybackInfo,
@@ -359,6 +361,7 @@ export function PlayerControls({
               versionLocked={versionLocked}
               onSwitchVersion={onSwitchVersion}
               onRefreshVersions={onRefreshVersions}
+              onCancelRefresh={onCancelRefresh}
             />
             <button
               type="button"
@@ -538,6 +541,7 @@ export function PlayerControls({
                 versionLocked={versionLocked}
                 onSwitchVersion={onSwitchVersion}
                 onRefreshVersions={onRefreshVersions}
+                onCancelRefresh={onCancelRefresh}
               />
 
               {markerEditAvailable && onToggleMarkerEdit && (

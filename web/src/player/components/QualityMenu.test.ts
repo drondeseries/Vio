@@ -73,6 +73,7 @@ const qualityOptions = [
 function renderVersionMenu(
   overrides: {
     onRefreshVersions?: () => Promise<void>;
+    onCancelRefresh?: () => Promise<void> | void;
     onSwitchVersion?: (fileId: number) => void;
     versions?: VersionInfo[];
     indexerReleases?: PlayerIndexerRelease[];
@@ -94,6 +95,7 @@ function renderVersionMenu(
       contentId: overrides.contentId ?? "content-1",
       onSwitchVersion: overrides.onSwitchVersion ?? (() => {}),
       onRefreshVersions: overrides.onRefreshVersions,
+      onCancelRefresh: overrides.onCancelRefresh,
     }),
   );
   fireEvent.click(screen.getByRole("button", { name: "Quality" }));
@@ -445,6 +447,33 @@ describe("QualityMenu version list refresh", () => {
       finishJob();
       await Promise.resolve();
     });
+    expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
+  });
+
+  it("cancels on a second press while running and unlocks the row", async () => {
+    let finishJob: (() => void) | undefined;
+    const onRefreshVersions = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          finishJob = () => reject(new Error("Job cancelled"));
+        }),
+    );
+    const onCancelRefresh = vi.fn().mockResolvedValue(undefined);
+    renderVersionMenu({ onRefreshVersions, onCancelRefresh });
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Refresh List/ }));
+    const running = screen.getByRole("menuitem", { name: /Cancel refresh/ });
+    expect(running).not.toBeDisabled();
+    expect(running).toHaveAttribute("aria-busy", "true");
+
+    fireEvent.click(running);
+    expect(onCancelRefresh).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      finishJob?.();
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(REFRESH_VERSIONS_ERROR)).not.toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
   });
 

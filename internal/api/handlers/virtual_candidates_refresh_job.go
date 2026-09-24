@@ -35,7 +35,8 @@ const (
 // VirtualCandidatesRefreshJobService accepts the asynchronous "Refresh List":
 // it validates access through the same watch-detail path the version list uses,
 // resolves the item's indexer-search identity once, and queues one job per
-// title. A second request for an in-flight title returns the existing job.
+// title. A second request for an in-flight title returns the existing job; a
+// refresh the caller owns is canceled through CancelRefreshJob instead.
 type VirtualCandidatesRefreshJobService struct {
 	// Detail validates the target and the caller's access.
 	Detail VirtualCandidatesDetailReader
@@ -53,11 +54,17 @@ type VirtualCandidatesRefreshJobService struct {
 	EpisodeFiles VirtualCandidateFiles
 	// Jobs creates the durable refresh job.
 	Jobs *adminjob.Repository
+	// CancelRegistry bridges a running refresh's cancellation to its in-process
+	// context on this node. Nil (or a job owned by another node) still cancels
+	// durably through the job row; the owning runner observes CancelRequested.
+	CancelRegistry *adminjob.CancelRegistry
 }
 
 // CreateRefreshJob validates the request, builds the job payload, and queues it.
 // An in-flight job for the same title is returned as-is so the caller answers
-// 202 with the existing job rather than a conflict.
+// 202 with the existing job rather than a conflict. Cancellation of an owned
+// in-flight refresh is the separate CancelRefreshJob command, so a retried
+// start never stops the work it started.
 func (s *VirtualCandidatesRefreshJobService) CreateRefreshJob(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) (*models.AdminJob, error) {
 	if s == nil || s.Jobs == nil || s.Detail == nil {
 		return nil, apiError(503, "unavailable", "Virtual candidates refresh is unavailable")
@@ -110,6 +117,64 @@ func (s *VirtualCandidatesRefreshJobService) CreateRefreshJob(ctx context.Contex
 		return nil, apiError(500, "internal_error", "Failed to queue the refresh")
 	}
 	return job, nil
+}
+
+// CancelRefreshJob cancels the caller's in-flight refresh for a title. It is the
+// second press of a locked Refresh control: the job is canceled (queued) or
+// marked for cancellation (running) and returned so the control can unlock.
+// Cancellation is non-destructive to candidates already persisted, and the
+// automatic re-listing intervals are untouched. A refresh owned by another
+// account is refused, preserving the refusal semantics of a second press that a
+// caller has no authority to act on.
+func (s *VirtualCandidatesRefreshJobService) CancelRefreshJob(ctx context.Context, userID int, profileID, contentID string, filter catalog.AccessFilter) (*models.AdminJob, error) {
+	if s == nil || s.Jobs == nil || s.Detail == nil {
+		return nil, apiError(503, "unavailable", "Virtual candidates refresh is unavailable")
+	}
+	if _, err := s.Detail.WatchDetail(ctx, userID, profileID, contentID, filter); err != nil {
+		return nil, err
+	}
+	active, err := s.Jobs.GetActiveVirtualRefreshByContentID(ctx, contentID)
+	if err != nil {
+		if errors.Is(err, adminjob.ErrJobNotFound) {
+			return nil, apiError(409, "not_cancellable", "There is no refresh to cancel")
+		}
+		return nil, apiError(500, "internal_error", "Failed to load the refresh")
+	}
+	if active.CreatedByUserID != userID {
+		return nil, apiError(403, "forbidden", "This refresh belongs to another account")
+	}
+	expiresAt := time.Now().UTC().Add(7 * 24 * time.Hour)
+	switch active.Status {
+	case adminjob.StatusQueued:
+		// A queued job releases its unique active-job lock the moment it turns
+		// terminal, so cancel it here rather than waiting for the runner to
+		// claim and acknowledge it.
+		canceled, cancelErr := s.Jobs.CancelQueued(ctx, active.ID, "Virtual candidates refresh canceled", expiresAt)
+		if cancelErr == nil {
+			return canceled, nil
+		}
+		if !errors.Is(cancelErr, adminjob.ErrJobNotCancellable) {
+			return nil, apiError(500, "internal_error", "Failed to cancel the refresh")
+		}
+		// The job advanced to running between the lookup and the cancel; fall
+		// through to the running path.
+	case adminjob.StatusRunning:
+	default:
+		return nil, apiError(409, "not_cancellable", "The refresh is no longer running")
+	}
+	updated, err := s.Jobs.RequestCancellation(ctx, active.ID)
+	if err != nil {
+		if errors.Is(err, adminjob.ErrJobNotCancellable) || errors.Is(err, adminjob.ErrJobNotFound) {
+			return nil, apiError(409, "not_cancellable", "The refresh is no longer running")
+		}
+		return nil, apiError(500, "internal_error", "Failed to cancel the refresh")
+	}
+	// Cancel the in-process context promptly on this node; a job running on
+	// another node observes the durable CancelRequested through its runner.
+	if s.CancelRegistry != nil {
+		s.CancelRegistry.Cancel(active.ID)
+	}
+	return updated, nil
 }
 
 func (s *VirtualCandidatesRefreshJobService) itemFor(ctx context.Context, contentID string) (*models.MediaItem, error) {

@@ -176,6 +176,36 @@ describe("VersionDropdown Refresh List", () => {
     });
     expect(dialog.getByRole("button", { name: /Refresh List/ })).not.toBeDisabled();
   });
+
+  it("cancels on a second press while running and unlocks the control", async () => {
+    let finishJob: (() => void) | undefined;
+    const onRefreshVersions = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          finishJob = () => reject(new Error("Job cancelled"));
+        }),
+    );
+    const onCancelRefresh = vi.fn().mockResolvedValue(undefined);
+    const dialog = openPicker(versions, { onRefreshVersions, onCancelRefresh });
+
+    fireEvent.click(dialog.getByRole("button", { name: /Refresh List/ }));
+    // While running the row is not disabled when the surface can cancel; it
+    // switches to the cancel affordance.
+    const running = dialog.getByRole("button", { name: /Cancel refresh/ });
+    expect(running).not.toBeDisabled();
+    expect(running).toHaveAttribute("aria-busy", "true");
+
+    fireEvent.click(running);
+    expect(onCancelRefresh).toHaveBeenCalledTimes(1);
+    // The first refresh rejects because the job was canceled; the cancel is not
+    // shown as an error.
+    await act(async () => {
+      finishJob?.();
+      await Promise.resolve();
+    });
+    expect(dialog.queryByText(REFRESH_VERSIONS_ERROR)).not.toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: /Refresh List/ })).not.toBeDisabled();
+  });
 });
 
 describe("VersionDropdown indexer releases", () => {

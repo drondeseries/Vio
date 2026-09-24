@@ -33,7 +33,10 @@ import {
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDeleteMediaItem } from "@/hooks/queries/items";
-import { awaitVirtualCandidatesRefresh } from "@/api/v2/mediaCandidates";
+import {
+  awaitVirtualCandidatesRefresh,
+  cancelVirtualCandidatesRefresh,
+} from "@/api/v2/mediaCandidates";
 import { catalogKeys, itemKeys } from "@/hooks/queries/keys";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
@@ -238,7 +241,7 @@ export default function ActionBar({
   // finish, then re-read the item and the watch detail so both the page's
   // version list and the picker's indexer rows are replaced from the server's
   // answer rather than a client-side merge. The refresh control stays locked
-  // for this whole flow.
+  // for this whole flow; a second press cancels the job and unlocks it.
   const handleRefreshVersions = useCallback(async () => {
     if (!contentId) return;
     await awaitVirtualCandidatesRefresh(contentId, awaitAdminJob);
@@ -251,6 +254,10 @@ export default function ActionBar({
       }),
     ]);
   }, [awaitAdminJob, contentId, queryClient]);
+  const handleCancelRefresh = useCallback(async () => {
+    if (!contentId) return;
+    await cancelVirtualCandidatesRefresh(contentId);
+  }, [contentId]);
   const showMarkerEditor = canEditMarkers && !!contentId;
   const hasMultipleVersions = (playbackVariants?.length ?? 0) > 1 || (versions?.length ?? 0) > 1;
   const showPlayChoiceDialog =
@@ -883,6 +890,7 @@ export default function ActionBar({
               contentId={contentId}
               onOpenChange={onVersionPickerOpenChange}
               onRefreshVersions={contentId ? handleRefreshVersions : undefined}
+              onCancelRefresh={contentId ? handleCancelRefresh : undefined}
             />
           )}
           {selectedVersion && (selectedVersion.audio_tracks?.length ?? 0) > 0 && (

@@ -1273,12 +1273,13 @@ func newChiRouter(deps Dependencies) chi.Router {
 							Events:   deps.RealtimeHub,
 						}
 						virtualRefreshJobs = &handlers.VirtualCandidatesRefreshJobService{
-							Detail:       itemsHandler,
-							Items:        itemRepo,
-							Episodes:     episodeRepo,
-							ContentFiles: deps.FileRepo.GetByContentID,
-							EpisodeFiles: deps.FileRepo.GetByEpisodeID,
-							Jobs:         adminjob.NewRepository(deps.DB),
+							Detail:         itemsHandler,
+							Items:          itemRepo,
+							Episodes:       episodeRepo,
+							ContentFiles:   deps.FileRepo.GetByContentID,
+							EpisodeFiles:   deps.FileRepo.GetByEpisodeID,
+							Jobs:           adminjob.NewRepository(deps.DB),
+							CancelRegistry: deps.AdminJobCancelRegistry,
 						}
 					}
 				}
