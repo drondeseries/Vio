@@ -2260,11 +2260,42 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			h.recoverVirtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid)
 			return declaredFallback()
 		}
-		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
+		// Cache-first probe. The probe cache is keyed on the canonical candidate
+		// URI plus a query-stripped provider URL, so an earlier resolution of
+		// this exact candidate — the plan that is still playing — already holds
+		// the inventory this synchronous probe would re-measure. On an
+		// audio-switch or version-switch replan the source bytes are unchanged,
+		// so paying the ffprobe again is pure latency; serve the cached evidence
+		// and persist it with a fresh stamp. The cache never fabricates a
+		// verdict: a miss falls through to the real probe below, and a
+		// resolver-substituted sibling (a different release whose declared
+		// metadata was already dropped) is never served from the requested
+		// candidate's cache entry.
 		syncProbeFile := cloneVirtualProbeTransient(transient)
-		// Zero the duration so the synchronous probe measures the empirical
-		// duration instead of inheriting the catalog value.
+		// Zero the duration so a real probe measures the empirical duration
+		// instead of inheriting the catalog value.
 		syncProbeFile.Duration = 0
+		if !substituted {
+			if cached := h.virtualProbeFromCache(attemptCtx, file, streamURL, syncProbeFile, cand, oid); cached != nil {
+				trace.probeRan = true
+				empiricalDuration := cached.Duration
+				if transient.ID > 0 {
+					cached.ID = transient.ID
+					cached.MediaFolderID = transient.MediaFolderID
+				}
+				if empiricalDuration > 0 {
+					h.maybeSubmitRemuxDBEvidence(attemptCtx, cached, cand)
+				}
+				if transient.Duration > 0 && cached.Duration <= 0 {
+					cached.Duration = transient.Duration
+				}
+				h.maybeTriggerSubtitleSearch(attemptCtx, cached, cand)
+				return &resolvedVirtualPlaybackSource{
+					URL: streamURL, URI: cand.URI, OwnerID: oid, File: cached, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,
+				}, nil
+			}
+		}
+		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
 		trace.probeRan = true
 		probeStart := time.Now()
 		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &syncProbeFile, cand.RequestHeaders)
@@ -2573,6 +2604,43 @@ func (h *PlaybackHandler) probeVirtualSourceAndPersist(
 	h.persistVirtualProbeEvidence(bgCtx, catalogFile, probeCand.URI, probed, true, false)
 }
 
+// virtualProbeFromCache returns a probe already completed for this candidate's
+// source bytes, or nil when the cache holds no entry. It is the cache-first seam
+// shared by the synchronous resolve and every recovery path: the virtual probe
+// cache is keyed on the canonical candidate URI and a query-stripped provider
+// URL, so a credential rotation on the same provider path still hits. Serving
+// the cached evidence skips a redundant ffprobe — the dominant cost of an
+// audio-switch or version-switch replan — and persists it with a fresh stamp so
+// the row stops being probed on every start. The failure damper is cleared on a
+// hit, exactly like the transient-timeout recovery it generalizes.
+func (h *PlaybackHandler) virtualProbeFromCache(
+	ctx context.Context,
+	catalogFile *models.MediaFile,
+	sourceURL string,
+	probeFile models.MediaFile,
+	probeCand VirtualPlaybackStream,
+	ownerInstallationID int,
+) *models.MediaFile {
+	if h == nil || h.VirtualProbeCacheLookup == nil || catalogFile == nil {
+		return nil
+	}
+	probed := h.VirtualProbeCacheLookup(sourceURL, &probeFile)
+	if probed == nil {
+		return nil
+	}
+	virtualProbeFailures.clear(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
+	if probeFile.ID > 0 {
+		probed.ID = probeFile.ID
+		probed.MediaFolderID = probeFile.MediaFolderID
+	}
+	if probeFile.Duration > 0 && probed.Duration <= 0 {
+		probed.Duration = probeFile.Duration
+	}
+	mergeVirtualCandidateTracks(probed, probeCand)
+	h.persistVirtualProbeEvidence(ctx, catalogFile, probeCand.URI, probed, true, false)
+	return probed
+}
+
 // recoverVirtualProbeFromCache attempts a cache-only probe for a candidate the
 // failure damper would otherwise skip. A transient outer timeout can leave the
 // inner probe running under its own scanner.VirtualProbeTimeout; when it
@@ -2588,24 +2656,7 @@ func (h *PlaybackHandler) recoverVirtualProbeFromCache(
 	probeCand VirtualPlaybackStream,
 	ownerInstallationID int,
 ) bool {
-	if h == nil || h.VirtualProbeCacheLookup == nil || catalogFile == nil {
-		return false
-	}
-	probed := h.VirtualProbeCacheLookup(sourceURL, &probeFile)
-	if probed == nil {
-		return false
-	}
-	virtualProbeFailures.clear(virtualProbeFailureKey(probeCand.URI, ownerInstallationID))
-	if probeFile.ID > 0 {
-		probed.ID = probeFile.ID
-		probed.MediaFolderID = probeFile.MediaFolderID
-	}
-	if probeFile.Duration > 0 && probed.Duration <= 0 {
-		probed.Duration = probeFile.Duration
-	}
-	mergeVirtualCandidateTracks(probed, probeCand)
-	h.persistVirtualProbeEvidence(ctx, catalogFile, probeCand.URI, probed, true, false)
-	return true
+	return h.virtualProbeFromCache(ctx, catalogFile, sourceURL, probeFile, probeCand, ownerInstallationID) != nil
 }
 
 // revalidateVirtualCandidateBackground resolves the provider URL for a
@@ -4089,6 +4140,20 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		RequestHeaders: cloneHeaderMap(candidate.RequestHeaders),
 	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
+		return &resolved, nil
+	}
+	// Probe-cache-first, same seam the shared resolve uses: a version-switch or
+	// provider-churn candidate that already has a completed probe needs no
+	// second synchronous ffprobe. The cache key strips the provider query, so a
+	// renumbered ?result= or rotated credential still hits the same release's
+	// cached bytes evidence.
+	if cached := h.virtualProbeFromCache(ctx, file, streamURL, transient, candidate, ownerID); cached != nil {
+		resolved.File = cached
+		resolved.ProbeSucceeded = true
+		resolved.Provenance = ProbeProvenanceVerified
+		if err := h.virtualCandidateVerdictError(ctx, candidate.URI, file, ownerID, allowFailed); err != nil {
+			return nil, err
+		}
 		return &resolved, nil
 	}
 	probeCtx, probeCancel := context.WithTimeout(ctx, virtualProbeBudget)

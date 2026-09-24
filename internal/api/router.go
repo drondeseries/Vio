@@ -1693,8 +1693,25 @@ func newChiRouter(deps Dependencies) chi.Router {
 				var resolved string
 				var headers map[string]string
 				if playbackHandler.VirtualMediaDetailedResolver != nil {
+					// A reconstructed session re-resolves the release it was
+					// already serving. Thread the intents explicitly: without
+					// them the resolver inherits the candidate-rotation default
+					// (true), so a rebuilt session whose pin is absent from the
+					// provider list would silently swap to a sibling release. A
+					// session-bound rehydrate declares session-bound and
+					// withholds rotation; the row's durable identity is threaded
+					// so a renumbered same-release candidate is re-identified
+					// (IdentityRematched) instead of replaced.
+					resolveCtx := handlers.WithVirtualSessionBinding(ctx, true)
+					resolveCtx = handlers.WithVirtualCandidateRotation(resolveCtx, false)
+					resolveCtx = virtuallibrary.WithPersistedCandidateIdentity(resolveCtx, virtuallibrary.PersistedCandidateIdentity{
+						VideoHash:   file.ProviderVideoHash,
+						GUID:        file.ProviderGUID,
+						ReleaseName: file.ProviderReleaseName,
+						ReleaseSize: file.ProviderReleaseSize,
+					})
 					res, dErr := playbackHandler.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-						ctx, canonicalPath, ownerInstallationID, userID, profileID, false, nil, "",
+						resolveCtx, canonicalPath, ownerInstallationID, userID, profileID, false, nil, "",
 					)
 					if dErr != nil {
 						return "", nil, dErr
