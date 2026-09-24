@@ -7044,9 +7044,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// listener from an eng/ac3 commentary track to the identically-shaped
 			// main track on a quality change. A same-row candidate rotation keeps
 			// the id but replaces the tracks, so the guard is the union of an id
-			// change (a real edition switch, which always remaps) and an
-			// inventory fingerprint change under a fixed id.
-			if currentEffectiveFile.ID != effectiveFile.ID || !sameMediaInventoryV3(remapSource, effectiveFile) {
+			// change (a real edition switch, which always remaps), an inventory
+			// fingerprint change under a fixed id, and a recorded candidate
+			// rotation (a moved revision) whose tracks happen to compare equal.
+			if currentEffectiveFile.ID != effectiveFile.ID ||
+				!sameMediaInventoryV3(remapSource, effectiveFile) ||
+				virtualCandidateRotationRecordedV3(session, currentEffectiveFile) {
 				candidateStart := start
 				remapErr := remapAudioSelectionV3(remapSource, effectiveFile, &candidateStart)
 				if remapErr == nil && (candidateStart.SubtitleTrackIndex != nil || candidateStart.SubtitleTrackID != "") {
@@ -8912,6 +8915,26 @@ func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, s
 	evidence.SubtitleTracks = session.VirtualSubtitleTracks
 	evidence.ExternalSubtitles = session.VirtualExternalSubtitles
 	return &evidence
+}
+
+// virtualCandidateRotationRecordedV3 reports whether the session recorded a
+// virtual candidate move that no plan has re-probed yet. A binding move leaves
+// the carried subtitle evidence anchored at the previous candidate
+// (VirtualSubtitleEvidenceURI) while clearing VirtualSourceRevision (see
+// SetVirtualSource); the loaded effective row still names a virtual candidate.
+// In that window the row's inventory may look identical to what the plan
+// carried — a provider can rotate to a release with the same track shapes — so
+// id/inventory comparison alone must not treat the selection as unchanged. This
+// is the signal the fingerprint cannot provide; it fires only on a recorded
+// rotation, so an ordinary same-file replan is unaffected.
+func virtualCandidateRotationRecordedV3(session *playback.Session, effectiveFile *models.MediaFile) bool {
+	if session == nil || effectiveFile == nil || !isVirtualPlaybackFile(effectiveFile) {
+		return false
+	}
+	if session.VirtualSourceRevision != "" || session.VirtualSourceURI == "" {
+		return false
+	}
+	return session.VirtualSubtitleEvidenceSet && !virtualEvidenceMatchesBoundFile(effectiveFile, session)
 }
 
 // planVirtualSourceRevisionV3 returns the opaque virtual-source revision the

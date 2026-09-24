@@ -69,18 +69,19 @@ type Session struct {
 	// so the selection remap needs the plan-time audio inventory to compare
 	// against and remap from.
 	VirtualAudioTracks []models.AudioTrack
+	// VirtualSourceRevision is the opaque media-generation revision the planner
+	// published for this session's virtual candidate (PlanV3.VirtualSourceRevision).
+	// A candidate binding move clears it (see SetVirtualSource), so a non-empty
+	// value marks evidence that a plan has re-probed against the current
+	// binding; it is the rotation signal a track fingerprint cannot always
+	// provide.
+	VirtualSourceRevision string
 	// VirtualSubtitleEvidenceURI names the provider-neutral candidate the
 	// evidence above was captured for. It is the provenance anchor: evidence
 	// may only be applied to a file bound to the same candidate, and a
 	// rotation must move or clear it together with the evidence.
 	VirtualSubtitleEvidenceURI string
 	VirtualSubtitleEvidenceSet bool
-	// VirtualSourceRevision is the opaque media-generation revision the planner
-	// published for this session's virtual candidate (PlanV3.VirtualSourceRevision).
-	// It changes on a candidate rotation even when the catalog row id and the
-	// provider-neutral effective URI stay fixed, so it is the rotation signal
-	// for the same-row case where a track inventory fingerprint is impractical.
-	VirtualSourceRevision string
 
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
 	// only a route (media requests must present an authenticated user) from
@@ -197,10 +198,16 @@ type SessionStreamState struct {
 	// effective file (clearing evidence), instead of the legacy partial-update
 	// behavior that only ever overwrites.
 	VirtualSourceOwnershipSet bool
-	VirtualSourceRevision     string
-	VirtualSubtitleTracks     []models.SubtitleTrack
-	VirtualExternalSubtitles  []models.ExternalSubtitle
-	VirtualAudioTracks        []models.AudioTrack
+	// VirtualSourceRevision is the opaque media-generation revision the planner
+	// published for this session's virtual candidate (PlanV3.VirtualSourceRevision).
+	// It changes when a candidate is resolved even if the catalog row id and the
+	// provider-neutral effective URI stay fixed, so it records a same-row
+	// rotation that an inventory fingerprint alone cannot prove. A candidate
+	// move clears it (see SetVirtualSource) until the planner re-probes.
+	VirtualSourceRevision    string
+	VirtualSubtitleTracks    []models.SubtitleTrack
+	VirtualExternalSubtitles []models.ExternalSubtitle
+	VirtualAudioTracks       []models.AudioTrack
 	// VirtualSubtitleEvidenceURI names the provider-neutral candidate the
 	// carried evidence belongs to. It is the provenance anchor for the serve
 	// path: evidence may only be applied to a file bound to the same candidate.
@@ -1201,6 +1208,7 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
 			s.VirtualAudioTracks = state.VirtualAudioTracks
 			s.VirtualSubtitleEvidenceURI = state.VirtualSubtitleEvidenceURI
+			s.VirtualSourceRevision = state.VirtualSourceRevision
 			s.VirtualSubtitleEvidenceSet = true
 		} else if state.VirtualSourceOwnershipSet {
 			// A full v3 snapshot owns the binding and its evidence outright.
@@ -1213,10 +1221,8 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 			s.VirtualExternalSubtitles = nil
 			s.VirtualAudioTracks = nil
 			s.VirtualSubtitleEvidenceURI = ""
+			s.VirtualSourceRevision = ""
 			s.VirtualSubtitleEvidenceSet = false
-		}
-		if state.VirtualSourceOwnershipSet {
-			s.VirtualSourceRevision = state.VirtualSourceRevision
 		}
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
