@@ -27,6 +27,14 @@ interface IndexerReleaseListProps {
    * a menu.
    */
   rowRole?: "menuitem";
+  /**
+   * Registers a row with the parent menu's roving-focus list so Arrow Up/Down
+   * reach the indexer rows too. `index` is an absolute slot in the menu's item
+   * list; `rowIndexStart` is the first slot the first row should take. Both are
+   * omitted where the surface is not a keyboard-navigable menu.
+   */
+  registerRow?: (index: number, el: HTMLButtonElement | null) => void;
+  rowIndexStart?: number;
   className?: string;
 }
 
@@ -47,6 +55,8 @@ export function IndexerReleaseList({
   requests,
   tone = "surface",
   rowRole,
+  registerRow,
+  rowIndexStart,
   className,
 }: IndexerReleaseListProps) {
   if (releases.length === 0) return null;
@@ -55,7 +65,7 @@ export function IndexerReleaseList({
 
   return (
     <div className={className}>
-      {releases.map((release) => {
+      {releases.map((release, rowIndex) => {
         const status = requests.statusFor(release);
         const error = requests.errorFor(release);
         const meta = indexerReleaseMeta(release);
@@ -69,6 +79,11 @@ export function IndexerReleaseList({
         return (
           <button
             key={release.release_id}
+            ref={
+              registerRow && rowIndexStart !== undefined
+                ? (el) => registerRow(rowIndexStart + rowIndex, el)
+                : undefined
+            }
             type="button"
             role={rowRole}
             data-indexer-release={release.release_id}
