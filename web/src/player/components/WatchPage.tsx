@@ -998,7 +998,6 @@ function WatchPagePlayer({
         selectedVersion={selectedVersion}
         versions={playbackVersions}
         indexerReleases={indexerReleaseRows}
-        contentId={contentId}
         virtualRanking={virtualRanking}
         activeFileId={session.mediaFileId}
         chapters={activeChapters}

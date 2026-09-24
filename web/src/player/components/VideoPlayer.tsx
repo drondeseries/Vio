@@ -214,8 +214,6 @@ interface VideoPlayerProps {
   versions?: PlayerFileVersion[];
   /** Releases on the indexers that are not downloaded on the provider yet. */
   indexerReleases?: PlayerIndexerRelease[];
-  /** The item id, so the menu can request an indexer release. */
-  contentId?: string;
   /** The ranking the server applied to the version list, forwarded to the menu. */
   virtualRanking?: PlayerVirtualRanking;
   activeFileId?: number | null;
@@ -407,7 +405,6 @@ export function VideoPlayer({
   selectedVersion,
   versions = [],
   indexerReleases = [],
-  contentId,
   virtualRanking,
   activeFileId,
   chapters = [],
