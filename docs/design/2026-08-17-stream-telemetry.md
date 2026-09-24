@@ -603,7 +603,9 @@ merge (§2.5, §8). Still read-only, so no election and no sanctions are needed 
 
 `GET /api/v1/admin/stream-telemetry/parity`, a new additive admin endpoint behind the
 same authorization as `/admin/sessions`. Read-only: no `/api/v1` response changed, no
-migration, no Postgres or Redis write.
+migration, no Postgres or Redis write. The v2 contract exposes the same projection
+at `GET /api/v2/admin/stream-telemetry/parity`; the v1 route is the pre-1.0 bridge
+alias and retires with the rest of `/api/v1`.
 
 The phase was specified as "serve a debug projection, **compare it against both legacy
 projections**, *then* repoint admin sessions, stats and events". **The comparison
@@ -947,6 +949,8 @@ is configured; nothing has to be set to get a parity read.
 #    transcode_node, jellycompat, abs), distributed merge on wherever Redis is
 #    configured.
 curl -fsS localhost:8091/api/v1/admin/stream-telemetry/parity
+# or the native contract route, same projection:
+curl -fsS localhost:8091/api/v2/admin/stream-telemetry/parity
 
 # 2. read repeatedly, over days — one report is a sample, not proof
 
