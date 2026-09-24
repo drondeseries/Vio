@@ -27,19 +27,14 @@ import (
 // legacy and protocol-v3 orchestration. Callers retain ownership of lifecycle
 // locking and decide whether registration is immediate or transactionally
 // staged.
-type localPlaybackStartupError struct {
-	cause   error
-	running bool
-}
-
-func (e *localPlaybackStartupError) Error() string {
-	return e.cause.Error()
-}
-
-func (e *localPlaybackStartupError) Unwrap() error {
-	return e.cause
-}
-
+//
+// It starts exactly one FFmpeg process and returns without waiting for its
+// first manifest: manifest readiness belongs to the caller
+// (startReadyLocalPlaybackTransportV3) or to the hw_accel=auto pipeline loop
+// (runTranscodeStartup), which advances to a safer path only when the attempt
+// it started exits before its first manifest. Waiting here would convert a
+// manifest failure into a start error, and the pipeline treats start errors
+// as non-hardware failures it must not retry.
 func (h *PlaybackHandler) startLocalPlaybackTransport(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
 	// Tone-map hardware/software selection and retries are owned by the v3
 	// planner (softwareToneMapRetryOptsV3) and the compat recipe resolver; this
@@ -97,16 +92,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		opts.OnSourceRejected = h.tm.OnSourceRejected
 	}
 	if !strings.HasPrefix(strings.ToLower(opts.InputPath), virtualPlaybackPrefix) {
-		session, startErr := h.startTranscodeSession(context.WithoutCancel(ctx), opts)
-		if startErr != nil {
-			return nil, startErr
-		}
-		if _, readyErr := session.WaitForManifest(8 * time.Second); readyErr != nil {
-			startupErr := &localPlaybackStartupError{cause: readyErr, running: session.IsRunning()}
-			_ = session.Close()
-			return nil, startupErr
-		}
-		return session, nil
+		return h.startTranscodeSession(context.WithoutCancel(ctx), opts)
 	}
 	// The catalog candidate can be replaced while playback is starting. Do not
 	// make a just-selected virtual row a second hard dependency; the canonical
