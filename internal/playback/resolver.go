@@ -3,6 +3,7 @@
 package playback
 
 import (
+	"errors"
 	"slices"
 	"strings"
 
@@ -27,12 +28,65 @@ const (
 // instead of downmixing+re-encoding to AAC. Distinct from CodecsAudio, which
 // describes what the client itself can decode.
 type ClientCapabilities struct {
-	CodecsVideo            []string `json:"codecs_video"` // e.g., h264, hevc, av1
-	CodecsAudio            []string `json:"codecs_audio"` // e.g., aac, opus, flac
-	AudioPassthroughCodecs []string `json:"audio_passthrough_codecs,omitempty"`
-	Containers             []string `json:"containers"`     // e.g., mp4, webm, mkv
-	MaxResolution          string   `json:"max_resolution"` // e.g., 1080p, 2160p
-	HDR                    bool     `json:"hdr"`
+	ClientFeatures         []string                  `json:"client_features,omitempty"`
+	VideoEvidence          CapabilityEvidenceV3      `json:"video_evidence,omitempty"`
+	CodecsVideo            []string                  `json:"codecs_video"` // e.g., h264, hevc, av1
+	CodecsAudio            []string                  `json:"codecs_audio"` // e.g., aac, opus, flac
+	AudioPassthroughCodecs []string                  `json:"audio_passthrough_codecs,omitempty"`
+	Containers             []string                  `json:"containers"`     // e.g., mp4, webm, mkv
+	MaxResolution          string                    `json:"max_resolution"` // e.g., 1080p, 2160p
+	HDR                    bool                      `json:"hdr"`
+	VideoDecode            []VideoDecodeCapabilityV3 `json:"video_decode,omitempty"`
+}
+
+// hasDetailedVideoEvidence reports whether the payload carries a strict-tier
+// detailed decoder description: per-decoder video_decode entries backed by an
+// evidence tier that can validate them. It is the single predicate shared by
+// the additive validator and Resolve so the two cannot drift.
+func (c *ClientCapabilities) hasDetailedVideoEvidence() bool {
+	return (c.VideoEvidence == EvidenceExactV3 || c.VideoEvidence == EvidencePlatformAttestedV3) &&
+		len(c.VideoDecode) > 0
+}
+
+// NormalizeAndValidateVideoDecode applies the protocol-v3 detailed decoder
+// limits to additive capability payloads such as download creation. It mirrors
+// the v3 playback start path: flat-list payloads at any evidence tier — and
+// feature-token-only payloads — stay valid and unchanged, because those resolve
+// from the flat codec lists exactly as playback does. Only a partial detailed
+// opt-in is refused: video_decode entries whose evidence tier cannot validate
+// them would otherwise be silently ignored.
+func (c *ClientCapabilities) NormalizeAndValidateVideoDecode() error {
+	// A present-but-unrecognized tier is a client bug, not a legacy payload:
+	// silently resolving it from the flat lists would hide a typo behind a
+	// working-looking answer, where the v3 playback path rejects it outright.
+	// Omitting the field entirely stays valid — that is what a legacy flat
+	// payload looks like.
+	if c.VideoEvidence != "" && !validCapabilityEvidenceV3(c.VideoEvidence) {
+		return errors.New("video_evidence must be exact, platform_attested, or declared")
+	}
+	if len(c.VideoDecode) == 0 {
+		return nil
+	}
+	if !c.hasDetailedVideoEvidence() {
+		return errors.New("video_decode requires exact or platform_attested video_evidence")
+	}
+	detailed := ClientCodecCapabilitiesV3{
+		VideoEvidence: c.VideoEvidence,
+		CodecsVideo:   c.CodecsVideo,
+		VideoDecode:   c.VideoDecode,
+	}
+	// The structural validate/normalize split is the current protocol-v3
+	// shape: validate first (nothing rewritten), then canonicalize. The
+	// download path has already proven the evidence tier can validate the
+	// entries above, so structural validation here only enforces the same
+	// bounds the v3 start path applies.
+	if err := validateVideoCapabilitiesStructureV3(&detailed, c.ClientFeatures); err != nil {
+		return err
+	}
+	normalizeVideoCapabilitiesV3(&detailed)
+	c.CodecsVideo = detailed.CodecsVideo
+	c.VideoDecode = detailed.VideoDecode
+	return nil
 }
 
 // AdminSettings controls server-side playback constraints.
@@ -55,6 +109,37 @@ type PlayDecision struct {
 func Resolve(file *models.MediaFile, caps ClientCapabilities, settings AdminSettings) *PlayDecision {
 	// Check if client supports the video codec.
 	videoOK := containsStr(caps.CodecsVideo, file.CodecVideo)
+	detailedVideoEvidence := caps.hasDetailedVideoEvidence()
+	// detailedBoundsChecked is true only when the videoEligibleV3 bounds walk
+	// below actually ran. It gates the resolution ceiling check further down:
+	// when the detailed walk ran, its per-decoder max_width/max_height are
+	// authoritative and the coarse ceiling is redundant; when it could not run
+	// (sparse probe metadata), the coarse ceiling must still apply so sparse
+	// metadata cannot widen eligibility beyond the flat contract.
+	detailedBoundsChecked := false
+	if detailedVideoEvidence {
+		source := SourceDescriptorFromFileV3(file, 0)
+		// Detailed validation needs complete probe facts (codec, bit depth,
+		// dimensions, frame rate, bitrate). A file whose probe metadata is
+		// sparse cannot be checked against the decoder bounds at all — that is
+		// "can't tell", not "incompatible", and forcing a transcode of an
+		// original-quality download over it would be a silent quality loss. Keep
+		// the flat-list answer in that case — which includes the coarse
+		// max_resolution ceiling, so sparse metadata fails closed to that
+		// ceiling instead of failing open; a real mismatch (complete metadata
+		// whose entries do not cover the source) still fails closed below.
+		if routeVideoMetadataCompleteV3(source) {
+			detailedBoundsChecked = true
+			videoOK, _ = videoEligibleV3(source, StartRequestV3{
+				ClientFeatures: caps.ClientFeatures,
+				Capabilities: ClientCodecCapabilitiesV3{
+					VideoEvidence: caps.VideoEvidence,
+					CodecsVideo:   caps.CodecsVideo,
+					VideoDecode:   caps.VideoDecode,
+				},
+			})
+		}
+	}
 	// Audio is considered OK if the client can decode the codec itself OR its
 	// sink can passthrough it. Passthrough lets us stream-copy surround audio
 	// (EAC3/AC3/DTS/TrueHD) to HDMI AVRs instead of re-encoding to stereo AAC.
@@ -74,7 +159,7 @@ func Resolve(file *models.MediaFile, caps ClientCapabilities, settings AdminSett
 	containerOK := containsStr(caps.Containers, file.Container)
 
 	// Check resolution constraint.
-	if !resolutionFits(file.Resolution, caps.MaxResolution) {
+	if !detailedBoundsChecked && !resolutionFits(file.Resolution, caps.MaxResolution) {
 		if !settings.TranscodeEnabled {
 			return &PlayDecision{
 				Method: PlayDirect,
