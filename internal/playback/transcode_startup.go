@@ -34,6 +34,12 @@ type TranscodeStartup struct {
 	// Timeout bounds each attempt's wait for its first manifest. Zero uses
 	// ManifestStartupTimeout.
 	Timeout time.Duration
+	// Budget bounds the whole startup across every attempt, spawn included.
+	// Zero leaves the startup bounded only by each attempt's Timeout and the
+	// caller's context, which under hw_accel=auto can total one Timeout per
+	// execution path. Callers that must answer within a request-level deadline
+	// set it explicitly.
+	Budget time.Duration
 	// Start launches one attempt. Nil uses StartTranscode.
 	Start TranscodeStartFunc
 	// LegacyRetry applies only when the pipeline is not enabled.
@@ -104,9 +110,23 @@ func (startup TranscodeStartup) timeout() time.Duration {
 // runTranscodeStartup starts attempts until one produces a manifest. See
 // StartReconstructTranscode for the reconstruct rules.
 func runTranscodeStartup(ctx context.Context, pipeline *AutoTranscodePipeline, startup TranscodeStartup, reconstruct bool) (*TranscodeSession, error) {
+	if startup.Budget > 0 {
+		// One deadline bounds every attempt's spawn and manifest wait, so a
+		// fallback that spends a full per-attempt timeout on each path cannot
+		// outlive the caller's request budget. Derived from the caller's ctx,
+		// so an explicit cancel still propagates.
+		budgetCtx, cancel := context.WithTimeout(ctx, startup.Budget)
+		defer cancel()
+		ctx = budgetCtx
+	}
 	attempt := pipeline.Current()
 	legacyRetryUsed := false
 	for {
+		if ctx.Err() != nil {
+			// The overall budget ended between attempts: report it as a
+			// readiness failure so callers keep the same classification.
+			return nil, &TranscodeStartupError{Err: ctx.Err()}
+		}
 		session, err := startup.start(ctx, attempt)
 		if err != nil {
 			// Validation, directory, and exec failures are not hardware
@@ -114,10 +134,16 @@ func runTranscodeStartup(ctx context.Context, pipeline *AutoTranscodePipeline, s
 			return nil, err
 		}
 
-		_, err = session.WaitForGenerationManifest(startup.timeout())
+		_, err = session.WaitForGenerationManifestContext(ctx, startup.timeout())
 		if err == nil {
 			pipeline.RememberSuccess()
 			return session, nil
+		}
+		if ctx.Err() != nil {
+			// The overall budget ended during this attempt's wait. Report the
+			// budget cause so callers classify it as the request deadline, not
+			// as this attempt's unrelated per-attempt timeout.
+			err = ctx.Err()
 		}
 
 		wasRunning := session.IsRunning()

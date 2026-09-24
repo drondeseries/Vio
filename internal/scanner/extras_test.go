@@ -106,6 +106,52 @@ func TestClassifyExtraPathSeriesLibrary(t *testing.T) {
 	}
 }
 
+// TestClassifyExtraPathUsesLibraryRootsForEpisodeGuard pins the guard in
+// extras.go's classify: the episode-token guard must parse the filename through
+// the same root-aware parser the rest of the scan pipeline uses. Without the
+// configured root the parser reads library-organization segments as media
+// identity and can suppress an extras classification the root-aware sites keep.
+func TestClassifyExtraPathUsesLibraryRootsForEpisodeGuard(t *testing.T) {
+	// A show folder directly at the library root. The show folder owns its
+	// extras through its own media, so "Show/Extras/01 - Making Of.mkv" is an
+	// Extra when the root is present.
+	walked := []string{
+		"/tv/Show/Show S01E01.mkv",
+		"/tv/Show/Extras/01 - Making Of.mkv",
+	}
+	for _, folderType := range []string{"series", "mixed"} {
+		classifier := newExtrasClassifier(folderType, []string{"/tv"}, walked)
+		candidate, ok := classifier.classify("/tv/Show/Extras/01 - Making Of.mkv")
+		if !ok {
+			t.Fatalf("%s: show folder at library root: extras file must classify, got not-an-extra", folderType)
+		}
+		if candidate.Kind != models.ExtraKindOther || candidate.SupplementalDir != "/tv/Show/Extras" {
+			t.Fatalf("%s: classify = (%q, %q), want (%q, %q)",
+				folderType, candidate.Kind, candidate.SupplementalDir, models.ExtraKindOther, "/tv/Show/Extras")
+		}
+	}
+}
+
+// TestClassifyExtraPathEpisodeGuardIsRootScoped pins the behavior difference the
+// root-aware parse produces: when the configured root is the candidate's own
+// directory, the parser sees no season context above it, so a suffix-classified
+// file stays an Extra. The pre-rework guard parsed without the root, saw a
+// "Season 01" parent as media identity, and suppressed it.
+func TestClassifyExtraPathEpisodeGuardIsRootScoped(t *testing.T) {
+	const (
+		root = "/tv/Show/Season 01"
+		path = "/tv/Show/Season 01/01 - Making Of-trailer.mkv"
+	)
+	classifier := newExtrasClassifier("mixed", []string{root}, []string{path})
+	candidate, ok := classifier.classify(path)
+	if !ok {
+		t.Fatal("root-scoped suffix-classified file must remain an Extra")
+	}
+	if candidate.Kind != models.ExtraKindTrailer {
+		t.Fatalf("classify kind = %q, want %q", candidate.Kind, models.ExtraKindTrailer)
+	}
+}
+
 func TestClassifyExtraPathWatchMode(t *testing.T) {
 	// Watch-event scans have no walked path list; title ownership is probed
 	// from the filesystem.

@@ -42,6 +42,62 @@ func startupTestOpts() TranscodeOpts {
 	return opts
 }
 
+func TestStartReadyTranscodeBudgetBoundsAllAttempts(t *testing.T) {
+	cache := newAutoTranscodePipelineCache()
+	pipeline := newResolvedAutoTranscodePipeline(startupTestOpts(), cache)
+	attempts := 0
+	start := func(_ context.Context, opts TranscodeOpts) (*TranscodeSession, error) {
+		attempts++
+		// Every attempt is still running at its deadline, so each would
+		// consume the full per-attempt timeout without an overall budget.
+		return fakeStartupSession(t, opts, t.TempDir(), false, true), nil
+	}
+	startedAt := time.Now()
+	_, err := StartReadyTranscode(context.Background(), pipeline, TranscodeStartup{
+		Timeout: 10 * time.Second,
+		Budget:  50 * time.Millisecond,
+		Start:   start,
+	})
+	var startupErr *TranscodeStartupError
+	if !errors.As(err, &startupErr) {
+		t.Fatalf("error = %v, want a readiness failure", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded cause", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 2*time.Second {
+		t.Fatalf("startup ran %v, budget was not enforced", elapsed)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempt count = %d, want 1 before the budget ended the walk", attempts)
+	}
+}
+
+func TestStartReadyTranscodeWithoutBudgetKeepsPerAttemptTimeout(t *testing.T) {
+	cache := newAutoTranscodePipelineCache()
+	pipeline := newResolvedAutoTranscodePipeline(startupTestOpts(), cache)
+	attempts := 0
+	var outputDirs []string
+	start := func(_ context.Context, opts TranscodeOpts) (*TranscodeSession, error) {
+		attempts++
+		outputDir := t.TempDir()
+		outputDirs = append(outputDirs, outputDir)
+		return fakeStartupSession(t, opts, outputDir, attempts == 2, false), nil
+	}
+	// With no Budget the two attempts still complete their per-attempt waits.
+	session, err := StartReadyTranscode(context.Background(), pipeline, TranscodeStartup{
+		Timeout: time.Millisecond,
+		Start:   start,
+	})
+	if err != nil || session == nil {
+		t.Fatalf("StartReadyTranscode without a budget = (%v, %v)", session, err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempt count = %d, want the fallback to still walk without a budget", attempts)
+	}
+	_ = outputDirs
+}
+
 func TestStartReadyTranscodeAdvancesOnExitAndAvoidsFailedDevice(t *testing.T) {
 	cache := newAutoTranscodePipelineCache()
 	pipeline := newResolvedAutoTranscodePipeline(startupTestOpts(), cache)

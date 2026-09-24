@@ -41,7 +41,14 @@ const extrasDirAncestorDepth = 2
 // so the titles beneath them stay primary.
 type extrasClassifier struct {
 	folderType string
-	rootSet    map[string]bool
+	// libraryRoots are the library's configured roots. Filename parsing is
+	// root-aware: the root decides where library organization ends and media
+	// identity begins, so the same path can parse as a movie or a series
+	// depending on it. The classifier must parse exactly as the migrated
+	// root-aware call sites do, or its extras decision diverges from the rest
+	// of the scan pipeline.
+	libraryRoots []string
+	rootSet      map[string]bool
 	// dirFiles marks directories that directly contain a walked media file.
 	dirFiles map[string]bool
 	// dirFilesBelow marks directories with a walked media file exactly two
@@ -58,6 +65,7 @@ type extrasClassifier struct {
 func newExtrasClassifier(folderType string, libraryRoots []string, walkedPaths []string) *extrasClassifier {
 	c := &extrasClassifier{
 		folderType:    folderType,
+		libraryRoots:  libraryRoots,
 		rootSet:       walkRootSet(libraryRoots),
 		dirFiles:      make(map[string]bool, len(walkedPaths)),
 		dirFilesBelow: make(map[string]bool, len(walkedPaths)),
@@ -76,9 +84,10 @@ func newExtrasClassifier(folderType string, libraryRoots []string, walkedPaths [
 // ownership is probed from the filesystem instead of a walked path list.
 func newWatchExtrasClassifier(folderType string, libraryRoots []string) *extrasClassifier {
 	return &extrasClassifier{
-		folderType: folderType,
-		rootSet:    walkRootSet(libraryRoots),
-		probeFS:    true,
+		folderType:   folderType,
+		libraryRoots: libraryRoots,
+		rootSet:      walkRootSet(libraryRoots),
+		probeFS:      true,
 	}
 }
 
@@ -118,7 +127,7 @@ func (c *extrasClassifier) classify(path string) (extraCandidate, bool) {
 	// Preserve the documented series behavior: an episode-tokened file under
 	// Extras/ is a season-0 special, not an extra.
 	if !librarykind.IsMovie(c.folderType) {
-		if hints := naming.ParseFilename(path, c.folderType); hints != nil &&
+		if hints := naming.ParseFilename(path, c.folderType, c.libraryRoots...); hints != nil &&
 			hints.Type == "series" && hints.EpisodeNum > 0 {
 			return extraCandidate{}, false
 		}
