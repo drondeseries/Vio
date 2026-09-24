@@ -14,6 +14,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -188,6 +189,18 @@ func TestWritePlaybackSegmentErrorMapping(t *testing.T) {
 			err:        fmt.Errorf("restart: %w", playback.ErrManifestNotReady),
 			wantStatus: http.StatusServiceUnavailable,
 			wantCode:   "unavailable",
+		},
+		{
+			name:       "session-bound candidate absent during restart",
+			err:        fmt.Errorf("refresh transcode input: %w", fmt.Errorf("resolve virtual input: %w", virtuallibrary.ErrSessionBoundCandidateAbsent)),
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "virtual_resolve_failed",
+		},
+		{
+			name:       "persisted candidate trusted during restart",
+			err:        fmt.Errorf("refresh transcode input: %w", fmt.Errorf("resolve virtual input: %w", virtuallibrary.ErrPersistedCandidateTrusted)),
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "virtual_resolve_failed",
 		},
 		{
 			name:       "unexpected",

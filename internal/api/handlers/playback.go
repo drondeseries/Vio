@@ -46,6 +46,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
 	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 	"github.com/Silo-Server/silo-server/internal/userstore"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/watchstate"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
 )
@@ -2192,13 +2193,20 @@ func writePlaybackDecodeError(w http.ResponseWriter) {
 // stopped session is not a server defect. Both map to 404, mirroring
 // hlsSegmentErrorResponse on the Jellyfin-compatible surface. A playlist that
 // is still being produced (ErrManifestNotReady) is transient and stays
-// retryable as 503. Everything else is an unexpected server error.
+// retryable as 503. A restart whose virtual-provider resolve hit the
+// session-bound absent-pin / trusted-persisted sentinels is a dependency
+// failure the client can recover from on the next segment request (provider
+// relists renumber ids), so it is a retryable 503 with a
+// virtual_resolve_failed problem code instead of a fatal 500 the player
+// treats as a dead generation. Everything else is an unexpected server error.
 func writePlaybackSegmentError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, playback.ErrSegmentNotFound), errors.Is(err, playback.ErrTranscodeFailed):
 		writeError(w, http.StatusNotFound, "not_found", "Segment not found")
 	case errors.Is(err, playback.ErrManifestNotReady):
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode session is temporarily unavailable")
+	case errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent), errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted):
+		writeError(w, http.StatusServiceUnavailable, "virtual_resolve_failed", "Failed to resolve virtual source")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load segment")
 	}

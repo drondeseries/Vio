@@ -751,20 +751,16 @@ func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidateOnManifestReady(
 			if virtualURI == "virtual://series/tt1/1/1?result=dead" {
 				return ResolvedVirtualMedia{CandidateID: "dead"}, errors.New("stream 404")
 			}
-			if forceRefresh && len(excludedCandidateIDs) == 0 {
-				refreshedURI = virtualURI
-				return ResolvedVirtualMedia{
-					URL:            "http://localhost:8080/stream-refreshed.mp4",
-					URI:            virtualURI,
-					CandidateID:    "live-winner",
-					RequestHeaders: map[string]string{"Referer": "https://stream.example/renewed"},
-				}, nil
-			}
+			// A restart resolves the winning candidate's own URI. The
+			// stored-first attempt (no stored row here) and a forced relist both
+			// renew the same live-winner candidate, which is what this test
+			// pins.
+			refreshedURI = virtualURI
 			return ResolvedVirtualMedia{
-				URL:            "http://localhost:8080/stream.mp4",
-				URI:            "virtual://series/tt1/1/1?result=live-winner",
+				URL:            "http://localhost:8080/stream-refreshed.mp4",
+				URI:            virtualURI,
 				CandidateID:    "live-winner",
-				RequestHeaders: map[string]string{"Referer": "https://stream.example/"},
+				RequestHeaders: map[string]string{"Referer": "https://stream.example/renewed"},
 			}, nil
 		}),
 		StartTranscodeFunc: func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {

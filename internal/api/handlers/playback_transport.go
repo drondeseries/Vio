@@ -161,11 +161,58 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		// can silently swap to a differently-ranked candidate mid-stream. The
 		// canonical path still carries the ?result= identity the session bound
 		// to during planning.
+		//
+		// First attempt with forceRefresh=false: the session's own persisted
+		// provider URL is a perfectly good restart input, and the stored-URL
+		// shortcut serves it from the catalog row with zero provider calls. The
+		// historical force here was meant to bypass cached transport, not to
+		// discard the stored URL; forcing it made every mid-session restart
+		// re-list the provider, so an altmount ?result= renumbering (ids are
+		// per-listing) turned a healthy persisted URL into a fatal resolve
+		// error and every segment 500'd until hls.js gave up. Identity is still
+		// threaded (see resolveVirtualInputURI), so a harmless renumbering
+		// re-matches the same release.
 		res, cleanup, err := h.resolveVirtualInputURI(
 			refreshCtx, canonicalPath, ownerInstallationID,
-			userID, profileID, true, nil, "",
+			userID, profileID, false, nil, "",
 		)
-		return res.URL, cleanup, err
+		if err == nil {
+			return res.URL, cleanup, nil
+		}
+		// The stored path failed. Retry once with a fresh relist and rotation
+		// declared, excluding the pinned candidate, and thread the row's durable
+		// identity so a renumbered same-release candidate is re-identified rather
+		// than swapped. Mirror resolveVirtualAnchorURIWithRotationV3: the retry
+		// must never silently anchor this already-planned session on sibling
+		// bytes, so accept it only when the same release re-matched.
+		pinnedID := virtualResultCandidateID(canonicalPath)
+		var excluded []string
+		if pinnedID != "" {
+			excluded = []string{pinnedID}
+		}
+		retryCtx := virtualResolveContextWithPersistedIdentity(refreshCtx, file)
+		rotated, rotatedCleanup, rotateErr := h.resolveVirtualInputURI(
+			retryCtx, canonicalPath, ownerInstallationID,
+			userID, profileID, true, excluded, "", true,
+		)
+		if rotateErr != nil {
+			return rotated.URL, rotatedCleanup, rotateErr
+		}
+		if !rotated.IdentityRematched && !resolvedMatchesPersistedIdentity(rotated, file) {
+			if rotatedCleanup != nil {
+				rotatedCleanup()
+			}
+			slog.WarnContext(refreshCtx, "virtual transport restart rotation resolved a different release; refusing a silent restart swap",
+				"component", "api", "session_anchor", canonicalPath,
+				"status", "rotation_refused", "old_candidate_id", pinnedID,
+				"new_candidate_id", virtualResultCandidateID(rotated.URI))
+			return "", nil, err
+		}
+		slog.InfoContext(refreshCtx, "virtual transport restart rotated an absent session-bound candidate",
+			"component", "api", "session_anchor", canonicalPath,
+			"status", "rotated", "old_candidate_id", pinnedID,
+			"new_candidate_id", virtualResultCandidateID(rotated.URI), "virtual_uri", rotated.URI)
+		return rotated.URL, rotatedCleanup, nil
 	}
 	var lastErr error
 	// One deadline owns the whole transport startup: provider resolution,
