@@ -16810,11 +16810,14 @@ export interface components {
     };
     ClientCapabilities: {
       audio_passthrough_codecs?: string[];
+      client_features?: string[];
       codecs_audio: string[];
       codecs_video: string[];
       containers: string[];
       hdr: boolean;
       max_resolution: string;
+      video_decode?: components["schemas"]["VideoDecodeCapabilityV3"][];
+      video_evidence?: string;
     };
     ClientCodecCapabilitiesV3: {
       audio_evidence: string;
@@ -29565,7 +29568,7 @@ export interface operations {
         cursor?: string;
         limit?: number;
         q?: string;
-        status?: "" | "accepted" | "running" | "completed" | "failed" | "canceled";
+        status?: "" | "accepted" | "running" | "completed" | "failed" | "canceled" | "cancelled";
       };
       header?: {
         /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */

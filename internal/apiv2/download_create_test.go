@@ -3,6 +3,7 @@ package apiv2
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,13 +83,13 @@ func TestDownloadCreateTransport(t *testing.T) {
 			t.Fatalf("invalid %s: %d %s", body, rec.Code, rec.Body.String())
 		}
 	}
-	// A caps object carrying a property the v2 schema does not define is a schema
-	// violation, so it is refused with 422 before the handler runs — unlike the
-	// handler-level 400s above.
+	// A caps object carrying an unrecognized video_evidence tier is a domain
+	// violation the handler refuses with 422 validation_failed (the field is in
+	// the contract; the handler validates its value), unlike the 400s above.
 	beforeSchema := svc.calls
 	rec = do(t, h, "POST", path, `{"content_id":"movie","expected_revision":0,"caps":{"video_evidence":"typo","codecs_video":[],"codecs_audio":[],"containers":[],"max_resolution":"1080p","hdr":false}}`, device)
-	if rec.Code != 422 || svc.calls != beforeSchema {
-		t.Fatalf("caps unknown property: %d %s", rec.Code, rec.Body.String())
+	if rec.Code != 422 || svc.calls != beforeSchema || !strings.Contains(rec.Body.String(), "validation_failed") {
+		t.Fatalf("caps invalid tier: %d %s", rec.Code, rec.Body.String())
 	}
 	rec = do(t, h, "POST", path, `{"content_id":"movie"}`, viewer)
 	if rec.Code != 202 || svc.req.DeviceID != "" {

@@ -18161,6 +18161,12 @@
             },
             "type": "array"
           },
+          "client_features": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "codecs_audio": {
             "items": {
               "type": "string"
@@ -18183,6 +18189,15 @@
             "type": "boolean"
           },
           "max_resolution": {
+            "type": "string"
+          },
+          "video_decode": {
+            "items": {
+              "$ref": "#/components/schemas/VideoDecodeCapabilityV3"
+            },
+            "type": "array"
+          },
+          "video_evidence": {
             "type": "string"
           }
         },
@@ -47330,7 +47345,8 @@
                 "running",
                 "completed",
                 "failed",
-                "canceled"
+                "canceled",
+                "cancelled"
               ],
               "type": "string"
             }

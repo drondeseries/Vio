@@ -281,7 +281,7 @@ verify-apiv2-contract:
 	@go test -count=1 ./internal/contractspec/ \
 		|| { echo "::error::$(APIV2_OPENAPI) fails the spec lint or the diff tool no longer detects the seeded breaking fixture"; exit 1; }
 	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
-		base=$$(git merge-base $(BASE_REF) HEAD) && \
+		base=$$(scripts/apiv2-contract-base.sh $(BASE_REF) HEAD) && \
 		{ git show "$$base:$(APIV2_OPENAPI)" > "$$tmp/base.json" 2>/dev/null || : ; } && \
 		go run ./cmd/apiv2-contract-diff -base "$$tmp/base.json" -revision $(APIV2_OPENAPI) -contracts contracts/api/v2 \
 		|| { echo "::error::$(APIV2_OPENAPI) has an unapproved breaking change against $$base; see contracts/api/v2/breaking-approvals.schema.json"; exit 1; }

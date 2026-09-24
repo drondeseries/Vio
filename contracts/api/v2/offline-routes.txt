@@ -91,6 +91,7 @@ GET /api/v1/admin/stats/downloads
 GET /api/v1/admin/stats/playback-activity
 GET /api/v1/admin/stats/timeseries
 GET /api/v1/admin/stats/top-activity
+GET /api/v1/admin/stream-telemetry/parity
 GET /api/v1/admin/subtitle-providers/
 GET /api/v1/admin/subtitles/
 GET /api/v1/admin/subtitles/{id}/download
