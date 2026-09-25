@@ -35,6 +35,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
 
+// ErrProviderUnavailable marks a provider-listing failure rather than a
+// successful answer that merely lacks candidates: the provider request failed,
+// timed out, or answered with a non-200 status. Callers that hold a
+// session-bound candidate with persisted delivery evidence can distinguish this
+// transient condition from a genuine "this release is gone" verdict and retry
+// with backoff instead of rotating the release or returning a permanent error.
+var ErrProviderUnavailable = errors.New("virtual playback provider unavailable")
+
 const (
 	virtualPathPrefix = "virtual://"
 
@@ -713,6 +721,15 @@ func (r *Resolver) GetCandidatesFreshWithKeepers(ctx context.Context, virtualPat
 	return r.getCandidatesWithKeepers(ctx, virtualPath, true, false)
 }
 
+// GetCandidatesFreshUnboundedWithKeepers is GetCandidatesFreshWithKeepers with
+// the fresh-serve floor bypassed. A provider-outage retry needs a real re-list:
+// the outage's empty answer was just negative-cached, so a floor-bounded forced
+// lookup would serve the same empty entry back and the retry would be
+// pointless. Only callers that declared a genuine outage re-list use it.
+func (r *Resolver) GetCandidatesFreshUnboundedWithKeepers(ctx context.Context, virtualPath string) ([]StreamCandidate, map[string]string, string, string, error) {
+	return r.getCandidatesWithKeepers(ctx, virtualPath, true, true)
+}
+
 // getCandidatesWithKeepers serves the candidate list and runs the ingestion
 // pipeline on every answer. The classifier is a live source of truth, so a
 // release that completed or failed since the cache entry was written is
@@ -1017,11 +1034,11 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, errors.New("request streaming provider failed")
+		return nil, fmt.Errorf("%w: request streaming provider failed", ErrProviderUnavailable)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("streaming provider returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("%w: streaming provider returned status %d", ErrProviderUnavailable, resp.StatusCode)
 	}
 	var payload stremioResponse
 	if err := decodeBoundedJSON(resp.Body, maxResponseBytes, &payload); err != nil {

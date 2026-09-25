@@ -22,6 +22,8 @@ export interface PlayerVersionSubtitleTrack {
   hearing_impaired?: boolean;
   external?: boolean;
   file_name?: string;
+  /** Opaque stable hash of an external sidecar's full path; distinguishes two same-basename sidecars. */
+  path_key?: string;
 }
 
 /** A file version available for playback. */

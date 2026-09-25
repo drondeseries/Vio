@@ -411,9 +411,23 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 			// serves, so it declares session-bound: a profile-removed candidate
 			// refuses instead of silently swapping the release.
 			ctx = withVirtualSessionBindingV3(ctx, true)
-			resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-				ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, "",
-			)
+			// A transient provider-listing blackout for the session's own
+			// trusted candidate must not be read as an indictment of the
+			// release. Retry it with a short bounded backoff before giving up,
+			// and classify the final failure as a retryable provider outage so
+			// the client keeps retrying the release it picked. The retry keeps
+			// the caller's exact parameters (exclusions, forceRefresh), so an
+			// intentional rotation still rotates on the first successful
+			// relist; only a failed listing is retried.
+			outageTrusted := h.virtualCandidateTrustedForOutageRetry(file)
+			resolved, err = retryVirtualProviderOutageResolve(ctx, outageTrusted, func(retryCtx context.Context, relist bool) (ResolvedVirtualMedia, error) {
+				if relist {
+					retryCtx = virtuallibrary.WithProviderOutageRelist(retryCtx)
+				}
+				return h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+					retryCtx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh || relist, excludedCandidateIDs, "",
+				)
+			})
 			if err == nil && resolved.IdentityRematched {
 				// Same release, new provider id: adopt the new ?result= and the
 				// resolution's identity under the existing CAS/fence write.
@@ -422,6 +436,8 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 				// Same best-effort contract as the transport resolver: the URL
 				// is already in hand, so persistence must not fail the serve.
 				_, _ = refreshStoredVirtualResolution(ctx, storedExpiredRow, resolved, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+			} else if err != nil {
+				err = classifyVirtualProviderOutage(err, outageTrusted)
 			}
 		} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
 			resolved.URL, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
@@ -616,10 +632,16 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		if resolveErr != nil {
 			logVirtualStreamFailure(r.Context(), sessionID, file, resolveErr)
 			// A provider resolve failure is a dependency problem, not an
-			// internal error. The v1 status stays 502; the v2 byte-delivery
-			// adapter maps it to a defined, retryable dependency_unavailable,
-			// because the catalog has no 502 entry and a raw 502 would surface
-			// as internal_error/500.
+			// internal error. A transient provider-listing blackout for the
+			// session's own trusted candidate is answered 503
+			// provider_unavailable (retryable) so hls.js keeps retrying the
+			// release the viewer picked instead of rotating; every other
+			// resolve failure keeps the v1 502 that the v2 byte-delivery
+			// adapter maps to a retryable dependency_unavailable.
+			if errors.Is(resolveErr, errVirtualProviderUnavailable) {
+				writeError(w, http.StatusServiceUnavailable, "provider_unavailable", "The virtual source provider is temporarily unavailable")
+				return
+			}
 			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
 			return
 		}

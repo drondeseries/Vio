@@ -641,6 +641,13 @@ func writeAPIError(w http.ResponseWriter, err error) {
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
+	// A v2 byte-delivery adapter discards this body and renders a Problem
+	// Details envelope from the status alone. Record the machine-readable code
+	// so it can keep a semantic type (e.g. provider_unavailable) that the bare
+	// status cannot express. Every other writer ignores the optional method.
+	if recorder, ok := w.(interface{ SetPlaybackProblemCode(string) }); ok {
+		recorder.SetPlaybackProblemCode(code)
+	}
 	writeJSON(w, status, errorResponse{
 		Error:   code,
 		Message: message,

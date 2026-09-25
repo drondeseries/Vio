@@ -4772,7 +4772,12 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			h.applyRemoteTransportMarkV3(r.Context(), session.ID, false)
 			unlock()
 			if previous != nil && previous != ts {
-				_ = previous.Close()
+				// Keep the displaced generation's already-produced bytes
+				// servable for a bounded overlap so the client's in-flight
+				// old playlist (before it adopts the new plan) is not 503'd
+				// while the new generation warms. The process is stopped;
+				// only its output directory is retained.
+				h.tm.RetireTranscodeSessionPredecessor(session.ID, previous, playback.RetainedGenerationRetention)
 			}
 			if previousNodeURL != "" {
 				h.tm.StopRemoteTranscode(previousTransportID, previousNodeURL)

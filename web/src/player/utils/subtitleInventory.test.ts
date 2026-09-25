@@ -114,6 +114,43 @@ describe("buildPublishedSubtitleTracks round-trip against the server", () => {
     expect(published.map((track) => Boolean(track.hearing_impaired))).toEqual([false, false, true]);
   });
 
+  it("keeps two same-basename sidecars distinct when path_key is present", () => {
+    // The server keys a sidecar on its full path and now publishes an opaque
+    // path_key hash of it. Two sidecars named a.en.srt in different directories
+    // must not collapse: with path_key the client matches the server.
+    const published = buildPublishedSubtitleTracks([
+      {
+        index: 4,
+        external: true,
+        language: "ENG",
+        codec: "srt",
+        file_name: "a.en.srt",
+        path_key: "hash-dir-one",
+      },
+      {
+        index: 5,
+        external: true,
+        language: "ENG",
+        codec: "srt",
+        file_name: "a.en.srt",
+        path_key: "hash-dir-two",
+      },
+    ]);
+    expect(published).toHaveLength(2);
+    expect(published.map((track) => track.index)).toEqual([0, 1]);
+  });
+
+  it("collapses two same-basename sidecars when path_key is absent (older server)", () => {
+    // Fallback contract: a server predating path_key publishes only the
+    // basename, so the client cannot separate two same-basename sidecars and
+    // must dedupe them rather than invent ordinals the server did not publish.
+    const published = buildPublishedSubtitleTracks([
+      { index: 4, external: true, language: "ENG", codec: "srt", file_name: "a.en.srt" },
+      { index: 5, external: true, language: "ENG", codec: "srt", file_name: "a.en.srt" },
+    ]);
+    expect(published).toHaveLength(1);
+  });
+
   it("treats forced as part of the identity so a forced and plain variant coexist", () => {
     // Same stream index and title, differing only in forced: the server's
     // alias key includes forced, so both survive.

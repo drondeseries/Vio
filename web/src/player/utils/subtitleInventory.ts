@@ -13,6 +13,8 @@ export interface SubtitleInventoryTrackInput {
   title?: string;
   embedded_title?: string;
   file_name?: string;
+  /** Opaque stable hash of an external sidecar's full path (newer servers). */
+  path_key?: string;
   forced?: boolean;
   hearing_impaired?: boolean;
   external?: boolean;
@@ -274,12 +276,15 @@ function isInventoryDuplicate(
 
 /**
  * Mirrors playback.externalSubtitleIdentityV3. The server keys a sidecar on its
- * full path; the wire only carries the basename (`file_name`), so the client
- * uses that as the closest faithful discriminator. Two same-basename sidecars
- * in different directories would be kept apart by the server but collapsed
- * here — a gap the wire cannot close without publishing the sidecar path.
+ * full path; the wire carries an opaque `path_key` hash of that path when the
+ * server computes one, which keeps two same-basename sidecars in different
+ * directories distinct. Older servers publish only the basename
+ * (`file_name`), used as the closest faithful fallback; two same-basename
+ * sidecars then collapse, a gap only a newer server can close.
  */
 function externalIdentity(track: SubtitleInventoryTrackInput): string {
+  const key = (track.path_key ?? "").trim();
+  if (key) return `path:${key}`;
   const name = (track.file_name ?? "").trim();
   return name ? `path:${name}` : "";
 }

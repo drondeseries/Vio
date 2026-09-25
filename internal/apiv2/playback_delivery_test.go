@@ -100,6 +100,31 @@ func TestPlaybackDeliveryMapsUpstreamFailureToDependencyUnavailable(t *testing.T
 	}
 }
 
+// TestPlaybackDeliveryProviderUnavailableProblem proves the code-carrying
+// adapter: a v1 media handler that answers 503 with the provider_unavailable
+// code surfaces the distinct v2 provider_unavailable problem (retry this
+// release) rather than the generic dependency_unavailable, while the same
+// writer's 502 mapping is unchanged.
+func TestPlaybackDeliveryProviderUnavailableProblem(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	deps.PlaybackMedia = &PlaybackMediaHandlers{Original: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The v1 handler records the code through writeError's optional seam;
+		// simulate it directly since the test writer is the v2 adapter.
+		if recorder, ok := w.(interface{ SetPlaybackProblemCode(string) }); ok {
+			recorder.SetPlaybackProblemCode("provider_unavailable")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"provider_unavailable","message":"PRIVATE_PROVIDER_DETAIL"}`))
+	})}
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"?st=opaque", "", viewerHeaders())
+	requireProblem(t, rec, TypeProviderUnavailable)
+	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "PRIVATE_PROVIDER_DETAIL") {
+		t.Fatalf("provider outage problem: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestPlaybackDeliveryFailureAfterBytesAborts(t *testing.T) {
 	w := httptest.NewRecorder()
 	writer := &playbackDeliveryWriter{ResponseWriter: w, request: httptest.NewRequest(http.MethodGet, "/", nil)}

@@ -138,6 +138,31 @@ func PersistedCandidateTrusted(ctx context.Context) bool {
 	return persistedCandidateTrustFromContext(ctx)
 }
 
+// providerOutageRelistContextKey marks a resolve as a retry of a transient
+// provider-listing outage, which must re-list the provider rather than serve
+// the empty answer the outage just cached.
+type providerOutageRelistContextKey struct{}
+
+// WithProviderOutageRelist marks ctx as a provider-outage retry. A forced
+// resolve carrying this flag bypasses the fresh-serve floor so the retry asks
+// the provider again instead of re-serving the negative entry the outage wrote.
+func WithProviderOutageRelist(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, providerOutageRelistContextKey{}, true)
+}
+
+// providerOutageRelistFromContext reports whether this resolve is an outage
+// retry that must bypass the fresh-serve floor.
+func providerOutageRelistFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	relist, _ := ctx.Value(providerOutageRelistContextKey{}).(bool)
+	return relist
+}
+
 // PlaybackStream represents an available stream candidate formatted for
 // playback selection in API handlers and Jellyfin compatibility.
 type PlaybackStream struct {
@@ -440,7 +465,11 @@ func (s *Service) ResolveDetailed(
 		err        error
 	)
 	if forceRefresh {
-		candidates, keepers, _, _, err = s.Resolver.GetCandidatesFreshWithKeepers(ctx, virtualPath)
+		if providerOutageRelistFromContext(ctx) {
+			candidates, keepers, _, _, err = s.Resolver.GetCandidatesFreshUnboundedWithKeepers(ctx, virtualPath)
+		} else {
+			candidates, keepers, _, _, err = s.Resolver.GetCandidatesFreshWithKeepers(ctx, virtualPath)
+		}
 	} else {
 		candidates, keepers, _, _, err = s.Resolver.GetCandidatesWithKeepers(ctx, virtualPath)
 	}

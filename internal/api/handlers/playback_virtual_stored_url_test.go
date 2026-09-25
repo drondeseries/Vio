@@ -755,8 +755,16 @@ func TestResolveVirtualInputURLLessDeliveredRowCarriesTrust(t *testing.T) {
 	if _, _, err := h.resolveVirtualInputURI(context.Background(), pinned, 5, 1, "profile", false, nil, ""); err == nil {
 		t.Fatal("a trusted URL-less delivered row must refuse a sibling substitution")
 	}
-	if len(sawTrust) != 1 || !sawTrust[0] {
-		t.Fatalf("inside the window the resolve trust flag = %v, want [true]", sawTrust)
+	// Inside the window every attempt (the initial resolve plus the bounded
+	// provider-outage retries the handler now performs for a trusted
+	// empty-listing refusal) threads trust, so no attempt may substitute.
+	if len(sawTrust) == 0 {
+		t.Fatalf("inside the window no resolve ran; want at least one trusted attempt")
+	}
+	for i, trusted := range sawTrust {
+		if !trusted {
+			t.Fatalf("inside the window attempt %d trust flag = false, want true for every attempt: %v", i, sawTrust)
+		}
 	}
 
 	// Outside the window the same row resolves through the ordinary path: no
@@ -765,6 +773,7 @@ func TestResolveVirtualInputURLLessDeliveredRowCarriesTrust(t *testing.T) {
 	oldRow.UpdatedAt = now.Add(-60 * 24 * time.Hour)
 	oldRow.LastDeliveredAt = &oldRow.UpdatedAt
 	h.VirtualFileLookup = storedURLLookup(&oldRow)
+	sawTrust = nil
 	res, cleanup, err := h.resolveVirtualInputURI(context.Background(), pinned, 5, 1, "profile", false, nil, "")
 	if err != nil {
 		t.Fatalf("outside the window resolve error: %v", err)
@@ -775,7 +784,7 @@ func TestResolveVirtualInputURLLessDeliveredRowCarriesTrust(t *testing.T) {
 	if res.CandidateID != "cand-b" {
 		t.Fatalf("outside the window resolved candidate = %q, want the ordinary sibling", res.CandidateID)
 	}
-	if len(sawTrust) != 2 || sawTrust[1] {
-		t.Fatalf("outside the window the resolve trust flag = %v, want [true false]", sawTrust)
+	if len(sawTrust) != 1 || sawTrust[0] {
+		t.Fatalf("outside the window the resolve trust flag = %v, want [false]", sawTrust)
 	}
 }

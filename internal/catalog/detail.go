@@ -608,6 +608,11 @@ type VersionSubtitleTrack struct {
 	HearingImpaired bool   `json:"hearing_impaired"`
 	External        bool   `json:"external"`
 	FileName        string `json:"file_name,omitempty"`
+	// PathKey is a stable opaque hash of an external sidecar's full path. It
+	// lets a client distinguish two same-basename sidecars in different
+	// directories without publishing the server filesystem path. Empty for
+	// embedded tracks and for older servers that do not compute it.
+	PathKey string `json:"path_key,omitempty"`
 }
 
 // SubtitleInfo represents a subtitle track available for a media item.
@@ -4416,6 +4421,7 @@ func buildVersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {
 			HearingImpaired: sub.HearingImpaired,
 			External:        true,
 			FileName:        filepath.Base(sub.Path),
+			PathKey:         playback.ExternalSubtitlePathKeyV3(sub.Path),
 		})
 	}
 	return tracks

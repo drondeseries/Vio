@@ -98,6 +98,9 @@ type TranscodeManager struct {
 
 	transcodeMu sync.RWMutex
 	transcodes  map[string]*TranscodeSession
+	// retired holds displaced generations kept servable for a bounded overlap
+	// after a same-session replan publishes a successor. Guarded by transcodeMu.
+	retired map[string]*RetainedGeneration
 	// shuttingDown is set under transcodeMu before the shutdown drain takes the
 	// live map. Every publication path checks it under the same lock so a late
 	// FFmpeg process cannot escape the drain and leave its cache behind.
@@ -144,6 +147,7 @@ type lifecycleLock struct {
 func NewTranscodeManager() *TranscodeManager {
 	return &TranscodeManager{
 		transcodes:          make(map[string]*TranscodeSession),
+		retired:             make(map[string]*RetainedGeneration),
 		reconstructInFlight: make(map[string]struct{}),
 	}
 }
@@ -1093,12 +1097,92 @@ func (m *TranscodeManager) CloseTranscodeSession(sessionID, transcodeNodeURL str
 	m.transcodeMu.Lock()
 	session := m.transcodes[sessionID]
 	delete(m.transcodes, sessionID)
+	retained := m.retired[sessionID]
+	delete(m.retired, sessionID)
 	m.transcodeMu.Unlock()
 	if session != nil {
 		_ = session.Close()
 	}
+	if retained != nil && retained.Session != nil {
+		_ = retained.Session.Close()
+	}
 
 	m.StopRemoteTranscode(sessionID, transcodeNodeURL)
+}
+
+// RetainedGeneration is a displaced local transcode generation kept servable
+// for a bounded overlap window after a same-session replan publishes its
+// successor. The predecessor's process is stopped but its output directory is
+// left in place, so manifest/segment requests landing before the client adopts
+// the new playlist are served from already-produced bytes instead of 503.
+type RetainedGeneration struct {
+	Session   *TranscodeSession
+	ExpiresAt time.Time
+}
+
+// RetainedGenerationRetention bounds how long a displaced generation stays
+// servable. It covers the client's playlist-reload latency after a track or
+// version switch without pinning a stale directory indefinitely.
+const RetainedGenerationRetention = 30 * time.Second
+
+// RetireTranscodeSessionPredecessor displaces the predecessor without deleting
+// its output directory and keeps it servable for the bounded overlap. The
+// previous generation's process is stopped immediately (CloseProcess) so it
+// cannot compete for CPU; only its files are retained. A nil or already-retired
+// predecessor is a no-op. When retention is non-positive the predecessor is
+// closed outright, restoring the pre-overlap behavior.
+func (m *TranscodeManager) RetireTranscodeSessionPredecessor(sessionID string, predecessor *TranscodeSession, retention time.Duration) {
+	if m == nil || sessionID == "" || predecessor == nil {
+		return
+	}
+	if retention <= 0 {
+		_ = predecessor.Close()
+		return
+	}
+	// Stop the process but leave the output directory for the overlap window.
+	_ = predecessor.CloseProcess()
+	m.transcodeMu.Lock()
+	if m.shuttingDown {
+		m.transcodeMu.Unlock()
+		_ = predecessor.Close()
+		return
+	}
+	if m.retired == nil {
+		m.retired = make(map[string]*RetainedGeneration)
+	}
+	// Replace any prior retained generation: only the most recently displaced
+	// bytes can still match the client's in-flight playlist.
+	if prior := m.retired[sessionID]; prior != nil && prior.Session != nil && prior.Session != predecessor {
+		_ = prior.Session.Close()
+	}
+	m.retired[sessionID] = &RetainedGeneration{Session: predecessor, ExpiresAt: time.Now().Add(retention)}
+	m.transcodeMu.Unlock()
+}
+
+// GetRetainedTranscodeSession returns a displaced generation still inside its
+// overlap window, or nil. It reaps an expired entry (deleting its output dir)
+// on read so retention cannot outlive the window.
+func (m *TranscodeManager) GetRetainedTranscodeSession(sessionID string) *TranscodeSession {
+	if m == nil {
+		return nil
+	}
+	m.transcodeMu.Lock()
+	entry := m.retired[sessionID]
+	if entry == nil {
+		m.transcodeMu.Unlock()
+		return nil
+	}
+	if !time.Now().Before(entry.ExpiresAt) {
+		delete(m.retired, sessionID)
+		m.transcodeMu.Unlock()
+		if entry.Session != nil {
+			_ = entry.Session.Close()
+		}
+		return nil
+	}
+	session := entry.Session
+	m.transcodeMu.Unlock()
+	return session
 }
 
 // StartShutdownCleanup closes every local transcode when ctx is canceled and
@@ -1117,10 +1201,17 @@ func (m *TranscodeManager) StartShutdownCleanup(ctx context.Context) <-chan stru
 		m.shuttingDown = true
 		transcodes := m.transcodes
 		m.transcodes = make(map[string]*TranscodeSession)
+		retired := m.retired
+		m.retired = make(map[string]*RetainedGeneration)
 		m.transcodeMu.Unlock()
 		for _, session := range transcodes {
 			if session != nil {
 				_ = session.Close()
+			}
+		}
+		for _, entry := range retired {
+			if entry != nil && entry.Session != nil {
+				_ = entry.Session.Close()
 			}
 		}
 	}()
