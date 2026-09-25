@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
@@ -300,4 +304,250 @@ func TestVirtualProviderListingOutageClassification(t *testing.T) {
 			}
 		})
 	}
+}
+
+// outageStartupProvider drives a transport startup against a session-bound row
+// whose provider fails every listing, counting resolves. The resolver always
+// reports a transient 5xx, so the only thing that can stop the retry loop early
+// is the loop's own context observation — exactly what the prompt-cancellation
+// test needs to prove.
+type outageStartupProvider struct {
+	calls  atomic.Int64
+	onCall func(n int64)
+}
+
+func (p *outageStartupProvider) resolver() VirtualMediaDetailedResolver {
+	return VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		n := p.calls.Add(1)
+		if p.onCall != nil {
+			p.onCall(n)
+		}
+		return ResolvedVirtualMedia{}, provider502()
+	})
+}
+
+// outageStartupCatalog is a race-free catalog double for the concurrent outage
+// test: reads hand back a fresh copy and the dead-pin write is an inert no-op,
+// so N goroutines sharing one handler never touch the same mutable row. The
+// pre-existing fakePinFileResolver mutates its row in place, which is fine for
+// single-threaded tests but a data race under concurrent startups.
+type outageStartupCatalog struct{ row *models.MediaFile }
+
+func (c *outageStartupCatalog) GetByID(context.Context, int) (*models.MediaFile, error) {
+	copy := *c.row
+	return &copy, nil
+}
+
+func (c *outageStartupCatalog) ReplaceVirtualResultPin(context.Context, int, string, string) (bool, error) {
+	return true, nil
+}
+
+func (c *outageStartupCatalog) lookup(_ context.Context, path string) (*models.MediaFile, error) {
+	if c.row == nil || c.row.FilePath != path {
+		return nil, ErrVirtualCandidateNotFound
+	}
+	copy := *c.row
+	return &copy, nil
+}
+
+// outageStartupHandler builds a handler whose transport startup resolves through
+// provider. The failover cap is pinned to one attempt so the startup's provider
+// calls are exactly the retry machinery's bound (initial + two retries); the
+// pre-existing neutral-failover attempt would otherwise add one more call and
+// hide a runaway retry.
+func outageStartupHandler(t *testing.T, row *models.MediaFile, provider *outageStartupProvider) *PlaybackHandler {
+	t.Helper()
+	catalog := &outageStartupCatalog{row: row}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.fileResolver = catalog
+	handler.VirtualFileLookup = catalog.lookup
+	handler.VirtualCandidateTrustWindow = func() time.Duration { return 720 * time.Hour }
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{MaxVirtualFailoverAttempts: 1, TranscodeEnabled: true}
+	}
+	handler.VirtualMediaDetailedResolver = provider.resolver()
+	handler.StartTranscodeFunc = func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+		opts.OutputDir = t.TempDir()
+		return playback.NewReadyTranscodeSessionForTesting(opts.OutputDir, opts)
+	}
+	return handler
+}
+
+// outageStartupSession binds session id to row's pinned candidate so the startup
+// treats it as an existing session (sessionVirtualURI non-empty), which is the
+// path the outage retry protects.
+func outageStartupSession(t *testing.T, handler *PlaybackHandler, fileID int, pinned string) string {
+	t.Helper()
+	manager := playback.NewSessionManager(0, 0)
+	session, err := manager.StartSession(1, "profile-1", fileID, playback.PlayRemux, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := manager.SetVirtualSource(session.ID, pinned, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	handler.sessionMgr = manager
+	return session.ID
+}
+
+// TestVirtualTransportConcurrentProviderOutageCallBounds drives N concurrent
+// transport startups against the same session-bound row while the provider
+// fails every listing. It asserts the retry never amplifies calls (at most one
+// initial attempt plus two retries per startup, so ≤ N×3), and that once every
+// startup has returned no provider call is still in flight.
+func TestVirtualTransportConcurrentProviderOutageCallBounds(t *testing.T) {
+	const concurrency = 8
+	// Bound the waits: the backoff schedule is 1s + 2s, so a startup that walks
+	// both retries takes ≤ ~3s. A cancellable context per startup keeps the slow
+	// path bounded without depending on wall-clock luck.
+	pinned := "virtual://movie/tt-concurrent-outage?result=pinned"
+	row := providerOutageRow(201, pinned)
+	row.ResolvedURL = ""
+
+	provider := &outageStartupProvider{}
+	handler := outageStartupHandler(t, row, provider)
+	sessionID := outageStartupSession(t, handler, row.ID, pinned)
+
+	baselineGoroutines := runtime.NumGoroutine()
+
+	var wg sync.WaitGroup
+	started := make(chan struct{}, concurrency)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			started <- struct{}{}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _ = handler.startLocalPlaybackTransportOnce(ctx, playback.TranscodeOpts{
+				MediaFileID:                      row.ID,
+				InputPath:                        pinned,
+				VirtualSourceOwnerInstallationID: 5,
+				SessionID:                        sessionID,
+			})
+		}()
+	}
+	for i := 0; i < concurrency; i++ {
+		<-started
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("concurrent outage startups did not finish")
+	}
+
+	if got := provider.calls.Load(); got > concurrency*3 {
+		t.Fatalf("provider resolves = %d, want ≤ %d (N×3: initial + 2 retries per startup), no unbounded amplification", got, concurrency*3)
+	}
+	if got := provider.calls.Load(); got == 0 {
+		t.Fatal("provider resolves = 0; the outage path was never exercised")
+	} else {
+		t.Logf("concurrent provider resolves = %d across %d startups (bound %d)", got, concurrency, concurrency*3)
+	}
+
+	// No leaked work: after every startup returned, the call count must stop
+	// growing. Wait on observable stability, not a fixed sleep.
+	if grew := waitForProviderCallsToQuiesce(&provider.calls, 250*time.Millisecond, 3*time.Second); grew {
+		t.Fatalf("provider calls kept growing after startups finished (%d); a retry loop leaked", provider.calls.Load())
+	}
+
+	// A returned startup owns no retry goroutine: goroutine count settles back
+	// near its pre-start baseline. A settle wait keeps scheduler/GC noise from
+	// flaking the assertion while still catching a leaked retry loop.
+	if goroutinesLeaked := goroutinesExceedBaseline(baselineGoroutines, 8, 3*time.Second); goroutinesLeaked {
+		t.Fatalf("goroutines = %d, want within 8 of the pre-start baseline %d; a retry goroutine leaked", runtime.NumGoroutine(), baselineGoroutines)
+	}
+}
+
+// goroutinesExceedBaseline reports whether the goroutine count fails to return
+// to within slack of target before timeout. It polls the observable runtime
+// count so a leaked retry goroutine is caught while transient scheduler growth
+// is not falsely flagged.
+func goroutinesExceedBaseline(target, slack int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if runtime.NumGoroutine() <= target+slack {
+			return false
+		}
+		if time.Now().After(deadline) {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// waitForProviderCallsToQuiesce reports whether calls kept growing after a
+// quiet window. It returns false once the count is stable across the window or
+// the timeout elapses, so a leaked goroutine that stopped is not falsely
+// reported and a live one is caught.
+func waitForProviderCallsToQuiesce(calls *atomic.Int64, quiet, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	last := calls.Load()
+	stableSince := time.Now()
+	for time.Now().Before(deadline) {
+		time.Sleep(quiet / 4)
+		now := calls.Load()
+		if now != last {
+			last = now
+			stableSince = time.Now()
+			continue
+		}
+		if time.Since(stableSince) >= quiet {
+			return false
+		}
+	}
+	return calls.Load() != last
+}
+
+// TestVirtualTransportProviderOutageCancellationIsPrompt proves a startup whose
+// context is canceled mid-retry stops promptly: the retry loop observes the
+// canceled context on its next resolve and returns, and the elapsed time stays
+// well under the full backoff budget (1s + 2s).
+func TestVirtualTransportProviderOutageCancellationIsPrompt(t *testing.T) {
+	pinned := "virtual://movie/tt-outage-cancel?result=pinned"
+	row := providerOutageRow(202, pinned)
+	row.ResolvedURL = ""
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	provider := &outageStartupProvider{}
+	// Cancel from within the second resolve (call 2). The provider always
+	// returns a transient failure, so only the retry loop's own context
+	// observation can stop it: the next backoff (1s, then 2s) must see the
+	// canceled context and return instead of sleeping the full 2s and issuing
+	// a third resolve.
+	provider.onCall = func(n int64) {
+		if n == 2 {
+			once.Do(cancel)
+		}
+	}
+	handler := outageStartupHandler(t, row, provider)
+	sessionID := outageStartupSession(t, handler, row.ID, pinned)
+
+	start := time.Now()
+	_, _ = handler.startLocalPlaybackTransportOnce(ctx, playback.TranscodeOpts{
+		MediaFileID:                      row.ID,
+		InputPath:                        pinned,
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        sessionID,
+	})
+	elapsed := time.Since(start)
+
+	// The full budget is len(backoff) waits = 3s. A prompt cancellation is
+	// observed by sleepWithContext on the very next backoff, so the startup
+	// returns well before the full budget.
+	budget := time.Duration(0)
+	for _, d := range virtualProviderOutageBackoff {
+		budget += d
+	}
+	if elapsed >= budget {
+		t.Fatalf("canceled startup took %s, want < the full backoff budget %s", elapsed, budget)
+	}
+	if got := provider.calls.Load(); got > 2 {
+		t.Fatalf("provider resolves after cancellation = %d, want ≤ 2 (no final retry after cancel)", got)
+	}
+	t.Logf("canceled startup returned in %s (full budget %s) after %d provider calls", elapsed, budget, provider.calls.Load())
 }
