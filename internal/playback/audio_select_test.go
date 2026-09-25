@@ -100,6 +100,96 @@ func TestSelectAudioTrack_PrefersExactRegionalTag(t *testing.T) {
 	}
 }
 
+func TestSelectAudioTrack_RegionalPrecedenceExactBareVariant(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "en", Codec: "aac", Channels: 2},
+		{Language: "fr-BE", Codec: "aac", Channels: 2},
+		{Language: "fr", Codec: "aac", Channels: 2},
+		{Language: "fr-CA", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "fr-CA", nil); got != 3 {
+		t.Fatalf("SelectAudioTrack(fr-CA) = %d, want exact track 3", got)
+	}
+	withoutExact := []models.AudioTrack{tracks[0], tracks[1], tracks[2]}
+	if got := playback.SelectAudioTrack(withoutExact, "fr-CA", nil); got != 2 {
+		t.Fatalf("SelectAudioTrack(fr-CA) without exact = %d, want bare track 2", got)
+	}
+	withoutBare := []models.AudioTrack{tracks[0], tracks[1]}
+	if got := playback.SelectAudioTrack(withoutBare, "fr-CA", nil); got != 1 {
+		t.Fatalf("SelectAudioTrack(fr-CA) variant-only = %d, want variant track 1", got)
+	}
+}
+
+func TestSelectAudioTrack_ChineseScripts(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "zh-Hant", Codec: "aac", Channels: 2},
+		{Language: "zh-Hans", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "zh-Hans", nil); got != 1 {
+		t.Fatalf("SelectAudioTrack(zh-Hans) = %d, want simplified track 1", got)
+	}
+	if got := playback.SelectAudioTrack(tracks, "zh-Hant", nil); got != 0 {
+		t.Fatalf("SelectAudioTrack(zh-Hant) = %d, want traditional track 0", got)
+	}
+}
+
+func TestSelectAudioTrack_MULTiLanguageList(t *testing.T) {
+	multi := []models.AudioTrack{
+		{Language: "en", Languages: []string{"en", "fr", "de"}, Codec: "eac3", Channels: 6, Default: true},
+		{Language: "ja", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(multi, "fr", nil); got != 0 {
+		t.Fatalf("profile fr = %d, want MULTi track 0", got)
+	}
+	single := []models.AudioTrack{
+		{Language: "ja", Codec: "aac", Channels: 2, Default: true},
+		{Language: "fr", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(single, "fr", nil); got != 1 {
+		t.Fatalf("single-language fr = %d, want 1", got)
+	}
+	noDe := []models.AudioTrack{
+		{Language: "en", Languages: []string{"en", "fr"}, Codec: "eac3", Channels: 6, Default: true},
+		{Language: "ja", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(noDe, "de", nil); got != 0 {
+		t.Fatalf("unmatched de = %d, want default 0", got)
+	}
+	seriesIndex := &playback.AudioTrackPreference{AudioTrackIndex: 1, AudioLanguage: "fr"}
+	if got := playback.SelectAudioTrack(multi, "", seriesIndex); got != 0 {
+		t.Fatalf("series index 1 fr = %d, want MULTi track 0", got)
+	}
+	seriesFallback := &playback.AudioTrackPreference{AudioTrackIndex: 99, AudioLanguage: "fr"}
+	if got := playback.SelectAudioTrack(multi, "", seriesFallback); got != 0 {
+		t.Fatalf("series language fallback fr = %d, want MULTi track 0", got)
+	}
+}
+
+func TestSelectAudioTrack_MULTiPrimaryMul(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "mul", Languages: []string{"en", "fr"}, Codec: "eac3", Channels: 6},
+		{Language: "ja", Codec: "aac", Channels: 2, Default: true},
+	}
+	if got := playback.SelectAudioTrack(tracks, "fr", nil); got != 0 {
+		t.Fatalf("profile fr on mul primary = %d, want MULTi track 0", got)
+	}
+	pref := &playback.AudioTrackPreference{AudioTrackIndex: 0, AudioLanguage: "en"}
+	if got := playback.SelectAudioTrack(tracks, "", pref); got != 0 {
+		t.Fatalf("saved mul index = %d, want 0", got)
+	}
+}
+
+func TestSelectAudioTrack_MULTiRegionalRanking(t *testing.T) {
+	tracks := []models.AudioTrack{
+		{Language: "mul", Languages: []string{"fr-BE"}, Codec: "aac", Channels: 2},
+		{Language: "fr", Codec: "aac", Channels: 2},
+		{Language: "fr-CA", Codec: "aac", Channels: 2},
+	}
+	if got := playback.SelectAudioTrack(tracks, "fr-CA", nil); got != 2 {
+		t.Fatalf("SelectAudioTrack(fr-CA) = %d, want exact track 2", got)
+	}
+}
+
 func TestSelectAudioTrack_NoDefaultFallsToFirst(t *testing.T) {
 	tracks := []models.AudioTrack{
 		{Language: "ja", Codec: "aac"},
@@ -262,6 +352,89 @@ func TestMatchAudioTrackAcrossVersionsFallsBackToLanguageAcrossCodecs(t *testing
 
 	if got := playback.MatchAudioTrackAcrossVersions(requested, effective, 1); got != 0 {
 		t.Fatalf("MatchAudioTrackAcrossVersions() = %d, want English track 0", got)
+	}
+}
+
+func TestMatchAudioTrackAcrossVersions_MULTiCrossFile(t *testing.T) {
+	requested := []models.AudioTrack{
+		{Language: "es", Codec: "ac3", Channels: 2},
+		{Language: "ja", Codec: "aac", Channels: 2},
+		{Language: "en", Languages: []string{"en", "fr", "de"}, Codec: "eac3", Channels: 6, Title: "MULTi"},
+	}
+	target := []models.AudioTrack{
+		{Language: "es", Codec: "ac3", Channels: 2},
+		{Language: "en", Languages: []string{"fr", "de", "en"}, Codec: "eac3", Channels: 6, Title: "MULTi"},
+		{Language: "ja", Codec: "aac", Channels: 2, Default: true},
+	}
+	if got := playback.MatchAudioTrackAcrossVersions(requested, target, 2); got != 1 {
+		t.Fatalf("MULTi remap = %d, want target MULTi track 1", got)
+	}
+	if got := playback.MatchAudioTrackAcrossVersions(requested, target, 0); got != 0 {
+		t.Fatalf("es remap = %d, want 0", got)
+	}
+	if got := playback.MatchAudioTrackAcrossVersions(requested, target, 1); got != 2 {
+		t.Fatalf("ja remap = %d, want target track 2", got)
+	}
+	absent := []models.AudioTrack{
+		{Language: "es", Codec: "ac3", Channels: 2},
+		{Language: "it", Codec: "ac3", Channels: 2},
+		{Language: "en", Languages: []string{"en", "fr", "de"}, Codec: "eac3", Channels: 6},
+	}
+	if got := playback.MatchAudioTrackAcrossVersions(absent, target, 1); got != 2 {
+		t.Fatalf("absent-track remap = %d, want target default 2", got)
+	}
+}
+
+func TestMatchAudioTrackAcrossVersionsTriesEveryLanguage(t *testing.T) {
+	requested := []models.AudioTrack{
+		{Language: "es", Codec: "ac3", Channels: 2, Default: true},
+		{Language: "mul", Languages: []string{"en", "fr"}, Codec: "eac3", Channels: 6, Title: "MULTi"},
+	}
+	effective := []models.AudioTrack{
+		{Language: "es", Codec: "ac3", Channels: 2, Default: true},
+		{Language: "fr", Codec: "eac3", Channels: 6, Title: "French"},
+	}
+	if got := playback.MatchAudioTrackAcrossVersions(requested, effective, 1); got != 1 {
+		t.Fatalf("second-language MULTi remap = %d, want target French track 1", got)
+	}
+}
+
+func TestMatchAudioTrackAcrossVersionsTriesLanguageListAfterPrimary(t *testing.T) {
+	requested := []models.AudioTrack{
+		{Language: "en", Languages: []string{"en", "de"}, Codec: "eac3", Channels: 6, Title: "MULTi"},
+	}
+	effective := []models.AudioTrack{
+		{Language: "es", Codec: "ac3", Channels: 2, Default: true},
+		{Language: "de", Codec: "eac3", Channels: 6},
+	}
+	if got := playback.MatchAudioTrackAcrossVersions(requested, effective, 0); got != 1 {
+		t.Fatalf("language-list fallback = %d, want target German track 1", got)
+	}
+}
+
+func TestMatchAudioTrackAcrossVersionsFallsBackToDefaultWhenNoLanguageMatches(t *testing.T) {
+	requested := []models.AudioTrack{
+		{Language: "mul", Languages: []string{"en", "fr"}, Codec: "eac3", Channels: 6},
+	}
+	effective := []models.AudioTrack{
+		{Language: "es", Codec: "ac3", Channels: 2, Default: true},
+		{Language: "ja", Codec: "aac", Channels: 2},
+	}
+	if got := playback.MatchAudioTrackAcrossVersions(requested, effective, 0); got != 0 {
+		t.Fatalf("no-language-match remap = %d, want target default 0", got)
+	}
+}
+
+func TestMatchAudioTrackAcrossVersionsSkipsPlaceholderListEntries(t *testing.T) {
+	requested := []models.AudioTrack{
+		{Language: "mul", Languages: []string{"mul", "und", "fr"}, Codec: "eac3", Channels: 6, Title: "MULTi"},
+	}
+	effective := []models.AudioTrack{
+		{Language: "mul", Languages: []string{"mul"}, Codec: "eac3", Channels: 6, Title: "Other"},
+		{Language: "fr", Codec: "eac3", Channels: 6, Title: "French", Default: true},
+	}
+	if got := playback.MatchAudioTrackAcrossVersions(requested, effective, 0); got != 1 {
+		t.Fatalf("placeholder-skip remap = %d, want target French track 1", got)
 	}
 }
 

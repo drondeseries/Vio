@@ -37,6 +37,34 @@ type AudioTrackPreference struct {
 // langMatch accepts compatible languages for previously saved track selections.
 func langMatch(a, b string) bool { return langMatchRank(a, b) >= 0 }
 
+// trackLanguageRank returns the best language rank for a track against the
+// preferred language, considering both the primary code and the MULTi
+// language list. -1 when nothing matches.
+func trackLanguageRank(track models.AudioTrack, preferred string) int {
+	best := -1
+	if rank := langMatchRank(track.Language, preferred); rank >= 0 {
+		best = rank
+		if best == 0 {
+			return best
+		}
+	}
+	for _, code := range track.Languages {
+		if rank := langMatchRank(code, preferred); rank >= 0 && (best < 0 || rank < best) {
+			best = rank
+			if best == 0 {
+				break
+			}
+		}
+	}
+	return best
+}
+
+// trackHasLanguage reports whether the track carries the preferred language,
+// either as its primary code or anywhere in its MULTi language list.
+func trackHasLanguage(track models.AudioTrack, preferred string) bool {
+	return trackLanguageRank(track, preferred) >= 0
+}
+
 // langMatchRank prefers an exact BCP-47 tag, then a bare language tag, and
 // finally another regional/script variant of the same language.
 func langMatchRank(candidate, preferred string) int {
@@ -88,7 +116,7 @@ func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPr
 		// scanner now preserves regional subtags, so any compatible match keeps
 		// the index rather than falling through to a different track.
 		if seriesPref.AudioTrackIndex >= 0 && seriesPref.AudioTrackIndex < len(tracks) {
-			if langMatch(tracks[seriesPref.AudioTrackIndex].Language, seriesPref.AudioLanguage) {
+			if trackHasLanguage(tracks[seriesPref.AudioTrackIndex], seriesPref.AudioLanguage) {
 				return seriesPref.AudioTrackIndex
 			}
 		}
@@ -122,8 +150,11 @@ func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPr
 func bestLanguageTrack(tracks []models.AudioTrack, preferred string) int {
 	best, bestRank := -1, 3
 	for i, track := range tracks {
-		if rank := langMatchRank(track.Language, preferred); rank >= 0 && rank < bestRank {
+		if rank := trackLanguageRank(track, preferred); rank >= 0 && rank < bestRank {
 			best, bestRank = i, rank
+			if bestRank == 0 {
+				break
+			}
 		}
 	}
 	return best
@@ -150,11 +181,54 @@ func MatchAudioTrackAcrossVersions(
 	}
 
 	selected := requestedTracks[requestedIndex]
-	return SelectAudioTrack(effectiveTracks, "", &AudioTrackPreference{
-		AudioTrackIndex: requestedIndex,
-		AudioLanguage:   selected.Language,
-		TrackSignature:  AudioTrackSignatureFromTrack(selected),
-	})
+	signature := AudioTrackSignatureFromTrack(selected)
+	if idx := findExactAudioTrack(effectiveTracks, signature); idx >= 0 {
+		return idx
+	}
+	for _, code := range crossVersionAudioLanguages(selected) {
+		candidate := SelectAudioTrack(effectiveTracks, "", &AudioTrackPreference{
+			AudioTrackIndex: requestedIndex,
+			AudioLanguage:   code,
+			TrackSignature:  signature,
+		})
+		if trackHasLanguage(effectiveTracks[candidate], code) {
+			return candidate
+		}
+	}
+	return SelectAudioTrack(effectiveTracks, "", nil)
+}
+
+// crossVersionAudioLanguages returns the concrete languages a track carries,
+// primary code first, then its MULTi language list, deduplicated by canonical
+// tag form. The "und"/"mul" sentinels are placeholders and are skipped.
+func crossVersionAudioLanguages(track models.AudioTrack) []string {
+	codes := make([]string, 0, len(track.Languages)+1)
+	if primary := track.Language; !isPlaceholderLanguage(primary) {
+		codes = append(codes, primary)
+	}
+	for _, code := range track.Languages {
+		if isPlaceholderLanguage(code) {
+			continue
+		}
+		duplicate := false
+		for _, existing := range codes {
+			if lang.CompatibleTag(existing) == lang.CompatibleTag(code) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			codes = append(codes, code)
+		}
+	}
+	return codes
+}
+
+// isPlaceholderLanguage reports whether a language code carries no concrete
+// language intent: empty, "und"/"mul", or their long forms.
+func isPlaceholderLanguage(code string) bool {
+	canonical := lang.Canonical(code)
+	return canonical == "" || canonical == "und" || canonical == "mul"
 }
 
 // BrowserSupportsAudioCodec returns true if the given audio codec can be
