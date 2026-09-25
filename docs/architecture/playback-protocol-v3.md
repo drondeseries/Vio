@@ -950,12 +950,23 @@ as a bad *candidate*, not a bad route: it re-resolves the same request with the
 failed provider result id in `excluded_candidate_ids`, plans the next-ranked
 release, and commits that plan. Rotation is bounded by the server's virtual
 failover attempt limit (`playback.max_virtual_failover_attempts`); excluding the
-failed id each round is what guarantees termination. The failed id is carried
-explicitly in the exclusion list, so rotation does not depend on the
-asynchronous catalog `failed_at` stamp having landed. A fresh start whose first
+failed id each round is what guarantees termination. A fresh start whose first
 generation is rejected during startup rotates the same way, before the plan is
 committed, so a client never receives a manifest for a generation the decoder
 already rejected.
+
+A confirmed rejection is persisted durably on the attempt record
+(`playback_v3_attempts.recovery_state`, a JSONB list scoped to the provider
+source) before the next candidate is selected, and each replan unions the
+attempt's whole confirmed chain rather than only the candidate that just failed.
+The rotation therefore terminates at A → B → C → terminal even when the
+asynchronous catalog `failed_at` stamp is delayed, fails, or is cleared, and
+even after a server restart that re-reads the attempt from the database. A
+failed durable write surfaces as a retryable controlled failure instead of
+rotating to an untracked candidate. The chain is attempt-scoped: a fresh
+playback attempt inherits nothing. Only a *confirmed* verdict (the observation
+lifecycle above) enters the chain, so a suspected-but-unconfirmed candidate
+stays eligible. The `failed_at` marker remains as supplementary suppression.
 
 Rotation requires server-side evidence: the live generation must actually have
 been rejected by its decoder (`IsSourceRejected`), so a client-supplied
