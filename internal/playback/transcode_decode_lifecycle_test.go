@@ -427,6 +427,66 @@ func TestConcurrentVerdictReadsCoalesceProbe(t *testing.T) {
 	close(probeRelease)
 }
 
+// TestResetAndCloseStayResponsiveDuringBlockedProbe pins D's responsiveness
+// rule: reset and close must not wait on a slow generation-scoped probe, so a
+// caller can install or tear down a generation while an output scan is stuck.
+func TestResetAndCloseStayResponsiveDuringBlockedProbe(t *testing.T) {
+	base := time.Unix(18_500, 0)
+	s := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "hevc"}}
+	attachDecodeClock(s, base)
+
+	probeStarted := make(chan struct{}, 1)
+	probeRelease := make(chan struct{})
+	s.mu.Lock()
+	s.outputDir = t.TempDir()
+	s.decodeProbe = func(string, time.Time) bool {
+		select {
+		case probeStarted <- struct{}{}:
+		default:
+		}
+		<-probeRelease
+		return false
+	}
+	s.decodeStage = decodeStageSuspected
+	s.decodeSuspectAt = base
+	s.decodeWatchCancel = func() {}
+	s.mu.Unlock()
+
+	go s.evaluateDecodeVerdict()
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe never started")
+	}
+
+	// Reset and close must both return promptly while the probe is blocked.
+	resetDone := make(chan struct{})
+	go func() {
+		s.mu.Lock()
+		s.resetDecodeVerdictLocked()
+		s.mu.Unlock()
+		close(resetDone)
+	}()
+	select {
+	case <-resetDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reset blocked behind the slow probe")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		_ = s.shutdown(false)
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("close blocked behind the slow probe")
+	}
+
+	close(probeRelease)
+}
+
 // TestCleanupRacingResetDoesNotKillReplacement pins D's reap fencing: a
 // confirmation's teardown started for a dead generation must not cancel a
 // replacement installed by a concurrent reset.
