@@ -2,13 +2,77 @@ package prowlarr
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
+
+// slowServer answers only after delay, so a short caller deadline fires in
+// client.Do and the transport error reaches the caller.
+func slowServer(t *testing.T, delay time.Duration) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, "[]")
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestSearchTransportErrorPreservesCause(t *testing.T) {
+	srv := slowServer(t, 500*time.Millisecond)
+	c := NewSearchClient(newRestrictedRedirectHTTPClient(0))
+	c.Configure(srv.URL, "", 15)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := c.search(ctx, monitoredMedia{Title: "The Show"})
+	if err == nil {
+		t.Fatal("search: expected a transport error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("search error %v does not wrap context.DeadlineExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "Prowlarr search request failed") {
+		t.Errorf("search error %q lost the generic summary", err)
+	}
+}
+
+func TestRefreshTransportErrorPreservesCause(t *testing.T) {
+	srv := slowServer(t, 500*time.Millisecond)
+	c := NewSearchClient(newRestrictedRedirectHTTPClient(0))
+	c.Configure(srv.URL, "", 15)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := c.refresh(ctx)
+	if err == nil {
+		t.Fatal("refresh: expected a transport error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("refresh error %v does not wrap context.DeadlineExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "Prowlarr search request failed") {
+		t.Errorf("refresh error %q lost the generic summary", err)
+	}
+	c.mu.Lock()
+	lastErr := c.lastErr
+	c.mu.Unlock()
+	if !errors.Is(lastErr, context.DeadlineExceeded) {
+		t.Errorf("recorded lastErr %v does not wrap context.DeadlineExceeded", lastErr)
+	}
+}
 
 func configureTestClient(t *testing.T, baseURL, apiKey string) *prowlarrSearchClient {
 	t.Helper()

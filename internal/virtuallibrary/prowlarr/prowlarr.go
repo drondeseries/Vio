@@ -485,7 +485,7 @@ func (c *prowlarrSearchClient) search(ctx context.Context, item monitoredMedia) 
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, errors.New("Prowlarr search request failed")
+		return nil, fmt.Errorf("Prowlarr search request failed: %w", err) //nolint:staticcheck // Prowlarr is a proper product name.
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -528,7 +528,7 @@ func (c *prowlarrSearchClient) refresh(ctx context.Context) error {
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		err = errors.New("Prowlarr search request failed")
+		err = fmt.Errorf("Prowlarr search request failed: %w", err) //nolint:staticcheck // Prowlarr is a proper product name.
 		c.mu.Lock()
 		c.lastErr = err
 		c.mu.Unlock()
@@ -1197,7 +1197,7 @@ func (c *prowlarrSearchClient) Validate(ctx context.Context) (string, error) {
 	validateClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := validateClient.Do(req)
 	if err != nil {
-		return "", errors.New("connect to Prowlarr failed")
+		return "", fmt.Errorf("connect to Prowlarr failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
