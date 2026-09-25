@@ -8,6 +8,7 @@ import (
 	"time"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
@@ -40,6 +41,64 @@ func (h *PlaybackHandler) finalizeVirtualCandidateOrder(r *http.Request, streams
 	ranked, _ := h.rankVirtualCandidatesForDevice(r, streams)
 	ranked = reorderVirtualCandidatesForQuality(ranked, qualityPreference, bandwidthCapKbps)
 	return partitionVirtualStreamsAcceptedFirst(ranked)
+}
+
+// preferProbedVirtualCandidates stably moves candidates whose catalog row
+// carries planner-grade probed evidence (complete video, audio and container
+// evidence plus a probe stamp) ahead of unprobed stubs, within each
+// accepted/rejected group. Compatibility still wins: a rejected probed row
+// never jumps a healthy accepted stub. Best-effort: rows that fail the
+// verdict lookup keep their relative order rather than blocking the start.
+func (h *PlaybackHandler) preferProbedVirtualCandidates(ctx context.Context, candidates []VirtualPlaybackStream, file *models.MediaFile, ownerID int) []VirtualPlaybackStream {
+	if h == nil || len(candidates) < 2 {
+		return candidates
+	}
+	probed := make([]bool, len(candidates))
+	anyProbed, anyUnprobed := false, false
+	for i, cand := range candidates {
+		probed[i] = h.virtualCandidateHasProbeEvidence(ctx, cand.URI, file, ownerID)
+		if probed[i] {
+			anyProbed = true
+		} else {
+			anyUnprobed = true
+		}
+	}
+	if !anyProbed || !anyUnprobed {
+		return candidates
+	}
+	ordered := make([]VirtualPlaybackStream, 0, len(candidates))
+	for _, accepted := range []bool{true, false} {
+		for i, cand := range candidates {
+			if !cand.Rejected == accepted && probed[i] {
+				ordered = append(ordered, cand)
+			}
+		}
+		for i, cand := range candidates {
+			if !cand.Rejected == accepted && !probed[i] {
+				ordered = append(ordered, cand)
+			}
+		}
+	}
+	return ordered
+}
+
+// virtualCandidateHasProbeEvidence reports whether the catalog row owning a
+// candidate carries planner-grade probe evidence: complete video, audio and
+// container evidence plus a probe stamp. Unknown verdicts (lookup error or
+// incomplete row) return false so the candidate keeps its listed position.
+func (h *PlaybackHandler) virtualCandidateHasProbeEvidence(ctx context.Context, candidateURI string, file *models.MediaFile, ownerID int) bool {
+	if h == nil || candidateURI == "" {
+		return false
+	}
+	contentID, episodeID := "", ""
+	if file != nil {
+		contentID, episodeID = file.ContentID, file.EpisodeID
+	}
+	row, found, err := h.lookupVirtualCandidateRowDetailed(ctx, candidateURI, contentID, episodeID, ownerID)
+	if err != nil || !found || row == nil || row.ProbeUpdatedAt == nil {
+		return false
+	}
+	return completeVirtualVideoEvidenceV3(row) && completeVirtualAudioEvidenceV3(row) && completeVirtualContainerEvidenceV3(row)
 }
 
 // partitionVirtualStreamsAcceptedFirst stably moves rejected streams behind

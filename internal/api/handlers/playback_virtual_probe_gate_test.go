@@ -1274,6 +1274,133 @@ func TestResolveVirtualRepeatPlayFastPathRequiresCandidateIdentity(t *testing.T)
 // stored row with empty Resolution adopts the candidate label, and only a
 // truly-empty (stored + candidate) resolution falls back to the 1080p
 // baseline. No-prober branch (prober nil, deferProbe false).
+// A fresh auto start prefers a probed catalog row over an unprobed stub:
+// the probed release is known-good, the stub is speculative. The preference
+// only breaks ties inside each accepted/rejected group — a rejected probed
+// row never jumps a healthy accepted stub. Explicit picks are untouched.
+func TestPreferProbedCandidateOverUnprobedStub(t *testing.T) {
+	probedAt := time.Now().Add(-time.Hour)
+	probedURI := "virtual://movie/tt-probe-gate?result=cand-probed"
+	stubURI := "virtual://movie/tt-probe-gate?result=cand-stub"
+	probedRow := &models.MediaFile{
+		ID:                         501,
+		ContentID:                  "movie-1",
+		FilePath:                   probedURI,
+		Container:                  "mkv",
+		CodecVideo:                 "hevc",
+		CodecAudio:                 "dts",
+		Resolution:                 "2160p",
+		Bitrate:                    40_000,
+		ProbeUpdatedAt:             &probedAt,
+		VirtualOwnerInstallationID: 5,
+		VideoTracks:                []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160, FrameRate: "23.976", BitDepth: 10, Bitrate: 40_000}},
+		AudioTracks:                []models.AudioTrack{{Codec: "dts", Channels: 6, Language: "en", Default: true}},
+	}
+	stubRow := &models.MediaFile{
+		ID:                         502,
+		ContentID:                  "movie-1",
+		FilePath:                   stubURI,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	byURI := map[string]*models.MediaFile{probedURI: probedRow, stubURI: stubRow}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{
+			{ID: "cand-stub", URI: stubURI},
+			{ID: "cand-probed", URI: probedURI, Resolution: "2160p", CodecVideo: "hevc", CodecAudio: "dts", Container: "mkv"},
+		}, nil
+	})
+	h := virtualProbeGateCandidateHandler(stubRow, lister, nil, nil)
+	h.VirtualFileLookup = func(_ context.Context, uri string) (*models.MediaFile, error) {
+		if row, ok := byURI[uri]; ok {
+			return row, nil
+		}
+		return nil, ErrVirtualCandidateNotFound
+	}
+	h.VirtualCandidateFileLookup = func(_ context.Context, _ string, _ string, _ string, _ int) (*models.MediaFile, error) {
+		return nil, ErrVirtualCandidateNotFound
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := &models.MediaFile{
+		ID:                         500,
+		ContentID:                  "movie-1",
+		FilePath:                   "virtual://movie/tt-probe-gate",
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.URI != probedURI {
+		t.Fatalf("resolved URI = %q, want probed %q", resolved.URI, probedURI)
+	}
+	if resolved.CandidateRank != 0 {
+		t.Fatalf("candidate rank = %d, want 0 for the preferred probed release", resolved.CandidateRank)
+	}
+}
+
+func TestPreferProbedNeverJumpsRejectedGroup(t *testing.T) {
+	probedAt := time.Now().Add(-time.Hour)
+	probedURI := "virtual://movie/tt-probe-gate?result=cand-probed"
+	stubURI := "virtual://movie/tt-probe-gate?result=cand-stub"
+	probedRow := &models.MediaFile{
+		ID:                         511,
+		ContentID:                  "movie-1",
+		FilePath:                   probedURI,
+		Container:                  "mkv",
+		CodecVideo:                 "hevc",
+		CodecAudio:                 "dts",
+		Resolution:                 "2160p",
+		Bitrate:                    40_000,
+		ProbeUpdatedAt:             &probedAt,
+		VirtualOwnerInstallationID: 5,
+		VideoTracks:                []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160, FrameRate: "23.976", BitDepth: 10, Bitrate: 40_000}},
+		AudioTracks:                []models.AudioTrack{{Codec: "dts", Channels: 6, Language: "en", Default: true}},
+	}
+	stubRow := &models.MediaFile{
+		ID:                         512,
+		ContentID:                  "movie-1",
+		FilePath:                   stubURI,
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	byURI := map[string]*models.MediaFile{probedURI: probedRow, stubURI: stubRow}
+	lister := VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{
+			{ID: "cand-stub", URI: stubURI},
+			{ID: "cand-probed", URI: probedURI, Resolution: "2160p", CodecVideo: "hevc", CodecAudio: "dts", Container: "mkv", Rejected: true},
+		}, nil
+	})
+	h := virtualProbeGateCandidateHandler(stubRow, lister, nil, nil)
+	h.VirtualFileLookup = func(_ context.Context, uri string) (*models.MediaFile, error) {
+		if row, ok := byURI[uri]; ok {
+			return row, nil
+		}
+		return nil, ErrVirtualCandidateNotFound
+	}
+	h.VirtualCandidateFileLookup = func(_ context.Context, _ string, _ string, _ string, _ int) (*models.MediaFile, error) {
+		return nil, ErrVirtualCandidateNotFound
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := &models.MediaFile{
+		ID:                         510,
+		ContentID:                  "movie-1",
+		FilePath:                   "virtual://movie/tt-probe-gate",
+		Container:                  "virtual",
+		VirtualOwnerInstallationID: 5,
+	}
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", true, nil, "", "", 0, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.URI != stubURI {
+		t.Fatalf("resolved URI = %q, want accepted stub %q (rejected probed must not jump groups)", resolved.URI, stubURI)
+	}
+}
+
 func TestCandidateResolutionPreferredOverBaseline(t *testing.T) {
 	uri := "virtual://movie/tt-cand-res-pref?result=cand-2160p"
 	stored := &models.MediaFile{
