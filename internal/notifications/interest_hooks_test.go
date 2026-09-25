@@ -626,6 +626,14 @@ func (s *allCapabilitiesFakeStore) SeriesEpisodeWatchCounts(context.Context, str
 	return map[string]userstore.SeriesWatchCounts{}, nil
 }
 
+func (s *allCapabilitiesFakeStore) SeriesSeasonWatchCounts(context.Context, string, string) (map[int]userstore.SeriesWatchCounts, error) {
+	return map[int]userstore.SeriesWatchCounts{}, nil
+}
+
+func (s *allCapabilitiesFakeStore) SeasonEpisodeWatchCounts(context.Context, string, []string) (map[string]userstore.SeriesWatchCounts, error) {
+	return map[string]userstore.SeriesWatchCounts{}, nil
+}
+
 func (s *allCapabilitiesFakeStore) SeriesCompletion(context.Context, string, []string) (map[string]bool, error) {
 	return map[string]bool{}, nil
 }

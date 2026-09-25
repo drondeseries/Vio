@@ -152,7 +152,7 @@ func TestThemeConversionHeadAndRelay(t *testing.T) {
 		t.Fatalf("relayed conversion = %d %q", got.status, got.body)
 	}
 	if relayed == nil || relayed.URL.Path != "/remux/theme-transport" || relayed.URL.Query().Get("seek") != "4" ||
-		relayed.Header.Get("X-Silo-Stream-Token") != relayToken || !strings.HasPrefix(relayed.Header.Get("Authorization"), "Bearer ") {
+		relayed.Header.Get("X-Vio-Stream-Token") != relayToken || !strings.HasPrefix(relayed.Header.Get("Authorization"), "Bearer ") {
 		t.Fatalf("relayed request = %+v", relayed)
 	}
 
