@@ -4433,6 +4433,13 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 			"total_ms", time.Since(startedAt).Milliseconds(),
 			"outcome", "spawn_failed",
 		)
+		// A revoked generation surfaces its decode verdict through the
+		// transport start: it is a readiness outcome (the process ran and
+		// rejected the bytes), not a spawn failure, so the rotation loop
+		// must see it as such instead of a generic transcode_start_failed.
+		if errors.Is(err, playback.ErrSourceDecodeRejected) {
+			return nil, &localTransportStartupFailureV3{cause: err}
+		}
 		return nil, &localTransportStartupFailureV3{cause: err, failedToStart: true}
 	}
 	if _, err := ts.WaitForManifest(playback.ManifestStartupTimeout); err != nil {
@@ -4515,6 +4522,11 @@ func (h *PlaybackHandler) startReadyAutoLocalPlaybackTransportV3(ctx context.Con
 			wasRunning:   startupErr.WasRunning,
 			failedDevice: startupErr.FailedDevice,
 		}
+	case errors.Is(err, playback.ErrSourceDecodeRejected):
+		// Same revoked-generation verdict as the non-auto path below: a
+		// readiness outcome for rotation, never a spawn failure.
+		outcome = "readiness_failed"
+		failure = &localTransportStartupFailureV3{cause: err}
 	default:
 		outcome = "spawn_failed"
 		failure = &localTransportStartupFailureV3{cause: err, failedToStart: true}
@@ -4806,6 +4818,17 @@ func manifestStartupTransportErrorV3(running bool, cause error) *transportErrorV
 	if running {
 		message = "The playback transport did not become ready in time."
 	}
+	// A revoked generation surfaces its decode verdict through the readiness
+	// wait: without this mapping the rotation loop would see a generic
+	// transcode_start_failed and retry the same undecodable bytes instead of
+	// substituting another provider candidate.
+	if errors.Is(cause, playback.ErrSourceDecodeRejected) {
+		return &transportErrorV3{
+			reason:  candidateSourceDecodeRejectedReasonV3,
+			message: "The selected media source was rejected by the video decoder.",
+			cause:   cause,
+		}
+	}
 	return &transportErrorV3{reason: transcodeStartFailedReasonV3, message: message, retryable: running, cause: cause}
 }
 
@@ -4816,6 +4839,15 @@ func manifestStartupTransportErrorV3(running bool, cause error) *transportErrorV
 // as the subtitle-local reason instead, so the release is unchanged and the
 // client gets a clear subtitle outcome.
 func localTransportReadinessErrorV3(opts playback.TranscodeOpts, running bool, cause error) *transportErrorV3 {
+	// Decode verdict outranks the subtitle-local slow path below: undecodable
+	// video is a candidate failure on every release, never a subtitle problem.
+	if errors.Is(cause, playback.ErrSourceDecodeRejected) {
+		return &transportErrorV3{
+			reason:  candidateSourceDecodeRejectedReasonV3,
+			message: "The selected media source was rejected by the video decoder.",
+			cause:   cause,
+		}
+	}
 	if running && opts.SubtitleBurnIn && opts.SubtitleTrackIndex >= 0 {
 		return &transportErrorV3{
 			reason:    subtitleUnavailableReasonV3,
@@ -6899,12 +6931,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// credential — keeps the same file so the attempted-key guard
 				// advances to the next transformation rung on it (for example
 				// the server DV7->HDR10 strip) instead of swapping the release.
-				failedID := virtualResultCandidateID(currentEffectiveFile.FilePath)
+				failedID := virtualResultCandidateID(session.VirtualSourceURI)
 				if failedID == "" {
-					// The row may have been neutralized between planning and
-					// this replan; the session holds the authoritative failed
-					// result id.
-					failedID = virtualResultCandidateID(session.VirtualSourceURI)
+					// The session holds no binding (e.g. a fresh start that
+					// failed before committing one); fall back to the catalog
+					// row the plan was built against.
+					failedID = virtualResultCandidateID(currentEffectiveFile.FilePath)
 				}
 				if failedID != "" && virtualDecodeRotation {
 					excludedCandidateIDs = []string{failedID}
@@ -6920,7 +6952,14 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// resolveRehydratedVirtualSourceV3 retries with rotation declared
 				// when the resolver reports the pinned candidate is no longer
 				// listed. Session-bound stays true; only the anchor rotates.
-				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: virtualDecodeRotation, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI})
+				// Rotation honors active failed_at stamps: allowFailed stays
+				// false so a sibling the marker already stamped (a prior hop
+				// in this chain) is skipped rather than re-mounted. The
+				// current failure travels explicitly in excludedCandidateIDs,
+				// so nothing needs the bypass; bypassing stamps here is what
+				// would let sequential rotations cycle A→B→C→A instead of
+				// terminating when every sibling is known-bad.
+				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI})
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true
@@ -9267,6 +9306,18 @@ func decodeFailureClassificationV3(classification string) bool {
 	}
 }
 
+// corroboratedStartupTimeoutV3 admits a generic startup-timeout failure
+// classification into candidate-rotation consideration. A timeout alone
+// diagnoses nothing — the player reports it whenever the transport never
+// produces, for any reason — so it is only a candidate here; the live
+// generation verdict check below corroborates it before anything rotates.
+// The production incident classified an undecodable provider stream exactly
+// this way (startup_timeout → adaptation_exhausted with no rotation), because
+// only explicit decode classes passed the old gate.
+func corroboratedStartupTimeoutV3(classification string) bool {
+	return failureClassificationKeyV3(classification) == "startup_timeout"
+}
+
 // softwareDecodeVariantPendingV3 reports whether the failed plan still has an
 // untried software-decode variant of the same server-transcode HLS delivery.
 // When one is pending, a transport failure must not demote the whole delivery:
@@ -9307,19 +9358,21 @@ func (h *PlaybackHandler) softwareDecodeRetryPendingV3(record *playback.AttemptR
 	return ts != nil && ts.IsDecodeFailed()
 }
 
-// virtualCandidateRotationPendingV3 reports whether a decode-classified failure
-// recovery on a non-explicit virtual selection can still rotate to another
-// provider candidate under the same server-transcode delivery. When true the
-// delivery must not be demoted: rotation, not delivery retirement, is the next
-// hop, and demoting first would make the planner abandon the only delivery the
-// replacement candidate can use.
+// virtualCandidateRotationPendingV3 reports whether a decode-classified (or
+// corroborated-timeout) failure recovery on a non-explicit virtual selection
+// can still rotate to another provider candidate under the same
+// server-transcode delivery. When true the delivery must not be demoted:
+// rotation, not delivery retirement, is the next hop, and demoting first
+// would make the planner abandon the only delivery the replacement candidate
+// can use.
 //
 // The predicate requires the live generation's own decode verdict: a client's
-// classification alone never triggers rotation. It is otherwise structural and
-// deliberately conservative: it does not list candidates (that would put a
-// provider round-trip on the demotion decision). If rotation later finds no
-// sibling, executeReplanV3 retires the delivery explicitly on the exhausted
-// path. An explicit pin is never a rotation.
+// classification alone never triggers rotation, whether it names the decoder
+// or reports a generic startup timeout the verdict corroborates. It is
+// otherwise structural and deliberately conservative: it does not list
+// candidates (that would put a provider round-trip on the demotion decision).
+// If rotation later finds no sibling, executeReplanV3 retires the delivery
+// explicitly on the exhausted path. An explicit pin is never a rotation.
 func (h *PlaybackHandler) virtualCandidateRotationPendingV3(record *playback.AttemptRecordV3, req playback.ReplanRequestV3) bool {
 	if h == nil || record == nil {
 		return false
@@ -9327,7 +9380,8 @@ func (h *PlaybackHandler) virtualCandidateRotationPendingV3(record *playback.Att
 	if req.EffectiveOperation() != playback.ReplanOperationFailureRecoveryV3 {
 		return false
 	}
-	if !decodeFailureClassificationV3(req.Failure.Classification) {
+	if !decodeFailureClassificationV3(req.Failure.Classification) &&
+		!corroboratedStartupTimeoutV3(req.Failure.Classification) {
 		return false
 	}
 	if record.NormalizedRequest.FileSelection == playback.FileSelectionExplicitV3 {

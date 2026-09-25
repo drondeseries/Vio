@@ -264,8 +264,11 @@ type TranscodeSession struct {
 	lastDemuxErrorAt time.Time
 	demuxStamped     bool
 	// decodeErrorCount counts decoder failure lines within the current decay
-	// window; lastDecodeErrorAt timestamps the newest and decodeSample keeps a
-	// representative matched line for diagnostics. decodeStamped is set once
+	// window; firstDecodeErrorAt opens the window and lastDecodeErrorAt
+	// timestamps the newest, and decodeSample keeps a representative matched
+	// line for diagnostics. The window is scoped to one ffmpeg generation: a
+	// restart resets it (see resetDecodeVerdictLocked) so a fresh process never
+	// inherits its predecessor's strikes. decodeStamped is set once
 	// the count crosses decodeErrorThreshold on a hardware plan, which reports
 	// that the executed hardware decoder rejected the source and a software
 	// retry is warranted. sourceRejected is set on the same crossing for every
@@ -276,6 +279,7 @@ type TranscodeSession struct {
 	// source-candidate failure callback, so the marker is invoked exactly once
 	// per session regardless of how many decoder lines follow.
 	decodeErrorCount     int
+	firstDecodeErrorAt   time.Time
 	lastDecodeErrorAt    time.Time
 	decodeSample         string
 	decodeStamped        bool
@@ -2425,6 +2429,22 @@ func (s *TranscodeSession) waitForManifest(ctx context.Context, timeout time.Dur
 			return nil, err
 		}
 
+		// A revoked generation surfaces its decode verdict here instead of
+		// the deadline's generic startup timeout — but only for virtual
+		// inputs. Virtual rotation needs the verdict pre-commit (it is the
+		// only path that substitutes another provider candidate), while a
+		// local file commits and recovers through the replan software path,
+		// which requires the committed session the verdict must not preempt.
+		// The production SPS/PPS incident decayed through this exact wait.
+		// The check runs every 100ms tick alongside the manifest stat, so a
+		// verdict surfaces within one tick without any notification channel.
+		s.mu.Lock()
+		virtualInput := isVirtualInputPath(s.opts.CanonicalInputPath)
+		s.mu.Unlock()
+		if virtualInput && s.IsSourceRejected() {
+			return nil, ErrSourceDecodeRejected
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil, s.manifestTimeoutError(timeout)
@@ -2433,6 +2453,14 @@ func (s *TranscodeSession) waitForManifest(ctx context.Context, timeout time.Dur
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+// isVirtualInputPath reports whether an ffmpeg input path names a virtual
+// catalog source. Virtual playback carries the virtual:// URI in
+// CanonicalInputPath while InputPath points at the loopback relay, so only
+// the canonical path identifies it.
+func isVirtualInputPath(path string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(path)), "virtual://")
 }
 
 // BuildPlaybackManifest returns the manifest we should expose to clients.
@@ -3456,6 +3484,9 @@ func (s *TranscodeSession) RestartSegment(ctx context.Context, segNum int) (Segm
 	if s.IsDemuxFailed() {
 		return SegmentRecoveryTarget{}, false, ErrVirtualSourceDemuxFailed
 	}
+	if s.IsSourceRejected() {
+		return SegmentRecoveryTarget{}, false, ErrSourceDecodeRejected
+	}
 	target, ok, err := s.ResolveSegmentRecoveryTarget(ctx, segNum)
 	if err != nil || !ok {
 		return SegmentRecoveryTarget{}, ok, err
@@ -3501,6 +3532,14 @@ func (s *TranscodeSession) restart(
 	if s.demuxStamped {
 		s.mu.Unlock()
 		return ErrVirtualSourceDemuxFailed
+	}
+	// A decoder-rejected generation must not be rebuilt either: the bytes are
+	// undecodable, so a restart would only re-encode the same failure. The
+	// gated verdict keeps healthy mid-stream sessions restartable; only a
+	// storm with no output since this generation started refuses.
+	if s.sourceRejectedLocked() {
+		s.mu.Unlock()
+		return ErrSourceDecodeRejected
 	}
 	// Single-flight: a second caller arriving while a restart is in
 	// progress must not kill the process the first restart just started.
@@ -3683,6 +3722,9 @@ func (s *TranscodeSession) restart(
 	s.lastRequestedSegment = startSegment
 	s.lastCompletedSegment = startSegment - 1
 	s.generationStartedAt = startedAt
+	// A new generation re-opens the decode-failure window: strikes from the
+	// dead process must not stamp its replacement on the first error.
+	s.resetDecodeVerdictLocked()
 	s.inheritedManifest = inheritedManifest
 	s.done = make(chan struct{})
 	hook := s.restartHook
@@ -3720,7 +3762,18 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 		running := s.running
 		restarting := s.restarting != nil
 		waitErr := s.waitErr
+		virtualInput := isVirtualInputPath(s.opts.CanonicalInputPath)
 		s.mu.Unlock()
+
+		// A revoked generation reports its typed verdict ahead of every other
+		// wait outcome: the bytes will never arrive, so the deadline,
+		// exit-error, and restart branches below must not reclassify it.
+		// Virtual-scoped like the manifest wait: local segment waits keep
+		// their legacy timeout behavior. The check runs every 100ms tick
+		// alongside the stat, so no notification channel is needed.
+		if virtualInput && s.IsSourceRejected() {
+			return "", ErrSourceDecodeRejected
+		}
 
 		if restarting {
 			select {
@@ -3773,7 +3826,15 @@ func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration
 		running := s.running
 		restarting := s.restarting != nil
 		waitErr := s.waitErr
+		virtualInput := isVirtualInputPath(s.opts.CanonicalInputPath)
 		s.mu.Unlock()
+
+		// Revocation outranks every other wait outcome (see WaitForSegment).
+		// Virtual-scoped like the manifest wait; local segment waits keep
+		// their legacy timeout behavior.
+		if virtualInput && s.IsSourceRejected() {
+			return nil, ErrSourceDecodeRejected
+		}
 
 		if restarting {
 			select {
@@ -4365,6 +4426,24 @@ func demuxInputErrorLine(line string) bool {
 	return strings.Contains(line, "Error during demuxing")
 }
 
+// resetDecodeVerdictLocked clears the decoder-failure window and the source
+// verdict so a new ffmpeg generation re-proves from zero: strikes, window,
+// sample, rejection flag, and marker latch never cross a generation boundary.
+// Without this, the first error of a fresh process could complete a threshold
+// the dead process accumulated. decodeStamped deliberately persists: it
+// records that this session's hardware decoder failed the source, which still
+// licenses a software-decode rebuild even after an unrelated seek restart.
+// Callers must hold mu. Fresh sessions start zeroed, so the spawn path needs
+// no call.
+func (s *TranscodeSession) resetDecodeVerdictLocked() {
+	s.decodeErrorCount = 0
+	s.firstDecodeErrorAt = time.Time{}
+	s.lastDecodeErrorAt = time.Time{}
+	s.decodeSample = ""
+	s.sourceRejected = false
+	s.sourceRejectNotified = false
+}
+
 // decodeErrorLine reports whether an FFmpeg stderr line is a decoder rejecting
 // the source bitstream. Only failures that mean the bitstream itself is invalid
 // count; encoder, muxer, output, HLS, and network chatter ([h264_qsv], Error
@@ -4378,8 +4457,11 @@ func demuxInputErrorLine(line string) bool {
 // afterwards: live sessions with 50-170 of those lines produced 17 to 1600
 // decodable segments while the session was wrongly stamped as source-rejected.
 // Counting them fatalised playable content. The lines that do mean the bytes
-// are undecodable (a bad NAL split, an invalid NAL size, or the decoder
-// refusing a packet) are matched instead.
+// are undecodable (a bad NAL split, an invalid NAL size, the decoder
+// refusing a packet, or parameter sets the decoder never received) are matched
+// instead. The SPS/PPS-missing family below is the production shape of a
+// provider stream ffmpeg cannot open at all: repeated "SPS 0 does not exist"
+// and "PPS id out of range" lines with zero segments produced.
 //
 // The pattern alone does not name a stream: a corrupt subtitle stream can make
 // the same decoder refuse a packet, so logFFmpegLine only counts a match that
@@ -4395,6 +4477,12 @@ func decodeErrorLine(line string) bool {
 	case strings.Contains(line, "Failed to decode"):
 		return true
 	case strings.Contains(line, "decode_slice_header error"):
+		return true
+	case strings.Contains(line, "SPS") && strings.Contains(line, "does not exist"):
+		return true
+	case strings.Contains(line, "PPS id out of range"):
+		return true
+	case strings.Contains(line, "non-existing PPS"):
 		return true
 	default:
 		return false
@@ -4493,17 +4581,24 @@ func (s *TranscodeSession) observeDecodeError(now time.Time, sample string) bool
 	if strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
 		return false
 	}
-	if s.decodeStamped || s.sourceRejected {
-		// Already decided; the transition fires once.
-		return false
-	}
+	// Observations continue past the latch: timestamps and the sample keep
+	// advancing so a later storm after recovery re-opens the window on fresh
+	// evidence instead of inheriting a frozen cutoff. Only the transition
+	// below fires once.
+	latched := s.decodeStamped || s.sourceRejected
 	if !s.lastDecodeErrorAt.IsZero() && now.Sub(s.lastDecodeErrorAt) > decodeErrorDecay {
 		s.decodeErrorCount = 0
+	}
+	if s.decodeErrorCount == 0 {
+		s.firstDecodeErrorAt = now
 	}
 	s.decodeErrorCount++
 	s.lastDecodeErrorAt = now
 	if strings.TrimSpace(sample) != "" {
 		s.decodeSample = sample
+	}
+	if latched {
+		return false
 	}
 	if s.decodeErrorCount < decodeErrorThreshold {
 		return false
@@ -4523,13 +4618,68 @@ func (s *TranscodeSession) observeDecodeError(now time.Time, sample string) bool
 // once true, no segment produced by this generation is trustworthy and the
 // client should replan (and, for a hardware plan, get the software-decode
 // variant) instead of waiting out its own startup timeout.
+//
+// The verdict is suppressed while the decoder demonstrably recovered: usable
+// video muxed after the latest error contradicts it (see sourceRejectedLocked).
+// Sessions without an output directory (unit fixtures) have no progress to
+// consult, so the verdict stands for them.
 func (s *TranscodeSession) IsSourceRejected() bool {
 	if s == nil {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.sourceRejected
+	return s.sourceRejectedLocked()
+}
+
+// sourceRejectedLocked is the gated verdict: the latched rejection stands
+// unless the decoder demonstrably recovered — usable video produced after the
+// latest error. Output that predates the storm proves nothing: the incident
+// shape is a storm with zero output, and a mid-stream death looks like older
+// output plus a fresh storm. Only progress newer than the newest failure
+// suppresses. Callers must hold mu.
+func (s *TranscodeSession) sourceRejectedLocked() bool {
+	if !s.sourceRejected {
+		return false
+	}
+	cutoff := s.lastDecodeErrorAt
+	if cutoff.IsZero() {
+		cutoff = s.generationStartedAt
+	}
+	return !s.videoProgressAfterLocked(cutoff)
+}
+
+// videoProgressAfterLocked reports whether ffmpeg muxed segment output newer
+// than cutoff. Segment existence (not content) is the signal: any muxed
+// segment proves the decoder is extracting usable video, which contradicts a
+// source-undecodable verdict. Manifests, empty files, and unparseable names
+// never count. A zero cutoff (no errors and no generation stamp, as in unit
+// fixtures) matches nothing only if no segments exist at all — callers
+// consult this only after a rejection was recorded. Callers must hold mu.
+func (s *TranscodeSession) videoProgressAfterLocked(cutoff time.Time) bool {
+	if s.outputDir == "" {
+		return false
+	}
+	entries, err := os.ReadDir(s.outputDir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, err := ParseSegmentNumber(entry.Name()); err != nil {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.Size() <= 0 {
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			return true
+		}
+	}
+	return false
 }
 
 // DecodeErrorHeader names the machine-readable decode verdict on a media
@@ -4649,11 +4799,21 @@ func (s *TranscodeSession) notifySourceRejected(ctx context.Context) {
 		return
 	}
 	s.mu.Lock()
-	if !s.sourceRejected || s.sourceRejectNotified {
+	// The gated verdict: a storm alongside flowing segments must not mark the
+	// candidate. Not latching on suppression leaves a later stall markable.
+	if !s.sourceRejectedLocked() || s.sourceRejectNotified {
 		s.mu.Unlock()
 		return
 	}
 	s.sourceRejectNotified = true
+	// The ffmpeg process is deliberately NOT killed here: the manifest it is
+	// about to write (or the session the rotation loop closes) still drives
+	// downstream checks, and killing it would convert "manifest will appear"
+	// into "manifest never appears", engaging the hw_accel=auto HW→software
+	// fallback per candidate and multiplying transcode starts. Waiters observe
+	// the verdict through their tick-bounded gated checks instead. The
+	// failure paths close the session promptly once the typed verdict routes
+	// them to rotation.
 	cb := s.opts.OnSourceRejected
 	fileID := s.opts.MediaFileID
 	canonical := strings.TrimSpace(s.opts.CanonicalInputPath)

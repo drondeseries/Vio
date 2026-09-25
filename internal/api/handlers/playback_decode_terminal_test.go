@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
@@ -19,6 +20,18 @@ import (
 // startup timeout).
 func TestTranscodeServeReportsDecoderRejectedSource(t *testing.T) {
 	handler, _ := hardwareDecodeFailureHandler(t)
+	// Delay the storm past the commit: the start must observe a healthy
+	// generation (manifest ready, no verdict) so the rejection under test
+	// lands on the committed session whose manifest and segment routes are
+	// asserted below. An immediate storm would fail the start itself before
+	// anything commits.
+	prevConfig := handler.PlaybackConfig
+	delayedFFmpeg := writePlaybackTestFFmpegDelayedDecodeFailure(t)
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		cfg := prevConfig()
+		cfg.FFmpegPath = delayedFFmpeg
+		return cfg
+	}
 
 	start := v3HandlerStartRequest()
 	start.QualityPreference = "auto"
