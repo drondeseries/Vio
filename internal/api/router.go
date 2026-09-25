@@ -56,6 +56,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/netaccess"
 	"github.com/Silo-Server/silo-server/internal/nodemetrics"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
+	"github.com/Silo-Server/silo-server/internal/noderecipe"
 	"github.com/Silo-Server/silo-server/internal/notifications"
 	"github.com/Silo-Server/silo-server/internal/onboarding"
 	"github.com/Silo-Server/silo-server/internal/opslog"
@@ -85,6 +86,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/subtitles/subsource"
 	"github.com/Silo-Server/silo-server/internal/taskmanager"
 	"github.com/Silo-Server/silo-server/internal/taskmanager/repository"
+	"github.com/Silo-Server/silo-server/internal/themedelivery"
+	"github.com/Silo-Server/silo-server/internal/themesongs"
 	"github.com/Silo-Server/silo-server/internal/usercollections"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	virtuallibrary "github.com/Silo-Server/silo-server/internal/virtuallibrary"
@@ -302,6 +305,26 @@ func (d *Dependencies) CurrentConfig() *config.Config {
 		}
 	}
 	return d.Config
+}
+
+// themeRouter routes theme audio with the same planner, token secret, recipe
+// store and routing policy as video playback. The local AAC recipe is read
+// from the playback handler's cached FFmpeg registry.
+func (deps Dependencies) themeRouter(playbackHandler *handlers.PlaybackHandler) *themedelivery.Router {
+	router := &themedelivery.Router{
+		Secret:  func() string { return deps.CurrentConfig().Auth.JWTSecret },
+		Recipes: noderecipe.NewStore(deps.RedisClient, 0),
+		Policy:  func() config.PlaybackRoutingPolicy { return deps.CurrentConfig().Playback.Routing },
+		LocalConversion: func(ctx context.Context) bool {
+			return playbackHandler.LocalTransformationAvailableV3(ctx, playback.TransformationAudioToAACV3)
+		},
+	}
+	// Assigned only when present: a nil *Planner in the interface would read
+	// as a worker pool.
+	if deps.NodePlanner != nil {
+		router.Planner = deps.NodePlanner
+	}
+	return router
 }
 
 // invalidateNodeCapabilities drops every cached view of one node's hardware.
@@ -2784,6 +2807,17 @@ func newChiRouter(deps Dependencies) chi.Router {
 		}
 		v2deps.Invitations = invitationHandler
 	}
+	if deps.DB != nil && deps.Config != nil && viewerResolver != nil {
+		v2deps.ThemeSongs = &handlers.ThemeSongsHandler{
+			Service: themesongs.NewService(themesongs.NewRepository(deps.DB), deps.Config.Auth.JWTSecret), Sessions: sessionRepo, Users: userRepo, Resolver: viewerResolver,
+			Router:     deps.themeRouter(playbackHandler),
+			FFmpegPath: func() string { return deps.CurrentConfig().Playback.FFmpegPath },
+		}
+	}
+	v2deps.ObserveThemeAudio = func(method string, handler http.Handler) http.Handler {
+		return observeNative(deps.StreamTelemetry, method, "/api/v2/catalog/items/{id}/themes/{theme_id}/audio", handler.ServeHTTP)
+	}
+
 	var themeHandler *handlers.ThemeHandler
 	if settingsRepo != nil {
 		themeHandler = handlers.NewThemeHandler(settingsRepo)
@@ -4961,6 +4995,8 @@ func skipNativeMediaCompression(r *http.Request) bool {
 		return false
 	}
 	switch {
+	case len(p) == 8 && p[1] == "v2" && p[2] == "catalog" && p[3] == "items" && p[4] != "" && p[5] == "themes" && p[6] != "" && p[7] == "audio":
+		return true
 	case len(p) == 4 && p[2] == "stream" && p[3] != "":
 		return true
 	case len(p) == 7 && p[2] == "playback" && p[3] == "transcode" && p[4] != "" && p[5] == "segment" && p[6] != "":

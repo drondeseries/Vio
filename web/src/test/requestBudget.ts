@@ -47,6 +47,7 @@ export type FakeRoute = FakeResponse | ((request: RecordedRequest) => FakeRespon
 const PUBLIC_OPERATIONS = new Set<string>([
   "GET /api/v2/system/setup",
   "GET /api/v2/auth/providers",
+  "GET /api/v2/auth/signup",
   "GET /api/v2/theme/branding",
   "GET /api/v2/theme/admin-css",
   "POST /api/v2/auth/refresh",
@@ -101,6 +102,14 @@ export interface FakeServer {
    * impersonate operation would hand one out.
    */
   issueTokens(): { access_token: string; refresh_token: string; expires_in: number };
+  /**
+   * Stops accepting every token issued so far, as the server does when an
+   * admin disables the account or the session is revoked. A refresh with a
+   * revoked token is 401 `session_expired`.
+   */
+  revokeSessions(): void;
+  /** Stops accepting one issued token pair, leaving every other session live. */
+  revokeSession(tokens: { access_token: string; refresh_token: string }): void;
 }
 
 export interface FakeServerOptions {
@@ -120,6 +129,8 @@ export function createFakeServer(
   const requests: RecordedRequest[] = [];
   const refreshTokensUsed: string[] = [];
   const issuedAccessTokens = new Set<string>();
+  const refusedRefreshTokens = new Set<string>(revokedRefreshTokens);
+  let issuedRefreshTokens: string[] = [];
   let pending: Array<() => void> = [];
   let wave = 1;
   let tokenCounter = 0;
@@ -128,6 +139,7 @@ export function createFakeServer(
     tokenCounter += 1;
     const accessToken = `access-${tokenCounter}`;
     issuedAccessTokens.add(accessToken);
+    issuedRefreshTokens.push(`refresh-${tokenCounter}`);
     return {
       access_token: accessToken,
       refresh_token: `refresh-${tokenCounter}`,
@@ -141,8 +153,11 @@ export function createFakeServer(
     }
     if (record.operation === "POST /api/v2/auth/refresh") {
       const body = JSON.parse(String(init?.body ?? "{}")) as { refresh_token?: string };
-      if (!body.refresh_token || revokedRefreshTokens.includes(body.refresh_token)) {
-        return problem(401, "invalid_token", "The refresh token is invalid or revoked.");
+      if (body.refresh_token && refusedRefreshTokens.has(body.refresh_token)) {
+        return problem(401, "session_expired", "Session has been revoked.");
+      }
+      if (!body.refresh_token) {
+        return problem(401, "invalid_token", "Invalid or expired refresh token.");
       }
       refreshTokensUsed.push(body.refresh_token);
       return { body: issueTokens() };
@@ -187,6 +202,17 @@ export function createFakeServer(
     requests,
     refreshTokensUsed,
     issueTokens,
+    revokeSessions() {
+      issuedAccessTokens.clear();
+      for (const token of [...refreshTokensUsed, ...issuedRefreshTokens]) {
+        refusedRefreshTokens.add(token);
+      }
+      issuedRefreshTokens = [];
+    },
+    revokeSession(tokens) {
+      issuedAccessTokens.delete(tokens.access_token);
+      refusedRefreshTokens.add(tokens.refresh_token);
+    },
     pendingCount: () => pending.length,
     releaseWave() {
       const batch = pending;

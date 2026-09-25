@@ -31,10 +31,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
+	"github.com/Silo-Server/silo-server/internal/themedelivery"
 )
 
 // ItemsHandler serves Jellyfin browse/search/item endpoints.
 type ItemsHandler struct {
+	themeSongs       themeSongStore
+	themeRouter      *themedelivery.Router
+	themeFFmpegPath  func() string
 	content          ContentService
 	userData         UserDataService
 	codec            *ResourceIDCodec
@@ -318,6 +322,10 @@ func (h *ItemsHandler) HandleItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rawID := chi.URLParam(r, "id")
+	if themeID, err := h.codec.DecodeIntID(EncodedIDThemeSong, rawID); err == nil {
+		h.handleThemeItem(w, r, session, themeID)
+		return
+	}
 
 	// The synthetic Collections view is a fixed sentinel ID, not a codec-encoded
 	// one; clients fetch the CollectionFolder by ID (e.g. Infuse) before browsing
@@ -726,7 +734,7 @@ func (h *ItemsHandler) HandleItemStub(w http.ResponseWriter, r *http.Request) {
 // /Items/{id}/ThemeSongs. It cannot share HandleItemStub because this
 // response shape additionally requires OwnerId (see themeMediaResultDTO).
 func (h *ItemsHandler) HandleThemeSongsStub(w http.ResponseWriter, r *http.Request) {
-	if !h.validateThemeOwner(w, r) {
+	if _, ok := h.validateThemeOwner(w, r); !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, themeMediaResultDTO{
@@ -3864,35 +3872,35 @@ func (h *ItemsHandler) HandleAncestors(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, items)
 }
 
-// Theme media are not indexed by Silo; return the upstream envelope only after
-// proving the referenced item is visible to this viewer.
+// HandleThemeMedia serves Jellyfin's outer theme collection envelope.
 func (h *ItemsHandler) HandleThemeMedia(w http.ResponseWriter, r *http.Request) {
-	if !h.validateThemeOwner(w, r) {
+	result, ok := h.themeSongsResult(w, r)
+	if !ok {
 		return
 	}
 	empty := themeMediaResultDTO{Items: []baseItemDTO{}, OwnerID: chi.URLParam(r, "id")}
-	writeJSON(w, 200, map[string]themeMediaResultDTO{"ThemeSongsResult": empty, "ThemeVideosResult": empty, "SoundtrackSongsResult": empty})
+	writeJSON(w, 200, map[string]themeMediaResultDTO{"ThemeSongsResult": result, "ThemeVideosResult": empty, "SoundtrackSongsResult": empty})
 }
-func (h *ItemsHandler) validateThemeOwner(w http.ResponseWriter, r *http.Request) bool {
+func (h *ItemsHandler) validateThemeOwner(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if h.content == nil || h.codec == nil {
 		writeError(w, 503, "Unavailable", "Catalog unavailable")
-		return false
+		return "", false
 	}
 	session := SessionFromContext(r.Context())
 	if session == nil {
 		writeError(w, 401, "Unauthorized", "Missing authentication token")
-		return false
+		return "", false
 	}
 	id, err := decodeContentID(h.codec, chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, 404, "NotFound", "Item not found")
-		return false
+		return "", false
 	}
 	if _, err = h.content.GetItemDetail(r.Context(), session, id, nil); err != nil {
 		writeCompatUpstreamError(w, err)
-		return false
+		return "", false
 	}
-	return true
+	return id, true
 }
 
 // Mixed Ids requests retain the catalog's composed predicates for ordinary

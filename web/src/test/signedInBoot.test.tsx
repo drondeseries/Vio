@@ -106,6 +106,7 @@ function serverRoutes() {
   return {
     "GET /api/v2/system/setup": { body: { needs_setup: false, wizard_completed: true } },
     "GET /api/v2/auth/providers": { body: { items: [] } },
+    "GET /api/v2/auth/signup": { body: { enabled: false } },
     "GET /api/v2/theme/branding": { body: {} },
     "GET /api/v2/theme/admin-css": { body: {} },
     "GET /api/v2/account/me": { body: getCurrentUserOk },
@@ -227,9 +228,123 @@ describe("app boot request budget", () => {
       unauthorized: 1,
       refreshes: 1,
       duplicateGets: 0,
-      total: 5,
+      // Includes the login page's public signup-status read.
+      total: 6,
     });
     expect(storage.get(storage.KEYS.REFRESH_TOKEN)).toBeNull();
+  });
+
+  it("sends a session the server stops accepting mid-use to sign-in", async () => {
+    // An admin disables the account (or revokes the session) while it browses.
+    signInReturningOwner();
+    await boot(server);
+    expect(screen.getByTestId("home"), describeRequests(server.requests)).toBeInTheDocument();
+
+    server.revokeSessions();
+    await act(async () => {
+      void queryClient.invalidateQueries();
+    });
+    await releaseUntilQuiet(server);
+
+    const log = describeRequests(server.requests);
+    expect(screen.getByRole("heading", { name: /sign in/i }), log).toBeInTheDocument();
+    expect(screen.queryByTestId("home"), log).not.toBeInTheDocument();
+    expect(appRouter!.state.location.pathname, log).toBe("/login");
+    expect(storage.get(storage.KEYS.REFRESH_TOKEN)).toBeNull();
+    // One refused refresh is shared; nothing retries the rejected session.
+    const refusedRefreshes = server.requests.filter(
+      (request) => request.operation === "POST /api/v2/auth/refresh" && request.status === 401,
+    );
+    expect(refusedRefreshes, log).toHaveLength(1);
+  });
+
+  it("returns an admin to their own session when the viewed session is revoked", async () => {
+    signInReturningOwner();
+    await boot(server);
+    expect(screen.getByTestId("home"), describeRequests(server.requests)).toBeInTheDocument();
+    const adminRefreshToken = storage.get(storage.KEYS.REFRESH_TOKEN);
+
+    // What AdminUserImpersonationDialog does with the impersonate answer.
+    const viewedTokens = server.issueTokens();
+    const pair = { ...adminAccountImpersonate, ...viewedTokens } as TokenPair;
+    await act(async () => {
+      homeAuth!.beginImpersonation(sessionFromTokenPair(pair), "/admin/users");
+    });
+    await releaseUntilQuiet(server);
+    expect(storage.get(storage.KEYS.REFRESH_TOKEN)).toBe(viewedTokens.refresh_token);
+
+    // The viewed account is disabled while the admin browses as it.
+    server.revokeSession(viewedTokens);
+    await act(async () => {
+      void queryClient.invalidateQueries();
+    });
+    await releaseUntilQuiet(server);
+
+    const log = describeRequests(server.requests);
+    expect(appRouter!.state.location.pathname, log).not.toBe("/login");
+    expect(screen.queryByRole("heading", { name: /sign in/i }), log).not.toBeInTheDocument();
+    expect(storage.get(storage.KEYS.REFRESH_TOKEN), log).toBe(adminRefreshToken);
+    expect(localStorage.getItem("impersonation_admin_session"), log).toBeNull();
+    // Every request refused on the viewed session joins one recovery.
+    const refusedRefreshes = server.requests.filter(
+      (request) => request.operation === "POST /api/v2/auth/refresh" && request.status === 401,
+    );
+    expect(refusedRefreshes.length, log).toBeGreaterThan(0);
+    expect(
+      server.requests.filter(
+        (request) =>
+          request.operation === "GET /api/v2/account/me" && request.seq > refusedRefreshes[0]!.seq,
+      ),
+      log,
+    ).toHaveLength(1);
+  });
+
+  it("keeps a sign-in that replaces the session while the admin session is restored", async () => {
+    signInReturningOwner();
+    await boot(server);
+    const adminRefreshToken = storage.get(storage.KEYS.REFRESH_TOKEN);
+    const viewedTokens = server.issueTokens();
+    const pair = { ...adminAccountImpersonate, ...viewedTokens } as TokenPair;
+    await act(async () => {
+      homeAuth!.beginImpersonation(sessionFromTokenPair(pair), "/admin/users");
+    });
+    await releaseUntilQuiet(server);
+
+    server.revokeSession(viewedTokens);
+    await act(async () => {
+      void queryClient.invalidateQueries();
+    });
+    // Release waves until the admin restore's account read is in flight.
+    const refusedAt = () =>
+      server.requests.find(
+        (request) => request.operation === "POST /api/v2/auth/refresh" && request.status === 401,
+      );
+    const restoreRead = () =>
+      server.requests.find(
+        (request) =>
+          request.operation === "GET /api/v2/account/me" &&
+          refusedAt() !== undefined &&
+          request.seq > refusedAt()!.seq,
+      );
+    for (let wave = 0; wave < 20 && !restoreRead(); wave += 1) {
+      await settle(server);
+      if (!restoreRead()) server.releaseWave();
+    }
+    expect(restoreRead(), describeRequests(server.requests)).toBeDefined();
+
+    // Another sign-in lands before the restore answers.
+    const next = server.issueTokens();
+    await act(async () => {
+      setAccessToken(next.access_token);
+      storage.set(storage.KEYS.REFRESH_TOKEN, next.refresh_token);
+    });
+    await releaseUntilQuiet(server);
+
+    const log = describeRequests(server.requests);
+    // The new session may rotate its own token; the admin's must not replace it.
+    expect(storage.get(storage.KEYS.REFRESH_TOKEN), log).not.toBe(adminRefreshToken);
+    expect(server.refreshTokensUsed, log).not.toContain(adminRefreshToken);
+    expect(appRouter!.state.location.pathname, log).not.toBe("/login");
   });
 
   it("reads the viewed account once when an admin starts viewing as another user", async () => {
@@ -301,7 +416,8 @@ describe("app boot request budget", () => {
       unauthorized: 0,
       refreshes: 0,
       duplicateGets: 0,
-      total: 4,
+      // Includes the login page's public signup-status read.
+      total: 5,
     });
   });
 });

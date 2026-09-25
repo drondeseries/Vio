@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import QRCode from "react-qr-code";
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router";
+import { useQuery } from "@tanstack/react-query";
 import { sessionFromTokenPair } from "@/api/v2/account";
 import { v2, type V2Result } from "@/api/v2/request";
 import { listProfiles } from "@/hooks/queries/profiles";
@@ -91,6 +92,17 @@ export default function Login() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { serverName, loginSubtitle } = useServerBranding();
+  // Always refetch on mount so a cached answer from before an admin closed
+  // signups can't show the link, and show it only from that fresh result.
+  const signupStatusQuery = useQuery({
+    queryKey: ["auth", "signup-status"],
+    queryFn: () => v2("GET /api/v2/auth/signup"),
+    refetchOnMount: "always",
+  });
+  const signupOpen =
+    signupStatusQuery.isSuccess &&
+    signupStatusQuery.isFetchedAfterMount &&
+    signupStatusQuery.data.enabled;
 
   useDocumentTitle("Sign In");
 
@@ -412,12 +424,14 @@ export default function Login() {
             </div>
           </div>
 
-          <p className="text-muted-foreground text-center text-sm">
-            Don&apos;t have an account?{" "}
-            <Link to={signupHref} className="text-foreground underline hover:no-underline">
-              Sign up
-            </Link>
-          </p>
+          {signupOpen && (
+            <p className="text-muted-foreground text-center text-sm">
+              Don&apos;t have an account?{" "}
+              <Link to={signupHref} className="text-foreground underline hover:no-underline">
+                Sign up
+              </Link>
+            </p>
+          )}
         </CardContent>
       </Card>
     </main>

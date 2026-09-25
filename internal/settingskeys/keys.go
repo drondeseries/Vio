@@ -9,7 +9,7 @@
 package settingskeys
 
 // Revision is the manifest revision these bindings were generated from.
-const Revision = 13
+const Revision = 14
 
 // Setting keys, one constant per definition.
 const (
@@ -145,6 +145,10 @@ const (
 	UiTextWeight = "ui.text_weight"
 	// Theme
 	UiTheme = "ui.theme"
+	// Theme music
+	UiThemeMusicEnabled = "ui.theme_music_enabled"
+	// Loop theme music
+	UiThemeMusicLoop = "ui.theme_music_loop"
 	// Time format
 	UiTimeFormat = "ui.time_format"
 )
@@ -209,6 +213,8 @@ var Remote = []string{
 	UiTextScale,
 	UiTextWeight,
 	UiTheme,
+	UiThemeMusicEnabled,
+	UiThemeMusicLoop,
 	UiTimeFormat,
 }
 
