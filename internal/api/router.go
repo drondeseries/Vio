@@ -1718,35 +1718,35 @@ func newChiRouter(deps Dependencies) chi.Router {
 				if ownerInstallationID <= 0 {
 					ownerInstallationID = file.VirtualOwnerInstallationID
 				}
-				var resolved string
-				var headers map[string]string
 				if playbackHandler.VirtualMediaDetailedResolver != nil {
 					// A reconstructed session re-resolves the release it was
-					// already serving. Thread the intents explicitly: without
-					// them the resolver inherits the candidate-rotation default
-					// (true), so a rebuilt session whose pin is absent from the
-					// provider list would silently swap to a sibling release. A
-					// session-bound rehydrate declares session-bound and
-					// withholds rotation; the row's durable identity is threaded
-					// so a renumbered same-release candidate is re-identified
-					// (IdentityRematched) instead of replaced.
-					resolveCtx := handlers.WithVirtualSessionBinding(ctx, true)
-					resolveCtx = handlers.WithVirtualCandidateRotation(resolveCtx, false)
-					resolveCtx = virtuallibrary.WithPersistedCandidateIdentity(resolveCtx, virtuallibrary.PersistedCandidateIdentity{
+					// already serving. Route it through the same stored-first,
+					// trust-window, outage-retrying, same-release-rematching
+					// seam the transport startup uses: a persisted provider URL
+					// serves the rebuild with zero provider calls, a transient
+					// provider listing is retried before failing, and a
+					// genuinely different release is still refused rather than
+					// silently swapped. The seam returns the relay-registered
+					// input (the same shared relay), so it is returned directly.
+					// The row's durable identity is threaded so a renumbered
+					// same-release candidate is re-identified even when the
+					// exact-path stored lookup misses because the session
+					// already rebound.
+					resolveCtx := virtuallibrary.WithPersistedCandidateIdentity(ctx, virtuallibrary.PersistedCandidateIdentity{
 						VideoHash:   file.ProviderVideoHash,
 						GUID:        file.ProviderGUID,
 						ReleaseName: file.ProviderReleaseName,
 						ReleaseSize: file.ProviderReleaseSize,
 					})
-					res, dErr := playbackHandler.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-						resolveCtx, canonicalPath, ownerInstallationID, userID, profileID, false, nil, "",
-					)
+					res, resCleanup, dErr := playbackHandler.ResolveVirtualTransportInput(resolveCtx, canonicalPath, ownerInstallationID, userID, profileID)
 					if dErr != nil {
 						return "", nil, dErr
 					}
-					resolved = res.URL
-					headers = res.RequestHeaders
-				} else if playbackHandler.VirtualMediaRefreshResolver != nil {
+					return res.URL, resCleanup, nil
+				}
+				var resolved string
+				var headers map[string]string
+				if playbackHandler.VirtualMediaRefreshResolver != nil {
 					resolved, err = playbackHandler.VirtualMediaRefreshResolver.RefreshVirtualMedia(
 						ctx, canonicalPath, ownerInstallationID, userID, profileID,
 					)

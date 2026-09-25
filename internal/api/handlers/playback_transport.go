@@ -21,6 +21,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
 
 // startLocalPlaybackTransport is the shared local ffmpeg launch primitive for
@@ -282,6 +283,27 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		// lifetime: resolveVirtualInputURI runs under startupCtx, and the
 		// manifest wait below observes startupCtx as an owner deadline while
 		// the session itself runs on transcodeCtx.
+		if attempt > 0 && sessionVirtualURI != "" && file != nil {
+			// A fallback attempt declares substitution so the resolver may
+			// serve a sibling when this loop just indicted the pin. An existing
+			// session is bound to the release the viewer picked, though, so it
+			// must never silently swap to different bytes: accept the fallback
+			// only when the same release re-identified (IdentityRematched) or
+			// its durable identity matches the row's. A legacy row with no
+			// durable identity keeps the pre-existing failover behavior, and a
+			// fresh start (no session binding) is unaffected.
+			if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity &&
+				!resolvedMedia.IdentityRematched && !resolvedMatchesPersistedIdentity(resolvedMedia, file) {
+				if cleanup != nil {
+					cleanup()
+				}
+				lastErr = fmt.Errorf("virtual transport fallback resolved a different release; refusing a silent release swap")
+				if resolvedMedia.CandidateID != "" {
+					failedCandidateIDs = append(failedCandidateIDs, resolvedMedia.CandidateID)
+				}
+				continue
+			}
+		}
 		transcodeCtx, transcodeCancel := context.WithCancel(context.WithoutCancel(ctx))
 		timer := time.AfterFunc(4*time.Hour, transcodeCancel)
 		cleanupWithCancel := func() {
@@ -472,6 +494,59 @@ func virtualFallbackAudioChannels(probed *models.MediaFile) int {
 	return probed.AudioTracks[0].Channels
 }
 
+// ResolveVirtualTransportInput resolves the session-bound virtual source for a
+// reconstructed local transport. It is the exported front door for the same
+// stored-URL-first + trust-window + provider-outage-retry resolution the
+// transport startup uses: a rebuilt session must first try the row's persisted
+// URL (zero provider calls, no release swap), fall through to a provider
+// resolve with the row's durable identity threaded, and retry a transient
+// provider listing before giving up. When the pinned candidate is genuinely
+// absent from the provider list it retries once with rotation declared,
+// excluding the absent pin, and accepts the retry only when the same release
+// re-matched — mirroring RefreshInput and resolveVirtualAnchorURIWithRotationV3,
+// so a rebuilt session never silently anchors on sibling bytes. It returns the
+// relay-registered input and its cleanup.
+func (h *PlaybackHandler) ResolveVirtualTransportInput(ctx context.Context, virtualURI string, ownerInstallationID, userID int, profileID string) (ResolvedVirtualMedia, func(), error) {
+	resolved, cleanup, err := h.resolveVirtualInputURI(ctx, virtualURI, ownerInstallationID, userID, profileID, false, nil, "")
+	if err == nil || !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		return resolved, cleanup, err
+	}
+	file, lookupErr := h.VirtualFileLookup(ctx, virtualURI)
+	if lookupErr != nil || file == nil {
+		return resolved, cleanup, err
+	}
+	pinnedID := virtualResultCandidateID(virtualURI)
+	var excluded []string
+	if pinnedID != "" {
+		excluded = []string{pinnedID}
+	}
+	retryCtx := virtualResolveContextWithPersistedIdentity(ctx, file)
+	rotated, rotatedCleanup, rotateErr := h.resolveVirtualInputURI(
+		retryCtx, virtualURI, ownerInstallationID, userID, profileID, true, excluded, "", true,
+	)
+	if rotateErr != nil {
+		return rotated, rotatedCleanup, rotateErr
+	}
+	if !rotated.IdentityRematched && !resolvedMatchesPersistedIdentity(rotated, file) {
+		if rotatedCleanup != nil {
+			rotatedCleanup()
+		}
+		slog.WarnContext(ctx, "virtual transport rebuild rotation resolved a different release; refusing a silent rebuild swap",
+			"component", "api", "session_anchor", virtualURI,
+			"status", "rotation_refused", "old_candidate_id", pinnedID,
+			"new_candidate_id", virtualResultCandidateID(rotated.URI))
+		return resolved, cleanup, err
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	slog.InfoContext(ctx, "virtual transport rebuild rotated an absent session-bound candidate",
+		"component", "api", "session_anchor", virtualURI,
+		"status", "rotated", "old_candidate_id", pinnedID,
+		"new_candidate_id", virtualResultCandidateID(rotated.URI), "virtual_uri", rotated.URI)
+	return rotated, rotatedCleanup, nil
+}
+
 // final rotateCandidates argument is the caller's explicit declaration that
 // excluding a candidate is a verdict against that release, which authorizes
 // serving a sibling. It defaults to false, so an exclusion on its own never
@@ -551,9 +626,23 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			// already serves, so it declares session-bound: a profile-removed
 			// candidate refuses instead of silently swapping the release.
 			ctx = withVirtualSessionBindingV3(ctx, true)
-			res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-				ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID,
-			)
+			// A transient provider-listing blackout for the session's own
+			// trusted candidate must not be read as an indictment of the
+			// release. Retry it with a short bounded backoff before giving up,
+			// and classify the final failure as a retryable provider outage so
+			// the client keeps retrying the release it picked. The retry keeps
+			// the caller's exact parameters (exclusions, forceRefresh), so an
+			// intentional rotation still rotates on the first successful
+			// relist; only a failed listing is retried.
+			outageTrusted := h.virtualCandidateTrustedForOutageRetry(storedRow)
+			res, err = retryVirtualProviderOutageResolve(ctx, outageTrusted, func(retryCtx context.Context, relist bool) (ResolvedVirtualMedia, error) {
+				if relist {
+					retryCtx = virtuallibrary.WithProviderOutageRelist(retryCtx)
+				}
+				return h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+					retryCtx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh || relist, excludedCandidateIDs, preferredCandidateID,
+				)
+			})
 			if err == nil && res.IdentityRematched && storedRow != nil {
 				// The pinned id was absent but the same release re-identified
 				// under a new id. Adopt it through the Phase-1 CAS/fence write
@@ -568,6 +657,8 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 				// the serve path already holds the resolved URL, so persistence
 				// is best-effort cache hygiene, not the request's outcome.
 				_, _ = refreshStoredVirtualResolution(ctx, storedExpiredRow, res, h.VirtualFileMetadataSaver, h.VirtualFileSaver)
+			} else if err != nil {
+				err = classifyVirtualProviderOutage(err, outageTrusted)
 			}
 		} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
 			var inputPath string

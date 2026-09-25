@@ -205,18 +205,31 @@ func playbackSubtitleFontProblem(err error) *Problem {
 	return NewProblem(kind, detail)
 }
 
-// Playback success bytes pass through immediately. A pre-body transport error
-// becomes a safe v2 problem; its legacy JSON/text body is never exposed. Once
-// bytes have begun, a transport failure must end the stream, not append JSON.
+// playbackDeliveryWriter carries the v1 handler's machine-readable error code
+// to the v2 delivery adapter so a semantic problem (e.g. a retryable
+// provider_unavailable) survives the status-only adaptation. The v1 handler
+// writes its code into the response body, which the adapter discards before
+// commitment, so the code is captured out of band.
 type playbackDeliveryWriter struct {
 	http.ResponseWriter
-	request *http.Request
-	inner   *streamResponseWriter
+	request     *http.Request
+	inner       *streamResponseWriter
+	problemCode string
+}
+
+// SetPlaybackProblemCode records the v1 error code for the next pre-body
+// WriteHeader. It is a no-op after the response is committed.
+func (w *playbackDeliveryWriter) SetPlaybackProblemCode(code string) {
+	if w.problemCode == "" {
+		w.problemCode = code
+	}
 }
 
 func (w *playbackDeliveryWriter) transport() *streamResponseWriter {
 	if w.inner == nil {
-		w.inner = &streamResponseWriter{ResponseWriter: w.ResponseWriter, request: w.request, problemType: playbackDeliveryProblemType, redactHeaders: []string{playbackContentLength, playbackContentEncoding, directDisposition, jobLocationHeader, etagField, playbackLastModified}}
+		w.inner = &streamResponseWriter{ResponseWriter: w.ResponseWriter, request: w.request, problemType: func(status int) ProblemType {
+			return playbackDeliveryProblemType(status, w.problemCode)
+		}, redactHeaders: []string{playbackContentLength, playbackContentEncoding, directDisposition, jobLocationHeader, etagField, playbackLastModified}}
 	}
 	return w.inner
 }
@@ -229,12 +242,22 @@ func (w *playbackDeliveryWriter) transport() *streamResponseWriter {
 // dependency unavailability as 503 dependency_unavailable, so map it there
 // rather than letting the catalog's internal_error default report a server bug.
 // The v2 route declares 503 for exactly this reason.
-func playbackDeliveryProblemType(status int) ProblemType {
+//
+// A v1 handler may also write a 503 with a machine-readable code that deserves
+// its own v2 type: provider_unavailable distinguishes a transient provider
+// outage (keep retrying this release) from a missing server dependency. The
+// code is matched only at 503 so a mismatched handler can never mint a type
+// whose status disagrees with the response.
+func playbackDeliveryProblemType(status int, code string) ProblemType {
 	switch status {
 	case http.StatusGone:
 		return TypePlaybackSessionEnded
 	case http.StatusBadGateway:
 		return TypeDependencyUnavailable
+	case http.StatusServiceUnavailable:
+		if code == TypeProviderUnavailable.ID {
+			return TypeProviderUnavailable
+		}
 	}
 	return TypeForStatus(status)
 }
