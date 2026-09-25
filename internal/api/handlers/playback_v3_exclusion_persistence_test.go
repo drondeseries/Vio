@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -265,6 +267,81 @@ func TestDurableExclusionsDoNotShrinkOnIdempotentReplay(t *testing.T) {
 	after := f.durableExcludedCandidateIDs(t, started.SessionID)
 	if len(after) != len(before) {
 		t.Fatalf("idempotent replay changed the exclusion chain: %v -> %v", before, after)
+	}
+}
+
+// postPlaybackReplanRawV3 posts a replan and returns the decoded response and
+// the HTTP status, without calling t.Fatal, so a caller can drive it from a
+// goroutine and assert on a deadline.
+func postPlaybackReplanRawV3(handler *PlaybackHandler, sessionID string, request playback.ReplanRequestV3) (playback.DecisionResponseV3, int, string) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return playback.DecisionResponseV3{}, 0, err.Error()
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/"+sessionID+"/replan", strings.NewReader(string(body))).WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", sessionID)
+	rr := httptest.NewRecorder()
+	handler.HandleReplanPlaybackV3(rr, req)
+	var response playback.DecisionResponseV3
+	if rr.Body.Len() > 0 {
+		_ = json.Unmarshal(rr.Body.Bytes(), &response)
+	}
+	return response, rr.Code, rr.Body.String()
+}
+
+// TestBlockedMarkerDoesNotStallDurableRotation proves a marker callback that
+// never returns cannot stall the rotation: the durable chain is written by the
+// replan itself, independent of the asynchronous marker. With the marker wedged,
+// A → B still completes and the excluded A is never re-selected.
+func TestBlockedMarkerDoesNotStallDurableRotation(t *testing.T) {
+	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		candidateIDs:        []string{"A", "B"},
+		decodeFailCalls:     1,
+		rejectAfterManifest: true,
+		markerBlocked:       true,
+	})
+	// Release the wedged marker once the test is done so its goroutine exits.
+	if f.markerRelease != nil {
+		t.Cleanup(func() { close(f.markerRelease) })
+	}
+	start := f.request()
+
+	code, started := f.start(t, start)
+	if code != http.StatusCreated || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d response=%+v", code, started)
+	}
+	defer f.handler.tm.CloseTranscodeSession(started.SessionID, "")
+	f.waitForCandidateRejected(t, started.SessionID)
+
+	// The marker is blocked; the durable write is the replan's own, so the
+	// rotation must not wait on the callback.
+	type result struct {
+		response playback.DecisionResponseV3
+		status   int
+		body     string
+	}
+	done := make(chan result, 1)
+	go func() {
+		response, status, body := postPlaybackReplanRawV3(f.handler, started.SessionID, decodeRotationReplanRequest(start, started.PlaybackPlan, "blocked-marker-replan-0001"))
+		done <- result{response: response, status: status, body: body}
+	}()
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("a blocked marker stalled the rotation")
+	}
+	if got.status != http.StatusOK {
+		t.Fatalf("blocked-marker rotation status = %d, body = %s", got.status, got.body)
+	}
+	if got.response.Terminal != nil || got.response.PlaybackPlan == nil {
+		t.Fatalf("blocked-marker rotation terminalled: %+v", got.response.Terminal)
+	}
+	if uri := f.sessionVirtualURI(t, started.SessionID); uri != decodeRotationCandidateURI("B") {
+		t.Fatalf("blocked-marker rotation bound %q, want B", uri)
+	}
+	if durable := f.durableExcludedCandidateIDs(t, started.SessionID); len(durable) != 1 || durable[0] != "A" {
+		t.Fatalf("blocked-marker durable exclusions = %v, want [A]", durable)
 	}
 }
 
