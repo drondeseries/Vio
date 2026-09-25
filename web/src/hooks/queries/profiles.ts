@@ -136,7 +136,7 @@ export function useHouseholdSessions(enabled = true) {
   });
 }
 
-export function useProfiles() {
+export function useProfiles(options?: { enabled?: boolean }) {
   // The profile list needs an authenticated session, but shell-level
   // components (sidebar, realtime provider, route gates) subscribe to it
   // before the auth provider has finished restoring a stored session — the
@@ -149,7 +149,7 @@ export function useProfiles() {
   const query = useQuery({
     queryKey: profileKeys.list(),
     queryFn: listProfiles,
-    enabled: authReady,
+    enabled: (options?.enabled ?? true) && authReady,
   });
 
   return {

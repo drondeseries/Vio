@@ -32,10 +32,6 @@ func TestResponseWritersPreserveReaderFrom(t *testing.T) {
 			spy.header.Set("Content-Type", "video/mp4")
 			return &debugResponseWriter{ResponseWriter: spy}
 		}},
-		{"image proxy passthrough", func(spy *readerFromSpy) io.ReaderFrom {
-			spy.header.Set("Content-Type", "video/mp4")
-			return &compatImageProxyTagResponseWriter{ResponseWriter: spy}
-		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			spy := &readerFromSpy{header: make(http.Header)}

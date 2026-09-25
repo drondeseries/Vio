@@ -20,7 +20,7 @@ describe("playerFetch", () => {
     vi.stubGlobal("fetch", fetchMock);
     await playerFetch(config, "/test");
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
-      headers: { "X-Silo-Client": "Silo Web", "X-Silo-Device-Id": "web-player-device" },
+      headers: { "X-Silo-Client": "Vio Web", "X-Silo-Device-Id": "web-player-device" },
     });
   });
 

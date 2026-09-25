@@ -1746,6 +1746,7 @@ export function usePlaybackSession(
       carriedAudioTrackId: target.carriedAudioTrackId,
       fileSelection: target.fileSelection,
       forceRelink: true,
+      intentAt: performance.now(),
     }).finally(() => {
       retryingRef.current = false;
       setState((current) => (current.retrying ? { ...current, retrying: false } : current));

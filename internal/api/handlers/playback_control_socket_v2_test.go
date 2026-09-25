@@ -265,7 +265,7 @@ func TestControlSocketReconnectResumesOnlySameOwnerAndInstallation(t *testing.T)
 
 	// The same owner and installation reconnects and takes over the lane; the
 	// old connection's frames are no longer routed and it is closed.
-	firstLane := f.lane()
+	_ = f.lane()
 	second, _, err := f.dial(t, f.mint(t, controlInstallation), nil) //nolint:bodyclose // dial registers t.Cleanup to close the response body
 	if err != nil {
 		t.Fatal(err)
