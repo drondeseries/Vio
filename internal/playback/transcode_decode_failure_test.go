@@ -611,7 +611,7 @@ func TestSourceRejectionSuppressedAfterVideoProgress(t *testing.T) {
 		clock.Advance(decodeObservationWindow)
 		s.evaluateDecodeVerdict()
 		if !s.IsSourceRejected() {
-			t.Fatal("manifest without segments cancelled the verdict")
+			t.Fatal("manifest without segments canceled the verdict")
 		}
 	})
 
@@ -624,7 +624,7 @@ func TestSourceRejectionSuppressedAfterVideoProgress(t *testing.T) {
 		clock.Advance(decodeObservationWindow)
 		s.evaluateDecodeVerdict()
 		if !s.IsSourceRejected() {
-			t.Fatal("empty segment cancelled the verdict")
+			t.Fatal("empty segment canceled the verdict")
 		}
 	})
 
@@ -637,7 +637,7 @@ func TestSourceRejectionSuppressedAfterVideoProgress(t *testing.T) {
 		clock.Advance(decodeObservationWindow)
 		s.evaluateDecodeVerdict()
 		if !s.IsSourceRejected() {
-			t.Fatal("stale segments cancelled the fresh generation's verdict")
+			t.Fatal("stale segments canceled the fresh generation's verdict")
 		}
 	})
 }

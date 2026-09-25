@@ -168,7 +168,7 @@ func TestDecodeProgressBeforeExpiryCancelsSuspicion(t *testing.T) {
 		t.Fatal("qualifying progress did not cancel suspicion")
 	}
 	if got := decodeStageOf(s); got != decodeStageObserving {
-		t.Fatalf("cancelled stage = %d, want observing", got)
+		t.Fatalf("canceled stage = %d, want observing", got)
 	}
 	clock.Advance(decodeObservationWindow * 2)
 	s.evaluateDecodeVerdict()
@@ -177,7 +177,7 @@ func TestDecodeProgressBeforeExpiryCancelsSuspicion(t *testing.T) {
 	}
 	select {
 	case <-marked:
-		t.Fatal("cancelled suspicion invoked the source-rejected marker")
+		t.Fatal("canceled suspicion invoked the source-rejected marker")
 	default:
 	}
 
@@ -452,7 +452,7 @@ func TestCleanupRacingResetDoesNotKillReplacement(t *testing.T) {
 
 	s.reapRejectedGeneration(generation)
 	if got := atomic.LoadInt32(&killed); got != 0 {
-		t.Fatalf("reap cancelled the replacement (cancel id %d)", got)
+		t.Fatalf("reap canceled the replacement (cancel id %d)", got)
 	}
 }
 
