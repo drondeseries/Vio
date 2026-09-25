@@ -47,4 +47,10 @@ var (
 	// known-bad. A restart must not rebuild the same bad transport; the caller
 	// rotates to another candidate on the next failure recovery.
 	ErrVirtualSourceDemuxFailed = errors.New("virtual source produced repeated demux failures")
+	// ErrSourceDecodeRejected reports that a transcode generation was revoked
+	// after its decoder rejected the source with no usable video produced.
+	// Segment and manifest waits return it instead of burning their full
+	// timeout, and restarts refuse with it: rebuilding the same undecodable
+	// bytes can never succeed, so the caller rotates to another candidate.
+	ErrSourceDecodeRejected = errors.New("transcode source rejected by video decoder")
 )

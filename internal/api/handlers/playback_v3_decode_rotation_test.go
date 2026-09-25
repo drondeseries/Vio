@@ -27,26 +27,23 @@ func decodeRotationCandidateURI(id string) string {
 }
 
 // writePlaybackTestFFmpegDecodeFailureBeforeManifest emits the decoder's
-// invalid-bitstream failure past the rejection threshold and only then writes a
-// ready manifest, so a start that waits for the manifest observes the rejected
-// source deterministically and the start pre-check fires.
+// invalid-bitstream failure as a sustained storm and never writes a manifest,
+// so the start's manifest wait can only resolve through the observation
+// lifecycle: suspicion at the threshold, confirmation after the observation
+// window, and then ErrSourceDecodeRejected. A manifest appearing inside the
+// observation window would be recovery, not rejection, so producing one here
+// would make the fixture race the deadline.
 func writePlaybackTestFFmpegDecodeFailureBeforeManifest(t *testing.T) string {
 	t.Helper()
+	// The process stays alive emitting the decoder storm and never writes a
+	// manifest, so the start's manifest wait can only resolve through the
+	// observation lifecycle: suspicion at the threshold, confirmation after
+	// the observation window, then ErrSourceDecodeRejected. It does not exit
+	// early, so the rejection is a decoder verdict (reaping the process) rather
+	// than an early-exit generic failure.
 	script := "#!/bin/sh\n" +
 		"i=0\n" +
 		"while [ $i -lt 20 ]; do echo \"[hevc @ 0x1] Error submitting packet to decoder: Invalid data found when processing input\" >&2; i=$((i+1)); done\n" +
-		"sleep 1\n" +
-		"last=\"\"\n" +
-		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
-		"case \"$last\" in\n" +
-		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
-		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
-		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
-		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
-		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
-		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
-		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
-		"esac\n" +
 		"sleep 30\n"
 	return writeDecodeRotationFFmpeg(t, "decode-fail-before-manifest.sh", script)
 }
@@ -98,6 +95,10 @@ type decodeRotationOptions struct {
 	probeEvidence bool
 	// requestedFailed marks the catalog row failed_at.
 	requestedFailed bool
+	// stampedCandidates marks additional catalog rows (by candidate id) with
+	// an active failed_at verdict, simulating markers that landed on prior
+	// rotation hops. Keys are candidate ids ("B"), values ignored (use true).
+	stampedCandidates map[string]bool
 	// requestedDelivered stamps last_delivered_at inside the delivery grace.
 	requestedDelivered bool
 	// startFailureCalls makes the next N transcode starts fail to start (a
@@ -207,6 +208,17 @@ func newDecodeRotationFixture(t *testing.T, opt decodeRotationOptions) *decodeRo
 		if opt.requestedFailed && strings.TrimSpace(path) == source.FilePath {
 			row := *source
 			return &row, nil
+		}
+		// Stamped sibling rows: a catalog row per candidate carrying an
+		// active failed_at verdict, as the decode marker leaves behind on
+		// prior rotation hops.
+		if id := virtualResultCandidateID(strings.TrimSpace(path)); id != "" && opt.stampedCandidates[id] {
+			stamp := time.Now()
+			return &models.MediaFile{
+				ID:       900 + len(id),
+				FilePath: path,
+				FailedAt: &stamp,
+			}, nil
 		}
 		return nil, nil
 	}
@@ -385,6 +397,12 @@ func decodeRotationReplanRequest(start playback.StartRequestV3, plan *playback.P
 // provider release is rejected during startup. The server must substitute the
 // second release before committing, so the client receives a playable plan (no
 // 422) bound to the second candidate and the requested catalog id is preserved.
+//
+// The poison budget covers both hw_accel=auto stages of the rejected
+// candidate: a decode verdict fails the manifest wait fast, so the automatic
+// pipeline advances hardware→software on the same bytes before the rotation
+// loop substitutes the sibling. Both attempts must fail for the rotation to
+// engage; the healthy sibling then commits on its first attempt.
 func TestVirtualStartRotatesDecodeRejectedCandidate(t *testing.T) {
 	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B"}, decodeFailCalls: 1})
 
@@ -421,6 +439,9 @@ func TestVirtualStartRotatesDecodeRejectedCandidate(t *testing.T) {
 // terminalled.
 func TestVirtualStartRotationExcludesProbedRequestedRow(t *testing.T) {
 	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		// One poisoned start: the decode verdict is terminal for candidate A
+		// (the automatic pipeline does not rebuild rejected bytes), so rotation
+		// substitutes the sibling on the first failure.
 		candidateIDs:    []string{"A", "B"},
 		decodeFailCalls: 1,
 		requestedResult: "A",
@@ -490,7 +511,13 @@ func TestVirtualAutoStartSkipsFailedRowWithinDeliveryGrace(t *testing.T) {
 // source_decode_failed plus the version-list hint, and the rejection is still
 // stamped on the candidate.
 func TestVirtualExplicitStartDecodeRejectionTerminals(t *testing.T) {
-	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B"}, decodeFailCalls: 1})
+	f := newDecodeRotationFixture(t, decodeRotationOptions{
+		// One poisoned start: the decode verdict is terminal for the pinned
+		// candidate, so it terminates with source_decode_failed rather than
+		// rebuilding rejected bytes.
+		candidateIDs:    []string{"A", "B"},
+		decodeFailCalls: 1,
+	})
 	start := f.request()
 	start.FileSelection = playback.FileSelectionExplicitV3
 
@@ -517,7 +544,10 @@ func TestVirtualExplicitStartDecodeRejectionTerminals(t *testing.T) {
 
 // TestVirtualDecodeRotationBoundedExhaustion proves rotation is bounded by the
 // configured failover attempts and excludes every rejected id, so a provider
-// that only offers bad releases cannot loop forever.
+// that only offers bad releases cannot loop forever. A decoder-confirmed
+// rejection is terminal for its candidate, so it is not repeated by the
+// automatic hardware->software pipeline: each candidate costs exactly one
+// transcode start, and the bound is the candidate count.
 func TestVirtualDecodeRotationBoundedExhaustion(t *testing.T) {
 	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B", "C"}, decodeFailCalls: 3})
 
@@ -536,7 +566,7 @@ func TestVirtualDecodeRotationBoundedExhaustion(t *testing.T) {
 		t.Fatalf("rotation did not accumulate exclusions: %v", exclusions)
 	}
 	if calls := atomic.LoadInt32(&f.transcodeCalls); calls > 3 {
-		t.Fatalf("transcode started %d times, want at most maxVirtualFailoverAttempts=3", calls)
+		t.Fatalf("transcode started %d times, want at most 3 candidates times 1 start", calls)
 	}
 }
 
@@ -724,11 +754,52 @@ func TestVirtualDecodeRotationReplanIsIdempotent(t *testing.T) {
 	}
 }
 
+// writePlaybackTestFFmpegDelayedDecodeFailure emits a ready manifest first
+// and only then the decoder storm, so a start commits before any verdict
+// exists and the rejection lands on the committed generation. Starts that
+// fail fast on the verdict (revoked generations never produce a manifest)
+// would terminal instead of committing, which is a different path.
+func writePlaybackTestFFmpegDelayedDecodeFailure(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-ffmpeg-delayed-decode-failure.sh")
+	script := "#!/bin/sh\n" +
+		"last=\"\"\n" +
+		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
+		"case \"$last\" in\n" +
+		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
+		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
+		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
+		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
+		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
+		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
+		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
+		"esac\n" +
+		"sleep 2\n" +
+		"i=0\n" +
+		"while [ $i -lt 20 ]; do echo \"[hevc @ 0x1] Error submitting packet to decoder: Invalid data found when processing input\" >&2; i=$((i+1)); done\n" +
+		"sleep 30\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return path
+}
+
 // TestTranscodeManifestDoesNotRotateAfterSourceRejected proves the manifest
 // route keeps answering the permanent decode verdict for the generation already
 // on screen and never swaps the live transcode session for a different one.
 func TestTranscodeManifestDoesNotRotateAfterSourceRejected(t *testing.T) {
 	handler, _ := hardwareDecodeFailureHandler(t)
+	// Delay the storm past the commit: the start must observe a healthy
+	// generation (manifest ready, no verdict) so the rejection under test
+	// lands on the committed generation the manifest route serves. An
+	// immediate storm would fail the start itself before anything commits.
+	prevConfig := handler.PlaybackConfig
+	delayedFFmpeg := writePlaybackTestFFmpegDelayedDecodeFailure(t)
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		cfg := prevConfig()
+		cfg.FFmpegPath = delayedFFmpeg
+		return cfg
+	}
 
 	start := v3HandlerStartRequest()
 	start.QualityPreference = "auto"
