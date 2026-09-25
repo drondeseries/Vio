@@ -2138,6 +2138,18 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 
 	manifest, err := transcodeSession.BuildPlaybackManifest("segment/", r.URL.RawQuery)
 	if err != nil {
+		// Switchover overlap: a replan publishes its successor only after the
+		// successor's first manifest is ready, so this live path normally
+		// succeeds. When it does not (the predecessor's directory is retained
+		// while the client's old playlist is in flight), serve the displaced
+		// generation instead of 503.
+		if fallbackManifest, ok := h.retainedGenerationManifest(sessionID, "segment/", r.URL.RawQuery); ok {
+			slog.InfoContext(r.Context(), "transcode manifest served from the retained switchover generation",
+				"component", "api", "session", sessionID, "playback_session_id", sessionID)
+			manifest, err = fallbackManifest, nil
+		}
+	}
+	if err != nil {
 		// A client stop (DELETE) cancels the transcode context, killing the
 		// encoder while an in-flight manifest build is running. That race is
 		// the expected teardown path, not a server fault.
@@ -2224,6 +2236,21 @@ func writePlaybackSegmentError(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load segment")
 	}
+}
+
+// retainedGenerationManifest builds the displaced generation's playlist for
+// the served route, reporting false when no retained generation exists or it
+// cannot produce a manifest.
+func (h *PlaybackHandler) retainedGenerationManifest(sessionID, segPrefix, rawQuery string) ([]byte, bool) {
+	retained := h.tm.GetRetainedTranscodeSession(sessionID)
+	if retained == nil {
+		return nil, false
+	}
+	manifest, err := retained.BuildPlaybackManifest(segPrefix, rawQuery)
+	if err != nil {
+		return nil, false
+	}
+	return manifest, true
 }
 
 // HandleGetTranscodeSegment handles GET /playback/transcode/{session_id}/segment/{name}.
@@ -2340,7 +2367,32 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	}
 
 	segmentName := chi.URLParam(r, "name")
+	// servedSession is the generation the returned lease came from: the live
+	// one normally, the retained predecessor during the switchover overlap. The
+	// delivery report below must name the session that owns the lease's
+	// generation.
+	servedSession := transcodeSession
 	segmentLease, err := transcodeSession.OpenSegment(segmentName)
+	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
+		// Switchover overlap: a same-session replan publishes its successor
+		// once the successor's first manifest is ready, but the client keeps
+		// requesting the session-keyed playlist and its old segments for a
+		// moment after a track/version switch. A segment the new generation has
+		// not produced, but the displaced generation still holds, is served
+		// from the retained predecessor instead of entering the wait/restart
+		// machinery (or 404-ing). The new generation becomes authoritative as
+		// soon as it produces the segment; the retained entry is replaced on
+		// the next switch and expires after the bounded window, so stale bytes
+		// cannot be served indefinitely.
+		if retained := h.tm.GetRetainedTranscodeSession(sessionID); retained != nil {
+			if lease, retainedErr := retained.OpenSegment(segmentName); retainedErr == nil {
+				slog.InfoContext(r.Context(), "transcode segment served from the retained switchover generation",
+					"component", "api", "session", sessionID, "playback_session_id", sessionID, "segment", segmentName)
+				segmentLease, err = lease, nil
+				servedSession = retained
+			}
+		}
+	}
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(segmentName)
 		if parseErr == nil {
@@ -2477,7 +2529,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	if r.Method == http.MethodGet &&
 		sw.CompletedFullResponse(segmentLease.Info.Size()) {
 		if segNum, parseErr := playback.ParseSegmentNumber(segmentName); parseErr == nil {
-			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, segmentLease.Generation)
+			servedSession.ReportSegmentDownloadedForGeneration(segNum, segmentLease.Generation)
 		}
 		// The complete representation reached the client, so this is the
 		// HLS/transcode "it really delivered" signal — the counterpart of the
