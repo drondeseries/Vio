@@ -119,9 +119,6 @@ func AudioLayoutsEqual(a, b []models.AudioTrack) bool {
 // canonical lowercase form, so a MULTI/DUAL track's language list changes are
 // detected regardless of the order the provider reports them in.
 func stringSlicesEqualFold(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
 	canonical := func(in []string) []string {
 		out := make([]string, 0, len(in))
 		for _, value := range in {
@@ -133,7 +130,15 @@ func stringSlicesEqualFold(a, b []string) bool {
 		sort.Strings(out)
 		return out
 	}
+	// Normalize before comparing lengths: trimming can drop blank tokens, so a
+	// raw-length check would admit differently-sized normalized slices and then
+	// index past the shorter one (or, in the other order, silently compare only
+	// a prefix and report false equality). Comparing the normalized slices keeps
+	// the comparison symmetric.
 	ca, cb := canonical(a), canonical(b)
+	if len(ca) != len(cb) {
+		return false
+	}
 	for i := range ca {
 		if ca[i] != cb[i] {
 			return false
