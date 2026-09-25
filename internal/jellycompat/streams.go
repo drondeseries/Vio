@@ -31,8 +31,10 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/streamlocation"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
+	"github.com/Silo-Server/silo-server/internal/telemetry"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
 )
 
@@ -1459,7 +1461,7 @@ func (h *PlaybackHandler) fetchRemoteCompatManifest(ctx context.Context, nodeURL
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+h.JWTSecret)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := telemetry.DoTrustedNode(transcodeproxy.NodeClient(), req, "stream")
 	if err != nil {
 		return nil, err
 	}
@@ -1481,7 +1483,7 @@ func (h *PlaybackHandler) proxyRemoteCompatSegment(w http.ResponseWriter, r *htt
 	}
 	req.Header.Set("Authorization", "Bearer "+h.JWTSecret)
 	transcodeproxy.PrepareRequest(req, r)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := telemetry.DoTrustedNode(transcodeproxy.NodeClient(), req, "stream")
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "TranscodeUnavailable", "Remote transcode segment is unavailable")
 		return
@@ -1495,7 +1497,7 @@ func (h *PlaybackHandler) proxyRemoteCompatSegment(w http.ResponseWriter, r *htt
 		return
 	}
 	if generation != "" && r.Method == http.MethodGet && sw.CompletedFullResponse(transcodeproxy.FullRepresentationSize(resp)) {
-		if err := transcodeproxy.Acknowledge(r.Context(), http.DefaultClient, nodepool.NodeEndpoint(nodeURL, path), h.JWTSecret, generation); err != nil {
+		if err := transcodeproxy.Acknowledge(r.Context(), transcodeproxy.NodeClient(), nodepool.NodeEndpoint(nodeURL, path), h.JWTSecret, generation); err != nil {
 			slog.WarnContext(r.Context(), "acknowledge Jellyfin-compatible transcode segment", "component", "jellycompat", "error", err, "playback_session_id", upstreamSessionID)
 		}
 	}
@@ -2320,14 +2322,18 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, "BadRequest", "Invalid session report")
 		return
 	}
-	if req.PlaySessionID == "" {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
 	var playSession *PlaybackSession
 	var ok bool
-	if stop {
+	unidentified := req.PlaySessionID == ""
+	if unidentified {
+		var lookupErr error
+		playSession, lookupErr = h.playbackStore.FindUnidentifiedPlayback(session.Token, req.ItemID, req.MediaSourceID)
+		ok = lookupErr == nil && playSession != nil
+		if !ok {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	} else if stop {
 		playSession, ok = h.playbackStore.GetFinalizable(req.PlaySessionID, session.Token)
 	} else {
 		playSession, ok = h.playbackStore.Get(req.PlaySessionID)
@@ -2385,7 +2391,7 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 	// report, not just on track changes. Restarting ffmpeg on each report
 	// (every ~10s) tears down segments the player is still appending and
 	// causes an hls.js retry loop. Only act when the index actually changes.
-	if req.AudioStreamIndex != nil && audioSelectionChanged(playSession, req.MediaSourceID, int(*req.AudioStreamIndex)) {
+	if (!stop || !unidentified) && req.AudioStreamIndex != nil && audioSelectionChanged(playSession, req.MediaSourceID, int(*req.AudioStreamIndex)) {
 		selectedAudioStreamIndex := int(*req.AudioStreamIndex)
 		updatedPlaySession, updatedSource, restarted, selectionErr := h.applyCompatAudioSelection(
 			r.Context(), playSession, req.MediaSourceID, selectedAudioStreamIndex, positionSeconds,
@@ -2447,7 +2453,14 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 			findMediaSource(playSession, req.MediaSourceID), &positionSeconds,
 		)
 	}
-	// Persist progress to user store
+	// Only the Stopped report and the report that marks the item watched change
+	// the taste profile; a position-only report does not. A Stopped report
+	// refreshes even when it carries no position: the play's earlier reports
+	// already wrote its progress, and StopSession does not run the native stop
+	// finalizer that would otherwise refresh the profile.
+	refreshTasteProfile := stop
+	// Ignore early zero reports while a client is still seeking to its resume
+	// point, matching the native playback persistence rule.
 	if positionSeconds > 0 && h.storeProvider != nil && playSession.ItemID != "" {
 		if store, storeErr := h.storeProvider.ForUser(r.Context(), session.StreamAppUserID); storeErr == nil {
 			// Find the duration from the media source
@@ -2458,12 +2471,21 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 					break
 				}
 			}
-			if err := store.UpdateProgress(r.Context(), session.ProfileID, playSession.ItemID, positionSeconds, duration, h.playbackThresholds(r.Context())); err == nil {
-				triggerProfileRefresh(r.Context(), h.profileStaler, h.profileRefreshRequester, session.StreamAppUserID, session.ProfileID)
+			completed, err := userstore.UpdateProgressReportingCompletion(r.Context(), store, session.ProfileID, playSession.ItemID, positionSeconds, duration, h.playbackThresholds(r.Context()))
+			if err == nil && completed {
+				refreshTasteProfile = true
 			}
 		}
 	}
-	if stop {
+	if refreshTasteProfile && playSession.ItemID != "" {
+		triggerProfileRefresh(r.Context(), h.profileStaler, h.profileRefreshRequester, session.StreamAppUserID, session.ProfileID)
+	}
+	// ID-less players still supply a final resume sample on Stopped. Persist
+	// it above, but do not use an item/source match to tear down a play: a
+	// delayed report has no generation identifier. Normal idle cleanup owns
+	// resource expiry for these clients. Their samples are last-write-wins,
+	// just like progress reports (including intentional backward seeks).
+	if stop && !unidentified {
 		// Direct ids and recorded aliases are per-play, caller-owned identifiers.
 		// Route-only matching is intentionally excluded for Stopped reports: a
 		// delayed stop for an earlier play of the same item must never tear down
@@ -3626,6 +3648,18 @@ func (h *PlaybackHandler) resolvePlaybackRoute(r *http.Request, compatSession *S
 		}
 		// Clients that skip PlaybackInfo reuse their own PlaySessionId on range
 		// requests. Reuse remains scoped to this token and the requested item.
+	}
+
+	// An ID-less direct player's repeated range requests and resumes belong
+	// to the already-started stream, not an unstarted PlaybackInfo negotiation.
+	if clientPlaySessionID == "" && staticRequest {
+		active, err := h.playbackStore.FindUnidentifiedPlayback(compatSession.Token, routeID, mediaSourceID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if active != nil {
+			return active, playbackRouteSource(active, mediaSourceID, allowItemAlias, staticRequest), nil
+		}
 	}
 
 	playSession, _, ok := h.playbackStore.FindByRoute(compatSession.Token, routeID)

@@ -832,7 +832,7 @@
       "expected_status": 412,
       "response_headers": {
         "Content-Type": "application/problem+json",
-        "ETag": "\"faabd5e2d11a55980e701ee1.2gbju2epduq44\""
+        "ETag": "\"03162360ca7232de7d4f44cd.3e084bgn9fpb7\""
       },
       "response_media_type": "application/problem+json",
       "schema": "#/components/schemas/Problem",
@@ -1998,7 +1998,7 @@
       "expected_status": 200,
       "response_headers": {
         "Content-Type": "application/json",
-        "ETag": "\"90f5613bc4659499fc475e97.s2d99uz9dna2\""
+        "ETag": "\"dddf498a8d36d3c0443a254c.2xf5o435kgkcd\""
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/AdminPolicyApplyResult",
@@ -2019,7 +2019,7 @@
       "expected_status": 201,
       "response_headers": {
         "Content-Type": "application/json",
-        "ETag": "\"90f5613bc4659499fc475e97.s2d99uz9dna7\"",
+        "ETag": "\"dddf498a8d36d3c0443a254c.2xf5o435kgkc8\"",
         "Location": "/api/v2/admin/policy/documents/1"
       },
       "response_media_type": "application/json",
@@ -2079,7 +2079,7 @@
       "expected_status": 412,
       "response_headers": {
         "Content-Type": "application/problem+json",
-        "ETag": "\"90f5613bc4659499fc475e97.s2d99uz9dna2\""
+        "ETag": "\"dddf498a8d36d3c0443a254c.2xf5o435kgkcd\""
       },
       "response_media_type": "application/problem+json",
       "schema": "#/components/schemas/Problem",
@@ -2099,7 +2099,7 @@
       "expected_status": 200,
       "response_headers": {
         "Content-Type": "application/json",
-        "ETag": "\"90f5613bc4659499fc475e97.s2d99uz9dna7\""
+        "ETag": "\"dddf498a8d36d3c0443a254c.2xf5o435kgkc8\""
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/AdminPolicySnapshot",
@@ -2159,7 +2159,7 @@
       "expected_status": 200,
       "response_headers": {
         "Content-Type": "application/json",
-        "ETag": "\"90f5613bc4659499fc475e97.s2d99uz9dna5\""
+        "ETag": "\"dddf498a8d36d3c0443a254c.2xf5o435kgkca\""
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/AdminPolicyApplyResult",
@@ -2263,7 +2263,7 @@
       "expected_status": 412,
       "response_headers": {
         "Content-Type": "application/problem+json",
-        "ETag": "\"90f5613bc4659499fc475e97.s2d99uz9dna2\""
+        "ETag": "\"dddf498a8d36d3c0443a254c.2xf5o435kgkcd\""
       },
       "response_media_type": "application/problem+json",
       "schema": "#/components/schemas/Problem",
@@ -2751,7 +2751,7 @@
       "expected_status": 200,
       "response_headers": {
         "Content-Type": "application/json",
-        "ETag": "\"93272854178acc6b53f14e94.1fmgqpavefas9\""
+        "ETag": "\"6868161890535f639610dc9b.xl90occ865ir\""
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/AdminSectionOrder",
@@ -2772,7 +2772,7 @@
       "expected_status": 412,
       "response_headers": {
         "Content-Type": "application/problem+json",
-        "ETag": "\"35ce951926424eeb772d6f6e.3hay8xviit405\""
+        "ETag": "\"c5311de6fc802ea5a41b590b.1snzg7zndlyk7\""
       },
       "response_media_type": "application/problem+json",
       "schema": "#/components/schemas/Problem",
@@ -3017,7 +3017,7 @@
       "expected_status": 200,
       "response_headers": {
         "Content-Type": "application/json",
-        "ETag": "\"a184e75510a2b7ed5f432900.1rtsrip3bemn2\""
+        "ETag": "\"468f6573f9ccbba8734666b6.15r12u2fktxzu\""
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/AdminTaskSchedule",
@@ -3508,7 +3508,7 @@
       "expected_status": 412,
       "response_headers": {
         "Content-Type": "application/problem+json",
-        "ETag": "\"851a440b070a75a6569aa59c.3r49ydbqg4fzt\""
+        "ETag": "\"a398556adb45deecf5779ee6.25gpp42zguq5f\""
       },
       "response_media_type": "application/problem+json",
       "schema": "#/components/schemas/Problem",
@@ -5074,7 +5074,7 @@
       "expected_status": 200,
       "response_headers": {
         "Content-Type": "application/json",
-        "ETag": "\"faabd5e2d11a55980e701ee1.2gbju2epduq44\""
+        "ETag": "\"03162360ca7232de7d4f44cd.3e084bgn9fpb7\""
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/AdminCollection",
@@ -5114,7 +5114,7 @@
       "expected_status": 200,
       "response_headers": {
         "Content-Type": "application/json",
-        "ETag": "\"35ce951926424eeb772d6f6e.3hay8xviit405\""
+        "ETag": "\"c5311de6fc802ea5a41b590b.1snzg7zndlyk7\""
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/AdminSection",
@@ -5440,7 +5440,7 @@
       "expected_status": 200,
       "response_headers": {
         "Content-Type": "application/json",
-        "ETag": "\"0c504e617c17fd3b12546443.2liy2jaopuymu\""
+        "ETag": "\"1ccfbbd89c0c45a4c0c5565a.2yjng52toqtml\""
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/PersonalCollection",
@@ -12127,6 +12127,108 @@
       "response_media_type": "application/json",
       "schema": "#/components/schemas/ThemeDownloadResponse",
       "body_file": "theme_download_document.json"
+    },
+    {
+      "name": "theme_songs_capability",
+      "operation_id": "getThemeSongsCapability",
+      "scenario": "A profile can discover routed theme audio, conversion and cluster delivery.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/catalog/themes/capabilities",
+        "headers": {
+          "Authorization": "Bearer tok-events",
+          "X-Profile-Id": "p-owner"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "private, no-cache",
+        "Content-Type": "application/json",
+        "ETag": "\"2926f95f749872122ec674143e41c217fc8d24f60d43c3907ac6fa5c567c4204\""
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/ThemeSongsCapability",
+      "body_file": "theme_songs_capability.json"
+    },
+    {
+      "name": "theme_songs_playback",
+      "operation_id": "createThemeSongPlayback",
+      "scenario": "A login and verified profile receive a short-lived, non-cacheable theme playback grant.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/catalog/items/movie:heat-1995/themes/7/playback",
+        "headers": {
+          "Authorization": "Bearer tok-events",
+          "X-Profile-Id": "p-owner"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/ThemePlayback",
+      "body_file": "theme_songs_playback.json"
+    },
+    {
+      "name": "theme_songs_playback_converted",
+      "operation_id": "createThemeSongPlayback",
+      "scenario": "A client that cannot decode the original theme receives a grant for its AAC conversion.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/catalog/items/movie:heat-1995/themes/7/playback",
+        "headers": {
+          "Authorization": "Bearer tok-events",
+          "X-Profile-Id": "p-owner"
+        },
+        "body": "{\"accepted_formats\":[{\"container\":\"m4a\",\"audio_codec\":\"aac\"}]}"
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/ThemePlayback",
+      "body_file": "theme_songs_playback_converted.json"
+    },
+    {
+      "name": "theme_songs_playback_not_acceptable",
+      "operation_id": "createThemeSongPlayback",
+      "scenario": "A client that decodes neither the original theme nor its AAC conversion is refused.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/catalog/items/movie:heat-1995/themes/7/playback",
+        "headers": {
+          "Authorization": "Bearer tok-events",
+          "X-Profile-Id": "p-owner"
+        },
+        "body": "{\"accepted_formats\":[{\"container\":\"ogg\",\"audio_codec\":\"opus\"}]}"
+      },
+      "expected_status": 406,
+      "response_headers": {
+        "Content-Type": "application/problem+json"
+      },
+      "response_media_type": "application/problem+json",
+      "schema": "#/components/schemas/Problem",
+      "body_file": "theme_songs_playback_not_acceptable.json"
+    },
+    {
+      "name": "theme_songs_playback_unauthorized",
+      "operation_id": "createThemeSongPlayback",
+      "scenario": "Theme playback cannot be granted without account authentication.",
+      "request": {
+        "method": "POST",
+        "path": "/api/v2/catalog/items/movie:heat-1995/themes/7/playback"
+      },
+      "expected_status": 401,
+      "response_headers": {
+        "Content-Type": "application/problem+json"
+      },
+      "response_media_type": "application/problem+json",
+      "schema": "#/components/schemas/Problem",
+      "body_file": "theme_songs_playback_unauthorized.json"
     },
     {
       "name": "translate_catalog_item_description_authentication_required",

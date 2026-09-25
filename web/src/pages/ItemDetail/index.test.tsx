@@ -17,6 +17,13 @@ vi.mock("@/hooks/queries/catalogRead", () => ({
   useCatalogItemDetail: (...args: unknown[]) => mocks.useCatalogItemDetail(...args),
 }));
 
+// Mocked like every other data hook in this file: the page renders here
+// without a QueryClient, and the badge setting is not what these cases cover.
+vi.mock("@/hooks/useShowAdvisoryAge", () => ({
+  useShowAdvisoryAge: () => false,
+}));
+vi.mock("./useThemeMusic", () => ({ useThemeMusic: vi.fn() }));
+
 vi.mock("sonner", () => ({
   toast: {
     error: (...args: unknown[]) => mocks.toastError(...args),

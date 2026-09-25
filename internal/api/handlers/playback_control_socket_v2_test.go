@@ -112,6 +112,13 @@ func (f *controlSocketFixture) hello(t *testing.T, conn *websocket.Conn) {
 	}, "session did not become control-ready after hello")
 }
 
+// lane returns the control lane currently registered for the fixture session.
+func (f *controlSocketFixture) lane() *playbackControlLane {
+	f.handler.laneMu.Lock()
+	defer f.handler.laneMu.Unlock()
+	return f.handler.lanes[f.session.ID]
+}
+
 func waitForCondition(t *testing.T, cond func() bool, message string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -258,6 +265,7 @@ func TestControlSocketReconnectResumesOnlySameOwnerAndInstallation(t *testing.T)
 
 	// The same owner and installation reconnects and takes over the lane; the
 	// old connection's frames are no longer routed and it is closed.
+	_ = f.lane()
 	second, _, err := f.dial(t, f.mint(t, controlInstallation), nil) //nolint:bodyclose // dial registers t.Cleanup to close the response body
 	if err != nil {
 		t.Fatal(err)

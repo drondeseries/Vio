@@ -14,6 +14,7 @@ import {
   routeEventPlanIdentityV3,
   VIDEO_CLIENT_FEATURES_V3,
 } from "../playback-session-wire-v3";
+import { markPlaybackIntent } from "../first-frame";
 import { usePlaybackSession } from "./usePlaybackSession";
 import { resetCodecDetectionForTests } from "./useCodecDetection";
 import { resetSessionMutations } from "../session-mutations";
@@ -794,6 +795,65 @@ describe("usePlaybackSession output capability changes", () => {
     expect(startBodies[1]).not.toHaveProperty("start_position");
     expect(startBodies[0]?.client_capabilities.hdr_details?.dolby_vision_profiles).toEqual([]);
     expect(startBodies[1]?.client_capabilities.hdr_details?.dolby_vision_profiles).toEqual([8]);
+    unmount();
+  });
+
+  it("keeps the Play tap's clock when an output change retries a start that never played", async () => {
+    const setHDR = outputProbe(false);
+    let starts = 0;
+    const routeEvents: Array<{ event: string; diagnostics: Record<string, string> }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        starts += 1;
+        if (starts === 1) {
+          return jsonResponse({
+            protocol_version: 3,
+            server_features: ["playback_plan_v3", "output_change_v1"],
+            outcome: "terminal",
+            terminal: { reason: "hdr_transcode_unsupported", message: "HDR unsupported" },
+          });
+        }
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3", "output_change_v1"],
+          outcome: "playable",
+          session_id: "session-hdr",
+          playback_plan: fixturePlanV3({ session_id: "session-hdr" }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) {
+        routeEvents.push(JSON.parse(String(init?.body)) as (typeof routeEvents)[number]);
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") return jsonResponse({ outcome: "stopped" });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tap = performance.now();
+    markPlaybackIntent("request-1", tap);
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+
+    act(() => setHDR(true));
+    await waitFor(() => expect(result.current.sessionId).toBe("session-hdr"));
+    const clock = vi.spyOn(performance, "now").mockReturnValue(tap + 3_000);
+    try {
+      act(() => result.current.reportFirstFrame());
+    } finally {
+      clock.mockRestore();
+    }
+
+    await waitFor(() =>
+      expect(routeEvents.filter((event) => event.event === "first_frame")).toHaveLength(1),
+    );
+    expect(routeEvents.find((event) => event.event === "first_frame")?.diagnostics).toEqual({
+      first_frame_ms: "3000",
+    });
     unmount();
   });
 

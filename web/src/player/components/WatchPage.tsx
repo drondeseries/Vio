@@ -660,14 +660,18 @@ function WatchPagePlayer({
     }
 
     handledSelectionRevisionRef.current = room.selection_revision;
-    playbackController.startPlayback({
-      contentId: room.selected_content_id,
-      fileId: room.selected_file_id,
-      libraryId: room.selected_library_id,
-      roomId: watchTogetherRoomId,
-      roomToken: watchTogetherRoomToken,
-      restart: true,
-    });
+    // The room changed its selection; this viewer did not press Play.
+    playbackController.startPlayback(
+      {
+        contentId: room.selected_content_id,
+        fileId: room.selected_file_id,
+        libraryId: room.selected_library_id,
+        roomId: watchTogetherRoomId,
+        roomToken: watchTogetherRoomToken,
+        restart: true,
+      },
+      "automatic",
+    );
   }, [
     contentId,
     fileId,
@@ -1034,6 +1038,7 @@ function WatchPagePlayer({
         autoEnterPictureInPicture={autoEnterPictureInPicture}
         onPlaybackStateChange={handlePlaybackStateChange}
         onPlaybackTransportReady={onPlaybackTransportReady}
+        onFirstFrame={session.reportFirstFrame}
         seekIntervals={seekIntervals}
         onRealtimeEvent={handleRealtimeEvent}
         onRealtimeConnectionStateChange={setRealtimeConnectionState}

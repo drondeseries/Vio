@@ -1,5 +1,6 @@
 import { ArrowLeft, Plus, Trash2, UsersRound } from "lucide-react";
-import { useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useLocation, useNavigate, useParams } from "react-router";
 
 import { useAuth } from "@/hooks/useAuth";
 import {
@@ -77,6 +78,10 @@ function AccessGroupsPage() {
   const groups = useAccessGroups();
   const capabilities = useAccessGroupCapabilities();
   const available = capabilities.data?.access_groups === true;
+  // The open group lives in the URL (/admin/access-groups/:id) so Back returns
+  // to the list and a group link can be reloaded or shared.
+  const { id: selectedId } = useParams();
+  const navigate = useNavigate();
   const [selected, setSelected] = useState<GroupEditor | null>(null);
   const [authority] = useState(captureAccessGroupAuthority);
   const busy = useRef(false);
@@ -84,32 +89,77 @@ function AccessGroupsPage() {
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
+  // Bumped to retry a failed load of the group already in the URL.
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const mounted = useRef(true);
+  // One page instance serves the list and every group URL, so a finished create
+  // or delete compares history entries to tell whether the admin moved on meanwhile.
+  const location = useLocation();
+  const locationKey = useRef(location.key);
   const createGroup = useCreateAccessGroup();
 
-  async function select(id: number) {
-    if (busy.current || !available) return;
-    busy.current = true;
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    locationKey.current = location.key;
+  }, [location.key]);
+
+  function stillOn(key: string) {
+    return mounted.current && locationKey.current === key;
+  }
+
+  useEffect(() => {
+    setSelected(null);
+    if (!selectedId || !available) {
+      // A load cancelled by leaving the group must not leave its status behind.
+      setLoading(false);
+      setError("");
+      return;
+    }
+    let cancelled = false;
     setLoading(true);
     setError("");
-    try {
-      setSelected(await getAccessGroup(id, authority));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load group.");
-    } finally {
-      busy.current = false;
-      setLoading(false);
+    getAccessGroup(Number(selectedId), authority)
+      .then((editor) => {
+        if (!cancelled) setSelected(editor);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Could not load group.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId, available, authority, loadAttempt]);
+
+  function select(id: number | string) {
+    if (!available) return;
+    if (String(id) === selectedId) {
+      setLoadAttempt((attempt) => attempt + 1);
+      return;
     }
+    navigate(`/admin/access-groups/${id}`);
   }
   async function create() {
     const name = newName.trim();
     if (!name || busy.current || !available) return;
     busy.current = true;
+    const startedAt = locationKey.current;
     setError("");
     try {
       const group = await createGroup.mutateAsync({ body: { name }, profileContext: authority });
       setNewName("");
       setCreating(false);
-      setSelected(await getAccessGroup(group.id, authority));
+      // Don't pull the admin away if they opened another group or left the page
+      // while the group was created.
+      if (stillOn(startedAt)) select(group.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create group.");
     } finally {
@@ -125,7 +175,7 @@ function AccessGroupsPage() {
           variant="ghost"
           size="sm"
           className="text-muted-foreground -ml-2 w-fit"
-          onClick={() => setSelected(null)}
+          onClick={() => navigate("/admin/access-groups")}
         >
           <ArrowLeft className="size-4" />
           All groups
@@ -133,7 +183,9 @@ function AccessGroupsPage() {
         <AccessGroupEditor
           key={selected.group.id}
           initialEditor={selected}
-          onDeleted={() => setSelected(null)}
+          onDeleted={() => {
+            if (stillOn(location.key)) navigate("/admin/access-groups", { replace: true });
+          }}
         />
       </div>
     );
@@ -215,7 +267,7 @@ function AccessGroupsPage() {
       {groups.data && groups.data.length > 0 && (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           {groups.data.map((group) => (
-            <AccessGroupCard key={group.id} group={group} onClick={() => void select(group.id)} />
+            <AccessGroupCard key={group.id} group={group} onClick={() => select(group.id)} />
           ))}
         </div>
       )}

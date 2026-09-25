@@ -22,6 +22,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
+	"github.com/Silo-Server/silo-server/internal/themesongs"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
@@ -35,6 +36,7 @@ func NewRouter(deps Dependencies) chi.Router {
 	r := chi.NewRouter()
 	r.Use(stripSlashesExceptWeb)
 	r.Use(middleware.RequestID)
+	r.Use(observeCompatRequest)
 	if deps.ClientIPResolver != nil {
 		r.Use(clientip.Middleware(deps.ClientIPResolver))
 	}
@@ -95,6 +97,7 @@ func NewRouter(deps Dependencies) chi.Router {
 	itemsHandler.catalogUserState = deps.Config != nil && deps.Config.UserDB.Backend != sqliteUserStoreBackend
 	itemsHandler.recommender = deps.Recommender
 	if deps.DB != nil {
+		itemsHandler.themeSongs = themesongs.NewRepository(deps.DB)
 		itemsHandler.collections = catalog.NewLibraryCollectionRepository(deps.DB)
 		// Smart (live-query) collections derive membership at read time, so the
 		// BoxSet children path needs a query executor to resolve them.
@@ -193,6 +196,8 @@ func NewRouter(deps Dependencies) chi.Router {
 	playbackHandler.profileRefreshRequester = deps.RecWorker
 	playbackHandler.SettingsRepo = deps.SettingsRepo
 	playbackHandler.RecipeNodeStore = deps.RecipeNodeStore
+	itemsHandler.themeRouter = compatThemeRouter(deps, playbackHandler)
+	itemsHandler.themeFFmpegPath = func() string { return playback.ResolveFFmpegPath(playbackHandler.FFmpegPath) }
 	playbackHandler.SessionSyncer = deps.SessionSyncer
 	playbackHandler.WatchScrobbler = deps.WatchScrobbler
 	playbackHandler.StableIdentityResolver = deps.StableIdentityResolver
@@ -255,6 +260,7 @@ func NewRouter(deps Dependencies) chi.Router {
 			r.Get("/Users/{id}", authHandler.HandleUserByID)
 			r.Get("/UserViews", itemsHandler.HandleViews)
 			r.Get("/UserViews/GroupingOptions", itemsHandler.HandleGroupingOptionsStub)
+			r.Get("/Users/{userId}/GroupingOptions", itemsHandler.HandleGroupingOptionsStub)
 			if !autoscanVirtualFoldersRegistered {
 				r.Get("/Library/VirtualFolders", itemsHandler.HandleVirtualFolders)
 			}
@@ -273,13 +279,13 @@ func NewRouter(deps Dependencies) chi.Router {
 			r.Get("/Items/{id}/Ancestors", itemsHandler.HandleAncestors)
 			r.Get("/Items/{id}/Collections", itemsHandler.HandleItemCollections)
 			r.Get("/Items/{id}/ThemeVideos", itemsHandler.HandleThemeSongsStub)
-			r.Get("/Items/{id}/ThemeSongs", itemsHandler.HandleThemeSongsStub)
+			r.Get("/Items/{id}/ThemeSongs", itemsHandler.HandleThemeSongs)
 			r.Get("/Items/{id}/SpecialFeatures", itemsHandler.HandleSpecialFeatures)
 			r.Get("/Items/{id}/Intros", itemsHandler.HandleItemStub)
 			r.Get("/Items/{id}/LocalTrailers", itemsHandler.HandleLocalTrailers)
 			r.Get("/Users/{userId}/Items/{id}/ThemeMedia", itemsHandler.HandleThemeMedia)
 			r.Get("/Users/{userId}/Items/{id}/ThemeVideos", itemsHandler.HandleThemeSongsStub)
-			r.Get("/Users/{userId}/Items/{id}/ThemeSongs", itemsHandler.HandleThemeSongsStub)
+			r.Get("/Users/{userId}/Items/{id}/ThemeSongs", itemsHandler.HandleThemeSongs)
 			r.Get("/Users/{userId}/Items/{id}/SpecialFeatures", itemsHandler.HandleSpecialFeatures)
 			r.Get("/Users/{userId}/Items/{id}/Intros", itemsHandler.HandleItemStub)
 			r.Get("/Users/{userId}/Items/{id}/LocalTrailers", itemsHandler.HandleLocalTrailers)
@@ -303,6 +309,10 @@ func NewRouter(deps Dependencies) chi.Router {
 			r.Post("/Users/Configuration", authHandler.HandleUpdateConfiguration)
 			r.Post("/Users/{userId}/Configuration", authHandler.HandleUpdateConfiguration)
 			r.Get("/Localization/Cultures", authHandler.HandleCultures)
+			// Clients probe group discovery even when SyncPlayAccess is None.
+			r.Get("/SyncPlay/List", func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, http.StatusOK, []struct{}{})
+			})
 			r.Post("/UserFavoriteItems/{itemId}", userDataHandler.HandleAddFavorite)
 			r.Delete("/UserFavoriteItems/{itemId}", userDataHandler.HandleRemoveFavorite)
 			r.Post("/UserPlayedItems/{itemId}", userDataHandler.HandleMarkPlayed)
@@ -349,6 +359,12 @@ func NewRouter(deps Dependencies) chi.Router {
 		r.Method(http.MethodHead, "/Items/{id}/Download", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Items/{id}/Download", playbackHandler.HandleDownload))
 		r.Get("/Items/{id}/Download", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Items/{id}/Download", playbackHandler.HandleDownload))
 		r.Method(http.MethodHead, "/Videos/{id}/stream", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Videos/{id}/stream", playbackHandler.HandleVideoStream))
+		r.Get("/Audio/{itemId}/stream", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Audio/{itemId}/stream", itemsHandler.HandleThemeAudio))
+		r.Head("/Audio/{itemId}/stream", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Audio/{itemId}/stream", itemsHandler.HandleThemeAudio))
+		r.Get("/Audio/{itemId}/stream.{container}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Audio/{itemId}/stream.{container}", itemsHandler.HandleThemeAudio))
+		r.Head("/Audio/{itemId}/stream.{container}", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Audio/{itemId}/stream.{container}", itemsHandler.HandleThemeAudio))
+		r.Get("/Audio/{itemId}/universal", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Audio/{itemId}/universal", itemsHandler.HandleThemeAudio))
+		r.Head("/Audio/{itemId}/universal", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Audio/{itemId}/universal", itemsHandler.HandleThemeAudio))
 		r.Get("/Videos/{id}/stream", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/stream", playbackHandler.HandleVideoStream))
 		r.Method(http.MethodHead, "/Videos/{id}/stream.{container}", observeCompat(deps.StreamTelemetry, http.MethodHead, "/Videos/{id}/stream.{container}", playbackHandler.HandleVideoStream))
 		r.Get("/Videos/{id}/stream.{container}", observeCompat(deps.StreamTelemetry, http.MethodGet, "/Videos/{id}/stream.{container}", playbackHandler.HandleVideoStream))
@@ -393,6 +409,8 @@ func skipCompatMediaCompression(r *http.Request) bool {
 	}
 	p := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
 	switch {
+	case len(p) == 3 && p[0] == compatThemeAudio && p[1] != "" && (p[2] == compatThemeStream || strings.HasPrefix(p[2], "stream.") || p[2] == compatThemeUniversal):
+		return true
 	case len(p) == 3 && p[0] == videosSegment && p[1] != "" && (p[2] == "stream" || strings.HasPrefix(p[2], "stream.")):
 		return p[2] == "stream" || len(strings.TrimPrefix(p[2], "stream.")) > 0
 	case len(p) == 4 && p[0] == videosSegment && p[1] != "" && p[2] == compatAudioV2PathSegment && (p[3] == "stream" || strings.HasPrefix(p[3], "stream.")):

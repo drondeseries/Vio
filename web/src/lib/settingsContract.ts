@@ -9,7 +9,7 @@
  */
 
 export const SETTINGS_API_VERSION = 1;
-export const SETTINGS_REVISION = 12;
+export const SETTINGS_REVISION = 14;
 
 export interface SettingSuggestedOption {
   value: string;
@@ -184,6 +184,8 @@ export const SETTING_KEYS = {
   CATALOG_METADATA_LANGUAGE: "catalog.metadata_language",
   /** Metadata language exceptions */
   CATALOG_METADATA_LANGUAGE_OVERRIDES: "catalog.metadata_language_overrides",
+  /** Show advisory age */
+  CATALOG_SHOW_ADVISORY_AGE: "catalog.show_advisory_age",
   /** Download quality */
   DOWNLOADS_DEFAULT_QUALITY: "downloads.default_quality",
   /** Keep watched downloads */
@@ -310,6 +312,10 @@ export const SETTING_KEYS = {
   UI_TEXT_WEIGHT: "ui.text_weight",
   /** Theme */
   UI_THEME: "ui.theme",
+  /** Theme music */
+  UI_THEME_MUSIC_ENABLED: "ui.theme_music_enabled",
+  /** Loop theme music */
+  UI_THEME_MUSIC_LOOP: "ui.theme_music_loop",
   /** Time format */
   UI_TIME_FORMAT: "ui.time_format",
 } as const;
@@ -398,6 +404,22 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     category: "catalog",
     control: "panel",
   },
+  "catalog.show_advisory_age": {
+    key: "catalog.show_advisory_age",
+    type: "boolean",
+    nullable: false,
+    persistence: "remote",
+    introducedIn: 10,
+    scopes: ["profile"],
+    scopeIntroducedIn: [10],
+    resolutionOrder: ["profile", "default"],
+    defaultValue: false,
+    label: "Show advisory age",
+    description:
+      "Show a recommended minimum viewer age from an advisory service, such as Common Sense Media, on item detail.",
+    category: "catalog",
+    control: "switch",
+  },
   "downloads.default_quality": {
     key: "downloads.default_quality",
     type: "enum",
@@ -480,7 +502,9 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     scopes: ["profile"],
     scopeIntroducedIn: [5],
     resolutionOrder: ["profile", "default"],
-    defaultValue: { items: [] },
+    defaultValue: {
+      items: [],
+    },
     label: "Navigation shortcuts",
     description: "Libraries, sections, and collections pinned for use across navigation surfaces.",
     category: "navigation",
@@ -1261,7 +1285,10 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     scopes: ["profile", "profile_client", "profile_device"],
     scopeIntroducedIn: [5, 5, 5],
     resolutionOrder: ["profile_device", "profile_client", "profile", "default"],
-    defaultValue: { poster_size: "standard", caption: "title_metadata" },
+    defaultValue: {
+      poster_size: "standard",
+      caption: "title_metadata",
+    },
     label: "Media cards",
     description: "Poster size and caption detail used by media cards.",
     category: "appearance",
@@ -1531,6 +1558,38 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
       { value: "oxblood-noir", label: "Oxblood Noir", introducedIn: 1 },
       { value: "evergreen-studio", label: "Evergreen Studio", introducedIn: 1 },
     ],
+  },
+  "ui.theme_music_enabled": {
+    key: "ui.theme_music_enabled",
+    type: "boolean",
+    nullable: false,
+    persistence: "remote",
+    introducedIn: 11,
+    scopes: ["profile", "profile_device"],
+    scopeIntroducedIn: [11, 11],
+    resolutionOrder: ["profile_device", "profile", "default"],
+    defaultValue: false,
+    label: "Theme music",
+    description: "Play local theme music while browsing movie and show detail pages.",
+    category: "playback",
+    control: "switch",
+    platforms: ["web"],
+  },
+  "ui.theme_music_loop": {
+    key: "ui.theme_music_loop",
+    type: "boolean",
+    nullable: false,
+    persistence: "remote",
+    introducedIn: 11,
+    scopes: ["profile", "profile_device"],
+    scopeIntroducedIn: [11, 11],
+    resolutionOrder: ["profile_device", "profile", "default"],
+    defaultValue: false,
+    label: "Loop theme music",
+    description: "Repeat theme music while the detail page stays open.",
+    category: "playback",
+    control: "switch",
+    platforms: ["web"],
   },
   "ui.time_format": {
     key: "ui.time_format",

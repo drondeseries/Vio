@@ -1,158 +1,572 @@
 {
   "api_version": 1,
-  "revision": 12,
+  "revision": 14,
   "option_sets": {
     "playback_audio_languages": {
       "type": "language_tag",
       "options": [
-        { "value": "ar", "introduced_in": 1 },
-        { "value": "bn", "introduced_in": 1 },
-        { "value": "bg", "introduced_in": 1 },
-        { "value": "zh", "introduced_in": 1 },
-        { "value": "zh-Hans", "introduced_in": 8 },
-        { "value": "zh-Hant", "introduced_in": 8 },
-        { "value": "hr", "introduced_in": 1 },
-        { "value": "cs", "introduced_in": 1 },
-        { "value": "da", "introduced_in": 1 },
-        { "value": "nl", "introduced_in": 1 },
-        { "value": "en", "introduced_in": 1 },
-        { "value": "en-US", "introduced_in": 8 },
-        { "value": "en-GB", "introduced_in": 8 },
-        { "value": "fi", "introduced_in": 1 },
-        { "value": "fr", "introduced_in": 1 },
-        { "value": "fr-CA", "introduced_in": 8 },
-        { "value": "de", "introduced_in": 1 },
-        { "value": "el", "introduced_in": 1 },
-        { "value": "he", "introduced_in": 1 },
-        { "value": "hi", "introduced_in": 1 },
-        { "value": "hu", "introduced_in": 1 },
-        { "value": "id", "introduced_in": 1 },
-        { "value": "it", "introduced_in": 1 },
-        { "value": "ja", "introduced_in": 1 },
-        { "value": "ko", "introduced_in": 1 },
-        { "value": "ms", "introduced_in": 1 },
-        { "value": "no", "introduced_in": 1 },
-        { "value": "fa", "introduced_in": 1 },
-        { "value": "pl", "introduced_in": 1 },
-        { "value": "pt", "introduced_in": 1 },
-        { "value": "pt-BR", "introduced_in": 8 },
-        { "value": "pt-PT", "introduced_in": 8 },
-        { "value": "ro", "introduced_in": 1 },
-        { "value": "ru", "introduced_in": 1 },
-        { "value": "sk", "introduced_in": 1 },
-        { "value": "sl", "introduced_in": 1 },
-        { "value": "es", "introduced_in": 1 },
-        { "value": "es-419", "introduced_in": 8 },
-        { "value": "es-ES", "introduced_in": 8 },
-        { "value": "sv", "introduced_in": 1 },
-        { "value": "ta", "introduced_in": 1 },
-        { "value": "te", "introduced_in": 1 },
-        { "value": "th", "introduced_in": 1 },
-        { "value": "tr", "introduced_in": 1 },
-        { "value": "uk", "introduced_in": 1 },
-        { "value": "vi", "introduced_in": 1 }
+        {
+          "value": "ar",
+          "introduced_in": 1
+        },
+        {
+          "value": "bn",
+          "introduced_in": 1
+        },
+        {
+          "value": "bg",
+          "introduced_in": 1
+        },
+        {
+          "value": "zh",
+          "introduced_in": 1
+        },
+        {
+          "value": "zh-Hans",
+          "introduced_in": 8
+        },
+        {
+          "value": "zh-Hant",
+          "introduced_in": 8
+        },
+        {
+          "value": "hr",
+          "introduced_in": 1
+        },
+        {
+          "value": "cs",
+          "introduced_in": 1
+        },
+        {
+          "value": "da",
+          "introduced_in": 1
+        },
+        {
+          "value": "nl",
+          "introduced_in": 1
+        },
+        {
+          "value": "en",
+          "introduced_in": 1
+        },
+        {
+          "value": "en-US",
+          "introduced_in": 8
+        },
+        {
+          "value": "en-GB",
+          "introduced_in": 8
+        },
+        {
+          "value": "fi",
+          "introduced_in": 1
+        },
+        {
+          "value": "fr",
+          "introduced_in": 1
+        },
+        {
+          "value": "fr-CA",
+          "introduced_in": 8
+        },
+        {
+          "value": "de",
+          "introduced_in": 1
+        },
+        {
+          "value": "el",
+          "introduced_in": 1
+        },
+        {
+          "value": "he",
+          "introduced_in": 1
+        },
+        {
+          "value": "hi",
+          "introduced_in": 1
+        },
+        {
+          "value": "hu",
+          "introduced_in": 1
+        },
+        {
+          "value": "id",
+          "introduced_in": 1
+        },
+        {
+          "value": "it",
+          "introduced_in": 1
+        },
+        {
+          "value": "ja",
+          "introduced_in": 1
+        },
+        {
+          "value": "ko",
+          "introduced_in": 1
+        },
+        {
+          "value": "ms",
+          "introduced_in": 1
+        },
+        {
+          "value": "no",
+          "introduced_in": 1
+        },
+        {
+          "value": "fa",
+          "introduced_in": 1
+        },
+        {
+          "value": "pl",
+          "introduced_in": 1
+        },
+        {
+          "value": "pt",
+          "introduced_in": 1
+        },
+        {
+          "value": "pt-BR",
+          "introduced_in": 8
+        },
+        {
+          "value": "pt-PT",
+          "introduced_in": 8
+        },
+        {
+          "value": "ro",
+          "introduced_in": 1
+        },
+        {
+          "value": "ru",
+          "introduced_in": 1
+        },
+        {
+          "value": "sk",
+          "introduced_in": 1
+        },
+        {
+          "value": "sl",
+          "introduced_in": 1
+        },
+        {
+          "value": "es",
+          "introduced_in": 1
+        },
+        {
+          "value": "es-419",
+          "introduced_in": 8
+        },
+        {
+          "value": "es-ES",
+          "introduced_in": 8
+        },
+        {
+          "value": "sv",
+          "introduced_in": 1
+        },
+        {
+          "value": "ta",
+          "introduced_in": 1
+        },
+        {
+          "value": "te",
+          "introduced_in": 1
+        },
+        {
+          "value": "th",
+          "introduced_in": 1
+        },
+        {
+          "value": "tr",
+          "introduced_in": 1
+        },
+        {
+          "value": "uk",
+          "introduced_in": 1
+        },
+        {
+          "value": "vi",
+          "introduced_in": 1
+        }
       ]
     },
     "playback_subtitle_languages": {
       "type": "language_tag",
       "options": [
-        { "value": "ar", "introduced_in": 1 },
-        { "value": "bn", "introduced_in": 1 },
-        { "value": "bg", "introduced_in": 1 },
-        { "value": "zh", "introduced_in": 1 },
-        { "value": "zh-Hans", "introduced_in": 8 },
-        { "value": "zh-Hant", "introduced_in": 8 },
-        { "value": "hr", "introduced_in": 1 },
-        { "value": "cs", "introduced_in": 1 },
-        { "value": "da", "introduced_in": 1 },
-        { "value": "nl", "introduced_in": 1 },
-        { "value": "en", "introduced_in": 1 },
-        { "value": "en-US", "introduced_in": 8 },
-        { "value": "en-GB", "introduced_in": 8 },
-        { "value": "fi", "introduced_in": 1 },
-        { "value": "fr", "introduced_in": 1 },
-        { "value": "fr-CA", "introduced_in": 8 },
-        { "value": "de", "introduced_in": 1 },
-        { "value": "el", "introduced_in": 1 },
-        { "value": "he", "introduced_in": 1 },
-        { "value": "hi", "introduced_in": 1 },
-        { "value": "hu", "introduced_in": 1 },
-        { "value": "id", "introduced_in": 1 },
-        { "value": "it", "introduced_in": 1 },
-        { "value": "ja", "introduced_in": 1 },
-        { "value": "ko", "introduced_in": 1 },
-        { "value": "ms", "introduced_in": 1 },
-        { "value": "no", "introduced_in": 1 },
-        { "value": "fa", "introduced_in": 1 },
-        { "value": "pl", "introduced_in": 1 },
-        { "value": "pt", "introduced_in": 1 },
-        { "value": "pt-BR", "introduced_in": 8 },
-        { "value": "pt-PT", "introduced_in": 8 },
-        { "value": "ro", "introduced_in": 1 },
-        { "value": "ru", "introduced_in": 1 },
-        { "value": "sk", "introduced_in": 1 },
-        { "value": "sl", "introduced_in": 1 },
-        { "value": "es", "introduced_in": 1 },
-        { "value": "es-419", "introduced_in": 8 },
-        { "value": "es-ES", "introduced_in": 8 },
-        { "value": "sv", "introduced_in": 1 },
-        { "value": "ta", "introduced_in": 1 },
-        { "value": "te", "introduced_in": 1 },
-        { "value": "th", "introduced_in": 1 },
-        { "value": "tr", "introduced_in": 1 },
-        { "value": "uk", "introduced_in": 1 },
-        { "value": "vi", "introduced_in": 1 }
+        {
+          "value": "ar",
+          "introduced_in": 1
+        },
+        {
+          "value": "bn",
+          "introduced_in": 1
+        },
+        {
+          "value": "bg",
+          "introduced_in": 1
+        },
+        {
+          "value": "zh",
+          "introduced_in": 1
+        },
+        {
+          "value": "zh-Hans",
+          "introduced_in": 8
+        },
+        {
+          "value": "zh-Hant",
+          "introduced_in": 8
+        },
+        {
+          "value": "hr",
+          "introduced_in": 1
+        },
+        {
+          "value": "cs",
+          "introduced_in": 1
+        },
+        {
+          "value": "da",
+          "introduced_in": 1
+        },
+        {
+          "value": "nl",
+          "introduced_in": 1
+        },
+        {
+          "value": "en",
+          "introduced_in": 1
+        },
+        {
+          "value": "en-US",
+          "introduced_in": 8
+        },
+        {
+          "value": "en-GB",
+          "introduced_in": 8
+        },
+        {
+          "value": "fi",
+          "introduced_in": 1
+        },
+        {
+          "value": "fr",
+          "introduced_in": 1
+        },
+        {
+          "value": "fr-CA",
+          "introduced_in": 8
+        },
+        {
+          "value": "de",
+          "introduced_in": 1
+        },
+        {
+          "value": "el",
+          "introduced_in": 1
+        },
+        {
+          "value": "he",
+          "introduced_in": 1
+        },
+        {
+          "value": "hi",
+          "introduced_in": 1
+        },
+        {
+          "value": "hu",
+          "introduced_in": 1
+        },
+        {
+          "value": "id",
+          "introduced_in": 1
+        },
+        {
+          "value": "it",
+          "introduced_in": 1
+        },
+        {
+          "value": "ja",
+          "introduced_in": 1
+        },
+        {
+          "value": "ko",
+          "introduced_in": 1
+        },
+        {
+          "value": "ms",
+          "introduced_in": 1
+        },
+        {
+          "value": "no",
+          "introduced_in": 1
+        },
+        {
+          "value": "fa",
+          "introduced_in": 1
+        },
+        {
+          "value": "pl",
+          "introduced_in": 1
+        },
+        {
+          "value": "pt",
+          "introduced_in": 1
+        },
+        {
+          "value": "pt-BR",
+          "introduced_in": 8
+        },
+        {
+          "value": "pt-PT",
+          "introduced_in": 8
+        },
+        {
+          "value": "ro",
+          "introduced_in": 1
+        },
+        {
+          "value": "ru",
+          "introduced_in": 1
+        },
+        {
+          "value": "sk",
+          "introduced_in": 1
+        },
+        {
+          "value": "sl",
+          "introduced_in": 1
+        },
+        {
+          "value": "es",
+          "introduced_in": 1
+        },
+        {
+          "value": "es-419",
+          "introduced_in": 8
+        },
+        {
+          "value": "es-ES",
+          "introduced_in": 8
+        },
+        {
+          "value": "sv",
+          "introduced_in": 1
+        },
+        {
+          "value": "ta",
+          "introduced_in": 1
+        },
+        {
+          "value": "te",
+          "introduced_in": 1
+        },
+        {
+          "value": "th",
+          "introduced_in": 1
+        },
+        {
+          "value": "tr",
+          "introduced_in": 1
+        },
+        {
+          "value": "uk",
+          "introduced_in": 1
+        },
+        {
+          "value": "vi",
+          "introduced_in": 1
+        }
       ]
     },
     "catalog_metadata_languages": {
       "type": "language_tag",
       "options": [
-        { "value": "ar", "introduced_in": 1 },
-        { "value": "bn", "introduced_in": 1 },
-        { "value": "bg", "introduced_in": 1 },
-        { "value": "zh", "introduced_in": 1 },
-        { "value": "zh-Hans", "introduced_in": 8 },
-        { "value": "zh-Hant", "introduced_in": 8 },
-        { "value": "hr", "introduced_in": 1 },
-        { "value": "cs", "introduced_in": 1 },
-        { "value": "da", "introduced_in": 1 },
-        { "value": "nl", "introduced_in": 1 },
-        { "value": "en", "introduced_in": 1 },
-        { "value": "en-US", "introduced_in": 8 },
-        { "value": "en-GB", "introduced_in": 8 },
-        { "value": "fi", "introduced_in": 1 },
-        { "value": "fr", "introduced_in": 1 },
-        { "value": "fr-CA", "introduced_in": 8 },
-        { "value": "de", "introduced_in": 1 },
-        { "value": "el", "introduced_in": 1 },
-        { "value": "he", "introduced_in": 1 },
-        { "value": "hi", "introduced_in": 1 },
-        { "value": "hu", "introduced_in": 1 },
-        { "value": "id", "introduced_in": 1 },
-        { "value": "it", "introduced_in": 1 },
-        { "value": "ja", "introduced_in": 1 },
-        { "value": "ko", "introduced_in": 1 },
-        { "value": "ms", "introduced_in": 1 },
-        { "value": "no", "introduced_in": 1 },
-        { "value": "fa", "introduced_in": 1 },
-        { "value": "pl", "introduced_in": 1 },
-        { "value": "pt", "introduced_in": 1 },
-        { "value": "pt-BR", "introduced_in": 8 },
-        { "value": "pt-PT", "introduced_in": 8 },
-        { "value": "ro", "introduced_in": 1 },
-        { "value": "ru", "introduced_in": 1 },
-        { "value": "sk", "introduced_in": 1 },
-        { "value": "sl", "introduced_in": 1 },
-        { "value": "es", "introduced_in": 1 },
-        { "value": "es-419", "introduced_in": 8 },
-        { "value": "es-ES", "introduced_in": 8 },
-        { "value": "sv", "introduced_in": 1 },
-        { "value": "ta", "introduced_in": 1 },
-        { "value": "te", "introduced_in": 1 },
-        { "value": "th", "introduced_in": 1 },
-        { "value": "tr", "introduced_in": 1 },
-        { "value": "uk", "introduced_in": 1 },
-        { "value": "vi", "introduced_in": 1 }
+        {
+          "value": "ar",
+          "introduced_in": 1
+        },
+        {
+          "value": "bn",
+          "introduced_in": 1
+        },
+        {
+          "value": "bg",
+          "introduced_in": 1
+        },
+        {
+          "value": "zh",
+          "introduced_in": 1
+        },
+        {
+          "value": "zh-Hans",
+          "introduced_in": 8
+        },
+        {
+          "value": "zh-Hant",
+          "introduced_in": 8
+        },
+        {
+          "value": "hr",
+          "introduced_in": 1
+        },
+        {
+          "value": "cs",
+          "introduced_in": 1
+        },
+        {
+          "value": "da",
+          "introduced_in": 1
+        },
+        {
+          "value": "nl",
+          "introduced_in": 1
+        },
+        {
+          "value": "en",
+          "introduced_in": 1
+        },
+        {
+          "value": "en-US",
+          "introduced_in": 8
+        },
+        {
+          "value": "en-GB",
+          "introduced_in": 8
+        },
+        {
+          "value": "fi",
+          "introduced_in": 1
+        },
+        {
+          "value": "fr",
+          "introduced_in": 1
+        },
+        {
+          "value": "fr-CA",
+          "introduced_in": 8
+        },
+        {
+          "value": "de",
+          "introduced_in": 1
+        },
+        {
+          "value": "el",
+          "introduced_in": 1
+        },
+        {
+          "value": "he",
+          "introduced_in": 1
+        },
+        {
+          "value": "hi",
+          "introduced_in": 1
+        },
+        {
+          "value": "hu",
+          "introduced_in": 1
+        },
+        {
+          "value": "id",
+          "introduced_in": 1
+        },
+        {
+          "value": "it",
+          "introduced_in": 1
+        },
+        {
+          "value": "ja",
+          "introduced_in": 1
+        },
+        {
+          "value": "ko",
+          "introduced_in": 1
+        },
+        {
+          "value": "ms",
+          "introduced_in": 1
+        },
+        {
+          "value": "no",
+          "introduced_in": 1
+        },
+        {
+          "value": "fa",
+          "introduced_in": 1
+        },
+        {
+          "value": "pl",
+          "introduced_in": 1
+        },
+        {
+          "value": "pt",
+          "introduced_in": 1
+        },
+        {
+          "value": "pt-BR",
+          "introduced_in": 8
+        },
+        {
+          "value": "pt-PT",
+          "introduced_in": 8
+        },
+        {
+          "value": "ro",
+          "introduced_in": 1
+        },
+        {
+          "value": "ru",
+          "introduced_in": 1
+        },
+        {
+          "value": "sk",
+          "introduced_in": 1
+        },
+        {
+          "value": "sl",
+          "introduced_in": 1
+        },
+        {
+          "value": "es",
+          "introduced_in": 1
+        },
+        {
+          "value": "es-419",
+          "introduced_in": 8
+        },
+        {
+          "value": "es-ES",
+          "introduced_in": 8
+        },
+        {
+          "value": "sv",
+          "introduced_in": 1
+        },
+        {
+          "value": "ta",
+          "introduced_in": 1
+        },
+        {
+          "value": "te",
+          "introduced_in": 1
+        },
+        {
+          "value": "th",
+          "introduced_in": 1
+        },
+        {
+          "value": "tr",
+          "introduced_in": 1
+        },
+        {
+          "value": "uk",
+          "introduced_in": 1
+        },
+        {
+          "value": "vi",
+          "introduced_in": 1
+        }
       ]
     }
   },
@@ -161,8 +575,13 @@
       "key": "player.video_skip_back_seconds",
       "introduced_in": 9,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
@@ -198,7 +617,14 @@
       },
       "default_value": 10,
       "unit": "seconds",
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv", "web"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv",
+        "web"
+      ],
       "category": "player",
       "label": "Video rewind interval",
       "description": "Seconds to skip back in video playback. Applies to buttons, keyboard shortcuts, gestures, and supported media controls.",
@@ -208,8 +634,13 @@
       "key": "player.video_skip_forward_seconds",
       "introduced_in": 9,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
@@ -245,7 +676,14 @@
       },
       "default_value": 30,
       "unit": "seconds",
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv", "web"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv",
+        "web"
+      ],
       "category": "player",
       "label": "Video fast-forward interval",
       "description": "Seconds to skip forward in video playback. Applies to buttons, keyboard shortcuts, gestures, and supported media controls.",
@@ -255,8 +693,13 @@
       "key": "player.audiobook_skip_back_seconds",
       "introduced_in": 9,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
@@ -292,7 +735,14 @@
       },
       "default_value": 10,
       "unit": "seconds",
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv", "web"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv",
+        "web"
+      ],
       "category": "player",
       "label": "Audiobook rewind interval",
       "description": "Seconds to skip back in audiobook playback. Applies to buttons, keyboard shortcuts, gestures, and supported media controls.",
@@ -302,8 +752,13 @@
       "key": "player.audiobook_skip_forward_seconds",
       "introduced_in": 9,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
@@ -339,7 +794,14 @@
       },
       "default_value": 30,
       "unit": "seconds",
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv", "web"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv",
+        "web"
+      ],
       "category": "player",
       "label": "Audiobook fast-forward interval",
       "description": "Seconds to skip forward in audiobook playback. Applies to buttons, keyboard shortcuts, gestures, and supported media controls.",
@@ -349,7 +811,12 @@
       "key": "playback.audio_language",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device", "profile_library", "profile_series"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device",
+        "profile_library",
+        "profile_series"
+      ],
       "resolution_order": [
         "profile_series",
         "profile_library",
@@ -357,7 +824,10 @@
         "profile",
         "default"
       ],
-      "value_schema": { "type": "language_tag", "nullable": true },
+      "value_schema": {
+        "type": "language_tag",
+        "nullable": true
+      },
       "default_value": null,
       "category": "playback",
       "label": "Preferred audio language",
@@ -371,12 +841,18 @@
       "key": "playback.version_sort",
       "introduced_in": 10,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
+      "allowed_scopes": [
+        "profile"
+      ],
       "resolution_order": [
         "profile",
         "default"
       ],
-      "value_schema": { "type": "object", "schema_ref": "version-sort.json", "nullable": true },
+      "value_schema": {
+        "type": "object",
+        "schema_ref": "version-sort.json",
+        "nullable": true
+      },
       "default_value": null,
       "category": "playback",
       "label": "Version order",
@@ -388,7 +864,12 @@
       "key": "playback.subtitle_language",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device", "profile_library", "profile_series"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device",
+        "profile_library",
+        "profile_series"
+      ],
       "resolution_order": [
         "profile_series",
         "profile_library",
@@ -396,7 +877,10 @@
         "profile",
         "default"
       ],
-      "value_schema": { "type": "language_tag", "nullable": true },
+      "value_schema": {
+        "type": "language_tag",
+        "nullable": true
+      },
       "default_value": null,
       "category": "playback",
       "label": "Preferred subtitle language",
@@ -410,7 +894,12 @@
       "key": "playback.subtitle_mode",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device", "profile_library", "profile_series"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device",
+        "profile_library",
+        "profile_series"
+      ],
       "resolution_order": [
         "profile_series",
         "profile_library",
@@ -421,9 +910,18 @@
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "auto", "label": "Auto" },
-          { "value": "always", "label": "Always on" },
-          { "value": "off", "label": "Off" }
+          {
+            "value": "auto",
+            "label": "Auto"
+          },
+          {
+            "value": "always",
+            "label": "Always on"
+          },
+          {
+            "value": "off",
+            "label": "Off"
+          }
         ]
       },
       "default_value": "off",
@@ -437,7 +935,12 @@
       "key": "playback.show_forced_subtitles",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device", "profile_library", "profile_series"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device",
+        "profile_library",
+        "profile_series"
+      ],
       "resolution_order": [
         "profile_series",
         "profile_library",
@@ -445,21 +948,33 @@
         "profile",
         "default"
       ],
-      "value_schema": { "type": "boolean" },
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
       "category": "playback",
       "label": "Show forced subtitles",
       "description": "Show subtitles for foreign-language dialogue even when subtitles are off.",
       "recommended_control": "switch",
-      "notes": "Default is true because that is what the server resolves today: user_profiles.show_forced_subtitles is NOT NULL DEFAULT true (migration 029) and profile creation sets it true. A false default here would silently turn forced subtitles off for every profile that never touched the toggle. The Has* companion booleans on LibraryPlaybackPreference and SubtitlePreference encode set-vs-unset at the library and series scopes, so migration writes rows there only where Has* is true. The profile column has no companion and cannot distinguish an explicit true from the column default, so migration writes a profile row only where the value is false — the value that differs from the default."
+      "notes": "Default is true because that is what the server resolves today: user_profiles.show_forced_subtitles is NOT NULL DEFAULT true (migration 029) and profile creation sets it true. A false default here would silently turn forced subtitles off for every profile that never touched the toggle. The Has* companion booleans on LibraryPlaybackPreference and SubtitlePreference encode set-vs-unset at the library and series scopes, so migration writes rows there only where Has* is true. The profile column has no companion and cannot distinguish an explicit true from the column default, so migration writes a profile row only where the value is false \u2014 the value that differs from the default."
     },
     {
       "key": "playback.subtitle_appearance",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
-      "value_schema": { "type": "object", "schema_ref": "subtitle-appearance.json" },
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "object",
+        "schema_ref": "subtitle-appearance.json"
+      },
       "default_value": {
         "fontSize": "large",
         "fontFamily": "sans-serif",
@@ -481,18 +996,43 @@
       "key": "playback.preferred_quality",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "ordered": true,
         "values": [
-          { "value": "auto", "label": "Auto" },
-          { "value": "480p", "label": "480p" },
-          { "value": "720p", "label": "720p" },
-          { "value": "1080p", "label": "1080p" },
-          { "value": "2160p", "label": "2160p / 4K" },
-          { "value": "original", "label": "Original quality" }
+          {
+            "value": "auto",
+            "label": "Auto"
+          },
+          {
+            "value": "480p",
+            "label": "480p"
+          },
+          {
+            "value": "720p",
+            "label": "720p"
+          },
+          {
+            "value": "1080p",
+            "label": "1080p"
+          },
+          {
+            "value": "2160p",
+            "label": "2160p / 4K"
+          },
+          {
+            "value": "original",
+            "label": "Original quality"
+          }
         ]
       },
       "default_value": "auto",
@@ -504,14 +1044,21 @@
       "label": "Preferred quality",
       "description": "Pick the quality Silo should prefer.",
       "recommended_control": "select",
-      "notes": "The resolution axis. Members are exactly the vocabulary the server already speaks: NormalizeQualityV3 in internal/playback/protocol_v3.go accepts auto, 480p, 720p, 1080p, 2160p and original and normalizes anything else to auto with a degradation warning. Transcode ladder rungs (328p, 720p-high, 1080p-8 and friends) are deliberately absent — they were never a third dimension, only a bitrate spelled into the resolution string. web/src/player/hooks/useTranscodeQuality.ts already decomposes them, defining 1080p-high as {resolution: 1080p, bitrate: 10000} and sending the two to the server separately, so the compound form never reached the wire. playback.max_bitrate_kbps is now that second axis, and clients compose the two into whatever presets they want to show. Members are listed ascending so the ceiling constraint has a defined direction; \"auto\" sorts lowest because it never exceeds a cap, and \"original\" highest because it is the uncapped source. Enforcing the ceiling needs internal/access/quality.go to learn both sentinels: qualityRank ranks neither today, so auto and original both tie at 0 with unset and a cap would let original through. Migrates user_profiles.quality_preference as the profile fallback. The legacy column is NOT NULL DEFAULT '1080p', and that default was the effective playback cap, so existing profiles receive explicit 1080p and 6000 kbps rows; newly created profiles use the contract's auto/null defaults. The account/profile max_playback_quality columns stay in internal/policy and are NOT settings."
+      "notes": "The resolution axis. Members are exactly the vocabulary the server already speaks: NormalizeQualityV3 in internal/playback/protocol_v3.go accepts auto, 480p, 720p, 1080p, 2160p and original and normalizes anything else to auto with a degradation warning. Transcode ladder rungs (328p, 720p-high, 1080p-8 and friends) are deliberately absent \u2014 they were never a third dimension, only a bitrate spelled into the resolution string. web/src/player/hooks/useTranscodeQuality.ts already decomposes them, defining 1080p-high as {resolution: 1080p, bitrate: 10000} and sending the two to the server separately, so the compound form never reached the wire. playback.max_bitrate_kbps is now that second axis, and clients compose the two into whatever presets they want to show. Members are listed ascending so the ceiling constraint has a defined direction; \"auto\" sorts lowest because it never exceeds a cap, and \"original\" highest because it is the uncapped source. Enforcing the ceiling needs internal/access/quality.go to learn both sentinels: qualityRank ranks neither today, so auto and original both tie at 0 with unset and a cap would let original through. Migrates user_profiles.quality_preference as the profile fallback. The legacy column is NOT NULL DEFAULT '1080p', and that default was the effective playback cap, so existing profiles receive explicit 1080p and 6000 kbps rows; newly created profiles use the contract's auto/null defaults. The account/profile max_playback_quality columns stay in internal/policy and are NOT settings."
     },
     {
       "key": "playback.max_bitrate_kbps",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "integer",
         "nullable": true,
@@ -524,15 +1071,24 @@
       "label": "Maximum bitrate",
       "description": "Cap how much bandwidth playback may use. No cap means Silo picks for the chosen resolution.",
       "recommended_control": "select",
-      "notes": "The bitrate axis, orthogonal to playback.preferred_quality. Splitting them is what the clients were already doing: the in-player switcher sends resolution and bitrate as separate fields, and downloads (DownloadQuality in silo-android) dropped resolution entirely and kept only a bitrate ladder. Two values rather than one compound enum means a client can offer \"1080p High\" without the server having to agree on what \"High\" means — retuning a preset is a client release, not a contract break, and it stays additive under the widening rule. null is uncapped, which is why this is nullable rather than defaulting to a large number: absent and \"as much as you like\" are the same statement, and a numeric sentinel would have to be widened every time hardware improves. The bounds are deliberately loose — 100 kbps is below any watchable stream and 200 Mbps is above any remux — because this caps a preference, not a policy; entitlement limits live in internal/policy. Migration decomposes the legacy compound values: 1080p-high becomes (1080p, 10000), 720p-medium becomes (720p, 3000), 420p becomes (480p, 720), following the bitrates in web/src/player/hooks/useTranscodeQuality.ts, so no stored preference is lost to the rejects table."
+      "notes": "The bitrate axis, orthogonal to playback.preferred_quality. Splitting them is what the clients were already doing: the in-player switcher sends resolution and bitrate as separate fields, and downloads (DownloadQuality in silo-android) dropped resolution entirely and kept only a bitrate ladder. Two values rather than one compound enum means a client can offer \"1080p High\" without the server having to agree on what \"High\" means \u2014 retuning a preset is a client release, not a contract break, and it stays additive under the widening rule. null is uncapped, which is why this is nullable rather than defaulting to a large number: absent and \"as much as you like\" are the same statement, and a numeric sentinel would have to be widened every time hardware improves. The bounds are deliberately loose \u2014 100 kbps is below any watchable stream and 200 Mbps is above any remux \u2014 because this caps a preference, not a policy; entitlement limits live in internal/policy. Migration decomposes the legacy compound values: 1080p-high becomes (1080p, 10000), 720p-medium becomes (720p, 3000), 420p becomes (480p, 720), following the bitrates in web/src/player/hooks/useTranscodeQuality.ts, so no stored preference is lost to the rejects table."
     },
     {
       "key": "playback.auto_skip_intro",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
       "category": "playback",
       "label": "Auto-skip intros",
@@ -545,14 +1101,30 @@
       "key": "playback.intro_skip_mode",
       "introduced_in": 7,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "never", "label": "Never" },
-          { "value": "ask", "label": "Ask to skip" },
-          { "value": "always", "label": "Skip automatically" }
+          {
+            "value": "never",
+            "label": "Never"
+          },
+          {
+            "value": "ask",
+            "label": "Ask to skip"
+          },
+          {
+            "value": "always",
+            "label": "Skip automatically"
+          }
         ]
       },
       "default_value": "ask",
@@ -566,9 +1138,18 @@
       "key": "playback.auto_skip_credits",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
       "category": "playback",
       "label": "Auto-skip credits",
@@ -579,9 +1160,18 @@
       "key": "playback.auto_skip_recap",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
       "category": "playback",
       "label": "Auto-skip recaps",
@@ -592,9 +1182,18 @@
       "key": "playback.auto_play_next",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
       "category": "playback",
       "label": "Auto-play next episode",
@@ -605,9 +1204,18 @@
       "key": "playback.auto_play_next_preview",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
       "category": "playback",
       "label": "Preview next episode",
@@ -618,9 +1226,20 @@
       "key": "playback.next_up_prompt_seconds",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
-      "value_schema": { "type": "integer", "minimum": 0, "maximum": 120 },
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 120
+      },
       "default_value": 30,
       "unit": "seconds",
       "category": "playback",
@@ -633,9 +1252,17 @@
       "key": "catalog.metadata_language",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
-      "value_schema": { "type": "language_tag", "nullable": true },
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "language_tag",
+        "nullable": true
+      },
       "default_value": null,
       "category": "catalog",
       "label": "Metadata language",
@@ -649,8 +1276,13 @@
       "key": "catalog.metadata_language_overrides",
       "introduced_in": 3,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "metadata-language-overrides.json"
@@ -666,9 +1298,16 @@
       "key": "player.hdr_enabled",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
       "category": "player",
       "label": "HDR",
@@ -679,11 +1318,24 @@
       "key": "player.dolby_vision_enabled",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv"
+      ],
       "category": "player",
       "label": "Dolby Vision",
       "description": "Allow Dolby Vision output on this device.",
@@ -693,11 +1345,24 @@
       "key": "player.dv_profile7_hdr10_fallback",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv"
+      ],
       "category": "player",
       "label": "Dolby Vision Profile 7 fallback",
       "description": "Play Profile 7 sources as HDR10 when this device cannot decode them natively.",
@@ -708,9 +1373,16 @@
       "key": "player.seek_cache_enabled",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
       "category": "player",
       "label": "Seek cache",
@@ -721,11 +1393,22 @@
       "key": "player.match_frame_rate",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
-      "platforms": ["android", "android_tv", "tvos"],
+      "platforms": [
+        "android",
+        "android_tv",
+        "tvos"
+      ],
       "category": "player",
       "label": "Match content frame rate",
       "description": "Switch the display refresh rate to match what is playing.",
@@ -736,9 +1419,19 @@
       "key": "player.playback_speed",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "number", "minimum": 0.25, "maximum": 3.0, "step": 0.05 },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "number",
+        "minimum": 0.25,
+        "maximum": 3.0,
+        "step": 0.05
+      },
       "default_value": 1.0,
       "unit": "x",
       "category": "player",
@@ -751,11 +1444,26 @@
       "key": "player.audio_sync_ms",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "integer", "minimum": -5000, "maximum": 5000 },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "integer",
+        "minimum": -5000,
+        "maximum": 5000
+      },
       "default_value": 0,
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv"
+      ],
       "unit": "milliseconds",
       "category": "player",
       "label": "Audio sync offset",
@@ -766,9 +1474,18 @@
       "key": "player.subtitle_sync_ms",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "integer", "minimum": -10000, "maximum": 10000 },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "integer",
+        "minimum": -10000,
+        "maximum": 10000
+      },
       "default_value": 0,
       "unit": "milliseconds",
       "category": "player",
@@ -780,14 +1497,28 @@
       "key": "player.video_gravity",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "fit", "label": "Fit" },
-          { "value": "fill", "label": "Fill" },
-          { "value": "stretch", "label": "Stretch" }
+          {
+            "value": "fit",
+            "label": "Fit"
+          },
+          {
+            "value": "fill",
+            "label": "Fill"
+          },
+          {
+            "value": "stretch",
+            "label": "Stretch"
+          }
         ]
       },
       "default_value": "fit",
@@ -800,17 +1531,31 @@
       "key": "player.orientation_mode",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "landscapeLocked", "label": "Landscape" },
-          { "value": "rotateFreely", "label": "Rotate freely" }
+          {
+            "value": "landscapeLocked",
+            "label": "Landscape"
+          },
+          {
+            "value": "rotateFreely",
+            "label": "Rotate freely"
+          }
         ]
       },
       "default_value": "landscapeLocked",
-      "platforms": ["ios", "android"],
+      "platforms": [
+        "ios",
+        "android"
+      ],
       "category": "player",
       "label": "Screen orientation",
       "description": "Whether the player rotates with the device.",
@@ -820,58 +1565,109 @@
       "key": "player.sleep_timer_default_minutes",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "integer", "minimum": 0, "maximum": 240 },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 240
+      },
       "default_value": 30,
       "unit": "minutes",
       "category": "player",
       "label": "Default sleep timer",
       "description": "Duration the sleep timer starts on when you turn it on. 0 leaves it off.",
       "recommended_control": "stepper",
-      "notes": "Android keeps this device-local today and clamps to 0..240; it was never written to the server rather than written and rejected. The maximum matches that clamp rather than exceeding it, and the default matches Android's shipped 30, because a manifest that disagrees with the only client implementing a setting is the drift this contract exists to remove — and a default of 0 would silently turn the preset off for everyone at cutover. Raising the maximum later is additive under the widening rule: replace the bare maximum with its history so a client can still see the 240 an older server enforces. This is the duration the timer starts on, not whether one is running: the design classes a running sleep timer as private local, so only the persisted default is registered."
+      "notes": "Android keeps this device-local today and clamps to 0..240; it was never written to the server rather than written and rejected. The maximum matches that clamp rather than exceeding it, and the default matches Android's shipped 30, because a manifest that disagrees with the only client implementing a setting is the drift this contract exists to remove \u2014 and a default of 0 would silently turn the preset off for everyone at cutover. Raising the maximum later is additive under the widening rule: replace the bare maximum with its history so a client can still see the 240 an older server enforces. This is the duration the timer starts on, not whether one is running: the design classes a running sleep timer as private local, so only the persisted default is registered."
     },
     {
       "key": "ui.theme",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "midnight-cinema", "label": "Midnight Cinema" },
-          { "value": "cinema-light", "label": "Cinema Light" },
-          { "value": "cobalt-studio", "label": "Cobalt Studio" },
-          { "value": "oxblood-noir", "label": "Oxblood Noir" },
-          { "value": "evergreen-studio", "label": "Evergreen Studio" }
+          {
+            "value": "midnight-cinema",
+            "label": "Midnight Cinema"
+          },
+          {
+            "value": "cinema-light",
+            "label": "Cinema Light"
+          },
+          {
+            "value": "cobalt-studio",
+            "label": "Cobalt Studio"
+          },
+          {
+            "value": "oxblood-noir",
+            "label": "Oxblood Noir"
+          },
+          {
+            "value": "evergreen-studio",
+            "label": "Evergreen Studio"
+          }
         ]
       },
       "default_value": "midnight-cinema",
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "appearance",
       "label": "Theme",
       "description": "Colour theme for the Silo interface.",
       "recommended_control": "select",
-      "notes": "Renamed from the unregistered legacy key \"ui_theme\", which the extension bag accepted without validation. Moved from account to profile scope: appearance is per household member, and the account row is copied to every profile during migration. Carries a device override because the right theme is partly a function of the screen and the room — a light theme on a phone in daylight, a dark one on a TV at night — which is the same reasoning that gives ui.text_scale one. Note that ui.custom_theme_vars and ui.custom_css stay profile-wide, so a profile's custom styling still applies on top of a device's theme override. Adding a theme is an additive enum widening. The admin-set default theme stays in server_settings and is not a user setting. Migration must also update internal/plugins/user_theme_lookup.go, which reads this value with raw SQL bound to both the old name and the account scope (SELECT value FROM user_settings WHERE user_id = $1 AND key = 'ui_theme') and feeds the X-Silo-Theme header on every plugin request. Left alone, that query matches nothing after the rename and every plugin UI silently falls back to its own theme, with no error to notice."
+      "notes": "Renamed from the unregistered legacy key \"ui_theme\", which the extension bag accepted without validation. Moved from account to profile scope: appearance is per household member, and the account row is copied to every profile during migration. Carries a device override because the right theme is partly a function of the screen and the room \u2014 a light theme on a phone in daylight, a dark one on a TV at night \u2014 which is the same reasoning that gives ui.text_scale one. Note that ui.custom_theme_vars and ui.custom_css stay profile-wide, so a profile's custom styling still applies on top of a device's theme override. Adding a theme is an additive enum widening. The admin-set default theme stays in server_settings and is not a user setting. Migration must also update internal/plugins/user_theme_lookup.go, which reads this value with raw SQL bound to both the old name and the account scope (SELECT value FROM user_settings WHERE user_id = $1 AND key = 'ui_theme') and feeds the X-Silo-Theme header on every plugin request. Left alone, that query matches nothing after the rename and every plugin UI silently falls back to its own theme, with no error to notice."
     },
     {
       "key": "ui.text_scale",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "ordered": true,
         "values": [
-          { "value": "default", "label": "Default" },
-          { "value": "large", "label": "Large" },
-          { "value": "x-large", "label": "Extra large" }
+          {
+            "value": "default",
+            "label": "Default"
+          },
+          {
+            "value": "large",
+            "label": "Large"
+          },
+          {
+            "value": "x-large",
+            "label": "Extra large"
+          }
         ]
       },
       "default_value": "default",
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "appearance",
       "label": "Text size",
       "description": "Overall interface text size.",
@@ -882,17 +1678,32 @@
       "key": "ui.text_weight",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "default", "label": "Default" },
-          { "value": "strong", "label": "Bolder" }
+          {
+            "value": "default",
+            "label": "Default"
+          },
+          {
+            "value": "strong",
+            "label": "Bolder"
+          }
         ]
       },
       "default_value": "default",
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "appearance",
       "label": "Text weight",
       "description": "Use heavier interface text for readability.",
@@ -903,11 +1714,22 @@
       "key": "ui.high_contrast",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_device"],
-      "resolution_order": ["profile_device", "profile", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "appearance",
       "label": "High contrast",
       "description": "Increase contrast across the interface.",
@@ -918,15 +1740,22 @@
       "key": "ui.custom_theme_vars",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "theme-var-overrides.json",
         "nullable": true
       },
       "default_value": null,
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "appearance",
       "label": "Custom theme variables",
       "description": "Per-token overrides applied on top of the selected theme.",
@@ -937,11 +1766,22 @@
       "key": "ui.custom_css",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
-      "value_schema": { "type": "string", "max_length": 65536, "nullable": true },
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "string",
+        "max_length": 65536,
+        "nullable": true
+      },
       "default_value": null,
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "appearance",
       "label": "Custom CSS",
       "description": "Raw CSS applied on top of the selected theme.",
@@ -952,15 +1792,29 @@
       "key": "ui.date_format",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "auto", "label": "Match device" },
-          { "value": "DD/MM/YYYY" },
-          { "value": "MM/DD/YYYY" },
-          { "value": "YYYY-MM-DD" }
+          {
+            "value": "auto",
+            "label": "Match device"
+          },
+          {
+            "value": "DD/MM/YYYY"
+          },
+          {
+            "value": "MM/DD/YYYY"
+          },
+          {
+            "value": "YYYY-MM-DD"
+          }
         ]
       },
       "default_value": "auto",
@@ -974,14 +1828,28 @@
       "key": "ui.time_format",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "auto", "label": "Match device" },
-          { "value": "12h", "label": "12-hour" },
-          { "value": "24h", "label": "24-hour" }
+          {
+            "value": "auto",
+            "label": "Match device"
+          },
+          {
+            "value": "12h",
+            "label": "12-hour"
+          },
+          {
+            "value": "24h",
+            "label": "24-hour"
+          }
         ]
       },
       "default_value": "auto",
@@ -995,15 +1863,22 @@
       "key": "ui.library_page_state",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "library-page-state.json",
         "nullable": true
       },
       "default_value": null,
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "navigation",
       "label": "Remembered library view",
       "description": "Saved browse state for each library.",
@@ -1013,11 +1888,20 @@
       "key": "ui.remember_library_page_state",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile_device"],
-      "resolution_order": ["profile_device", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "navigation",
       "label": "Remember library view",
       "description": "Return to where you left off when reopening a library.",
@@ -1027,14 +1911,28 @@
       "key": "search.media_scope",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "all", "label": "Everything" },
-          { "value": "video", "label": "Movies and series" },
-          { "value": "audiobook", "label": "Audiobooks" }
+          {
+            "value": "all",
+            "label": "Everything"
+          },
+          {
+            "value": "video",
+            "label": "Movies and series"
+          },
+          {
+            "value": "audiobook",
+            "label": "Audiobooks"
+          }
         ]
       },
       "default_value": "video",
@@ -1048,29 +1946,51 @@
       "key": "ui.card_overlays",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "card-overlays.json",
         "nullable": true
       },
       "default_value": null,
-      "platforms": ["web", "ios", "tvos", "macos", "android", "android_tv"],
+      "platforms": [
+        "web",
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv"
+      ],
       "category": "appearance",
       "label": "Poster badges",
       "description": "Which badges appear on poster cards, and where.",
-      "notes": "Registered from the legacy unprefixed key card_overlays, which reached the server only through the unknown-key extension bag — stored as an arbitrary string with no validation. null means the user has expressed no preference, which is what lets the server-wide admin default in the overlay-config endpoint apply; writing a resolved-but-unchosen value would silently pin them. The server-wide default configuration stays in server_settings and is not a user setting. This key describes which badges to show, not whether to show them — that is ui.card_overlays_enabled."
+      "notes": "Registered from the legacy unprefixed key card_overlays, which reached the server only through the unknown-key extension bag \u2014 stored as an arbitrary string with no validation. null means the user has expressed no preference, which is what lets the server-wide admin default in the overlay-config endpoint apply; writing a resolved-but-unchosen value would silently pin them. The server-wide default configuration stays in server_settings and is not a user setting. This key describes which badges to show, not whether to show them \u2014 that is ui.card_overlays_enabled."
     },
     {
       "key": "ui.card_overlays_enabled",
       "introduced_in": 8,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
-      "value_schema": { "type": "boolean", "nullable": true },
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean",
+        "nullable": true
+      },
       "default_value": null,
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "appearance",
       "label": "Card overlays enabled",
       "description": "Show overlay badges on media cards.",
@@ -1081,19 +2001,35 @@
       "key": "ui.card_quick_actions",
       "introduced_in": 8,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "nullable": true,
         "values": [
-          { "value": "both", "label": "Both" },
-          { "value": "favorites", "label": "Favorites only" },
-          { "value": "watched", "label": "Watch indicator only" }
+          {
+            "value": "both",
+            "label": "Both"
+          },
+          {
+            "value": "favorites",
+            "label": "Favorites only"
+          },
+          {
+            "value": "watched",
+            "label": "Watch indicator only"
+          }
         ]
       },
       "default_value": null,
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "appearance",
       "label": "Card quick actions",
       "description": "Which favorite and watched shortcuts appear on media cards.",
@@ -1104,11 +2040,21 @@
       "key": "ui.card_quick_actions_enabled",
       "introduced_in": 8,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
-      "value_schema": { "type": "boolean", "nullable": true },
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean",
+        "nullable": true
+      },
       "default_value": null,
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "appearance",
       "label": "Card quick actions enabled",
       "description": "Show the selected favorite and watched shortcuts on media cards.",
@@ -1119,13 +2065,24 @@
       "key": "ui.next_up_mode",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "values": [
-          { "value": "combined", "label": "With Continue Watching" },
-          { "value": "separate", "label": "Separate row" }
+          {
+            "value": "combined",
+            "label": "With Continue Watching"
+          },
+          {
+            "value": "separate",
+            "label": "Separate row"
+          }
         ]
       },
       "default_value": "combined",
@@ -1139,15 +2096,29 @@
       "key": "nav.primary_menu",
       "introduced_in": 5,
       "persistence": "remote",
-      "allowed_scopes": ["profile_client", "profile_device"],
-      "resolution_order": ["profile_device", "profile_client", "default"],
+      "allowed_scopes": [
+        "profile_client",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile_client",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "primary-menu.json",
         "nullable": true
       },
       "default_value": null,
-      "platforms": ["web", "ios", "tvos", "macos", "android", "android_tv"],
+      "platforms": [
+        "web",
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv"
+      ],
       "category": "navigation",
       "label": "Primary menu",
       "description": "The ordered visible destinations shared by like clients.",
@@ -1158,13 +2129,20 @@
       "key": "nav.shortcuts",
       "introduced_in": 5,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "navigation-shortcuts.json"
       },
-      "default_value": { "items": [] },
+      "default_value": {
+        "items": []
+      },
       "category": "navigation",
       "label": "Navigation shortcuts",
       "description": "Libraries, sections, and collections pinned for use across navigation surfaces.",
@@ -1174,14 +2152,33 @@
       "key": "ui.card_presentation",
       "introduced_in": 5,
       "persistence": "remote",
-      "allowed_scopes": ["profile", "profile_client", "profile_device"],
-      "resolution_order": ["profile_device", "profile_client", "profile", "default"],
+      "allowed_scopes": [
+        "profile",
+        "profile_client",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile_client",
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "card-presentation.json"
       },
-      "default_value": { "poster_size": "standard", "caption": "title_metadata" },
-      "platforms": ["web", "ios", "tvos", "macos", "android", "android_tv"],
+      "default_value": {
+        "poster_size": "standard",
+        "caption": "title_metadata"
+      },
+      "platforms": [
+        "web",
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv"
+      ],
       "category": "appearance",
       "label": "Media cards",
       "description": "Poster size and caption detail used by media cards.",
@@ -1192,15 +2189,22 @@
       "key": "ui.sidebar_pins",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "sidebar-pins.json",
         "nullable": true
       },
       "default_value": null,
-      "platforms": ["web"],
+      "platforms": [
+        "web"
+      ],
       "category": "navigation",
       "label": "Pinned sidebar items",
       "description": "Sections and collections pinned into the sidebar.",
@@ -1210,8 +2214,13 @@
       "key": "ui.disabled_library_ids",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "library-id-list.json",
@@ -1221,14 +2230,19 @@
       "category": "navigation",
       "label": "Hidden libraries",
       "description": "Libraries you have hidden from your own browsing.",
-      "notes": "Registered from the legacy unprefixed key disabled_library_ids. This is the user hiding a library from themselves — it is not an access control. Library visibility enforcement lives in internal/access and internal/policy, and nothing here may be read as a permission. Profile scope rather than profile_device because hiding a library is a statement about what you want to see, not about one screen."
+      "notes": "Registered from the legacy unprefixed key disabled_library_ids. This is the user hiding a library from themselves \u2014 it is not an access control. Library visibility enforcement lives in internal/access and internal/policy, and nothing here may be read as a permission. Profile scope rather than profile_device because hiding a library is a statement about what you want to see, not about one screen."
     },
     {
       "key": "ui.library_order",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
       "value_schema": {
         "type": "object",
         "schema_ref": "library-id-list.json",
@@ -1244,11 +2258,21 @@
       "key": "downloads.wifi_only",
       "introduced_in": 1,
       "persistence": "client_local",
-      "allowed_scopes": ["client_local"],
-      "resolution_order": ["client_local", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "client_local"
+      ],
+      "resolution_order": [
+        "client_local",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
-      "platforms": ["ios", "android"],
+      "platforms": [
+        "ios",
+        "android"
+      ],
       "category": "downloads",
       "label": "Download over Wi-Fi only",
       "description": "Only download while connected to Wi-Fi.",
@@ -1259,11 +2283,21 @@
       "key": "downloads.keep_watched",
       "introduced_in": 1,
       "persistence": "client_local",
-      "allowed_scopes": ["client_local"],
-      "resolution_order": ["client_local", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "client_local"
+      ],
+      "resolution_order": [
+        "client_local",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
-      "platforms": ["ios", "android"],
+      "platforms": [
+        "ios",
+        "android"
+      ],
       "category": "downloads",
       "label": "Keep watched downloads",
       "description": "Do not suggest reclaiming space from downloads you have finished.",
@@ -1274,22 +2308,48 @@
       "key": "downloads.default_quality",
       "introduced_in": 1,
       "persistence": "client_local",
-      "allowed_scopes": ["client_local"],
-      "resolution_order": ["client_local", "default"],
+      "allowed_scopes": [
+        "client_local"
+      ],
+      "resolution_order": [
+        "client_local",
+        "default"
+      ],
       "value_schema": {
         "type": "enum",
         "ordered": true,
         "values": [
-          { "value": "1mbps", "label": "1 Mbps" },
-          { "value": "2mbps", "label": "2 Mbps" },
-          { "value": "5mbps", "label": "5 Mbps" },
-          { "value": "10mbps", "label": "10 Mbps" },
-          { "value": "20mbps", "label": "20 Mbps" },
-          { "value": "original", "label": "Original" }
+          {
+            "value": "1mbps",
+            "label": "1 Mbps"
+          },
+          {
+            "value": "2mbps",
+            "label": "2 Mbps"
+          },
+          {
+            "value": "5mbps",
+            "label": "5 Mbps"
+          },
+          {
+            "value": "10mbps",
+            "label": "10 Mbps"
+          },
+          {
+            "value": "20mbps",
+            "label": "20 Mbps"
+          },
+          {
+            "value": "original",
+            "label": "Original"
+          }
         ]
       },
       "default_value": "original",
-      "platforms": ["ios", "android"],
+      "platforms": [
+        "ios",
+        "android"
+      ],
       "category": "downloads",
       "label": "Download quality",
       "description": "Quality preset used for new downloads.",
@@ -1300,27 +2360,56 @@
       "key": "subtitle.matches_device",
       "introduced_in": 1,
       "persistence": "client_local",
-      "allowed_scopes": ["client_local"],
-      "resolution_order": ["client_local", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "client_local"
+      ],
+      "resolution_order": [
+        "client_local",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv"
+      ],
       "category": "playback",
       "label": "Match device caption settings",
       "description": "Use the operating system's caption style instead of Silo's.",
       "recommended_control": "switch",
-      "notes": "Contract-known local: reads OS accessibility settings that only exist on the device. When enabled, playback.subtitle_appearance is not applied. Apple's existing copy separating this from profile subtitle behavior is the UX baseline. A contract key names a setting; it is not a storage key. Clients keep whatever local key they already use — Android stores this at subtitle.matches_device.local, Apple at player.subtitleMatchesSystemAppearance — so adopting the contract does not reset anyone's local preferences. The same applies to downloads.wifi_only and downloads.keep_watched, which Apple stores as downloads.wifiOnly and downloads.keepWatchedDownloads."
+      "notes": "Contract-known local: reads OS accessibility settings that only exist on the device. When enabled, playback.subtitle_appearance is not applied. Apple's existing copy separating this from profile subtitle behavior is the UX baseline. A contract key names a setting; it is not a storage key. Clients keep whatever local key they already use \u2014 Android stores this at subtitle.matches_device.local, Apple at player.subtitleMatchesSystemAppearance \u2014 so adopting the contract does not reset anyone's local preferences. The same applies to downloads.wifi_only and downloads.keep_watched, which Apple stores as downloads.wifiOnly and downloads.keepWatchedDownloads."
     },
     {
       "key": "player.resume_rewind_seconds",
       "introduced_in": 1,
       "persistence": "client_local",
-      "allowed_scopes": ["client_local"],
-      "resolution_order": ["client_local", "default"],
-      "value_schema": { "type": "integer", "minimum": 0, "maximum": 30 },
+      "allowed_scopes": [
+        "client_local"
+      ],
+      "resolution_order": [
+        "client_local",
+        "default"
+      ],
+      "value_schema": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 30
+      },
       "default_value": 7,
       "unit": "seconds",
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv", "web"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv",
+        "web"
+      ],
       "category": "player",
       "label": "Rewind on resume",
       "description": "Skip back this far when resuming a partly watched item, to re-establish context. 0 turns it off.",
@@ -1331,12 +2420,28 @@
       "key": "player.passout_threshold",
       "introduced_in": 1,
       "persistence": "client_local",
-      "allowed_scopes": ["client_local"],
-      "resolution_order": ["client_local", "default"],
-      "value_schema": { "type": "integer", "minimum": 0, "maximum": 20 },
+      "allowed_scopes": [
+        "client_local"
+      ],
+      "resolution_order": [
+        "client_local",
+        "default"
+      ],
+      "value_schema": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 20
+      },
       "default_value": 3,
       "unit": "episodes",
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv", "web"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv",
+        "web"
+      ],
       "category": "player",
       "label": "Still watching prompt",
       "description": "How many episodes auto-play before Silo asks whether you are still watching. 0 never asks.",
@@ -1347,11 +2452,22 @@
       "key": "player.picture_in_picture_enabled",
       "introduced_in": 1,
       "persistence": "client_local",
-      "allowed_scopes": ["client_local"],
-      "resolution_order": ["client_local", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "client_local"
+      ],
+      "resolution_order": [
+        "client_local",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": true,
-      "platforms": ["ios", "macos", "android"],
+      "platforms": [
+        "ios",
+        "macos",
+        "android"
+      ],
       "category": "player",
       "label": "Picture in picture",
       "description": "Keep playing in a floating window when you leave the player.",
@@ -1362,11 +2478,24 @@
       "key": "nav.show_audiobooks",
       "introduced_in": 1,
       "persistence": "client_local",
-      "allowed_scopes": ["client_local"],
-      "resolution_order": ["client_local", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "client_local"
+      ],
+      "resolution_order": [
+        "client_local",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
-      "platforms": ["ios", "tvos", "macos", "android", "android_tv"],
+      "platforms": [
+        "ios",
+        "tvos",
+        "macos",
+        "android",
+        "android_tv"
+      ],
       "category": "nav",
       "label": "Show audiobooks",
       "description": "Show the Audiobooks section in navigation.",
@@ -1377,9 +2506,16 @@
       "key": "remuxdb.enabled",
       "introduced_in": 9,
       "persistence": "remote",
-      "allowed_scopes": ["account"],
-      "resolution_order": ["account", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "account"
+      ],
+      "resolution_order": [
+        "account",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
       "category": "providers",
       "label": "RemuxDB stream metadata",
@@ -1390,9 +2526,17 @@
       "key": "remuxdb.base_url",
       "introduced_in": 9,
       "persistence": "remote",
-      "allowed_scopes": ["account"],
-      "resolution_order": ["account", "default"],
-      "value_schema": { "type": "string", "max_length": 2048 },
+      "allowed_scopes": [
+        "account"
+      ],
+      "resolution_order": [
+        "account",
+        "default"
+      ],
+      "value_schema": {
+        "type": "string",
+        "max_length": 2048
+      },
       "default_value": "https://remuxdb.1632022.xyz",
       "category": "providers",
       "label": "RemuxDB base URL",
@@ -1403,9 +2547,17 @@
       "key": "remuxdb.token",
       "introduced_in": 9,
       "persistence": "remote",
-      "allowed_scopes": ["account"],
-      "resolution_order": ["account", "default"],
-      "value_schema": { "type": "string", "max_length": 1024 },
+      "allowed_scopes": [
+        "account"
+      ],
+      "resolution_order": [
+        "account",
+        "default"
+      ],
+      "value_schema": {
+        "type": "string",
+        "max_length": 1024
+      },
       "default_value": "",
       "category": "providers",
       "label": "RemuxDB API token",
@@ -1416,13 +2568,91 @@
       "key": "remuxdb.submit_enabled",
       "introduced_in": 9,
       "persistence": "remote",
-      "allowed_scopes": ["account"],
-      "resolution_order": ["account", "default"],
-      "value_schema": { "type": "boolean" },
+      "allowed_scopes": [
+        "account"
+      ],
+      "resolution_order": [
+        "account",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
       "default_value": false,
       "category": "providers",
       "label": "Contribute to RemuxDB",
       "description": "Submit probed stream metadata to RemuxDB to help the community.",
+      "recommended_control": "switch"
+    },
+    {
+      "key": "catalog.show_advisory_age",
+      "introduced_in": 10,
+      "persistence": "remote",
+      "allowed_scopes": [
+        "profile"
+      ],
+      "resolution_order": [
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
+      "default_value": false,
+      "category": "catalog",
+      "label": "Show advisory age",
+      "description": "Show a recommended minimum viewer age from an advisory service, such as Common Sense Media, on item detail.",
+      "recommended_control": "switch",
+      "notes": "Profile scope because the reader is a household parent deciding what a child may watch, and they browse on their own profile. Default false: the advisory is extra chrome most viewers do not want, and only the profiles that ask for it should carry it. Display only. The advisory age never feeds content_rating_age, ApplyContentRatingCeiling, or any other parental control, so turning this on cannot change what a profile is allowed to watch, and turning it off hides nothing that was restricting anything. Coverage is partial by nature: the provider that supplies the advisory is rate limited per day, so on a large library some titles carry one and others do not."
+    },
+    {
+      "key": "ui.theme_music_enabled",
+      "introduced_in": 11,
+      "persistence": "remote",
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
+      "default_value": false,
+      "platforms": [
+        "web"
+      ],
+      "category": "playback",
+      "label": "Theme music",
+      "description": "Play local theme music while browsing movie and show detail pages.",
+      "recommended_control": "switch"
+    },
+    {
+      "key": "ui.theme_music_loop",
+      "introduced_in": 11,
+      "persistence": "remote",
+      "allowed_scopes": [
+        "profile",
+        "profile_device"
+      ],
+      "resolution_order": [
+        "profile_device",
+        "profile",
+        "default"
+      ],
+      "value_schema": {
+        "type": "boolean"
+      },
+      "default_value": false,
+      "platforms": [
+        "web"
+      ],
+      "category": "playback",
+      "label": "Loop theme music",
+      "description": "Repeat theme music while the detail page stays open.",
       "recommended_control": "switch"
     }
   ]

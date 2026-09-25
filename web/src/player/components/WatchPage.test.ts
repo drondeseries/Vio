@@ -141,6 +141,7 @@ function playbackSession(
     applySubtitleTrack: vi.fn(),
     applyAudioInventory: vi.fn(),
     updatePlaybackState: vi.fn(),
+    reportFirstFrame: vi.fn(),
     reportEvent: vi.fn(),
     ...overrides,
   };
@@ -1572,6 +1573,7 @@ describe("Watch Party source fallback", () => {
       await waitFor(() =>
         expect(startPlaybackMock).toHaveBeenCalledWith(
           expect.objectContaining({ fileId: 8, roomId: "room-1", restart: true }),
+          "automatic",
         ),
       );
       finish();

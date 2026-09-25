@@ -195,9 +195,9 @@ type releaseDeadlinePlanStoreV3 struct {
 	contextErr   error
 }
 
-func (s *recordingRouteEventPlanStoreV3) RecordRouteEvent(_ context.Context, event playback.RouteEventRecordV3) error {
+func (s *recordingRouteEventPlanStoreV3) RecordRouteEvent(_ context.Context, event playback.RouteEventRecordV3) (bool, error) {
 	s.events <- event
-	return nil
+	return true, nil
 }
 
 func (s *releaseDeadlinePlanStoreV3) ReleaseReplan(ctx context.Context, _, _, _ string) error {
@@ -1546,7 +1546,7 @@ func TestPreferredAudioTrackIndexV3PropagatesSeriesPreferenceReadFailure(t *test
 		AudioTracks: []models.AudioTrack{{Codec: "aac", Language: "eng"}, {Codec: "aac", Language: "spa"}},
 	}
 
-	if _, _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "", file, nil); !errors.Is(err, wantErr) {
+	if _, _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "", file); !errors.Is(err, wantErr) {
 		t.Fatalf("preferredAudioTrackIndexV3 error = %v, want %v", err, wantErr)
 	}
 }
@@ -1560,7 +1560,7 @@ func TestPreferredAudioTrackIndexV3PropagatesCanonicalPreferenceReadFailure(t *t
 		AudioTracks: []models.AudioTrack{{Codec: "aac", Language: "eng"}, {Codec: "aac", Language: "spa"}},
 	}
 
-	if _, _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "living-room", file, nil); !errors.Is(err, wantErr) {
+	if _, _, err := handler.preferredAudioTrackIndexV3(context.Background(), 1, "profile-1", "living-room", file); !errors.Is(err, wantErr) {
 		t.Fatalf("preferredAudioTrackIndexV3 error = %v, want %v", err, wantErr)
 	}
 }
@@ -3151,7 +3151,7 @@ func TestAttachSubtitleArtifactV3UsesFrozenDownloadedIdentityWithoutOrdinalLooku
 		SubtitleSource: playback.SubtitleSourceDownloadedV3, DownloadedSubtitleID: 71,
 		SubtitleTrackIndex: selectedIndex, SubtitleCodec: "vtt",
 	}
-	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-frozen-subtitle", file, plan, selectedIndex, &recipe); err != nil {
+	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-frozen-subtitle", file, plan, selectedIndex, &recipe, nil); err != nil {
 		t.Fatalf("attach frozen downloaded subtitle: %v", err)
 	}
 	if plan.Subtitle.Artifact == nil || !strings.Contains(plan.Subtitle.Artifact.URL, "downloaded_subtitle_id=71") {
@@ -3193,7 +3193,7 @@ func TestAttachSubtitleArtifactV3ClearsStaleArtifactWhenNoArtifactMode(t *testin
 					Inventory: playback.BuildSubtitleInventoryV3(file, nil),
 				},
 			}
-			if err := handler.attachSubtitleArtifactV3(context.Background(), "session-current", file, plan, test.selectedIndex, nil); err != nil {
+			if err := handler.attachSubtitleArtifactV3(context.Background(), "session-current", file, plan, test.selectedIndex, nil, nil); err != nil {
 				t.Fatalf("attach: %v", err)
 			}
 			if plan.Subtitle.Artifact != nil {
@@ -3227,7 +3227,7 @@ func TestAttachSubtitleArtifactV3DropsArtifactAcrossRenderToOffReplan(t *testing
 			Inventory: playback.BuildSubtitleInventoryV3(file, nil),
 		},
 	}
-	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-1", file, rendered, 0, nil); err != nil {
+	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-1", file, rendered, 0, nil, nil); err != nil {
 		t.Fatalf("attach render: %v", err)
 	}
 	if rendered.Subtitle.Artifact == nil {
@@ -3237,7 +3237,7 @@ func TestAttachSubtitleArtifactV3DropsArtifactAcrossRenderToOffReplan(t *testing
 	// subtitles off; the durable artifact must not survive the transition.
 	replanned := *rendered
 	replanned.Subtitle.Mode = playback.SubtitleOffV3
-	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-1", file, &replanned, -1, nil); err != nil {
+	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-1", file, &replanned, -1, nil, nil); err != nil {
 		t.Fatalf("attach off: %v", err)
 	}
 	if replanned.Subtitle.Artifact != nil || replanned.Subtitle.TrackID != "" {
@@ -3273,7 +3273,7 @@ func TestSubtitleArtifactStoreFailuresAreRetryable(t *testing.T) {
 		SubtitleSource: playback.SubtitleSourceDownloadedV3, DownloadedSubtitleID: 71,
 		SubtitleTrackIndex: 0, SubtitleCodec: "vtt",
 	}
-	err := handler.attachSubtitleArtifactV3(context.Background(), "session-store-error", file, plan, 0, &recipe)
+	err := handler.attachSubtitleArtifactV3(context.Background(), "session-store-error", file, plan, 0, &recipe, nil)
 	if !errors.Is(err, errSubtitleStoreUnavailableV3) {
 		t.Fatalf("attach error = %v, want wrapped subtitle-store failure", err)
 	}
@@ -9807,7 +9807,7 @@ func TestAttachSubtitleArtifactV3ValidatesDeduplicatedEmbeddedSelection(t *testi
 			TrackID:   playback.TrackIDV3(file.ID, "subtitle", 2),
 		},
 	}
-	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-dedup-artifact", file, plan, 2, nil); err != nil {
+	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-dedup-artifact", file, plan, 2, nil, nil); err != nil {
 		t.Fatalf("published 2 must validate against the deu embedded track: %v", err)
 	}
 	if plan.Subtitle.Artifact != nil {
@@ -9826,7 +9826,7 @@ func TestAttachSubtitleArtifactV3ValidatesDeduplicatedEmbeddedSelection(t *testi
 			TrackID:   playback.TrackIDV3(file.ID, "subtitle", 2),
 		},
 	}
-	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-dedup-artifact", file, mismatch, 2, nil); err == nil {
+	if err := handler.attachSubtitleArtifactV3(context.Background(), "session-dedup-artifact", file, mismatch, 2, nil, nil); err == nil {
 		t.Fatal("a mismatched embedded identity was accepted")
 	}
 }

@@ -226,6 +226,22 @@ function planInvalidatedCommand(
   };
 }
 
+/**
+ * Fires the `timeupdate` of a source that has data for its position. jsdom
+ * keeps readyState at HAVE_NOTHING, where the player ignores the event as the
+ * one a transport teardown queues.
+ */
+function fireFrameTimeUpdate(video: HTMLVideoElement) {
+  const own = Object.getOwnPropertyDescriptor(video, "readyState");
+  Object.defineProperty(video, "readyState", {
+    configurable: true,
+    value: Math.max(video.readyState, HTMLMediaElement.HAVE_CURRENT_DATA),
+  });
+  fireEvent.timeUpdate(video);
+  if (own) Object.defineProperty(video, "readyState", own);
+  else Reflect.deleteProperty(video, "readyState");
+}
+
 function setMediaError(video: HTMLVideoElement, message: string) {
   Object.defineProperty(video, "error", {
     configurable: true,
@@ -337,7 +353,7 @@ describe("VideoPlayer room catch-up", () => {
     });
     const video = rendered.container.querySelector("video")!;
     video.currentTime = localPosition - timelineOffset;
-    fireEvent.timeUpdate(video);
+    fireFrameTimeUpdate(video);
     const command = {
       command_id: "room-command-1",
       session_id: "session-1",
@@ -2518,6 +2534,64 @@ describe("VideoPlayer plan failure recovery", () => {
   });
 });
 
+describe("VideoPlayer first frame", () => {
+  beforeEach(() => {
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("reports the first frame of each transport once", async () => {
+    const onFirstFrame = vi.fn();
+    const { container, rerenderPlayer } = renderPlayer({ onFirstFrame });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-1"));
+    expect(onFirstFrame).not.toHaveBeenCalled();
+
+    fireEvent.playing(video);
+    fireFrameTimeUpdate(video);
+    fireFrameTimeUpdate(video);
+    expect(onFirstFrame).toHaveBeenCalledTimes(1);
+
+    // A replan loads a new transport, which has a first frame of its own.
+    rerenderPlayer({ planRevision: 2 });
+    expect(onFirstFrame).toHaveBeenCalledTimes(1);
+    fireEvent.playing(video);
+    expect(onFirstFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores the timeupdate a transport teardown queues", async () => {
+    const onFirstFrame = vi.fn();
+    const { container, rerenderPlayer } = renderPlayer({ onFirstFrame });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    await waitFor(() => expect(video.src).toContain("/api/v1/stream/session-1"));
+    fireEvent.playing(video);
+    expect(onFirstFrame).toHaveBeenCalledTimes(1);
+
+    // Switching transports empties the element with load(), which resets the
+    // position and queues a timeupdate while no source has data. It is not the
+    // new transport's first frame, and the loading overlay stays up for it.
+    rerenderPlayer({ planRevision: 2 });
+    fireEvent.timeUpdate(video);
+    fireEvent.seeked(video);
+    expect(onFirstFrame).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status", { name: "Loading video" })).toBeInTheDocument();
+
+    fireEvent.playing(video);
+    expect(onFirstFrame).toHaveBeenCalledTimes(2);
+    fireFrameTimeUpdate(video);
+    expect(onFirstFrame).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("VideoPlayer intro skip prompt", () => {
   beforeEach(() => {
     vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
@@ -2539,7 +2613,7 @@ describe("VideoPlayer intro skip prompt", () => {
     if (!video) throw new Error("expected video element");
 
     video.currentTime = 12;
-    fireEvent.timeUpdate(video);
+    fireFrameTimeUpdate(video);
     await act(async () => Promise.resolve());
     return rendered;
   }

@@ -51,6 +51,7 @@ const BASE_PLAYBACK_KEYS: SettingKey[] = [
   SETTING_KEYS.PLAYBACK_AUTO_SKIP_RECAP,
   SETTING_KEYS.CATALOG_METADATA_LANGUAGE,
   SETTING_KEYS.CATALOG_METADATA_LANGUAGE_OVERRIDES,
+  SETTING_KEYS.CATALOG_SHOW_ADVISORY_AGE,
   SETTING_KEYS.UI_NEXT_UP_MODE,
 ];
 
@@ -410,6 +411,14 @@ export default function PlaybackSettings() {
     capabilities.data,
     SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE,
   );
+  const supportsThemeMusic = settingsCapabilitiesSupportKey(
+    capabilities.data,
+    SETTING_KEYS.UI_THEME_MUSIC_ENABLED,
+  );
+  const supportsThemeMusicLoop = settingsCapabilitiesSupportKey(
+    capabilities.data,
+    SETTING_KEYS.UI_THEME_MUSIC_LOOP,
+  );
   /**
    * Which intro control this server can honestly show.
    *
@@ -429,13 +438,19 @@ export default function PlaybackSettings() {
   const playbackKeys = useMemo(
     () => [
       ...BASE_PLAYBACK_KEYS,
+      ...(supportsThemeMusic ? [SETTING_KEYS.UI_THEME_MUSIC_ENABLED] : []),
+      ...(supportsThemeMusicLoop ? [SETTING_KEYS.UI_THEME_MUSIC_LOOP] : []),
       supportsIntroSkipMode
         ? SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE
         : SETTING_KEYS.PLAYBACK_AUTO_SKIP_INTRO,
     ],
-    [supportsIntroSkipMode],
+    [supportsIntroSkipMode, supportsThemeMusic, supportsThemeMusicLoop],
   );
-  const { data: effective } = useEffectiveSettings({ keys: playbackKeys });
+  const {
+    data: effective,
+    isPending: effectivePending,
+    isError: effectiveError,
+  } = useEffectiveSettings({ keys: playbackKeys });
   const {
     save: saveProfileDefault,
     reset: resetProfileDefault,
@@ -508,6 +523,35 @@ export default function PlaybackSettings() {
         description="These preferences apply unless a library or item has a more specific playback choice."
       >
         <QualitySetting />
+        {supportsThemeMusic ? (
+          <SettingRow
+            label={SETTING_DEFINITIONS[SETTING_KEYS.UI_THEME_MUSIC_ENABLED].label}
+            description={SETTING_DEFINITIONS[SETTING_KEYS.UI_THEME_MUSIC_ENABLED].description}
+            control={(id) => (
+              <Switch
+                id={id}
+                checked={read<boolean>(SETTING_KEYS.UI_THEME_MUSIC_ENABLED)}
+                disabled={pending || effectivePending || effectiveError}
+                onCheckedChange={(value) => saveValue(SETTING_KEYS.UI_THEME_MUSIC_ENABLED, value)}
+              />
+            )}
+          />
+        ) : null}
+
+        {supportsThemeMusicLoop ? (
+          <SettingRow
+            label={SETTING_DEFINITIONS[SETTING_KEYS.UI_THEME_MUSIC_LOOP].label}
+            description={SETTING_DEFINITIONS[SETTING_KEYS.UI_THEME_MUSIC_LOOP].description}
+            control={(id) => (
+              <Switch
+                id={id}
+                checked={read<boolean>(SETTING_KEYS.UI_THEME_MUSIC_LOOP)}
+                disabled={pending || effectivePending || effectiveError}
+                onCheckedChange={(value) => saveValue(SETTING_KEYS.UI_THEME_MUSIC_LOOP, value)}
+              />
+            )}
+          />
+        ) : null}
 
         <SettingRow
           label="Spoken language"
@@ -544,6 +588,21 @@ export default function PlaybackSettings() {
             saveValue(SETTING_KEYS.CATALOG_METADATA_LANGUAGE, language)
           }
           onOverridesChange={saveMetadataOverrides}
+        />
+
+        <SettingRow
+          label="Show advisory age"
+          description="Show a suggested minimum viewer age, such as Common Sense Media's, on item detail. This is advice for you, not a restriction: it never changes what anyone can watch."
+          control={(id) => (
+            <Switch
+              id={id}
+              checked={read<boolean>(SETTING_KEYS.CATALOG_SHOW_ADVISORY_AGE)}
+              disabled={pending}
+              onCheckedChange={(checked) =>
+                saveValue(SETTING_KEYS.CATALOG_SHOW_ADVISORY_AGE, checked)
+              }
+            />
+          )}
         />
 
         {introSkipControl === "mode" ? (

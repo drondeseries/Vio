@@ -5215,6 +5215,39 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/catalog/items/{id}/themes/{theme_id}/audio": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["getThemeSongAudio"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head: operations["headThemeSongAudio"];
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/catalog/items/{id}/themes/{theme_id}/playback": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Authorize theme audio for this account and profile, routed like video playback and converted to AAC when the client cannot decode the original. */
+    post: operations["createThemeSongPlayback"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/catalog/items/{id}/trailers/refresh": {
     parameters: {
       query?: never;
@@ -5394,6 +5427,23 @@ export interface paths {
     };
     /** The episodes of one season of a series by number. */
     get: operations["listSeasonEpisodes"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/catalog/themes/capabilities": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Local theme audio support and delivery limitations. */
+    get: operations["getThemeSongsCapability"];
     put?: never;
     post?: never;
     delete?: never;
@@ -6279,7 +6329,10 @@ export interface paths {
     /** Page the calling device's series monitors, including paused monitors. */
     get: operations["listDownloadSubscriptions"];
     put?: never;
-    /** Create a monitor or return the existing monitor without changing it. Sync explicitly after receipt; do not automatically resend an uncertain create. */
+    /**
+     * Create a monitor or return the device's existing monitor for the series.
+     * @description An existing monitor keeps its options and forgets the episodes deleted under it, so the next sync can register them again. Sync explicitly after receipt; do not automatically resend an uncertain create.
+     */
     post: operations["createDownloadSubscription"];
     delete?: never;
     options?: never;
@@ -16296,6 +16349,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       backdrop_thumbhash?: string;
       /** @description Presigned, short-lived */
       backdrop_url?: string;
@@ -16414,6 +16479,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       /** @description Calendar date, YYYY-MM-DD */
       air_date?: string;
       air_time?: string;
@@ -16547,6 +16624,7 @@ export interface components {
       /** @description Empty, never null */
       subtitles: components["schemas"]["SubtitleInfo"][];
       tagline?: string;
+      themes?: components["schemas"]["ThemeSongSet"];
       /** @example Heat */
       title: string;
       tmdb_id?: string;
@@ -17400,11 +17478,13 @@ export interface components {
     };
     ConnectionUpdate: {
       export_favorites_enabled?: boolean;
+      export_ratings_enabled?: boolean;
       export_unwatched_enabled?: boolean;
       export_watched_enabled?: boolean;
       export_watchlist_enabled?: boolean;
       import_favorites_enabled?: boolean;
       import_progress_enabled?: boolean;
+      import_ratings_enabled?: boolean;
       import_watched_enabled?: boolean;
       import_watchlist_enabled?: boolean;
       scrobble_enabled?: boolean;
@@ -18935,6 +19015,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       backdrop_thumbhash?: string;
       /** @description Presigned, short-lived */
       backdrop_url?: string;
@@ -25004,6 +25096,18 @@ export interface components {
       reason: string;
       retryable: boolean;
     };
+    ThemeAudioFormat: {
+      /**
+       * @description Codec, lower case, e.g. mp3, aac, alac, flac, vorbis, opus, pcm. Empty accepts any codec in the container
+       * @example vorbis
+       */
+      audio_codec?: string;
+      /**
+       * @description File container, lower case, e.g. mp3, mp4, m4a, flac, ogg, opus, wav, aac
+       * @example ogg
+       */
+      container: string;
+    };
     ThemeCatalogCapabilitiesOutputBody: {
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
@@ -25060,6 +25164,59 @@ export interface components {
     ThemeOverrides: {
       raw_css: string;
       vars: string;
+    };
+    ThemePlayback: {
+      /**
+       * @description Media type of the audio at url
+       * @example audio/mpeg
+       */
+      content_type: string;
+      /**
+       * @description converted is progressive AAC in audio-only MP4 with no length and no byte ranges; fetch a new grant to replay it
+       * @enum {string}
+       */
+      delivery: "original" | "converted";
+      /** Format: date-time */
+      expires_at: string;
+      /** @description Short-lived credential; do not log, persist, or share. Relative to this server, or an absolute URL on a proxy node's origin */
+      url: string;
+    };
+    ThemePlaybackRequest: {
+      /** @description Container and codec pairs the client decodes. The original is chosen when it matches; otherwise AAC in audio-only MP4 when an mp4 (or m4a) entry accepts aac or any codec. Unknown values are ignored */
+      accepted_formats?: components["schemas"]["ThemeAudioFormat"][];
+    };
+    ThemeSong: {
+      container: string;
+      /** Format: int64 */
+      duration_seconds: number;
+      id: string;
+      title: string;
+    };
+    ThemeSongsCapability: {
+      /** @description Whether the current principal may use the capability */
+      allowed: boolean;
+      /** @description Theme audio can be served by worker nodes */
+      cluster_routing: boolean;
+      /**
+       * @description routed: themes follow the playback routing policy, so audio may come from a proxy node on another origin; local_direct_play: audio comes from this API origin only
+       * @enum {string}
+       */
+      delivery: "local_direct_play" | "routed";
+      /** Format: int64 */
+      grant_lifetime_seconds: number;
+      /** @description Opaque revision of this document */
+      revision: string;
+      /**
+       * @description Support and configuration state, not health
+       * @enum {string}
+       */
+      state: "available" | "disabled" | "not_configured" | "unsupported";
+      /** @description A theme the client cannot decode can be converted to AAC in audio-only MP4 when the client accepts it */
+      transcode: boolean;
+    };
+    ThemeSongSet: {
+      items: components["schemas"]["ThemeSong"][];
+      owner_id: string;
     };
     TimelineV3: {
       can_seek_anywhere: boolean;
@@ -25766,11 +25923,13 @@ export interface components {
     };
     WatchProviderCapabilities: {
       export_favorites: boolean;
+      export_ratings: boolean;
       export_unwatched: boolean;
       export_watched: boolean;
       export_watchlist: boolean;
       import_favorites: boolean;
       import_progress: boolean;
+      import_ratings: boolean;
       import_watched: boolean;
       import_watchlist: boolean;
       provides_watchlist_order: boolean;
@@ -25786,11 +25945,13 @@ export interface components {
       credentials_configured: boolean;
       display_name: string;
       export_favorites_enabled: boolean;
+      export_ratings_enabled: boolean;
       export_unwatched_enabled: boolean;
       export_watched_enabled: boolean;
       export_watchlist_enabled: boolean;
       import_favorites_enabled: boolean;
       import_progress_enabled: boolean;
+      import_ratings_enabled: boolean;
       import_watched_enabled: boolean;
       import_watchlist_enabled: boolean;
       last_error?: string;
@@ -25854,11 +26015,15 @@ export interface components {
     };
     WatchProviderSettings: {
       export_favorites_enabled: boolean;
+      /** @description Send the profile's star ratings to the provider (stars times two) and clear removed ones. */
+      export_ratings_enabled: boolean;
       export_unwatched_enabled: boolean;
       export_watched_enabled: boolean;
       export_watchlist_enabled: boolean;
       import_favorites_enabled: boolean;
       import_progress_enabled: boolean;
+      /** @description Import the provider's movie and series ratings as stars (1-2 is 1 star, 9-10 is 5 stars). */
+      import_ratings_enabled: boolean;
       import_watched_enabled: boolean;
       import_watchlist_enabled: boolean;
       scrobble_enabled: boolean;
@@ -25910,6 +26075,10 @@ export interface components {
       /** Format: int64 */
       inbound_progress_imported: number;
       /** Format: int64 */
+      inbound_ratings_found: number;
+      /** Format: int64 */
+      inbound_ratings_imported: number;
+      /** Format: int64 */
       inbound_watched_found: number;
       /** Format: int64 */
       inbound_watched_imported: number;
@@ -25923,6 +26092,16 @@ export interface components {
       outbound_favorites_sent: number;
       /** Format: int64 */
       outbound_found: number;
+      /**
+       * Format: int64
+       * @description Movie and series ratings the profile holds.
+       */
+      outbound_ratings_found: number;
+      /**
+       * Format: int64
+       * @description Ratings set or cleared on the provider.
+       */
+      outbound_ratings_sent: number;
       /** Format: int64 */
       outbound_sent: number;
       /** Format: int64 */
@@ -26339,6 +26518,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       backdrop_thumbhash?: string;
       /** @description Presigned, short-lived */
       backdrop_url?: string;
@@ -26486,6 +26677,18 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       added_at?: string;
+      /**
+       * Format: int64
+       * @description Recommended minimum viewer age from an advisory service. Display only: it is never enforced and never narrows what a profile may watch
+       * @example 13
+       */
+      advisory_age?: number;
+      /**
+       * @description Who recommended advisory_age
+       * @example commonsense
+       * @enum {string}
+       */
+      advisory_source?: "commonsense" | "mdblist";
       backdrop_thumbhash?: string;
       /** @description Presigned, short-lived */
       backdrop_url?: string;
@@ -46735,7 +46938,7 @@ export interface operations {
         user_id?: number;
       };
       header: {
-        /** @description Browser origin must match the configured public origin. */
+        /** @description Browser origin must match the configured public origin, the request origin, or a connected network access overlay origin. */
         Origin?: string;
         /** @description Offer silo.admin-logs.v2 followed by silo.ticket.<single-use-ticket>. */
         "Sec-WebSocket-Protocol": string;
@@ -73754,6 +73957,407 @@ export interface operations {
       };
     };
   };
+  getThemeSongAudio: {
+    parameters: {
+      query: {
+        /** @description Short-lived theme playback grant */
+        token: string;
+      };
+      header?: {
+        "If-Match"?: string;
+        "If-Modified-Since"?: string;
+        "If-None-Match"?: string;
+        "If-Range"?: string;
+        "If-Unmodified-Since"?: string;
+        Range?: string;
+      };
+      path: {
+        id: string;
+        theme_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Original audio, or for a converted grant progressive AAC in audio-only MP4 with no length or ranges */
+      200: {
+        headers: {
+          "Accept-Ranges"?: string;
+          "Cache-Control"?: string;
+          "Content-Length"?: string;
+          "Content-Range"?: string;
+          "Content-Type"?: string;
+          ETag?: string;
+          "Last-Modified"?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "audio/aac": string;
+          "audio/flac": string;
+          "audio/mp4": string;
+          "audio/mpeg": string;
+          "audio/ogg": string;
+          "audio/wav": string;
+          "multipart/byteranges": string;
+        };
+      };
+      /** @description Requested byte range */
+      206: {
+        headers: {
+          "Accept-Ranges"?: string;
+          "Cache-Control"?: string;
+          "Content-Length"?: string;
+          "Content-Range"?: string;
+          "Content-Type"?: string;
+          ETag?: string;
+          "Last-Modified"?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "audio/aac": string;
+          "audio/flac": string;
+          "audio/mp4": string;
+          "audio/mpeg": string;
+          "audio/ogg": string;
+          "audio/wav": string;
+          "multipart/byteranges": string;
+        };
+      };
+      /** @description Audio unchanged */
+      304: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Requested Range Not Satisfiable */
+      416: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  headThemeSongAudio: {
+    parameters: {
+      query: {
+        /** @description Short-lived theme playback grant */
+        token: string;
+      };
+      header?: {
+        "If-Match"?: string;
+        "If-Modified-Since"?: string;
+        "If-None-Match"?: string;
+        "If-Range"?: string;
+        "If-Unmodified-Since"?: string;
+        Range?: string;
+      };
+      path: {
+        id: string;
+        theme_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Original audio, or for a converted grant progressive AAC in audio-only MP4 with no length or ranges */
+      200: {
+        headers: {
+          "Accept-Ranges"?: string;
+          "Cache-Control"?: string;
+          "Content-Length"?: string;
+          "Content-Range"?: string;
+          "Content-Type"?: string;
+          ETag?: string;
+          "Last-Modified"?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Requested byte range */
+      206: {
+        headers: {
+          "Accept-Ranges"?: string;
+          "Cache-Control"?: string;
+          "Content-Length"?: string;
+          "Content-Range"?: string;
+          "Content-Type"?: string;
+          ETag?: string;
+          "Last-Modified"?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Audio unchanged */
+      304: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Requested Range Not Satisfiable */
+      416: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  createThemeSongPlayback: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        id: string;
+        theme_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        "application/json": components["schemas"]["ThemePlaybackRequest"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ThemePlayback"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   refreshCatalogItemTrailers: {
     parameters: {
       query?: never;
@@ -75051,6 +75655,138 @@ export interface operations {
       /** @description Not Acceptable */
       406: {
         headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getThemeSongsCapability: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ThemeSongsCapability"];
+        };
+      };
+      /** @description The representation named by If-None-Match is current; no body. */
+      304: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
           [name: string]: unknown;
         };
         content: {
@@ -85833,7 +86569,7 @@ export interface operations {
         channels?: string;
       };
       header: {
-        /** @description Browser origin must match the configured public origin. */
+        /** @description Browser origin must match the configured public origin, the request origin, or a connected network access overlay origin. */
         Origin?: string;
         /** @description Offer silo.events.v2 followed by silo.ticket.<single-use-ticket>. */
         "Sec-WebSocket-Protocol": string;
@@ -99306,7 +100042,7 @@ export interface operations {
     parameters: {
       query?: never;
       header: {
-        /** @description Browser origin must match the configured public origin. */
+        /** @description Browser origin must match the configured public origin, the request origin, or a connected network access overlay origin. */
         Origin?: string;
         /** @description Offer silo.playback-control.v2 followed by silo.ticket.<single-use-ticket>. */
         "Sec-WebSocket-Protocol": string;
@@ -109018,6 +109754,8 @@ export interface operations {
         duration?: number;
         /** @description Source media file the inventory URL names; must be the plan's effective or requested file. */
         file_id?: string;
+        /** @description 1 on a .srt URL published under subrip_sidecar_v1: serve the stored SRT bytes instead of the WebVTT conversion. */
+        original?: string;
         /** @description Seek position in seconds for windowed text extraction. */
         position?: number;
         /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
@@ -109035,7 +109773,7 @@ export interface operations {
       };
       path: {
         session_id: string;
-        /** @description Combined subtitle ordinal from the plan inventory, optionally suffixed with the sidecar extension (.vtt, .ass, .sup) the inventory URL carries. */
+        /** @description Combined subtitle ordinal from the plan inventory, optionally suffixed with the sidecar extension (.vtt, .ass, .sup, .srt) the inventory URL carries. */
         track: string;
       };
       cookie?: never;
@@ -109166,6 +109904,8 @@ export interface operations {
         duration?: number;
         /** @description Source media file the inventory URL names; must be the plan's effective or requested file. */
         file_id?: string;
+        /** @description 1 on a .srt URL published under subrip_sidecar_v1: serve the stored SRT bytes instead of the WebVTT conversion. */
+        original?: string;
         /** @description Seek position in seconds for windowed text extraction. */
         position?: number;
         /** @description Signed stream reference the plan URL carries; it reconstructs the session after a restart. Omitted for header-authenticated media. Account and viewer authorization are always required. */
@@ -109183,7 +109923,7 @@ export interface operations {
       };
       path: {
         session_id: string;
-        /** @description Combined subtitle ordinal from the plan inventory, optionally suffixed with the sidecar extension (.vtt, .ass, .sup) the inventory URL carries. */
+        /** @description Combined subtitle ordinal from the plan inventory, optionally suffixed with the sidecar extension (.vtt, .ass, .sup, .srt) the inventory URL carries. */
         track: string;
       };
       cookie?: never;
@@ -117155,7 +117895,7 @@ export interface operations {
     parameters: {
       query?: never;
       header: {
-        /** @description Browser origin must match configured public origin. */
+        /** @description Browser origin must match the configured public origin, the request origin, or a connected network access overlay origin. */
         Origin?: string;
         /** @description Offer silo.room.v2 followed by silo.ticket.<single-use-ticket>. */
         "Sec-WebSocket-Protocol": string;

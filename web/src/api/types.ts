@@ -1167,6 +1167,10 @@ export interface ItemExtra {
 }
 
 export interface ItemDetail {
+  themes?: {
+    owner_id: string;
+    items: { id: string; title: string; duration_seconds: number; container: string }[];
+  };
   content_id: string;
   play_content_id?: string;
   type: "movie" | "series" | "season" | "episode" | "audiobook" | "ebook" | "manga" | "podcast";
@@ -1187,6 +1191,15 @@ export interface ItemDetail {
   pending_translation_language?: string;
   runtime: number;
   content_rating: string;
+  /**
+   * Recommended minimum viewer age from an advisory service, with
+   * advisory_source naming who recommended it. Display only: the advisory
+   * never restricts anything, and content_rating remains the certification
+   * that drives the server's content-rating ceiling. Absent means "no
+   * advisory fetched", never "suitable for everyone".
+   */
+  advisory_age?: number | null;
+  advisory_source?: string;
   genres: string[];
   rating_imdb: number | null;
   rating_tmdb: number | null;

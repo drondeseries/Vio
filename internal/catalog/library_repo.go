@@ -240,18 +240,18 @@ func (r *LibraryItemRepository) GetItemsInFolders(ctx context.Context, contentID
 // The emitted SQL is built by buildFilterAccessibleContentIDsSQL so its shape
 // (placeholder numbering, the parent-series join for episodes, the optional
 // rating predicate) is unit-testable without a database.
-func (r *LibraryItemRepository) FilterAccessibleContentIDs(ctx context.Context, contentIDs []string, allowedFolderIDs, disabledFolderIDs []int, maxContentRating string) (map[string]bool, error) {
-	return filterAccessibleContentIDs(ctx, r.pool, contentIDs, allowedFolderIDs, disabledFolderIDs, maxContentRating)
+func (r *LibraryItemRepository) FilterAccessibleContentIDs(ctx context.Context, contentIDs []string, allowedFolderIDs, disabledFolderIDs []int, maxContentRating string, allowUnratedContent bool) (map[string]bool, error) {
+	return filterAccessibleContentIDs(ctx, r.pool, contentIDs, allowedFolderIDs, disabledFolderIDs, maxContentRating, allowUnratedContent)
 }
 
 // FilterAccessibleContentIDsInTransaction uses the same catalog visibility query
 // as ordinary reads, in the caller's consistent snapshot.
-func FilterAccessibleContentIDsInTransaction(ctx context.Context, tx pgx.Tx, contentIDs []string, allowedFolderIDs, disabledFolderIDs []int, maxContentRating string) (map[string]bool, error) {
-	return filterAccessibleContentIDs(ctx, tx, contentIDs, allowedFolderIDs, disabledFolderIDs, maxContentRating)
+func FilterAccessibleContentIDsInTransaction(ctx context.Context, tx pgx.Tx, contentIDs []string, allowedFolderIDs, disabledFolderIDs []int, maxContentRating string, allowUnratedContent bool) (map[string]bool, error) {
+	return filterAccessibleContentIDs(ctx, tx, contentIDs, allowedFolderIDs, disabledFolderIDs, maxContentRating, allowUnratedContent)
 }
 func filterAccessibleContentIDs(ctx context.Context, db interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, contentIDs []string, allowedFolderIDs, disabledFolderIDs []int, maxContentRating string) (map[string]bool, error) {
+}, contentIDs []string, allowedFolderIDs, disabledFolderIDs []int, maxContentRating string, allowUnratedContent bool) (map[string]bool, error) {
 	result := make(map[string]bool, len(contentIDs))
 	if len(contentIDs) == 0 {
 		return result, nil
@@ -261,16 +261,22 @@ func filterAccessibleContentIDs(ctx context.Context, db interface {
 		return result, nil
 	}
 
-	var allowedRatings []string
-	if maxContentRating != "" {
-		allowedRatings = access.AllowedRatingsUpTo(maxContentRating)
-		if len(allowedRatings) == 0 {
-			// Ceiling permits no ratings → nothing is accessible.
+	var ceilingAge *int
+	// access.HasCeiling, not a trimmed emptiness test, so this agrees with
+	// ApplyContentRatingCeiling: a stored " " is a set ceiling that resolves to
+	// nothing, and it must block here too. These callers are the progress list
+	// and sync paths, so treating it as absent would let a viewer read and
+	// write progress for titles the catalog hides from them.
+	if access.HasCeiling(maxContentRating) {
+		age, ok := access.AgeForCeiling(maxContentRating)
+		if !ok {
+			// Ceiling names no usable age → nothing is accessible.
 			return result, nil
 		}
+		ceilingAge = age
 	}
 
-	query, args := buildFilterAccessibleContentIDsSQL(contentIDs, allowedFolderIDs, disabledFolderIDs, allowedRatings)
+	query, args := buildFilterAccessibleContentIDsSQL(contentIDs, allowedFolderIDs, disabledFolderIDs, ceilingAge, allowUnratedContent)
 
 	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
@@ -294,15 +300,15 @@ func filterAccessibleContentIDs(ctx context.Context, db interface {
 // buildFilterAccessibleContentIDsSQL builds the membership/rating query used by
 // FilterAccessibleContentIDs. It is a pure function (no DB access) so the query
 // shape can be unit-tested. allowedRatings must already be resolved via
-// access.AllowedRatingsUpTo (nil/empty means no rating ceiling); the caller
-// handles the "permits nothing" early-outs.
+// access.AgeForCeiling (nil means no rating ceiling); the caller handles the
+// "permits nothing" early-outs.
 //
 // The structure mirrors ItemRepository.EnsureAccessible: select FROM the owning
 // media_items row, gate library membership through the shared per-item
 // EXISTS / NOT EXISTS predicates (libraryAccessConditions), and resolve
 // episodes through their parent series so an episode is gated on
 // EnsureAccessible(series_id)-equivalent membership.
-func buildFilterAccessibleContentIDsSQL(contentIDs []string, allowedFolderIDs, disabledFolderIDs []int, allowedRatings []string) (string, []any) {
+func buildFilterAccessibleContentIDsSQL(contentIDs []string, allowedFolderIDs, disabledFolderIDs []int, ceilingAge *int, allowUnratedContent bool) (string, []any) {
 	args := []any{contentIDs}
 	var allowedIdx, disabledIdx, ratingIdx int
 	if allowedFolderIDs != nil {
@@ -313,8 +319,8 @@ func buildFilterAccessibleContentIDsSQL(contentIDs []string, allowedFolderIDs, d
 		args = append(args, disabledFolderIDs)
 		disabledIdx = len(args)
 	}
-	if len(allowedRatings) > 0 {
-		args = append(args, allowedRatings)
+	if ceilingAge != nil {
+		args = append(args, *ceilingAge)
 		ratingIdx = len(args)
 	}
 
@@ -329,7 +335,7 @@ func buildFilterAccessibleContentIDsSQL(contentIDs []string, allowedFolderIDs, d
 	itemConds = append(itemConds, libraryAccessConditions("mi.content_id", allowedIdx, disabledIdx)...)
 	episodeConds = append(episodeConds, libraryAccessConditions("e.series_id", allowedIdx, disabledIdx)...)
 	if ratingIdx > 0 {
-		rc := fmt.Sprintf("mi.content_rating = ANY($%d)", ratingIdx)
+		rc := contentRatingCeilingSQL("mi", allowUnratedContent, ratingIdx)
 		itemConds = append(itemConds, rc)
 		episodeConds = append(episodeConds, rc)
 	}
@@ -520,31 +526,11 @@ func (r *LibraryItemRepository) ReconcileFolderMembership(ctx context.Context, f
 			}
 		}
 
-		// Collect image paths before deletion.
 		if len(orphanIDs) > 0 {
-			orphanedImageDirs, err = collectImageDirs(ctx, tx, orphanIDs)
+			var deletedContentIDs []string
+			deletedContentIDs, orphanedImageDirs, err = deleteOrphanedItemsAndImageDirs(ctx, tx, orphanIDs)
 			if err != nil {
 				return 0, 0, nil, err
-			}
-		}
-
-		if len(orphanIDs) > 0 {
-			rows, err := tx.Query(ctx, `
-				DELETE FROM media_items mi
-				WHERE mi.content_id = ANY($1)
-				  AND NOT EXISTS (
-					SELECT 1
-					FROM media_item_libraries mil
-					WHERE mil.content_id = mi.content_id
-				  )
-				RETURNING mi.content_id
-			`, orphanIDs)
-			if err != nil {
-				return 0, 0, nil, fmt.Errorf("deleting orphaned media items after folder reconciliation: %w", err)
-			}
-			deletedContentIDs, err := pgx.CollectRows(rows, pgx.RowTo[string])
-			if err != nil {
-				return 0, 0, nil, fmt.Errorf("collecting deleted orphaned media item IDs: %w", err)
 			}
 			deletedItems = len(deletedContentIDs)
 			if err := EnqueueSearchIndexDeletes(ctx, tx, deletedContentIDs); err != nil {
@@ -558,6 +544,49 @@ func (r *LibraryItemRepository) ReconcileFolderMembership(ctx context.Context, f
 	}
 
 	return len(removedContentIDs), deletedItems, orphanedImageDirs, nil
+}
+
+// deleteOrphanedItemsAndImageDirs deletes the orphanIDs that still have no
+// library membership and returns the IDs it deleted, plus the artwork
+// directories that no surviving row references any more.
+//
+// The directories are filtered after the DELETE, against the IDs it actually
+// removed. orphanIDs was read earlier in the transaction, and a concurrent scan
+// can link one of those items to a library before the DELETE runs; the guarded
+// DELETE then keeps it. Filtering before the DELETE would have treated that
+// item as gone and reported its directories as unreferenced, so the caller
+// would delete artwork a surviving item still uses. The raw paths are read
+// first because the deleted rows are gone afterwards.
+func deleteOrphanedItemsAndImageDirs(ctx context.Context, tx pgx.Tx, orphanIDs []string) ([]string, []string, error) {
+	rawImageDirs, err := collectRawImageDirs(ctx, tx, orphanIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err := tx.Query(ctx, `
+		DELETE FROM media_items mi
+		WHERE mi.content_id = ANY($1)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM media_item_libraries mil
+			WHERE mil.content_id = mi.content_id
+		  )
+		RETURNING mi.content_id
+	`, orphanIDs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("deleting orphaned media items after folder reconciliation: %w", err)
+	}
+	deletedContentIDs, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, nil, fmt.Errorf("collecting deleted orphaned media item IDs: %w", err)
+	}
+	if len(deletedContentIDs) == 0 || len(rawImageDirs) == 0 {
+		return deletedContentIDs, nil, nil
+	}
+	imageDirs, err := filterUnreferencedImageDirs(ctx, tx, rawImageDirs, deletedContentIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return deletedContentIDs, imageDirs, nil
 }
 
 func collectFolderFileOrphanIDs(ctx context.Context, tx pgx.Tx, folderID int) ([]string, error) {

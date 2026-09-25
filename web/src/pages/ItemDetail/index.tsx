@@ -1,3 +1,4 @@
+import { useThemeMusic } from "./useThemeMusic";
 import { useEffect, useState } from "react";
 import { Navigate, useParams, useSearchParams } from "react-router";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
@@ -22,6 +23,7 @@ import {
   useSidebarItemEnteredFromHome,
 } from "@/components/sidebarItemNavigationContext";
 import { parseOptionalLibraryId } from "@/components/sidebarItemNavigation";
+import { useShowAdvisoryAge } from "@/hooks/useShowAdvisoryAge";
 
 function ItemDetailSkeleton() {
   return (
@@ -167,9 +169,14 @@ export default function ItemDetail() {
   const libraryId = parseOptionalLibraryId(searchParams.get("libraryId"));
   const { data: item, isLoading: loading, error: itemError } = useCatalogItemDetail(id, libraryId);
   const itemDetailsReady = useSidebarItemDetailsReady();
+  // Resolved once here rather than in each content component: the badge is a
+  // display choice, and a leaf component should not have to fetch to render.
+  // Items without an advisory skip the lookup, which is most of them.
+  const showAdvisoryAge = useShowAdvisoryAge(item?.advisory_age != null);
   const enteredItemFromHome = useSidebarItemEnteredFromHome();
 
   useDocumentTitle(item?.title ?? "Item");
+  useThemeMusic(item, loading);
 
   useEffect(() => {
     if (itemError) {
@@ -190,9 +197,19 @@ export default function ItemDetail() {
 
   switch (item.type) {
     case "movie":
-      return <MovieContent item={item as ItemDetail & { type: "movie" }} />;
+      return (
+        <MovieContent
+          item={item as ItemDetail & { type: "movie" }}
+          showAdvisoryAge={showAdvisoryAge}
+        />
+      );
     case "series":
-      return <SeriesContent item={item as ItemDetail & { type: "series" }} />;
+      return (
+        <SeriesContent
+          item={item as ItemDetail & { type: "series" }}
+          showAdvisoryAge={showAdvisoryAge}
+        />
+      );
     case "season":
       return <SeasonContent item={item as ItemDetail & { type: "season" }} />;
     case "episode":
@@ -202,9 +219,21 @@ export default function ItemDetail() {
         <AudiobookContent item={item as ItemDetail & { type: "audiobook" }} libraryId={libraryId} />
       );
     case "ebook":
-      return <EbookContent item={item as ItemDetail & { type: "ebook" }} libraryId={libraryId} />;
+      return (
+        <EbookContent
+          item={item as ItemDetail & { type: "ebook" }}
+          libraryId={libraryId}
+          showAdvisoryAge={showAdvisoryAge}
+        />
+      );
     case "manga":
-      return <MangaContent item={item as ItemDetail & { type: "manga" }} libraryId={libraryId} />;
+      return (
+        <MangaContent
+          item={item as ItemDetail & { type: "manga" }}
+          libraryId={libraryId}
+          showAdvisoryAge={showAdvisoryAge}
+        />
+      );
     case "podcast":
       return <Navigate to={`/podcasts/show/${item.content_id}`} replace />;
     default:
