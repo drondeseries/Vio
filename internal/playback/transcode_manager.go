@@ -1099,6 +1099,7 @@ func (m *TranscodeManager) CloseTranscodeSession(sessionID, transcodeNodeURL str
 	delete(m.transcodes, sessionID)
 	retained := m.retired[sessionID]
 	delete(m.retired, sessionID)
+	stopRetainedTimerLocked(retained)
 	m.transcodeMu.Unlock()
 	if session != nil {
 		_ = session.Close()
@@ -1118,6 +1119,12 @@ func (m *TranscodeManager) CloseTranscodeSession(sessionID, transcodeNodeURL str
 type RetainedGeneration struct {
 	Session   *TranscodeSession
 	ExpiresAt time.Time
+	// timer reaps the entry at ExpiresAt even when no serve request ever reads
+	// it. Read-time reaping alone would leave a displaced directory pinned past
+	// its window when a switch is lost before a successor is registered (for
+	// example the switching worker dying between retire and publish), until the
+	// coarse orphan sweep hours later. Guarded by transcodeMu.
+	timer *time.Timer
 }
 
 // RetainedGenerationRetention bounds how long a displaced generation stays
@@ -1151,17 +1158,58 @@ func (m *TranscodeManager) RetireTranscodeSessionPredecessor(sessionID string, p
 		m.retired = make(map[string]*RetainedGeneration)
 	}
 	// Replace any prior retained generation: only the most recently displaced
-	// bytes can still match the client's in-flight playlist.
-	if prior := m.retired[sessionID]; prior != nil && prior.Session != nil && prior.Session != predecessor {
-		_ = prior.Session.Close()
+	// bytes can still match the client's in-flight playlist. Its timer is
+	// stopped so a replaced entry cannot fire later.
+	if prior := m.retired[sessionID]; prior != nil {
+		stopRetainedTimerLocked(prior)
+		if prior.Session != nil && prior.Session != predecessor {
+			_ = prior.Session.Close()
+		}
 	}
-	m.retired[sessionID] = &RetainedGeneration{Session: predecessor, ExpiresAt: time.Now().Add(retention)}
+	entry := &RetainedGeneration{Session: predecessor, ExpiresAt: time.Now().Add(retention)}
+	m.retired[sessionID] = entry
+	// Reap at expiry even if no serve request ever reads the entry, so a switch
+	// lost before its successor is published cannot pin the directory past the
+	// bounded window.
+	entry.timer = time.AfterFunc(retention, func() {
+		m.reapRetainedIfCurrent(sessionID, entry)
+	})
 	m.transcodeMu.Unlock()
+}
+
+// reapRetainedIfCurrent removes and closes a retained generation only while the
+// map still holds this exact entry, so a replacement or an earlier read that
+// already reaped it is left untouched. It is the timer-driven counterpart of
+// the read-time reap in GetRetainedTranscodeSession.
+func (m *TranscodeManager) reapRetainedIfCurrent(sessionID string, entry *RetainedGeneration) {
+	if m == nil || entry == nil {
+		return
+	}
+	m.transcodeMu.Lock()
+	if m.retired[sessionID] != entry {
+		m.transcodeMu.Unlock()
+		return
+	}
+	delete(m.retired, sessionID)
+	m.transcodeMu.Unlock()
+	if entry.Session != nil {
+		_ = entry.Session.Close()
+	}
+}
+
+// stopRetainedTimerLocked stops an entry's expiry timer. Callers already hold
+// transcodeMu; the AfterFunc callback only ever takes the lock, so stopping
+// under it cannot deadlock (Stop does not wait for a running callback).
+func stopRetainedTimerLocked(entry *RetainedGeneration) {
+	if entry != nil && entry.timer != nil {
+		entry.timer.Stop()
+		entry.timer = nil
+	}
 }
 
 // GetRetainedTranscodeSession returns a displaced generation still inside its
 // overlap window, or nil. It reaps an expired entry (deleting its output dir)
-// on read so retention cannot outlive the window.
+// on read; the entry's own timer reaps it out-of-band when no read arrives.
 func (m *TranscodeManager) GetRetainedTranscodeSession(sessionID string) *TranscodeSession {
 	if m == nil {
 		return nil
@@ -1174,6 +1222,7 @@ func (m *TranscodeManager) GetRetainedTranscodeSession(sessionID string) *Transc
 	}
 	if !time.Now().Before(entry.ExpiresAt) {
 		delete(m.retired, sessionID)
+		stopRetainedTimerLocked(entry)
 		m.transcodeMu.Unlock()
 		if entry.Session != nil {
 			_ = entry.Session.Close()
@@ -1203,6 +1252,9 @@ func (m *TranscodeManager) StartShutdownCleanup(ctx context.Context) <-chan stru
 		m.transcodes = make(map[string]*TranscodeSession)
 		retired := m.retired
 		m.retired = make(map[string]*RetainedGeneration)
+		for _, entry := range retired {
+			stopRetainedTimerLocked(entry)
+		}
 		m.transcodeMu.Unlock()
 		for _, session := range transcodes {
 			if session != nil {
