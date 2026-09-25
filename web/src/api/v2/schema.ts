@@ -25602,6 +25602,7 @@ export interface components {
       /** Format: int64 */
       index?: number;
       language?: string;
+      path_key?: string;
       resolution?: string;
       title?: string;
     };
@@ -26220,6 +26221,7 @@ export interface components {
       index?: number;
       /** @example eng */
       language?: string;
+      path_key?: string;
       resolution?: string;
       title?: string;
     };

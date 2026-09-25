@@ -161,6 +161,11 @@ type WatchSubtitleTrack struct {
 	HearingImpaired bool   `json:"hearing_impaired"`
 	External        bool   `json:"external"`
 	FileName        string `json:"file_name,omitempty"`
+	// PathKey is an opaque, stable hash of an external sidecar's full path.
+	// Two sidecars with the same basename in different directories keep
+	// distinct identities without exposing the server filesystem path. Empty
+	// for embedded tracks and for older servers that do not compute it.
+	PathKey string `json:"path_key,omitempty"`
 }
 
 // WatchChapter is one chapter of a version.
@@ -513,7 +518,7 @@ func watchVersionOf(v catalogpkg.FileVersion) WatchFileVersion {
 		out.AudioTracks = append(out.AudioTracks, WatchAudioTrack{Title: t.Title, EmbeddedTitle: t.EmbeddedTitle, Language: t.Language, Codec: t.Codec, Profile: t.Profile, Layout: t.Layout, Channels: t.Channels, Bitrate: t.Bitrate, SampleRate: t.SampleRate, BitDepth: t.BitDepth, Default: t.Default})
 	}
 	for _, t := range v.SubtitleTracks {
-		out.SubtitleTracks = append(out.SubtitleTracks, WatchSubtitleTrack{Index: t.Index, Language: t.Language, Codec: t.Codec, Title: t.Title, EmbeddedTitle: t.EmbeddedTitle, Resolution: t.Resolution, Forced: t.Forced, Default: t.Default, HearingImpaired: t.HearingImpaired, External: t.External, FileName: t.FileName})
+		out.SubtitleTracks = append(out.SubtitleTracks, WatchSubtitleTrack{Index: t.Index, Language: t.Language, Codec: t.Codec, Title: t.Title, EmbeddedTitle: t.EmbeddedTitle, Resolution: t.Resolution, Forced: t.Forced, Default: t.Default, HearingImpaired: t.HearingImpaired, External: t.External, FileName: t.FileName, PathKey: t.PathKey})
 	}
 	for _, c := range v.Chapters {
 		out.Chapters = append(out.Chapters, WatchChapter{Index: c.Index, Title: c.Title, StartSeconds: c.StartSeconds, EndSeconds: c.EndSeconds, Source: c.Source, ThumbnailURL: c.ThumbnailURL, ThumbnailThumbhash: c.ThumbnailThumbhash})

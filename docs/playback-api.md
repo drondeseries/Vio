@@ -265,6 +265,16 @@ builder. The web player applies the same mapping to realtime subtitle URLs.
 Absolute delivery URLs from distributed nodes retain their origin and path;
 signed query strings are preserved without decoding or re-encoding.
 
+### Sidecar identity
+
+A version's `subtitle_tracks` publishes external sidecars with their basename
+in `file_name` and an opaque `path_key` — a stable SHA-256 hash of the full
+sidecar path. The key lets a client keep two sidecars that share a basename in
+different directories distinct without publishing the server filesystem path;
+it mirrors the server's own sidecar de-duplication discriminator. `path_key` is
+absent on embedded tracks and on servers that predate it: a client falls back
+to `file_name` there, which cannot separate same-basename sidecars.
+
 ## Revocation
 
 Stop, session expiry or abort, and admin stop or terminate (v1 and v2) write the
