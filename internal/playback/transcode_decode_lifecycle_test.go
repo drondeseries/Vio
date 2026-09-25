@@ -612,6 +612,46 @@ func TestConfirmedRejectionReapsDespiteBlockedMarker(t *testing.T) {
 	}
 }
 
+// TestRestartDrivesSharedEvaluator proves restart is another entry into the one
+// lifecycle: a suspected generation whose observation deadline has passed is
+// confirmed by the restart call itself, refusing the rebuild with the typed
+// verdict even though no serving or waiter read happened first.
+func TestRestartDrivesSharedEvaluator(t *testing.T) {
+	base := time.Unix(22_500, 0)
+	s := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo:   "hevc",
+		CanonicalInputPath: "virtual://movie/tt-restart-eval?result=x",
+	}}
+	clock := attachDecodeClock(s, base)
+	tornDown := make(chan struct{})
+	s.mu.Lock()
+	s.cancel = func() { close(tornDown) }
+	s.done = make(chan struct{})
+	s.decodeReapTimeout = 200 * time.Millisecond
+	s.mu.Unlock()
+
+	stormDecode(s)
+	// Move the deadline into the past without evaluating via another path.
+	s.mu.Lock()
+	s.decodeSuspectAt = clock.Now().Add(-decodeObservationWindow)
+	// Read the raw latched flag, not IsSourceRejected, which would itself
+	// drive the evaluator and defeat the point of this test.
+	latched := s.sourceRejected
+	s.mu.Unlock()
+	if latched {
+		t.Fatal("precondition: verdict must not be latched before the restart drives the evaluator")
+	}
+
+	if err := s.Restart(context.Background(), 0, 0); !errors.Is(err, ErrSourceDecodeRejected) {
+		t.Fatalf("Restart err = %v, want ErrSourceDecodeRejected", err)
+	}
+	select {
+	case <-tornDown:
+	case <-time.After(2 * time.Second):
+		t.Fatal("evaluator-driven confirmation did not reap the process")
+	}
+}
+
 func writeDecodeSegment(t *testing.T, dir, name string, mtime time.Time) {
 	t.Helper()
 	path := filepath.Join(dir, name)

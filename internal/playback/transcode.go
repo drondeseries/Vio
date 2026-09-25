@@ -3567,6 +3567,11 @@ func (s *TranscodeSession) restart(
 	streamOriginSeconds float64,
 	copySeekAnchorResolved bool,
 ) error {
+	// Drive the shared evaluator before taking the lock: a suspected
+	// generation whose observation deadline has passed confirms here exactly as
+	// it would for serving or a waiter, so restart refuses the same way every
+	// other verdict path does.
+	s.evaluateDecodeVerdict()
 	s.mu.Lock()
 	// A source candidate already stamped known-bad must not be rebuilt: the
 	// caller rotates on the next failure recovery instead of looping on the
