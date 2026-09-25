@@ -129,6 +129,13 @@ func canonicalizeCompatPath(path string) string {
 		if part == "" {
 			continue
 		}
+		// LocalTrailers is matched only in its route position,
+		// /Items/{id}/LocalTrailers, so a DisplayPreferences id or other
+		// opaque value that happens to read "localtrailers" keeps its case.
+		if i >= 3 && strings.EqualFold(part, "localtrailers") && strings.EqualFold(parts[i-2], "items") {
+			parts[i] = "LocalTrailers"
+			continue
+		}
 		parts[i] = canonicalizeCompatSegment(part)
 	}
 	return strings.Join(parts, "/")
