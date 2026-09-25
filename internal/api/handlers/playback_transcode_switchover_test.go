@@ -76,10 +76,24 @@ func TestTranscodeSegmentServedFromRetainedSwitchoverGeneration(t *testing.T) {
 // TestTranscodeSegmentWithoutRetainedGenerationStaysNotFound proves the
 // fallback is inert outside the overlap: with no retained predecessor, a
 // missing segment keeps its pre-existing 404.
+//
+// The live generation is a copy-video session with no seek anchor available
+// for the missing segment, so its recovery path resolves no target and never
+// spawns ffmpeg. That keeps the assertion independent of an ambient host
+// ffmpeg: an encoded session would fall back to the process-wide ffmpeg
+// resolver, whose absence on CI surfaces as an unclassified exec error and a
+// 500 instead of the pre-existing 404 this test is about.
 func TestTranscodeSegmentWithoutRetainedGenerationStaysNotFound(t *testing.T) {
 	const sessionID = "no-retained-session"
 	liveDir := t.TempDir()
-	live := playback.NewTranscodeSessionForTest(liveDir)
+	live, err := playback.NewReadyTranscodeSessionForTesting(liveDir, playback.TranscodeOpts{
+		SessionID:        sessionID,
+		TargetCodecVideo: "copy",
+		SegmentDuration:  2,
+	})
+	if err != nil {
+		t.Fatalf("ready transcode session: %v", err)
+	}
 
 	sessions := playback.NewSessionManager(0, 0)
 	sessions.RegisterReconstructed(&playback.Session{

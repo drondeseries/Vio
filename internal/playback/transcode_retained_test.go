@@ -132,3 +132,24 @@ func TestShutdownCleanupClosesRetainedGenerations(t *testing.T) {
 		t.Fatalf("retained generation survived shutdown: %v", err)
 	}
 }
+
+// TestNilRetainedGenerationRegistryIsInert proves the serve-route lookup is
+// nil-tolerant: a manager with no retained registry (the pre-feature shape)
+// returns zero results and never errors, so the route falls through to its
+// pre-existing behavior instead of a 500.
+func TestNilRetainedGenerationRegistryIsInert(t *testing.T) {
+	var nilManager *TranscodeManager
+	if got := nilManager.GetRetainedTranscodeSession("s1"); got != nil {
+		t.Fatal("a nil manager must report no retained generation")
+	}
+	// A manager built as a bare struct literal has a nil retired map; the
+	// lookup must not panic or error on it.
+	bare := &TranscodeManager{}
+	if got := bare.GetRetainedTranscodeSession("s1"); got != nil {
+		t.Fatal("a nil retained map must report no retained generation")
+	}
+	bare.RetireTranscodeSessionPredecessor("s1", nil, RetainedGenerationRetention)
+	if got := bare.GetRetainedTranscodeSession("s1"); got != nil {
+		t.Fatal("retiring a nil predecessor must not register anything")
+	}
+}
