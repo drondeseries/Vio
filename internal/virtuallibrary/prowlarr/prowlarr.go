@@ -141,8 +141,9 @@ type virtualEpisode struct {
 	Available bool      `json:"available,omitempty"`
 }
 
-// NewSearchClient builds a SearchClient with an injectable HTTP client
-// (nil selects the restricted-redirect client).
+// NewSearchClient builds a SearchClient with an injectable HTTP client. A nil
+// client selects a restricted-redirect client whose timeout Configure sets
+// from the operator's indexer search timeout.
 func NewSearchClient(client *http.Client) *SearchClient {
 	return newProwlarrSearchClient(client)
 }
@@ -211,14 +212,17 @@ const (
 	defaultSearchCheckMinutes = 15
 	minSearchCheckMinutes     = 15
 	maxSearchCheckMinutes     = 10080
-	maxSearchBodyBytes        = 8 << 20
-	maxErrorBodyBytes         = 4 << 10
-	maxProwlarrIndexBytes     = 64 << 20
-	maxProwlarrIndexReleases  = 20000
-	prowlarrIndexRetention    = 14 * 24 * time.Hour
+	// defaultSearchTimeoutSeconds matches
+	// virtual_library.indexer_search_timeout_seconds' default and bounds.
+	defaultSearchTimeoutSeconds = 20
+	minSearchTimeoutSeconds     = 5
+	maxSearchTimeoutSeconds     = 120
+	maxSearchBodyBytes          = 8 << 20
+	maxErrorBodyBytes           = 4 << 10
+	maxProwlarrIndexBytes       = 64 << 20
+	maxProwlarrIndexReleases    = 20000
+	prowlarrIndexRetention      = 14 * 24 * time.Hour
 )
-
-var searchHTTPClient = newRestrictedRedirectHTTPClient(20 * time.Second)
 
 // prowlarrRelease is one result from Prowlarr's /api/v1/search endpoint.
 type prowlarrRelease struct {
@@ -256,22 +260,44 @@ func prepareProwlarrRelease(release *prowlarrRelease) {
 // search and refreshes it on a configurable interval (min 15 minutes). One
 // request covers every enabled indexer.
 type prowlarrSearchClient struct {
-	mu        sync.Mutex
-	url       string
-	apiKey    string
-	interval  time.Duration
-	client    *http.Client
-	lastFetch time.Time
-	lastErr   error
-	releases  []prowlarrRelease
-	indexFile string
+	mu       sync.Mutex
+	url      string
+	apiKey   string
+	interval time.Duration
+	// timeout bounds a single search request. It is the operator's
+	// virtual_library.indexer_search_timeout_seconds and applies only to the
+	// restricted-redirect client this package constructs.
+	timeout time.Duration
+	// injectedClient marks a caller-supplied HTTP client. Configure leaves
+	// that client untouched; only the package-built client follows the
+	// configured timeout.
+	injectedClient bool
+	client         *http.Client
+	lastFetch      time.Time
+	lastErr        error
+	releases       []prowlarrRelease
+	indexFile      string
 }
 
 func newProwlarrSearchClient(client *http.Client) *prowlarrSearchClient {
-	if client == nil {
-		client = searchHTTPClient
+	c := &prowlarrSearchClient{timeout: defaultSearchTimeoutSeconds * time.Second}
+	if client != nil {
+		c.client = client
+		c.injectedClient = true
 	}
-	return &prowlarrSearchClient{client: client}
+	return c
+}
+
+// httpClient returns the HTTP client for this configuration. The package-built
+// client honors the configured timeout; a caller-injected client is returned
+// as-is so its own transport semantics win.
+func (c *prowlarrSearchClient) httpClient() *http.Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client == nil {
+		c.client = newRestrictedRedirectHTTPClient(c.timeout)
+	}
+	return c.client
 }
 
 // URL returns the configured Prowlarr base URL, or empty string.
@@ -281,8 +307,10 @@ func (c *prowlarrSearchClient) URL() string {
 	return c.url
 }
 
-// Configure sets the Prowlarr base URL, API key, and check interval.
-func (c *prowlarrSearchClient) Configure(baseURL, apiKey string, intervalMinutes int) {
+// Configure sets the Prowlarr base URL, API key, check interval, and per-search
+// timeout. A timeout outside [minSearchTimeoutSeconds, maxSearchTimeoutSeconds]
+// falls back to the default, matching the admin-setting validator's bounds.
+func (c *prowlarrSearchClient) Configure(baseURL, apiKey string, intervalMinutes, timeoutSeconds int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	newURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
@@ -293,15 +321,25 @@ func (c *prowlarrSearchClient) Configure(baseURL, apiKey string, intervalMinutes
 	if intervalMinutes > maxSearchCheckMinutes {
 		intervalMinutes = maxSearchCheckMinutes
 	}
+	if timeoutSeconds < minSearchTimeoutSeconds || timeoutSeconds > maxSearchTimeoutSeconds {
+		timeoutSeconds = defaultSearchTimeoutSeconds
+	}
 	newInterval := time.Duration(intervalMinutes) * time.Minute
+	newTimeout := time.Duration(timeoutSeconds) * time.Second
 	if newURL != c.url || newKey != c.apiKey || newInterval != c.interval {
 		c.releases = nil
 		c.lastFetch = time.Time{}
 		c.lastErr = nil
 	}
+	// Rebuild only the package-built client; a caller-injected client owns its
+	// own timeout. newRestrictedRedirectHTTPClient keeps the redirect policy.
+	if !c.injectedClient && newTimeout != c.timeout {
+		c.client = newRestrictedRedirectHTTPClient(newTimeout)
+	}
 	c.url = newURL
 	c.apiKey = newKey
 	c.interval = newInterval
+	c.timeout = newTimeout
 }
 
 func (c *prowlarrSearchClient) ConfigureIndexFile(path string) error {
@@ -483,9 +521,9 @@ func (c *prowlarrSearchClient) search(ctx context.Context, item monitoredMedia) 
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.client.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return nil, errors.New("Prowlarr search request failed")
+		return nil, fmt.Errorf("Prowlarr search request failed: %w", err) //nolint:staticcheck // Prowlarr is a proper product name.
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -526,9 +564,9 @@ func (c *prowlarrSearchClient) refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.client.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		err = errors.New("Prowlarr search request failed")
+		err = fmt.Errorf("Prowlarr search request failed: %w", err) //nolint:staticcheck // Prowlarr is a proper product name.
 		c.mu.Lock()
 		c.lastErr = err
 		c.mu.Unlock()
@@ -899,8 +937,8 @@ func (c *prowlarrSearchClient) SearchItem(ctx context.Context, item monitoredMed
 // A non-nil episode narrows the match to that episode's release keys, so a
 // series search does not offer another episode's releases. Quality filtering
 // follows the same helpers as the cached Match paths so an operator's profile
-// settings mean the same thing here. The caller owns the timeout (the client's
-// shared HTTP client still bounds a single request at 20s).
+// settings mean the same thing here. The caller owns the request context; the
+// client's configured indexer search timeout still bounds a single request.
 func (c *prowlarrSearchClient) SearchMonitoredReleases(ctx context.Context, item monitoredMedia, episode *virtualEpisode, quality QualityConfig) ([]prowlarrRelease, error) {
 	releases, err := c.search(ctx, item)
 	if err != nil {
@@ -1197,7 +1235,7 @@ func (c *prowlarrSearchClient) Validate(ctx context.Context) (string, error) {
 	validateClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := validateClient.Do(req)
 	if err != nil {
-		return "", errors.New("connect to Prowlarr failed")
+		return "", fmt.Errorf("connect to Prowlarr failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

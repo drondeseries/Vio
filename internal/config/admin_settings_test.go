@@ -275,6 +275,8 @@ func TestNormalizeAdminSettingRejectsInvalidValues(t *testing.T) {
 		{key: "playback.segment_retention_seconds", value: "119"},
 		{key: "scanner.max_concurrent_libraries", value: "0"},
 		{key: "scanner.max_concurrent_scoped", value: "-1"},
+		{key: "virtual_library.indexer_search_timeout_seconds", value: "4"},
+		{key: "virtual_library.indexer_search_timeout_seconds", value: "121"},
 		{key: "scanner.empty_trash_after_scan", value: "sometimes"},
 		{key: "scanner.file_removal_grace", value: "a while"},
 		{key: "matcher.enable_tv_series_root_queue", value: "yes please"},
@@ -487,6 +489,27 @@ func TestNormalizeAdminSettingMaxVirtualFailoverAttempts(t *testing.T) {
 	}
 	if _, err := NormalizeAdminSetting("playback.max_virtual_failover_attempts", "51"); err == nil {
 		t.Fatal("expected error for > 50 max failover attempts")
+	}
+}
+
+// TestNormalizeAdminSettingIndexerSearchTimeoutRoundTrip proves the Prowlarr
+// search timeout accepts the documented 5-120 range and rejects values the
+// client would silently clamp.
+func TestNormalizeAdminSettingIndexerSearchTimeoutRoundTrip(t *testing.T) {
+	const key = "virtual_library.indexer_search_timeout_seconds"
+	for _, value := range []string{"5", "20", "120"} {
+		got, err := NormalizeAdminSetting(key, "  "+value+"  ")
+		if err != nil {
+			t.Fatalf("NormalizeAdminSetting(%q, %q): %v", key, value, err)
+		}
+		if got != value {
+			t.Fatalf("normalized timeout = %q, want %q", got, value)
+		}
+	}
+	for _, value := range []string{"4", "121", "0", "-1", "soon"} {
+		if _, err := NormalizeAdminSetting(key, value); err == nil {
+			t.Fatalf("NormalizeAdminSetting(%q, %q) accepted an out-of-range value", key, value)
+		}
 	}
 }
 

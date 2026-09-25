@@ -223,6 +223,7 @@ describe("StreamingSettings", () => {
     expect(screen.getByLabelText("Prowlarr URL")).toBeInTheDocument();
     expect(screen.getByLabelText("Prowlarr API key")).toBeInTheDocument();
     expect(screen.getByLabelText("Prowlarr check interval (minutes)")).toBeInTheDocument();
+    expect(screen.getByLabelText("Prowlarr search timeout (seconds)")).toBeInTheDocument();
     expect(screen.getByLabelText("AltMount URL")).toBeInTheDocument();
     expect(screen.getByLabelText("AltMount API key")).toBeInTheDocument();
     expect(screen.getByLabelText("AltMount check interval (minutes)")).toBeInTheDocument();
@@ -237,6 +238,19 @@ describe("StreamingSettings", () => {
     expect(field).toBeInTheDocument();
     fireEvent.change(field, { target: { value: "48" } });
     expect(form.setValue).toHaveBeenCalledWith("virtual_library.candidate_store_hours", "48");
+  });
+
+  it("stages a Prowlarr search timeout edit", () => {
+    const form = makeForm({});
+    useSettingsFormMock.mockReturnValue(form);
+    renderPage();
+
+    const field = screen.getByLabelText("Prowlarr search timeout (seconds)");
+    fireEvent.change(field, { target: { value: "60" } });
+    expect(form.setValue).toHaveBeenCalledWith(
+      "virtual_library.indexer_search_timeout_seconds",
+      "60",
+    );
   });
 
   it("shows API key fields as not configured without a clear action", () => {

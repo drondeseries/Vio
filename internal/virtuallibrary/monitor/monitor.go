@@ -191,8 +191,8 @@ func (m *mediaMonitor) classifyCandidates(candidates []stream.StreamCandidate) {
 func (s *Monitor) Configure(c Config) error { return s.monitor.Configure(c) }
 
 // ConfigureProwlarr sets up the Prowlarr search client (delegates).
-func (s *Monitor) ConfigureProwlarr(urls, apiKey string, intervalMinutes int, indexFile string) error {
-	return s.monitor.configureProwlarr(urls, apiKey, intervalMinutes, indexFile)
+func (s *Monitor) ConfigureProwlarr(urls, apiKey string, intervalMinutes, timeoutSeconds int, indexFile string) error {
+	return s.monitor.configureProwlarr(urls, apiKey, intervalMinutes, timeoutSeconds, indexFile)
 }
 
 // ConfigureAltmount sets up the AltMount state client (delegates).
@@ -353,7 +353,7 @@ func (m *mediaMonitor) prowlarrMatch(item monitoredMedia) bool {
 // configureProwlarr sets up the Prowlarr search client with the first
 // non-empty URL from the list. Multiple URLs / per-indexer discovery are
 // no longer needed — /api/v1/search covers all indexers in one request.
-func (m *mediaMonitor) configureProwlarr(urls, apiKey string, intervalMinutes int, indexFile string) error {
+func (m *mediaMonitor) configureProwlarr(urls, apiKey string, intervalMinutes, timeoutSeconds int, indexFile string) error {
 	firstURL := ""
 	for _, u := range strings.FieldsFunc(urls, func(r rune) bool { return r == '\n' || r == ',' }) {
 		u = strings.TrimSpace(u)
@@ -367,7 +367,7 @@ func (m *mediaMonitor) configureProwlarr(urls, apiKey string, intervalMinutes in
 		m.prowlarr = prowlarr.NewSearchClient(nil)
 	}
 	m.mu.Unlock()
-	m.prowlarr.Configure(firstURL, apiKey, intervalMinutes)
+	m.prowlarr.Configure(firstURL, apiKey, intervalMinutes, timeoutSeconds)
 	return m.prowlarr.ConfigureIndexFile(indexFile)
 }
 
