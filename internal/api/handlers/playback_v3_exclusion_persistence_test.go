@@ -96,6 +96,16 @@ func TestDurableExclusionChainDrivesAToBToCTerminal(t *testing.T) {
 	if len(durable) != 2 || !containsStringExactV3(durable, "A") || !containsStringExactV3(durable, "B") {
 		t.Fatalf("hop 2 durable exclusions = %v, want [A B]", durable)
 	}
+	// The next hop's replan loads its record from the store, so the chain must
+	// have reached the attempt row itself — the same read a restarted replica
+	// performs. A chain held only in handler memory would read back empty here.
+	reloaded, err := f.handler.PlanStoreV3.GetAttempt(t.Context(), started.SessionID)
+	if err != nil {
+		t.Fatalf("reload attempt: %v", err)
+	}
+	if ids := playback.RecoveryExcludedCandidateIDsV3(reloaded.RecoveryState, decodeRotationNeutralURI); len(ids) != 2 {
+		t.Fatalf("reloaded attempt recovery chain = %v, want [A B]", ids)
+	}
 
 	// Hop 3: C rejected → terminal. The walk must never return to A.
 	f.waitForCandidateRejected(t, started.SessionID)
