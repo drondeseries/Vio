@@ -358,6 +358,16 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				return session, nil
 			} else {
 				startErr = readyErr
+				// A decoder-rejected candidate belongs to the start/replan
+				// rotation loops, not this transport fallback: they bound
+				// attempts, accumulate exclusions, and persist the terminal.
+				// Advancing here as well would double-rotate (and could
+				// exhaust the poisoned-start budget the tests pin down),
+				// so surface the verdict immediately.
+				if errors.Is(readyErr, playback.ErrSourceDecodeRejected) {
+					_ = session.Close()
+					return nil, readyErr
+				}
 			}
 			_ = session.Close()
 		} else if cleanup != nil {

@@ -2,6 +2,9 @@ package playback
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -428,5 +431,437 @@ func TestDecodeFailureAudioStreamIdentityNeverStamps(t *testing.T) {
 	videoBitstream := `[hevc @ 0x55d0] Invalid NAL unit size (1215484279 > 206) while parsing bitstream.`
 	if rejected, marked := stamped(videoBitstream); !rejected || !marked {
 		t.Fatal("a video bitstream failure no longer rejected the video source")
+	}
+}
+
+// prodSPSMissingLine and prodPPSRangeLine are the exact stderr shapes from the
+// production incident where a 4K HEVC provider stream carried no parameter
+// sets: ffmpeg emitted them for every frame with zero segments produced, while
+// the pre-split matcher counted nothing and the start decayed into a generic
+// startup timeout instead of a candidate rotation.
+func prodSPSMissingLine() string {
+	return `[hevc @ 0x560d3bfc3280] SPS 0 does not exist.`
+}
+
+func prodPPSRangeLine() string {
+	return `[hevc @ 0x560d3bfc82c0] PPS id out of range: 0`
+}
+
+// TestDecodeErrorLineMatchesParameterSetLoss proves the parameter-set-missing
+// family counts as a decoder rejecting the source, while reference-list
+// warnings and encoder/output chatter still do not.
+func TestDecodeErrorLineMatchesParameterSetLoss(t *testing.T) {
+	positive := []string{
+		prodSPSMissingLine(),
+		prodPPSRangeLine(),
+		`[hevc @ 0x55d0] non-existing PPS 0 referenced`,
+		`[h265 @ 0x55d0] SPS 1 does not exist.`,
+	}
+	for _, line := range positive {
+		if !decodeErrorLine(line) {
+			t.Errorf("decodeErrorLine(%q) = false, want true", line)
+		}
+		if !videoStreamEvidenceV3(line) {
+			t.Errorf("videoStreamEvidenceV3(%q) = false, want true: the indictment path requires video identity", line)
+		}
+	}
+	negative := []string{
+		`[hevc @ 0x55d0] Could not find ref with POC 16`,
+		`[hevc @ 0x55d0] Error constructing the frame RPS`,
+		`[hevc_qsv @ 0x55d0] Error writing trailer: Broken pipe`,
+		`[hevc @ 0x55d0] Reinit context to 1920x1080, pix_fmt yuv420p`,
+	}
+	for _, line := range negative {
+		if decodeErrorLine(line) {
+			t.Errorf("decodeErrorLine(%q) = true, want false", line)
+		}
+	}
+}
+
+// TestDecodeFailureStampsParameterSetLossStorm replays the production
+// incident shape: a storm of SPS/PPS-missing lines with no output stamps the
+// source rejection and invokes the candidate marker exactly once, so the serve
+// path rotates instead of stalling into a startup timeout.
+func TestDecodeFailureStampsParameterSetLossStorm(t *testing.T) {
+	markedCh := make(chan struct{}, 1)
+	s := &TranscodeSession{opts: TranscodeOpts{
+		MediaFileID:        1433,
+		CanonicalInputPath: "virtual://series/tt3006802/8/5?result=59959f2d428d742fb6d18d0c",
+		TargetCodecVideo:   "hevc",
+		OnSourceRejected: func(context.Context, int, string) error {
+			markedCh <- struct{}{}
+			return nil
+		},
+	}}
+	ctx := context.Background()
+	lines := []string{prodSPSMissingLine(), prodPPSRangeLine()}
+	for i := 0; i < decodeErrorThreshold; i++ {
+		s.logFFmpegLine(ctx, lines[i%len(lines)])
+	}
+	if !s.IsSourceRejected() {
+		t.Fatal("parameter-set-loss storm did not record the source rejection")
+	}
+	select {
+	case <-markedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("parameter-set-loss storm did not invoke the source-rejected marker")
+	}
+	sample, count := s.DecodeFailureEvidence()
+	if count != decodeErrorThreshold {
+		t.Fatalf("evidence count = %d, want %d", count, decodeErrorThreshold)
+	}
+	if sample == "" {
+		t.Fatal("evidence sample is empty")
+	}
+}
+
+// TestSourceRejectionSuppressedAfterVideoProgress proves the verdict is about
+// an undecodable source, not a noisy one: a decoder storm on a generation
+// that already muxed segments neither rejects nor marks. A manifest alone, an
+// empty segment, or segments older than the generation (a previous
+// generation's leftovers) prove nothing and leave the verdict standing.
+func TestSourceRejectionSuppressedAfterVideoProgress(t *testing.T) {
+	storm := func(s *TranscodeSession) {
+		ctx := context.Background()
+		for i := 0; i < decodeErrorThreshold; i++ {
+			s.logFFmpegLine(ctx, prodSPSMissingLine())
+		}
+	}
+	writeFile := func(t *testing.T, dir, name string, size int, mtime time.Time) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if !mtime.IsZero() {
+			if err := os.Chtimes(filepath.Join(dir, name), mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	t.Run("recovery after the storm suppresses", func(t *testing.T) {
+		dir := t.TempDir()
+		s := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "hevc"}}
+		s.mu.Lock()
+		s.outputDir = dir
+		s.generationStartedAt = time.Now().Add(-time.Minute)
+		s.mu.Unlock()
+		// Fake-clock storm in the past; the segment file written afterwards
+		// carries a real (newer) mtime, proving the decoder recovered.
+		base := time.Unix(7000, 0)
+		for i := 0; i < decodeErrorThreshold; i++ {
+			s.observeDecodeError(base.Add(time.Duration(i)*100*time.Millisecond), prodSPSMissingLine())
+		}
+		if !s.IsSourceRejected() {
+			t.Fatal("storm with no output did not record the verdict")
+		}
+		writeFile(t, dir, "seg_00000.ts", 188, time.Time{})
+		if s.IsSourceRejected() {
+			t.Fatal("video produced after the storm did not lift the verdict")
+		}
+	})
+
+	t.Run("manifest alone does not suppress", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "stream.m3u8", 64, time.Time{})
+		s := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "hevc"}}
+		s.mu.Lock()
+		s.outputDir = dir
+		s.generationStartedAt = time.Now().Add(-time.Minute)
+		s.mu.Unlock()
+		storm(s)
+		if !s.IsSourceRejected() {
+			t.Fatal("manifest without segments suppressed the verdict")
+		}
+	})
+
+	t.Run("empty segment does not suppress", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "seg_00000.ts", 0, time.Time{})
+		s := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "hevc"}}
+		s.mu.Lock()
+		s.outputDir = dir
+		s.generationStartedAt = time.Now().Add(-time.Minute)
+		s.mu.Unlock()
+		storm(s)
+		if !s.IsSourceRejected() {
+			t.Fatal("empty segment suppressed the verdict")
+		}
+	})
+
+	t.Run("previous generation leftovers do not suppress", func(t *testing.T) {
+		dir := t.TempDir()
+		now := time.Now()
+		writeFile(t, dir, "seg_00000.ts", 188, now.Add(-time.Hour))
+		s := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "hevc"}}
+		s.mu.Lock()
+		s.outputDir = dir
+		s.generationStartedAt = now
+		s.mu.Unlock()
+		storm(s)
+		if !s.IsSourceRejected() {
+			t.Fatal("stale segments suppressed the fresh generation's verdict")
+		}
+	})
+}
+
+// rejectedGenerationFixture builds a live-looking session with a stamped
+// generation and an empty output directory: waiters block, and a decoder
+// storm records the verdict under test control. No ffmpeg process runs,
+// so revocation only latches verdict state (cancel is nil-safe).
+func rejectedGenerationFixture(t *testing.T) *TranscodeSession {
+	t.Helper()
+	s := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo:   "hevc",
+		CanonicalInputPath: "virtual://movie/tt-test?result=x",
+	}}
+	s.mu.Lock()
+	s.outputDir = t.TempDir()
+	s.running = true
+	s.generationStartedAt = time.Now()
+	s.mu.Unlock()
+	return s
+}
+
+func stormCurrentGeneration(ctx context.Context, s *TranscodeSession) {
+	for i := 0; i < decodeErrorThreshold; i++ {
+		s.logFFmpegLine(ctx, prodSPSMissingLine())
+	}
+}
+
+// TestRejectedGenerationWakesSegmentWaits proves a rejected generation
+// terminates every waiter flavor on the typed verdict instead of the
+// deadline: segment, opened-segment, and manifest waits must all return
+// ErrSourceDecodeRejected promptly once the storm crosses the threshold.
+// Waiters observe the verdict through their tick-bounded gated checks.
+func TestRejectedGenerationWakesSegmentWaits(t *testing.T) {
+	s := rejectedGenerationFixture(t)
+	ctx := context.Background()
+
+	type outcome struct {
+		name string
+		err  error
+	}
+	results := make(chan outcome, 3)
+	go func() {
+		_, err := s.WaitForSegment("seg_00009.ts", 30*time.Second)
+		results <- outcome{"segment", err}
+	}()
+	go func() {
+		_, err := s.WaitForOpenSegment("seg_00009.ts", 30*time.Second)
+		results <- outcome{"open-segment", err}
+	}()
+	go func() {
+		_, err := s.waitForManifest(ctx, 30*time.Second, true)
+		results <- outcome{"manifest", err}
+	}()
+	// Let the waiters block before the storm lands.
+	time.Sleep(200 * time.Millisecond)
+	stormCurrentGeneration(ctx, s)
+
+	for i := 0; i < 3; i++ {
+		select {
+		case got := <-results:
+			if !errors.Is(got.err, ErrSourceDecodeRejected) {
+				t.Fatalf("%s wait err = %v, want ErrSourceDecodeRejected", got.name, got.err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("revoked generation did not wake a waiter promptly")
+		}
+	}
+}
+
+// TestSimultaneousWaitsReceiveSameVerdict proves one rejection fans out to
+// every waiter: concurrent segment requests on the same dead generation all
+// observe the identical typed verdict.
+func TestSimultaneousWaitsReceiveSameVerdict(t *testing.T) {
+	s := rejectedGenerationFixture(t)
+	ctx := context.Background()
+
+	const waiters = 5
+	errs := make(chan error, waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			_, err := s.WaitForSegment("seg_00007.ts", 30*time.Second)
+			errs <- err
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	stormCurrentGeneration(ctx, s)
+
+	for i := 0; i < waiters; i++ {
+		select {
+		case err := <-errs:
+			if !errors.Is(err, ErrSourceDecodeRejected) {
+				t.Fatalf("waiter %d err = %v, want ErrSourceDecodeRejected", i, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("waiter %d was not woken by the revocation", i)
+		}
+	}
+}
+
+// TestManifestWaitIgnoresRevocationForLocalInput proves the startup manifest
+// wait only short-circuits on the verdict for virtual inputs. A local file
+// commits and recovers through the replan software path, which requires the
+// committed session the verdict must not preempt — so the wait runs to its
+// deadline (here shrunk) instead of returning the typed verdict, even though
+// IsSourceRejected is true.
+func TestManifestWaitIgnoresRevocationForLocalInput(t *testing.T) {
+	s := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo:   "hevc",
+		CanonicalInputPath: "/media/movies/local.mkv",
+	}}
+	s.mu.Lock()
+	s.outputDir = t.TempDir()
+	s.running = true
+	s.generationStartedAt = time.Now()
+	s.mu.Unlock()
+
+	ctx := context.Background()
+	for i := 0; i < decodeErrorThreshold; i++ {
+		s.logFFmpegLine(ctx, prodSPSMissingLine())
+	}
+	if !s.IsSourceRejected() {
+		t.Fatal("storm did not record the verdict to ignore")
+	}
+	start := time.Now()
+	_, err := s.waitForManifest(ctx, 300*time.Millisecond, true)
+	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+		t.Fatalf("local manifest wait returned after %v, want the full deadline", elapsed)
+	}
+	if err == nil || errors.Is(err, ErrSourceDecodeRejected) {
+		t.Fatalf("local manifest wait err = %v, want the deadline error, never the typed verdict", err)
+	}
+}
+
+// TestRestartRefusedAfterRejection proves a revoked generation cannot be
+// rebuilt: restarting the same undecodable bytes is refused with the typed
+// verdict so the caller rotates instead. A healthy session keeps its restart.
+func TestRestartRefusedAfterRejection(t *testing.T) {
+	ctx := context.Background()
+	rejected := rejectedGenerationFixture(t)
+	stormCurrentGeneration(ctx, rejected)
+	if !rejected.IsSourceRejected() {
+		t.Fatal("storm did not record the verdict to refuse against")
+	}
+	if err := rejected.Restart(ctx, 0, 0); !errors.Is(err, ErrSourceDecodeRejected) {
+		t.Fatalf("Restart err = %v, want ErrSourceDecodeRejected", err)
+	}
+	if _, _, err := rejected.RestartSegment(ctx, 9); !errors.Is(err, ErrSourceDecodeRejected) {
+		t.Fatalf("RestartSegment err = %v, want ErrSourceDecodeRejected", err)
+	}
+
+	healthy := rejectedGenerationFixture(t)
+	if healthy.IsSourceRejected() {
+		t.Fatal("fresh generation reports a verdict it never earned")
+	}
+}
+
+// TestRevokeWakesWithoutKillingProcess proves rejection latches the verdict
+// while leaving process lifetime to the existing close paths: killing ffmpeg
+// at verdict time would convert "manifest will appear" into "manifest never
+// appears", engaging the hw_accel=auto HW→software fallback per candidate
+// and multiplying transcode starts. Waiters observe the verdict through
+// their tick-bounded gated checks; the marker latch fires even with no
+// marker callback configured.
+func TestRevokeWakesWithoutKillingProcess(t *testing.T) {
+	s := rejectedGenerationFixture(t)
+	killed := make(chan struct{})
+	s.mu.Lock()
+	_, innerCancel := context.WithCancel(context.Background())
+	s.cancel = func() {
+		innerCancel()
+		close(killed)
+	}
+	s.mu.Unlock()
+
+	stormCurrentGeneration(context.Background(), s)
+	select {
+	case <-killed:
+		t.Fatal("revocation killed the process; close paths own process lifetime")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if !s.IsSourceRejected() {
+		t.Fatal("verdict missing after revocation")
+	}
+	s.mu.Lock()
+	notified := s.sourceRejectNotified
+	s.mu.Unlock()
+	if !notified {
+		t.Fatal("marker latch not set after revocation")
+	}
+}
+
+// TestRevocationScopedToGeneration proves a dead generation's verdict cannot
+// indict a replacement: after a rejection plus a generation reset, waiters on
+// the fresh generation block on the deadline instead of inheriting the old
+// verdict.
+func TestRevocationScopedToGeneration(t *testing.T) {
+	ctx := context.Background()
+	s := rejectedGenerationFixture(t)
+	stormCurrentGeneration(ctx, s)
+	if !s.IsSourceRejected() {
+		t.Fatal("first generation did not record the verdict")
+	}
+
+	s.mu.Lock()
+	s.generationStartedAt = time.Now()
+	s.resetDecodeVerdictLocked()
+	s.running = true
+	s.mu.Unlock()
+	if s.IsSourceRejected() {
+		t.Fatal("fresh generation inherits the dead generation's verdict")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.WaitForSegment("seg_00009.ts", 400*time.Millisecond)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if errors.Is(err, ErrSourceDecodeRejected) {
+			t.Fatal("fresh generation waiter inherited the stale verdict")
+		}
+		if !errors.Is(err, ErrSegmentNotFound) {
+			t.Fatalf("fresh waiter err = %v, want deadline ErrSegmentNotFound", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("fresh generation waiter did not terminate")
+	}
+}
+
+// TestDecodeWindowResetsOnNewGeneration proves a restart never inherits its
+// predecessor's strikes: nine errors, a generation stamp, and one more error
+// must not stamp, while ten fresh errors after the stamp must.
+func TestDecodeWindowResetsOnNewGeneration(t *testing.T) {
+	s := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "h264"}}
+	base := time.Unix(9000, 0)
+	for i := 0; i < decodeErrorThreshold-1; i++ {
+		if s.observeDecodeError(base.Add(time.Duration(i)*time.Millisecond), hevcFatalErrorLine()) {
+			t.Fatalf("stamped after only %d errors", i+1)
+		}
+	}
+	s.mu.Lock()
+	s.generationStartedAt = base.Add(time.Second)
+	s.resetDecodeVerdictLocked()
+	s.mu.Unlock()
+	if s.observeDecodeError(base.Add(2*time.Second), hevcFatalErrorLine()) {
+		t.Fatal("fresh generation stamped on the dead generation's count")
+	}
+	s.mu.Lock()
+	first := s.firstDecodeErrorAt
+	s.mu.Unlock()
+	if !first.Equal(base.Add(2 * time.Second)) {
+		t.Fatalf("window did not reopen at the fresh error: %v", first)
+	}
+	for i := 1; i < decodeErrorThreshold-1; i++ {
+		s.observeDecodeError(base.Add(2*time.Second+time.Duration(i)*time.Millisecond), hevcFatalErrorLine())
+	}
+	if !s.observeDecodeError(base.Add(3*time.Second), hevcFatalErrorLine()) {
+		t.Fatal("fresh generation did not stamp after ten new errors")
+	}
+	if !s.IsSourceRejected() {
+		t.Fatal("fresh generation verdict missing after the threshold")
 	}
 }
