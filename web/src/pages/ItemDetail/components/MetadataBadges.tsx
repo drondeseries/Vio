@@ -1,12 +1,13 @@
 interface MetadataBadgesProps {
   year?: string;
   contentRating?: string;
-  /** Recommended minimum viewer age. Display only; never a restriction. */
+  /** Recommended minimum viewer age from an advisory service. */
   advisoryAge?: number;
   /** Who recommended advisoryAge, used to attribute the badge. */
   advisorySource?: string;
   duration?: string;
   seasonCount?: number;
+  seasonLabel?: string;
   episodeCount?: number;
   volumeCount?: number;
   chapterCount?: number;
@@ -25,6 +26,7 @@ export default function MetadataBadges({
   advisorySource,
   duration,
   seasonCount,
+  seasonLabel,
   episodeCount,
   volumeCount,
   chapterCount,
@@ -39,8 +41,8 @@ export default function MetadataBadges({
           className="metadata-badge"
           title={
             advisorySource && ADVISORY_SOURCE_LABELS[advisorySource]
-              ? `${ADVISORY_SOURCE_LABELS[advisorySource]} suggests age ${advisoryAge} and up. This is advice, not a restriction.`
-              : `Suggested for ages ${advisoryAge} and up. This is advice, not a restriction.`
+              ? `${ADVISORY_SOURCE_LABELS[advisorySource]} suggests age ${advisoryAge} and up.`
+              : `Suggested for ages ${advisoryAge} and up.`
           }
         >
           {advisorySource && ADVISORY_SOURCE_LABELS[advisorySource]
@@ -54,6 +56,7 @@ export default function MetadataBadges({
           {seasonCount} {seasonCount === 1 ? "Season" : "Seasons"}
         </span>
       )}
+      {seasonLabel && <span className="metadata-badge">{seasonLabel}</span>}
       {episodeCount != null && (
         <span className="metadata-badge">
           {episodeCount} {episodeCount === 1 ? "Episode" : "Episodes"}

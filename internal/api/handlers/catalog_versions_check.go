@@ -254,10 +254,12 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 	filter := catalog.AccessFilter{
 		AllowedLibraryIDs:  accessScopeAllowedLibraryIDs(ctx),
 		DisabledLibraryIDs: accessScopeDisabledLibraryIDs(ctx),
-		MaxContentRating:   accessScopeMaxContentRating(ctx),
 		MaxPlaybackQuality: accessScopeMaxPlaybackQuality(ctx),
 		UserID:             apimw.GetUserID(ctx),
 		ProfileID:          apimw.GetProfileID(ctx),
+	}
+	if scope, ok := access.GetScope(ctx); ok {
+		filter.MaturityLimits = scope.MaturityLimits
 	}
 	switch {
 	case file.EpisodeID != "":
@@ -340,13 +342,6 @@ func accessScopeDisabledLibraryIDs(ctx context.Context) []int {
 		return scope.DisabledLibraryIDs
 	}
 	return nil
-}
-
-func accessScopeMaxContentRating(ctx context.Context) string {
-	if scope, ok := access.GetScope(ctx); ok {
-		return scope.MaxContentRating
-	}
-	return ""
 }
 
 func accessScopeMaxPlaybackQuality(ctx context.Context) string {
