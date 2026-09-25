@@ -216,7 +216,7 @@ const (
 	// virtual_library.indexer_search_timeout_seconds' default and bounds.
 	defaultSearchTimeoutSeconds = 20
 	minSearchTimeoutSeconds     = 5
-	maxSearchTimeoutSeconds     = 120
+	maxSearchTimeoutSeconds     = 900
 	maxSearchBodyBytes          = 8 << 20
 	maxErrorBodyBytes           = 4 << 10
 	maxProwlarrIndexBytes       = 64 << 20

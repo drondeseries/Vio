@@ -472,7 +472,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 	case "virtual_library.cache_ttl_minutes", "virtual_library.indexer_rss_check_minutes", "virtual_library.altmount_check_minutes":
 		return normalizeAdminInt(key, value, 1, 10080)
 	case "virtual_library.indexer_search_timeout_seconds":
-		return normalizeAdminInt(key, value, 5, 120)
+		return normalizeAdminInt(key, value, 5, 900)
 	case "virtual_library.candidate_store_hours":
 		// 0 disables the trust window and keeps the pre-window behavior.
 		return normalizeAdminInt(key, value, 0, 8760)
