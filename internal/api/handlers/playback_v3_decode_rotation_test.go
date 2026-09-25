@@ -27,26 +27,23 @@ func decodeRotationCandidateURI(id string) string {
 }
 
 // writePlaybackTestFFmpegDecodeFailureBeforeManifest emits the decoder's
-// invalid-bitstream failure past the rejection threshold and only then writes a
-// ready manifest, so a start that waits for the manifest observes the rejected
-// source deterministically and the start pre-check fires.
+// invalid-bitstream failure as a sustained storm and never writes a manifest,
+// so the start's manifest wait can only resolve through the observation
+// lifecycle: suspicion at the threshold, confirmation after the observation
+// window, and then ErrSourceDecodeRejected. A manifest appearing inside the
+// observation window would be recovery, not rejection, so producing one here
+// would make the fixture race the deadline.
 func writePlaybackTestFFmpegDecodeFailureBeforeManifest(t *testing.T) string {
 	t.Helper()
+	// The process stays alive emitting the decoder storm and never writes a
+	// manifest, so the start's manifest wait can only resolve through the
+	// observation lifecycle: suspicion at the threshold, confirmation after
+	// the observation window, then ErrSourceDecodeRejected. It does not exit
+	// early, so the rejection is a decoder verdict (reaping the process) rather
+	// than an early-exit generic failure.
 	script := "#!/bin/sh\n" +
 		"i=0\n" +
 		"while [ $i -lt 20 ]; do echo \"[hevc @ 0x1] Error submitting packet to decoder: Invalid data found when processing input\" >&2; i=$((i+1)); done\n" +
-		"sleep 1\n" +
-		"last=\"\"\n" +
-		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
-		"case \"$last\" in\n" +
-		"  *.m3u8) out=\"$(dirname \"$last\")\"; mkdir -p \"$out\"; " +
-		"printf x > \"$out/init.mp4\"; printf x > \"$out/seg_0.m4s\"; " +
-		"printf x > \"$out/seg_1.m4s\"; printf x > \"$out/seg_2.m4s\"; " +
-		"printf '#EXTM3U\\n#EXT-X-VERSION:7\\n#EXT-X-TARGETDURATION:2\\n" +
-		"#EXT-X-MEDIA-SEQUENCE:0\\n#EXT-X-MAP:URI=\"init.mp4\"\\n" +
-		"#EXTINF:2.0,\\nseg_0.m4s\\n#EXTINF:2.0,\\nseg_1.m4s\\n" +
-		"#EXTINF:2.0,\\nseg_2.m4s\\n' > \"$last\" ;;\n" +
-		"esac\n" +
 		"sleep 30\n"
 	return writeDecodeRotationFFmpeg(t, "decode-fail-before-manifest.sh", script)
 }
@@ -407,7 +404,7 @@ func decodeRotationReplanRequest(start playback.StartRequestV3, plan *playback.P
 // loop substitutes the sibling. Both attempts must fail for the rotation to
 // engage; the healthy sibling then commits on its first attempt.
 func TestVirtualStartRotatesDecodeRejectedCandidate(t *testing.T) {
-	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B"}, decodeFailCalls: 2})
+	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B"}, decodeFailCalls: 1})
 
 	code, response := f.start(t, f.request())
 	if code != http.StatusCreated {
@@ -442,11 +439,11 @@ func TestVirtualStartRotatesDecodeRejectedCandidate(t *testing.T) {
 // terminalled.
 func TestVirtualStartRotationExcludesProbedRequestedRow(t *testing.T) {
 	f := newDecodeRotationFixture(t, decodeRotationOptions{
-		// Both hw_accel=auto stages of the rejected candidate must fail:
-		// a fast decode verdict advances hardware→software on the same
-		// bytes before rotation substitutes the sibling.
+		// One poisoned start: the decode verdict is terminal for candidate A
+		// (the automatic pipeline does not rebuild rejected bytes), so rotation
+		// substitutes the sibling on the first failure.
 		candidateIDs:    []string{"A", "B"},
-		decodeFailCalls: 2,
+		decodeFailCalls: 1,
 		requestedResult: "A",
 		probeEvidence:   true,
 	})
@@ -515,10 +512,11 @@ func TestVirtualAutoStartSkipsFailedRowWithinDeliveryGrace(t *testing.T) {
 // stamped on the candidate.
 func TestVirtualExplicitStartDecodeRejectionTerminals(t *testing.T) {
 	f := newDecodeRotationFixture(t, decodeRotationOptions{
-		// Both hw_accel=auto stages must fail: the verdict advances
-		// hardware→software before the explicit pin terminals.
+		// One poisoned start: the decode verdict is terminal for the pinned
+		// candidate, so it terminates with source_decode_failed rather than
+		// rebuilding rejected bytes.
 		candidateIDs:    []string{"A", "B"},
-		decodeFailCalls: 2,
+		decodeFailCalls: 1,
 	})
 	start := f.request()
 	start.FileSelection = playback.FileSelectionExplicitV3
@@ -546,13 +544,12 @@ func TestVirtualExplicitStartDecodeRejectionTerminals(t *testing.T) {
 
 // TestVirtualDecodeRotationBoundedExhaustion proves rotation is bounded by the
 // configured failover attempts and excludes every rejected id, so a provider
-// that only offers bad releases cannot loop forever. Every candidate costs up
-// to three transcode starts (the hw_accel=auto HW→mixed→software fallback
-// engages per candidate now that decode verdicts fail fast instead of timing
-// out), so the poison budget covers all of them and the start bound is three
-// candidates times three stages.
+// that only offers bad releases cannot loop forever. A decoder-confirmed
+// rejection is terminal for its candidate, so it is not repeated by the
+// automatic hardware->software pipeline: each candidate costs exactly one
+// transcode start, and the bound is the candidate count.
 func TestVirtualDecodeRotationBoundedExhaustion(t *testing.T) {
-	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B", "C"}, decodeFailCalls: 12})
+	f := newDecodeRotationFixture(t, decodeRotationOptions{candidateIDs: []string{"A", "B", "C"}, decodeFailCalls: 3})
 
 	code, response := f.start(t, f.request())
 	if code != http.StatusCreated {
@@ -568,8 +565,8 @@ func TestVirtualDecodeRotationBoundedExhaustion(t *testing.T) {
 	if !containsExclusion(exclusions, "A") || !containsExclusion(exclusions, "A", "B") {
 		t.Fatalf("rotation did not accumulate exclusions: %v", exclusions)
 	}
-	if calls := atomic.LoadInt32(&f.transcodeCalls); calls > 9 {
-		t.Fatalf("transcode started %d times, want at most 3 candidates times 3 auto stages", calls)
+	if calls := atomic.LoadInt32(&f.transcodeCalls); calls > 3 {
+		t.Fatalf("transcode started %d times, want at most 3 candidates times 1 start", calls)
 	}
 }
 

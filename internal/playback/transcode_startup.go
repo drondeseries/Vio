@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -138,6 +139,15 @@ func runTranscodeStartup(ctx context.Context, pipeline *AutoTranscodePipeline, s
 		if err == nil {
 			pipeline.RememberSuccess()
 			return session, nil
+		}
+		// A decoder-confirmed rejection is terminal for this candidate, not a
+		// hardware/safety failure another execution path can fix: advancing the
+		// auto pipeline (or the legacy retry) would rebuild the same undecodable
+		// bytes and multiply transcode starts. Surface the typed verdict so the
+		// caller's rotation loop substitutes a different provider candidate.
+		if errors.Is(err, ErrSourceDecodeRejected) {
+			_ = session.Close()
+			return nil, err
 		}
 		if ctx.Err() != nil {
 			// The overall budget ended during this attempt's wait. Report the

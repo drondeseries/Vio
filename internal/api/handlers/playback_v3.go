@@ -4666,6 +4666,15 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 			return preparedTransportV3{}, transportErr
 		}
 
+		if errors.Is(startupFailure.cause, playback.ErrSourceDecodeRejected) {
+			// A confirmed decoder rejection is terminal for this candidate:
+			// rebuilding the same undecodable bytes cannot help, and the
+			// candidate rotation loop owns the substitution. Return the typed
+			// readiness outcome before the generic one-clean-generation retry
+			// below can start an extra transcode on the rejected release.
+			unlock()
+			return preparedTransportV3{}, localTransportReadinessErrorV3(opts, startupFailure.wasRunning, startupFailure.cause)
+		}
 		if fallbackOpts, eligible := h.softwareToneMapRetryOptsV3(r.Context(), opts, result.FrozenSourceMetadata != nil); eligible {
 			slog.WarnContext(r.Context(), "hardware tone-map failed during startup; retrying once in software",
 				logComponentKey, playbackLogValueV3,

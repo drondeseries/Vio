@@ -263,28 +263,46 @@ type TranscodeSession struct {
 	demuxErrorCount  int
 	lastDemuxErrorAt time.Time
 	demuxStamped     bool
-	// decodeErrorCount counts decoder failure lines within the current decay
-	// window; firstDecodeErrorAt opens the window and lastDecodeErrorAt
-	// timestamps the newest, and decodeSample keeps a representative matched
-	// line for diagnostics. The window is scoped to one ffmpeg generation: a
-	// restart resets it (see resetDecodeVerdictLocked) so a fresh process never
-	// inherits its predecessor's strikes. decodeStamped is set once
-	// the count crosses decodeErrorThreshold on a hardware plan, which reports
-	// that the executed hardware decoder rejected the source and a software
-	// retry is warranted. sourceRejected is set on the same crossing for every
-	// non-copy plan, hardware or software, because a decoder that rejects this
-	// many frames is evidence about the source itself; the serve path uses it
-	// to report a permanent failure instead of stalling the player. Guarded by
-	// mu. sourceRejectNotified is set once the rejection has been handed to the
-	// source-candidate failure callback, so the marker is invoked exactly once
-	// per session regardless of how many decoder lines follow.
+	// Decoder-verdict lifecycle. Each ffmpeg generation moves observing ->
+	// suspected -> confirmed independently. decodeErrorCount counts decoder
+	// failure lines within the current decay window and lastDecodeErrorAt
+	// timestamps the newest; decodeSample keeps a representative matched line
+	// for diagnostics. decodeErrorThreshold strikes inside the decay window set
+	// decodeStage to suspected and anchor decodeSuspectAt; qualifying
+	// current-generation video progress cancels the suspicion back to
+	// observing, while decodeObservationWindow expiring without recovery
+	// confirms it and sets sourceRejected. decodeStamped is the session-level
+	// hardware latch: it survives a restart because it records that this
+	// session's hardware decoder failed the source, which licenses a
+	// software-decode rebuild, but it never blocks a replacement generation from
+	// reaching its own verdict. decodeGeneration fences the evaluator and old
+	// stderr writers; decodeWatchCancel stops the single evaluator on reset or
+	// close. sourceRejectNotified is set once the confirmed rejection has been
+	// handed to the source-candidate failure callback. All guarded by mu.
 	decodeErrorCount     int
-	firstDecodeErrorAt   time.Time
 	lastDecodeErrorAt    time.Time
 	decodeSample         string
+	decodeStage          decodeVerdictStage
+	decodeSuspectAt      time.Time
+	decodeGeneration     uint64
+	decodeWatchCancel    context.CancelFunc
 	decodeStamped        bool
 	sourceRejected       bool
 	sourceRejectNotified bool
+	// decodeNow and decodeProbe are test seams: the injected clock and the
+	// generation-scoped progress probe. Production leaves both nil, using
+	// time.Now and the output-directory scan.
+	decodeNow   func() time.Time
+	decodeProbe func(outputDir string, cutoff time.Time) bool
+	// decodeReapTimeout is the per-session teardown bound for a confirmed
+	// generation. Zero uses decodeReapTimeout. Tests shrink it without
+	// mutating a package global.
+	decodeReapTimeout time.Duration
+	// decodeProbeMu guards decodeProbeRunning, the coalescing flag that keeps
+	// concurrent verdict reads from multiplying output scans or serializing
+	// behind a slow probe.
+	decodeProbeMu      sync.Mutex
+	decodeProbeRunning bool
 	// generationStartedAt is when the currently-owning ffmpeg process was
 	// spawned. Output in the shared directory older than this timestamp was
 	// written by a previous generation (or a previous session sharing the
@@ -408,6 +426,24 @@ const (
 const (
 	decodeErrorThreshold = 10
 	decodeErrorDecay     = 60 * time.Second
+)
+
+// decodeObservationWindow is the internal grace between the strike threshold
+// (suspected) and confirmation. A suspected generation can still prove recovery
+// by muxing a segment within this window; expiry without recovery confirms the
+// rejection. It is deliberately a code constant, not a user setting: the window
+// is a safety margin sized to the segment cadence, not an operator preference.
+const decodeObservationWindow = time.Second
+
+// decodeVerdictStage is the internal decoder-verdict lifecycle for one ffmpeg
+// generation: observing (no verdict), suspected (threshold crossed, awaiting a
+// progress check or expiry), and confirmed (terminal for the generation).
+type decodeVerdictStage uint8
+
+const (
+	decodeStageObserving decodeVerdictStage = iota
+	decodeStageSuspected
+	decodeStageConfirmed
 )
 
 // ManifestStartupTimeout is the maximum wait for FFmpeg's first safe playback
@@ -3307,6 +3343,12 @@ func (s *TranscodeSession) shutdown(removeOutput bool) error {
 	defer s.mu.Unlock()
 
 	s.running = false
+	// Release the decoder-verdict evaluator so a closed session never keeps a
+	// goroutine (or confirms a generation nobody is serving) alive.
+	if s.decodeWatchCancel != nil {
+		s.decodeWatchCancel()
+		s.decodeWatchCancel = nil
+	}
 	s.inputCleanupOnce.Do(func() {
 		if s.opts.InputCleanup != nil {
 			s.opts.InputCleanup()
@@ -3606,6 +3648,11 @@ func (s *TranscodeSession) restart(
 	if s.stderr != nil {
 		s.stderr.Reset()
 	}
+	// Open the decoder-verdict generation as soon as the old process is dead
+	// and before the replacement's stderr writer is created: this fences the
+	// dead process's late stderr and any in-flight evaluator away from the
+	// replacement, and lets the new writer capture the new generation.
+	s.resetDecodeVerdictLocked()
 	s.restartCount++
 	if refreshedPath != "" {
 		if opts.InputCleanup != nil {
@@ -3722,9 +3769,9 @@ func (s *TranscodeSession) restart(
 	s.lastRequestedSegment = startSegment
 	s.lastCompletedSegment = startSegment - 1
 	s.generationStartedAt = startedAt
-	// A new generation re-opens the decode-failure window: strikes from the
-	// dead process must not stamp its replacement on the first error.
-	s.resetDecodeVerdictLocked()
+	// The verdict generation was already opened when the old process died,
+	// before this replacement's stderr writer was created; do not bump it
+	// again here or that writer would be fenced as stale.
 	s.inheritedManifest = inheritedManifest
 	s.done = make(chan struct{})
 	hook := s.restartHook
@@ -4370,7 +4417,18 @@ func (s *TranscodeSession) StopThrottler() {
 type ffmpegStderrWriter struct {
 	session *TranscodeSession
 	ctx     context.Context
-	partial []byte
+	// generation is the decoder-verdict generation this writer belongs to.
+	// Lines emitted after a reset (a replacement process is running) are
+	// dropped so a dead process's stderr can never touch the replacement.
+	generation uint64
+	partial    []byte
+}
+
+func (w *ffmpegStderrWriter) logLine(line string) {
+	if !w.session.stderrGenerationCurrent(w.generation) {
+		return
+	}
+	w.session.logFFmpegLine(w.ctx, line)
 }
 
 func (w *ffmpegStderrWriter) Write(p []byte) (int, error) {
@@ -4384,7 +4442,7 @@ func (w *ffmpegStderrWriter) Write(p []byte) (int, error) {
 			break
 		}
 		line := strings.TrimRight(string(w.partial[:idx]), "\r")
-		w.session.logFFmpegLine(w.ctx, line)
+		w.logLine(line)
 		w.partial = append([]byte(nil), w.partial[idx+1:]...)
 	}
 	return len(p), nil
@@ -4394,18 +4452,29 @@ func (w *ffmpegStderrWriter) Flush() {
 	if len(w.partial) == 0 {
 		return
 	}
-	w.session.logFFmpegLine(w.ctx, strings.TrimRight(string(w.partial), "\r"))
+	w.logLine(strings.TrimRight(string(w.partial), "\r"))
 	w.partial = nil
 }
 
-func (s *TranscodeSession) newStderrWriter(ctx context.Context) io.Writer {
-	lineWriter := &ffmpegStderrWriter{session: s, ctx: ctx}
+// stderrGenerationCurrent reports whether a stderr writer's generation still
+// owns this session's verdict lifecycle. A stale writer's lines are discarded.
+func (s *TranscodeSession) stderrGenerationCurrent(generation uint64) bool {
+	if s == nil {
+		return true
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return generation == s.decodeGeneration
+}
+
+func (s *TranscodeSession) newStderrWriter(ctx context.Context) io.Writer {
+	s.mu.Lock()
+	lineWriter := &ffmpegStderrWriter{session: s, ctx: ctx, generation: s.decodeGeneration}
 	if s.stderr == nil {
 		s.stderr = newBoundedTailBuffer(stderrTailMaxBytes)
 	}
 	s.stderrWriter = lineWriter
+	s.mu.Unlock()
 	return io.MultiWriter(s.stderr, lineWriter)
 }
 
@@ -4426,22 +4495,39 @@ func demuxInputErrorLine(line string) bool {
 	return strings.Contains(line, "Error during demuxing")
 }
 
-// resetDecodeVerdictLocked clears the decoder-failure window and the source
-// verdict so a new ffmpeg generation re-proves from zero: strikes, window,
-// sample, rejection flag, and marker latch never cross a generation boundary.
-// Without this, the first error of a fresh process could complete a threshold
-// the dead process accumulated. decodeStamped deliberately persists: it
-// records that this session's hardware decoder failed the source, which still
-// licenses a software-decode rebuild even after an unrelated seek restart.
-// Callers must hold mu. Fresh sessions start zeroed, so the spawn path needs
-// no call.
+// resetDecodeVerdictLocked opens a fresh decoder-verdict generation: strikes,
+// window, sample, stage, deadline, and marker latch never cross a generation
+// boundary, so a replacement process re-proves from zero instead of completing
+// a threshold its predecessor accumulated. It bumps decodeGeneration so any
+// evaluator or stderr writer still running for the dead generation is fenced,
+// and cancels the dead generation's evaluator. decodeStamped deliberately
+// persists: it records that this session's hardware decoder failed the source,
+// which still licenses a software-decode rebuild after an unrelated seek
+// restart, without blocking the replacement's own verdict.
+//
+// Callers must hold mu. Fresh sessions start zeroed, so the spawn path needs no
+// call; the returned cancel function (if any) may be invoked after unlocking.
 func (s *TranscodeSession) resetDecodeVerdictLocked() {
 	s.decodeErrorCount = 0
-	s.firstDecodeErrorAt = time.Time{}
 	s.lastDecodeErrorAt = time.Time{}
 	s.decodeSample = ""
+	s.decodeStage = decodeStageObserving
+	s.decodeSuspectAt = time.Time{}
 	s.sourceRejected = false
 	s.sourceRejectNotified = false
+	s.decodeGeneration++
+	if s.decodeWatchCancel != nil {
+		s.decodeWatchCancel()
+		s.decodeWatchCancel = nil
+	}
+}
+
+// decodeClock returns the injected clock when a test set one, else time.Now.
+func (s *TranscodeSession) decodeClock() time.Time {
+	if s.decodeNow != nil {
+		return s.decodeNow()
+	}
+	return time.Now()
 }
 
 // decodeErrorLine reports whether an FFmpeg stderr line is a decoder rejecting
@@ -4562,17 +4648,27 @@ func videoStreamEvidenceV3(line string) bool {
 	return false
 }
 
-// observeDecodeError records one decoder failure line and reports whether it is
-// the occurrence that crosses the known-bad threshold. The counter resets when
-// more than decodeErrorDecay elapsed since the previous failure, so decoder
-// blips that recover are forgiven. It reports true at most once per session,
-// when a hardware plan crosses the threshold and a software-decode retry is
-// warranted. A copy target never stamps: a decoder error there is an
-// output/remux anomaly, not a decode verdict. A software plan does not report
-// the hardware transition (there is no decoder to replace) but still records
-// sourceRejected so the serve path can fail the session permanently rather than
-// let the player retry a stream the CPU decoder also cannot read.
-func (s *TranscodeSession) observeDecodeError(now time.Time, sample string) bool {
+// decodeWatchInterval is the cadence of the suspicion evaluator. It is a code
+// constant, not a setting, and is deliberately finer than the segment cadence
+// so confirmation lands within one tick of the observation deadline.
+const decodeWatchInterval = 100 * time.Millisecond
+
+// decodeReapTimeout bounds the server-owned teardown of a confirmed generation.
+const decodeReapTimeout = 2 * time.Second
+
+// observeDecodeError records one decoder failure line and advances the
+// generation's verdict lifecycle. The counter resets when more than
+// decodeErrorDecay elapsed since the previous failure, so decoder blips that
+// recover are forgiven. Crossing decodeErrorThreshold enters the suspected
+// stage and starts the single evaluator; it no longer confirms by itself —
+// qualifying progress cancels suspicion and expiry without recovery confirms it
+// (see evaluateDecodeVerdict). It reports true only on the call that enters
+// suspicion, for logging. A copy target never observes: a decoder error there is
+// an output/remux anomaly, not a decode verdict.
+//
+// It reads time through the session clock so production and tests share one
+// timeline.
+func (s *TranscodeSession) observeDecodeError(sample string) bool {
 	if s == nil {
 		return false
 	}
@@ -4581,86 +4677,250 @@ func (s *TranscodeSession) observeDecodeError(now time.Time, sample string) bool
 	if strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
 		return false
 	}
-	// Observations continue past the latch: timestamps and the sample keep
-	// advancing so a later storm after recovery re-opens the window on fresh
-	// evidence instead of inheriting a frozen cutoff. Only the transition
-	// below fires once.
-	latched := s.decodeStamped || s.sourceRejected
+	// A confirmed generation is terminal: keep the diagnostic evidence
+	// current but never reopen the verdict.
+	if s.decodeStage == decodeStageConfirmed {
+		s.recordDecodeEvidenceLocked(s.decodeClock(), sample)
+		return false
+	}
+	now := s.decodeClock()
 	if !s.lastDecodeErrorAt.IsZero() && now.Sub(s.lastDecodeErrorAt) > decodeErrorDecay {
 		s.decodeErrorCount = 0
 	}
-	if s.decodeErrorCount == 0 {
-		s.firstDecodeErrorAt = now
-	}
 	s.decodeErrorCount++
-	s.lastDecodeErrorAt = now
-	if strings.TrimSpace(sample) != "" {
-		s.decodeSample = sample
-	}
-	if latched {
+	s.recordDecodeEvidenceLocked(now, sample)
+	if s.decodeStage == decodeStageSuspected {
 		return false
 	}
 	if s.decodeErrorCount < decodeErrorThreshold {
 		return false
 	}
-	s.sourceRejected = true
-	if s.opts.SoftwareVideoDecode {
-		// A software decoder rejecting the bitstream indicts the source, not
-		// the decode mode; there is no further decoder to fall back to.
-		return false
+	s.decodeStage = decodeStageSuspected
+	s.decodeSuspectAt = now
+	// The session-level hardware latch records that this session's hardware
+	// decoder rejected the source; it licenses the reactive software-decode
+	// rebuild and is deliberately set at suspicion, not confirmation, so the
+	// client's replan can act on it without waiting out the observation window.
+	// A software plan has no further decoder to fall back to and never latches.
+	if !s.opts.SoftwareVideoDecode {
+		s.decodeStamped = true
 	}
-	s.decodeStamped = true
+	s.startDecodeWatchLocked()
 	return true
 }
 
-// IsSourceRejected reports whether the running plan's decoder rejected the
-// source past the confidence threshold. The serve path treats it as permanent:
-// once true, no segment produced by this generation is trustworthy and the
-// client should replan (and, for a hardware plan, get the software-decode
-// variant) instead of waiting out its own startup timeout.
+// recordDecodeEvidenceLocked advances the newest-failure timestamp and sample.
+// Callers must hold mu.
+func (s *TranscodeSession) recordDecodeEvidenceLocked(now time.Time, sample string) {
+	s.lastDecodeErrorAt = now
+	if strings.TrimSpace(sample) != "" {
+		s.decodeSample = sample
+	}
+}
+
+// startDecodeWatchLocked launches the one evaluator for a suspected generation.
+// The watcher is generation-fenced by context: a reset or confirmation cancels
+// it, and evaluateDecodeVerdict discards results whose generation moved on.
+// Callers must hold mu.
+func (s *TranscodeSession) startDecodeWatchLocked() {
+	if s.decodeWatchCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.decodeWatchCancel = cancel
+	generation := s.decodeGeneration
+	go s.watchDecodeSuspicion(ctx, generation)
+}
+
+// watchDecodeSuspicion drives the shared evaluator while this generation is
+// suspected. Running it here, independent of further stderr, is what makes the
+// deadline fire even when decoding goes quiet.
+func (s *TranscodeSession) watchDecodeSuspicion(ctx context.Context, generation uint64) {
+	ticker := time.NewTicker(decodeWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.evaluateDecodeVerdict()
+		}
+	}
+}
+
+// IsSourceRejected reports whether the running plan's decoder confirmed that
+// the source is undecodable. It drives the shared evaluator first so serving,
+// waiters, restart, and notification all observe the same lifecycle: a read
+// after the observation deadline confirms exactly like the watcher would. The
+// serve path treats a confirmed verdict as permanent: once true, the client
+// should replan (and, for a hardware plan, get the software-decode variant)
+// instead of waiting out its own startup timeout.
 //
-// The verdict is suppressed while the decoder demonstrably recovered: usable
-// video muxed after the latest error contradicts it (see sourceRejectedLocked).
-// Sessions without an output directory (unit fixtures) have no progress to
-// consult, so the verdict stands for them.
+// A read is cheap and never scans under the mutex; only a suspected generation
+// samples progress, through one coalesced generation-scoped probe.
 func (s *TranscodeSession) IsSourceRejected() bool {
 	if s == nil {
 		return false
 	}
+	s.evaluateDecodeVerdict()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.sourceRejectedLocked()
+	return s.sourceRejected
 }
 
-// sourceRejectedLocked is the gated verdict: the latched rejection stands
-// unless the decoder demonstrably recovered — usable video produced after the
-// latest error. Output that predates the storm proves nothing: the incident
-// shape is a storm with zero output, and a mid-stream death looks like older
-// output plus a fresh storm. Only progress newer than the newest failure
-// suppresses. Callers must hold mu.
+// sourceRejectedLocked reads the confirmed verdict without driving the
+// evaluator. It exists for callers already holding mu (restart, notification).
 func (s *TranscodeSession) sourceRejectedLocked() bool {
-	if !s.sourceRejected {
-		return false
-	}
-	cutoff := s.lastDecodeErrorAt
-	if cutoff.IsZero() {
-		cutoff = s.generationStartedAt
-	}
-	return !s.videoProgressAfterLocked(cutoff)
+	return s.sourceRejected
 }
 
-// videoProgressAfterLocked reports whether ffmpeg muxed segment output newer
-// than cutoff. Segment existence (not content) is the signal: any muxed
+// evaluateDecodeVerdict is the one shared evaluator for a suspected generation.
+// It snapshots state under mu, samples progress outside the mutex, then applies
+// the result only if the generation has not moved on. Recovery cancels
+// suspicion; expiry confirms it and hands off to notification and bounded
+// teardown. It is a no-op while observing or confirmed.
+func (s *TranscodeSession) evaluateDecodeVerdict() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.decodeStage != decodeStageSuspected {
+		s.mu.Unlock()
+		return
+	}
+	generation := s.decodeGeneration
+	outputDir := s.outputDir
+	suspectAt := s.decodeSuspectAt
+	probe := s.decodeProbe
+	s.mu.Unlock()
+
+	recovered, ok := s.runDecodeProbe(generation, outputDir, suspectAt, probe)
+	if !ok {
+		// Another probe owns the sampling path; a later tick applies its own
+		// result. Never block a verdict read behind slow I/O.
+		return
+	}
+	s.applyDecodeVerdict(generation, recovered)
+}
+
+// runDecodeProbe samples generation-scoped progress outside the session mutex,
+// coalescing concurrent probes: while one probe is in flight, other callers
+// return ok=false rather than launching a scan or serializing behind the first.
+// A session with no output directory (unit fixtures) reports no recovery so the
+// suspicion can still confirm on expiry.
+func (s *TranscodeSession) runDecodeProbe(generation uint64, outputDir string, cutoff time.Time, probe func(string, time.Time) bool) (recovered bool, ok bool) {
+	if outputDir == "" {
+		return false, true
+	}
+	s.decodeProbeMu.Lock()
+	if s.decodeProbeRunning {
+		s.decodeProbeMu.Unlock()
+		return false, false
+	}
+	s.decodeProbeRunning = true
+	s.decodeProbeMu.Unlock()
+
+	if probe == nil {
+		probe = videoProgressAfter
+	}
+	recovered = probe(outputDir, cutoff)
+
+	s.decodeProbeMu.Lock()
+	s.decodeProbeRunning = false
+	s.decodeProbeMu.Unlock()
+	return recovered, true
+}
+
+// applyDecodeVerdict folds a completed probe into the lifecycle, validating the
+// generation first so a stale probe can never indict or clear a replacement.
+func (s *TranscodeSession) applyDecodeVerdict(generation uint64, recovered bool) {
+	s.mu.Lock()
+	if generation != s.decodeGeneration || s.decodeStage != decodeStageSuspected {
+		s.mu.Unlock()
+		return
+	}
+	if recovered {
+		// Qualifying progress retires the episode: strikes, suspicion
+		// deadline, and pending notification all clear, so a later isolated
+		// error needs fresh evidence.
+		s.decodeErrorCount = 0
+		s.lastDecodeErrorAt = time.Time{}
+		s.decodeStage = decodeStageObserving
+		s.decodeSuspectAt = time.Time{}
+		cancel := s.decodeWatchCancel
+		s.decodeWatchCancel = nil
+		s.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return
+	}
+	now := s.decodeClock()
+	if s.decodeSuspectAt.IsZero() || now.Sub(s.decodeSuspectAt) < decodeObservationWindow {
+		s.mu.Unlock()
+		return
+	}
+	s.confirmDecodeRejectionLocked()
+	cancel := s.decodeWatchCancel
+	s.decodeWatchCancel = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	// Preserve the typed verdict before teardown: the process exit must not
+	// reclassify a revoked generation, and notification must not depend on a
+	// client replan or a marker landing. Teardown is server-owned and bounded.
+	s.notifySourceRejected(context.Background())
+	go s.reapRejectedGeneration(generation)
+}
+
+// confirmDecodeRejectionLocked marks the generation confirmed. The
+// session-level hardware latch was already set at suspicion entry; a software
+// plan never sets it. Callers must hold mu.
+func (s *TranscodeSession) confirmDecodeRejectionLocked() {
+	s.decodeStage = decodeStageConfirmed
+	s.sourceRejected = true
+}
+
+// reapRejectedGeneration tears down a confirmed generation's ffmpeg process
+// within decodeReapTimeout, with no dependency on a client replan, waiters, or
+// the marker callback. It is generation-fenced: a reset that installed a
+// replacement first makes this a no-op, so cleanup racing reset cannot kill the
+// new process.
+func (s *TranscodeSession) reapRejectedGeneration(generation uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if generation != s.decodeGeneration || !s.sourceRejected {
+		s.mu.Unlock()
+		return
+	}
+	cancel := s.cancel
+	done := s.done
+	reapTimeout := s.decodeReapTimeout
+	if reapTimeout <= 0 {
+		reapTimeout = decodeReapTimeout
+	}
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(reapTimeout):
+		}
+	}
+}
+
+// videoProgressAfter reports whether ffmpeg muxed non-empty segment output
+// newer than cutoff. Segment existence (not content) is the signal: any muxed
 // segment proves the decoder is extracting usable video, which contradicts a
 // source-undecodable verdict. Manifests, empty files, and unparseable names
-// never count. A zero cutoff (no errors and no generation stamp, as in unit
-// fixtures) matches nothing only if no segments exist at all — callers
-// consult this only after a rejection was recorded. Callers must hold mu.
-func (s *TranscodeSession) videoProgressAfterLocked(cutoff time.Time) bool {
-	if s.outputDir == "" {
-		return false
-	}
-	entries, err := os.ReadDir(s.outputDir)
+// never count. It runs outside the session mutex.
+func videoProgressAfter(outputDir string, cutoff time.Time) bool {
+	entries, err := os.ReadDir(outputDir)
 	if err != nil {
 		return false
 	}
@@ -4787,33 +5047,27 @@ func (s *TranscodeSession) notifyDemuxFailure(ctx context.Context) {
 }
 
 // notifySourceRejected invokes the source-candidate failure callback exactly
-// once, when the decoder rejection has crossed its confidence threshold. It is
-// the decode counterpart of notifyDemuxFailure and reuses the same identity
-// (effective media file id + durable canonical path) so the embedding handler
-// stamps the candidate through the one existing failed_at mechanism. The
-// callback is read under mu, then invoked off the stderr goroutine with a
-// detached, bounded context so a slow write cannot stall FFmpeg's pipe. It is a
-// no-op when the source was never rejected or the callback is unset.
+// once, when the decoder rejection has been confirmed. It is the decode
+// counterpart of notifyDemuxFailure and reuses the same identity (effective
+// media file id + durable canonical path) so the embedding handler stamps the
+// candidate through the one existing failed_at mechanism. The callback is read
+// under mu, then invoked off the evaluator goroutine with a detached, bounded
+// context so a slow write cannot stall the verdict. It is a no-op when the
+// source was never confirmed or the callback is unset.
+//
+// Notification is synchronous with respect to the marker latch but never with
+// respect to recovery: it is only reachable from confirmation, so it cannot
+// misroute a generation that is still observing or suspected.
 func (s *TranscodeSession) notifySourceRejected(ctx context.Context) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	// The gated verdict: a storm alongside flowing segments must not mark the
-	// candidate. Not latching on suppression leaves a later stall markable.
 	if !s.sourceRejectedLocked() || s.sourceRejectNotified {
 		s.mu.Unlock()
 		return
 	}
 	s.sourceRejectNotified = true
-	// The ffmpeg process is deliberately NOT killed here: the manifest it is
-	// about to write (or the session the rotation loop closes) still drives
-	// downstream checks, and killing it would convert "manifest will appear"
-	// into "manifest never appears", engaging the hw_accel=auto HW→software
-	// fallback per candidate and multiplying transcode starts. Waiters observe
-	// the verdict through their tick-bounded gated checks instead. The
-	// failure paths close the session promptly once the typed verdict routes
-	// them to rotation.
 	cb := s.opts.OnSourceRejected
 	fileID := s.opts.MediaFileID
 	canonical := strings.TrimSpace(s.opts.CanonicalInputPath)
@@ -4848,8 +5102,10 @@ func (s *TranscodeSession) logFFmpegLine(ctx context.Context, line string) {
 		}
 	}
 	if video && decodeErrorLine(line) {
-		s.observeDecodeError(time.Now(), line)
-		s.notifySourceRejected(ctx)
+		// Observation only: a decoder line never confirms by itself. The
+		// shared evaluator (a later progress sample or the observation
+		// deadline) confirms and then notifies.
+		s.observeDecodeError(line)
 	}
 	if s == nil || s.opts.FFmpegLogSink == nil {
 		return
