@@ -43,3 +43,19 @@ func TestConfigFromSettingsQualitySortRoundTrip(t *testing.T) {
 		t.Fatalf("legacy profile decoded sort = %+v, want nil", legacy.Quality.Profiles[0].Sort)
 	}
 }
+
+// TestConfigFromSettingsIndexerSearchTimeout proves the Prowlarr search timeout
+// round-trips as an int with the documented default of 20.
+func TestConfigFromSettingsIndexerSearchTimeout(t *testing.T) {
+	got := virtuallibrary.ConfigFromSettings(map[string]string{
+		"virtual_library.indexer_search_timeout_seconds": "45",
+	}).IndexerSearchTimeoutSeconds
+	if got != 45 {
+		t.Fatalf("IndexerSearchTimeoutSeconds = %d, want 45", got)
+	}
+
+	def := virtuallibrary.ConfigFromSettings(map[string]string{}).IndexerSearchTimeoutSeconds
+	if def != 20 {
+		t.Fatalf("default IndexerSearchTimeoutSeconds = %d, want 20", def)
+	}
+}

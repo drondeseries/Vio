@@ -54,6 +54,7 @@ const AUTOMATION_KEYS = [
   "virtual_library.indexer_rss_url",
   "virtual_library.indexer_api_key",
   "virtual_library.indexer_rss_check_minutes",
+  "virtual_library.indexer_search_timeout_seconds",
   "virtual_library.altmount_url",
   "virtual_library.altmount_api_key",
   "virtual_library.altmount_check_minutes",
@@ -428,6 +429,14 @@ export default function StreamingSettings() {
             value={form.getValue("virtual_library.indexer_rss_check_minutes") || "15"}
             onChange={(v) => form.setValue("virtual_library.indexer_rss_check_minutes", v)}
             restartRequired={restartKeys.has("virtual_library.indexer_rss_check_minutes")}
+          />
+          <SettingField
+            label="Prowlarr search timeout (seconds)"
+            type="number"
+            description="How long to wait for Prowlarr to aggregate a search before giving up. Raise it if Prowlarr searches many slow indexers. 5–120."
+            value={form.getValue("virtual_library.indexer_search_timeout_seconds") || "20"}
+            onChange={(v) => form.setValue("virtual_library.indexer_search_timeout_seconds", v)}
+            restartRequired={restartKeys.has("virtual_library.indexer_search_timeout_seconds")}
           />
           <SettingField
             label="AltMount URL"

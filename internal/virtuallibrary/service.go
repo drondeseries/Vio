@@ -73,23 +73,24 @@ var ErrVirtualLibraryUnavailable = fmt.Errorf("virtual library core service is u
 // Config carries the virtual_library.* settings snapshot used to build the
 // service. An empty ManifestURL keeps the service dormant.
 type Config struct {
-	Enabled                bool
-	ManifestURL            string
-	MovieLibraryID         int
-	SeriesLibraryID        int
-	TMDBAPIKey             string
-	AllowInsecureHTTP      bool
-	AllowPrivateStreams    bool
-	CacheTTLMinutes        int
-	ScheduleRefreshMinutes int
-	MonitorFile            string
-	Quality                quality.QualityConfig
-	IndexerRSSURL          string
-	IndexerAPIKey          string
-	IndexerCheckMinutes    int
-	AltmountURL            string
-	AltmountAPIKey         string
-	AltmountCheckMinutes   int
+	Enabled                     bool
+	ManifestURL                 string
+	MovieLibraryID              int
+	SeriesLibraryID             int
+	TMDBAPIKey                  string
+	AllowInsecureHTTP           bool
+	AllowPrivateStreams         bool
+	CacheTTLMinutes             int
+	ScheduleRefreshMinutes      int
+	MonitorFile                 string
+	Quality                     quality.QualityConfig
+	IndexerRSSURL               string
+	IndexerAPIKey               string
+	IndexerCheckMinutes         int
+	IndexerSearchTimeoutSeconds int
+	AltmountURL                 string
+	AltmountAPIKey              string
+	AltmountCheckMinutes        int
 }
 
 // ConfigFromSettings builds a Config from a settings map (e.g. from
@@ -124,23 +125,24 @@ func ConfigFromSettings(m map[string]string) Config {
 	}
 
 	return Config{
-		Enabled:                boolOr(m, "virtual_library.enabled", true),
-		ManifestURL:            m["virtual_library.manifest_url"],
-		MovieLibraryID:         intOr(m, "virtual_library.movie_library_id", 1),
-		SeriesLibraryID:        intOr(m, "virtual_library.series_library_id", 2),
-		TMDBAPIKey:             m["virtual_library.tmdb_api_key"],
-		AllowInsecureHTTP:      boolOr(m, "virtual_library.allow_insecure_http", false),
-		AllowPrivateStreams:    boolOr(m, "virtual_library.allow_private_streams", false),
-		CacheTTLMinutes:        intOr(m, "virtual_library.cache_ttl_minutes", 10),
-		ScheduleRefreshMinutes: intOr(m, "virtual_library.schedule_refresh_minutes", 360),
-		MonitorFile:            stringOr(m, "virtual_library.monitor_file", ".vio-virtual-library-monitored.json"),
-		Quality:                qc,
-		IndexerRSSURL:          m["virtual_library.indexer_rss_url"],
-		IndexerAPIKey:          m["virtual_library.indexer_api_key"],
-		IndexerCheckMinutes:    intOr(m, "virtual_library.indexer_rss_check_minutes", 15),
-		AltmountURL:            m["virtual_library.altmount_url"],
-		AltmountAPIKey:         m["virtual_library.altmount_api_key"],
-		AltmountCheckMinutes:   intOr(m, "virtual_library.altmount_check_minutes", 15),
+		Enabled:                     boolOr(m, "virtual_library.enabled", true),
+		ManifestURL:                 m["virtual_library.manifest_url"],
+		MovieLibraryID:              intOr(m, "virtual_library.movie_library_id", 1),
+		SeriesLibraryID:             intOr(m, "virtual_library.series_library_id", 2),
+		TMDBAPIKey:                  m["virtual_library.tmdb_api_key"],
+		AllowInsecureHTTP:           boolOr(m, "virtual_library.allow_insecure_http", false),
+		AllowPrivateStreams:         boolOr(m, "virtual_library.allow_private_streams", false),
+		CacheTTLMinutes:             intOr(m, "virtual_library.cache_ttl_minutes", 10),
+		ScheduleRefreshMinutes:      intOr(m, "virtual_library.schedule_refresh_minutes", 360),
+		MonitorFile:                 stringOr(m, "virtual_library.monitor_file", ".vio-virtual-library-monitored.json"),
+		Quality:                     qc,
+		IndexerRSSURL:               m["virtual_library.indexer_rss_url"],
+		IndexerAPIKey:               m["virtual_library.indexer_api_key"],
+		IndexerCheckMinutes:         intOr(m, "virtual_library.indexer_rss_check_minutes", 15),
+		IndexerSearchTimeoutSeconds: intOr(m, "virtual_library.indexer_search_timeout_seconds", 20),
+		AltmountURL:                 m["virtual_library.altmount_url"],
+		AltmountAPIKey:              m["virtual_library.altmount_api_key"],
+		AltmountCheckMinutes:        intOr(m, "virtual_library.altmount_check_minutes", 15),
 	}
 }
 
@@ -224,7 +226,7 @@ func New(cfg Config, registrar *catalog.VirtualMediaRegistrar, logger *slog.Logg
 		logger.Warn("virtual library monitor state unavailable; starting with empty state", "error", err)
 	}
 	if cfg.IndexerRSSURL != "" {
-		if err := m.ConfigureProwlarr(cfg.IndexerRSSURL, cfg.IndexerAPIKey, cfg.IndexerCheckMinutes, ".vio-virtual-library-prowlarr-index.json"); err != nil {
+		if err := m.ConfigureProwlarr(cfg.IndexerRSSURL, cfg.IndexerAPIKey, cfg.IndexerCheckMinutes, cfg.IndexerSearchTimeoutSeconds, ".vio-virtual-library-prowlarr-index.json"); err != nil {
 			logger.Warn("virtual library prowlarr configuration error", "error", err)
 		}
 	}

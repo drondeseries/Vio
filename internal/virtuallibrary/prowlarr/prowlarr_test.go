@@ -28,10 +28,82 @@ func slowServer(t *testing.T, delay time.Duration) *httptest.Server {
 	return srv
 }
 
+// isTimeoutError reports a request timeout either via errors.Is on the wrapped
+// context deadline or the net.Error Timeout method.
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr interface{ Timeout() bool }
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// TestConfiguredTimeoutBoundsSearch proves a 5s configured timeout aborts a
+// Prowlarr search that has not answered, without any caller deadline.
+func TestConfiguredTimeoutBoundsSearch(t *testing.T) {
+	srv := slowServer(t, 25*time.Second)
+	c := NewSearchClient(nil)
+	c.Configure(srv.URL, "", 15, 5)
+
+	start := time.Now()
+	_, err := c.search(context.Background(), monitoredMedia{Title: "The Show"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("search: expected a timeout error")
+	}
+	if !isTimeoutError(err) {
+		t.Errorf("search error %v is not a timeout", err)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("search took %v; the 5s configured timeout did not bound it", elapsed)
+	}
+}
+
+// TestConfiguredTimeoutAllowsSlowSuccess proves a raised timeout lets a slow
+// aggregation succeed: a 30s timeout accepts a server that takes 1s.
+func TestConfiguredTimeoutAllowsSlowSuccess(t *testing.T) {
+	srv := slowServer(t, time.Second)
+	c := NewSearchClient(nil)
+	c.Configure(srv.URL, "", 15, 30)
+
+	releases, err := c.search(context.Background(), monitoredMedia{Title: "The Show"})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if releases == nil {
+		t.Fatal("search returned nil releases for an empty [] body")
+	}
+}
+
+// TestConfigureClampsTimeout locks the fallback for out-of-range values to the
+// same bounds the admin-setting validator enforces.
+func TestConfigureClampsTimeout(t *testing.T) {
+	cases := []struct {
+		in   int
+		want time.Duration
+	}{
+		{5, 5 * time.Second},
+		{120, 120 * time.Second},
+		{4, defaultSearchTimeoutSeconds * time.Second},
+		{121, defaultSearchTimeoutSeconds * time.Second},
+		{0, defaultSearchTimeoutSeconds * time.Second},
+	}
+	for _, tc := range cases {
+		c := NewSearchClient(nil)
+		c.Configure("http://prowlarr:9696", "key", 15, tc.in)
+		c.mu.Lock()
+		got := c.timeout
+		c.mu.Unlock()
+		if got != tc.want {
+			t.Errorf("Configure(timeout=%d) timeout = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestSearchTransportErrorPreservesCause(t *testing.T) {
 	srv := slowServer(t, 500*time.Millisecond)
 	c := NewSearchClient(newRestrictedRedirectHTTPClient(0))
-	c.Configure(srv.URL, "", 15)
+	c.Configure(srv.URL, "", 15, defaultSearchTimeoutSeconds)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -51,7 +123,7 @@ func TestSearchTransportErrorPreservesCause(t *testing.T) {
 func TestRefreshTransportErrorPreservesCause(t *testing.T) {
 	srv := slowServer(t, 500*time.Millisecond)
 	c := NewSearchClient(newRestrictedRedirectHTTPClient(0))
-	c.Configure(srv.URL, "", 15)
+	c.Configure(srv.URL, "", 15, defaultSearchTimeoutSeconds)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -77,7 +149,7 @@ func TestRefreshTransportErrorPreservesCause(t *testing.T) {
 func configureTestClient(t *testing.T, baseURL, apiKey string) *prowlarrSearchClient {
 	t.Helper()
 	c := NewSearchClient(nil)
-	c.Configure(baseURL, apiKey, 15)
+	c.Configure(baseURL, apiKey, 15, defaultSearchTimeoutSeconds)
 	return c
 }
 
