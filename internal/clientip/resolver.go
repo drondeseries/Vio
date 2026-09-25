@@ -128,6 +128,11 @@ func (r *Resolver) ReloadTrustedCIDRs(ctx context.Context, store SettingsStore) 
 // Proxies must preserve Host and overwrite X-Forwarded-Proto, never append it.
 // On a WebSocket upgrade, Traefik sends "wss" or "ws" instead of "https" or
 // "http"; those name the same transport security and are accepted there only.
+//
+// websocketSchemeToHTTPScheme maps a WebSocket forwarded-proto value to the
+// HTTP scheme naming the same transport security.
+var websocketSchemeToHTTPScheme = map[string]string{"ws": "http", "wss": "https"}
+
 func (r *Resolver) requestScheme(req *http.Request) string {
 	scheme := "http"
 	if req.TLS != nil {
@@ -159,7 +164,7 @@ func (r *Resolver) requestScheme(req *http.Request) string {
 		return values[0]
 	case "ws", "wss":
 		if isWebSocketUpgrade(req) {
-			return map[string]string{"ws": "http", "wss": "https"}[values[0]]
+			return websocketSchemeToHTTPScheme[values[0]]
 		}
 	}
 	return ""
