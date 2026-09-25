@@ -59,7 +59,11 @@ type PluginProvider struct {
 	installationID int
 	capabilityID   string
 	displayName    string
-	clientFactory  pluginMetadataClientFactory
+	// lookupProviderIDs are the provider-ID keys the capability declared it can
+	// look an item up by (lookup_provider_ids). GetMetadata runs when the item
+	// carries any of them, even without an ID of the provider's own.
+	lookupProviderIDs []string
+	clientFactory     pluginMetadataClientFactory
 }
 
 func NewPluginProvider(settings map[string]string, resolver pluginMetadataResolver) (*PluginProvider, error) {
@@ -114,10 +118,12 @@ func NewPluginProviderWithClientFactory(
 
 // NewPluginProviderFromCapability constructs a PluginProvider directly from
 // plugin capability data, without going through a settings map or registry.
+// lookupProviderIDs is the capability's declared lookup_provider_ids, or nil.
 func NewPluginProviderFromCapability(
 	installationID int,
 	capabilityID string,
 	displayName string,
+	lookupProviderIDs []string,
 	resolver pluginMetadataResolver,
 ) (*PluginProvider, error) {
 	if resolver == nil {
@@ -127,10 +133,11 @@ func NewPluginProviderFromCapability(
 		displayName = capabilityID
 	}
 	return &PluginProvider{
-		installationID: installationID,
-		capabilityID:   capabilityID,
-		displayName:    displayName,
-		clientFactory:  resolver.MetadataProviderClient,
+		installationID:    installationID,
+		capabilityID:      capabilityID,
+		displayName:       displayName,
+		lookupProviderIDs: lookupProviderIDs,
+		clientFactory:     resolver.MetadataProviderClient,
 	}, nil
 }
 
@@ -218,9 +225,14 @@ func (p *PluginProvider) Search(ctx context.Context, query SearchQuery) ([]Searc
 	return results, nil
 }
 
+// GetMetadata fetches the item from the plugin. It runs when the item carries
+// the provider's own ID, or, for an enrichment-only provider that never assigns
+// one, any of the provider-ID keys it declared in lookup_provider_ids. In the
+// second case ProviderId is empty and the plugin reads the IDs it needs from
+// ProviderIds.
 func (p *PluginProvider) GetMetadata(ctx context.Context, req MetadataRequest) (*MetadataResult, error) {
 	providerID := req.ProviderIDs[p.capabilityID]
-	if providerID == "" {
+	if providerID == "" && !p.hasLookupProviderID(req.ProviderIDs) {
 		return nil, nil
 	}
 
@@ -249,6 +261,9 @@ func (p *PluginProvider) GetMetadata(ctx context.Context, req MetadataRequest) (
 	}
 
 	advisoryAge, advisorySource := advisoryFromPluginMetadata(response.GetItem().GetMetadata())
+	if !models.AdvisoryAgeApplies(req.ContentType) {
+		advisoryAge, advisorySource = 0, ""
+	}
 
 	return &MetadataResult{
 		HasMetadata:          true,
@@ -288,6 +303,17 @@ func (p *PluginProvider) GetMetadata(ctx context.Context, req MetadataRequest) (
 		AirTime:              response.GetItem().GetAirTime(),
 		ReleaseDate:          response.GetItem().GetReleaseDate(),
 	}, nil
+}
+
+// hasLookupProviderID reports whether ids holds a non-empty value for any of
+// the provider's declared lookup keys.
+func (p *PluginProvider) hasLookupProviderID(ids map[string]string) bool {
+	for _, key := range p.lookupProviderIDs {
+		if ids[key] != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func titleAliasesFromPlugin(aliases []*pluginv1.TitleAlias, provider string) []TitleAlias {
@@ -596,7 +622,7 @@ var advisoryAgeSources = map[string]string{
 // bare numeric certification.
 const maxAdvisoryAge = 21
 
-// advisoryFromPluginMetadata reads a display-only advisory age out of the
+// advisoryFromPluginMetadata reads an advisory age out of the
 // free-form plugin metadata Struct. MetadataItem has no typed advisory fields
 // yet, so plugins carry the pair under these two keys; typed proto fields
 // remain a later additive option.

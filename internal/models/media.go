@@ -626,14 +626,32 @@ type AudiobookSeriesMembership struct {
 // either half is missing, both columns store NULL, so "no advisory" has one
 // spelling in the database rather than a NULL, an empty string, and a zero.
 //
+// Only movies and series store an advisory (see AdvisoryAgeApplies), so a
+// profile's advisory-age limit can never hide an item of any other type, such
+// as a title in the beta book libraries.
+//
 // Every write path funnels through here, including the COPY-based bulk import,
-// which cannot lean on a NULLIF in SQL.
-func AdvisoryColumns(age *int, source string) (*int, *string) {
-	if age == nil || *age <= 0 || source == "" {
+// which cannot lean on a NULLIF in SQL, and the catalog-bundle imports, which
+// may carry an advisory from any source.
+func AdvisoryColumns(itemType string, age *int, source string) (*int, *string) {
+	if !AdvisoryAgeApplies(itemType) || age == nil || *age <= 0 || source == "" {
 		return nil, nil
 	}
 	return age, &source
 }
+
+// AdvisoryAgeApplies reports whether an item of itemType may carry an advisory
+// age. Only movies and series do: those are the types advisory services rate
+// and the only ones the profile advisory-age limit is meant for.
+func AdvisoryAgeApplies(itemType string) bool {
+	return itemType == advisoryItemTypeMovie || itemType == advisoryItemTypeSeries
+}
+
+// The media_items.type values that may carry an advisory age.
+const (
+	advisoryItemTypeMovie  = "movie"
+	advisoryItemTypeSeries = "series"
+)
 
 type MediaItem struct {
 	ContentID               string // Sonyflake ID (PK)
@@ -647,9 +665,11 @@ type MediaItem struct {
 	ContentRating           string // PG-13, TV-MA
 	// AdvisoryAge is a recommended minimum viewer age from an advisory service
 	// (Common Sense Media), distinct from the certification in ContentRating.
-	// Display only: it feeds no ceiling or other parental control. Nil means no
-	// advisory; the column is nullable and a stored age is always positive,
-	// since providers spell "unknown" as zero.
+	// It never feeds ContentRating or content_rating_age; a profile's
+	// separate advisory-age limit (access.MaturityLimits.MaxAdvisoryAge)
+	// compares against it, and a nil age never hides a title from that limit.
+	// Nil means no advisory; the column is nullable and a stored age is always
+	// positive, since providers spell "unknown" as zero.
 	AdvisoryAge *int
 	// AdvisorySource attributes AdvisoryAge so the UI can name who recommended
 	// it. Empty when AdvisoryAge is nil.

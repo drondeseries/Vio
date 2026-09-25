@@ -677,6 +677,7 @@ func testProfiles(t *testing.T, newStore func(t *testing.T) userstore.UserStore)
 		Avatar:                     "avatar1.png",
 		IsChild:                    false,
 		MaxContentRating:           "R",
+		MaxAdvisoryAge:             12,
 		QualityPreference:          "1080p",
 		Language:                   "en",
 		SubtitleLanguage:           "es",
@@ -716,6 +717,9 @@ func testProfiles(t *testing.T, newStore func(t *testing.T) userstore.UserStore)
 	if got.MaxPlaybackQuality != "1080p" {
 		t.Errorf("MaxPlaybackQuality = %q, want %q", got.MaxPlaybackQuality, "1080p")
 	}
+	if got.MaxAdvisoryAge != 12 {
+		t.Errorf("MaxAdvisoryAge = %d, want 12", got.MaxAdvisoryAge)
+	}
 
 	// Get non-existent
 	missing, err := store.GetProfile(ctx, "nonexistent")
@@ -742,6 +746,9 @@ func testProfiles(t *testing.T, newStore func(t *testing.T) userstore.UserStore)
 	}
 	if profiles[0].MaxPlaybackQuality != "1080p" {
 		t.Errorf("ListProfiles()[0].MaxPlaybackQuality = %q, want %q", profiles[0].MaxPlaybackQuality, "1080p")
+	}
+	if profiles[0].MaxAdvisoryAge != 12 {
+		t.Errorf("ListProfiles()[0].MaxAdvisoryAge = %d, want 12", profiles[0].MaxAdvisoryAge)
 	}
 
 	// Update
@@ -774,6 +781,25 @@ func testProfiles(t *testing.T, newStore func(t *testing.T) userstore.UserStore)
 	}
 	if updated.MaxPlaybackQuality != "720p" {
 		t.Errorf("Updated MaxPlaybackQuality = %q, want %q", updated.MaxPlaybackQuality, "720p")
+	}
+	// An update that does not mention the advisory-age limit leaves it alone.
+	if updated.MaxAdvisoryAge != 12 {
+		t.Errorf("Untouched MaxAdvisoryAge = %d, want 12", updated.MaxAdvisoryAge)
+	}
+
+	// Advisory-age limit: a value sets it and 0 clears it.
+	for _, want := range []int{9, 0} {
+		age := want
+		if err := store.UpdateProfile(ctx, "prof-1", userstore.UpdateProfileInput{MaxAdvisoryAge: &age}); err != nil {
+			t.Fatalf("UpdateProfile(MaxAdvisoryAge=%d): %v", want, err)
+		}
+		got, err := store.GetProfile(ctx, "prof-1")
+		if err != nil {
+			t.Fatalf("GetProfile after MaxAdvisoryAge=%d: %v", want, err)
+		}
+		if got.MaxAdvisoryAge != want {
+			t.Errorf("MaxAdvisoryAge after update to %d = %d", want, got.MaxAdvisoryAge)
+		}
 	}
 
 	// PIN set and verify

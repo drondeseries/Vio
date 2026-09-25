@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useRef,
   useState,
 } from "react";
 import { Link, useLocation } from "react-router";
@@ -64,6 +65,26 @@ interface LayoutProps {
 }
 
 export default function Layout({ children }: LayoutProps) {
+  const shellRef = useRef<HTMLDivElement>(null);
+  const mobileHeaderRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const shell = shellRef.current;
+    const header = mobileHeaderRef.current;
+    if (!shell || !header) return;
+    const measureHeader = () => {
+      const height = header.getBoundingClientRect().height;
+      const margin = height ? parseFloat(getComputedStyle(header).marginTop) || 0 : 0;
+      shell.style.setProperty("--detail-header-height", `${height + margin}px`);
+    };
+    const observer = new ResizeObserver(measureHeader);
+    observer.observe(header);
+    window.addEventListener("resize", measureHeader);
+    measureHeader();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", measureHeader);
+    };
+  }, []);
   const location = useLocation();
   const navigate = useViewTransitionNavigate();
   const queryClient = useQueryClient();
@@ -338,7 +359,7 @@ export default function Layout({ children }: LayoutProps) {
       itemDetailsReady={itemDetailsReady}
       enteredItemFromHome={enteredItemFromHome}
     >
-      <div className="bg-background relative min-h-[100dvh] overflow-x-clip">
+      <div ref={shellRef} className="bg-background relative min-h-[100dvh] overflow-x-clip">
         <a
           href="#main-content"
           className="focus:bg-background focus:text-foreground focus:ring-ring sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:rounded-lg focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:ring-2 focus:outline-none"
@@ -357,6 +378,7 @@ export default function Layout({ children }: LayoutProps) {
         {/* Mobile header — visible below lg. Slides up on scroll-down within
           the Calendar route to free vertical space; pulling up reveals it. */}
         <div
+          ref={mobileHeaderRef}
           className={`mobile-header glass-dark border-border/70 sticky top-0 z-30 mx-3 mt-3 flex items-center justify-between rounded-2xl border px-4 py-3 transition-transform duration-200 ease-out lg:hidden ${
             mobileHeaderHidden ? "-translate-y-[140%]" : "translate-y-0"
           }`}
