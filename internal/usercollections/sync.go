@@ -2,9 +2,7 @@ package usercollections
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -300,32 +298,12 @@ func limitCollectionItems(items []userstore.CollectionItemReplacement, limit *in
 	return items
 }
 
+// fetchMDBListEntries fetches a list from MDBList's public /json feed through
+// the shared paging helper. The feed truncates at 2000 entries by default but
+// honors undocumented limit/offset parameters, so paging is required for
+// larger lists (see collectionutil.FetchMDBListJSONPaged).
 func (s *Service) fetchMDBListEntries(ctx context.Context, url string) ([]mdblistEntry, error) {
-	url, err := collectionutil.CanonicalMDBListURL(url)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating mdblist request: %w", err)
-	}
-	res, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetching mdblist list: %w", err)
-	}
-	defer func() { _ = res.Body.Close() }()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("mdblist request failed with status %d", res.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
-	if err != nil {
-		return nil, fmt.Errorf("reading mdblist response: %w", err)
-	}
-	var entries []mdblistEntry
-	if err := json.Unmarshal(body, &entries); err != nil {
-		return nil, fmt.Errorf("parsing mdblist response: %w", err)
-	}
-	return entries, nil
+	return collectionutil.FetchMDBListJSONPaged[mdblistEntry](ctx, s.httpClient, url, collectionutil.MaxExplicitItemLimit)
 }
 
 // ── TMDB presets ─────────────────────────────────────────────────────────────

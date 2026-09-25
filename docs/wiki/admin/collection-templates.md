@@ -102,6 +102,11 @@ retired or re-pointed in `builtin.go` (this has already happened once for the Cr
 Collection and A24 templates). Operators who maintain their own MDBList lists can register
 additional templates against `templates.Default` at startup without forking this repo.
 
+The public `/json` feed returns at most 2000 entries by default, but that default is not a hard
+cap: the endpoint honors undocumented `limit`/`offset` parameters (verified against a
+4,283-entry list), so sync pages the feed until it is exhausted. Lists larger than 2000 entries
+are imported whole when no API key is configured.
+
 ## Template Bundles
 
 A bundle is a named, ordered set of built-in templates that can be applied together in one pass —

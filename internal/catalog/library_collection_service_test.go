@@ -409,6 +409,63 @@ func TestFetchMDBListEntriesUsesAPIFetcherWhenSet(t *testing.T) {
 	}
 }
 
+// TestFetchMDBListEntriesPagesPastDefaultTruncation proves the catalog's /json
+// path pages past the feed's 2000-entry default through the shared helper: a
+// 3500-entry list arrives whole, in order, across four limit/offset requests.
+func TestFetchMDBListEntriesPagesPastDefaultTruncation(t *testing.T) {
+	const total = 3500
+	var offsets []string
+	var paths []string
+	svc := &LibraryCollectionService{
+		httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			query := req.URL.Query()
+			offsets = append(offsets, query.Get("offset"))
+			paths = append(paths, req.URL.Path)
+			offset, _ := strconv.Atoi(query.Get("offset"))
+			limit, _ := strconv.Atoi(query.Get("limit"))
+			end := offset + limit
+			if end > total {
+				end = total
+			}
+			var b strings.Builder
+			b.WriteByte('[')
+			for i := offset; i < end; i++ {
+				if i > offset {
+					b.WriteByte(',')
+				}
+				fmt.Fprintf(&b, `{"id":%d,"title":"Item %d","mediatype":"movie","release_year":2000}`, i, i)
+			}
+			b.WriteByte(']')
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(b.String())),
+				Header:     make(http.Header),
+			}, nil
+		})},
+	}
+
+	entries, err := svc.fetchMDBListEntries(context.Background(), "https://mdblist.com/lists/alice/large/json")
+	if err != nil {
+		t.Fatalf("fetchMDBListEntries: %v", err)
+	}
+	if len(entries) != total {
+		t.Fatalf("entries = %d, want %d (must page past 2000)", len(entries), total)
+	}
+	for i, entry := range entries {
+		if entry.ID != i {
+			t.Fatalf("entries[%d].ID = %d, want %d", i, entry.ID, i)
+		}
+	}
+	if got := strings.Join(offsets, ","); got != "0,1000,2000,3000" {
+		t.Fatalf("offsets = %s, want 0,1000,2000,3000", got)
+	}
+	for _, path := range paths {
+		if path != "/lists/alice/large/json" {
+			t.Fatalf("path = %q, want /lists/alice/large/json", path)
+		}
+	}
+}
+
 func TestFetchMDBListEntriesFallsBackToJSONWhenAPINil(t *testing.T) {
 	httpHits := 0
 	svc := &LibraryCollectionService{
