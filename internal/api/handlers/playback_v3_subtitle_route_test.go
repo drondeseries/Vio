@@ -382,7 +382,9 @@ func TestV2RetryReplaysATerminalStartWithSubripSidecar(t *testing.T) {
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	startRequest := v3HandlerStartRequest()
 	startRequest.ClientFeatures = append(startRequest.ClientFeatures, playback.FeatureSubripSidecarV3)
-	// A track identity for another file makes the start terminal.
+	// A track identity for another file degrades to subtitles-off under the
+	// fork's stale-selection policy (subtitle_policy_v3.go): the start stays
+	// playable instead of terminating.
 	startRequest.SubtitleTrackID = playback.TrackIDV3(file.ID+1, "subtitle", 0)
 	body := marshalV3StartRequest(t, startRequest)
 	start := func() (*httptest.ResponseRecorder, playback.DecisionResponseV3) {
@@ -393,11 +395,20 @@ func TestV2RetryReplaysATerminalStartWithSubripSidecar(t *testing.T) {
 		return rr, response
 	}
 	firstRR, first := start()
-	if first.Terminal == nil {
-		t.Fatalf("expected a terminal start, got %d %s", firstRR.Code, firstRR.Body.String())
+	if first.Terminal != nil {
+		t.Fatalf("expected a playable degraded start, got terminal %d %s", firstRR.Code, firstRR.Body.String())
+	}
+	if firstRR.Code != http.StatusCreated {
+		t.Fatalf("expected 201 playable start, got %d %s", firstRR.Code, firstRR.Body.String())
+	}
+	if first.PlaybackPlan == nil || first.PlaybackPlan.Subtitle.Mode != playback.SubtitleOffV3 {
+		t.Fatalf("expected subtitles-off degradation, got %+v", first.PlaybackPlan)
 	}
 	retryRR, retry := start()
-	if retryRR.Code != firstRR.Code || retry.Terminal == nil || retry.Terminal.Reason != first.Terminal.Reason {
-		t.Fatalf("terminal retry = %d %s, want a replay of %d", retryRR.Code, retryRR.Body.String(), firstRR.Code)
+	if retryRR.Code != firstRR.Code || retry.Terminal != nil {
+		t.Fatalf("retry = %d %s, want a replay of playable %d", retryRR.Code, retryRR.Body.String(), firstRR.Code)
+	}
+	if retry.PlaybackPlan == nil || retry.PlaybackPlan.Subtitle.Mode != playback.SubtitleOffV3 {
+		t.Fatalf("expected retry subtitles-off, got %+v", retry.PlaybackPlan)
 	}
 }
