@@ -501,6 +501,117 @@ func TestConfirmedRejectionReapsWithinBound(t *testing.T) {
 	}
 }
 
+// TestVerdictPathsAgreeUnderInterleaving pins B's "all verdict paths agree"
+// rule: a suspected generation hammered concurrently by stderr observations,
+// verdict reads, and evaluations settles on exactly one verdict — never a
+// transient disagreement where one path reports rejection and another does not
+// for the same generation.
+func TestVerdictPathsAgreeUnderInterleaving(t *testing.T) {
+	base := time.Unix(21_500, 0)
+	s := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo:   "hevc",
+		CanonicalInputPath: "virtual://movie/tt-interleave?result=x",
+	}}
+	clock := attachDecodeClock(s, base)
+
+	stormDecode(s)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	// Continuous observations while readers and evaluators run.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				s.observeDecodeError(hevcFatalErrorLine())
+			}
+		}
+	}()
+	var rejectedSeen, notRejectedSeen int32
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					if s.IsSourceRejected() {
+						atomic.AddInt32(&rejectedSeen, 1)
+					} else {
+						atomic.AddInt32(&notRejectedSeen, 1)
+					}
+					s.evaluateDecodeVerdict()
+				}
+			}
+		}()
+	}
+	// Let the race run, then confirm via the deadline and quiesce.
+	time.Sleep(30 * time.Millisecond)
+	clock.Advance(decodeObservationWindow)
+	s.evaluateDecodeVerdict()
+	waitSourceRejected(t, s)
+	close(stop)
+	wg.Wait()
+
+	// Once confirmed, every subsequent read must agree; the verdict is
+	// monotone within a generation and never flips back.
+	for i := 0; i < 50; i++ {
+		if !s.IsSourceRejected() {
+			t.Fatal("confirmed verdict flipped back under interleaving")
+		}
+	}
+	if atomic.LoadInt32(&rejectedSeen) == 0 {
+		t.Fatal("interleaving never observed the confirmed verdict")
+	}
+}
+
+// TestConfirmedRejectionReapsDespiteBlockedMarker pins D's independence from
+// the marker: a marker callback that never returns must not delay the bounded,
+// server-owned teardown, and the typed verdict must already be preserved.
+func TestConfirmedRejectionReapsDespiteBlockedMarker(t *testing.T) {
+	base := time.Unix(21_800, 0)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	s := &TranscodeSession{opts: TranscodeOpts{
+		MediaFileID:        3,
+		CanonicalInputPath: "virtual://movie/tt-blocked-marker?result=x",
+		TargetCodecVideo:   "hevc",
+		OnSourceRejected: func(context.Context, int, string) error {
+			<-release // never returns until cleanup
+			return nil
+		},
+	}}
+	attachDecodeClock(s, base)
+	tornDown := make(chan struct{})
+	s.mu.Lock()
+	s.cancel = func() { close(tornDown) }
+	s.done = make(chan struct{})
+	s.decodeReapTimeout = 200 * time.Millisecond
+	s.mu.Unlock()
+
+	stormDecode(s)
+	s.mu.Lock()
+	s.decodeSuspectAt = s.decodeClock().Add(-decodeObservationWindow)
+	s.mu.Unlock()
+	s.evaluateDecodeVerdict()
+
+	// The typed verdict is preserved immediately.
+	if !s.IsSourceRejected() {
+		t.Fatal("typed verdict missing with a blocked marker")
+	}
+	select {
+	case <-tornDown:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked marker delayed the bounded teardown")
+	}
+}
+
 func writeDecodeSegment(t *testing.T, dir, name string, mtime time.Time) {
 	t.Helper()
 	path := filepath.Join(dir, name)
