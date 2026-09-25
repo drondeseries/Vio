@@ -433,7 +433,7 @@ export default function StreamingSettings() {
           <SettingField
             label="Prowlarr search timeout (seconds)"
             type="number"
-            description="How long to wait for Prowlarr to aggregate a search before giving up. Raise it if Prowlarr searches many slow indexers. 5–120."
+            description="How long to wait for Prowlarr to aggregate a search before giving up. Raise it if Prowlarr searches many slow indexers. 5–900."
             value={form.getValue("virtual_library.indexer_search_timeout_seconds") || "20"}
             onChange={(v) => form.setValue("virtual_library.indexer_search_timeout_seconds", v)}
             restartRequired={restartKeys.has("virtual_library.indexer_search_timeout_seconds")}

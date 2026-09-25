@@ -64,7 +64,7 @@ retired: collection syncs, repairs, and variant discovery route to core, and new
 virtual rows persist under the core owner identity (installation 0). The plugin
 configuration reference below remains for the generic config mechanism only.
 
-`virtual_library.indexer_search_timeout_seconds` (default `20`, range `5`–`120`)
+`virtual_library.indexer_search_timeout_seconds` (default `20`, range `5`–`900`)
 bounds one Prowlarr `/api/v1/search` request. Raise it when Prowlarr aggregates
 many slow indexers, or a search fails with a timeout cause. A transport failure
 is wrapped so its timeout, DNS, or TLS cause stays visible to the monitor log.

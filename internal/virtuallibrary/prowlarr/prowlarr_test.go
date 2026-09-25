@@ -83,9 +83,9 @@ func TestConfigureClampsTimeout(t *testing.T) {
 		want time.Duration
 	}{
 		{5, 5 * time.Second},
-		{120, 120 * time.Second},
+		{900, 900 * time.Second},
 		{4, defaultSearchTimeoutSeconds * time.Second},
-		{121, defaultSearchTimeoutSeconds * time.Second},
+		{901, defaultSearchTimeoutSeconds * time.Second},
 		{0, defaultSearchTimeoutSeconds * time.Second},
 	}
 	for _, tc := range cases {

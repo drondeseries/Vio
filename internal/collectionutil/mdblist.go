@@ -1,10 +1,14 @@
 package collectionutil
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -181,6 +185,106 @@ func MDBListHTTPClient(base *http.Client) *http.Client {
 		return nil
 	}
 	return &clone
+}
+
+// MDBListJSONPageSize is the per-request limit used when paging the public
+// MDBList /lists/{user}/{list}/json feed.
+const MDBListJSONPageSize = 1000
+
+// maxMDBListJSONResponseBytes bounds each page body read. The 4MiB ceiling is
+// per response, not per fetch, so paging a large list still reads every page.
+const maxMDBListJSONResponseBytes = 4 << 20
+
+// FetchMDBListJSONPaged fetches MDBList's public JSON list feed, paging past
+// the feed's default truncation.
+//
+// The /json feed returns at most 2000 entries by default. That default is not a
+// hard cap: the endpoint accepts undocumented limit/offset query parameters
+// (verified empirically against a 4,283-entry list — limit up to the full list
+// size, offset to page; page/cursor are ignored). A bare GET, which the client
+// used to send, therefore silently truncates any list larger than 2000. This
+// helper pages with limit/offset until a page comes back shorter than the
+// requested limit (feed exhausted), merging entries in feed order.
+//
+// hardCap > 0 bounds the total entries returned; otherwise MaxExplicitItemLimit
+// applies. Each response's body is bounded by maxMDBListJSONResponseBytes, and
+// the fetch stops at hardCap even if the feed ignores the page parameters.
+//
+// The raw URL is canonicalized with CanonicalMDBListURL, so callers may pass
+// either the list page URL or its /json variant. Error semantics match the
+// previous single-GET path: non-2xx yields the status, and malformed JSON or a
+// read failure is wrapped.
+func FetchMDBListJSONPaged[T any](ctx context.Context, client *http.Client, rawURL string, hardCap int) ([]T, error) {
+	listURL, err := CanonicalMDBListURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if hardCap <= 0 || hardCap > MaxExplicitItemLimit {
+		hardCap = MaxExplicitItemLimit
+	}
+
+	parsed, err := url.Parse(listURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing mdblist url: %w", err)
+	}
+
+	entries := make([]T, 0)
+	offset := 0
+	for len(entries) < hardCap {
+		query := parsed.Query()
+		query.Set("limit", strconv.Itoa(MDBListJSONPageSize))
+		query.Set("offset", strconv.Itoa(offset))
+		parsed.RawQuery = query.Encode()
+
+		page, err := fetchMDBListJSONPage[T](ctx, client, parsed.String())
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		entries = append(entries, page...)
+		if len(page) < MDBListJSONPageSize {
+			break
+		}
+		offset += len(page)
+	}
+
+	if len(entries) > hardCap {
+		entries = entries[:hardCap]
+	}
+	return entries, nil
+}
+
+// fetchMDBListJSONPage performs one bounded GET of a canonical /json URL and
+// decodes a single page.
+func fetchMDBListJSONPage[T any](ctx context.Context, client *http.Client, listURL string) ([]T, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating mdblist request: %w", err)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching mdblist list: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, fmt.Errorf("mdblist request failed with status %d", res.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxMDBListJSONResponseBytes))
+	if err != nil {
+		return nil, fmt.Errorf("reading mdblist response: %w", err)
+	}
+	var page []T
+	if err := json.Unmarshal(body, &page); err != nil {
+		return nil, fmt.Errorf("parsing mdblist response: %w", err)
+	}
+	return page, nil
 }
 
 // FetchMDBListWithFallback tries each candidate URL in order and returns the

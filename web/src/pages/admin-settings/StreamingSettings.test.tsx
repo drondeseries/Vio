@@ -253,6 +253,12 @@ describe("StreamingSettings", () => {
     );
   });
 
+  it("documents the 5–900 Prowlarr search timeout range", () => {
+    renderPage();
+
+    expect(screen.getByText(/5–900/)).toBeInTheDocument();
+  });
+
   it("shows API key fields as not configured without a clear action", () => {
     renderPage();
 
