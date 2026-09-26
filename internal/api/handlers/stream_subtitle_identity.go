@@ -23,14 +23,18 @@ var (
 // file. The requested edition's inventory is not what is playing: interpreting
 // its ordinal against the effective file can serve a different language.
 //
-// The named file is treated as foreign unless the request's pinned identity
-// proves it exists in the current plan's inventory. A pin that resolves against
-// the effective file does prove it, and the effective file with that resolved
-// ordinal is returned. A pin that does not resolve against the effective file —
-// or a bare ordinal carry — is translated from the named file's segment
-// identity (external path/language or embedded language/codec/flags) onto the
-// effective file's inventory. A miss returns errSubtitleIdentityUnavailable so
-// the client degrades to subtitles-off instead of being served a wrong track.
+// The unchanged-edition shortcut and the request-boundary rules live here; the
+// inventory translation itself is remapSubtitleInventoryIdentityV3. The named
+// file is treated as foreign unless the request's pinned identity proves it
+// exists in the current plan's inventory. A pin that resolves against the
+// effective file does prove it, and the effective file with that resolved
+// ordinal is returned. A named row with no subtitle inventory is a catalog
+// placeholder with nothing to remap FROM, so its plan-time ordinal already
+// names the effective inventory. Anything else is translated from the named
+// file's segment identity (external path/language or embedded
+// language/codec/flags) onto the effective file's inventory; a miss returns
+// errSubtitleIdentityUnavailable so the client degrades to subtitles-off
+// instead of being served a wrong track.
 func (h *StreamHandler) resolveSubtitleEditionSwitch(
 	ctx context.Context,
 	namedFile, effectiveFile *models.MediaFile,
@@ -57,14 +61,33 @@ func (h *StreamHandler) resolveSubtitleEditionSwitch(
 		}
 		return nil, 0, errSubtitleIdentityUnavailable
 	}
-	location, ok := classifySubtitleIndexV3(namedFile, index)
+	return h.remapSubtitleInventoryIdentityV3(ctx, namedFile, effectiveFile, index)
+}
+
+// remapSubtitleInventoryIdentityV3 translates a selection minted against
+// oldFile's inventory onto the bound candidate's inventory and returns the
+// bound file with the mapped published ordinal. Identity is decided by track
+// layout, never by file id: a same-row candidate rotation re-probes the catalog
+// row in place (same id, different release), so id equality proves nothing
+// here. The returned file is always the bound candidate, and a target with no
+// equivalent returns errSubtitleIdentityUnavailable rather than an unrelated
+// ordinal.
+func (h *StreamHandler) remapSubtitleInventoryIdentityV3(
+	ctx context.Context,
+	oldFile, bound *models.MediaFile,
+	index int,
+) (*models.MediaFile, int, error) {
+	if oldFile == nil || bound == nil {
+		return bound, index, nil
+	}
+	location, ok := classifySubtitleIndexV3(oldFile, index)
 	if !ok {
 		return nil, 0, errSubtitleIdentityUnavailable
 	}
 	switch location.source {
 	case playback.SubtitleSourceExternalV3:
-		wanted := namedFile.ExternalSubtitles[location.offset]
-		for candidateIndex, candidate := range effectiveFile.ExternalSubtitles {
+		wanted := oldFile.ExternalSubtitles[location.offset]
+		for candidateIndex, candidate := range bound.ExternalSubtitles {
 			equivalent := strings.EqualFold(candidate.Language, wanted.Language) &&
 				strings.EqualFold(candidate.Format, wanted.Format) &&
 				candidate.Forced == wanted.Forced &&
@@ -72,37 +95,58 @@ func (h *StreamHandler) resolveSubtitleEditionSwitch(
 			if candidate.Path != wanted.Path && !equivalent {
 				continue
 			}
-			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(effectiveFile, candidateIndex); mapped {
-				return effectiveFile, published, nil
+			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(bound, candidateIndex); mapped {
+				return bound, published, nil
 			}
 		}
 	case playback.SubtitleSourceEmbeddedV3:
-		wanted := namedFile.SubtitleTracks[location.offset]
-		if ordinal, _, matched := playback.MatchEmbeddedSubtitleTrack(wanted, effectiveFile.SubtitleTracks); matched {
-			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(effectiveFile, len(effectiveFile.ExternalSubtitles)+ordinal); mapped {
-				return effectiveFile, published, nil
+		wanted := oldFile.SubtitleTracks[location.offset]
+		if ordinal, _, matched := playback.MatchEmbeddedSubtitleTrack(wanted, bound.SubtitleTracks); matched {
+			if published, mapped := playback.SubtitleInventoryOwnPublishedIndexV3(bound, len(bound.ExternalSubtitles)+ordinal); mapped {
+				return bound, published, nil
 			}
 		}
 	default:
 		// Downloaded rows are file-bound. Only a stable row-id match against the
-		// effective file's own downloaded list may survive the switch.
+		// bound file's own downloaded list may survive.
 		if h.SubtitleRepo != nil {
-			wantedList, wantedErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, namedFile.ID)
-			targetList, targetErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, effectiveFile.ID)
+			wantedList, wantedErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, oldFile.ID)
+			targetList, targetErr := h.SubtitleRepo.ListDownloadedSubtitles(ctx, bound.ID)
 			if wantedErr == nil && targetErr == nil && location.offset >= 0 && location.offset < len(wantedList) {
 				wanted := wantedList[location.offset]
-				base := len(playback.BuildSubtitleInventoryV3(effectiveFile, nil))
+				base := len(playback.BuildSubtitleInventoryV3(bound, nil))
 				for candidateIndex, candidate := range targetList {
 					if wanted.ID > 0 && candidate.ID == wanted.ID {
-						return effectiveFile, base + candidateIndex, nil
+						return bound, base + candidateIndex, nil
 					}
 				}
 			}
 		}
 	}
-	slog.InfoContext(ctx, "subtitle edition switch has no equivalent track on the effective file",
-		"component", "api", "named_file_id", namedFile.ID, "effective_file_id", effectiveFile.ID, "track_index", index)
+	slog.InfoContext(ctx, "subtitle inventory remap has no equivalent track on the bound file",
+		"component", "api", "old_file_id", oldFile.ID, "bound_file_id", bound.ID, "track_index", index)
 	return nil, 0, errSubtitleIdentityUnavailable
+}
+
+// remapSubtitleFromEvidenceV3 resolves a request's ordinal and any stale
+// identity pin against the plan-time evidence, then translates the named track
+// onto the bound candidate. It is the rotation-entry counterpart of
+// resolveSubtitleEditionSwitch: the evidence, not the bound row, is the
+// inventory the request was minted against, so the pin/ordinal is resolved
+// there before the identity is mapped. The bound candidate is always the
+// returned file, and captured-empty evidence yields unavailable rather than an
+// ordinal reinterpreted against the replacement.
+func (h *StreamHandler) remapSubtitleFromEvidenceV3(
+	ctx context.Context,
+	evidence, bound *models.MediaFile,
+	index int,
+	query url.Values,
+) (*models.MediaFile, int, error) {
+	evidenceIndex, err := subtitleRouteIndex(evidence, index, query)
+	if err != nil {
+		return nil, 0, err
+	}
+	return h.remapSubtitleInventoryIdentityV3(ctx, evidence, bound, evidenceIndex)
 }
 
 // resolveSubtitleSourceRequest resolves the media file and combined ordinal a
@@ -149,16 +193,15 @@ func (h *StreamHandler) resolveSubtitleSourceRequest(
 	// minted against that evidence's inventory. Resolve it there first, then
 	// translate the evidence-local ordinal onto the bound release by
 	// language/class instead of serving the bound release at a stale ordinal.
+	// Captured-empty evidence is genuine evidence with no old track to name, so
+	// it yields unavailable rather than reinterpreting an ordinal against the
+	// replacement.
 	if isVirtualPlaybackFile(bound) && session.VirtualSubtitleEvidenceSet &&
 		!virtualEvidenceMatchesBoundFile(bound, session) {
 		if evidence := virtualEvidenceFileV3(bound, session); evidence != nil {
-			evidenceIndex, evidenceErr := subtitleRouteIndex(evidence, index, query)
-			if evidenceErr != nil {
-				return nil, 0, evidenceErr
-			}
-			resolvedFile, resolvedIndex, switchErr := h.resolveSubtitleEditionSwitch(ctx, evidence, bound, evidenceIndex, nil)
-			if switchErr != nil {
-				return nil, 0, switchErr
+			resolvedFile, resolvedIndex, remapErr := h.remapSubtitleFromEvidenceV3(ctx, evidence, bound, index, query)
+			if remapErr != nil {
+				return nil, 0, remapErr
 			}
 			return resolvedFile, resolvedIndex, nil
 		}
