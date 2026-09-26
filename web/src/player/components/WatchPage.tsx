@@ -512,12 +512,14 @@ function WatchPagePlayer({
       // without a request, hiding the inventory the probe just persisted.
       const isFirstAttempt = scheduledAttempts === 1;
       try {
-        // Shared with the mounted `useWatchDetail` query: the same key means a
-        // poll inside the stale window reuses that payload, and concurrent
-        // callers dedupe onto one in-flight request.
+        // Key on the *live* session file, not the mount-time request: an
+        // in-player version switch moves `session.mediaFileId` while the
+        // `fileId` prop still names the version the page opened with. A stale
+        // key would keep reading the mount version's inventory (or a cached
+        // payload for it) and never see the newly selected version's probe.
         const detail = await queryClient.fetchQuery({
-          queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
-          queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
+          queryKey: itemKeys.watchDetail(contentId, mediaFileId, libraryId),
+          queryFn: () => fetchWatchDetail(contentId, mediaFileId, libraryId),
           staleTime: isFirstAttempt ? 0 : WATCH_DETAIL_STALE_TIME_MS,
         });
         if (cancelled) return;
@@ -541,22 +543,32 @@ function WatchPagePlayer({
         });
         if (version) {
           const nextAudioTracks = version.audio_tracks ?? [];
-          if (nextAudioTracks.length > current.planAudioTracks.length) {
-            applyAudioInventory(nextAudioTracks);
+          // The menu may replace the plan's inventory when the poll resolved a
+          // different file than the plan names (a virtual candidate vs. the
+          // collapsed row). `applyAudioInventory` owns the replacement, but the
+          // poll decides here whether the attempt found anything: a same-file
+          // list no richer than the plan's keeps the poll running so a later
+          // probe can still expand it.
+          const audioTargetChanged = version.file_id !== current.mediaFileId;
+          if (
+            nextAudioTracks.length > 0 &&
+            (audioTargetChanged || nextAudioTracks.length > current.planAudioTracks.length)
+          ) {
+            applyAudioInventory(nextAudioTracks, version.file_id);
             audioComplete = true;
           }
           const resolvedSubtitleTracks = version.subtitle_tracks ?? [];
-          // Probe repair persists embedded tracks to the effective candidate's
-          // file row, which a first-play plan may not identify yet (no
-          // `effective_virtual_uri`, so `resolveEffectiveVersion` returns the
-          // collapsed row). Fall back to any row the probe actually wrote so
-          // the no-op replan can pull the inventory in instead of waiting on a
-          // resolved snapshot that stays empty.
+          // Keep the first-play probe self-heal on the *current* file's row.
+          // `resolveEffectiveVersion` already returns the effective candidate
+          // when the plan publishes a virtual URI; when it does not, the plan
+          // names the collapsed row. Either way only that row's probed tracks
+          // may seed the no-op replan — another release's inventory must not
+          // stand in for the version actually playing.
           const nextSubtitleTracks =
             resolvedSubtitleTracks.length > 0
               ? resolvedSubtitleTracks
               : isVirtualActiveFile
-                ? (detail.versions.find((candidate) => (candidate.subtitle_tracks?.length ?? 0) > 0)
+                ? (detail.versions.find((candidate) => candidate.file_id === mediaFileId)
                     ?.subtitle_tracks ?? [])
                 : resolvedSubtitleTracks;
           if (
@@ -594,7 +606,6 @@ function WatchPagePlayer({
   }, [
     applyAudioInventory,
     contentId,
-    fileId,
     isVirtualActiveFile,
     libraryId,
     queryClient,
