@@ -278,7 +278,7 @@ func TestResolveCopySeekAnchorForSourceCachesByStableIdentity(t *testing.T) {
 	}
 }
 
-func TestResolveCopySeekAnchorForSourceSeparatesPositionAndIdentity(t *testing.T) {
+func TestResolveCopySeekAnchorForSourceSeparatesPositionBucketAndIdentity(t *testing.T) {
 	var calls int
 	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
 		calls++
@@ -299,7 +299,47 @@ func TestResolveCopySeekAnchorForSourceSeparatesPositionAndIdentity(t *testing.T
 		}
 	}
 	if calls != 3 {
-		t.Fatalf("probe calls = %d, want 3 (position and identity are part of the key)", calls)
+		t.Fatalf("probe calls = %d, want 3 (position bucket and identity are part of the key)", calls)
+	}
+}
+
+// TestResolveCopySeekAnchorForSourceBucketsNearPositions proves a random seek a
+// few seconds past a cached position hits the cache instead of paying for a
+// second FFmpeg probe. Before the fix the exact float position was the cache
+// key, so every in-buffer seek re-probed and hung the request (#158).
+func TestResolveCopySeekAnchorForSourceBucketsNearPositions(t *testing.T) {
+	var calls int
+	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		calls++
+		return requested - 0.5, int((requested - 0.5) / float64(segmentDuration)), nil
+	})
+	ctx := context.Background()
+	// Two positions within one nominal 2s bucket: the second must be served the
+	// first probe's anchor without another probe.
+	anchor, segment, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/bucket", "http://relay/bucket", 120, 2)
+	if err != nil {
+		t.Fatalf("first probe: %v", err)
+	}
+	if anchor != 119.5 || segment != 59 {
+		t.Fatalf("first probe anchor = %v segment = %d; want 119.5, 59", anchor, segment)
+	}
+	nearAnchor, nearSegment, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/bucket", "http://relay/bucket", 121, 2)
+	if err != nil {
+		t.Fatalf("near probe: %v", err)
+	}
+	if nearAnchor != anchor || nearSegment != segment {
+		t.Fatalf("near-position anchor = %v segment = %d; want the cached %v/%d", nearAnchor, nearSegment, anchor, segment)
+	}
+	if calls != 1 {
+		t.Fatalf("probe calls = %d, want 1 (a near position in the same bucket must hit the cache)", calls)
+	}
+	// A position beyond the bucket still re-probes so a real forward seek is
+	// not served a distant keyframe.
+	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/bucket", "http://relay/bucket", 124, 2); err != nil {
+		t.Fatalf("far probe: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2 (a seek beyond the bucket must re-probe)", calls)
 	}
 }
 

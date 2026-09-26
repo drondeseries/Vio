@@ -3774,7 +3774,12 @@ func (s *TranscodeSession) restart(
 	// replacement, and lets the new writer capture the new generation.
 	s.resetDecodeVerdictLocked()
 	s.restartCount++
-	if refreshedPath != "" {
+	if refreshedPath != "" && refreshedPath != opts.InputPath {
+		// A refresh that hands back the same path is a reuse of the pinned
+		// transport: the resource the old cleanup releases is exactly the one
+		// the replacement opens, so releasing it here would delete the relay
+		// out from under the restart. Only a genuinely new input swaps the
+		// path and releases the previous one (#158).
 		if opts.InputCleanup != nil {
 			opts.InputCleanup()
 		}
