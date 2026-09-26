@@ -293,7 +293,10 @@ func (s *Service) EnqueueIndexerRelease(ctx context.Context, downloadURL, name s
 
 // ClassifyProviderCandidates applies the provider's completion classification
 // to a candidate list. It exposes the monitor's classifier so the refresh job
-// can build a dedup set that includes badge-confirmed and cached streams.
+// can build a dedup set that includes badge-confirmed and cached streams. A
+// confirmed candidate also adopts AltMount's release-scoped identity and exact
+// size when it has none, so the persisted row is re-matchable even when the
+// Stremio answer carried no hash and Prowlarr is unwired.
 func (s *Service) ClassifyProviderCandidates(candidates []stream.StreamCandidate) {
 	if s == nil || s.Monitor == nil {
 		return
