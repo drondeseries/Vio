@@ -82,6 +82,17 @@ func newPlanstoreFixture(t *testing.T) *planstoreFixture {
 	if !hasStartResponse {
 		t.Skip("test database has not applied the terminal playback v3 attempt migration")
 	}
+	var hasRecoveryState bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'playback_v3_attempts' AND column_name = 'recovery_state'
+		)`).Scan(&hasRecoveryState); err != nil {
+		t.Fatalf("check recovery_state column: %v", err)
+	}
+	if !hasRecoveryState {
+		t.Skip("test database has not applied the playback v3 recovery state migration")
+	}
 
 	f := &planstoreFixture{pool: pool}
 	unique := fmt.Sprintf("planstore-test-%d", time.Now().UnixNano())

@@ -105,6 +105,14 @@ type decodeRotationOptions struct {
 	// non-decode transport failure), used to prove the rotation rebind is not
 	// applied to the live session before the durable replacement commits.
 	startFailureCalls int32
+	// markerFails makes the source-rejected marker callback return an error
+	// instead of succeeding, so a test can prove rotation no longer depends on
+	// the asynchronous failed_at stamp landing.
+	markerFails bool
+	// markerBlocked makes the source-rejected marker callback block until the
+	// test releases it, so a test can prove a wedged marker cannot stall the
+	// rotation: the durable chain is written by the replan, not the callback.
+	markerBlocked bool
 }
 
 // decodeRotationFixture is a virtual HLS-transcode handler whose provider
@@ -122,6 +130,8 @@ type decodeRotationFixture struct {
 	marked          []string
 	softwareSpawns  int
 	transcodeCalls  int32
+	// markerRelease unblocks a blocked marker callback when non-nil.
+	markerRelease chan struct{}
 }
 
 func newDecodeRotationFixture(t *testing.T, opt decodeRotationOptions) *decodeRotationFixture {
@@ -182,6 +192,9 @@ func newDecodeRotationFixture(t *testing.T, opt decodeRotationOptions) *decodeRo
 	}}
 
 	f := &decodeRotationFixture{handler: handler, file: source, candidateIDs: opt.candidateIDs}
+	if opt.markerBlocked {
+		f.markerRelease = make(chan struct{})
+	}
 	resolved := func(id string) ResolvedVirtualMedia {
 		return ResolvedVirtualMedia{
 			URL:         "http://127.0.0.1:9/stream?result=" + id,
@@ -271,7 +284,15 @@ func newDecodeRotationFixture(t *testing.T, opt decodeRotationOptions) *decodeRo
 	handler.TranscodeManager().OnSourceRejected = func(_ context.Context, _ int, canonical string) error {
 		f.mu.Lock()
 		f.marked = append(f.marked, canonical)
+		release := f.markerRelease
+		markerFails := opt.markerFails
 		f.mu.Unlock()
+		if release != nil {
+			<-release
+		}
+		if markerFails {
+			return errors.New("marker persistence failed")
+		}
 		return nil
 	}
 	return f

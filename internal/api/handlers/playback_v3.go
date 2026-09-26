@@ -2409,6 +2409,12 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 		}
 		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, &resolvedFile, &resolvedFile, audioIndex, virtualPlanDecisionV3{candidateRank: resolved.CandidateRank, candidateCount: resolved.CandidateCount}, planResult, clientInfo)
 		if statusErr == nil {
+			// The start committed a replacement candidate after excluding the
+			// rejected ones. Persist the chain on the new attempt so a later
+			// replan — on this replica or another after a reload — skips every
+			// release this start already proved bad, even if the asynchronous
+			// failed_at marker never landed.
+			h.persistStartRotationExclusionsV3(r.Context(), response.SessionID, resolved.URI, excluded)
 			return response, true
 		}
 		if statusErr.reason != candidateSourceDecodeRejectedReasonV3 || nextID == "" {
@@ -2417,6 +2423,49 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 		excluded = append(excluded, nextID)
 	}
 	return playback.DecisionResponseV3{}, false
+}
+
+// persistStartRotationExclusionsV3 records the candidates a start rotation
+// excluded onto the freshly committed attempt. It is best-effort only in the
+// sense that the start has already succeeded and returned a playable plan;
+// the exclusion is insurance for the next hop, so a failure here is logged and
+// does not fail the start (the marker remains a supplementary suppression).
+func (h *PlaybackHandler) persistStartRotationExclusionsV3(ctx context.Context, sessionID, candidateURI string, excludedIDs []string) {
+	if sessionID == "" || len(excludedIDs) == 0 {
+		return
+	}
+	store := h.recoveryStateStoreV3()
+	if store == nil {
+		slog.WarnContext(ctx, "start rotation exclusions could not be persisted: no recovery state store", "component", "api", "session_id", sessionID)
+		return
+	}
+	record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID)
+	if err != nil || record == nil {
+		slog.WarnContext(ctx, "start rotation exclusions could not load the committed attempt", "component", "api", "session_id", sessionID, "error", err)
+		return
+	}
+	providerSource := virtualAttemptProviderSourceV3(candidateURI)
+	if providerSource == "" {
+		providerSource = virtualAttemptProviderSourceV3(record.CurrentPlan.EffectiveVirtualURI)
+	}
+	exclusions := make([]playback.RecoveryExclusionV3, 0, len(excludedIDs))
+	for _, id := range excludedIDs {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		exclusions = append(exclusions, playback.RecoveryExclusionV3{
+			ProviderSource: providerSource,
+			CandidateID:    id,
+			FileID:         record.EffectiveMediaFileID,
+			ConfirmedAt:    time.Now().UTC(),
+		})
+	}
+	if len(exclusions) == 0 {
+		return
+	}
+	if _, err := h.appendRecoveryExclusionsV3(ctx, record, exclusions); err != nil {
+		slog.WarnContext(ctx, "start rotation exclusions could not be persisted", "component", "api", "session_id", sessionID, "error", err)
+	}
 }
 
 type playbackStartRequestDigestsV3 struct {
@@ -6947,8 +6996,48 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					// row the plan was built against.
 					failedID = virtualResultCandidateID(currentEffectiveFile.FilePath)
 				}
+				providerSource := virtualAttemptProviderSourceV3(session.VirtualSourceURI)
+				if providerSource == "" {
+					providerSource = virtualAttemptProviderSourceV3(currentEffectiveFile.FilePath)
+				}
 				if failedID != "" && virtualDecodeRotation {
-					excludedCandidateIDs = []string{failedID}
+					// Persist the confirmed verdict on the attempt before
+					// rotating. The durable chain is what makes a later replan
+					// — on this replica or another after a reload — skip every
+					// candidate already indicted, instead of relying on the
+					// asynchronous failed_at marker landing in time. A failed
+					// write must surface as a controlled error rather than let
+					// the rotation publish an untracked candidate the next hop
+					// could re-select.
+					exclusion := playback.RecoveryExclusionV3{
+						ProviderSource: providerSource,
+						CandidateID:    failedID,
+						ReleaseID:      virtualCandidateReleaseIdentityV3(currentEffectiveFile),
+						FileID:         record.EffectiveMediaFileID,
+						ConfirmedAt:    time.Now().UTC(),
+					}
+					chain, persistErr := h.appendRecoveryExclusionsV3(r.Context(), record, []playback.RecoveryExclusionV3{exclusion})
+					if persistErr != nil {
+						slog.ErrorContext(r.Context(), "virtual decode rejection exclusions could not be persisted", "component", "api", "session_id", record.SessionID, "candidate_id", failedID, "error", persistErr)
+						return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
+							reason:    "recovery_state_unavailable",
+							message:   "The server could not durably record the failed source candidate; retry the replay.",
+							retryable: true,
+							cause:     persistErr,
+						}
+					}
+					record.RecoveryState = chain
+					// Union every confirmed exclusion in this provider scope,
+					// not just the candidate that just failed: a prior hop the
+					// durable chain already recorded must stay excluded even
+					// when its failed_at marker never landed or was cleared.
+					excludedCandidateIDs = playback.RecoveryExcludedCandidateIDsV3(chain, providerSource)
+					if !containsStringExactV3(excludedCandidateIDs, failedID) {
+						excludedCandidateIDs = append(excludedCandidateIDs, failedID)
+					}
+					// A suspected-but-unconfirmed sibling is still eligible:
+					// only confirmed verdicts enter the chain, so no extra
+					// filtering is applied here.
 				}
 				// Only a confirmed rotation may re-select a candidate the
 				// catalog marked failed (for example one this serve layer just
@@ -6964,7 +7053,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// Rotation honors active failed_at stamps: allowFailed stays
 				// false so a sibling the marker already stamped (a prior hop
 				// in this chain) is skipped rather than re-mounted. The
-				// current failure travels explicitly in excludedCandidateIDs,
+				// durable chain travels explicitly in excludedCandidateIDs,
 				// so nothing needs the bypass; bypassing stamps here is what
 				// would let sequential rotations cycle A→B→C→A instead of
 				// terminating when every sibling is known-bad.
@@ -9412,6 +9501,87 @@ func (h *PlaybackHandler) virtualCandidateRotationPendingV3(record *playback.Att
 		return false
 	}
 	return true
+}
+
+// virtualAttemptProviderSourceV3 returns the provider/source scope for a
+// session-bound virtual candidate: the provider-neutral URI with the concrete
+// result pick removed. It scopes durable exclusions so an identically numbered
+// result from another provider or release set cannot suppress this attempt's
+// candidate.
+func virtualAttemptProviderSourceV3(uri string) string {
+	neutral := strings.TrimSpace(virtualPlaybackNeutralKey(uri))
+	if neutral != "" {
+		return neutral
+	}
+	return strings.TrimSpace(uri)
+}
+
+// recoveryStateStoreV3 returns the durable exclusion capability of the active
+// plan store, or nil when the store cannot persist recovery state (a legacy
+// in-memory fake). A nil store is not silently tolerated on a confirmed
+// rotation: the caller surfaces a controlled failure instead.
+func (h *PlaybackHandler) recoveryStateStoreV3() playback.RecoveryStateStoreV3 {
+	if h == nil || h.PlanStoreV3 == nil {
+		return nil
+	}
+	store, _ := h.PlanStoreV3.(playback.RecoveryStateStoreV3)
+	return store
+}
+
+// appendRecoveryExclusionsV3 durably records the confirmed candidate exclusions
+// on the attempt, unioning them with the chain the store already holds. It
+// retries a losing revision compare against the committed state, so concurrent
+// replans converge on the union instead of clobbering each other. It returns
+// the first persistence error so the caller can fail the rotation as a
+// controlled error rather than publish an untracked candidate.
+func (h *PlaybackHandler) appendRecoveryExclusionsV3(ctx context.Context, record *playback.AttemptRecordV3, exclusions []playback.RecoveryExclusionV3) (playback.RecoveryStateV3, error) {
+	if record == nil || len(exclusions) == 0 {
+		return playback.RecoveryStateV3{}, nil
+	}
+	store := h.recoveryStateStoreV3()
+	if store == nil {
+		return playback.RecoveryStateV3{}, fmt.Errorf("recovery state store unavailable")
+	}
+	revision := record.RecoveryRevision
+	var lastErr error
+	for attempt := 0; attempt < recoveryAppendMaxAttempts; attempt++ {
+		merged, _, err := store.AppendRecoveryExclusions(ctx, record.SessionID, revision, exclusions)
+		if err == nil {
+			record.RecoveryState = merged
+			return merged, nil
+		}
+		if !errors.Is(err, playback.ErrRecoveryRevisionConflictV3) {
+			return playback.RecoveryStateV3{}, err
+		}
+		// The committed chain advanced after this record was read. Re-read and
+		// retry the union against the newer revision.
+		lastErr = err
+		_, currentRevision, readErr := store.GetRecoveryState(ctx, record.SessionID)
+		if readErr != nil {
+			return playback.RecoveryStateV3{}, readErr
+		}
+		revision = currentRevision
+	}
+	return playback.RecoveryStateV3{}, lastErr
+}
+
+// recoveryAppendMaxAttempts bounds the revision-conflict retry. The union is
+// monotone and the only concurrent writer is another confirmed verdict for the
+// same attempt, so a handful of retries converges; the bound keeps a
+// pathological writer loop from spinning a replan.
+const recoveryAppendMaxAttempts = 8
+
+// virtualCandidateReleaseIdentityV3 returns the durable release identity for a
+// session-bound candidate (provider GUID or video hash), so an exclusion can
+// match a renumbered result for the same release.
+func virtualCandidateReleaseIdentityV3(file *models.MediaFile) string {
+	if file == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(file.ProviderGUID); id != "" {
+		return id
+	}
+	return strings.TrimSpace(file.ProviderVideoHash)
 }
 
 // demoteDeliveryCapabilityV3 disables one delivery class in the context's

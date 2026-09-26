@@ -19,6 +19,12 @@ var ErrStaleReplanLeaseV3 = errors.New("stale replan lease")
 // newer replan already moved the attempt past the caller's base revision.
 var ErrReplanSupersededV3 = errors.New("replan superseded")
 
+// ErrRecoveryRevisionConflictV3 means an AppendRecoveryExclusions lost the
+// recovery_revision compare: a concurrent writer already advanced the durable
+// recovery state. The caller re-reads the returned state and retries the union
+// against it; the append is monotone, so a retry converges.
+var ErrRecoveryRevisionConflictV3 = errors.New("recovery revision conflict")
+
 // ErrProgressConflictV3 means a progress sample reused an already-applied
 // sequence number with a different payload: a retry must replay the exact
 // sample it originally sent.
@@ -148,6 +154,57 @@ type AttemptRecordV3 struct {
 	// A replica reaping a stale local copy compares it with its own activity
 	// clock, since requests can land on other replicas.
 	LastSampleAt time.Time
+	// RecoveryState is the durable attempt-scoped exclusion chain: the provider
+	// candidates this attempt has confirmed as failed, keyed to the release
+	// scope they indict. It is written only by AppendRecoveryExclusions (a
+	// revision-checked union), never by SaveAttempt or CompleteReplan, so a
+	// stale attempt write can never shrink the chain. A fresh attempt starts
+	// with the zero value and inherits nothing.
+	RecoveryState RecoveryStateV3
+	// RecoveryRevision advances with every durable RecoveryState write. It is
+	// the compare-and-set token for concurrent exclusion appends: a caller
+	// reads the revision with the state and a mismatched write is retried
+	// against the freshly read state instead of clobbering it.
+	RecoveryRevision int64
+}
+
+// RecoveryStateV3 is the durable, attempt-scoped recovery memory. The
+// exclusion list records provider candidates that a confirmed verdict indicted
+// so the candidate-selection loop for later replans skips them even when the
+// asynchronous failed_at marker never landed.
+type RecoveryStateV3 struct {
+	// Exclusions is the confirmed chain, in the order verdicts arrived. It is
+	// scoped by provider/source so a candidate id from one release set cannot
+	// suppress an identically named candidate from another.
+	Exclusions []RecoveryExclusionV3 `json:"exclusions,omitempty"`
+}
+
+// RecoveryExclusionV3 is one confirmed candidate failure. The tuple is scoped
+// so only the release the verdict actually examined is excluded:
+//
+//   - ProviderSource identifies the provider/source namespace (for a virtual
+//     release the provider-neutral URI without the concrete result pick), so
+//     two providers cannot suppress each other's identically numbered results.
+//   - CandidateID is the provider result id that was confirmed bad.
+//   - ReleaseID is the durable release identity (provider GUID/hash) when
+//     known, so a renumbered result still matches the excluded release. Empty
+//     when the release carried no durable identity.
+//   - FileID is the session-bound catalog row id. It narrows the exclusion to
+//     the file identity the attempt was bound to when the catalog row moved.
+type RecoveryExclusionV3 struct {
+	ProviderSource string `json:"provider_source,omitempty"`
+	CandidateID    string `json:"candidate_id"`
+	ReleaseID      string `json:"release_id,omitempty"`
+	FileID         int    `json:"file_id,omitempty"`
+	// ConfirmedAt is diagnostic: when the durable write recorded the verdict.
+	ConfirmedAt time.Time `json:"confirmed_at,omitempty"`
+}
+
+// RecoveryExclusionKeyV3 is the dedup identity of one exclusion: two verdicts
+// for the same provider source and candidate id are the same exclusion even
+// when their release identity or file binding differ.
+func RecoveryExclusionKeyV3(providerSource, candidateID string) string {
+	return strings.TrimSpace(providerSource) + "\x00" + strings.TrimSpace(candidateID)
 }
 
 // AttemptIdentityV3 carries only the ownership columns of an attempt so
@@ -214,6 +271,103 @@ type PlanStoreV3 interface {
 	// returns false, so derived metrics count a retried report once.
 	RecordRouteEvent(context.Context, RouteEventRecordV3) (inserted bool, err error)
 	CleanupExpired(context.Context, time.Time) (int64, error)
+}
+
+// RecoveryStateStoreV3 is the durable attempt-scoped exclusion chain. It is a
+// separate capability so the handler can detect a store that cannot persist
+// recovery state (a legacy wrapper) rather than silently dropping a confirmed
+// verdict. An implementation must union, never replace: a write can only grow
+// the chain, and concurrent writers serialize on the recovery revision so
+// neither loses an exclusion.
+type RecoveryStateStoreV3 interface {
+	// AppendRecoveryExclusions adds the confirmed exclusions to the attempt's
+	// durable chain and returns the resulting state. baseRevision is the
+	// revision the caller read alongside its current state; a mismatched write
+	// returns ErrRecoveryRevisionConflictV3 with the committed revision instead
+	// of clobbering, and the caller re-reads and retries the union. A negative
+	// baseRevision unions unconditionally. It returns ErrSessionNotFound when
+	// there is no live attempt row.
+	AppendRecoveryExclusions(ctx context.Context, sessionID string, baseRevision int64, exclusions []RecoveryExclusionV3) (RecoveryStateV3, int64, error)
+	// GetRecoveryState reads the durable chain and its current revision.
+	GetRecoveryState(ctx context.Context, sessionID string) (RecoveryStateV3, int64, error)
+}
+
+// UnionRecoveryExclusions appends the incoming exclusions to a copy of base,
+// deduplicating on provider source + candidate id. The result preserves the
+// order of base first, then the newly added entries in input order, so
+// successive unions converge and a replayed append is a no-op. It is the one
+// merge both the memory and Postgres stores apply, so their semantics cannot
+// drift.
+func UnionRecoveryExclusions(base RecoveryStateV3, incoming []RecoveryExclusionV3) RecoveryStateV3 {
+	merged := make([]RecoveryExclusionV3, 0, len(base.Exclusions)+len(incoming))
+	seen := make(map[string]struct{}, len(base.Exclusions)+len(incoming))
+	for _, exclusion := range base.Exclusions {
+		key := RecoveryExclusionKeyV3(exclusion.ProviderSource, exclusion.CandidateID)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, exclusion)
+	}
+	for _, exclusion := range incoming {
+		if strings.TrimSpace(exclusion.CandidateID) == "" {
+			continue
+		}
+		key := RecoveryExclusionKeyV3(exclusion.ProviderSource, exclusion.CandidateID)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, exclusion)
+	}
+	if len(merged) == 0 {
+		return RecoveryStateV3{}
+	}
+	return RecoveryStateV3{Exclusions: merged}
+}
+
+// RecoveryCandidateExcludedV3 reports whether candidateID is excluded for the
+// given provider source in state. A match is by candidate id under the same
+// source, or by a shared non-empty release identity, so a renumbered result
+// still matches the release a prior verdict indicted. An empty candidate id
+// never matches.
+func RecoveryCandidateExcludedV3(state RecoveryStateV3, providerSource, candidateID, releaseID string) bool {
+	candidateID = strings.TrimSpace(candidateID)
+	if candidateID == "" {
+		return false
+	}
+	providerSource = strings.TrimSpace(providerSource)
+	releaseID = strings.TrimSpace(releaseID)
+	for _, exclusion := range state.Exclusions {
+		if strings.TrimSpace(exclusion.ProviderSource) != providerSource {
+			continue
+		}
+		if strings.TrimSpace(exclusion.CandidateID) == candidateID {
+			return true
+		}
+		if releaseID != "" && strings.TrimSpace(exclusion.ReleaseID) == releaseID {
+			return true
+		}
+	}
+	return false
+}
+
+// RecoveryExcludedCandidateIDsV3 returns the candidate ids in state that are
+// scoped to providerSource, for threading into a resolver's exclusion list.
+// Order follows the stored chain so a deterministic resolver sees a stable
+// list.
+func RecoveryExcludedCandidateIDsV3(state RecoveryStateV3, providerSource string) []string {
+	providerSource = strings.TrimSpace(providerSource)
+	var ids []string
+	for _, exclusion := range state.Exclusions {
+		if strings.TrimSpace(exclusion.ProviderSource) != providerSource {
+			continue
+		}
+		if id := strings.TrimSpace(exclusion.CandidateID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 type memoryReplanV3 struct {
@@ -398,6 +552,12 @@ func (s *MemoryPlanStoreV3) CompleteReplan(_ context.Context, sessionID, request
 	entry.completed = true
 	entry.response = append(json.RawMessage(nil), response...)
 	s.replans[key] = entry
+	// Recovery state is owned by AppendRecoveryExclusions, not by the plan
+	// write: the record here was read at replan start, so overwriting it would
+	// drop an exclusion a concurrent verdict appended mid-replan. Postgres
+	// updates only the plan columns; the memory store preserves the fields the
+	// same way.
+	record.RecoveryState, record.RecoveryRevision = existing.RecoveryState, existing.RecoveryRevision
 	record.LastSequence, record.LastSample, record.StoppedAt = existing.LastSequence, existing.LastSample, existing.StoppedAt
 	s.attempts[attemptID] = record
 	return nil
@@ -444,6 +604,43 @@ func (s *MemoryPlanStoreV3) CleanupExpired(_ context.Context, now time.Time) (in
 		}
 	}
 	return count, nil
+}
+
+// AppendRecoveryExclusions unions the confirmed exclusions into the attempt's
+// durable chain. It is a compare-and-set on record.RecoveryRevision: a caller
+// presenting a stale revision loses and its union is recomputed against the
+// committed state, so no writer can drop another's exclusion. The memory store
+// serializes on mu, so the compare never actually races, but the semantics
+// mirror Postgres exactly.
+func (s *MemoryPlanStoreV3) AppendRecoveryExclusions(_ context.Context, sessionID string, baseRevision int64, exclusions []RecoveryExclusionV3) (RecoveryStateV3, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attemptID, record := s.findAttemptLocked(sessionID)
+	if record == nil {
+		return RecoveryStateV3{}, 0, ErrSessionNotFound
+	}
+	base := record.RecoveryState
+	if baseRevision >= 0 && record.RecoveryRevision != baseRevision {
+		// A concurrent writer advanced the chain after the caller's read.
+		// Recompute against the committed state rather than the caller's copy.
+		return RecoveryStateV3{}, record.RecoveryRevision, ErrRecoveryRevisionConflictV3
+	}
+	merged := UnionRecoveryExclusions(base, exclusions)
+	record.RecoveryState = merged
+	record.RecoveryRevision++
+	s.attempts[attemptID] = *record
+	return merged, record.RecoveryRevision, nil
+}
+
+// GetRecoveryState reads the durable chain and its revision.
+func (s *MemoryPlanStoreV3) GetRecoveryState(_ context.Context, sessionID string) (RecoveryStateV3, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, record := s.findAttemptLocked(sessionID)
+	if record == nil {
+		return RecoveryStateV3{}, 0, ErrSessionNotFound
+	}
+	return record.RecoveryState, record.RecoveryRevision, nil
 }
 
 // findAttemptLocked returns the live attempt for a session; the caller holds

@@ -373,6 +373,26 @@ type virtualFallbackEligibility struct {
 	// the fallback is anchored to. It is carried for logging and for asserting
 	// that a same-release refresh did not drift.
 	releaseID string
+	// excludedCandidateIDs are provider result ids a confirmed verdict has
+	// indicted. The fallback must never serve or adopt one: without this the
+	// re-list can hand back a release an earlier hop already proved bad, which
+	// is exactly the A→B→C→A cycle the durable chain exists to stop.
+	excludedCandidateIDs []string
+}
+
+// candidateExcluded reports whether candidateID is in the fallback's exclusion
+// set.
+func (e virtualFallbackEligibility) candidateExcluded(candidateID string) bool {
+	candidateID = strings.TrimSpace(candidateID)
+	if candidateID == "" {
+		return false
+	}
+	for _, excluded := range e.excludedCandidateIDs {
+		if strings.TrimSpace(excluded) == candidateID {
+			return true
+		}
+	}
+	return false
 }
 
 // allowsSibling reports whether the fallback may resolve (and, when it wins,
@@ -2475,10 +2495,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		anchoredReleaseID = virtualResultCandidateID(options.sessionAnchorURI)
 	}
 	fallbackEligibility := virtualFallbackEligibility{
-		sessionBound:    options.sessionBound,
-		rotationAllowed: rotateCandidates,
-		allowFailed:     allowFailed,
-		releaseID:       anchoredReleaseID,
+		sessionBound:         options.sessionBound,
+		rotationAllowed:      rotateCandidates,
+		allowFailed:          allowFailed,
+		releaseID:            anchoredReleaseID,
+		excludedCandidateIDs: append([]string(nil), excludedCandidateIDs...),
 	}
 	fb := h.fallbackResolveStaleVirtualSource(attemptCtx, file, userID, profileID, fallbackEligibility)
 	trace.fallback = time.Since(fallbackStart)
@@ -3903,6 +3924,13 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 	attempts := 0
 	for _, stream := range streams {
 		if stream.URI == "" || stream.URI == file.FilePath {
+			continue
+		}
+		// A confirmed exclusion is absolute: a release an earlier hop already
+		// indicted must never be served or adopted by the stale fallback, or
+		// the re-list would reopen the A→B→C→A cycle the durable chain exists
+		// to stop.
+		if elig.candidateExcluded(virtualResultCandidateID(stream.URI)) {
 			continue
 		}
 		// Re-enforce the release-identity contract at the point of deciding to

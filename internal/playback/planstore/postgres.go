@@ -177,13 +177,13 @@ func (s *Postgres) getAttemptIdentity(ctx context.Context, predicate string, val
 
 func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) (*playback.AttemptRecordV3, error) {
 	var record playback.AttemptRecordV3
-	var planJSON, recipeJSON, requestJSON, responseJSON, sampleJSON []byte
+	var planJSON, recipeJSON, requestJSON, responseJSON, sampleJSON, recoveryJSON []byte
 	err := s.db.QueryRow(ctx, `
 		SELECT playback_attempt_id, COALESCE(session_id::text, ''), user_id, profile_id,
 		       requested_media_file_id, effective_media_file_id,
 		       current_plan_id, current_replan_request_id, current_plan, frozen_recipe,
 		       normalized_request, start_response, request_digest, expires_at, server_bitrate_cap_kbps,
-		       last_sequence, last_sample, stopped_at, updated_at
+		       last_sequence, last_sample, stopped_at, updated_at, recovery_state, recovery_revision
 		FROM playback_v3_attempts
 		WHERE `+predicate+` AND expires_at > NOW()`, value).Scan(
 		&record.PlaybackAttemptID, &record.SessionID, &record.UserID, &record.ProfileID,
@@ -191,6 +191,7 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 		&record.CurrentPlanID, &record.CurrentReplanRequestID, &planJSON, &recipeJSON,
 		&requestJSON, &responseJSON, &record.RequestDigest, &record.ExpiresAt, &record.ServerBitrateCapKbps,
 		&record.LastSequence, &sampleJSON, &record.StoppedAt, &record.LastSampleAt,
+		&recoveryJSON, &record.RecoveryRevision,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, playback.ErrSessionNotFound
@@ -213,7 +214,86 @@ func (s *Postgres) getAttempt(ctx context.Context, predicate string, value any) 
 	if err := json.Unmarshal(responseJSON, &record.StartResponse); err != nil {
 		return nil, err
 	}
+	if len(recoveryJSON) > 0 {
+		if err := json.Unmarshal(recoveryJSON, &record.RecoveryState); err != nil {
+			return nil, err
+		}
+	}
 	return &record, nil
+}
+
+// AppendRecoveryExclusions unions confirmed exclusions into the attempt's
+// durable recovery_state under a row lock. The transaction serializes
+// concurrent appends on the attempt row, and the base_revision compare makes a
+// writer that read a stale revision lose with ErrRecoveryRevisionConflictV3
+// instead of clobbering a newer chain. The merge itself is the shared
+// UnionRecoveryExclusions, so the memory and Postgres stores cannot drift.
+func (s *Postgres) AppendRecoveryExclusions(ctx context.Context, sessionID string, baseRevision int64, exclusions []playback.RecoveryExclusionV3) (playback.RecoveryStateV3, int64, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var stateJSON []byte
+	var revision int64
+	err = tx.QueryRow(ctx, `
+		SELECT recovery_state, recovery_revision FROM playback_v3_attempts
+		WHERE session_id = $1::uuid AND expires_at > NOW()
+		FOR UPDATE`, sessionID).Scan(&stateJSON, &revision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return playback.RecoveryStateV3{}, 0, playback.ErrSessionNotFound
+	}
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	if baseRevision >= 0 && revision != baseRevision {
+		return playback.RecoveryStateV3{}, revision, playback.ErrRecoveryRevisionConflictV3
+	}
+	var base playback.RecoveryStateV3
+	if len(stateJSON) > 0 {
+		if err := json.Unmarshal(stateJSON, &base); err != nil {
+			return playback.RecoveryStateV3{}, 0, err
+		}
+	}
+	merged := playback.UnionRecoveryExclusions(base, exclusions)
+	mergedJSON, err := json.Marshal(merged)
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	var next int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE playback_v3_attempts
+		SET recovery_state = $2, recovery_revision = recovery_revision + 1, updated_at = NOW()
+		WHERE session_id = $1::uuid AND expires_at > NOW()
+		RETURNING recovery_revision`, sessionID, mergedJSON).Scan(&next); err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	return merged, next, nil
+}
+
+// GetRecoveryState reads the durable exclusion chain and its revision.
+func (s *Postgres) GetRecoveryState(ctx context.Context, sessionID string) (playback.RecoveryStateV3, int64, error) {
+	var stateJSON []byte
+	var revision int64
+	err := s.db.QueryRow(ctx, `
+		SELECT recovery_state, recovery_revision FROM playback_v3_attempts
+		WHERE session_id = $1::uuid AND expires_at > NOW()`, sessionID).Scan(&stateJSON, &revision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return playback.RecoveryStateV3{}, 0, playback.ErrSessionNotFound
+	}
+	if err != nil {
+		return playback.RecoveryStateV3{}, 0, err
+	}
+	var state playback.RecoveryStateV3
+	if len(stateJSON) > 0 {
+		if err := json.Unmarshal(stateJSON, &state); err != nil {
+			return playback.RecoveryStateV3{}, 0, err
+		}
+	}
+	return state, revision, nil
 }
 
 func (s *Postgres) BeginReplan(ctx context.Context, sessionID, requestID, digest, baseReplanRequestID string, leaseUntil time.Time) (playback.ReplanLeaseV3, error) {
