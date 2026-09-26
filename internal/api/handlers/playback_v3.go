@@ -9099,16 +9099,14 @@ func sameMediaInventoryV3(a, b *models.MediaFile) bool {
 // actually names. The evidence is used regardless of which candidate it is
 // anchored to — unlike serving, where a provenance mismatch means the evidence
 // must be discarded, a remap needs exactly the inventory the ordinal was minted
-// against. When no evidence is carried, or the effective file is not virtual,
-// the loaded row is used.
+// against. Presence is decided by the evidence-set flag, not by slice length:
+// a captured-empty inventory is genuine evidence (the old candidate had no such
+// track), and only absent evidence permits falling back to the loaded row.
 func (h *PlaybackHandler) replanRemapSourceV3(effectiveFile *models.MediaFile, session *playback.Session) *models.MediaFile {
 	if effectiveFile == nil || session == nil || !session.VirtualSubtitleEvidenceSet {
 		return effectiveFile
 	}
 	if !isVirtualPlaybackFile(effectiveFile) {
-		return effectiveFile
-	}
-	if len(session.VirtualAudioTracks) == 0 && len(session.VirtualSubtitleTracks) == 0 && len(session.VirtualExternalSubtitles) == 0 {
 		return effectiveFile
 	}
 	evidence := *effectiveFile
@@ -9236,12 +9234,14 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	if source.ID == target.ID && sameSubtitleInventoryV3(source, target) {
 		return nil
 	}
-	// A virtual parent row (virtual://movie/ttNNNN with no result= param) is a
-	// catalog placeholder with no probed streams. When it has no subtitle
-	// inventory at all — no external, no embedded, and no downloaded subtitles —
-	// there is nothing to remap FROM: any selection the client made was against
-	// a resolved candidate's track list, not this placeholder. Clear the stale
-	// selection and let the target file's own default apply, mirroring
+	// A source with no subtitle inventory has nothing to remap FROM. That is
+	// either a virtual parent row (virtual://movie/ttNNNN with no result= param)
+	// — a catalog placeholder with no probed streams — or captured-empty
+	// plan-time evidence, where the candidate genuinely had no subtitles. In
+	// both cases any selection the client made names no track on this
+	// inventory: clear the stale selection and let the target file's own
+	// default apply, rather than reinterpreting the ordinal against the
+	// replacement and inventing a selection the viewer never made. Mirrors
 	// resolveV3AudioIndex's graceful empty-tracks fallback.
 	if len(source.ExternalSubtitles) == 0 && len(source.SubtitleTracks) == 0 {
 		noDownloaded := h.SubtitleRepo == nil

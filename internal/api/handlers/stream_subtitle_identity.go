@@ -215,12 +215,12 @@ func (h *StreamHandler) resolveSubtitleSourceRequest(
 
 // virtualEvidenceFileV3 builds the file whose inventory the session's carried
 // subtitle evidence describes, sharing the bound file's identity/path. It is
-// the remap source for a rotated candidate; nil when no evidence is carried.
+// the remap source for a rotated candidate. The evidence-set flag decides
+// presence, not the slice lengths: a captured-empty inventory is still the
+// inventory the request was minted against and must not be treated as absent.
+// nil only when no evidence is carried.
 func virtualEvidenceFileV3(bound *models.MediaFile, session *playback.Session) *models.MediaFile {
 	if bound == nil || session == nil || !session.VirtualSubtitleEvidenceSet {
-		return nil
-	}
-	if len(session.VirtualSubtitleTracks) == 0 && len(session.VirtualExternalSubtitles) == 0 {
 		return nil
 	}
 	evidence := *bound
