@@ -3774,19 +3774,32 @@ func (s *TranscodeSession) restart(
 	// replacement, and lets the new writer capture the new generation.
 	s.resetDecodeVerdictLocked()
 	s.restartCount++
-	if refreshedPath != "" && refreshedPath != opts.InputPath {
-		// A refresh that hands back the same path is a reuse of the pinned
-		// transport: the resource the old cleanup releases is exactly the one
-		// the replacement opens, so releasing it here would delete the relay
-		// out from under the restart. Only a genuinely new input swaps the
-		// path and releases the previous one (#158).
-		if opts.InputCleanup != nil {
-			opts.InputCleanup()
+	if refreshedPath != "" {
+		if refreshedPath == opts.InputPath {
+			// A refresh that hands back the same path is a reuse of the pinned
+			// transport: the resource the existing cleanup releases is exactly
+			// the one the replacement opens, so retaining that cleanup is what
+			// keeps the live relay alive. A cleanup the refresh returned for the
+			// same path is a redundant registration, not the retained input's
+			// owner, so release it here rather than leaking it until session
+			// close (#158).
+			if refreshedCleanup != nil {
+				refreshedCleanup()
+			}
+		} else {
+			// A genuinely new input: release the previous cleanup exactly once,
+			// then adopt the replacement. The replacement cleanup is installed
+			// for release on session close and is deliberately never invoked
+			// here, so the swap can neither leak the old input nor tear down the
+			// replacement (#158).
+			if opts.InputCleanup != nil {
+				opts.InputCleanup()
+			}
+			opts.InputPath = refreshedPath
+			opts.InputCleanup = refreshedCleanup
+			s.opts.InputPath = refreshedPath
+			s.opts.InputCleanup = refreshedCleanup
 		}
-		opts.InputPath = refreshedPath
-		opts.InputCleanup = refreshedCleanup
-		s.opts.InputPath = refreshedPath
-		s.opts.InputCleanup = refreshedCleanup
 	}
 	s.segmentGeneration++
 	s.segmentPruneRunning = false

@@ -334,10 +334,10 @@ exec sleep 30
 }
 
 // TestRestartKeepsInputWhenRefreshReturnsSamePath proves an in-place restart
-// whose refresh hands back the pinned input does not release the existing
-// cleanup. Reuse semantics (#158) depend on this: the cleanup releases the very
-// relay the replacement generation opens, so releasing it would delete the
-// transport out from under the restart.
+// whose refresh hands back the pinned input does not release the cleanup that
+// owns the live relay. Reuse semantics (#158) depend on this: that cleanup
+// releases the very relay the replacement generation opens, so releasing it
+// would delete the transport out from under the restart.
 func TestRestartKeepsInputWhenRefreshReturnsSamePath(t *testing.T) {
 	const pinnedInput = "/relay/source/pinned-token/movie.mp4"
 	var releases int
@@ -361,9 +361,54 @@ func TestRestartKeepsInputWhenRefreshReturnsSamePath(t *testing.T) {
 	}
 }
 
+// TestRestartReleasesRedundantCleanupOnSamePath proves a same-path refresh that
+// still supplies a cleanup does not leak it: the retained cleanup owns the live
+// relay, so the refresh's redundant registration is released immediately and is
+// never installed as the session's input cleanup. Before the fix the same-path
+// branch discarded the refresh cleanup outright (#158).
+func TestRestartReleasesRedundantCleanupOnSamePath(t *testing.T) {
+	const pinnedInput = "/relay/source/pinned-token/movie.mp4"
+	var retainedReleases, redundantReleases int
+	s := newFakeFFmpegSession(t)
+	s.opts.InputPath = pinnedInput
+	s.opts.InputCleanup = func() { retainedReleases++ }
+	s.opts.RefreshInput = func(context.Context) (string, func(), error) {
+		// Same path but a fresh cleanup: a redundant re-registration of the
+		// same relay, which the restart must release rather than leak.
+		return pinnedInput, func() { redundantReleases++ }, nil
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.Restart(context.Background(), 12, 3); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if redundantReleases != 1 {
+		t.Fatalf("refresh cleanup ran %d times, want 1 (same-path refresh must not leak it)", redundantReleases)
+	}
+	if retainedReleases != 0 {
+		t.Fatalf("retained cleanup ran %d times, want 0 (reuse must keep the pinned relay)", retainedReleases)
+	}
+	if got := s.Opts().InputPath; got != pinnedInput {
+		t.Fatalf("InputPath = %q, want the unchanged pinned input %q", got, pinnedInput)
+	}
+
+	// The retained cleanup still owns the relay and runs exactly once at close;
+	// the redundant cleanup is not installed, so close does not run it again.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if retainedReleases != 1 {
+		t.Fatalf("retained cleanup ran %d times total, want 1 at close", retainedReleases)
+	}
+	if redundantReleases != 1 {
+		t.Fatalf("refresh cleanup ran %d times total, want 1 (never the installed cleanup)", redundantReleases)
+	}
+}
+
 // TestRestartReleasesPreviousInputOnNewPath proves a refresh that supplies a
-// genuinely new input still releases the previous cleanup, so a rotated relay
-// does not leak.
+// genuinely new input releases the previous cleanup exactly once and never runs
+// the replacement's cleanup during the swap, so a rotated relay does not leak
+// and the replacement relay is not torn down.
 func TestRestartReleasesPreviousInputOnNewPath(t *testing.T) {
 	const newInput = "/relay/source/new-token/movie.mp4"
 	var releases int
@@ -387,5 +432,66 @@ func TestRestartReleasesPreviousInputOnNewPath(t *testing.T) {
 	}
 	if newReleases != 0 {
 		t.Fatalf("new input cleanup ran %d times before session close, want 0", newReleases)
+	}
+
+	// The replacement is installed as the session's cleanup: close releases it
+	// exactly once, while the old cleanup is never run a second time.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if newReleases != 1 {
+		t.Fatalf("new input cleanup ran %d times after close, want 1", newReleases)
+	}
+	if releases != 1 {
+		t.Fatalf("old input cleanup ran %d times total, want exactly 1", releases)
+	}
+}
+
+// TestRestartRotationDoesNotLeakAcrossRestarts proves repeated path-changing
+// restarts release each superseded input exactly once and retain only the final
+// replacement, so a chain of relay rotations cannot leak a registration or tear
+// down the live one.
+func TestRestartRotationDoesNotLeakAcrossRestarts(t *testing.T) {
+	var firstReleases, secondReleases, finalReleases int
+	s := newFakeFFmpegSession(t)
+	s.opts.InputPath = "/relay/source/token-0/movie.mp4"
+	s.opts.InputCleanup = func() { firstReleases++ }
+	started := 0
+	s.opts.RefreshInput = func(context.Context) (string, func(), error) {
+		started++
+		if started == 1 {
+			return "/relay/source/token-1/movie.mp4", func() { secondReleases++ }, nil
+		}
+		return "/relay/source/token-2/movie.mp4", func() { finalReleases++ }, nil
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.Restart(context.Background(), 12, 3); err != nil {
+		t.Fatalf("first restart: %v", err)
+	}
+	if err := s.Restart(context.Background(), 14, 4); err != nil {
+		t.Fatalf("second restart: %v", err)
+	}
+	if got, want := s.Opts().InputPath, "/relay/source/token-2/movie.mp4"; got != want {
+		t.Fatalf("InputPath = %q, want the final rotated input %q", got, want)
+	}
+	if firstReleases != 1 {
+		t.Fatalf("token-0 cleanup ran %d times, want 1", firstReleases)
+	}
+	if secondReleases != 1 {
+		t.Fatalf("token-1 cleanup ran %d times, want 1", secondReleases)
+	}
+	if finalReleases != 0 {
+		t.Fatalf("final cleanup ran %d times before session close, want 0", finalReleases)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if finalReleases != 1 {
+		t.Fatalf("final cleanup ran %d times after close, want 1", finalReleases)
+	}
+	if firstReleases != 1 || secondReleases != 1 {
+		t.Fatalf("superseded cleanups ran again after close: token-0=%d token-1=%d, want 1 each", firstReleases, secondReleases)
 	}
 }
