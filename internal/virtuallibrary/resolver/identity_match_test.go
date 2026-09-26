@@ -6,20 +6,15 @@ import "testing"
 // identity fields. It exercises the same candidateDedupKey the deduplication
 // chain uses, so the assertions below pin the re-match precedence.
 func candidateWithIdentity(url, title, videoHash, guid string, size int64) StreamCandidate {
-	return StreamCandidate{
+	candidate := StreamCandidate{
 		URL:        url,
 		Name:       title,
 		Title:      title,
 		FileSize:   size,
 		SourceGUID: guid,
-		BehaviorHints: struct {
-			VideoHash    string         `json:"videoHash"`
-			Filename     string         `json:"filename"`
-			BingeGroup   string         `json:"bingeGroup"`
-			NotWebReady  bool           `json:"notWebReady"`
-			ProxyHeaders map[string]any `json:"proxyHeaders"`
-		}{VideoHash: videoHash},
 	}
+	candidate.BehaviorHints.VideoHash = videoHash
+	return candidate
 }
 
 func TestPersistedDedupKeyPrecedence(t *testing.T) {

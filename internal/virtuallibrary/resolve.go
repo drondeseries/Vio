@@ -706,11 +706,15 @@ func (s *Service) ResolveDetailed(
 			// order matches candidateDedupKey: hash, then GUID, then the
 			// normalized release name + size. ReleaseName is always derived
 			// (name+size is the fallback tier), so a row with no hash/GUID is
-			// still re-matchable.
-			ProviderVideoHash:   c.BehaviorHints.VideoHash,
+			// still re-matchable. The hash accepts both the Stremio
+			// behaviorHints.videoHash and a torrent infoHash, and the size
+			// accepts a parsed size or behaviorHints.videoSize, so an addon
+			// that declares identity only through those fields is still
+			// durable.
+			ProviderVideoHash:   stream.CandidateVideoHash(c),
 			ProviderGUID:        c.SourceGUID,
 			ProviderReleaseName: resolver.CandidateReleaseName(c),
-			ProviderReleaseSize: c.FileSize,
+			ProviderReleaseSize: stream.CandidateDeclaredSize(c),
 			// The candidate's provider-declared inventory travels with the
 			// resolution so a caller can seed a declared inventory on adoption.
 			CodecAudio:        c.CodecAudio,
@@ -824,7 +828,7 @@ func (s *Service) playbackStreamsFrom(ctx context.Context, virtualPath string, c
 			Visible:             true,
 			VisibilitySpecified: true,
 			ProviderURL:         c.URL,
-			ProviderVideoHash:   c.BehaviorHints.VideoHash,
+			ProviderVideoHash:   stream.CandidateVideoHash(c),
 			ProviderGUID:        c.SourceGUID,
 			ProviderReleaseName: resolver.CandidateReleaseName(c),
 		})

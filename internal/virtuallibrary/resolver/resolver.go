@@ -447,8 +447,10 @@ func dropFailedCandidates(candidates []StreamCandidate) []StreamCandidate {
 // keeping genuinely distinct releases apart. An empty key means the candidate
 // carries too little identity to collapse and is always kept.
 func candidateDedupKey(candidate StreamCandidate) string {
-	// Tier 1a: provider-supplied content hash.
-	if hash := strings.ToLower(strings.TrimSpace(candidate.BehaviorHints.VideoHash)); hash != "" {
+	// Tier 1a: provider-supplied content hash. Accepts the Stremio
+	// behaviorHints.videoHash and a torrent infoHash; both pin the bytes
+	// across a re-listing's result renumbering.
+	if hash := strings.ToLower(stream.CandidateVideoHash(candidate)); hash != "" {
 		return "vidhash:" + hash
 	}
 	// Tier 1b: GUID of the indexed release the classifier tied us to.
@@ -467,8 +469,8 @@ func candidateDedupKey(candidate StreamCandidate) string {
 	// True duplicates report identical byte sizes; distinct releases differ.
 	// Unknown sizes collapse only with other unknown sizes of the same name.
 	sizeKey := "0"
-	if candidate.FileSize > 0 {
-		sizeKey = strconv.FormatInt(candidate.FileSize, 10)
+	if size := stream.CandidateDeclaredSize(candidate); size > 0 {
+		sizeKey = strconv.FormatInt(size, 10)
 	}
 	return releaseKey + "\x00" + sizeKey
 }
