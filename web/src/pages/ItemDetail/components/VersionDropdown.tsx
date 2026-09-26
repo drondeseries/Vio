@@ -246,6 +246,14 @@ function VersionDropdown({
               onReset={resetSort}
               className="px-3 pt-1.5 pb-0.5"
             />
+            {onRefreshVersions ? (
+              <VersionRefreshRow
+                refreshing={refreshingVersions}
+                cancelable={cancelableVersions}
+                error={refreshVersionsError}
+                onPress={handleRefreshVersions}
+              />
+            ) : null}
             {visibleVersions.map((version) => {
               const isSelected = version.file_id === activeVersion?.file_id;
               const summary = buildQualitySummary(version);
@@ -353,33 +361,51 @@ function VersionDropdown({
               </div>
             )}
             {onRefreshVersions ? (
-              <button
-                type="button"
-                disabled={refreshingVersions && !cancelableVersions}
-                aria-busy={refreshingVersions || undefined}
-                onClick={() => handleRefreshVersions()}
-                className="text-muted-foreground hover:bg-accent/50 hover:text-foreground flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <RefreshCw
-                  className={`size-3.5 shrink-0 ${refreshingVersions ? "animate-spin" : ""}`}
-                  aria-hidden="true"
-                />
-                <span className="flex min-w-0 flex-col">
-                  <span>
-                    {refreshingVersions && cancelableVersions ? "Cancel refresh" : "Refresh List"}
-                  </span>
-                  {refreshVersionsError ? (
-                    <span className="text-destructive text-[10px] leading-tight">
-                      {refreshVersionsError}
-                    </span>
-                  ) : null}
-                </span>
-              </button>
+              <VersionRefreshRow
+                refreshing={refreshingVersions}
+                cancelable={cancelableVersions}
+                error={refreshVersionsError}
+                onPress={handleRefreshVersions}
+              />
             ) : null}
           </div>
         </DetailPopover>
       ) : null}
     </>
+  );
+}
+
+interface VersionRefreshRowProps {
+  refreshing: boolean;
+  cancelable: boolean;
+  error: string | null;
+  onPress: () => void;
+}
+
+/**
+ * The version picker's "Refresh List" row, rendered both above and below the
+ * version list so the control is reachable without scrolling past a long list.
+ * Both instances read the same `useVersionListRefresh` state, so one refresh
+ * locks and spins both.
+ */
+function VersionRefreshRow({ refreshing, cancelable, error, onPress }: VersionRefreshRowProps) {
+  return (
+    <button
+      type="button"
+      disabled={refreshing && !cancelable}
+      aria-busy={refreshing || undefined}
+      onClick={onPress}
+      className="text-muted-foreground hover:bg-accent/50 hover:text-foreground flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+    >
+      <RefreshCw
+        className={`size-3.5 shrink-0 ${refreshing ? "animate-spin" : ""}`}
+        aria-hidden="true"
+      />
+      <span className="flex min-w-0 flex-col">
+        <span>{refreshing && cancelable ? "Cancel refresh" : "Refresh List"}</span>
+        {error ? <span className="text-destructive text-[10px] leading-tight">{error}</span> : null}
+      </span>
+    </button>
   );
 }
 
