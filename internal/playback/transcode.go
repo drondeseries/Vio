@@ -4550,10 +4550,9 @@ type ffmpegStderrWriter struct {
 }
 
 func (w *ffmpegStderrWriter) logLine(line string) {
-	if !w.session.stderrGenerationCurrent(w.generation) {
+	if !w.session.logFFmpegLineForGeneration(w.ctx, w.generation, line) {
 		return
 	}
-	w.session.logFFmpegLine(w.ctx, line)
 }
 
 func (w *ffmpegStderrWriter) Write(p []byte) (int, error) {
@@ -4581,15 +4580,97 @@ func (w *ffmpegStderrWriter) Flush() {
 	w.partial = nil
 }
 
-// stderrGenerationCurrent reports whether a stderr writer's generation still
-// owns this session's verdict lifecycle. A stale writer's lines are discarded.
-func (s *TranscodeSession) stderrGenerationCurrent(generation uint64) bool {
+// logFFmpegLineForGeneration handles one stderr line emitted by the writer that
+// owns generation. It validates the generation atomically with the observation
+// it performs, so a reset interleaved between the writer's check and the
+// observation can never let a dead process's line touch the replacement. The
+// full pipeline runs under one hold of mu: a generation fence at the head, the
+// demux and decode observations — which mutate generation-scoped counters,
+// latching hardware state, stage, and evaluator — and finally the diagnostic
+// sink. Because the observations record the writer's generation rather than
+// re-reading the live one, a reset that waits on mu either lands before the
+// whole line (dropping it) or after it, never between check and mutation. It
+// reports whether the line's generation was still current, so the caller can
+// skip work for a discarded line.
+func (s *TranscodeSession) logFFmpegLineForGeneration(ctx context.Context, generation uint64, line string) bool {
 	if s == nil {
-		return true
+		return false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return generation == s.decodeGeneration
+	if generation != s.decodeGeneration {
+		s.mu.Unlock()
+		return false
+	}
+	// Both verdicts indict the video source candidate, so both require the line
+	// to resolve to the video stream. A demux or decoder failure with no video
+	// identity is left unstamped rather than risk stamping the release for a
+	// corrupt audio or subtitle stream sharing the input container.
+	video := videoStreamEvidenceV3(line)
+	if video && demuxInputErrorLine(line) {
+		notifyCtx := ctx
+		if notifyCtx == nil {
+			notifyCtx = context.Background()
+		}
+		if s.observeDemuxErrorLocked(s.decodeClock()) {
+			go s.notifyDemuxFailure(notifyCtx)
+		}
+	}
+	if video && decodeErrorLine(line) {
+		// Observation only: a decoder line never confirms by itself. The
+		// shared evaluator (a later progress sample or the observation
+		// deadline) confirms and then notifies.
+		s.observeDecodeErrorLocked(generation, line, s.decodeClock())
+	}
+	s.writeFFmpegLogLocked(ctx, line)
+	s.mu.Unlock()
+	return true
+}
+
+// logFFmpegLine handles one already-split stderr line for any caller that names
+// no generation (tests and diagnostics). It resolves the live generation under
+// mu and delegates to logFFmpegLineForGeneration, so a direct call observes for
+// whatever generation is current when it starts and is fenced exactly like a
+// writer's line.
+func (s *TranscodeSession) logFFmpegLine(ctx context.Context, line string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	generation := s.decodeGeneration
+	s.mu.Unlock()
+	s.logFFmpegLineForGeneration(ctx, generation, line)
+}
+
+// writeFFmpegLogLocked persists one stderr line to the diagnostic sink,
+// honoring the per-session cap. Callers hold mu.
+func (s *TranscodeSession) writeFFmpegLogLocked(ctx context.Context, line string) {
+	if s.opts.FFmpegLogSink == nil {
+		return
+	}
+	line = strings.ToValidUTF8(line, "\uFFFD")
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+	trimmed, truncated := truncateUTF8String(line, maxPersistedFFmpegChars)
+	if truncated {
+		trimmed += "...[truncated]"
+	}
+	if s.stderrLinesLogged >= maxPersistedFFmpegLines || s.stderrBytesLogged+len(trimmed) > maxPersistedFFmpegBytes {
+		s.stderrDroppedLines++
+		if !s.stderrCapLogged {
+			s.stderrCapLogged = true
+			attrs := s.ffmpegAttrsLocked()
+			attrs.DroppedLines = s.stderrDroppedLines
+			s.opts.FFmpegLogSink.WriteEvent(ctx, s.opts.SessionID, attrs, "ffmpeg stderr logging capped")
+		}
+		return
+	}
+	s.stderrLinesLogged++
+	s.stderrBytesLogged += len(trimmed)
+	s.stderrLineIndex++
+	attrs := s.ffmpegAttrsLocked()
+	attrs.LineIndex = s.stderrLineIndex
+	s.opts.FFmpegLogSink.WriteLine(ctx, s.opts.SessionID, attrs, trimmed)
 }
 
 func (s *TranscodeSession) newStderrWriter(ctx context.Context) io.Writer {
@@ -4781,34 +4862,41 @@ const decodeWatchInterval = 100 * time.Millisecond
 // decodeReapTimeout bounds the server-owned teardown of a confirmed generation.
 const decodeReapTimeout = 2 * time.Second
 
-// observeDecodeError records one decoder failure line and advances the
-// generation's verdict lifecycle. The counter resets when more than
-// decodeErrorDecay elapsed since the previous failure, so decoder blips that
-// recover are forgiven. Crossing decodeErrorThreshold enters the suspected
-// stage and starts the single evaluator; it no longer confirms by itself —
-// qualifying progress cancels suspicion and expiry without recovery confirms it
-// (see evaluateDecodeVerdict). It reports true only on the call that enters
-// suspicion, for logging. A copy target never observes: a decoder error there is
-// an output/remux anomaly, not a decode verdict.
+// observeDecodeErrorLocked records one decoder failure line emitted by the
+// writer that owns generation, binding the observation to that generation
+// rather than re-reading the live one. The caller already holds mu and has
+// verified generation's currency, so a reset cannot interleave between the
+// check and this mutation; a line from a dead process can never misattribute a
+// strike to the replacement. It advances the generation's verdict lifecycle:
+// the counter resets when more than decodeErrorDecay elapsed since the previous
+// failure, so decoder blips that recover are forgiven. Crossing
+// decodeErrorThreshold enters the suspected stage and starts the single
+// evaluator; it no longer confirms by itself — qualifying progress cancels
+// suspicion and expiry without recovery confirms it (see
+// evaluateDecodeVerdict). It reports true only on the call that enters
+// suspicion, for logging. A copy target never observes: a decoder error there
+// is an output/remux anomaly, not a decode verdict.
 //
 // It reads time through the session clock so production and tests share one
-// timeline.
-func (s *TranscodeSession) observeDecodeError(sample string) bool {
+// timeline. Callers must hold mu.
+func (s *TranscodeSession) observeDecodeErrorLocked(generation uint64, sample string, now time.Time) bool {
 	if s == nil {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
+		return false
+	}
+	// A generation can only be observed while it is live. A line that names a
+	// generation the session has already replaced is stale and dropped.
+	if generation != s.decodeGeneration {
 		return false
 	}
 	// A confirmed generation is terminal: keep the diagnostic evidence
 	// current but never reopen the verdict.
 	if s.decodeStage == decodeStageConfirmed {
-		s.recordDecodeEvidenceLocked(s.decodeClock(), sample)
+		s.recordDecodeEvidenceLocked(now, sample)
 		return false
 	}
-	now := s.decodeClock()
 	if !s.lastDecodeErrorAt.IsZero() && now.Sub(s.lastDecodeErrorAt) > decodeErrorDecay {
 		s.decodeErrorCount = 0
 	}
@@ -4832,6 +4920,19 @@ func (s *TranscodeSession) observeDecodeError(sample string) bool {
 	}
 	s.startDecodeWatchLocked()
 	return true
+}
+
+// observeDecodeError records one decoder failure line for the generation that is
+// current when it is called. It exists for callers that name no generation;
+// production stderr flows through observeDecodeErrorLocked with the writer's
+// own generation.
+func (s *TranscodeSession) observeDecodeError(sample string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.observeDecodeErrorLocked(s.decodeGeneration, sample, s.decodeClock())
 }
 
 // recordDecodeEvidenceLocked advances the newest-failure timestamp and sample.
@@ -5101,18 +5202,19 @@ func (s *TranscodeSession) DecodeFailureEvidence() (string, int) {
 	return s.decodeSample, s.decodeErrorCount
 }
 
-// observeDemuxError records one input demux failure and reports whether it is
-// the occurrence that crosses the known-bad threshold. The counter resets when
-// more than demuxErrorDecay elapsed since the previous failure, so blips that
-// recover are forgiven. It reports true at most once per session: demuxStamped
-// is set under mu before returning, keeping the failure marker idempotent when
-// concurrent stderr lines arrive.
-func (s *TranscodeSession) observeDemuxError(now time.Time) bool {
+// observeDemuxErrorLocked records one input demux failure and reports whether
+// it is the occurrence that crosses the known-bad threshold. The counter resets
+// when more than demuxErrorDecay elapsed since the previous failure, so blips
+// that recover are forgiven. It reports true at most once per session:
+// demuxStamped is set under mu before returning, keeping the failure marker
+// idempotent when concurrent stderr lines arrive. Callers must hold mu; the
+// generation fence belongs to logFFmpegLineForGeneration, which calls this
+// inside the same critical section as the check, so a stale line cannot
+// misattribute the stamp to a replacement.
+func (s *TranscodeSession) observeDemuxErrorLocked(now time.Time) bool {
 	if s == nil {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.demuxStamped {
 		return false
 	}
@@ -5126,6 +5228,18 @@ func (s *TranscodeSession) observeDemuxError(now time.Time) bool {
 	}
 	s.demuxStamped = true
 	return true
+}
+
+// observeDemuxError records one input demux failure for the current session. It
+// exists for callers that name no generation; production stderr flows through
+// observeDemuxErrorLocked inside the generation-fenced line path.
+func (s *TranscodeSession) observeDemuxError(now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.observeDemuxErrorLocked(now)
 }
 
 // IsDemuxFailed reports whether repeated input demux failures stamped this
@@ -5213,58 +5327,6 @@ func (s *TranscodeSession) notifySourceRejected(ctx context.Context) {
 			log.Printf("playback: mark virtual candidate failed after decoder rejection (file_id=%d): %v", fileID, err)
 		}
 	}()
-}
-
-func (s *TranscodeSession) logFFmpegLine(ctx context.Context, line string) {
-	// Both verdicts indict the video source candidate, so both require the line
-	// to resolve to the video stream. A demux or decoder failure with no video
-	// identity is left unstamped rather than risk stamping the release for a
-	// corrupt audio or subtitle stream sharing the input container.
-	video := videoStreamEvidenceV3(line)
-	if video && demuxInputErrorLine(line) {
-		if s.observeDemuxError(time.Now()) {
-			s.notifyDemuxFailure(ctx)
-		}
-	}
-	if video && decodeErrorLine(line) {
-		// Observation only: a decoder line never confirms by itself. The
-		// shared evaluator (a later progress sample or the observation
-		// deadline) confirms and then notifies.
-		s.observeDecodeError(line)
-	}
-	if s == nil || s.opts.FFmpegLogSink == nil {
-		return
-	}
-
-	line = strings.ToValidUTF8(line, "\uFFFD")
-	if strings.TrimSpace(line) == "" {
-		return
-	}
-	trimmed, truncated := truncateUTF8String(line, maxPersistedFFmpegChars)
-	if truncated {
-		trimmed += "...[truncated]"
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.stderrLinesLogged >= maxPersistedFFmpegLines || s.stderrBytesLogged+len(trimmed) > maxPersistedFFmpegBytes {
-		s.stderrDroppedLines++
-		if !s.stderrCapLogged {
-			s.stderrCapLogged = true
-			attrs := s.ffmpegAttrsLocked()
-			attrs.DroppedLines = s.stderrDroppedLines
-			s.opts.FFmpegLogSink.WriteEvent(ctx, s.opts.SessionID, attrs, "ffmpeg stderr logging capped")
-		}
-		return
-	}
-
-	s.stderrLinesLogged++
-	s.stderrBytesLogged += len(trimmed)
-	s.stderrLineIndex++
-	attrs := s.ffmpegAttrsLocked()
-	attrs.LineIndex = s.stderrLineIndex
-	s.opts.FFmpegLogSink.WriteLine(ctx, s.opts.SessionID, attrs, trimmed)
 }
 
 func (s *TranscodeSession) logFFmpegEvent(ctx context.Context, message, exitError string) {
