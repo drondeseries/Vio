@@ -747,28 +747,25 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 			var reqHeaders map[string]string
 			ownerID := task.file.VirtualOwnerInstallationID
 			if h.VirtualMediaDetailedResolver != nil {
-				if res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+				res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 					prefetchCtx, topCand.URI, task.file.VirtualOwnerInstallationID, task.userID, task.profileID, false, nil, "",
-				); err == nil {
-					// Bind the resolved identity atomically: a resolver that
-					// substitutes (dedup keeper, renumbered result id) must not
-					// have its bytes probed and persisted under the cached
-					// candidate's URI. Without this the probe evidence of
-					// release B would land on release A's catalog row.
-					if (res.URI != "" && res.URI != topCand.URI) ||
-						(res.CandidateID != "" && topCand.ID != "" && res.CandidateID != topCand.ID) {
-						return
-					}
-					streamURL = res.URL
-					reqHeaders = res.RequestHeaders
-					if res.OwnerID > 0 {
-						ownerID = res.OwnerID
-					}
-				}
-			} else if h.VirtualPlaybackResolver != nil {
-				streamURL, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(
-					prefetchCtx, topCand.URI, task.userID, task.profileID, task.file.VirtualOwnerInstallationID,
 				)
+				if err != nil {
+					return
+				}
+				// Speculative pre-probe requires strict identity verification:
+				// the resolved candidate URI must strictly match topCand.URI
+				// (and matching candidate ID when known). Never proceed on an
+				// empty URI or a resolver-substituted candidate (dedup keeper,
+				// sibling), which would persist release B's probe on release A.
+				if res.URI != topCand.URI || (res.CandidateID != "" && topCand.ID != "" && res.CandidateID != topCand.ID) {
+					return
+				}
+				streamURL = res.URL
+				reqHeaders = res.RequestHeaders
+				if res.OwnerID > 0 {
+					ownerID = res.OwnerID
+				}
 			}
 			if streamURL != "" {
 				probeTransient := cloneVirtualProbeTransient(task.file)

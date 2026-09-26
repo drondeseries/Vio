@@ -244,3 +244,44 @@ func TestPlaybackV2ProblemMapping(t *testing.T) {
 		t.Fatalf("opaque error: %+v", problem)
 	}
 }
+
+func TestPlaybackV2InventoryEndpoint(t *testing.T) {
+	deps, _ := catalogDeps(t)
+	fake := &fakePlaybackService{}
+	deps.Playback = fake
+	h := newTestHandler(t, deps)
+
+	path := Prefix + "/playback/session-1/inventory"
+
+	// 1. Success 200 with ETag and Cache-Control
+	res := do(t, h, http.MethodGet, path, "", viewerHeaders())
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", res.Code, res.Body.String())
+	}
+	etag := res.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("missing ETag header")
+	}
+	if cc := res.Header().Get("Cache-Control"); cc != "private, no-cache" {
+		t.Fatalf("Cache-Control = %q, want 'private, no-cache'", cc)
+	}
+
+	// 2. Conditional request matching ETag -> 304 Not Modified
+	condRes := do(t, h, http.MethodGet, path, "", with(viewerHeaders(), "If-None-Match", etag))
+	if condRes.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want 304 Not Modified", condRes.Code)
+	}
+	if condRes.Body.Len() != 0 {
+		t.Fatalf("304 response body must be empty, got %d bytes", condRes.Body.Len())
+	}
+
+	// 3. Error mapping: session_not_found -> 404 Problem
+	fake.err = &handlers.PlaybackOperationError{Status: http.StatusNotFound, Code: "session_not_found", Message: "Playback session not found"}
+	notFoundRes := do(t, h, http.MethodGet, path, "", viewerHeaders())
+	requireProblem(t, notFoundRes, TypeNotFound)
+
+	// 4. Error mapping: store failure -> 503 Problem
+	fake.err = &handlers.PlaybackOperationError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "Database unavailable"}
+	unavailRes := do(t, h, http.MethodGet, path, "", viewerHeaders())
+	requireProblem(t, unavailRes, TypeDependencyUnavailable)
+}

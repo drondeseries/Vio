@@ -5726,18 +5726,26 @@ func (h *PlaybackHandler) attachSubtitleArtifactV3(ctx context.Context, sessionI
 	return nil
 }
 
+// downloadedSubtitleInventoryWithErrorV3 lists downloaded/AI tracks and
+// propagates any repository read failure so callers can fail closed instead of
+// silently serving a partial inventory.
+func (h *PlaybackHandler) downloadedSubtitleInventoryWithErrorV3(ctx context.Context, file *models.MediaFile) ([]playback.SubtitleInventoryEntryV3, error) {
+	if h == nil || h.SubtitleRepo == nil || file == nil {
+		return nil, nil
+	}
+	downloaded, err := h.SubtitleRepo.ListDownloadedSubtitles(ctx, file.ID)
+	if err != nil {
+		return nil, err
+	}
+	return downloadedSubtitleEntriesV3(file, downloaded), nil
+}
+
 // downloadedSubtitleInventoryV3 lists the downloaded and AI-generated tracks
 // that follow the file's own tracks in the combined-ordinal space. The
 // repository orders by created_at, so the ordinals it produces are stable.
 func (h *PlaybackHandler) downloadedSubtitleInventoryV3(ctx context.Context, file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
-	if h == nil || h.SubtitleRepo == nil || file == nil {
-		return nil
-	}
-	downloaded, err := h.SubtitleRepo.ListDownloadedSubtitles(ctx, file.ID)
-	if err != nil {
-		return nil
-	}
-	return downloadedSubtitleEntriesV3(file, downloaded)
+	entries, _ := h.downloadedSubtitleInventoryWithErrorV3(ctx, file)
+	return entries
 }
 
 // downloadedSubtitleEntriesV3 converts downloaded rows into inventory entries

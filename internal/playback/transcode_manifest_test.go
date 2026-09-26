@@ -330,6 +330,11 @@ func TestBuildPlaybackManifest_LongEncodedTranscodeUsesRealManifest(t *testing.T
 	if err := os.WriteFile(filepath.Join(tempDir, "stream.m3u8"), []byte(manifest), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
+	for _, name := range []string{"seg_00000.ts", "seg_00001.ts"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
 
 	session := &TranscodeSession{
 		outputDir: tempDir,
@@ -338,6 +343,8 @@ func TestBuildPlaybackManifest_LongEncodedTranscodeUsesRealManifest(t *testing.T
 			TargetCodecAudio: "aac",
 			SegmentDuration:  2,
 			TotalDuration:    1_000_000,
+			FastStart:        true,
+			HWAccel:          transcodeHWQSV,
 		},
 	}
 

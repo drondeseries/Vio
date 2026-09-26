@@ -27,6 +27,9 @@ func fakeStartupSession(t *testing.T, opts TranscodeOpts, outputDir string, read
 		if err := os.WriteFile(filepath.Join(outputDir, "stream.m3u8"), []byte(startupTestManifest), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.WriteFile(filepath.Join(outputDir, "seg_00000.ts"), []byte("segment"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	} else if !running {
 		session.waitErr = errors.New("gpu failed")
 	}

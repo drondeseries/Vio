@@ -825,15 +825,26 @@ func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller Pla
 		}
 	}
 
-	var clientFeatures []string
-	if h.PlanStoreV3 != nil {
-		if record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID); err == nil && record != nil {
-			clientFeatures = replanSubtitleFeaturesV3(record, record.NormalizedRequest.ClientFeatures)
-		}
+	if h.PlanStoreV3 == nil {
+		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
 	}
+	record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, playback.ErrSessionNotFound) {
+			return playback.PlaybackInventoryV3{}, playbackSessionNotFoundOperationError()
+		}
+		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
+	}
+	if record == nil {
+		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
+	}
+	clientFeatures := replanSubtitleFeaturesV3(record, record.NormalizedRequest.ClientFeatures)
 
 	audioTracks := playback.AudioInventoryV3(file)
-	additional := h.downloadedSubtitleInventoryV3(ctx, file)
+	additional, subErr := h.downloadedSubtitleInventoryWithErrorV3(ctx, file)
+	if subErr != nil {
+		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
+	}
 	subtitleInventory := playback.ScopeSubtitleInventoryV3(sessionID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
 	status := "declared"

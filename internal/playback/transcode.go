@@ -2868,11 +2868,12 @@ func manifestURIToFilename(uri string) string {
 	return filepath.Base(base)
 }
 
-func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int, float64, bool) {
+func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int, float64, bool, bool) {
 	files := make([]string, 0, maxSegments+1)
 	segmentCount := 0
 	duration := 0.0
 	endList := false
+	allValidDurations := true
 	var pendingDuration float64
 	var havePending bool
 
@@ -2902,10 +2903,11 @@ func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int, floa
 		}
 		if bytes.HasPrefix(trimmed, []byte("#EXTINF:")) {
 			pendingDuration, havePending = 0, false
-			if value := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(string(trimmed), "#EXTINF:"), ",")); value != "" {
-				if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds > 0 && !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
-					pendingDuration, havePending = seconds, true
-				}
+			raw := strings.TrimSpace(strings.TrimPrefix(string(trimmed), "#EXTINF:"))
+			val, _, _ := strings.Cut(raw, ",")
+			val = strings.TrimSpace(val)
+			if seconds, err := strconv.ParseFloat(val, 64); err == nil && seconds > 0 && !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
+				pendingDuration, havePending = seconds, true
 			}
 			continue
 		}
@@ -2913,18 +2915,21 @@ func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int, floa
 			continue
 		}
 
-		files = append(files, manifestURIToFilename(string(trimmed)))
-		segmentCount++
-		if havePending {
+		if !havePending || pendingDuration <= 0 {
+			allValidDurations = false
+		} else {
 			duration += pendingDuration
+			pendingDuration = 0
 			havePending = false
 		}
+		files = append(files, manifestURIToFilename(string(trimmed)))
+		segmentCount++
 		if complete() {
 			break
 		}
 	}
 
-	return files, segmentCount, duration, endList
+	return files, segmentCount, duration, endList, allValidDurations
 }
 
 // minManifestDurationSeconds is the minimum contiguous completed-segment duration
@@ -2942,7 +2947,7 @@ func startupCopyManifestIsBroken(manifest []byte) bool {
 	if err := validateManifestHeader(manifest); err != nil {
 		return false
 	}
-	_, segmentCount, _, _ := manifestStartupFiles(manifest, 2)
+	_, segmentCount, _, _, _ := manifestStartupFiles(manifest, 2)
 	if segmentCount < 2 {
 		return false
 	}
@@ -2963,11 +2968,14 @@ func startupCopyManifestIsBroken(manifest []byte) bool {
 }
 
 func startupFilesReady(manifest []byte, outputDir string, requiredSegments int) bool {
-	files, segmentCount, duration, endList := manifestStartupFiles(manifest, requiredSegments)
+	files, segmentCount, duration, endList, allValidDurations := manifestStartupFiles(manifest, requiredSegments)
+	if !allValidDurations || segmentCount == 0 {
+		return false
+	}
 	// A completed playlist with nonempty referenced files is valid content
 	// even below the live runway: short clips and near-end seeks must start.
 	if endList {
-		if segmentCount == 0 {
+		if duration <= 0 {
 			return false
 		}
 		for _, name := range files {

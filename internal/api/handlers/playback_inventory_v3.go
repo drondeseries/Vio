@@ -68,8 +68,19 @@ func (h *PlaybackHandler) HandleGetPlaybackInventoryV3(w http.ResponseWriter, r 
 		}
 	}
 
+	var clientFeatures []string
+	if h.PlanStoreV3 != nil {
+		if record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID); err == nil && record != nil {
+			clientFeatures = replanSubtitleFeaturesV3(record, record.NormalizedRequest.ClientFeatures)
+		}
+	}
 	audioTracks := playback.AudioInventoryV3(file)
-	subtitleInventory := playback.BuildSubtitleInventoryV3(file, nil)
+	additional, subErr := h.downloadedSubtitleInventoryWithErrorV3(r.Context(), file)
+	if subErr != nil {
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Failed to load subtitle inventory")
+		return
+	}
+	subtitleInventory := playback.ScopeSubtitleInventoryV3(sessionID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
 	status := "declared"
 	if file != nil && file.ProbeUpdatedAt != nil {
