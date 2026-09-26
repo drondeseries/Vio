@@ -4685,7 +4685,8 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 		if startupFailure != nil {
 			unlock()
 			if startupFailure.failedToStart {
-				return preparedTransportV3{}, toneMapExecutionTransportErrorV3(startupFailure.cause, "Failed to start the playback transport.")
+				return preparedTransportV3{}, transportStartFailureV3(startupFailure.cause,
+					toneMapExecutionTransportErrorV3(startupFailure.cause, "Failed to start the playback transport."))
 			}
 			return preparedTransportV3{}, manifestStartupTransportErrorV3(startupFailure.wasRunning, startupFailure.cause)
 		}
@@ -4703,10 +4704,14 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 	}
 	if startupFailure != nil && startupFailure.failedToStart {
 		unlock()
+		fallback := &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to start the playback transport.", retryable: false, cause: startupFailure.cause}
 		if opts.ToneMapMode != "" {
-			return preparedTransportV3{}, toneMapExecutionTransportErrorV3(startupFailure.cause, "Failed to start the playback transport.")
+			fallback = toneMapExecutionTransportErrorV3(startupFailure.cause, "Failed to start the playback transport.")
 		}
-		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to start the playback transport.", retryable: false, cause: startupFailure.cause}
+		// A provider-outage classify outranks the tone-map/transcode reason: the
+		// transport never started because the release could not be re-resolved,
+		// so the client should retry the release, not rebuild the recipe.
+		return preparedTransportV3{}, transportStartFailureV3(startupFailure.cause, fallback)
 	}
 	if startupFailure != nil {
 		transportErr := localTransportReadinessErrorV3(opts, startupFailure.wasRunning, startupFailure.cause)

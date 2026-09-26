@@ -21,6 +21,13 @@ import (
 // retrying the same pinned release instead of rotating to a sibling.
 var errVirtualProviderUnavailable = errors.New("virtual provider listing temporarily unavailable")
 
+// providerUnavailableReasonV3 is the retryable transport/terminal reason a
+// classified provider outage surfaces under. It matches the serve layer's
+// machine-readable code (stream.go writes the same string as a 503), so a
+// v3 start and a byte serve describe the same transient dependence on the
+// provider's listing.
+const providerUnavailableReasonV3 = "provider_unavailable"
+
 // virtualProviderOutageBackoff is the bounded wait schedule for a transient
 // provider-listing failure on a session-bound candidate the catalog still
 // trusts. Two retries add at most ~3s of latency, well under the serve and
@@ -158,6 +165,26 @@ func classifyVirtualProviderOutage(err error, trusted bool) error {
 		return err
 	}
 	return fmt.Errorf("%w: %w", errVirtualProviderUnavailable, err)
+}
+
+// transportStartFailureV3 classifies a local transport start failure. A
+// virtual provider-listing outage on a release the catalog still trusts is a
+// transient dependency failure, not a transcode fault: the transport start
+// itself never ran FFmpeg, so reporting transcode_start_failed would tell the
+// client the start is broken rather than that the provider should be retried.
+// It maps to the retryable provider_unavailable reason the serve layer already
+// answers 503 with, so a start and a byte serve agree. Every other cause keeps
+// the caller's reason and message.
+func transportStartFailureV3(cause error, fallback *transportErrorV3) *transportErrorV3 {
+	if errors.Is(cause, errVirtualProviderUnavailable) {
+		return &transportErrorV3{
+			reason:    providerUnavailableReasonV3,
+			message:   "The virtual source provider is temporarily unavailable.",
+			retryable: true,
+			cause:     cause,
+		}
+	}
+	return fallback
 }
 
 // sleepWithContext waits for d or returns false when ctx is canceled first.
