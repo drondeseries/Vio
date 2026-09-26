@@ -621,7 +621,7 @@ func (h *CatalogResourceHandler) SeasonEpisodes(ctx context.Context, v ItemViewe
 	}
 	episodes, err := h.items.episodeRepo.ListBySeason(ctx, id, num)
 	if err != nil {
-		return nil, apiError(http.StatusInternalServerError, "internal_error", failed)
+		return nil, apiError(http.StatusInternalServerError, "internal_error", failed).WithCause(err)
 	}
 	if h.items.seasonRepo != nil {
 		if season, seasonErr := h.items.seasonRepo.GetBySeriesAndNumber(ctx, id, num); seasonErr == nil && season != nil {

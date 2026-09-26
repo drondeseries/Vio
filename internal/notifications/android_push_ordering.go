@@ -107,18 +107,18 @@ func (r *PushDeviceRepository) ApplyAndroidPush(ctx context.Context, cmd Android
 	keyHash := pushDigest([]byte(cmd.InstallationKey))
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("begin ordered push registration: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	generation, err := lockAndroidPushInstallation(ctx, tx, cmd.DeviceID)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("lock ordered push installation: %w", err)
 	}
 	var storedKey, storedIntent, profile string
 	var user int
 	err = tx.QueryRow(ctx, `SELECT installation_key_hash,intent_hash,user_id,profile_id,generation,registration_id,server_device_id,push_mode,removed FROM android_push_installations WHERE device_id=$1`, cmd.DeviceID).Scan(&storedKey, &storedIntent, &user, &profile, &result.Generation, &result.RegistrationID, &result.ServerDeviceID, &result.PushMode, &result.Removed)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("load ordered push installation: %w", err)
 	}
 	if generation > 0 {
 		if !hmac.Equal([]byte(storedKey), []byte(keyHash)) {
@@ -128,7 +128,10 @@ func (r *PushDeviceRepository) ApplyAndroidPush(ctx context.Context, cmd Android
 			return AndroidPushReceipt{}, ErrPushGenerationConflict
 		}
 		if cmd.Generation == generation {
-			return result, tx.Commit(ctx)
+			if err := tx.Commit(ctx); err != nil {
+				return result, fmt.Errorf("commit ordered push registration: %w", err)
+			}
+			return result, nil
 		}
 		if cmd.Remove && (user != cmd.UserID || profile != cmd.ProfileID) {
 			return AndroidPushReceipt{}, ErrPushGenerationConflict
@@ -139,7 +142,7 @@ func (r *PushDeviceRepository) ApplyAndroidPush(ctx context.Context, cmd Android
 		var foreign bool
 		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM push_devices WHERE device_id=$1 AND platform=$2 AND user_id<>$3)`, cmd.DeviceID, PushPlatformAndroid, cmd.UserID).Scan(&foreign)
 		if err != nil {
-			return result, err
+			return result, fmt.Errorf("check ordered push ownership: %w", err)
 		}
 		if foreign {
 			return AndroidPushReceipt{}, ErrPushGenerationConflict
@@ -147,7 +150,7 @@ func (r *PushDeviceRepository) ApplyAndroidPush(ctx context.Context, cmd Android
 		if cmd.Remove {
 			err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM push_devices WHERE device_id=$1 AND platform=$2 AND profile_id<>$3)`, cmd.DeviceID, PushPlatformAndroid, cmd.ProfileID).Scan(&foreign)
 			if err != nil {
-				return result, err
+				return result, fmt.Errorf("check ordered push profile: %w", err)
 			}
 			if foreign {
 				return AndroidPushReceipt{}, ErrPushGenerationConflict
@@ -158,19 +161,19 @@ func (r *PushDeviceRepository) ApplyAndroidPush(ctx context.Context, cmd Android
 	// Cascading deletion retires old pending/retry attempts; it cannot unsend an
 	// external request that already left the server.
 	if _, err = tx.Exec(ctx, `DELETE FROM push_devices WHERE device_id=$1 AND platform=$2`, cmd.DeviceID, PushPlatformAndroid); err != nil {
-		return result, err
+		return result, fmt.Errorf("retire ordered push predecessors: %w", err)
 	}
 	result = AndroidPushReceipt{Generation: cmd.Generation, Removed: cmd.Remove}
 	if !cmd.Remove {
 		device, err := r.insertFCM(ctx, tx, FCMPushDeviceRegistration{UserID: cmd.UserID, ProfileID: cmd.ProfileID, DeviceID: cmd.DeviceID, FCMToken: cmd.Token, PushMode: cmd.PushMode}, cipher)
 		if err != nil {
-			return result, err
+			return result, fmt.Errorf("insert ordered push registration: %w", err)
 		}
 		result.RegistrationID, result.ServerDeviceID, result.PushMode = device.ID, device.ServerDeviceID, device.PushMode
 	}
 	_, err = tx.Exec(ctx, `UPDATE android_push_installations SET installation_key_hash=$2,generation=$3,user_id=$4,profile_id=$5,intent_hash=$6,registration_id=$7,server_device_id=$8,push_mode=$9,removed=$10 WHERE device_id=$1`, cmd.DeviceID, keyHash, cmd.Generation, cmd.UserID, cmd.ProfileID, intent, result.RegistrationID, result.ServerDeviceID, result.PushMode, result.Removed)
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("store ordered push registration: %w", err)
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return result, fmt.Errorf("commit ordered push registration: %w", err)
