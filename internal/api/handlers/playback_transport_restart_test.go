@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -352,5 +353,227 @@ func TestVirtualTransportRestartWithoutRelayKeepsResolvePath(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got == startupCalls {
 		t.Fatalf("provider resolve calls = %d, want the stored-first path to resolve without a relay", got)
+	}
+}
+
+// TestPinnedRelayRegistrationClearIfVersionIgnoresStaleFailure pins the #158
+// clobber guard: a failure that observed pin version V must not clear a
+// replacement installed after it. It is the reason the pin carries a version
+// rather than clearing unconditionally.
+func TestPinnedRelayRegistrationClearIfVersionIgnoresStaleFailure(t *testing.T) {
+	var pin pinnedRelayRegistration
+	pin.set("http://relay-a/source/a", "virtual://movie/a")
+	_, _, staleVersion := pin.snapshot()
+
+	// A concurrent restart installs a replacement.
+	pin.set("http://relay-b/source/b", "virtual://movie/b")
+
+	if pin.clearIfVersion(staleVersion) {
+		t.Fatal("a stale failure cleared the replacement pin")
+	}
+	url, identity, currentVersion := pin.snapshot()
+	if url != "http://relay-b/source/b" || identity != "virtual://movie/b" {
+		t.Fatalf("pin = %q/%q, want the replacement", url, identity)
+	}
+	if currentVersion == staleVersion {
+		t.Fatal("setting a replacement did not advance the pin version")
+	}
+
+	if !pin.clearIfVersion(currentVersion) {
+		t.Fatal("the current failure did not clear its own pin")
+	}
+	if url, identity, _ := pin.snapshot(); url != "" || identity != "" {
+		t.Fatalf("pin = %q/%q, want cleared", url, identity)
+	}
+}
+
+// TestVirtualTransportRestartRenewsRelayAfterUpstreamAuthRejection proves the
+// observed-401/403 path: once a request through the pinned relay is refused by
+// the upstream, the next restart clears the pin and forces a fresh provider
+// listing to renew the signed URL instead of replaying the refusal.
+func TestVirtualTransportRestartRenewsRelayAfterUpstreamAuthRejection(t *testing.T) {
+	tempDir := t.TempDir()
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer rejecting.Close()
+	renewed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("renewed-media"))
+	}))
+	defer renewed.Close()
+
+	neutral := "virtual://movie/tt-relay-renew"
+	pinned := neutral + "?result=pinned"
+	row := &models.MediaFile{
+		ID:                         97,
+		ContentID:                  "movie-relay-renew",
+		FilePath:                   pinned,
+		VirtualOwnerInstallationID: 5,
+	}
+	var calls int32
+	var forceRefreshes []bool
+	h := &PlaybackHandler{
+		fileResolver: &fakePinFileResolver{file: row},
+		sessionMgr:   playback.NewSessionManager(0, 0),
+		RemoteStreamRelay: func() *remotestream.Relay {
+			r := remotestream.NewRelay()
+			t.Cleanup(func() { _ = r.Close(context.Background()) })
+			return r
+		}(),
+		AllowPrivateStreams: func(int) bool { return true },
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			atomic.AddInt32(&calls, 1)
+			forceRefreshes = append(forceRefreshes, forceRefresh)
+			if forceRefresh {
+				return ResolvedVirtualMedia{URL: renewed.URL + "/provider/renewed.mp4", URI: uri, CandidateID: "pinned"}, nil
+			}
+			return ResolvedVirtualMedia{URL: rejecting.URL + "/provider/rejected.mp4", URI: uri, CandidateID: "pinned"}, nil
+		}),
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			opts.OutputDir = tempDir
+			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
+	}
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      97,
+		InputPath:                        pinned,
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "restart-relay-renew",
+		OutputDir:                        tempDir,
+	}
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	startupInput := session.Opts().InputPath
+	if !strings.Contains(startupInput, "/source/") {
+		t.Fatalf("startup input = %q, want a registered relay URL", startupInput)
+	}
+
+	// Drive one request through the pinned relay so the upstream 401 is
+	// observed and the registration is marked rejected.
+	response, err := http.Get(startupInput)
+	if err != nil {
+		t.Fatalf("request pinned relay: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode == http.StatusOK {
+		t.Fatalf("pinned relay request status = %d, want the upstream refusal surfaced", response.StatusCode)
+	}
+
+	refreshed, cleanup, err := session.Opts().RefreshInput(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshInput error: %v", err)
+	}
+	if refreshed == startupInput {
+		t.Fatal("restart reused a relay whose upstream rejected credentials")
+	}
+	if cleanup == nil {
+		t.Fatal("renewal must hand back a cleanup for the new relay registration")
+	}
+	defer cleanup()
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("provider resolve calls = %d, want 2 (startup + forced renewal)", got)
+	}
+	if len(forceRefreshes) != 2 || forceRefreshes[0] || !forceRefreshes[1] {
+		t.Fatalf("force-refresh flags = %v, want [false true]", forceRefreshes)
+	}
+
+	// The renewed pin is live and must be reused without another provider call.
+	if again, _, err := session.Opts().RefreshInput(context.Background()); err != nil || again != refreshed {
+		t.Fatalf("post-renewal restart refreshed = %q err = %v, want the renewed relay %q", again, err, refreshed)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("provider resolve calls after renewal reuse = %d, want 2", got)
+	}
+}
+
+// TestVirtualTransportRestartResolvesStoredFirstWhenPinnedRelayGone proves a
+// pin whose registration is no longer live (expired or evicted) is cleared and
+// the restart falls through to the stored-first resolve, then re-pins the
+// replacement for the next restart.
+func TestVirtualTransportRestartResolvesStoredFirstWhenPinnedRelayGone(t *testing.T) {
+	tempDir := t.TempDir()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("stored-first-media"))
+	}))
+	defer upstream.Close()
+
+	neutral := "virtual://movie/tt-relay-gone"
+	pinned := neutral + "?result=pinned"
+	row := &models.MediaFile{
+		ID:                         98,
+		ContentID:                  "movie-relay-gone",
+		FilePath:                   pinned,
+		VirtualOwnerInstallationID: 5,
+	}
+	var pinnedStatus = remotestream.RegistrationAbsent
+	var calls int32
+	var forceRefreshes []bool
+	h := &PlaybackHandler{
+		fileResolver: &fakePinFileResolver{file: row},
+		sessionMgr:   playback.NewSessionManager(0, 0),
+		RemoteStreamRelay: func() *remotestream.Relay {
+			r := remotestream.NewRelay()
+			t.Cleanup(func() { _ = r.Close(context.Background()) })
+			return r
+		}(),
+		AllowPrivateStreams: func(int) bool { return true },
+		RelayRegistrationStatus: func(string) remotestream.RegistrationStatus {
+			return pinnedStatus
+		},
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			atomic.AddInt32(&calls, 1)
+			forceRefreshes = append(forceRefreshes, forceRefresh)
+			return ResolvedVirtualMedia{URL: upstream.URL + "/provider/" + strconv.Itoa(int(atomic.LoadInt32(&calls))) + ".mp4", URI: uri, CandidateID: "pinned"}, nil
+		}),
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			opts.OutputDir = tempDir
+			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
+	}
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      98,
+		InputPath:                        pinned,
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "restart-relay-gone",
+		OutputDir:                        tempDir,
+	}
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+	startupInput := session.Opts().InputPath
+
+	refreshed, cleanup, err := session.Opts().RefreshInput(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshInput error: %v", err)
+	}
+	if refreshed == startupInput {
+		t.Fatal("a gone pin was reused")
+	}
+	if cleanup == nil {
+		t.Fatal("the stored-first resolve must hand back a cleanup for its new relay")
+	}
+	defer cleanup()
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("provider resolve calls = %d, want 2 (startup + stored-first miss)", got)
+	}
+	if len(forceRefreshes) != 2 || forceRefreshes[0] || forceRefreshes[1] {
+		t.Fatalf("force-refresh flags = %v, want [false false] (a gone pin resolves stored-first)", forceRefreshes)
+	}
+
+	// Once the replacement is live it is reused, proving the miss re-pinned.
+	pinnedStatus = remotestream.RegistrationLive
+	if again, _, err := session.Opts().RefreshInput(context.Background()); err != nil || again != refreshed {
+		t.Fatalf("post-repin restart refreshed = %q err = %v, want the replacement %q", again, err, refreshed)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("provider resolve calls after re-pin reuse = %d, want 2", got)
 	}
 }

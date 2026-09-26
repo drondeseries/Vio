@@ -575,6 +575,12 @@ type relayEntry struct {
 	createdAt time.Time
 	insecure  bool // private/local destinations explicitly allowed by admin
 	headers   map[string]string
+	// upstreamAuthRejected records that the upstream answered a proxied request
+	// with 401 or 403. The signed provider URL behind this registration is no
+	// longer authorized, so a restart must renew the provider listing instead of
+	// reusing the registration. It is monotonic for the entry's lifetime: a
+	// renewal registers a fresh entry with a fresh token.
+	upstreamAuthRejected bool
 }
 
 // ProxyError reports whether an upstream failure happened before any response
@@ -823,6 +829,87 @@ func (r *Relay) deleteEntryLocked(token string) {
 	delete(r.entries, token)
 }
 
+// RegistrationStatus is the live state of one relay registration, as reported
+// by Relay.RegistrationStatus.
+type RegistrationStatus int
+
+const (
+	// RegistrationAbsent means no live registration matches the URL: the relay
+	// is nil or closed, the token is unknown, or the entry's lifetime elapsed.
+	RegistrationAbsent RegistrationStatus = iota
+	// RegistrationLive means the registration exists and its upstream has not
+	// rejected credentials.
+	RegistrationLive
+	// RegistrationAuthRejected means the registration exists but its upstream
+	// answered a proxied request with 401 or 403, so the signed URL behind it is
+	// no longer authorized and must be renewed.
+	RegistrationAuthRejected
+)
+
+// RegistrationStatus reports whether rawURL still names a live relay
+// registration. It lets a caller holding a previously registered relay URL
+// decide between reuse, renewal, and a fresh resolve without a provider call:
+// an expired or evicted entry reports RegistrationAbsent (and is dropped), a
+// closed relay reports RegistrationAbsent, and an entry whose upstream rejected
+// credentials reports RegistrationAuthRejected. A URL that is not a relay
+// source path reports RegistrationAbsent. The check is read-only apart from
+// dropping an expired entry, which the presentation path would drop anyway.
+func (r *Relay) RegistrationStatus(rawURL string) RegistrationStatus {
+	if r == nil {
+		return RegistrationAbsent
+	}
+	token, ok := relayTokenFromURL(rawURL)
+	if !ok {
+		return RegistrationAbsent
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return RegistrationAbsent
+	}
+	entry, ok := r.entryForRequestLocked(token, time.Now())
+	if !ok {
+		return RegistrationAbsent
+	}
+	if entry.upstreamAuthRejected {
+		return RegistrationAuthRejected
+	}
+	return RegistrationLive
+}
+
+// relayTokenFromURL extracts the registration token from a relay source URL of
+// the form <base>/source/<token>/<name>. It is deliberately structural rather
+// than compared against r.baseURL so it works for a URL captured before a
+// restart handed the relay a new base.
+func relayTokenFromURL(rawURL string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", false
+	}
+	rest, found := strings.CutPrefix(parsed.Path, "/source/")
+	if !found {
+		return "", false
+	}
+	token, _, found := strings.Cut(rest, "/")
+	if !found || token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+// markUpstreamAuthRejected records that the registration's upstream answered
+// 401 or 403. Caller must not hold r.mu.
+func (r *Relay) markUpstreamAuthRejected(token string) {
+	if r == nil || token == "" {
+		return
+	}
+	r.mu.Lock()
+	if entry, ok := r.entries[token]; ok {
+		entry.upstreamAuthRejected = true
+	}
+	r.mu.Unlock()
+}
+
 func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet && request.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -1001,6 +1088,13 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	}
 	responseReceivedAt := r.rangeCache.clock()
 	defer func() { _ = response.Body.Close() }()
+	// An upstream 401/403 means the provider URL behind this registration is no
+	// longer authorized. Record it so a later restart renews the provider
+	// listing instead of reusing a registration that will keep refusing.
+	if relayToken != "" &&
+		(response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
+		r.markUpstreamAuthRejected(relayToken)
+	}
 	// Detect upstream sources that ignore Range headers: when we ask for a
 	// byte range but get back 200 OK (full file), strip Accept-Ranges from
 	// the response so clients don't assume range support and fail on seek.
