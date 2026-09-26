@@ -41,6 +41,11 @@ func TestMergeCompatCandidateTracksFiltersReleaseMarkersAndOrdersDeclaration(t *
 // Mirror of the native surface's hint-becomes-metadata fixture: once a real
 // probed inventory exists, provider-only language hints must not become
 // fabricated selectable audio tracks on the Jellyfin surface either.
+// TestMergeCompatCandidateTracksAuthoritativeInventory is the Jellyfin-surface
+// mirror of the native authoritative-inventory merge test. The "genuine multi
+// membership" case follows the same MULTi rule as the native surface: a track
+// carrying "fr" in its Languages list satisfies a "fr" preference and is
+// selected, rather than falling to the default track.
 func TestMergeCompatCandidateTracksAuthoritativeInventory(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -50,7 +55,7 @@ func TestMergeCompatCandidateTracksAuthoritativeInventory(t *testing.T) {
 		{"index zero", []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2, Default: true}}, 0},
 		{"default beats hint", []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2}, {Index: 2, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 1},
 		{"audio first", []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2}, {Index: 1, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 1},
-		{"genuine multi primary-only", []models.AudioTrack{{Index: 0, Language: "en", Languages: []string{"en", "fr"}, Codec: "aac", Channels: 2}, {Index: 1, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 1},
+		{"genuine multi membership", []models.AudioTrack{{Index: 0, Language: "en", Languages: []string{"en", "fr"}, Codec: "aac", Channels: 2}, {Index: 1, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before, _ := json.Marshal(tc.tracks)

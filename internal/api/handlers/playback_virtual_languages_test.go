@@ -501,6 +501,16 @@ func TestMergeVirtualCandidateLanguagesKeepsProbedTracks(t *testing.T) {
 	}
 }
 
+// TestMergeVirtualCandidateLanguagesAuthoritativeInventory pins the merge
+// against a real probed inventory: provider-only language hints must not
+// fabricate selectable tracks, and the probed tracks must survive byte-for-byte.
+//
+// The "genuine multi membership" case is the MULTi rule: a track whose primary
+// code is "en" but whose Languages list carries "fr" *does* satisfy a "fr"
+// preference, so selection returns that track (index 0), not the default German
+// track. This is the membership-aware semantics restored in 867270f9 via
+// playback.trackHasLanguage; an earlier merge-sync had pinned it to the
+// primary-only index 1, which contradicted the audio selector.
 func TestMergeVirtualCandidateLanguagesAuthoritativeInventory(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -510,7 +520,7 @@ func TestMergeVirtualCandidateLanguagesAuthoritativeInventory(t *testing.T) {
 		{"index zero", []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2, Default: true}}, 0},
 		{"default beats hint", []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2}, {Index: 2, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 1},
 		{"audio first", []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2}, {Index: 1, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 1},
-		{"genuine multi primary-only", []models.AudioTrack{{Index: 0, Language: "en", Languages: []string{"en", "fr"}, Codec: "aac", Channels: 2}, {Index: 1, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 1},
+		{"genuine multi membership", []models.AudioTrack{{Index: 0, Language: "en", Languages: []string{"en", "fr"}, Codec: "aac", Channels: 2}, {Index: 1, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before, _ := json.Marshal(tc.tracks)
