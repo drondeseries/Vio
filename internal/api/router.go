@@ -2496,6 +2496,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 		if appCtx == nil {
 			appCtx = context.Background()
 		}
+		libraryCollectionHandler.SubscribePurgeInvalidations(appCtx)
+		if deps.DB != nil {
+			sections.StartPurgeRevisionPoller(appCtx, deps.DB, 5*time.Second)
+		}
 		go func() {
 			select {
 			case <-time.After(15 * time.Second):
