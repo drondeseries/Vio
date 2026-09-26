@@ -2152,24 +2152,44 @@ func cloneRemuxPlanCandidateV3(plan PlanV3) PlanV3 {
 	return plan
 }
 
+// deliveryAudioCodecSupportedV3 is the single scoped-audio rule shared by the
+// pre-plan claim check and the post-recipe delivery check, so both agree on
+// exactly which codec a delivery accepts for a given claim.
+//
+// A delivery that declares no audio lists at all keeps the caller's legacy
+// fallback, because older clients use an absent list to mean "unspecified."
+// When it does declare lists, they are authoritative subsets of the top-level
+// device capabilities — with one deliberate exception for passthrough. A
+// validated passthrough claim is a property of the sink (proven by exact
+// evidence, a matching entry, and the layout-aware feature), not of the
+// delivery: a delivery that declares decode-only lists says nothing about
+// passthrough, so its empty passthrough list must not revoke the validated
+// claim. Re-reading that silence as "no passthrough" forced an E-AC-3 sink
+// that the server had just validated into an unnecessary E-AC-3 to AAC
+// conversion on the remux route. When the delivery does declare passthrough
+// codecs, they stay authoritative.
+func deliveryAudioCodecSupportedV3(capability DeliveryCapabilityV3, codec string, claim AudioClaimsV3, fallback bool) bool {
+	hasAudioConstraints := len(capability.AudioDecodeCodecs) > 0 || len(capability.AudioPassthroughCodecs) > 0
+	if !hasAudioConstraints {
+		return fallback
+	}
+	if claim.Passthrough {
+		if len(capability.AudioPassthroughCodecs) == 0 {
+			return true
+		}
+		return containsFoldV3(capability.AudioPassthroughCodecs, codec)
+	}
+	return containsFoldV3(capability.AudioDecodeCodecs, codec)
+}
+
 // deliverySupportsAudioClaimV3 narrows a device-wide audio claim to the active
-// delivery when the client supplies scoped decode or passthrough lists. Empty
-// scoped lists retain the legacy fallback because older clients use them to
-// mean "unspecified."
+// delivery when the client supplies scoped decode or passthrough lists.
 func deliverySupportsAudioClaimV3(request StartRequestV3, deliveryClass, codec string, claim AudioClaimsV3, fallback bool) bool {
 	capability, ok := request.ClientPlaybackContext.Deliveries[deliveryClass]
 	if !ok || !capability.Enabled || !capability.SupportedOnDevice {
 		return false
 	}
-	hasAudioConstraints := len(capability.AudioDecodeCodecs) > 0 || len(capability.AudioPassthroughCodecs) > 0
-	if !hasAudioConstraints {
-		return fallback
-	}
-	supportedCodecs := capability.AudioDecodeCodecs
-	if claim.Passthrough {
-		supportedCodecs = capability.AudioPassthroughCodecs
-	}
-	return containsFoldV3(supportedCodecs, codec)
+	return deliveryAudioCodecSupportedV3(capability, codec, claim, fallback)
 }
 
 // deliverySupportsPlanV3 applies the capability limits scoped to the delivery
@@ -2188,15 +2208,12 @@ func deliverySupportsPlanV3(request StartRequestV3, deliveryClass string, plan P
 		return false
 	}
 	if codec := strings.TrimSpace(plan.EffectiveRecipe.AudioCodec); codec != "" {
-		hasAudioConstraints := len(capability.AudioDecodeCodecs) > 0 || len(capability.AudioPassthroughCodecs) > 0
-		if hasAudioConstraints {
-			supportedCodecs := capability.AudioDecodeCodecs
-			if plan.Claims.Audio.Passthrough {
-				supportedCodecs = capability.AudioPassthroughCodecs
-			}
-			if !containsFoldV3(supportedCodecs, codec) {
-				return false
-			}
+		// A delivery that declares no audio lists is permissive here: the
+		// classic behavior skips the check entirely. fallback=true preserves
+		// that, while the scoped codec rule is shared with the pre-plan claim
+		// check so the two cannot drift.
+		if !deliveryAudioCodecSupportedV3(capability, codec, plan.Claims.Audio, true) {
+			return false
 		}
 	}
 	if capability.MaxChannels != nil && plan.EffectiveRecipe.AudioChannels != nil && *plan.EffectiveRecipe.AudioChannels > *capability.MaxChannels {
