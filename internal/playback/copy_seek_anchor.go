@@ -33,8 +33,15 @@ const (
 	// position without risking a stale anchor.
 	copySeekAnchorCacheTTL = 10 * time.Minute
 	// copySeekAnchorCacheMax bounds the cache. Entries are tiny and the live
-	// working set is the distinct (source, position) pairs being resumed.
+	// working set is the distinct (source, keyframe bucket) pairs being resumed.
 	copySeekAnchorCacheMax = 256
+	// copySeekAnchorBucketSeconds is the nominal copy-mode segment length used
+	// to bucket requested positions. It mirrors the fixed segment duration the
+	// HLS timeline enforces (see the 2s probes in prepareTransportTimelineV3):
+	// copy fragments are keyframe-aligned, so a position within one nominal
+	// segment very likely resolves to the same anchor keyframe, and bucketing
+	// turns a position-miss into a cache hit.
+	copySeekAnchorBucketSeconds = 2.0
 )
 
 var (
@@ -177,14 +184,24 @@ func (c *copySeekAnchorCache) set(key string, anchor copySeekAnchor) {
 	c.entries[key] = copySeekAnchorCacheEntry{anchor: anchor, expiresAt: now.Add(c.ttl)}
 }
 
-// copySeekAnchorCacheKey identifies one (source, seek position) observation. The
-// resolved FFmpeg path stays in the key because a different build can copy a
-// different packet at the same position.
+// copySeekAnchorCacheKey identifies one (source, keyframe bucket) observation.
+// The resolved FFmpeg path stays in the key because a different build can copy a
+// different packet at the same position. The requested position is bucketed to
+// the nominal segment length rather than exact: a seek a few seconds further
+// than a previous one lands in the same bucket, and copy-mode fragments are
+// keyframe-aligned at that granularity, so it very likely resolves to the same
+// keyframe. Two positions of the same bucket may in rare cases straddle a
+// keyframe boundary; the cache then serves the neighbor's anchor, whose error is
+// bounded by one keyframe (a few seconds) and far below the multi-second probe
+// cost this removes. Segment boundaries are exact because axis-aligned bucket
+// edges make boundary-adjacent positions — the common sequential case — share a
+// bucket, turning the whole row into one probe.
 func copySeekAnchorCacheKey(ffmpegPath, sourceIdentity string, requestedSeekSeconds float64, segmentDuration int) string {
+	bucket := int64(math.Floor(requestedSeekSeconds / copySeekAnchorBucketSeconds))
 	return strings.Join([]string{
 		ffmpegPath,
 		sourceIdentity,
-		strconv.FormatFloat(requestedSeekSeconds, 'f', 6, 64),
+		strconv.FormatInt(bucket, 10),
 		strconv.Itoa(segmentDuration),
 	}, "\x00")
 }
@@ -230,6 +247,10 @@ func ResolveCopySeekAnchor(
 // different relay URLs still share one probe. The anchor is a property of the
 // source bytes at the requested position, and the caller's candidate points at
 // one underlying release for the session, so a short-TTL cache is safe.
+//
+// The cache buckets the requested position to the nominal copy segment length: a
+// near-position seek resolves the same keyframe and is served the cached anchor
+// without paying for another probe, while a seek beyond the bucket re-probes.
 func ResolveCopySeekAnchorForSource(
 	ctx context.Context,
 	ffmpegPath string,
@@ -256,7 +277,8 @@ func ResolveCopySeekAnchorForSource(
 	key := copySeekAnchorCacheKey(resolvedFFmpegPath, identity, requestedSeekSeconds, segmentDuration)
 
 	// Fast path: a previous call already resolved this anchor. This is what
-	// turns a repeat resume at the same position into a zero-probe start.
+	// turns a repeat resume at the same position — or a near one in the same
+	// keyframe bucket — into a zero-probe start.
 	if anchor, ok := copySeekAnchors.get(key); ok {
 		return anchor.seconds, anchor.segment, nil
 	}
