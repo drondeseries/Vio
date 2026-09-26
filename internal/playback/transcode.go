@@ -5088,6 +5088,7 @@ func (s *TranscodeSession) applyDecodeVerdict(generation uint64, recovered bool)
 	}
 	s.confirmDecodeRejectionLocked()
 	cancel := s.decodeWatchCancel
+	notify, notifyOK := s.claimSourceRejectNotificationLocked()
 	s.decodeWatchCancel = nil
 	s.mu.Unlock()
 	if cancel != nil {
@@ -5096,8 +5097,46 @@ func (s *TranscodeSession) applyDecodeVerdict(generation uint64, recovered bool)
 	// Preserve the typed verdict before teardown: the process exit must not
 	// reclassify a revoked generation, and notification must not depend on a
 	// client replan or a marker landing. Teardown is server-owned and bounded.
-	s.notifySourceRejected(context.Background())
+	// The marker was claimed in the same critical section as the verdict, so a
+	// reader that sees the confirmed verdict also sees the claim.
+	if notifyOK {
+		s.invokeSourceRejected(notify)
+	}
 	go s.reapRejectedGeneration(generation)
+}
+
+// decodeRejectNotification carries the identity a confirmed generation's marker
+// callback needs, captured under mu so the callback can run detached.
+type decodeRejectNotification struct {
+	ctx       context.Context
+	callback  func(context.Context, int, string) error
+	fileID    int
+	canonical string
+}
+
+// claimSourceRejectNotificationLocked claims the confirmed generation's marker
+// exactly once, atomically with confirmation, and returns the callback identity
+// to invoke. It reports false when the marker was already claimed or no
+// callback is wired. Callers must hold mu.
+func (s *TranscodeSession) claimSourceRejectNotificationLocked() (decodeRejectNotification, bool) {
+	if !s.sourceRejected || s.sourceRejectNotified {
+		return decodeRejectNotification{}, false
+	}
+	s.sourceRejectNotified = true
+	cb := s.opts.OnSourceRejected
+	if cb == nil {
+		return decodeRejectNotification{}, false
+	}
+	canonical := strings.TrimSpace(s.opts.CanonicalInputPath)
+	if canonical == "" {
+		canonical = strings.TrimSpace(s.opts.InputPath)
+	}
+	return decodeRejectNotification{
+		ctx:       context.Background(),
+		callback:  cb,
+		fileID:    s.opts.MediaFileID,
+		canonical: canonical,
+	}, true
 }
 
 // confirmDecodeRejectionLocked marks the generation confirmed. The
@@ -5294,37 +5333,47 @@ func (s *TranscodeSession) notifyDemuxFailure(ctx context.Context) {
 // context so a slow write cannot stall the verdict. It is a no-op when the
 // source was never confirmed or the callback is unset.
 //
-// Notification is synchronous with respect to the marker latch but never with
-// respect to recovery: it is only reachable from confirmation, so it cannot
-// misroute a generation that is still observing or suspected.
+// It drives the shared evaluator first, exactly like serving, waiters, and
+// restart: a suspected generation whose observation deadline has passed is
+// confirmed here too, so notification observes the same lifecycle as every
+// other verdict read instead of depending on one of them happening to run
+// first. Calling it from applyDecodeVerdict after confirmation is harmless —
+// the evaluator is a no-op once the stage is confirmed, and confirmation
+// already claimed the marker in the same critical section, so this does not
+// double-invoke.
 func (s *TranscodeSession) notifySourceRejected(ctx context.Context) {
 	if s == nil {
 		return
 	}
+	s.evaluateDecodeVerdict()
 	s.mu.Lock()
-	if !s.sourceRejectedLocked() || s.sourceRejectNotified {
-		s.mu.Unlock()
-		return
-	}
-	s.sourceRejectNotified = true
-	cb := s.opts.OnSourceRejected
-	fileID := s.opts.MediaFileID
-	canonical := strings.TrimSpace(s.opts.CanonicalInputPath)
-	if canonical == "" {
-		canonical = strings.TrimSpace(s.opts.InputPath)
-	}
+	notify, ok := s.claimSourceRejectNotificationLocked()
 	s.mu.Unlock()
-	if cb == nil {
+	if !ok {
 		return
 	}
+	if ctx != nil {
+		notify.ctx = ctx
+	}
+	s.invokeSourceRejected(notify)
+}
+
+// invokeSourceRejected hands a claimed marker to its callback off the evaluator
+// goroutine, with a detached, bounded context so a slow persistence write
+// cannot stall the verdict. An unset callback is a no-op.
+func (s *TranscodeSession) invokeSourceRejected(notify decodeRejectNotification) {
+	if notify.callback == nil {
+		return
+	}
+	ctx := notify.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	go func() {
 		callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
-		if err := cb(callCtx, fileID, canonical); err != nil {
-			log.Printf("playback: mark virtual candidate failed after decoder rejection (file_id=%d): %v", fileID, err)
+		if err := notify.callback(callCtx, notify.fileID, notify.canonical); err != nil {
+			log.Printf("playback: mark virtual candidate failed after decoder rejection (file_id=%d): %v", notify.fileID, err)
 		}
 	}()
 }
