@@ -33,6 +33,7 @@ const (
 	// named once rather than repeated as literals.
 	hdrValueHDR10     = "hdr10"
 	hdrValueHDR10Plus = "hdr10+"
+	hdrValueDV        = "dv"
 )
 
 type CustomFormat struct {
@@ -545,11 +546,14 @@ func (q *QualityConfig) Validate() error {
 // profile's HDR requirement. The classifier's emitted values are the source of
 // truth: hdr, hdr10, hdr10+, dv (see stream.ParseStreamDetails).
 //
-// A profile requiring the generic "hdr" accepts the HDR10 family (hdr, hdr10,
-// hdr10+) but not Dolby Vision. DV is a distinct HDR format, not HDR10, and a
-// profile that wants it must say so explicitly with HDR "dv" (the 4K Dolby
-// Vision preset already does). Conflating them would let a plain-HDR profile
-// select DV content whose dynamic metadata the client may not render. Every
+// The generic "hdr" requirement means "any high dynamic range", so it accepts
+// the whole family: the HDR10 variants and Dolby Vision. A profile named for
+// HDR content must match HDR content; treating DV as a non-match made the
+// "4K HDR" preset reject exactly the releases it exists to select (a DV-only
+// listing then matched zero candidates and hard-failed playback). The
+// requirement is a selection preference, so a broad match is the safe side.
+// A profile that wants only Dolby Vision still says so explicitly with HDR
+// "dv" (the 4K Dolby Vision preset does) and keeps the exact match. Every
 // other value matches case-insensitively and exactly.
 func hdrSatisfies(required, candidate string) bool {
 	required = strings.ToLower(strings.TrimSpace(required))
@@ -558,9 +562,30 @@ func hdrSatisfies(required, candidate string) bool {
 		return true
 	}
 	if required == "hdr" {
-		return candidate == hdrValueHDR10 || candidate == hdrValueHDR10Plus
+		switch candidate {
+		case hdrValueHDR10, hdrValueHDR10Plus, hdrValueDV:
+			return true
+		}
 	}
 	return false
+}
+
+// resolutionSatisfies reports whether a candidate's parsed resolution meets a
+// profile's resolution requirement. A known resolution must match exactly; an
+// unknown one (the parser found no marker) does not. The resolution is a
+// selection preference, not a proof requirement, so a candidate whose
+// resolution could not be parsed must not be treated as a proven mismatch and
+// filtered out. Doing so turned a listing whose releases carried no explicit
+// resolution marker into a zero-match hard failure for an auto-picked profile.
+// Known resolutions still gate exactly, and the ranking keeps a known
+// higher-resolution candidate ahead of an unknown one.
+func resolutionSatisfies(required, candidate string) bool {
+	required = stream.NormalizeResolution(required)
+	candidate = stream.NormalizeResolution(candidate)
+	if candidate == "" {
+		return true
+	}
+	return candidate == required
 }
 
 // MatchProfile reports whether a candidate satisfies a quality profile's
@@ -573,7 +598,7 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 	if p.IncludeCompiled() != nil && !p.IncludeCompiled().MatchString(fullText) {
 		return false
 	}
-	if p.Resolution != "" && stream.NormalizeResolution(c.Resolution) != stream.NormalizeResolution(p.Resolution) {
+	if p.Resolution != "" && !resolutionSatisfies(p.Resolution, c.Resolution) {
 		return false
 	}
 	if p.CodecVideo != "" && c.CodecVideo != p.CodecVideo {
@@ -589,8 +614,9 @@ func MatchProfile(c stream.StreamCandidate, p QualityProfile) bool {
 		return false
 	}
 	// The same sibling rule as the requirement side: ExcludeHDR "hdr" excludes
-	// the HDR10 family (hdr, hdr10, hdr10+) but not Dolby Vision, while
-	// ExcludeHDR "dv" excludes only DV. The two sides stay symmetric.
+	// the whole HDR family (hdr, hdr10, hdr10+, dv) just as HDR "hdr" accepts
+	// it, while ExcludeHDR "dv" excludes only DV. The two sides stay symmetric,
+	// so "exclude HDR" means SDR-only rather than leaving DV behind.
 	if p.ExcludeHDR != "" && p.ExcludeHDR != "*" && hdrSatisfies(p.ExcludeHDR, c.HDR) {
 		return false
 	}
