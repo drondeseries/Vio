@@ -385,6 +385,11 @@ func TestBuildSourceAlignedPlaybackManifestAnchorsSeekedRealPlaylist(t *testing.
 	if err := os.WriteFile(filepath.Join(tempDir, "stream.m3u8"), []byte(manifest), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
+	for _, name := range []string{"seg_00008.ts", "seg_00009.ts"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
 
 	session := &TranscodeSession{
 		outputDir: tempDir,
@@ -395,6 +400,8 @@ func TestBuildSourceAlignedPlaybackManifestAnchorsSeekedRealPlaylist(t *testing.
 			TotalDuration:      1_000_000,
 			SeekSeconds:        17.3,
 			StartSegmentNumber: 8,
+			FastStart:          true,
+			HWAccel:            transcodeHWQSV,
 		},
 	}
 

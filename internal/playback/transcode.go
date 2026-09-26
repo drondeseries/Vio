@@ -2388,6 +2388,13 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 	if s.running && !startupFilesReady(data, s.outputDir, requiredSegments) {
 		return nil, ErrManifestNotReady
 	}
+	if !s.running && s.waitErr != nil && !startupFilesReady(data, s.outputDir, 1) {
+		stderr := truncateStderr(s.stderr.String())
+		if stderr != "" {
+			return nil, fmt.Errorf("%w: %w (stderr: %s)", ErrTranscodeFailed, s.waitErr, stderr)
+		}
+		return nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, s.waitErr)
+	}
 	if strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
 		if err := validateCopyPlaybackManifest(data); err != nil {
 			return nil, fmt.Errorf("invalid copy playback manifest: %w", err)
