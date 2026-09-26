@@ -189,6 +189,35 @@ func providerOutageRelistFromContext(ctx context.Context) bool {
 	return relist
 }
 
+// autoProfileFallbackContextKey marks a resolve whose quality profile was
+// selected by the server or the client's automatic best-match logic rather than
+// an explicit user version pick. A zero-match against an auto-picked profile
+// degrades to the best-ranked candidate instead of hard-failing, because a
+// listing the server's own recommendation cannot satisfy is a dead end the
+// viewer never chose. An explicit pick keeps the refusal so the client can show
+// the version list.
+type autoProfileFallbackContextKey struct{}
+
+// WithAutoProfileFallback declares that a zero-match quality profile may fall
+// back to the best-ranked candidate. Absent means false, so a caller that does
+// not participate keeps the conservative refusal.
+func WithAutoProfileFallback(ctx context.Context, auto bool) context.Context {
+	if ctx == nil || !auto {
+		return ctx
+	}
+	return context.WithValue(ctx, autoProfileFallbackContextKey{}, true)
+}
+
+// autoProfileFallbackFromContext reports whether the caller declared the
+// quality profile auto-picked and therefore fallback-eligible.
+func autoProfileFallbackFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	auto, _ := ctx.Value(autoProfileFallbackContextKey{}).(bool)
+	return auto
+}
+
 // PlaybackStream represents an available stream candidate formatted for
 // playback selection in API handlers and Jellyfin compatibility.
 type PlaybackStream struct {
@@ -634,14 +663,25 @@ func (s *Service) ResolveDetailed(
 			}
 		}
 		if len(filtered) == 0 && !s.cfg.Quality.FallbackToAnyStream {
-			if s.logger != nil {
-				s.logger.WarnContext(ctx, "virtual candidate set empty after profile filter",
-					"profile", strings.TrimSpace(profile.Label),
-					"total", len(candidates), "matched", 0, "fallback", false)
+			if !autoProfileFallbackFromContext(ctx) {
+				if s.logger != nil {
+					s.logger.WarnContext(ctx, "virtual candidate set empty after profile filter",
+						"profile", strings.TrimSpace(profile.Label),
+						"total", len(candidates), "matched", 0, "fallback", false)
+				}
+				return ResolvedVirtualStream{}, fmt.Errorf("no stream matches profile %q", strings.TrimSpace(profile.Label))
 			}
-			return ResolvedVirtualStream{}, fmt.Errorf("no stream matches profile %q", strings.TrimSpace(profile.Label))
-		}
-		if len(filtered) > 0 {
+			// The profile was auto-picked, not a viewer choice: a listing the
+			// server's own recommendation cannot satisfy must still play. Serve
+			// the best-ranked candidate unfiltered rather than hard-failing the
+			// auto start, which matches fallback_to_any_stream=true for this
+			// one resolve without changing the operator setting.
+			if s.logger != nil {
+				s.logger.InfoContext(ctx, "auto-picked virtual profile matched no candidate; serving best-ranked",
+					"profile", strings.TrimSpace(profile.Label),
+					"total", len(candidates), "matched", 0, "fallback", true, "auto_picked", true)
+			}
+		} else if len(filtered) > 0 {
 			candidates = filtered
 		}
 	}
