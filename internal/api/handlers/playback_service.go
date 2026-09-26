@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -784,6 +785,63 @@ func (h *PlaybackHandler) ReportRouteEventV2(ctx context.Context, caller Playbac
 	event.Diagnostics = sanitizeDiagnosticsV3(event.Diagnostics)
 	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: event, EventID: command.EventID, UserID: caller.UserID, ProfileID: caller.ProfileID, ClientName: firstNonEmptyValue(caller.ClientName, caller.SiloClientName), ClientVersion: caller.ClientVersion, ClientBuild: caller.ClientBuild, ClientChannel: caller.ClientChannel, ClientModel: event.Diagnostics["device_model"]})
 	return nil
+}
+
+// GetPlaybackInventoryV2 returns the live audio and subtitle track inventory for an active session.
+func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller PlaybackCaller, sessionID string) (playback.PlaybackInventoryV3, error) {
+	if err := h.validatePlaybackCaller(ctx, caller); err != nil {
+		return playback.PlaybackInventoryV3{}, err
+	}
+	if err := validatePlaybackSessionID(sessionID); err != nil {
+		return playback.PlaybackInventoryV3{}, err
+	}
+	session, err := h.sessionMgr.GetSession(sessionID)
+	if err != nil {
+		if errors.Is(err, playback.ErrSessionNotFound) {
+			return playback.PlaybackInventoryV3{}, playbackSessionNotFoundOperationError()
+		}
+		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
+	}
+	if session.UserID != caller.UserID || (caller.ProfileID != "" && session.ProfileID != caller.ProfileID) {
+		return playback.PlaybackInventoryV3{}, playbackOperationError(http.StatusForbidden, "forbidden", "Session belongs to another profile")
+	}
+
+	file, err := h.fileResolver.GetByID(ctx, session.MediaFileID)
+	if err != nil || file == nil {
+		return playback.PlaybackInventoryV3{}, playbackOperationError(http.StatusNotFound, "not_found", "Media file not found")
+	}
+
+	// For virtual files, prefer the live catalog row matching the session's
+	// active candidate URI if it has completed background probing.
+	if isVirtualPlaybackFile(file) && h.VirtualFileLookup != nil {
+		candidateURI := strings.TrimSpace(session.VirtualSourceURI)
+		if candidateURI == "" {
+			candidateURI = file.FilePath
+		}
+		if probedRow, lookupErr := h.VirtualFileLookup(ctx, candidateURI); lookupErr == nil && probedRow != nil && probedRow.ProbeUpdatedAt != nil {
+			file = probedRow
+		} else {
+			file = bindSessionVirtualSourceWithTracks(ctx, file, session, h.fileResolver)
+		}
+	}
+
+	audioTracks := playback.AudioInventoryV3(file)
+	subtitleInventory := playback.BuildSubtitleInventoryV3(file, nil)
+
+	status := "declared"
+	if file != nil && file.ProbeUpdatedAt != nil {
+		status = "verified"
+	}
+
+	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory)
+
+	return playback.PlaybackInventoryV3{
+		SessionID:         sessionID,
+		InventoryRevision: revision,
+		InventoryStatus:   status,
+		AudioTracks:       audioTracks,
+		SubtitleInventory: subtitleInventory,
+	}, nil
 }
 
 // ReplanDigestV3 fingerprints the exact replan body so a reused request id with

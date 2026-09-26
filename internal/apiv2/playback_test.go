@@ -66,6 +66,19 @@ func (f *fakePlaybackService) StopPlaybackV2(_ context.Context, caller handlers.
 	f.stop = command
 	return f.mutation, f.err
 }
+func (f *fakePlaybackService) GetPlaybackInventoryV2(_ context.Context, caller handlers.PlaybackCaller, session string) (playback.PlaybackInventoryV3, error) {
+	f.calls++
+	f.caller = caller
+	f.session = session
+	if f.err != nil {
+		return playback.PlaybackInventoryV3{}, f.err
+	}
+	return playback.PlaybackInventoryV3{
+		SessionID:         session,
+		InventoryRevision: "inv:test1234",
+		InventoryStatus:   "verified",
+	}, nil
+}
 
 func playbackStartFixture(t *testing.T) map[string]any {
 	t.Helper()

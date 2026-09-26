@@ -531,7 +531,7 @@ func virtualFallbackAudioChannels(probed *models.MediaFile) int {
 // relay-registered input and its cleanup.
 func (h *PlaybackHandler) ResolveVirtualTransportInput(ctx context.Context, virtualURI string, ownerInstallationID, userID int, profileID string) (ResolvedVirtualMedia, func(), error) {
 	resolved, cleanup, err := h.resolveVirtualInputURI(ctx, virtualURI, ownerInstallationID, userID, profileID, false, nil, "")
-	if err == nil || !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+	if err == nil || (!errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) && !errors.Is(err, ErrVirtualCandidateMarkedFailed)) {
 		return resolved, cleanup, err
 	}
 	file, lookupErr := h.VirtualFileLookup(ctx, virtualURI)
