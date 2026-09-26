@@ -165,6 +165,8 @@
         "track_id": "file:42:audio:0",
         "selection_index": 0
       }
-    ]
+    ],
+    "inventory_revision": "inv:052f16fac61aecf7659b3f29f453573c",
+    "inventory_status": "declared"
   }
 }

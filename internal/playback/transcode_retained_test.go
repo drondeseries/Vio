@@ -16,15 +16,19 @@ func readyRetainedSession(t *testing.T, dir string) *TranscodeSession {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	segment := filepath.Join(dir, "seg_00000.ts")
-	if err := os.WriteFile(segment, []byte("retained-segment-bytes"), 0o644); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"seg_00000.ts", "seg_00001.ts"} {
+		segment := filepath.Join(dir, name)
+		if err := os.WriteFile(segment, []byte("retained-segment-bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	manifest := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4.000000,\nseg_00000.ts\n"
+	manifest := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.000000,\nseg_00000.ts\n#EXTINF:2.000000,\nseg_00001.ts\n"
 	if err := os.WriteFile(filepath.Join(dir, "stream.m3u8"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return NewTranscodeSessionForTest(dir)
+	session := NewTranscodeSessionForTest(dir)
+	session.opts = TranscodeOpts{FastStart: true, HWAccel: transcodeHWQSV}
+	return session
 }
 
 // TestRetireTranscodeSessionPredecessorKeepsSegmentServable proves the core of

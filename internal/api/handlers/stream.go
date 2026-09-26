@@ -604,7 +604,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	releaseInput := func() {}
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
-		if resolveErr != nil && errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		if resolveErr != nil && (errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) || errors.Is(resolveErr, ErrVirtualCandidateMarkedFailed)) {
 			// The session's pinned release is absent from the provider's current
 			// list (it renumbered or dropped the result id). Mirror the transcode
 			// startup loop: relist fresh, exclude the absent pin, and declare the

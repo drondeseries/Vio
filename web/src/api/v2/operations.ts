@@ -360,6 +360,7 @@ export const v2Operations = {
   "GET /api/v2/playback/sessions/{session_id}/control/ws": "connectPlaybackControlSocket",
   "GET /api/v2/playback/transcode/{session_id}/master.m3u8": "getPlaybackManifest",
   "GET /api/v2/playback/transcode/{session_id}/segment/{name}": "getPlaybackSegment",
+  "GET /api/v2/playback/{session_id}/inventory": "getPlaybackInventory",
   "GET /api/v2/plugin-content/capabilities": "getPluginContentCapabilities",
   "GET /api/v2/policy/capability": "getPolicyCapability",
   "GET /api/v2/profile/sections": "listProfileSectionOverrides",

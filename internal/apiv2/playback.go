@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -24,6 +25,7 @@ const (
 	opStopPlayback             = "stopPlayback"
 	opReplanPlayback           = "replanPlayback"
 	opReportPlaybackRouteEvent = "reportPlaybackRouteEvent"
+	opGetPlaybackInventory     = "getPlaybackInventory"
 )
 
 // PlaybackService is the application seam behind the v2 playback operations.
@@ -36,6 +38,7 @@ type PlaybackService interface {
 	StopPlaybackV2(context.Context, handlers.PlaybackCaller, string, handlers.PlaybackStopCommand) (handlers.PlaybackMutationView, error)
 	ReplanPlaybackV2(context.Context, handlers.PlaybackCaller, string, handlers.PlaybackReplanCommand) (playback.DecisionResponseV3, error)
 	ReportRouteEventV2(context.Context, handlers.PlaybackCaller, handlers.PlaybackRouteEventCommand) error
+	GetPlaybackInventoryV2(context.Context, handlers.PlaybackCaller, string) (playback.PlaybackInventoryV3, error)
 }
 
 type PlaybackCapabilities struct {
@@ -288,6 +291,7 @@ func registerPlayback(reg *Registry) {
 		opStopPlayback:             "Stop the session with a client-minted stop id and an optional final sample. Every later stop for the session replays the stored receipt.",
 		opReplanPlayback:           "Replan the session after a route failure, a seek, or a track, quality or output change. The reply is a whole replacement plan.",
 		opReportPlaybackRouteEvent: "Record one playback route diagnostic for an attempt this profile owns. Never retried automatically; a 429 means drop the event.",
+		opGetPlaybackInventory:     "Retrieve the live audio and subtitle track inventory for an active playback session without restarting playback.",
 	}
 	op := func(method, path, id string) Operation {
 		operation := Operation{Operation: humaOp(method, Prefix+"/playback"+path, id, "playback", summaries[id]), Class: ClassProfileScoped, ServiceBacked: true}
@@ -298,7 +302,7 @@ func registerPlayback(reg *Registry) {
 		switch id {
 		case opStartPlayback:
 			operation.DefaultStatus = http.StatusCreated
-		case opReplanPlayback:
+		case opReplanPlayback, opGetPlaybackInventory:
 			operation.Errors = append(operation.Errors, http.StatusNotFound)
 		case opReportPlaybackRouteEvent:
 			operation.RetrySafety = RetrySafetyNonRetryable
@@ -365,6 +369,7 @@ func registerPlayback(reg *Registry) {
 	})
 	registerPlaybackReplan(reg, op)
 	registerPlaybackRouteEvents(reg, op)
+	registerPlaybackInventory(reg, op)
 	Register(reg, op(http.MethodDelete, "/{session_id}", opStopPlayback), func(ctx context.Context, in *PlaybackStopInput) (*PlaybackMutationOutput, error) {
 		caller, p := reg.playbackCaller(ctx, in.PlaybackRequestHeaders, in.Body.InstallationID)
 		if p != nil {
@@ -423,6 +428,60 @@ func registerPlaybackRouteEvents(reg *Registry, op func(method, path, id string)
 		return &PlaybackRouteEventOutput{Status: http.StatusAccepted, Body: PlaybackRouteEventReceipt{EventID: b.EventID, Outcome: adminHistoryAccepted}}, nil
 	})
 }
+
+type PlaybackInventoryInput struct {
+	SessionID   ID     `path:"session_id" minLength:"1" doc:"Playback session identifier"`
+	IfNoneMatch string `header:"If-None-Match" doc:"Entity tag of the client's current cached inventory"`
+}
+
+type PlaybackInventoryOutput struct {
+	CacheControl string `header:"Cache-Control"`
+	ETag         string `header:"ETag"`
+	Status       int
+	Body         playback.PlaybackInventoryV3
+}
+
+func registerPlaybackInventory(reg *Registry, op func(method, path, id string) Operation) {
+	operation := op(http.MethodGet, "/{session_id}/inventory", opGetPlaybackInventory)
+	operation.Errors = append(operation.Errors, http.StatusNotFound)
+	Register(reg, operation, func(ctx context.Context, in *PlaybackInventoryInput) (*PlaybackInventoryOutput, error) {
+		if reg.deps.Playback == nil {
+			return nil, NewProblem(TypeCapabilityNotConfigured, "Playback is not configured.")
+		}
+		userID, profileID, p := viewerIdentity(ctx)
+		if p != nil {
+			return nil, p
+		}
+		caller := handlers.PlaybackCaller{
+			UserID:     userID,
+			ProfileID:  profileID,
+			RemoteAddr: clientip.FromContext(ctx),
+		}
+		inv, err := reg.deps.Playback.GetPlaybackInventoryV2(ctx, caller, string(in.SessionID))
+		if err != nil {
+			return nil, playbackProblem(err)
+		}
+		for i := range inv.SubtitleInventory {
+			inv.SubtitleInventory[i].URL = playbackV2MediaURL(inv.SubtitleInventory[i].URL)
+			inv.SubtitleInventory[i].FontBundleURL = playbackV2MediaURL(inv.SubtitleInventory[i].FontBundleURL)
+		}
+		etag := fmt.Sprintf("%q", inv.InventoryRevision)
+		if in.IfNoneMatch != "" && (in.IfNoneMatch == etag || in.IfNoneMatch == inv.InventoryRevision || in.IfNoneMatch == "*") {
+			return &PlaybackInventoryOutput{
+				Status:       http.StatusNotModified,
+				CacheControl: cacheControlPrivateNoCache,
+				ETag:         etag,
+			}, nil
+		}
+		return &PlaybackInventoryOutput{
+			Status:       http.StatusOK,
+			CacheControl: cacheControlPrivateNoCache,
+			ETag:         etag,
+			Body:         inv,
+		}, nil
+	})
+}
+
 func playbackUUID(raw string) bool {
 	id, err := uuid.Parse(raw)
 	return err == nil && id != uuid.Nil && id.String() == raw

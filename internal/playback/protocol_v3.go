@@ -1,6 +1,8 @@
 package playback
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -76,6 +78,7 @@ const (
 	// SRT tracks keep their existing delivery. It exists only on /api/v2 (see
 	// NativeServerFeaturesV3).
 	FeatureSubripSidecarV3     = "subrip_sidecar_v1"
+	FeatureLiveInventoryV3     = "live_inventory_refresh_v1"
 	PlanRecipeVersionV3        = "v3.4"
 	ClientDV7ToDV81V3          = "client_dv7_to_dv81"
 	ClientDV7ToHDR10V3         = "client_dv7_to_hdr10"
@@ -152,7 +155,7 @@ func ServerFeaturesV3() []string {
 // advertises and honors only on /api/v2. They postdate the /api/v1 freeze, so
 // the frozen surface neither advertises nor negotiates them.
 func NativeServerFeaturesV3() []string {
-	return append(ServerFeaturesV3(), FeatureSubripSidecarV3)
+	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3)
 }
 
 // WithoutFeatureV3 returns features with every spelling of feature removed.
@@ -1019,6 +1022,51 @@ type PlanV3 struct {
 	// reflects the tracks the plan actually plays. Select a track by echoing an
 	// entry's track_id or selection_index, never by its raw index.
 	AudioTracks []AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
+	// InventoryRevision is an opaque, deterministic revision of the plan's
+	// authoritative audio and subtitle inventories. It advances when the
+	// background probe populates or repairs tracks under a live virtual session.
+	InventoryRevision string `json:"inventory_revision,omitempty"`
+	// InventoryStatus indicates whether the track inventory is "declared"
+	// (placeholder from candidate metadata) or "verified" (probed by ffprobe).
+	InventoryStatus string `json:"inventory_status,omitempty"`
+	// InventoryURL is the relative URL clients can fetch (with ETag/If-None-Match)
+	// to retrieve refreshed audio and subtitle inventories without replanning.
+	InventoryURL string `json:"inventory_url,omitempty"`
+}
+
+// PlaybackInventoryV3 is the live audio and subtitle inventory of an active
+// playback session, returned by GET /api/v2/playback/{session_id}/inventory.
+type PlaybackInventoryV3 struct {
+	SessionID         string                    `json:"session_id"`
+	InventoryRevision string                    `json:"inventory_revision"`
+	InventoryStatus   string                    `json:"inventory_status"`
+	AudioTracks       []AudioInventoryItemV3    `json:"audio_tracks"`
+	SubtitleInventory []SubtitleInventoryItemV3 `json:"subtitle_inventory"`
+}
+
+type inventoryRevisionEnvelope struct {
+	Status      string                    `json:"status"`
+	AudioTracks []AudioInventoryItemV3    `json:"audio_tracks"`
+	Subtitles   []SubtitleInventoryItemV3 `json:"subtitles"`
+}
+
+// ComputeInventoryRevisionV3 returns a deterministic opaque digest of the full
+// audio and subtitle inventories, suitable for ETag generation and inventory
+// caching. It serializes the exact response-visible inventory to canonical JSON
+// before hashing, preventing delimiter collisions and ensuring every field
+// mutation produces a distinct revision.
+func ComputeInventoryRevisionV3(status string, audio []AudioInventoryItemV3, subs []SubtitleInventoryItemV3) string {
+	payload, err := json.Marshal(inventoryRevisionEnvelope{
+		Status:      status,
+		AudioTracks: audio,
+		Subtitles:   subs,
+	})
+	if err != nil {
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", status, len(audio), len(subs))))
+		return fmt.Sprintf("inv:%x", h[:16])
+	}
+	h := sha256.Sum256(payload)
+	return fmt.Sprintf("inv:%x", h[:16])
 }
 
 // AudioInventoryItemV3 is one selectable audio track of the effective source at

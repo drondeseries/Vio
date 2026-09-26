@@ -270,6 +270,19 @@ var virtualProbeFailures = &virtualProbeFailureCache{marks: make(map[string]virt
 // is not retried on every start. It is a var so tests can shrink it.
 var virtualFailedVerdictMaxAge = 24 * time.Hour
 
+// ErrVirtualCandidateMarkedFailed reports that a virtual candidate cannot be
+// selected because its catalog row carries an active failed_at verdict.
+var ErrVirtualCandidateMarkedFailed = errors.New("candidate is marked failed")
+
+// isRehydratedVirtualSourceRotatableV3 reports whether an error from
+// resolving a session-bound candidate indicates that the candidate cannot
+// be served (absent from the provider's current list, or marked failed),
+// justifying a rotation to a live sibling during replan rehydration.
+func isRehydratedVirtualSourceRotatableV3(err error) bool {
+	return errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) ||
+		errors.Is(err, ErrVirtualCandidateMarkedFailed)
+}
+
 // virtualCandidateVerdictActive reports whether a failed_at stamp still
 // excludes a candidate from automatic resolution and adoption. An explicit
 // retry (allowFailedCandidate) is handled by callers and bypasses this check;
@@ -378,6 +391,10 @@ type virtualFallbackEligibility struct {
 	// re-list can hand back a release an earlier hop already proved bad, which
 	// is exactly the A→B→C→A cycle the durable chain exists to stop.
 	excludedCandidateIDs []string
+	// anchorErr captures a resolution failure of the session-bound anchor so
+	// callers can preserve the typed cause (e.g. ErrSessionBoundCandidateAbsent)
+	// across the fallback return instead of losing it to nil.
+	anchorErr *error
 }
 
 // candidateExcluded reports whether candidateID is in the fallback's exclusion
@@ -715,6 +732,58 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 		_, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(
 			prefetchCtx, task.neutralURI, task.userID, task.profileID, task.file.VirtualOwnerInstallationID,
 		)
+	}
+
+	// Opportunistic pre-probe: when a prober is configured and the top-ranked
+	// candidate has no real probe evidence yet, probe it under the prefetch
+	// budget so audio and subtitle inventories are persisted to the catalog
+	// before the viewer clicks play.
+	if (h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil) && h.BestResultCache != nil {
+		cacheKey := bestResultCacheKey(task.file.ContentID, task.neutralURI, task.file.VirtualOwnerInstallationID)
+		cached := h.BestResultCache.get(cacheKey, time.Now())
+		if len(cached) > 0 && cached[0].URI != "" && !h.virtualCandidateHasProbeEvidence(prefetchCtx, cached[0].URI, &task.file, task.file.VirtualOwnerInstallationID) {
+			topCand := cached[0]
+			var streamURL string
+			var reqHeaders map[string]string
+			ownerID := task.file.VirtualOwnerInstallationID
+			if h.VirtualMediaDetailedResolver != nil {
+				res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+					prefetchCtx, topCand.URI, task.file.VirtualOwnerInstallationID, task.userID, task.profileID, false, nil, "",
+				)
+				if err != nil {
+					return
+				}
+				// Speculative pre-probe requires strict identity verification:
+				// the resolved candidate URI must strictly match topCand.URI
+				// (and matching candidate ID when known). Never proceed on an
+				// empty URI or a resolver-substituted candidate (dedup keeper,
+				// sibling), which would persist release B's probe on release A.
+				if res.URI != topCand.URI || (res.CandidateID != "" && topCand.ID != "" && res.CandidateID != topCand.ID) {
+					return
+				}
+				// Owner consistency check: speculative pre-probing must not drift
+				// across plugin installations. Only accept matching owner or 0.
+				if res.OwnerID > 0 && task.file.VirtualOwnerInstallationID > 0 && res.OwnerID != task.file.VirtualOwnerInstallationID {
+					return
+				}
+				streamURL = res.URL
+				// Authoritative cloned header snapshot from resolver only:
+				// do not leak or retain unverified cached candidate headers.
+				reqHeaders = cloneHeaderMap(res.RequestHeaders)
+				if res.OwnerID > 0 {
+					ownerID = res.OwnerID
+				}
+			}
+			if streamURL != "" {
+				probeTransient := cloneVirtualProbeTransient(task.file)
+				probeTransient.FilePath = topCand.URI
+				probeTransient.VirtualOwnerInstallationID = ownerID
+				boundCand := topCand
+				boundCand.RequestHeaders = reqHeaders
+				boundCand.OwnerInstallationID = ownerID
+				h.probeVirtualSourceAndPersist(prefetchCtx, "", &task.file, streamURL, probeTransient, boundCand, h.virtualExpectedRuntimeMinutes(prefetchCtx, &task.file), ownerID)
+			}
+		}
 	}
 }
 
@@ -1430,7 +1499,7 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 	opts virtualResolveOptionsV3,
 ) (resolvedVirtualPlaybackSource, error) {
 	resolved, err := h.resolveVirtualPlaybackSource(r, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, false, opts)
-	if err == nil || opts.rotateCandidates || !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+	if err == nil || opts.rotateCandidates || !isRehydratedVirtualSourceRotatableV3(err) {
 		return resolved, err
 	}
 	if len(excludedCandidateIDs) == 0 {
@@ -1480,7 +1549,7 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 		ctx, file.FilePath, file.VirtualOwnerInstallationID,
 		session.UserID, session.ProfileID, false, nil, "",
 	)
-	if err == nil || !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+	if err == nil || (!errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) && !errors.Is(err, ErrVirtualCandidateMarkedFailed)) {
 		return resolved, cleanup, err
 	}
 	pinnedID := virtualResultCandidateID(file.FilePath)
@@ -2088,7 +2157,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// when no catalog row is found yet, mirroring the shared verdict gate.
 		if !allowFailed && sameVirtualReleaseIdentity(file.FilePath, cand.URI) &&
 			virtualCandidateVerdictActive(file.FailedAt, time.Now()) {
-			return nil, fmt.Errorf("candidate %s is marked failed", cand.URI)
+			return nil, fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, cand.URI)
 		}
 		if dbFound {
 			// Auto-pick skips candidates whose catalog row is marked failed
@@ -2103,9 +2172,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				// disagree about who failed; name both so an operator can
 				// trust the attribution.
 				if cand.URI != requestedURI {
-					return nil, fmt.Errorf("candidate %s resolved to %s, which is marked failed", requestedURI, cand.URI)
+					return nil, fmt.Errorf("%w: candidate %s resolved to %s, which is marked failed", ErrVirtualCandidateMarkedFailed, requestedURI, cand.URI)
 				}
-				return nil, fmt.Errorf("candidate %s is marked failed", cand.URI)
+				return nil, fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, cand.URI)
 			}
 			transient = *dbFile
 			transient.FilePath = cand.URI
@@ -2563,17 +2632,22 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if options.sessionBound && strings.TrimSpace(options.sessionAnchorURI) != "" {
 		anchoredReleaseID = virtualResultCandidateID(options.sessionAnchorURI)
 	}
+	var fallbackAnchorErr error
 	fallbackEligibility := virtualFallbackEligibility{
 		sessionBound:         options.sessionBound,
 		rotationAllowed:      rotateCandidates,
 		allowFailed:          allowFailed,
 		releaseID:            anchoredReleaseID,
 		excludedCandidateIDs: append([]string(nil), excludedCandidateIDs...),
+		anchorErr:            &fallbackAnchorErr,
 	}
 	fb := h.fallbackResolveStaleVirtualSource(attemptCtx, file, userID, profileID, fallbackEligibility)
 	trace.fallback = time.Since(fallbackStart)
 	if fb != nil {
 		return *fb, nil
+	}
+	if fallbackAnchorErr != nil {
+		attemptErr = errors.Join(attemptErr, fallbackAnchorErr)
 	}
 	return resolvedVirtualPlaybackSource{}, attemptErr
 }
@@ -3613,7 +3687,7 @@ func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, cand
 	now := time.Now()
 	if sameVirtualReleaseIdentity(file.FilePath, candidateURI) &&
 		virtualCandidateVerdictActive(file.FailedAt, now) {
-		return fmt.Errorf("candidate %s is marked failed", candidateURI)
+		return fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, candidateURI)
 	}
 	row, found, lookupErr := h.lookupVirtualCandidateRowDetailed(ctx, candidateURI, file.ContentID, file.EpisodeID, ownerID)
 	if lookupErr != nil {
@@ -3624,7 +3698,7 @@ func (h *PlaybackHandler) virtualCandidateVerdictError(ctx context.Context, cand
 		return nil
 	}
 	if virtualCandidateVerdictActive(row.FailedAt, now) {
-		return fmt.Errorf("candidate %s is marked failed", candidateURI)
+		return fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, candidateURI)
 	}
 	return nil
 }
@@ -3978,6 +4052,9 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					"component", "api", "original", file.FilePath, "resolved", resolved.URI,
 					"reason", "candidate rotation was not requested")
 			default:
+				if elig.anchorErr != nil {
+					*elig.anchorErr = err
+				}
 				slog.WarnContext(ctx, "virtual stale fallback: refusing to substitute a different release",
 					"component", "api", "original", file.FilePath,
 					"reason", "the session-bound candidate did not resolve and candidate rotation was not requested",

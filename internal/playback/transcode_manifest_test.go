@@ -29,15 +29,15 @@ func TestStartupSegmentRequirementScopesFastHardwareWindowsToFreshGenerations(t 
 		opts TranscodeOpts
 		want int
 	}{
-		{name: "fresh hardware bitmap burn in", opts: func() TranscodeOpts { o := bitmap; o.HWAccel = transcodeHWQSV; return o }(), want: 1},
+		{name: "fresh hardware bitmap burn in", opts: func() TranscodeOpts { o := bitmap; o.HWAccel = transcodeHWQSV; return o }(), want: 2},
 		{name: "CPU bitmap burn in", opts: func() TranscodeOpts { o := bitmap; o.HWAccel = HWAccelNone; return o }(), want: 3},
 		{name: "reconstructed hardware bitmap burn in", opts: func() TranscodeOpts { o := bitmap; o.HWAccel = transcodeHWQSV; o.FastStart = false; return o }(), want: 3},
-		{name: "ordinary fresh hardware transcode", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: transcodeHWQSV, FastStart: true}, want: 1},
+		{name: "ordinary fresh hardware transcode", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: transcodeHWQSV, FastStart: true}, want: 2},
 		{name: "ordinary hardware restart", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: transcodeHWQSV, FastStart: false}, want: 3},
 		{name: "ordinary CPU transcode", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: HWAccelNone, FastStart: true}, want: 3},
 		{name: "unknown backend falls back to CPU", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: "stale-backend", FastStart: true}, want: 3},
 		{name: "copy video", opts: TranscodeOpts{TargetCodecVideo: "copy", HWAccel: transcodeHWQSV, FastStart: true}, want: 1},
-		{name: "fresh videotoolbox hardware transcode", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: transcodeHWVideoToolbox, FastStart: true}, want: 1},
+		{name: "fresh videotoolbox hardware transcode", opts: TranscodeOpts{TargetCodecVideo: "h264", HWAccel: transcodeHWVideoToolbox, FastStart: true}, want: 2},
 		{name: "copy video CPU", opts: TranscodeOpts{TargetCodecVideo: "copy", HWAccel: HWAccelNone, FastStart: false}, want: 1},
 	}
 	for _, tt := range tests {
@@ -330,6 +330,11 @@ func TestBuildPlaybackManifest_LongEncodedTranscodeUsesRealManifest(t *testing.T
 	if err := os.WriteFile(filepath.Join(tempDir, "stream.m3u8"), []byte(manifest), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
+	for _, name := range []string{"seg_00000.ts", "seg_00001.ts"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
 
 	session := &TranscodeSession{
 		outputDir: tempDir,
@@ -338,6 +343,8 @@ func TestBuildPlaybackManifest_LongEncodedTranscodeUsesRealManifest(t *testing.T
 			TargetCodecAudio: "aac",
 			SegmentDuration:  2,
 			TotalDuration:    1_000_000,
+			FastStart:        true,
+			HWAccel:          transcodeHWQSV,
 		},
 	}
 
@@ -378,6 +385,11 @@ func TestBuildSourceAlignedPlaybackManifestAnchorsSeekedRealPlaylist(t *testing.
 	if err := os.WriteFile(filepath.Join(tempDir, "stream.m3u8"), []byte(manifest), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
+	for _, name := range []string{"seg_00008.ts", "seg_00009.ts"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
 
 	session := &TranscodeSession{
 		outputDir: tempDir,
@@ -388,6 +400,8 @@ func TestBuildSourceAlignedPlaybackManifestAnchorsSeekedRealPlaylist(t *testing.
 			TotalDuration:      1_000_000,
 			SeekSeconds:        17.3,
 			StartSegmentNumber: 8,
+			FastStart:          true,
+			HWAccel:            transcodeHWQSV,
 		},
 	}
 
@@ -481,6 +495,45 @@ func TestRewriteManifestPaths_RejectsInvalidManifest(t *testing.T) {
 				t.Fatalf("expected RewriteManifestPaths to fail for %s", tc.name)
 			}
 		})
+	}
+}
+
+func TestStartupFilesReadyRunwayDuration(t *testing.T) {
+	tempDir := t.TempDir()
+	for _, name := range []string{"init.mp4", "seg_00000.m4s", "seg_00001.m4s", "seg_00002.m4s"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("test-media"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	// 1. Single 1.5s segment: count requirement 1 satisfied, but duration < 4.0s -> not ready.
+	manifest1 := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1.500000,\nseg_00000.m4s\n")
+	if startupFilesReady(manifest1, tempDir, 1) {
+		t.Fatal("1.5s live segment should not satisfy 4.0s runway threshold")
+	}
+
+	// 2. Three 1.5s segments: count 3 >= 1, duration 4.5s >= 4.0s -> ready.
+	manifest3 := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1.500000,\nseg_00000.m4s\n#EXTINF:1.500000,\nseg_00001.m4s\n#EXTINF:1.500000,\nseg_00002.m4s\n")
+	if !startupFilesReady(manifest3, tempDir, 1) {
+		t.Fatal("4.5s accumulated media should satisfy runway threshold")
+	}
+
+	// 3. Exact 4.0s boundary (two 2.0s segments) -> ready.
+	manifestExact := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.000000,\nseg_00000.m4s\n#EXTINF:2.000000,\nseg_00001.m4s\n")
+	if !startupFilesReady(manifestExact, tempDir, 2) {
+		t.Fatal("exact 4.0s media should satisfy runway threshold")
+	}
+
+	// 4. Sub-4s completed clip with ENDLIST (one 2.5s segment) -> ready.
+	manifestEndList := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:3\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.500000,\nseg_00000.m4s\n#EXT-X-ENDLIST\n")
+	if !startupFilesReady(manifestEndList, tempDir, 1) {
+		t.Fatal("completed ENDLIST stream should be ready even below 4.0s")
+	}
+
+	// 5. Empty ENDLIST (0 segments) -> rejected.
+	manifestEmptyEndList := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-ENDLIST\n")
+	if startupFilesReady(manifestEmptyEndList, tempDir, 1) {
+		t.Fatal("empty ENDLIST stream with 0 segments must not be ready")
 	}
 }
 

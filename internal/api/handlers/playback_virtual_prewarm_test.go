@@ -167,3 +167,88 @@ func TestPrefetchVirtualPlaybackWarmsBestResultCache(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// TestPrefetchVirtualPlaybackOpportunisticallyProbesTopCandidate proves prefetching
+// an unprobed virtual file invokes the prober for the top-ranked candidate so real
+// audio/subtitle tracks are discovered before playback starts.
+func TestPrefetchVirtualPlaybackOpportunisticallyProbesTopCandidate(t *testing.T) {
+	h := &PlaybackHandler{}
+	h.BestResultCache = NewVirtualBestResultCache(time.Hour, 16)
+	candURI := "virtual://movie/tt-preprobe?result=cand-preprobe-top"
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(
+		func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "http://provider.example/stream?path=" + uri, URI: uri}, nil
+		})
+
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(
+		func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{{
+				URI: candURI, Resolution: "1080p",
+				CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+			}}, nil
+		})
+
+	probed := make(chan string, 1)
+	h.VirtualPlaybackSourceProber = func(_ context.Context, url string, f *models.MediaFile) (*models.MediaFile, error) {
+		select {
+		case probed <- f.FilePath:
+		default:
+		}
+		f.VideoTracks = []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}}
+		f.AudioTracks = []models.AudioTrack{{Codec: "aac", Channels: 2, Language: "eng"}}
+		return f, nil
+	}
+
+	file := prewarmFile("virtual://movie/tt-preprobe")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/prefetch", nil)
+	req = req.WithContext(apimw.SetClaims(req.Context(), &auth.Claims{UserID: 7, Role: "user", TokenType: auth.TokenTypeAccess}))
+	h.PrefetchVirtualPlayback(req.Context(), []*models.MediaFile{file}, "profile-1")
+
+	select {
+	case gotURI := <-probed:
+		if gotURI != candURI {
+			t.Fatalf("probed candidate = %q, want %q", gotURI, candURI)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("prefetch never opportunistically probed the top candidate")
+	}
+}
+
+// TestPrefetchVirtualPlaybackRejectsSubstitutedCandidate proves prefetch aborts
+// speculative probing when the detailed resolver substitutes a different candidate,
+// preventing release B's probe evidence from landing on release A's catalog row.
+func TestPrefetchVirtualPlaybackRejectsSubstitutedCandidate(t *testing.T) {
+	h := &PlaybackHandler{}
+	h.BestResultCache = NewVirtualBestResultCache(time.Hour, 16)
+	candURI := "virtual://movie/tt-preprobe-sub?result=cand-original"
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(
+		func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "http://provider.example/stream", URI: "virtual://movie/tt-preprobe-sub?result=cand-substituted"}, nil
+		})
+
+	h.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(
+		func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{{
+				URI: candURI, Resolution: "1080p",
+				CodecVideo: "h264", CodecAudio: "aac", Container: "mkv",
+			}}, nil
+		})
+
+	probed := make(chan string, 1)
+	h.VirtualPlaybackSourceProber = func(_ context.Context, url string, f *models.MediaFile) (*models.MediaFile, error) {
+		probed <- f.FilePath
+		return f, nil
+	}
+
+	file := prewarmFile("virtual://movie/tt-preprobe-sub")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/prefetch", nil)
+	req = req.WithContext(apimw.SetClaims(req.Context(), &auth.Claims{UserID: 7, Role: "user", TokenType: auth.TokenTypeAccess}))
+	h.PrefetchVirtualPlayback(req.Context(), []*models.MediaFile{file}, "profile-1")
+
+	select {
+	case bad := <-probed:
+		t.Fatalf("substituted candidate %q must not be speculatively probed", bad)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: speculative probe aborted on identity mismatch.
+	}
+}

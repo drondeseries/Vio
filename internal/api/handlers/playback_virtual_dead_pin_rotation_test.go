@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -187,6 +188,44 @@ func TestResolveRehydratedVirtualSourceRotatesAbsentAnchor(t *testing.T) {
 	}
 	if !containsStringExactV3(excluded[1], "pinned") {
 		t.Fatalf("retry exclusions = %v, want the dead pin excluded", excluded[1])
+	}
+}
+
+// TestResolveRehydratedVirtualSourceRotatesMarkedFailedAnchor proves the failure-replan
+// rehydration rotates when the session anchor carries an active failed_at verdict,
+// rather than getting stuck refusing the marked-bad release.
+func TestResolveRehydratedVirtualSourceRotatesMarkedFailedAnchor(t *testing.T) {
+	const (
+		neutralURI = "virtual://movie/tt-replan-failed-anchor"
+		pinnedURI  = neutralURI + "?result=pinned"
+		siblingURI = neutralURI + "?result=sibling"
+	)
+	failedAt := time.Now().Add(-time.Minute)
+	file := &models.MediaFile{ID: 77, ContentID: "movie-replan-failed-anchor", FilePath: pinnedURI, FailedAt: &failedAt, VirtualOwnerInstallationID: 5}
+
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+		return "http://127.0.0.1:9/unused", nil
+	})
+	var rotates []bool
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, uri string, ownerInstallationID, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+		rotates = append(rotates, VirtualCandidateRotationAllowed(ctx))
+		if !VirtualCandidateRotationAllowed(ctx) {
+			return ResolvedVirtualMedia{}, fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, pinnedURI)
+		}
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/sibling", URI: siblingURI, CandidateID: "sibling"}, nil
+	})
+
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil).WithContext(newAuthorizedPlaybackContext())
+	resolved, err := h.resolveRehydratedVirtualSourceV3(r, file, "profile-1", nil, "pinned", "auto", 0, virtualResolveOptionsV3{sessionBound: true, sessionAnchorURI: pinnedURI})
+	if err != nil {
+		t.Fatalf("resolveRehydratedVirtualSourceV3: %v", err)
+	}
+	if got := virtualResultCandidateID(resolved.URI); got != "sibling" {
+		t.Fatalf("resolved candidate = %q, want the rotated sibling", got)
+	}
+	if len(rotates) != 2 || rotates[0] || !rotates[1] {
+		t.Fatalf("rotation intents = %v, want exactly [false true]", rotates)
 	}
 }
 

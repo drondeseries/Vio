@@ -2306,7 +2306,7 @@ const minCopyManifestSegments = 1
 // after the first playable fragment. A fresh hardware encoder produces that
 // window comfortably ahead of real time, while CPU encodes and reconstructed
 // generations retain the larger three-fragment safety margin below.
-const minFreshHardwareManifestSegments = 1
+const minFreshHardwareManifestSegments = 2
 
 func startupSegmentRequirement(opts TranscodeOpts) int {
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") {
@@ -2364,14 +2364,39 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 
 	requiredSegments := startupSegmentRequirement(s.opts)
 
+	// A copy-mode manifest with a zero TARGETDURATION or non-positive EXTINF
+	// durations is broken output, not playable media: fail fast with the
+	// validation error so the broken fixture surfaces "invalid copy playback
+	// manifest" instead of "manifest not ready after 30s". This runs before
+	// the readiness gate because a zero-duration playlist can never satisfy
+	// it: without the fail-fast it would block for ManifestStartupTimeout.
+	// It also runs when the session stopped before the readiness check so
+	// broken output from a finished-but-invalid transcode cannot leak to the
+	// player either.
+	if startupCopyManifestIsBroken(data) {
+		if err := validateCopyPlaybackManifest(data); err != nil {
+			return nil, fmt.Errorf("invalid copy playback manifest: %w", err)
+		}
+	}
+
 	// Wait until enough startup media exists before serving. Counting #EXTINF
 	// lines alone is not enough for FFmpeg's live-written manifest because the
 	// playlist can reference copy-mode segments before the files are fully
 	// flushed to disk, especially on resumed sessions with a non-zero media
 	// sequence. Requiring the referenced startup files prevents the browser from
 	// stalling on its very first segment fetch.
-	if s.running && !startupFilesReady(data, s.outputDir, requiredSegments) {
-		return nil, ErrManifestNotReady
+	if !startupFilesReady(data, s.outputDir, requiredSegments) {
+		if s.running || s.restarting != nil {
+			return nil, ErrManifestNotReady
+		}
+		if s.waitErr != nil {
+			stderr := truncateStderr(s.stderr.String())
+			if stderr != "" {
+				return nil, fmt.Errorf("%w: %w (stderr: %s)", ErrTranscodeFailed, s.waitErr, stderr)
+			}
+			return nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, s.waitErr)
+		}
+		return nil, ErrTranscodeFailed
 	}
 	if strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
 		if err := validateCopyPlaybackManifest(data); err != nil {
@@ -2853,13 +2878,31 @@ func manifestURIToFilename(uri string) string {
 	return filepath.Base(base)
 }
 
-func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int) {
+func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int, float64, bool, bool) {
 	files := make([]string, 0, maxSegments+1)
 	segmentCount := 0
+	duration := 0.0
+	endList := false
+	allValidDurations := true
+	var pendingDuration float64
+	var havePending bool
+
+	// Scan the whole playlist: an EXTINF duration belongs to the URI line that
+	// follows it, so durations accumulate per completed segment. Stop only
+	// when BOTH the segment count and the duration runway hold — stopping at
+	// the count alone would demand 4s inside a 1-segment prefix that can
+	// never satisfy it (e.g. copy mode).
+	complete := func() bool {
+		return segmentCount >= maxSegments && duration >= minManifestDurationSeconds
+	}
 
 	for line := range bytes.SplitSeq(manifest, []byte("\n")) {
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) == 0 {
+			continue
+		}
+		if bytes.HasPrefix(trimmed, []byte("#EXT-X-ENDLIST")) {
+			endList = true
 			continue
 		}
 		if bytes.HasPrefix(trimmed, []byte("#EXT-X-MAP:")) {
@@ -2868,23 +2911,95 @@ func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int) {
 			}
 			continue
 		}
+		if bytes.HasPrefix(trimmed, []byte("#EXTINF:")) {
+			pendingDuration, havePending = 0, false
+			raw := strings.TrimSpace(strings.TrimPrefix(string(trimmed), "#EXTINF:"))
+			val, _, _ := strings.Cut(raw, ",")
+			val = strings.TrimSpace(val)
+			if seconds, err := strconv.ParseFloat(val, 64); err == nil && seconds > 0 && !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
+				pendingDuration, havePending = seconds, true
+			}
+			continue
+		}
 		if trimmed[0] == '#' {
 			continue
 		}
 
+		if !havePending || pendingDuration <= 0 {
+			allValidDurations = false
+		} else {
+			duration += pendingDuration
+			pendingDuration = 0
+			havePending = false
+		}
 		files = append(files, manifestURIToFilename(string(trimmed)))
 		segmentCount++
-		if segmentCount >= maxSegments {
+		if complete() {
 			break
 		}
 	}
 
-	return files, segmentCount
+	return files, segmentCount, duration, endList, allValidDurations
+}
+
+// minManifestDurationSeconds is the minimum contiguous completed-segment duration
+// required to declare transcode startup ready. Two 2s segments provide the
+// ~4s runway the consumer needs to fetch the init map and first media without
+// immediately catching the encoder head.
+const minManifestDurationSeconds = 4.0
+
+// startupCopyManifestIsBroken reports whether a manifest is a broken
+// copy-mode playlist (zero TARGETDURATION or non-positive EXTINF durations).
+// Callers gate on evidence completeness first (startupFilesReady true) so an
+// incomplete live manifest waits for more media instead of asserting broken
+// output.
+func startupCopyManifestIsBroken(manifest []byte) bool {
+	if err := validateManifestHeader(manifest); err != nil {
+		return false
+	}
+	_, segmentCount, _, _, _ := manifestStartupFiles(manifest, 2)
+	if segmentCount < 2 {
+		return false
+	}
+	targetDuration, err := parseTargetDuration(manifest)
+	if err != nil || targetDuration <= 0 {
+		return true
+	}
+	timeline, err := parseManifestTimeline(manifest)
+	if err != nil || len(timeline.entries) == 0 {
+		return true
+	}
+	for _, entry := range timeline.entries {
+		if entry.duration <= 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func startupFilesReady(manifest []byte, outputDir string, requiredSegments int) bool {
-	files, segmentCount := manifestStartupFiles(manifest, requiredSegments)
+	files, segmentCount, duration, endList, allValidDurations := manifestStartupFiles(manifest, requiredSegments)
+	if !allValidDurations || segmentCount == 0 {
+		return false
+	}
+	// A completed playlist with nonempty referenced files is valid content
+	// even below the live runway: short clips and near-end seeks must start.
+	if endList {
+		if duration <= 0 {
+			return false
+		}
+		for _, name := range files {
+			info, err := os.Stat(filepath.Join(outputDir, name))
+			if err != nil || info.Size() <= 0 {
+				return false
+			}
+		}
+		return true
+	}
 	if segmentCount < requiredSegments {
+		return false
+	}
+	if duration < minManifestDurationSeconds {
 		return false
 	}
 

@@ -2679,6 +2679,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to load the initialized playback session.", cause: err}
 	}
 	result.Plan.SessionID = session.ID
+	result.Plan.InventoryURL = "/api/v2/playback/" + session.ID + "/inventory"
 	transport, transportErr := h.prepareTransportV3(r, session, effectiveFile, result, mode)
 	if transportErr != nil {
 		abort()
@@ -5725,18 +5726,26 @@ func (h *PlaybackHandler) attachSubtitleArtifactV3(ctx context.Context, sessionI
 	return nil
 }
 
+// downloadedSubtitleInventoryWithErrorV3 lists downloaded/AI tracks and
+// propagates any repository read failure so callers can fail closed instead of
+// silently serving a partial inventory.
+func (h *PlaybackHandler) downloadedSubtitleInventoryWithErrorV3(ctx context.Context, file *models.MediaFile) ([]playback.SubtitleInventoryEntryV3, error) {
+	if h == nil || h.SubtitleRepo == nil || file == nil {
+		return nil, nil
+	}
+	downloaded, err := h.SubtitleRepo.ListDownloadedSubtitles(ctx, file.ID)
+	if err != nil {
+		return nil, err
+	}
+	return downloadedSubtitleEntriesV3(file, downloaded), nil
+}
+
 // downloadedSubtitleInventoryV3 lists the downloaded and AI-generated tracks
 // that follow the file's own tracks in the combined-ordinal space. The
 // repository orders by created_at, so the ordinals it produces are stable.
 func (h *PlaybackHandler) downloadedSubtitleInventoryV3(ctx context.Context, file *models.MediaFile) []playback.SubtitleInventoryEntryV3 {
-	if h == nil || h.SubtitleRepo == nil || file == nil {
-		return nil
-	}
-	downloaded, err := h.SubtitleRepo.ListDownloadedSubtitles(ctx, file.ID)
-	if err != nil {
-		return nil
-	}
-	return downloadedSubtitleEntriesV3(file, downloaded)
+	entries, _ := h.downloadedSubtitleInventoryWithErrorV3(ctx, file)
+	return entries
 }
 
 // downloadedSubtitleEntriesV3 converts downloaded rows into inventory entries
@@ -5938,6 +5947,9 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 			if errors.Is(err, playback.ErrReplanSupersededV3) {
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
 			}
+			if replanErr != nil && (replanErr.reason == string(noderouting.OutcomeCapacityUnavailable) || (replanErr.cause != nil && strings.Contains(replanErr.cause.Error(), string(noderouting.OutcomeCapacityUnavailable)))) {
+				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
+			}
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to persist the terminal replan decision")
 		}
 		leaseCompleted = true
@@ -5953,6 +5965,9 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 			if rollbackErr, _ := rollbackFailedReplanV3(transport, nil); rollbackErr != nil {
 				slog.ErrorContext(r.Context(), "protocol v3 unapplied replacement transport cancellation failed", "session", sessionID, "error", rollbackErr)
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the unapplied replacement transport")
+			}
+			if strings.Contains(err.Error(), string(noderouting.OutcomeCapacityUnavailable)) {
+				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 			}
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the live replacement session")
 		}
@@ -7576,6 +7591,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	mode = headerAuthenticatedMediaV3(start.ClientFeatures)
 	_, reservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
 	result.Plan.SessionID = session.ID
+	result.Plan.InventoryURL = "/api/v2/playback/" + session.ID + "/inventory"
 	artifactRecipe = record.FrozenRecipe
 	if !seekReanchor {
 		frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)

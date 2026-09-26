@@ -409,6 +409,12 @@ func PlanPlaybackV3(input PlannerInputV3) (result PlannerResultV3) {
 	// should prefer it over item metadata, which can be stale after a version
 	// fallback rehydrates a different candidate under the same catalog row.
 	base.AudioTracks = audioInventoryV3(file)
+	invStatus := "declared"
+	if file != nil && file.ProbeUpdatedAt != nil {
+		invStatus = "verified"
+	}
+	base.InventoryStatus = invStatus
+	base.InventoryRevision = ComputeInventoryRevisionV3(invStatus, base.AudioTracks, base.Subtitle.Inventory)
 	base.Claims.Audio.Passthrough = passthrough
 	if mkvQuirkFired {
 		appendAppliedQuirkV3(&base, *mkvQuirk, "")
@@ -1716,6 +1722,11 @@ func selectedTracksForPlanV3(file *models.MediaFile, audioIndex int, subtitle Su
 // selection_index name the value a client must echo to select the track; they
 // always agree with selected_tracks.audio and the audio_track_index request
 // field. The input slice is never mutated; the catalog keeps its own tracks.
+// AudioInventoryV3 builds the authoritative per-track audio inventory for file.
+func AudioInventoryV3(file *models.MediaFile) []AudioInventoryItemV3 {
+	return audioInventoryV3(file)
+}
+
 func audioInventoryV3(file *models.MediaFile) []AudioInventoryItemV3 {
 	if file == nil || len(file.AudioTracks) == 0 {
 		return nil
