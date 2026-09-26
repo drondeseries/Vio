@@ -900,7 +900,14 @@ func (c *prowlarrSearchClient) ClassifyCandidates(candidates []StreamCandidate) 
 		for j := range releases {
 			if prowlarrReleaseConfirmsCandidate(releases[j], candidates[i]) {
 				candidates[i].SourceConfirmed = true
-				candidates[i].SourceGUID = releases[j].GUID
+				// AltMount's release-scoped identity (namespaced) is
+				// authoritative for a candidate it already confirmed: Prowlarr
+				// corroborates the same release, it does not re-identify it.
+				// Overwriting would move the row's GUID to a different provider
+				// key and break re-matching. Only fill an empty GUID.
+				if strings.TrimSpace(candidates[i].SourceGUID) == "" && releases[j].GUID != "" {
+					candidates[i].SourceGUID = releases[j].GUID
+				}
 				break
 			}
 		}

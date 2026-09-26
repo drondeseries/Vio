@@ -143,6 +143,32 @@ func PersistedCandidateTrusted(ctx context.Context) bool {
 // the empty answer the outage just cached.
 type providerOutageRelistContextKey struct{}
 
+// requestIDContextKey carries the transport request id into a resolve.
+type requestIDContextKey struct{}
+
+// WithRequestID threads the transport's request id into a resolve so a refusal
+// log can be correlated with the edge request that caused it. The virtual
+// library must not import the HTTP middleware (which owns chi's request-id
+// key), so the caller passes the value it already read with chimw.GetReqID. An
+// empty id leaves ctx untouched.
+func WithRequestID(ctx context.Context, requestID string) context.Context {
+	requestID = strings.TrimSpace(requestID)
+	if ctx == nil || requestID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestIDContextKey{}, requestID)
+}
+
+// RequestIDFromContext returns the request id threaded by WithRequestID, or ""
+// when none is present. It is exported so handler tests can pin the seam.
+func RequestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	requestID, _ := ctx.Value(requestIDContextKey{}).(string)
+	return requestID
+}
+
 // WithProviderOutageRelist marks ctx as a provider-outage retry. A forced
 // resolve carrying this flag bypasses the fresh-serve floor so the retry asks
 // the provider again instead of re-serving the negative entry the outage wrote.
@@ -548,14 +574,17 @@ func (s *Service) ResolveDetailed(
 	// refuse a substitution; a rotation already authorizes the ordinary
 	// fallback.
 	identityRematched := false
+	var rematchReport resolver.PersistedIdentityMatch
 	if pinnedRelease && !allowSubstitution && effectiveResultID != "" && !sessionCandidatePresent {
 		_, requestedExcludedEarly := excluded[requestedResultID]
 		_, keeperExcludedEarly := excluded[effectiveResultID]
 		if !requestedExcludedEarly && !keeperExcludedEarly {
 			if identity, ok := persistedCandidateIdentityFromContext(ctx); ok {
-				if matched, found := resolver.MatchCandidateByPersistedIdentity(
+				matched, found, report := resolver.MatchCandidateByPersistedIdentityReport(
 					candidates, identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize,
-				); found {
+				)
+				rematchReport = report
+				if found {
 					if matchedID := stream.CandidateVariantID(matched); matchedID != "" && matchedID != effectiveResultID {
 						effectiveResultID = matchedID
 						// The matched candidate is the same release as the
@@ -654,22 +683,50 @@ func (s *Service) ResolveDetailed(
 	sessionReleasePresent := sessionReleaseResolvable ||
 		(preferredCandidateID == "" && effectiveResultID != "" && candidateIDPresent(candidates, effectiveResultID))
 	if pinnedRelease && !allowSubstitution && effectiveResultID != "" && !pinBlocked && !sessionReleasePresent {
+		// Identity presence is logged explicitly: a refusal because the row
+		// carries no durable identity at all is a different operator action
+		// (backfill, or wait for the row to be re-listed) than a refusal
+		// because the row's identity disagreed with every listed candidate
+		// (provider renumbered to a different release, or the identity is
+		// stale). request_id ties the line back to the edge request.
+		_, hasIdentity := persistedCandidateIdentityFromContext(ctx)
+		identityTier, identityMatched := rematchReport.Tier, rematchReport.Matched
+		emptyTiers := rematchReport.IdentityEmptyTiers
+		if len(emptyTiers) == 0 && !hasIdentity {
+			// The rematch block never ran (no identity was threaded), so
+			// report every tier as empty: this refusal is "the row carries no
+			// durable identity", which is a different operator action than a
+			// genuine tier mismatch.
+			emptyTiers = []string{"video_hash", "guid", "release_name"}
+		}
 		if persistedCandidateTrustFromContext(ctx) {
-			if _, hasIdentity := persistedCandidateIdentityFromContext(ctx); hasIdentity {
+			if hasIdentity {
 				// Same-identity preference, not substitution: the persisted row
 				// is inside its trust window and the request withheld rotation,
 				// so declaring the release absent would let a caller rotate to
 				// a sibling. Refuse with a distinct cause instead.
 				if s.logger != nil {
 					s.logger.WarnContext(ctx, "trusted persisted virtual candidate is absent from the provider list; refusing to substitute",
-						"candidate_id", effectiveResultID)
+						"candidate_id", effectiveResultID,
+						"has_identity", hasIdentity,
+						"identity_tier", identityTier,
+						"identity_matched", identityMatched,
+						"identity_empty_tiers", emptyTiers,
+						"identity_candidate_empty_tiers", rematchReport.CandidateEmptyTiers,
+						"request_id", RequestIDFromContext(ctx))
 				}
 				return ResolvedVirtualStream{}, fmt.Errorf("trusted persisted virtual candidate %q is no longer listed and candidate rotation was not requested: %w", effectiveResultID, ErrPersistedCandidateTrusted)
 			}
 		}
 		if s.logger != nil {
 			s.logger.WarnContext(ctx, "refusing to substitute a dead session-bound virtual candidate",
-				"candidate_id", effectiveResultID)
+				"candidate_id", effectiveResultID,
+				"has_identity", hasIdentity,
+				"identity_tier", identityTier,
+				"identity_matched", identityMatched,
+				"identity_empty_tiers", emptyTiers,
+				"identity_candidate_empty_tiers", rematchReport.CandidateEmptyTiers,
+				"request_id", RequestIDFromContext(ctx))
 		}
 		return ResolvedVirtualStream{}, fmt.Errorf("session-bound virtual candidate %q is no longer listed and candidate rotation was not requested: %w", effectiveResultID, ErrSessionBoundCandidateAbsent)
 	}
@@ -706,11 +763,15 @@ func (s *Service) ResolveDetailed(
 			// order matches candidateDedupKey: hash, then GUID, then the
 			// normalized release name + size. ReleaseName is always derived
 			// (name+size is the fallback tier), so a row with no hash/GUID is
-			// still re-matchable.
-			ProviderVideoHash:   c.BehaviorHints.VideoHash,
+			// still re-matchable. The hash accepts both the Stremio
+			// behaviorHints.videoHash and a torrent infoHash, and the size
+			// accepts a parsed size or behaviorHints.videoSize, so an addon
+			// that declares identity only through those fields is still
+			// durable.
+			ProviderVideoHash:   stream.CandidateVideoHash(c),
 			ProviderGUID:        c.SourceGUID,
 			ProviderReleaseName: resolver.CandidateReleaseName(c),
-			ProviderReleaseSize: c.FileSize,
+			ProviderReleaseSize: stream.CandidateDeclaredSize(c),
 			// The candidate's provider-declared inventory travels with the
 			// resolution so a caller can seed a declared inventory on adoption.
 			CodecAudio:        c.CodecAudio,
@@ -824,7 +885,7 @@ func (s *Service) playbackStreamsFrom(ctx context.Context, virtualPath string, c
 			Visible:             true,
 			VisibilitySpecified: true,
 			ProviderURL:         c.URL,
-			ProviderVideoHash:   c.BehaviorHints.VideoHash,
+			ProviderVideoHash:   stream.CandidateVideoHash(c),
 			ProviderGUID:        c.SourceGUID,
 			ProviderReleaseName: resolver.CandidateReleaseName(c),
 		})
