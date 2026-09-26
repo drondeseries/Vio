@@ -13,7 +13,7 @@ import (
 // TestRefusalLogsCarryIdentityPresenceAndRequestID pins #147: the
 // session-bound dead-pin refusal must name whether the row carried any durable
 // identity, which tier (if any) was compared, and the threaded request id, so a
-// renumber can be correlated from one grep instead of manual log archaeology.
+// renumber can be correlated from one grep instead of hand-reading the logs.
 func TestRefusalLogsCarryIdentityPresenceAndRequestID(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -83,7 +83,11 @@ func TestRefusalLogsReportNoIdentityForLegacyRow(t *testing.T) {
 // empty id and readable through the exported accessor, so the handlers lane can
 // thread chimw.GetReqID without the resolver importing the middleware.
 func TestWithRequestIDRoundTrips(t *testing.T) {
-	if got := virtuallibrary.RequestIDFromContext(nil); got != "" {
+	// A nil context must be tolerated: the accessor may be called before any
+	// request id has been threaded. Pass it through a typed variable so the
+	// nil-safety intent is explicit rather than an untyped nil literal.
+	var nilCtx context.Context
+	if got := virtuallibrary.RequestIDFromContext(nilCtx); got != "" {
 		t.Fatalf("nil ctx id = %q, want empty", got)
 	}
 	base := context.Background()

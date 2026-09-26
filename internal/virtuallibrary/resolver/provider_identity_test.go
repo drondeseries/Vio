@@ -1,41 +1,10 @@
 package resolver
 
 import (
-	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
 )
-
-// infoHashProvider answers with torrent-style streams that carry identity only
-// through infoHash and behaviorHints.videoSize — the shape an addon uses when it
-// has no behaviorHints.videoHash and no Prowlarr GUID.
-func infoHashProvider(t *testing.T) *httptest.Server {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/manifest.json" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"id":"org.stremio.test","resources":["stream"],"types":["movie","series"]}`))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{
-			"streams": [
-				{
-					"name": "AltMount 1080p",
-					"title": "My.Movie.2024.1080p.WEB-DL.x264\n💾 8.50 GB 🌐 NZBgeek",
-					"url": "https://provider.example/my.movie.mkv",
-					"infoHash": "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333",
-					"behaviorHints": {"videoSize": 8500000000}
-				}
-			]
-		}`))
-	}))
-	t.Cleanup(server.Close)
-	return server
-}
 
 // TestCandidateDedupKeyUsesInfoHashAndVideoSize proves the dedup hash tier
 // accepts a torrent infoHash and the name tier reads the videoSize hint, so a
