@@ -1717,6 +1717,17 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if noResult {
 		candidates = h.applyVirtualStickyPin(stickyKey, pinnedURI, candidates, deviceCaps)
 	}
+	// Prefer planner-grade probed evidence on a fresh (unbound, non-explicit)
+	// start: a candidate whose catalog row already carries complete video,
+	// audio and container evidence (plus a probe stamp) is a known-good
+	// release, while an unprobed stub is speculative. This runs before the
+	// candidate cap so the probed row survives maxAttempts, and inside each
+	// accepted/rejected group so compatibility still wins — evidence only
+	// breaks ties within a group. Explicit picks and session-bound resolves
+	// are untouched: the viewer chose that exact release.
+	if noResult && !options.sessionBound && !options.explicitSelection && len(candidates) > 1 {
+		candidates = h.preferProbedVirtualCandidates(stagingCtx, candidates, file, file.VirtualOwnerInstallationID)
+	}
 	remuxMatches := map[string]remuxdb.Evidence{}
 	remuxEnabled := false
 	if needsCandidateMetadata && len(candidates) > 0 {
