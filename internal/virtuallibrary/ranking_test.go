@@ -359,6 +359,42 @@ func TestResolveDetailedFreshStartFallsThroughToProfileMatch(t *testing.T) {
 	}
 }
 
+// TestResolveDetailedAutoPickedProfileZeroMatchFallsBack proves the zero-match
+// policy with fallback_to_any_stream=false: an auto-picked profile that matches
+// no candidate degrades to the best-ranked candidate, while an explicit pick
+// (no auto flag) keeps the refusal so the client can choose another version.
+func TestResolveDetailedAutoPickedProfileZeroMatchFallsBack(t *testing.T) {
+	cfg := virtuallibrary.Config{Quality: quality.QualityConfig{
+		EnableProfiles: true,
+		Profiles:       []quality.QualityProfile{{Label: "4k", Resolution: "2160p"}},
+		// FallbackToAnyStream deliberately false: the auto-picked profile is
+		// the only reason a fallback is legal here.
+	}}
+	svc := newProviderService(t, nil, cfg,
+		streamEntry("1080p", "http://192.168.1.10/a.mkv"),
+		streamEntry("1080p", "http://192.168.1.10/b.mkv"),
+	)
+	const uri = "virtual://movie/tt100?profile=4k"
+
+	// An explicit pick keeps the refusal: the viewer chose this profile and can
+	// be shown the version list instead of a silent downgrade.
+	if _, err := svc.ResolveDetailed(context.Background(), uri, false, nil, "", false, false); err == nil {
+		t.Fatal("explicit-pick zero-match resolved instead of refusing")
+	} else if !strings.Contains(err.Error(), "no stream matches profile") {
+		t.Fatalf("explicit-pick zero-match error = %v, want the no-stream-matches-profile refusal", err)
+	}
+
+	// An auto-picked profile degrades to the best-ranked candidate.
+	autoCtx := virtuallibrary.WithAutoProfileFallback(context.Background(), true)
+	resolved, err := svc.ResolveDetailed(autoCtx, uri, false, nil, "", false, false)
+	if err != nil {
+		t.Fatalf("auto-picked zero-match failed instead of falling back: %v", err)
+	}
+	if resolved.CandidateID == "" {
+		t.Fatal("auto-picked zero-match produced no candidate")
+	}
+}
+
 // TestResolveDetailedSessionBoundExclusionStillRefuses proves a session-bound
 // pin with an exclusion and no rotation still refuses, preserving the
 // no-silent-swap invariant independently of the profile gate.

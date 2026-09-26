@@ -1056,6 +1056,41 @@ type resolvedVirtualPlaybackSource struct {
 	CandidateCount int
 }
 
+// virtualProbeIdentity is the durable provider identity of the candidate a
+// resolve actually returned. It travels with the resolved source so every
+// adoption write persists the identity of the bytes being adopted, not just
+// the probed track inventory. Without it a cross-release adoption cleared the
+// row's identity (the replace-on-adoption SQL writes the supplied tiers) and a
+// later re-list could not re-identify the same release.
+type virtualProbeIdentity struct {
+	VideoHash   string
+	GUID        string
+	ReleaseName string
+	ReleaseSize int64
+}
+
+// applyResolvedIdentity stamps the resolved candidate's durable identity onto
+// the file being served and persisted. It fills empty tiers only, never
+// overwriting stored identity, so a legacy row gains re-match capability
+// without risking a cross-release overwrite.
+func applyResolvedIdentity(transient *models.MediaFile, id virtualProbeIdentity) {
+	if transient == nil {
+		return
+	}
+	if transient.ProviderVideoHash == "" {
+		transient.ProviderVideoHash = id.VideoHash
+	}
+	if transient.ProviderGUID == "" {
+		transient.ProviderGUID = id.GUID
+	}
+	if transient.ProviderReleaseName == "" {
+		transient.ProviderReleaseName = id.ReleaseName
+	}
+	if transient.ProviderReleaseSize <= 0 {
+		transient.ProviderReleaseSize = id.ReleaseSize
+	}
+}
+
 // shouldListVirtualPlaybackCandidates reports whether the resolver must ask
 // the provider for a candidate list. A pinned result= URI with complete
 // probed evidence normally skips the round-trip. forceRelist overrides that so
@@ -1749,6 +1784,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	attemptCtx := coldCtx
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
 	attemptCtx = withVirtualSessionBindingV3(attemptCtx, options.sessionBound)
+	// An auto-picked quality profile that matches no candidate degrades to the
+	// best-ranked candidate instead of hard-failing the start. Only a fresh,
+	// non-explicit selection qualifies: a session binding must not swap the
+	// release it is serving, and an explicit version pick keeps the refusal so
+	// the client can offer the version list.
+	attemptCtx = virtuallibrary.WithAutoProfileFallback(attemptCtx, !options.sessionBound && !options.explicitSelection)
 
 	// fastPathHit records that resolveAndProbe returned the repeat-play fast
 	// path so the candidate loop can return it immediately instead of treating
@@ -1924,6 +1965,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		}
 		var streamURL string
 		var resolveErr error
+		// resolvedIdentity is the durable identity of the candidate the
+		// resolver actually returned, populated below and carried on every
+		// resolved source this iteration produces. It is what the probe
+		// adoption write persists.
+		var resolvedIdentity virtualProbeIdentity
 		trace.resolveRan = true
 		resolveStart := time.Now()
 		// probedCandidateID is the candidate this iteration asked the resolver
@@ -1973,6 +2019,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if err == nil {
 				streamURL = res.URL
 				cand.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
+				resolvedIdentity = virtualProbeIdentity{
+					VideoHash:   res.ProviderVideoHash,
+					GUID:        res.ProviderGUID,
+					ReleaseName: res.ProviderReleaseName,
+					ReleaseSize: res.ProviderReleaseSize,
+				}
 				resolvedID := res.CandidateID
 				if resolvedID == "" && res.URI != "" {
 					resolvedID = virtualResultCandidateID(res.URI)
@@ -2059,6 +2111,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid
 		}
+		// Carry the resolved candidate's durable identity on the served file
+		// so the probe-evidence adoption persists the identity of the bytes
+		// being adopted. Fill-empty-only: stored tiers are never overwritten.
+		applyResolvedIdentity(&transient, resolvedIdentity)
 		// Recovery coherence. A row the pre-validation gate sent down the
 		// resolve path (active verdict or stale probe) that still resolves to
 		// its own release is healthy again: clear the stale verdict through the
@@ -2320,6 +2376,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				if transient.Duration > 0 && cached.Duration <= 0 {
 					cached.Duration = transient.Duration
 				}
+				applyResolvedIdentity(cached, resolvedIdentity)
 				h.maybeTriggerSubtitleSearch(attemptCtx, cached, cand)
 				return &resolvedVirtualPlaybackSource{
 					URL: streamURL, URI: cand.URI, OwnerID: oid, File: cached, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,
@@ -2350,6 +2407,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			probed.Duration = transient.Duration
 		}
 		mergeVirtualCandidateTracks(probed, cand)
+		applyResolvedIdentity(probed, resolvedIdentity)
 		h.maybeTriggerSubtitleSearch(probeCtx, probed, cand)
 		return &resolvedVirtualPlaybackSource{
 			URL: streamURL, URI: cand.URI, OwnerID: oid, File: probed, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,

@@ -1111,20 +1111,22 @@ func unavailable(what string) *Problem {
 func serviceProblem(err error) *Problem {
 	var problem *Problem
 	if errors.As(err, &problem) {
-		return problem
+		return problem.withCause(err)
 	}
 	var apiErr *handlers.APIError
 	if errors.As(err, &apiErr) {
 		if apiErr.Status >= 500 && apiErr.Status != http.StatusServiceUnavailable {
-			return NewProblem(TypeInternalError, "An unexpected error occurred.")
+			// The generic envelope is deliberate: the underlying cause is
+			// attached for the request log, never the response body.
+			return NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
 		}
 		p := NewProblem(TypeForStatus(apiErr.Status), apiErr.Message)
 		if apiErr.RetryAfter > 0 {
 			p = p.WithRetryAfter(apiErr.RetryAfter)
 		}
-		return p
+		return p.withCause(err)
 	}
-	return NewProblem(TypeInternalError, "An unexpected error occurred.")
+	return NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
 }
 
 // OAuthService is the slice of *auth.OAuthHandler completeOAuthLogin uses.

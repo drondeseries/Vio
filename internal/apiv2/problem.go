@@ -126,6 +126,20 @@ type Problem struct {
 	Errors   []ProblemError `json:"errors,omitempty" doc:"Field-level validation details"`
 
 	headers http.Header
+	// cause is the application error an operation swallowed while building a
+	// safe envelope (see serviceProblem). It is never serialized; the observe
+	// middleware logs it under the request ID so a 500 names its underlying
+	// failure instead of only the generic problem code.
+	cause error
+}
+
+// withCause attaches the underlying application error to a problem. It keeps
+// the first cause so a wrapped/annotated problem cannot replace the original.
+func (p *Problem) withCause(err error) *Problem {
+	if p != nil && err != nil && p.cause == nil {
+		p.cause = err
+	}
+	return p
 }
 
 // NewProblem builds an application problem of type t.
@@ -415,6 +429,13 @@ func installErrorAdapter() {
 		if ctx != nil {
 			requestID = requestIDFrom(ctx.Context())
 			limit = operationBodyLimit(ctx.Operation())
+			// A handler that returned a plain (non-StatusError) error reaches
+			// Huma here, which would otherwise reduce it to the fixed 500
+			// envelope with the cause discarded. Record it so the request log
+			// carries the actual failure under the same request ID.
+			for _, err := range errs {
+				noteOperationError(ctx.Context(), err)
+			}
 		}
 		return fromHumaError(requestID, status, msg, errs, limit)
 	}

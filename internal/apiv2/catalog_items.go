@@ -581,7 +581,7 @@ func (reg *Registry) itemViewer(ctx context.Context, imageSize string, libraryID
 	}
 	filter, err := reg.deps.CatalogAccess.ContextAccessFilter(ctx, opts)
 	if err != nil {
-		return handlers.ItemViewer{}, NewProblem(TypeInternalError, "An unexpected error occurred.")
+		return handlers.ItemViewer{}, NewProblem(TypeInternalError, "An unexpected error occurred.").withCause(err)
 	}
 	size, err := imagesize.Parse(imageSize)
 	if err != nil {
