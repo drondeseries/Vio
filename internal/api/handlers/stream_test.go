@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -1896,5 +1897,43 @@ func TestVerifyVirtualSubtitleLayoutPositiveMismatchForcesReplan(t *testing.T) {
 	proceed, probeErr := handler.verifyVirtualSubtitleLayout(t.Context(), requested, session.VirtualSubtitleTracks, opts)
 	if proceed || probeErr != nil {
 		t.Fatal("a positively different live layout must force a 409 replan")
+	}
+}
+
+// deliverySeamRecorder captures the optional v1 code/cause seam the v2 delivery
+// adapter implements.
+type deliverySeamRecorder struct {
+	http.ResponseWriter
+	code  string
+	cause error
+}
+
+func (s *deliverySeamRecorder) SetPlaybackProblemCode(code string) { s.code = code }
+func (s *deliverySeamRecorder) SetPlaybackProblemCause(err error)  { s.cause = err }
+
+// TestWriteErrorCauseReachesDeliverySeamThroughStreamingWrapper pins that a v1
+// stream handler writing through httpstream.RollingDeadlineWriter still reaches
+// the v2 delivery adapter's code/cause seam: the wrapper exposes only Unwrap,
+// so writeErrorCause must walk it. Without the walk the 502 reaches the request
+// log as the bare status and the underlying stream failure is lost. The
+// response body stays the generic message.
+func TestWriteErrorCauseReachesDeliverySeamThroughStreamingWrapper(t *testing.T) {
+	rec := httptest.NewRecorder()
+	seam := &deliverySeamRecorder{ResponseWriter: rec}
+	wrapped := httpstream.NewRollingDeadlineWriter(seam)
+	cause := errors.New("provider stream dial failed")
+	writeErrorCause(wrapped, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", cause)
+
+	if seam.code != "virtual_stream_unavailable" {
+		t.Fatalf("adapter code = %q, want virtual_stream_unavailable", seam.code)
+	}
+	if !errors.Is(seam.cause, cause) {
+		t.Fatalf("adapter cause = %v, want %v", seam.cause, cause)
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Failed to stream virtual media source") || strings.Contains(rec.Body.String(), cause.Error()) {
+		t.Fatalf("response body = %s", rec.Body.String())
 	}
 }

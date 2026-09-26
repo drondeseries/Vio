@@ -15,6 +15,10 @@ type streamResponseWriter struct {
 	redactHeaders []string
 	status        int
 	rejected      bool
+	// cause is the underlying stream failure the v1 handler handed to the
+	// adapter through SetPlaybackProblemCause. The handler's own body stays
+	// generic, so without it the discard log names only the generic code.
+	cause error
 	// discardLogged guards the single log line for the legacy error body the
 	// adapter replaces with a problem envelope, so a handler that writes it in
 	// pieces does not log it repeatedly.
@@ -68,11 +72,16 @@ func (w *streamResponseWriter) logDiscardedBody(data []byte) {
 		return
 	}
 	w.discardLogged = true
-	slog.ErrorContext(w.request.Context(), "apiv2 raw stream error body discarded",
+	attrs := []any{
 		"component", "apiv2",
 		"request_id", requestIDFrom(w.request.Context()),
 		"status", w.status,
-		"discarded", string(data))
+		"discarded", string(data),
+	}
+	if w.cause != nil {
+		attrs = append(attrs, "cause", w.cause.Error())
+	}
+	slog.ErrorContext(w.request.Context(), "apiv2 raw stream error body discarded", attrs...)
 }
 
 func (w *streamResponseWriter) FlushError() error {

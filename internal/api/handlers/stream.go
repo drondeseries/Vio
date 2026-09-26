@@ -531,13 +531,13 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		// from a recipe whose route was never checked against a clean miss.
 		loadCard = nil
 	}
-	session, status, reconstructed := h.TM.LoadOrReconstructSessionDetail(r.Context(), h.sessionMgr.GetSession, sessionID, userID, loadCard)
+	session, status, reconstructed, sessionErr := h.TM.LoadOrReconstructSessionDetailWithError(r.Context(), h.sessionMgr.GetSession, sessionID, userID, loadCard)
 	switch status {
 	case playback.SessionMissing:
 		writePlaybackSessionNotFound(w)
 		return
 	case playback.SessionLoadFailed:
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load playback session")
+		writeErrorCause(w, http.StatusInternalServerError, "internal_error", "Failed to load playback session", sessionErr)
 		return
 	case playback.SessionForbidden:
 		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
@@ -557,7 +557,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "Media file not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load media file")
+		writeErrorCause(w, http.StatusInternalServerError, "internal_error", "Failed to load media file", err)
 		return
 	}
 	if file == nil {
@@ -643,10 +643,10 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// resolve failure keeps the v1 502 that the v2 byte-delivery
 			// adapter maps to a retryable dependency_unavailable.
 			if errors.Is(resolveErr, errVirtualProviderUnavailable) {
-				writeError(w, http.StatusServiceUnavailable, "provider_unavailable", "The virtual source provider is temporarily unavailable")
+				writeErrorCause(w, http.StatusServiceUnavailable, "provider_unavailable", "The virtual source provider is temporarily unavailable", resolveErr)
 				return
 			}
-			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
+			writeErrorCause(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source", resolveErr)
 			return
 		}
 		inputPath = resolved.URL
@@ -675,7 +675,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				logVirtualStreamFailure(r.Context(), sessionID, file, err)
 				h.handleTransportStartFailure(r.Context(), session, file, err)
-				writeError(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
+				writeErrorCause(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", err)
 				return
 			}
 			// This proxy forwards client headers to the target by design; that
@@ -686,7 +686,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				err := fmt.Errorf("virtual direct-play proxy target %q is not the local relay", targetURL.Host)
 				logVirtualStreamFailure(r.Context(), sessionID, file, err)
 				h.handleTransportStartFailure(r.Context(), session, file, err)
-				writeError(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
+				writeErrorCause(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", err)
 				return
 			}
 			var lastProxyErr error
@@ -767,7 +767,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					h.handleTransportStartFailure(r.Context(), session, file, lastProxyErr)
 					if streamWriter.StatusCode() == 0 {
 						logVirtualStreamFailure(r.Context(), sessionID, file, lastProxyErr)
-						writeError(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
+						writeErrorCause(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source", lastProxyErr)
 					}
 				}
 			}
@@ -927,12 +927,12 @@ func (h *StreamHandler) loadSidecarSession(ctx context.Context, reference, sessi
 	} else if !errors.Is(err, playback.ErrSessionNotFound) {
 		loadCard = nil
 	}
-	session, status, _ := h.TM.LoadOrReconstructSessionDetail(ctx, h.sessionMgr.GetSession, sessionID, userID, loadCard)
+	session, status, _, sessionErr := h.TM.LoadOrReconstructSessionDetailWithError(ctx, h.sessionMgr.GetSession, sessionID, userID, loadCard)
 	switch status {
 	case playback.SessionMissing:
 		return nil, nil, apiError(http.StatusNotFound, playbackSessionNotFoundErrorCode, "Playback session not found")
 	case playback.SessionLoadFailed:
-		return nil, nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to load playback session")
+		return nil, nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to load playback session").WithCause(sessionErr)
 	case playback.SessionForbidden:
 		return nil, nil, apiError(http.StatusForbidden, "forbidden", "Session belongs to another user")
 	case playback.SessionUnauthorized:
@@ -1067,7 +1067,7 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 				"downloaded_subtitle_id", downloadedID,
 				"error", lookupErr,
 			)
-			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load downloaded subtitle")
+			writeErrorCause(w, http.StatusInternalServerError, "internal_error", "Failed to load downloaded subtitle", lookupErr)
 			return
 		}
 		if downloaded == nil || downloaded.MediaFileID != file.ID {
@@ -1099,8 +1099,8 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		if servesOriginalSubRip(r, sub.Format, requestedFormat) {
 			data, err := playback.LoadExternalSubtitleRaw(sub.Path)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, "internal_error",
-					"Failed to load external subtitle")
+				writeErrorCause(w, http.StatusInternalServerError, "internal_error",
+					"Failed to load external subtitle", err)
 				return
 			}
 			serveOriginalSubRip(w, data)
@@ -1109,8 +1109,8 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		if playback.IsASS(sub.Format) && requestedFormat != "vtt" {
 			data, err := playback.LoadExternalSubtitleRaw(sub.Path)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, "internal_error",
-					"Failed to load external subtitle")
+				writeErrorCause(w, http.StatusInternalServerError, "internal_error",
+					"Failed to load external subtitle", err)
 				return
 			}
 			playback.ServeSubtitle(w, data, subtitleFormatASS)
@@ -1119,8 +1119,8 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 
 		vttData, err := playback.LoadExternalSubtitleAsVTT(r.Context(), sub.Path, sub.Format, h.ffmpegPath())
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error",
-				"Failed to load external subtitle")
+			writeErrorCause(w, http.StatusInternalServerError, "internal_error",
+				"Failed to load external subtitle", err)
 			return
 		}
 		playback.ServeSubtitle(w, vttData, "vtt")
@@ -1173,7 +1173,7 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 				"track", trackIndex,
 				"error", err,
 			)
-			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list downloaded subtitles")
+			writeErrorCause(w, http.StatusInternalServerError, "internal_error", "Failed to list downloaded subtitles", err)
 			return
 		}
 
@@ -1199,7 +1199,7 @@ func (h *StreamHandler) serveDownloadedSubtitle(w http.ResponseWriter, r *http.R
 	}
 	data, err := h.SubtitleBlobs.Get(r.Context(), subtitle.S3Key)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "s3_error", "Failed to load subtitle from storage")
+		writeErrorCause(w, http.StatusBadGateway, "s3_error", "Failed to load subtitle from storage", err)
 		return
 	}
 
@@ -1223,7 +1223,7 @@ func (h *StreamHandler) serveDownloadedSubtitle(w http.ResponseWriter, r *http.R
 	// Convert other text formats to VTT using the playback conversion pipeline.
 	vttData, err := playback.ConvertToVTTWithFFmpeg(r.Context(), data, string(subtitle.Format), h.ffmpegPath())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "convert_error", "Failed to convert subtitle")
+		writeErrorCause(w, http.StatusInternalServerError, "convert_error", "Failed to convert subtitle", err)
 		return
 	}
 	playback.ServeSubtitle(w, vttData, "vtt")

@@ -634,10 +634,47 @@ func writeAPIError(w http.ResponseWriter, err error) {
 		if apiErr.RetryAfter > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(apiErr.RetryAfter))
 		}
-		writeError(w, apiErr.Status, apiErr.Code, apiErr.Message)
+		writeErrorCause(w, apiErr.Status, apiErr.Code, apiErr.Message, apiErr.cause)
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "internal_error", "An unexpected error occurred")
+}
+
+// writeErrorCause is writeError plus an out-of-band cause for the request log.
+// The response body stays the generic code and message; when the writer is a
+// v2 byte-delivery adapter, the cause is recorded so the request log and the
+// discarded-body log name the underlying failure. Writers without the optional
+// hook (the v1 listener, test recorders) are unchanged.
+func writeErrorCause(w http.ResponseWriter, status int, code, message string, cause error) {
+	if cause != nil {
+		if recorder, ok := playbackProblemRecorder(w).(interface{ SetPlaybackProblemCause(error) }); ok {
+			recorder.SetPlaybackProblemCause(cause)
+		}
+	}
+	writeError(w, status, code, message)
+}
+
+// playbackProblemRecorder finds the optional v2 byte-delivery seam on w or, for
+// a streaming wrapper such as httpstream.RollingDeadlineWriter, on the writer
+// it unwraps. The seam carries the v1 machine-readable code and the underlying
+// cause, which the adapter cannot read from the discarded generic body. Returns
+// nil when no writer in the chain implements the seam.
+func playbackProblemRecorder(w http.ResponseWriter) any {
+	for w != nil {
+		if _, ok := w.(interface{ SetPlaybackProblemCode(string) }); ok {
+			return w
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return nil
+		}
+		next := unwrapper.Unwrap()
+		if next == w {
+			return nil
+		}
+		w = next
+	}
+	return nil
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
@@ -645,7 +682,7 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	// Details envelope from the status alone. Record the machine-readable code
 	// so it can keep a semantic type (e.g. provider_unavailable) that the bare
 	// status cannot express. Every other writer ignores the optional method.
-	if recorder, ok := w.(interface{ SetPlaybackProblemCode(string) }); ok {
+	if recorder, ok := playbackProblemRecorder(w).(interface{ SetPlaybackProblemCode(string) }); ok {
 		recorder.SetPlaybackProblemCode(code)
 	}
 	writeJSON(w, status, errorResponse{
