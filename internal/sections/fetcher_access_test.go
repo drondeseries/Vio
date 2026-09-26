@@ -70,6 +70,37 @@ func TestApplyEpisodeTargetLibraryAccessRejectsAnyDisabledSeriesMembership(t *te
 	}
 }
 
+func TestApplyEpisodeTargetLibraryAccessRequiresMembershipWhenUnrestricted(t *testing.T) {
+	var conditions []string
+	var args []any
+	argIdx := 1
+
+	ok := applyEpisodeTargetLibraryAccess(
+		catalog.AccessFilter{},
+		nil,
+		nil,
+		&conditions,
+		&args,
+		&argIdx,
+	)
+	if !ok {
+		t.Fatal("unrestricted access unexpectedly returned an empty scope")
+	}
+
+	where := strings.Join(conditions, " AND ")
+	if !strings.Contains(where, "EXISTS (SELECT 1 FROM media_item_libraries mil_scope_any WHERE mil_scope_any.content_id = si.content_id)") {
+		t.Fatalf("unrestricted episode hydration must require series membership, got %s", where)
+	}
+}
+
+func TestBuildLibraryScopeRequiresMembershipWhenUnrestricted(t *testing.T) {
+	_, conditions, _, _ := buildLibraryScope(nil, nil, nil, nil, 1)
+	where := strings.Join(conditions, " AND ")
+	if !strings.Contains(where, "EXISTS (SELECT 1 FROM media_item_libraries mil_scope_any WHERE mil_scope_any.content_id = mi.content_id)") {
+		t.Fatalf("unrestricted home scope must require library membership, got %s", where)
+	}
+}
+
 func TestApplyEpisodeTargetLibraryAccessComposesAllowedAndDisabledMembership(t *testing.T) {
 	var conditions []string
 	var args []any

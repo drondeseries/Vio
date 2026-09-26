@@ -224,12 +224,27 @@ type VirtualPurgeOptions struct {
 
 // VirtualPurgeResult reports what one purge pass removed. StateRowsDeleted
 // counts per-user consumption rows (watch progress, history, favorites,
-// ratings, watchlist, hidden-history bookkeeping) plus metadata-debt and
-// plugin stream-metadata rows whose content no longer exists.
+// ratings, watchlist, hidden-history bookkeeping), metadata-debt and
+// plugin stream-metadata rows, and orphaned episode/season metadata whose
+// content no longer exists.
+// CollectionsPruned counts dangling collection links removed plus distinct
+// recommendation cache rows affected (malformed rows evicted, pre-existing
+// empty rows removed, rows pruned). Each affected row counts exactly once
+// on the statement that removes or rewrites it; rows the prune empties are
+// counted once on update and removed without an additional count.
+//
+// Dry-run previews FilesDeleted and ItemsDeleted only; the state and
+// collection sweeps are commit-time cleanup and are reported as zero in
+// dry-run results (not estimated).
 type VirtualPurgeResult struct {
-	FilesDeleted     int64
-	ItemsDeleted     int64
-	StateRowsDeleted int64
+	FilesDeleted      int64
+	ItemsDeleted      int64
+	StateRowsDeleted  int64
+	CollectionsPruned int64
+	// PurgeRevision is the shared catalog_purge_revision value committed by
+	// this purge (0 on dry-run, which changes nothing). Callers carry it on
+	// the fan-out event so other replicas can reconcile by revision.
+	PurgeRevision int64
 }
 
 // PurgeVirtualPlaybackItems removes zero-storage virtual files and any
@@ -470,6 +485,10 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 	}
 	result.ItemsDeleted = int64(len(deletedIDs))
 	if opts.DryRun {
+		// Dry-run previews catalog deletions only; the state and collection
+		// sweeps below are commit-time cleanup and are intentionally not
+		// counted here (they would require read-only COUNT queries to
+		// preview). See VirtualPurgeResult.
 		return result, nil
 	}
 	// Remove orphaned library memberships: items that have no files and no
@@ -519,14 +538,115 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 		result.StateRowsDeleted += stateResult.RowsAffected()
 	}
 
-	if _, err := tx.Exec(ctx, `
+	pruneResult, err := tx.Exec(ctx, `
 		DELETE FROM library_collection_items lci
-		WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = lci.media_item_id)`); err != nil {
+		WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = lci.media_item_id)`)
+	if err != nil {
 		return result, fmt.Errorf("clean virtual collection links: %w", err)
+	}
+	result.CollectionsPruned += pruneResult.RowsAffected()
+	// Links in personal (per-user) collections have no foreign key to
+	// media_items, so the orphan delete above cannot reach them. A purged
+	// title must not linger on a Home collection rail via a dangling
+	// personal-collection reference. Links to surviving (physical) items
+	// are intentionally kept.
+	pruneResult, err = tx.Exec(ctx, `
+		DELETE FROM user_personal_collection_items upci
+		WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = upci.media_item_id)`)
+	if err != nil {
+		return result, fmt.Errorf("clean virtual personal collection links: %w", err)
+	}
+	result.CollectionsPruned += pruneResult.RowsAffected()
+	// Recommendation rows cache item IDs as JSONB with no foreign key, and
+	// their cleanup is otherwise expiry-only. Drop cache rows whose source
+	// item is gone and prune purged IDs out of surviving rows so Home
+	// recommendation rails cannot serve ghosts.
+	recResult, err := tx.Exec(ctx, `
+		DELETE FROM recommendation_cache rc
+		WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = rc.source_item_id)`)
+	if err != nil {
+		return result, fmt.Errorf("clean virtual recommendation sources: %w", err)
+	}
+	result.CollectionsPruned += recResult.RowsAffected()
+	// Evict malformed cache rows (items not a JSON array — NULL, object,
+	// scalar) before pruning. jsonb_array_elements errors on non-arrays,
+	// which would abort the purge transaction; these derived rows are not
+	// worth keeping.
+	if len(deletedIDs) > 0 {
+		malformedResult, err := tx.Exec(ctx, `
+			DELETE FROM recommendation_cache rc
+			WHERE jsonb_typeof(rc.items) IS DISTINCT FROM 'array'`)
+		if err != nil {
+			return result, fmt.Errorf("evict malformed recommendation rows: %w", err)
+		}
+		result.CollectionsPruned += malformedResult.RowsAffected()
+		// Remove pre-existing empty rows first so the prune below only
+		// touches rows that reference a purged ID; every row the UPDATE
+		// touches is then attributable to this purge.
+		preEmptied, err := tx.Exec(ctx, `
+			DELETE FROM recommendation_cache rc
+			WHERE rc.items = '[]'::jsonb`)
+		if err != nil {
+			return result, fmt.Errorf("clean pre-existing empty recommendation rows: %w", err)
+		}
+		result.CollectionsPruned += preEmptied.RowsAffected()
+		// Both array expansions substitute an empty array for non-arrays via
+		// CASE, so each is intrinsically safe regardless of predicate
+		// evaluation order: a concurrent writer inserting a non-array row
+		// mid-purge can neither abort the transaction (jsonb_array_elements
+		// errors on non-arrays) nor be miscounted. Only rows the UPDATE
+		// touches are counted; rows it empties are removed below without an
+		// additional count.
+		prunedRows, err := tx.Exec(ctx, `
+			UPDATE recommendation_cache rc
+			SET items = (
+				SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)
+				FROM jsonb_array_elements(CASE WHEN jsonb_typeof(rc.items) = 'array' THEN rc.items ELSE '[]'::jsonb END) AS elem
+				WHERE elem ->> 'media_item_id' <> ALL($1::text[])
+			)
+			WHERE EXISTS (
+				SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(rc.items) = 'array' THEN rc.items ELSE '[]'::jsonb END) AS elem
+				WHERE elem ->> 'media_item_id' = ANY($1::text[])
+			)`,
+			deletedIDs)
+		if err != nil {
+			return result, fmt.Errorf("prune virtual recommendation items: %w", err)
+		}
+		result.CollectionsPruned += prunedRows.RowsAffected()
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM recommendation_cache rc
+			WHERE jsonb_typeof(rc.items) = 'array' AND rc.items = '[]'::jsonb`); err != nil {
+			return result, fmt.Errorf("clean emptied recommendation rows: %w", err)
+		}
+	}
+	// Defensive orphan sweep: episodes and seasons normally cascade when
+	// their series media_items row is deleted. This heals residue from
+	// earlier partial removals. Rows belonging to a retained series (mixed
+	// local+virtual, or a library-scoped purge) are never touched: file-less
+	// episode metadata can be legitimate.
+	for _, stmt := range []string{
+		`DELETE FROM episodes ep WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = ep.series_id)`,
+		`DELETE FROM seasons s WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = s.series_id)`,
+	} {
+		orphanResult, err := tx.Exec(ctx, stmt)
+		if err != nil {
+			return result, fmt.Errorf("purge orphaned virtual episode rows: %w", err)
+		}
+		result.StateRowsDeleted += orphanResult.RowsAffected()
+	}
+	// Persist the purge revision transactionally with the deletion so other
+	// API replicas can reconcile via the shared revision even if the
+	// pub/sub event is lost. The revision is bumped once per committed purge.
+	// The new value is returned so callers can carry it on the event payload.
+	var newRevision int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE catalog_purge_revision SET revision = revision + 1, updated_at = NOW() WHERE id = 1 RETURNING revision`).Scan(&newRevision); err != nil {
+		return result, fmt.Errorf("bump purge revision: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return result, fmt.Errorf("commit virtual playback purge: %w", err)
 	}
+	result.PurgeRevision = newRevision
 	return result, nil
 }
 
