@@ -213,9 +213,10 @@ func playbackSubtitleFontProblem(err error) *Problem {
 // commitment, so the code is captured out of band.
 type playbackDeliveryWriter struct {
 	http.ResponseWriter
-	request     *http.Request
-	inner       *streamResponseWriter
-	problemCode string
+	request      *http.Request
+	inner        *streamResponseWriter
+	problemCode  string
+	problemCause error
 }
 
 // SetPlaybackProblemCode records the v1 error code for the next pre-body
@@ -226,11 +227,22 @@ func (w *playbackDeliveryWriter) SetPlaybackProblemCode(code string) {
 	}
 }
 
+// SetPlaybackProblemCause records the underlying stream failure behind the v1
+// handler's generic error body, so the request log and the discarded-body log
+// name it. Like SetPlaybackProblemCode the cause is carried out of band and
+// never reaches the response body. It is a no-op after the response is
+// committed.
+func (w *playbackDeliveryWriter) SetPlaybackProblemCause(err error) {
+	if w.problemCause == nil {
+		w.problemCause = err
+	}
+}
+
 func (w *playbackDeliveryWriter) transport() *streamResponseWriter {
 	if w.inner == nil {
 		w.inner = &streamResponseWriter{ResponseWriter: w.ResponseWriter, request: w.request, problemType: func(status int) ProblemType {
 			return playbackDeliveryProblemType(status, w.problemCode)
-		}, redactHeaders: []string{playbackContentLength, playbackContentEncoding, directDisposition, jobLocationHeader, etagField, playbackLastModified}}
+		}, redactHeaders: []string{playbackContentLength, playbackContentEncoding, directDisposition, jobLocationHeader, etagField, playbackLastModified}, cause: w.problemCause}
 	}
 	return w.inner
 }
@@ -275,7 +287,11 @@ func (w *playbackDeliveryWriter) WriteHeader(status int) {
 		if code == "" {
 			code = TypeInternalError.ID
 		}
-		noteOperationError(w.request.Context(), fmt.Errorf("playback delivery failed: status=%d code=%s", status, code))
+		message := fmt.Sprintf("playback delivery failed: status=%d code=%s", status, code)
+		if w.problemCause != nil {
+			message = fmt.Sprintf("%s: %v", message, w.problemCause)
+		}
+		noteOperationError(w.request.Context(), errors.New(message))
 	}
 	w.transport().WriteHeader(status)
 }

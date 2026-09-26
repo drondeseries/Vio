@@ -686,6 +686,19 @@ func (s *Service) ResolveDetailed(
 		}
 	}
 
+	// The session's own pin (preferredCandidateID) can itself be listed while
+	// the probed result id is absent and keeper-remaps to a surviving keeper of
+	// another release. The session binding is satisfiable by its own live pin,
+	// so serve that pin instead of refusing: rotation was not requested, and a
+	// still-listed release must not fail the restart. A pin reachable only
+	// through the keeper map (a collapsed variant) keeps the refusal below, so
+	// a collapsed session pin under a different release is never swapped in
+	// silently.
+	if !allowSubstitution && effectiveResultID != "" && effectiveResultID != effectivePreferredID &&
+		preferredCandidateID != "" && candidateIDPresent(candidates, preferredCandidateID) {
+		effectiveResultID = effectivePreferredID
+	}
+
 	// Only an indicted candidate is refused when substitution is disallowed: an
 	// explicit exclusion, a collapsed-keeper exclusion, or a confirmed decode
 	// rejection. All three arrive through excludedCandidateIDs. A profile
@@ -704,8 +717,11 @@ func (s *Service) ResolveDetailed(
 	// handler probes candidates by URI, so resultID is the probed candidate and
 	// the session pin arrives only as preferredCandidateID; without this guard a
 	// present resultID for a different release wins and swaps the release under
-	// the session binding even though substitution was refused. When
-	// substitution is allowed the explicit resultID still wins.
+	// the session binding even though substitution was refused. A directly
+	// listed pin was already normalized to above, so this covers the remaining
+	// case: a pin reachable only through the keeper map (its variant collapsed)
+	// while a present resultID names a different release. When substitution is
+	// allowed the explicit resultID still wins.
 	if !allowSubstitution && sessionReleaseResolvable && effectiveResultID != "" && effectiveResultID != effectivePreferredID {
 		return ResolvedVirtualStream{}, fmt.Errorf(
 			"session-bound virtual candidate %q does not match resolved candidate %q and candidate rotation was not requested",

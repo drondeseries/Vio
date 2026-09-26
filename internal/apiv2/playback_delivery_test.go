@@ -125,6 +125,34 @@ func TestPlaybackDeliveryProviderUnavailableProblem(t *testing.T) {
 	}
 }
 
+// TestPlaybackDeliveryNamesStreamFailureCause pins the cause seam: a v1 stream
+// handler that records the underlying failure through SetPlaybackProblemCause
+// has it named in the request log and the discarded-body log, while the client
+// only sees the generic problem envelope. Without the seam the 502 reaches the
+// log as the bare virtual_stream_unavailable code.
+func TestPlaybackDeliveryNamesStreamFailureCause(t *testing.T) {
+	buf := captureLogs(t)
+	deps, _ := catalogDeps(t)
+	deps.PlaybackMedia = &PlaybackMediaHandlers{Original: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if recorder, ok := w.(interface{ SetPlaybackProblemCause(error) }); ok {
+			recorder.SetPlaybackProblemCause(errors.New("PRIVATE_STREAM_CAUSE"))
+		}
+		if recorder, ok := w.(interface{ SetPlaybackProblemCode(string) }); ok {
+			recorder.SetPlaybackProblemCode("virtual_stream_unavailable")
+		}
+		http.Error(w, `{"error":"virtual_stream_unavailable","message":"Failed to stream virtual media source"}`, http.StatusBadGateway)
+	})}
+	h := newTestHandler(t, deps)
+	rec := do(t, h, http.MethodGet, Prefix+"/stream/"+deliveryTestSession+"?st=opaque", "", viewerHeaders())
+	requireProblem(t, rec, TypeDependencyUnavailable)
+	if strings.Contains(rec.Body.String(), "PRIVATE_STREAM_CAUSE") {
+		t.Fatalf("cause leaked to the response body: %s", rec.Body.String())
+	}
+	if line := buf.String(); !strings.Contains(line, "PRIVATE_STREAM_CAUSE") || !strings.Contains(line, "virtual_stream_unavailable") {
+		t.Fatalf("log does not name the stream failure: %s", line)
+	}
+}
+
 func TestPlaybackDeliveryFailureAfterBytesAborts(t *testing.T) {
 	w := httptest.NewRecorder()
 	writer := &playbackDeliveryWriter{ResponseWriter: w, request: httptest.NewRequest(http.MethodGet, "/", nil)}

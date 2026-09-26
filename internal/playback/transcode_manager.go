@@ -445,23 +445,33 @@ func (m *TranscodeManager) LoadOrReconstructSession(ctx context.Context, getSess
 	return session, status
 }
 
-// LoadOrReconstructSessionDetail is LoadOrReconstructSession plus whether the
-// session it returned was rebuilt from the card rather than found live.
+// LoadOrReconstructSessionDetail is LoadOrReconstructSessionDetailWithError
+// with the underlying failure dropped, for callers that render the status only.
+func (m *TranscodeManager) LoadOrReconstructSessionDetail(ctx context.Context, getSession func(string) (*Session, error), sessionID string, requestUserID int, card *RecipeCard) (*Session, SessionLoadStatus, bool) {
+	session, status, reconstructed, _ := m.LoadOrReconstructSessionDetailWithError(ctx, getSession, sessionID, requestUserID, card)
+	return session, status, reconstructed
+}
+
+// LoadOrReconstructSessionDetailWithError is LoadOrReconstructSession plus
+// whether the session it returned was rebuilt from the card rather than found
+// live, and the backend error behind SessionLoadFailed. A serve handler needs
+// the error so its request log names the cause while its response body stays
+// generic.
 //
 // A handler needs the distinction when the card pins a route that may have been
 // withdrawn since it was signed: a live session was already re-decided by
 // whatever withdrew it, while a reconstruction replays the recipe verbatim and
 // has to re-check it. See the copy-safety refusal on the stream serve path.
-func (m *TranscodeManager) LoadOrReconstructSessionDetail(ctx context.Context, getSession func(string) (*Session, error), sessionID string, requestUserID int, card *RecipeCard) (*Session, SessionLoadStatus, bool) {
+func (m *TranscodeManager) LoadOrReconstructSessionDetailWithError(ctx context.Context, getSession func(string) (*Session, error), sessionID string, requestUserID int, card *RecipeCard) (*Session, SessionLoadStatus, bool, error) {
 	session, err := getSession(sessionID)
 	if err != nil {
 		if !errors.Is(err, ErrSessionNotFound) {
-			return nil, SessionLoadFailed, false
+			return nil, SessionLoadFailed, false, err
 		}
 		// A nil manager (documented optional on StreamHandler) cannot reconstruct,
 		// so a missing session is simply not-found rather than a panic.
 		if m == nil || card == nil {
-			return nil, SessionMissing, false
+			return nil, SessionMissing, false, nil
 		}
 		// Lost the in-memory session (e.g. restart): rebuild it from the token's
 		// recipe. ReconstructSession re-binds the session to the card owner and
@@ -469,9 +479,9 @@ func (m *TranscodeManager) LoadOrReconstructSessionDetail(ctx context.Context, g
 		// the authless bearer routes), so a nil result here is a genuine not-found.
 		session = m.ReconstructSession(ctx, sessionID, requestUserID, *card)
 		if session == nil {
-			return nil, SessionMissing, false
+			return nil, SessionMissing, false, nil
 		}
-		return session, SessionLoaded, true
+		return session, SessionLoaded, true, nil
 	}
 	// Live session: enforce the existing ownership check. A zero caller is
 	// allowed (these routes treat the session UUID as a bearer when auth is
@@ -484,12 +494,12 @@ func (m *TranscodeManager) LoadOrReconstructSessionDetail(ctx context.Context, g
 	// negotiated the mode (legacy v3 and jellycompat alike) keep the bearer
 	// behavior unchanged.
 	if requestUserID == 0 && session.RequireMediaAuthorization {
-		return nil, SessionUnauthorized, false
+		return nil, SessionUnauthorized, false, nil
 	}
 	if requestUserID != 0 && session.UserID != requestUserID {
-		return nil, SessionForbidden, false
+		return nil, SessionForbidden, false, nil
 	}
-	return session, SessionLoaded, false
+	return session, SessionLoaded, false, nil
 }
 
 type transcodeLoadResult struct {
