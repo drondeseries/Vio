@@ -111,6 +111,11 @@ type observation struct {
 	errorCode   string
 	authClass   string
 	userID      *int
+	// operationError is the application error a handler returned, captured
+	// before Huma converts it to a problem envelope. It is what the request log
+	// reports, so a 500 names its underlying cause under the same request_id
+	// instead of discarding it.
+	operationError error
 	// clientName and clientVersion are the clamped X-Silo-Client identity,
 	// read once when the request arrives.
 	clientName    string
@@ -122,6 +127,18 @@ type observationKey struct{}
 func observationFrom(ctx context.Context) *observation {
 	o, _ := ctx.Value(observationKey{}).(*observation)
 	return o
+}
+
+// noteOperationError records the application error an operation returned. It
+// only keeps the first error, so a wrapped/handler-level capture cannot be
+// overwritten by a later conversion.
+func noteOperationError(ctx context.Context, err error) {
+	if err == nil {
+		return
+	}
+	if o := observationFrom(ctx); o != nil && o.operationError == nil {
+		o.operationError = err
+	}
 }
 
 // observedClientName is the clamped X-Silo-Client name the observe middleware
@@ -241,6 +258,16 @@ func report(r *http.Request, o *observation, status int, hijacked bool, elapsed 
 	if o.userID != nil {
 		attrs = append(attrs, "user_id", *o.userID)
 	}
+	if o.operationError != nil {
+		// The underlying application error is logged under the same request_id
+		// as the response, so a 500 (or a converted 408) names its cause
+		// instead of leaving only the generic problem code.
+		attrs = append(attrs, "error", o.operationError.Error())
+	}
+	if status >= 500 {
+		slog.ErrorContext(r.Context(), "apiv2 request", attrs...)
+		return
+	}
 	slog.InfoContext(r.Context(), "apiv2 request", attrs...)
 }
 
@@ -356,9 +383,13 @@ func authClassFor(claims *auth.Claims) string {
 }
 
 // noteProblem records the problem type identifier for the metric and log
-// labels. The identifier is the catalog's, never client input.
+// labels. The identifier is the catalog's, never client input. When the
+// envelope was built from a masked application error (serviceProblem), the
+// cause is recorded too so the request log names the underlying failure under
+// the same request ID.
 func noteProblem(ctx context.Context, p *Problem) {
 	if o := observationFrom(ctx); o != nil && p != nil {
 		o.errorCode = strings.TrimPrefix(p.Type, ProblemTypeOrigin)
+		noteOperationError(ctx, p.cause)
 	}
 }
