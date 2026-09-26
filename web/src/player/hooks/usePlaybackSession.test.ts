@@ -2790,6 +2790,97 @@ describe("usePlaybackSession plan audio inventory", () => {
     expect(result.current.planAudioTracks).toEqual(planAudioTracks);
     unmount();
   });
+
+  it("replaces the inventory when the poll resolved a different file", async () => {
+    const planAudioTracks = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+      { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+    ];
+    // The plan names the collapsed row (7); the poll resolved the effective
+    // candidate (8), whose probed inventory is poorer but authoritative for the
+    // file actually playing.
+    const poorerCandidateInventory = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              audio_tracks: planAudioTracks,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.applyAudioInventory(poorerCandidateInventory, 8));
+
+    expect(result.current.planAudioTracks).toEqual(poorerCandidateInventory);
+    unmount();
+  });
+
+  it("keeps the superset guard when the poll names the plan's own file", async () => {
+    const planAudioTracks = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+      { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              audio_tracks: planAudioTracks,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() =>
+      result.current.applyAudioInventory(
+        [{ codec: "eac3", channels: 6, layout: "5.1", language: "eng" }],
+        7,
+      ),
+    );
+
+    expect(result.current.planAudioTracks).toEqual(planAudioTracks);
+    unmount();
+  });
 });
 
 describe("usePlaybackSession effective virtual source", () => {

@@ -178,10 +178,13 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * inventory the server had then. Polling the catalog later can reveal the
    * file's real tracks; this adopts them for rendering only. It never bumps
    * `planRevision`/`transportRevision`, so the stream is not reloaded, and the
-   * plan stays the source of truth: a request no richer than the plan's current
-   * inventory is ignored.
+   * plan stays the source of truth: for the file the plan already names, a
+   * request no richer than the current inventory is ignored. When `fileId`
+   * names a different file — a poll that resolved the effective virtual
+   * candidate while the plan still names the collapsed row — the inventory is
+   * for another target and replaces the menu wholesale.
    */
-  applyAudioInventory: (tracks: PlayerAudioTrack[]) => void;
+  applyAudioInventory: (tracks: PlayerAudioTrack[], fileId?: number | null) => void;
   /** Keeps transport state current for output-capability replans. */
   updatePlaybackState: (positionSeconds: number, playing: boolean) => void;
   /**
@@ -1605,16 +1608,20 @@ export function usePlaybackSession(
   /**
    * Fills in a richer probed audio inventory discovered after the plan landed.
    *
-   * Only a strict superset is accepted: once the plan carries a full inventory
-   * it stays authoritative, so a poorer catalog row (for example the requested
-   * version after the server fell back to another) never overwrites it. The plan
-   * object and its revisions are untouched, so menus re-render while the
-   * transport keeps playing.
+   * For the file the plan already names, only a strict superset is accepted:
+   * once the plan carries a full inventory it stays authoritative, so a poorer
+   * catalog row never overwrites it. When `fileId` names another file (a poll
+   * that resolved the effective virtual candidate while the plan names the
+   * collapsed row) the inventory belongs to a different target, so it replaces
+   * the menu even when it is not larger — the superset guard is only for
+   * same-file refreshes. The plan object and its revisions are untouched, so
+   * menus re-render while the transport keeps playing.
    */
-  const applyAudioInventory = useCallback((tracks: PlayerAudioTrack[]) => {
+  const applyAudioInventory = useCallback((tracks: PlayerAudioTrack[], fileId?: number | null) => {
     if (tracks.length === 0) return;
     setState((current) => {
-      if (tracks.length <= current.planAudioTracks.length) return current;
+      const sameFile = fileId == null || fileId === current.mediaFileId;
+      if (sameFile && tracks.length <= current.planAudioTracks.length) return current;
       return { ...current, planAudioTracks: tracks.map((track) => ({ ...track })) };
     });
   }, []);
