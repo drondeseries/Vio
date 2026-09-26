@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -158,7 +159,53 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	}
 	opts.CanonicalInputPath = canonicalPath
 	opts.VirtualSourceOwnerInstallationID = ownerInstallationID
+	// pinnedRelay is the concrete relay URL the session's generation currently
+	// serves. An in-place segment restart reuses it without a provider call:
+	// the URL names the exact candidate the session is bound to, and the relay
+	// entry lives for the session's lifetime, so re-resolving and re-registering
+	// it on every random seek only adds provider latency (#158). The fast path
+	// is scoped to a configured relay: without one there is no pinned transport
+	// to reuse and the stored-URL/rotation path below is unchanged, so the
+	// no-relay tests and callers keep their behavior. The mutex makes the read
+	// and the clear safe across concurrent restart callers; the resolve path
+	// below runs outside the lock because it performs provider I/O and can take
+	// seconds.
+	var pinnedRelayMu sync.Mutex
+	pinnedRelayURL := ""
+	pinnedRelayIdentity := ""
+	relayConfigured := h.RemoteStreamRelay != nil
+	setPinnedRelay := func(res ResolvedVirtualMedia) {
+		if !relayConfigured {
+			return
+		}
+		pinnedRelayMu.Lock()
+		pinnedRelayURL = res.URL
+		pinnedRelayIdentity = res.URI
+		pinnedRelayMu.Unlock()
+	}
+	clearPinnedRelay := func() {
+		pinnedRelayMu.Lock()
+		pinnedRelayURL = ""
+		pinnedRelayIdentity = ""
+		pinnedRelayMu.Unlock()
+	}
 	opts.RefreshInput = func(refreshCtx context.Context) (string, func(), error) {
+		// Reuse the pinned relay first. This is what keeps an in-place segment
+		// restart off the provider: the URL the session already holds is the
+		// exact candidate it is bound to, and the relay entry lives for the
+		// session's lifetime, so re-registering the same upstream URL every
+		// restart only adds provider latency to each random seek (#158). A
+		// restart that previously failed to re-establish its input cleared the
+		// pin below, so reuse is never attempted for a relay already known bad.
+		pinnedRelayMu.Lock()
+		pinnedURL, pinnedURI := pinnedRelayURL, pinnedRelayIdentity
+		pinnedRelayMu.Unlock()
+		if trimmed := strings.TrimSpace(pinnedURL); trimmed != "" {
+			slog.InfoContext(refreshCtx, "virtual transport restart reused the pinned relay without a provider call",
+				"component", "api", "session_anchor", canonicalPath,
+				"status", "reused", "virtual_uri", pinnedURI)
+			return trimmed, nil, nil
+		}
 		// A restart renews the exact candidate pinned to this session, never a
 		// provider-neutral re-selection: re-resolving through the neutral path
 		// can silently swap to a differently-ranked candidate mid-stream. The
@@ -180,6 +227,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			userID, profileID, false, nil, "",
 		)
 		if err == nil {
+			setPinnedRelay(res)
 			return res.URL, cleanup, nil
 		}
 		// The stored path failed. Retry once with a fresh relist and rotation
@@ -199,6 +247,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			userID, profileID, true, excluded, "", true,
 		)
 		if rotateErr != nil {
+			clearPinnedRelay()
 			return rotated.URL, rotatedCleanup, rotateErr
 		}
 		if !rotated.IdentityRematched && !resolvedMatchesPersistedIdentity(rotated, file) {
@@ -209,12 +258,14 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				"component", "api", "session_anchor", canonicalPath,
 				"status", "rotation_refused", "old_candidate_id", pinnedID,
 				"new_candidate_id", virtualResultCandidateID(rotated.URI))
+			clearPinnedRelay()
 			return "", nil, err
 		}
 		slog.InfoContext(refreshCtx, "virtual transport restart rotated an absent session-bound candidate",
 			"component", "api", "session_anchor", canonicalPath,
 			"status", "rotated", "old_candidate_id", pinnedID,
 			"new_candidate_id", virtualResultCandidateID(rotated.URI), "virtual_uri", rotated.URI)
+		setPinnedRelay(rotated)
 		return rotated.URL, rotatedCleanup, nil
 	}
 	var lastErr error
@@ -377,7 +428,12 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				if file != nil {
 					file.FilePath = winningURI
 				}
-				// Transport successfully ready. If this was a fallback attempt from a dead pin,
+				// Transport successfully ready. Record the winning relay as the
+				// session's pinned input so an in-place restart reuses it without
+				// re-resolving the provider. On a fallback the winning candidate
+				// is the one the attempts above accepted, so the pin follows it.
+				setPinnedRelay(ResolvedVirtualMedia{URL: resolvedMedia.URL, URI: winningURI})
+				// If this was a fallback attempt from a dead pin,
 				// update the persisted pin compare-and-swap so future sessions use the live source.
 				if replacer, ok := h.fileResolver.(interface {
 					ReplaceVirtualResultPin(context.Context, int, string, string) (bool, error)

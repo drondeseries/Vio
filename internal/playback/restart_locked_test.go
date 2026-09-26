@@ -332,3 +332,60 @@ exec sleep 30
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// TestRestartKeepsInputWhenRefreshReturnsSamePath proves an in-place restart
+// whose refresh hands back the pinned input does not release the existing
+// cleanup. Reuse semantics (#158) depend on this: the cleanup releases the very
+// relay the replacement generation opens, so releasing it would delete the
+// transport out from under the restart.
+func TestRestartKeepsInputWhenRefreshReturnsSamePath(t *testing.T) {
+	const pinnedInput = "/relay/source/pinned-token/movie.mp4"
+	var releases int
+	s := newFakeFFmpegSession(t)
+	s.opts.InputPath = pinnedInput
+	s.opts.InputCleanup = func() { releases++ }
+	s.opts.RefreshInput = func(context.Context) (string, func(), error) {
+		// Reuse: same path, no new cleanup.
+		return pinnedInput, nil, nil
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.Restart(context.Background(), 12, 3); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if releases != 0 {
+		t.Fatalf("input cleanup ran %d times, want 0 (reuse must keep the pinned relay)", releases)
+	}
+	if got := s.Opts().InputPath; got != pinnedInput {
+		t.Fatalf("InputPath = %q, want the unchanged pinned input %q", got, pinnedInput)
+	}
+}
+
+// TestRestartReleasesPreviousInputOnNewPath proves a refresh that supplies a
+// genuinely new input still releases the previous cleanup, so a rotated relay
+// does not leak.
+func TestRestartReleasesPreviousInputOnNewPath(t *testing.T) {
+	const newInput = "/relay/source/new-token/movie.mp4"
+	var releases int
+	s := newFakeFFmpegSession(t)
+	s.opts.InputPath = "/relay/source/old-token/movie.mp4"
+	s.opts.InputCleanup = func() { releases++ }
+	var newReleases int
+	s.opts.RefreshInput = func(context.Context) (string, func(), error) {
+		return newInput, func() { newReleases++ }, nil
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.Restart(context.Background(), 12, 3); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if releases != 1 {
+		t.Fatalf("old input cleanup ran %d times, want 1", releases)
+	}
+	if got := s.Opts().InputPath; got != newInput {
+		t.Fatalf("InputPath = %q, want the refreshed input %q", got, newInput)
+	}
+	if newReleases != 0 {
+		t.Fatalf("new input cleanup ran %d times before session close, want 0", newReleases)
+	}
+}

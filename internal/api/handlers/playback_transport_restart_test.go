@@ -3,11 +3,16 @@ package handlers
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
 
@@ -212,5 +217,140 @@ func TestVirtualTransportRestartRefusesSiblingRelease(t *testing.T) {
 	_, _, err = session.Opts().RefreshInput(context.Background())
 	if !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
 		t.Fatalf("RefreshInput err = %v, want the absent-pin cause, not a silent sibling restart", err)
+	}
+}
+
+// TestVirtualTransportRestartReusesPinnedRelay proves the #158 fast path: once a
+// virtual session owns a registered relay, an in-place segment restart renews
+// its input from that pinned relay without any provider call. Before the fix
+// every mid-session restart re-listed the provider and re-registered a new
+// relay, so each random seek paid a provider round trip and hung past 2s.
+func TestVirtualTransportRestartReusesPinnedRelay(t *testing.T) {
+	tempDir := t.TempDir()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("pinned-media"))
+	}))
+	defer upstream.Close()
+
+	neutral := "virtual://movie/tt-relay-reuse"
+	pinned := neutral + "?result=pinned"
+	row := &models.MediaFile{
+		ID:                         94,
+		ContentID:                  "movie-relay-reuse",
+		FilePath:                   pinned,
+		VirtualOwnerInstallationID: 5,
+		ProviderVideoHash:          "hash-a",
+		ProviderReleaseName:        "Movie.2024",
+	}
+	var calls int32
+	h := &PlaybackHandler{
+		fileResolver: &fakePinFileResolver{file: row},
+		sessionMgr:   playback.NewSessionManager(0, 0),
+		RemoteStreamRelay: func() *remotestream.Relay {
+			r := remotestream.NewRelay()
+			t.Cleanup(func() { _ = r.Close(context.Background()) })
+			return r
+		}(),
+		AllowPrivateStreams: func(int) bool { return true },
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			atomic.AddInt32(&calls, 1)
+			return ResolvedVirtualMedia{URL: upstream.URL + "/provider/pinned.mp4", URI: uri, CandidateID: "pinned"}, nil
+		}),
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			opts.OutputDir = tempDir
+			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
+	}
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      94,
+		InputPath:                        pinned,
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "restart-relay-reuse",
+		OutputDir:                        tempDir,
+	}
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	startupCalls := atomic.LoadInt32(&calls)
+	startupInput := session.Opts().InputPath
+	if !strings.Contains(startupInput, "/source/") {
+		t.Fatalf("startup input = %q, want a registered relay URL", startupInput)
+	}
+
+	refreshed, cleanup, err := session.Opts().RefreshInput(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshInput error: %v", err)
+	}
+	if cleanup != nil {
+		t.Fatalf("reuse must not hand back a cleanup for a relay the session already owns")
+	}
+	if refreshed != startupInput {
+		t.Fatalf("refreshed URL = %q, want the pinned relay %q", refreshed, startupInput)
+	}
+	if got := atomic.LoadInt32(&calls); got != startupCalls {
+		t.Fatalf("provider resolve calls = %d, want the startup count %d (restart must reuse the pinned relay)", got, startupCalls)
+	}
+
+	// A second restart keeps reusing: the relay is still live and no provider
+	// call is allowed.
+	if again, _, err := session.Opts().RefreshInput(context.Background()); err != nil || again != startupInput {
+		t.Fatalf("second restart refreshed = %q err = %v, want the pinned relay", again, err)
+	}
+	if got := atomic.LoadInt32(&calls); got != startupCalls {
+		t.Fatalf("provider resolve calls after second restart = %d, want %d", got, startupCalls)
+	}
+}
+
+// TestVirtualTransportRestartWithoutRelayKeepsResolvePath pins the scope of the
+// reuse fast path: it applies only once a relay is registered. Without a relay
+// there is no pinned transport to renew, so the restart keeps the stored-first
+// resolve path (and its provider re-list) unchanged.
+func TestVirtualTransportRestartWithoutRelayKeepsResolvePath(t *testing.T) {
+	tempDir := t.TempDir()
+	neutral := "virtual://movie/tt-no-relay"
+	pinned := neutral + "?result=pinned"
+	row := &models.MediaFile{
+		ID:                         96,
+		ContentID:                  "movie-no-relay",
+		FilePath:                   pinned,
+		VirtualOwnerInstallationID: 5,
+	}
+	var calls int32
+	h := &PlaybackHandler{
+		fileResolver: &fakePinFileResolver{file: row},
+		sessionMgr:   playback.NewSessionManager(0, 0),
+		// No RemoteStreamRelay: the resolved provider URL is used directly.
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			atomic.AddInt32(&calls, 1)
+			return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/pinned.mp4", URI: uri, CandidateID: "pinned"}, nil
+		}),
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			opts.OutputDir = tempDir
+			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
+	}
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      96,
+		InputPath:                        pinned,
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "restart-no-relay",
+		OutputDir:                        tempDir,
+	}
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	startupCalls := atomic.LoadInt32(&calls)
+	if _, _, err := session.Opts().RefreshInput(context.Background()); err != nil {
+		t.Fatalf("RefreshInput error: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got == startupCalls {
+		t.Fatalf("provider resolve calls = %d, want the stored-first path to resolve without a relay", got)
 	}
 }
