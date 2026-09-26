@@ -273,7 +273,7 @@ func (w *playbackDeliveryWriter) WriteHeader(status int) {
 	if status >= http.StatusInternalServerError {
 		code := w.problemCode
 		if code == "" {
-			code = "internal_error"
+			code = TypeInternalError.ID
 		}
 		noteOperationError(w.request.Context(), fmt.Errorf("playback delivery failed: status=%d code=%s", status, code))
 	}
