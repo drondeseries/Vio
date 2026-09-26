@@ -36,11 +36,18 @@ var virtualProviderOutageBackoff = []time.Duration{1 * time.Second, 2 * time.Sec
 //     candidate was absent from an empty/partial answer (the resolver refuses
 //     to substitute, which is exactly the case that should be retried, not
 //     rotated);
+//   - ErrSessionBoundCandidateAbsent: a pinned candidate absent from the
+//     current listing. Providers renumber their per-listing result ids, so an
+//     absence can be a listing artifact rather than a dead release; a bounded
+//     forced relist can re-identify the same release under its new id;
 //   - the "no streams available from provider" message: an empty answer that
 //     carried no pinned-candidate refusal (e.g. a neutral re-list).
 //
 // A genuine different-release substitution or an untrusted dead pin never
-// reaches here because callers gate the retry on the trust predicate below.
+// reaches here because callers gate the retry on the trust predicate below. A
+// genuine rotation verdict (an excluded, indicted pin) surfaces as a different
+// error because substitution was allowed and the resolver substituted a
+// sibling, so it is never turned into a retry loop.
 func virtualProviderListingOutage(err error) bool {
 	if err == nil {
 		return false
@@ -51,7 +58,24 @@ func virtualProviderListingOutage(err error) bool {
 	if errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted) {
 		return true
 	}
+	if errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		return true
+	}
 	return strings.Contains(err.Error(), "no streams available from provider")
+}
+
+// virtualProviderOutageRetries returns how many bounded forced relists a
+// retryable provider-listing failure gets. A pinned id that is merely absent
+// from the listing gets exactly one: providers renumber result ids per listing,
+// so a single forced relist can re-identify the same release under its new id,
+// while waiting out the full schedule would only delay a genuinely dead pin. A
+// transient provider outage (5XX, empty listing) keeps the full backoff
+// schedule.
+func virtualProviderOutageRetries(err error) int {
+	if errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		return min(1, len(virtualProviderOutageBackoff))
+	}
+	return len(virtualProviderOutageBackoff)
 }
 
 // virtualCandidateTrustedForOutageRetry reports whether a catalog row is the
@@ -91,14 +115,20 @@ func virtualCandidateTrustedForOutageRetry(row *models.MediaFile, window time.Du
 }
 
 // retryVirtualProviderOutageResolve runs resolve, and while it fails with a
-// transient provider-listing outage for a trusted session-bound row, retries up
-// to len(virtualProviderOutageBackoff) times with the bounded schedule. A
-// canceled request stops immediately. Retry attempts are passed relist=true so
-// the resolve closure forces a genuine re-list past the negative cache the
-// outage just wrote, and marks the service resolve as an outage re-list. The
-// stored-first resolve stays the first attempt, so a healthy persisted URL
-// still wins with zero provider calls and a transient outage never swaps the
-// viewer's release.
+// transient provider-listing outage for a trusted session-bound row, retries
+// with the bounded schedule. A canceled request stops immediately. Retry
+// attempts are passed relist=true so the resolve closure forces a genuine
+// re-list past the negative cache the outage just wrote, and marks the service
+// resolve as an outage re-list. The stored-first resolve stays the first
+// attempt, so a healthy persisted URL still wins with zero provider calls and a
+// transient outage never swaps the viewer's release.
+//
+// The retry budget is error-shaped (see virtualProviderOutageRetries): a pinned
+// id merely absent from the listing gets a single forced relist (a provider
+// renumber is a listing artifact), while a transient provider outage keeps the
+// full backoff schedule. A genuine rotation verdict never reaches this loop
+// because the resolver substitutes a sibling instead of reporting the pin
+// absent.
 func retryVirtualProviderOutageResolve(
 	ctx context.Context,
 	trusted bool,
@@ -108,7 +138,7 @@ func retryVirtualProviderOutageResolve(
 	if !trusted {
 		return resolved, err
 	}
-	for attempt := 0; err != nil && virtualProviderListingOutage(err) && attempt < len(virtualProviderOutageBackoff); attempt++ {
+	for attempt := 0; err != nil && virtualProviderListingOutage(err) && attempt < virtualProviderOutageRetries(err); attempt++ {
 		wait := virtualProviderOutageBackoff[attempt]
 		if !sleepWithContext(ctx, wait) {
 			return resolved, err

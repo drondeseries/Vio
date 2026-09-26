@@ -44,13 +44,83 @@ func TestRetryVirtualProviderOutageResolveStopsOnNonOutage(t *testing.T) {
 	calls := 0
 	_, err := retryVirtualProviderOutageResolve(context.Background(), true, func(context.Context, bool) (ResolvedVirtualMedia, error) {
 		calls++
-		return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+		return ResolvedVirtualMedia{}, errors.New("virtual playback provider returned an unsafe stream URL")
 	})
 	if calls != 1 {
 		t.Fatalf("provider calls = %d, want 1: a non-outage error must not be retried", calls)
 	}
 	if errors.Is(err, errVirtualProviderUnavailable) {
 		t.Fatalf("non-outage error was classified as provider_unavailable: %v", err)
+	}
+}
+
+// TestRetryVirtualProviderOutageResolveRenumberGetsOneRelist proves #143: a
+// pinned id absent from the listing is a renumber artifact eligible for exactly
+// one bounded forced relist, not the full transient-outage schedule. Providers
+// renumber result ids per listing, so one relist can re-identify the release;
+// retrying the full schedule would only delay a genuinely dead pin.
+func TestRetryVirtualProviderOutageResolveRenumberGetsOneRelist(t *testing.T) {
+	restore := virtualProviderOutageBackoff
+	virtualProviderOutageBackoff = []time.Duration{time.Millisecond, 2 * time.Millisecond}
+	defer func() { virtualProviderOutageBackoff = restore }()
+
+	calls := 0
+	relisted := 0
+	_, err := retryVirtualProviderOutageResolve(context.Background(), true, func(_ context.Context, relist bool) (ResolvedVirtualMedia, error) {
+		calls++
+		if relist {
+			relisted++
+		}
+		return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+	})
+	if calls != 2 || relisted != 1 {
+		t.Fatalf("calls=%d relists=%d, want exactly 2 calls (initial + one forced relist) and 1 relist", calls, relisted)
+	}
+	if !virtualProviderListingOutage(err) {
+		t.Fatalf("final error = %v, want it still recognized as a listing artifact", err)
+	}
+}
+
+// TestRetryVirtualProviderOutageResolveRenumberRecoversOnRelist proves the other
+// half of #143: a single renumber event resolves on the forced relist instead of
+// failing the start.
+func TestRetryVirtualProviderOutageResolveRenumberRecoversOnRelist(t *testing.T) {
+	restore := virtualProviderOutageBackoff
+	virtualProviderOutageBackoff = []time.Duration{time.Millisecond, 2 * time.Millisecond}
+	defer func() { virtualProviderOutageBackoff = restore }()
+
+	calls := 0
+	resolved, err := retryVirtualProviderOutageResolve(context.Background(), true, func(_ context.Context, relist bool) (ResolvedVirtualMedia, error) {
+		calls++
+		if !relist {
+			return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+		}
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/rematched", URI: "virtual://movie/x?result=new", CandidateID: "new"}, nil
+	})
+	if err != nil {
+		t.Fatalf("renumber retry failed: %v", err)
+	}
+	if calls != 2 || resolved.CandidateID != "new" {
+		t.Fatalf("calls=%d resolved=%+v, want the relisted candidate after one relist", calls, resolved)
+	}
+}
+
+// TestRetryVirtualProviderOutageResolveDoesNotRetryRotationVerdict proves #143's
+// bound on genuine rotation verdicts: the pinned-candidate-excluded refusal is a
+// verdict about the release, not a listing artifact, so it is never turned into
+// a retry loop.
+func TestRetryVirtualProviderOutageResolveDoesNotRetryRotationVerdict(t *testing.T) {
+	verdict := errors.New(`pinned virtual candidate "pinned" is excluded and candidate rotation was not requested`)
+	calls := 0
+	_, err := retryVirtualProviderOutageResolve(context.Background(), true, func(context.Context, bool) (ResolvedVirtualMedia, error) {
+		calls++
+		return ResolvedVirtualMedia{}, verdict
+	})
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1: a genuine rotation verdict must not be retried", calls)
+	}
+	if errors.Is(err, errVirtualProviderUnavailable) {
+		t.Fatalf("rotation verdict was classified as provider_unavailable: %v", err)
 	}
 }
 
@@ -69,7 +139,8 @@ func TestClassifyVirtualProviderOutageNeverLeaksForNonOutage(t *testing.T) {
 		{"outage + untrusted", provider502(), false, false},
 		{"empty listing + trusted", providerEmptyListing(), true, true},
 		{"nil error", nil, true, false},
-		{"absent pin + trusted", absentSessionPinError("pinned"), true, false},
+		{"absent pin renumber + trusted", absentSessionPinError("pinned"), true, true},
+		{"absent pin renumber + untrusted", absentSessionPinError("pinned"), false, false},
 		{"arbitrary error + trusted", errors.New("decode failed"), true, false},
 		{"resolver unavailable sentinel + trusted", fmt.Errorf("listing: %w", resolver.ErrProviderUnavailable), true, true},
 	}

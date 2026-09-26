@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	chimw "github.com/go-chi/chi/v5/middleware"
+
 	"github.com/Silo-Server/silo-server/internal/telemetry"
 
 	"github.com/Silo-Server/silo-server/internal/logredact"
@@ -228,6 +230,17 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	if sessionVirtualURI != "" {
 		maxAttempts = min(2, maxAttempts)
 	}
+	// A fresh start has no session binding yet, so it declares the resolve
+	// not-session-bound: a provider that renumbered its per-listing result ids
+	// falls through to a live sibling instead of refusing with the
+	// session-bound absent-pin sentinel (ErrSessionBoundCandidateAbsent) and
+	// failing the start. A start that already owns a session binding (a
+	// restart or replan against a live session) keeps the session-bound
+	// default and refuses a genuine release swap.
+	resolveStartupCtx := startupCtx
+	if sessionVirtualURI == "" {
+		resolveStartupCtx = withVirtualSessionBindingV3(startupCtx, false)
+	}
 	failedCandidateIDs := make([]string, 0)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		targetURI := canonicalPath
@@ -246,7 +259,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		// it explicitly so the resolver may serve a sibling; a neutral first
 		// attempt, or a failure that identified no candidate, keeps refusing.
 		resolvedMedia, cleanup, resolveErr := h.resolveVirtualInputURI(
-			startupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0, failedCandidateIDs, preferredID, attempt > 0 && len(failedCandidateIDs) > 0,
+			resolveStartupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0, failedCandidateIDs, preferredID, attempt > 0 && len(failedCandidateIDs) > 0,
 		)
 		if resolveErr != nil {
 			lastErr = resolveErr
@@ -632,10 +645,15 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			// The intent travels with the context so the resolver can distinguish a
 			// serve-layer indictment from a display-driven same-file re-plan.
 			ctx = withVirtualCandidateRotationV3(ctx, rotationRequested)
-			// The transport serve layer re-resolves a release an existing session
-			// already serves, so it declares session-bound: a profile-removed
-			// candidate refuses instead of silently swapping the release.
-			ctx = withVirtualSessionBindingV3(ctx, true)
+			// The session-binding intent is declared by the caller and travels
+			// on the context (see withVirtualSessionBindingV3): absent means
+			// session-bound, the conservative default that refuses a
+			// profile-removed or absent pin instead of silently swapping the
+			// release. A fresh transport start declares false (no session
+			// binding yet) so a provider renumber falls through to a live
+			// sibling; the restart, anchor and reconstructed-transport callers
+			// declare or default to true so a genuine release swap still
+			// refuses.
 			// A transient provider-listing blackout for the session's own
 			// trusted candidate must not be read as an indictment of the
 			// release. Retry it with a short bounded backoff before giving up,
@@ -686,10 +704,19 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 		}
 	}
 	if err != nil {
+		// A resolve refusal is hard to correlate to its request without the
+		// edge request id, and has_identity distinguishes a legacy row with no
+		// durable provider identity (which cannot same-release re-match) from a
+		// renumber. The identity presence is read from the resolve context the
+		// caller already threaded, so the virtuallibrary resolver never needs
+		// the edge middleware.
+		_, hasIdentity := virtuallibrary.PersistedCandidateIdentityFromContext(ctx)
 		slog.WarnContext(ctx, "virtual stream resolve failed",
 			"component", "api",
+			requestIDLogKeyV3, chimw.GetReqID(ctx),
 			"owner_installation_id", ownerInstallationID,
 			"virtual_uri", virtualURI,
+			"has_identity", hasIdentity,
 			"error", logredact.SanitizeURLError(err),
 		)
 		return res, nil, fmt.Errorf("resolve virtual input: %w", err)

@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 
+	chimw "github.com/go-chi/chi/v5/middleware"
+
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
@@ -25,6 +27,11 @@ type virtualDetailedResolverSource interface {
 // falls through to a profile-satisfying candidate.
 func newVirtualMediaDetailedResolver(service virtualDetailedResolverSource) handlers.VirtualMediaDetailedResolver {
 	return handlers.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (handlers.ResolvedVirtualMedia, error) {
+		// Thread the edge request id across the resolve boundary so the
+		// virtuallibrary refusal logs can be correlated with the request that
+		// caused them. The ctx seam keeps virtuallibrary free of the HTTP
+		// middleware that owns chi's request-id key.
+		ctx = virtuallibrary.WithRequestID(ctx, chimw.GetReqID(ctx))
 		res, err := service.ResolveDetailed(ctx, path, forceRefresh, excludedCandidateIDs, preferredCandidateID, handlers.VirtualSessionBinding(ctx), handlers.VirtualCandidateRotationAllowed(ctx))
 		if err != nil {
 			return handlers.ResolvedVirtualMedia{}, err
