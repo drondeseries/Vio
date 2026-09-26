@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	chimw "github.com/go-chi/chi/v5/middleware"
+
 	"github.com/Silo-Server/silo-server/internal/telemetry"
 
 	"github.com/Silo-Server/silo-server/internal/logredact"
@@ -686,10 +688,19 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 		}
 	}
 	if err != nil {
+		// A resolve refusal is hard to correlate to its request without the
+		// edge request id, and has_identity distinguishes a legacy row with no
+		// durable provider identity (which cannot same-release re-match) from a
+		// renumber. The identity presence is read from the resolve context the
+		// caller already threaded, so the virtuallibrary resolver never needs
+		// the edge middleware.
+		_, hasIdentity := virtuallibrary.PersistedCandidateIdentityFromContext(ctx)
 		slog.WarnContext(ctx, "virtual stream resolve failed",
 			"component", "api",
+			requestIDLogKeyV3, chimw.GetReqID(ctx),
 			"owner_installation_id", ownerInstallationID,
 			"virtual_uri", virtualURI,
+			"has_identity", hasIdentity,
 			"error", logredact.SanitizeURLError(err),
 		)
 		return res, nil, fmt.Errorf("resolve virtual input: %w", err)
