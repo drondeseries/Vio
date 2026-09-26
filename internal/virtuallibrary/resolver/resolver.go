@@ -535,15 +535,6 @@ func NewPersistedIdentityTiers(videoHash, guid, releaseName string, releaseSize 
 	}
 }
 
-// Shared reports whether two identities share any non-empty tier. It is the
-// tier-by-tier answer to "is this the same release": a name-only row matches a
-// candidate that also carries a GUID or hash, which a precedence-key comparison
-// could never see.
-func (p PersistedIdentityTiers) Shared(other PersistedIdentityTiers) bool {
-	_, ok := p.SharedTier(other)
-	return ok
-}
-
 // SharedTier returns the name of the strongest shared non-empty tier and
 // whether any tier agreed. Tier names are "video_hash", "guid" and
 // "release_name". It is used for logging so "identity mismatch" and "no shared
