@@ -716,6 +716,31 @@ func TestResolveDetailedRefusesDifferentReleaseForSessionPin(t *testing.T) {
 	}
 }
 
+// TestResolveDetailedServesListedPinOverKeeperRemappedProbe reproduces issue
+// #154: the probed result id (the plan URI) is absent from a fresh listing and
+// keeper-remaps to a surviving keeper, while the session's own pin is still
+// listed. The session binding is satisfiable by its listed pin, so the resolve
+// must serve the pin rather than refuse with the mismatch error.
+func TestResolveDetailedServesListedPinOverKeeperRemappedProbe(t *testing.T) {
+	svc, droppedID, keeperID, otherID := collapsedPinFixture(t)
+	ctx := context.Background()
+
+	resolved, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+droppedID, false, nil, otherID, true, false)
+	if err != nil {
+		t.Fatalf("ResolveDetailed(listed pin, keeper-remapped probe): %v", err)
+	}
+	if resolved.CandidateID != otherID {
+		t.Fatalf("resolved candidate = %q, want the listed session pin %q (not the keeper %q)", resolved.CandidateID, otherID, keeperID)
+	}
+
+	// The normalization keys on the pin being directly listed. A collapsed
+	// session pin (reachable only through the keeper map) still refuses a
+	// different release under the binding, so this is not a silent swap.
+	if _, err := svc.ResolveDetailed(ctx, "virtual://movie/tt100?result="+otherID, false, nil, droppedID, true, false); err == nil {
+		t.Fatal("expected refusal when the session pin is only reachable through the keeper map")
+	}
+}
+
 // TestKeeperMapDropsKeepersBeyondTheCandidateCap proves the dropped -> keeper
 // map is filtered to the surviving candidates: when a release's keeper ranks
 // beyond the selectable cap, its entry is removed so a pin on the collapsed
