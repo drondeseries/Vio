@@ -3,6 +3,7 @@ package apiv2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -261,7 +262,23 @@ func playbackDeliveryProblemType(status int, code string) ProblemType {
 	}
 	return TypeForStatus(status)
 }
-func (w *playbackDeliveryWriter) Unwrap() http.ResponseWriter    { return w.ResponseWriter }
-func (w *playbackDeliveryWriter) WriteHeader(status int)         { w.transport().WriteHeader(status) }
+func (w *playbackDeliveryWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *playbackDeliveryWriter) WriteHeader(status int) {
+	// A raw byte handler writes its own error envelope and discards the
+	// detail; the v2 request log would otherwise record only a bare 500. The
+	// v1 machine-readable code was captured by SetPlaybackProblemCode, so
+	// record it (with the request ID already on the context) before the
+	// adapter collapses the body into a problem envelope.
+	if status >= http.StatusInternalServerError {
+		code := w.problemCode
+		if code == "" {
+			code = "internal_error"
+		}
+		noteOperationError(w.request.Context(), fmt.Errorf("playback delivery failed: status=%d code=%s", status, code))
+	}
+	w.transport().WriteHeader(status)
+}
+
 func (w *playbackDeliveryWriter) Write(data []byte) (int, error) { return w.transport().Write(data) }
 func (w *playbackDeliveryWriter) FlushError() error              { return w.transport().FlushError() }
