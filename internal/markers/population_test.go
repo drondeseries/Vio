@@ -351,3 +351,53 @@ func TestPopulationUsesPriorityChangedDuringFetch(t *testing.T) {
 		t.Fatalf("stale priority or repeated fetch: %+v; calls=%d/%d", written.Markers, first.calls, second.calls)
 	}
 }
+
+// A plugin provider whose season cannot be addressed must not abort the pass:
+// its request is clamped, and a healthy provider's markers still reach the
+// file. Related issue: #148.
+func TestPopulationClampsAndKeepsOtherProviders(t *testing.T) {
+	client := &fakePluginMarkerClient{}
+	pluginProvider, err := NewPluginProviderWithClientFactory(PluginProviderOptions{
+		InstallationID: 12,
+		CapabilityID:   "introdb",
+	}, func(context.Context, int, string) (pluginMarkerClient, error) {
+		return client, nil
+	})
+	if err != nil {
+		t.Fatalf("NewPluginProviderWithClientFactory: %v", err)
+	}
+	healthy := &populationProvider{id: "healthy", fetch: func() (Result, error) {
+		return Result{Markers: []Marker{{Kind: MarkerKindCredits, Start: 800 * time.Second, End: 850 * time.Second}}}, nil
+	}}
+
+	registry := NewRegistry(nil)
+	if err := registry.Register(pluginProvider); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(healthy); err != nil {
+		t.Fatal(err)
+	}
+	store := &populationRecorder{}
+	service := NewPopulationService(PopulationOptions{
+		Registry: registry, Store: store,
+		Settings: populationSettings{"setup.completed": "true", SettingMode: "online", SettingOnlineStorage: string(OnlineStorageStored), SettingLazyPlayback: "true"},
+		Resolver: populationResolver{ExternalIDs{Kind: ItemKindEpisode, TmdbID: "30984", SeasonNumber: 2009, EpisodeNumber: 3}},
+	})
+	var written Result
+	service.opts.Write = func(_ context.Context, _ *models.MediaFile, result Result) (bool, error) {
+		written = result
+		return true, nil
+	}
+	if _, _, err := service.Populate(t.Context(), &models.MediaFile{ID: 1, Duration: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if client.fetchReq == nil {
+		t.Fatal("plugin provider was not queried")
+	}
+	if got := client.fetchReq.GetSeasonNumber(); got != int32(MaxProviderSeason) {
+		t.Fatalf("plugin season = %d, want clamped %d", got, MaxProviderSeason)
+	}
+	if len(written.Markers) != 1 || written.Markers[0].ProviderID != "healthy" {
+		t.Fatalf("healthy provider markers were lost: %+v", written.Markers)
+	}
+}

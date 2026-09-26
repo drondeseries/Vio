@@ -3,6 +3,7 @@ package markers
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -155,8 +156,51 @@ func (p *PluginProvider) SubmissionRequirements() SubmissionRequirements {
 	return SubmissionRequirements{RequiredExternalIDs: append([]string(nil), p.requiredExternalIDs...)}
 }
 
+// markerCoordinate resolves an episode season/episode pair into the bounded
+// coordinate providers index. It reports false when the season is unknown and
+// the request cannot be addressed at all, so the caller degrades to a miss
+// instead of sending a value the provider will reject.
+//
+// Filename parsing can overrun provider limits for long-running or oddly named
+// shows (absolute-numbered anime, yearly "Season 2009" folders), and TheIntroDB
+// answers an out-of-range season with an HTTP 400 rather than an empty result.
+// Clamp into range and warn with the original value so the offending scan stays
+// diagnosable.
+func (p *PluginProvider) markerCoordinate(kind ItemKind, season, episode int) (int, int, bool) {
+	if kind != ItemKindEpisode {
+		return season, episode, true
+	}
+	if season < 0 {
+		p.warnCoordinate("season", season, 0)
+		return 0, 0, false
+	}
+	clampedSeason := clampProviderCoordinate(season, MaxProviderSeason)
+	if clampedSeason != season {
+		p.warnCoordinate("season", season, clampedSeason)
+	}
+	clampedEpisode := clampProviderCoordinate(episode, MaxProviderEpisode)
+	if clampedEpisode != episode {
+		p.warnCoordinate("episode", episode, clampedEpisode)
+	}
+	return clampedSeason, clampedEpisode, true
+}
+
+func (p *PluginProvider) warnCoordinate(field string, value, clamped int) {
+	slog.Default().Warn("marker provider coordinate out of range",
+		"provider", p.ID(),
+		"field", field,
+		"value", value,
+		"clamped", clamped,
+	)
+}
+
 func (p *PluginProvider) FetchMarkers(ctx context.Context, req Request) (Result, error) {
 	if p == nil || p.clientFactory == nil {
+		return Result{}, nil
+	}
+	season, episode, ok := p.markerCoordinate(req.Kind, req.SeasonNumber, req.EpisodeNumber)
+	if !ok {
+		// Season is unknown: skip this provider and keep any other markers.
 		return Result{}, nil
 	}
 	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
@@ -166,8 +210,8 @@ func (p *PluginProvider) FetchMarkers(ctx context.Context, req Request) (Result,
 	response, err := client.FetchMarkers(ctx, &pluginv1.FetchMarkersRequest{
 		ItemType:        itemTypeName(req.Kind),
 		ExternalIds:     externalIDsProto(req.ExternalIDs),
-		SeasonNumber:    int32(req.SeasonNumber),
-		EpisodeNumber:   int32(req.EpisodeNumber),
+		SeasonNumber:    int32(season),
+		EpisodeNumber:   int32(episode),
 		DurationSeconds: req.Duration.Seconds(),
 	})
 	if err != nil {
@@ -201,6 +245,10 @@ func (p *PluginProvider) SubmitMarker(ctx context.Context, req SubmissionRequest
 	if p == nil || p.clientFactory == nil {
 		return SubmissionResult{}, fmt.Errorf("plugin marker provider not configured")
 	}
+	season, episode, ok := p.markerCoordinate(req.Kind, req.SeasonNumber, req.EpisodeNumber)
+	if !ok {
+		return SubmissionResult{}, fmt.Errorf("marker season is unknown for %s", p.ID())
+	}
 	client, err := p.clientFactory(ctx, p.installationID, p.capabilityID)
 	if err != nil {
 		return SubmissionResult{}, err
@@ -208,8 +256,8 @@ func (p *PluginProvider) SubmitMarker(ctx context.Context, req SubmissionRequest
 	body := &pluginv1.SubmitMarkerRequest{
 		ItemType:        itemTypeName(req.Kind),
 		ExternalIds:     externalIDsProto(req.ExternalIDs),
-		SeasonNumber:    int32(req.SeasonNumber),
-		EpisodeNumber:   int32(req.EpisodeNumber),
+		SeasonNumber:    int32(season),
+		EpisodeNumber:   int32(episode),
 		Segment:         markerKindName(req.Segment),
 		DurationSeconds: req.Duration.Seconds(),
 	}
