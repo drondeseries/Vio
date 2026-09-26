@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -122,9 +123,17 @@ func (f *Fetcher) ResolvePlayableTargets(ctx context.Context, query catalog.Play
 
 type editorialCandidateLoader func(context.Context, string, *int, []int, catalog.AccessFilter) ([]string, error)
 
+// editorialCandidateCacheEpoch is the process-global purge epoch for
+// editorial candidate caches. A destructive purge bumps it; caches keyed
+// under the old epoch are never read again. Package-global so every Fetcher
+// instance (native API, recommendations, jellycompat) observes the same
+// epoch without a registry.
+var editorialCandidateCacheEpoch atomic.Uint64
+
 type editorialCandidateCache struct {
 	mu      sync.RWMutex
 	entries map[string]editorialCandidateCacheEntry
+	epoch   uint64 // purge epoch of the last write; used to drop stale entries
 }
 
 type editorialCandidateCacheEntry struct {
@@ -156,6 +165,12 @@ func (c *editorialCandidateCache) set(key string, candidates []string, expiresAt
 	}
 
 	c.mu.Lock()
+	// Drop entries from a prior purge epoch: the key embeds the epoch, so
+	// they can never be hit again, but clearing keeps the map bounded.
+	if c.epoch < editorialCandidateCacheEpoch.Load() {
+		c.entries = make(map[string]editorialCandidateCacheEntry)
+		c.epoch = editorialCandidateCacheEpoch.Load()
+	}
 	c.entries[key] = editorialCandidateCacheEntry{
 		candidates: append([]string(nil), candidates...),
 		expiresAt:  expiresAt,
@@ -212,7 +227,12 @@ func (f *Fetcher) cachedEditorialCandidates(ctx context.Context, subjectType str
 
 func editorialCandidateCacheKey(subjectType string, libraryID *int, libraryIDs []int, filter catalog.AccessFilter) string {
 	var b strings.Builder
-	b.WriteString("subject=")
+	// The purge epoch scopes the key: a destructive purge bumps it, so a load
+	// that starts after the purge computes a fresh key and can never be
+	// served a pre-purge candidate list.
+	b.WriteString("purge=")
+	b.WriteString(strconv.FormatUint(editorialCandidateCacheEpoch.Load(), 10))
+	b.WriteString("|subject=")
 	b.WriteString(strings.ToLower(strings.TrimSpace(subjectType)))
 
 	b.WriteString("|library=")
@@ -2767,6 +2787,14 @@ func applyEpisodeTargetLibraryAccess(
 		return false
 	}
 	catalog.ApplyLibraryAccessFilter("si.content_id", scoped, conditions, args, argIdx)
+	if scoped.AllowedLibraryIDs == nil && len(scoped.DisabledLibraryIDs) == 0 {
+		// Unrestricted episode-target scope: require series library
+		// membership, mirroring buildLibraryScope, so purged or stale
+		// episode rows with no membership cannot surface on Home rails.
+		*conditions = append(*conditions,
+			"EXISTS (SELECT 1 FROM media_item_libraries mil_scope_any WHERE mil_scope_any.content_id = si.content_id)",
+		)
+	}
 	return true
 }
 
@@ -3311,6 +3339,18 @@ func buildLibraryScope(libraryID *int, libraryIDs []int, configLibraryIDs []int,
 			return fromClause, conditions, args, argIdx
 		}
 		memberOfAny(libraryIDs)
+	}
+
+	if libraryID == nil && libraryIDs == nil && len(configLibraryIDs) == 0 && len(disabledLibraryIDs) == 0 {
+		// Unrestricted Home scope: still require at least one library
+		// membership so stale or purged media_items rows with no membership
+		// (e.g. a virtual item stripped of its library links) can never
+		// surface on a Home rail. Library browse already scopes by
+		// membership; this aligns Home with browse. Matches the deny-only
+		// guard below and appendDiscoveryLibraryScope in package catalog.
+		conditions = append(conditions,
+			"EXISTS (SELECT 1 FROM media_item_libraries mil_scope_any WHERE mil_scope_any.content_id = mi.content_id)",
+		)
 	}
 
 	if len(disabledLibraryIDs) > 0 {

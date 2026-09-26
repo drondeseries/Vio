@@ -3284,17 +3284,82 @@ func (h *LibraryCollectionHandler) PurgeVirtualPlaybackItems(w http.ResponseWrit
 		return
 	}
 	if !dryRun {
-		sections.InvalidateResolvedListCache()
+		// Hard purge invalidation: every Home rail (not just recently_added)
+		// plus the editorial candidate caches are dropped synchronously, so
+		// purged titles cannot linger on Home. DB deletes already committed
+		// inside PurgeVirtualPlaybackItems; dry-run never reaches here.
+		sections.InvalidateAllResolvedListCachesForPurge()
+		if h.EventsHub != nil {
+			// Publish on a context detached from the request: the purge
+			// transaction already committed, so request cancellation must not
+			// abort fan-out to other replicas.
+			publishCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+			defer cancel()
+			if err := h.EventsHub.PublishJSON(publishCtx, evt.ChannelCatalog, "virtual_purge_complete",
+				map[string]any{"library_id": libraryID, "installation_id": installationID, "purge_revision": purgeResult.PurgeRevision}, evt.PublishOptions{}); err != nil {
+				slog.WarnContext(r.Context(), "purge: failed to publish virtual_purge_complete",
+					"component", "api", "error", err)
+			}
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
+	message := fmt.Sprintf("%s %d virtual files and %d virtual media items",
+		map[bool]string{true: "Would purge", false: "Purged"}[dryRun],
+		purgeResult.FilesDeleted, purgeResult.ItemsDeleted)
+	if dryRun {
+		message += " (cleanup rows not estimated in dry-run)"
+	} else {
+		message += fmt.Sprintf(" (%d stale playback-state and metadata rows, %d collection references pruned)",
+			purgeResult.StateRowsDeleted, purgeResult.CollectionsPruned)
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"success": true, "dry_run": dryRun,
 		"files_deleted": purgeResult.FilesDeleted, "items_deleted": purgeResult.ItemsDeleted,
 		"state_rows_deleted": purgeResult.StateRowsDeleted,
-		"message": fmt.Sprintf("%s %d virtual files and %d virtual media items (%d stale playback-state rows)",
-			map[bool]string{true: "Would purge", false: "Purged"}[dryRun],
-			purgeResult.FilesDeleted, purgeResult.ItemsDeleted, purgeResult.StateRowsDeleted),
+		"collections_pruned": purgeResult.CollectionsPruned,
+		"message":            message,
 	})
+}
+
+// SubscribePurgeInvalidations listens for virtual_purge_complete events from
+// other API replicas and reconciles the carried purge revision locally. Each
+// instance must call this once at startup; the subscription lives until ctx is
+// canceled. Events that carry a purge revision reconcile by revision; events
+// without one (legacy publishers) force reconciliation without advancing the
+// watermark. The local publisher's own echo reconciles too (it carries the
+// just-committed revision), which costs one redundant invalidation; the
+// subsequent duplicate is a no-op by revision comparison.
+func (h *LibraryCollectionHandler) SubscribePurgeInvalidations(ctx context.Context) {
+	if h == nil || h.EventsHub == nil || ctx == nil {
+		return
+	}
+	events, unsubscribe := h.EventsHub.Subscribe()
+	go func() {
+		defer unsubscribe()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case env, ok := <-events:
+				if !ok {
+					return
+				}
+				if env.Channel != evt.ChannelCatalog || env.Event != "virtual_purge_complete" {
+					continue
+				}
+				revision := int64(-1)
+				if len(env.Data) > 0 {
+					var payload struct {
+						PurgeRevision *int64 `json:"purge_revision"`
+					}
+					if err := json.Unmarshal(env.Data, &payload); err == nil && payload.PurgeRevision != nil {
+						revision = *payload.PurgeRevision
+					}
+				}
+				sections.ReconcilePurgeRevision(revision)
+			}
+		}
+	}()
 }
 
 // HandleMaterializeAdminCollectionItem handles
