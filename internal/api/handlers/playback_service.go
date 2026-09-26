@@ -825,8 +825,16 @@ func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller Pla
 		}
 	}
 
+	var clientFeatures []string
+	if h.PlanStoreV3 != nil {
+		if record, err := h.PlanStoreV3.GetAttempt(ctx, sessionID); err == nil && record != nil {
+			clientFeatures = replanSubtitleFeaturesV3(record, record.NormalizedRequest.ClientFeatures)
+		}
+	}
+
 	audioTracks := playback.AudioInventoryV3(file)
-	subtitleInventory := playback.BuildSubtitleInventoryV3(file, nil)
+	additional := h.downloadedSubtitleInventoryV3(ctx, file)
+	subtitleInventory := playback.ScopeSubtitleInventoryV3(sessionID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
 	status := "declared"
 	if file != nil && file.ProbeUpdatedAt != nil {

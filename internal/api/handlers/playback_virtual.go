@@ -744,11 +744,26 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 		if len(cached) > 0 && cached[0].URI != "" && !h.virtualCandidateHasProbeEvidence(prefetchCtx, cached[0].URI, &task.file, task.file.VirtualOwnerInstallationID) {
 			topCand := cached[0]
 			var streamURL string
+			var reqHeaders map[string]string
+			ownerID := task.file.VirtualOwnerInstallationID
 			if h.VirtualMediaDetailedResolver != nil {
 				if res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 					prefetchCtx, topCand.URI, task.file.VirtualOwnerInstallationID, task.userID, task.profileID, false, nil, "",
 				); err == nil {
+					// Bind the resolved identity atomically: a resolver that
+					// substitutes (dedup keeper, renumbered result id) must not
+					// have its bytes probed and persisted under the cached
+					// candidate's URI. Without this the probe evidence of
+					// release B would land on release A's catalog row.
+					if (res.URI != "" && res.URI != topCand.URI) ||
+						(res.CandidateID != "" && topCand.ID != "" && res.CandidateID != topCand.ID) {
+						return
+					}
 					streamURL = res.URL
+					reqHeaders = res.RequestHeaders
+					if res.OwnerID > 0 {
+						ownerID = res.OwnerID
+					}
 				}
 			} else if h.VirtualPlaybackResolver != nil {
 				streamURL, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(
@@ -758,8 +773,14 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 			if streamURL != "" {
 				probeTransient := cloneVirtualProbeTransient(task.file)
 				probeTransient.FilePath = topCand.URI
-				probeTransient.VirtualOwnerInstallationID = task.file.VirtualOwnerInstallationID
-				h.probeVirtualSourceAndPersist(prefetchCtx, "", &task.file, streamURL, probeTransient, topCand, h.virtualExpectedRuntimeMinutes(prefetchCtx, &task.file), task.file.VirtualOwnerInstallationID)
+				probeTransient.VirtualOwnerInstallationID = ownerID
+				// Copy so header mutation here cannot race the cached entry.
+				boundCand := topCand
+				if reqHeaders != nil {
+					boundCand.RequestHeaders = reqHeaders
+				}
+				boundCand.OwnerInstallationID = ownerID
+				h.probeVirtualSourceAndPersist(prefetchCtx, "", &task.file, streamURL, probeTransient, boundCand, h.virtualExpectedRuntimeMinutes(prefetchCtx, &task.file), ownerID)
 			}
 		}
 	}

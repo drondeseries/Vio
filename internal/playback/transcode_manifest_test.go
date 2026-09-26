@@ -484,6 +484,45 @@ func TestRewriteManifestPaths_RejectsInvalidManifest(t *testing.T) {
 	}
 }
 
+func TestStartupFilesReadyRunwayDuration(t *testing.T) {
+	tempDir := t.TempDir()
+	for _, name := range []string{"init.mp4", "seg_00000.m4s", "seg_00001.m4s", "seg_00002.m4s"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("test-media"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	// 1. Single 1.5s segment: count requirement 1 satisfied, but duration < 4.0s -> not ready.
+	manifest1 := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1.500000,\nseg_00000.m4s\n")
+	if startupFilesReady(manifest1, tempDir, 1) {
+		t.Fatal("1.5s live segment should not satisfy 4.0s runway threshold")
+	}
+
+	// 2. Three 1.5s segments: count 3 >= 1, duration 4.5s >= 4.0s -> ready.
+	manifest3 := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1.500000,\nseg_00000.m4s\n#EXTINF:1.500000,\nseg_00001.m4s\n#EXTINF:1.500000,\nseg_00002.m4s\n")
+	if !startupFilesReady(manifest3, tempDir, 1) {
+		t.Fatal("4.5s accumulated media should satisfy runway threshold")
+	}
+
+	// 3. Exact 4.0s boundary (two 2.0s segments) -> ready.
+	manifestExact := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.000000,\nseg_00000.m4s\n#EXTINF:2.000000,\nseg_00001.m4s\n")
+	if !startupFilesReady(manifestExact, tempDir, 2) {
+		t.Fatal("exact 4.0s media should satisfy runway threshold")
+	}
+
+	// 4. Sub-4s completed clip with ENDLIST (one 2.5s segment) -> ready.
+	manifestEndList := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:3\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.500000,\nseg_00000.m4s\n#EXT-X-ENDLIST\n")
+	if !startupFilesReady(manifestEndList, tempDir, 1) {
+		t.Fatal("completed ENDLIST stream should be ready even below 4.0s")
+	}
+
+	// 5. Empty ENDLIST (0 segments) -> rejected.
+	manifestEmptyEndList := []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-ENDLIST\n")
+	if startupFilesReady(manifestEmptyEndList, tempDir, 1) {
+		t.Fatal("empty ENDLIST stream with 0 segments must not be ready")
+	}
+}
+
 func TestTranscodeSession_SegmentStartTimeUsesManifestTimeline(t *testing.T) {
 	tempDir := t.TempDir()
 	manifest := strings.Join([]string{

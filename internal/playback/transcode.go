@@ -2873,6 +2873,17 @@ func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int, floa
 	segmentCount := 0
 	duration := 0.0
 	endList := false
+	var pendingDuration float64
+	var havePending bool
+
+	// Scan the whole playlist: an EXTINF duration belongs to the URI line that
+	// follows it, so durations accumulate per completed segment. Stop only
+	// when BOTH the segment count and the duration runway hold — stopping at
+	// the count alone would demand 4s inside a 1-segment prefix that can
+	// never satisfy it (e.g. copy mode).
+	complete := func() bool {
+		return segmentCount >= maxSegments && duration >= minManifestDurationSeconds
+	}
 
 	for line := range bytes.SplitSeq(manifest, []byte("\n")) {
 		trimmed := bytes.TrimSpace(line)
@@ -2890,9 +2901,10 @@ func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int, floa
 			continue
 		}
 		if bytes.HasPrefix(trimmed, []byte("#EXTINF:")) {
+			pendingDuration, havePending = 0, false
 			if value := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(string(trimmed), "#EXTINF:"), ",")); value != "" {
 				if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds > 0 && !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
-					duration += seconds
+					pendingDuration, havePending = seconds, true
 				}
 			}
 			continue
@@ -2903,7 +2915,11 @@ func manifestStartupFiles(manifest []byte, maxSegments int) ([]string, int, floa
 
 		files = append(files, manifestURIToFilename(string(trimmed)))
 		segmentCount++
-		if segmentCount >= maxSegments {
+		if havePending {
+			duration += pendingDuration
+			havePending = false
+		}
+		if complete() {
 			break
 		}
 	}
@@ -2947,7 +2963,21 @@ func startupCopyManifestIsBroken(manifest []byte) bool {
 }
 
 func startupFilesReady(manifest []byte, outputDir string, requiredSegments int) bool {
-	files, segmentCount, duration, _ := manifestStartupFiles(manifest, requiredSegments)
+	files, segmentCount, duration, endList := manifestStartupFiles(manifest, requiredSegments)
+	// A completed playlist with nonempty referenced files is valid content
+	// even below the live runway: short clips and near-end seeks must start.
+	if endList {
+		if segmentCount == 0 {
+			return false
+		}
+		for _, name := range files {
+			info, err := os.Stat(filepath.Join(outputDir, name))
+			if err != nil || info.Size() <= 0 {
+				return false
+			}
+		}
+		return true
+	}
 	if segmentCount < requiredSegments {
 		return false
 	}

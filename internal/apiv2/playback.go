@@ -461,6 +461,10 @@ func registerPlaybackInventory(reg *Registry, op func(method, path, id string) O
 		if err != nil {
 			return nil, playbackProblem(err)
 		}
+		for i := range inv.SubtitleInventory {
+			inv.SubtitleInventory[i].URL = playbackV2MediaURL(inv.SubtitleInventory[i].URL)
+			inv.SubtitleInventory[i].FontBundleURL = playbackV2MediaURL(inv.SubtitleInventory[i].FontBundleURL)
+		}
 		etag := fmt.Sprintf("%q", inv.InventoryRevision)
 		if in.IfNoneMatch != "" && (in.IfNoneMatch == etag || in.IfNoneMatch == inv.InventoryRevision || in.IfNoneMatch == "*") {
 			return &PlaybackInventoryOutput{

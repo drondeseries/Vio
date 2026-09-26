@@ -122,4 +122,17 @@ func TestComputeInventoryRevisionDeterministic(t *testing.T) {
 	if rUpdated == r1 {
 		t.Fatal("revision must differ when audio tracks change")
 	}
+
+	// Delimiter collision test: titles containing colons must not produce identical digests
+	audioCol1 := []playback.AudioInventoryItemV3{
+		{Title: "a:b", EmbeddedTitle: "c", TrackID: "1"},
+	}
+	audioCol2 := []playback.AudioInventoryItemV3{
+		{Title: "a", EmbeddedTitle: "b:c", TrackID: "1"},
+	}
+	rCol1 := playback.ComputeInventoryRevisionV3("verified", audioCol1, subs)
+	rCol2 := playback.ComputeInventoryRevisionV3("verified", audioCol2, subs)
+	if rCol1 == rCol2 {
+		t.Fatalf("delimiter collision: %q == %q", rCol1, rCol2)
+	}
 }

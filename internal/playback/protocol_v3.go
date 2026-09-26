@@ -2,6 +2,7 @@ package playback
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -1043,18 +1044,29 @@ type PlaybackInventoryV3 struct {
 	SubtitleInventory []SubtitleInventoryItemV3 `json:"subtitle_inventory"`
 }
 
-// ComputeInventoryRevisionV3 returns a deterministic opaque digest of the audio
-// and subtitle inventories, suitable for ETag generation and inventory caching.
+type inventoryRevisionEnvelope struct {
+	Status      string                    `json:"status"`
+	AudioTracks []AudioInventoryItemV3    `json:"audio_tracks"`
+	Subtitles   []SubtitleInventoryItemV3 `json:"subtitles"`
+}
+
+// ComputeInventoryRevisionV3 returns a deterministic opaque digest of the full
+// audio and subtitle inventories, suitable for ETag generation and inventory
+// caching. It serializes the exact response-visible inventory to canonical JSON
+// before hashing, preventing delimiter collisions and ensuring every field
+// mutation produces a distinct revision.
 func ComputeInventoryRevisionV3(status string, audio []AudioInventoryItemV3, subs []SubtitleInventoryItemV3) string {
-	h := sha256.New()
-	_, _ = h.Write([]byte(status))
-	for _, a := range audio {
-		_, _ = fmt.Fprintf(h, "|a:%d:%s:%s:%s:%d:%v", a.Index, a.Language, a.Codec, a.Layout, a.Channels, a.Default)
+	payload, err := json.Marshal(inventoryRevisionEnvelope{
+		Status:      status,
+		AudioTracks: audio,
+		Subtitles:   subs,
+	})
+	if err != nil {
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", status, len(audio), len(subs))))
+		return fmt.Sprintf("inv:%x", h[:16])
 	}
-	for _, s := range subs {
-		_, _ = fmt.Fprintf(h, "|s:%s:%s:%s:%v:%v", s.TrackID, s.Language, s.Codec, s.Forced, s.Default)
-	}
-	return fmt.Sprintf("inv:%x", h.Sum(nil)[:16])
+	h := sha256.Sum256(payload)
+	return fmt.Sprintf("inv:%x", h[:16])
 }
 
 // AudioInventoryItemV3 is one selectable audio track of the effective source at
