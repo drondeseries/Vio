@@ -19,10 +19,15 @@ func TestCopyManifestEvictionRetainsObservedSourceTimeline(t *testing.T) {
 				CopySeekAnchorResolved: true, StreamOriginSeconds: initial, SeekSeconds: initial,
 				SegmentDuration: 2, StartSegmentNumber: 10}
 			s := &TranscodeSession{opts: opts, outputDir: dir}
+			allDurations := []float64{3.5, 4.75, 2.25, 3.0, 3.0}
 			for i, want := range []float64{initial, initial + 3.5, initial + 8.25} {
 				manifest := fmt.Sprintf("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:%d\n", 10+i)
-				for j, duration := range []float64{3.5, 4.75, 2.25}[i:] {
-					manifest += fmt.Sprintf("#EXTINF:%g,\nseg_%05d.ts\n", duration, 10+i+j)
+				for j, duration := range allDurations[i : i+3] {
+					name := fmt.Sprintf("seg_%05d.ts", 10+i+j)
+					manifest += fmt.Sprintf("#EXTINF:%g,\n%s\n", duration, name)
+					if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+						t.Fatal(err)
+					}
 				}
 				if err := os.WriteFile(filepath.Join(dir, "stream.m3u8"), []byte(manifest), 0600); err != nil {
 					t.Fatal(err)

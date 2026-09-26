@@ -253,7 +253,15 @@ func TestPlaybackV2InventoryEndpoint(t *testing.T) {
 
 	path := Prefix + "/playback/session-1/inventory"
 
-	// 1. Success 200 with ETag and Cache-Control
+	// 1. Unauthenticated request -> 401 Problem
+	initialCalls := fake.calls
+	unauthRes := do(t, h, http.MethodGet, path, "", nil)
+	requireProblem(t, unauthRes, TypeAuthenticationRequired)
+	if fake.calls != initialCalls {
+		t.Fatal("unauthenticated inventory request reached service")
+	}
+
+	// 2. Success 200 with ETag and Cache-Control
 	res := do(t, h, http.MethodGet, path, "", viewerHeaders())
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body = %s", res.Code, res.Body.String())
@@ -266,7 +274,7 @@ func TestPlaybackV2InventoryEndpoint(t *testing.T) {
 		t.Fatalf("Cache-Control = %q, want 'private, no-cache'", cc)
 	}
 
-	// 2. Conditional request matching ETag -> 304 Not Modified
+	// 3. Conditional request matching ETag -> 304 Not Modified
 	condRes := do(t, h, http.MethodGet, path, "", with(viewerHeaders(), "If-None-Match", etag))
 	if condRes.Code != http.StatusNotModified {
 		t.Fatalf("status = %d, want 304 Not Modified", condRes.Code)
@@ -275,13 +283,18 @@ func TestPlaybackV2InventoryEndpoint(t *testing.T) {
 		t.Fatalf("304 response body must be empty, got %d bytes", condRes.Body.Len())
 	}
 
-	// 3. Error mapping: session_not_found -> 404 Problem
+	// 4. Error mapping: session_not_found -> 404 Problem
 	fake.err = &handlers.PlaybackOperationError{Status: http.StatusNotFound, Code: "session_not_found", Message: "Playback session not found"}
 	notFoundRes := do(t, h, http.MethodGet, path, "", viewerHeaders())
 	requireProblem(t, notFoundRes, TypeNotFound)
 
-	// 4. Error mapping: store failure -> 503 Problem
+	// 5. Error mapping: cross-profile forbidden -> 403 Problem
+	fake.err = &handlers.PlaybackOperationError{Status: http.StatusForbidden, Code: "forbidden", Message: "Session belongs to another profile"}
+	forbiddenRes := do(t, h, http.MethodGet, path, "", viewerHeaders())
+	requireProblem(t, forbiddenRes, TypePermissionDenied)
+
+	// 6. Error mapping: store failure -> 503 Problem (must not return 304 even with If-None-Match)
 	fake.err = &handlers.PlaybackOperationError{Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "Database unavailable"}
-	unavailRes := do(t, h, http.MethodGet, path, "", viewerHeaders())
+	unavailRes := do(t, h, http.MethodGet, path, "", with(viewerHeaders(), "If-None-Match", etag))
 	requireProblem(t, unavailRes, TypeDependencyUnavailable)
 }

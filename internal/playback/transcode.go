@@ -2385,15 +2385,18 @@ func (s *TranscodeSession) getManifest(currentGeneration bool) ([]byte, error) {
 	// flushed to disk, especially on resumed sessions with a non-zero media
 	// sequence. Requiring the referenced startup files prevents the browser from
 	// stalling on its very first segment fetch.
-	if s.running && !startupFilesReady(data, s.outputDir, requiredSegments) {
-		return nil, ErrManifestNotReady
-	}
-	if !s.running && s.waitErr != nil && !startupFilesReady(data, s.outputDir, 1) {
-		stderr := truncateStderr(s.stderr.String())
-		if stderr != "" {
-			return nil, fmt.Errorf("%w: %w (stderr: %s)", ErrTranscodeFailed, s.waitErr, stderr)
+	if !startupFilesReady(data, s.outputDir, requiredSegments) {
+		if s.running || s.restarting != nil {
+			return nil, ErrManifestNotReady
 		}
-		return nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, s.waitErr)
+		if s.waitErr != nil {
+			stderr := truncateStderr(s.stderr.String())
+			if stderr != "" {
+				return nil, fmt.Errorf("%w: %w (stderr: %s)", ErrTranscodeFailed, s.waitErr, stderr)
+			}
+			return nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, s.waitErr)
+		}
+		return nil, ErrTranscodeFailed
 	}
 	if strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
 		if err := validateCopyPlaybackManifest(data); err != nil {

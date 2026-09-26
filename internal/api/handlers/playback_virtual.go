@@ -761,8 +761,15 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 				if res.URI != topCand.URI || (res.CandidateID != "" && topCand.ID != "" && res.CandidateID != topCand.ID) {
 					return
 				}
+				// Owner consistency check: speculative pre-probing must not drift
+				// across plugin installations. Only accept matching owner or 0.
+				if res.OwnerID > 0 && task.file.VirtualOwnerInstallationID > 0 && res.OwnerID != task.file.VirtualOwnerInstallationID {
+					return
+				}
 				streamURL = res.URL
-				reqHeaders = res.RequestHeaders
+				// Authoritative cloned header snapshot from resolver only:
+				// do not leak or retain unverified cached candidate headers.
+				reqHeaders = cloneHeaderMap(res.RequestHeaders)
 				if res.OwnerID > 0 {
 					ownerID = res.OwnerID
 				}
@@ -771,11 +778,8 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 				probeTransient := cloneVirtualProbeTransient(task.file)
 				probeTransient.FilePath = topCand.URI
 				probeTransient.VirtualOwnerInstallationID = ownerID
-				// Copy so header mutation here cannot race the cached entry.
 				boundCand := topCand
-				if reqHeaders != nil {
-					boundCand.RequestHeaders = reqHeaders
-				}
+				boundCand.RequestHeaders = reqHeaders
 				boundCand.OwnerInstallationID = ownerID
 				h.probeVirtualSourceAndPersist(prefetchCtx, "", &task.file, streamURL, probeTransient, boundCand, h.virtualExpectedRuntimeMinutes(prefetchCtx, &task.file), ownerID)
 			}
