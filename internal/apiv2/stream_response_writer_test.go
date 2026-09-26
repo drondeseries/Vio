@@ -1,6 +1,7 @@
 package apiv2
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +18,7 @@ import (
 func TestRawStreamWriterLogsDiscardedBody(t *testing.T) {
 	buf := captureLogs(t)
 	r := httptest.NewRequest(http.MethodGet, Prefix+"/stream/session", nil)
-	r = r.WithContext(chimw.WithReqID(r.Context(), "raw-stream-request"))
+	r = r.WithContext(context.WithValue(r.Context(), chimw.RequestIDKey, "raw-stream-request"))
 
 	rec := httptest.NewRecorder()
 	w := &streamResponseWriter{ResponseWriter: rec, request: r, problemType: TypeForStatus}
