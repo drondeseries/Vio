@@ -354,3 +354,232 @@ func TestResolveSubtitleEditionSwitchHonorsPinOnEffectiveFile(t *testing.T) {
 		t.Fatalf("pinned identity resolved file=%v index=%d, want effective index 1", file, index)
 	}
 }
+
+// Captured-empty evidence is genuine evidence: the flag is set even though the
+// old candidate had no tracks. The remap source must then be the (empty)
+// evidence, not the newly populated row, so a carried selection is never
+// reinterpreted against a release it was not minted on.
+func TestReplanRemapSourceUsesCapturedEmptyEvidence(t *testing.T) {
+	uri := "virtual://movie/tt-row?result=candidate-b"
+	row := &models.MediaFile{
+		ID: 3459774, FilePath: uri,
+		AudioTracks:    []models.AudioTrack{{Codec: "aac", Language: "eng", Channels: 2}},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 4, Codec: "subrip", Language: "eng"}},
+	}
+	session := &playback.Session{
+		ID:                         "sess",
+		VirtualSourceURI:           uri,
+		VirtualSubtitleEvidenceSet: true,
+		// Captured for a candidate whose inventory was empty.
+		VirtualSubtitleEvidenceURI: "virtual://movie/tt-row?result=candidate-a",
+	}
+	handler := &PlaybackHandler{}
+
+	source := handler.replanRemapSourceV3(row, session)
+	if source == row {
+		t.Fatal("captured-empty evidence fell back to the newly populated row")
+	}
+	if source.ID != row.ID {
+		t.Fatalf("remap source id = %d, want the same catalog row", source.ID)
+	}
+	if len(source.AudioTracks) != 0 || len(source.SubtitleTracks) != 0 || len(source.ExternalSubtitles) != 0 {
+		t.Fatalf("captured-empty evidence was repopulated from the row: %+v", source)
+	}
+}
+
+// Only absent evidence (the flag is clear) permits falling back to the loaded
+// row; the row's populated inventory is otherwise never used as an old-state
+// source.
+func TestReplanRemapSourceAbsentEvidenceFallsBackToRow(t *testing.T) {
+	row := &models.MediaFile{
+		ID: 7, FilePath: "virtual://movie/tt?result=b",
+		AudioTracks:    []models.AudioTrack{{Codec: "aac", Language: "eng"}},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 4, Codec: "subrip", Language: "eng"}},
+	}
+	session := &playback.Session{
+		ID:                         "sess",
+		VirtualSourceURI:           row.FilePath,
+		VirtualSubtitleEvidenceSet: false,
+	}
+	handler := &PlaybackHandler{}
+	if got := handler.replanRemapSourceV3(row, session); got != row {
+		t.Fatalf("absent evidence remap source = %+v, want the loaded row", got)
+	}
+}
+
+// Populated evidence against a newly populated row is still the remap source:
+// the carried ordinal names the captured track, not the row's new layout.
+func TestReplanRemapSourcePopulatedEvidenceAgainstNewlyPopulatedRow(t *testing.T) {
+	uri := "virtual://movie/tt-row?result=candidate-b"
+	row := &models.MediaFile{
+		ID: 7, FilePath: uri,
+		AudioTracks:    []models.AudioTrack{{Codec: "aac", Language: "eng"}},
+		SubtitleTracks: []models.SubtitleTrack{{Index: 4, Codec: "subrip", Language: "eng"}},
+	}
+	session := &playback.Session{
+		ID:                         "sess",
+		VirtualSourceURI:           uri,
+		VirtualSubtitleEvidenceSet: true,
+		VirtualSubtitleEvidenceURI: "virtual://movie/tt-row?result=candidate-a",
+		VirtualAudioTracks:         []models.AudioTrack{{Codec: "aac", Language: "fra"}},
+		VirtualSubtitleTracks:      []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "fra"}},
+	}
+	handler := &PlaybackHandler{}
+
+	source := handler.replanRemapSourceV3(row, session)
+	if source == row {
+		t.Fatal("populated evidence fell back to the newly populated row")
+	}
+	if len(source.AudioTracks) != 1 || source.AudioTracks[0].Language != "fra" {
+		t.Fatalf("remap source audio = %+v, want the captured French inventory", source.AudioTracks)
+	}
+	if len(source.SubtitleTracks) != 1 || source.SubtitleTracks[0].Language != "fra" {
+		t.Fatalf("remap source subtitles = %+v, want the captured French inventory", source.SubtitleTracks)
+	}
+
+	// The carried French selections remap onto the row's English layout by
+	// identity, not by the stale ordinals.
+	audioIndex := 0
+	audio := playback.StartRequestV3{AudioTrackIndex: &audioIndex, AudioTrackID: playback.TrackIDV3(row.ID, "audio", 0)}
+	if err := remapAudioSelectionV3(source, row, &audio); err != nil {
+		t.Fatalf("audio remap: %v", err)
+	}
+	if audio.AudioTrackIndex == nil || *audio.AudioTrackIndex != 0 {
+		t.Fatalf("audio remap index = %v, want 0 (the row's only track)", audio.AudioTrackIndex)
+	}
+}
+
+// Audio and subtitle evidence are applied independently: a captured-empty audio
+// inventory must not take the row's audio, and a captured-empty subtitle
+// inventory must not take the row's subtitles.
+func TestReplanRemapSourceAudioAndSubtitleEvidenceIndependent(t *testing.T) {
+	uri := "virtual://movie/tt-row?result=candidate-b"
+	newRow := func() *models.MediaFile {
+		return &models.MediaFile{
+			ID: 7, FilePath: uri,
+			AudioTracks:    []models.AudioTrack{{Codec: "aac", Language: "eng", Channels: 2}},
+			SubtitleTracks: []models.SubtitleTrack{{Index: 4, Codec: "subrip", Language: "eng"}},
+		}
+	}
+	baseSession := func() *playback.Session {
+		return &playback.Session{
+			ID:                         "sess",
+			VirtualSourceURI:           uri,
+			VirtualSubtitleEvidenceSet: true,
+			VirtualSubtitleEvidenceURI: "virtual://movie/tt-row?result=candidate-a",
+		}
+	}
+	handler := &PlaybackHandler{}
+
+	t.Run("captured-empty audio keeps captured subtitles", func(t *testing.T) {
+		session := baseSession()
+		session.VirtualSubtitleTracks = []models.SubtitleTrack{{Index: 1, Codec: "subrip", Language: "fra"}}
+		row := newRow()
+		source := handler.replanRemapSourceV3(row, session)
+		if len(source.AudioTracks) != 0 {
+			t.Fatalf("captured-empty audio was repopulated from the row: %+v", source.AudioTracks)
+		}
+		if len(source.SubtitleTracks) != 1 || source.SubtitleTracks[0].Language != "fra" {
+			t.Fatalf("captured subtitles were lost: %+v", source.SubtitleTracks)
+		}
+		// A captured-empty audio inventory has no old track to name: the audio
+		// remap takes the row's default rather than inventing one.
+		audioIndex := 0
+		audio := playback.StartRequestV3{AudioTrackIndex: &audioIndex, AudioTrackID: playback.TrackIDV3(row.ID, "audio", 0)}
+		if err := remapAudioSelectionV3(source, row, &audio); err != nil {
+			t.Fatalf("audio remap: %v", err)
+		}
+		want := playback.SelectAudioTrack(row.AudioTracks, "", nil)
+		if audio.AudioTrackIndex == nil || *audio.AudioTrackIndex != want {
+			t.Fatalf("audio remap index = %v, want the row default %d", audio.AudioTrackIndex, want)
+		}
+	})
+
+	t.Run("captured-empty subtitles keep captured audio", func(t *testing.T) {
+		session := baseSession()
+		session.VirtualAudioTracks = []models.AudioTrack{{Codec: "aac", Language: "fra", Channels: 2}}
+		row := newRow()
+		source := handler.replanRemapSourceV3(row, session)
+		if len(source.AudioTracks) != 1 || source.AudioTracks[0].Language != "fra" {
+			t.Fatalf("captured audio was lost: %+v", source.AudioTracks)
+		}
+		if len(source.SubtitleTracks) != 0 {
+			t.Fatalf("captured-empty subtitles were repopulated from the row: %+v", source.SubtitleTracks)
+		}
+		// The captured French audio maps onto the row's English layout.
+		audioIndex := 0
+		audio := playback.StartRequestV3{AudioTrackIndex: &audioIndex, AudioTrackID: playback.TrackIDV3(row.ID, "audio", 0)}
+		if err := remapAudioSelectionV3(source, row, &audio); err != nil {
+			t.Fatalf("audio remap: %v", err)
+		}
+		if audio.AudioTrackIndex == nil || *audio.AudioTrackIndex != 0 {
+			t.Fatalf("audio remap index = %v, want 0 (the row's only track)", audio.AudioTrackIndex)
+		}
+	})
+}
+
+// A captured-empty subtitle inventory names no old track, so a subtitle remap
+// must clear the carried selection instead of reinterpreting its ordinal
+// against the replacement and inventing a selection the viewer never made.
+func TestCapturedEmptyEvidenceDoesNotInventOldSelection(t *testing.T) {
+	uri := "virtual://movie/tt-row?result=candidate-b"
+	row := &models.MediaFile{
+		ID: 7, FilePath: uri,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 4, Codec: "subrip", Language: "eng"},
+			{Index: 7, Codec: "subrip", Language: "fra"},
+		},
+	}
+	session := &playback.Session{
+		ID:                         "sess",
+		VirtualSourceURI:           uri,
+		VirtualSubtitleEvidenceSet: true,
+		VirtualSubtitleEvidenceURI: "virtual://movie/tt-row?result=candidate-a",
+	}
+	handler := &PlaybackHandler{}
+	source := handler.replanRemapSourceV3(row, session)
+
+	index := 0
+	request := playback.StartRequestV3{
+		SubtitleTrackIndex: &index,
+		SubtitleTrackID:    playback.TrackIDV3(row.ID, "subtitle", 0),
+	}
+	if err := handler.remapSubtitleSelectionV3(context.Background(), source, row, &request); err != nil {
+		t.Fatalf("captured-empty subtitle remap: %v", err)
+	}
+	if request.SubtitleTrackIndex != nil || request.SubtitleTrackID != "" {
+		t.Fatalf("captured-empty evidence invented a selection: index=%v id=%q", request.SubtitleTrackIndex, request.SubtitleTrackID)
+	}
+}
+
+// virtualEvidenceFileV3 must return the evidence file for a captured-empty
+// inventory: nil would send the caller down the placeholder path, which
+// reinterprets the empty evidence against the replacement.
+func TestVirtualEvidenceFileReturnsCapturedEmpty(t *testing.T) {
+	bound := &models.MediaFile{ID: 7, FilePath: "virtual://movie/tt?result=candidate-b",
+		SubtitleTracks: []models.SubtitleTrack{{Index: 4, Codec: "subrip", Language: "eng"}},
+	}
+	session := &playback.Session{
+		ID:                         "sess",
+		VirtualSourceURI:           bound.FilePath,
+		VirtualSubtitleEvidenceSet: true,
+		VirtualSubtitleEvidenceURI: "virtual://movie/tt?result=candidate-a",
+	}
+	evidence := virtualEvidenceFileV3(bound, session)
+	if evidence == nil {
+		t.Fatal("captured-empty evidence returned nil")
+	}
+	if evidence.ID != bound.ID || evidence.FilePath != bound.FilePath {
+		t.Fatalf("evidence provenance = (%d, %q), want the bound identity", evidence.ID, evidence.FilePath)
+	}
+	if len(evidence.SubtitleTracks) != 0 || len(evidence.ExternalSubtitles) != 0 {
+		t.Fatalf("captured-empty evidence carried tracks: %+v", evidence)
+	}
+
+	// With no evidence flag the file is nil, so absent evidence still takes the
+	// bound row's own inventory.
+	session.VirtualSubtitleEvidenceSet = false
+	if virtualEvidenceFileV3(bound, session) != nil {
+		t.Fatal("absent evidence returned a file")
+	}
+}

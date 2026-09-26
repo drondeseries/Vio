@@ -991,3 +991,189 @@ func TestVirtualSegmentAndManifestWaitsSurfaceConfirmation(t *testing.T) {
 		t.Fatalf("waitForManifest err = %v, want ErrSourceDecodeRejected", err)
 	}
 }
+
+// stderrWriterLineWriter names the fenced stderr writer's line-entry point so a
+// test can drive a line without depending on its unexported concrete type.
+type stderrWriterLineWriter interface {
+	Write([]byte) (int, error)
+}
+
+// TestResetInterleavedBetweenStderrCheckAndObserve pins A's fencing: a reset
+// that lands after the writer's generation check must not let the stale line
+// misattribute a strike to the replacement. The writer's whole pipeline — its
+// generation fence and the observation it performs — runs under one hold of mu,
+// so reset can never interleave between the check and the mutation. Driving the
+// generation-fenced path with a dead writer after a reset proves the line is
+// dropped rather than charged to the live generation.
+func TestResetInterleavedBetweenStderrCheckAndObserve(t *testing.T) {
+	base := time.Unix(31_000, 0)
+	s := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "hevc"}}
+	attachDecodeClock(s, base)
+
+	writer := s.newStderrWriter(context.Background()).(stderrWriterLineWriter)
+	s.mu.Lock()
+	writerGeneration := s.decodeGeneration
+	s.mu.Unlock()
+
+	// Install the replacement first, then deliver the dead writer's storm. If
+	// the pipe were re-checked instead of bound to the writer's generation, the
+	// first line would charge a strike to the replacement.
+	s.mu.Lock()
+	s.resetDecodeVerdictLocked()
+	s.mu.Unlock()
+
+	for i := 0; i < decodeErrorThreshold*3; i++ {
+		if _, err := writer.Write([]byte(prodSPSMissingLine() + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.mu.Lock()
+	count := s.decodeErrorCount
+	stage := s.decodeStage
+	generation := s.decodeGeneration
+	s.mu.Unlock()
+
+	if generation == writerGeneration {
+		t.Fatal("reset did not advance the generation")
+	}
+	if count != 0 || stage != decodeStageObserving {
+		t.Fatalf("stale writer touched the replacement: count=%d stage=%d", count, stage)
+	}
+	if s.IsSourceRejected() {
+		t.Fatal("stale writer's line rejected the replacement")
+	}
+
+	// A line bound to the live generation still observes, proving the fence is
+	// specific to the stale writer rather than disabling all observation.
+	s.mu.Lock()
+	liveGeneration := s.decodeGeneration
+	s.mu.Unlock()
+	if !s.logFFmpegLineForGeneration(context.Background(), liveGeneration, prodSPSMissingLine()) {
+		t.Fatal("live-generation line was fenced out")
+	}
+	s.mu.Lock()
+	count = s.decodeErrorCount
+	s.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("live-generation line count = %d, want 1", count)
+	}
+}
+
+// TestStaleStderrCallbacksAfterReplacementDoNotTouchReplacement pins A's
+// callback fencing end to end: a writer belonging to a dead generation whose
+// lines arrive after the replacement is installed is discarded whole. It
+// neither counts a strike, latches the hardware decoder, nor invokes the
+// source-rejected marker, and the replacement reaches its own verdict from its
+// own evidence.
+func TestStaleStderrCallbacksAfterReplacementDoNotTouchReplacement(t *testing.T) {
+	base := time.Unix(32_000, 0)
+	dir := t.TempDir()
+	marked := make(chan struct{}, 4)
+	s := &TranscodeSession{opts: TranscodeOpts{
+		TargetCodecVideo:   "hevc",
+		CanonicalInputPath: "virtual://movie/tt-stale-cb?result=x",
+		OnSourceRejected: func(context.Context, int, string) error {
+			marked <- struct{}{}
+			return nil
+		},
+	}}
+	clock := attachDecodeClock(s, base)
+	s.mu.Lock()
+	s.outputDir = dir
+	s.generationStartedAt = base
+	s.mu.Unlock()
+
+	stale := s.newStderrWriter(context.Background()).(stderrWriterLineWriter)
+
+	// A hardware failure confirms and latches, then the reset installs a fresh
+	// generation that owns no verdict of its own.
+	stormDecode(s)
+	clock.Advance(decodeObservationWindow)
+	s.evaluateDecodeVerdict()
+	waitSourceRejected(t, s)
+	// Drain the first generation's legitimate marker so only a stale
+	// generation's marker could be observed below.
+	waitDecodeMarker(t, marked)
+	s.mu.Lock()
+	s.resetDecodeVerdictLocked()
+	s.generationStartedAt = clock.Now()
+	s.running = true
+	s.mu.Unlock()
+	if !s.IsDecodeFailed() {
+		t.Fatal("reset dropped the session-level hardware latch")
+	}
+	if s.IsSourceRejected() {
+		t.Fatal("fresh generation inherited the dead generation's verdict")
+	}
+
+	// The dead process keeps emitting: its lines must be dropped.
+	for i := 0; i < decodeErrorThreshold*2; i++ {
+		if _, err := stale.Write([]byte(prodSPSMissingLine() + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.mu.Lock()
+	count := s.decodeErrorCount
+	stage := s.decodeStage
+	s.mu.Unlock()
+	if count != 0 || stage != decodeStageObserving {
+		t.Fatalf("stale callbacks advanced the replacement: count=%d stage=%d", count, stage)
+	}
+	select {
+	case <-marked:
+		t.Fatal("stale stderr invoked the source-rejected marker on the replacement")
+	default:
+	}
+}
+
+// TestHardwareLatchSurvivesResetWhileReplacementReachesOwnVerdict pins A's
+// split: the hardware latch is session-level and persists across a reset, but it
+// never blocks the replacement from reaching its own suspected and confirmed
+// verdict. A partial fresh storm must not reject; a complete fresh storm must.
+func TestHardwareLatchSurvivesResetWhileReplacementReachesOwnVerdict(t *testing.T) {
+	base := time.Unix(33_000, 0)
+	s := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "hevc"}}
+	clock := attachDecodeClock(s, base)
+
+	// First generation latches the hardware decoder by confirming.
+	stormDecode(s)
+	clock.Advance(decodeObservationWindow)
+	s.evaluateDecodeVerdict()
+	waitSourceRejected(t, s)
+	if !s.IsDecodeFailed() {
+		t.Fatal("first generation did not latch the hardware decoder")
+	}
+
+	// Reset: the latch persists but the replacement starts observing.
+	s.mu.Lock()
+	s.resetDecodeVerdictLocked()
+	s.generationStartedAt = clock.Now()
+	s.mu.Unlock()
+	if !s.IsDecodeFailed() {
+		t.Fatal("reset dropped the session-level hardware latch")
+	}
+	if s.IsSourceRejected() {
+		t.Fatal("replacement inherited the dead generation's verdict")
+	}
+
+	// A partial fresh storm is its own evidence: no rejection before its own
+	// observation window.
+	for i := 0; i < decodeErrorThreshold-1; i++ {
+		s.observeDecodeError(hevcFatalErrorLine())
+	}
+	if s.IsSourceRejected() {
+		t.Fatal("replacement confirmed before its own threshold")
+	}
+	if got := decodeStageOf(s); got != decodeStageObserving {
+		t.Fatalf("replacement stage = %d, want observing", got)
+	}
+
+	// A complete fresh storm crosses its own threshold despite the latch.
+	s.observeDecodeError(hevcFatalErrorLine())
+	if got := decodeStageOf(s); got != decodeStageSuspected {
+		t.Fatalf("replacement stage at its threshold = %d, want suspected", got)
+	}
+	clock.Advance(decodeObservationWindow)
+	s.evaluateDecodeVerdict()
+	waitSourceRejected(t, s)
+}

@@ -190,6 +190,74 @@ func TestSelectAudioTrack_MULTiRegionalRanking(t *testing.T) {
 	}
 }
 
+// TestSelectAudioTrack_MULTiMembershipAcceptance pins G2: a track's MULTi
+// `.Languages` list carries the language for both saved-index compatibility and
+// ranking. Before the fix only `.Language` was consulted, so a saved index onto
+// a MULTi track was discarded and any MULTi entry lost to a single-language
+// track, regardless of rank.
+func TestSelectAudioTrack_MULTiMembershipAcceptance(t *testing.T) {
+	cases := []struct {
+		name          string
+		tracks        []models.AudioTrack
+		preferredLang string
+		seriesPref    *playback.AudioTrackPreference
+		want          int
+	}{
+		{
+			// The saved index lands on a MULTi track. It must be kept even
+			// though the bare single-language track would win the language
+			// ranking; without list membership the saved index is dropped.
+			name: "saved index keeps MULTi track over ranked language",
+			tracks: []models.AudioTrack{
+				{Language: "en", Languages: []string{"en", "fr"}, Codec: "eac3", Channels: 6, Default: true},
+				{Language: "fr", Codec: "aac", Channels: 2},
+			},
+			seriesPref: &playback.AudioTrackPreference{AudioTrackIndex: 0, AudioLanguage: "fr"},
+			want:       0,
+		},
+		{
+			// An exact regional entry in the MULTi list (rank 0) must beat a
+			// bare primary code (rank 1).
+			name: "exact list entry beats bare primary",
+			tracks: []models.AudioTrack{
+				{Language: "en", Languages: []string{"fr-CA"}, Codec: "eac3", Channels: 6},
+				{Language: "fr", Codec: "aac", Channels: 2, Default: true},
+			},
+			preferredLang: "fr-CA",
+			want:          0,
+		},
+		{
+			// A bare entry in the MULTi list (rank 1) must beat a regional
+			// primary variant (rank 2).
+			name: "bare list entry beats regional primary variant",
+			tracks: []models.AudioTrack{
+				{Language: "mul", Languages: []string{"fr"}, Codec: "eac3", Channels: 6},
+				{Language: "fr-BE", Codec: "aac", Channels: 2, Default: true},
+			},
+			preferredLang: "fr-FR",
+			want:          0,
+		},
+		{
+			// Equal variant rank across a MULTi list entry and a primary code is
+			// broken by track order: the earlier track wins.
+			name: "equal variant rank keeps first track",
+			tracks: []models.AudioTrack{
+				{Language: "mul", Languages: []string{"fr-BE"}, Codec: "eac3", Channels: 6},
+				{Language: "fr-CA", Codec: "aac", Channels: 2, Default: true},
+			},
+			preferredLang: "fr-FR",
+			want:          0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := playback.SelectAudioTrack(tc.tracks, tc.preferredLang, tc.seriesPref); got != tc.want {
+				t.Fatalf("SelectAudioTrack() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSelectAudioTrack_NoDefaultFallsToFirst(t *testing.T) {
 	tracks := []models.AudioTrack{
 		{Language: "ja", Codec: "aac"},
