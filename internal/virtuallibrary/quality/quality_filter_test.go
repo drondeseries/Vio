@@ -72,20 +72,28 @@ func TestSortCandidatesForProfileRecordsRejected(t *testing.T) {
 	}
 }
 
-// TestMatchProfileGenericHDRMatchesHDR10Family proves the "4K HDR" profile
-// (HDR: "hdr") matches the HDR10 family the classifier emits, instead of
-// rejecting the content it exists to match. Dolby Vision is a distinct format
-// and is only matched by a profile that asks for "dv" explicitly.
-func TestMatchProfileGenericHDRMatchesHDR10Family(t *testing.T) {
+// TestMatchProfileGenericHDRMatchesWholeHDRFamily proves the "4K HDR" profile
+// (HDR: "hdr") matches every HDR format the classifier emits, including Dolby
+// Vision, instead of rejecting the content it exists to match.
+//
+// This reverses the earlier pin that deliberately excluded DV. The exclusion
+// was user-hostile: a DV-only listing made the "4K HDR" preset match zero
+// candidates, which the resolver turns into a hard "no stream matches profile"
+// failure for an auto-picked profile — playback lost entirely rather than a
+// slightly-off selection. "HDR" names the family, so DV belongs in it; a
+// profile that wants only Dolby Vision still asks for "dv" explicitly and
+// stays exact.
+func TestMatchProfileGenericHDRMatchesWholeHDRFamily(t *testing.T) {
 	profile := QualityProfile{Label: "4K HDR", Resolution: "2160p", HDR: "hdr"}
-	for _, candidateHDR := range []string{"hdr", hdrValueHDR10, hdrValueHDR10Plus} {
+	for _, candidateHDR := range []string{"hdr", hdrValueHDR10, hdrValueHDR10Plus, hdrValueDV} {
 		candidate := stream.StreamCandidate{Resolution: "2160p", HDR: candidateHDR}
 		if !MatchProfile(candidate, profile) {
 			t.Fatalf("HDR %q did not satisfy a generic hdr profile", candidateHDR)
 		}
 	}
-	if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "dv"}, profile) {
-		t.Fatal("generic hdr profile matched Dolby Vision, which is not HDR10")
+	// SDR (no HDR marker) still fails the requirement.
+	if MatchProfile(stream.StreamCandidate{Resolution: "2160p"}, profile) {
+		t.Fatal("generic hdr profile matched an SDR candidate")
 	}
 
 	dvProfile := QualityProfile{Label: "4K DV", Resolution: "2160p", HDR: "dv"}
@@ -94,6 +102,27 @@ func TestMatchProfileGenericHDRMatchesHDR10Family(t *testing.T) {
 	}
 	if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: hdrValueHDR10}, dvProfile) {
 		t.Fatal("dv profile matched HDR10 content")
+	}
+}
+
+// TestMatchProfileUnknownResolutionDoesNotFailRequirement proves an unparsed
+// resolution is treated as unknown rather than as a proven mismatch. A listing
+// whose releases carry no explicit resolution marker must not be filtered to
+// zero (a hard failure) by an auto-picked profile; the ranked order still
+// prefers a candidate with a known, higher resolution.
+func TestMatchProfileUnknownResolutionDoesNotFailRequirement(t *testing.T) {
+	profile := QualityProfile{Label: "4K HDR", Resolution: "2160p", HDR: "hdr"}
+
+	if !MatchProfile(stream.StreamCandidate{HDR: "hdr", Name: "Show.S01E05.REPACK"}, profile) {
+		t.Fatal("unknown resolution failed the resolution requirement")
+	}
+	// A known resolution still gates exactly: 1080p does not satisfy 2160p.
+	if MatchProfile(stream.StreamCandidate{Resolution: "1080p", HDR: "hdr"}, profile) {
+		t.Fatal("a known 1080p candidate satisfied a 2160p requirement")
+	}
+	// A known 2160p candidate still matches.
+	if !MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "hdr"}, profile) {
+		t.Fatal("a known 2160p candidate failed a 2160p requirement")
 	}
 }
 
@@ -133,17 +162,21 @@ func TestSortCandidatesForProfileRanksProfileMatchedFirst(t *testing.T) {
 
 // TestMatchProfileExcludeHDRSymmetricWithRequirement proves the exclude side
 // uses the same sibling rule as the requirement side: ExcludeHDR "hdr" excludes
-// the HDR10 family but not Dolby Vision, while ExcludeHDR "dv" excludes only
-// DV.
+// the whole HDR family including Dolby Vision, while ExcludeHDR "dv" excludes
+// only DV.
+//
+// This reverses the earlier pin that left DV behind an ExcludeHDR "hdr". With
+// HDR "hdr" now accepting DV, the exclusion must cover it too or "exclude HDR"
+// would mean "exclude everything except DV" — the opposite of its name.
 func TestMatchProfileExcludeHDRSymmetricWithRequirement(t *testing.T) {
 	hdrExclude := QualityProfile{Label: "no hdr", Resolution: "2160p", ExcludeHDR: "hdr"}
-	for _, candidateHDR := range []string{"hdr", hdrValueHDR10, hdrValueHDR10Plus} {
+	for _, candidateHDR := range []string{"hdr", hdrValueHDR10, hdrValueHDR10Plus, hdrValueDV} {
 		if MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: candidateHDR}, hdrExclude) {
 			t.Fatalf("ExcludeHDR \"hdr\" did not exclude %q", candidateHDR)
 		}
 	}
-	if !MatchProfile(stream.StreamCandidate{Resolution: "2160p", HDR: "dv"}, hdrExclude) {
-		t.Fatal("ExcludeHDR \"hdr\" excluded Dolby Vision")
+	if !MatchProfile(stream.StreamCandidate{Resolution: "2160p"}, hdrExclude) {
+		t.Fatal("ExcludeHDR \"hdr\" excluded an SDR candidate")
 	}
 
 	dvExclude := QualityProfile{Label: "no dv", Resolution: "2160p", ExcludeHDR: "dv"}

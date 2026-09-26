@@ -165,9 +165,48 @@ func TestResolveDetailedRematchStillRefusesDifferentRelease(t *testing.T) {
 }
 
 // TestResolveDetailedRematchRejectsSameNameDifferentSize proves a provider that
-// reuses a release name cannot be treated as the same release when the size
-// differs and there is no stronger identity tier.
+// reuses a release name cannot be treated as the same release when the size is
+// materially different and there is no stronger identity tier. A small relative
+// drift is tolerated (release sizes are rounded and a re-list can report a
+// slightly different byte count); a different quality tier is not.
 func TestResolveDetailedRematchRejectsSameNameDifferentSize(t *testing.T) {
+	server := identityRematchProvider(t)
+	svc := virtuallibrary.New(virtuallibrary.Config{
+		Enabled:             true,
+		ManifestURL:         server.URL + "/manifest.json",
+		AllowInsecureHTTP:   true,
+		AllowPrivateStreams: true,
+	}, nil, nil)
+	ctx := context.Background()
+	streams, err := svc.ListStreams(ctx, "virtual://movie/tt100")
+	if err != nil || len(streams) != 2 {
+		t.Fatalf("ListStreams: count=%d err=%v, want 2", len(streams), err)
+	}
+	// The fixture's two releases are 8 GB and 4 GB: the stored name matches the
+	// 8 GB release but the stored size is the 4 GB tier.
+	identity := virtuallibrary.PersistedCandidateIdentity{
+		ReleaseName: streams[0].ProviderReleaseName,
+		ReleaseSize: streams[0].FileSize / 2,
+	}
+
+	_, err = svc.ResolveDetailed(
+		virtuallibrary.WithPersistedCandidateIdentity(ctx, identity),
+		"virtual://movie/tt100?result="+absentResultID,
+		false, nil, "", true, false,
+	)
+	if err == nil {
+		t.Fatal("expected the dead-pin refusal when the name matches but the size tier differs")
+	}
+	if !strings.Contains(err.Error(), "no longer listed") {
+		t.Fatalf("error = %v, want the session-bound dead-pin refusal", err)
+	}
+}
+
+// TestResolveDetailedRematchToleratesNameSizeDrift is the complement: a
+// name-only row whose stored size drifted within tolerance still re-identifies
+// the renumbered release. Sizes are rounded (and parsed as decimal GB), so a
+// byte-exact comparison would spuriously report a live release dead.
+func TestResolveDetailedRematchToleratesNameSizeDrift(t *testing.T) {
 	server := identityRematchProvider(t)
 	svc := virtuallibrary.New(virtuallibrary.Config{
 		Enabled:             true,
@@ -182,19 +221,19 @@ func TestResolveDetailedRematchRejectsSameNameDifferentSize(t *testing.T) {
 	}
 	identity := virtuallibrary.PersistedCandidateIdentity{
 		ReleaseName: streams[0].ProviderReleaseName,
-		ReleaseSize: streams[0].FileSize + 1,
+		ReleaseSize: streams[0].FileSize + streams[0].FileSize/100,
 	}
 
-	_, err = svc.ResolveDetailed(
+	res, err := svc.ResolveDetailed(
 		virtuallibrary.WithPersistedCandidateIdentity(ctx, identity),
 		"virtual://movie/tt100?result="+absentResultID,
 		false, nil, "", true, false,
 	)
-	if err == nil {
-		t.Fatal("expected the dead-pin refusal when only the name matches but the size differs")
+	if err != nil {
+		t.Fatalf("a 1%% size drift must still re-identify the release: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no longer listed") {
-		t.Fatalf("error = %v, want the session-bound dead-pin refusal", err)
+	if !res.IdentityRematched {
+		t.Fatal("resolver did not report the re-identification under size drift")
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	chimw "github.com/go-chi/chi/v5/middleware"
+
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 )
@@ -42,6 +44,26 @@ func TestNewVirtualMediaDetailedResolverForwardsIdentityRematch(t *testing.T) {
 	}
 	if resolved.CandidateID != "renumbered" || resolved.URI != "virtual://movie/1?result=renumbered" {
 		t.Fatalf("adapter returned %+v, want the re-identified candidate", resolved)
+	}
+}
+
+// TestNewVirtualMediaDetailedResolverThreadsRequestID proves the adapter crosses
+// the edge request id into the resolve context, so the virtuallibrary refusal
+// logs can be correlated with the request that caused them.
+func TestNewVirtualMediaDetailedResolverThreadsRequestID(t *testing.T) {
+	var got string
+	source := detailedResolverSourceFunc(func(ctx context.Context, _ string, _ bool, _ []string, _ string, _ bool, _ ...bool) (virtuallibrary.ResolvedVirtualStream, error) {
+		got = virtuallibrary.RequestIDFromContext(ctx)
+		return virtuallibrary.ResolvedVirtualStream{URL: "http://127.0.0.1:8080/stream", URI: "virtual://movie/1?result=one", CandidateID: "one"}, nil
+	})
+	resolver := newVirtualMediaDetailedResolver(source)
+
+	ctx := context.WithValue(context.Background(), chimw.RequestIDKey, "req-adapter-1")
+	if _, err := resolver.ResolveVirtualMediaDetailed(ctx, "virtual://movie/1?result=one", 1, 2, "profile", false, nil, ""); err != nil {
+		t.Fatalf("ResolveVirtualMediaDetailed() error = %v", err)
+	}
+	if got != "req-adapter-1" {
+		t.Fatalf("request id threaded to resolve = %q, want %q", got, "req-adapter-1")
 	}
 }
 

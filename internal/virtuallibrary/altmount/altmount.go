@@ -43,9 +43,17 @@ var altmountHTTPClient = newRestrictedRedirectHTTPClient(20 * time.Second)
 
 // altmountReleaseRecord is one release's source-of-truth state as reported by
 // AltMount's SABnzbd-compatible history API.
+//
+// Identity is AltMount's own stable name for the release (its NZB name when the
+// slot reports one, else the storage/relative path), reduced to a comparable
+// key. It is release-scoped, so it is a durable identity a candidate can adopt
+// when the Stremio answer carries no hash and Prowlarr is unwired. Size is
+// AltMount's exact imported byte count, which is stronger than a rounded
+// display size and can fill a candidate's otherwise-unknown size tier.
 type altmountReleaseRecord struct {
-	Size        int64 `json:"size,omitempty"`
-	CompletedAt int64 `json:"completed_at,omitempty"`
+	Size        int64  `json:"size,omitempty"`
+	CompletedAt int64  `json:"completed_at,omitempty"`
+	Identity    string `json:"identity,omitempty"`
 }
 
 type altmountStateSnapshot struct {
@@ -444,7 +452,11 @@ func parseAltmountHistory(r io.Reader, now time.Time) (altmountStateSnapshot, er
 		if completedAt <= 0 {
 			completedAt = now.Unix()
 		}
-		record := altmountReleaseRecord{Size: slot.Bytes, CompletedAt: completedAt}
+		record := altmountReleaseRecord{
+			Size:        slot.Bytes,
+			CompletedAt: completedAt,
+			Identity:    altmountReleaseIdentity(slot.NzbName, slot.Name, slot.Storage, slot.Path),
+		}
 		keys := altmountSlotKeys(slot.Name, slot.NzbName, slot.Storage, slot.Path)
 		switch {
 		case strings.EqualFold(slot.Status, "Completed") && strings.TrimSpace(slot.Storage) != "":
@@ -458,6 +470,20 @@ func parseAltmountHistory(r io.Reader, now time.Time) (altmountStateSnapshot, er
 		}
 	}
 	return snapshot, nil
+}
+
+// altmountReleaseIdentity returns AltMount's most release-stable name for a
+// history slot: the NZB name the operator/ indexer submitted when present,
+// else the display name, else the storage or relative path base. The value is
+// normalized to the same comparable key the slot map uses, so two postings of
+// one release yield one identity. Empty means the slot exposes nothing usable.
+func altmountReleaseIdentity(values ...string) string {
+	for _, value := range values {
+		if key := releaseNameKey(value); key != "" {
+			return key
+		}
+	}
+	return ""
 }
 
 // altmountSlotKeys returns every normalized identity a history slot exposes.
@@ -576,6 +602,13 @@ func saveAltmountState(path string, snapshot altmountStateSnapshot) error {
 // ClassifyCandidates applies AltMount's authoritative state: completed
 // releases are marked SourceConfirmed, failed releases SourceFailed. A
 // completed record always wins over a stale failed one.
+//
+// A confirmed candidate additionally adopts AltMount's durable identity when
+// it lacks one: the record's release-scoped key becomes a namespaced
+// SourceGUID (so it can never be confused with a Prowlarr GUID), and AltMount's
+// exact imported size fills an unknown candidate size. Both are additive — a
+// value the candidate already carries is never overwritten — so this only
+// raises identity coverage without changing which release a candidate is.
 func (c *altmountStateClient) ClassifyCandidates(candidates []stream.StreamCandidate) {
 	if c == nil || len(candidates) == 0 {
 		return
@@ -594,11 +627,33 @@ func (c *altmountStateClient) ClassifyCandidates(candidates []stream.StreamCandi
 		}
 		if record, ok := completed[key]; ok && releaseSizesMatch(record.Size, candidates[i].FileSize) {
 			candidates[i].SourceConfirmed = true
+			adoptAltmountIdentity(&candidates[i], record)
 			continue
 		}
 		if _, ok := failed[key]; ok {
 			candidates[i].SourceFailed = true
 		}
+	}
+}
+
+// altmountGUIDPrefix namespaces an AltMount release key used as a candidate's
+// source GUID, so it can never collide with a Prowlarr GUID (which is an
+// indexer-assigned release id, not a normalized name).
+const altmountGUIDPrefix = "altmount:"
+
+// adoptAltmountIdentity fills a candidate's durable identity from AltMount's
+// completed record. A candidate that already carries a video hash, a source
+// GUID or a size keeps it: AltMount is corroboration, not an override, and a
+// re-list must not lose the stronger tier the provider already declared.
+func adoptAltmountIdentity(candidate *stream.StreamCandidate, record altmountReleaseRecord) {
+	if candidate == nil {
+		return
+	}
+	if strings.TrimSpace(candidate.SourceGUID) == "" && strings.TrimSpace(record.Identity) != "" {
+		candidate.SourceGUID = altmountGUIDPrefix + record.Identity
+	}
+	if candidate.FileSize <= 0 && record.Size > 0 {
+		candidate.FileSize = record.Size
 	}
 }
 

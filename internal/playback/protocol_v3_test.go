@@ -3930,6 +3930,164 @@ func TestPlanPlaybackV3VideoRemuxUsesCurrentAACRecipeForHLSFallback(t *testing.T
 	}
 }
 
+// eac3RouteFixtureV3 returns a 1080p H.264 + E-AC-3 5.1 source plus a request
+// whose progressive and HLS deliveries both accept H.264 video. Tests vary the
+// audio scoping and container to drive the route order.
+func eac3RouteFixtureV3() (*models.MediaFile, StartRequestV3) {
+	file := &models.MediaFile{
+		ID: 42, FilePath: "/media/movie.mkv", Container: "mkv",
+		CodecVideo: "h264", CodecAudio: "eac3", Resolution: "1080p", Bitrate: 8_000, AudioChannels: 6,
+		VideoTracks: []models.VideoTrack{{Codec: "h264", Profile: "High", Level: 41, Width: 1920, Height: 1080, FrameRate: "24", Bitrate: 8_000, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR"}},
+		AudioTracks: []models.AudioTrack{{Codec: "eac3", Channels: 6, Layout: "5.1"}},
+	}
+	req := validStartRequestV3()
+	req.Capabilities.Containers = []string{"mkv", "mp4"}
+	req.Capabilities.MaxResolution = "1080p"
+	req.Capabilities.CodecsVideo = []string{"h264"}
+	req.Capabilities.CodecsAudio = []string{"aac", "eac3"}
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "h264", Profiles: []string{"high"}, Levels: []int{41}, BitDepths: []int{8}, MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 20_000, Hardware: true}}
+	progressive := req.ClientPlaybackContext.Deliveries[DeliveryClassProgressiveV3]
+	progressive.Containers = []string{"mp4"}
+	progressive.VideoCodecs = []string{"h264"}
+	progressive.AudioDecodeCodecs = []string{"aac", "eac3"}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassProgressiveV3] = progressive
+	hls := req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3]
+	hls.Containers = []string{"hls"}
+	hls.VideoCodecs = []string{"h264"}
+	hls.AudioDecodeCodecs = []string{"aac", "eac3"}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3] = hls
+	return file, req
+}
+
+// TestPlanPlaybackV3EAC3RouteOrder pins the route family an E-AC-3 source takes:
+// direct play first, then a video-copy remux with at most an audio-only
+// conversion, and never a full video transcode. Full video transcode stays
+// strictly last and fires only for a video reason, never for audio alone.
+func TestPlanPlaybackV3EAC3RouteOrder(t *testing.T) {
+	planFor := func(t *testing.T, req StartRequestV3) PlannerResultV3 {
+		t.Helper()
+		file, _ := eac3RouteFixtureV3()
+		return PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3()})
+	}
+
+	t.Run("capable client direct plays the original container", func(t *testing.T) {
+		_, req := eac3RouteFixtureV3()
+		result := planFor(t, req)
+		if result.Plan == nil || result.Plan.Delivery != DeliveryOriginalHTTPV3 || result.PlayMethod != PlayDirect || result.TranscodeAudio || len(result.Plan.Transformations) != 0 {
+			t.Fatalf("result = %s, want direct play with no transformation", ExplainPlannerResultV3(result))
+		}
+	})
+
+	t.Run("capable client remuxes when the container is foreign", func(t *testing.T) {
+		_, req := eac3RouteFixtureV3()
+		req.Capabilities.Containers = []string{"mp4"} // mkv rejected -> remux
+		result := planFor(t, req)
+		if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 || result.PlayMethod != PlayRemux || result.TranscodeAudio || result.TargetAudioCodec != "eac3" {
+			t.Fatalf("result = %s, want a video-copy remux with eac3 copied", ExplainPlannerResultV3(result))
+		}
+	})
+
+	t.Run("aac-only client copies video and converts audio only", func(t *testing.T) {
+		_, req := eac3RouteFixtureV3()
+		req.Capabilities.CodecsAudio = []string{"aac"}
+		progressive := req.ClientPlaybackContext.Deliveries[DeliveryClassProgressiveV3]
+		progressive.AudioDecodeCodecs = []string{"aac"}
+		req.ClientPlaybackContext.Deliveries[DeliveryClassProgressiveV3] = progressive
+		hls := req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3]
+		hls.AudioDecodeCodecs = []string{"aac"}
+		req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3] = hls
+		result := planFor(t, req)
+		if result.Plan == nil || result.PlayMethod != PlayRemux || !result.TranscodeAudio || result.TargetAudioCodec != "aac" || result.TargetVideoCodec != "" {
+			t.Fatalf("result = %s, want remux with audio-only AAC conversion", ExplainPlannerResultV3(result))
+		}
+		if len(result.Plan.Transformations) != 1 || result.Plan.Transformations[0].Name != TransformationAudioToAACV3 {
+			t.Fatalf("transformations = %#v, want only %s", result.Plan.Transformations, TransformationAudioToAACV3)
+		}
+	})
+
+	t.Run("aac-only client without progressive delivery keeps video copied on HLS", func(t *testing.T) {
+		_, req := eac3RouteFixtureV3()
+		req.Capabilities.CodecsAudio = []string{"aac"}
+		delete(req.ClientPlaybackContext.Deliveries, DeliveryClassProgressiveV3)
+		hls := req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3]
+		hls.AudioDecodeCodecs = []string{"aac"}
+		req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3] = hls
+		result := planFor(t, req)
+		if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxHLSV3 || result.PlayMethod != PlayRemux || !result.TranscodeAudio || result.TargetVideoCodec != "copy" {
+			t.Fatalf("result = %s, want an HLS remux with copied video", ExplainPlannerResultV3(result))
+		}
+	})
+
+	t.Run("missing AAC toolchain is the audio-conversion terminal, not a video transcode", func(t *testing.T) {
+		file, req := eac3RouteFixtureV3()
+		req.Capabilities.CodecsAudio = []string{"aac"}
+		progressive := req.ClientPlaybackContext.Deliveries[DeliveryClassProgressiveV3]
+		progressive.AudioDecodeCodecs = []string{"aac"}
+		req.ClientPlaybackContext.Deliveries[DeliveryClassProgressiveV3] = progressive
+		hls := req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3]
+		hls.AudioDecodeCodecs = []string{"aac"}
+		req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3] = hls
+		result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: nil})
+		if result.Plan != nil || result.Terminal == nil || result.Terminal.Reason != TerminalAudioConversionUnsupportedV3 || !result.Terminal.Retryable {
+			t.Fatalf("result = %s, want the retryable audio-conversion terminal", ExplainPlannerResultV3(result))
+		}
+	})
+}
+
+// TestPlanPlaybackV3EAC3PassthroughSurvivesDecodeOnlyDelivery pins the scoped
+// audio rule for a validated E-AC-3 passthrough sink: a delivery that declares
+// a decode list but no passthrough list must not revoke the validated
+// passthrough. Reading that silence as "no passthrough" forced an unnecessary
+// E-AC-3 to AAC conversion on the remux route even though the sink could pass
+// the codec through.
+func TestPlanPlaybackV3EAC3PassthroughSurvivesDecodeOnlyDelivery(t *testing.T) {
+	file, req := eac3RouteFixtureV3()
+	req.Capabilities.Containers = []string{"mp4"} // mkv rejected -> remux path
+	req.Capabilities.CodecsAudio = []string{"aac"}
+	req.ClientFeatures = append(req.ClientFeatures, FeatureLayoutPassthrough)
+	req.Capabilities.AudioPassthrough = &AudioPassthroughV3{
+		PassthroughCodecs: []string{"eac3"}, MaxChannels: 8,
+		Entries: []AudioPassthroughEntryV3{{Codec: "eac3", ChannelCounts: []int{6}, Layouts: []string{"5.1"}}},
+	}
+	// Both server deliveries advertise decode-only constraints; neither names
+	// passthrough. The sink claim is validated at the top level.
+	for _, delivery := range []string{DeliveryClassProgressiveV3, DeliveryClassHLSV3} {
+		capability := req.ClientPlaybackContext.Deliveries[delivery]
+		capability.AudioDecodeCodecs = []string{"aac"}
+		capability.AudioPassthroughCodecs = nil
+		req.ClientPlaybackContext.Deliveries[delivery] = capability
+	}
+
+	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3()})
+	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 || result.TranscodeAudio || !result.Plan.Claims.Audio.Passthrough {
+		t.Fatalf("result = %s, want a passthrough remux with no audio conversion", ExplainPlannerResultV3(result))
+	}
+	if result.Plan.Claims.Audio.Reason != "sink_passthrough_validated" {
+		t.Fatalf("audio claim reason = %q, want sink_passthrough_validated", result.Plan.Claims.Audio.Reason)
+	}
+
+	// A delivery that does declare passthrough codecs stays authoritative: an
+	// eac3-less list removes the claim and restores the AAC conversion.
+	scopedFile, scoped := eac3RouteFixtureV3()
+	scoped.Capabilities.Containers = []string{"mp4"}
+	scoped.Capabilities.CodecsAudio = []string{"aac"}
+	scoped.ClientFeatures = append(scoped.ClientFeatures, FeatureLayoutPassthrough)
+	scoped.Capabilities.AudioPassthrough = &AudioPassthroughV3{
+		PassthroughCodecs: []string{"eac3"}, MaxChannels: 8,
+		Entries: []AudioPassthroughEntryV3{{Codec: "eac3", ChannelCounts: []int{6}, Layouts: []string{"5.1"}}},
+	}
+	for _, delivery := range []string{DeliveryClassProgressiveV3, DeliveryClassHLSV3} {
+		capability := scoped.ClientPlaybackContext.Deliveries[delivery]
+		capability.AudioDecodeCodecs = []string{"aac"}
+		capability.AudioPassthroughCodecs = []string{"ac3"} // declared, eac3 absent
+		scoped.ClientPlaybackContext.Deliveries[delivery] = capability
+	}
+	scopedResult := PlanPlaybackV3(PlannerInputV3{Request: scoped, RequestedFile: scopedFile, EffectiveFile: scopedFile, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3()})
+	if scopedResult.Plan == nil || !scopedResult.TranscodeAudio || scopedResult.Plan.Claims.Audio.Passthrough {
+		t.Fatalf("scoped result = %s, want the delivery-scoped passthrough list to win", ExplainPlannerResultV3(scopedResult))
+	}
+}
+
 // A container mismatch on decodable audio is a remux, not a conversion, and a
 // client with neither route left gets an honest terminal. An audio-only file
 // with no probed audio codec keeps its own metadata terminal.

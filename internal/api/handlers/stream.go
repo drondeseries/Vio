@@ -407,10 +407,14 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 			// The caller declares whether excluding the candidate indicted the
 			// release; a display-driven same-file re-plan never does.
 			ctx = withVirtualCandidateRotationV3(ctx, rotateCandidates)
-			// The serve layer re-resolves a release an existing session already
-			// serves, so it declares session-bound: a profile-removed candidate
-			// refuses instead of silently swapping the release.
-			ctx = withVirtualSessionBindingV3(ctx, true)
+			// The session-binding intent travels on the context and is
+			// declared by the caller: absent means session-bound, the
+			// conservative default that refuses a profile-removed or absent
+			// pin instead of silently swapping the release. The serve layer
+			// always re-resolves a release an existing session serves, so it
+			// leaves the default in place; a fresh selection that does not
+			// serve a session declares false (withVirtualSessionBindingV3) and
+			// falls through to a profile-satisfying sibling.
 			// A transient provider-listing blackout for the session's own
 			// trusted candidate must not be read as an indictment of the
 			// release. Retry it with a short bounded backoff before giving up,
