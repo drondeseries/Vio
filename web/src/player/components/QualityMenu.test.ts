@@ -382,25 +382,27 @@ describe("QualityMenu version sort preference", () => {
 });
 
 describe("QualityMenu version list refresh", () => {
-  it("renders Refresh List as the last row of the version list", () => {
+  it("renders Refresh List above and below the version rows", () => {
     renderVersionMenu({ onRefreshVersions: vi.fn().mockResolvedValue(undefined) });
 
     expect(screen.getByText("Version")).toBeInTheDocument();
     const rows = screen.getAllByRole("menuitem");
-    // Two version rows, then the refresh action, then the quality options.
-    expect(rows[0]).toHaveTextContent("1080p H264");
-    expect(rows[1]).toHaveTextContent("2160p HEVC");
-    expect(rows[2]).toHaveTextContent("Refresh List");
-    expect(rows[3]).toHaveTextContent("Original");
+    expect(rows[0]).toHaveTextContent("Refresh List");
+    // The header, then the top control, then the version rows.
+    expect(rows[1]).toHaveTextContent("1080p H264");
+    expect(rows[2]).toHaveTextContent("2160p HEVC");
+    // The bottom control closes the version list, before the quality options.
+    expect(rows[3]).toHaveTextContent("Refresh List");
+    expect(rows[4]).toHaveTextContent("Original");
   });
 
-  it("does not render the refresh row when no refresh handler is wired", () => {
+  it("does not render any refresh row when no refresh handler is wired", () => {
     renderVersionMenu();
 
     expect(screen.queryByRole("menuitem", { name: /Refresh List/ })).not.toBeInTheDocument();
   });
 
-  it("triggers exactly one refresh and disables the row while in flight", async () => {
+  it("triggers exactly one refresh from the top control and locks both rows", async () => {
     let resolveRefresh: () => void = () => {};
     const onRefreshVersions = vi.fn(
       () =>
@@ -410,26 +412,46 @@ describe("QualityMenu version list refresh", () => {
     );
     renderVersionMenu({ onRefreshVersions });
 
-    const refreshRow = screen.getByRole("menuitem", { name: /Refresh List/ });
-    fireEvent.click(refreshRow);
+    const [topRefresh] = screen.getAllByRole("menuitem", { name: /Refresh List/ });
+    fireEvent.click(topRefresh!);
 
     expect(onRefreshVersions).toHaveBeenCalledTimes(1);
-    const busyRow = screen.getByRole("menuitem", { name: /Refresh List/ });
-    expect(busyRow).toBeDisabled();
-    expect(busyRow).toHaveAttribute("aria-busy", "true");
+    // Both controls read the one refreshing state, so both lock and show busy.
+    const busyRows = screen.getAllByRole("menuitem", { name: /Refresh List/ });
+    expect(busyRows).toHaveLength(2);
+    for (const row of busyRows) {
+      expect(row).toBeDisabled();
+      expect(row).toHaveAttribute("aria-busy", "true");
+    }
 
     // A second click while the request is in flight is ignored.
-    fireEvent.click(busyRow);
+    fireEvent.click(busyRows[1]!);
     expect(onRefreshVersions).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       resolveRefresh();
       await Promise.resolve();
     });
-    expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
+    for (const row of screen.getAllByRole("menuitem", { name: /Refresh List/ })) {
+      expect(row).not.toBeDisabled();
+    }
   });
 
-  it("keeps the row locked for the whole async job, not just acceptance", async () => {
+  it("triggers exactly one refresh from the bottom control", async () => {
+    const onRefreshVersions = vi.fn().mockResolvedValue(undefined);
+    renderVersionMenu({ onRefreshVersions });
+
+    const rows = screen.getAllByRole("menuitem", { name: /Refresh List/ });
+    fireEvent.click(rows[1]!);
+
+    expect(onRefreshVersions).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getAllByRole("menuitem", { name: /Refresh List/ })).toHaveLength(2);
+  });
+
+  it("keeps both rows locked for the whole async job, not just acceptance", async () => {
     let finishJob: () => void = () => {};
     const onRefreshVersions = vi.fn(
       () =>
@@ -439,18 +461,22 @@ describe("QualityMenu version list refresh", () => {
     );
     renderVersionMenu({ onRefreshVersions });
 
-    fireEvent.click(screen.getByRole("menuitem", { name: /Refresh List/ }));
-    // Locked while the job runs; the control is never left enabled mid-job.
-    expect(screen.getByRole("menuitem", { name: /Refresh List/ })).toBeDisabled();
+    fireEvent.click(screen.getAllByRole("menuitem", { name: /Refresh List/ })[0]!);
+    // Locked while the job runs; neither control is left enabled mid-job.
+    for (const row of screen.getAllByRole("menuitem", { name: /Refresh List/ })) {
+      expect(row).toBeDisabled();
+    }
 
     await act(async () => {
       finishJob();
       await Promise.resolve();
     });
-    expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
+    for (const row of screen.getAllByRole("menuitem", { name: /Refresh List/ })) {
+      expect(row).not.toBeDisabled();
+    }
   });
 
-  it("cancels on a second press while running and unlocks the row", async () => {
+  it("cancels from either control on a second press while running and unlocks both", async () => {
     let finishJob: (() => void) | undefined;
     const onRefreshVersions = vi.fn(
       () =>
@@ -461,12 +487,16 @@ describe("QualityMenu version list refresh", () => {
     const onCancelRefresh = vi.fn().mockResolvedValue(undefined);
     renderVersionMenu({ onRefreshVersions, onCancelRefresh });
 
-    fireEvent.click(screen.getByRole("menuitem", { name: /Refresh List/ }));
-    const running = screen.getByRole("menuitem", { name: /Cancel refresh/ });
-    expect(running).not.toBeDisabled();
-    expect(running).toHaveAttribute("aria-busy", "true");
+    fireEvent.click(screen.getAllByRole("menuitem", { name: /Refresh List/ })[0]!);
+    const running = screen.getAllByRole("menuitem", { name: /Cancel refresh/ });
+    expect(running).toHaveLength(2);
+    for (const row of running) {
+      expect(row).not.toBeDisabled();
+      expect(row).toHaveAttribute("aria-busy", "true");
+    }
 
-    fireEvent.click(running);
+    // Pressing the bottom control cancels the job the top control started.
+    fireEvent.click(running[1]!);
     expect(onCancelRefresh).toHaveBeenCalledTimes(1);
 
     await act(async () => {
@@ -474,20 +504,37 @@ describe("QualityMenu version list refresh", () => {
       await Promise.resolve();
     });
     expect(screen.queryByText(REFRESH_VERSIONS_ERROR)).not.toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
+    for (const row of screen.getAllByRole("menuitem", { name: /Refresh List/ })) {
+      expect(row).not.toBeDisabled();
+    }
   });
 
-  it("keeps the version rows and shows an inline message when a refresh fails", async () => {
+  it("keeps the version rows, shows the message on both rows, and unlocks them after a failure", async () => {
     const onRefreshVersions = vi.fn().mockRejectedValue(new Error("network"));
     renderVersionMenu({ onRefreshVersions });
 
-    fireEvent.click(screen.getByRole("menuitem", { name: /Refresh List/ }));
+    fireEvent.click(screen.getAllByRole("menuitem", { name: /Refresh List/ })[0]!);
 
-    expect(await screen.findByText(REFRESH_VERSIONS_ERROR)).toBeInTheDocument();
+    expect(await screen.findAllByText(REFRESH_VERSIONS_ERROR)).toHaveLength(2);
     // The known candidates stay on screen next to the failure.
     expect(screen.getByRole("menuitem", { name: /1080p H264/ })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /2160p HEVC/ })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: /Refresh List/ })).not.toBeDisabled();
+    for (const row of screen.getAllByRole("menuitem", { name: /Refresh List/ })) {
+      expect(row).not.toBeDisabled();
+    }
+  });
+
+  it("includes the top refresh row in the menu's arrow-key roving focus", () => {
+    renderVersionMenu({ onRefreshVersions: vi.fn().mockResolvedValue(undefined) });
+
+    const [topRefresh] = screen.getAllByRole("menuitem", { name: /Refresh List/ });
+    const firstVersionRow = screen.getByRole("menuitem", { name: /1080p H264/ });
+
+    // Arrow Up from the first version row reaches the top refresh control.
+    firstVersionRow.focus();
+    expect(firstVersionRow).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "ArrowUp" });
+    expect(topRefresh).toHaveFocus();
   });
 });
 

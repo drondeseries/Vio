@@ -104,21 +104,44 @@ describe("VersionDropdown Refresh List", () => {
     makeVersion({ file_id: 2, resolution: "1080p" }),
   ];
 
-  it("renders Refresh List as the last row and triggers exactly one refresh", async () => {
+  it("renders a Refresh List control above and below the version rows", () => {
+    const dialog = openPicker(versions, { onRefreshVersions: vi.fn() });
+
+    const refreshButtons = dialog.getAllByRole("button", { name: /Refresh List/ });
+    expect(refreshButtons).toHaveLength(2);
+
+    // The top control precedes the first version row; the bottom one follows
+    // the last version row.
+    const buttons = dialog.getAllByRole("button");
+    const firstVersion = buttons.findIndex((b) => /2160p/.test(b.textContent ?? ""));
+    const lastVersion = buttons.findIndex((b) => /1080p/.test(b.textContent ?? ""));
+    expect(buttons.indexOf(refreshButtons[0]!)).toBeLessThan(firstVersion);
+    expect(buttons.indexOf(refreshButtons[1]!)).toBeGreaterThan(lastVersion);
+  });
+
+  it("triggers exactly one refresh when the top control is pressed", async () => {
     const onRefreshVersions = vi.fn().mockResolvedValue(undefined);
     const dialog = openPicker(versions, { onRefreshVersions });
 
-    const buttons = dialog.getAllByRole("button");
-    expect(buttons[buttons.length - 1]).toHaveTextContent("Refresh List");
-
     await act(async () => {
-      fireEvent.click(dialog.getByRole("button", { name: /Refresh List/ }));
+      fireEvent.click(dialog.getAllByRole("button", { name: /Refresh List/ })[0]!);
       await Promise.resolve();
     });
     expect(onRefreshVersions).toHaveBeenCalledTimes(1);
   });
 
-  it("disables the row while refreshing and keeps the list on failure", async () => {
+  it("triggers exactly one refresh when the bottom control is pressed", async () => {
+    const onRefreshVersions = vi.fn().mockResolvedValue(undefined);
+    const dialog = openPicker(versions, { onRefreshVersions });
+
+    await act(async () => {
+      fireEvent.click(dialog.getAllByRole("button", { name: /Refresh List/ })[1]!);
+      await Promise.resolve();
+    });
+    expect(onRefreshVersions).toHaveBeenCalledTimes(1);
+  });
+
+  it("locks both controls while refreshing and keeps the list on failure", async () => {
     let reject: (error: unknown) => void = () => {};
     const onRefreshVersions = vi.fn(
       () =>
@@ -128,31 +151,38 @@ describe("VersionDropdown Refresh List", () => {
     );
     const dialog = openPicker(versions, { onRefreshVersions });
 
-    fireEvent.click(dialog.getByRole("button", { name: /Refresh List/ }));
-    const busy = dialog.getByRole("button", { name: /Refresh List/ });
-    expect(busy).toBeDisabled();
-    expect(busy).toHaveAttribute("aria-busy", "true");
+    fireEvent.click(dialog.getAllByRole("button", { name: /Refresh List/ })[0]!);
+    // Both controls share the one refreshing state, so both lock together.
+    const busy = dialog.getAllByRole("button", { name: /Refresh List/ });
+    expect(busy).toHaveLength(2);
+    for (const row of busy) {
+      expect(row).toBeDisabled();
+      expect(row).toHaveAttribute("aria-busy", "true");
+    }
 
     await act(async () => {
       reject(new Error("network"));
       await Promise.resolve();
     });
 
-    expect(await screen.findByText(REFRESH_VERSIONS_ERROR)).toBeInTheDocument();
-    // The known versions stay on screen next to the failure.
+    expect(await screen.findAllByText(REFRESH_VERSIONS_ERROR)).toHaveLength(2);
+    // The known versions stay on screen next to the failure; both controls
+    // unlock together.
     expect(dialog.getByRole("button", { name: /2160p/ })).toBeInTheDocument();
     expect(dialog.getByRole("button", { name: /1080p/ })).toBeInTheDocument();
-    expect(dialog.getByRole("button", { name: /Refresh List/ })).not.toBeDisabled();
+    for (const row of dialog.getAllByRole("button", { name: /Refresh List/ })) {
+      expect(row).not.toBeDisabled();
+    }
   });
 
-  it("omits the row when no refresh handler is wired", () => {
+  it("omits both rows when no refresh handler is wired", () => {
     const dialog = openPicker(versions);
-    expect(dialog.queryByRole("button", { name: /Refresh List/ })).not.toBeInTheDocument();
+    expect(dialog.queryAllByRole("button", { name: /Refresh List/ })).toHaveLength(0);
   });
 
-  it("holds the control disabled until the whole refresh job resolves", async () => {
+  it("holds both controls disabled until the whole refresh job resolves", async () => {
     // The handler models the async flow: it resolves only once the job has
-    // finished, so the control must stay locked the entire time.
+    // finished, so the controls must stay locked the entire time.
     let finishJob: () => void = () => {};
     const onRefreshVersions = vi.fn(
       () =>
@@ -162,22 +192,22 @@ describe("VersionDropdown Refresh List", () => {
     );
     const dialog = openPicker(versions, { onRefreshVersions });
 
-    fireEvent.click(dialog.getByRole("button", { name: /Refresh List/ }));
-    const busy = dialog.getByRole("button", { name: /Refresh List/ });
-    expect(busy).toBeDisabled();
-    expect(busy).toHaveAttribute("aria-busy", "true");
-
-    // Still locked while the job runs.
-    expect(dialog.getByRole("button", { name: /Refresh List/ })).toBeDisabled();
+    fireEvent.click(dialog.getAllByRole("button", { name: /Refresh List/ })[0]!);
+    for (const row of dialog.getAllByRole("button", { name: /Refresh List/ })) {
+      expect(row).toBeDisabled();
+      expect(row).toHaveAttribute("aria-busy", "true");
+    }
 
     await act(async () => {
       finishJob();
       await Promise.resolve();
     });
-    expect(dialog.getByRole("button", { name: /Refresh List/ })).not.toBeDisabled();
+    for (const row of dialog.getAllByRole("button", { name: /Refresh List/ })) {
+      expect(row).not.toBeDisabled();
+    }
   });
 
-  it("cancels on a second press while running and unlocks the control", async () => {
+  it("cancels from either control on a second press while running and unlocks both", async () => {
     let finishJob: (() => void) | undefined;
     const onRefreshVersions = vi.fn(
       () =>
@@ -188,14 +218,18 @@ describe("VersionDropdown Refresh List", () => {
     const onCancelRefresh = vi.fn().mockResolvedValue(undefined);
     const dialog = openPicker(versions, { onRefreshVersions, onCancelRefresh });
 
-    fireEvent.click(dialog.getByRole("button", { name: /Refresh List/ }));
-    // While running the row is not disabled when the surface can cancel; it
-    // switches to the cancel affordance.
-    const running = dialog.getByRole("button", { name: /Cancel refresh/ });
-    expect(running).not.toBeDisabled();
-    expect(running).toHaveAttribute("aria-busy", "true");
+    fireEvent.click(dialog.getAllByRole("button", { name: /Refresh List/ })[0]!);
+    // While running the controls switch to the cancel affordance together and
+    // stay enabled so a second press can stop the job.
+    const running = dialog.getAllByRole("button", { name: /Cancel refresh/ });
+    expect(running).toHaveLength(2);
+    for (const row of running) {
+      expect(row).not.toBeDisabled();
+      expect(row).toHaveAttribute("aria-busy", "true");
+    }
 
-    fireEvent.click(running);
+    // Pressing the bottom control cancels the job the top control started.
+    fireEvent.click(running[1]!);
     expect(onCancelRefresh).toHaveBeenCalledTimes(1);
     // The first refresh rejects because the job was canceled; the cancel is not
     // shown as an error.
@@ -204,7 +238,9 @@ describe("VersionDropdown Refresh List", () => {
       await Promise.resolve();
     });
     expect(dialog.queryByText(REFRESH_VERSIONS_ERROR)).not.toBeInTheDocument();
-    expect(dialog.getByRole("button", { name: /Refresh List/ })).not.toBeDisabled();
+    for (const row of dialog.getAllByRole("button", { name: /Refresh List/ })) {
+      expect(row).not.toBeDisabled();
+    }
   });
 });
 

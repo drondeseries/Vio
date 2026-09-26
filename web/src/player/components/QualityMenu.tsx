@@ -149,9 +149,9 @@ export function QualityMenu({
 
   const menuItemsRef = useRef<(HTMLButtonElement | null)[]>([]);
 
-  // Stable so React does not detach the indexer rows' refs (writing `null` into
-  // the roving-focus list) on every re-render.
-  const registerIndexerRow = useCallback((index: number, el: HTMLButtonElement | null) => {
+  // Stable so React does not detach a row's ref (writing `null` into the
+  // roving-focus list) on every re-render.
+  const registerMenuRow = useCallback((index: number, el: HTMLButtonElement | null) => {
     menuItemsRef.current[index] = el;
   }, []);
 
@@ -189,21 +189,26 @@ export function QualityMenu({
   const resolvedActiveId = resolveActiveQualityOptionId(options, activeId);
   const activeOption = options.find((option) => option.id === resolvedActiveId);
   // Explicit roving-focus slots per group. Mixing a render-time counter with the
-  // refresh row's commit-time `ref` increment let one overwrite another; naming
-  // each group's start removes the ambiguity. Indexer rows are selectable menu
-  // items and get slots between the version rows and the refresh action so
-  // Arrow Up/Down follow visual order.
+  // refresh rows' commit-time `ref` increments let one overwrite another; naming
+  // each group's start removes the ambiguity. The refresh action is rendered at
+  // both the top and the bottom of the version list, so it owns a slot in each
+  // place. Indexer rows are selectable menu items and get slots between the
+  // version rows and the bottom refresh action so Arrow Up/Down follow visual
+  // order.
   const versionRowsRendered =
     !versionLocked && Boolean(versions && versions.length > 1 && onSwitchVersion);
   const indexerRowsRendered = !versionLocked && visibleIndexerReleases.length > 0;
   // Mirrors the render condition of the Version/Quality header block: the
   // refresh action lives inside it, so it renders only when this is true.
   const menuBlockRendered = versionRowsRendered || indexerRowsRendered;
-  const versionRowStart = 0;
-  const indexerRowStart = versionRowsRendered ? orderedVersions.length : 0;
-  const refreshRowIndex =
+  const topRefreshRowIndex = 0;
+  const versionRowStart = onRefreshVersions ? 1 : 0;
+  const indexerRowStart = versionRowStart + (versionRowsRendered ? orderedVersions.length : 0);
+  const bottomRefreshRowIndex =
     indexerRowStart + (indexerRowsRendered ? visibleIndexerReleases.length : 0);
-  const qualityRowStart = menuBlockRendered ? refreshRowIndex + (onRefreshVersions ? 1 : 0) : 0;
+  const qualityRowStart = menuBlockRendered
+    ? bottomRefreshRowIndex + (onRefreshVersions ? 1 : 0)
+    : 0;
 
   return (
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
@@ -242,6 +247,16 @@ export function QualityMenu({
                 <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
                   Version
                 </div>
+                {onRefreshVersions && (
+                  <VersionRefreshRow
+                    rowIndex={topRefreshRowIndex}
+                    registerRow={registerMenuRow}
+                    refreshing={refreshingVersions}
+                    cancelable={cancelableVersions}
+                    error={refreshVersionsError}
+                    onPress={handleRefreshVersions}
+                  />
+                )}
                 {versions && versions.length > 1 && onSwitchVersion && (
                   <>
                     <QualityRankingSummary
@@ -352,49 +367,20 @@ export function QualityMenu({
                     requests={indexerRequests}
                     tone="dark"
                     rowRole="menuitem"
-                    registerRow={registerIndexerRow}
+                    registerRow={registerMenuRow}
                     rowIndexStart={indexerRowStart}
                     className="border-t border-white/10 pt-0.5"
                   />
                 )}
                 {onRefreshVersions && (
-                  <button
-                    ref={(el) => {
-                      menuItemsRef.current[refreshRowIndex] = el;
-                    }}
-                    role="menuitem"
-                    type="button"
-                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
-                    disabled={refreshingVersions && !cancelableVersions}
-                    aria-busy={refreshingVersions || undefined}
-                    onClick={() => {
-                      handleRefreshVersions();
-                    }}
-                  >
-                    {refreshingVersions ? (
-                      <span
-                        className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-white/30 border-t-white"
-                        aria-hidden="true"
-                      />
-                    ) : (
-                      <RefreshCw
-                        className="h-3.5 w-3.5 shrink-0 text-white/50"
-                        aria-hidden="true"
-                      />
-                    )}
-                    <span className="flex min-w-0 flex-col">
-                      <span>
-                        {refreshingVersions && cancelableVersions
-                          ? "Cancel refresh"
-                          : "Refresh List"}
-                      </span>
-                      {refreshVersionsError && (
-                        <span className="text-[11px] leading-tight text-red-400">
-                          {refreshVersionsError}
-                        </span>
-                      )}
-                    </span>
-                  </button>
+                  <VersionRefreshRow
+                    rowIndex={bottomRefreshRowIndex}
+                    registerRow={registerMenuRow}
+                    refreshing={refreshingVersions}
+                    cancelable={cancelableVersions}
+                    error={refreshVersionsError}
+                    onPress={handleRefreshVersions}
+                  />
                 )}
                 <div className="my-1 border-t border-white/10" />
                 <div className="px-3 py-1 text-xs tracking-wider text-white/40 uppercase">
@@ -452,4 +438,55 @@ export function buildVersionStatusLabels(version: VersionInfo): string[] {
     labels.push("Will retry on play");
   }
   return labels;
+}
+
+interface VersionRefreshRowProps {
+  rowIndex: number;
+  registerRow: (index: number, el: HTMLButtonElement | null) => void;
+  refreshing: boolean;
+  cancelable: boolean;
+  error: string | null;
+  onPress: () => void;
+}
+
+/**
+ * The player menu's "Refresh List" row, rendered both above and below the
+ * version list so the control is reachable without scrolling past a long list.
+ * Both instances read the same `useVersionListRefresh` state, so one refresh
+ * locks and spins both, and each has its own roving-focus slot.
+ */
+function VersionRefreshRow({
+  rowIndex,
+  registerRow,
+  refreshing,
+  cancelable,
+  error,
+  onPress,
+}: VersionRefreshRowProps) {
+  return (
+    <button
+      ref={(el) => {
+        registerRow(rowIndex, el);
+      }}
+      role="menuitem"
+      type="button"
+      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-white/70 hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+      disabled={refreshing && !cancelable}
+      aria-busy={refreshing || undefined}
+      onClick={onPress}
+    >
+      {refreshing ? (
+        <span
+          className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-white/30 border-t-white"
+          aria-hidden="true"
+        />
+      ) : (
+        <RefreshCw className="h-3.5 w-3.5 shrink-0 text-white/50" aria-hidden="true" />
+      )}
+      <span className="flex min-w-0 flex-col">
+        <span>{refreshing && cancelable ? "Cancel refresh" : "Refresh List"}</span>
+        {error && <span className="text-[11px] leading-tight text-red-400">{error}</span>}
+      </span>
+    </button>
+  );
 }
