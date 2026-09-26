@@ -22,6 +22,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
@@ -83,6 +84,65 @@ func virtualSourceRotationFromContextV3(ctx context.Context) (string, int, bool)
 		return "", 0, false
 	}
 	return rotation.URI, rotation.Owner, true
+}
+
+// pinnedRelayRegistration is the relay a session generation currently serves.
+// version increases on every replacement (and on a successful clear) so a stale
+// failure that observed an older generation clears only that generation and
+// never wipes a replacement another restart installed in the meantime (#158).
+type pinnedRelayRegistration struct {
+	mu       sync.Mutex
+	version  uint64
+	url      string
+	identity string
+}
+
+// set replaces the pin with a new generation.
+func (p *pinnedRelayRegistration) set(url, identity string) {
+	p.mu.Lock()
+	p.version++
+	p.url = url
+	p.identity = identity
+	p.mu.Unlock()
+}
+
+// snapshot returns the current pin and the version it belongs to.
+func (p *pinnedRelayRegistration) snapshot() (url, identity string, version uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.url, p.identity, p.version
+}
+
+// clearIfVersion empties the pin only when it still belongs to version. It
+// reports whether the pin was cleared; a stale caller whose observed generation
+// was already replaced leaves the replacement intact.
+func (p *pinnedRelayRegistration) clearIfVersion(version uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.version != version {
+		return false
+	}
+	p.url = ""
+	p.identity = ""
+	p.version++
+	return true
+}
+
+// pinnedRelayStatus reports the live state of a pinned relay registration. It
+// prefers the injected RelayRegistrationStatus seam so tests can exercise
+// absent, expired, and upstream-rejected pins, and otherwise queries the
+// configured relay.
+func (h *PlaybackHandler) pinnedRelayStatus(relayURL string) remotestream.RegistrationStatus {
+	if h == nil {
+		return remotestream.RegistrationAbsent
+	}
+	if h.RelayRegistrationStatus != nil {
+		return h.RelayRegistrationStatus(relayURL)
+	}
+	if h.RemoteStreamRelay == nil {
+		return remotestream.RegistrationAbsent
+	}
+	return h.RemoteStreamRelay.RegistrationStatus(relayURL)
 }
 
 func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
@@ -159,52 +219,59 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	}
 	opts.CanonicalInputPath = canonicalPath
 	opts.VirtualSourceOwnerInstallationID = ownerInstallationID
-	// pinnedRelay is the concrete relay URL the session's generation currently
-	// serves. An in-place segment restart reuses it without a provider call:
-	// the URL names the exact candidate the session is bound to, and the relay
-	// entry lives for the session's lifetime, so re-resolving and re-registering
-	// it on every random seek only adds provider latency (#158). The fast path
-	// is scoped to a configured relay: without one there is no pinned transport
-	// to reuse and the stored-URL/rotation path below is unchanged, so the
-	// no-relay tests and callers keep their behavior. The mutex makes the read
-	// and the clear safe across concurrent restart callers; the resolve path
-	// below runs outside the lock because it performs provider I/O and can take
-	// seconds.
-	var pinnedRelayMu sync.Mutex
-	pinnedRelayURL := ""
-	pinnedRelayIdentity := ""
+	// pin is the concrete relay URL the session's generation currently serves.
+	// An in-place segment restart reuses it without a provider call: the URL
+	// names the exact candidate the session is bound to, and a live relay entry
+	// avoids provider latency on every random seek (#158). Reuse is gated on the
+	// registration still being live — not expired, not evicted, relay not
+	// closed, upstream not rejecting credentials — because a stale pin would
+	// otherwise wedge the restart on a dead transport. The fast path is scoped
+	// to a configured relay: without one there is no pinned transport to reuse
+	// and the stored-URL/rotation path below is unchanged, so the no-relay tests
+	// and callers keep their behavior. The pin is versioned so a stale failure
+	// clears only the generation it observed, never a concurrent replacement.
+	pin := &pinnedRelayRegistration{}
 	relayConfigured := h.RemoteStreamRelay != nil
 	setPinnedRelay := func(res ResolvedVirtualMedia) {
 		if !relayConfigured {
 			return
 		}
-		pinnedRelayMu.Lock()
-		pinnedRelayURL = res.URL
-		pinnedRelayIdentity = res.URI
-		pinnedRelayMu.Unlock()
-	}
-	clearPinnedRelay := func() {
-		pinnedRelayMu.Lock()
-		pinnedRelayURL = ""
-		pinnedRelayIdentity = ""
-		pinnedRelayMu.Unlock()
+		pin.set(res.URL, res.URI)
 	}
 	opts.RefreshInput = func(refreshCtx context.Context) (string, func(), error) {
-		// Reuse the pinned relay first. This is what keeps an in-place segment
-		// restart off the provider: the URL the session already holds is the
-		// exact candidate it is bound to, and the relay entry lives for the
-		// session's lifetime, so re-registering the same upstream URL every
-		// restart only adds provider latency to each random seek (#158). A
-		// restart that previously failed to re-establish its input cleared the
-		// pin below, so reuse is never attempted for a relay already known bad.
-		pinnedRelayMu.Lock()
-		pinnedURL, pinnedURI := pinnedRelayURL, pinnedRelayIdentity
-		pinnedRelayMu.Unlock()
+		// Reuse the pinned relay only while its registration is live. A pin can
+		// go stale without this session noticing yet: the relay drops entries
+		// after 24h, evicts the oldest past its bound, and refuses every entry
+		// once closed, while an upstream 401/403 marks the registration
+		// rejected because the signed URL behind it is no longer authorized.
+		// Reusing any of those would pin the restart to a dead transport. On a
+		// miss, clear only the generation observed here and fall through: an
+		// auth-rejected pin forces a fresh provider listing to renew the token,
+		// an absent pin keeps the stored-first path.
+		pinnedURL, pinnedURI, pinnedVersion := pin.snapshot()
+		forceRefresh := false
 		if trimmed := strings.TrimSpace(pinnedURL); trimmed != "" {
-			slog.InfoContext(refreshCtx, "virtual transport restart reused the pinned relay without a provider call",
-				"component", "api", "session_anchor", canonicalPath,
-				"status", "reused", "virtual_uri", pinnedURI)
-			return trimmed, nil, nil
+			switch h.pinnedRelayStatus(trimmed) {
+			case remotestream.RegistrationLive:
+				slog.InfoContext(refreshCtx, "virtual transport restart reused the pinned relay without a provider call",
+					"component", "api", "session_anchor", canonicalPath,
+					"status", "reused", "virtual_uri", pinnedURI)
+				return trimmed, nil, nil
+			case remotestream.RegistrationAuthRejected:
+				// The pin's upstream rejected its credentials (401/403). The
+				// stored URL behind it is the same dead URL, so skip the
+				// stored-first shortcut and force a provider relist to renew.
+				pin.clearIfVersion(pinnedVersion)
+				forceRefresh = true
+				slog.InfoContext(refreshCtx, "virtual transport restart renewing a relay whose upstream rejected credentials",
+					"component", "api", "session_anchor", canonicalPath,
+					"status", "renewing", "virtual_uri", pinnedURI)
+			default:
+				pin.clearIfVersion(pinnedVersion)
+				slog.InfoContext(refreshCtx, "virtual transport restart found the pinned relay registration gone; resolving stored-first",
+					"component", "api", "session_anchor", canonicalPath,
+					"status", "pin_lost", "virtual_uri", pinnedURI)
+			}
 		}
 		// A restart renews the exact candidate pinned to this session, never a
 		// provider-neutral re-selection: re-resolving through the neutral path
@@ -212,19 +279,21 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		// canonical path still carries the ?result= identity the session bound
 		// to during planning.
 		//
-		// First attempt with forceRefresh=false: the session's own persisted
-		// provider URL is a perfectly good restart input, and the stored-URL
-		// shortcut serves it from the catalog row with zero provider calls. The
-		// historical force here was meant to bypass cached transport, not to
-		// discard the stored URL; forcing it made every mid-session restart
-		// re-list the provider, so an altmount ?result= renumbering (ids are
-		// per-listing) turned a healthy persisted URL into a fatal resolve
-		// error and every segment 500'd until hls.js gave up. Identity is still
-		// threaded (see resolveVirtualInputURI), so a harmless renumbering
-		// re-matches the same release.
+		// First attempt with forceRefresh=false (or true after an auth
+		// rejection): the session's own persisted provider URL is a perfectly
+		// good restart input, and the stored-URL shortcut serves it from the
+		// catalog row with zero provider calls. The historical force here was
+		// meant to bypass cached transport, not to discard the stored URL;
+		// forcing it made every mid-session restart re-list the provider, so an
+		// altmount ?result= renumbering (ids are per-listing) turned a healthy
+		// persisted URL into a fatal resolve error and every segment 500'd until
+		// hls.js gave up. Identity is still threaded (see
+		// resolveVirtualInputURI), so a harmless renumbering re-matches the same
+		// release. An observed 401/403 is the one case that legitimately needs
+		// the forced relist: the stored URL is equally unauthorized.
 		res, cleanup, err := h.resolveVirtualInputURI(
 			refreshCtx, canonicalPath, ownerInstallationID,
-			userID, profileID, false, nil, "",
+			userID, profileID, forceRefresh, nil, "",
 		)
 		if err == nil {
 			setPinnedRelay(res)
@@ -247,7 +316,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			userID, profileID, true, excluded, "", true,
 		)
 		if rotateErr != nil {
-			clearPinnedRelay()
+			pin.clearIfVersion(pinnedVersion)
 			return rotated.URL, rotatedCleanup, rotateErr
 		}
 		if !rotated.IdentityRematched && !resolvedMatchesPersistedIdentity(rotated, file) {
@@ -258,7 +327,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				"component", "api", "session_anchor", canonicalPath,
 				"status", "rotation_refused", "old_candidate_id", pinnedID,
 				"new_candidate_id", virtualResultCandidateID(rotated.URI))
-			clearPinnedRelay()
+			pin.clearIfVersion(pinnedVersion)
 			return "", nil, err
 		}
 		slog.InfoContext(refreshCtx, "virtual transport restart rotated an absent session-bound candidate",

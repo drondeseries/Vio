@@ -1962,3 +1962,128 @@ func TestRelayRangeCacheEvictsUnderByteCap(t *testing.T) {
 		t.Fatalf("totalBytes = %d, want the retained body sum %d", cache.totalBytes, sum)
 	}
 }
+
+// TestRelayRegistrationStatusLiveExpiredAndEvicted proves the registration
+// check distinguishes a live registration from one whose lifetime elapsed and
+// from one evicted at capacity. The expired case is enforced when the status is
+// queried (like the presentation path), not only when an unrelated registration
+// triggers eviction.
+func TestRelayRegistrationStatusLiveExpiredAndEvicted(t *testing.T) {
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+
+	liveURL, cleanup := registerRelayForTest(t, relay, "status-live", "https://1.1.1.1/live.mkv")
+	defer cleanup()
+	if got := relay.RegistrationStatus(liveURL); got != RegistrationLive {
+		t.Fatalf("live status = %v, want RegistrationLive", got)
+	}
+
+	relay.mu.Lock()
+	relay.entries["status-live"].createdAt = time.Now().Add(-relayEntryLifetime - time.Minute)
+	relay.mu.Unlock()
+	if got := relay.RegistrationStatus(liveURL); got != RegistrationAbsent {
+		t.Fatalf("expired status = %v, want RegistrationAbsent", got)
+	}
+	relay.mu.Lock()
+	_, stillPresent := relay.entries["status-live"]
+	relay.mu.Unlock()
+	if stillPresent {
+		t.Fatal("expired entry was not dropped by the status check")
+	}
+
+	// Seed a full table and evict the oldest, then confirm the evicted URL is
+	// reported absent while a newer one stays live.
+	base := time.Now().Add(-time.Hour)
+	var evictedURL string
+	relay.mu.Lock()
+	for i := 0; i < relayMaxEntries; i++ {
+		source, _ := url.Parse("https://1.1.1.1/evict")
+		token := "status-old-" + strconv.Itoa(i)
+		relay.entries[token] = &relayEntry{source: source, baseName: "stream", createdAt: base.Add(time.Duration(i) * time.Second)}
+		if i == 0 {
+			evictedURL = "/source/" + token + "/stream"
+		}
+	}
+	relay.evictOldestLocked(relayMaxEntries - 1)
+	_, newestPresent := relay.entries["status-old-"+strconv.Itoa(relayMaxEntries-1)]
+	relay.mu.Unlock()
+	if got := relay.RegistrationStatus(evictedURL); got != RegistrationAbsent {
+		t.Fatalf("evicted status = %v, want RegistrationAbsent", got)
+	}
+	if !newestPresent {
+		t.Fatal("the newest entry was evicted before the oldest")
+	}
+	if got := relay.RegistrationStatus("/source/status-old-" + strconv.Itoa(relayMaxEntries-1) + "/stream"); got != RegistrationLive {
+		t.Fatalf("surviving status = %v, want RegistrationLive", got)
+	}
+}
+
+// TestRelayRegistrationStatusReportsClosed proves a closed relay reports every
+// registration absent, so a caller holding a pinned URL learned before shutdown
+// does not reuse it against a relay that will refuse the request.
+func TestRelayRegistrationStatusReportsClosed(t *testing.T) {
+	relay := NewRelay()
+	relayURL, cleanup := registerRelayForTest(t, relay, "status-closed", "https://1.1.1.1/closed.mkv")
+	defer cleanup()
+	if got := relay.RegistrationStatus(relayURL); got != RegistrationLive {
+		t.Fatalf("status before close = %v, want RegistrationLive", got)
+	}
+	if err := relay.Close(context.Background()); err != nil {
+		t.Fatalf("close relay: %v", err)
+	}
+	if got := relay.RegistrationStatus(relayURL); got != RegistrationAbsent {
+		t.Fatalf("status after close = %v, want RegistrationAbsent", got)
+	}
+}
+
+// TestRelayRegistrationStatusReportsUnknownURL proves a URL that is not a relay
+// source path — or that names an unknown token — reports absent rather than
+// being mistaken for a live registration.
+func TestRelayRegistrationStatusReportsUnknownURL(t *testing.T) {
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+	for _, raw := range []string{
+		"",
+		"not a url",
+		"https://example.test/other/path",
+		"http://127.0.0.1:1/source/unknown/stream.mkv",
+	} {
+		if got := relay.RegistrationStatus(raw); got != RegistrationAbsent {
+			t.Fatalf("status for %q = %v, want RegistrationAbsent", raw, got)
+		}
+	}
+}
+
+// TestRelayRegistrationStatusReportsUpstreamAuthRejection proves an upstream
+// 401 or 403 marks the registration rejected: the proxied request still fails,
+// and a later status query reports RegistrationAuthRejected so the caller can
+// renew instead of reusing the dead registration.
+func TestRelayRegistrationStatusReportsUpstreamAuthRejection(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer upstream.Close()
+
+			relay := NewRelay()
+			defer func() { _ = relay.Close(context.Background()) }()
+			relayURL, release, err := relay.RegisterInsecure(context.Background(), upstream.URL+"/stream.mkv")
+			if err != nil {
+				t.Fatalf("RegisterInsecure: %v", err)
+			}
+			defer release()
+			if got := relay.RegistrationStatus(relayURL); got != RegistrationLive {
+				t.Fatalf("status before request = %v, want RegistrationLive", got)
+			}
+			parsed, err := url.Parse(relayURL)
+			if err != nil {
+				t.Fatalf("parse relay URL: %v", err)
+			}
+			fetchRelay(t, relay, parsed.EscapedPath(), http.MethodGet, "")
+			if got := relay.RegistrationStatus(relayURL); got != RegistrationAuthRejected {
+				t.Fatalf("status after upstream %d = %v, want RegistrationAuthRejected", status, got)
+			}
+		})
+	}
+}

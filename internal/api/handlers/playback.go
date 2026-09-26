@@ -469,6 +469,11 @@ type PlaybackHandler struct {
 	VirtualMediaRefreshResolver  VirtualMediaRefreshResolver
 	VirtualMediaDetailedResolver VirtualMediaDetailedResolver
 	RemoteStreamRelay            *remotestream.Relay
+	// RelayRegistrationStatus reports whether a pinned relay URL still names a
+	// live registration. Optional; when nil the handler queries
+	// RemoteStreamRelay. It lets tests exercise absent, expired, evicted, and
+	// upstream-rejected pins without reaching into relay internals.
+	RelayRegistrationStatus func(relayURL string) remotestream.RegistrationStatus
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for HTTP manifests on
 	// private/local provider hosts.
