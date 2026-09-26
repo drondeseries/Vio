@@ -278,6 +278,34 @@ func TestPushDeviceAPNsTokenEncryptionUsesRowAAD(t *testing.T) {
 	}
 }
 
+// TestPushProviderMatchesDatabaseConstraint pins that the provider the insert
+// paths write is one the push_devices and push_delivery_attempts provider check
+// constraints accept. A drift here (the rebrand once made it "vio_relay") makes
+// every registration insert fail with SQLSTATE 23514, which the API reports as
+// a 500; normalizePushProvider turns an unknown value into the 400-class
+// ErrPushDeviceUnsupported instead.
+func TestPushProviderMatchesDatabaseConstraint(t *testing.T) {
+	provider, err := normalizePushProvider(PushProviderSiloRelay)
+	if err != nil || provider != PushProviderSiloRelay {
+		t.Fatalf("normalizePushProvider(%q) = %q, %v", PushProviderSiloRelay, provider, err)
+	}
+	if _, err := normalizePushProvider("unlisted_relay"); !errors.Is(err, ErrPushDeviceUnsupported) {
+		t.Fatalf("unknown provider error = %v, want ErrPushDeviceUnsupported", err)
+	}
+	for _, name := range []string{
+		"20260701143000_push_devices.sql",
+		"20260701170000_push_delivery_attempts.sql",
+	} {
+		migration, err := os.ReadFile("../../migrations/sql/" + name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if !strings.Contains(string(migration), "'"+PushProviderSiloRelay+"'") {
+			t.Fatalf("%s does not accept provider %q", name, PushProviderSiloRelay)
+		}
+	}
+}
+
 // newPushDeviceTestRepo connects to SILO_TEST_DATABASE_URL (skipping when
 // unset) and shadows push_devices with a session-local temp table, pinning the
 // pool to one connection so every query sees it.

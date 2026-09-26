@@ -17,9 +17,13 @@ import (
 )
 
 const (
-	PushPlatformApple      = "apple"
-	PushPlatformAndroid    = "android"
-	PushProviderSiloRelay  = "vio_relay"
+	PushPlatformApple   = "apple"
+	PushPlatformAndroid = "android"
+	// PushProviderSiloRelay must stay inside push_devices_provider_check and
+	// push_delivery_attempts_provider_check (see migrations/sql/). A value the
+	// constraints reject makes Postgres fail the insert with SQLSTATE 23514,
+	// which surfaces as a 500 instead of a client error.
+	PushProviderSiloRelay  = "silo_relay"
 	PushModeOff            = "off"
 	PushModeInAppOnly      = "in_app_only"
 	PushModePrivatePush    = "private_push"
@@ -33,10 +37,31 @@ var (
 	ErrPushDeviceInvalid     = errors.New("invalid push device registration")
 	ErrPushDeviceUnsupported = errors.New("unsupported push device registration")
 
+	// pushProviders is the set of provider values the push_devices and
+	// push_delivery_attempts provider check constraints accept. Keep it in sync
+	// with migrations/sql/20260701143000_push_devices.sql and
+	// migrations/sql/20260701170000_push_delivery_attempts.sql.
+	pushProviders = map[string]struct{}{
+		PushProviderSiloRelay: {},
+	}
+
 	apnsTokenHexPattern = regexp.MustCompile(`^[0-9a-f]+$`)
 	// The relay validates FCM registration tokens against the same shape.
 	fcmTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_:-]{64,512}$`)
 )
+
+// normalizePushProvider returns the database-accepted provider value, or
+// ErrPushDeviceUnsupported when the value is outside the constraints' set. The
+// insert paths call it before writing so an unknown provider is answered as a
+// validation failure instead of a check-constraint violation (SQLSTATE 23514)
+// that the transport reports as a 500.
+func normalizePushProvider(provider string) (string, error) {
+	provider = strings.TrimSpace(provider)
+	if _, ok := pushProviders[provider]; !ok {
+		return "", ErrPushDeviceUnsupported
+	}
+	return provider, nil
+}
 
 // PushDevice represents one profile-scoped notification endpoint.
 type PushDevice struct {
@@ -485,6 +510,10 @@ func (r *PushDeviceRepository) selectForUpdate(ctx context.Context, tx pgx.Tx, p
 }
 
 func (r *PushDeviceRepository) insertApple(ctx context.Context, tx pgx.Tx, registration ApplePushDeviceRegistration, cipher *secret.Cipher) (*PushDevice, error) {
+	provider, err := normalizePushProvider(PushProviderSiloRelay)
+	if err != nil {
+		return nil, err
+	}
 	id := ulid.Make().String()
 	serverDeviceID := ulid.Make().String()
 	ciphertext, err := cipher.Encrypt(registration.APNsToken, pushDeviceAPNsTokenAAD(id))
@@ -517,7 +546,7 @@ func (r *PushDeviceRepository) insertApple(ctx context.Context, tx pgx.Tx, regis
 		registration.ProfileID,
 		registration.DeviceID,
 		PushPlatformApple,
-		PushProviderSiloRelay,
+		provider,
 		registration.APNsEnvironment,
 		registration.APNsTopic,
 		ciphertext,
@@ -533,6 +562,10 @@ func (r *PushDeviceRepository) insertApple(ctx context.Context, tx pgx.Tx, regis
 }
 
 func (r *PushDeviceRepository) updateApple(ctx context.Context, tx pgx.Tx, registration ApplePushDeviceRegistration, cipher *secret.Cipher, existing *PushDevice) (*PushDevice, error) {
+	provider, err := normalizePushProvider(PushProviderSiloRelay)
+	if err != nil {
+		return nil, err
+	}
 	ciphertext, err := cipher.Encrypt(registration.APNsToken, pushDeviceAPNsTokenAAD(existing.ID))
 	if err != nil {
 		return nil, fmt.Errorf("encrypt apns token: %w", err)
@@ -555,7 +588,7 @@ func (r *PushDeviceRepository) updateApple(ctx context.Context, tx pgx.Tx, regis
 		WHERE id = $8
 		RETURNING `+pushDeviceColumns,
 		registration.UserID,
-		PushProviderSiloRelay,
+		provider,
 		registration.APNsEnvironment,
 		registration.APNsTopic,
 		ciphertext,
@@ -571,6 +604,10 @@ func (r *PushDeviceRepository) updateApple(ctx context.Context, tx pgx.Tx, regis
 }
 
 func (r *PushDeviceRepository) insertFCM(ctx context.Context, tx pgx.Tx, registration FCMPushDeviceRegistration, cipher *secret.Cipher) (*PushDevice, error) {
+	provider, err := normalizePushProvider(PushProviderSiloRelay)
+	if err != nil {
+		return nil, err
+	}
 	id := ulid.Make().String()
 	serverDeviceID := ulid.Make().String()
 	ciphertext, err := cipher.Encrypt(registration.FCMToken, pushDeviceFCMTokenAAD(id))
@@ -601,7 +638,7 @@ func (r *PushDeviceRepository) insertFCM(ctx context.Context, tx pgx.Tx, registr
 		registration.ProfileID,
 		registration.DeviceID,
 		PushPlatformAndroid,
-		PushProviderSiloRelay,
+		provider,
 		ciphertext,
 		fcmTokenHash(registration.FCMToken),
 		serverDeviceID,
@@ -615,6 +652,10 @@ func (r *PushDeviceRepository) insertFCM(ctx context.Context, tx pgx.Tx, registr
 }
 
 func (r *PushDeviceRepository) updateFCM(ctx context.Context, tx pgx.Tx, registration FCMPushDeviceRegistration, cipher *secret.Cipher, existing *PushDevice) (*PushDevice, error) {
+	provider, err := normalizePushProvider(PushProviderSiloRelay)
+	if err != nil {
+		return nil, err
+	}
 	ciphertext, err := cipher.Encrypt(registration.FCMToken, pushDeviceFCMTokenAAD(existing.ID))
 	if err != nil {
 		return nil, fmt.Errorf("encrypt fcm token: %w", err)
@@ -635,7 +676,7 @@ func (r *PushDeviceRepository) updateFCM(ctx context.Context, tx pgx.Tx, registr
 		WHERE id = $6
 		RETURNING `+pushDeviceColumns,
 		registration.UserID,
-		PushProviderSiloRelay,
+		provider,
 		ciphertext,
 		fcmTokenHash(registration.FCMToken),
 		registration.PushMode,
