@@ -847,9 +847,9 @@ func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller Pla
 	}
 	subtitleInventory := playback.ScopeSubtitleInventoryV3(sessionID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
-	status := "declared"
+	status := string(ProbeProvenanceDeclared)
 	if file != nil && file.ProbeUpdatedAt != nil {
-		status = "verified"
+		status = string(ProbeProvenanceVerified)
 	}
 
 	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory)
