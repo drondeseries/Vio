@@ -447,8 +447,10 @@ func dropFailedCandidates(candidates []StreamCandidate) []StreamCandidate {
 // keeping genuinely distinct releases apart. An empty key means the candidate
 // carries too little identity to collapse and is always kept.
 func candidateDedupKey(candidate StreamCandidate) string {
-	// Tier 1a: provider-supplied content hash.
-	if hash := strings.ToLower(strings.TrimSpace(candidate.BehaviorHints.VideoHash)); hash != "" {
+	// Tier 1a: provider-supplied content hash. Accepts the Stremio
+	// behaviorHints.videoHash and a torrent infoHash; both pin the bytes
+	// across a re-listing's result renumbering.
+	if hash := strings.ToLower(stream.CandidateVideoHash(candidate)); hash != "" {
 		return "vidhash:" + hash
 	}
 	// Tier 1b: GUID of the indexed release the classifier tied us to.
@@ -467,8 +469,8 @@ func candidateDedupKey(candidate StreamCandidate) string {
 	// True duplicates report identical byte sizes; distinct releases differ.
 	// Unknown sizes collapse only with other unknown sizes of the same name.
 	sizeKey := "0"
-	if candidate.FileSize > 0 {
-		sizeKey = strconv.FormatInt(candidate.FileSize, 10)
+	if size := stream.CandidateDeclaredSize(candidate); size > 0 {
+		sizeKey = strconv.FormatInt(size, 10)
 	}
 	return releaseKey + "\x00" + sizeKey
 }
@@ -508,6 +510,143 @@ func CandidateReleaseName(candidate StreamCandidate) string {
 	return candidateDedupName(candidate)
 }
 
+// PersistedIdentityTiers is a persisted candidate identity split into its three
+// comparison tiers, each already normalized the way the deduplication chain
+// normalizes it: the lowercase video hash, the source GUID, and the normalized
+// release name. Size is kept separately because the name tier compares it with
+// a tolerance rather than for equality. A tier is empty when the row never
+// carried it.
+type PersistedIdentityTiers struct {
+	VideoHash   string
+	GUID        string
+	ReleaseName string
+	ReleaseSize int64
+}
+
+// NewPersistedIdentityTiers normalizes an identity into its comparison tiers.
+// The hash is lowercased like candidateDedupKey's hash tier, so a
+// differently-cased stored hash still matches.
+func NewPersistedIdentityTiers(videoHash, guid, releaseName string, releaseSize int64) PersistedIdentityTiers {
+	return PersistedIdentityTiers{
+		VideoHash:   strings.ToLower(strings.TrimSpace(videoHash)),
+		GUID:        strings.TrimSpace(guid),
+		ReleaseName: strings.TrimSpace(releaseName),
+		ReleaseSize: releaseSize,
+	}
+}
+
+// SharedTier returns the name of the strongest shared non-empty tier and
+// whether any tier agreed. Tier names are "video_hash", "guid" and
+// "release_name". It is used for logging so "identity mismatch" and "no shared
+// tier" are distinguishable.
+//
+// The comparison is deliberately asymmetric, because the persisted row is the
+// viewer's authoritative selection while the listed candidate is a fresh claim:
+//
+//   - A tier both sides carry that disagrees is a veto: two different hashes
+//     (or GUIDs) are proof of different releases.
+//   - A stored stronger tier the candidate does not carry is also a veto. The
+//     row recorded a hash; a listing that cannot corroborate it is not proof of
+//     the same release, so a coincidental release name must not re-identify it.
+//   - A candidate stronger tier the stored row does not carry is neutral. That
+//     asymmetry is exactly what lets the ~thousand name-only rows re-identify a
+//     renumbered release whose fresh listing now carries a hash or GUID.
+func (p PersistedIdentityTiers) SharedTier(other PersistedIdentityTiers) (string, bool) {
+	// Disagreement on a tier both sides carry is decisive.
+	if p.VideoHash != "" && other.VideoHash != "" && p.VideoHash != other.VideoHash {
+		return "", false
+	}
+	if p.GUID != "" && other.GUID != "" && p.GUID != other.GUID && p.VideoHash != other.VideoHash {
+		return "", false
+	}
+	// A stronger stored tier the candidate cannot corroborate constrains the
+	// match: it may only be satisfied by the same tier, never by a weaker one.
+	if p.VideoHash != "" && other.VideoHash != "" {
+		return "video_hash", true
+	}
+	if p.VideoHash != "" {
+		return "", false
+	}
+	if p.GUID != "" && other.GUID != "" {
+		return "guid", true
+	}
+	if p.GUID != "" {
+		return "", false
+	}
+	if p.ReleaseName != "" && other.ReleaseName != "" && p.ReleaseName == other.ReleaseName {
+		if releaseSizesAgree(p.ReleaseSize, other.ReleaseSize) {
+			return "release_name", true
+		}
+	}
+	return "", false
+}
+
+// releaseSizesAgree reports whether two release sizes plausibly describe the
+// same file for the name tier. Provider display sizes are rounded, and a
+// re-list may report a slightly different byte count for one release, so a
+// small relative drift is tolerated instead of requiring equality. An unknown
+// size on either side is neutral: the names already agree, and refusing the
+// match would turn a renumbered release into a dead pin.
+func releaseSizesAgree(a, b int64) bool {
+	if a <= 0 || b <= 0 {
+		return true
+	}
+	if a == b {
+		return true
+	}
+	diff := a - b
+	if diff < 0 {
+		diff = -diff
+	}
+	largest := a
+	if b > largest {
+		largest = b
+	}
+	return float64(diff)/float64(largest) <= persistedNameSizeDrift
+}
+
+// persistedNameSizeDrift is the tolerated relative size difference on the name
+// tier, matching the ≤10% width the provider classifiers already use so a
+// rounded display size does not miss a renumbered release.
+const persistedNameSizeDrift = 0.10
+
+// PersistedIdentityMatch reports why a persisted identity did or did not match a
+// candidate, so a refusal can log identity presence instead of a bare miss.
+type PersistedIdentityMatch struct {
+	// Matched is true when the candidate shares a non-empty tier.
+	Matched bool
+	// Tier is the strongest shared tier ("video_hash", "guid",
+	// "release_name") when Matched.
+	Tier string
+	// IdentityEmptyTiers lists the persisted identity's tiers that are empty,
+	// in tier order. An identity with every tier empty can never match.
+	IdentityEmptyTiers []string
+	// CandidateEmptyTiers lists the matched candidate's empty tiers.
+	CandidateEmptyTiers []string
+}
+
+// HasIdentity reports whether the persisted identity carried any usable tier at
+// all. A false value explains a refusal as "no identity", distinct from a real
+// tier mismatch.
+func (m PersistedIdentityMatch) HasIdentity() bool {
+	return len(m.IdentityEmptyTiers) < 3
+}
+
+// emptyTiers names the tiers absent from an identity, in tier order.
+func (p PersistedIdentityTiers) emptyTiers() []string {
+	var empty []string
+	if p.VideoHash == "" {
+		empty = append(empty, "video_hash")
+	}
+	if p.GUID == "" {
+		empty = append(empty, "guid")
+	}
+	if p.ReleaseName == "" {
+		empty = append(empty, "release_name")
+	}
+	return empty
+}
+
 // PersistedDedupKey builds the dedup key a persisted candidate identity
 // represents, using the same tier precedence as candidateDedupKey: a non-empty
 // video hash, then a source GUID, then the normalized release name plus exact
@@ -515,6 +654,12 @@ func CandidateReleaseName(candidate StreamCandidate) string {
 // fresh listing without duplicating the tier rules that decide whether two
 // candidates are one release. An empty result means the identity carries no
 // usable tier and can never be re-matched.
+//
+// MatchCandidateByPersistedIdentityReport is the per-tier alternative for a
+// re-match: this key is deliberately strongest-tier-only, so a name-only row
+// keys as name+size and can never be compared against a GUID/hash candidate.
+// Use it only where an exact same-tier equality is the question (a transport
+// replacement decision), not for re-identification.
 func PersistedDedupKey(videoHash, guid, releaseName string, releaseSize int64) string {
 	if hash := strings.ToLower(strings.TrimSpace(videoHash)); hash != "" {
 		return "vidhash:" + hash
@@ -533,25 +678,55 @@ func PersistedDedupKey(videoHash, guid, releaseName string, releaseSize int64) s
 	return releaseKey + "\x00" + sizeKey
 }
 
-// MatchCandidateByPersistedIdentity returns the first listed candidate whose
-// dedup key equals the persisted identity's key. The comparison uses
-// candidateDedupKey, so the persisted identity is matched in exactly the tier
-// order the deduplication chain uses and a stronger tier is never satisfied by
-// a weaker one: a row with a video hash only matches a candidate with that same
-// hash, a row with a GUID only matches that GUID, and a name+size row only
-// matches a candidate with the same normalized release name and size. It
-// reports false when the persisted identity has no usable tier.
+// MatchCandidateByPersistedIdentity returns the first listed candidate that
+// shares any non-empty durable identity tier with the persisted identity.
+//
+// The comparison is per tier, not by a single precedence key: a name-only row
+// matches a listed candidate that also carries a GUID or a hash for the same
+// release, with a small size drift tolerated on the name tier. This is what
+// lets the ~thousand name-only rows re-identify a renumbered release instead of
+// being reported dead. An identity with every tier empty never matches, so a
+// legacy row keeps today's behavior.
 func MatchCandidateByPersistedIdentity(candidates []StreamCandidate, videoHash, guid, releaseName string, releaseSize int64) (StreamCandidate, bool) {
-	want := PersistedDedupKey(videoHash, guid, releaseName, releaseSize)
-	if want == "" {
-		return StreamCandidate{}, false
+	matched, ok, _ := MatchCandidateByPersistedIdentityReport(candidates, videoHash, guid, releaseName, releaseSize)
+	return matched, ok
+}
+
+// MatchCandidateByPersistedIdentityReport is MatchCandidateByPersistedIdentity
+// plus the report that distinguishes "the row carries no identity" from "the
+// row's identity disagreed with every listed candidate". Callers that log a
+// refusal should use this so a renumber can be diagnosed from one line.
+func MatchCandidateByPersistedIdentityReport(candidates []StreamCandidate, videoHash, guid, releaseName string, releaseSize int64) (StreamCandidate, bool, PersistedIdentityMatch) {
+	identity := NewPersistedIdentityTiers(videoHash, guid, releaseName, releaseSize)
+	report := PersistedIdentityMatch{IdentityEmptyTiers: identity.emptyTiers()}
+	if !report.HasIdentity() {
+		return StreamCandidate{}, false, report
 	}
 	for _, candidate := range candidates {
-		if candidateDedupKey(candidate) == want {
-			return candidate, true
+		candidateTiers := NewPersistedIdentityTiers(
+			stream.CandidateVideoHash(candidate),
+			candidate.SourceGUID,
+			candidateDedupName(candidate),
+			stream.CandidateDeclaredSize(candidate),
+		)
+		if tier, shared := identity.SharedTier(candidateTiers); shared {
+			report.Matched = true
+			report.Tier = tier
+			return candidate, true, report
 		}
 	}
-	return StreamCandidate{}, false
+	// No candidate agreed. Report the first candidate's empty tiers so the
+	// caller can tell "the provider stopped declaring identity" from a genuine
+	// mismatch.
+	if len(candidates) > 0 {
+		report.CandidateEmptyTiers = NewPersistedIdentityTiers(
+			stream.CandidateVideoHash(candidates[0]),
+			candidates[0].SourceGUID,
+			candidateDedupName(candidates[0]),
+			stream.CandidateDeclaredSize(candidates[0]),
+		).emptyTiers()
+	}
+	return StreamCandidate{}, false, report
 }
 
 // urlPathBase returns the last path segment of a stream URL, or "" when the

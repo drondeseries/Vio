@@ -70,14 +70,21 @@ var subtitlePattern = regexp.MustCompile(`(?i)\b(?:srt|ass|ssa|sub|vtt|pgs|sup|s
 var subtitleLanguagePattern = regexp.MustCompile(`(?i)\b(?:eng|en|fra|fre|fr|deu|ger|de|ita|es|spa|jpn|kor|zho|chi|por|rus|ara)\b`)
 
 type StreamCandidate struct {
-	URL           string
-	Name          string
-	Description   string
-	Title         string
+	URL         string
+	Name        string
+	Description string
+	Title       string
+	// InfoHash is the Stremio stream's torrent info hash. Torrent-style addons
+	// (and AltMount proxying one) identify the release by infoHash rather than a
+	// behaviorHints.videoHash, and it is stable across a re-listing's result
+	// renumbering, so it is a durable identity tier. It is provider-declared
+	// payload, not a resolved URL, and never leaves the server process.
+	InfoHash      string `json:"infoHash"`
 	BehaviorHints struct {
 		VideoHash    string         `json:"videoHash"`
 		Filename     string         `json:"filename"`
 		BingeGroup   string         `json:"bingeGroup"`
+		VideoSize    int64          `json:"videoSize"`
 		NotWebReady  bool           `json:"notWebReady"`
 		ProxyHeaders map[string]any `json:"proxyHeaders"`
 	}
@@ -278,6 +285,29 @@ func streamSize(s StreamCandidate) string {
 	return streamSizePattern.FindString(s.Name + " " + s.Description + " " + s.Title)
 }
 
+// CandidateVideoHash returns the candidate's provider-declared content hash:
+// the Stremio behaviorHints.videoHash when the addon sends one, else the
+// torrent infoHash. Both identify the same bytes across a re-listing's result
+// renumbering, so either is a durable hash tier. Empty means the provider
+// declared no content hash.
+func CandidateVideoHash(candidate StreamCandidate) string {
+	if hash := strings.TrimSpace(candidate.BehaviorHints.VideoHash); hash != "" {
+		return hash
+	}
+	return strings.TrimSpace(candidate.InfoHash)
+}
+
+// CandidateDeclaredSize returns the candidate's best provider-declared byte
+// size: the parsed stream-level FileSize when present, else the Stremio
+// behaviorHints.videoSize. Addons that report size only as a hint otherwise
+// leave the name tier's size key unknown.
+func CandidateDeclaredSize(candidate StreamCandidate) int64 {
+	if candidate.FileSize > 0 {
+		return candidate.FileSize
+	}
+	return candidate.BehaviorHints.VideoSize
+}
+
 // CandidateVariantID computes the stable 24-character hex candidate identity
 // from stable stream fields. It matches the algorithm used by the plugin and
 // ensures ?result= identifiers survive between plugin and core.
@@ -300,6 +330,7 @@ func CandidateVariantID(candidate StreamCandidate) string {
 		strings.TrimSpace(candidate.BehaviorHints.VideoHash),
 		strings.TrimSpace(candidate.BehaviorHints.Filename),
 		strings.TrimSpace(candidate.BehaviorHints.BingeGroup),
+		strings.TrimSpace(candidate.InfoHash),
 		urlIdentity,
 	}, "\x00")
 	digest := sha256.Sum256([]byte(fingerprint))
@@ -499,6 +530,11 @@ func ParseStreamMetadata(s *StreamCandidate) {
 				s.FileSize = int64(value * multiplier)
 			}
 		}
+	}
+	// A provider that declares an exact size hint but no parseable size text
+	// still gets a size tier, so its name+size identity is re-matchable.
+	if s.FileSize <= 0 && s.BehaviorHints.VideoSize > 0 {
+		s.FileSize = s.BehaviorHints.VideoSize
 	}
 
 	cleanText := text
