@@ -1184,9 +1184,20 @@ export function usePlaybackSession(
       retireSessionOnRefusal = false,
     ): Promise<boolean> {
       const plan = planRef.current;
+      // Stamp the load sequence with the plan, at the same read. A version
+      // switch bumps the sequence before it adopts its replacement plan, so a
+      // replan that read the sequence later would pair the outgoing plan with
+      // the incoming generation and its stale discard could never fire.
+      const loadSequence = loadSequenceRef.current;
       const sessionId = sessionIdRef.current;
       const playbackAttemptId = playbackAttemptIdRef.current;
       if (!plan || !sessionId || !playbackAttemptId) return false;
+      // A switch is replacing the whole session and about to retire the plan
+      // below. A replan built from that outgoing plan would be stamped with the
+      // switch's sequence once the switch lands, so it could clobber the
+      // replacement instead of being discarded. Refuse until the switch
+      // settles; the switch completion path owns what happens next.
+      if (switchingRef.current) return false;
       if (replanInFlightRef.current) {
         const isPendingFailureRecovery =
           options.operation === "failure_recovery" || options.operation === "seek_failure_recovery";
@@ -1229,7 +1240,7 @@ export function usePlaybackSession(
           return new Promise<boolean>((resolve) => {
             pendingReplanRef.current = {
               options,
-              loadSequence: loadSequenceRef.current,
+              loadSequence,
               retireSessionOnRefusal,
               resolve,
               planId: plan.plan_id,
@@ -1281,7 +1292,6 @@ export function usePlaybackSession(
         clientPlaybackContext,
       });
 
-      const loadSequence = loadSequenceRef.current;
       replanInFlightRef.current = true;
       beginAdoption(loadSequence);
       const isQualityReplan =
@@ -1368,12 +1378,21 @@ export function usePlaybackSession(
         const pendingReplan = pendingReplanRef.current;
         pendingReplanRef.current = null;
         if (pendingReplan?.loadSequence === loadSequenceRef.current) {
-          const recoveryAppliesToCurrentPlan =
-            pendingReplan.options.operation !== "failure_recovery" &&
-            pendingReplan.options.operation !== "seek_failure_recovery"
-              ? true
-              : pendingReplan.planId === planRef.current?.plan_id;
-          if (recoveryAppliesToCurrentPlan) {
+          // The queued op was built against the plan its `planId` names. When
+          // the in-flight replan has replaced that plan, an op may only be
+          // replayed if it carries no plan-derived state: a seek target, a
+          // quality label and an output refresh are resolved against the live
+          // plan, either by this re-dispatch or by the server. A track
+          // selection bakes in a plan-derived ordinal, and a failure recovery
+          // bakes in the plan to exclude, so both are dropped once the plan
+          // identity they name is gone. The id is checked on every op.
+          const planStillCurrent = pendingReplan.planId === planRef.current?.plan_id;
+          const pendingIsPlanBound =
+            pendingReplan.options.operation === "failure_recovery" ||
+            pendingReplan.options.operation === "seek_failure_recovery" ||
+            pendingReplan.options.audio !== undefined ||
+            pendingReplan.options.subtitle !== undefined;
+          if (planStillCurrent || !pendingIsPlanBound) {
             // A capability change can queue behind a replan created by an older
             // render. Dispatch through the latest callback so its request carries
             // the current output evidence rather than the closed-over snapshot.

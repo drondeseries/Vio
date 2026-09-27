@@ -1826,6 +1826,112 @@ describe("usePlaybackSession version switches", () => {
 
     unmount();
   });
+
+  it("refuses replans issued while a version switch is in flight", async () => {
+    const startBodies: Array<{ file_id: number }> = [];
+    const replanBodies: Array<{ operation: string }> = [];
+    let releaseSwitch: ((response: Response) => void) | undefined;
+    const switchResponse = new Promise<Response>((resolve) => {
+      releaseSwitch = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) {
+          // Hold the switch open so replans land while it is rebuilding the
+          // session.
+          return switchResponse;
+        }
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3(),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as { operation: string });
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-2",
+            plan_attempt_key: "v3:switch-2",
+            requested_media_file_id: 99,
+            effective_media_file_id: 99,
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(99, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    expect(result.current.replacing).toBe(true);
+
+    // A stale render, the realtime channel and the output-capability effect
+    // can all try to replan while the switch is rebuilding the session. Each
+    // would be built from the outgoing plan but stamped with the sequence the
+    // switch just took, so its response could overwrite the replacement plan.
+    // All must be refused.
+    act(() => {
+      result.current.switchAudioTrack(2, 120);
+      result.current.changeQuality("1080p", 130);
+      void result.current.reanchorSeek(140);
+    });
+    expect(replanBodies).toEqual([]);
+
+    await act(async () => {
+      releaseSwitch?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-2",
+            plan_attempt_key: "v3:switch-2",
+            requested_media_file_id: 99,
+            effective_media_file_id: 99,
+            stream: { ...fixturePlanV3().stream, url: "/stream/session-2/master.m3u8" },
+            source: { ...fixturePlanV3().source, media_file_id: 99 },
+          }),
+        }),
+      );
+      await switchResponse;
+    });
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(99));
+    expect(result.current.plan?.plan_id).toBe("plan:switch-2");
+    expect(replanBodies).toEqual([]);
+
+    // Once the switch settles the fence lifts and replans flow again.
+    act(() => {
+      void result.current.reanchorSeek(150);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    unmount();
+  });
 });
 
 describe("usePlaybackSession replans", () => {
@@ -2000,6 +2106,80 @@ describe("usePlaybackSession replans", () => {
       { operation: "track_change", position_seconds: 120 },
       { operation: "seek_reanchor", position_seconds: 450 },
     ]);
+
+    unmount();
+  });
+
+  it("drops a queued track change whose plan the in-flight replan replaced", async () => {
+    const initialPlan = fixturePlanV3();
+    const replannedPlan = fixturePlanV3({
+      plan_id: "plan:2222222222222222",
+      plan_attempt_key: "v3:2222222222222222",
+    });
+    let resolveFirstReplan: ((response: Response) => void) | undefined;
+    const firstReplanResponse = new Promise<Response>((resolve) => {
+      resolveFirstReplan = resolve;
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: initialPlan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return firstReplanResponse;
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      // In flight, and it will replace the plan the queued audio change is
+      // built from.
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    // The audio ordinal was resolved off the outgoing plan's menu. Once the
+    // in-flight refresh adopts a different plan identity that ordinal no longer
+    // names the same track, so the queued change must be dropped rather than
+    // replayed against the replacement plan.
+    act(() => result.current.switchAudioTrack(2, 130));
+    expect(replanBodies).toHaveLength(1);
+
+    await act(async () => {
+      resolveFirstReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: replannedPlan,
+        }),
+      );
+      await firstReplanResponse;
+    });
+
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
+    expect(replanBodies).toHaveLength(1);
 
     unmount();
   });
