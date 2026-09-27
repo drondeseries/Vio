@@ -126,12 +126,12 @@ func TestHasFinishedJobOfTypeGatesOneShot(t *testing.T) {
 	if err != nil || !done {
 		t.Fatalf("has finished = %v %v, want true for completed", done, err)
 	}
-	if _, err := r.pool.Exec(t.Context(), `UPDATE admin_jobs SET status='cancelled' WHERE id=$1`, job.ID); err != nil {
-		t.Fatalf("mark cancelled: %v", err)
+	if _, err := r.pool.Exec(t.Context(), `UPDATE admin_jobs SET status='cancelled' WHERE id=$1`, job.ID); err != nil { //nolint:misspell // Persisted DB enum value, see StatusCancelled.
+		t.Fatalf("mark canceled: %v", err)
 	}
 	done, err = r.HasFinishedJobOfType(t.Context(), JobTypeVirtualIdentityBackfill)
 	if err != nil || !done {
-		t.Fatalf("has finished = %v %v, want true for cancelled", done, err)
+		t.Fatalf("has finished = %v %v, want true for canceled", done, err)
 	}
 }
 

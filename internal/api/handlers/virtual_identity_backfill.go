@@ -240,7 +240,7 @@ func matchBackfillCandidate(row *models.MediaFile, streams []virtuallibrary.Play
 }
 
 // EnsureBackfillJob queues the one-shot backfill at boot when legacy rows exist
-// and no backfill has finished. A completed (or explicitly cancelled) job is the
+// and no backfill has finished. A completed (or explicitly canceled) job is the
 // one-shot marker: rows that could not be matched stay legacy on purpose, and
 // re-listing every provider on every restart would be a permanent tax. An
 // already-active job is a no-op, so a restart during a run resumes the existing
