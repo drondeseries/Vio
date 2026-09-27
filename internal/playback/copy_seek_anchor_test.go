@@ -255,6 +255,28 @@ func resetCopySeekAnchorCache(t *testing.T, now func() time.Time, probe anchorPr
 	return cache
 }
 
+// awaitCopySeekProbeFlight waits for the singleflight probe registered under key
+// to finish before the test restores the process-wide cache. A caller whose
+// context is already done returns while its singleflight closure still runs on a
+// detached goroutine, and that closure reads copySeekAnchors; restoring the
+// global without joining the flight races with that read.
+//
+// Joining the in-flight call waits for the closure to finish. If the call already
+// completed and left the group, this starts an inert call that also finishes
+// immediately; either way no closure that reads copySeekAnchors can still be
+// running when this returns.
+func awaitCopySeekProbeFlight(t *testing.T, key string) {
+	t.Helper()
+	result := copySeekProbeGroup.DoChan(key, func() (any, error) {
+		return copySeekAnchor{}, nil
+	})
+	select {
+	case <-result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("copy seek probe flight did not settle")
+	}
+}
+
 func TestResolveCopySeekAnchorForSourceCachesByStableIdentity(t *testing.T) {
 	var calls int
 	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
@@ -547,6 +569,9 @@ func TestResolveCopySeekAnchorSkipsProbeWhenCallerBudgetExpired(t *testing.T) {
 	if got := atomic.LoadInt32(&calls); got != 0 {
 		t.Fatalf("probe calls = %d, want 0 with no caller budget", got)
 	}
+	// The caller returned on its already-done context while the singleflight
+	// closure was still starting; join it before the cleanup restores the cache.
+	awaitCopySeekProbeFlight(t, copySeekAnchorCacheKey(ResolveFFmpegPath("ffmpeg"), "virtual://movie/expired", 120, 2))
 }
 
 // TestTransientProviderCauseClassifiesUpstream5xx pins the provider-error
