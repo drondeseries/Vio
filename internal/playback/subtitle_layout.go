@@ -246,9 +246,6 @@ func MatchEmbeddedSubtitleTrack(requested models.SubtitleTrack, live []models.Su
 	if len(candidates) == 0 {
 		return 0, models.SubtitleTrack{}, false
 	}
-	if len(candidates) == 1 {
-		return candidates[0].ordinal, candidates[0].track, true
-	}
 
 	filter := func(match func(models.SubtitleTrack) bool) []candidate {
 		out := make([]candidate, 0, len(candidates))
@@ -266,8 +263,9 @@ func MatchEmbeddedSubtitleTrack(requested models.SubtitleTrack, live []models.Su
 		return 0, models.SubtitleTrack{}, false
 	}
 
-	// A requested language is a hard constraint: never silently serve a
-	// different-language track just because the class survived the rotation.
+	// A requested language is a hard constraint, applied before the single-candidate
+	// shortcut below: one surviving class candidate is still the wrong track when
+	// the client asked for a different language.
 	requestedLanguage := lang.Canonical(requested.Language)
 	if requestedLanguage != "" {
 		sameLanguage := filter(func(t models.SubtitleTrack) bool {
@@ -281,6 +279,12 @@ func MatchEmbeddedSubtitleTrack(requested models.SubtitleTrack, live []models.Su
 		}
 		candidates = sameLanguage
 	}
+	// With the language already pinned, a lone survivor needs no further
+	// narrowing.
+	if len(candidates) == 1 {
+		return candidates[0].ordinal, candidates[0].track, true
+	}
+
 	sameForced := filter(func(t models.SubtitleTrack) bool { return t.Forced == requested.Forced })
 	if len(sameForced) == 0 {
 		return 0, models.SubtitleTrack{}, false

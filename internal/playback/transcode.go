@@ -5232,10 +5232,17 @@ const (
 // session's hardware decoder as unable to handle the source. The handler reads
 // it during failure recovery to decide whether to attempt a software-decode
 // rebuild at replan.
+//
+// It drives the shared evaluator first, like IsSourceRejected and restart, so
+// the hardware-fallback decision cannot disagree with the serving verdict. A
+// read that skipped the evaluator could report a stale latch for a generation
+// the evaluator had since recovered, and would miss a confirmation that landed
+// since the latch was set.
 func (s *TranscodeSession) IsDecodeFailed() bool {
 	if s == nil {
 		return false
 	}
+	s.evaluateDecodeVerdict()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.decodeStamped
