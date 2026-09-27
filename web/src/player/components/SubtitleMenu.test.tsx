@@ -102,4 +102,26 @@ describe("SubtitleMenu", () => {
     expect(trackRows[0]?.textContent).not.toContain("✓");
     expect(trackRows[1]?.textContent).toContain("✓");
   });
+
+  it("marks the menu unverified while the inventory is provisional", () => {
+    render(
+      createElement(SubtitleMenu, {
+        tracks: [subtitleTrack()],
+        activeIndex: null,
+        onSelect: () => {},
+        delayMs: 0,
+        onDelayChange: () => {},
+        provisional: true,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /(Enable|Disable) captions/ }));
+
+    expect(screen.getByText("Unverified")).toBeTruthy();
+  });
+
+  it("hides the unverified marker once the inventory is verified", () => {
+    renderMenu([subtitleTrack()]);
+
+    expect(screen.queryByText("Unverified")).toBeNull();
+  });
 });
