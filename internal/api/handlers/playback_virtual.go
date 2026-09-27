@@ -1123,6 +1123,12 @@ type resolvedVirtualPlaybackSource struct {
 	// many?") is answerable without a second resolve.
 	CandidateRank  int
 	CandidateCount int
+	// IdentityRematched is true when the resolver reported that the requested
+	// pin's result id was absent from a fresh listing but the same durable
+	// identity was found under a new result id. The candidate is then the same
+	// release re-identified, not a substitution, and a rotation that requires
+	// release continuity may accept it.
+	IdentityRematched bool
 }
 
 // virtualProbeIdentity is the durable provider identity of the candidate a
@@ -1480,6 +1486,39 @@ func clearVirtualCandidateDeclaredMetadata(file *models.MediaFile) {
 	file.ProbeUpdatedAt = nil
 }
 
+// withResolvedCandidate stamps the resolver's actual result identity onto a
+// resolved virtual source. The struct's Provider* fields and IdentityRematched
+// are the resolver's own evidence about the candidate it returned, kept
+// separate from the transient File identity, which is seeded from the requested
+// row and therefore cannot by itself prove what was served.
+func withResolvedCandidate(src *resolvedVirtualPlaybackSource, id virtualProbeIdentity, rematched bool) *resolvedVirtualPlaybackSource {
+	if src == nil {
+		return nil
+	}
+	src.ProviderVideoHash = id.VideoHash
+	src.ProviderGUID = id.GUID
+	src.ProviderReleaseName = id.ReleaseName
+	src.ProviderReleaseSize = id.ReleaseSize
+	src.IdentityRematched = rematched
+	return src
+}
+
+// rehydratedMatchesPersistedIdentity reports whether a rehydration resolve is
+// the same release as the session anchor row, judged by the durable identity
+// tiers in the same precedence resolvedMatchesPersistedIdentity uses. It is the
+// rehydration counterpart of the transport anchor's same-release assertion: a
+// resolve with no usable identity tier can never confirm the release, so an
+// unprovable rotation is refused instead of silently swapping releases.
+func rehydratedMatchesPersistedIdentity(resolved resolvedVirtualPlaybackSource, row *models.MediaFile) bool {
+	identity, ok := persistedVirtualIdentity(row)
+	if !ok {
+		return false
+	}
+	want := resolver.PersistedDedupKey(identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize)
+	got := resolver.PersistedDedupKey(resolved.ProviderVideoHash, resolved.ProviderGUID, resolved.ProviderReleaseName, resolved.ProviderReleaseSize)
+	return want != "" && want == got
+}
+
 // resolveRehydratedVirtualSourceV3 resolves the session-bound virtual source for
 // a replan rehydration. When the pinned candidate is absent from the provider's
 // current list the resolver refuses with ErrSessionBoundCandidateAbsent; this
@@ -1509,13 +1548,30 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 	}
 	rotatedOpts := opts
 	rotatedOpts.rotateCandidates = true
-	rotated, rotateErr := h.resolveVirtualPlaybackSource(r, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, true, rotatedOpts)
+	// Thread the anchor's durable identity so the resolver can re-identify a
+	// renumbered same-release candidate rather than mistake it for a sibling.
+	// A row with no durable identity is unchanged and the assertion below then
+	// refuses any rotation it cannot prove is the same release, exactly as the
+	// transport anchor does.
+	retryReq := r.WithContext(virtualResolveContextWithPersistedIdentity(r.Context(), pinnedFile))
+	rotated, rotateErr := h.resolveVirtualPlaybackSource(retryReq, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, true, rotatedOpts)
 	if rotateErr != nil {
 		slog.WarnContext(r.Context(), "virtual replan candidate rotation failed",
 			"component", "api", "session_anchor", pinnedFile.FilePath,
 			"status", "rotation_failed", "old_candidate_id", virtualResultCandidateID(pinnedFile.FilePath),
 			"error", logredact.SanitizeURLError(rotateErr))
 		return rotated, rotateErr
+	}
+	// Same-release assertion, mirroring the transport anchor refusal. A
+	// rotation that resolves a genuinely different release must not anchor the
+	// rehydrated plan on sibling bytes; return the original absent/marked-failed
+	// cause so the caller keeps its terminal/rotation policy.
+	if !rotated.IdentityRematched && !rehydratedMatchesPersistedIdentity(rotated, pinnedFile) {
+		slog.WarnContext(r.Context(), "virtual replan candidate rotation resolved a different release; refusing a silent release swap",
+			"component", "api", "session_anchor", pinnedFile.FilePath,
+			"status", "rotation_refused", "old_candidate_id", virtualResultCandidateID(pinnedFile.FilePath),
+			"new_candidate_id", virtualResultCandidateID(rotated.URI))
+		return resolved, err
 	}
 	slog.InfoContext(r.Context(), "virtual replan rotated an absent session-bound candidate",
 		"component", "api", "session_anchor", pinnedFile.FilePath,
@@ -2039,6 +2095,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// resolved source this iteration produces. It is what the probe
 		// adoption write persists.
 		var resolvedIdentity virtualProbeIdentity
+		resolvedRematched := false
 		trace.resolveRan = true
 		resolveStart := time.Now()
 		// probedCandidateID is the candidate this iteration asked the resolver
@@ -2094,6 +2151,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					ReleaseName: res.ProviderReleaseName,
 					ReleaseSize: res.ProviderReleaseSize,
 				}
+				resolvedRematched = res.IdentityRematched
 				resolvedID := res.CandidateID
 				if resolvedID == "" && res.URI != "" {
 					resolvedID = virtualResultCandidateID(res.URI)
@@ -2262,9 +2320,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			return &resolvedVirtualPlaybackSource{
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
-			}, nil
+			}, resolvedIdentity, resolvedRematched), nil
 		}
 		ev, _ := remuxMatches[origKey]
 		appliedRemux := false
@@ -2330,9 +2388,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					// to declared metadata; otherwise the row stays unprobed
 					// until the damper lapses.
 					h.recoverVirtualProbeFromCache(r.Context(), file, streamURL, probeTransient, cand, oid)
-					return &resolvedVirtualPlaybackSource{
+					return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
-					}, nil
+					}, resolvedIdentity, resolvedRematched), nil
 				}
 				probeCand := cand
 				expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
@@ -2360,9 +2418,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 				}
 			}
-			return &resolvedVirtualPlaybackSource{
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
-			}, nil
+			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 			// Resolution precedence: stored evidence wins; otherwise adopt
@@ -2381,9 +2439,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			return &resolvedVirtualPlaybackSource{
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
-			}, nil
+			}, resolvedIdentity, resolvedRematched), nil
 		}
 		probeKey := virtualProbeFailureKey(cand.URI, oid)
 		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
@@ -2403,9 +2461,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			return &resolvedVirtualPlaybackSource{
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
-			}, nil
+			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if virtualProbeFailures.recent(probeKey) {
 			// A recent probe failure already consumed the probe budget. A
@@ -2447,9 +2505,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 				applyResolvedIdentity(cached, resolvedIdentity)
 				h.maybeTriggerSubtitleSearch(attemptCtx, cached, cand)
-				return &resolvedVirtualPlaybackSource{
+				return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 					URL: streamURL, URI: cand.URI, OwnerID: oid, File: cached, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,
-				}, nil
+				}, resolvedIdentity, resolvedRematched), nil
 			}
 		}
 		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
@@ -2478,9 +2536,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		mergeVirtualCandidateTracks(probed, cand)
 		applyResolvedIdentity(probed, resolvedIdentity)
 		h.maybeTriggerSubtitleSearch(probeCtx, probed, cand)
-		return &resolvedVirtualPlaybackSource{
+		return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 			URL: streamURL, URI: cand.URI, OwnerID: oid, File: probed, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,
-		}, nil
+		}, resolvedIdentity, resolvedRematched), nil
 	}
 
 	var firstResolved *resolvedVirtualPlaybackSource
@@ -4252,6 +4310,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	var resolvedExpiresAt *time.Time
 	var providerVideoHash, providerGUID, providerReleaseName string
 	var providerReleaseSize int64
+	var identityRematched bool
 	if h.VirtualMediaDetailedResolver != nil {
 		// When this candidate is the persisted row's own release, thread the
 		// durable identity and trust window so an absent same-identity candidate
@@ -4280,6 +4339,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		providerGUID = res.ProviderGUID
 		providerReleaseName = res.ProviderReleaseName
 		providerReleaseSize = res.ProviderReleaseSize
+		identityRematched = res.IdentityRematched
 		candidate.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
 		if res.URI != "" {
 			candidate.URI = res.URI
@@ -4311,7 +4371,8 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		ResolvedURL: streamURL, ResolvedURLExpiresAt: resolvedExpiresAt,
 		ProviderVideoHash: providerVideoHash, ProviderGUID: providerGUID,
 		ProviderReleaseName: providerReleaseName, ProviderReleaseSize: providerReleaseSize,
-		RequestHeaders: cloneHeaderMap(candidate.RequestHeaders),
+		IdentityRematched: identityRematched,
+		RequestHeaders:    cloneHeaderMap(candidate.RequestHeaders),
 	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 		return &resolved, nil
