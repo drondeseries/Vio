@@ -1824,6 +1824,12 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// It stays zero for a local source, and the log only reads it when the
 	// plan carries a virtual candidate URI.
 	virtualDecision := virtualPlanDecisionV3{}
+	// resolvedEffectiveFileID is the catalog row id of the candidate the
+	// virtual resolver actually served. It differs from the requested row when
+	// the resolver substituted a different candidate that has its own row
+	// (dedup keeper, rotation, sibling); the plan's effective_media_file_id
+	// must name that row so the substitution is visible to the client.
+	resolvedEffectiveFileID := 0
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve and
 	// probe them through the virtual provider before the generic probe repair
 	// path, which only understands local/HTTP media files.
@@ -1856,6 +1862,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		if resolved.File == nil {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
 		}
+		resolvedEffectiveFileID = resolved.File.ID
 		resolvedFile := *resolved.File
 		resolvedFile.ID = requestedCatalogFileID
 		requestedFile = &resolvedFile
@@ -1908,6 +1915,16 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	}
 	timings.mark("audio_preference")
 	effectiveFile := requestedFile
+	// The plan's effective file is the candidate the resolver actually served.
+	// requestedFile keeps the caller's requested row id (for the attempt record
+	// and idempotent replay), so a substituted candidate needs its own copy
+	// carrying the served row id; otherwise effective_media_file_id would
+	// silently report the requested row for bytes it did not describe.
+	if resolvedEffectiveFileID > 0 && resolvedEffectiveFileID != requestedFile.ID {
+		effectiveCopy := *requestedFile
+		effectiveCopy.ID = resolvedEffectiveFileID
+		effectiveFile = &effectiveCopy
+	}
 	// downloadedSubtitleInventoryV3 is an indexed read, and the planner appends
 	// the inventory after the effective file's own external and embedded tracks
 	// (BuildSubtitleInventoryV3). A candidate therefore needs its own inventory,
@@ -2321,7 +2338,9 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 		return nil, errors.New("virtual playback resolver returned no file")
 	}
 	resolvedFile := *resolved.File
-	resolvedFile.ID = alternate.ID
+	// Keep the candidate's own catalog row id when the resolver substituted a
+	// different release that has a row; only a same-row resolve carries the
+	// alternate row id. Overwriting it with alternate.ID hid the substitution.
 	resolved.File = &resolvedFile
 	resolved.File.FilePath = resolved.URI
 	resolved.File.VirtualOwnerInstallationID = resolved.OwnerID
@@ -2393,7 +2412,9 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 			return playback.DecisionResponseV3{}, false
 		}
 		resolvedFile := *resolved.File
-		resolvedFile.ID = catalogFile.ID
+		// Keep the rotated candidate's own catalog row id so the replacement
+		// plan names the bytes it will play; the request keeps catalogFile as
+		// its requested row below.
 		resolvedFile.FilePath = resolved.URI
 		resolvedFile.VirtualOwnerInstallationID = resolved.OwnerID
 		audioIndex, audioErr := resolveV3AudioIndex(&resolvedFile, req.AudioTrackID, req.AudioTrackIndex)
@@ -2401,11 +2422,12 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 			return playback.DecisionResponseV3{}, false
 		}
 		planResult, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
-			Request: req, RequestedFile: &resolvedFile, EffectiveFile: &resolvedFile,
+			Request: req, RequestedFile: catalogFile, EffectiveFile: &resolvedFile,
 			AudioTrackIndex: audioIndex, Settings: settings,
-			Registry:        h.transformationRegistryV3(r.Context()),
-			DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), &resolvedFile),
-			Now:             time.Now(),
+			Registry:            h.transformationRegistryV3(r.Context()),
+			DVRPUStrippable:     h.lazyDVRPUStrippableV3(r.Context(), &resolvedFile),
+			Now:                 time.Now(),
+			InventoryProvenance: string(resolved.Provenance),
 		})
 		planResult = retryIncompleteToneMapPlanningV3(planResult, toneMapCapabilityErr)
 		planResult = retryIncompletePlaybackSettingsV3(planResult, settingsErr)
@@ -2413,7 +2435,7 @@ func (h *PlaybackHandler) rotateRejectedVirtualCandidateStartV3(
 		if planResult.Terminal != nil || planResult.Plan == nil {
 			return playback.DecisionResponseV3{}, false
 		}
-		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, &resolvedFile, &resolvedFile, audioIndex, virtualPlanDecisionV3{candidateRank: resolved.CandidateRank, candidateCount: resolved.CandidateCount}, planResult, clientInfo)
+		response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, catalogFile, &resolvedFile, audioIndex, virtualPlanDecisionV3{candidateRank: resolved.CandidateRank, candidateCount: resolved.CandidateCount}, planResult, clientInfo)
 		if statusErr == nil {
 			// The start committed a replacement candidate after excluding the
 			// rejected ones. Persist the chain on the new attempt so a later
@@ -7097,7 +7119,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					virtualRehydrationFailed = true
 				} else {
 					resolvedFile := *resolved.File
-					resolvedFile.ID = currentEffectiveFile.ID
+					// The effective file is the candidate the resolver actually
+					// served; keep its own catalog row id (the substituted
+					// candidate) instead of overwriting it with the record's
+					// previous effective id, so the replan plan can name the
+					// bytes it will play. The plan's requested id stays the
+					// record's requested row.
 					resolvedFile.FilePath = resolved.URI
 					resolvedFile.VirtualOwnerInstallationID = resolved.OwnerID
 					currentEffectiveFile = &resolvedFile
