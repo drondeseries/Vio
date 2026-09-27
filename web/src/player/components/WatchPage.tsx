@@ -1048,6 +1048,7 @@ function WatchPagePlayer({
         shouldAutoPlay={session.shouldAutoPlay}
         replanning={session.replanning}
         replanningQuality={session.replanningQuality}
+        replacing={session.replacing}
         pendingSwitchFileId={session.pendingSwitchFileId}
         replanError={fallingBack ? null : session.error}
         replanErrorTitle={session.errorTitle}

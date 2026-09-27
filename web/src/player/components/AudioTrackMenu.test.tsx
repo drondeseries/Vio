@@ -71,6 +71,52 @@ describe("AudioTrackMenu", () => {
     expect(entry).toHaveTextContent("\u2713");
   });
 
+  it("locks the menu shut while the session inventory is switching", () => {
+    const onSelect = vi.fn();
+    const tracks = [
+      { title: "English", codec: "eac3", channels: 6, default: true },
+      { title: "French", codec: "aac", channels: 2 },
+    ];
+    render(
+      createElement(AudioTrackMenu, {
+        tracks,
+        activeIndex: 0,
+        onSelect,
+        currentPosition: 0,
+        locked: true,
+      }),
+    );
+
+    const trigger = screen.getByRole("button", { name: "Audio tracks" });
+    expect(trigger).toBeDisabled();
+    expect(trigger).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(trigger);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("closes an already-open menu when the inventory is locked", () => {
+    const onSelect = vi.fn();
+    const tracks = [
+      { title: "English", codec: "eac3", channels: 6, default: true },
+      { title: "French", codec: "aac", channels: 2 },
+    ];
+    const props = {
+      tracks,
+      activeIndex: 0,
+      onSelect,
+      currentPosition: 0,
+    };
+    const view = render(createElement(AudioTrackMenu, { ...props, open: true, hideTrigger: true }));
+    expect(screen.getAllByRole("menuitem")).toHaveLength(2);
+
+    view.rerender(
+      createElement(AudioTrackMenu, { ...props, open: true, hideTrigger: true, locked: true }),
+    );
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it("renders nothing when there are no tracks", () => {
     const { container } = render(
       createElement(AudioTrackMenu, {

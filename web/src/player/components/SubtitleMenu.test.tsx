@@ -102,4 +102,32 @@ describe("SubtitleMenu", () => {
     expect(trackRows[0]?.textContent).not.toContain("✓");
     expect(trackRows[1]?.textContent).toContain("✓");
   });
+
+  it("locks the menu shut while the session inventory is switching", () => {
+    const onSelect = vi.fn();
+    const props = {
+      tracks: [subtitleTrack({ index: 3 })],
+      activeIndex: null,
+      onSelect,
+      delayMs: 0,
+      onDelayChange: () => {},
+    };
+    const view = render(createElement(SubtitleMenu, { ...props, locked: true }));
+
+    const trigger = screen.getByRole("button", { name: "Enable captions" });
+    expect(trigger).toBeDisabled();
+    expect(trigger).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(trigger);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+
+    // A switch beginning mid-menu closes it rather than leave the outgoing
+    // inventory selectable.
+    view.rerender(createElement(SubtitleMenu, { ...props, locked: false }));
+    fireEvent.click(trigger);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    view.rerender(createElement(SubtitleMenu, { ...props, locked: true }));
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
 });

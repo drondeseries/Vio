@@ -18,6 +18,12 @@ interface AudioTrackMenuProps {
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   hideTrigger?: boolean;
+  /**
+   * True while the session is replacing its plan or replanning, when the
+   * rendered inventory belongs to the outgoing plan. Keeps the menu shut so a
+   * pick cannot name a stale slot.
+   */
+  locked?: boolean;
 }
 
 /**
@@ -64,25 +70,32 @@ export function AudioTrackMenu({
   open: controlledOpen,
   onOpenChange,
   hideTrigger = false,
+  locked = false,
 }: AudioTrackMenuProps) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
-  const open = controlledOpen ?? uncontrolledOpen;
+  const rawOpen = controlledOpen ?? uncontrolledOpen;
+  // A replace or replan swaps the inventory out from under the menu. The raw
+  // open state is kept so the menu returns once the replacement lands, but the
+  // trigger and surface stay shut until then so a pick cannot name a slot the
+  // outgoing plan owned.
+  const open = rawOpen && !locked;
   const setOpen = useCallback(
     (value: boolean | ((previous: boolean) => boolean)) => {
-      const next = typeof value === "function" ? value(open) : value;
+      const next = typeof value === "function" ? value(rawOpen) : value;
       if (controlledOpen === undefined) setUncontrolledOpen(next);
       onOpenChange?.(next);
     },
-    [controlledOpen, onOpenChange, open],
+    [controlledOpen, onOpenChange, rawOpen],
   );
   const menuRef = useRef<HTMLDivElement>(null);
 
   const handleSelect = useCallback(
     (index: number) => {
+      if (locked) return;
       onSelect(index, currentPosition);
       setOpen(false);
     },
-    [currentPosition, onSelect],
+    [currentPosition, locked, onSelect, setOpen],
   );
 
   const handleBlur = useCallback((e: React.FocusEvent) => {
@@ -101,7 +114,7 @@ export function AudioTrackMenu({
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [open]);
+  }, [open, setOpen]);
 
   const menuItemsRef = useRef<(HTMLButtonElement | null)[]>([]);
 
@@ -147,11 +160,13 @@ export function AudioTrackMenu({
       {!hideTrigger && (
         <button
           type="button"
-          className="player-utility-btn"
+          className="player-utility-btn disabled:cursor-not-allowed disabled:opacity-40"
           onClick={() => setOpen((v) => !v)}
           aria-label="Audio tracks"
           aria-expanded={open}
           aria-haspopup="menu"
+          aria-disabled={locked || undefined}
+          disabled={locked}
         >
           <AudioLines className="h-[18px] w-[18px]" />
         </button>

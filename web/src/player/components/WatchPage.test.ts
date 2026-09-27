@@ -677,6 +677,19 @@ describe("WatchPage version switch feedback", () => {
     expect(props.pendingSwitchFileId).toBe(99);
   });
 
+  it("forwards the replace and replan state so the track menus can gate", () => {
+    playbackSessionMock.mockReturnValue(playbackSession({ replacing: true, replanning: true }));
+
+    render(createElement(WatchPage, watchPageProps));
+
+    const props = videoPlayerMock.mock.calls[0]?.[0] as {
+      replacing?: boolean;
+      replanning?: boolean;
+    };
+    expect(props.replacing).toBe(true);
+    expect(props.replanning).toBe(true);
+  });
+
   it("shows a dismissible notice when the server played a different version than auto-selected", () => {
     playbackSessionMock.mockReturnValue(
       playbackSession({

@@ -3943,6 +3943,26 @@ describe("VideoPlayer version switch UX", () => {
     expect((controls.current as unknown as { isTranscoding: boolean }).isTranscoding).toBe(true);
   });
 
+  it("gates the track menus on the replace or replan state", () => {
+    const { rerenderPlayer } = renderPlayer({});
+    const locked = () =>
+      (controls.current as unknown as { trackMenusLocked?: boolean }).trackMenusLocked;
+
+    expect(locked()).toBe(false);
+
+    // A replan keeps the outgoing plan on screen while the new one lands.
+    rerenderPlayer({ replanning: true });
+    expect(locked()).toBe(true);
+
+    // So does a version/episode switch rebuilding the session.
+    rerenderPlayer({ replanning: false, replacing: true });
+    expect(locked()).toBe(true);
+
+    // Once the replacement is adopted the menus unlock.
+    rerenderPlayer({ replacing: false, replanning: false });
+    expect(locked()).toBe(false);
+  });
+
   it("remaps a manual subtitle selection by identity across a version switch", async () => {
     const englishTrack: PlayerSubtitleInfo = {
       index: 0,
