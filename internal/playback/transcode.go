@@ -5232,10 +5232,18 @@ const (
 // session's hardware decoder as unable to handle the source. The handler reads
 // it during failure recovery to decide whether to attempt a software-decode
 // rebuild at replan.
+//
+// The evaluator call advances lifecycle processing — a suspected generation
+// with no fresh progress still needs a probe sample before it can confirm —
+// and shares that one verdict with the serving path. It does not make the
+// hardware latch equivalent to current-generation rejection: decodeStamped
+// intentionally survives recovery and restart, so a true read stays true even
+// when no generation is suspected.
 func (s *TranscodeSession) IsDecodeFailed() bool {
 	if s == nil {
 		return false
 	}
+	s.evaluateDecodeVerdict()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.decodeStamped

@@ -229,7 +229,13 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 		return bound
 	}
 
-	hasEvidence := len(session.VirtualSubtitleTracks) > 0 || len(session.VirtualExternalSubtitles) > 0
+	// The evidence-set flag, not slice length, is the signal. A candidate probed
+	// with no subtitle tracks is captured-empty evidence, and it is still
+	// authoritative: the plan promised this release has none, so serving the
+	// row's later-populated inventory would serve a track the client never
+	// selected. Absent evidence (the flag unset) is the only case with nothing
+	// to apply, and the only case the live row may speak for.
+	hasEvidence := session.VirtualSubtitleEvidenceSet
 	if hasEvidence && !virtualEvidenceMatchesBoundFile(bound, session) {
 		slog.WarnContext(ctx, "virtual session track evidence belongs to a different candidate; using the bound file's tracks",
 			"component", "api",
