@@ -89,10 +89,11 @@ func TestStaleGenerationDemuxStderrDoesNotStampReplacement(t *testing.T) {
 	}
 }
 
-// The generation handle is carried into the mutation, not only checked
-// beforehand: a reset landing between the check and the observation discards
-// the line. Calling the generation-scoped entry point directly reproduces the
-// interleaving the stderr writer relies on.
+// The generation handle is the rejection token, not a race interleaving: the
+// test submits a stale token after the reset and asserts the fenced entry
+// point rejects it. It does not force a reset between check and mutation —
+// production logFFmpegLineForGeneration holds the generation check and the
+// observations under one mutex, so no such interleaving exists there.
 func TestGenerationScopedObservationDiscardsLineAfterReset(t *testing.T) {
 	s := &TranscodeSession{opts: TranscodeOpts{TargetCodecVideo: "h264"}}
 	attachDecodeClock(s, time.Unix(4000, 0))

@@ -5233,11 +5233,12 @@ const (
 // it during failure recovery to decide whether to attempt a software-decode
 // rebuild at replan.
 //
-// It drives the shared evaluator first, like IsSourceRejected and restart, so
-// the hardware-fallback decision cannot disagree with the serving verdict. A
-// read that skipped the evaluator could report a stale latch for a generation
-// the evaluator had since recovered, and would miss a confirmation that landed
-// since the latch was set.
+// The evaluator call advances lifecycle processing — a suspected generation
+// with no fresh progress still needs a probe sample before it can confirm —
+// and shares that one verdict with the serving path. It does not make the
+// hardware latch equivalent to current-generation rejection: decodeStamped
+// intentionally survives recovery and restart, so a true read stays true even
+// when no generation is suspected.
 func (s *TranscodeSession) IsDecodeFailed() bool {
 	if s == nil {
 		return false

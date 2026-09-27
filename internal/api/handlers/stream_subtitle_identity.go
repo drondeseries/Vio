@@ -161,12 +161,24 @@ func (h *StreamHandler) remapSubtitleInventoryIdentityV3(
 // there before the identity is mapped. The bound candidate is always the
 // returned file, and captured-empty evidence yields unavailable rather than an
 // ordinal reinterpreted against the replacement.
+//
+// A downloaded pin never reaches the evidence inventory: downloaded rows are
+// file-bound, so the pin is resolved against the bound file's own downloaded
+// list independently of evidence emptiness and the historical ordinal. Pin
+// shape is validated first so malformed combinations are rejected on every
+// path, not only when the evidence is nonempty.
 func (h *StreamHandler) remapSubtitleFromEvidenceV3(
 	ctx context.Context,
 	evidence, bound *models.MediaFile,
 	index int,
 	query url.Values,
 ) (*models.MediaFile, int, error) {
+	if err := validateSubtitleIdentityPinShape(query); err != nil {
+		return nil, 0, err
+	}
+	if pin := query.Get(playback.DownloadedSubtitleIDParamV3); pin != "" {
+		return h.resolveDownloadedSubtitle(ctx, bound, pin)
+	}
 	evidenceIndex, err := subtitleRouteIndex(evidence, index, query)
 	if err != nil {
 		return nil, 0, err
@@ -268,8 +280,13 @@ func (h *StreamHandler) resolveSubtitleSourceRequest(
 			// A validated downloaded pin is the exception and is not
 			// plan-bound: its identity survives a rotation that replaced the
 			// plan-time inventory, so it is resolved against the bound row's
-			// own downloaded list instead of being refused here.
+			// own downloaded list instead of being refused here. Pin shape is
+			// validated first so the exception cannot accept a malformed
+			// combination (mixed pins, repeated pins) the normal path rejects.
 			if len(evidence.ExternalSubtitles) == 0 && len(evidence.SubtitleTracks) == 0 {
+				if err := validateSubtitleIdentityPinShape(query); err != nil {
+					return nil, 0, err
+				}
 				if downloadedSubtitlePin := query.Get(playback.DownloadedSubtitleIDParamV3); downloadedSubtitlePin != "" {
 					return h.resolveDownloadedSubtitle(ctx, bound, downloadedSubtitlePin)
 				}
@@ -295,6 +312,15 @@ func (h *StreamHandler) resolveSubtitleSourceRequest(
 	// Downloaded subtitles are file-bound rather than plan-bound, so they are
 	// excluded from the evidence substitution above and stay resolvable against
 	// the live row; only the plan-bound embedded/external inventories are gated.
+	// A downloaded pin appended to an embedded/external ordinal never names a
+	// plan track: it bypasses the download list's current offsets and resolves
+	// the pinned row directly, so it is resolved first and exactly.
+	if err := validateSubtitleIdentityPinShape(query); err != nil {
+		return nil, 0, err
+	}
+	if pin := query.Get(playback.DownloadedSubtitleIDParamV3); pin != "" {
+		return h.resolveDownloadedSubtitle(ctx, bound, pin)
+	}
 	if isVirtualPlaybackFile(bound) && session.VirtualSubtitleEvidenceSet &&
 		virtualEvidenceMatchesBoundFile(bound, session) &&
 		!hasApplicableSubtitleEvidence(session, query) {
@@ -366,9 +392,14 @@ func hasApplicableSubtitleEvidence(session *playback.Session, query url.Values) 
 	return strings.TrimSpace(query.Get(playback.DownloadedSubtitleIDParamV3)) != ""
 }
 
-// subtitleRouteIndex resolves a pinned identity before applying the combined
-// ordinal dispatch. Old URLs without a pin retain their original behavior.
-func subtitleRouteIndex(file *models.MediaFile, index int, query url.Values) (int, error) {
+// validateSubtitleIdentityPinShape rejects malformed identity-pin
+// combinations: a pin key repeated or blank, or pins from different identity
+// types combined on one request. It is shared by every resolution path — the
+// normal route, the evidence remap, and the captured-empty downloaded
+// exception — and runs before any exception or early return, so a path that
+// resolves a downloaded pin directly can never accept a combination the
+// normal path rejects.
+func validateSubtitleIdentityPinShape(query url.Values) error {
 	pins := 0
 	for _, key := range []string{
 		playback.EmbeddedSubtitleStreamIndexParamV3,
@@ -377,13 +408,22 @@ func subtitleRouteIndex(file *models.MediaFile, index int, query url.Values) (in
 	} {
 		if values, ok := query[key]; ok {
 			if len(values) != 1 || values[0] == "" {
-				return 0, errSubtitleIdentityInvalid
+				return errSubtitleIdentityInvalid
 			}
 			pins++
 		}
 	}
 	if pins > 1 {
-		return 0, errSubtitleIdentityInvalid
+		return errSubtitleIdentityInvalid
+	}
+	return nil
+}
+
+// subtitleRouteIndex resolves a pinned identity before applying the combined
+// ordinal dispatch. Old URLs without a pin retain their original behavior.
+func subtitleRouteIndex(file *models.MediaFile, index int, query url.Values) (int, error) {
+	if err := validateSubtitleIdentityPinShape(query); err != nil {
+		return 0, err
 	}
 	if value := query.Get(playback.EmbeddedSubtitleStreamIndexParamV3); value != "" {
 		streamIndex, err := strconv.Atoi(value)

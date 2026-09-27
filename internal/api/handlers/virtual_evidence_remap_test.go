@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"testing"
 
@@ -37,7 +38,9 @@ func rotatedSession(oldTracks, newTracks []models.SubtitleTrack, oldURI, newURI 
 
 // Same-row rotation with reordered embedded tracks: the selection must follow
 // its language onto the bound release, and the result must be served from the
-// bound candidate rather than the old evidence.
+// bound candidate rather than the old evidence. The bound release reverses the
+// evidence order, so an ordinal assertion proves the remap ran: serving the
+// stale ordinal would select the other language.
 func TestResolveSubtitleSourceRequestSameRowRotationReorderedEmbedded(t *testing.T) {
 	oldURI := "virtual://movie/tt-rot?result=cand-a"
 	newURI := "virtual://movie/tt-rot?result=cand-b"
@@ -47,8 +50,8 @@ func TestResolveSubtitleSourceRequestSameRowRotationReorderedEmbedded(t *testing
 			{Index: 3, Codec: "subrip", Language: "fra"},
 		},
 		[]models.SubtitleTrack{
-			{Index: 9, Codec: "subrip", Language: "eng"},
 			{Index: 7, Codec: "subrip", Language: "fra"},
+			{Index: 9, Codec: "subrip", Language: "eng"},
 		}, oldURI, newURI)
 
 	// Ordinal 1 named the French track against the plan-time evidence.
@@ -66,9 +69,9 @@ func TestResolveSubtitleSourceRequestSameRowRotationReorderedEmbedded(t *testing
 	if got := resolvedFile.SubtitleTracks[resolvedIndex].Language; got != "fra" {
 		t.Fatalf("selected %q, want the French track carried across the rotation", got)
 	}
-	// An ordinal check alone cannot prove the remap ran (both inventories
-	// happen to hold French at ordinal 1), but the language match against a
-	// DIFFERENT inventory plus the bound-candidate URI above can.
+	if resolvedIndex != 0 {
+		t.Fatalf("resolved ordinal %d, want 0 (French leads the bound release; the stale ordinal 1 would name English)", resolvedIndex)
+	}
 }
 
 // A container index reused for a different language must not be selected: the
@@ -370,5 +373,97 @@ func TestResolveSubtitleSourceRequestEditionSwitchCapturedEmptyDownloadedPin(t *
 	}
 	if resolvedIndex < 0 {
 		t.Fatalf("resolved index %d, want the downloaded row's published ordinal", resolvedIndex)
+	}
+}
+
+// A pinned downloaded row must be resolved against the bound file's own
+// downloaded list even when the evidence is nonempty: removing an earlier
+// downloaded row changes the list offset, but the pinned row still belongs to
+// this file. The remapped ordinal must name the pinned row's current position,
+// not the evidence-time offset.
+func TestResolveSubtitleSourceRequestDownloadedPinSurvivesNonemptyEvidenceRotation(t *testing.T) {
+	oldURI := "virtual://movie/tt-dlrot?result=cand-a"
+	newURI := "virtual://movie/tt-dlrot?result=cand-b"
+	row := &models.MediaFile{ID: 930, FilePath: newURI, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 3, Codec: "subrip", Language: "eng"},
+	}}
+	session := &playback.Session{
+		ID:                         "sess-dlrot",
+		VirtualSourceURI:           newURI,
+		VirtualSubtitleEvidenceURI: oldURI,
+		VirtualSubtitleEvidenceSet: true,
+		VirtualSubtitleTracks: []models.SubtitleTrack{
+			{Index: 1, Codec: "subrip", Language: "eng"},
+		},
+	}
+	// The pinned row survived the rotation, but an earlier downloaded row was
+	// removed, so its list offset moved from 1 to 0. The stale ordinal 1 would
+	// name a different row (or nothing at all); only the row id is stable.
+	handler := &StreamHandler{SubtitleRepo: downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+		930: {{ID: 92, MediaFileID: 930, Language: "eng", Format: subtitles.FormatSRT}},
+	}}}
+	query := url.Values{playback.DownloadedSubtitleIDParamV3: []string{"92"}}
+
+	resolvedFile, resolvedIndex, err := handler.resolveSubtitleSourceRequest(
+		context.Background(), row, session, 2, query)
+	if err != nil {
+		t.Fatalf("nonempty-evidence rotation refused a surviving downloaded pin: %v", err)
+	}
+	if resolvedFile.FilePath != newURI {
+		t.Fatalf("served from %q, want the bound candidate %q", resolvedFile.FilePath, newURI)
+	}
+	if want := len(playback.BuildSubtitleInventoryV3(row, nil)); resolvedIndex != want {
+		t.Fatalf("resolved index %d, want %d (the pinned row's current published ordinal)", resolvedIndex, want)
+	}
+}
+
+// Captured-empty evidence with a downloaded pin plus an embedded pin must be
+// rejected: different identity-pin types can never be combined, and the
+// captured-empty exception must not bypass that validation.
+func TestResolveSubtitleSourceRequestCapturedEmptyMixedPinsRejected(t *testing.T) {
+	oldURI := "virtual://movie/tt-dlmix?result=cand-a"
+	newURI := "virtual://movie/tt-dlmix?result=cand-b"
+	row := &models.MediaFile{ID: 931, FilePath: newURI}
+	session := &playback.Session{
+		ID:                         "sess-dlmix",
+		VirtualSourceURI:           newURI,
+		VirtualSubtitleEvidenceURI: oldURI,
+		VirtualSubtitleEvidenceSet: true,
+	}
+	handler := &StreamHandler{SubtitleRepo: downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+		931: {{ID: 93, MediaFileID: 931, Language: "eng", Format: subtitles.FormatSRT}},
+	}}}
+	query := url.Values{
+		playback.DownloadedSubtitleIDParamV3:        []string{"93"},
+		playback.EmbeddedSubtitleStreamIndexParamV3: []string{"3"},
+	}
+
+	if _, _, err := handler.resolveSubtitleSourceRequest(
+		context.Background(), row, session, 0, query); !errors.Is(err, errSubtitleIdentityInvalid) {
+		t.Fatalf("mixed pins under captured-empty evidence: err = %v, want errSubtitleIdentityInvalid", err)
+	}
+}
+
+// Captured-empty evidence with a repeated downloaded pin must be rejected like
+// the normal path: the exception resolves the pin directly, but the pin-shape
+// validation still runs first.
+func TestResolveSubtitleSourceRequestCapturedEmptyDuplicatePinRejected(t *testing.T) {
+	oldURI := "virtual://movie/tt-dldup?result=cand-a"
+	newURI := "virtual://movie/tt-dldup?result=cand-b"
+	row := &models.MediaFile{ID: 932, FilePath: newURI}
+	session := &playback.Session{
+		ID:                         "sess-dldup",
+		VirtualSourceURI:           newURI,
+		VirtualSubtitleEvidenceURI: oldURI,
+		VirtualSubtitleEvidenceSet: true,
+	}
+	handler := &StreamHandler{SubtitleRepo: downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+		932: {{ID: 94, MediaFileID: 932, Language: "eng", Format: subtitles.FormatSRT}},
+	}}}
+	query := url.Values{playback.DownloadedSubtitleIDParamV3: []string{"94", "94"}}
+
+	if _, _, err := handler.resolveSubtitleSourceRequest(
+		context.Background(), row, session, 0, query); !errors.Is(err, errSubtitleIdentityInvalid) {
+		t.Fatalf("duplicate pin under captured-empty evidence: err = %v, want errSubtitleIdentityInvalid", err)
 	}
 }
