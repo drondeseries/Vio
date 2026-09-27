@@ -32,7 +32,6 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { usePurgeVirtualPlaybackItems } from "@/hooks/queries/admin/collections";
 import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
-import { useAdminPluginInstallations } from "@/hooks/queries/admin/plugins";
 import {
   useAdminServerStatus,
   useCancelStorageTransition,
@@ -895,15 +894,15 @@ function LogsGroup({ form, restartKeys }: { form: SettingsForm; restartKeys: Res
 /**
  * Danger-zone maintenance for the zero-storage virtual library rows: remove
  * virtual media files and any orphaned catalog items they reference, scoped by
- * library or plugin installation. Everything here is destructive, so the flow
- * always offers a dry-run preview first and a confirm on the real purge.
+ * library only. Omitting the library selects every library, and the backend
+ * already fans out across all plugin installations — so the panel only needs
+ * one scope control. Everything here is destructive, so the flow always
+ * offers a dry-run preview first and a confirm on the real purge.
  */
 function VirtualLibraryGroup() {
   const purgeVirtual = usePurgeVirtualPlaybackItems();
   const { data: librariesData } = useAdminLibraries();
-  const { data: pluginInstallations } = useAdminPluginInstallations();
   const [libraryID, setLibraryID] = useState("all");
-  const [installationID, setInstallationID] = useState("all");
 
   const libraryOptions = useMemo(() => {
     const opts: { value: string; label: string }[] = [{ value: "all", label: "All Libraries" }];
@@ -915,25 +914,10 @@ function VirtualLibraryGroup() {
     return opts;
   }, [librariesData]);
 
-  const pluginOptions = useMemo(() => {
-    const opts: { value: string; label: string }[] = [{ value: "all", label: "All Plugins" }];
-    if (pluginInstallations) {
-      for (const plugin of pluginInstallations) {
-        opts.push({
-          value: String(plugin.id),
-          label: `${plugin.plugin_id} v${plugin.version} (ID: ${plugin.id})`,
-        });
-      }
-    }
-    return opts;
-  }, [pluginInstallations]);
-
   const scope = () => {
     const libraryId = Number.parseInt(libraryID, 10);
-    const installationId = Number.parseInt(installationID, 10);
     return {
       libraryId: libraryId > 0 ? libraryId : undefined,
-      installationId: installationId > 0 ? installationId : undefined,
     };
   };
 
@@ -964,9 +948,8 @@ function VirtualLibraryGroup() {
             size="sm"
             disabled={purgeVirtual.isPending}
             onClick={() => {
-              const { libraryId, installationId } = scope();
-              const scoped =
-                libraryId || installationId ? "the selected scope" : "all virtual items";
+              const { libraryId } = scope();
+              const scoped = libraryId ? "the selected library" : "all virtual items";
               if (
                 window.confirm(
                   `Purge all zero-storage virtual library items for ${scoped}? This cannot be undone.`,
@@ -975,7 +958,6 @@ function VirtualLibraryGroup() {
                 purgeVirtual.mutate({
                   dryRun: false,
                   libraryId,
-                  installationId,
                 });
               }
             }}
@@ -986,20 +968,13 @@ function VirtualLibraryGroup() {
           </Button>
         </div>
       </div>
-      <div className="grid gap-3 pt-2 pb-1 md:grid-cols-2">
+      <div className="grid gap-3 pt-2 pb-1">
         <SettingField
           label="Library Scope"
           type="select"
           options={libraryOptions}
           value={libraryID}
           onChange={setLibraryID}
-        />
-        <SettingField
-          label="Plugin Installation Scope"
-          type="select"
-          options={pluginOptions}
-          value={installationID}
-          onChange={setInstallationID}
         />
       </div>
     </FieldGroup>
