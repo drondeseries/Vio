@@ -609,18 +609,25 @@ function WatchPagePlayer({
             audioComplete = true;
           }
           const resolvedSubtitleTracks = version.subtitle_tracks ?? [];
-          // Keep the first-play probe self-heal on the *current* file's row.
-          // `resolveEffectiveVersion` already returns the effective candidate
-          // when the plan publishes a virtual URI; when it does not, the plan
-          // names the collapsed row. Either way only that row's probed tracks
-          // may seed the no-op replan — another release's inventory must not
-          // stand in for the version actually playing.
+          // The first-play probe persists its tracks to the resolved candidate
+          // row, which a plan that has not learned `effective_virtual_uri` yet
+          // cannot name: the resolved version is then the collapsed row and
+          // carries nothing. Keep the current-row lookup first so a row with its
+          // own probe inventory wins, then fall back to the first row that
+          // actually carries probed tracks. The candidate fallback is scoped
+          // under that lookup, never instead of it.
+          const currentRowSubtitleTracks =
+            detail.versions.find((candidate) => candidate.file_id === mediaFileId)
+              ?.subtitle_tracks ?? [];
           const nextSubtitleTracks =
             resolvedSubtitleTracks.length > 0
               ? resolvedSubtitleTracks
               : isVirtualActiveFile
-                ? (detail.versions.find((candidate) => candidate.file_id === mediaFileId)
-                    ?.subtitle_tracks ?? [])
+                ? currentRowSubtitleTracks.length > 0
+                  ? currentRowSubtitleTracks
+                  : (detail.versions.find(
+                      (candidate) => (candidate.subtitle_tracks?.length ?? 0) > 0,
+                    )?.subtitle_tracks ?? [])
                 : resolvedSubtitleTracks;
           if (
             !hasSelectableSessionSubtitles(current.subtitleUrls) &&

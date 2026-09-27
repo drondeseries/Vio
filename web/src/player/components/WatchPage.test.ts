@@ -1503,21 +1503,22 @@ describe("WatchPage live inventory refresh", () => {
     expect(refreshSubtitles).toHaveBeenCalledTimes(1);
   });
 
-  it("does not seed a subtitle replan from another virtual row's probed tracks", async () => {
+  it("requests a subtitle replan when only the resolved candidate row carries the probed tracks", async () => {
     const refreshSubtitles = vi.fn();
-    // The live session plays the collapsed row (id 7) with no probed tracks.
-    // Another release's candidate row (id 8) carries tracks, but its inventory
-    // must not stand in for the version actually playing.
+    // A first-play plan has not learned the effective candidate, so the resolved
+    // version is the collapsed virtual row with no probed tracks. The probe
+    // persisted the embedded tracks to the candidate row instead; the seed must
+    // fall back to it so the no-op replan can pull the inventory in.
     const collapsedVirtualVersion = {
       ...virtualVersion,
       file_id: 7,
       file_path: "virtual://movie/tt1",
       subtitle_tracks: [],
     };
-    const otherReleaseVersion = {
+    const candidateVersion = {
       ...virtualVersion,
       file_id: 8,
-      file_path: "virtual://movie/tt1?result=alternate",
+      file_path: "virtual://movie/tt1?result=all",
       subtitle_tracks: [{ index: 13, language: "en", codec: "ass", title: "English" }],
     };
     playbackSessionMock.mockReturnValue(
@@ -1530,21 +1531,23 @@ describe("WatchPage live inventory refresh", () => {
       }),
     );
     fetchWatchDetailMock.mockResolvedValue({
-      versions: [collapsedVirtualVersion, otherReleaseVersion],
+      versions: [collapsedVirtualVersion, candidateVersion],
     });
 
     render(
       createElement(WatchPage, {
         ...watchPageProps,
-        versions: [collapsedVirtualVersion, otherReleaseVersion],
+        versions: [collapsedVirtualVersion, candidateVersion],
       }),
     );
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+      await vi.advanceTimersByTimeAsync(2_000);
     });
 
-    expect(refreshSubtitles).not.toHaveBeenCalled();
+    // The candidate's probed tracks must trigger the no-op replan even though
+    // the resolved-version snapshot stays empty.
+    expect(refreshSubtitles).toHaveBeenCalledTimes(1);
   });
 
   it("seeds the subtitle replan from the live mediaFileId row's probed tracks", async () => {
