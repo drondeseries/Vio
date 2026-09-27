@@ -1759,6 +1759,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	deviceID := deviceMetadataFromRequest(r).DeviceID
 	requestDigests := newPlaybackStartRequestDigestsV3(body, deviceID)
 	resolutionWasAssumed := false
+	// resolutionProvenance is the virtual resolver's provenance for the source
+	// this start actually resolves, published additively on the plan (see
+	// PlanV3.InventoryProvenance). It stays empty for a local source.
+	resolutionProvenance := ProbeProvenance("")
 	if existing, lookupErr := h.PlanStoreV3.GetAttemptByPlaybackAttemptID(r.Context(), req.PlaybackAttemptID); lookupErr == nil {
 		if existing.UserID != userID || existing.ProfileID != profileID || existing.RequestedMediaFileID != req.FileID ||
 			!requestDigests.matches(existing.RequestDigest) {
@@ -1860,6 +1864,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// Do NOT mutate req.FileID here: the original caller-supplied file ID
 		// must survive into the attempt record for idempotent replay.
 		resolutionWasAssumed = resolved.ResolutionAssumed
+		resolutionProvenance = resolved.Provenance
 		virtualDecision.candidateRank = resolved.CandidateRank
 		virtualDecision.candidateCount = resolved.CandidateCount
 	} else {
@@ -1979,6 +1984,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		AudioTrackIndex:      audioIndex, Settings: settings,
 		Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(),
 		AdditionalSubtitles: subtitleInventoryFor(effectiveFile),
+		InventoryProvenance: string(resolutionProvenance),
 	})
 	timings.mark("planning")
 	// A subtitle-only refusal is resolved on the release already mounted: before
@@ -6962,6 +6968,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	}
 	virtualRehydrationFailed := false
 	var virtualRehydrationErr error
+	// replanVirtualProvenance is the resolver's provenance for the rehydrated
+	// effective source, published additively on the replan's plan. Empty when
+	// the source is not virtual or the rehydration did not resolve.
+	replanVirtualProvenance := ProbeProvenance("")
 	if isVirtualPlaybackFile(currentEffectiveFile) {
 		if session.VirtualSourceURI == "" {
 			slog.WarnContext(r.Context(), "virtual playback rehydration has no pinned source", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID)
@@ -7091,6 +7101,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					resolvedFile.FilePath = resolved.URI
 					resolvedFile.VirtualOwnerInstallationID = resolved.OwnerID
 					currentEffectiveFile = &resolvedFile
+					replanVirtualProvenance = resolved.Provenance
 				}
 			}
 		}
@@ -7352,7 +7363,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				}
 			}
 		} else {
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, InventoryProvenance: string(replanVirtualProvenance)})
 			clampPlannerTargetResolution(&result, effectiveFile)
 		}
 		if outputChange && result.Terminal != nil && effectiveFile.ID != currentEffectiveFile.ID {

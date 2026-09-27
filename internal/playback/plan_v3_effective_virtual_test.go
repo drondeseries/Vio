@@ -80,6 +80,43 @@ func TestPlanPlaybackV3AudioOnlyExposesEffectiveVirtualURI(t *testing.T) {
 	}
 }
 
+// The resolver's inventory provenance is published additively on the plan and,
+// like the effective virtual URI, must not perturb plan identity: a plan with
+// and without the field is the same attempt.
+func TestPlanPlaybackV3PublishesInventoryProvenance(t *testing.T) {
+	candidate := detailedFixtureFileV3()
+	candidate.FilePath = "virtual://movie/tt1234567?result=working"
+	requested := &models.MediaFile{ID: 41, ContentID: candidate.ContentID, Container: candidate.Container, FilePath: "virtual://movie/tt1234567"}
+	req := validStartRequestV3()
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
+	req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+
+	input := PlannerInputV3{
+		Request: req, RequestedFile: requested, EffectiveFile: candidate, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+	}
+	input.InventoryProvenance = "declared"
+	declared := PlanPlaybackV3(input)
+	if declared.Plan == nil {
+		t.Fatalf("result = %#v, want a plan", declared)
+	}
+	if declared.Plan.InventoryProvenance != "declared" {
+		t.Fatalf("inventory provenance = %q, want declared", declared.Plan.InventoryProvenance)
+	}
+
+	input.InventoryProvenance = ""
+	without := PlanPlaybackV3(input)
+	if without.Plan == nil {
+		t.Fatalf("result = %#v, want a plan", without)
+	}
+	if without.Plan.InventoryProvenance != "" {
+		t.Fatalf("inventory provenance = %q, want empty", without.Plan.InventoryProvenance)
+	}
+	if without.Plan.PlanID != declared.Plan.PlanID {
+		t.Fatalf("plan id changed with the provenance hint: %q vs %q", without.Plan.PlanID, declared.Plan.PlanID)
+	}
+}
+
 // The URI is a UI hint, not a route input: attaching it must not perturb plan
 // identity, or replans would miss the cache and clients would see spurious new
 // attempts.
