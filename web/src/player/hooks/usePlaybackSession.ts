@@ -24,6 +24,7 @@ import { randomUUID } from "@/lib/uuid";
 import { matchSubtitleTrackAcrossVersions } from "../utils/subtitleSort";
 import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
 import { isBitmapCodec } from "../utils/subtitleCodecs";
+import { isInventoryProvisional } from "../utils/inventoryProvenance";
 import {
   FEATURE_OUTPUT_CHANGE_V3,
   MAX_ATTEMPT_COUNT_V3,
@@ -86,6 +87,19 @@ interface PlaybackSessionState {
    * preference to item metadata, which can be stale after a version fallback.
    */
   planAudioTracks: PlayerAudioTrack[];
+  /**
+   * True while the plan's audio inventory is still declared metadata (or a
+   * deferred/failed probe) rather than probe evidence. The audio menu reads it
+   * to say the list may not match the bytes yet. Cleared when the inventory
+   * poll folds in probed catalog tracks or a verified replan lands.
+   */
+  audioInventoryProvisional: boolean;
+  /**
+   * True while the plan's subtitle inventory is still declared metadata rather
+   * than probe evidence. Cleared when a verified replan publishes the real
+   * inventory; the poll's subtitle fill is a replan, so it resolves here too.
+   */
+  subtitleInventoryProvisional: boolean;
   qualityPreference: string;
   shouldAutoPlay: boolean;
   loading: boolean;
@@ -336,6 +350,14 @@ function planToSessionState(
     audioTrackIndex: plan.selected_tracks.audio?.index ?? 0,
     durationSeconds: plan.source.duration_seconds ?? null,
     planAudioTracks: plan.audio_tracks ?? [],
+    audioInventoryProvisional: isInventoryProvisional(
+      plan.inventory_status,
+      plan.inventory_provenance,
+    ),
+    subtitleInventoryProvisional: isInventoryProvisional(
+      plan.inventory_status,
+      plan.inventory_provenance,
+    ),
     subtitleUrls: mapSubtitleInventory(
       plan.subtitle.inventory,
       plan.effective_media_file_id,
@@ -453,6 +475,8 @@ export function usePlaybackSession(
     durationSeconds: null,
     subtitleUrls: [],
     planAudioTracks: [],
+    audioInventoryProvisional: false,
+    subtitleInventoryProvisional: false,
     qualityPreference: qualityPreference?.trim() || "auto",
     shouldAutoPlay: true,
     loading: true,
@@ -801,6 +825,8 @@ export function usePlaybackSession(
           durationSeconds: null,
           subtitleUrls: [],
           planAudioTracks: [],
+          audioInventoryProvisional: false,
+          subtitleInventoryProvisional: false,
           loading: false,
           replacing: false,
           replanning: false,
@@ -928,6 +954,8 @@ export function usePlaybackSession(
           durationSeconds: null,
           subtitleUrls: [],
           planAudioTracks: [],
+          audioInventoryProvisional: false,
+          subtitleInventoryProvisional: false,
           loading: false,
           replacing: false,
           replanning: false,
@@ -1622,7 +1650,13 @@ export function usePlaybackSession(
     setState((current) => {
       const sameFile = fileId == null || fileId === current.mediaFileId;
       if (sameFile && tracks.length <= current.planAudioTracks.length) return current;
-      return { ...current, planAudioTracks: tracks.map((track) => ({ ...track })) };
+      return {
+        ...current,
+        planAudioTracks: tracks.map((track) => ({ ...track })),
+        // Catalog tracks are probe-persisted, so folding them in is the probed
+        // evidence the provisional marker was waiting for.
+        audioInventoryProvisional: false,
+      };
     });
   }, []);
 
