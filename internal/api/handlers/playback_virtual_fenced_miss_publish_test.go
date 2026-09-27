@@ -64,9 +64,13 @@ func TestFencedUpdateMissIsNotAnAdoptionOrCachePublish(t *testing.T) {
 // TestFencedUpdateMissLeavesEvidenceBufferUnpublished pins the other half: when
 // the fenced saver refuses the row, the evidence task reports a terminal miss
 // and retries nothing, so a refused candidate can never be retried into landing.
+// The saver call count is the regression guard: a stale result is terminal, so
+// the task must invoke the saver exactly once and never back off and retry.
 func TestFencedUpdateMissLeavesEvidenceBufferUnpublished(t *testing.T) {
+	saverCalls := 0
 	h := &PlaybackHandler{
 		VirtualFileMetadataSaver: func(context.Context, models.VirtualFilePersistArgs) (VirtualFileMetadataUpdateResult, error) {
+			saverCalls++
 			// The fence matched no row: neither metadata nor identity landed.
 			return VirtualFileMetadataUpdateResult{RowsAffected: 0, MetadataUpdated: false, IdentityAdopted: false}, nil
 		},
@@ -74,5 +78,8 @@ func TestFencedUpdateMissLeavesEvidenceBufferUnpublished(t *testing.T) {
 	err := h.persistVirtualEvidenceTask(evidenceTask(21, "virtual://movie/tt-fenced-miss?result=rejected", time.Now()), time.Time{})
 	if !errors.Is(err, errVirtualEvidenceStale) {
 		t.Fatalf("fenced miss error = %v, want errVirtualEvidenceStale (a CAS/ownership miss, not a retriable failure)", err)
+	}
+	if saverCalls != 1 {
+		t.Fatalf("metadata saver calls = %d, want exactly 1 (a fenced miss is terminal, not retried)", saverCalls)
 	}
 }
