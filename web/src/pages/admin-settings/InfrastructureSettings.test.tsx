@@ -29,6 +29,16 @@ const { realForm, serverSettings, sensitiveStatus, updateSettingsMock } = vi.hoi
   updateSettingsMock: vi.fn(),
 }));
 
+const { purgeVirtualMutateMock, adminLibrariesMock } = vi.hoisted(() => ({
+  purgeVirtualMutateMock: vi.fn(),
+  adminLibrariesMock: vi.fn(
+    (): { data: { id: number; name: string }[] | undefined; isLoading: boolean } => ({
+      data: undefined,
+      isLoading: false,
+    }),
+  ),
+}));
+
 vi.mock("@/hooks/useSettingsForm", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/hooks/useSettingsForm")>();
   return {
@@ -85,16 +95,12 @@ vi.mock("@/hooks/queries/admin/collections", () => ({
   usePurgeVirtualPlaybackItems: () => ({
     isPending: false,
     variables: undefined,
-    mutate: vi.fn(),
+    mutate: purgeVirtualMutateMock,
   }),
 }));
 
 vi.mock("@/hooks/queries/admin/libraries", () => ({
-  useAdminLibraries: () => ({ data: undefined, isLoading: false }),
-}));
-
-vi.mock("@/hooks/queries/admin/plugins", () => ({
-  useAdminPluginInstallations: () => ({ data: undefined, isLoading: false }),
+  useAdminLibraries: () => adminLibrariesMock(),
 }));
 
 const serverStatus: {
@@ -180,6 +186,9 @@ describe("InfrastructureSettings", () => {
       isPending: false,
       isError: false,
     });
+    purgeVirtualMutateMock.mockReset();
+    adminLibrariesMock.mockReset();
+    adminLibrariesMock.mockReturnValue({ data: undefined, isLoading: false });
   });
 
   it("renders every field group heading", () => {
@@ -1728,6 +1737,78 @@ describe("InfrastructureSettings", () => {
     await userEvent.click(screen.getByRole("button", { name: /Remove metadata rule/ }));
 
     expect(setValue).toHaveBeenCalledWith(OPSLOG_BUCKET_POLICIES_KEY, "[]");
+  });
+
+  describe("purge virtual library", () => {
+    it("scopes the purge to the library only and never sends a plugin scope", async () => {
+      adminLibrariesMock.mockReturnValue({
+        data: [
+          { id: 7, name: "Movies" },
+          { id: 9, name: "Shows" },
+        ],
+        isLoading: false,
+      });
+      mockForm();
+      render(<InfrastructureSettings />);
+
+      const virtualGroup = within(screen.getByRole("group", { name: "Virtual Library" }));
+      expect(virtualGroup.getByLabelText("Library Scope")).toBeInTheDocument();
+      expect(virtualGroup.queryByLabelText("Plugin Installation Scope")).not.toBeInTheDocument();
+
+      await userEvent.click(virtualGroup.getByRole("button", { name: "Preview Purge" }));
+      expect(purgeVirtualMutateMock).toHaveBeenCalledWith({ dryRun: true });
+
+      await userEvent.click(virtualGroup.getByRole("combobox", { name: "Library Scope" }));
+      await userEvent.click(screen.getByRole("option", { name: "Movies (ID: 7)" }));
+
+      // The confirm spy is restored before the assertions below, and restoring
+      // drops the recorded calls, so the prompt text is read out first.
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+      let confirmArgs: unknown[] | undefined;
+      try {
+        await userEvent.click(virtualGroup.getByRole("button", { name: "Purge Virtual Items" }));
+        confirmArgs = confirm.mock.calls[0];
+      } finally {
+        confirm.mockRestore();
+      }
+      expect(confirmArgs).toEqual([
+        "Purge all zero-storage virtual library items for the selected library? This cannot be undone.",
+      ]);
+
+      expect(purgeVirtualMutateMock).toHaveBeenLastCalledWith({
+        dryRun: false,
+        libraryId: 7,
+      });
+      for (const call of purgeVirtualMutateMock.mock.calls) {
+        expect(call[0]).not.toHaveProperty("installationId");
+      }
+    });
+
+    it("does not purge when the library-scoped confirmation is dismissed", async () => {
+      mockForm();
+      render(<InfrastructureSettings />);
+
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      let confirmCalls: unknown[][] = [];
+      try {
+        await userEvent.click(
+          within(screen.getByRole("group", { name: "Virtual Library" })).getByRole("button", {
+            name: "Purge Virtual Items",
+          }),
+        );
+        confirmCalls = confirm.mock.calls;
+      } finally {
+        confirm.mockRestore();
+      }
+
+      // No library chosen reads as "everything", and the prompt says so.
+      expect(confirmCalls).toEqual([
+        [
+          "Purge all zero-storage virtual library items for all virtual items? This cannot be undone.",
+        ],
+      ]);
+      expect(purgeVirtualMutateMock).not.toHaveBeenCalled();
+    });
   });
 
   describe("clearing a stored credential", () => {

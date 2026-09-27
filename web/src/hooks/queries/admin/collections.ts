@@ -489,12 +489,11 @@ export function usePurgeVirtualPlaybackItems() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (options?: { dryRun?: boolean; libraryId?: number; installationId?: number }) =>
+    mutationFn: (options?: { dryRun?: boolean; libraryId?: number }) =>
       api<{ success: boolean; files_deleted: number; items_deleted: number; message: string }>(
         `/admin/collections/purge-virtual?${new URLSearchParams({
           ...(options?.dryRun ? { dry_run: "true" } : {}),
           ...(options?.libraryId ? { library_id: String(options.libraryId) } : {}),
-          ...(options?.installationId ? { installation_id: String(options.installationId) } : {}),
         })}`,
         { method: "POST" },
       ),
