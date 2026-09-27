@@ -19,6 +19,12 @@ package resolver
 //
 // The returned tier is "video_hash", "guid", or "release_name", matching the
 // dedup-key tier names.
+const (
+	backfillTierVideoHash  = "video_hash"
+	backfillTierGUID       = "guid"
+	backfillTierReleaseKey = "release_name"
+)
+
 func MatchCandidateIdentityForBackfill(identity, candidate PersistedIdentityTiers) (string, bool) {
 	// A stronger stored tier that the candidate contradicts or cannot
 	// corroborate is decisive, exactly as in SharedTier: the row recorded that
@@ -30,7 +36,7 @@ func MatchCandidateIdentityForBackfill(identity, candidate PersistedIdentityTier
 		if candidate.VideoHash == "" {
 			return "", false
 		}
-		return "video_hash", true
+		return backfillTierVideoHash, true
 	}
 	if identity.GUID != "" && candidate.GUID != "" && identity.GUID != candidate.GUID {
 		return "", false
@@ -39,7 +45,7 @@ func MatchCandidateIdentityForBackfill(identity, candidate PersistedIdentityTier
 		if candidate.GUID == "" {
 			return "", false
 		}
-		return "guid", true
+		return backfillTierGUID, true
 	}
 	// Name tier: both sides must carry a real size that plausibly describes the
 	// same file. An unknown size is not corroboration and is refused here.
@@ -49,7 +55,7 @@ func MatchCandidateIdentityForBackfill(identity, candidate PersistedIdentityTier
 		identity.ReleaseSize > 0 &&
 		candidate.ReleaseSize > 0 &&
 		releaseSizesAgree(identity.ReleaseSize, candidate.ReleaseSize) {
-		return "release_name", true
+		return backfillTierReleaseKey, true
 	}
 	return "", false
 }

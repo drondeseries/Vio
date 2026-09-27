@@ -97,7 +97,7 @@ func TestVirtualIdentityBackfillRunnerResumesAndCompletes(t *testing.T) {
 }
 
 // TestHasFinishedJobOfTypeGatesOneShot proves the one-shot marker: a completed
-// or cancelled job is reported, while a queued or absent one is not (so a
+// or canceled job is reported, while a queued or absent one is not (so a
 // failed run is retried on the next boot).
 func TestHasFinishedJobOfTypeGatesOneShot(t *testing.T) {
 	r := lifecycleRepo(t)

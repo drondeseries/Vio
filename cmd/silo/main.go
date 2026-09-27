@@ -3552,7 +3552,7 @@ func main() {
 		defer adminJobRunner.Stop()
 
 		// Queue the one-shot backfill after the runner is live. A job that has
-		// already finished (completed or cancelled) is the one-shot gate; rows
+		// already finished (completed or canceled) is the one-shot gate; rows
 		// it could not match stay legacy and are not re-listed on every
 		// restart. A server with no admin account has no job owner and is
 		// skipped.

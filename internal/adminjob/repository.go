@@ -310,7 +310,7 @@ func (r *Repository) GetActiveByType(ctx context.Context, jobType string) (*mode
 }
 
 // HasFinishedJobOfType reports whether a job of this kind has reached a
-// terminal state the operator did not ask to retry: completed, or cancelled.
+// terminal state the operator did not ask to retry: completed, or canceled.
 // It is the one-shot gate for work that must not be re-queued on every process
 // start, such as the virtual identity backfill. A failed job is deliberately
 // not "finished": the next boot re-queues it and the durable cursor resumes.
