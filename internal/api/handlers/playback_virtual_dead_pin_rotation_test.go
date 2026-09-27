@@ -151,7 +151,7 @@ func TestResolveRehydratedVirtualSourceRotatesAbsentAnchor(t *testing.T) {
 		pinnedURI  = neutralURI + "?result=pinned"
 		siblingURI = neutralURI + "?result=sibling"
 	)
-	file := &models.MediaFile{ID: 7, ContentID: "movie-replan-absent", FilePath: pinnedURI, VirtualOwnerInstallationID: 5}
+	file := &models.MediaFile{ID: 7, ContentID: "movie-replan-absent", FilePath: pinnedURI, VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024"}
 
 	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	h.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
@@ -167,7 +167,7 @@ func TestResolveRehydratedVirtualSourceRotatesAbsentAnchor(t *testing.T) {
 		if !VirtualCandidateRotationAllowed(ctx) {
 			return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
 		}
-		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/sibling", URI: siblingURI, CandidateID: "sibling"}, nil
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/sibling", URI: siblingURI, CandidateID: "sibling", IdentityRematched: true, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024"}, nil
 	})
 
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil).WithContext(newAuthorizedPlaybackContext())
@@ -201,7 +201,7 @@ func TestResolveRehydratedVirtualSourceRotatesMarkedFailedAnchor(t *testing.T) {
 		siblingURI = neutralURI + "?result=sibling"
 	)
 	failedAt := time.Now().Add(-time.Minute)
-	file := &models.MediaFile{ID: 77, ContentID: "movie-replan-failed-anchor", FilePath: pinnedURI, FailedAt: &failedAt, VirtualOwnerInstallationID: 5}
+	file := &models.MediaFile{ID: 77, ContentID: "movie-replan-failed-anchor", FilePath: pinnedURI, FailedAt: &failedAt, VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024"}
 
 	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	h.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
@@ -213,7 +213,7 @@ func TestResolveRehydratedVirtualSourceRotatesMarkedFailedAnchor(t *testing.T) {
 		if !VirtualCandidateRotationAllowed(ctx) {
 			return ResolvedVirtualMedia{}, fmt.Errorf("%w: candidate %s is marked failed", ErrVirtualCandidateMarkedFailed, pinnedURI)
 		}
-		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/sibling", URI: siblingURI, CandidateID: "sibling"}, nil
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:9/sibling", URI: siblingURI, CandidateID: "sibling", IdentityRematched: true, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024"}, nil
 	})
 
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil).WithContext(newAuthorizedPlaybackContext())
@@ -223,6 +223,52 @@ func TestResolveRehydratedVirtualSourceRotatesMarkedFailedAnchor(t *testing.T) {
 	}
 	if got := virtualResultCandidateID(resolved.URI); got != "sibling" {
 		t.Fatalf("resolved candidate = %q, want the rotated sibling", got)
+	}
+	if len(rotates) != 2 || rotates[0] || !rotates[1] {
+		t.Fatalf("rotation intents = %v, want exactly [false true]", rotates)
+	}
+}
+
+// TestResolveRehydratedVirtualSourceRefusesDifferentRelease proves the
+// rehydration rotation now carries the transport anchor's same-release
+// assertion: when the retry resolves a genuinely different release, the
+// resolver refuses with the original absent-pin cause instead of silently
+// swapping the plan onto sibling bytes.
+func TestResolveRehydratedVirtualSourceRefusesDifferentRelease(t *testing.T) {
+	const (
+		neutralURI = "virtual://movie/tt-replan-swap"
+		pinnedURI  = neutralURI + "?result=pinned"
+		siblingURI = neutralURI + "?result=sibling"
+	)
+	file := &models.MediaFile{
+		ID: 11, ContentID: "movie-replan-swap", FilePath: pinnedURI,
+		VirtualOwnerInstallationID: 5, ProviderVideoHash: "hash-a", ProviderReleaseName: "Movie.2024",
+	}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+		return "http://127.0.0.1:9/unused", nil
+	})
+	var rotates []bool
+	h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(ctx context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		rotates = append(rotates, VirtualCandidateRotationAllowed(ctx))
+		if !VirtualCandidateRotationAllowed(ctx) {
+			return ResolvedVirtualMedia{}, absentSessionPinError("pinned")
+		}
+		// A different release under the same neutral key: no rematch, no
+		// matching durable identity. The rotation must be refused.
+		return ResolvedVirtualMedia{
+			URL: "http://127.0.0.1:9/sibling", URI: siblingURI, CandidateID: "sibling",
+			ProviderVideoHash: "hash-b", ProviderReleaseName: "Movie.2024.OTHER",
+		}, nil
+	})
+
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil).WithContext(newAuthorizedPlaybackContext())
+	resolved, err := h.resolveRehydratedVirtualSourceV3(r, file, "profile-1", nil, "pinned", "auto", 0, virtualResolveOptionsV3{sessionBound: true, sessionAnchorURI: pinnedURI})
+	if !errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+		t.Fatalf("err = %v, want the original absent-pin refusal", err)
+	}
+	if got := virtualResultCandidateID(resolved.URI); got != "" {
+		t.Fatalf("resolved candidate = %q, want no accepted rotation", got)
 	}
 	if len(rotates) != 2 || rotates[0] || !rotates[1] {
 		t.Fatalf("rotation intents = %v, want exactly [false true]", rotates)

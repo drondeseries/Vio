@@ -88,6 +88,11 @@ type PlannerInputV3 struct {
 	Now                 time.Time
 	AttemptedKeys       []string
 	AdditionalSubtitles []SubtitleInventoryEntryV3
+	// InventoryProvenance is the virtual resolver's provenance for the
+	// effective source (see PlanV3.InventoryProvenance). The handler sets it
+	// from the resolve result; it is empty for a local source. It is copied
+	// onto the plan verbatim and never affects route selection.
+	InventoryProvenance string
 	// ForceSoftwareVideoDecode asks the planner to mark the resulting
 	// server-transcode plan as a software-decode variant. It is set only by
 	// reactive failure recovery after the live hardware decoder rejected the
@@ -415,6 +420,9 @@ func PlanPlaybackV3(input PlannerInputV3) (result PlannerResultV3) {
 	}
 	base.InventoryStatus = invStatus
 	base.InventoryRevision = ComputeInventoryRevisionV3(invStatus, base.AudioTracks, base.Subtitle.Inventory)
+	// The resolver's own provenance for the effective virtual source, distinct
+	// from the coarse stamp-derived status above. Empty for a local source.
+	base.InventoryProvenance = input.InventoryProvenance
 	base.Claims.Audio.Passthrough = passthrough
 	if mkvQuirkFired {
 		appendAppliedQuirkV3(&base, *mkvQuirk, "")
@@ -890,6 +898,7 @@ func planAudioOnlyV3(input PlannerInputV3, file *models.MediaFile, source Source
 		EffectiveMediaFileID:   file.ID,
 		EffectiveVirtualURI:    effectiveVirtualURIV3(input),
 		VirtualSourceRevision:  virtualSourceRevisionV3(input),
+		InventoryProvenance:    input.InventoryProvenance,
 		Source:                 source,
 		SubtitleFidelityPolicy: subtitlePolicyNameV3(request.SubtitleFidelityPreference),
 		Timeline:               TimelineV3{SourceStartSeconds: floatOrZeroV3(request.StartPosition), PlayerStartSeconds: floatOrZeroV3(request.StartPosition), CanSeekAnywhere: true, SeekRestoration: "player_position"},

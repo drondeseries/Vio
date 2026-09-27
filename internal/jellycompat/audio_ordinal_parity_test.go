@@ -89,11 +89,15 @@ func TestEnsureTranscodeSession_MultiAudioUsesContainerOrdinal(t *testing.T) {
 		t.Fatalf("AudioTrackIndex = %d, want 0 (English is the first audio stream)", got)
 	}
 
-	// The emitted ffmpeg args must map the audio-only ordinal.
+	// The fake ffmpeg creates argsPath by shell redirection before it writes the
+	// arguments, so a single successful read can still observe an empty file.
+	// Poll until the recorder has written content, not merely until the path
+	// exists; otherwise a loaded runner races the truncate against the write and
+	// fails with "args were not recorded" even though ffmpeg ran.
 	deadline := time.Now().Add(5 * time.Second)
 	var args []byte
 	for time.Now().Before(deadline) {
-		if data, readErr := os.ReadFile(argsPath); readErr == nil {
+		if data, readErr := os.ReadFile(argsPath); readErr == nil && len(data) > 0 {
 			args = data
 			break
 		}

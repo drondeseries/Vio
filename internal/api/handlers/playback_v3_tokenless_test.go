@@ -250,6 +250,46 @@ func TestEscalateRefusedProgressiveRemuxV3PlansHLSForCapableClients(t *testing.T
 	}
 }
 
+// The escalated plan is the same decision rebuilt on HLS, so it must carry the
+// selected source's inventory provenance. Dropping it on the rebuilt planner
+// input would publish an empty provenance on a plan whose primary plan had one.
+func TestEscalateRefusedProgressiveRemuxV3KeepsInventoryProvenance(t *testing.T) {
+	handler, input, result := escalationFixtureV3(t, true)
+	input.InventoryProvenance = string(ProbeProvenanceDeclared)
+
+	escalated, transportErr := handler.escalateRefusedProgressiveRemuxV3(context.Background(), mediaAuthModeV3{headerAuth: true}, func() playback.PlannerInputV3 { return input }, result)
+	if transportErr != nil {
+		t.Fatalf("escalation error = %#v", transportErr)
+	}
+	if escalated.Plan == nil {
+		t.Fatalf("escalated = %#v, want a plan", escalated)
+	}
+	if escalated.Plan.Delivery != playback.DeliveryRemuxHLSV3 {
+		t.Fatalf("escalated delivery = %#v, want %q", escalated.Plan.Delivery, playback.DeliveryRemuxHLSV3)
+	}
+	if escalated.Plan.InventoryProvenance != "declared" {
+		t.Fatalf("escalated provenance = %q, want declared carried from the primary plan", escalated.Plan.InventoryProvenance)
+	}
+}
+
+// The primary plan and its escalation must agree on provenance: the escalation
+// rebuilds the same source, so an empty primary provenance stays empty and a
+// declared one stays declared.
+func TestEscalateRefusedProgressiveRemuxV3ProvenanceMatchesPrimaryPlan(t *testing.T) {
+	handler, input, result := escalationFixtureV3(t, true)
+	if result.Plan.InventoryProvenance != "" {
+		t.Fatalf("fixture primary provenance = %q, want empty", result.Plan.InventoryProvenance)
+	}
+
+	escalated, transportErr := handler.escalateRefusedProgressiveRemuxV3(context.Background(), mediaAuthModeV3{headerAuth: true}, func() playback.PlannerInputV3 { return input }, result)
+	if transportErr != nil {
+		t.Fatalf("escalation error = %#v", transportErr)
+	}
+	if escalated.Plan.InventoryProvenance != result.Plan.InventoryProvenance {
+		t.Fatalf("escalated provenance = %q, want the primary plan's %q", escalated.Plan.InventoryProvenance, result.Plan.InventoryProvenance)
+	}
+}
+
 // worker_only refuses every API remux, including a container-only copy that
 // converts nothing. Escalation therefore cannot key on how heavy the recipe is:
 // the copy-only remux has no progressive route either, and must reach the same

@@ -2,6 +2,7 @@ package playback
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -77,6 +78,145 @@ func TestPlanPlaybackV3AudioOnlyExposesEffectiveVirtualURI(t *testing.T) {
 	}
 	if result.Plan.EffectiveVirtualURI != candidate.FilePath {
 		t.Fatalf("effective virtual URI = %q, want %q", result.Plan.EffectiveVirtualURI, candidate.FilePath)
+	}
+}
+
+// The resolver's inventory provenance is published additively on the plan and,
+// like the effective virtual URI, must not perturb plan identity: a plan with
+// and without the field is the same attempt.
+func TestPlanPlaybackV3PublishesInventoryProvenance(t *testing.T) {
+	candidate := detailedFixtureFileV3()
+	candidate.FilePath = "virtual://movie/tt1234567?result=working"
+	requested := &models.MediaFile{ID: 41, ContentID: candidate.ContentID, Container: candidate.Container, FilePath: "virtual://movie/tt1234567"}
+	req := validStartRequestV3()
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
+	req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+
+	input := PlannerInputV3{
+		Request: req, RequestedFile: requested, EffectiveFile: candidate, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+	}
+	input.InventoryProvenance = "declared"
+	declared := PlanPlaybackV3(input)
+	if declared.Plan == nil {
+		t.Fatalf("result = %#v, want a plan", declared)
+	}
+	if declared.Plan.InventoryProvenance != "declared" {
+		t.Fatalf("inventory provenance = %q, want declared", declared.Plan.InventoryProvenance)
+	}
+
+	input.InventoryProvenance = ""
+	without := PlanPlaybackV3(input)
+	if without.Plan == nil {
+		t.Fatalf("result = %#v, want a plan", without)
+	}
+	if without.Plan.InventoryProvenance != "" {
+		t.Fatalf("inventory provenance = %q, want empty", without.Plan.InventoryProvenance)
+	}
+	if without.Plan.PlanID != declared.Plan.PlanID {
+		t.Fatalf("plan id changed with the provenance hint: %q vs %q", without.Plan.PlanID, declared.Plan.PlanID)
+	}
+}
+
+// The provenance value the resolver produced is published verbatim on the plan,
+// for every value the resolver can report: verified (this resolve probed the
+// served bytes), declared (provider metadata only, including after a stale
+// stamp), pending (a probe is deferred), and failed (a probe ran and failed).
+// The plan must not invent a value or downgrade a declared/failed resolve to
+// verified just because the row carries a probe stamp.
+func TestPlanPlaybackV3PublishesEachInventoryProvenanceValue(t *testing.T) {
+	candidate := detailedFixtureFileV3()
+	candidate.FilePath = "virtual://movie/tt1234567?result=working"
+	requested := &models.MediaFile{ID: 41, ContentID: candidate.ContentID, Container: candidate.Container, FilePath: "virtual://movie/tt1234567"}
+	req := validStartRequestV3()
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
+	req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+
+	for _, want := range []string{"verified", "declared", "pending", "failed"} {
+		t.Run(want, func(t *testing.T) {
+			input := PlannerInputV3{
+				Request: req, RequestedFile: requested, EffectiveFile: candidate, AudioTrackIndex: 0,
+				Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+			}
+			input.InventoryProvenance = want
+			result := PlanPlaybackV3(input)
+			if result.Plan == nil {
+				t.Fatalf("result = %#v, want a plan", result)
+			}
+			if result.Plan.InventoryProvenance != want {
+				t.Fatalf("inventory provenance = %q, want %q", result.Plan.InventoryProvenance, want)
+			}
+		})
+	}
+}
+
+// The audio-only planner builds its own plan and must publish the resolver's
+// provenance exactly like the video planner; a path that forgot the copy would
+// report empty provenance for an audiobook resolve.
+func TestPlanPlaybackV3AudioOnlyPublishesEachInventoryProvenanceValue(t *testing.T) {
+	candidate := audioOnlyFixtureFileV3()
+	candidate.FilePath = "virtual://audiobook/tt7654321?result=working"
+	requested := &models.MediaFile{ID: 76, ContentID: candidate.ContentID, Container: candidate.Container, FilePath: "virtual://audiobook/tt7654321"}
+	req := validStartRequestV3()
+	req.FileID = requested.ID
+	req.Capabilities.Containers = []string{"mp4"}
+
+	for _, want := range []string{"verified", "declared", "pending", "failed"} {
+		t.Run(want, func(t *testing.T) {
+			result := PlanPlaybackV3(PlannerInputV3{
+				Request: req, RequestedFile: requested, EffectiveFile: candidate, AudioTrackIndex: 0,
+				Settings:            PlannerSettingsV3{TranscodeEnabled: true},
+				InventoryProvenance: want,
+			})
+			if result.Plan == nil {
+				t.Fatalf("result = %#v, want a plan", result)
+			}
+			if result.Plan.InventoryProvenance != want {
+				t.Fatalf("audio-only inventory provenance = %q, want %q", result.Plan.InventoryProvenance, want)
+			}
+			// The provenance hint must never change route selection or identity.
+			if result.Plan.PlanID == "" {
+				t.Fatal("the audio-only plan lost its identity")
+			}
+		})
+	}
+}
+
+// The plan's stamp-derived InventoryStatus and the resolve-derived
+// InventoryProvenance are distinct signals. A row carrying a probe stamp makes
+// InventoryStatus read "verified" even when the resolve that produced the plan
+// only served declared or failed fallback metadata; the provenance must keep
+// reporting what this resolve did rather than inherit the stamp.
+func TestPlanPlaybackV3ProvenanceStaysTruthfulAgainstStaleStampStatus(t *testing.T) {
+	candidate := detailedFixtureFileV3()
+	candidate.FilePath = "virtual://movie/tt1234567?result=working"
+	// A stale probe stamp on the served row: InventoryStatus is verified off the
+	// stamp alone.
+	staleStamp := time.Now().Add(-72 * time.Hour)
+	candidate.ProbeUpdatedAt = &staleStamp
+	requested := &models.MediaFile{ID: 41, ContentID: candidate.ContentID, Container: candidate.Container, FilePath: "virtual://movie/tt1234567"}
+	req := validStartRequestV3()
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
+	req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+
+	for _, want := range []string{"declared", "failed", "pending"} {
+		t.Run(want, func(t *testing.T) {
+			input := PlannerInputV3{
+				Request: req, RequestedFile: requested, EffectiveFile: candidate, AudioTrackIndex: 0,
+				Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+			}
+			input.InventoryProvenance = want
+			result := PlanPlaybackV3(input)
+			if result.Plan == nil {
+				t.Fatalf("result = %#v, want a plan", result)
+			}
+			if result.Plan.InventoryStatus != "verified" {
+				t.Fatalf("inventory status = %q, want the stamp-derived verified", result.Plan.InventoryStatus)
+			}
+			if result.Plan.InventoryProvenance != want {
+				t.Fatalf("inventory provenance = %q, want %q: the stamp must not overwrite the resolve's own verdict", result.Plan.InventoryProvenance, want)
+			}
+		})
 	}
 }
 

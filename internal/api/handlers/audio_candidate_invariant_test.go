@@ -80,7 +80,7 @@ func TestDegradeStartAudioInPlaceLeavesExplicitPickAlone(t *testing.T) {
 	req := playback.StartRequestV3{AudioTrackIndex: &index}
 	_, _, _, _, ok := handler.degradeStartAudioInPlaceV3(
 		httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil),
-		req, &models.MediaFile{ID: 1}, &models.MediaFile{ID: 1, AudioTracks: []models.AudioTrack{{Codec: "dts"}, {Codec: "aac"}}}, 0, playback.PlannerSettingsV3{},
+		req, &models.MediaFile{ID: 1}, &models.MediaFile{ID: 1, AudioTracks: []models.AudioTrack{{Codec: "dts"}, {Codec: "aac"}}}, 0, playback.PlannerSettingsV3{}, ProbeProvenance(""),
 	)
 	if ok {
 		t.Fatal("an explicit audio pick was silently substituted")
@@ -201,6 +201,7 @@ func TestEvaluateAudioDegradeInPlaceRequiresAFileAndNoExplicitPick(t *testing.T)
 		httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil),
 		nil, &playback.AttemptRecordV3{}, req, playback.StartRequestV3{},
 		&models.MediaFile{ID: 1, AudioTracks: []models.AudioTrack{{Codec: "dts"}, {Codec: "aac"}}},
+		ProbeProvenance(""),
 		&models.MediaFile{ID: 1}, playback.PlannerSettingsV3{}, nil, nil,
 	)
 	if ok {
