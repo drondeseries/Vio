@@ -306,8 +306,8 @@ func TestResolveSubtitleSourceRequestCapturedEmptyDownloadedPinServed(t *testing
 	if resolvedFile.FilePath != newURI {
 		t.Fatalf("served from %q, want the bound candidate %q", resolvedFile.FilePath, newURI)
 	}
-	if resolvedIndex < 0 {
-		t.Fatalf("resolved index %d, want the downloaded row's published ordinal", resolvedIndex)
+	if want := len(playback.BuildSubtitleInventoryV3(row, nil)); resolvedIndex != want {
+		t.Fatalf("resolved index %d, want %d (the downloaded row's published ordinal)", resolvedIndex, want)
 	}
 }
 
@@ -371,8 +371,95 @@ func TestResolveSubtitleSourceRequestEditionSwitchCapturedEmptyDownloadedPin(t *
 	if resolvedFile.FilePath != newURI {
 		t.Fatalf("served from %q, want the effective candidate %q", resolvedFile.FilePath, newURI)
 	}
-	if resolvedIndex < 0 {
-		t.Fatalf("resolved index %d, want the downloaded row's published ordinal", resolvedIndex)
+	// The effective file has one embedded track, so the downloaded row's
+	// published ordinal is 1: the historical ordinal (0) must not survive.
+	if want := len(playback.BuildSubtitleInventoryV3(effective, nil)); resolvedIndex != want {
+		t.Fatalf("resolved index %d, want %d (the downloaded row's published ordinal on the effective file)", resolvedIndex, want)
+	}
+}
+
+// An edition switch must resolve a downloaded pin against the effective file's
+// own downloaded list: a row the effective file does not own is unavailable,
+// never the historical ordinal passed through.
+func TestResolveSubtitleSourceRequestEditionSwitchDownloadedPinMissingOnEffective(t *testing.T) {
+	oldURI := "virtual://movie/tt-edmiss?result=cand-a"
+	newURI := "virtual://movie/tt-edmiss?result=cand-b"
+	named := &models.MediaFile{ID: 912, FilePath: oldURI, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 1, Codec: "subrip", Language: "eng"},
+	}}
+	effective := &models.MediaFile{ID: 913, FilePath: newURI, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 7, Codec: "subrip", Language: "eng"},
+	}}
+	session := &playback.Session{
+		ID:                         "sess-edmiss",
+		MediaFileID:                913,
+		VirtualSourceURI:           newURI,
+		VirtualSubtitleEvidenceURI: oldURI,
+		VirtualSubtitleEvidenceSet: true,
+	}
+	handler := &StreamHandler{
+		fileResolver: zzResolver{byID: map[int]*models.MediaFile{913: effective}},
+		SubtitleRepo: downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+			912: {{ID: 56, MediaFileID: 912, Language: "eng", Format: subtitles.FormatSRT}},
+		}},
+	}
+	query := url.Values{playback.DownloadedSubtitleIDParamV3: []string{"56"}}
+
+	if _, _, err := handler.resolveSubtitleSourceRequest(
+		context.Background(), named, session, 0, query); !errors.Is(err, errSubtitleIdentityUnavailable) {
+		t.Fatalf("downloaded pin missing from the effective file: err = %v, want errSubtitleIdentityUnavailable", err)
+	}
+}
+
+// An edition switch must reject mixed identity pins before any remap: a
+// downloaded pin combined with an embedded pin can never name a single track,
+// even when both editions publish equivalent embedded tracks at the ordinal.
+func TestResolveSubtitleSourceRequestEditionSwitchMixedPinsRejected(t *testing.T) {
+	named := &models.MediaFile{ID: 914, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 1, Codec: "subrip", Language: "eng"},
+	}}
+	effective := &models.MediaFile{ID: 915, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 7, Codec: "subrip", Language: "eng"},
+	}}
+	session := &playback.Session{ID: "sess-edmix", MediaFileID: 915}
+	handler := &StreamHandler{
+		fileResolver: zzResolver{byID: map[int]*models.MediaFile{915: effective}},
+		SubtitleRepo: downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+			915: {{ID: 57, MediaFileID: 915, Language: "eng", Format: subtitles.FormatSRT}},
+		}},
+	}
+	query := url.Values{
+		playback.DownloadedSubtitleIDParamV3:        []string{"57"},
+		playback.EmbeddedSubtitleStreamIndexParamV3: []string{"7"},
+	}
+
+	if _, _, err := handler.resolveSubtitleSourceRequest(
+		context.Background(), named, session, 0, query); !errors.Is(err, errSubtitleIdentityInvalid) {
+		t.Fatalf("mixed pins on edition switch: err = %v, want errSubtitleIdentityInvalid", err)
+	}
+}
+
+// An edition switch must reject a repeated downloaded pin before any remap,
+// even when the effective file owns that row.
+func TestResolveSubtitleSourceRequestEditionSwitchDuplicatePinRejected(t *testing.T) {
+	named := &models.MediaFile{ID: 916, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 1, Codec: "subrip", Language: "eng"},
+	}}
+	effective := &models.MediaFile{ID: 917, SubtitleTracks: []models.SubtitleTrack{
+		{Index: 7, Codec: "subrip", Language: "eng"},
+	}}
+	session := &playback.Session{ID: "sess-eddup", MediaFileID: 917}
+	handler := &StreamHandler{
+		fileResolver: zzResolver{byID: map[int]*models.MediaFile{917: effective}},
+		SubtitleRepo: downloadedSubtitleRepoByFile{byFile: map[int][]subtitles.DownloadedSubtitle{
+			917: {{ID: 58, MediaFileID: 917, Language: "eng", Format: subtitles.FormatSRT}},
+		}},
+	}
+	query := url.Values{playback.DownloadedSubtitleIDParamV3: []string{"58", "58"}}
+
+	if _, _, err := handler.resolveSubtitleSourceRequest(
+		context.Background(), named, session, 0, query); !errors.Is(err, errSubtitleIdentityInvalid) {
+		t.Fatalf("duplicate pin on edition switch: err = %v, want errSubtitleIdentityInvalid", err)
 	}
 }
 

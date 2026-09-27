@@ -65,11 +65,32 @@ func (h *StreamHandler) remapSubtitleInventory(
 	index int,
 	query url.Values,
 ) (*models.MediaFile, int, error) {
+	// Pin shape is validated on every entry to this remapper, not only on the
+	// normal serving path: a malformed combination (mixed pins, repeated pins)
+	// must be rejected even when the named inventory is nonempty. Without this
+	// check the pinned fast path below would discard the shape error and fall
+	// through to the identity translation, which ignores the query and can map
+	// the stale ordinal onto an equivalent track as if the pins were valid.
+	if err := validateSubtitleIdentityPinShape(query); err != nil {
+		return nil, 0, err
+	}
+	// A validated downloaded pin is file-bound: resolve it against the
+	// effective file's own downloaded list and return its published ordinal.
+	// It must never reach the generic pin shortcut below, which has no
+	// downloaded-row lookup and would return the historical ordinal unchanged
+	// — or succeed even when the effective file does not own that row.
+	if pin := query.Get(playback.DownloadedSubtitleIDParamV3); pin != "" {
+		return h.resolveDownloadedSubtitle(ctx, effectiveFile, pin)
+	}
 	// A pinned identity that resolves against the effective file is the
-	// current plan's own track: honor it directly.
+	// current plan's own track: honor it directly. Only a shape-invalid pin
+	// returns here; an unavailable pin falls through to the identity
+	// translation below so a stale pin can still be remapped by language.
 	if pinned := hasSubtitleIdentityPin(query); pinned {
 		if resolved, err := subtitleRouteIndex(effectiveFile, index, query); err == nil {
 			return effectiveFile, resolved, nil
+		} else if errors.Is(err, errSubtitleIdentityInvalid) {
+			return nil, 0, err
 		}
 	}
 	// A named row with no subtitle inventory has nothing to remap FROM: it is
@@ -83,6 +104,8 @@ func (h *StreamHandler) remapSubtitleInventory(
 	if len(namedFile.ExternalSubtitles) == 0 && len(namedFile.SubtitleTracks) == 0 {
 		if resolved, err := subtitleRouteIndex(effectiveFile, index, query); err == nil {
 			return effectiveFile, resolved, nil
+		} else if errors.Is(err, errSubtitleIdentityInvalid) {
+			return nil, 0, err
 		}
 		return nil, 0, errSubtitleIdentityUnavailable
 	}
@@ -192,10 +215,11 @@ func (h *StreamHandler) remapSubtitleFromEvidenceV3(
 // that replaced the plan-time embedded/external inventory does not retire them:
 // the row id keeps identifying the same artifact.
 //
-// The edition switch resolves the same identity across two files, matching the
-// wanted row id from the named file's list against the effective file's list;
-// that is the only difference from this single-file form, and it is why the
-// switch keeps its own branch rather than delegating here.
+// The edition switch resolves a validated downloaded pin the same way, against
+// the effective file's own downloaded list via remapSubtitleInventory before
+// the generic pin shortcut. A downloaded pin never falls through to the
+// ordinal passthrough: only a row-id match on the effective file may serve it,
+// and the published ordinal comes from that file's own list.
 func (h *StreamHandler) resolveDownloadedSubtitle(ctx context.Context, file *models.MediaFile, rowID string) (*models.MediaFile, int, error) {
 	if h.SubtitleRepo == nil || file == nil {
 		return nil, 0, errSubtitleIdentityUnavailable
@@ -238,6 +262,13 @@ func (h *StreamHandler) resolveSubtitleSourceRequest(
 ) (*models.MediaFile, int, error) {
 	if namedFile == nil || session == nil {
 		return namedFile, index, nil
+	}
+	// Pin shape is validated before the edition branch so the edition-switch
+	// fast path can never accept a malformed combination (mixed pins, repeated
+	// pins) the normal path rejects. The remapper re-validates on entry for
+	// independently callable use; invalid pins are returned, never remapped.
+	if err := validateSubtitleIdentityPinShape(query); err != nil {
+		return nil, 0, err
 	}
 	// After an edition switch the session's effective file differs from the
 	// requested edition. A request naming the requested (old) edition must not
