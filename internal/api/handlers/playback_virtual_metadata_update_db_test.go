@@ -492,3 +492,56 @@ func TestVirtualFileMetadataUpdateNeutralRowRefusesSiblingOwnedCandidate(t *test
 		t.Fatalf("neutral row changed on a sibling-owned candidate write:\nbefore=%s\nafter =%s", before, after)
 	}
 }
+
+// TestVirtualFileMetadataUpdateNeutralRowRefusesSiblingOwnedCandidateWithoutExpectedPath
+// proves the neutral-row candidate-URI fence does not depend on the optional
+// expected path. A metadata-only write that omits it must still refuse when a
+// sibling row owns the concrete candidate, so the neutral row cannot absorb
+// evidence for bytes it does not own. Comparing the optional expected path
+// against the neutral key instead of the row's actual file_path made an omitted
+// expected path bypass the fence.
+func TestVirtualFileMetadataUpdateNeutralRowRefusesSiblingOwnedCandidateWithoutExpectedPath(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	ctx := context.Background()
+	const folderID, ownerID = 994317, 7007
+	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
+
+	neutral := "virtual://movie/tt-db-neutral-no-expected"
+	candidatePath := neutral + "?result=cand-a"
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id, probe_source)
+		VALUES('movie-db-neutral-no-expected', $1, $2, 'virtual', $3, 'virtual')`, folderID, candidatePath, ownerID); err != nil {
+		t.Fatalf("insert sibling row: %v", err)
+	}
+
+	var rowID int
+	var updatedAt time.Time
+	var probeUpdatedAt *time.Time
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id, probe_source)
+		VALUES('movie-db-neutral-no-expected', $1, $2, 'virtual', $3, 'virtual')
+		RETURNING id, updated_at, probe_updated_at`, folderID, neutral, ownerID,
+	).Scan(&rowID, &updatedAt, &probeUpdatedAt); err != nil {
+		t.Fatalf("insert neutral row: %v", err)
+	}
+	before := readVirtualEvidenceRowJSON(t, pool, rowID)
+
+	args := models.VirtualFilePersistArgs{
+		FileID:      rowID, // ExpectedFilePath is deliberately omitted.
+		VideoTracks: []byte(`[{"codec":"av1"}]`), AudioTracks: []byte(`[]`), SubtitleTracks: []byte(`[]`),
+		Resolution: "2160p", CodecVideo: "av1", CodecAudio: "eac3", Container: "mkv",
+		StampProbe: true, UpdatedAt: updatedAt, ProbeUpdatedAt: probeUpdatedAt,
+		OwnerID: ownerID, LibraryID: folderID,
+		AdoptPath: candidatePath,
+	}
+	result, err := ExecVirtualFileMetadataUpdateResult(ctx, pool, args)
+	if err != nil {
+		t.Fatalf("neutral-row missing-expected write error = %v, want a silent CAS miss", err)
+	}
+	if result.MetadataUpdated || result.RowsAffected != 0 || result.IdentityAdopted {
+		t.Fatalf("result = %+v, want a refused write", result)
+	}
+	if after := readVirtualEvidenceRowJSON(t, pool, rowID); after != before {
+		t.Fatalf("neutral row changed on a sibling-owned candidate write with no expected path:\nbefore=%s\nafter =%s", before, after)
+	}
+}

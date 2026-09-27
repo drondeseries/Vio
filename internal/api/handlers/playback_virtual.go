@@ -3175,16 +3175,19 @@ WHERE id = $11
   AND probe_updated_at IS NOT DISTINCT FROM $15::timestamptz
   AND virtual_owner_installation_id IS NOT DISTINCT FROM $16
   AND media_folder_id IS NOT DISTINCT FROM $17
-  -- A provider-neutral row (its expected path equals the neutral key of the
+  -- A provider-neutral row (the row file_path equals the neutral key of the
   -- candidate URI) must not absorb evidence for a candidate a sibling row already
   -- owns: the tracks and stamp would describe bytes this row does not own. The
   -- file_path CASE below would skip the adoption, but a metadata-only write
   -- would still land; fence the whole neutral-row write on the candidate URI
-  -- as well as the expected path. Non-neutral writes are unchanged.
+  -- as well as the expected path. The comparison is against the actual row
+  -- file_path rather than the optional expected path, which is empty for a
+  -- write that does not constrain the row identity and would otherwise bypass
+  -- the fence. Non-neutral writes are unchanged.
   AND (
     NULLIF($18, '') IS NULL
     OR NULLIF($19, '') IS NULL
-    OR $12 IS DISTINCT FROM $19
+    OR media_files.file_path IS DISTINCT FROM $19
     OR NOT EXISTS (
       SELECT 1 FROM media_files neutral_owner
       WHERE neutral_owner.id <> media_files.id
