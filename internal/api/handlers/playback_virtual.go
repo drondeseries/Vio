@@ -3006,7 +3006,10 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 // adoption (sibling owner, collection row, live failed verdict) matches no row
 // and leaves the track inventory and probe stamp untouched. Metadata-only
 // writers leave $22 false and keep the previous behavior: adoption is best-effort
-// while the metadata and stamp still apply.
+// while the metadata and stamp still apply. The one exception is a
+// provider-neutral row writing a candidate URI a sibling row already owns: the
+// top-level candidate-ownership fence refuses the whole write so its tracks and
+// stamp cannot describe bytes the row does not own.
 //
 // Adoption is additionally fenced on the candidate's own verdict. A failed_at
 // stamp committed after the handler's last verdict read (the serve layer and
@@ -3134,6 +3137,24 @@ WHERE id = $11
   AND probe_updated_at IS NOT DISTINCT FROM $15::timestamptz
   AND virtual_owner_installation_id IS NOT DISTINCT FROM $16
   AND media_folder_id IS NOT DISTINCT FROM $17
+  -- A provider-neutral row (its expected path equals the neutral key of the
+  -- candidate URI) must not absorb evidence for a candidate a sibling row already
+  -- owns: the tracks and stamp would describe bytes this row does not own. The
+  -- file_path CASE below would skip the adoption, but a metadata-only write
+  -- would still land; fence the whole neutral-row write on the candidate URI
+  -- as well as the expected path. Non-neutral writes are unchanged.
+  AND (
+    NULLIF($18, '') IS NULL
+    OR NULLIF($19, '') IS NULL
+    OR $12 IS DISTINCT FROM $19
+    OR NOT EXISTS (
+      SELECT 1 FROM media_files neutral_owner
+      WHERE neutral_owner.id <> media_files.id
+        AND neutral_owner.file_path = $18
+        AND neutral_owner.virtual_owner_installation_id IS NOT DISTINCT FROM $16
+        AND neutral_owner.media_folder_id IS NOT DISTINCT FROM $17
+    )
+  )
   -- Mirrors the file_path CASE below: when a confirmed adoption is required,
   -- the row only matches if that adoption will actually happen, so the track
   -- inventory and probe stamp cannot land without the identity. Keep the two

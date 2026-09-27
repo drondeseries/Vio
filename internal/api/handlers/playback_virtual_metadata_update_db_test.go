@@ -440,3 +440,55 @@ func TestVirtualFileMetadataUpdateSkipsAdoptionForNullProbeSourceSiblingOwner(t 
 		t.Fatal("probe_updated_at was not stamped despite skipped adoption")
 	}
 }
+
+// TestVirtualFileMetadataUpdateNeutralRowRefusesSiblingOwnedCandidate is the
+// DB-gated proof of the neutral-row candidate-URI fence: when a sibling row
+// already owns the concrete candidate a provider-neutral row is about to take
+// evidence for, the whole write is refused. Without the fence the adoption
+// would be skipped but the sibling's tracks and probe stamp would still land on
+// the neutral row, describing bytes it does not own.
+func TestVirtualFileMetadataUpdateNeutralRowRefusesSiblingOwnedCandidate(t *testing.T) {
+	pool := virtualMetadataUpdateTestPool(t)
+	ctx := context.Background()
+	const folderID, ownerID = 994313, 7003
+	seedVirtualMetadataUpdateFolder(t, pool, folderID, ownerID)
+
+	neutral := "virtual://movie/tt-db-neutral-sibling"
+	candidatePath := neutral + "?result=cand-a"
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id, probe_source)
+		VALUES('movie-db-neutral-sibling', $1, $2, 'virtual', $3, 'virtual')`, folderID, candidatePath, ownerID); err != nil {
+		t.Fatalf("insert sibling row: %v", err)
+	}
+
+	var rowID int
+	var updatedAt time.Time
+	var probeUpdatedAt *time.Time
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(content_id, media_folder_id, file_path, container, virtual_owner_installation_id, probe_source)
+		VALUES('movie-db-neutral-sibling', $1, $2, 'virtual', $3, 'virtual')
+		RETURNING id, updated_at, probe_updated_at`, folderID, neutral, ownerID,
+	).Scan(&rowID, &updatedAt, &probeUpdatedAt); err != nil {
+		t.Fatalf("insert neutral row: %v", err)
+	}
+	before := readVirtualEvidenceRowJSON(t, pool, rowID)
+
+	args := models.VirtualFilePersistArgs{
+		FileID: rowID, ExpectedFilePath: neutral,
+		VideoTracks: []byte(`[{"codec":"av1"}]`), AudioTracks: []byte(`[]`), SubtitleTracks: []byte(`[]`),
+		Resolution: "2160p", CodecVideo: "av1", CodecAudio: "eac3", Container: "mkv",
+		StampProbe: true, UpdatedAt: updatedAt, ProbeUpdatedAt: probeUpdatedAt,
+		OwnerID: ownerID, LibraryID: folderID,
+		AdoptPath: candidatePath,
+	}
+	result, err := ExecVirtualFileMetadataUpdateResult(ctx, pool, args)
+	if err != nil {
+		t.Fatalf("neutral-row sibling-owned write error = %v, want a silent CAS miss", err)
+	}
+	if result.MetadataUpdated || result.RowsAffected != 0 || result.IdentityAdopted {
+		t.Fatalf("result = %+v, want a refused write", result)
+	}
+	if after := readVirtualEvidenceRowJSON(t, pool, rowID); after != before {
+		t.Fatalf("neutral row changed on a sibling-owned candidate write:\nbefore=%s\nafter =%s", before, after)
+	}
+}
