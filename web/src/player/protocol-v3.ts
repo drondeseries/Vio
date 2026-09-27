@@ -622,6 +622,23 @@ export interface PlanV3 {
    * plays. Shape matches the catalog's file-version `audio_tracks`.
    */
   audio_tracks?: AudioTrackV3[];
+  /**
+   * Whether the plan's track inventory is "declared" (placeholder from
+   * candidate metadata, a deferred probe, or a failed one) or "verified"
+   * (probed by ffprobe). Derived from the served row's probe stamp alone, so a
+   * stale stamp can read "verified" for a plan that served declared metadata.
+   * Absent on older servers; absent is treated as confident.
+   */
+  inventory_status?: string;
+  /**
+   * The resolver's own provenance for a virtual source, qualifying
+   * `inventory_status`: "verified" (this resolve probed the served bytes),
+   * "declared" (provider metadata only), "pending" (a probe is deferred), or
+   * "failed" (a probe ran and failed, so declared metadata is served). Empty or
+   * absent for a non-virtual source. When present it is authoritative over the
+   * stamp-derived `inventory_status`.
+   */
+  inventory_provenance?: string;
 }
 
 export interface TerminalV3 {

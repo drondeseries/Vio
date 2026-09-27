@@ -9,6 +9,7 @@ import {
 } from "@/pages/ItemDetail/components/versionFormatUtils";
 import { dedupeAudioTracks } from "../utils/trackDedupe";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
+import { ProvisionalTrackBadge } from "./ProvisionalTrackBadge";
 
 interface AudioTrackMenuProps {
   tracks: PlayerAudioTrack[];
@@ -18,6 +19,11 @@ interface AudioTrackMenuProps {
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   hideTrigger?: boolean;
+  /**
+   * True while the server's inventory is declared metadata rather than probe
+   * evidence, so the menu says so instead of presenting every row as final.
+   */
+  provisional?: boolean;
 }
 
 /**
@@ -64,6 +70,7 @@ export function AudioTrackMenu({
   open: controlledOpen,
   onOpenChange,
   hideTrigger = false,
+  provisional = false,
 }: AudioTrackMenuProps) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
   const open = controlledOpen ?? uncontrolledOpen;
@@ -163,8 +170,9 @@ export function AudioTrackMenu({
           onClose={() => setOpen(false)}
           onKeyDown={handleMenuKeyDown}
         >
-          <div className="px-3 py-1.5 text-xs font-medium tracking-wide text-white/50 uppercase">
-            Audio
+          <div className="flex items-center justify-between gap-2 px-3 py-1.5">
+            <span className="text-xs font-medium tracking-wide text-white/50 uppercase">Audio</span>
+            {provisional && <ProvisionalTrackBadge />}
           </div>
           {dedupedTracks.map(({ track, index }) => {
             const descriptor = describeTrack(track, index);
