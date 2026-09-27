@@ -2021,7 +2021,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// the failure proves the release itself is blocked.
 	subtitleDegradeUnresolved := false
 	if subtitleOnlyTerminalV3(result.Terminal) {
-		if degradedReq, degradedResult, degradedToneMapErr, ok := h.degradeStartSubtitleInPlaceV3(r, req, requestedFile, effectiveFile, audioIndex, settings); ok {
+		if degradedReq, degradedResult, degradedToneMapErr, ok := h.degradeStartSubtitleInPlaceV3(r, req, requestedFile, effectiveFile, audioIndex, settings, resolutionProvenance); ok {
 			req = degradedReq
 			result = degradedResult
 			toneMapCapabilityErr = degradedToneMapErr
@@ -2049,7 +2049,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// explicit audio pick is the viewer's intent: its failure surfaces as
 		// an audio terminal so the client can re-pick, and it never re-admits
 		// the version hunt.
-		if degradedReq, degradedIndex, degradedResult, degradedToneMapErr, ok := h.degradeStartAudioInPlaceV3(r, req, requestedFile, effectiveFile, audioIndex, settings); ok {
+		if degradedReq, degradedIndex, degradedResult, degradedToneMapErr, ok := h.degradeStartAudioInPlaceV3(r, req, requestedFile, effectiveFile, audioIndex, settings, resolutionProvenance); ok {
 			req = degradedReq
 			audioIndex = degradedIndex
 			result = degradedResult
@@ -2075,6 +2075,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			var firstFailureToneMapErr error
 			var firstFailureFile *models.MediaFile
 			var firstFailureReq playback.StartRequestV3
+			var firstFailureProvenance ProbeProvenance
 			firstFailureAudioIndex := 0
 			// A candidate that cannot honor the subtitle selection is held as a
 			// last-resort degrade and only used after every candidate has been
@@ -2128,6 +2129,11 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 					audioIndex = candidateAudioIndex
 					result = candidateResult
 					toneMapCapabilityErr = candidateToneMapErr
+					// The candidate is now the selected source, so the
+					// provenance that reaches any replacement input (a degrade,
+					// an escalation) must be its resolver verdict, not the
+					// primary source's.
+					resolutionProvenance = candidateProvenance
 					break
 				}
 				if firstFailureFile == nil {
@@ -2135,6 +2141,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 					firstFailureToneMapErr = candidateToneMapErr
 					firstFailureFile = candidateFile
 					firstFailureReq = candidateReq
+					firstFailureProvenance = candidateProvenance
 					firstFailureAudioIndex = candidateAudioIndex
 				}
 			}
@@ -2144,6 +2151,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				audioIndex = firstFailureAudioIndex
 				result = firstFailureResult
 				toneMapCapabilityErr = firstFailureToneMapErr
+				resolutionProvenance = firstFailureProvenance
 			}
 			if result.Terminal != nil && subtitleMissFile != nil {
 				// Every alternate that could honor the subtitle selection has
@@ -2170,6 +2178,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 						audioIndex = subtitleMissAudioIndex
 						result = degradeResult
 						toneMapCapabilityErr = degradeToneMapErr
+						// The held candidate is now the selected source; carry
+						// its provenance so a later replacement input does not
+						// fall back to the primary source's.
+						resolutionProvenance = subtitleMissProvenance
 						annotateSubtitleDroppedV3(&result)
 					}
 				}
@@ -2207,7 +2219,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// a session is opened, so the logged route is the one that will actually run.
 	escalated, escalateErr := h.escalateRefusedProgressiveRemuxV3(r.Context(), headerAuthenticatedMediaV3(req.ClientFeatures),
 		func() playback.PlannerInputV3 {
-			return h.plannerInputV3(r.Context(), req, requestedFile, effectiveFile, audioIndex, nil)
+			return h.plannerInputV3(r.Context(), req, requestedFile, effectiveFile, audioIndex, nil, resolutionProvenance)
 		}, result)
 	if escalateErr != nil {
 		persistedResponse, persistErr := h.startFailureDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, escalateErr)
@@ -4075,7 +4087,7 @@ func identityLocalFallbackAllowedV3(result playback.PlannerResultV3, policy conf
 // plus the refused route's attempt key. The HLS registries and tone-map
 // capabilities are deliberately left unset: planPlaybackWithCapabilitiesV3
 // installs its own lazily memoized snapshot, so the inputs can never disagree.
-func (h *PlaybackHandler) plannerInputV3(ctx context.Context, req playback.StartRequestV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, attemptedKeys []string) playback.PlannerInputV3 {
+func (h *PlaybackHandler) plannerInputV3(ctx context.Context, req playback.StartRequestV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, attemptedKeys []string, provenance ProbeProvenance) playback.PlannerInputV3 {
 	return playback.PlannerInputV3{
 		Request:              req,
 		RequestedFile:        requestedFile,
@@ -4088,6 +4100,11 @@ func (h *PlaybackHandler) plannerInputV3(ctx context.Context, req playback.Start
 		Now:                  time.Now(),
 		AttemptedKeys:        attemptedKeys,
 		AdditionalSubtitles:  h.downloadedSubtitleInventoryV3(ctx, effectiveFile),
+		// The escalation rebuilds the same decision from the same source, so the
+		// selected source's provenance travels with it. Dropping it here would
+		// publish an empty provenance on an escalated plan whose primary plan
+		// carried one.
+		InventoryProvenance: string(provenance),
 	}
 }
 
@@ -6565,6 +6582,7 @@ func (h *PlaybackHandler) degradeStartSubtitleInPlaceV3(
 	requestedFile, effectiveFile *models.MediaFile,
 	audioIndex int,
 	settings playback.PlannerSettingsV3,
+	provenance ProbeProvenance,
 ) (playback.StartRequestV3, playback.PlannerResultV3, error, bool) {
 	degradedReq := subtitleDegradedStartV3(req)
 	degradedResult, degradedToneMapErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
@@ -6574,6 +6592,9 @@ func (h *PlaybackHandler) degradeStartSubtitleInPlaceV3(
 		DVRPUStrippable:     h.lazyDVRPUStrippableV3(r.Context(), effectiveFile),
 		Now:                 time.Now(),
 		AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile),
+		// The degraded plan serves the same release with the subtitle dropped,
+		// so it keeps the selected source's provenance.
+		InventoryProvenance: string(provenance),
 	})
 	clampPlannerTargetResolution(&degradedResult, effectiveFile)
 	if degradedResult.Terminal != nil {
@@ -6657,6 +6678,7 @@ func (h *PlaybackHandler) degradeStartAudioInPlaceV3(
 	requestedFile, effectiveFile *models.MediaFile,
 	currentAudioIndex int,
 	settings playback.PlannerSettingsV3,
+	provenance ProbeProvenance,
 ) (playback.StartRequestV3, int, playback.PlannerResultV3, error, bool) {
 	if req.AudioTrackID != "" || req.AudioTrackIndex != nil {
 		return req, currentAudioIndex, playback.PlannerResultV3{}, nil, false
@@ -6670,6 +6692,9 @@ func (h *PlaybackHandler) degradeStartAudioInPlaceV3(
 			DVRPUStrippable:     h.lazyDVRPUStrippableV3(r.Context(), effectiveFile),
 			Now:                 time.Now(),
 			AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile),
+			// The degraded plan serves the same release with another audio
+			// track, so it keeps the selected source's provenance.
+			InventoryProvenance: string(provenance),
 		})
 		clampPlannerTargetResolution(&degradedResult, effectiveFile)
 		if degradedResult.Terminal == nil {
