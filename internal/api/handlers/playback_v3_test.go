@@ -7681,6 +7681,11 @@ func TestHandleReplanPlaybackV3RehydratesPinnedVirtualSourceBeforePlanning(t *te
 	complete := v3HandlerFixtureFile(t)
 	complete.FilePath = "virtual://movie/tt-replan"
 	complete.VirtualOwnerInstallationID = 5
+	// The persisted row that owns the resolved candidate URI is a different row
+	// from the session's requested/anchor row (the rescan recreated it). The
+	// plan's effective/source identity must name that served row, while the
+	// requested identity stays the caller's row.
+	servedCandidateID := complete.ID + 1000
 	files := map[int]*models.MediaFile{complete.ID: complete}
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
 	stubCopySeekAnchorV3(handler)
@@ -7691,7 +7696,7 @@ func TestHandleReplanPlaybackV3RehydratesPinnedVirtualSourceBeforePlanning(t *te
 	})
 	handler.VirtualCandidateFileLookup = func(_ context.Context, path, _ string, _ string, _ int) (*models.MediaFile, error) {
 		candidate := *complete
-		candidate.ID = complete.ID + 1000
+		candidate.ID = servedCandidateID
 		candidate.FilePath = path
 		return &candidate, nil
 	}
@@ -7732,8 +7737,16 @@ func TestHandleReplanPlaybackV3RehydratesPinnedVirtualSourceBeforePlanning(t *te
 	if response.PlaybackPlan.Source.VideoCodec != "h264" || response.PlaybackPlan.Source.Width != 1920 || response.PlaybackPlan.Source.Height != 1080 {
 		t.Fatalf("rehydrated source = %#v", response.PlaybackPlan.Source)
 	}
-	if response.PlaybackPlan.EffectiveMediaFileID != complete.ID || response.PlaybackPlan.Source.MediaFileID != complete.ID {
-		t.Fatalf("virtual replan identity = effective %d source %d, want %d", response.PlaybackPlan.EffectiveMediaFileID, response.PlaybackPlan.Source.MediaFileID, complete.ID)
+	if response.PlaybackPlan.RequestedMediaFileID != complete.ID {
+		t.Fatalf("virtual replan requested identity = %d, want the caller's row %d", response.PlaybackPlan.RequestedMediaFileID, complete.ID)
+	}
+	// The rehydrated source is the persisted row that owns the resolved anchor
+	// URI, so the plan names that served row rather than collapsing it back to
+	// the requested row; the requested id above still identifies the caller's
+	// edition. Reporting the requested id here made a rescan-recreated row
+	// invisible to the client.
+	if response.PlaybackPlan.EffectiveMediaFileID != servedCandidateID || response.PlaybackPlan.Source.MediaFileID != servedCandidateID {
+		t.Fatalf("virtual replan identity = effective %d source %d, want the served row %d", response.PlaybackPlan.EffectiveMediaFileID, response.PlaybackPlan.Source.MediaFileID, servedCandidateID)
 	}
 }
 
@@ -8307,11 +8320,17 @@ func writePlaybackTestFFmpegFailingForInputPattern(t *testing.T, failPattern str
 	return path
 }
 
-func TestHandleStartPlaybackV3PreservesInitialCatalogIDAfterCandidateEnrichment(t *testing.T) {
+// The resolver enriches the served file from the persisted candidate row. When
+// that row differs from the caller's requested catalog row, the plan must name
+// the served row on effective_media_file_id and source.media_file_id while the
+// requested id keeps identifying the caller's edition, so a substitution is
+// visible instead of being collapsed back onto the requested row.
+func TestHandleStartPlaybackV3EmitsServedCandidateIDAfterEnrichment(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.ID = 150
 	source.FilePath = "virtual://movie/source-150"
 	source.VirtualOwnerInstallationID = 5
+	servedCandidateID := source.ID + 1000
 
 	manager := playback.NewSessionManager(0, 0)
 	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: map[int]*models.MediaFile{source.ID: source}})
@@ -8322,7 +8341,7 @@ func TestHandleStartPlaybackV3PreservesInitialCatalogIDAfterCandidateEnrichment(
 	})
 	handler.VirtualCandidateFileLookup = func(_ context.Context, path, _ string, _ string, _ int) (*models.MediaFile, error) {
 		candidate := *source
-		candidate.ID = 1150
+		candidate.ID = servedCandidateID
 		candidate.FilePath = path
 		candidate.Container = "mp4"
 		return &candidate, nil
@@ -8342,22 +8361,22 @@ func TestHandleStartPlaybackV3PreservesInitialCatalogIDAfterCandidateEnrichment(
 	if response.PlaybackPlan == nil {
 		t.Fatalf("response has no playback plan: %#v", response)
 	}
-	if response.PlaybackPlan.RequestedMediaFileID != source.ID || response.PlaybackPlan.EffectiveMediaFileID != source.ID || response.PlaybackPlan.Source.MediaFileID != source.ID {
-		t.Fatalf("plan identity = requested %d effective %d source %d, want %d", response.PlaybackPlan.RequestedMediaFileID, response.PlaybackPlan.EffectiveMediaFileID, response.PlaybackPlan.Source.MediaFileID, source.ID)
+	if response.PlaybackPlan.RequestedMediaFileID != source.ID || response.PlaybackPlan.EffectiveMediaFileID != servedCandidateID || response.PlaybackPlan.Source.MediaFileID != servedCandidateID {
+		t.Fatalf("plan identity = requested %d effective %d source %d, want requested %d effective/source %d", response.PlaybackPlan.RequestedMediaFileID, response.PlaybackPlan.EffectiveMediaFileID, response.PlaybackPlan.Source.MediaFileID, source.ID, servedCandidateID)
 	}
 	session, err := manager.GetSession(response.SessionID)
 	if err != nil {
 		t.Fatalf("session lookup failed: %v", err)
 	}
-	if session.MediaFileID != source.ID {
-		t.Fatalf("session file = %d, want %d", session.MediaFileID, source.ID)
+	if session.MediaFileID != servedCandidateID {
+		t.Fatalf("session file = %d, want the served candidate row %d", session.MediaFileID, servedCandidateID)
 	}
 	record, err := handler.PlanStoreV3.GetAttemptByPlaybackAttemptID(context.Background(), start.PlaybackAttemptID)
 	if err != nil {
 		t.Fatalf("attempt lookup failed: %v", err)
 	}
-	if record.RequestedMediaFileID != source.ID || record.EffectiveMediaFileID != source.ID || record.CurrentPlan.EffectiveMediaFileID != source.ID {
-		t.Fatalf("attempt identity = requested %d effective %d plan %d, want %d", record.RequestedMediaFileID, record.EffectiveMediaFileID, record.CurrentPlan.EffectiveMediaFileID, source.ID)
+	if record.RequestedMediaFileID != source.ID || record.EffectiveMediaFileID != servedCandidateID || record.CurrentPlan.EffectiveMediaFileID != servedCandidateID {
+		t.Fatalf("attempt identity = requested %d effective %d plan %d, want requested %d effective/plan %d", record.RequestedMediaFileID, record.EffectiveMediaFileID, record.CurrentPlan.EffectiveMediaFileID, source.ID, servedCandidateID)
 	}
 }
 
@@ -8394,6 +8413,11 @@ func TestHandleStartPlaybackV3SkipsUnresolvableVirtualAlternateForLaterWorkingAl
 		Codec: "h264", Profile: "high", Level: 40, Width: 1920, Height: 1080,
 		BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
 	}}
+	// The persisted row that owns the working alternate's resolved URI is a
+	// different catalog row from the version-list alternate. The plan's
+	// effective/source identity must name that served row; the requested id
+	// stays the caller's original source row.
+	servedAltGoodID := altGood.ID + 1000
 
 	files := map[int]*models.MediaFile{source.ID: source, altBroken.ID: &altBroken, altGood.ID: &altGood}
 	manager := playback.NewSessionManager(0, 0)
@@ -8438,28 +8462,28 @@ func TestHandleStartPlaybackV3SkipsUnresolvableVirtualAlternateForLaterWorkingAl
 	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if response.PlaybackPlan.EffectiveMediaFileID != altGood.ID {
-		t.Fatalf("effective file = %d, want working virtual alternate %d", response.PlaybackPlan.EffectiveMediaFileID, altGood.ID)
+	if response.PlaybackPlan.EffectiveMediaFileID != servedAltGoodID {
+		t.Fatalf("effective file = %d, want served row %d for the working virtual alternate", response.PlaybackPlan.EffectiveMediaFileID, servedAltGoodID)
 	}
 	if response.PlaybackPlan.RequestedMediaFileID != source.ID {
 		t.Fatalf("requested file = %d, want original source %d", response.PlaybackPlan.RequestedMediaFileID, source.ID)
 	}
-	if response.PlaybackPlan.Source.MediaFileID != altGood.ID {
-		t.Fatalf("source file = %d, want catalog alternate %d after candidate enrichment", response.PlaybackPlan.Source.MediaFileID, altGood.ID)
+	if response.PlaybackPlan.Source.MediaFileID != servedAltGoodID {
+		t.Fatalf("source file = %d, want served row %d after candidate enrichment", response.PlaybackPlan.Source.MediaFileID, servedAltGoodID)
 	}
 	session, err := manager.GetSession(response.SessionID)
 	if err != nil {
 		t.Fatalf("session lookup failed: %v", err)
 	}
-	if session.MediaFileID != altGood.ID {
-		t.Fatalf("session file = %d, want catalog alternate %d", session.MediaFileID, altGood.ID)
+	if session.MediaFileID != servedAltGoodID {
+		t.Fatalf("session file = %d, want served row %d", session.MediaFileID, servedAltGoodID)
 	}
 	record, err := handler.PlanStoreV3.GetAttemptByPlaybackAttemptID(context.Background(), start.PlaybackAttemptID)
 	if err != nil {
 		t.Fatalf("attempt lookup failed: %v", err)
 	}
-	if record.EffectiveMediaFileID != altGood.ID || record.CurrentPlan.EffectiveMediaFileID != altGood.ID {
-		t.Fatalf("attempt identity = effective %d plan %d, want %d", record.EffectiveMediaFileID, record.CurrentPlan.EffectiveMediaFileID, altGood.ID)
+	if record.EffectiveMediaFileID != servedAltGoodID || record.CurrentPlan.EffectiveMediaFileID != servedAltGoodID {
+		t.Fatalf("attempt identity = effective %d plan %d, want served row %d", record.EffectiveMediaFileID, record.CurrentPlan.EffectiveMediaFileID, servedAltGoodID)
 	}
 }
 
@@ -9002,11 +9026,17 @@ func TestHandleReplanPlaybackV3VirtualRehydrationSeekRecoveryPinsCurrentVersion(
 func TestPrepareVirtualAlternateFileV3BindsOwnerInstallationAndResolvedURI(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	resolvedOwner := 42
+	// The persisted row that owns the resolved URI is a different catalog row
+	// from the alternate being prepared (virtualFile.ID + 1000). It is the row
+	// the plan actually serves, so prepareVirtualAlternateFileV3 must return its
+	// id, not the caller's alternate row, while still binding the owner
+	// installation and the resolved URI.
+	const servedCandidateID = 1099
 	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
 		return "http://relay.local/stream?resolved=true", nil
 	})
 	handler.VirtualCandidateFileLookup = func(_ context.Context, path, _ string, episodeID string, _ int) (*models.MediaFile, error) {
-		return &models.MediaFile{ID: 1099, FilePath: path, EpisodeID: episodeID, Container: "mp4"}, nil
+		return &models.MediaFile{ID: servedCandidateID, FilePath: path, EpisodeID: episodeID, Container: "mp4"}, nil
 	}
 	handler.EpisodeLookup = testEpisodeLookup{
 		episode: &models.Episode{ContentID: "ep-101", Runtime: 45},
@@ -9024,8 +9054,8 @@ func TestPrepareVirtualAlternateFileV3BindsOwnerInstallationAndResolvedURI(t *te
 	if err != nil {
 		t.Fatalf("prepareVirtualAlternateFileV3 failed: %v", err)
 	}
-	if prepared.ID != virtualFile.ID {
-		t.Fatalf("prepared ID = %d, want %d", prepared.ID, virtualFile.ID)
+	if prepared.ID != servedCandidateID {
+		t.Fatalf("prepared ID = %d, want the served candidate row %d", prepared.ID, servedCandidateID)
 	}
 	if prepared.FilePath != virtualFile.FilePath {
 		t.Fatalf("prepared FilePath = %q, want %q", prepared.FilePath, virtualFile.FilePath)
