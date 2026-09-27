@@ -12,6 +12,7 @@ import {
   INVENTORY_REFRESH_DEADLINE_MS,
   INVENTORY_REFRESH_INTERVAL_MS,
   inventoryPollDelayMs,
+  mergeResolvedLiveVersion,
   WatchPage,
 } from "./WatchPage";
 
@@ -871,6 +872,106 @@ describe("WatchPage effective virtual version", () => {
 
     const props = videoPlayerMock.mock.calls[0]?.[0] as { selectedVersion?: PlayerFileVersion };
     expect(props.selectedVersion?.file_id).toBe(7);
+  });
+});
+
+describe("mergeResolvedLiveVersion", () => {
+  const candidate: PlayerFileVersion = {
+    ...version,
+    file_id: 8,
+    container: "virtual",
+    file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
+  };
+
+  it("re-keys a path-resolved candidate row under the live session file id", () => {
+    const merged = mergeResolvedLiveVersion(
+      [candidate],
+      7,
+      { mediaFileId: 7, effectiveVirtualUri: candidate.file_path ?? null },
+      [candidate],
+    );
+
+    expect(merged.map((row) => row.file_id)).toEqual([8, 7]);
+    expect(merged.find((row) => row.file_id === 7)).toMatchObject({
+      file_path: candidate.file_path,
+      container: "virtual",
+    });
+  });
+
+  it("restores a live row dropped from the list using the version list prop", () => {
+    const merged = mergeResolvedLiveVersion([], 7, { mediaFileId: 7, effectiveVirtualUri: null }, [
+      version,
+    ]);
+
+    expect(merged).toEqual([version]);
+  });
+
+  it("leaves the list untouched when the live row is already present", () => {
+    const list = [candidate];
+    const merged = mergeResolvedLiveVersion(
+      list,
+      8,
+      { mediaFileId: 8, effectiveVirtualUri: null },
+      [candidate],
+    );
+
+    expect(merged).toBe(list);
+  });
+
+  it("leaves the list untouched when the live file cannot be resolved", () => {
+    const list = [candidate];
+    const merged = mergeResolvedLiveVersion(
+      list,
+      7,
+      { mediaFileId: 7, effectiveVirtualUri: null },
+      [candidate],
+    );
+
+    expect(merged).toBe(list);
+  });
+});
+
+describe("WatchPage live session version re-keying", () => {
+  it("re-keys the resolved live row so duration and chapters use the playing file", async () => {
+    const candidateRow: PlayerFileVersion = {
+      ...version,
+      file_id: 8,
+      container: "virtual",
+      file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
+      duration: 7200,
+      chapters: [
+        { index: 0, title: "Live chapter", start_seconds: 0, end_seconds: 7200, source: "test" },
+      ],
+      audio_tracks: richerAudioTracks,
+    };
+    // The session plays file 7, which the version list does not carry; the plan
+    // publishes the candidate's path, so the live row resolves to row 8.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        effectiveVirtualUri: candidateRow.file_path ?? null,
+        durationSeconds: null,
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [planSubtitle],
+      }),
+    );
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [candidateRow] }));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const props = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      versions?: PlayerFileVersion[];
+      duration?: number;
+      chapters?: Array<{ title?: string }>;
+    };
+    // The live file is keyed into the list, so the version-keyed fallbacks
+    // resolve to the playing file instead of another release's first row.
+    expect(props.versions?.find((row) => row.file_id === 7)?.duration).toBe(7200);
+    expect(props.duration).toBe(7200);
+    expect(props.chapters?.map((chapter) => chapter.title)).toEqual(["Live chapter"]);
   });
 });
 

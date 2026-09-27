@@ -19,7 +19,10 @@ import {
   buildSubtitleChoiceRequests,
   sendSubtitleChoiceRequest,
 } from "../utils/subtitleChoicePersistence";
-import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
+import {
+  resolveEffectiveVersion,
+  type EffectiveVersionIdentity,
+} from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
 import {
@@ -113,6 +116,36 @@ function buildEffectiveVersionLabel(version: PlayerFileVersion): string | null {
     return null;
   }
   return `${parts.join(" ")}${version.hdr ? " HDR" : ""}`;
+}
+
+/**
+ * Re-keys the resolved row for the live session file into the version list.
+ *
+ * A start or an in-player switch can leave the session playing a file the
+ * item's version list does not name: the server substituted another version,
+ * or the plan resolved a virtual candidate the list carries under a different
+ * row. Lookups keyed on `session.mediaFileId` then miss, so `activeVersion`
+ * falls through to another release's first row and `isVirtualActiveFile`,
+ * `selectedDuration` and `activeChapters` lose the live file's data. Resolve
+ * the row for the live file — by the plan's published path when it has one,
+ * otherwise by id — and merge it under the session's file id. The list is
+ * returned unchanged when the live row is already present or cannot be
+ * resolved.
+ */
+export function mergeResolvedLiveVersion(
+  versions: PlayerFileVersion[],
+  liveFileId: number | null,
+  identity: EffectiveVersionIdentity,
+  candidates: readonly PlayerFileVersion[],
+): PlayerFileVersion[] {
+  if (liveFileId == null) return versions;
+  if (versions.some((version) => version.file_id === liveFileId)) return versions;
+  const liveIdentity = { ...identity, mediaFileId: liveFileId };
+  const resolved =
+    resolveEffectiveVersion(versions, liveIdentity) ??
+    resolveEffectiveVersion(candidates, liveIdentity);
+  if (!resolved) return versions;
+  return [...versions, { ...resolved, file_id: liveFileId }];
 }
 
 /**
@@ -434,6 +467,24 @@ function WatchPagePlayer({
     () => playbackVersions.find((version) => version.file_id === session.mediaFileId),
     [playbackVersions, session.mediaFileId],
   );
+
+  // Re-key the live session file into the version list whenever it changes.
+  // A start or switch can target a file the current list does not carry, which
+  // leaves `activePlaybackVersion` undefined and makes `activeVersion` (and the
+  // audio menu, duration and chapters that read through it) fall back to
+  // another release's row.
+  useEffect(() => {
+    const liveFileId = session.mediaFileId;
+    if (liveFileId == null) return;
+    setPlaybackVersions((current) =>
+      mergeResolvedLiveVersion(
+        current,
+        liveFileId,
+        { mediaFileId: liveFileId, effectiveVirtualUri: session.effectiveVirtualUri },
+        versions,
+      ),
+    );
+  }, [session.effectiveVirtualUri, session.mediaFileId, versions]);
 
   const handleEnded = useCallback(() => {
     onEnded?.({
