@@ -1688,6 +1688,30 @@ func TestHandleReplanPlaybackV3UpdatesSelectedAudioAndReplaysIdempotently(t *tes
 	if retried.PlaybackPlan.PlanID != started.PlaybackPlan.PlanID {
 		t.Fatalf("start replay plan = %q, want original %q", retried.PlaybackPlan.PlanID, started.PlaybackPlan.PlanID)
 	}
+	// The requested/effective split must be identical on every response surface
+	// around the replan: the replan's own plan, the attempt record it advances,
+	// and the start replay that returns the durable decision. A dedup keeper or
+	// substitution must not collapse the requested edition back onto the served
+	// row (or vice versa) on any of them.
+	assertRequestedEffectiveSplit := func(surface string, plan *playback.PlanV3, record *playback.AttemptRecordV3) {
+		t.Helper()
+		if plan == nil {
+			t.Fatalf("%s: no plan", surface)
+		}
+		if plan.RequestedMediaFileID != file.ID || plan.EffectiveMediaFileID != file.ID {
+			t.Fatalf("%s: plan identity requested %d effective %d, want requested/effective %d",
+				surface, plan.RequestedMediaFileID, plan.EffectiveMediaFileID, file.ID)
+		}
+		if record != nil && (record.RequestedMediaFileID != file.ID || record.EffectiveMediaFileID != file.ID) {
+			t.Fatalf("%s: attempt identity requested %d effective %d, want requested/effective %d",
+				surface, record.RequestedMediaFileID, record.EffectiveMediaFileID, file.ID)
+		}
+	}
+	// Both replan calls return the same plan for the same replan request, so the
+	// split cannot drift between the first replan and its idempotent replay.
+	assertRequestedEffectiveSplit("replan first", first.PlaybackPlan, record)
+	assertRequestedEffectiveSplit("replan replay", second.PlaybackPlan, record)
+	assertRequestedEffectiveSplit("start replay", retried.PlaybackPlan, record)
 	replan.PositionSeconds++
 	conflictBody, err := json.Marshal(replan)
 	if err != nil {

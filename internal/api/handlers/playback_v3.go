@@ -1833,6 +1833,15 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve and
 	// probe them through the virtual provider before the generic probe repair
 	// path, which only understands local/HTTP media files.
+	//
+	// Jellycompat cannot see this split and is intentionally excluded from it.
+	// The Jellyfin protocol surface (internal/jellycompat) reads its own
+	// session/media-source model and never consumes PlanV3: it does not import
+	// internal/playback and has no reference to RequestedMediaFileID,
+	// EffectiveMediaFileID, EffectiveVirtualURI, or InventoryProvenance. A
+	// client-visible jellycompat driver of the requested/effective split is
+	// therefore out of scope here, not silently missing; adding one means
+	// teaching its session model the split first.
 	if isVirtualPlaybackFile(requestedFile) {
 		requestedCatalogFileID := requestedFile.ID
 		// An auto selection skips a catalog row the catalog marked failed, even
