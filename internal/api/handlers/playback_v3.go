@@ -2072,6 +2072,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			// tried, so an explicit pick still hunts for a version that has it.
 			var subtitleMissFile *models.MediaFile
 			var subtitleMissReq playback.StartRequestV3
+			var subtitleMissProvenance ProbeProvenance
 			subtitleMissAudioIndex := 0
 			// A tone-map capability failure is server-wide, not per-candidate:
 			// every sibling would plan to the same verdict, so paying a
@@ -2082,7 +2083,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				if capabilityBlocked {
 					break
 				}
-				candidateFile, err := h.prepareVirtualAlternateFileV3(r, alternate, profileID)
+				candidateFile, candidateProvenance, err := h.prepareVirtualAlternateFileV3(r, alternate, profileID)
 				if err != nil || candidateFile == nil {
 					continue
 				}
@@ -2095,13 +2096,14 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 					if errors.Is(err, errSubtitleUnavailableInTargetV3) && subtitleMissFile == nil {
 						subtitleMissFile = candidateFile
 						subtitleMissReq = candidateReq
+						subtitleMissProvenance = candidateProvenance
 						subtitleMissAudioIndex = candidateAudioIndex
 					}
 				} else {
 					if err := preflightPlaybackFile(r.Context(), candidateFile, h.MissingMarker, h.EventsHub); err != nil {
 						continue
 					}
-					candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateReq, RequestedFile: requestedFile, EffectiveFile: candidateFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: candidateAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AdditionalSubtitles: subtitleInventoryFor(candidateFile)})
+					candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateReq, RequestedFile: requestedFile, EffectiveFile: candidateFile, ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: candidateAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AdditionalSubtitles: subtitleInventoryFor(candidateFile), InventoryProvenance: string(candidateProvenance)})
 					// A retryable tone-map discovery failure converts to
 					// transcode_start_failed below; that verdict will not
 					// change for a sibling file, so stop here.
@@ -2148,6 +2150,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 						AudioTrackIndex: subtitleMissAudioIndex, Settings: settings,
 						Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), subtitleMissFile), Now: time.Now(),
 						AdditionalSubtitles: subtitleInventoryFor(subtitleMissFile),
+						InventoryProvenance: string(subtitleMissProvenance),
 					})
 					clampPlannerTargetResolution(&degradeResult, subtitleMissFile)
 					if degradeResult.Terminal == nil {
@@ -2255,7 +2258,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 			// per alternate; a generic transport failure keeps the full list.
 			if alternates, alternateErr := h.virtualTransportAlternatesV3(r.Context(), requestedFile, alternateOrder, playback.IsTransientProviderError(statusErr.cause)); alternateErr == nil && len(alternates) > 0 {
 				for alternateRank, altCandidate := range alternates {
-					alternate, err := h.prepareVirtualAlternateFileV3(r, altCandidate, profileID)
+					alternate, alternateProvenance, err := h.prepareVirtualAlternateFileV3(r, altCandidate, profileID)
 					if err != nil || alternate == nil {
 						continue
 					}
@@ -2276,6 +2279,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 							Registry:        h.transformationRegistryV3(r.Context()),
 							DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), alternate), Now: time.Now(),
 							AdditionalSubtitles: subtitleInventoryFor(alternate),
+							InventoryProvenance: string(alternateProvenance),
 						})
 						clampPlannerTargetResolution(&alternateResult, alternate)
 						if alternateResult.Terminal == nil {
@@ -2323,19 +2327,24 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	return response, nil
 }
 
-func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alternate *models.MediaFile, profileID string) (*models.MediaFile, error) {
+// prepareVirtualAlternateFileV3 resolves an alternate candidate row into the
+// file a plan will serve. It returns the resolver's provenance alongside the
+// file so each alternate planner input can publish the same inventory
+// provenance the primary plan carries; a local alternate has no resolver and
+// reports empty provenance.
+func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alternate *models.MediaFile, profileID string) (*models.MediaFile, ProbeProvenance, error) {
 	if alternate == nil {
-		return nil, errors.New("nil alternate file")
+		return nil, "", errors.New("nil alternate file")
 	}
 	if !isVirtualPlaybackFile(alternate) {
-		return h.ensurePlaybackProbe(r.Context(), alternate), nil
+		return h.ensurePlaybackProbe(r.Context(), alternate), "", nil
 	}
 	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if resolved.File == nil {
-		return nil, errors.New("virtual playback resolver returned no file")
+		return nil, "", errors.New("virtual playback resolver returned no file")
 	}
 	resolvedFile := *resolved.File
 	// Keep the candidate's own catalog row id when the resolver substituted a
@@ -2355,7 +2364,7 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 			}
 		}
 	}
-	return resolved.File, nil
+	return resolved.File, resolved.Provenance, nil
 }
 
 // sourceDecodeFailedTerminalResponseV3 builds the durable terminal for a
@@ -6310,14 +6319,14 @@ func (h *PlaybackHandler) evaluateReplanCandidateV3(
 	if candidateAlternate == nil {
 		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil candidate alternate"}
 	}
-	candidateFile, err := h.prepareVirtualAlternateFileV3(r, candidateAlternate, record.ProfileID)
+	candidateFile, candidateProvenance, err := h.prepareVirtualAlternateFileV3(r, candidateAlternate, record.ProfileID)
 	if err != nil || candidateFile == nil {
 		if err == nil {
 			err = errors.New("candidate alternate unavailable")
 		}
 		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: fmt.Sprintf("candidate %d resolution failed", candidateAlternate.ID), Err: err}
 	}
-	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+	return h.evaluatePreparedReplanCandidateV3(r, session, record, req, baseStart, sourceFile, candidateFile, candidateProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
 }
 
 // evaluatePreparedReplanCandidateV3 is evaluateReplanCandidateV3 with the
@@ -6333,6 +6342,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 	baseStart playback.StartRequestV3,
 	sourceFile *models.MediaFile,
 	candidateFile *models.MediaFile,
+	candidateProvenance ProbeProvenance,
 	plannerRequestedFile *models.MediaFile,
 	plannerSettings playback.PlannerSettingsV3,
 	plannerSettingsErr error,
@@ -6379,6 +6389,7 @@ func (h *PlaybackHandler) evaluatePreparedReplanCandidateV3(
 			AudioTrackIndex: candidateAudioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()),
 			DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(),
 			AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidateFile),
+			InventoryProvenance: string(candidateProvenance),
 		})
 	}
 	clampPlannerTargetResolution(&candidateResult, candidateFile)
@@ -6494,6 +6505,7 @@ func (h *PlaybackHandler) evaluateSubtitleDegradeInPlaceV3(
 	req playback.ReplanRequestV3,
 	baseStart playback.StartRequestV3,
 	file *models.MediaFile,
+	provenance ProbeProvenance,
 	plannerRequestedFile *models.MediaFile,
 	plannerSettings playback.PlannerSettingsV3,
 	plannerSettingsErr error,
@@ -6503,7 +6515,7 @@ func (h *PlaybackHandler) evaluateSubtitleDegradeInPlaceV3(
 		return nil, &candidateErrorV3{Stage: candidateStageResolve, Message: "nil same-release subtitle degrade target"}
 	}
 	degradedStart := subtitleDegradedStartV3(baseStart)
-	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+	eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
 	if eval != nil {
 		annotateSubtitleDroppedV3(&eval.result)
 	}
@@ -6674,6 +6686,7 @@ func (h *PlaybackHandler) evaluateAudioDegradeInPlaceV3(
 	req playback.ReplanRequestV3,
 	baseStart playback.StartRequestV3,
 	file *models.MediaFile,
+	provenance ProbeProvenance,
 	plannerRequestedFile *models.MediaFile,
 	plannerSettings playback.PlannerSettingsV3,
 	plannerSettingsErr error,
@@ -6691,7 +6704,7 @@ func (h *PlaybackHandler) evaluateAudioDegradeInPlaceV3(
 	}
 	for _, index := range inPlaceAudioCandidateOrderV3(baseStart, file, current) {
 		degradedStart := audioDegradedStartV3(baseStart, file, index)
-		eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
+		eval, evalErr := h.evaluatePreparedReplanCandidateV3(r, session, record, req, degradedStart, file, file, provenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
 		if evalErr == nil && eval != nil && eval.result.Terminal == nil {
 			annotateAudioTrackSubstitutedV3(&eval.result, index)
 			return eval, nil, true
@@ -7439,7 +7452,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// never re-listed or substituted. If the same release cannot play
 			// without the subtitle either, the original subtitle terminal
 			// stands and no sibling is tried.
-			if eval, evalErr := h.evaluateSubtitleDegradeInPlaceV3(r, session, record, req, start, effectiveFile, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys); evalErr == nil && eval != nil && eval.result.Terminal == nil {
+			if eval, evalErr := h.evaluateSubtitleDegradeInPlaceV3(r, session, record, req, start, effectiveFile, replanVirtualProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys); evalErr == nil && eval != nil && eval.result.Terminal == nil {
 				start = eval.start
 				effectiveFile = eval.file
 				result = eval.result
@@ -7455,7 +7468,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			// resolved file verbatim, so a virtual release is never re-listed or
 			// substituted. If no track is playable the original audio terminal
 			// stands and no sibling is tried.
-			if eval, evalErr, ok := h.evaluateAudioDegradeInPlaceV3(r, session, record, req, start, effectiveFile, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys); ok && evalErr == nil && eval != nil && eval.result.Terminal == nil {
+			if eval, evalErr, ok := h.evaluateAudioDegradeInPlaceV3(r, session, record, req, start, effectiveFile, replanVirtualProvenance, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys); ok && evalErr == nil && eval != nil && eval.result.Terminal == nil {
 				start = eval.start
 				effectiveFile = eval.file
 				result = eval.result

@@ -201,6 +201,7 @@ func TestEvaluateAudioDegradeInPlaceRequiresAFileAndNoExplicitPick(t *testing.T)
 		httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil),
 		nil, &playback.AttemptRecordV3{}, req, playback.StartRequestV3{},
 		&models.MediaFile{ID: 1, AudioTracks: []models.AudioTrack{{Codec: "dts"}, {Codec: "aac"}}},
+		ProbeProvenance(""),
 		&models.MediaFile{ID: 1}, playback.PlannerSettingsV3{}, nil, nil,
 	)
 	if ok {

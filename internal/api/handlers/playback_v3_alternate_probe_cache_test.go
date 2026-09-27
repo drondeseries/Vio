@@ -65,12 +65,15 @@ func TestPrepareVirtualAlternateFileSkipsProbeForCachedCandidate(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil)
-	prepared, err := h.prepareVirtualAlternateFileV3(req, alternate, "profile-1")
+	prepared, provenance, err := h.prepareVirtualAlternateFileV3(req, alternate, "profile-1")
 	if err != nil {
 		t.Fatalf("prepareVirtualAlternateFileV3 error: %v", err)
 	}
 	if prepared == nil || prepared.FilePath != alternateURI {
 		t.Fatalf("prepared alternate = %#v, want the resolved candidate %q", prepared, alternateURI)
+	}
+	if provenance != ProbeProvenanceVerified {
+		t.Fatalf("prepared provenance = %q, want %q (the resolver's cached-probe verdict, not discarded)", provenance, ProbeProvenanceVerified)
 	}
 	if proberCalls != 0 {
 		t.Fatalf("synchronous prober calls = %d, want 0: the cached candidate must not be re-probed", proberCalls)
