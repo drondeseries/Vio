@@ -40,6 +40,13 @@ const (
 var (
 	copySeekProbeGroup singleflight.Group
 	copySeekProbeSlots = make(chan struct{}, maxConcurrentCopySeekProbes)
+	// copySeekAnchorCallerHook, when non-nil, runs on every caller of
+	// ResolveCopySeekAnchorForSource after it has registered with the probe
+	// singleflight and before it waits for the shared result. It exists so a
+	// test can hold a flight open until concurrent callers have coalesced onto
+	// it rather than racing the first probe to completion. Production leaves it
+	// nil; the hook never changes coalescing or probe behavior.
+	copySeekAnchorCallerHook func()
 	// copySeekAnchors is the process-wide resolved-anchor cache. Tests replace
 	// it to inject a clock and probe runner.
 	copySeekAnchors = &copySeekAnchorCache{
@@ -396,6 +403,14 @@ func ResolveCopySeekAnchorForSource(
 		copySeekAnchors.store(sourceKey, requestedSeekSeconds, anchor)
 		return anchor, nil
 	})
+
+	// DoChan returns as soon as the caller is registered on the flight, for the
+	// goroutine that leads the probe and for any that coalesce onto it. Reaching
+	// this point therefore means the peer has joined this flight; a test uses the
+	// hook to hold the probe open until both callers are here.
+	if hook := copySeekAnchorCallerHook; hook != nil {
+		hook()
+	}
 
 	select {
 	case <-ctx.Done():

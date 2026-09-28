@@ -634,26 +634,36 @@ func TestResolveCopySeekAnchorCacheBoundedToMaxEntries(t *testing.T) {
 
 func TestResolveCopySeekAnchorForSourceCoalescesConcurrentIdenticalProbes(t *testing.T) {
 	var calls int32
+	// Hold the probe open until both callers have registered with the
+	// singleflight group. An exact-position repeat now re-probes once the flight
+	// settles, so the coalescing assertion only holds while the first probe is
+	// still running; parking here removes any dependence on scheduling order.
+	probeRelease := make(chan struct{})
 	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
 		atomic.AddInt32(&calls, 1)
-		// Keep the probe in flight long enough for the peer caller to overlap
-		// it. An exact-position repeat now re-probes once the flight settles, so
-		// this test pins coalescing only while the probe is still running.
-		time.Sleep(100 * time.Millisecond)
+		<-probeRelease
 		return requested - 5, 12, nil
 	})
+
+	// Every caller parks here after copySeekProbeGroup.DoChan returns, meaning it
+	// has joined a flight. Reading both arrivals before releasing the probe is
+	// what proves the callers share one flight instead of the second racing the
+	// first probe to completion and starting a probe of its own.
+	joined := make(chan struct{}, 2)
+	joinRelease := make(chan struct{})
+	copySeekAnchorCallerHook = func() {
+		joined <- struct{}{}
+		<-joinRelease
+	}
+	t.Cleanup(func() { copySeekAnchorCallerHook = nil })
+
 	ctx := context.Background()
-	start := make(chan struct{})
-	var ready sync.WaitGroup
-	ready.Add(2)
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
 	for i := range 2 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ready.Done()
-			<-start
 			// Distinct relay URLs still name the same stable source identity.
 			anchor, segment, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/parallel", fmt.Sprintf("http://relay/%d", i), 80, 2)
 			if err == nil && (anchor != 75 || segment != 12) {
@@ -662,8 +672,16 @@ func TestResolveCopySeekAnchorForSourceCoalescesConcurrentIdenticalProbes(t *tes
 			errs <- err
 		}(i)
 	}
-	ready.Wait()
-	close(start)
+
+	for range 2 {
+		select {
+		case <-joined:
+		case <-time.After(10 * time.Second):
+			t.Fatal("both callers did not join the copy seek probe flight")
+		}
+	}
+	close(joinRelease)
+	close(probeRelease)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
