@@ -536,6 +536,11 @@ function WatchPagePlayer({
     const mediaFileId = session.mediaFileId;
     const sessionId = session.sessionId;
     let cancelled = false;
+    // Aborts the in-flight catalog read when the poll is torn down — unmount or
+    // a superseding switch that restarts this effect. Without it a slow
+    // response can land after teardown and populate the shared cache with the
+    // outgoing file's inventory.
+    const controller = new AbortController();
     let completedAttempts = 0;
     // Counts every scheduled attempt, successful or not, so the early cadence
     // advances even when requests fail and the completed-attempt cap does not.
@@ -570,7 +575,8 @@ function WatchPagePlayer({
         // payload for it) and never see the newly selected version's probe.
         const detail = await queryClient.fetchQuery({
           queryKey: itemKeys.watchDetail(contentId, mediaFileId, libraryId),
-          queryFn: () => fetchWatchDetail(contentId, mediaFileId, libraryId),
+          queryFn: () =>
+            fetchWatchDetail(contentId, mediaFileId, libraryId, { signal: controller.signal }),
           staleTime: isFirstAttempt ? 0 : WATCH_DETAIL_STALE_TIME_MS,
         });
         if (cancelled) return;
@@ -655,6 +661,7 @@ function WatchPagePlayer({
 
     return () => {
       cancelled = true;
+      controller.abort();
       if (timer !== null) window.clearTimeout(timer);
     };
     // The track counts that gate the poll are read once when it starts. They

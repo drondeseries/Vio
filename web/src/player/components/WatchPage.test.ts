@@ -1047,6 +1047,42 @@ describe("WatchPage live inventory refresh", () => {
     expect(playerProps.streamUrl).toBe("/stream/session-1");
   });
 
+  it("aborts an in-flight inventory read when the page unmounts", async () => {
+    const applyAudioInventory = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: [{ codec: "eac3", channels: 6, layout: "5.1", language: "eng" }],
+        subtitleUrls: [planSubtitle],
+        applyAudioInventory,
+      }),
+    );
+    let capturedSignal: AbortSignal | undefined;
+    fetchWatchDetailMock.mockImplementation(
+      (_id: string, _fileId?: number, _libraryId?: number, options?: RequestInit) => {
+        capturedSignal = options?.signal ?? undefined;
+        // Never settles: the read is still in flight when the page unmounts.
+        return new Promise(() => {});
+      },
+    );
+
+    const { unmount } = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    unmount();
+
+    // Teardown aborts the read so it cannot land in the shared cache after the
+    // player has moved on.
+    expect(capturedSignal?.aborted).toBe(true);
+  });
+
   it("reads the effective virtual candidate's inventory when the id names the collapsed row", async () => {
     const applyAudioInventory = vi.fn();
     const refreshSubtitles = vi.fn();
