@@ -793,7 +793,9 @@ func (r *Repository) RequeueStaleRunning(ctx context.Context, before time.Time) 
 // a boot retry resumes it, preserving its result payload. The identity backfill
 // persists a retriable watermark there; without this the boot gate would queue
 // a fresh job that restarts from zero and re-lists every unmatched row. It
-// reports whether a job was requeued and leaves an already-active job alone.
+// clears the terminal retention deadline so the expired-job cleanup cannot
+// sweep the retry before it runs, and leaves an already-active job alone. It
+// reports whether a job was requeued.
 func (r *Repository) RequeueLatestFailedOfType(ctx context.Context, jobType string) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE admin_jobs
@@ -803,6 +805,7 @@ func (r *Repository) RequeueLatestFailedOfType(ctx context.Context, jobType stri
 			started_at = NULL,
 			completed_at = NULL,
 			heartbeat_at = NULL,
+			expires_at = NULL,
 			updated_at = NOW()
 		WHERE id = (
 			SELECT id FROM admin_jobs
