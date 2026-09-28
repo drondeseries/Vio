@@ -107,7 +107,7 @@ the document is always the full one:
 }
 ```
 
-The fifteen feature strings above are the full set this server version advertises on `/api/v1`. `/api/v2` advertises them plus `subrip_sidecar_v1`:
+The fifteen feature strings above are the full set this server version advertises on `/api/v1`. `/api/v2` advertises them plus `subrip_sidecar_v1` and `source_committed_event_v1`:
 
 | Feature | What it promises |
 | --- | --- |
