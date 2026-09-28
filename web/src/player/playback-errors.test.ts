@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { describePlanTerminal, describePlaybackTransportError } from "./playback-errors";
+import {
+  describePlanTerminal,
+  describePlaybackTransportError,
+  isDeadPlaybackSessionError,
+} from "./playback-errors";
 import { PlayerFetchError } from "./player-fetch";
 
 describe("describePlanTerminal", () => {
@@ -240,5 +244,32 @@ describe("describePlaybackTransportError", () => {
     expect(
       describePlaybackTransportError(new PlayerFetchError(409, "Conflict", "stale_playback_plan")),
     ).toBeNull();
+  });
+});
+
+describe("isDeadPlaybackSessionError", () => {
+  it("names the errors a fresh start can repair", () => {
+    expect(
+      isDeadPlaybackSessionError(
+        new PlayerFetchError(404, "Playback session not found", "playback_session_not_found"),
+      ),
+    ).toBe(true);
+    expect(
+      isDeadPlaybackSessionError(
+        new PlayerFetchError(410, "Playback session has ended", "playback_session_ended"),
+      ),
+    ).toBe(true);
+    // A 401 has already survived the one token-refresh retry in player-fetch.
+    expect(isDeadPlaybackSessionError(new PlayerFetchError(401, "Unauthorized"))).toBe(true);
+  });
+
+  it("keeps a missing source file and non-fetch failures out", () => {
+    expect(
+      isDeadPlaybackSessionError(
+        new PlayerFetchError(404, "Source media file is missing", "not_found"),
+      ),
+    ).toBe(false);
+    expect(isDeadPlaybackSessionError(new PlayerFetchError(500, "Server error"))).toBe(false);
+    expect(isDeadPlaybackSessionError(new Error("boom"))).toBe(false);
   });
 });

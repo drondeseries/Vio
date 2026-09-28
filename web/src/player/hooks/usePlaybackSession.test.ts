@@ -2641,6 +2641,152 @@ describe("usePlaybackSession replans", () => {
   });
 });
 
+describe("usePlaybackSession dead-session recovery", () => {
+  // A plan the viewer has selections on, so the rebuild can be checked to carry
+  // them rather than falling back to server defaults.
+  const selectedPlan = (sessionId: string) =>
+    fixturePlanV3({
+      session_id: sessionId,
+      selected_tracks: {
+        audio: { id: "file:7:audio:1", index: 1 },
+        subtitle: { id: "file:7:subtitle:2", index: 2 },
+      },
+    });
+
+  it("rebuilds a reaped session once at the live position and selections", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        const sessionId = startBodies.length === 1 ? "session-1" : "session-2";
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: sessionId,
+            playback_plan: selectedPlan(sessionId),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        return jsonResponse(
+          { error: "playback_session_not_found", message: "Playback session not found" },
+          { status: 404 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) {
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") {
+        return jsonResponse({ outcome: "stopped" });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    // The viewer pauses at 321s, then the server reaps the session under them.
+    act(() => {
+      result.current.updatePlaybackState(300, true);
+      result.current.updatePlaybackState(321, false);
+    });
+
+    await act(async () => {
+      await result.current.reanchorSeek(321);
+    });
+
+    await waitFor(() => expect(result.current.plan?.session_id).toBe("session-2"));
+    expect(startBodies).toHaveLength(2);
+    const rebuild = startBodies[1]!;
+    expect(rebuild.file_id).toBe(7);
+    expect(rebuild.start_position).toBe(321);
+    expect(rebuild.carried_audio_track_id).toBe("file:7:audio:1");
+    expect(rebuild.subtitle_track_index).toBe(2);
+    // The dead plan no longer owns the player, and no error dead-ends it.
+    expect(result.current.error).toBeNull();
+    // Play/pause state survives the rebuild.
+    expect(result.current.shouldAutoPlay).toBe(false);
+
+    // One reaped session gets exactly one rebuild: flushing further turns must
+    // not produce a third start.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(startBodies).toHaveLength(2);
+
+    unmount();
+  });
+
+  it("does not rebuild the same dead session twice", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        startBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        // The replacement start re-mints the same session id, so the second
+        // refusal names the session already rebuilt.
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({ session_id: "session-1" }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        return jsonResponse(
+          { error: "playback_session_not_found", message: "Playback session not found" },
+          { status: 404 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) {
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") {
+        return jsonResponse({ outcome: "stopped" });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    await act(async () => {
+      await result.current.reanchorSeek(300);
+    });
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+
+    // A second refusal for the session already rebuilt surfaces its copy
+    // instead of starting a third time.
+    await act(async () => {
+      await result.current.reanchorSeek(600);
+    });
+    await waitFor(() =>
+      expect(result.current.error).toBe(
+        "This playback session is no longer active. Start it again to keep watching.",
+      ),
+    );
+    expect(startBodies).toHaveLength(2);
+
+    unmount();
+  });
+});
+
 describe("usePlaybackSession server-invalidated plans", () => {
   function invalidationFetchMock(replanBodies: Array<Record<string, unknown>>, replan: unknown) {
     return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
