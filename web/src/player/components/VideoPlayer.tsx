@@ -43,6 +43,11 @@ import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
 import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import { HlsStartupGuard } from "../utils/hlsStartupGuard";
 import { isSafariBrowserV3, resolveHLSEngineV3 } from "../utils/hlsEngine";
+import {
+  hlsBufferPolicy,
+  isTimeBuffered,
+  prefetchBufferTargetSeconds,
+} from "../utils/bufferPolicy";
 import { isFirefoxUserAgent } from "../utils/browser";
 import { normalizeSubtitleMode } from "../utils/subtitleMode";
 import {
@@ -152,29 +157,6 @@ const MARKER_SKIP_LABELS: Record<MarkerKind, string> = {
   credits: "Skip Credits",
   preview: "Skip Preview",
 };
-
-/**
- * Whether `nativeSeconds` lies inside a buffered range: any target inside a
- * buffered range seeks locally.
- *
- * The plan's timeline says what the server *can* serve; the element's buffer
- * says what it already has. Buffered bytes are playable without any server
- * interaction, so a target that is already buffered — at any distance from the
- * current playhead — must not be handed to the reanchor path just because the
- * plan reports `can_seek_anywhere=false` or the growing manifest has not
- * published the target yet. The range is half-open: `buffered.start(i)` is
- * inside and `buffered.end(i)` is not, so landing exactly on a buffered edge
- * still reanchors rather than stalling on the next missing chunk.
- */
-function isTimeBuffered(video: HTMLVideoElement, nativeSeconds: number): boolean {
-  const buffered = video.buffered;
-  for (let i = 0; i < buffered.length; i++) {
-    if (nativeSeconds >= buffered.start(i) && buffered.end(i) > nativeSeconds) {
-      return true;
-    }
-  }
-  return false;
-}
 
 interface VideoPlayerProps {
   contentId?: string;
@@ -501,6 +483,11 @@ export function VideoPlayer({
   const effectiveTransportRevision = transportRevision ?? planRevision;
   const hlsRef = useRef<HlsType | null>(null);
   const hlsStartupGuardRef = useRef<HlsStartupGuard | null>(null);
+  // Buffer settings for the active HLS transport. Kept in a ref because the
+  // media event listeners are subscribed once and cannot close over per-plan
+  // values; they retarget hls.js's forward prefetch as playback starts, pauses
+  // and seeks.
+  const bufferPolicyRef = useRef(hlsBufferPolicy(0));
   const mediaRecoveryAttemptsRef = useRef(0);
   const networkRecoveryAttemptsRef = useRef(0);
   const lastRecoveryRef = useRef(0);
@@ -2298,7 +2285,9 @@ export function VideoPlayer({
             attachNativeHLS();
           } else if (resolution.engine === "hlsjs") {
             const Hls = resolution.hlsjs;
-            const maxBufferLength = plannedBitrateKbps >= 25000 ? 60 : 120;
+            const bufferPolicy = hlsBufferPolicy(plannedBitrateKbps);
+            bufferPolicyRef.current = bufferPolicy;
+            const { forwardBufferSeconds, backBufferSeconds } = bufferPolicy;
             const retryingLoadPolicy = {
               maxTimeToFirstByteMs: 45000,
               maxLoadTimeMs: 45000,
@@ -2308,10 +2297,18 @@ export function VideoPlayer({
 
             hls = new Hls({
               lowLatencyMode: false,
-              backBufferLength: Infinity,
-              maxBufferLength,
-              maxMaxBufferLength: maxBufferLength,
+              // Bound the bytes kept behind the playhead. Infinity lets a long
+              // session grow the SourceBuffer without limit; this window is
+              // large enough that a short skip back stays a local seek. hls.js
+              // evicts the excess with SourceBuffer.remove(), so trimming never
+              // reloads the element or rebuilds the transport.
+              backBufferLength: backBufferSeconds,
+              maxBufferLength: forwardBufferSeconds,
+              maxMaxBufferLength: forwardBufferSeconds,
               startPosition: effectiveInitialPositionRef.current,
+              // Prefetch the first fragment instead of waiting for the media
+              // element to run dry; the media event listeners below retarget
+              // the forward buffer while playback is stable.
               startFragPrefetch: true,
               // Segment requests may block while FFmpeg encodes on demand.
               // Remote transcode nodes can also briefly defer the initial
@@ -2503,16 +2500,39 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (!video) return;
 
+    // Retarget hls.js's forward buffer as the element's transport state moves:
+    // while playing and not seeking it fills toward the produced head, while
+    // paused or seeking it drops back to the prefetch window so the client
+    // stops pulling media past a playhead that is not advancing. hls.js reads
+    // `config.maxBufferLength` on every stream-controller tick, so this is the
+    // supported way to keep prefetch cooperating with the server's throttler.
+    const applyPrefetchTarget = () => {
+      const hls = hlsRef.current;
+      if (!hls) return;
+      const policy = bufferPolicyRef.current;
+      const target = prefetchBufferTargetSeconds({
+        playing: !video.paused,
+        seeking: video.seeking,
+        forwardBufferSeconds: policy.forwardBufferSeconds,
+        prefetchSeconds: policy.prefetchSeconds,
+      });
+      if (hls.config.maxBufferLength !== target) {
+        hls.config.maxBufferLength = target;
+      }
+    };
+
     const onPlay = () => {
       if (connectionReplacedRef.current) {
         video.pause();
         return;
       }
       setPlaying(true);
+      applyPrefetchTarget();
     };
     const onPause = () => {
       resetRoomCatchupRate();
       setPlaying(false);
+      applyPrefetchTarget();
     };
     const clearBuffering = () => {
       if (bufferingTimerRef.current) {
@@ -2566,11 +2586,14 @@ export function VideoPlayer({
       // where `waiting` fired but `canplay`/`playing` never followed.
       if (hasCurrentFrame()) markPlaybackStarted();
       clearBuffering();
+      applyPrefetchTarget();
       if (roomReadinessPending && watchTogetherSync.attachedSessionId === sessionId) {
         watchTogetherSync.reportReady();
       }
     };
+    const onSeeking = () => applyPrefetchTarget();
     const onSeeked = () => {
+      applyPrefetchTarget();
       const resolved = resolvePendingSeekTime(
         toMediaTime(video.currentTime, timelineOffsetRef.current),
         pendingSeekTime,
@@ -2663,6 +2686,7 @@ export function VideoPlayer({
     video.addEventListener("play", onPlay);
     video.addEventListener("pause", onPause);
     video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("seeking", onSeeking);
     video.addEventListener("seeked", onSeeked);
     video.addEventListener("durationchange", onDurationChange);
     video.addEventListener("progress", onProgress);
@@ -2680,6 +2704,7 @@ export function VideoPlayer({
       video.removeEventListener("play", onPlay);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("seeking", onSeeking);
       video.removeEventListener("seeked", onSeeked);
       video.removeEventListener("durationchange", onDurationChange);
       video.removeEventListener("progress", onProgress);
