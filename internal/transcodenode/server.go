@@ -2628,11 +2628,11 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	// rebuilds the live generation, which is not the generation this request
 	// named, and the final lease fence would only refuse the bytes after the
 	// wait and restart had already been spent.
-	if err != nil && err == playback.ErrSegmentNotFound && requestedGeneration != "" &&
+	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && requestedGeneration != "" &&
 		!session.MatchesGenerationToken(requestedGeneration) {
 		err = playback.ErrStaleSegmentGeneration
 	}
-	if err != nil && err == playback.ErrSegmentNotFound {
+	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(name)
 		if parseErr == nil {
 			now := time.Now()
