@@ -3095,6 +3095,25 @@ describe("VideoPlayer translation handoff", () => {
     expect(onSourceCommitted).toHaveBeenCalledExactlyOnceWith(payload);
   });
 
+  it("ignores a source committed event for another session", () => {
+    const onSourceCommitted = vi.fn();
+    renderPlayer({ onSourceCommitted });
+    act(() =>
+      realtimeOptions.current?.onEvent?.({
+        type: "event",
+        session_id: "other-session",
+        name: "source_committed",
+        payload: {
+          session_id: "other-session",
+          effective_media_file_id: 8,
+          effective_virtual_uri: "virtual://movie/x?result=B",
+          audio_tracks: [],
+        },
+      }),
+    );
+    expect(onSourceCommitted).not.toHaveBeenCalled();
+  });
+
   it("reconciles a failure before the acceptance response and ignores stale job and session failures", async () => {
     playerV2Mock.mockResolvedValue({
       job: { status: "failed", error_message: "Source subtitle unavailable" },

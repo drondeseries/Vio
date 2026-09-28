@@ -1782,7 +1782,10 @@ export function VideoPlayer({
         case "source_committed": {
           // The server committed to an effective version (a fresh start or a
           // serve-layer rotation). Adopt its identity and declared inventory
-          // now; the inventory poll fills in probe evidence later.
+          // now; the inventory poll fills in probe evidence later. A payload
+          // for another session is stale and must not move this session's
+          // menus.
+          if (event.payload.session_id !== sessionId) break;
           onSourceCommitted?.(event.payload);
           break;
         }
