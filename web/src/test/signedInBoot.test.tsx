@@ -192,8 +192,15 @@ describe("app boot request budget", () => {
       unauthorized: 0,
       refreshes: 1,
       duplicateGets: 0,
-      total: 19,
+      total: 13,
     });
+    // The shell's theme, date/time, customization and playback preference hooks
+    // all resolve into one default-context batch, not one GET per hook.
+    const effectiveReads = server.requests.filter(
+      (request) => request.operation === "GET /api/v2/settings/values/effective",
+    );
+    expect(effectiveReads, log).toHaveLength(1);
+    expect(effectiveReads[0]!.url).toBe("/api/v2/settings/values/effective");
     // The session restore starts beside the public setup reads, not after them.
     expect(
       server.requests.filter((request) => request.wave === 1).map((request) => request.operation),
@@ -396,7 +403,7 @@ describe("app boot request budget", () => {
       unauthorized: 0,
       refreshes: 0,
       duplicateGets: 1,
-      total: 9,
+      total: 7,
     });
     expect(
       viewedAccount.filter((request) => request.operation === "GET /api/v2/profiles"),

@@ -815,6 +815,16 @@ type DetailService struct {
 	// copy-safety preparation and chapter-thumbnail enqueue on every request.
 	watchPrepareMu sync.Mutex
 	watchPrepared  map[string]watchPrepareState
+	// watchRefreshWG tracks the detached watch preparations so tests can wait
+	// for them. Production never waits: see prepareWatchFiles.
+	watchRefreshWG sync.WaitGroup
+	// watchRefreshSem bounds the detached watch preparations that run at once.
+	// Each refresh can wait behind the ensurer's own probe slots for up to
+	// watchPrepareRefreshTimeout; without a cap a burst of distinct watch
+	// targets would accumulate waiting goroutines and queue work. Lazily
+	// created by watchRefreshSemaphore.
+	watchRefreshSem     chan struct{}
+	watchRefreshSemOnce sync.Once
 
 	// resolver is built once on first use; see settingsResolver.
 	resolverOnce sync.Once
@@ -4346,6 +4356,21 @@ const watchPrepareTTL = 5 * time.Minute
 // stale targets rather than live ones.
 const watchPreparedMaxEntries = 4096
 
+// watchPrepareRefreshTimeout bounds one detached watch preparation. The watch
+// response never waits on this work, so the bound exists only to keep a wedged
+// probe or chapter-thumbnail enqueue from holding its goroutine open forever.
+// It deliberately sits above the ensurer's own probe deadline (10s) and the
+// multi-second remote reads a cold probe performs, so an ordinary slow repair
+// still lands and persists instead of being canceled on every attempt.
+const watchPrepareRefreshTimeout = 30 * time.Second
+
+// watchRefreshConcurrency bounds how many detached watch preparations run at
+// once. Each one blocks on the ensurer's probe slots, so the cap keeps a burst
+// of distinct watch targets from accumulating goroutines and thumbnail queue
+// work faster than the probe pipeline can drain them. A refresh that cannot
+// take a slot drops its memo claim so a later fetch retries.
+const watchRefreshConcurrency = 8
+
 // watchPrepareState records one prepared watch target: the identity of the file
 // set it was prepared against (watchFilesFingerprint) and when.
 type watchPrepareState struct {
@@ -4373,16 +4398,21 @@ func watchFilesFingerprint(files []*models.MediaFile) string {
 	return b.String()
 }
 
-// prepareWatchFiles prepares a watch target once per unchanged file set.
+// prepareWatchFiles prepares a watch target once per unchanged file set, off
+// the request path.
 //
-// Every watch-detail fetch used to repair probe metadata, resolve the cached
-// copy-safety verdict and enqueue chapter thumbnails for all of its files. All
-// three are idempotent, but the enqueue still costs a database read per file in
-// the chapter-thumbnail worker on every page load, so a client polling watch
-// detail paid for the same unchangeable work repeatedly. This memo collapses
-// repeat fetches of an unchanged file set to a map lookup. The first fetch for
-// a target (and any fetch after the probe state changes or the TTL lapses)
-// still prepares everything.
+// Probe repair, the cached copy-safety verdict and the chapter-thumbnail
+// enqueue are all idempotent, but the repair can cost multi-second remote reads
+// on a cold library and the enqueue costs a database read per file in the
+// worker. Both used to run synchronously on every watch/start fetch, so a slow
+// probe sat directly on the playback-start path. The response is now built from
+// the file metadata already on the row, and preparation runs in the background.
+//
+// The first fetch for a target (and any fetch after the probe state changes or
+// the TTL lapses) schedules one refresh; repeated or concurrent fetches of an
+// unchanged file set do not. The memo below is the coherence point: the refresh
+// records the post-repair fingerprint when it lands, so the next fetch reads
+// the repaired rows and recognizes them as already prepared.
 func (s *DetailService) prepareWatchFiles(
 	ctx context.Context,
 	contentID string,
@@ -4397,28 +4427,113 @@ func (s *DetailService) prepareWatchFiles(
 
 	s.watchPrepareMu.Lock()
 	previous, seen := s.watchPrepared[contentID]
+	fresh := seen && previous.fingerprint == fingerprint && now.Sub(previous.preparedAt) < watchPrepareTTL
+	if !fresh {
+		// Claim the refresh before launching it so a burst of fetches for the
+		// same target schedules one background preparation, not one each.
+		s.recordWatchPrepareLocked(contentID, watchPrepareState{fingerprint: fingerprint, preparedAt: now}, now)
+	}
 	s.watchPrepareMu.Unlock()
-	if seen && previous.fingerprint == fingerprint && now.Sub(previous.preparedAt) < watchPrepareTTL {
-		return files
+
+	if !fresh {
+		s.refreshWatchFilesAsync(ctx, contentID, contentType, files)
+	}
+	return files
+}
+
+// refreshWatchFilesAsync runs one watch preparation on a detached goroutine.
+//
+// The request has already been answered from existing row metadata, so the
+// refresh must outlive the request context: a client that disconnects while the
+// watch page loads must not cancel the repair that the next fetch (and the
+// playback start behind it) will read. context.WithoutCancel keeps the request's
+// logging and tracing values while dropping its cancellation, and
+// watchPrepareRefreshTimeout guards against a wedged ensurer.
+//
+// A slot from watchRefreshSemaphore bounds how many refreshes run at once. If
+// none is free the claim is removed and the refresh is skipped, so a burst of
+// distinct targets cannot pile up goroutines waiting behind the probe slots; a
+// later fetch retries.
+func (s *DetailService) refreshWatchFilesAsync(
+	ctx context.Context,
+	contentID string,
+	contentType string,
+	files []*models.MediaFile,
+) {
+	// Copy each row before handing it to the goroutine: the caller builds its
+	// response from these same pointers, and probe repair must not race it.
+	snapshot := make([]*models.MediaFile, 0, len(files))
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		clone := *file
+		snapshot = append(snapshot, &clone)
+	}
+	if len(snapshot) == 0 {
+		return
 	}
 
-	prepared := s.preparePlaybackFiles(ctx, files)
-	s.queueWatchPlaybackFiles(ctx, contentID, contentType, prepared)
+	base := context.WithoutCancel(ctx)
+	sem := s.watchRefreshSemaphore()
+	select {
+	case sem <- struct{}{}:
+	default:
+		// Saturated: drop the claim so a later fetch retries instead of
+		// queuing another goroutine behind the probe slots.
+		s.watchPrepareMu.Lock()
+		delete(s.watchPrepared, contentID)
+		s.watchPrepareMu.Unlock()
+		return
+	}
+	s.watchRefreshWG.Add(1)
+	go func() {
+		defer s.watchRefreshWG.Done()
+		defer func() { <-sem }()
+		refreshCtx, cancel := context.WithTimeout(base, watchPrepareRefreshTimeout)
+		defer cancel()
+		prepared := s.preparePlaybackFiles(refreshCtx, snapshot)
+		s.queueWatchPlaybackFiles(refreshCtx, contentID, contentType, prepared)
+		// Record the post-repair fingerprint: if probe repair rewrote
+		// probe_updated_at, the next fetch reads the repaired row, and this
+		// marks it as already prepared instead of scheduling another refresh.
+		s.recordWatchPrepare(contentID, watchPrepareState{
+			fingerprint: watchFilesFingerprint(prepared),
+			preparedAt:  time.Now(),
+		})
+	}()
+}
 
+// watchRefreshSemaphore lazily creates the semaphore that bounds detached watch
+// preparations. It is created on first use so a service that never serves a
+// watch detail allocates nothing.
+func (s *DetailService) watchRefreshSemaphore() chan struct{} {
+	s.watchRefreshSemOnce.Do(func() {
+		s.watchRefreshSem = make(chan struct{}, watchRefreshConcurrency)
+	})
+	return s.watchRefreshSem
+}
+
+// recordWatchPrepare stores a prepared state, pruning expired entries when the
+// memo reaches its ceiling.
+func (s *DetailService) recordWatchPrepare(contentID string, state watchPrepareState) {
 	s.watchPrepareMu.Lock()
+	s.recordWatchPrepareLocked(contentID, state, time.Now())
+	s.watchPrepareMu.Unlock()
+}
+
+func (s *DetailService) recordWatchPrepareLocked(contentID string, state watchPrepareState, now time.Time) {
 	if s.watchPrepared == nil {
 		s.watchPrepared = make(map[string]watchPrepareState)
 	}
 	if len(s.watchPrepared) >= watchPreparedMaxEntries {
-		for id, state := range s.watchPrepared {
-			if now.Sub(state.preparedAt) >= watchPrepareTTL {
+		for id, existing := range s.watchPrepared {
+			if now.Sub(existing.preparedAt) >= watchPrepareTTL {
 				delete(s.watchPrepared, id)
 			}
 		}
 	}
-	s.watchPrepared[contentID] = watchPrepareState{fingerprint: fingerprint, preparedAt: now}
-	s.watchPrepareMu.Unlock()
-	return prepared
+	s.watchPrepared[contentID] = state
 }
 
 func (s *DetailService) buildVersionChapters(ctx context.Context, file *models.MediaFile) []VersionChapter {

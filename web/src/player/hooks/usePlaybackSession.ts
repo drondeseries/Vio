@@ -332,6 +332,15 @@ function isSameAVTransport(prev: PlanV3 | null, next: PlanV3): boolean {
   if (prev.stream.container !== next.stream.container) return false;
   if (prev.stream.mime_type !== next.stream.mime_type) return false;
   if (prev.effective_media_file_id !== next.effective_media_file_id) return false;
+  // A start naming a different requested file is a version switch even when the
+  // server resolves both rows to the same effective file and reuses the same
+  // transport URL: collapsed `virtual://…` rows share one concrete candidate, so
+  // `effective_media_file_id` and `stream.url` can be identical across the two
+  // plans. Reusing the mounted element there leaves the old session's picture on
+  // screen, so the requested identity is part of the transport identity. Replans
+  // carry no file id and keep the durable requested row, so this never fires on
+  // an ordinary track/quality replan.
+  if (prev.requested_media_file_id !== next.requested_media_file_id) return false;
   if (prev.selected_tracks.audio?.index !== next.selected_tracks.audio?.index) return false;
   if (prev.timeline.stream_origin_seconds !== next.timeline.stream_origin_seconds) return false;
   if (prev.timeline.can_seek_anywhere !== next.timeline.can_seek_anywhere) return false;

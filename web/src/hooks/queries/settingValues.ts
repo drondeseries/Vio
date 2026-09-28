@@ -141,6 +141,33 @@ function activeProfileId() {
 }
 
 /**
+ * Whether a read resolves in the app's default context: the signed-in profile,
+ * this browser's device, and no library/series content context.
+ *
+ * Reads in this context all share one broad cache entry (`*` for the keys
+ * component) and one request. The shell mounts many small settings hooks — the
+ * theme, date/time, customization, overlay, seek and playback preferences — and
+ * each used to ask the effective endpoint for its own handful of keys, so a
+ * single page load fanned out into a dozen near-identical GETs. One batch for
+ * all remote keys in the default context costs one request and serves every one
+ * of them; each hook still selects only its own keys from the map.
+ *
+ * A named device, a named profile, or a content context resolves a genuinely
+ * different answer, so it keeps its own keyed entry and its own request.
+ */
+function usesDefaultResolveContext(options?: {
+  libraryIds?: readonly number[];
+  seriesIds?: readonly string[];
+  deviceId?: string;
+  profileId?: string;
+}) {
+  const { libraryIds, seriesIds, deviceId, profileId } = options ?? {};
+  if (libraryIds?.length || seriesIds?.length) return false;
+  if (deviceId) return false;
+  return (profileId ?? activeProfileId()) === activeProfileId();
+}
+
+/**
  * The cache key one useEffectiveSettings call resolves under. Exported so a
  * store that layers optimistic updates on top of an effective read (sidebar
  * pins) can target the exact entry that read populated.
@@ -153,6 +180,12 @@ export function effectiveSettingsQueryKey(options?: {
   profileId?: string;
 }) {
   const { keys, libraryIds, seriesIds, deviceId, profileId } = options ?? {};
+  const defaultContext = usesDefaultResolveContext({
+    libraryIds,
+    seriesIds,
+    deviceId,
+    profileId,
+  });
   return [
     ...settingsKeys.all,
     "values",
@@ -163,7 +196,10 @@ export function effectiveSettingsQueryKey(options?: {
     // serve one device's settings as another's.
     profileId ?? activeProfileId(),
     deviceId ?? "",
-    keys ? [...keys].sort().join(",") : "*",
+    // The default context ignores the caller's subset: every such read shares
+    // the all-keys entry. A content or named-identity read keeps its keys so a
+    // series view and a device screen cannot collide.
+    !defaultContext && keys ? [...keys].sort().join(",") : "*",
     libraryIds ? [...libraryIds].sort().join(",") : "",
     seriesIds ? [...seriesIds].sort().join(",") : "",
   ] as const;
@@ -175,7 +211,10 @@ export function effectiveSettingsQueryKey(options?: {
  *
  * Batched on purpose: a settings screen wants every key at once and a series
  * view wants several keys for one series, and the server answers either in one
- * read. Passing no keys returns every remote setting.
+ * read. Every read in the default profile/device context omits `keys` and asks
+ * for the whole remote set, so all shell and home consumers share one cache
+ * entry and one request; each still selects only its own keys from the map.
+ * Passing no keys returns every remote setting.
  */
 export function useEffectiveSettings(options?: {
   keys?: readonly SettingKey[];
@@ -197,13 +236,22 @@ export function useEffectiveSettings(options?: {
   // request already carries a token rather than answering 401 pre-bootstrap.
   const auth = useOptionalAuth();
   const authReady = auth === null || (!auth.loading && !auth.setupLoading && auth.user !== null);
+  // Mirror the key's context decision in the request: a default-context read
+  // asks for every key, which is what the shared entry holds. A keyed context
+  // still names its keys.
+  const defaultContext = usesDefaultResolveContext({
+    libraryIds,
+    seriesIds,
+    deviceId,
+    profileId,
+  });
 
   return useQuery({
     queryKey: effectiveSettingsQueryKey({ keys, libraryIds, seriesIds, deviceId, profileId }),
     queryFn: async () => {
       const result = await v2("GET /api/v2/settings/values/effective", {
         query: {
-          keys: keys?.length ? [...keys] : undefined,
+          keys: !defaultContext && keys?.length ? [...keys] : undefined,
           library_ids: libraryIds?.length ? libraryIds.map(String) : undefined,
           series_ids: seriesIds?.length ? [...seriesIds] : undefined,
           device_id: deviceId || undefined,

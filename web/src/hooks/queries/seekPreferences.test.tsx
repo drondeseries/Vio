@@ -64,9 +64,17 @@ beforeEach(() => {
       }
       const profile = storage.get(storage.KEYS.PROFILE_ID);
       if (operation.endsWith("/effective")) {
+        // A default-context read omits `keys` and asks for the whole remote
+        // set; the hook still selects only the seek keys.
+        const requested = options?.query?.keys ?? [
+          SEEK_KEYS.video.back,
+          SEEK_KEYS.video.forward,
+          SEEK_KEYS.audiobook.back,
+          SEEK_KEYS.audiobook.forward,
+        ];
         return {
           revision,
-          items: options!.query!.keys!.map((key) => ({
+          items: requested.map((key) => ({
             key,
             value:
               stored.get(`${profile}:${key}`) ??
