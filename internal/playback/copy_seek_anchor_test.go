@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -284,19 +283,25 @@ func TestResolveCopySeekAnchorForSourceCachesByStableIdentity(t *testing.T) {
 		return requested - 1, int((requested - 1) / float64(segmentDuration)), nil
 	})
 
-	for i := range 2 {
-		// Each call resolves a fresh relay URL for the same virtual source.
-		inputPath := fmt.Sprintf("http://relay/stream/%d", i)
-		anchor, segment, err := ResolveCopySeekAnchorForSource(context.Background(), "ffmpeg", "virtual://movie/42", inputPath, 120, 2)
-		if err != nil {
-			t.Fatalf("call %d: %v", i, err)
-		}
-		if anchor != 119 || segment != 59 {
-			t.Fatalf("call %d anchor = %v segment = %d; want 119, 59", i, anchor, segment)
-		}
+	// A probe at 120 resolves anchor 119 and proves the open interval (119,120).
+	anchor, segment, err := ResolveCopySeekAnchorForSource(context.Background(), "ffmpeg", "virtual://movie/42", "http://relay/stream/0", 120, 2)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if anchor != 119 || segment != 59 {
+		t.Fatalf("probe anchor = %v segment = %d; want 119, 59", anchor, segment)
+	}
+	// A request strictly inside the proven interval reuses the probe even
+	// though it resolves a fresh relay URL for the same virtual source.
+	anchor, segment, err = ResolveCopySeekAnchorForSource(context.Background(), "ffmpeg", "virtual://movie/42", "http://relay/stream/1", 119.5, 2)
+	if err != nil {
+		t.Fatalf("cached call: %v", err)
+	}
+	if anchor != 119 || segment != 59 {
+		t.Fatalf("cached anchor = %v segment = %d; want 119, 59", anchor, segment)
 	}
 	if calls != 1 {
-		t.Fatalf("probe calls = %d, want 1 (second call must hit the stable-identity cache)", calls)
+		t.Fatalf("probe calls = %d, want 1 (the second call must hit the stable-identity cache)", calls)
 	}
 }
 
@@ -358,19 +363,24 @@ func TestResolveCopySeekAnchorForSourceProbesExactPositionAcrossKeyframeBoundary
 	if calls != 2 {
 		t.Fatalf("probe calls = %d, want 2 (a straddling position must re-probe)", calls)
 	}
-	// A repeat of the exact same position is still a zero-probe cache hit.
-	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/boundary", "http://relay/boundary", 121, 2); err != nil {
-		t.Fatalf("repeat probe: %v", err)
+	// A request strictly inside the interval the 121 probe proved reuses it.
+	anchor, segment, err = ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/boundary", "http://relay/boundary", 120.75, 2)
+	if err != nil {
+		t.Fatalf("proven-interval probe: %v", err)
+	}
+	if anchor != 120.5 || segment != 60 {
+		t.Fatalf("proven-interval anchor = %v segment = %d; want cached 120.5, 60", anchor, segment)
 	}
 	if calls != 2 {
-		t.Fatalf("probe calls = %d, want 2 (an exact repeat must hit the cache)", calls)
+		t.Fatalf("probe calls = %d, want 2 (a request inside the proven interval must hit the cache)", calls)
 	}
 }
 
 // TestResolveCopySeekAnchorForSourceReusesProvenInterval proves reuse is
 // bounded to the interval a probe actually covered, not a whole nominal GOP.
-// Probing 121 resolves keyframe 120 and proves no keyframe lies in (120,121],
-// so requests at or before 121 reuse 120 while 121.5 must probe.
+// Probing 121 resolves keyframe 120 and proves no keyframe lies in the open
+// interval (120,121), so a request strictly between 120 and 121 reuses 120 while
+// 121 itself and 121.5 must probe.
 func TestResolveCopySeekAnchorForSourceReusesProvenInterval(t *testing.T) {
 	var calls int
 	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
@@ -390,12 +400,21 @@ func TestResolveCopySeekAnchorForSourceReusesProvenInterval(t *testing.T) {
 	if anchor, segment := resolve(121); anchor != 120 || segment != 60 {
 		t.Fatalf("first anchor = %v segment = %d; want 120, 60", anchor, segment)
 	}
-	// 120.5 is inside the interval the 121 probe proved, so it reuses 120.
+	// The exact probed position is the interval's exclusive upper bound, so it
+	// re-probes instead of reusing the packet the first probe observed.
+	if anchor, _ := resolve(121); anchor != 120 {
+		t.Fatalf("boundary anchor = %v; want its own 120", anchor)
+	}
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2 (the probed boundary is exclusive)", calls)
+	}
+	// 120.5 is strictly inside the interval the 121 probe proved, so it reuses
+	// 120.
 	if anchor, _ := resolve(120.5); anchor != 120 {
 		t.Fatalf("proven-interval anchor = %v; want cached 120", anchor)
 	}
-	if calls != 1 {
-		t.Fatalf("probe calls = %d, want 1 (120.5 is inside the proven interval)", calls)
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2 (120.5 is inside the proven interval)", calls)
 	}
 	// 121.5 is past the proven interval, so it probes rather than assuming the
 	// GOP continues; the fixture still resolves it to 120 and extends the
@@ -403,15 +422,15 @@ func TestResolveCopySeekAnchorForSourceReusesProvenInterval(t *testing.T) {
 	if anchor, _ := resolve(121.5); anchor != 120 {
 		t.Fatalf("anchor for 121.5 = %v; want its own 120", anchor)
 	}
-	if calls != 2 {
-		t.Fatalf("probe calls = %d, want 2 (121.5 is past the proven interval)", calls)
+	if calls != 3 {
+		t.Fatalf("probe calls = %d, want 3 (121.5 is past the proven interval)", calls)
 	}
 	// 121.2 now falls inside the extended interval and reuses 120.
 	if anchor, _ := resolve(121.2); anchor != 120 {
 		t.Fatalf("extended-interval anchor = %v; want cached 120", anchor)
 	}
-	if calls != 2 {
-		t.Fatalf("probe calls = %d, want 2 (the extended interval is reused)", calls)
+	if calls != 3 {
+		t.Fatalf("probe calls = %d, want 3 (the extended interval is reused)", calls)
 	}
 }
 
@@ -515,8 +534,8 @@ func TestResolveCopySeekAnchorForSourceIsolatesSourcesAndSegmentDurations(t *tes
 		}
 	}
 	// The same source and segment duration, even reached through a different
-	// pinned relay URL, is a cache hit.
-	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/a", "http://relay/rotated", 120, 2); err != nil {
+	// pinned relay URL, is a cache hit for a request inside the proven interval.
+	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/a", "http://relay/rotated", 119.5, 2); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 3 {
@@ -532,13 +551,16 @@ func TestResolveCopySeekAnchorForSourceReProbesAfterTTL(t *testing.T) {
 		return requested - 1, 0, nil
 	})
 	ctx := context.Background()
+	// A probe at 90 resolves anchor 89 and proves the open interval (89,90).
+	if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/ttl", "http://relay/ttl", 90, 2); err != nil {
+		t.Fatal(err)
+	}
 	call := func() {
 		t.Helper()
-		if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/ttl", "http://relay/ttl", 90, 2); err != nil {
+		if _, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/ttl", "http://relay/ttl", 89.5, 2); err != nil {
 			t.Fatal(err)
 		}
 	}
-	call()
 	now = now.Add(copySeekAnchorCacheTTL - time.Second)
 	call()
 	if calls != 1 {
@@ -612,20 +634,25 @@ func TestResolveCopySeekAnchorCacheBoundedToMaxEntries(t *testing.T) {
 
 func TestResolveCopySeekAnchorForSourceCoalescesConcurrentIdenticalProbes(t *testing.T) {
 	var calls int32
-	release := make(chan struct{})
 	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
 		atomic.AddInt32(&calls, 1)
-		<-release
+		// Keep the probe in flight long enough for the peer caller to overlap
+		// it. An exact-position repeat now re-probes once the flight settles, so
+		// this test pins coalescing only while the probe is still running.
+		time.Sleep(100 * time.Millisecond)
 		return requested - 5, 12, nil
 	})
 	ctx := context.Background()
 	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(2)
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
 	for i := range 2 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			ready.Done()
 			<-start
 			// Distinct relay URLs still name the same stable source identity.
 			anchor, segment, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/parallel", fmt.Sprintf("http://relay/%d", i), 80, 2)
@@ -635,18 +662,8 @@ func TestResolveCopySeekAnchorForSourceCoalescesConcurrentIdenticalProbes(t *tes
 			errs <- err
 		}(i)
 	}
+	ready.Wait()
 	close(start)
-	// Let at least one probe start, then release it. singleflight admits one
-	// closure per key, so the peer either joins the flight or hits the cache.
-	deadline := time.Now().Add(2 * time.Second)
-	for atomic.LoadInt32(&calls) == 0 {
-		if time.Now().After(deadline) {
-			close(release)
-			t.Fatal("probe never started")
-		}
-		runtime.Gosched()
-	}
-	close(release)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
