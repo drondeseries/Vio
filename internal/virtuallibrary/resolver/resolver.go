@@ -96,6 +96,25 @@ const (
 	// grace; the provider client timeout is the tighter bound in practice.
 	syncFetchTimeout = 45 * time.Second
 
+	// providerFailureBackoff bounds how long a failed provider listing is
+	// remembered per cache key. Without it, a provider that times out at the
+	// client's 45s bound re-pays the full timeout on every resolve: there is
+	// no entry to negative-cache because the fetch never produced an answer.
+	// Within the backoff window a resolve fails fast with the same
+	// ErrProviderUnavailable a timeout would produce, preserving the outage
+	// semantics callers branch on. A declared outage re-list
+	// (GetCandidatesFreshUnbounded) deliberately bypasses it so recovery is
+	// never blocked by the backoff the outage itself wrote.
+	providerFailureBackoff = 30 * time.Second
+
+	// tmdbExternalIDCacheTTL reuses a successful tmdb -> imdb translation for
+	// this long. External IDs are stable, so a long TTL is safe.
+	tmdbExternalIDCacheTTL = time.Hour
+	// tmdbExternalIDNegativeTTL is the shorter reuse window for a translation
+	// that failed or carried no IMDb id, so a transient TMDB outage or a newly
+	// populated ID recovers quickly.
+	tmdbExternalIDNegativeTTL = time.Minute
+
 	// altmountCachedBadge is the display badge AltMount's Stremio addon puts
 	// on imported, fresh releases; honored as a zero-config confirmed signal.
 	altmountCachedBadge = "⚡ cached"
@@ -184,6 +203,23 @@ type Resolver struct {
 	cacheBytes      int64
 	refreshes       map[string]chan struct{}
 	syncFlights     map[string]*candidateFlight
+	// failures records the last provider failure per cache key so a provider
+	// that is timing out or answering errors is not re-fetched, at full
+	// timeout, once per resolve. Guarded by cacheMu.
+	failures map[string]time.Time
+
+	// tmdbCache memoizes the tmdb -> imdb translation, including negative
+	// results, keyed by media type and tmdb id. Guarded by tmdbMu.
+	tmdbMu    sync.Mutex
+	tmdbCache map[string]tmdbCacheEntry
+}
+
+// tmdbCacheEntry is one cached TMDB external-ID translation. An empty imdbID
+// is a negative entry: the lookup failed or the title has no IMDb id, so the
+// short negative TTL applies.
+type tmdbCacheEntry struct {
+	imdbID    string
+	expiresAt time.Time
 }
 
 // candidateFlight tracks one in-flight provider fetch for a cache key. done
@@ -1043,23 +1079,20 @@ func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, for
 			return candidates, mediaType, mediaID, nil
 		}
 		r.cacheMu.Unlock()
+	}
 
-		// Past stale grace: deduplicate concurrent blocking fetches through
-		// the same keyed flight used for background refreshes. The first
-		// caller blocks on the provider; later callers receive its result.
-		// The wait respects context cancellation so a canceled caller does not
-		// block for the full provider timeout.
-		if wait := r.joinFlight(cacheKey, config, generation, mediaType, mediaID); wait != nil {
-			candidates, ok, err := r.awaitFlight(ctx, wait, cacheKey)
-			if err != nil {
-				return nil, "", "", err
-			}
-			if ok {
-				return candidates, mediaType, mediaID, nil
-			}
-			// Flight completed without a usable entry (expired, past grace,
-			// or absent); fall through to our own attempt.
+	// A recent provider failure for this key is failed fast instead of
+	// re-paying the provider timeout on every resolve. A still-servable
+	// positive entry (fresh or inside stale grace) is preferred over the
+	// error, so a provider flap keeps playback alive. A declared outage
+	// re-list (bypassFloor) skips this: recovery must not be blocked by the
+	// backoff the outage itself recorded.
+	if !bypassFloor && r.providerFailureActive(cacheKey) {
+		if cached, ok := r.servePositiveCachedCandidates(cacheKey, generation); ok {
+			r.debugLog("recent provider failure; serving cached positive", cacheKey, len(cached))
+			return cached, mediaType, mediaID, nil
 		}
+		return nil, mediaType, mediaID, fmt.Errorf("%w: provider listing failed recently", ErrProviderUnavailable)
 	}
 
 	// Forced lookups skip the cache tiers above, so without this they would
@@ -1071,20 +1104,32 @@ func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, for
 	// one provider fetch per listing, with every caller served its result. The
 	// join respects context cancellation, so a caller bounded by its own
 	// per-file budget still returns when that budget fires.
-	if forceRefresh {
-		if wait := r.joinFlight(cacheKey, config, generation, mediaType, mediaID); wait != nil {
-			candidates, ok, err := r.awaitFlight(ctx, wait, cacheKey)
-			if err != nil {
-				return nil, "", "", err
-			}
-			if ok {
-				return candidates, mediaType, mediaID, nil
-			}
+	if wait := r.joinFlight(cacheKey, config, generation, mediaType, mediaID); wait != nil {
+		candidates, ok, err := r.awaitFlight(ctx, wait, cacheKey)
+		if err != nil {
+			// The joined flight failed. Surface its provider error instead of
+			// starting a second full-timeout fetch on this request's context;
+			// the failure backoff recorded by that flight makes the next
+			// resolve fail fast.
+			return nil, "", "", err
 		}
+		if ok {
+			return candidates, mediaType, mediaID, nil
+		}
+		// Flight completed without a usable entry (expired, past grace, or
+		// absent); fall through to our own attempt.
 	}
 
 	candidates, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID)
-	if err == nil && len(candidates) == 0 {
+	if err != nil {
+		if ctx.Err() == nil {
+			// A caller-canceled request is not the provider's state; recording
+			// it would blackhole this key against a healthy provider.
+			r.recordProviderFailure(cacheKey)
+		}
+		return candidates, mediaType, mediaID, err
+	}
+	if len(candidates) == 0 {
 		// The provider flapped to an empty answer, but the store may have kept
 		// a positive entry that is still servable (fresh, or within stale
 		// grace). Serving it keeps playback alive; the empty answer is
@@ -1207,6 +1252,7 @@ func (r *Resolver) joinFlight(cacheKey string, config Config, generation uint64,
 		_, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID)
 		flight.err = err
 		if err != nil {
+			r.recordProviderFailure(cacheKey)
 			r.debugLog("synchronous candidate fetch failed", cacheKey, 0)
 			return
 		}
@@ -1244,6 +1290,7 @@ func (r *Resolver) startRefreshLocked(cacheKey string, generation uint64, config
 		_, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID)
 		flight.err = err
 		if err != nil {
+			r.recordProviderFailure(cacheKey)
 			r.debugLog("background candidate refresh failed", cacheKey, 0)
 			return
 		}
@@ -1316,6 +1363,8 @@ func (r *Resolver) fetchProviderCandidates(ctx context.Context, config Config, g
 	// as an ordinary negative entry.
 	now := time.Now()
 	r.storeCandidateCache(cacheKey, validCandidates, now.Add(config.CacheTTL), now, generation)
+	// The provider answered, so any recorded failure for this key is stale.
+	r.clearProviderFailure(cacheKey)
 	r.mu.RLock()
 	logger := r.logger
 	r.mu.RUnlock()
@@ -1451,6 +1500,65 @@ func (r *Resolver) storeCandidateCache(key string, candidates []StreamCandidate,
 	r.cacheBytes += size
 }
 
+// recordProviderFailure remembers that the provider listing for cacheKey
+// failed. Within providerFailureBackoff, getCandidatesRaw fails fast instead of
+// re-paying the provider timeout. The map is pruned on every write and bounded
+// like the candidate cache.
+func (r *Resolver) recordProviderFailure(cacheKey string) {
+	now := time.Now()
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.failures == nil {
+		r.failures = make(map[string]time.Time)
+	}
+	for key, at := range r.failures {
+		if now.Sub(at) >= providerFailureBackoff {
+			delete(r.failures, key)
+		}
+	}
+	for len(r.failures) >= maxCandidateCacheEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for key, at := range r.failures {
+			if oldestKey == "" || at.Before(oldest) {
+				oldestKey, oldest = key, at
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(r.failures, oldestKey)
+	}
+	r.failures[cacheKey] = now
+}
+
+// clearProviderFailure forgets a key's provider failure, so a later resolve is
+// free to fetch again. Called whenever a fetch produces an answer, including a
+// genuine empty one.
+func (r *Resolver) clearProviderFailure(cacheKey string) {
+	r.cacheMu.Lock()
+	delete(r.failures, cacheKey)
+	r.cacheMu.Unlock()
+}
+
+// providerFailureActive reports whether cacheKey failed recently enough that
+// another full-timeout fetch should be skipped. An entry older than the
+// backoff is pruned and reported inactive.
+func (r *Resolver) providerFailureActive(cacheKey string) bool {
+	now := time.Now()
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	at, ok := r.failures[cacheKey]
+	if !ok {
+		return false
+	}
+	if now.Sub(at) >= providerFailureBackoff {
+		delete(r.failures, cacheKey)
+		return false
+	}
+	return true
+}
+
 func (r *Resolver) normalizeTMDBProviderID(ctx context.Context, mediaType, mediaID, apiKey, baseURL string) (string, error) {
 	parts := strings.Split(mediaID, ":")
 	if len(parts) < 2 || !strings.EqualFold(parts[0], "tmdb") {
@@ -1460,14 +1568,90 @@ func (r *Resolver) normalizeTMDBProviderID(ctx context.Context, mediaType, media
 	if key == "" {
 		return "", errors.New("TMDB ID requires a configured TMDB API token to resolve IMDb playback ID")
 	}
-	externals, err := fetchTMDBExternalIDs(ctx, mediaType, parts[1], key, baseURL)
-	if err != nil || strings.TrimSpace(externals.IMDbID) == "" {
+	cacheKey := strings.ToLower(mediaType) + "|" + parts[1]
+	if imdbID, ok := r.cachedTMDBExternalID(cacheKey); ok {
+		if imdbID == "" {
+			return "", fmt.Errorf("TMDB ID %s has no IMDb playback ID", parts[1])
+		}
+		return tmdbProviderID(imdbID, parts), nil
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, tmdbExternalIDTimeout)
+	defer cancel()
+	externals, err := fetchTMDBExternalIDs(lookupCtx, mediaType, parts[1], key, baseURL)
+	if err != nil {
+		// Remember a genuine translation failure so a burst of resolves does
+		// not re-pay it. A failure caused by this caller's own cancellation is
+		// not the provider's state, so it is never cached.
+		if ctx.Err() == nil {
+			r.storeTMDBExternalID(cacheKey, "", tmdbExternalIDNegativeTTL)
+		}
 		return "", fmt.Errorf("TMDB ID %s has no IMDb playback ID", parts[1])
 	}
-	if len(parts) > 2 {
-		return externals.IMDbID + ":" + strings.Join(parts[2:], ":"), nil
+	imdbID := strings.TrimSpace(externals.IMDbID)
+	if imdbID == "" {
+		r.storeTMDBExternalID(cacheKey, "", tmdbExternalIDNegativeTTL)
+		return "", fmt.Errorf("TMDB ID %s has no IMDb playback ID", parts[1])
 	}
-	return externals.IMDbID, nil
+	r.storeTMDBExternalID(cacheKey, imdbID, tmdbExternalIDCacheTTL)
+	return tmdbProviderID(imdbID, parts), nil
+}
+
+// tmdbProviderID rejoins a translated IMDb id with any season/episode suffix
+// the original tmdb virtual id carried, so a series path keeps its episode
+// coordinates.
+func tmdbProviderID(imdbID string, parts []string) string {
+	if len(parts) > 2 {
+		return imdbID + ":" + strings.Join(parts[2:], ":")
+	}
+	return imdbID
+}
+
+// cachedTMDBExternalID returns the cached translation for key, or false when
+// none is live. An empty imdbID with true is a live negative entry.
+func (r *Resolver) cachedTMDBExternalID(key string) (string, bool) {
+	now := time.Now()
+	r.tmdbMu.Lock()
+	defer r.tmdbMu.Unlock()
+	entry, ok := r.tmdbCache[key]
+	if !ok {
+		return "", false
+	}
+	if !now.Before(entry.expiresAt) {
+		delete(r.tmdbCache, key)
+		return "", false
+	}
+	return entry.imdbID, true
+}
+
+// storeTMDBExternalID records a translation under key. imdbID is empty for a
+// negative result. The map is bounded like the candidate cache so an
+// adversarial id stream cannot grow it without limit.
+func (r *Resolver) storeTMDBExternalID(key, imdbID string, ttl time.Duration) {
+	now := time.Now()
+	r.tmdbMu.Lock()
+	defer r.tmdbMu.Unlock()
+	if r.tmdbCache == nil {
+		r.tmdbCache = make(map[string]tmdbCacheEntry)
+	}
+	for existingKey, entry := range r.tmdbCache {
+		if !now.Before(entry.expiresAt) {
+			delete(r.tmdbCache, existingKey)
+		}
+	}
+	for len(r.tmdbCache) >= maxCandidateCacheEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for existingKey, entry := range r.tmdbCache {
+			if oldestKey == "" || entry.expiresAt.Before(oldest) {
+				oldestKey, oldest = existingKey, entry.expiresAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(r.tmdbCache, oldestKey)
+	}
+	r.tmdbCache[key] = tmdbCacheEntry{imdbID: imdbID, expiresAt: now.Add(ttl)}
 }
 
 // ValidateConnection checks the manifest URL policy and fetches the provider
@@ -1758,6 +1942,12 @@ func isPrivateHost(host string) bool {
 // metadataHTTPClient serves the TMDB external-ID lookups (mirrors the shared
 // metadata client in the plugin's routing.go).
 var metadataHTTPClient = newRestrictedRedirectHTTPClient(20 * time.Second)
+
+// tmdbExternalIDTimeout bounds one TMDB external-ID translation. The shared
+// metadata client allows 20s and this lookup runs before the candidate-cache
+// singleflight, so nothing downstream bounds it; a slow TMDB would hold the
+// whole resolve. It is a var so tests can shorten it without waiting seconds.
+var tmdbExternalIDTimeout = 5 * time.Second
 
 type tmdbExternalIDs struct {
 	IMDbID string `json:"imdb_id"`
