@@ -25,10 +25,10 @@ func TestRemuxWindowHitSeekKeepsRetainedSegments(t *testing.T) {
 		writeSegmentFile(t, dir, segmentFilename(i, opts), []byte("window bytes"), time.Now())
 	}
 
-	session := &TranscodeSession{outputDir: dir, opts: opts}
+	session := &TranscodeSession{outputDir: dir, opts: opts, runningRecipe: emittedRecipeOf(opts)}
 
 	// A seek back to segment 7 re-emits the identical recipe.
-	if session.cleanStaleOutputForRestart(opts, opts, 9) {
+	if session.cleanStaleOutputForRestart(emittedRecipeOf(opts), 9) {
 		t.Fatal("an identical-recipe remux restart discarded retained segments")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "stream.m3u8")); err != nil {
@@ -69,12 +69,12 @@ func TestRemuxRecipeChangeDiscardsRetainedSegments(t *testing.T) {
 		writeSegmentFile(t, dir, segmentFilename(i, previous), []byte("old recipe"), time.Now())
 	}
 
-	session := &TranscodeSession{outputDir: dir, opts: previous}
+	session := &TranscodeSession{outputDir: dir, opts: previous, runningRecipe: emittedRecipeOf(previous)}
 
 	next := previous
 	next.AudioTrackIndex = 2 // a different track re-renders every segment
 
-	if !session.cleanStaleOutputForRestart(previous, next, 9) {
+	if !session.cleanStaleOutputForRestart(emittedRecipeOf(next), 9) {
 		t.Fatal("a changed remux recipe kept stale segments")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "stream.m3u8")); err == nil {
@@ -88,6 +88,40 @@ func TestRemuxRecipeChangeDiscardsRetainedSegments(t *testing.T) {
 	// Retained segments below the restart point still survive the clean.
 	if _, err := os.Stat(filepath.Join(dir, segmentFilename(5, previous))); err != nil {
 		t.Fatalf("pre-restart segment was removed by the clean: %v", err)
+	}
+}
+
+// An audio selection changed before Restart mutates s.opts, but the segments on
+// disk were emitted by the running process's earlier selection. Comparing the
+// replacement against s.opts would see no change and retain old-generation
+// audio; the decision must use the running process's frozen recipe.
+func TestRemuxAudioSelectionChangeBeforeRestartDiscardsRetainedSegments(t *testing.T) {
+	dir := t.TempDir()
+	running := TranscodeOpts{
+		SessionID:               "remux-audio-switch",
+		TargetCodecVideo:        "copy",
+		TargetCodecAudio:        "aac",
+		AudioTrackIndex:         1,
+		SourceAudioChannels:     6,
+		SegmentDuration:         2,
+		SegmentRetentionSeconds: 600,
+	}
+	writeManifestRange(t, dir, 5, 9, hlsSegmentExtension(running))
+	for i := 5; i <= 9; i++ {
+		writeSegmentFile(t, dir, segmentFilename(i, running), []byte("old audio"), time.Now())
+	}
+
+	session := &TranscodeSession{outputDir: dir, opts: running, runningRecipe: emittedRecipeOf(running)}
+
+	// The pre-restart mutation path an audio switch uses: it edits s.opts, not
+	// the running recipe.
+	session.SetAudioTrackIndex(2)
+	session.SetSourceAudioChannels(2)
+
+	// The replacement recipe mirrors the mutated opts exactly as restart
+	// computes it; retention must still compare against the running recipe.
+	if !session.cleanStaleOutputForRestart(emittedRecipeOf(session.opts), 9) {
+		t.Fatal("an audio selection change before restart retained old-generation segments")
 	}
 }
 
@@ -108,6 +142,7 @@ func TestRemuxRecipeComparisonCoversPackagingAndAudio(t *testing.T) {
 		"audio track":       func(o *TranscodeOpts) { o.AudioTrackIndex = 2 },
 		"audio codec":       func(o *TranscodeOpts) { o.TargetCodecAudio = "copy" },
 		"audio channels":    func(o *TranscodeOpts) { o.TargetAudioChannels = 6 },
+		"source channels":   func(o *TranscodeOpts) { o.SourceAudioChannels = 6 },
 		"mpegts packaging":  func(o *TranscodeOpts) { o.CopyVideoMPEGTS = true },
 		"sample entry":      func(o *TranscodeOpts) { o.VideoSampleEntry = VideoSampleEntryHVC1 },
 		"copy recipe":       func(o *TranscodeOpts) { o.CopyFMP4RecipeVersion = CopyFMP4RecipeVersion },

@@ -247,15 +247,22 @@ type TranscodeSession struct {
 	copyTimeline         observedCopyTimeline
 	segmentGeneration    uint64
 	segmentIncarnation   string
-	throttler            *TranscodeThrottler
-	stderrLinesLogged    int
-	stderrBytesLogged    int
-	stderrDroppedLines   int
-	stderrCapLogged      bool
-	restartCount         int
-	stderrLineIndex      int
-	stderrWriter         *ffmpegStderrWriter
-	restartHook          func(context.Context)
+	// runningRecipe is the emitted-byte recipe of the currently-running ffmpeg
+	// process. It is frozen when the process is spawned and is deliberately not
+	// updated by SetAudioTrackIndex / SetSourceAudioChannels, which mutate opts
+	// ahead of Restart. A restart compares this frozen recipe, not the mutated
+	// opts, against the replacement so retained segments were actually produced
+	// by the same recipe. Guarded by mu.
+	runningRecipe      emittedStreamRecipe
+	throttler          *TranscodeThrottler
+	stderrLinesLogged  int
+	stderrBytesLogged  int
+	stderrDroppedLines int
+	stderrCapLogged    bool
+	restartCount       int
+	stderrLineIndex    int
+	stderrWriter       *ffmpegStderrWriter
+	restartHook        func(context.Context)
 	// demuxErrorCount counts input demux I/O failures within the current decay
 	// window; lastDemuxErrorAt timestamps the newest one. demuxStamped is set
 	// once the count crosses demuxErrorThreshold and then refuses restarts so
@@ -560,6 +567,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	s := &TranscodeSession{
 		cancel:               cancel,
 		opts:                 opts,
+		runningRecipe:        emittedRecipeOf(opts),
 		outputDir:            opts.OutputDir,
 		running:              true,
 		done:                 make(chan struct{}),
@@ -3701,8 +3709,11 @@ type emittedStreamRecipe struct {
 	copyVideoMPEGTS  bool
 	// Audio bytes. Copying the selected track, encoding it to a target codec,
 	// and the encoded channel layout/bitrate all change the segment contents.
+	// SourceAudioChannels chooses the stereo-downmix gain filter, so it changes
+	// the emitted audio even when the target codec and layout are unchanged.
 	targetAudioCodec       string
 	audioTrackIndex        int
+	sourceAudioChannels    int
 	targetAudioChannels    int
 	targetAudioBitrateKbps int
 	// Burned-in subtitles are rendered into the video, so the burn-in choice,
@@ -3729,6 +3740,7 @@ func emittedRecipeOf(opts TranscodeOpts) emittedStreamRecipe {
 		copyVideoMPEGTS:        opts.CopyVideoMPEGTS,
 		targetAudioCodec:       strings.ToLower(strings.TrimSpace(opts.TargetCodecAudio)),
 		audioTrackIndex:        opts.AudioTrackIndex,
+		sourceAudioChannels:    opts.SourceAudioChannels,
 		targetAudioChannels:    opts.TargetAudioChannels,
 		targetAudioBitrateKbps: opts.TargetAudioBitrateKbps,
 		subtitleBurnIn:         opts.SubtitleBurnIn,
@@ -3757,9 +3769,18 @@ func emittedRecipeOf(opts TranscodeOpts) emittedStreamRecipe {
 // numbering and origin are re-derived from the manifest on every restart, so
 // retained files remain addressable.
 //
+// The previous recipe is read from the running process, not from the caller's
+// options: SetAudioTrackIndex and SetSourceAudioChannels mutate s.opts before
+// Restart, so a caller-supplied previous recipe would already describe the
+// replacement and wrongly retain segments emitted with the earlier audio
+// selection or filter.
+//
 // It reports whether it cleaned, so callers can log the decision.
-func (s *TranscodeSession) cleanStaleOutputForRestart(previous, next TranscodeOpts, startSegment int) bool {
-	if emittedRecipeOf(previous) == emittedRecipeOf(next) {
+func (s *TranscodeSession) cleanStaleOutputForRestart(next emittedStreamRecipe, startSegment int) bool {
+	s.mu.Lock()
+	previous := s.runningRecipe
+	s.mu.Unlock()
+	if previous == next {
 		return false
 	}
 	s.cleanStaleSegments(startSegment)
@@ -3872,6 +3893,11 @@ func (s *TranscodeSession) restart(
 	flight := &restartFlight{done: make(chan struct{})}
 	s.restarting = flight
 	opts := s.opts
+	// The running process's recipe, not the possibly-mutated opts: a caller
+	// that changed the audio selection before Restart leaves s.opts describing
+	// the replacement, and only the frozen recipe proves the retained segments
+	// came from the same emitted bytes.
+	previousRecipe := s.runningRecipe
 	refreshInput := s.opts.RefreshInput
 	cancelCurrent := s.cancel
 	done := s.done
@@ -3975,8 +4001,6 @@ func (s *TranscodeSession) restart(
 	hwWorkloadDevice := s.hwWorkloadDevice
 	s.mu.Unlock()
 
-	previousOpts := opts
-
 	opts.SeekSeconds = seekSeconds
 	opts.StartSegmentNumber = startSegment
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") {
@@ -3991,10 +4015,13 @@ func (s *TranscodeSession) restart(
 
 	// Old segments are only reusable when this generation emits the same recipe
 	// as the previous one; otherwise they, and the manifest describing them,
-	// have to go before the replacement process starts.
-	if s.cleanStaleOutputForRestart(previousOpts, opts, startSegment) {
+	// have to go before the replacement process starts. The comparison uses the
+	// running process's frozen recipe, not the caller's opts (which already
+	// carry any pre-restart audio selection mutation).
+	nextRecipe := emittedRecipeOf(opts)
+	if s.cleanStaleOutputForRestart(nextRecipe, startSegment) {
 		log.Printf("playback: cleaned stale transcode output at/after segment %d before restart (video %q -> %q)",
-			startSegment, previousOpts.TargetCodecVideo, opts.TargetCodecVideo)
+			startSegment, previousRecipe.videoCodec, opts.TargetCodecVideo)
 	}
 
 	args := buildFFmpegArgs(opts)
@@ -4057,6 +4084,7 @@ func (s *TranscodeSession) restart(
 	s.cmd = cmd
 	s.cancel = cancel
 	s.opts = opts
+	s.runningRecipe = nextRecipe
 	s.running = true
 	s.restarting = nil
 	s.stdinPipe = stdinPipe

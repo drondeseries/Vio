@@ -1250,9 +1250,9 @@ func TestCleanStaleOutputForRestart_CopyToToneMapEncodeRemovesStaleOutput(t *tes
 		ToneMapFilter:    "tonemap_opencl",
 	}
 
-	session := &TranscodeSession{outputDir: tempDir, opts: previous}
+	session := &TranscodeSession{outputDir: tempDir, opts: previous, runningRecipe: emittedRecipeOf(previous)}
 
-	if !session.cleanStaleOutputForRestart(previous, next, 7) {
+	if !session.cleanStaleOutputForRestart(emittedRecipeOf(next), 7) {
 		t.Fatal("cleanStaleOutputForRestart = false, want true for a copy -> tone-map restart")
 	}
 
@@ -1278,9 +1278,9 @@ func TestCleanStaleOutputForRestart_ToneMapModeChangeRemovesStaleOutput(t *testi
 	previous := TranscodeOpts{TargetCodecVideo: "h264", HWAccel: "qsv", ToneMapMode: tonemap.ModeHardware, ToneMapFilter: "tonemap_opencl"}
 	next := TranscodeOpts{TargetCodecVideo: "h264", HWAccel: HWAccelNone, ToneMapMode: tonemap.ModeSoftware, ToneMapFilter: "tonemap"}
 
-	session := &TranscodeSession{outputDir: tempDir, opts: previous}
+	session := &TranscodeSession{outputDir: tempDir, opts: previous, runningRecipe: emittedRecipeOf(previous)}
 
-	if !session.cleanStaleOutputForRestart(previous, next, 7) {
+	if !session.cleanStaleOutputForRestart(emittedRecipeOf(next), 7) {
 		t.Fatal("cleanStaleOutputForRestart = false, want true for a tone-map mode change")
 	}
 	if _, err := os.Stat(filepath.Join(tempDir, "stream.m3u8")); err == nil {
@@ -1299,10 +1299,10 @@ func TestCleanStaleOutputForRestart_SameEncodedRecipeKeepsSegments(t *testing.T)
 	}
 
 	opts := TranscodeOpts{TargetCodecVideo: "h264", HWAccel: "qsv", ToneMapMode: tonemap.ModeHardware, ToneMapFilter: "tonemap_opencl"}
-	session := &TranscodeSession{outputDir: tempDir, opts: opts}
+	session := &TranscodeSession{outputDir: tempDir, opts: opts, runningRecipe: emittedRecipeOf(opts)}
 
 	// A backward seek within one generation keeps its segments reusable.
-	if session.cleanStaleOutputForRestart(opts, opts, 7) {
+	if session.cleanStaleOutputForRestart(emittedRecipeOf(opts), 7) {
 		t.Fatal("cleanStaleOutputForRestart = true, want false for an unchanged encoded recipe")
 	}
 	if _, err := os.Stat(filepath.Join(tempDir, "stream.m3u8")); err != nil {

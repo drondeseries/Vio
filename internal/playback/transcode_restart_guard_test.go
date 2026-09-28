@@ -44,19 +44,21 @@ func TestForwardRestartPreservesConfiguredBackBuffer(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	opts := TranscodeOpts{
+		OutputDir:               dir,
+		TargetCodecVideo:        "h264",
+		SegmentDuration:         4,
+		SegmentRetentionSeconds: 20,
+		StartSegmentNumber:      0,
+		FFmpegPath:              truePath,
+	}
 	session := &TranscodeSession{
 		outputDir:            dir,
 		lastRequestedSegment: 70,
 		lastCompletedSegment: 70,
 		lastPruneFloor:       -1,
-		opts: TranscodeOpts{
-			OutputDir:               dir,
-			TargetCodecVideo:        "h264",
-			SegmentDuration:         4,
-			SegmentRetentionSeconds: 20,
-			StartSegmentNumber:      0,
-			FFmpegPath:              truePath,
-		},
+		opts:                 opts,
+		runningRecipe:        emittedRecipeOf(opts),
 	}
 
 	if err := session.Restart(context.Background(), 400, 100); err != nil {
@@ -104,24 +106,27 @@ func TestNonForwardRestartKeepsPreservedRangePrunable(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	opts := TranscodeOpts{
+		OutputDir:               dir,
+		TargetCodecVideo:        "h264",
+		SegmentDuration:         4,
+		SegmentRetentionSeconds: 20,
+		StartSegmentNumber:      0,
+		FFmpegPath:              truePath,
+	}
 	session := &TranscodeSession{
 		outputDir:            dir,
 		lastRequestedSegment: 70,
 		lastCompletedSegment: 70,
 		lastPruneFloor:       40,
-		opts: TranscodeOpts{
-			OutputDir:               dir,
-			TargetCodecVideo:        "h264",
-			SegmentDuration:         4,
-			SegmentRetentionSeconds: 20,
-			StartSegmentNumber:      0,
-			FFmpegPath:              truePath,
-		},
+		opts:                 opts,
+		runningRecipe:        emittedRecipeOf(opts),
 	}
 
-	// Audio switches commonly restart from the reported playback position,
-	// which can trail the player's completed-download high-water mark.
-	session.SetAudioTrackIndex(1)
+	// A restart from the reported playback position can trail the player's
+	// completed-download high-water mark. The recipe is unchanged, so the
+	// preserved range survives the restart and must still become prunable once
+	// the replacement has produced a complete back buffer.
 	if err := session.Restart(context.Background(), 260, 65); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
@@ -143,6 +148,47 @@ func TestNonForwardRestartKeepsPreservedRangePrunable(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, segmentFilename(65, TranscodeOpts{}))); err != nil {
 		t.Fatalf("replacement startup segment was removed: %v", err)
+	}
+}
+
+// A pre-restart audio switch mutates the session options, but the running
+// process emitted its segments with the earlier track and downmix filter. The
+// restart must use the running process's frozen recipe, so the segment at the
+// restart point is discarded instead of served as wrong-generation audio.
+func TestRestartAfterAudioSwitchDiscardsSegmentsFromPreviousTrack(t *testing.T) {
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("`true` not found in PATH: %v", err)
+	}
+
+	dir := t.TempDir()
+	opts := TranscodeOpts{
+		OutputDir:               dir,
+		TargetCodecVideo:        "copy",
+		TargetCodecAudio:        "aac",
+		AudioTrackIndex:         1,
+		SourceAudioChannels:     6,
+		SegmentDuration:         2,
+		SegmentRetentionSeconds: 600,
+		FFmpegPath:              truePath,
+	}
+	writeSegmentFile(t, dir, segmentFilename(9, opts), []byte("old track"), time.Now())
+	writeManifestRange(t, dir, 5, 9, hlsSegmentExtension(opts))
+
+	session := &TranscodeSession{outputDir: dir, opts: opts, runningRecipe: emittedRecipeOf(opts)}
+
+	// The audio switch edits s.opts, exactly as the Jellyfin track switch does
+	// before calling Restart.
+	session.SetAudioTrackIndex(2)
+	session.SetSourceAudioChannels(2)
+
+	if err := session.Restart(context.Background(), 18, 9); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	if _, err := os.Stat(filepath.Join(dir, segmentFilename(9, opts))); !os.IsNotExist(err) {
+		t.Fatalf("segment emitted with the previous audio track survived the restart: %v", err)
 	}
 }
 
