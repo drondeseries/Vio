@@ -789,6 +789,42 @@ func (r *Repository) RequeueStaleRunning(ctx context.Context, before time.Time) 
 	return int(tag.RowsAffected()), nil
 }
 
+// RequeueLatestFailedOfType resets the newest failed job of a kind to queued so
+// a boot retry resumes it, preserving its result payload. The identity backfill
+// persists a retriable watermark there; without this the boot gate would queue
+// a fresh job that restarts from zero and re-lists every unmatched row. It
+// clears the terminal retention deadline so the expired-job cleanup cannot
+// sweep the retry before it runs, and leaves an already-active job alone. It
+// reports whether a job was requeued.
+func (r *Repository) RequeueLatestFailedOfType(ctx context.Context, jobType string) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE admin_jobs
+		SET status = $2,
+			message = 'Requeued after a partial run',
+			error_message = '',
+			started_at = NULL,
+			completed_at = NULL,
+			heartbeat_at = NULL,
+			expires_at = NULL,
+			updated_at = NOW()
+		WHERE id = (
+			SELECT id FROM admin_jobs
+			WHERE job_type = $1 AND status = $3
+			ORDER BY requested_at DESC, id DESC
+			LIMIT 1
+		)
+		  AND NOT EXISTS (
+			SELECT 1 FROM admin_jobs
+			WHERE job_type = $1 AND status IN ($2, $4)
+		)`,
+		jobType, StatusQueued, StatusFailed, StatusRunning,
+	)
+	if err != nil {
+		return false, fmt.Errorf("requeueing latest failed admin job of type: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (r *Repository) ListExpired(ctx context.Context, now time.Time, limit int) ([]*models.AdminJob, error) {
 	if limit <= 0 {
 		limit = 50

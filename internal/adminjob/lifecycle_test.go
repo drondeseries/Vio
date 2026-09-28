@@ -161,6 +161,61 @@ func TestJobClaimRecoveryAndTerminalRace(t *testing.T) {
 	}
 }
 
+// TestRequeueLatestFailedOfTypeClearsExpiration pins that reviving a failed job
+// also drops its terminal retention deadline. Otherwise the expired-job sweep
+// would keep selecting the requeued retry and delete it before it ran.
+func TestRequeueLatestFailedOfTypeClearsExpiration(t *testing.T) {
+	r := lifecycleRepo(t)
+	userID := seedRefreshUser(t, r)
+	job, err := r.Create(t.Context(), CreateJobInput{
+		JobType:         JobTypeVirtualIdentityBackfill,
+		CreatedByUserID: userID,
+		Message:         "queued",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = r.pool.Exec(context.Background(), "DELETE FROM admin_jobs WHERE id=$1", job.ID) })
+
+	// Drive the job to failed through the production path so its retention
+	// deadline is set exactly as a partial run would leave it.
+	if _, err := r.pool.Exec(t.Context(), `
+		UPDATE admin_jobs SET status = 'running', claim_generation = claim_generation + 1
+		WHERE id = $1`, job.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	if err := r.Fail(t.Context(), job.ID, FailJobInput{ErrorMessage: "partial run"}); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+	failed, err := r.GetByID(t.Context(), job.ID)
+	if err != nil || failed.ExpiresAt == nil {
+		t.Fatalf("failed expiration = %v %v, want a retention deadline", failed.ExpiresAt, err)
+	}
+
+	revived, err := r.RequeueLatestFailedOfType(t.Context(), JobTypeVirtualIdentityBackfill)
+	if err != nil || !revived {
+		t.Fatalf("requeue = %v %v, want true", revived, err)
+	}
+
+	requeued, err := r.GetByID(t.Context(), job.ID)
+	if err != nil || requeued.Status != StatusQueued {
+		t.Fatalf("job = %+v %v, want queued", requeued, err)
+	}
+	if requeued.ExpiresAt != nil {
+		t.Fatalf("requeued expiration = %v, want cleared", *requeued.ExpiresAt)
+	}
+	// A sweep just past the failed run's deadline must not name the retry.
+	expired, err := r.ListExpired(t.Context(), failed.ExpiresAt.Add(time.Minute), 50)
+	if err != nil {
+		t.Fatalf("list expired: %v", err)
+	}
+	for _, candidate := range expired {
+		if candidate.ID == job.ID {
+			t.Fatal("the requeued retry is still listed as expired")
+		}
+	}
+}
+
 type waitingRefresh struct{ started chan struct{} }
 
 func (e waitingRefresh) Execute(ctx context.Context, _ LibraryRefreshRequest, _ func(int, int, string)) (*LibraryRefreshResult, error) {

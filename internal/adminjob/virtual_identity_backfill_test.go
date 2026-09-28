@@ -96,6 +96,92 @@ func TestVirtualIdentityBackfillRunnerResumesAndCompletes(t *testing.T) {
 	}
 }
 
+// TestVirtualIdentityBackfillRunnerPartialFailureStaysRetriable proves a pass
+// where a provider group failed does not complete the job: the one-shot token
+// is not consumed and the retriable watermark is preserved in the result
+// payload for the next run.
+func TestVirtualIdentityBackfillRunnerPartialFailureStaysRetriable(t *testing.T) {
+	r := lifecycleRepo(t)
+	userID := seedRefreshUser(t, r)
+	job, err := r.Create(t.Context(), CreateJobInput{
+		JobType:         JobTypeVirtualIdentityBackfill,
+		CreatedByUserID: userID,
+		Message:         "queued",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = r.pool.Exec(context.Background(), "DELETE FROM admin_jobs WHERE id=$1", job.ID) })
+
+	executor := &fakeIdentityBackfillExecutor{result: &VirtualIdentityBackfillResult{
+		Cursor: 40, GroupsScanned: 3, GroupsFailed: 1, RowsTotal: 12, RowsScanned: 12, RowsMatched: 7, RowsUnmatched: 5,
+	}}
+	worker := NewRunner(NewRepository(r.pool), nil, nil, nil, nil, nil, nil, nil, nil)
+	worker.SetVirtualIdentityBackfillExecutor(executor)
+	worker.runNext()
+
+	got, err := r.GetByID(t.Context(), job.ID)
+	if err != nil || got.Status != StatusFailed {
+		t.Fatalf("job = %+v %v, want failed after a partial pass", got, err)
+	}
+	done, err := r.HasFinishedJobOfType(t.Context(), JobTypeVirtualIdentityBackfill)
+	if err != nil {
+		t.Fatalf("has finished: %v", err)
+	}
+	if done {
+		t.Fatal("a partially failed backfill consumed the one-shot token")
+	}
+	var resume VirtualIdentityBackfillResume
+	if err := json.Unmarshal(got.ResultPayload, &resume); err != nil {
+		t.Fatalf("decode retriable watermark: %v", err)
+	}
+	if resume.Cursor != 40 {
+		t.Fatalf("watermark cursor = %d, want 40", resume.Cursor)
+	}
+}
+
+// TestVirtualIdentityBackfillRunnerResumesAfterPartialFailure proves a failed
+// partial pass is revived with its watermark and the next claim resumes there
+// instead of restarting from zero.
+func TestVirtualIdentityBackfillRunnerResumesAfterPartialFailure(t *testing.T) {
+	r := lifecycleRepo(t)
+	userID := seedRefreshUser(t, r)
+	job, err := r.Create(t.Context(), CreateJobInput{
+		JobType:         JobTypeVirtualIdentityBackfill,
+		CreatedByUserID: userID,
+		Message:         "queued",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = r.pool.Exec(context.Background(), "DELETE FROM admin_jobs WHERE id=$1", job.ID) })
+
+	first := &fakeIdentityBackfillExecutor{result: &VirtualIdentityBackfillResult{
+		Cursor: 40, GroupsScanned: 3, GroupsFailed: 1, RowsTotal: 12, RowsScanned: 12, RowsMatched: 7, RowsUnmatched: 5,
+	}}
+	worker := NewRunner(NewRepository(r.pool), nil, nil, nil, nil, nil, nil, nil, nil)
+	worker.SetVirtualIdentityBackfillExecutor(first)
+	worker.runNext()
+
+	revived, err := r.RequeueLatestFailedOfType(t.Context(), JobTypeVirtualIdentityBackfill)
+	if err != nil || !revived {
+		t.Fatalf("requeue failed job = %v %v, want true", revived, err)
+	}
+	requeued, err := r.GetByID(t.Context(), job.ID)
+	if err != nil || requeued.Status != StatusQueued {
+		t.Fatalf("job = %+v %v, want queued for retry", requeued, err)
+	}
+
+	second := &fakeIdentityBackfillExecutor{}
+	worker2 := NewRunner(NewRepository(r.pool), nil, nil, nil, nil, nil, nil, nil, nil)
+	worker2.SetVirtualIdentityBackfillExecutor(second)
+	worker2.runNext()
+
+	if second.calls != 1 || second.resume.Cursor != 40 {
+		t.Fatalf("second executor = %+v, want one call resumed at 40", second)
+	}
+}
+
 // TestHasFinishedJobOfTypeGatesOneShot proves the one-shot marker: a completed
 // or canceled job is reported, while a queued or absent one is not (so a
 // failed run is retried on the next boot).

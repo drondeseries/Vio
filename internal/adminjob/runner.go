@@ -1210,9 +1210,12 @@ func (r *Runner) executeVirtualCandidatesRefresh(job *models.AdminJob) {
 // executeVirtualIdentityBackfill runs the one-shot resumable identity backfill.
 // The executor loops over pages of legacy rows and owns its degradation: a
 // provider that cannot be reached for one candidate group is counted and
-// skipped, so any error it returns is a genuine pipeline failure. The durable
-// cursor it reports is persisted with every progress tick, so a requeued claim
-// resumes after the last fully-processed page.
+// skipped, but the page it belongs to is left incomplete. A pass with any
+// failed group is failed rather than completed, so the one-shot token is not
+// consumed and the durable cursor in the result payload lets a later run
+// resume after the last fully-processed page and retry the rest. The durable
+// cursor is persisted with every progress tick as well, so a requeued claim
+// resumes instead of restarting.
 func (r *Runner) executeVirtualIdentityBackfill(job *models.AdminJob) {
 	if r.virtualIdentityBackfill == nil {
 		r.failJob(job.ID, 0, 0, "Virtual identity backfill failed", "virtual identity backfill executor is not configured")
@@ -1290,6 +1293,20 @@ func (r *Runner) executeVirtualIdentityBackfill(job *models.AdminJob) {
 		progressCurrent = result.RowsScanned
 		progressTotal = result.RowsTotal
 	}
+
+	// A provider group that could not be re-listed leaves rows unconsidered.
+	// Completing would consume the one-shot token and orphan them, so fail the
+	// job instead and keep the retriable watermark in the result payload. A
+	// failed job is not "finished", so the next boot requeues it and resumes
+	// after the last fully-processed page.
+	if result != nil && result.GroupsFailed > 0 {
+		r.failJobWithResult(job.ID, progressCurrent, progressTotal,
+			"Virtual identity backfill incomplete",
+			fmt.Sprintf("%d provider group(s) could not be re-listed; the backfill will retry", result.GroupsFailed),
+			result)
+		return
+	}
+
 	if err := r.repo.Complete(ctx, job.ID, CompleteJobInput{
 		ResultPayload:   result,
 		Message:         "Virtual identity backfill completed",

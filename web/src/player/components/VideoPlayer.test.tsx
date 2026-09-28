@@ -3915,6 +3915,45 @@ describe("VideoPlayer version switch UX", () => {
     expect(props.versions?.find((v) => v.fileId === 100)?.isCurrentSource).toBe(false);
   });
 
+  it("resolves the current source from the committed URI over the plan's stale one", () => {
+    const virtualRow = {
+      ...versionA,
+      file_id: 100,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=all",
+    };
+    const candidateA = {
+      ...versionA,
+      file_id: 8,
+      file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
+    };
+    const candidateB = {
+      ...versionA,
+      file_id: 9,
+      file_path: "/media/Movies/Example (2024)/Example.2160p.mkv",
+    };
+    // The plan still names the outgoing release; a serve-layer rotation moved
+    // the committed source to candidate B.
+    const plan = fixturePlanV3({
+      requested_media_file_id: 100,
+      effective_media_file_id: 100,
+      effective_virtual_uri: candidateA.file_path,
+    });
+
+    renderPlayer({
+      plan,
+      versions: [virtualRow, candidateA, candidateB],
+      activeFileId: 100,
+      activeVirtualUri: candidateB.file_path,
+    });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{ fileId: number; isCurrentSource: boolean }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 9)?.isCurrentSource).toBe(true);
+    expect(props.versions?.find((v) => v.fileId === 8)?.isCurrentSource).toBe(false);
+  });
+
   it("leaves the file_id match current when no effective virtual URI is published", () => {
     renderPlayer({ versions: [versionA, versionB], activeFileId: 7 });
 
