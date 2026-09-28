@@ -367,13 +367,11 @@ func TestResolveCopySeekAnchorForSourceProbesExactPositionAcrossKeyframeBoundary
 	}
 }
 
-// TestResolveCopySeekAnchorForSourceReusesResolvedGOP proves a probe at one
-// position serves the surrounding GOP: once a position's keyframe is resolved,
-// other positions in that GOP hit the cache instead of spawning another FFmpeg.
-// The probe models a source whose keyframes fall every 4s. Seeking 121 resolves
-// keyframe 120; seeking 125 resolves 124 and reveals the next keyframe, so 122
-// and 123 lie in [120,124) and reuse the 120 entry.
-func TestResolveCopySeekAnchorForSourceReusesResolvedGOP(t *testing.T) {
+// TestResolveCopySeekAnchorForSourceReusesProvenInterval proves reuse is
+// bounded to the interval a probe actually covered, not a whole nominal GOP.
+// Probing 121 resolves keyframe 120 and proves no keyframe lies in (120,121],
+// so requests at or before 121 reuse 120 while 121.5 must probe.
+func TestResolveCopySeekAnchorForSourceReusesProvenInterval(t *testing.T) {
 	var calls int
 	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
 		calls++
@@ -392,64 +390,105 @@ func TestResolveCopySeekAnchorForSourceReusesResolvedGOP(t *testing.T) {
 	if anchor, segment := resolve(121); anchor != 120 || segment != 60 {
 		t.Fatalf("first anchor = %v segment = %d; want 120, 60", anchor, segment)
 	}
-	// A position in the same nominal segment as the keyframe reuses it before
-	// any later keyframe is known.
+	// 120.5 is inside the interval the 121 probe proved, so it reuses 120.
+	if anchor, _ := resolve(120.5); anchor != 120 {
+		t.Fatalf("proven-interval anchor = %v; want cached 120", anchor)
+	}
+	if calls != 1 {
+		t.Fatalf("probe calls = %d, want 1 (120.5 is inside the proven interval)", calls)
+	}
+	// 121.5 is past the proven interval, so it probes rather than assuming the
+	// GOP continues; the fixture still resolves it to 120 and extends the
+	// interval through 121.5.
 	if anchor, _ := resolve(121.5); anchor != 120 {
-		t.Fatalf("same-segment anchor = %v; want cached 120", anchor)
-	}
-	// Seeking into the next GOP reveals keyframe 124, which bounds the first
-	// GOP at 124.
-	if anchor, _ := resolve(125); anchor != 124 {
-		t.Fatalf("next-GOP anchor = %v; want 124", anchor)
-	}
-	for _, requested := range []float64{122, 123} {
-		if anchor, _ := resolve(requested); anchor != 120 {
-			t.Fatalf("anchor for %v = %v; want cached 120", requested, anchor)
-		}
+		t.Fatalf("anchor for 121.5 = %v; want its own 120", anchor)
 	}
 	if calls != 2 {
-		t.Fatalf("probe calls = %d, want 2 (only the two distinct GOPs probe)", calls)
+		t.Fatalf("probe calls = %d, want 2 (121.5 is past the proven interval)", calls)
+	}
+	// 121.2 now falls inside the extended interval and reuses 120.
+	if anchor, _ := resolve(121.2); anchor != 120 {
+		t.Fatalf("extended-interval anchor = %v; want cached 120", anchor)
+	}
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2 (the extended interval is reused)", calls)
 	}
 }
 
-// TestResolveCopySeekAnchorForSourceReProbesPastObservedGOP proves reuse stops
-// at the next observed keyframe: a seek past it belongs to another GOP and must
-// probe, while a seek before it is still served the cached anchor.
-func TestResolveCopySeekAnchorForSourceReProbesPastObservedGOP(t *testing.T) {
-	var calls int
-	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
-		calls++
-		keyframe := math.Floor(requested/4) * 4
-		return keyframe, int(keyframe / float64(segmentDuration)), nil
-	})
-	ctx := context.Background()
-	resolve := func(requested float64) float64 {
-		t.Helper()
-		anchor, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", "virtual://movie/observed-gop", "http://relay/observed-gop", requested, 2)
-		if err != nil {
-			t.Fatalf("resolve %v: %v", requested, err)
+// TestResolveCopySeekAnchorForSourceReProbesInterveningKeyframe proves reuse is
+// never extended past the interval a probe covered, not to a later observed
+// keyframe and not to a nominal segment end. A source can hold a keyframe
+// between an observed anchor and either bound, so a request in that gap must
+// probe for its own anchor instead of serving the earlier one. The fixture
+// keyframes at 120, 121, and 124 make 121.5 resolve to 121, so reusing 120 would
+// produce a wrong timeline origin and segment number.
+func TestResolveCopySeekAnchorForSourceReProbesInterveningKeyframe(t *testing.T) {
+	keyframeAt := func(keyframes []float64, requested float64) float64 {
+		keyframe := keyframes[0]
+		for _, candidate := range keyframes {
+			if candidate <= requested {
+				keyframe = candidate
+			}
 		}
-		return anchor
+		return keyframe
 	}
-	// Establish keyframe 120 (from 121) and 124 (from 125).
-	resolve(121)
-	resolve(125)
-	if calls != 2 {
-		t.Fatalf("setup probe calls = %d, want 2", calls)
+	cases := []struct {
+		name       string
+		keyframes  []float64
+		probes     []float64
+		requested  float64
+		wantAnchor float64
+	}{
+		{
+			// 124 is the next keyframe observed after 120, but 121 sits
+			// between them; bounding 120's GOP at 124 would serve 120 for 121.5.
+			name:       "later observed keyframe does not bound the gap",
+			keyframes:  []float64{120, 121, 124},
+			probes:     []float64{120.5, 125},
+			requested:  121.5,
+			wantAnchor: 121,
+		},
+		{
+			// With no later keyframe observed, the nominal 2s segment end at
+			// 122 would have served 120 for 121.5, skipping keyframe 121.
+			name:       "nominal segment end does not bound the gap",
+			keyframes:  []float64{120, 121},
+			probes:     []float64{120.5},
+			requested:  121.5,
+			wantAnchor: 121,
+		},
 	}
-	// 128 is past keyframe 124 and beyond its nominal segment, so it probes.
-	if anchor := resolve(128); anchor != 128 {
-		t.Fatalf("anchor for 128 = %v; want its own 128", anchor)
-	}
-	if calls != 3 {
-		t.Fatalf("probe calls = %d, want 3 (a seek past the observed GOP re-probes)", calls)
-	}
-	// 126 now sits before the observed keyframe 128 and reuses 124.
-	if anchor := resolve(126); anchor != 124 {
-		t.Fatalf("anchor for 126 = %v; want cached 124", anchor)
-	}
-	if calls != 3 {
-		t.Fatalf("probe calls = %d, want 3 (126 is inside the observed GOP)", calls)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+				calls++
+				keyframe := keyframeAt(tc.keyframes, requested)
+				return keyframe, int(keyframe / float64(segmentDuration)), nil
+			})
+			ctx := context.Background()
+			source := "virtual://movie/intervening-" + tc.name
+			resolve := func(requested float64) float64 {
+				t.Helper()
+				anchor, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", source, "http://relay/intervening", requested, 2)
+				if err != nil {
+					t.Fatalf("resolve %v: %v", requested, err)
+				}
+				return anchor
+			}
+			for _, requested := range tc.probes {
+				resolve(requested)
+			}
+			if calls != len(tc.probes) {
+				t.Fatalf("setup probe calls = %d, want %d", calls, len(tc.probes))
+			}
+			if anchor := resolve(tc.requested); anchor != tc.wantAnchor {
+				t.Fatalf("anchor for %v = %v; want its own %v, not the reused anchor", tc.requested, anchor, tc.wantAnchor)
+			}
+			if calls != len(tc.probes)+1 {
+				t.Fatalf("probe calls = %d, want %d (an intervening keyframe must re-probe)", calls, len(tc.probes)+1)
+			}
+		})
 	}
 }
 
