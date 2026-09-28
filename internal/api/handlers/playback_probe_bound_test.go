@@ -17,7 +17,7 @@ import (
 // gatedPlaybackProbeEnsurer blocks the copy-safety call until it is released or
 // its context is done, standing in for the multi-second remote reads a cold
 // probe performs on a remote library. It records whether the detached repair
-// was cancelled, which is what proves a client disconnect cannot poison it.
+// was canceled, which is what proves a client disconnect cannot poison it.
 type gatedPlaybackProbeEnsurer struct {
 	started  chan struct{}
 	release  chan struct{}

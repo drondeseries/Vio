@@ -899,6 +899,9 @@ type playbackProbeRefresh struct {
 	repaired *models.MediaFile
 }
 
+// probeFingerprintUnset marks a missing timestamp inside a probe fingerprint.
+const probeFingerprintUnset = "none"
+
 // playbackProbeFingerprint identifies the file generation and probe state a
 // refresh was prepared against. Probe repair rewrites ProbeUpdatedAt (and
 // ProbeSource), so the post-repair fingerprint differs and the next start
@@ -907,11 +910,11 @@ func playbackProbeFingerprint(file *models.MediaFile) string {
 	if file == nil {
 		return ""
 	}
-	mtime := "none"
+	mtime := probeFingerprintUnset
 	if file.FileModifiedAt != nil {
 		mtime = strconv.FormatInt(file.FileModifiedAt.UnixMicro(), 10)
 	}
-	probe := "none"
+	probe := probeFingerprintUnset
 	if file.ProbeUpdatedAt != nil {
 		probe = strconv.FormatInt(file.ProbeUpdatedAt.UnixMicro(), 10)
 	}

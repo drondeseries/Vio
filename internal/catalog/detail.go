@@ -4361,7 +4361,7 @@ const watchPreparedMaxEntries = 4096
 // probe or chapter-thumbnail enqueue from holding its goroutine open forever.
 // It deliberately sits above the ensurer's own probe deadline (10s) and the
 // multi-second remote reads a cold probe performs, so an ordinary slow repair
-// still lands and persists instead of being cancelled on every attempt.
+// still lands and persists instead of being canceled on every attempt.
 const watchPrepareRefreshTimeout = 30 * time.Second
 
 // watchRefreshConcurrency bounds how many detached watch preparations run at
