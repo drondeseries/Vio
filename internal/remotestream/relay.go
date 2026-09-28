@@ -209,19 +209,23 @@ func (c *relayRangeCache) put(key string, entry relayRangeCacheEntry) {
 }
 
 // relayRangeCacheKey names one complete upstream range response for a source.
-// The exact Range header and the effective outbound-header identity are part of
-// the key: a cache hit must answer the same request the upstream answered, under
-// the same source URL (which carries provider credentials) and the same
-// forwarded headers.
-func relayRangeCacheKey(target *url.URL, rangeHeader, headerIdentity string) string {
-	if target == nil {
+// The exact Range header, the effective outbound-header identity, and the relay
+// registration are part of the key: a cache hit must answer the same request
+// the upstream answered, under the same source URL (which carries provider
+// credentials) and the same forwarded headers, for the same registration
+// lifetime. The registration is the relay's generation/incarnation: a restart
+// or provider re-resolve registers a fresh token, so bytes cached for a
+// displaced generation are never replayed to its replacement even when the
+// upstream URL and Range are unchanged.
+func relayRangeCacheKey(target *url.URL, rangeHeader, headerIdentity, registration string) string {
+	if target == nil || registration == "" {
 		return ""
 	}
 	rangeHeader = strings.TrimSpace(rangeHeader)
 	if rangeHeader == "" {
 		return ""
 	}
-	return target.String() + "\x00" + rangeHeader + "\x00" + headerIdentity
+	return registration + "\x00" + target.String() + "\x00" + rangeHeader + "\x00" + headerIdentity
 }
 
 // relayRangeCacheHeaderIdentity hashes the effective outbound request headers
@@ -1066,7 +1070,7 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		upstream.Header.Get("If-Range") == "" &&
 		upstream.Header.Get("If-None-Match") == "" &&
 		upstream.Header.Get("If-Modified-Since") == "" {
-		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"), relayRangeCacheHeaderIdentity(upstream.Header))
+		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"), relayRangeCacheHeaderIdentity(upstream.Header), relayToken)
 		if entry, ok := r.rangeCache.get(cacheKey); ok {
 			for key, values := range entry.header {
 				for _, value := range values {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -75,8 +76,10 @@ func TestBuildPlaybackManifest_CopyVideoUsesRealManifest(t *testing.T) {
 	}
 
 	session := &TranscodeSession{
-		outputDir: tempDir,
+		outputDir:          tempDir,
+		segmentIncarnation: "inc",
 		opts: TranscodeOpts{
+			SessionID:        "s",
 			TargetCodecVideo: "copy",
 			TargetCodecAudio: "aac",
 			SegmentDuration:  2,
@@ -96,9 +99,9 @@ func TestBuildPlaybackManifest_CopyVideoUsesRealManifest(t *testing.T) {
 		"#EXT-X-MEDIA-SEQUENCE:9",
 		"#EXTINF:2.669000,",
 		"#EXTINF:1.669000,",
-		"#EXT-X-MAP:URI=\"segment/init.mp4?token=test\"",
-		"segment/seg_00009.m4s?token=test",
-		"segment/seg_00010.m4s?token=test",
+		"#EXT-X-MAP:URI=\"segment/init.mp4?token=test&sgen=s%3Ainc%3A0\"",
+		"segment/seg_00009.m4s?token=test&sgen=s%3Ainc%3A0",
+		"segment/seg_00010.m4s?token=test&sgen=s%3Ainc%3A0",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("manifest missing %q:\n%s", want, text)
@@ -106,6 +109,86 @@ func TestBuildPlaybackManifest_CopyVideoUsesRealManifest(t *testing.T) {
 	}
 	if strings.Contains(text, "#EXT-X-PLAYLIST-TYPE:VOD") {
 		t.Fatalf("copy-mode manifest should not be synthetic VOD:\n%s", text)
+	}
+}
+
+// A manifest request URL that already carries an sgen token must have it
+// replaced, not duplicated. Segment handlers read Query().Get("sgen"), which
+// returns the first value, so an appended duplicate would leave the caller's
+// stale token authoritative and reject every valid segment of the generation
+// that actually produced the manifest.
+func TestBuildPlaybackManifest_ReplacesPreexistingGenerationToken(t *testing.T) {
+	tempDir := t.TempDir()
+	manifest := strings.Join([]string{
+		"#EXTM3U",
+		"#EXT-X-VERSION:7",
+		"#EXT-X-TARGETDURATION:3",
+		"#EXT-X-MEDIA-SEQUENCE:9",
+		"#EXT-X-INDEPENDENT-SEGMENTS",
+		"#EXT-X-MAP:URI=\"init.mp4\"",
+		"#EXTINF:2.669000,",
+		"seg_00009.m4s",
+		"#EXTINF:1.669000,",
+		"seg_00010.m4s",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(tempDir, "stream.m3u8"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	for _, name := range []string{"init.mp4", "seg_00009.m4s", "seg_00010.m4s"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	session := &TranscodeSession{
+		outputDir:          tempDir,
+		segmentIncarnation: "inc",
+		opts: TranscodeOpts{
+			SessionID:        "s",
+			TargetCodecVideo: "copy",
+			TargetCodecAudio: "aac",
+			SegmentDuration:  2,
+			TotalDuration:    10,
+		},
+	}
+	current := session.GenerationToken()
+
+	got, err := session.BuildPlaybackManifest("segment/", "token=test&sgen=stale-token")
+	if err != nil {
+		t.Fatalf("BuildPlaybackManifest: %v", err)
+	}
+	text := string(got)
+	if strings.Contains(text, "stale-token") {
+		t.Fatalf("manifest still exposes the stale generation token:\n%s", text)
+	}
+
+	// One generation token per exposed URI: the init map and both segments.
+	seen := 0
+	for _, line := range strings.Split(text, "\n") {
+		idx := strings.Index(line, "segment/")
+		if idx < 0 {
+			continue
+		}
+		uri := strings.TrimSuffix(line[idx:], "\"")
+		parsed, err := url.Parse(uri)
+		if err != nil {
+			t.Fatalf("parse segment URI %q: %v", uri, err)
+		}
+		values := parsed.Query()
+		if _, ok := values[GenerationQueryParam]; !ok {
+			t.Fatalf("segment URI %q carries no generation token", uri)
+		}
+		if got := values.Get(GenerationQueryParam); got != current {
+			t.Fatalf("Query().Get(%q) for %q = %q, want %q", GenerationQueryParam, uri, got, current)
+		}
+		if n := len(values[GenerationQueryParam]); n != 1 {
+			t.Fatalf("segment URI %q carries %d %q values, want 1", uri, n, GenerationQueryParam)
+		}
+		seen++
+	}
+	if seen != 3 {
+		t.Fatalf("checked %d segment URIs, want 3:\n%s", seen, text)
 	}
 }
 
@@ -218,8 +301,10 @@ func TestBuildPlaybackManifest_CopyVideoWithoutDurationUsesRealManifest(t *testi
 	}
 
 	session := &TranscodeSession{
-		outputDir: tempDir,
+		outputDir:          tempDir,
+		segmentIncarnation: "inc",
 		opts: TranscodeOpts{
+			SessionID:        "s",
 			TargetCodecVideo: "copy",
 			TargetCodecAudio: "aac",
 			SegmentDuration:  2,
@@ -237,9 +322,9 @@ func TestBuildPlaybackManifest_CopyVideoWithoutDurationUsesRealManifest(t *testi
 		"#EXT-X-MEDIA-SEQUENCE:9",
 		"#EXTINF:2.669000,",
 		"#EXTINF:1.669000,",
-		"#EXT-X-MAP:URI=\"segment/init.mp4?token=test\"",
-		"segment/seg_00009.m4s?token=test",
-		"segment/seg_00010.m4s?token=test",
+		"#EXT-X-MAP:URI=\"segment/init.mp4?token=test&sgen=s%3Ainc%3A0\"",
+		"segment/seg_00009.m4s?token=test&sgen=s%3Ainc%3A0",
+		"segment/seg_00010.m4s?token=test&sgen=s%3Ainc%3A0",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("manifest missing %q:\n%s", want, text)
@@ -1165,9 +1250,9 @@ func TestCleanStaleOutputForRestart_CopyToToneMapEncodeRemovesStaleOutput(t *tes
 		ToneMapFilter:    "tonemap_opencl",
 	}
 
-	session := &TranscodeSession{outputDir: tempDir, opts: previous}
+	session := &TranscodeSession{outputDir: tempDir, opts: previous, runningRecipe: emittedRecipeOf(previous)}
 
-	if !session.cleanStaleOutputForRestart(previous, next, 7) {
+	if !session.cleanStaleOutputForRestart(emittedRecipeOf(next), 7) {
 		t.Fatal("cleanStaleOutputForRestart = false, want true for a copy -> tone-map restart")
 	}
 
@@ -1193,9 +1278,9 @@ func TestCleanStaleOutputForRestart_ToneMapModeChangeRemovesStaleOutput(t *testi
 	previous := TranscodeOpts{TargetCodecVideo: "h264", HWAccel: "qsv", ToneMapMode: tonemap.ModeHardware, ToneMapFilter: "tonemap_opencl"}
 	next := TranscodeOpts{TargetCodecVideo: "h264", HWAccel: HWAccelNone, ToneMapMode: tonemap.ModeSoftware, ToneMapFilter: "tonemap"}
 
-	session := &TranscodeSession{outputDir: tempDir, opts: previous}
+	session := &TranscodeSession{outputDir: tempDir, opts: previous, runningRecipe: emittedRecipeOf(previous)}
 
-	if !session.cleanStaleOutputForRestart(previous, next, 7) {
+	if !session.cleanStaleOutputForRestart(emittedRecipeOf(next), 7) {
 		t.Fatal("cleanStaleOutputForRestart = false, want true for a tone-map mode change")
 	}
 	if _, err := os.Stat(filepath.Join(tempDir, "stream.m3u8")); err == nil {
@@ -1214,10 +1299,10 @@ func TestCleanStaleOutputForRestart_SameEncodedRecipeKeepsSegments(t *testing.T)
 	}
 
 	opts := TranscodeOpts{TargetCodecVideo: "h264", HWAccel: "qsv", ToneMapMode: tonemap.ModeHardware, ToneMapFilter: "tonemap_opencl"}
-	session := &TranscodeSession{outputDir: tempDir, opts: opts}
+	session := &TranscodeSession{outputDir: tempDir, opts: opts, runningRecipe: emittedRecipeOf(opts)}
 
 	// A backward seek within one generation keeps its segments reusable.
-	if session.cleanStaleOutputForRestart(opts, opts, 7) {
+	if session.cleanStaleOutputForRestart(emittedRecipeOf(opts), 7) {
 		t.Fatal("cleanStaleOutputForRestart = true, want false for an unchanged encoded recipe")
 	}
 	if _, err := os.Stat(filepath.Join(tempDir, "stream.m3u8")); err != nil {
@@ -1286,6 +1371,12 @@ func TestTranscodeThrottlerIgnoresOutputFromAnEarlierGeneration(t *testing.T) {
 	writeManifestRange(t, tempDir, 225, 293, ".ts")
 	if err := os.Chtimes(filepath.Join(tempDir, "stream.m3u8"), fresh, fresh); err != nil {
 		t.Fatalf("chtimes manifest: %v", err)
+	}
+	// The current process writes its own segments alongside the manifest; a
+	// fresh playlist alone does not count as produced output, because retained
+	// prior-generation segments can appear in it.
+	for i := 225; i <= 293; i++ {
+		writeSegmentFile(t, tempDir, segmentFilename(i, TranscodeOpts{TargetCodecVideo: "h264"}), []byte("x"), fresh)
 	}
 	throttler.CheckOnce()
 	if !throttler.paused {

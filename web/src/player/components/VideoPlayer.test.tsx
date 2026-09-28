@@ -10,6 +10,7 @@ import type {
   PlaybackRealtimeEventEnvelope,
 } from "../realtime-protocol";
 import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
+import { HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES } from "../utils/bufferPolicy";
 import { HLS_STARTUP_TIMEOUT_MS } from "../utils/hlsStartupGuard";
 import { VideoPlayer } from "./VideoPlayer";
 
@@ -120,8 +121,13 @@ vi.mock("hls.js", () => ({
     static ErrorTypes = { NETWORK_ERROR: "networkError", MEDIA_ERROR: "mediaError" };
     static isSupported = () => hlsJS.supported;
 
+    config: { maxBufferLength?: number } | undefined;
+
     constructor(config?: unknown) {
       hlsJS.constructed(config);
+      // Real hls.js exposes its merged buffer config here; the player
+      // retargets `maxBufferLength` as playback starts, pauses and seeks.
+      this.config = config as { maxBufferLength?: number };
     }
 
     on(event: string, handler: (event: unknown, data: unknown) => void) {
@@ -2805,6 +2811,170 @@ describe("VideoPlayer native HLS timeline", () => {
     renderPlayer({ plan });
 
     await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+  });
+});
+
+describe("VideoPlayer HLS buffer policy", () => {
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    hlsJS.supported = true;
+    hlsJS.constructed.mockClear();
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  function hlsPlan(bitrateKbps?: number) {
+    return fixturePlanV3({
+      effective_recipe: {
+        video_codec: "h264",
+        audio_codec: "aac",
+        height: 1080,
+        ...(bitrateKbps === undefined ? {} : { bitrate_kbps: bitrateKbps }),
+      },
+    });
+  }
+
+  interface RecordedHlsConfig {
+    backBufferLength: number;
+    maxBufferLength: number;
+    maxMaxBufferLength: number;
+    maxBufferSize?: number;
+    startFragPrefetch: boolean;
+  }
+
+  function recordedConfig(): RecordedHlsConfig {
+    return hlsJS.constructed.mock.calls[0]?.[0] as RecordedHlsConfig;
+  }
+
+  // hls.js stops loading once the forward buffer reaches
+  //   min(max((8 * maxBufferSize) / levelBitrate, maxBufferLength), maxMaxBufferLength)
+  // (base-stream-controller.ts `getMaxBufferLength`). Recomputing it here asserts
+  // the window the player actually reaches, not just the config it assigns. An
+  // unset `maxBufferSize` falls back to hls.js's 60 MB default so the test would
+  // catch a regression that drops the byte target.
+  function effectiveForwardBufferSeconds(
+    config: RecordedHlsConfig,
+    levelBitrateBps: number,
+  ): number {
+    const maxBufferSize = config.maxBufferSize ?? HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES;
+    const byByteTarget = levelBitrateBps > 0 ? (8 * maxBufferSize) / levelBitrateBps : 0;
+    return Math.min(Math.max(byByteTarget, config.maxBufferLength), config.maxMaxBufferLength);
+  }
+
+  it("bounds the hls.js back buffer instead of leaving it unbounded", async () => {
+    renderPlayer({ plan: hlsPlan() });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+
+    const config = recordedConfig();
+    expect(config.backBufferLength).toBe(120);
+    expect(Number.isFinite(config.backBufferLength)).toBe(true);
+  });
+
+  it("keeps the high-bitrate back buffer inside the 60-120s window", async () => {
+    renderPlayer({ plan: hlsPlan(30_000) });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+
+    const config = recordedConfig();
+    expect(config.backBufferLength).toBe(60);
+    // The stable-play window is the configured ceiling; the initial paused
+    // target sits below it until the play event raises it.
+    expect(config.maxMaxBufferLength).toBe(60);
+  });
+
+  it("starts the forward target at the paused prefetch window", async () => {
+    renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+
+    const config = recordedConfig();
+    // hls.js may start loading right after attachMedia with no media event, so
+    // a paused start must not be constructed with the full stable-play window.
+    expect(config.maxBufferLength).toBe(30);
+    expect(config.maxMaxBufferLength).toBe(120);
+  });
+
+  it("enables forward fragment prefetch", async () => {
+    renderPlayer({ plan: hlsPlan() });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+
+    expect(recordedConfig().startFragPrefetch).toBe(true);
+  });
+
+  it("retargets the forward prefetch between stable play and seeking or pause", async () => {
+    const { container } = renderPlayer({ plan: hlsPlan() });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    const config = recordedConfig();
+    let playing = false;
+    let seeking = false;
+    Object.defineProperty(video, "paused", { configurable: true, get: () => !playing });
+    Object.defineProperty(video, "seeking", { configurable: true, get: () => seeking });
+
+    // Stable play fills toward the produced head.
+    playing = true;
+    fireEvent.play(video);
+    expect(config.maxBufferLength).toBe(120);
+
+    // A seek drops the target to the prefetch window so the client stops
+    // pulling media past a playhead that is not advancing.
+    seeking = true;
+    fireEvent.seeking(video);
+    expect(config.maxBufferLength).toBe(30);
+
+    // The seek settles and prefetch resumes.
+    seeking = false;
+    fireEvent.seeked(video);
+    expect(config.maxBufferLength).toBe(120);
+
+    // Paused media is not heading anywhere either.
+    playing = false;
+    fireEvent.pause(video);
+    expect(config.maxBufferLength).toBe(30);
+  });
+
+  it("keeps paused and seeking loading inside the intended window at the source bitrate", async () => {
+    const levelBitrateBps = 8_000_000; // 8 Mbps
+    const { container } = renderPlayer({
+      plan: hlsPlan(8_000),
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    const config = recordedConfig();
+    let playing = false;
+    let seeking = false;
+    Object.defineProperty(video, "paused", { configurable: true, get: () => !playing });
+    Object.defineProperty(video, "seeking", { configurable: true, get: () => seeking });
+
+    // A paused start must not let the default byte target push loading to ~60s.
+    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
+
+    // Stable play fills toward the produced head, still bounded by the window.
+    playing = true;
+    fireEvent.play(video);
+    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(120);
+
+    // A seek drops the effective loading limit to the prefetch window.
+    seeking = true;
+    fireEvent.seeking(video);
+    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
+
+    // Pausing does the same without a seek.
+    seeking = false;
+    playing = false;
+    fireEvent.pause(video);
+    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
   });
 });
 

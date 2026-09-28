@@ -134,11 +134,32 @@ func (t *TranscodeThrottler) run() {
 // CheckOnce performs a single throttle check. Exported for testing.
 func (t *TranscodeThrottler) CheckOnce() {
 	progress := t.session.SegmentProgress(time.Now())
-	if progress.ProducedHead < progress.StartSegmentNumber {
+	// Measure the forward buffer against media the CURRENT generation actually
+	// produced, not against every segment the shared output directory holds. On
+	// a restart that keeps an identical recipe's segments, ProducedHead includes
+	// the retained window ahead of the replacement process; pausing on it would
+	// stop a stable play before the new process wrote anything, and the manifest
+	// would never refresh, deadlocking the stream until the user seeks. The
+	// per-segment mtime fence (see SegmentProgress.ProducedHeadCurrentGeneration)
+	// is generation-aware even when the manifest's own mtime looks fresh.
+	head := progress.ProducedHead
+	if !progress.GenerationStartedAt.IsZero() {
+		head = progress.ProducedHeadCurrentGeneration
+	}
+	if head < progress.StartSegmentNumber {
+		// This generation has produced nothing yet. Resume if an earlier check
+		// paused on a prior generation's output, then wait for real progress.
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if t.paused {
+			log.Printf("playback: throttler resuming ffmpeg (produced output predates current generation)")
+			t.sendResume()
+			t.paused = false
+		}
 		return
 	}
 
-	gapSegments := progress.ProducedHead - progress.LastRequestedSegment
+	gapSegments := head - progress.LastRequestedSegment
 	segmentDuration := progress.SegmentDuration
 	if segmentDuration <= 0 {
 		segmentDuration = t.segmentDuration
@@ -147,22 +168,6 @@ func (t *TranscodeThrottler) CheckOnce() {
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	// Never pause on output the current ffmpeg process did not produce. A
-	// manifest left behind by an earlier generation in the same output
-	// directory reports that generation's head, which after a restart at an
-	// earlier position looks like an enormous buffer. Pausing on it stops the
-	// new process before it writes its first segment, so the manifest never
-	// refreshes and the gap never shrinks: the stream deadlocks until the user
-	// seeks. Resume instead if a previous check already paused on stale output.
-	if progressPredatesGeneration(progress) {
-		if t.paused {
-			log.Printf("playback: throttler resuming ffmpeg (produced output predates current generation)")
-			t.sendResume()
-			t.paused = false
-		}
-		return
-	}
 
 	if gap >= t.thresholdSeconds && !t.paused {
 		log.Printf("playback: throttler pausing ffmpeg (gap=%ds, threshold=%ds)", gap, t.thresholdSeconds)
@@ -185,7 +190,7 @@ func progressPredatesGeneration(progress SegmentProgress) bool {
 	if progress.GenerationStartedAt.IsZero() || !progress.HasManifest {
 		return false
 	}
-	return progress.ManifestModTime.Before(progress.GenerationStartedAt)
+	return progress.ProducedHeadCurrentGeneration < progress.StartSegmentNumber
 }
 
 func (t *TranscodeThrottler) sendPause() {
