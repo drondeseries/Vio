@@ -348,13 +348,21 @@ type SegmentProgress struct {
 	// output directory was spawned. It is the zero time for sessions that never
 	// started a process. Output stamped before it belongs to an earlier
 	// generation and must not be read as this process's progress.
-	GenerationStartedAt  time.Time
-	HasManifest          bool
-	Running              bool
-	Restarting           bool
-	StartSegmentNumber   int
-	SegmentDuration      int
-	LastRequestedSegment int
+	GenerationStartedAt time.Time
+	HasManifest         bool
+	// ProducedHeadCurrentGeneration is ProducedHead restricted to segments this
+	// generation's process actually wrote, judged by file mtime at or after
+	// GenerationStartedAt. On a restart that keeps a prior generation's segments
+	// (identical recipe), ProducedHead includes media the new process did not
+	// produce; throttling must measure prefetch against this head so a retained
+	// window ahead cannot pause a process that has produced nothing. Equal to
+	// ProducedHead when GenerationStartedAt is zero.
+	ProducedHeadCurrentGeneration int
+	Running                       bool
+	Restarting                    bool
+	StartSegmentNumber            int
+	SegmentDuration               int
+	LastRequestedSegment          int
 }
 
 // SegmentRecoveryDecision tells the segment handler whether to briefly wait
@@ -3151,13 +3159,14 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 	s.mu.Lock()
 	opts := s.opts
 	progress := SegmentProgress{
-		ProducedHead:         opts.StartSegmentNumber - 1,
-		Running:              s.running,
-		Restarting:           s.restarting != nil,
-		StartSegmentNumber:   opts.StartSegmentNumber,
-		SegmentDuration:      opts.SegmentDuration,
-		LastRequestedSegment: s.lastRequestedSegment,
-		GenerationStartedAt:  s.generationStartedAt,
+		ProducedHead:                  opts.StartSegmentNumber - 1,
+		ProducedHeadCurrentGeneration: opts.StartSegmentNumber - 1,
+		Running:                       s.running,
+		Restarting:                    s.restarting != nil,
+		StartSegmentNumber:            opts.StartSegmentNumber,
+		SegmentDuration:               opts.SegmentDuration,
+		LastRequestedSegment:          s.lastRequestedSegment,
+		GenerationStartedAt:           s.generationStartedAt,
 	}
 	s.mu.Unlock()
 
@@ -3194,6 +3203,11 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 			if info.ModTime().After(progress.LastProducedAt) {
 				progress.LastProducedAt = info.ModTime()
 			}
+			if progress.GenerationStartedAt.IsZero() || !info.ModTime().Before(progress.GenerationStartedAt) {
+				if entry.number > progress.ProducedHeadCurrentGeneration {
+					progress.ProducedHeadCurrentGeneration = entry.number
+				}
+			}
 		}
 	} else if s.outputDir != "" {
 		// Fallback: If the manifest is temporarily unreadable or being rewritten
@@ -3218,6 +3232,11 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 				}
 				if info.ModTime().After(progress.LastProducedAt) {
 					progress.LastProducedAt = info.ModTime()
+				}
+				if progress.GenerationStartedAt.IsZero() || !info.ModTime().Before(progress.GenerationStartedAt) {
+					if segNum > progress.ProducedHeadCurrentGeneration {
+						progress.ProducedHeadCurrentGeneration = segNum
+					}
 				}
 			}
 			if statErr == nil && progress.ProducedCount > 0 {
@@ -3635,34 +3654,74 @@ type emittedStreamRecipe struct {
 	toneMapMode     tonemap.Mode
 	toneMapFilter   string
 	hwAccel         string
+	// Copy/remux packaging. A copy generation writes the source bytes into a
+	// chosen container: the sample entry, the versioned copy recipe, and the
+	// MPEG-TS vs. fMP4 packaging all change those bytes even when the video
+	// codec string is unchanged.
+	videoSampleEntry string
+	copyFMP4Version  string
+	copyVideoMPEGTS  bool
+	// Audio bytes. Copying the selected track, encoding it to a target codec,
+	// and the encoded channel layout/bitrate all change the segment contents.
+	targetAudioCodec       string
+	audioTrackIndex        int
+	targetAudioChannels    int
+	targetAudioBitrateKbps int
+	// Burned-in subtitles are rendered into the video, so the burn-in choice,
+	// track, and codec change the emitted bytes.
+	subtitleBurnIn     bool
+	subtitleTrackIndex int
+	subtitleCodec      string
+	// Scaling and a video bitrate cap change encoded pixels; the segment
+	// duration renumbers the output timeline.
+	targetResolution  string
+	targetBitrateKbps int
+	segmentDuration   int
 }
 
 func emittedRecipeOf(opts TranscodeOpts) emittedStreamRecipe {
 	return emittedStreamRecipe{
-		videoCodec:      strings.ToLower(strings.TrimSpace(opts.TargetCodecVideo)),
-		bitstreamFilter: strings.TrimSpace(opts.VideoBitstreamFilter),
-		toneMapMode:     opts.ToneMapMode,
-		toneMapFilter:   strings.TrimSpace(opts.ToneMapFilter),
-		hwAccel:         strings.ToLower(strings.TrimSpace(opts.HWAccel)),
+		videoCodec:             strings.ToLower(strings.TrimSpace(opts.TargetCodecVideo)),
+		bitstreamFilter:        strings.TrimSpace(opts.VideoBitstreamFilter),
+		toneMapMode:            opts.ToneMapMode,
+		toneMapFilter:          strings.TrimSpace(opts.ToneMapFilter),
+		hwAccel:                strings.ToLower(strings.TrimSpace(opts.HWAccel)),
+		videoSampleEntry:       strings.ToLower(strings.TrimSpace(opts.VideoSampleEntry)),
+		copyFMP4Version:        strings.TrimSpace(opts.CopyFMP4RecipeVersion),
+		copyVideoMPEGTS:        opts.CopyVideoMPEGTS,
+		targetAudioCodec:       strings.ToLower(strings.TrimSpace(opts.TargetCodecAudio)),
+		audioTrackIndex:        opts.AudioTrackIndex,
+		targetAudioChannels:    opts.TargetAudioChannels,
+		targetAudioBitrateKbps: opts.TargetAudioBitrateKbps,
+		subtitleBurnIn:         opts.SubtitleBurnIn,
+		subtitleTrackIndex:     opts.SubtitleTrackIndex,
+		subtitleCodec:          strings.ToLower(strings.TrimSpace(opts.SubtitleCodec)),
+		targetResolution:       strings.ToLower(strings.TrimSpace(opts.TargetResolution)),
+		targetBitrateKbps:      opts.TargetBitrateKbps,
+		segmentDuration:        opts.SegmentDuration,
 	}
 }
 
 // cleanStaleOutputForRestart removes output the replacement generation must not
 // inherit. Old segments are only reusable when the previous and next generation
-// emit the same recipe: a recipe change (copy to an encoded target, a tone-map
-// mode or filter switch, a different hardware backend) leaves both
+// emit the identical recipe: a recipe change (copy to an encoded target, a
+// tone-map mode or filter switch, a different hardware backend, a different
+// sample entry or copy recipe version, an audio/packaging change) leaves both
 // wrong-generation segments at or after the restart point and a manifest
 // describing a stream the new process will never produce. Serving either mixes
 // generations, and reading the stale manifest as produced progress makes the
 // throttler pause a process that has not produced anything yet.
 //
-// Copy-mode restarts always clean, recipe change or not: a copy generation's
-// segment boundaries follow source keyframes, so a re-seek re-cuts the timeline
-// even when the recipe is identical.
+// A copy/remux restart with an unchanged recipe keeps its segments: the source
+// bytes at a given timeline position are identical, so a seek back inside the
+// retention window is served from the retained files instead of re-spawning
+// FFmpeg. Segment boundaries for copy video follow source keyframes, but the
+// numbering and origin are re-derived from the manifest on every restart, so
+// retained files remain addressable.
 //
 // It reports whether it cleaned, so callers can log the decision.
 func (s *TranscodeSession) cleanStaleOutputForRestart(previous, next TranscodeOpts, startSegment int) bool {
-	if !strings.EqualFold(next.TargetCodecVideo, "copy") && emittedRecipeOf(previous) == emittedRecipeOf(next) {
+	if emittedRecipeOf(previous) == emittedRecipeOf(next) {
 		return false
 	}
 	s.cleanStaleSegments(startSegment)
