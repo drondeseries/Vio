@@ -29,12 +29,11 @@ const (
 	// transport URL used to reach them: a virtual source resolves to the same
 	// underlying release for the lifetime of a session's candidate. The probe
 	// costs roughly 1.9s of session startup, so a short in-process TTL removes
-	// that cost from resume starts, replans, and concurrent starts at the same
-	// position without risking a stale anchor.
+	// that cost from resume starts, replans, seeks into an already-probed GOP,
+	// and concurrent starts without risking a stale anchor.
 	copySeekAnchorCacheTTL = 10 * time.Minute
 	// copySeekAnchorCacheMax bounds the cache. Entries are tiny and the live
-	// working set is the distinct (source, requested position) pairs being
-	// resumed.
+	// working set is the distinct (source, GOP) observations being resumed.
 	copySeekAnchorCacheMax = 256
 )
 
@@ -108,12 +107,22 @@ type anchorProbeRunner func(
 ) (float64, int, error)
 
 type copySeekAnchorCacheEntry struct {
-	anchor    copySeekAnchor
+	anchor copySeekAnchor
+	// maxRequested is the highest requested position proven to resolve to
+	// anchor. The anchor is the greatest keyframe at or before that request, so
+	// every position in (anchor, maxRequested] resolves to it too.
+	maxRequested float64
+	// gopEnd is the lowest later keyframe observed for the same source, or 0
+	// while none has been seen. It bounds forward reuse: a seek at or past the
+	// next keyframe belongs to another GOP and must be probed.
+	gopEnd    float64
 	expiresAt time.Time
 }
 
-// copySeekAnchorCache memoizes anchors by stable source identity and exact
-// requested position so a resume start does not pay for a fresh FFmpeg probe.
+// copySeekAnchorCache memoizes anchors by stable source identity, segment
+// duration, and FFmpeg build, keyed by the GOP (resolved keyframe) each anchor
+// starts. A resolved keyframe serves positions in its GOP, so a repeat or
+// random seek into an already-probed GOP does not pay for a fresh FFmpeg probe.
 // now and probe are injectable for tests and default to time.Now and the real
 // probe.
 type copySeekAnchorCache struct {
@@ -132,25 +141,73 @@ func (c *copySeekAnchorCache) clock() time.Time {
 	return time.Now()
 }
 
-func (c *copySeekAnchorCache) get(key string) (copySeekAnchor, bool) {
-	if c == nil || key == "" {
+// lookup returns the cached anchor for a requested position. It finds the
+// latest observed keyframe at or before requested and serves it when requested
+// lies inside that keyframe's GOP: at or before maxRequested (a position the
+// probe already resolved to this keyframe), before gopEnd (the next keyframe
+// seen for the source), or, while no later keyframe is known, before the end of
+// the keyframe's own nominal segment. A request exactly on a keyframe is never
+// served from that keyframe's entry: FFmpeg can emit the preceding packet for
+// an exact keyframe seek (Matroska pre-roll), so the boundary always re-probes.
+// fallback is the nominal segment duration and only bounds reuse for the newest
+// keyframe before a later one is observed.
+func (c *copySeekAnchorCache) lookup(sourceKey string, requested, fallback float64) (copySeekAnchor, bool) {
+	if c == nil || sourceKey == "" {
 		return copySeekAnchor{}, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.entries[key]
-	if !ok {
+	now := c.clock()
+	prefix := sourceKey + "\x00kf="
+	var best copySeekAnchorCacheEntry
+	found := false
+	for key, entry := range c.entries {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if !now.Before(entry.expiresAt) {
+			delete(c.entries, key)
+			continue
+		}
+		if entry.anchor.seconds > requested {
+			continue
+		}
+		if !found || entry.anchor.seconds > best.anchor.seconds {
+			best, found = entry, true
+		}
+	}
+	if !found {
 		return copySeekAnchor{}, false
 	}
-	if !c.clock().Before(entry.expiresAt) {
-		delete(c.entries, key)
+	if requested <= best.anchor.seconds {
+		// The request sits on the keyframe boundary; the probe may resolve the
+		// preceding packet, so this entry cannot answer it.
 		return copySeekAnchor{}, false
 	}
-	return entry.anchor, true
+	if requested <= best.maxRequested {
+		return best.anchor, true
+	}
+	if best.gopEnd > 0 {
+		if requested < best.gopEnd {
+			return best.anchor, true
+		}
+		return copySeekAnchor{}, false
+	}
+	if fallback > 0 {
+		segmentEnd := (math.Floor(best.anchor.seconds/fallback) + 1) * fallback
+		if requested < segmentEnd {
+			return best.anchor, true
+		}
+	}
+	return copySeekAnchor{}, false
 }
 
-func (c *copySeekAnchorCache) set(key string, anchor copySeekAnchor) {
-	if c == nil || key == "" {
+// store records a resolved anchor under its GOP key. maxRequested extends the
+// proven interval for that keyframe, and observing a later keyframe bounds the
+// GOP end of every earlier keyframe for the same source so forward reuse cannot
+// cross into the next GOP.
+func (c *copySeekAnchorCache) store(sourceKey string, requested float64, anchor copySeekAnchor) {
+	if c == nil || sourceKey == "" {
 		return
 	}
 	c.mu.Lock()
@@ -166,37 +223,75 @@ func (c *copySeekAnchorCache) set(key string, anchor copySeekAnchor) {
 			delete(c.entries, k)
 		}
 	}
-	for len(c.entries) >= c.maxEntries {
-		var oldestKey string
+	key := copySeekAnchorGOPKey(sourceKey, anchor.seconds)
+	entry, ok := c.entries[key]
+	if ok {
+		if requested > entry.maxRequested {
+			entry.maxRequested = requested
+		}
+		entry.expiresAt = now.Add(c.ttl)
+	} else {
+		entry = copySeekAnchorCacheEntry{anchor: anchor, maxRequested: requested, expiresAt: now.Add(c.ttl)}
+	}
+	c.entries[key] = entry
+	// A probe that resolved this keyframe is evidence a keyframe exists here;
+	// every earlier observed keyframe for the same source ends its GOP at or
+	// before it.
+	prefix := sourceKey + "\x00kf="
+	for k, other := range c.entries {
+		if k == key || !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		if other.anchor.seconds >= anchor.seconds {
+			continue
+		}
+		if other.gopEnd <= 0 || anchor.seconds < other.gopEnd {
+			other.gopEnd = anchor.seconds
+			c.entries[k] = other
+		}
+	}
+	for len(c.entries) > c.maxEntries {
+		oldestKey := ""
 		var oldest time.Time
-		for k, entry := range c.entries {
-			if oldestKey == "" || entry.expiresAt.Before(oldest) {
-				oldestKey, oldest = k, entry.expiresAt
+		for k, e := range c.entries {
+			if oldestKey == "" || e.expiresAt.Before(oldest) {
+				oldestKey, oldest = k, e.expiresAt
 			}
+		}
+		if oldestKey == "" {
+			break
 		}
 		delete(c.entries, oldestKey)
 	}
-	c.entries[key] = copySeekAnchorCacheEntry{anchor: anchor, expiresAt: now.Add(c.ttl)}
 }
 
-// copySeekAnchorCacheKey identifies one (source, exact requested position)
-// observation. The resolved FFmpeg path stays in the key because a different
-// build can copy a different packet at the same position; the requested
-// position stays exact because the anchor is defined as the keyframe FFmpeg's
-// input seek actually uses for that exact -ss, and two nearby positions can
-// straddle a keyframe boundary and resolve different anchors. A bucketed key
-// paired with an exact-position probe served the neighbor's anchor for the
-// straddling position, so the position is never rounded. sourceIdentity — not
-// inputPath — is in the key so concurrent resume starts that resolve to
-// different pinned relay URLs still share one probe, and segmentDuration is
-// kept because the returned segment index is derived from it.
-func copySeekAnchorCacheKey(ffmpegPath, sourceIdentity string, requestedSeekSeconds float64, segmentDuration int) string {
+// copySeekAnchorSourceKey identifies one (source, segment duration, FFmpeg
+// build) observation space. sourceIdentity — not inputPath — is used so
+// concurrent resume starts that resolve to different pinned relay URLs still
+// share one probe. The resolved FFmpeg path and the segment duration stay in the
+// key because both change the resolved anchor or the segment index derived from
+// it, so anchors are never reused across sources or segment durations.
+func copySeekAnchorSourceKey(ffmpegPath, sourceIdentity string, segmentDuration int) string {
 	return strings.Join([]string{
 		ffmpegPath,
 		sourceIdentity,
-		strconv.FormatFloat(requestedSeekSeconds, 'g', -1, 64),
 		strconv.Itoa(segmentDuration),
 	}, "\x00")
+}
+
+// copySeekAnchorGOPKey identifies one observed GOP by the keyframe that starts
+// it. Anchors are stored under this key rather than the requested position so a
+// probe serves the rest of its GOP.
+func copySeekAnchorGOPKey(sourceKey string, keyframe float64) string {
+	return sourceKey + "\x00kf=" + strconv.FormatFloat(keyframe, 'g', -1, 64)
+}
+
+// copySeekAnchorFlightKey identifies one in-flight probe for singleflight
+// coalescing. It keeps the exact requested position because two positions in
+// one GOP cannot be known to share a keyframe until the probe returns; only an
+// identical concurrent request joins the flight.
+func copySeekAnchorFlightKey(sourceKey string, requestedSeekSeconds float64) string {
+	return sourceKey + "\x00ss=" + strconv.FormatFloat(requestedSeekSeconds, 'g', -1, 64)
 }
 
 // copySeekAnchorProbe returns the configured probe runner, falling back to the
@@ -238,12 +333,17 @@ func ResolveCopySeekAnchor(
 // sourceIdentity is the provider-neutral URI or on-disk path that names the
 // same source across calls, so concurrent resume starts that resolve to
 // different relay URLs still share one probe. The anchor is a property of the
-// source bytes at the requested position, and the caller's candidate points at
-// one underlying release for the session, so a short-TTL cache is safe.
+// source bytes, and the caller's candidate points at one underlying release for
+// the session, so a short-TTL cache is safe.
 //
-// The cache is keyed on the exact requested position. A nearby seek can
-// straddle a keyframe boundary and resolve a different anchor, so it re-probes;
-// only a repeat of the same position is served from the cache.
+// Anchors are cached by the GOP (resolved keyframe) they start, not by the
+// exact requested position: a probe at T records T's keyframe and the whole GOP
+// it begins, so repeated and random seeks into that GOP reuse the anchor,
+// including a seek-reanchor replan for the same session, instead of spawning
+// another ~1.9s FFmpeg probe. Reuse is bounded to the GOP observed for the
+// source (and one nominal segment for the newest keyframe), so a seek past the
+// next keyframe probes. The source identity and segment duration remain part of
+// the key, so an anchor is never reused across sources or segment durations.
 func ResolveCopySeekAnchorForSource(
 	ctx context.Context,
 	ffmpegPath string,
@@ -267,18 +367,21 @@ func ResolveCopySeekAnchorForSource(
 	if identity == "" {
 		identity = inputPath
 	}
-	key := copySeekAnchorCacheKey(resolvedFFmpegPath, identity, requestedSeekSeconds, segmentDuration)
+	sourceKey := copySeekAnchorSourceKey(resolvedFFmpegPath, identity, segmentDuration)
+	fallback := float64(segmentDuration)
 
-	// Fast path: a previous call already resolved this exact anchor. This is
-	// what turns a repeat resume at the same position into a zero-probe start.
-	if anchor, ok := copySeekAnchors.get(key); ok {
+	// Fast path: a previous probe resolved this position's GOP. This is what
+	// turns a repeat or random seek into an already-probed GOP into a zero-probe
+	// start.
+	if anchor, ok := copySeekAnchors.lookup(sourceKey, requestedSeekSeconds, fallback); ok {
 		return anchor.seconds, anchor.segment, nil
 	}
 
-	resultCh := copySeekProbeGroup.DoChan(key, func() (any, error) {
+	flightKey := copySeekAnchorFlightKey(sourceKey, requestedSeekSeconds)
+	resultCh := copySeekProbeGroup.DoChan(flightKey, func() (any, error) {
 		// Another caller may have populated the cache between the fast-path
 		// check and this closure starting.
-		if anchor, ok := copySeekAnchors.get(key); ok {
+		if anchor, ok := copySeekAnchors.lookup(sourceKey, requestedSeekSeconds, fallback); ok {
 			return anchor, nil
 		}
 		budget, shortened := copySeekProbeTimeoutFor(ctx)
@@ -315,7 +418,7 @@ func ResolveCopySeekAnchorForSource(
 			return copySeekAnchor{}, err
 		}
 		anchor := copySeekAnchor{seconds: seconds, segment: segment}
-		copySeekAnchors.set(key, anchor)
+		copySeekAnchors.store(sourceKey, requestedSeekSeconds, anchor)
 		return anchor, nil
 	})
 
