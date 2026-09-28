@@ -160,6 +160,29 @@ function describeTerminalCopy(terminal: TerminalV3): { title: string; message: s
 }
 
 /**
+ * True when a transport error means the playback session itself is gone.
+ *
+ * None of these can be repaired by retrying against the same session id:
+ * `playback_session_not_found` (404) is a reaped session, `playback_session_ended`
+ * (410) is one the server has stopped, and a 401 that survives the one token
+ * refresh `playerFetchResponse` already performs means the sign-in is gone.
+ * Callers retire the dead session and start a new one instead of reusing it.
+ *
+ * A plain 404 (`not_found`) is deliberately *not* dead: it names a missing
+ * source file, which a fresh start cannot conjure back.
+ */
+export function isDeadPlaybackSessionError(error: unknown): boolean {
+  if (!(error instanceof PlayerFetchError)) {
+    return false;
+  }
+  return (
+    error.code === "playback_session_not_found" ||
+    error.code === "playback_session_ended" ||
+    error.status === 401
+  );
+}
+
+/**
  * Describes the transport-level failures the v3 endpoints still express as HTTP
  * status codes, which are the ones about the *request* rather than the plan.
  * `426` is the one clients must render distinctly: it means this build is too
