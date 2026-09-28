@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -85,5 +86,45 @@ func TestAttachVirtualCandidateScoresRecoversScorerPanic(t *testing.T) {
 
 	if versions[0].FormatScore != nil {
 		t.Fatalf("score = %v, want nil after a scorer panic", versions[0].FormatScore)
+	}
+}
+
+// TestAttachVirtualCandidateScoresBoundsConcurrentScorers pins that a scorer
+// that ignores cancellation cannot strand an unbounded number of goroutines.
+// Every slot is filled with a scorer that never returns; the next lookup must
+// fail open without starting another scorer.
+func TestAttachVirtualCandidateScoresBoundsConcurrentScorers(t *testing.T) {
+	prev := virtualScoreTimeout
+	virtualScoreTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { virtualScoreTimeout = prev })
+
+	released := make(chan struct{})
+	var started atomic.Int64
+	svc := &DetailService{virtualScoreSource: func(_ context.Context, _ string, _ []*models.MediaFile) map[int]int {
+		started.Add(1)
+		<-released
+		return nil
+	}}
+	t.Cleanup(func() { close(released) })
+
+	for i := 0; i < virtualScoreConcurrency; i++ {
+		svc.attachVirtualCandidateScores(context.Background(), "movie:heat", []FileVersion{{FileID: 7}}, []*models.MediaFile{{ID: 7}})
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for started.Load() < int64(virtualScoreConcurrency) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := started.Load(); got != int64(virtualScoreConcurrency) {
+		t.Fatalf("scorers started = %d, want %d", got, virtualScoreConcurrency)
+	}
+
+	// Every slot is held, so this lookup must fail open without spawning.
+	versions := []FileVersion{{FileID: 7}}
+	svc.attachVirtualCandidateScores(context.Background(), "movie:heat", versions, []*models.MediaFile{{ID: 7}})
+	if versions[0].FormatScore != nil {
+		t.Fatalf("score = %v, want nil when every slot is held", versions[0].FormatScore)
+	}
+	if got := started.Load(); got != int64(virtualScoreConcurrency) {
+		t.Fatalf("scorers started = %d after saturation, want %d (no unbounded spawn)", got, virtualScoreConcurrency)
 	}
 }
