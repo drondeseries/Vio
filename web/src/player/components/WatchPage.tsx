@@ -465,9 +465,22 @@ function WatchPagePlayer({
       queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
       staleTime: 0,
     });
-    setPlaybackVersions(detail.versions);
+    // The refreshed list is the server's, but the live session may still be on
+    // a source the re-list did not return (a rotation, or a candidate the
+    // server resolved the collapsed row to). Re-key that committed source into
+    // the fresh list so the version, audio and subtitle menus keep resolving
+    // their active row — and the provenance they display — against it.
+    const live = sessionRef.current;
+    setPlaybackVersions(
+      mergeResolvedLiveVersion(
+        detail.versions,
+        live.mediaFileId,
+        { mediaFileId: live.mediaFileId, effectiveVirtualUri: live.effectiveVirtualUri },
+        versions,
+      ),
+    );
     setIndexerReleaseRows(detail.indexer_releases ?? []);
-  }, [awaitAdminJob, contentId, fileId, libraryId, queryClient]);
+  }, [awaitAdminJob, contentId, fileId, libraryId, queryClient, versions]);
   const handleCancelRefresh = useCallback(async () => {
     await cancelVirtualCandidatesRefresh(contentId);
   }, [contentId]);
@@ -1125,6 +1138,7 @@ function WatchPagePlayer({
         indexerReleases={indexerReleaseRows}
         virtualRanking={virtualRanking}
         activeFileId={session.mediaFileId}
+        activeVirtualUri={session.effectiveVirtualUri}
         chapters={activeChapters}
         onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}
         onRefreshVersions={handleRefreshVersions}

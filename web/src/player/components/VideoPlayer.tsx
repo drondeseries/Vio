@@ -226,6 +226,13 @@ interface VideoPlayerProps {
   /** The ranking the server applied to the version list, forwarded to the menu. */
   virtualRanking?: PlayerVirtualRanking;
   activeFileId?: number | null;
+  /**
+   * The committed effective source's file path, from the session's live
+   * `source_committed` identity. A serve-layer rotation moves it without
+   * rebuilding the plan, so the version menu must resolve its active row from
+   * this rather than the plan's stale `effective_virtual_uri`.
+   */
+  activeVirtualUri?: string | null;
   chapters?: PlayerChapter[];
   onSwitchVersion?: (fileId: number, currentPosition: number) => void;
   /** Re-lists the title's video candidates for the version menu. */
@@ -428,6 +435,7 @@ export function VideoPlayer({
   indexerReleases = [],
   virtualRanking,
   activeFileId,
+  activeVirtualUri,
   chapters = [],
   onSwitchVersion,
   onRefreshVersions,
@@ -777,10 +785,11 @@ export function VideoPlayer({
     () =>
       resolveEffectiveVersion(versions, {
         mediaFileId: activeFileId ?? plan.effective_media_file_id,
-        effectiveVirtualUri: plan.effective_virtual_uri ?? null,
+        effectiveVirtualUri: activeVirtualUri ?? plan.effective_virtual_uri ?? null,
       }) ?? selectedVersion,
     [
       activeFileId,
+      activeVirtualUri,
       plan.effective_media_file_id,
       plan.effective_virtual_uri,
       selectedVersion,
