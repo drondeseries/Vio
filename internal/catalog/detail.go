@@ -818,6 +818,13 @@ type DetailService struct {
 	// watchRefreshWG tracks the detached watch preparations so tests can wait
 	// for them. Production never waits: see prepareWatchFiles.
 	watchRefreshWG sync.WaitGroup
+	// watchRefreshSem bounds the detached watch preparations that run at once.
+	// Each refresh can wait behind the ensurer's own probe slots for up to
+	// watchPrepareRefreshTimeout; without a cap a burst of distinct watch
+	// targets would accumulate waiting goroutines and queue work. Lazily
+	// created by watchRefreshSemaphore.
+	watchRefreshSem     chan struct{}
+	watchRefreshSemOnce sync.Once
 
 	// resolver is built once on first use; see settingsResolver.
 	resolverOnce sync.Once
@@ -4357,6 +4364,13 @@ const watchPreparedMaxEntries = 4096
 // still lands and persists instead of being cancelled on every attempt.
 const watchPrepareRefreshTimeout = 30 * time.Second
 
+// watchRefreshConcurrency bounds how many detached watch preparations run at
+// once. Each one blocks on the ensurer's probe slots, so the cap keeps a burst
+// of distinct watch targets from accumulating goroutines and thumbnail queue
+// work faster than the probe pipeline can drain them. A refresh that cannot
+// take a slot drops its memo claim so a later fetch retries.
+const watchRefreshConcurrency = 8
+
 // watchPrepareState records one prepared watch target: the identity of the file
 // set it was prepared against (watchFilesFingerprint) and when.
 type watchPrepareState struct {
@@ -4435,6 +4449,11 @@ func (s *DetailService) prepareWatchFiles(
 // playback start behind it) will read. context.WithoutCancel keeps the request's
 // logging and tracing values while dropping its cancellation, and
 // watchPrepareRefreshTimeout guards against a wedged ensurer.
+//
+// A slot from watchRefreshSemaphore bounds how many refreshes run at once. If
+// none is free the claim is removed and the refresh is skipped, so a burst of
+// distinct targets cannot pile up goroutines waiting behind the probe slots; a
+// later fetch retries.
 func (s *DetailService) refreshWatchFilesAsync(
 	ctx context.Context,
 	contentID string,
@@ -4456,9 +4475,21 @@ func (s *DetailService) refreshWatchFilesAsync(
 	}
 
 	base := context.WithoutCancel(ctx)
+	sem := s.watchRefreshSemaphore()
+	select {
+	case sem <- struct{}{}:
+	default:
+		// Saturated: drop the claim so a later fetch retries instead of
+		// queuing another goroutine behind the probe slots.
+		s.watchPrepareMu.Lock()
+		delete(s.watchPrepared, contentID)
+		s.watchPrepareMu.Unlock()
+		return
+	}
 	s.watchRefreshWG.Add(1)
 	go func() {
 		defer s.watchRefreshWG.Done()
+		defer func() { <-sem }()
 		refreshCtx, cancel := context.WithTimeout(base, watchPrepareRefreshTimeout)
 		defer cancel()
 		prepared := s.preparePlaybackFiles(refreshCtx, snapshot)
@@ -4471,6 +4502,16 @@ func (s *DetailService) refreshWatchFilesAsync(
 			preparedAt:  time.Now(),
 		})
 	}()
+}
+
+// watchRefreshSemaphore lazily creates the semaphore that bounds detached watch
+// preparations. It is created on first use so a service that never serves a
+// watch detail allocates nothing.
+func (s *DetailService) watchRefreshSemaphore() chan struct{} {
+	s.watchRefreshSemOnce.Do(func() {
+		s.watchRefreshSem = make(chan struct{}, watchRefreshConcurrency)
+	})
+	return s.watchRefreshSem
 }
 
 // recordWatchPrepare stores a prepared state, pruning expired entries when the

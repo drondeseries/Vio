@@ -260,6 +260,57 @@ func (e *failingProbeEnsurer) EnsureCopySafetyCached(_ context.Context, file *mo
 	return file, errors.New("probe failed")
 }
 
+// A saturated watch-refresh semaphore must drop the memo claim and launch no
+// goroutine, so a later fetch can retry instead of piling up behind the probe
+// slots. Draining a slot lets the retry through.
+func TestPrepareWatchFilesDropsClaimWhenRefreshSaturated(t *testing.T) {
+	ensurer := newBlockingProbeEnsurer()
+	svc := &DetailService{probeEnsurer: ensurer}
+	sem := svc.watchRefreshSemaphore()
+	for i := 0; i < watchRefreshConcurrency; i++ {
+		sem <- struct{}{}
+	}
+	defer func() {
+		for {
+			select {
+			case <-sem:
+			default:
+				return
+			}
+		}
+	}()
+
+	files := []*models.MediaFile{{ID: 1}}
+	prepared := svc.prepareWatchFiles(context.Background(), "movie-saturated", "movie", files)
+	if len(prepared) != 1 {
+		t.Fatalf("prepareWatchFiles() returned %d files, want 1", len(prepared))
+	}
+	svc.watchRefreshWG.Wait()
+	if got := ensurer.calls.Load(); got != 0 {
+		t.Fatalf("saturated refresh ran %d probes, want 0", got)
+	}
+	svc.watchPrepareMu.Lock()
+	_, claimed := svc.watchPrepared["movie-saturated"]
+	svc.watchPrepareMu.Unlock()
+	if claimed {
+		t.Fatal("saturated refresh left its memo claim; a later fetch would not retry")
+	}
+
+	// Draining a slot lets a later fetch retry and claim again.
+	<-sem
+	prepared = svc.prepareWatchFiles(context.Background(), "movie-saturated", "movie", files)
+	if len(prepared) != 1 {
+		t.Fatalf("retry prepareWatchFiles() returned %d files, want 1", len(prepared))
+	}
+	select {
+	case <-ensurer.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry after draining did not start a refresh")
+	}
+	close(ensurer.release)
+	svc.watchRefreshWG.Wait()
+}
+
 // Chapter-thumbnail queueing moves with the rest of the preparation: the first
 // fetch for a file set enqueues once, in the background, and a repeated fetch
 // of the same unchanged set does not enqueue again.
