@@ -936,17 +936,15 @@ func (h *PlaybackHandler) ensurePlaybackProbeStart(ctx context.Context, file *mo
 		return file
 	}
 	entry, owner := h.claimPlaybackProbeRefresh(file)
-	if owner {
-		h.refreshPlaybackProbeAsync(ctx, entry, file)
-	} else {
-		select {
-		case <-entry.done:
-			// A refresh already landed for this generation before the request
-			// arrived; the row it read carries the repaired metadata.
-			return file
-		default:
-		}
+	if !owner {
+		// A refresh is already in flight for this generation, or the memo
+		// refused admission. Either way this caller is a joiner: the helper's
+		// contract is that concurrent starts do not block on the refresh, so
+		// serve the row's known metadata. The owner's repair persists (or a
+		// later start retries), and the next start reads the repaired rows.
+		return file
 	}
+	h.refreshPlaybackProbeAsync(ctx, entry, file)
 
 	timer := time.NewTimer(h.playbackProbeStartBudget())
 	defer timer.Stop()

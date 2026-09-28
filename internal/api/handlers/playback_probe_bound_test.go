@@ -205,6 +205,44 @@ func TestEnsurePlaybackProbeStartBackgroundRepairSurvivesClientCancel(t *testing
 	}
 }
 
+// A concurrent start that joins an in-flight refresh must not wait on it.
+// Only the refresh owner pays the bounded wait.
+func TestEnsurePlaybackProbeStartJoinerReturnsWithoutWaiting(t *testing.T) {
+	ensurer := newGatedPlaybackProbeEnsurer()
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.ProbeEnsurer = ensurer
+	// Long enough that a joiner entering the bounded wait would be obvious.
+	h.probeStartBudget = 5 * time.Second
+	file := &models.MediaFile{ID: 82, FilePath: "/library/join.mkv", FileSize: 1024}
+
+	// The owner starts the detached refresh and parks on the bounded wait.
+	ownerDone := make(chan struct{})
+	go func() {
+		h.ensurePlaybackProbeStart(context.Background(), file)
+		close(ownerDone)
+	}()
+	select {
+	case <-ensurer.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background probe repair never started")
+	}
+
+	start := time.Now()
+	if got := h.ensurePlaybackProbeStart(context.Background(), file); got != file {
+		t.Fatalf("joiner changed the served file: got %p want %p", got, file)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("joiner waited %s on the owner's in-flight refresh, want an immediate return", elapsed)
+	}
+
+	close(ensurer.release)
+	<-ownerDone
+	h.probeRefreshWG.Wait()
+	if got := ensurer.calls.Load(); got != 1 {
+		t.Fatalf("two starts called the probe %d times, want 1", got)
+	}
+}
+
 // The full start handler proves the bound end to end: a blocking probe does not
 // hold the POST /playback/start response past its budget.
 func TestHandleStartPlaybackV3ReturnsBoundedOnSlowProbe(t *testing.T) {
