@@ -10,8 +10,10 @@ import {
   settingsCapabilitiesSupportKey,
   type SettingIdentity,
   useClearSettingValue,
+  useEffectiveSettings,
   useSetNavigationShortcutPresence,
   useSetSettingValue,
+  useSettingValue,
   useSettingsCapabilities,
 } from "./settingValues";
 
@@ -276,5 +278,55 @@ describe("settings capability gates", () => {
         supports_atomic_shortcuts: true,
       }),
     ).toBe(true);
+  });
+});
+
+describe("effective settings batching", () => {
+  afterEach(() => {
+    cleanup();
+    v2Mock.mockReset().mockResolvedValue(undefined);
+  });
+
+  const effectiveCalls = () =>
+    v2Mock.mock.calls.filter(
+      ([operation]) => operation === "GET /api/v2/settings/values/effective",
+    );
+
+  it("shares one all-keys read across default-context callers", async () => {
+    v2Mock.mockResolvedValue({ items: [] });
+    const { result } = renderHook(
+      () => ({
+        theme: useSettingValue(SETTING_KEYS.UI_THEME),
+        quality: useSettingValue(SETTING_KEYS.PLAYBACK_PREFERRED_QUALITY),
+      }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.theme.isSuccess).toBe(true));
+    await waitFor(() => expect(result.current.quality.isSuccess).toBe(true));
+
+    // Two hooks with different key subsets, one request. The subset is not sent:
+    // the default context asks for the whole remote set so every shell read
+    // shares this entry.
+    expect(effectiveCalls()).toHaveLength(1);
+    expect(effectiveCalls()[0]![1].query.keys).toBeUndefined();
+  });
+
+  it("keeps a content-context read on its own keyed request", async () => {
+    v2Mock.mockResolvedValue({ items: [] });
+    const { result } = renderHook(
+      () =>
+        useEffectiveSettings({
+          keys: [SETTING_KEYS.UI_THEME],
+          libraryIds: [3],
+          seriesIds: ["tv:1"],
+        }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const request = effectiveCalls()[0]!;
+    expect(request[1].query.keys).toEqual([SETTING_KEYS.UI_THEME]);
+    expect(request[1].query.library_ids).toEqual(["3"]);
+    expect(request[1].query.series_ids).toEqual(["tv:1"]);
   });
 });
