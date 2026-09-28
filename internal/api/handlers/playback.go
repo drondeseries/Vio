@@ -973,6 +973,11 @@ func (h *PlaybackHandler) ensurePlaybackProbeStart(ctx context.Context, file *mo
 // caller owns starting its refresh. A caller owns the refresh when the memo has
 // no unexpired entry for this file generation. A fresh entry carries a closed
 // done channel; an in-flight entry's channel closes when the repair lands.
+//
+// The memo never exceeds playbackProbePreparedMaxEntries. When it is at the
+// ceiling and expiry has not freed a slot, the claim is refused: it returns no
+// entry and no owner, and the caller must serve known metadata without
+// scheduling a probe. A later start retries once an entry ages out.
 func (h *PlaybackHandler) claimPlaybackProbeRefresh(file *models.MediaFile) (*playbackProbeRefresh, bool) {
 	fingerprint := playbackProbeFingerprint(file)
 	now := time.Now()
@@ -985,17 +990,35 @@ func (h *PlaybackHandler) claimPlaybackProbeRefresh(file *models.MediaFile) (*pl
 		if existing.fingerprint == fingerprint && now.Sub(existing.preparedAt) < playbackProbePreparedTTL {
 			return existing, false
 		}
+		// A stale or superseded entry no longer suppresses a refresh; drop it
+		// before the admission check so it does not count against the ceiling.
+		delete(h.probeRefreshed, file.ID)
 	}
 	if len(h.probeRefreshed) >= playbackProbePreparedMaxEntries {
-		for id, existing := range h.probeRefreshed {
-			if now.Sub(existing.preparedAt) >= playbackProbePreparedTTL {
-				delete(h.probeRefreshed, id)
-			}
+		if h.prunePlaybackProbeRefreshesLocked(now) == 0 {
+			// Every entry is still live. Refuse admission rather than grow the
+			// memo past its ceiling; the caller schedules no probe and a later
+			// start retries once an entry ages out.
+			return nil, false
 		}
 	}
 	entry := &playbackProbeRefresh{fingerprint: fingerprint, preparedAt: now, done: make(chan struct{})}
 	h.probeRefreshed[file.ID] = entry
 	return entry, true
+}
+
+// prunePlaybackProbeRefreshesLocked drops expired entries and reports how many
+// it removed. It is called only when the memo is at its ceiling, so the sweep
+// runs at most once per claim while full.
+func (h *PlaybackHandler) prunePlaybackProbeRefreshesLocked(now time.Time) int {
+	removed := 0
+	for id, existing := range h.probeRefreshed {
+		if now.Sub(existing.preparedAt) >= playbackProbePreparedTTL {
+			delete(h.probeRefreshed, id)
+			removed++
+		}
+	}
+	return removed
 }
 
 // refreshPlaybackProbeAsync runs one probe repair on a detached goroutine. The

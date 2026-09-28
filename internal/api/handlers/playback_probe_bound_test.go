@@ -243,6 +243,64 @@ func TestEnsurePlaybackProbeStartJoinerReturnsWithoutWaiting(t *testing.T) {
 	}
 }
 
+// At the memo ceiling with every entry still live, a new claim is refused: the
+// memo does not grow and no detached probe is scheduled.
+func TestClaimPlaybackProbeRefreshRefusesWhenMemoFull(t *testing.T) {
+	ensurer := newGatedPlaybackProbeEnsurer()
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.ProbeEnsurer = ensurer
+	h.probeStartBudget = 20 * time.Millisecond
+
+	done := make(chan struct{})
+	close(done)
+	now := time.Now()
+	h.probeRefreshed = make(map[int]*playbackProbeRefresh, playbackProbePreparedMaxEntries)
+	for i := 0; i < playbackProbePreparedMaxEntries; i++ {
+		h.probeRefreshed[i] = &playbackProbeRefresh{fingerprint: "live", preparedAt: now, done: done}
+	}
+
+	file := &models.MediaFile{ID: playbackProbePreparedMaxEntries, FilePath: "/library/new.mkv", FileSize: 1}
+	if got := h.ensurePlaybackProbeStart(context.Background(), file); got != file {
+		t.Fatalf("saturated memo changed the served file: got %p want %p", got, file)
+	}
+	if got := len(h.probeRefreshed); got != playbackProbePreparedMaxEntries {
+		t.Fatalf("memo size = %d after a claim at the ceiling, want %d", got, playbackProbePreparedMaxEntries)
+	}
+	if got := ensurer.calls.Load(); got != 0 {
+		t.Fatalf("refused claim scheduled %d probe repairs, want 0", got)
+	}
+}
+
+// Expiry still frees slots at the ceiling: the sweep admits one new claim and
+// the memo stays within its bound.
+func TestClaimPlaybackProbeRefreshPrunesExpiredAtCeiling(t *testing.T) {
+	ensurer := newGatedPlaybackProbeEnsurer()
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	h.ProbeEnsurer = ensurer
+	h.probeStartBudget = 20 * time.Millisecond
+
+	done := make(chan struct{})
+	close(done)
+	stale := time.Now().Add(-2 * playbackProbePreparedTTL)
+	h.probeRefreshed = make(map[int]*playbackProbeRefresh, playbackProbePreparedMaxEntries)
+	for i := 0; i < playbackProbePreparedMaxEntries; i++ {
+		h.probeRefreshed[i] = &playbackProbeRefresh{fingerprint: "stale", preparedAt: stale, done: done}
+	}
+
+	file := &models.MediaFile{ID: playbackProbePreparedMaxEntries, FilePath: "/library/retry.mkv", FileSize: 1}
+	h.ensurePlaybackProbeStart(context.Background(), file)
+	if got := len(h.probeRefreshed); got > playbackProbePreparedMaxEntries {
+		t.Fatalf("memo size = %d after admitting past the ceiling, want at most %d", got, playbackProbePreparedMaxEntries)
+	}
+	select {
+	case <-ensurer.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expired-ceiling claim did not schedule a probe")
+	}
+	close(ensurer.release)
+	h.probeRefreshWG.Wait()
+}
+
 // The full start handler proves the bound end to end: a blocking probe does not
 // hold the POST /playback/start response past its budget.
 func TestHandleStartPlaybackV3ReturnsBoundedOnSlowProbe(t *testing.T) {
