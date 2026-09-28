@@ -107,7 +107,7 @@ the document is always the full one:
 }
 ```
 
-The fifteen feature strings above are the full set this server version advertises on `/api/v1`. `/api/v2` advertises them plus `subrip_sidecar_v1`:
+The fifteen feature strings above are the full set this server version advertises on `/api/v1`. `/api/v2` advertises them plus `subrip_sidecar_v1` and `source_committed_event_v1`:
 
 | Feature | What it promises |
 | --- | --- |
@@ -127,6 +127,7 @@ The fifteen feature strings above are the full set this server version advertise
 | `plan_invalidated_v1` | The client can be told mid-session that the plan it is playing was withdrawn, over the realtime `plan_invalidated` command, and replans off it. A session that did not negotiate it is stopped instead (§6.1) |
 | `plan_source_duration_v1` | `source.duration_seconds` is populated when known, so its absence means *unknown* rather than *unsupported* (§5) |
 | `subrip_sidecar_v1` | `/api/v2` only. An opted-in client that parses SubRip itself receives external and downloaded SRT tracks as the original `.srt` file instead of the WebVTT conversion (§8) |
+| `source_committed_event_v1` | `/api/v2` only. The server pushes the realtime `source_committed` event the moment a transport commits to an effective version, including a serve-layer rotation, so the client re-keys its version menu and adopts the declared inventory before the probe lands (§6.2) |
 
 `plan_source_duration_v1` is the reason feature detection is a list and not a version
 number: without it, a client cannot tell a server that never sends the runtime
@@ -1197,6 +1198,58 @@ verdict write is conditional on the row still holding the size and mtime that
 were scanned: a file rewritten in place while the scan read it produces a
 verdict about bytes nobody is serving, which is neither persisted nor pushed at
 any session.
+
+### 6.2 `source_committed_event_v1` — the committed version is published at commit
+
+A serve-layer rotation can move a live session to a sibling release without ever
+building a new plan: the pinned candidate stops resolving and the stream handler
+rebinds the session to a live sibling (§2.2, "Residual candidate-identity
+notes"). Until now the client learned about that move only indirectly — a
+subtitle fetch answered `409 subtitle_source_changed`, or a later replan — so a
+client with no subtitle traffic could keep naming the previous release and its
+tracks indefinitely.
+
+`source_committed` is the direct signal. The server pushes it as a realtime
+**event** (not a command; there is nothing to ack) on the session control socket
+the moment the transport commits to an effective version:
+
+```json
+{
+  "type": "event",
+  "session_id": "…",
+  "name": "source_committed",
+  "payload": {
+    "session_id": "…",
+    "effective_media_file_id": 200,
+    "effective_virtual_uri": "virtual://movie/…?result=B",
+    "virtual_source_revision": "",
+    "inventory_status": "declared",
+    "audio_tracks": [{"language": "deu", "codec": "eac3", "default": true}]
+  }
+}
+```
+
+`effective_virtual_uri` is the identity the version menu keys on; it is the
+live session binding, so it follows a rotation even though the plan still names
+release A. `audio_tracks` is the committed release's **declared** inventory and
+is always present (an empty release declares `[]`, never an absent field), and it
+is never the previous release's list. A client that adopts
+the payload re-keys its version and audio menus to the streamed release
+immediately and leaves the audio list provisional, exactly as it does for a plan
+with `inventory_provenance: "declared"`.
+
+The event carries the commit, not the probe. When the background ffprobe lands,
+its evidence is persisted to the catalog row and the client's existing inventory
+poll (or a verified replan) upgrades the declared list to real tracks: the same
+provenance path a deferred start already uses. A client that never receives the
+event — an older build, or a session without a live realtime connection — keeps
+its previous behavior and still converges through the subtitle `409` and replan
+paths.
+
+The server pushes the event best-effort and does not gate it on a negotiated
+feature; a client that does not know the name ignores it. `/api/v2` advertises
+`source_committed_event_v1` in `features` so a client can tell a server that
+sends it apart from one that does not.
 
 ---
 

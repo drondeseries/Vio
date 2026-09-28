@@ -77,8 +77,14 @@ const (
 	// of the WebVTT conversion, which cannot carry every SRT feature. Embedded
 	// SRT tracks keep their existing delivery. It exists only on /api/v2 (see
 	// NativeServerFeaturesV3).
-	FeatureSubripSidecarV3     = "subrip_sidecar_v1"
-	FeatureLiveInventoryV3     = "live_inventory_refresh_v1"
+	FeatureSubripSidecarV3 = "subrip_sidecar_v1"
+	FeatureLiveInventoryV3 = "live_inventory_refresh_v1"
+	// FeatureSourceCommittedV3 is the client's promise to handle the realtime
+	// source_committed event: re-key its version menu to the effective source
+	// the transport committed to and adopt the declared audio inventory without
+	// a replan. It only appears on /api/v2, like the other realtime-v3
+	// capabilities.
+	FeatureSourceCommittedV3   = "source_committed_event_v1"
 	PlanRecipeVersionV3        = "v3.4"
 	ClientDV7ToDV81V3          = "client_dv7_to_dv81"
 	ClientDV7ToHDR10V3         = "client_dv7_to_hdr10"
@@ -155,7 +161,7 @@ func ServerFeaturesV3() []string {
 // advertises and honors only on /api/v2. They postdate the /api/v1 freeze, so
 // the frozen surface neither advertises nor negotiates them.
 func NativeServerFeaturesV3() []string {
-	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3)
+	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3)
 }
 
 // WithoutFeatureV3 returns features with every spelling of feature removed.
@@ -1053,27 +1059,71 @@ type PlaybackInventoryV3 struct {
 	InventoryStatus   string                    `json:"inventory_status"`
 	AudioTracks       []AudioInventoryItemV3    `json:"audio_tracks"`
 	SubtitleInventory []SubtitleInventoryItemV3 `json:"subtitle_inventory"`
+	// EffectiveMediaFileID is the catalog row the transport is committed to.
+	// It moves when a serve-layer rotation rebinds the session to a sibling
+	// release, so a client polling this endpoint can follow the streamed
+	// version instead of the plan's stale identity. It equals the plan's
+	// effective_media_file_id on an un-rotated session.
+	EffectiveMediaFileID int `json:"effective_media_file_id,omitempty"`
+	// EffectiveVirtualURI is the provider-neutral candidate URI the session is
+	// bound to. Like the plan's effective_virtual_uri it lets a client re-key
+	// its version menu to the release actually being served; unlike the plan it
+	// is read from the live session, so it survives a rotation.
+	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
+	// VirtualSourceRevision is the opaque media-generation revision the plan
+	// published for the bound candidate. A serve-layer rotation clears it (the
+	// new release is not probed yet), which is itself a signal that the
+	// inventory is declared rather than verified. Empty for a non-virtual
+	// source.
+	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
 }
 
 type inventoryRevisionEnvelope struct {
 	Status      string                    `json:"status"`
 	AudioTracks []AudioInventoryItemV3    `json:"audio_tracks"`
 	Subtitles   []SubtitleInventoryItemV3 `json:"subtitles"`
+	// EffectiveMediaFileID, EffectiveVirtualURI and VirtualSourceRevision name
+	// the effective source. They are omitted for the zero identity, so a plan's
+	// inventory-only revision keeps its historical digest; a live-session
+	// reader supplies them so a rotation to a sibling with an identical track
+	// list still changes the revision (and therefore the ETag).
+	EffectiveMediaFileID  int    `json:"effective_media_file_id,omitempty"`
+	EffectiveVirtualURI   string `json:"effective_virtual_uri,omitempty"`
+	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
+}
+
+// InventorySourceIdentityV3 names the effective source an inventory revision
+// describes. The zero value is valid and omits every field from the digest.
+type InventorySourceIdentityV3 struct {
+	EffectiveMediaFileID  int
+	EffectiveVirtualURI   string
+	VirtualSourceRevision string
 }
 
 // ComputeInventoryRevisionV3 returns a deterministic opaque digest of the full
 // audio and subtitle inventories, suitable for ETag generation and inventory
 // caching. It serializes the exact response-visible inventory to canonical JSON
 // before hashing, preventing delimiter collisions and ensuring every field
-// mutation produces a distinct revision.
-func ComputeInventoryRevisionV3(status string, audio []AudioInventoryItemV3, subs []SubtitleInventoryItemV3) string {
+// mutation produces a distinct revision. A caller that reads a live session may
+// pass one source identity so the effective version is part of the digest: a
+// rotation to a sibling with an identical inventory then changes the revision
+// instead of returning 304. Callers that only revise a plan's inventory pass no
+// identity and keep the historical digest.
+func ComputeInventoryRevisionV3(status string, audio []AudioInventoryItemV3, subs []SubtitleInventoryItemV3, source ...InventorySourceIdentityV3) string {
+	var identity InventorySourceIdentityV3
+	if len(source) > 0 {
+		identity = source[0]
+	}
 	payload, err := json.Marshal(inventoryRevisionEnvelope{
-		Status:      status,
-		AudioTracks: audio,
-		Subtitles:   subs,
+		Status:                status,
+		AudioTracks:           audio,
+		Subtitles:             subs,
+		EffectiveMediaFileID:  identity.EffectiveMediaFileID,
+		EffectiveVirtualURI:   identity.EffectiveVirtualURI,
+		VirtualSourceRevision: identity.VirtualSourceRevision,
 	})
 	if err != nil {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", status, len(audio), len(subs))))
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d:%d:%s:%s", status, len(audio), len(subs), identity.EffectiveMediaFileID, identity.EffectiveVirtualURI, identity.VirtualSourceRevision)))
 		return fmt.Sprintf("inv:%x", h[:16])
 	}
 	h := sha256.Sum256(payload)

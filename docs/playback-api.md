@@ -16,7 +16,27 @@ unavailable store is `503`.
 | `updatePlaybackProgress` | POST `/api/v2/playback/{session_id}/progress` | 200 mutation receipt |
 | `stopPlayback` | DELETE `/api/v2/playback/{session_id}` | 200 mutation receipt |
 | `replanPlayback` | POST `/api/v2/playback/{session_id}/replan` | 200 v3 decision |
+| `getPlaybackInventory` | GET `/api/v2/playback/{session_id}/inventory` | 200 live audio and subtitle inventory |
 | `reportPlaybackRouteEvent` | POST `/api/v2/playback/route-events` | 202 `{event_id, outcome: "accepted"}` |
+
+## Live inventory
+
+`getPlaybackInventory` returns the live audio and subtitle inventory of an
+active session and supports `ETag` / `If-None-Match` (`304` when unchanged). The
+revision the ETag is derived from includes the effective version identity
+(`effective_media_file_id`, `effective_virtual_uri`,
+`virtual_source_revision`), so a rotation to a sibling release changes the ETag
+even when the new release's declared inventory is identical. It also names the
+version the transport is committed to:
+`effective_media_file_id`, `effective_virtual_uri`, and
+`virtual_source_revision`. These are read from the live session, so they move
+when a serve-layer rotation rebinds the session to a sibling release — unlike
+the plan's `effective_media_file_id`, which keeps the identity it was built
+with. A client polls this endpoint (or consumes the realtime `source_committed`
+event) to follow the streamed version. The response's inventory is the committed
+release's own; a rotated session whose new release is not yet probed reports
+`inventory_status: declared` and that release's declared (possibly empty)
+tracks, never the previous release's.
 
 ## Capabilities
 

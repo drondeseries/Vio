@@ -36,6 +36,33 @@ func TestNewChapterThumbnailReadyEvent(t *testing.T) {
 	}
 }
 
+// TestNewSourceCommittedEventEncodesEmptyAudioTracksAsArray pins that a
+// committed release which declares no audio tracks still serializes the field
+// as [], so a client can tell "none declared" from "field absent".
+func TestNewSourceCommittedEventEncodesEmptyAudioTracksAsArray(t *testing.T) {
+	event, err := NewSourceCommittedEvent("session-1", SourceCommittedPayload{
+		EffectiveMediaFileID: 200,
+		EffectiveVirtualURI:  "virtual://movie/x?result=B",
+	})
+	if err != nil {
+		t.Fatalf("NewSourceCommittedEvent() error = %v", err)
+	}
+	if event.Name != RealtimeEventSourceCommitted {
+		t.Fatalf("event.Name = %q, want %q", event.Name, RealtimeEventSourceCommitted)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(event.Payload, &raw); err != nil {
+		t.Fatalf("json.Unmarshal(payload): %v", err)
+	}
+	tracks, ok := raw["audio_tracks"]
+	if !ok {
+		t.Fatal("audio_tracks is absent; want an explicit empty array")
+	}
+	if string(tracks) != "[]" {
+		t.Fatalf("audio_tracks = %s, want []", tracks)
+	}
+}
+
 func TestNewMarkersUpdatedEvent(t *testing.T) {
 	event, err := NewMarkersUpdatedEvent(
 		"session-1",

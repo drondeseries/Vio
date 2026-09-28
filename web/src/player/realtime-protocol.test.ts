@@ -149,6 +149,44 @@ describe("realtime protocol", () => {
     });
   });
 
+  it("parses a source committed event with its declared inventory", () => {
+    const payload = {
+      session_id: "session-1",
+      effective_media_file_id: 200,
+      effective_virtual_uri: "virtual://movie/x?result=B",
+      inventory_status: "declared",
+      audio_tracks: [{ index: 1, codec: "eac3", language: "deu", default: true }],
+    };
+    const event = parsePlaybackRealtimeMessage(
+      JSON.stringify({
+        type: "event",
+        session_id: "session-1",
+        name: "source_committed",
+        payload,
+      }),
+    );
+
+    expect(event).toEqual({
+      type: "event",
+      session_id: "session-1",
+      name: "source_committed",
+      payload,
+    });
+  });
+
+  it("rejects a source committed event without a session id", () => {
+    const event = parsePlaybackRealtimeMessage(
+      JSON.stringify({
+        type: "event",
+        session_id: "session-1",
+        name: "source_committed",
+        payload: { effective_virtual_uri: "virtual://movie/x?result=B" },
+      }),
+    );
+
+    expect(event).toBeNull();
+  });
+
   it("parses subtitle ready events", () => {
     const event = parsePlaybackRealtimeMessage(
       JSON.stringify({

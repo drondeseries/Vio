@@ -7,6 +7,7 @@ import { itemKeys } from "@/hooks/queries/keys";
 import { fixturePlanV3 } from "../protocol-v3.fixtures";
 import { derivePersistedSubtitleMode } from "../utils/subtitleMode";
 import type { UsePlaybackSessionResult } from "../hooks/usePlaybackSession";
+import type { PlaybackSourceCommittedPayload } from "../realtime-protocol";
 import type { PlayerAudioTrack, PlayerFileVersion, WatchPageProps } from "../types";
 import {
   INVENTORY_REFRESH_DEADLINE_MS,
@@ -143,6 +144,7 @@ function playbackSession(
     refreshSubtitles: vi.fn(),
     applySubtitleTrack: vi.fn(),
     applyAudioInventory: vi.fn(),
+    applyCommittedSource: vi.fn(),
     updatePlaybackState: vi.fn(),
     reportFirstFrame: vi.fn(),
     reportEvent: vi.fn(),
@@ -442,6 +444,66 @@ describe("WatchPage audio menu", () => {
 
     const props = videoPlayerMock.mock.calls[0]?.[0] as { audioTracks?: unknown[] };
     expect(props.audioTracks).toEqual(planAudioTracks);
+  });
+
+  it("adopts a committed source's declared inventory and re-keys on a real change", () => {
+    const applyCommittedSource = vi.fn();
+    const refreshSubtitles = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        applyCommittedSource,
+        refreshSubtitles,
+        mediaFileId: 7,
+        effectiveVirtualUri: "virtual://movie/x?result=A",
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    const props = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onSourceCommitted?: (payload: PlaybackSourceCommittedPayload) => void;
+    };
+    props.onSourceCommitted?.({
+      session_id: "session-1",
+      effective_media_file_id: 8,
+      effective_virtual_uri: "virtual://movie/x?result=B",
+      inventory_status: "declared",
+      audio_tracks: [{ language: "deu", codec: "eac3", channels: 6, default: true }],
+    });
+
+    expect(applyCommittedSource).toHaveBeenCalledWith(
+      {
+        effectiveMediaFileId: 8,
+        effectiveVirtualUri: "virtual://movie/x?result=B",
+        inventoryStatus: "declared",
+      },
+      [{ language: "deu", codec: "eac3", channels: 6, default: true }],
+    );
+    // The source actually changed, so the subtitle inventory is re-read.
+    expect(refreshSubtitles).toHaveBeenCalled();
+  });
+
+  it("does not fall back to another release's tracks when the plan names an effective source", () => {
+    const otherRelease: PlayerFileVersion = {
+      ...version,
+      file_id: 9,
+      file_path: "virtual://movie/x?result=OTHER",
+      audio_tracks: [{ language: "eng", codec: "aac", channels: 2, default: true }],
+    };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: [],
+        mediaFileId: 7,
+        effectiveVirtualUri: "virtual://movie/x?result=B",
+      }),
+    );
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [otherRelease] }));
+
+    const props = videoPlayerMock.mock.calls.at(-1)?.[0] as { audioTracks?: unknown[] };
+    // No row names the effective source; the menu must stay empty rather than
+    // show the unrelated release's tracks.
+    expect(props.audioTracks).toEqual([]);
   });
 
   it("falls back to the version's item metadata when the plan publishes no inventory", () => {
@@ -1389,6 +1451,63 @@ describe("WatchPage live inventory refresh", () => {
     // File 7's response resolves after the switch.
     await act(async () => {
       resolveFetch({ versions: [{ ...virtualVersion, audio_tracks: richerAudioTracks }] });
+      await Promise.resolve();
+    });
+
+    expect(applyAudioInventory).not.toHaveBeenCalled();
+  });
+
+  it("discards a slow response that lands after a same-file source rotation", async () => {
+    const applyAudioInventory = vi.fn();
+    let resolveFetch: (value: { versions: PlayerFileVersion[] }) => void = () => {};
+    fetchWatchDetailMock.mockImplementation(
+      () =>
+        new Promise<{ versions: PlayerFileVersion[] }>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    const sourceA = "virtual://movie/x?result=A";
+    const sourceB = "virtual://movie/x?result=B";
+    const versionA: PlayerFileVersion = { ...virtualVersion, file_id: 7, file_path: sourceA };
+    const versionB: PlayerFileVersion = { ...virtualVersion, file_id: 8, file_path: sourceB };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        sessionId: "session-1",
+        effectiveVirtualUri: sourceA,
+        planAudioTracks: [{ codec: "eac3", channels: 6, layout: "5.1", language: "eng" }],
+        subtitleUrls: [planSubtitle],
+        applyAudioInventory,
+      }),
+    );
+
+    const { rerender } = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [versionA, versionB] }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS);
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+
+    // The transport rotates to sibling B while the collapsed file id and the
+    // session id stay the same; only the effective virtual source moves.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        sessionId: "session-1",
+        effectiveVirtualUri: sourceB,
+        planAudioTracks: [{ codec: "eac3", channels: 6, layout: "5.1", language: "eng" }],
+        subtitleUrls: [planSubtitle],
+        applyAudioInventory,
+      }),
+    );
+    rerender(createElement(WatchPage, { ...watchPageProps, versions: [versionA, versionB] }));
+
+    // Source A's response resolves after the rotation. It must not be applied
+    // as source B's inventory even though its row resolves.
+    await act(async () => {
+      resolveFetch({ versions: [{ ...versionB, audio_tracks: richerAudioTracks }] });
       await Promise.resolve();
     });
 

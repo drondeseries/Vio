@@ -78,6 +78,11 @@ type StreamHandler struct {
 	// PlaybackHandler's); an aborted session's attempt row is marked stopped
 	// through it. May be nil (tests / minimal setups).
 	PlanStoreV3 playback.PlanStoreV3
+	// SourceCommittedNotifier publishes the effective version a serve-layer
+	// rotation just committed to, with its declared inventory, so a playing
+	// client can follow the streamed release before any replan. Optional: a nil
+	// notifier keeps the rotation commit but sends no event.
+	SourceCommittedNotifier sourceCommittedNotifier
 	// PlaybackConfig returns the current playback config; read it through
 	// ffmpegPath(). May be nil (tests).
 	PlaybackConfig func() config.PlaybackConfig
@@ -188,6 +193,19 @@ type virtualSessionSourceBinder interface {
 	SetVirtualSource(sessionID, virtualURI string, ownerInstallationID int) error
 }
 
+// sourceCommittedNotifier publishes the effective version a transport just
+// committed to, with its declared inventory, to the live session. The
+// PlaybackHandler implements it; a minimal/test setup without a notifier skips
+// the push while keeping the rotation commit itself.
+type sourceCommittedNotifier interface {
+	PublishSourceCommitted(ctx context.Context, sessionID string)
+}
+
+// sourceCommittedPublishBudget bounds the detached publish of a committed
+// source so a slow catalog read cannot outlive the stream far beyond the media
+// response.
+const sourceCommittedPublishBudget = 5 * time.Second
+
 // commitRotatedVirtualSessionSource rebinds a live session to the candidate a
 // serve-layer rotation just resolved. The session id and account are unchanged:
 // only the pinned anchor moves, so the client-visible session identity survives
@@ -205,7 +223,57 @@ func (h *StreamHandler) commitRotatedVirtualSessionSource(ctx context.Context, s
 	if err := binder.SetVirtualSource(sessionID, resolved.URI, resolved.OwnerID); err != nil {
 		slog.WarnContext(ctx, "failed to rebind virtual session after candidate rotation",
 			"component", "api", "session", sessionID, "virtual_uri", resolved.URI, "error", err)
+		return
 	}
+	// Associate the session with the rotated release's catalog row before
+	// publishing. The plan's MediaFileID still names the release the plan was
+	// built with, so notifiers that look sessions up by the new file id (marker
+	// and subtitle events) would otherwise miss this session. The manager keeps
+	// RequestedMediaFileID untouched.
+	h.associateEffectiveMediaFile(ctx, sessionID, resolved.URI)
+	// Publish the new effective version the moment the binding moves, before
+	// any replan, so the client re-keys its menus to the streamed release while
+	// the background probe's inventory poll upgrades the declared tracks. The
+	// publish is detached: it reads the catalog for the new release's declared
+	// inventory, and that must not delay the media response that is about to
+	// serve.
+	h.publishSourceCommittedAsync(ctx, sessionID)
+}
+
+// associateEffectiveMediaFile points the live session at the catalog row of the
+// candidate a rotation just bound, preserving its requested file selection.
+func (h *StreamHandler) associateEffectiveMediaFile(ctx context.Context, sessionID, candidateURI string) {
+	if h == nil || h.sessionMgr == nil || strings.TrimSpace(candidateURI) == "" {
+		return
+	}
+	pathResolver, ok := h.fileResolver.(interface {
+		GetByPath(context.Context, string) (*models.MediaFile, error)
+	})
+	if !ok {
+		return
+	}
+	row, err := pathResolver.GetByPath(ctx, candidateURI)
+	if err != nil || row == nil || row.ID <= 0 {
+		return
+	}
+	if err := h.sessionMgr.SetEffectiveMediaFileID(sessionID, row.ID); err != nil {
+		slog.WarnContext(ctx, "failed to associate virtual session with the rotated release row",
+			"component", "api", "session", sessionID, "virtual_uri", candidateURI, "file_id", row.ID, "error", err)
+	}
+}
+
+// publishSourceCommittedAsync delivers the committed-source event on a detached
+// five-second context. A missing notifier is a no-op.
+func (h *StreamHandler) publishSourceCommittedAsync(ctx context.Context, sessionID string) {
+	if h == nil || h.SourceCommittedNotifier == nil {
+		return
+	}
+	notifier := h.SourceCommittedNotifier
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sourceCommittedPublishBudget)
+	go func() {
+		defer cancel()
+		notifier.PublishSourceCommitted(bgCtx, sessionID)
+	}()
 }
 
 // bindSessionVirtualSourceWithTracks binds the session's virtual source and

@@ -30,6 +30,14 @@ const (
 	RealtimeEventSubtitleTranslationCues  RealtimeEventName = "subtitle_translation_cues"
 	RealtimeEventSubtitleTranslationDone  RealtimeEventName = "subtitle_translation_completed"
 	RealtimeEventSubtitleTranslationFail  RealtimeEventName = "subtitle_translation_failed"
+	// RealtimeEventSourceCommitted publishes the effective version a transport
+	// has committed to — a fresh start or a serve-layer rotation — together
+	// with that release's declared (not yet probed) track inventory. It is sent
+	// the moment the commit happens so a playing client can re-key its version
+	// menu and refresh its track list without waiting for a plan rebuild or the
+	// background ffprobe. The existing inventory poll and provenance upgrade
+	// then replace the declared list with probe evidence when it lands.
+	RealtimeEventSourceCommitted RealtimeEventName = "source_committed"
 )
 
 var supportedRealtimeEventNameSet = map[RealtimeEventName]struct{}{
@@ -40,6 +48,7 @@ var supportedRealtimeEventNameSet = map[RealtimeEventName]struct{}{
 	RealtimeEventSubtitleTranslationCues:  {},
 	RealtimeEventSubtitleTranslationDone:  {},
 	RealtimeEventSubtitleTranslationFail:  {},
+	RealtimeEventSourceCommitted:          {},
 }
 
 // CommandName identifies a supported realtime command.
@@ -223,6 +232,31 @@ type SubtitleTranslationFailedPayload struct {
 	Message   string `json:"message,omitempty"`
 }
 
+// SourceCommittedPayload publishes the effective version a transport has
+// committed to and its declared track inventory. It is sent at commit time,
+// before the background probe has produced verified evidence: AudioTracks is
+// provider-declared metadata (possibly empty), and InventoryStatus says so.
+// Clients use it to follow a serve-layer rotation immediately; a later
+// inventory poll or replan upgrades the list to probe evidence.
+type SourceCommittedPayload struct {
+	SessionID string `json:"session_id"`
+	// EffectiveMediaFileID is the catalog row of the committed release.
+	EffectiveMediaFileID int `json:"effective_media_file_id,omitempty"`
+	// EffectiveVirtualURI is the provider-neutral candidate URI the session is
+	// bound to, and is the identity the version menu keys on.
+	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
+	// VirtualSourceRevision is the plan's opaque media-generation revision. It
+	// is empty after a rotation (the sibling is not probed yet).
+	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
+	// InventoryStatus is "declared" or "verified", matching the plan's field.
+	InventoryStatus string `json:"inventory_status,omitempty"`
+	// AudioTracks is the committed release's audio inventory. It is declared
+	// metadata until a probe upgrades it. The tag deliberately has no
+	// omitempty: an empty inventory must encode as [] so a client can tell
+	// "this release declares no audio tracks" from a missing field.
+	AudioTracks []AudioInventoryItemV3 `json:"audio_tracks"`
+}
+
 // NewEventEnvelope creates a validated realtime event envelope.
 func NewEventEnvelope(sessionID string, name RealtimeEventName, payload json.RawMessage) (EventEnvelope, error) {
 	normalizedPayload, err := normalizeJSONPayload(payload)
@@ -357,6 +391,25 @@ func NewSubtitleTranslationFailedEvent(sessionID string, fileID int, jobID int64
 		return EventEnvelope{}, err
 	}
 	return NewEventEnvelope(sessionID, RealtimeEventSubtitleTranslationFail, payload)
+}
+
+// NewSourceCommittedEvent creates a validated effective-source event. The
+// session id must be non-empty; a missing identity is allowed (the client then
+// only refreshes its inventory) but a nil audio list is normalized to an empty
+// one so the payload shape is stable.
+func NewSourceCommittedEvent(sessionID string, payload SourceCommittedPayload) (EventEnvelope, error) {
+	if sessionID == "" {
+		return EventEnvelope{}, ErrInvalidRealtimePayload
+	}
+	payload.SessionID = sessionID
+	if payload.AudioTracks == nil {
+		payload.AudioTracks = []AudioInventoryItemV3{}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return EventEnvelope{}, err
+	}
+	return NewEventEnvelope(sessionID, RealtimeEventSourceCommitted, raw)
 }
 
 // ParseEventEnvelope decodes and validates a realtime event envelope.

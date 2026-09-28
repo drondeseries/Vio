@@ -36,6 +36,7 @@ import { readPlanInvalidatedPayload, VIDEO_PLAYBACK_COMMANDS } from "../realtime
 import type {
   PlaybackRealtimeCommandEnvelope,
   PlaybackRealtimeEventEnvelope,
+  PlaybackSourceCommittedPayload,
 } from "../realtime-protocol";
 import { resolvePendingSeekTime } from "../utils/pendingSeek";
 import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
@@ -278,6 +279,11 @@ interface VideoPlayerProps {
   onRefreshSubtitles?: (currentPosition: number) => void;
   /** Folds a realtime-delivered inventory entry in at the server's ordinal. */
   onApplySubtitleTrack?: (track: SubtitleInventoryItemV3) => void;
+  /**
+   * Adopts the effective version a transport just committed to, and its
+   * declared audio inventory, from the realtime `source_committed` event.
+   */
+  onSourceCommitted?: (payload: PlaybackSourceCommittedPayload) => void;
   audioTracks?: PlayerAudioTrack[];
   activeAudioIndex?: number;
   onAudioSelect?: (index: number, currentPosition: number) => void;
@@ -454,6 +460,7 @@ export function VideoPlayer({
   qualityPreference,
   onRefreshSubtitles,
   onApplySubtitleTrack,
+  onSourceCommitted,
   audioTracks = [],
   activeAudioIndex = 0,
   onAudioSelect,
@@ -1772,6 +1779,16 @@ export function VideoPlayer({
           reportSubtitleFailure(jobId, event.payload.message);
           break;
         }
+        case "source_committed": {
+          // The server committed to an effective version (a fresh start or a
+          // serve-layer rotation). Adopt its identity and declared inventory
+          // now; the inventory poll fills in probe evidence later. A payload
+          // for another session is stale and must not move this session's
+          // menus.
+          if (event.payload.session_id !== sessionId) break;
+          onSourceCommitted?.(event.payload);
+          break;
+        }
         default:
           onRealtimeEvent?.(event);
       }
@@ -1783,6 +1800,7 @@ export function VideoPlayer({
       onApplySubtitleTrack,
       onRealtimeEvent,
       onRefreshSubtitles,
+      onSourceCommitted,
       planRevision,
       resumeFromTranslationPause,
       reportSubtitleFailure,

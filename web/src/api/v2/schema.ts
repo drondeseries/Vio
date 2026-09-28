@@ -21904,10 +21904,14 @@ export interface components {
     };
     PlaybackInventoryV3: {
       audio_tracks: components["schemas"]["AudioInventoryItemV3"][];
+      /** Format: int64 */
+      effective_media_file_id?: number;
+      effective_virtual_uri?: string;
       inventory_revision: string;
       inventory_status: string;
       session_id: string;
       subtitle_inventory: components["schemas"]["SubtitleInventoryItemV3"][];
+      virtual_source_revision?: string;
     };
     PlaybackMutation: {
       accepted?: components["schemas"]["PlaybackAccepted"];

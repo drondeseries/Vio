@@ -1,4 +1,4 @@
-import type { SubtitleInventoryItemV3 } from "./protocol-v3";
+import type { AudioTrackV3, SubtitleInventoryItemV3 } from "./protocol-v3";
 import type { PlayerMarkerSegment } from "./types";
 
 export type PlaybackRealtimeMessageType = "command" | "event" | "hello" | "ack" | "result";
@@ -157,6 +157,23 @@ export interface PlaybackSubtitleTranslationFailedPayload {
   message?: string;
 }
 
+/**
+ * The effective version a transport committed to (fresh start or rotation) and
+ * its declared audio inventory, pushed before the background probe lands.
+ *
+ * `effective_virtual_uri` is the identity the version menu keys on, so a client
+ * re-keys to the streamed release immediately rather than waiting for a replan.
+ * `audio_tracks` is declared metadata; the inventory poll upgrades it.
+ */
+export interface PlaybackSourceCommittedPayload {
+  session_id: string;
+  effective_media_file_id?: number;
+  effective_virtual_uri?: string;
+  virtual_source_revision?: string;
+  inventory_status?: string;
+  audio_tracks?: AudioTrackV3[];
+}
+
 export interface PlaybackRealtimeEventEnvelopeBase {
   type: "event";
   session_id: string;
@@ -190,6 +207,10 @@ export type PlaybackRealtimeEventEnvelope =
   | (PlaybackRealtimeEventEnvelopeBase & {
       name: "subtitle_translation_failed";
       payload: PlaybackSubtitleTranslationFailedPayload;
+    })
+  | (PlaybackRealtimeEventEnvelopeBase & {
+      name: "source_committed";
+      payload: PlaybackSourceCommittedPayload;
     });
 
 export interface PlaybackRealtimeAckEnvelope {
@@ -435,6 +456,22 @@ function isTranslationFailedPayload(
   );
 }
 
+function isOptionalNumber(value: unknown): value is number | undefined {
+  return value === undefined || typeof value === "number";
+}
+
+function isSourceCommittedPayload(value: unknown): value is PlaybackSourceCommittedPayload {
+  return (
+    isRecord(value) &&
+    typeof value.session_id === "string" &&
+    isOptionalNumber(value.effective_media_file_id) &&
+    isOptionalString(value.effective_virtual_uri) &&
+    isOptionalString(value.virtual_source_revision) &&
+    isOptionalString(value.inventory_status) &&
+    (value.audio_tracks === undefined || Array.isArray(value.audio_tracks))
+  );
+}
+
 export function parsePlaybackRealtimeMessage(
   data: string,
 ): PlaybackRealtimeCommandEnvelope | PlaybackRealtimeEventEnvelope | null {
@@ -527,6 +564,14 @@ export function parsePlaybackRealtimeMessage(
         value.name === "subtitle_translation_failed" &&
         isTranslationFailedPayload(value.payload)
       ) {
+        return {
+          type: "event",
+          session_id: value.session_id,
+          name: value.name,
+          payload: value.payload,
+        };
+      }
+      if (value.name === "source_committed" && isSourceCommittedPayload(value.payload)) {
         return {
           type: "event",
           session_id: value.session_id,

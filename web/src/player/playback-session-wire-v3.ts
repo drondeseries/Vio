@@ -1,6 +1,7 @@
 import {
   FEATURE_PLAN_INVALIDATED_V3,
   FEATURE_PLAYBACK_PLAN_V3,
+  FEATURE_SOURCE_COMMITTED_V3,
   PROTOCOL_V3,
   type ClientCodecCapabilitiesV3,
   type ClientPlaybackContextV3,
@@ -32,9 +33,10 @@ const BASE_CLIENT_FEATURES_V3 = [FEATURE_PLAYBACK_PLAN_V3];
 /**
  * The features the video watch page adds: it executes the realtime
  * `plan_invalidated` command (see `VideoPlayer`) and replans off the plan the
- * server names.
+ * server names, and it follows the realtime `source_committed` event to re-key
+ * its version menu to the streamed release.
  */
-export const VIDEO_CLIENT_FEATURES_V3 = [FEATURE_PLAN_INVALIDATED_V3];
+export const VIDEO_CLIENT_FEATURES_V3 = [FEATURE_PLAN_INVALIDATED_V3, FEATURE_SOURCE_COMMITTED_V3];
 
 /**
  * `client_features` is the contract's single advertisement location, and a
