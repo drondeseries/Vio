@@ -578,6 +578,11 @@ function WatchPagePlayer({
 
     const mediaFileId = session.mediaFileId;
     const sessionId = session.sessionId;
+    // A serve-layer rotation can move the effective virtual source without
+    // changing the session or the collapsed file id, so the poll must key on
+    // the source identity too. Otherwise a delayed response for source A is
+    // applied as source B's inventory.
+    const effectiveVirtualUri = session.effectiveVirtualUri;
     let cancelled = false;
     // Aborts the in-flight catalog read when the poll is torn down — unmount or
     // a superseding switch that restarts this effect. Without it a slow
@@ -627,10 +632,15 @@ function WatchPagePlayer({
         // errors are retried without burning the attempt budget.
         completedAttempts += 1;
         const current = sessionRef.current;
-        // A version switch can land while the request is in flight. If the
-        // session no longer targets the file/session we polled for, discard
-        // the response silently; the restarted effect picks up the new target.
-        if (current.mediaFileId !== mediaFileId || current.sessionId !== sessionId) {
+        // A version switch or a serve-layer rotation can land while the
+        // request is in flight. If the session no longer targets the
+        // file/session/source we polled for, discard the response silently; the
+        // restarted effect picks up the new target.
+        if (
+          current.mediaFileId !== mediaFileId ||
+          current.sessionId !== sessionId ||
+          current.effectiveVirtualUri !== effectiveVirtualUri
+        ) {
           return;
         }
         // Probe metadata is persisted to the effective candidate row, not the
@@ -639,7 +649,7 @@ function WatchPagePlayer({
         // the fallback for ordinary files and older plans.
         const version = resolveEffectiveVersion(detail.versions, {
           mediaFileId,
-          effectiveVirtualUri: current.effectiveVirtualUri,
+          effectiveVirtualUri,
         });
         if (version) {
           const nextAudioTracks = version.audio_tracks ?? [];
@@ -718,6 +728,7 @@ function WatchPagePlayer({
     libraryId,
     queryClient,
     refreshSubtitles,
+    session.effectiveVirtualUri,
     session.loading,
     session.mediaFileId,
     session.replacing,

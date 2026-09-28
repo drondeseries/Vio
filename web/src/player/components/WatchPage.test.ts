@@ -1457,6 +1457,63 @@ describe("WatchPage live inventory refresh", () => {
     expect(applyAudioInventory).not.toHaveBeenCalled();
   });
 
+  it("discards a slow response that lands after a same-file source rotation", async () => {
+    const applyAudioInventory = vi.fn();
+    let resolveFetch: (value: { versions: PlayerFileVersion[] }) => void = () => {};
+    fetchWatchDetailMock.mockImplementation(
+      () =>
+        new Promise<{ versions: PlayerFileVersion[] }>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    const sourceA = "virtual://movie/x?result=A";
+    const sourceB = "virtual://movie/x?result=B";
+    const versionA: PlayerFileVersion = { ...virtualVersion, file_id: 7, file_path: sourceA };
+    const versionB: PlayerFileVersion = { ...virtualVersion, file_id: 8, file_path: sourceB };
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        sessionId: "session-1",
+        effectiveVirtualUri: sourceA,
+        planAudioTracks: [{ codec: "eac3", channels: 6, layout: "5.1", language: "eng" }],
+        subtitleUrls: [planSubtitle],
+        applyAudioInventory,
+      }),
+    );
+
+    const { rerender } = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [versionA, versionB] }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS);
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+
+    // The transport rotates to sibling B while the collapsed file id and the
+    // session id stay the same; only the effective virtual source moves.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        sessionId: "session-1",
+        effectiveVirtualUri: sourceB,
+        planAudioTracks: [{ codec: "eac3", channels: 6, layout: "5.1", language: "eng" }],
+        subtitleUrls: [planSubtitle],
+        applyAudioInventory,
+      }),
+    );
+    rerender(createElement(WatchPage, { ...watchPageProps, versions: [versionA, versionB] }));
+
+    // Source A's response resolves after the rotation. It must not be applied
+    // as source B's inventory even though its row resolves.
+    await act(async () => {
+      resolveFetch({ versions: [{ ...versionB, audio_tracks: richerAudioTracks }] });
+      await Promise.resolve();
+    });
+
+    expect(applyAudioInventory).not.toHaveBeenCalled();
+  });
+
   it("re-keys the poll to the live session file after a version switch", async () => {
     const richerForNewFile = [
       { codec: "eac3", channels: 6, layout: "5.1", language: "eng" },
