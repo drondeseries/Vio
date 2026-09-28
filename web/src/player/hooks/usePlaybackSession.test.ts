@@ -1750,7 +1750,7 @@ describe("usePlaybackSession version switches", () => {
   });
 
   it("coalesces a rapid second version click to the latest target", async () => {
-    const startBodies: Array<{ file_id: number }> = [];
+    const startBodies: Array<{ file_id: number; start_position?: number }> = [];
     let releaseFirstSwitch: ((response: Response) => void) | undefined;
     const firstSwitchResponse = new Promise<Response>((resolve) => {
       releaseFirstSwitch = resolve;
@@ -1758,7 +1758,7 @@ describe("usePlaybackSession version switches", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/playback/start")) {
-        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        const body = JSON.parse(String(init?.body)) as { file_id: number; start_position?: number };
         startBodies.push(body);
         if (startBodies.length === 2) {
           // Hold the first switch open so the second click lands while it is
@@ -1793,10 +1793,10 @@ describe("usePlaybackSession version switches", () => {
     );
     await waitFor(() => expect(result.current.plan).not.toBeNull());
 
-    act(() => result.current.switchVersion(99, 0));
+    act(() => result.current.switchVersion(99, 15));
     await waitFor(() => expect(startBodies).toHaveLength(2));
     // The second click lands while the first switch is still in flight.
-    act(() => result.current.switchVersion(123, 0));
+    act(() => result.current.switchVersion(123, 347));
     expect(startBodies).toHaveLength(2);
     expect(result.current.pendingSwitchFileId).toBe(123);
 
@@ -1821,6 +1821,11 @@ describe("usePlaybackSession version switches", () => {
     // The coalesced switch to the latest target runs immediately after.
     await waitFor(() => expect(startBodies).toHaveLength(3));
     expect(startBodies.map((body) => body.file_id)).toEqual([7, 99, 123]);
+    // The first switch seeks to where its click was; the chained one must use
+    // the live position at second-click time, not the first click's closure
+    // position (15).
+    expect(startBodies[1]?.start_position).toBe(15);
+    expect(startBodies[2]?.start_position).toBe(347);
     await waitFor(() => expect(result.current.mediaFileId).toBe(123));
     expect(result.current.pendingSwitchFileId).toBeNull();
 

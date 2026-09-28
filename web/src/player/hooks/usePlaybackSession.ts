@@ -493,6 +493,11 @@ export function usePlaybackSession(
   // a second click records the newest target here instead of being dropped, and
   // the completion handler starts the switch to it immediately.
   const pendingSwitchFileIdRef = useRef<number | null>(null);
+  // The live position the viewer was at when they made that second click. The
+  // chained switch starts only after the first one settles, so reusing the
+  // first click's closure position would seek the replacement back to where the
+  // viewer was dozens of seconds earlier.
+  const pendingSwitchPositionRef = useRef<number | null>(null);
   const loadSequenceRef = useRef(0);
   // The start that produced the current terminal, so a retry can re-issue it
   // against the same file with the viewer's original position and selection.
@@ -1684,10 +1689,12 @@ export function usePlaybackSession(
       if (!allowAlternateVersions) return;
       if (newFileId === stateRef.current.mediaFileId) return;
       if (switchingRef.current) {
-        // A switch is already in flight. Remember the newest target; the
-        // completion handler starts the switch to it once the current one
-        // settles (latest-wins, mirroring the replan queue pattern).
+        // A switch is already in flight. Remember the newest target and the
+        // live position it was clicked at; the completion handler starts the
+        // switch to it once the current one settles (latest-wins, mirroring the
+        // replan queue pattern).
         pendingSwitchFileIdRef.current = newFileId;
+        pendingSwitchPositionRef.current = currentPosition;
         setState((current) => ({ ...current, pendingSwitchFileId: newFileId }));
         return;
       }
@@ -1726,9 +1733,11 @@ export function usePlaybackSession(
         } finally {
           switchingRef.current = false;
           const latest = pendingSwitchFileIdRef.current;
+          const latestPosition = pendingSwitchPositionRef.current;
           pendingSwitchFileIdRef.current = null;
+          pendingSwitchPositionRef.current = null;
           if (latest !== null && latest !== stateRef.current.mediaFileId) {
-            switchVersion(latest, currentPosition);
+            switchVersion(latest, latestPosition ?? currentPosition);
           }
         }
       })();
