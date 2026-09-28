@@ -251,8 +251,10 @@ type SourceCommittedPayload struct {
 	// InventoryStatus is "declared" or "verified", matching the plan's field.
 	InventoryStatus string `json:"inventory_status,omitempty"`
 	// AudioTracks is the committed release's audio inventory. It is declared
-	// metadata until a probe upgrades it.
-	AudioTracks []AudioInventoryItemV3 `json:"audio_tracks,omitempty"`
+	// metadata until a probe upgrades it. The tag deliberately has no
+	// omitempty: an empty inventory must encode as [] so a client can tell
+	// "this release declares no audio tracks" from a missing field.
+	AudioTracks []AudioInventoryItemV3 `json:"audio_tracks"`
 }
 
 // NewEventEnvelope creates a validated realtime event envelope.

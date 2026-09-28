@@ -1082,21 +1082,48 @@ type inventoryRevisionEnvelope struct {
 	Status      string                    `json:"status"`
 	AudioTracks []AudioInventoryItemV3    `json:"audio_tracks"`
 	Subtitles   []SubtitleInventoryItemV3 `json:"subtitles"`
+	// EffectiveMediaFileID, EffectiveVirtualURI and VirtualSourceRevision name
+	// the effective source. They are omitted for the zero identity, so a plan's
+	// inventory-only revision keeps its historical digest; a live-session
+	// reader supplies them so a rotation to a sibling with an identical track
+	// list still changes the revision (and therefore the ETag).
+	EffectiveMediaFileID  int    `json:"effective_media_file_id,omitempty"`
+	EffectiveVirtualURI   string `json:"effective_virtual_uri,omitempty"`
+	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
+}
+
+// InventorySourceIdentityV3 names the effective source an inventory revision
+// describes. The zero value is valid and omits every field from the digest.
+type InventorySourceIdentityV3 struct {
+	EffectiveMediaFileID  int
+	EffectiveVirtualURI   string
+	VirtualSourceRevision string
 }
 
 // ComputeInventoryRevisionV3 returns a deterministic opaque digest of the full
 // audio and subtitle inventories, suitable for ETag generation and inventory
 // caching. It serializes the exact response-visible inventory to canonical JSON
 // before hashing, preventing delimiter collisions and ensuring every field
-// mutation produces a distinct revision.
-func ComputeInventoryRevisionV3(status string, audio []AudioInventoryItemV3, subs []SubtitleInventoryItemV3) string {
+// mutation produces a distinct revision. A caller that reads a live session may
+// pass one source identity so the effective version is part of the digest: a
+// rotation to a sibling with an identical inventory then changes the revision
+// instead of returning 304. Callers that only revise a plan's inventory pass no
+// identity and keep the historical digest.
+func ComputeInventoryRevisionV3(status string, audio []AudioInventoryItemV3, subs []SubtitleInventoryItemV3, source ...InventorySourceIdentityV3) string {
+	var identity InventorySourceIdentityV3
+	if len(source) > 0 {
+		identity = source[0]
+	}
 	payload, err := json.Marshal(inventoryRevisionEnvelope{
-		Status:      status,
-		AudioTracks: audio,
-		Subtitles:   subs,
+		Status:                status,
+		AudioTracks:           audio,
+		Subtitles:             subs,
+		EffectiveMediaFileID:  identity.EffectiveMediaFileID,
+		EffectiveVirtualURI:   identity.EffectiveVirtualURI,
+		VirtualSourceRevision: identity.VirtualSourceRevision,
 	})
 	if err != nil {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", status, len(audio), len(subs))))
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d:%d:%s:%s", status, len(audio), len(subs), identity.EffectiveMediaFileID, identity.EffectiveVirtualURI, identity.VirtualSourceRevision)))
 		return fmt.Sprintf("inv:%x", h[:16])
 	}
 	h := sha256.Sum256(payload)

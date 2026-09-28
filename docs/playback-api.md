@@ -22,8 +22,12 @@ unavailable store is `503`.
 ## Live inventory
 
 `getPlaybackInventory` returns the live audio and subtitle inventory of an
-active session and supports `ETag` / `If-None-Match` (`304` when unchanged). It
-also names the version the transport is committed to:
+active session and supports `ETag` / `If-None-Match` (`304` when unchanged). The
+revision the ETag is derived from includes the effective version identity
+(`effective_media_file_id`, `effective_virtual_uri`,
+`virtual_source_revision`), so a rotation to a sibling release changes the ETag
+even when the new release's declared inventory is identical. It also names the
+version the transport is committed to:
 `effective_media_file_id`, `effective_virtual_uri`, and
 `virtual_source_revision`. These are read from the live session, so they move
 when a serve-layer rotation rebinds the session to a sibling release — unlike

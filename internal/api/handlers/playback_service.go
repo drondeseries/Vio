@@ -879,12 +879,17 @@ func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, sessi
 		status = string(ProbeProvenanceVerified)
 	}
 
-	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory)
-
 	effectiveFileID := 0
 	if file != nil {
 		effectiveFileID = file.ID
 	}
+	// Include the effective source in the revision so a rotation to a sibling
+	// with an identical inventory still changes the ETag the poll compares.
+	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory, playback.InventorySourceIdentityV3{
+		EffectiveMediaFileID:  effectiveFileID,
+		EffectiveVirtualURI:   effectiveVirtualURI,
+		VirtualSourceRevision: session.VirtualSourceRevision,
+	})
 	return playback.PlaybackInventoryV3{
 		SessionID:             session.ID,
 		InventoryRevision:     revision,

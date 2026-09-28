@@ -312,4 +312,27 @@ func TestComputeInventoryRevisionDeterministic(t *testing.T) {
 	if rCol1 == rCol2 {
 		t.Fatalf("delimiter collision: %q == %q", rCol1, rCol2)
 	}
+
+	// The effective source is part of the digest, so a rotation to a sibling
+	// with an identical inventory still changes the ETag. The zero identity
+	// keeps the historical inventory-only digest.
+	rReleaseA := playback.ComputeInventoryRevisionV3("verified", audio, subs, playback.InventorySourceIdentityV3{
+		EffectiveMediaFileID:  100,
+		EffectiveVirtualURI:   "virtual://movie/x?result=A",
+		VirtualSourceRevision: "rev-a",
+	})
+	rReleaseB := playback.ComputeInventoryRevisionV3("verified", audio, subs, playback.InventorySourceIdentityV3{
+		EffectiveMediaFileID:  200,
+		EffectiveVirtualURI:   "virtual://movie/x?result=B",
+		VirtualSourceRevision: "",
+	})
+	if rReleaseA == rReleaseB {
+		t.Fatal("revision must differ when only the effective source changes")
+	}
+	if rReleaseA == r1 {
+		t.Fatal("revision must differ when a source identity is supplied")
+	}
+	if got := playback.ComputeInventoryRevisionV3("verified", audio, subs, playback.InventorySourceIdentityV3{}); got != r1 {
+		t.Fatalf("zero identity changed the historical digest: %q != %q", got, r1)
+	}
 }

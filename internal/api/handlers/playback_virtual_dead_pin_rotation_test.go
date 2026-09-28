@@ -98,33 +98,54 @@ func TestHandleStreamRotatesAbsentSessionPin(t *testing.T) {
 	}
 }
 
-// recordingSourceCommittedNotifier records the sessions a rotation published.
+// recordingSourceCommittedNotifier records the session a rotation published.
 type recordingSourceCommittedNotifier struct {
-	sessions []string
+	published chan string
 }
 
 func (n *recordingSourceCommittedNotifier) PublishSourceCommitted(_ context.Context, sessionID string) {
-	n.sessions = append(n.sessions, sessionID)
+	n.published <- sessionID
+}
+
+// byPathPlaybackFileResolver resolves a virtual candidate row by its URI so the
+// rotation's effective-file association can be exercised.
+type byPathPlaybackFileResolver struct {
+	testPlaybackFileResolver
+	byPath map[string]*models.MediaFile
+}
+
+func (r byPathPlaybackFileResolver) GetByPath(_ context.Context, path string) (*models.MediaFile, error) {
+	return r.byPath[path], nil
 }
 
 // TestCommitRotatedVirtualSessionSourcePublishesCommittedSource pins the
 // commit-time publish: the moment a rotation moves the session binding, the
-// effective version is pushed to the session without waiting for a replan.
+// effective version is pushed to the session (detached from the media response)
+// without waiting for a replan, and the session is associated with the rotated
+// release's row while its requested selection is preserved.
 func TestCommitRotatedVirtualSessionSourcePublishesCommittedSource(t *testing.T) {
 	sessionMgr := playback.NewSessionManager(0, 0)
 	session, err := sessionMgr.StartSession(1, "profile-1", 42, playback.PlayDirect, false)
 	if err != nil {
 		t.Fatalf("StartSession: %v", err)
 	}
-	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{})
-	notifier := &recordingSourceCommittedNotifier{}
+	const siblingURI = "virtual://movie/tt-rotated?result=sibling"
+	siblingRow := &models.MediaFile{ID: 77, FilePath: siblingURI, Container: "virtual"}
+	handler := NewStreamHandler(sessionMgr, byPathPlaybackFileResolver{
+		byPath: map[string]*models.MediaFile{siblingURI: siblingRow},
+	})
+	notifier := &recordingSourceCommittedNotifier{published: make(chan string, 1)}
 	handler.SourceCommittedNotifier = notifier
 
-	const siblingURI = "virtual://movie/tt-rotated?result=sibling"
 	handler.commitRotatedVirtualSessionSource(context.Background(), session.ID, ResolvedVirtualMedia{URI: siblingURI, OwnerID: 5})
 
-	if len(notifier.sessions) != 1 || notifier.sessions[0] != session.ID {
-		t.Fatalf("published sessions = %v, want exactly [%s]", notifier.sessions, session.ID)
+	select {
+	case got := <-notifier.published:
+		if got != session.ID {
+			t.Fatalf("published session = %q, want %q", got, session.ID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not publish the committed source")
 	}
 	bound, err := sessionMgr.GetSession(session.ID)
 	if err != nil || bound == nil {
@@ -132,6 +153,12 @@ func TestCommitRotatedVirtualSessionSourcePublishesCommittedSource(t *testing.T)
 	}
 	if bound.VirtualSourceURI != siblingURI {
 		t.Fatalf("session binding = %q, want %q", bound.VirtualSourceURI, siblingURI)
+	}
+	if bound.MediaFileID != siblingRow.ID {
+		t.Fatalf("session effective file id = %d, want the rotated row %d", bound.MediaFileID, siblingRow.ID)
+	}
+	if bound.RequestedMediaFileID != 42 {
+		t.Fatalf("session requested file id = %d, want the original 42 preserved", bound.RequestedMediaFileID)
 	}
 }
 

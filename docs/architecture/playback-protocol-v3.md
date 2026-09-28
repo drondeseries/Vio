@@ -1231,8 +1231,9 @@ the moment the transport commits to an effective version:
 
 `effective_virtual_uri` is the identity the version menu keys on; it is the
 live session binding, so it follows a rotation even though the plan still names
-release A. `audio_tracks` is the committed release's **declared** inventory: it
-may be empty, and it is never the previous release's list. A client that adopts
+release A. `audio_tracks` is the committed release's **declared** inventory and
+is always present (an empty release declares `[]`, never an absent field), and it
+is never the previous release's list. A client that adopts
 the payload re-keys its version and audio menus to the streamed release
 immediately and leaves the audio list provisional, exactly as it does for a plan
 with `inventory_provenance: "declared"`.
