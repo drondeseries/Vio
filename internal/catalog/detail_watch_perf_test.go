@@ -76,8 +76,8 @@ func TestBuildPlaybackInfoDurationFallbackOneLookupPerEpisode(t *testing.T) {
 }
 
 // A repeated watch-detail fetch of an unchanged file set must not re-enqueue
-// chapter-thumbnail work; the first fetch still prepares everything, and a
-// changed probe fingerprint lets the next fetch prepare again.
+// chapter-thumbnail work. Preparation runs in the background, so the test waits
+// for each detached refresh before reading the queuer's record.
 func TestGetWatchDetailRepeatedFetchDoesNotRequeueChapterThumbs(t *testing.T) {
 	f := newVersionsFixture(t)
 	queuer := &recordingChapterQueuer{}
@@ -86,6 +86,7 @@ func TestGetWatchDetailRepeatedFetchDoesNotRequeueChapterThumbs(t *testing.T) {
 	if _, err := f.svc.GetWatchDetail(t.Context(), f.ids["movie"], AccessFilter{}); err != nil {
 		t.Fatal(err)
 	}
+	f.svc.watchRefreshWG.Wait()
 	if len(queuer.calls) != 1 {
 		t.Fatalf("first watch-detail fetch queued %d chapter-thumb batches, want 1", len(queuer.calls))
 	}
@@ -93,6 +94,7 @@ func TestGetWatchDetailRepeatedFetchDoesNotRequeueChapterThumbs(t *testing.T) {
 	if _, err := f.svc.GetWatchDetail(t.Context(), f.ids["movie"], AccessFilter{}); err != nil {
 		t.Fatal(err)
 	}
+	f.svc.watchRefreshWG.Wait()
 	if len(queuer.calls) != 1 {
 		t.Fatalf("repeated watch-detail fetch re-queued chapter thumbs: %d batches, want 1", len(queuer.calls))
 	}
@@ -106,6 +108,7 @@ func TestGetWatchDetailRepeatedFetchDoesNotRequeueChapterThumbs(t *testing.T) {
 	if _, err := f.svc.GetWatchDetail(t.Context(), f.ids["movie"], AccessFilter{}); err != nil {
 		t.Fatal(err)
 	}
+	f.svc.watchRefreshWG.Wait()
 	if len(queuer.calls) != 2 {
 		t.Fatalf("fetch after fingerprint change queued %d chapter-thumb batches total, want 2", len(queuer.calls))
 	}
