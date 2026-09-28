@@ -12,6 +12,7 @@ import {
   INVENTORY_REFRESH_DEADLINE_MS,
   INVENTORY_REFRESH_INTERVAL_MS,
   inventoryPollDelayMs,
+  mergeResolvedLiveVersion,
   WatchPage,
 } from "./WatchPage";
 
@@ -696,6 +697,19 @@ describe("WatchPage version switch feedback", () => {
     expect(props.pendingSwitchFileId).toBe(99);
   });
 
+  it("forwards the replace and replan state so the track menus can gate", () => {
+    playbackSessionMock.mockReturnValue(playbackSession({ replacing: true, replanning: true }));
+
+    render(createElement(WatchPage, watchPageProps));
+
+    const props = videoPlayerMock.mock.calls[0]?.[0] as {
+      replacing?: boolean;
+      replanning?: boolean;
+    };
+    expect(props.replacing).toBe(true);
+    expect(props.replanning).toBe(true);
+  });
+
   it("shows a dismissible notice when the server played a different version than auto-selected", () => {
     playbackSessionMock.mockReturnValue(
       playbackSession({
@@ -894,6 +908,106 @@ describe("WatchPage effective virtual version", () => {
   });
 });
 
+describe("mergeResolvedLiveVersion", () => {
+  const candidate: PlayerFileVersion = {
+    ...version,
+    file_id: 8,
+    container: "virtual",
+    file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
+  };
+
+  it("re-keys a path-resolved candidate row under the live session file id", () => {
+    const merged = mergeResolvedLiveVersion(
+      [candidate],
+      7,
+      { mediaFileId: 7, effectiveVirtualUri: candidate.file_path ?? null },
+      [candidate],
+    );
+
+    expect(merged.map((row) => row.file_id)).toEqual([8, 7]);
+    expect(merged.find((row) => row.file_id === 7)).toMatchObject({
+      file_path: candidate.file_path,
+      container: "virtual",
+    });
+  });
+
+  it("restores a live row dropped from the list using the version list prop", () => {
+    const merged = mergeResolvedLiveVersion([], 7, { mediaFileId: 7, effectiveVirtualUri: null }, [
+      version,
+    ]);
+
+    expect(merged).toEqual([version]);
+  });
+
+  it("leaves the list untouched when the live row is already present", () => {
+    const list = [candidate];
+    const merged = mergeResolvedLiveVersion(
+      list,
+      8,
+      { mediaFileId: 8, effectiveVirtualUri: null },
+      [candidate],
+    );
+
+    expect(merged).toBe(list);
+  });
+
+  it("leaves the list untouched when the live file cannot be resolved", () => {
+    const list = [candidate];
+    const merged = mergeResolvedLiveVersion(
+      list,
+      7,
+      { mediaFileId: 7, effectiveVirtualUri: null },
+      [candidate],
+    );
+
+    expect(merged).toBe(list);
+  });
+});
+
+describe("WatchPage live session version re-keying", () => {
+  it("re-keys the resolved live row so duration and chapters use the playing file", async () => {
+    const candidateRow: PlayerFileVersion = {
+      ...version,
+      file_id: 8,
+      container: "virtual",
+      file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
+      duration: 7200,
+      chapters: [
+        { index: 0, title: "Live chapter", start_seconds: 0, end_seconds: 7200, source: "test" },
+      ],
+      audio_tracks: richerAudioTracks,
+    };
+    // The session plays file 7, which the version list does not carry; the plan
+    // publishes the candidate's path, so the live row resolves to row 8.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        effectiveVirtualUri: candidateRow.file_path ?? null,
+        durationSeconds: null,
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [planSubtitle],
+      }),
+    );
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [candidateRow] }));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const props = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      versions?: PlayerFileVersion[];
+      duration?: number;
+      chapters?: Array<{ title?: string }>;
+    };
+    // The live file is keyed into the list, so the version-keyed fallbacks
+    // resolve to the playing file instead of another release's first row.
+    expect(props.versions?.find((row) => row.file_id === 7)?.duration).toBe(7200);
+    expect(props.duration).toBe(7200);
+    expect(props.chapters?.map((chapter) => chapter.title)).toEqual(["Live chapter"]);
+  });
+});
+
 const planSubtitle = {
   index: 0,
   language: "en",
@@ -951,6 +1065,42 @@ describe("WatchPage live inventory refresh", () => {
     const playerCalls = videoPlayerMock.mock.calls;
     const playerProps = playerCalls[playerCalls.length - 1]?.[0] as { streamUrl?: string };
     expect(playerProps.streamUrl).toBe("/stream/session-1");
+  });
+
+  it("aborts an in-flight inventory read when the page unmounts", async () => {
+    const applyAudioInventory = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: [{ codec: "eac3", channels: 6, layout: "5.1", language: "eng" }],
+        subtitleUrls: [planSubtitle],
+        applyAudioInventory,
+      }),
+    );
+    let capturedSignal: AbortSignal | undefined;
+    fetchWatchDetailMock.mockImplementation(
+      (_id: string, _fileId?: number, _libraryId?: number, options?: RequestInit) => {
+        capturedSignal = options?.signal ?? undefined;
+        // Never settles: the read is still in flight when the page unmounts.
+        return new Promise(() => {});
+      },
+    );
+
+    const { unmount } = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    unmount();
+
+    // Teardown aborts the read so it cannot land in the shared cache after the
+    // player has moved on.
+    expect(capturedSignal?.aborted).toBe(true);
   });
 
   it("reads the effective virtual candidate's inventory when the id names the collapsed row", async () => {
@@ -1422,21 +1572,22 @@ describe("WatchPage live inventory refresh", () => {
     expect(refreshSubtitles).toHaveBeenCalledTimes(1);
   });
 
-  it("does not seed a subtitle replan from another virtual row's probed tracks", async () => {
+  it("requests a subtitle replan when only the resolved candidate row carries the probed tracks", async () => {
     const refreshSubtitles = vi.fn();
-    // The live session plays the collapsed row (id 7) with no probed tracks.
-    // Another release's candidate row (id 8) carries tracks, but its inventory
-    // must not stand in for the version actually playing.
+    // A first-play plan has not learned the effective candidate, so the resolved
+    // version is the collapsed virtual row with no probed tracks. The probe
+    // persisted the embedded tracks to the candidate row instead; the seed must
+    // fall back to it so the no-op replan can pull the inventory in.
     const collapsedVirtualVersion = {
       ...virtualVersion,
       file_id: 7,
       file_path: "virtual://movie/tt1",
       subtitle_tracks: [],
     };
-    const otherReleaseVersion = {
+    const candidateVersion = {
       ...virtualVersion,
       file_id: 8,
-      file_path: "virtual://movie/tt1?result=alternate",
+      file_path: "virtual://movie/tt1?result=all",
       subtitle_tracks: [{ index: 13, language: "en", codec: "ass", title: "English" }],
     };
     playbackSessionMock.mockReturnValue(
@@ -1449,21 +1600,23 @@ describe("WatchPage live inventory refresh", () => {
       }),
     );
     fetchWatchDetailMock.mockResolvedValue({
-      versions: [collapsedVirtualVersion, otherReleaseVersion],
+      versions: [collapsedVirtualVersion, candidateVersion],
     });
 
     render(
       createElement(WatchPage, {
         ...watchPageProps,
-        versions: [collapsedVirtualVersion, otherReleaseVersion],
+        versions: [collapsedVirtualVersion, candidateVersion],
       }),
     );
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+      await vi.advanceTimersByTimeAsync(2_000);
     });
 
-    expect(refreshSubtitles).not.toHaveBeenCalled();
+    // The candidate's probed tracks must trigger the no-op replan even though
+    // the resolved-version snapshot stays empty.
+    expect(refreshSubtitles).toHaveBeenCalledTimes(1);
   });
 
   it("seeds the subtitle replan from the live mediaFileId row's probed tracks", async () => {

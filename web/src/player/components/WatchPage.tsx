@@ -19,7 +19,10 @@ import {
   buildSubtitleChoiceRequests,
   sendSubtitleChoiceRequest,
 } from "../utils/subtitleChoicePersistence";
-import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
+import {
+  resolveEffectiveVersion,
+  type EffectiveVersionIdentity,
+} from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
 import {
@@ -113,6 +116,36 @@ function buildEffectiveVersionLabel(version: PlayerFileVersion): string | null {
     return null;
   }
   return `${parts.join(" ")}${version.hdr ? " HDR" : ""}`;
+}
+
+/**
+ * Re-keys the resolved row for the live session file into the version list.
+ *
+ * A start or an in-player switch can leave the session playing a file the
+ * item's version list does not name: the server substituted another version,
+ * or the plan resolved a virtual candidate the list carries under a different
+ * row. Lookups keyed on `session.mediaFileId` then miss, so `activeVersion`
+ * falls through to another release's first row and `isVirtualActiveFile`,
+ * `selectedDuration` and `activeChapters` lose the live file's data. Resolve
+ * the row for the live file — by the plan's published path when it has one,
+ * otherwise by id — and merge it under the session's file id. The list is
+ * returned unchanged when the live row is already present or cannot be
+ * resolved.
+ */
+export function mergeResolvedLiveVersion(
+  versions: PlayerFileVersion[],
+  liveFileId: number | null,
+  identity: EffectiveVersionIdentity,
+  candidates: readonly PlayerFileVersion[],
+): PlayerFileVersion[] {
+  if (liveFileId == null) return versions;
+  if (versions.some((version) => version.file_id === liveFileId)) return versions;
+  const liveIdentity = { ...identity, mediaFileId: liveFileId };
+  const resolved =
+    resolveEffectiveVersion(versions, liveIdentity) ??
+    resolveEffectiveVersion(candidates, liveIdentity);
+  if (!resolved) return versions;
+  return [...versions, { ...resolved, file_id: liveFileId }];
 }
 
 /**
@@ -435,6 +468,24 @@ function WatchPagePlayer({
     [playbackVersions, session.mediaFileId],
   );
 
+  // Re-key the live session file into the version list whenever it changes.
+  // A start or switch can target a file the current list does not carry, which
+  // leaves `activePlaybackVersion` undefined and makes `activeVersion` (and the
+  // audio menu, duration and chapters that read through it) fall back to
+  // another release's row.
+  useEffect(() => {
+    const liveFileId = session.mediaFileId;
+    if (liveFileId == null) return;
+    setPlaybackVersions((current) =>
+      mergeResolvedLiveVersion(
+        current,
+        liveFileId,
+        { mediaFileId: liveFileId, effectiveVirtualUri: session.effectiveVirtualUri },
+        versions,
+      ),
+    );
+  }, [session.effectiveVirtualUri, session.mediaFileId, versions]);
+
   const handleEnded = useCallback(() => {
     onEnded?.({
       positionSeconds: session.durationSeconds ?? 0,
@@ -485,6 +536,11 @@ function WatchPagePlayer({
     const mediaFileId = session.mediaFileId;
     const sessionId = session.sessionId;
     let cancelled = false;
+    // Aborts the in-flight catalog read when the poll is torn down — unmount or
+    // a superseding switch that restarts this effect. Without it a slow
+    // response can land after teardown and populate the shared cache with the
+    // outgoing file's inventory.
+    const controller = new AbortController();
     let completedAttempts = 0;
     // Counts every scheduled attempt, successful or not, so the early cadence
     // advances even when requests fail and the completed-attempt cap does not.
@@ -519,7 +575,8 @@ function WatchPagePlayer({
         // payload for it) and never see the newly selected version's probe.
         const detail = await queryClient.fetchQuery({
           queryKey: itemKeys.watchDetail(contentId, mediaFileId, libraryId),
-          queryFn: () => fetchWatchDetail(contentId, mediaFileId, libraryId),
+          queryFn: () =>
+            fetchWatchDetail(contentId, mediaFileId, libraryId, { signal: controller.signal }),
           staleTime: isFirstAttempt ? 0 : WATCH_DETAIL_STALE_TIME_MS,
         });
         if (cancelled) return;
@@ -558,18 +615,25 @@ function WatchPagePlayer({
             audioComplete = true;
           }
           const resolvedSubtitleTracks = version.subtitle_tracks ?? [];
-          // Keep the first-play probe self-heal on the *current* file's row.
-          // `resolveEffectiveVersion` already returns the effective candidate
-          // when the plan publishes a virtual URI; when it does not, the plan
-          // names the collapsed row. Either way only that row's probed tracks
-          // may seed the no-op replan — another release's inventory must not
-          // stand in for the version actually playing.
+          // The first-play probe persists its tracks to the resolved candidate
+          // row, which a plan that has not learned `effective_virtual_uri` yet
+          // cannot name: the resolved version is then the collapsed row and
+          // carries nothing. Keep the current-row lookup first so a row with its
+          // own probe inventory wins, then fall back to the first row that
+          // actually carries probed tracks. The candidate fallback is scoped
+          // under that lookup, never instead of it.
+          const currentRowSubtitleTracks =
+            detail.versions.find((candidate) => candidate.file_id === mediaFileId)
+              ?.subtitle_tracks ?? [];
           const nextSubtitleTracks =
             resolvedSubtitleTracks.length > 0
               ? resolvedSubtitleTracks
               : isVirtualActiveFile
-                ? (detail.versions.find((candidate) => candidate.file_id === mediaFileId)
-                    ?.subtitle_tracks ?? [])
+                ? currentRowSubtitleTracks.length > 0
+                  ? currentRowSubtitleTracks
+                  : (detail.versions.find(
+                      (candidate) => (candidate.subtitle_tracks?.length ?? 0) > 0,
+                    )?.subtitle_tracks ?? [])
                 : resolvedSubtitleTracks;
           if (
             !hasSelectableSessionSubtitles(current.subtitleUrls) &&
@@ -597,6 +661,7 @@ function WatchPagePlayer({
 
     return () => {
       cancelled = true;
+      controller.abort();
       if (timer !== null) window.clearTimeout(timer);
     };
     // The track counts that gate the poll are read once when it starts. They
@@ -990,6 +1055,7 @@ function WatchPagePlayer({
         shouldAutoPlay={session.shouldAutoPlay}
         replanning={session.replanning}
         replanningQuality={session.replanningQuality}
+        replacing={session.replacing}
         pendingSwitchFileId={session.pendingSwitchFileId}
         replanError={fallingBack ? null : session.error}
         replanErrorTitle={session.errorTitle}

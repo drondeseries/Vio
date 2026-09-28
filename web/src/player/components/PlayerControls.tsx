@@ -84,6 +84,12 @@ interface PlayerControlsProps {
   audioTracks: PlayerAudioTrack[];
   activeAudioIndex: number;
   onAudioSelect?: (index: number, currentPosition: number) => void;
+  /**
+   * True while a replace or replan is in flight and the on-screen track
+   * inventory still belongs to the outgoing plan. Keeps the audio and subtitle
+   * menus shut so a pick cannot be read off that stale inventory.
+   */
+  trackMenusLocked?: boolean;
   /** True while the server's audio inventory is declared, not probed. */
   audioInventoryProvisional?: boolean;
   // Quality
@@ -162,6 +168,7 @@ export function PlayerControls({
   audioTracks,
   activeAudioIndex,
   onAudioSelect,
+  trackMenusLocked = false,
   audioInventoryProvisional = false,
   qualityOptions,
   activeQualityId,
@@ -355,6 +362,7 @@ export function PlayerControls({
               sessionId={sessionId}
               getSubtitleStartPosition={getSubtitleStartPosition}
               audioTracks={audioTracks}
+              locked={trackMenusLocked}
             />
             <QualityMenu
               options={qualityOptions}
@@ -515,6 +523,7 @@ export function PlayerControls({
                   activeIndex={activeAudioIndex}
                   onSelect={onAudioSelect}
                   currentPosition={currentTime}
+                  locked={trackMenusLocked}
                   provisional={audioInventoryProvisional}
                 />
               )}
@@ -536,6 +545,7 @@ export function PlayerControls({
                 sessionId={sessionId}
                 getSubtitleStartPosition={getSubtitleStartPosition}
                 audioTracks={audioTracks}
+                locked={trackMenusLocked}
               />
 
               <QualityMenu
@@ -647,6 +657,7 @@ export function PlayerControls({
               <OverflowAction
                 icon={<AudioLines className="h-5 w-5" />}
                 label="Audio tracks"
+                disabled={trackMenusLocked}
                 onClick={() => {
                   setOverflowOpen(false);
                   setAudioOpen(true);
@@ -714,6 +725,7 @@ export function PlayerControls({
           open={audioOpen}
           onOpenChange={setAudioOpen}
           hideTrigger
+          locked={trackMenusLocked}
           provisional={audioInventoryProvisional}
         />
       )}
@@ -735,18 +747,21 @@ function OverflowAction({
   icon,
   label,
   active = false,
+  disabled = false,
   onClick,
 }: {
   icon: ReactNode;
   label: string;
   active?: boolean;
+  disabled?: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       role="menuitem"
       type="button"
-      className={`flex min-h-12 w-full items-center gap-3 px-5 py-3 text-left text-sm ${active ? "bg-white/10 text-white" : "text-white/80"}`}
+      disabled={disabled}
+      className={`flex min-h-12 w-full items-center gap-3 px-5 py-3 text-left text-sm disabled:cursor-not-allowed disabled:opacity-40 ${active ? "bg-white/10 text-white" : "text-white/80"}`}
       onClick={onClick}
     >
       {icon}

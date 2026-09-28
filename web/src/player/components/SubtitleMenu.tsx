@@ -30,6 +30,12 @@ interface SubtitleMenuProps {
   getSubtitleStartPosition?: () => number;
   audioTracks?: PlayerAudioTrack[];
   /**
+   * True while the session is replacing its plan or replanning, when the
+   * rendered inventory belongs to the outgoing plan. Keeps the menu shut so a
+   * pick cannot name a stale slot.
+   */
+  locked?: boolean;
+  /**
    * True while the server's inventory is declared metadata rather than probe
    * evidence, so the menu says so instead of presenting every row as final.
    */
@@ -65,9 +71,15 @@ export function SubtitleMenu({
   sessionId,
   getSubtitleStartPosition,
   audioTracks,
+  locked = false,
   provisional = false,
 }: SubtitleMenuProps) {
   const [open, setOpen] = useState(false);
+  // A replace or replan swaps the inventory out from under the menu. The open
+  // state is kept so the menu returns once the replacement lands, but the
+  // trigger and surface stay shut until then so a pick cannot name a slot the
+  // outgoing plan owned.
+  const menuOpen = open && !locked;
   const [searchOpen, setSearchOpen] = useState(false);
   const [translateOpen, setTranslateOpen] = useState(false);
   const [aiEnabled, setAiEnabled] = useState(false);
@@ -140,10 +152,11 @@ export function SubtitleMenu({
 
   const handleSelect = useCallback(
     (index: number | null) => {
+      if (locked) return;
       onSelect(index);
       setOpen(false);
     },
-    [onSelect],
+    [locked, onSelect],
   );
 
   const handleBlur = useCallback((e: React.FocusEvent) => {
@@ -203,12 +216,14 @@ export function SubtitleMenu({
     <div ref={menuRef} className="relative" onBlur={handleBlur}>
       <button
         type="button"
-        className="player-utility-btn"
+        className="player-utility-btn disabled:cursor-not-allowed disabled:opacity-40"
         data-active={activeIndex !== null ? "true" : "false"}
         onClick={() => setOpen((v) => !v)}
         aria-label={activeIndex !== null ? "Disable captions" : "Enable captions"}
-        aria-expanded={open}
+        aria-expanded={menuOpen}
         aria-haspopup="menu"
+        aria-disabled={locked || undefined}
+        disabled={locked}
       >
         {activeIndex !== null ? (
           <Captions className="h-[18px] w-[18px]" />
@@ -217,7 +232,7 @@ export function SubtitleMenu({
         )}
       </button>
 
-      {open && (
+      {menuOpen && (
         <PlayerMenuSurface
           className="absolute right-0 bottom-full z-30 mb-2 flex w-max max-w-[min(420px,calc(100vw-1rem))] min-w-[220px] flex-col rounded-lg bg-black/90 shadow-lg backdrop-blur"
           onClose={() => setOpen(false)}

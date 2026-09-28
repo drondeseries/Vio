@@ -200,6 +200,13 @@ interface VideoPlayerProps {
    */
   replanningQuality?: boolean;
   /**
+   * True while a start is replacing the current session — a version or episode
+   * switch rebuilding the transport. The outgoing plan's track inventory stays
+   * on screen until the replacement lands, so the track menus are gated on this
+   * (together with `replanning`) to keep a pick off the stale inventory.
+   */
+  replacing?: boolean;
+  /**
    * The file the viewer most recently asked to switch to while the switch is
    * still in flight. Lights the clicked version as "Requested" optimistically.
    */
@@ -404,6 +411,7 @@ export function VideoPlayer({
   shouldAutoPlay = true,
   replanning = false,
   replanningQuality = false,
+  replacing = false,
   pendingSwitchFileId = null,
   replanError = null,
   replanErrorTitle = null,
@@ -4488,6 +4496,7 @@ export function VideoPlayer({
           audioTracks={audioTracks}
           activeAudioIndex={activeAudioIndex}
           onAudioSelect={onAudioSelect}
+          trackMenusLocked={replacing || replanning}
           audioInventoryProvisional={audioInventoryProvisional}
           qualityOptions={qualityOptions}
           activeQualityId={activeQualityId}

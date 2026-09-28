@@ -5,6 +5,12 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PlayerControls } from "./PlayerControls";
 
+// The appearance panel reads settings through react-query; the controls' own
+// rendering does not need a provider.
+vi.mock("./SubtitleAppearancePanel", () => ({
+  SubtitleAppearancePanel: () => null,
+}));
+
 function renderControls(
   markerEditAvailable: boolean,
   overrides: Partial<ComponentProps<typeof PlayerControls>> = {},
@@ -210,5 +216,26 @@ describe("PlayerControls", () => {
     expect(screen.getByRole("button", { name: "More player options" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Play" })).toHaveClass("h-16", "w-16");
     expect(screen.queryByRole("button", { name: /mute/i })).toBeNull();
+  });
+
+  it("disables the track menu triggers while a replace or replan is in flight", () => {
+    renderControls(false, {
+      audioTracks: [{ title: "English", codec: "eac3", channels: 6 }],
+      onAudioSelect: vi.fn(),
+      subtitleTracks: [
+        {
+          index: 0,
+          language: "en",
+          codec: "srt",
+          label: "English",
+          source: "embedded",
+          url: "/stream/session-1/subtitles/0.vtt",
+        },
+      ],
+      trackMenusLocked: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Audio tracks" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Enable captions" })).toBeDisabled();
   });
 });

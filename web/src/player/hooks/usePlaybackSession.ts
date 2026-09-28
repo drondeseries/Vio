@@ -22,6 +22,7 @@ import { takePlaybackIntent } from "../first-frame";
 import { buildPlayerStreamUrl } from "../stream-url";
 import { randomUUID } from "@/lib/uuid";
 import { matchSubtitleTrackAcrossVersions } from "../utils/subtitleSort";
+import { resolvePlanAudioIdentity } from "../utils/audioTrackMatch";
 import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
 import { isBitmapCodec } from "../utils/subtitleCodecs";
 import { isInventoryProvisional } from "../utils/inventoryProvenance";
@@ -517,6 +518,11 @@ export function usePlaybackSession(
   // a second click records the newest target here instead of being dropped, and
   // the completion handler starts the switch to it immediately.
   const pendingSwitchFileIdRef = useRef<number | null>(null);
+  // The live position the viewer was at when they made that second click. The
+  // chained switch starts only after the first one settles, so reusing the
+  // first click's closure position would seek the replacement back to where the
+  // viewer was dozens of seconds earlier.
+  const pendingSwitchPositionRef = useRef<number | null>(null);
   const loadSequenceRef = useRef(0);
   // The start that produced the current terminal, so a retry can re-issue it
   // against the same file with the viewer's original position and selection.
@@ -1212,9 +1218,20 @@ export function usePlaybackSession(
       retireSessionOnRefusal = false,
     ): Promise<boolean> {
       const plan = planRef.current;
+      // Stamp the load sequence with the plan, at the same read. A version
+      // switch bumps the sequence before it adopts its replacement plan, so a
+      // replan that read the sequence later would pair the outgoing plan with
+      // the incoming generation and its stale discard could never fire.
+      const loadSequence = loadSequenceRef.current;
       const sessionId = sessionIdRef.current;
       const playbackAttemptId = playbackAttemptIdRef.current;
       if (!plan || !sessionId || !playbackAttemptId) return false;
+      // A switch is replacing the whole session and about to retire the plan
+      // below. A replan built from that outgoing plan would be stamped with the
+      // switch's sequence once the switch lands, so it could clobber the
+      // replacement instead of being discarded. Refuse until the switch
+      // settles; the switch completion path owns what happens next.
+      if (switchingRef.current) return false;
       if (replanInFlightRef.current) {
         const isPendingFailureRecovery =
           options.operation === "failure_recovery" || options.operation === "seek_failure_recovery";
@@ -1257,7 +1274,7 @@ export function usePlaybackSession(
           return new Promise<boolean>((resolve) => {
             pendingReplanRef.current = {
               options,
-              loadSequence: loadSequenceRef.current,
+              loadSequence,
               retireSessionOnRefusal,
               resolve,
               planId: plan.plan_id,
@@ -1309,7 +1326,6 @@ export function usePlaybackSession(
         clientPlaybackContext,
       });
 
-      const loadSequence = loadSequenceRef.current;
       replanInFlightRef.current = true;
       beginAdoption(loadSequence);
       const isQualityReplan =
@@ -1396,12 +1412,21 @@ export function usePlaybackSession(
         const pendingReplan = pendingReplanRef.current;
         pendingReplanRef.current = null;
         if (pendingReplan?.loadSequence === loadSequenceRef.current) {
-          const recoveryAppliesToCurrentPlan =
-            pendingReplan.options.operation !== "failure_recovery" &&
-            pendingReplan.options.operation !== "seek_failure_recovery"
-              ? true
-              : pendingReplan.planId === planRef.current?.plan_id;
-          if (recoveryAppliesToCurrentPlan) {
+          // The queued op was built against the plan its `planId` names. When
+          // the in-flight replan has replaced that plan, an op may only be
+          // replayed if it carries no plan-derived state: a seek target, a
+          // quality label and an output refresh are resolved against the live
+          // plan, either by this re-dispatch or by the server. A track
+          // selection bakes in a plan-derived ordinal, and a failure recovery
+          // bakes in the plan to exclude, so both are dropped once the plan
+          // identity they name is gone. The id is checked on every op.
+          const planStillCurrent = pendingReplan.planId === planRef.current?.plan_id;
+          const pendingIsPlanBound =
+            pendingReplan.options.operation === "failure_recovery" ||
+            pendingReplan.options.operation === "seek_failure_recovery" ||
+            pendingReplan.options.audio !== undefined ||
+            pendingReplan.options.subtitle !== undefined;
+          if (planStillCurrent || !pendingIsPlanBound) {
             // A capability change can queue behind a replan created by an older
             // render. Dispatch through the latest callback so its request carries
             // the current output evidence rather than the closed-over snapshot.
@@ -1487,13 +1512,29 @@ export function usePlaybackSession(
     (index: number, currentPosition: number) => {
       const plan = planRef.current;
       if (!plan) return;
-      if (plan.selected_tracks.audio?.index === index) return;
+      // The menu renders the probed inventory `applyAudioInventory` may have
+      // replaced, whose ordering a probe repair can change. Carry the plan's
+      // canonical identity for the picked track — matched by signature, then
+      // by language family when the menu no longer shows the plan's own list —
+      // so a raw position cannot name a different language. The client ordinal
+      // stays as the request's index fallback when the identity cannot be
+      // named.
+      const audio = resolvePlanAudioIdentity(
+        plan.audio_tracks ?? [],
+        stateRef.current.planAudioTracks,
+        index,
+      );
+      const current = plan.selected_tracks.audio;
+      // Compare the resolved identity, not the menu position: after a probe
+      // repair the already-playing track can sit at a different displayed
+      // index, and comparing ordinals would drop the viewer's real pick (or
+      // replan a track they already have).
+      const isCurrent = audio.id ? current?.id === audio.id : current?.index === audio.index;
+      if (isCurrent) return;
       void replan({
         operation: "track_change",
         positionSeconds: currentPosition,
-        // Sending the index alone lets the server resolve the identity against
-        // the effective file; sending a mismatched pair would be rejected.
-        audio: { id: "", index },
+        audio,
       });
     },
     [replan],
@@ -1699,10 +1740,12 @@ export function usePlaybackSession(
       if (!allowAlternateVersions) return;
       if (newFileId === stateRef.current.mediaFileId) return;
       if (switchingRef.current) {
-        // A switch is already in flight. Remember the newest target; the
-        // completion handler starts the switch to it once the current one
-        // settles (latest-wins, mirroring the replan queue pattern).
+        // A switch is already in flight. Remember the newest target and the
+        // live position it was clicked at; the completion handler starts the
+        // switch to it once the current one settles (latest-wins, mirroring the
+        // replan queue pattern).
         pendingSwitchFileIdRef.current = newFileId;
+        pendingSwitchPositionRef.current = currentPosition;
         setState((current) => ({ ...current, pendingSwitchFileId: newFileId }));
         return;
       }
@@ -1741,9 +1784,11 @@ export function usePlaybackSession(
         } finally {
           switchingRef.current = false;
           const latest = pendingSwitchFileIdRef.current;
+          const latestPosition = pendingSwitchPositionRef.current;
           pendingSwitchFileIdRef.current = null;
+          pendingSwitchPositionRef.current = null;
           if (latest !== null && latest !== stateRef.current.mediaFileId) {
-            switchVersion(latest, currentPosition);
+            switchVersion(latest, latestPosition ?? currentPosition);
           }
         }
       })();
