@@ -2287,7 +2287,19 @@ export function VideoPlayer({
             const Hls = resolution.hlsjs;
             const bufferPolicy = hlsBufferPolicy(plannedBitrateKbps);
             bufferPolicyRef.current = bufferPolicy;
-            const { forwardBufferSeconds, backBufferSeconds } = bufferPolicy;
+            const { forwardBufferSeconds, backBufferSeconds, prefetchSeconds } = bufferPolicy;
+            // Match the initial forward target to the element's transport state.
+            // hls.js can begin loading fragments immediately after attachMedia
+            // without emitting a media event, so a paused or seeking start must
+            // not be handed the stable-play window or it overshoots the prefetch
+            // target before any listener can retarget it. The media event
+            // listeners below still retarget on every later start, pause and seek.
+            const initialBufferTarget = prefetchBufferTargetSeconds({
+              playing: !video.paused,
+              seeking: video.seeking,
+              forwardBufferSeconds,
+              prefetchSeconds,
+            });
             const retryingLoadPolicy = {
               maxTimeToFirstByteMs: 45000,
               maxLoadTimeMs: 45000,
@@ -2303,7 +2315,9 @@ export function VideoPlayer({
               // evicts the excess with SourceBuffer.remove(), so trimming never
               // reloads the element or rebuilds the transport.
               backBufferLength: backBufferSeconds,
-              maxBufferLength: forwardBufferSeconds,
+              maxBufferLength: initialBufferTarget,
+              // Keep the stable-play window as the ceiling so the play event can
+              // raise `maxBufferLength` back to it without reloading the stream.
               maxMaxBufferLength: forwardBufferSeconds,
               startPosition: effectiveInitialPositionRef.current,
               // Prefetch the first fragment instead of waiting for the media

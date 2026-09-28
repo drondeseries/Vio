@@ -2867,8 +2867,20 @@ describe("VideoPlayer HLS buffer policy", () => {
 
     const config = recordedConfig();
     expect(config.backBufferLength).toBe(60);
-    expect(config.maxBufferLength).toBe(60);
+    // The stable-play window is the configured ceiling; the initial paused
+    // target sits below it until the play event raises it.
     expect(config.maxMaxBufferLength).toBe(60);
+  });
+
+  it("starts the forward target at the paused prefetch window", async () => {
+    renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+
+    const config = recordedConfig();
+    // hls.js may start loading right after attachMedia with no media event, so
+    // a paused start must not be constructed with the full stable-play window.
+    expect(config.maxBufferLength).toBe(30);
+    expect(config.maxMaxBufferLength).toBe(120);
   });
 
   it("enables forward fragment prefetch", async () => {
