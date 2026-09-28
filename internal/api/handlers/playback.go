@@ -2422,6 +2422,17 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 			}
 		}
 	}
+	// Wait/restart recovery may only run against the generation the request
+	// named. A matching retained generation that lacks the segment is terminal
+	// (its bytes were never produced and the live generation is a different
+	// stream), and a token that no longer names the live generation must not
+	// buy the request a wait or an FFmpeg restart it will refuse under the
+	// final lease fence. Convert both to the stale-generation verdict so the
+	// client reloads the manifest instead.
+	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) &&
+		requestedGeneration != "" && !transcodeSession.MatchesGenerationToken(requestedGeneration) {
+		err = playback.ErrStaleSegmentGeneration
+	}
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(segmentName)
 		if parseErr == nil {

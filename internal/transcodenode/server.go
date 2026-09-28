@@ -2622,6 +2622,16 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	segmentName := name
 	requestedGeneration := strings.TrimSpace(r.URL.Query().Get(playback.GenerationQueryParam))
 	segmentLease, err := session.OpenSegmentForGeneration(segmentName, requestedGeneration)
+	// OpenSegmentForGeneration checks the file before the token, so a stale
+	// token whose segment is missing surfaces as ErrSegmentNotFound. Reject it
+	// here, before the missing-segment wait/restart machinery: that recovery
+	// rebuilds the live generation, which is not the generation this request
+	// named, and the final lease fence would only refuse the bytes after the
+	// wait and restart had already been spent.
+	if err != nil && err == playback.ErrSegmentNotFound && requestedGeneration != "" &&
+		!session.MatchesGenerationToken(requestedGeneration) {
+		err = playback.ErrStaleSegmentGeneration
+	}
 	if err != nil && err == playback.ErrSegmentNotFound {
 		segNum, parseErr := playback.ParseSegmentNumber(name)
 		if parseErr == nil {
