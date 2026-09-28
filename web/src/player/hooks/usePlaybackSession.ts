@@ -596,6 +596,10 @@ export function usePlaybackSession(
     retireSessionOnRefusal: boolean;
     resolve: (adopted: boolean) => void;
     planId: string;
+    // The live effective file the op was built against. A serve-layer rotation
+    // moves it without changing `plan_id`, so the plan-id check alone would
+    // replay a plan-bound op against another release's track ordinals.
+    mediaFileId: number | null;
   } | null>(null);
   const issueReplanRef = useRef<
     (options: ReplanOptions, retireSessionOnRefusal?: boolean) => Promise<boolean>
@@ -1299,6 +1303,7 @@ export function usePlaybackSession(
               retireSessionOnRefusal,
               resolve,
               planId: plan.plan_id,
+              mediaFileId: stateRef.current.mediaFileId,
             };
           });
         }
@@ -1433,15 +1438,20 @@ export function usePlaybackSession(
         const pendingReplan = pendingReplanRef.current;
         pendingReplanRef.current = null;
         if (pendingReplan?.loadSequence === loadSequenceRef.current) {
-          // The queued op was built against the plan its `planId` names. When
-          // the in-flight replan has replaced that plan, an op may only be
-          // replayed if it carries no plan-derived state: a seek target, a
-          // quality label and an output refresh are resolved against the live
-          // plan, either by this re-dispatch or by the server. A track
-          // selection bakes in a plan-derived ordinal, and a failure recovery
-          // bakes in the plan to exclude, so both are dropped once the plan
-          // identity they name is gone. The id is checked on every op.
-          const planStillCurrent = pendingReplan.planId === planRef.current?.plan_id;
+          // The queued op was built against the plan its `planId` names and the
+          // live source its `mediaFileId` names. When the in-flight replan has
+          // replaced that plan, an op may only be replayed if it carries no
+          // plan-derived state: a seek target, a quality label and an output
+          // refresh are resolved against the live plan, either by this
+          // re-dispatch or by the server. A track selection bakes in a
+          // plan-derived ordinal, and a failure recovery bakes in the plan to
+          // exclude, so both are dropped once the plan identity they name is
+          // gone. A rotation moves the effective source without changing the
+          // plan id, so the live file id is checked too: the plan-bound ordinal
+          // no longer names the same bytes once the transport rebinds.
+          const planStillCurrent =
+            pendingReplan.planId === planRef.current?.plan_id &&
+            pendingReplan.mediaFileId === stateRef.current.mediaFileId;
           const pendingIsPlanBound =
             pendingReplan.options.operation === "failure_recovery" ||
             pendingReplan.options.operation === "seek_failure_recovery" ||
@@ -1698,20 +1708,29 @@ export function usePlaybackSession(
   /**
    * Fills in a richer probed audio inventory discovered after the plan landed.
    *
-   * For the file the plan already names, only a strict superset is accepted:
-   * once the plan carries a full inventory it stays authoritative, so a poorer
-   * catalog row never overwrites it. When `fileId` names another file (a poll
-   * that resolved the effective virtual candidate while the plan names the
-   * collapsed row) the inventory belongs to a different target, so it replaces
-   * the menu even when it is not larger — the superset guard is only for
-   * same-file refreshes. The plan object and its revisions are untouched, so
-   * menus re-render while the transport keeps playing.
+   * A catalog list is probe evidence, so it replaces a declared (provisional)
+   * inventory even when it is shorter: the declared list may be synthesized or
+   * stale, and only positive probe evidence resolves the provisional marker.
+   * For a same-file refresh against an already-verified inventory, only a strict
+   * superset is accepted — once the plan carries a full inventory it stays
+   * authoritative, so a poorer catalog row never overwrites it. When `fileId`
+   * names another file (a poll that resolved the effective virtual candidate
+   * while the plan names the collapsed row) the inventory belongs to a different
+   * target, so it replaces the menu even when it is not larger. The plan object
+   * and its revisions are untouched, so menus re-render while the transport
+   * keeps playing.
    */
   const applyAudioInventory = useCallback((tracks: PlayerAudioTrack[], fileId?: number | null) => {
     if (tracks.length === 0) return;
     setState((current) => {
       const sameFile = fileId == null || fileId === current.mediaFileId;
-      if (sameFile && tracks.length <= current.planAudioTracks.length) return current;
+      if (
+        sameFile &&
+        !current.audioInventoryProvisional &&
+        tracks.length <= current.planAudioTracks.length
+      ) {
+        return current;
+      }
       return {
         ...current,
         planAudioTracks: tracks.map((track) => ({ ...track })),
@@ -1731,29 +1750,52 @@ export function usePlaybackSession(
       },
       audioTracks: PlayerAudioTrack[],
     ) => {
+      // A replacement start is rebuilding the session and its plan is the
+      // authority for identity and inventory. A rotation on the outgoing
+      // transport must not mutate the menus under the pending replacement, nor
+      // move the live identity the chained-switch completion compares against.
+      // Drop the push. When it actually moved the source, the queued
+      // chained-switch position was captured against the outgoing timeline, so
+      // discard it and let the chained switch seek from the live playhead.
+      if (switchingRef.current || stateRef.current.replacing) {
+        const current = stateRef.current;
+        const movedSource =
+          (source.effectiveMediaFileId != null &&
+            source.effectiveMediaFileId !== current.mediaFileId) ||
+          (source.effectiveVirtualUri != null &&
+            source.effectiveVirtualUri !== current.effectiveVirtualUri);
+        if (movedSource) pendingSwitchPositionRef.current = null;
+        return;
+      }
       setState((current) => {
         const nextFileId = source.effectiveMediaFileId ?? current.mediaFileId;
         const nextUri = source.effectiveVirtualUri ?? current.effectiveVirtualUri;
         const identityChanged =
           nextFileId !== current.mediaFileId || nextUri !== current.effectiveVirtualUri;
+        // Only positive probe evidence clears the marker. A declared push after
+        // a verified one marks the menu provisional again rather than rendering
+        // the (possibly empty) declared list as final.
+        const verified = source.inventoryStatus === "verified";
+        const provisional =
+          source.inventoryStatus == null ? current.audioInventoryProvisional : !verified;
         const richer = audioTracks.length > current.planAudioTracks.length;
-        if (!identityChanged && !richer) return current;
+        // A verified push is the probe landing: it replaces a declared list even
+        // when shorter. A same-source push that is no richer and adds no
+        // evidence leaves the menu alone.
+        const replaceInventory =
+          identityChanged || richer || (verified && current.audioInventoryProvisional);
+        if (!identityChanged && !replaceInventory) return current;
         return {
           ...current,
           mediaFileId: nextFileId,
           effectiveVirtualUri: nextUri,
           // A moved effective source replaces the menu wholesale, including
           // with an empty list, so the previous release's tracks are never
-          // shown under the new one. A same-source push only accepts a richer
-          // probed list.
-          planAudioTracks:
-            identityChanged || richer
-              ? audioTracks.map((track) => ({ ...track }))
-              : current.planAudioTracks,
-          // Declared metadata stays provisional; a verified push clears the
-          // marker just like the inventory poll does.
-          audioInventoryProvisional:
-            source.inventoryStatus === "verified" ? false : current.audioInventoryProvisional,
+          // shown under the new one.
+          planAudioTracks: replaceInventory
+            ? audioTracks.map((track) => ({ ...track }))
+            : current.planAudioTracks,
+          audioInventoryProvisional: provisional,
         };
       });
     },
@@ -1847,7 +1889,10 @@ export function usePlaybackSession(
           pendingSwitchFileIdRef.current = null;
           pendingSwitchPositionRef.current = null;
           if (latest !== null && latest !== stateRef.current.mediaFileId) {
-            switchVersion(latest, latestPosition ?? currentPosition);
+            // A rotation during the switch clears the queued position (it was
+            // captured against the outgoing timeline), so fall back to the live
+            // playhead rather than the first click's stale closure position.
+            switchVersion(latest, latestPosition ?? playbackPositionRef.current);
           }
         }
       })();

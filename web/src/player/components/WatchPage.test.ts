@@ -574,13 +574,51 @@ describe("WatchPage version list refresh", () => {
     });
 
     // The async flow is awaited with the realtime job helper, then the list is
-    // re-read from the watch detail.
+    // re-read from the watch detail. The live session's own row is re-keyed in
+    // because the refreshed list does not carry it.
     expect(awaitVirtualCandidatesRefreshMock).toHaveBeenCalledTimes(1);
     expect(awaitVirtualCandidatesRefreshMock).toHaveBeenCalledWith("content-1", awaitAdminJobMock);
     const after = videoPlayerMock.mock.calls.at(-1)?.[0] as {
       versions?: PlayerFileVersion[];
     };
-    expect(after.versions).toEqual([refreshed]);
+    expect(after.versions).toEqual([refreshed, firstVersion]);
+  });
+
+  it("re-keys the committed source into the refreshed list", async () => {
+    const refreshed: PlayerFileVersion = { ...version, file_id: 9, resolution: "720p" };
+    awaitVirtualCandidatesRefreshMock.mockResolvedValueOnce(undefined);
+    fetchWatchDetailMock.mockResolvedValueOnce({
+      content_id: "content-1",
+      versions: [refreshed],
+      indexer_releases: [],
+    });
+    // The live session is on a virtual candidate (file 7) the refreshed list
+    // does not name; only the mount-time candidates carry its row.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ mediaFileId: 7, effectiveVirtualUri: "virtual://movie/x?result=A" }),
+    );
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [firstVersion, secondVersion],
+      }),
+    );
+
+    const before = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onRefreshVersions?: () => Promise<void>;
+    };
+    await act(async () => {
+      await before.onRefreshVersions?.();
+    });
+
+    const after = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      versions?: PlayerFileVersion[];
+      activeFileId?: number | null;
+    };
+    // The committed row stays present so the menus keep resolving it.
+    expect(after.versions).toEqual([refreshed, firstVersion]);
+    expect(after.activeFileId).toBe(7);
   });
 
   it("forwards the refreshed indexer releases to the menu", async () => {
