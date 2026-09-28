@@ -796,6 +796,12 @@ func (r *Repository) RequeueStaleRunning(ctx context.Context, before time.Time) 
 // clears the terminal retention deadline so the expired-job cleanup cannot
 // sweep the retry before it runs, and leaves an already-active job alone. It
 // reports whether a job was requeued.
+//
+// The outer `status = $3` re-checks the locked row's status: the subquery and
+// the NOT EXISTS guard are uncorrelated subplans the executor evaluates once,
+// before it takes the row lock, and does not re-run on the EvalPlanQual
+// recheck. Without the direct predicate a claim that commits while the requeue
+// waits for the lock would let it flip the now-running job back to queued.
 func (r *Repository) RequeueLatestFailedOfType(ctx context.Context, jobType string) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE admin_jobs
@@ -813,6 +819,7 @@ func (r *Repository) RequeueLatestFailedOfType(ctx context.Context, jobType stri
 			ORDER BY requested_at DESC, id DESC
 			LIMIT 1
 		)
+		  AND status = $3
 		  AND NOT EXISTS (
 			SELECT 1 FROM admin_jobs
 			WHERE job_type = $1 AND status IN ($2, $4)

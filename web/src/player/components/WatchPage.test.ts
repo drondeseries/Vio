@@ -1118,6 +1118,37 @@ describe("mergeResolvedLiveVersion", () => {
 
     expect(merged).toBe(list);
   });
+
+  it("appends a URI-matched candidate omitted from the refreshed list", () => {
+    const liveRow: PlayerFileVersion = {
+      ...version,
+      file_id: 7,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=all",
+    };
+    const committedRow: PlayerFileVersion = {
+      ...candidate,
+      file_id: 8,
+      file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
+    };
+
+    // The refreshed list collapsed the live row but no longer carries the
+    // concrete candidate. The URI match lands on the candidate in `candidates`,
+    // so the live row keeps its provenance while the candidate is appended
+    // under its own id instead of being discarded.
+    const merged = mergeResolvedLiveVersion(
+      [liveRow],
+      7,
+      { mediaFileId: 7, effectiveVirtualUri: committedRow.file_path ?? null },
+      [committedRow],
+    );
+
+    expect(merged.map((row) => row.file_id)).toEqual([7, 8]);
+    expect(merged.find((row) => row.file_id === 7)).toBe(liveRow);
+    expect(merged.find((row) => row.file_id === 8)).toMatchObject({
+      file_path: committedRow.file_path,
+    });
+  });
 });
 
 describe("WatchPage live session version re-keying", () => {

@@ -138,10 +138,10 @@ function buildEffectiveVersionLabel(version: PlayerFileVersion): string | null {
  * same file to replace it: a serve-layer rotation can move the effective source
  * without changing the collapsed file id, leaving a row whose URI is stale.
  * A path match that lands on a different catalog row (a virtual collapsed row
- * resolved to a concrete candidate) is left alone — that row is already present
- * and the menus resolve it by URI, while overwriting the live row would drop
- * the requested row's identity that the substitution notice reads. The list is
- * returned unchanged when the live row cannot be resolved.
+ * resolved to a concrete candidate) keeps the live row for provenance — the
+ * substitution notice reads its identity — and appends the candidate under its
+ * own id when the refreshed list omitted it. The list is returned unchanged when
+ * the live row cannot be resolved.
  */
 export function mergeResolvedLiveVersion(
   versions: PlayerFileVersion[],
@@ -165,7 +165,13 @@ export function mergeResolvedLiveVersion(
   if (!resolved) return versions;
   const index = versions.findIndex((version) => version.file_id === liveFileId);
   if (index === -1) return [...versions, { ...resolved, file_id: liveFileId }];
-  if (resolved.file_id !== liveFileId) return versions;
+  if (resolved.file_id !== liveFileId) {
+    // The committed source is a different catalog row (a virtual collapsed row
+    // resolved to a concrete candidate). Keep the live row for provenance, and
+    // append the candidate under its own id when the refreshed list omitted it.
+    if (versions.some((version) => version.file_id === resolved.file_id)) return versions;
+    return [...versions, resolved];
+  }
   if (versions[index] === resolved) return versions;
   const next = versions.slice();
   next[index] = { ...resolved, file_id: liveFileId };
