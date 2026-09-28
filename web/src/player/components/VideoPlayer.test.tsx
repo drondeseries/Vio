@@ -120,8 +120,13 @@ vi.mock("hls.js", () => ({
     static ErrorTypes = { NETWORK_ERROR: "networkError", MEDIA_ERROR: "mediaError" };
     static isSupported = () => hlsJS.supported;
 
+    config: { maxBufferLength?: number } | undefined;
+
     constructor(config?: unknown) {
       hlsJS.constructed(config);
+      // Real hls.js exposes its merged buffer config here; the player
+      // retargets `maxBufferLength` as playback starts, pauses and seeks.
+      this.config = config as { maxBufferLength?: number };
     }
 
     on(event: string, handler: (event: unknown, data: unknown) => void) {
@@ -2805,6 +2810,118 @@ describe("VideoPlayer native HLS timeline", () => {
     renderPlayer({ plan });
 
     await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+  });
+});
+
+describe("VideoPlayer HLS buffer policy", () => {
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    hlsJS.supported = true;
+    hlsJS.constructed.mockClear();
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  function hlsPlan(bitrateKbps?: number) {
+    return fixturePlanV3({
+      effective_recipe: {
+        video_codec: "h264",
+        audio_codec: "aac",
+        height: 1080,
+        ...(bitrateKbps === undefined ? {} : { bitrate_kbps: bitrateKbps }),
+      },
+    });
+  }
+
+  interface RecordedHlsConfig {
+    backBufferLength: number;
+    maxBufferLength: number;
+    maxMaxBufferLength: number;
+    startFragPrefetch: boolean;
+  }
+
+  function recordedConfig(): RecordedHlsConfig {
+    return hlsJS.constructed.mock.calls[0]?.[0] as RecordedHlsConfig;
+  }
+
+  it("bounds the hls.js back buffer instead of leaving it unbounded", async () => {
+    renderPlayer({ plan: hlsPlan() });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+
+    const config = recordedConfig();
+    expect(config.backBufferLength).toBe(120);
+    expect(Number.isFinite(config.backBufferLength)).toBe(true);
+  });
+
+  it("keeps the high-bitrate back buffer inside the 60-120s window", async () => {
+    renderPlayer({ plan: hlsPlan(30_000) });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+
+    const config = recordedConfig();
+    expect(config.backBufferLength).toBe(60);
+    // The stable-play window is the configured ceiling; the initial paused
+    // target sits below it until the play event raises it.
+    expect(config.maxMaxBufferLength).toBe(60);
+  });
+
+  it("starts the forward target at the paused prefetch window", async () => {
+    renderPlayer({ plan: hlsPlan(), shouldAutoPlay: false });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+
+    const config = recordedConfig();
+    // hls.js may start loading right after attachMedia with no media event, so
+    // a paused start must not be constructed with the full stable-play window.
+    expect(config.maxBufferLength).toBe(30);
+    expect(config.maxMaxBufferLength).toBe(120);
+  });
+
+  it("enables forward fragment prefetch", async () => {
+    renderPlayer({ plan: hlsPlan() });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+
+    expect(recordedConfig().startFragPrefetch).toBe(true);
+  });
+
+  it("retargets the forward prefetch between stable play and seeking or pause", async () => {
+    const { container } = renderPlayer({ plan: hlsPlan() });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    const config = recordedConfig();
+    let playing = false;
+    let seeking = false;
+    Object.defineProperty(video, "paused", { configurable: true, get: () => !playing });
+    Object.defineProperty(video, "seeking", { configurable: true, get: () => seeking });
+
+    // Stable play fills toward the produced head.
+    playing = true;
+    fireEvent.play(video);
+    expect(config.maxBufferLength).toBe(120);
+
+    // A seek drops the target to the prefetch window so the client stops
+    // pulling media past a playhead that is not advancing.
+    seeking = true;
+    fireEvent.seeking(video);
+    expect(config.maxBufferLength).toBe(30);
+
+    // The seek settles and prefetch resumes.
+    seeking = false;
+    fireEvent.seeked(video);
+    expect(config.maxBufferLength).toBe(120);
+
+    // Paused media is not heading anywhere either.
+    playing = false;
+    fireEvent.pause(video);
+    expect(config.maxBufferLength).toBe(30);
   });
 });
 
