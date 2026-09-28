@@ -5897,18 +5897,17 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if err := preflightReq.Validate(); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
-	releaseSlot, err := h.acquireReplanSlotV3(r.Context())
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "replan_capacity_exhausted", "The server is replanning too many sessions; retry shortly")
-	}
-	defer releaseSlot()
-	unlockReplan := h.lockReplanV3(sessionID)
-	defer unlockReplan()
-	unlockStore, err := h.PlanStoreV3.AcquireSessionLock(r.Context(), sessionID)
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
-	}
-	defer unlockStore()
+	// Resolve the cheap attempt/session lookups before queueing for a replan
+	// slot. A reaped in-memory session (or an expired attempt) must surface as
+	// a fast 404 instead of waiting behind the replan capacity bound;
+	// production saw an ~11s queue wait before the session_not_found verdict.
+	// The store read is a single pooled query that releases its connection
+	// immediately and holds none of the replan locks, so it cannot invert the
+	// slot -> per-session mutex -> advisory-lock order below or starve a lock
+	// holder's inner queries. Cross-replica serialization is still enforced
+	// where it must be: BeginReplan's lease compare and CompleteReplan's
+	// compare-and-swap reject a plan built from a stale read rather than
+	// committing it.
 	record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
 	if err != nil {
 		// A store outage must read as retryable, not as the session being
@@ -5945,6 +5944,18 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
 		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 	}
+	releaseSlot, err := h.acquireReplanSlotV3(r.Context())
+	if err != nil {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "replan_capacity_exhausted", "The server is replanning too many sessions; retry shortly")
+	}
+	defer releaseSlot()
+	unlockReplan := h.lockReplanV3(sessionID)
+	defer unlockReplan()
+	unlockStore, err := h.PlanStoreV3.AcquireSessionLock(r.Context(), sessionID)
+	if err != nil {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
+	}
+	defer unlockStore()
 	digestBytes := sha256.Sum256(body)
 	digest := hex.EncodeToString(digestBytes[:])
 	lease, err := h.PlanStoreV3.BeginReplan(
