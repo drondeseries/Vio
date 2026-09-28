@@ -2234,6 +2234,12 @@ func writePlaybackSegmentError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, playback.ErrSegmentNotFound), errors.Is(err, playback.ErrTranscodeFailed):
 		writeError(w, http.StatusNotFound, "not_found", "Segment not found")
+	case errors.Is(err, playback.ErrStaleSegmentGeneration):
+		// The URL named a generation that is no longer live and has no retained
+		// bytes to serve. A valid response would mix generations, so refuse with
+		// a permanent precondition failure; the client reloads the manifest and
+		// re-addresses the segment to the current generation.
+		writeError(w, http.StatusPreconditionFailed, "stale_generation", "Segment generation is stale")
 	case errors.Is(err, playback.ErrManifestNotReady):
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode session is temporarily unavailable")
 	case errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent), errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted):
@@ -2372,23 +2378,41 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	}
 
 	segmentName := chi.URLParam(r, "name")
+	requestedGeneration := strings.TrimSpace(r.URL.Query().Get("sgen"))
 	// servedSession is the generation the returned lease came from: the live
 	// one normally, the retained predecessor during the switchover overlap. The
 	// delivery report below must name the session that owns the lease's
 	// generation.
 	servedSession := transcodeSession
-	segmentLease, err := transcodeSession.OpenSegment(segmentName)
-	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
+	// A URL minted against an older generation is only answerable by a retained
+	// generation that explicitly owns that token. Anything else is a stale read
+	// that would silently mix generations, so refuse it before touching the
+	// filesystem.
+	var segmentLease *playback.SegmentLease
+	var err error
+	if requestedGeneration != "" && !transcodeSession.MatchesGenerationToken(requestedGeneration) {
+		if retained := h.tm.GetRetainedTranscodeSession(sessionID); retained != nil && retained.MatchesGenerationToken(requestedGeneration) {
+			segmentLease, err = retained.OpenSegmentForGeneration(segmentName, requestedGeneration)
+			servedSession = retained
+		} else {
+			err = playback.ErrStaleSegmentGeneration
+		}
+	} else {
+		segmentLease, err = transcodeSession.OpenSegmentForGeneration(segmentName, requestedGeneration)
+	}
+	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && requestedGeneration == "" {
 		// Switchover overlap: a same-session replan publishes its successor
-		// once the successor's first manifest is ready, but the client keeps
+		// once the successor's first manifest is ready, but a client on a
+		// token minted before segment URLs carried a generation keeps
 		// requesting the session-keyed playlist and its old segments for a
 		// moment after a track/version switch. A segment the new generation has
 		// not produced, but the displaced generation still holds, is served
 		// from the retained predecessor instead of entering the wait/restart
-		// machinery (or 404-ing). The new generation becomes authoritative as
-		// soon as it produces the segment; the retained entry is replaced on
-		// the next switch and expires after the bounded window, so stale bytes
-		// cannot be served indefinitely.
+		// machinery (or 404-ing). A generation-scoped request is routed by its
+		// token above, so it never falls through to here; the new generation
+		// becomes authoritative as soon as it produces the segment. The
+		// retained entry is replaced on the next switch and expires after the
+		// bounded window, so stale bytes cannot be served indefinitely.
 		if retained := h.tm.GetRetainedTranscodeSession(sessionID); retained != nil {
 			if lease, retainedErr := retained.OpenSegment(segmentName); retainedErr == nil {
 				slog.InfoContext(r.Context(), "transcode segment served from the retained switchover generation",
@@ -2516,6 +2540,15 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 			// Non-numbered segment (e.g., init.mp4 for fMP4 HLS).
 			// Wait briefly — the init segment is written almost immediately.
 			segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, 10*time.Second)
+		}
+	}
+	// Any recovery path above (a wait or a restart) can return a lease from a
+	// different generation than the URL named. Re-apply the fence before serving
+	// so a request minted against one generation is never answered with another's
+	// bytes.
+	if err == nil {
+		if segmentLease, err = playback.FenceSegmentLease(segmentLease, requestedGeneration); err != nil {
+			segmentLease = nil
 		}
 	}
 	if err != nil {

@@ -2619,7 +2619,9 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	segmentLease, err := session.OpenSegment(name)
+	segmentName := name
+	requestedGeneration := strings.TrimSpace(r.URL.Query().Get("sgen"))
+	segmentLease, err := session.OpenSegmentForGeneration(segmentName, requestedGeneration)
 	if err != nil && err == playback.ErrSegmentNotFound {
 		segNum, parseErr := playback.ParseSegmentNumber(name)
 		if parseErr == nil {
@@ -2718,7 +2720,17 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 			writeToneMapRecipeError(w, err)
 			return
 		}
+		if errors.Is(err, playback.ErrStaleSegmentGeneration) {
+			http.Error(w, "segment generation is stale", http.StatusPreconditionFailed)
+			return
+		}
 		http.Error(w, "segment not found", http.StatusNotFound)
+		return
+	}
+	// A wait or restart above can hand back a lease from a different generation
+	// than the URL named; refuse it rather than serve mixed-generation bytes.
+	if segmentLease, err = playback.FenceSegmentLease(segmentLease, requestedGeneration); err != nil {
+		http.Error(w, "segment generation is stale", http.StatusPreconditionFailed)
 		return
 	}
 

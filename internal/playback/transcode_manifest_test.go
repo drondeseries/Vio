@@ -75,8 +75,10 @@ func TestBuildPlaybackManifest_CopyVideoUsesRealManifest(t *testing.T) {
 	}
 
 	session := &TranscodeSession{
-		outputDir: tempDir,
+		outputDir:          tempDir,
+		segmentIncarnation: "inc",
 		opts: TranscodeOpts{
+			SessionID:        "s",
 			TargetCodecVideo: "copy",
 			TargetCodecAudio: "aac",
 			SegmentDuration:  2,
@@ -96,9 +98,9 @@ func TestBuildPlaybackManifest_CopyVideoUsesRealManifest(t *testing.T) {
 		"#EXT-X-MEDIA-SEQUENCE:9",
 		"#EXTINF:2.669000,",
 		"#EXTINF:1.669000,",
-		"#EXT-X-MAP:URI=\"segment/init.mp4?token=test\"",
-		"segment/seg_00009.m4s?token=test",
-		"segment/seg_00010.m4s?token=test",
+		"#EXT-X-MAP:URI=\"segment/init.mp4?token=test&sgen=s%3Ainc%3A0\"",
+		"segment/seg_00009.m4s?token=test&sgen=s%3Ainc%3A0",
+		"segment/seg_00010.m4s?token=test&sgen=s%3Ainc%3A0",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("manifest missing %q:\n%s", want, text)
@@ -218,8 +220,10 @@ func TestBuildPlaybackManifest_CopyVideoWithoutDurationUsesRealManifest(t *testi
 	}
 
 	session := &TranscodeSession{
-		outputDir: tempDir,
+		outputDir:          tempDir,
+		segmentIncarnation: "inc",
 		opts: TranscodeOpts{
+			SessionID:        "s",
 			TargetCodecVideo: "copy",
 			TargetCodecAudio: "aac",
 			SegmentDuration:  2,
@@ -237,9 +241,9 @@ func TestBuildPlaybackManifest_CopyVideoWithoutDurationUsesRealManifest(t *testi
 		"#EXT-X-MEDIA-SEQUENCE:9",
 		"#EXTINF:2.669000,",
 		"#EXTINF:1.669000,",
-		"#EXT-X-MAP:URI=\"segment/init.mp4?token=test\"",
-		"segment/seg_00009.m4s?token=test",
-		"segment/seg_00010.m4s?token=test",
+		"#EXT-X-MAP:URI=\"segment/init.mp4?token=test&sgen=s%3Ainc%3A0\"",
+		"segment/seg_00009.m4s?token=test&sgen=s%3Ainc%3A0",
+		"segment/seg_00010.m4s?token=test&sgen=s%3Ainc%3A0",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("manifest missing %q:\n%s", want, text)
@@ -1286,6 +1290,12 @@ func TestTranscodeThrottlerIgnoresOutputFromAnEarlierGeneration(t *testing.T) {
 	writeManifestRange(t, tempDir, 225, 293, ".ts")
 	if err := os.Chtimes(filepath.Join(tempDir, "stream.m3u8"), fresh, fresh); err != nil {
 		t.Fatalf("chtimes manifest: %v", err)
+	}
+	// The current process writes its own segments alongside the manifest; a
+	// fresh playlist alone does not count as produced output, because retained
+	// prior-generation segments can appear in it.
+	for i := 225; i <= 293; i++ {
+		writeSegmentFile(t, tempDir, segmentFilename(i, TranscodeOpts{TargetCodecVideo: "h264"}), []byte("x"), fresh)
 	}
 	throttler.CheckOnce()
 	if !throttler.paused {

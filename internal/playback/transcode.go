@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"mime"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2532,6 +2533,28 @@ func isVirtualInputPath(path string) bool {
 // use the synthetic full VOD manifest only while its segment count is bounded;
 // longer media uses FFmpeg's real sliding playlist.
 func (s *TranscodeSession) BuildPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
+	return s.buildPlaybackManifest(segPrefix, s.generationScopedQuery(rawQuery))
+}
+
+// generationScopedQuery appends this session's generation token to the segment
+// query so every segment URI the manifest exposes is addressed to the exact
+// generation that produced it.
+func (s *TranscodeSession) generationScopedQuery(rawQuery string) string {
+	token := s.GenerationToken()
+	if token == "" {
+		return rawQuery
+	}
+	encoded := "sgen=" + url.QueryEscape(token)
+	if rawQuery == "" {
+		return encoded
+	}
+	return rawQuery + "&" + encoded
+}
+
+// buildPlaybackManifest renders the manifest with an already generation-scoped
+// query, so a caller that must reuse the same scoped query (for an aligned gap
+// URI) cannot race a generation change between the two renders.
+func (s *TranscodeSession) buildPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
 	opts := s.Opts()
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") ||
 		!CanGenerateSyntheticManifest(opts.TotalDuration, opts.SegmentDuration) {
@@ -2619,7 +2642,8 @@ func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuer
 	if restarting {
 		return nil, ErrManifestNotReady
 	}
-	manifest, err := s.BuildPlaybackManifest(segPrefix, rawQuery)
+	scopedQuery := s.generationScopedQuery(rawQuery)
+	manifest, err := s.buildPlaybackManifest(segPrefix, scopedQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -2630,8 +2654,8 @@ func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuer
 	}
 
 	gapURI := segPrefix + "source_timeline_gap" + hlsSegmentExtension(opts)
-	if rawQuery != "" {
-		gapURI += "?" + rawQuery
+	if scopedQuery != "" {
+		gapURI += "?" + scopedQuery
 	}
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") && opts.CopySeekAnchorResolved {
 		timeline, err := parseManifestTimeline(manifest)
@@ -3422,6 +3446,41 @@ func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
 		Generation:      s.segmentGeneration,
 		GenerationToken: s.segmentGenerationTokenLocked(),
 	}, nil
+}
+
+// OpenSegmentForGeneration opens a segment only when the request's opaque
+// generation token names the generation the returned lease came from. An empty
+// token preserves the pre-fencing behavior for tokens minted before segment
+// URLs carried a generation. A token that no longer matches (a read that
+// outlived its generation, or bytes whose recipe changed) is refused with
+// ErrStaleSegmentGeneration instead of serving same-numbered bytes from a
+// different generation.
+func (s *TranscodeSession) OpenSegmentForGeneration(name, generationToken string) (*SegmentLease, error) {
+	lease, err := s.OpenSegment(name)
+	if err != nil {
+		return nil, err
+	}
+	if generationToken != "" && lease.GenerationToken != generationToken {
+		_ = lease.Close()
+		return nil, ErrStaleSegmentGeneration
+	}
+	return lease, nil
+}
+
+// FenceSegmentLease rejects a lease whose generation does not match the
+// request's opaque generation token. It applies the same fence after any
+// recovery path that produced a lease (a wait or a restart), so a request
+// minted against one generation can never be answered with another's bytes.
+// A nil lease or an empty token passes through unchanged.
+func FenceSegmentLease(lease *SegmentLease, generationToken string) (*SegmentLease, error) {
+	if lease == nil || generationToken == "" {
+		return lease, nil
+	}
+	if lease.GenerationToken != generationToken {
+		_ = lease.Close()
+		return nil, ErrStaleSegmentGeneration
+	}
+	return lease, nil
 }
 
 // Close terminates the ffmpeg process and removes the temporary output directory.
@@ -4506,8 +4565,40 @@ func (s *TranscodeSession) ReportSegmentDownloadedForGenerationToken(segNum int,
 	s.reportSegmentDownloadedLocked(segNum)
 }
 
+// GenerationToken returns this session's current opaque generation token. The
+// token binds the session identity, the per-session incarnation (a replacement
+// or reconstructed session object is a fresh attempt and gets a new
+// incarnation), and the numeric FFmpeg timeline generation. Manifest builders
+// put it on every segment URI so a read landing after a switch can be refused
+// rather than answered from the wrong generation's bytes. An empty token means
+// the session has no generation identity to fence on and callers keep the
+// pre-fencing behavior.
+func (s *TranscodeSession) GenerationToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.segmentIncarnation == "" {
+		s.segmentIncarnation = uuid.NewString()
+	}
+	return s.segmentGenerationTokenLocked()
+}
+
+// MatchesGenerationToken reports whether token names this session's current
+// generation. An empty token never matches: callers that need the pre-fencing
+// back-compat path must check for the empty token before calling this.
+func (s *TranscodeSession) MatchesGenerationToken(token string) bool {
+	if token == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.segmentIncarnation == "" {
+		return false
+	}
+	return token == s.segmentGenerationTokenLocked()
+}
+
 func (s *TranscodeSession) segmentGenerationTokenLocked() string {
-	return s.segmentIncarnation + ":" + strconv.FormatUint(s.segmentGeneration, 10)
+	return s.opts.SessionID + ":" + s.segmentIncarnation + ":" + strconv.FormatUint(s.segmentGeneration, 10)
 }
 
 func (s *TranscodeSession) reportSegmentDownloadedLocked(segNum int) {
