@@ -53,4 +53,10 @@ var (
 	// timeout, and restarts refuse with it: rebuilding the same undecodable
 	// bytes can never succeed, so the caller rotates to another candidate.
 	ErrSourceDecodeRejected = errors.New("transcode source rejected by video decoder")
+	// ErrStaleSegmentGeneration reports a segment or range request carrying a
+	// generation token that names neither the live generation nor a retained
+	// one. The bytes the URL was minted against no longer exist, so serving the
+	// current generation's same-numbered bytes would silently mix generations;
+	// the caller rejects the read and the client reloads the manifest.
+	ErrStaleSegmentGeneration = errors.New("segment generation is stale")
 )

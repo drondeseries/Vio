@@ -279,6 +279,13 @@ unsatisfiable range is `416 range_not_satisfiable`. A failure before the first
 byte is a v2 problem; a failure after it ends the stream. A stopped, expired or
 terminated session answers `410 playback_session_ended`.
 
+Segment URLs the manifest exposes carry an opaque `sgen` generation token. A
+segment request whose token names a generation the server no longer serves —
+neither the live FFmpeg timeline nor a retained switchover predecessor —
+answers `412 stale_generation`; the client reloads the manifest and re-addresses
+the segment to the current generation. A request without `sgen`, minted before
+the token existed, keeps the legacy behavior.
+
 Subtitle inventory URLs in v2 playback responses use the `/api/v2/stream/`
 mount, including relative `/stream/` values produced by the shared inventory
 builder. The web player applies the same mapping to realtime subtitle URLs.

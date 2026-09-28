@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"mime"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -246,15 +247,22 @@ type TranscodeSession struct {
 	copyTimeline         observedCopyTimeline
 	segmentGeneration    uint64
 	segmentIncarnation   string
-	throttler            *TranscodeThrottler
-	stderrLinesLogged    int
-	stderrBytesLogged    int
-	stderrDroppedLines   int
-	stderrCapLogged      bool
-	restartCount         int
-	stderrLineIndex      int
-	stderrWriter         *ffmpegStderrWriter
-	restartHook          func(context.Context)
+	// runningRecipe is the emitted-byte recipe of the currently-running ffmpeg
+	// process. It is frozen when the process is spawned and is deliberately not
+	// updated by SetAudioTrackIndex / SetSourceAudioChannels, which mutate opts
+	// ahead of Restart. A restart compares this frozen recipe, not the mutated
+	// opts, against the replacement so retained segments were actually produced
+	// by the same recipe. Guarded by mu.
+	runningRecipe      emittedStreamRecipe
+	throttler          *TranscodeThrottler
+	stderrLinesLogged  int
+	stderrBytesLogged  int
+	stderrDroppedLines int
+	stderrCapLogged    bool
+	restartCount       int
+	stderrLineIndex    int
+	stderrWriter       *ffmpegStderrWriter
+	restartHook        func(context.Context)
 	// demuxErrorCount counts input demux I/O failures within the current decay
 	// window; lastDemuxErrorAt timestamps the newest one. demuxStamped is set
 	// once the count crosses demuxErrorThreshold and then refuses restarts so
@@ -347,13 +355,21 @@ type SegmentProgress struct {
 	// output directory was spawned. It is the zero time for sessions that never
 	// started a process. Output stamped before it belongs to an earlier
 	// generation and must not be read as this process's progress.
-	GenerationStartedAt  time.Time
-	HasManifest          bool
-	Running              bool
-	Restarting           bool
-	StartSegmentNumber   int
-	SegmentDuration      int
-	LastRequestedSegment int
+	GenerationStartedAt time.Time
+	HasManifest         bool
+	// ProducedHeadCurrentGeneration is ProducedHead restricted to segments this
+	// generation's process actually wrote, judged by file mtime at or after
+	// GenerationStartedAt. On a restart that keeps a prior generation's segments
+	// (identical recipe), ProducedHead includes media the new process did not
+	// produce; throttling must measure prefetch against this head so a retained
+	// window ahead cannot pause a process that has produced nothing. Equal to
+	// ProducedHead when GenerationStartedAt is zero.
+	ProducedHeadCurrentGeneration int
+	Running                       bool
+	Restarting                    bool
+	StartSegmentNumber            int
+	SegmentDuration               int
+	LastRequestedSegment          int
 }
 
 // SegmentRecoveryDecision tells the segment handler whether to briefly wait
@@ -551,6 +567,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	s := &TranscodeSession{
 		cancel:               cancel,
 		opts:                 opts,
+		runningRecipe:        emittedRecipeOf(opts),
 		outputDir:            opts.OutputDir,
 		running:              true,
 		done:                 make(chan struct{}),
@@ -2532,6 +2549,66 @@ func isVirtualInputPath(path string) bool {
 // use the synthetic full VOD manifest only while its segment count is bounded;
 // longer media uses FFmpeg's real sliding playlist.
 func (s *TranscodeSession) BuildPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
+	return s.buildPlaybackManifest(segPrefix, s.generationScopedQuery(rawQuery))
+}
+
+// GenerationQueryParam names the query parameter that carries a session's
+// opaque generation token on manifest segment URIs. It must stay in sync with
+// the segment handlers, which read it with Query().Get.
+const GenerationQueryParam = "sgen"
+
+// generationScopedQuery sets this session's generation token on the segment
+// query so every segment URI the manifest exposes is addressed to the exact
+// generation that produced it.
+//
+// An existing token in rawQuery is replaced, not appended: a manifest request
+// that already carries sgen would otherwise expose a duplicate parameter, and
+// the segment handlers read Query().Get(GenerationQueryParam), which returns
+// only the first value. An appended token would then leave the caller's stale
+// value authoritative and reject the generation's own valid segments, making
+// the manifest unplayable.
+func (s *TranscodeSession) generationScopedQuery(rawQuery string) string {
+	rawQuery = stripQueryParam(rawQuery, GenerationQueryParam)
+	token := s.GenerationToken()
+	if token == "" {
+		return rawQuery
+	}
+	encoded := GenerationQueryParam + "=" + url.QueryEscape(token)
+	if rawQuery == "" {
+		return encoded
+	}
+	return rawQuery + "&" + encoded
+}
+
+// stripQueryParam removes every raw-query pair whose key is name, preserving the
+// order and encoding of the remaining pairs verbatim. A pair with no value
+// (bare "name") is removed as well.
+func stripQueryParam(rawQuery, name string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	parts := strings.Split(rawQuery, "&")
+	kept := parts[:0]
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		key := part
+		if i := strings.IndexByte(part, '='); i >= 0 {
+			key = part[:i]
+		}
+		if key == name {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	return strings.Join(kept, "&")
+}
+
+// buildPlaybackManifest renders the manifest with an already generation-scoped
+// query, so a caller that must reuse the same scoped query (for an aligned gap
+// URI) cannot race a generation change between the two renders.
+func (s *TranscodeSession) buildPlaybackManifest(segPrefix, rawQuery string) ([]byte, error) {
 	opts := s.Opts()
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") ||
 		!CanGenerateSyntheticManifest(opts.TotalDuration, opts.SegmentDuration) {
@@ -2619,7 +2696,8 @@ func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuer
 	if restarting {
 		return nil, ErrManifestNotReady
 	}
-	manifest, err := s.BuildPlaybackManifest(segPrefix, rawQuery)
+	scopedQuery := s.generationScopedQuery(rawQuery)
+	manifest, err := s.buildPlaybackManifest(segPrefix, scopedQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -2630,8 +2708,8 @@ func (s *TranscodeSession) BuildSourceAlignedPlaybackManifest(segPrefix, rawQuer
 	}
 
 	gapURI := segPrefix + "source_timeline_gap" + hlsSegmentExtension(opts)
-	if rawQuery != "" {
-		gapURI += "?" + rawQuery
+	if scopedQuery != "" {
+		gapURI += "?" + scopedQuery
 	}
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") && opts.CopySeekAnchorResolved {
 		timeline, err := parseManifestTimeline(manifest)
@@ -3127,13 +3205,14 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 	s.mu.Lock()
 	opts := s.opts
 	progress := SegmentProgress{
-		ProducedHead:         opts.StartSegmentNumber - 1,
-		Running:              s.running,
-		Restarting:           s.restarting != nil,
-		StartSegmentNumber:   opts.StartSegmentNumber,
-		SegmentDuration:      opts.SegmentDuration,
-		LastRequestedSegment: s.lastRequestedSegment,
-		GenerationStartedAt:  s.generationStartedAt,
+		ProducedHead:                  opts.StartSegmentNumber - 1,
+		ProducedHeadCurrentGeneration: opts.StartSegmentNumber - 1,
+		Running:                       s.running,
+		Restarting:                    s.restarting != nil,
+		StartSegmentNumber:            opts.StartSegmentNumber,
+		SegmentDuration:               opts.SegmentDuration,
+		LastRequestedSegment:          s.lastRequestedSegment,
+		GenerationStartedAt:           s.generationStartedAt,
 	}
 	s.mu.Unlock()
 
@@ -3170,6 +3249,11 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 			if info.ModTime().After(progress.LastProducedAt) {
 				progress.LastProducedAt = info.ModTime()
 			}
+			if progress.GenerationStartedAt.IsZero() || !info.ModTime().Before(progress.GenerationStartedAt) {
+				if entry.number > progress.ProducedHeadCurrentGeneration {
+					progress.ProducedHeadCurrentGeneration = entry.number
+				}
+			}
 		}
 	} else if s.outputDir != "" {
 		// Fallback: If the manifest is temporarily unreadable or being rewritten
@@ -3194,6 +3278,11 @@ func (s *TranscodeSession) SegmentProgress(time.Time) SegmentProgress {
 				}
 				if info.ModTime().After(progress.LastProducedAt) {
 					progress.LastProducedAt = info.ModTime()
+				}
+				if progress.GenerationStartedAt.IsZero() || !info.ModTime().Before(progress.GenerationStartedAt) {
+					if segNum > progress.ProducedHeadCurrentGeneration {
+						progress.ProducedHeadCurrentGeneration = segNum
+					}
 				}
 			}
 			if statErr == nil && progress.ProducedCount > 0 {
@@ -3424,6 +3513,41 @@ func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
 	}, nil
 }
 
+// OpenSegmentForGeneration opens a segment only when the request's opaque
+// generation token names the generation the returned lease came from. An empty
+// token preserves the pre-fencing behavior for tokens minted before segment
+// URLs carried a generation. A token that no longer matches (a read that
+// outlived its generation, or bytes whose recipe changed) is refused with
+// ErrStaleSegmentGeneration instead of serving same-numbered bytes from a
+// different generation.
+func (s *TranscodeSession) OpenSegmentForGeneration(name, generationToken string) (*SegmentLease, error) {
+	lease, err := s.OpenSegment(name)
+	if err != nil {
+		return nil, err
+	}
+	if generationToken != "" && lease.GenerationToken != generationToken {
+		_ = lease.Close()
+		return nil, ErrStaleSegmentGeneration
+	}
+	return lease, nil
+}
+
+// FenceSegmentLease rejects a lease whose generation does not match the
+// request's opaque generation token. It applies the same fence after any
+// recovery path that produced a lease (a wait or a restart), so a request
+// minted against one generation can never be answered with another's bytes.
+// A nil lease or an empty token passes through unchanged.
+func FenceSegmentLease(lease *SegmentLease, generationToken string) (*SegmentLease, error) {
+	if lease == nil || generationToken == "" {
+		return lease, nil
+	}
+	if lease.GenerationToken != generationToken {
+		_ = lease.Close()
+		return nil, ErrStaleSegmentGeneration
+	}
+	return lease, nil
+}
+
 // Close terminates the ffmpeg process and removes the temporary output directory.
 func (s *TranscodeSession) Close() error {
 	return s.shutdown(true)
@@ -3576,34 +3700,87 @@ type emittedStreamRecipe struct {
 	toneMapMode     tonemap.Mode
 	toneMapFilter   string
 	hwAccel         string
+	// Copy/remux packaging. A copy generation writes the source bytes into a
+	// chosen container: the sample entry, the versioned copy recipe, and the
+	// MPEG-TS vs. fMP4 packaging all change those bytes even when the video
+	// codec string is unchanged.
+	videoSampleEntry string
+	copyFMP4Version  string
+	copyVideoMPEGTS  bool
+	// Audio bytes. Copying the selected track, encoding it to a target codec,
+	// and the encoded channel layout/bitrate all change the segment contents.
+	// SourceAudioChannels chooses the stereo-downmix gain filter, so it changes
+	// the emitted audio even when the target codec and layout are unchanged.
+	targetAudioCodec       string
+	audioTrackIndex        int
+	sourceAudioChannels    int
+	targetAudioChannels    int
+	targetAudioBitrateKbps int
+	// Burned-in subtitles are rendered into the video, so the burn-in choice,
+	// track, and codec change the emitted bytes.
+	subtitleBurnIn     bool
+	subtitleTrackIndex int
+	subtitleCodec      string
+	// Scaling and a video bitrate cap change encoded pixels; the segment
+	// duration renumbers the output timeline.
+	targetResolution  string
+	targetBitrateKbps int
+	segmentDuration   int
 }
 
 func emittedRecipeOf(opts TranscodeOpts) emittedStreamRecipe {
 	return emittedStreamRecipe{
-		videoCodec:      strings.ToLower(strings.TrimSpace(opts.TargetCodecVideo)),
-		bitstreamFilter: strings.TrimSpace(opts.VideoBitstreamFilter),
-		toneMapMode:     opts.ToneMapMode,
-		toneMapFilter:   strings.TrimSpace(opts.ToneMapFilter),
-		hwAccel:         strings.ToLower(strings.TrimSpace(opts.HWAccel)),
+		videoCodec:             strings.ToLower(strings.TrimSpace(opts.TargetCodecVideo)),
+		bitstreamFilter:        strings.TrimSpace(opts.VideoBitstreamFilter),
+		toneMapMode:            opts.ToneMapMode,
+		toneMapFilter:          strings.TrimSpace(opts.ToneMapFilter),
+		hwAccel:                strings.ToLower(strings.TrimSpace(opts.HWAccel)),
+		videoSampleEntry:       strings.ToLower(strings.TrimSpace(opts.VideoSampleEntry)),
+		copyFMP4Version:        strings.TrimSpace(opts.CopyFMP4RecipeVersion),
+		copyVideoMPEGTS:        opts.CopyVideoMPEGTS,
+		targetAudioCodec:       strings.ToLower(strings.TrimSpace(opts.TargetCodecAudio)),
+		audioTrackIndex:        opts.AudioTrackIndex,
+		sourceAudioChannels:    opts.SourceAudioChannels,
+		targetAudioChannels:    opts.TargetAudioChannels,
+		targetAudioBitrateKbps: opts.TargetAudioBitrateKbps,
+		subtitleBurnIn:         opts.SubtitleBurnIn,
+		subtitleTrackIndex:     opts.SubtitleTrackIndex,
+		subtitleCodec:          strings.ToLower(strings.TrimSpace(opts.SubtitleCodec)),
+		targetResolution:       strings.ToLower(strings.TrimSpace(opts.TargetResolution)),
+		targetBitrateKbps:      opts.TargetBitrateKbps,
+		segmentDuration:        opts.SegmentDuration,
 	}
 }
 
 // cleanStaleOutputForRestart removes output the replacement generation must not
 // inherit. Old segments are only reusable when the previous and next generation
-// emit the same recipe: a recipe change (copy to an encoded target, a tone-map
-// mode or filter switch, a different hardware backend) leaves both
+// emit the identical recipe: a recipe change (copy to an encoded target, a
+// tone-map mode or filter switch, a different hardware backend, a different
+// sample entry or copy recipe version, an audio/packaging change) leaves both
 // wrong-generation segments at or after the restart point and a manifest
 // describing a stream the new process will never produce. Serving either mixes
 // generations, and reading the stale manifest as produced progress makes the
 // throttler pause a process that has not produced anything yet.
 //
-// Copy-mode restarts always clean, recipe change or not: a copy generation's
-// segment boundaries follow source keyframes, so a re-seek re-cuts the timeline
-// even when the recipe is identical.
+// A copy/remux restart with an unchanged recipe keeps its segments: the source
+// bytes at a given timeline position are identical, so a seek back inside the
+// retention window is served from the retained files instead of re-spawning
+// FFmpeg. Segment boundaries for copy video follow source keyframes, but the
+// numbering and origin are re-derived from the manifest on every restart, so
+// retained files remain addressable.
+//
+// The previous recipe is read from the running process, not from the caller's
+// options: SetAudioTrackIndex and SetSourceAudioChannels mutate s.opts before
+// Restart, so a caller-supplied previous recipe would already describe the
+// replacement and wrongly retain segments emitted with the earlier audio
+// selection or filter.
 //
 // It reports whether it cleaned, so callers can log the decision.
-func (s *TranscodeSession) cleanStaleOutputForRestart(previous, next TranscodeOpts, startSegment int) bool {
-	if !strings.EqualFold(next.TargetCodecVideo, "copy") && emittedRecipeOf(previous) == emittedRecipeOf(next) {
+func (s *TranscodeSession) cleanStaleOutputForRestart(next emittedStreamRecipe, startSegment int) bool {
+	s.mu.Lock()
+	previous := s.runningRecipe
+	s.mu.Unlock()
+	if previous == next {
 		return false
 	}
 	s.cleanStaleSegments(startSegment)
@@ -3716,6 +3893,11 @@ func (s *TranscodeSession) restart(
 	flight := &restartFlight{done: make(chan struct{})}
 	s.restarting = flight
 	opts := s.opts
+	// The running process's recipe, not the possibly-mutated opts: a caller
+	// that changed the audio selection before Restart leaves s.opts describing
+	// the replacement, and only the frozen recipe proves the retained segments
+	// came from the same emitted bytes.
+	previousRecipe := s.runningRecipe
 	refreshInput := s.opts.RefreshInput
 	cancelCurrent := s.cancel
 	done := s.done
@@ -3819,8 +4001,6 @@ func (s *TranscodeSession) restart(
 	hwWorkloadDevice := s.hwWorkloadDevice
 	s.mu.Unlock()
 
-	previousOpts := opts
-
 	opts.SeekSeconds = seekSeconds
 	opts.StartSegmentNumber = startSegment
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") {
@@ -3835,10 +4015,13 @@ func (s *TranscodeSession) restart(
 
 	// Old segments are only reusable when this generation emits the same recipe
 	// as the previous one; otherwise they, and the manifest describing them,
-	// have to go before the replacement process starts.
-	if s.cleanStaleOutputForRestart(previousOpts, opts, startSegment) {
+	// have to go before the replacement process starts. The comparison uses the
+	// running process's frozen recipe, not the caller's opts (which already
+	// carry any pre-restart audio selection mutation).
+	nextRecipe := emittedRecipeOf(opts)
+	if s.cleanStaleOutputForRestart(nextRecipe, startSegment) {
 		log.Printf("playback: cleaned stale transcode output at/after segment %d before restart (video %q -> %q)",
-			startSegment, previousOpts.TargetCodecVideo, opts.TargetCodecVideo)
+			startSegment, previousRecipe.videoCodec, opts.TargetCodecVideo)
 	}
 
 	args := buildFFmpegArgs(opts)
@@ -3901,6 +4084,7 @@ func (s *TranscodeSession) restart(
 	s.cmd = cmd
 	s.cancel = cancel
 	s.opts = opts
+	s.runningRecipe = nextRecipe
 	s.running = true
 	s.restarting = nil
 	s.stdinPipe = stdinPipe
@@ -4506,8 +4690,40 @@ func (s *TranscodeSession) ReportSegmentDownloadedForGenerationToken(segNum int,
 	s.reportSegmentDownloadedLocked(segNum)
 }
 
+// GenerationToken returns this session's current opaque generation token. The
+// token binds the session identity, the per-session incarnation (a replacement
+// or reconstructed session object is a fresh attempt and gets a new
+// incarnation), and the numeric FFmpeg timeline generation. Manifest builders
+// put it on every segment URI so a read landing after a switch can be refused
+// rather than answered from the wrong generation's bytes. An empty token means
+// the session has no generation identity to fence on and callers keep the
+// pre-fencing behavior.
+func (s *TranscodeSession) GenerationToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.segmentIncarnation == "" {
+		s.segmentIncarnation = uuid.NewString()
+	}
+	return s.segmentGenerationTokenLocked()
+}
+
+// MatchesGenerationToken reports whether token names this session's current
+// generation. An empty token never matches: callers that need the pre-fencing
+// back-compat path must check for the empty token before calling this.
+func (s *TranscodeSession) MatchesGenerationToken(token string) bool {
+	if token == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.segmentIncarnation == "" {
+		return false
+	}
+	return token == s.segmentGenerationTokenLocked()
+}
+
 func (s *TranscodeSession) segmentGenerationTokenLocked() string {
-	return s.segmentIncarnation + ":" + strconv.FormatUint(s.segmentGeneration, 10)
+	return s.opts.SessionID + ":" + s.segmentIncarnation + ":" + strconv.FormatUint(s.segmentGeneration, 10)
 }
 
 func (s *TranscodeSession) reportSegmentDownloadedLocked(segNum int) {
