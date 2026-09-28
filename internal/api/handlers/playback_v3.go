@@ -1737,6 +1737,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if err := json.Unmarshal(body, &req); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid protocol v3 request body")
 	}
+	// A selected track identity can name the effective file of an earlier
+	// attempt, which virtual candidate rotation replaces. Drop it before the
+	// structural id/index check, mirroring the replan path's re-key-before-
+	// validation order: the start degrades to the default track pipeline
+	// instead of failing 400. NormalizeAndValidate applies the same drop as a
+	// second line of defense for callers that validate a copy (api/v2).
+	dropStaleRequestTrackIdentitiesV3(r.Context(), &req)
 	warnings, err := req.NormalizeAndValidate()
 	if err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", err.Error())
@@ -5897,18 +5904,17 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if err := preflightReq.Validate(); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
-	releaseSlot, err := h.acquireReplanSlotV3(r.Context())
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "replan_capacity_exhausted", "The server is replanning too many sessions; retry shortly")
-	}
-	defer releaseSlot()
-	unlockReplan := h.lockReplanV3(sessionID)
-	defer unlockReplan()
-	unlockStore, err := h.PlanStoreV3.AcquireSessionLock(r.Context(), sessionID)
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
-	}
-	defer unlockStore()
+	// Resolve the cheap attempt/session lookups before queueing for a replan
+	// slot. A reaped in-memory session (or an expired attempt) must surface as
+	// a fast 404 instead of waiting behind the replan capacity bound;
+	// production saw an ~11s queue wait before the session_not_found verdict.
+	// The store read is a single pooled query that releases its connection
+	// immediately and holds none of the replan locks, so it cannot invert the
+	// slot -> per-session mutex -> advisory-lock order below or starve a lock
+	// holder's inner queries. Cross-replica serialization is still enforced
+	// where it must be: BeginReplan's lease compare and CompleteReplan's
+	// compare-and-swap reject a plan built from a stale read rather than
+	// committing it.
 	record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
 	if err != nil {
 		// A store outage must read as retryable, not as the session being
@@ -5945,6 +5951,18 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
 		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 	}
+	releaseSlot, err := h.acquireReplanSlotV3(r.Context())
+	if err != nil {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "replan_capacity_exhausted", "The server is replanning too many sessions; retry shortly")
+	}
+	defer releaseSlot()
+	unlockReplan := h.lockReplanV3(sessionID)
+	defer unlockReplan()
+	unlockStore, err := h.PlanStoreV3.AcquireSessionLock(r.Context(), sessionID)
+	if err != nil {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
+	}
+	defer unlockStore()
 	digestBytes := sha256.Sum256(body)
 	digest := hex.EncodeToString(digestBytes[:])
 	lease, err := h.PlanStoreV3.BeginReplan(
@@ -9091,25 +9109,50 @@ func (h *PlaybackHandler) startupRetryAllowedV3(opts playback.TranscodeOpts, ret
 	return true
 }
 
-// dropStaleAudioTrackIdentityV3 reports whether the request's audio track ID
-// embeds a file identity that no longer matches file. Virtual candidate
-// rotation replaces media_files rows whenever the provider surfaces a new
-// release, so a client replaying a cached selection would otherwise fail
-// playback outright; callers drop the selection and fall back to the
-// preferred-track pipeline instead.
-func dropStaleAudioTrackIdentityV3(ctx context.Context, file *models.MediaFile, trackID string) bool {
-	if file == nil || trackID == "" {
+// dropStaleTrackIdentityV3 reports whether trackID is a well-formed selected
+// identity of kind bound to a file other than fileID, and logs the discard.
+// Virtual candidate rotation replaces media_files rows whenever the provider
+// surfaces a new release, so a client replaying a cached selection would
+// otherwise fail playback outright; callers drop the selection and fall back to
+// the default/preferred-track pipeline instead. A malformed identity or one
+// bound to fileID itself is not stale.
+func dropStaleTrackIdentityV3(ctx context.Context, kind string, fileID int, trackID string) bool {
+	if !playback.StaleTrackIdentityV3(kind, fileID, trackID) {
 		return false
 	}
-	fileID, kind, _, ok := playback.ParseTrackIDV3(trackID)
-	if !ok || kind != "audio" || fileID == file.ID {
-		return false
-	}
-	slog.WarnContext(ctx, "stale audio track identity; discarding selection",
+	slog.WarnContext(ctx, "stale "+kind+" track identity; discarding selection",
 		"component", "playback",
 		"sent_track_id", trackID,
-		"current_file_id", file.ID)
+		"current_file_id", fileID)
 	return true
+}
+
+// dropStaleAudioTrackIdentityV3 reports whether the request's audio track ID
+// embeds a file identity that no longer matches file. Callers drop the
+// selection and fall back to the preferred-track pipeline instead.
+func dropStaleAudioTrackIdentityV3(ctx context.Context, file *models.MediaFile, trackID string) bool {
+	if file == nil {
+		return false
+	}
+	return dropStaleTrackIdentityV3(ctx, "audio", file.ID, trackID)
+}
+
+// dropStaleRequestTrackIdentitiesV3 drops the start request's selected audio
+// and subtitle identities when they name a file other than the requested file,
+// logging each discard. It runs before structural validation so a rotated-out
+// selection degrades instead of failing the start.
+func dropStaleRequestTrackIdentitiesV3(ctx context.Context, req *playback.StartRequestV3) {
+	if req == nil {
+		return
+	}
+	if dropStaleTrackIdentityV3(ctx, "audio", req.FileID, req.AudioTrackID) {
+		req.AudioTrackID = ""
+		req.AudioTrackIndex = nil
+	}
+	if dropStaleTrackIdentityV3(ctx, "subtitle", req.FileID, req.SubtitleTrackID) {
+		req.SubtitleTrackID = ""
+		req.SubtitleTrackIndex = nil
+	}
 }
 
 func resolveV3AudioIndex(file *models.MediaFile, trackID string, fallback *int) (int, error) {

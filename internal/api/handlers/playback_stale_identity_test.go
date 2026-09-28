@@ -2,6 +2,9 @@ package handlers
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -180,4 +183,71 @@ func TestVirtualStickyPinLifecycle(t *testing.T) {
 	if h.peekVirtualSticky(key) != "" {
 		t.Fatal("unpin should clear the pin")
 	}
+}
+
+// A start that carries a selected identity minted against a rotated-out
+// effective file must degrade to the default track pipeline instead of failing
+// structural validation. The pre-drop runs before the file-bound id/index
+// check; a genuinely mismatched pair on the request's own file is not stale and
+// must still be rejected.
+func TestHandleStartPlaybackV3StaleSelectedTrackIdentityDegrades(t *testing.T) {
+	newHandler := func(t *testing.T) (*PlaybackHandler, *models.MediaFile) {
+		t.Helper()
+		file := v3HandlerFixtureFile(t)
+		handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+		handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+		handler.ItemAccess = allowAllPlaybackItemAccess{}
+		return handler, file
+	}
+	start := func(t *testing.T, handler *PlaybackHandler, req playback.StartRequestV3) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, req))).WithContext(newAuthorizedPlaybackContext())
+		rr := httptest.NewRecorder()
+		handler.HandleStartPlayback(rr, r)
+		return rr
+	}
+
+	t.Run("rotated-out audio identity degrades", func(t *testing.T) {
+		handler, file := newHandler(t)
+		index := 0
+		req := v3HandlerStartRequest()
+		req.AudioTrackID = playback.TrackIDV3(file.ID+9999, "audio", index)
+		req.AudioTrackIndex = &index
+		if rr := start(t, handler, req); rr.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body = %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("rotated-out subtitle identity degrades", func(t *testing.T) {
+		handler, file := newHandler(t)
+		index := 0
+		req := v3HandlerStartRequest()
+		req.SubtitleTrackID = playback.TrackIDV3(file.ID+9999, "subtitle", index)
+		req.SubtitleTrackIndex = &index
+		if rr := start(t, handler, req); rr.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body = %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("same-file audio id/index mismatch still rejected", func(t *testing.T) {
+		handler, file := newHandler(t)
+		index := 0
+		req := v3HandlerStartRequest()
+		req.AudioTrackID = playback.TrackIDV3(file.ID, "audio", index+1)
+		req.AudioTrackIndex = &index
+		if rr := start(t, handler, req); rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("same-file subtitle id/index mismatch still rejected", func(t *testing.T) {
+		handler, file := newHandler(t)
+		index := 0
+		req := v3HandlerStartRequest()
+		req.SubtitleTrackID = playback.TrackIDV3(file.ID, "subtitle", index+1)
+		req.SubtitleTrackIndex = &index
+		if rr := start(t, handler, req); rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
+		}
+	})
 }
