@@ -547,6 +547,18 @@ export interface AudioTrackV3 {
   sample_rate?: number;
   bit_depth?: number;
   default: boolean;
+  /**
+   * Canonical selection identity (`file:<id>:audio:<selection_index>`) the
+   * server publishes for each selectable track, echoed back on a track change.
+   * Absent on older plans and synthesized inventories.
+   */
+  track_id?: string;
+  /**
+   * Zero-based position in the plan's audio inventory; the value
+   * `selected_tracks.audio.index` uses. Published beside the raw container
+   * `index` so a client never confuses the two.
+   */
+  selection_index?: number;
 }
 
 export interface AppliedQuirkV3 {

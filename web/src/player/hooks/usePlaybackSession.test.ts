@@ -15,6 +15,7 @@ import {
   VIDEO_CLIENT_FEATURES_V3,
 } from "../playback-session-wire-v3";
 import { markPlaybackIntent } from "../first-frame";
+import type { PlayerAudioTrack } from "../types";
 import { usePlaybackSession } from "./usePlaybackSession";
 import { resetCodecDetectionForTests } from "./useCodecDetection";
 import { resetSessionMutations } from "../session-mutations";
@@ -3064,6 +3065,100 @@ describe("usePlaybackSession plan audio inventory", () => {
     );
 
     expect(result.current.planAudioTracks).toEqual(planAudioTracks);
+    unmount();
+  });
+
+  it("carries the plan's audio identity for a pick from a repaired inventory", async () => {
+    const planAudioTracks = [
+      {
+        codec: "eac3",
+        channels: 6,
+        layout: "5.1",
+        language: "eng",
+        default: true,
+        track_id: "file:7:audio:0",
+        selection_index: 0,
+      },
+      {
+        codec: "ac3",
+        channels: 2,
+        layout: "stereo",
+        language: "spa",
+        default: false,
+        track_id: "file:7:audio:1",
+        selection_index: 1,
+      },
+    ];
+    // A probe repair reveals a third track and reorders the existing two.
+    const repaired: PlayerAudioTrack[] = [
+      { codec: "ac3", channels: 2, layout: "stereo", language: "spa" },
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng" },
+      { codec: "aac", channels: 2, layout: "stereo", language: "fra" },
+    ];
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              audio_tracks: planAudioTracks,
+              selected_tracks: { audio: { id: "file:7:audio:1", index: 1 } },
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:repaired000000001",
+            plan_attempt_key: "v3:repaired000000001",
+            audio_tracks: planAudioTracks,
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.applyAudioInventory(repaired, 7));
+    expect(result.current.planAudioTracks).toEqual(repaired);
+
+    // The menu's English row is at displayed index 1, but the plan holds it at
+    // ordinal 0. The identity names the picked language; the client ordinal
+    // rides along as the fallback.
+    act(() => result.current.switchAudioTrack(1, 130));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]).toMatchObject({
+      operation: "track_change",
+      selected_tracks: { audio: { id: "file:7:audio:0", index: 1 } },
+    });
+
+    // Picking the already-playing track resolves to the same identity and is a
+    // no-op, even though its displayed index (1) no longer matches the plan's
+    // selected ordinal (0).
+    act(() => result.current.applyAudioInventory(repaired, 7));
+    act(() => result.current.switchAudioTrack(1, 131));
+    expect(replanBodies).toHaveLength(1);
+
     unmount();
   });
 });

@@ -22,6 +22,7 @@ import { takePlaybackIntent } from "../first-frame";
 import { buildPlayerStreamUrl } from "../stream-url";
 import { randomUUID } from "@/lib/uuid";
 import { matchSubtitleTrackAcrossVersions } from "../utils/subtitleSort";
+import { resolvePlanAudioIdentity } from "../utils/audioTrackMatch";
 import { buildPublishedSubtitleTracks } from "../utils/subtitleInventory";
 import { isBitmapCodec } from "../utils/subtitleCodecs";
 import {
@@ -1483,13 +1484,29 @@ export function usePlaybackSession(
     (index: number, currentPosition: number) => {
       const plan = planRef.current;
       if (!plan) return;
-      if (plan.selected_tracks.audio?.index === index) return;
+      // The menu renders the probed inventory `applyAudioInventory` may have
+      // replaced, whose ordering a probe repair can change. Carry the plan's
+      // canonical identity for the picked track — matched by signature, then
+      // by language family when the menu no longer shows the plan's own list —
+      // so a raw position cannot name a different language. The client ordinal
+      // stays as the request's index fallback when the identity cannot be
+      // named.
+      const audio = resolvePlanAudioIdentity(
+        plan.audio_tracks ?? [],
+        stateRef.current.planAudioTracks,
+        index,
+      );
+      const current = plan.selected_tracks.audio;
+      // Compare the resolved identity, not the menu position: after a probe
+      // repair the already-playing track can sit at a different displayed
+      // index, and comparing ordinals would drop the viewer's real pick (or
+      // replan a track they already have).
+      const isCurrent = audio.id ? current?.id === audio.id : current?.index === audio.index;
+      if (isCurrent) return;
       void replan({
         operation: "track_change",
         positionSeconds: currentPosition,
-        // Sending the index alone lets the server resolve the identity against
-        // the effective file; sending a mismatched pair would be rejected.
-        audio: { id: "", index },
+        audio,
       });
     },
     [replan],
