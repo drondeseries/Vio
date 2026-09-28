@@ -38,6 +38,7 @@ type VirtualIdentityBackfillStore interface {
 // *adminjob.Repository implements it.
 type VirtualIdentityBackfillJobs interface {
 	HasFinishedJobOfType(ctx context.Context, jobType string) (bool, error)
+	RequeueLatestFailedOfType(ctx context.Context, jobType string) (bool, error)
 	Create(ctx context.Context, input adminjob.CreateJobInput) (*models.AdminJob, error)
 }
 
@@ -64,10 +65,11 @@ type VirtualIdentityBackfillExecutor struct {
 }
 
 // Execute runs the backfill page loop, resuming from resume.Cursor. A provider
-// that cannot be listed for one candidate group is counted and skipped rather
-// than failing the pass: the remaining groups are independent, and the one-shot
-// job still completes so its cursor never regresses. It returns an error only
-// for a catalog read/write failure that a retry might fix.
+// that cannot be listed for one candidate group is counted and skipped. The
+// pass stops at that page with the cursor left on the last fully-processed page
+// boundary, so the runner fails the job and a later run retries the page
+// instead of advancing past rows that were never considered. It returns an
+// error only for a catalog read/write failure that a retry might fix.
 func (e *VirtualIdentityBackfillExecutor) Execute(
 	ctx context.Context,
 	_ adminjob.VirtualIdentityBackfillRequest,
@@ -103,10 +105,18 @@ func (e *VirtualIdentityBackfillExecutor) Execute(
 			break
 		}
 		result.RowsScanned += len(rows)
-		if err := e.processPage(ctx, rows, result); err != nil {
+		failed, err := e.processPage(ctx, rows, result)
+		if err != nil {
 			return nil, err
 		}
 		report(fmt.Sprintf("Backfilled %d of %d legacy virtual rows", result.RowsScanned, total))
+		if failed {
+			// A provider group in this page could not be re-listed, so the
+			// page is not fully processed and its unmatched rows must stay
+			// retriable. Stop with the cursor on the page boundary so the next
+			// claim resumes after the last fully-processed page.
+			break
+		}
 		if len(rows) < e.batch() {
 			break
 		}
@@ -119,7 +129,13 @@ func (e *VirtualIdentityBackfillExecutor) Execute(
 // to the page's highest id. The cursor only advances after every row in the
 // page has been considered, so a crash mid-page resumes before it and no row
 // is silently skipped.
-func (e *VirtualIdentityBackfillExecutor) processPage(ctx context.Context, rows []*models.MediaFile, result *adminjob.VirtualIdentityBackfillResult) error {
+//
+// A provider group that cannot be re-listed leaves the page not fully
+// processed: the cursor is restored to the page boundary and failed is true so
+// the caller stops and a later run retries the page instead of skipping the
+// group's rows.
+func (e *VirtualIdentityBackfillExecutor) processPage(ctx context.Context, rows []*models.MediaFile, result *adminjob.VirtualIdentityBackfillResult) (bool, error) {
+	pageCursor := result.Cursor
 	type group struct {
 		path string
 		rows []*models.MediaFile
@@ -150,7 +166,8 @@ func (e *VirtualIdentityBackfillExecutor) processPage(ctx context.Context, rows 
 		existing.rows = append(existing.rows, row)
 	}
 	// Every row in the page advances the cursor, whether or not it could be
-	// grouped, so a crash after this point never re-lists work already done.
+	// grouped, so a crash after this point never re-lists work already done. A
+	// provider failure below restores the cursor to the page boundary.
 	for _, row := range rows {
 		if row != nil && row.ID > result.Cursor {
 			result.Cursor = row.ID
@@ -158,19 +175,22 @@ func (e *VirtualIdentityBackfillExecutor) processPage(ctx context.Context, rows 
 	}
 	sort.Strings(order)
 
+	failed := false
 	for _, key := range order {
 		group := groupsByKey[key]
 		result.GroupsScanned++
 		streams, err := e.Lister(ctx, group.path)
 		if err != nil {
-			// A provider outage is not fatal to the pass: count the group's
-			// rows unmatched and move on. The one-shot job still completes so a
-			// later operator re-run can pick these up.
+			// A provider outage is not fatal to the pass, but the page is left
+			// incomplete. Count the group's rows unmatched, restore the cursor
+			// to the page boundary, and report the page so the caller fails the
+			// job and a later run retries instead of orphaning these rows.
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return false, ctx.Err()
 			}
 			result.GroupsFailed++
 			result.RowsUnmatched += len(group.rows)
+			failed = true
 			e.logger().WarnContext(ctx, "virtual identity backfill: provider re-list failed",
 				"component", "api", "virtual_path", group.path, "rows", len(group.rows), "error", err)
 			continue
@@ -189,7 +209,7 @@ func (e *VirtualIdentityBackfillExecutor) processPage(ctx context.Context, rows 
 			}
 			wrote, err := e.Store.FillVirtualProviderIdentity(ctx, row.ID, row.FilePath, identity)
 			if err != nil {
-				return fmt.Errorf("fill virtual provider identity: %w", err)
+				return false, fmt.Errorf("fill virtual provider identity: %w", err)
 			}
 			if !wrote {
 				// The row gained identity between the page read and this write
@@ -202,7 +222,10 @@ func (e *VirtualIdentityBackfillExecutor) processPage(ctx context.Context, rows 
 			result.Tiers[tier]++
 		}
 	}
-	return nil
+	if failed {
+		result.Cursor = pageCursor
+	}
+	return failed, nil
 }
 
 // matchBackfillCandidate returns the fresh candidate a legacy row can be
@@ -241,11 +264,14 @@ func matchBackfillCandidate(row *models.MediaFile, streams []virtuallibrary.Play
 
 // EnsureBackfillJob queues the one-shot backfill at boot when legacy rows exist
 // and no backfill has finished. A completed (or explicitly canceled) job is the
-// one-shot marker: rows that could not be matched stay legacy on purpose, and
-// re-listing every provider on every restart would be a permanent tax. An
-// already-active job is a no-op, so a restart during a run resumes the existing
-// job instead of queueing a duplicate. A server with no admin account cannot
-// own a job and is skipped.
+// one-shot marker: rows that could not be matched against a reachable provider
+// stay legacy on purpose, and re-listing every provider on every restart would
+// be a permanent tax. A partially failed run is not a finished job: its durable
+// watermark makes the remaining rows retriable, so the newest failed job is
+// requeued instead of starting a fresh pass from zero. An already-active job is
+// a no-op, so a restart during a run resumes the existing job instead of
+// queueing a duplicate. A server with no admin account cannot own a job and is
+// skipped.
 func (e *VirtualIdentityBackfillExecutor) EnsureBackfillJob(ctx context.Context, ownerUserID int) error {
 	if e == nil || e.Store == nil || e.Jobs == nil || ownerUserID <= 0 {
 		return nil
@@ -262,6 +288,13 @@ func (e *VirtualIdentityBackfillExecutor) EnsureBackfillJob(ctx context.Context,
 		return err
 	}
 	if len(rows) == 0 {
+		return nil
+	}
+	requeued, err := e.Jobs.RequeueLatestFailedOfType(ctx, adminjob.JobTypeVirtualIdentityBackfill)
+	if err != nil {
+		return err
+	}
+	if requeued {
 		return nil
 	}
 	_, err = e.Jobs.Create(ctx, adminjob.CreateJobInput{

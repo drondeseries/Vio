@@ -97,12 +97,20 @@ func (f *fakeBackfillLister) list(_ context.Context, path string) ([]virtuallibr
 type fakeBackfillJobs struct {
 	completed    bool
 	completedErr error
+	requeue      bool
+	requeueErr   error
+	requeued     int
 	createErr    error
 	created      []adminjob.CreateJobInput
 }
 
 func (f *fakeBackfillJobs) HasFinishedJobOfType(context.Context, string) (bool, error) {
 	return f.completed, f.completedErr
+}
+
+func (f *fakeBackfillJobs) RequeueLatestFailedOfType(context.Context, string) (bool, error) {
+	f.requeued++
+	return f.requeue, f.requeueErr
 }
 
 func (f *fakeBackfillJobs) Create(_ context.Context, in adminjob.CreateJobInput) (*models.AdminJob, error) {
@@ -221,10 +229,11 @@ func TestVirtualIdentityBackfillRefusesBareName(t *testing.T) {
 	}
 }
 
-// TestVirtualIdentityBackfillProviderFailureIsNonFatal proves one unreachable
-// provider does not abort the pass, does not regress the cursor past the
-// failed group's rows, and leaves another group's match intact.
-func TestVirtualIdentityBackfillProviderFailureIsNonFatal(t *testing.T) {
+// TestVirtualIdentityBackfillProviderFailureStaysRetriable proves one
+// unreachable provider does not abort the pass or advance the watermark past
+// its page, leaves another group's match intact, and is retried on a resumed
+// run once the provider recovers.
+func TestVirtualIdentityBackfillProviderFailureStaysRetriable(t *testing.T) {
 	badPath := "virtual://movie/tt-bad"
 	goodPath := "virtual://movie/tt-good"
 	stream := virtuallibrary.PlaybackStream{
@@ -250,8 +259,54 @@ func TestVirtualIdentityBackfillProviderFailureIsNonFatal(t *testing.T) {
 	if len(store.filled) != 1 || store.filled[4].VideoHash != "hash-good" {
 		t.Fatalf("filled = %+v, want only the reachable group's row", store.filled)
 	}
-	if result.Cursor != 4 || result.RowsScanned != 2 || result.RowsTotal != 2 {
-		t.Fatalf("progress = %+v, want both rows scanned and cursor past them", result)
+	if result.Cursor != 0 || result.RowsScanned != 2 || result.RowsTotal != 2 {
+		t.Fatalf("progress = %+v, want the watermark held before the failed page", result)
+	}
+
+	// The provider recovers: the resumed run retries the failed group from the
+	// watermark instead of skipping it.
+	recovered := &fakeBackfillLister{byPath: map[string][]virtuallibrary.PlaybackStream{
+		badPath:  {{ID: "fresh", ProviderVideoHash: "hash-bad", ProviderReleaseName: "Bad.Movie.2024.1080p", FileSize: 5_000_000_000}},
+		goodPath: {stream},
+	}}
+	executor = &VirtualIdentityBackfillExecutor{Lister: recovered.list, Store: store}
+	second := runBackfill(t, executor, adminjob.VirtualIdentityBackfillResume{Cursor: result.Cursor})
+	if second.GroupsFailed != 0 || second.RowsMatched != 1 {
+		t.Fatalf("resumed result = %+v, want the previously failed row matched", second)
+	}
+	if second.Cursor != 3 || store.filled[3].VideoHash != "hash-bad" {
+		t.Fatalf("resumed cursor = %d, filled = %+v, want row 3 matched and cursor 3", second.Cursor, store.filled)
+	}
+}
+
+// TestVirtualIdentityBackfillStopsAtLastFullyProcessedPage proves a failure in
+// a later page holds the watermark at the page boundary before it, so a resumed
+// run re-lists only the failed page rather than skipping its rows.
+func TestVirtualIdentityBackfillStopsAtLastFullyProcessedPage(t *testing.T) {
+	goodPath := "virtual://movie/tt-good"
+	badPath := "virtual://movie/tt-bad"
+	good := virtuallibrary.PlaybackStream{
+		ID:                  "fresh",
+		ProviderVideoHash:   "hash-good",
+		ProviderReleaseName: "Good.Movie.2024.1080p",
+		FileSize:            6_000_000_000,
+	}
+	store := &fakeBackfillStore{rows: []*models.MediaFile{
+		legacyBackfillRow(5, goodPath+"?result=old", "Good.Movie.2024.1080p", 6_100_000_000),
+		legacyBackfillRow(11, badPath+"?result=bad", "Bad.Movie.2024.1080p", 5_000_000_000),
+	}}
+	lister := &fakeBackfillLister{
+		byPath: map[string][]virtuallibrary.PlaybackStream{goodPath: {good}},
+		errs:   map[string]error{badPath: errors.New("provider offline")},
+	}
+	executor := &VirtualIdentityBackfillExecutor{Lister: lister.list, Store: store, batchSize: 1}
+
+	result := runBackfill(t, executor, adminjob.VirtualIdentityBackfillResume{})
+	if result.Cursor != 5 || result.GroupsFailed != 1 || result.RowsMatched != 1 {
+		t.Fatalf("result = %+v, want the cursor held at the first fully-processed page boundary", result)
+	}
+	if len(lister.calls) != 2 || lister.calls[0] != goodPath || lister.calls[1] != badPath {
+		t.Fatalf("listed groups = %v, want the good page then the failed page", lister.calls)
 	}
 }
 
@@ -322,6 +377,16 @@ func TestEnsureBackfillJobGates(t *testing.T) {
 	}
 	if len(jobs.created) != 0 {
 		t.Fatal("queued a second one-shot backfill")
+	}
+
+	// A failed partial run is retriable: the failed job is requeued with its
+	// watermark instead of a fresh job starting from zero.
+	jobs = &fakeBackfillJobs{requeue: true}
+	if err := newExecutor(baseStore(), jobs).EnsureBackfillJob(context.Background(), 7); err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+	if jobs.requeued != 1 || len(jobs.created) != 0 {
+		t.Fatalf("requeued=%d created=%d, want the failed job revived, not a duplicate", jobs.requeued, len(jobs.created))
 	}
 
 	// No legacy rows: nothing to do.
