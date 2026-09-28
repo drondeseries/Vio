@@ -135,6 +135,51 @@ func TestGenerationTokenBindsSessionAttemptAndTimeline(t *testing.T) {
 	}
 }
 
+// A raw query that already names a generation must be replaced, not appended.
+// The segment handlers read Query().Get(sgen), which returns the first value, so
+// appending would leave the caller's stale token authoritative and reject the
+// current generation's own valid segments.
+func TestGenerationScopedQueryReplacesPreexistingToken(t *testing.T) {
+	session := &TranscodeSession{
+		outputDir:          t.TempDir(),
+		segmentIncarnation: "inc",
+		opts:               TranscodeOpts{SessionID: "session-1"},
+	}
+	current := session.GenerationToken()
+
+	tests := []struct {
+		name     string
+		rawQuery string
+	}{
+		{name: "token first", rawQuery: "sgen=stale&token=test"},
+		{name: "token last", rawQuery: "token=test&sgen=stale"},
+		{name: "only token", rawQuery: "sgen=stale"},
+		{name: "duplicate tokens", rawQuery: "st=jwt&sgen=old&sgen=older"},
+		{name: "unrelated sgen prefix", rawQuery: "xsgen=keep&sgen=stale"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			query := session.generationScopedQuery(tt.rawQuery)
+			values, err := url.ParseQuery(query)
+			if err != nil {
+				t.Fatalf("parse %q: %v", query, err)
+			}
+			got := values[GenerationQueryParam]
+			if len(got) != 1 || got[0] != current {
+				t.Fatalf("query %q has %s = %v, want [%q]", query, GenerationQueryParam, got, current)
+			}
+			if strings.Contains(query, "stale") {
+				t.Fatalf("query %q still carries the stale token", query)
+			}
+		})
+	}
+
+	// An unrelated prefix must survive untouched.
+	if got := session.generationScopedQuery("xsgen=keep"); !strings.Contains(got, "xsgen=keep") {
+		t.Fatalf("unrelated parameter dropped: %q", got)
+	}
+}
+
 // A segment URI built for a live generation parses back to a token the session
 // accepts, so the manifest and the fence agree on the format.
 func TestManifestGenerationTokenRoundTrips(t *testing.T) {

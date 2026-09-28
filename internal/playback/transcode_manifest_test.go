@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -108,6 +109,86 @@ func TestBuildPlaybackManifest_CopyVideoUsesRealManifest(t *testing.T) {
 	}
 	if strings.Contains(text, "#EXT-X-PLAYLIST-TYPE:VOD") {
 		t.Fatalf("copy-mode manifest should not be synthetic VOD:\n%s", text)
+	}
+}
+
+// A manifest request URL that already carries an sgen token must have it
+// replaced, not duplicated. Segment handlers read Query().Get("sgen"), which
+// returns the first value, so an appended duplicate would leave the caller's
+// stale token authoritative and reject every valid segment of the generation
+// that actually produced the manifest.
+func TestBuildPlaybackManifest_ReplacesPreexistingGenerationToken(t *testing.T) {
+	tempDir := t.TempDir()
+	manifest := strings.Join([]string{
+		"#EXTM3U",
+		"#EXT-X-VERSION:7",
+		"#EXT-X-TARGETDURATION:3",
+		"#EXT-X-MEDIA-SEQUENCE:9",
+		"#EXT-X-INDEPENDENT-SEGMENTS",
+		"#EXT-X-MAP:URI=\"init.mp4\"",
+		"#EXTINF:2.669000,",
+		"seg_00009.m4s",
+		"#EXTINF:1.669000,",
+		"seg_00010.m4s",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(tempDir, "stream.m3u8"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	for _, name := range []string{"init.mp4", "seg_00009.m4s", "seg_00010.m4s"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	session := &TranscodeSession{
+		outputDir:          tempDir,
+		segmentIncarnation: "inc",
+		opts: TranscodeOpts{
+			SessionID:        "s",
+			TargetCodecVideo: "copy",
+			TargetCodecAudio: "aac",
+			SegmentDuration:  2,
+			TotalDuration:    10,
+		},
+	}
+	current := session.GenerationToken()
+
+	got, err := session.BuildPlaybackManifest("segment/", "token=test&sgen=stale-token")
+	if err != nil {
+		t.Fatalf("BuildPlaybackManifest: %v", err)
+	}
+	text := string(got)
+	if strings.Contains(text, "stale-token") {
+		t.Fatalf("manifest still exposes the stale generation token:\n%s", text)
+	}
+
+	// One generation token per exposed URI: the init map and both segments.
+	seen := 0
+	for _, line := range strings.Split(text, "\n") {
+		idx := strings.Index(line, "segment/")
+		if idx < 0 {
+			continue
+		}
+		uri := strings.TrimSuffix(line[idx:], "\"")
+		parsed, err := url.Parse(uri)
+		if err != nil {
+			t.Fatalf("parse segment URI %q: %v", uri, err)
+		}
+		values := parsed.Query()
+		if _, ok := values[GenerationQueryParam]; !ok {
+			t.Fatalf("segment URI %q carries no generation token", uri)
+		}
+		if got := values.Get(GenerationQueryParam); got != current {
+			t.Fatalf("Query().Get(%q) for %q = %q, want %q", GenerationQueryParam, uri, got, current)
+		}
+		if n := len(values[GenerationQueryParam]); n != 1 {
+			t.Fatalf("segment URI %q carries %d %q values, want 1", uri, n, GenerationQueryParam)
+		}
+		seen++
+	}
+	if seen != 3 {
+		t.Fatalf("checked %d segment URIs, want 3:\n%s", seen, text)
 	}
 }
 

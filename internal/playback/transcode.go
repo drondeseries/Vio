@@ -2544,19 +2544,57 @@ func (s *TranscodeSession) BuildPlaybackManifest(segPrefix, rawQuery string) ([]
 	return s.buildPlaybackManifest(segPrefix, s.generationScopedQuery(rawQuery))
 }
 
-// generationScopedQuery appends this session's generation token to the segment
+// GenerationQueryParam names the query parameter that carries a session's
+// opaque generation token on manifest segment URIs. It must stay in sync with
+// the segment handlers, which read it with Query().Get.
+const GenerationQueryParam = "sgen"
+
+// generationScopedQuery sets this session's generation token on the segment
 // query so every segment URI the manifest exposes is addressed to the exact
 // generation that produced it.
+//
+// An existing token in rawQuery is replaced, not appended: a manifest request
+// that already carries sgen would otherwise expose a duplicate parameter, and
+// the segment handlers read Query().Get(GenerationQueryParam), which returns
+// only the first value. An appended token would then leave the caller's stale
+// value authoritative and reject the generation's own valid segments, making
+// the manifest unplayable.
 func (s *TranscodeSession) generationScopedQuery(rawQuery string) string {
+	rawQuery = stripQueryParam(rawQuery, GenerationQueryParam)
 	token := s.GenerationToken()
 	if token == "" {
 		return rawQuery
 	}
-	encoded := "sgen=" + url.QueryEscape(token)
+	encoded := GenerationQueryParam + "=" + url.QueryEscape(token)
 	if rawQuery == "" {
 		return encoded
 	}
 	return rawQuery + "&" + encoded
+}
+
+// stripQueryParam removes every raw-query pair whose key is name, preserving the
+// order and encoding of the remaining pairs verbatim. A pair with no value
+// (bare "name") is removed as well.
+func stripQueryParam(rawQuery, name string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	parts := strings.Split(rawQuery, "&")
+	kept := parts[:0]
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		key := part
+		if i := strings.IndexByte(part, '='); i >= 0 {
+			key = part[:i]
+		}
+		if key == name {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	return strings.Join(kept, "&")
 }
 
 // buildPlaybackManifest renders the manifest with an already generation-scoped

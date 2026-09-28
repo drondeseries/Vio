@@ -2620,7 +2620,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	segmentName := name
-	requestedGeneration := strings.TrimSpace(r.URL.Query().Get("sgen"))
+	requestedGeneration := strings.TrimSpace(r.URL.Query().Get(playback.GenerationQueryParam))
 	segmentLease, err := session.OpenSegmentForGeneration(segmentName, requestedGeneration)
 	if err != nil && err == playback.ErrSegmentNotFound {
 		segNum, parseErr := playback.ParseSegmentNumber(name)

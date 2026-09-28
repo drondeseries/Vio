@@ -2378,7 +2378,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	}
 
 	segmentName := chi.URLParam(r, "name")
-	requestedGeneration := strings.TrimSpace(r.URL.Query().Get("sgen"))
+	requestedGeneration := strings.TrimSpace(r.URL.Query().Get(playback.GenerationQueryParam))
 	// servedSession is the generation the returned lease came from: the live
 	// one normally, the retained predecessor during the switchover overlap. The
 	// delivery report below must name the session that owns the lease's
