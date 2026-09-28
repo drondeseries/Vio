@@ -137,6 +137,15 @@ export const FEATURE_OUTPUT_CHANGE_V3 = "output_change_v1";
  */
 export const FEATURE_PLAN_INVALIDATED_V3 = "plan_invalidated_v1";
 
+/**
+ * The client handles the realtime `source_committed` event: it re-keys its
+ * version menu to the effective source the transport committed to and adopts
+ * the declared audio inventory without waiting for a replan or probe. It is a
+ * best-effort UI promise, so the server may push the event to any connected
+ * session; a client that does not know it ignores it.
+ */
+export const FEATURE_SOURCE_COMMITTED_V3 = "source_committed_event_v1";
+
 /** The `original` rung label, which always preserves the source. */
 export const QUALITY_ORIGINAL_V3 = "original";
 

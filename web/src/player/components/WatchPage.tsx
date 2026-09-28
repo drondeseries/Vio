@@ -5,7 +5,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { PlayerFileVersion, PlayerPlaybackStateChange, WatchPageProps } from "../types";
 import type { PlayerIndexerRelease } from "../types";
-import type { PlaybackRealtimeEventEnvelope } from "../realtime-protocol";
+import type {
+  PlaybackRealtimeEventEnvelope,
+  PlaybackSourceCommittedPayload,
+} from "../realtime-protocol";
 import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
@@ -393,13 +396,19 @@ function WatchPagePlayer({
     });
   }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
-  const activeVersion = useMemo(
-    () =>
-      resolveEffectiveVersion(playbackVersions, session) ??
+  const activeVersion = useMemo(() => {
+    const resolved = resolveEffectiveVersion(playbackVersions, session);
+    if (resolved) return resolved;
+    // When the plan or a committed-source event names a concrete effective
+    // virtual source, a list miss is a real miss: never fall through to an
+    // unrelated release's row for the live session. An older plan with no
+    // effective identity keeps the historical id/first-row fallback.
+    if (session.effectiveVirtualUri) return undefined;
+    return (
       (fileId ? playbackVersions.find((v) => v.file_id === fileId) : undefined) ??
-      playbackVersions[0],
-    [fileId, playbackVersions, session],
-  );
+      playbackVersions[0]
+    );
+  }, [fileId, playbackVersions, session]);
 
   // The plan's audio inventory is authoritative for the effective source after
   // a version fallback; item metadata can be stale. Fall back to the version's
@@ -521,6 +530,40 @@ function WatchPagePlayer({
 
   const applyAudioInventory = session.applyAudioInventory;
   const refreshSubtitles = session.refreshSubtitles;
+
+  /**
+   * Follows the effective version a transport just committed to. The realtime
+   * event is the only signal for a serve-layer rotation, which never publishes
+   * a new plan: adopt the new identity and declared audio inventory, and when
+   * the source actually changed, re-read the subtitle inventory through the
+   * existing refresh path so the subtitle menu follows too.
+   */
+  const applyCommittedSource = session.applyCommittedSource;
+  const handleSourceCommitted = useCallback(
+    (payload: PlaybackSourceCommittedPayload) => {
+      // Compare against the live session identity (which a prior commit event
+      // has already moved), not the plan, so a duplicate delivery is a no-op.
+      const current = sessionRef.current;
+      const identityChanged =
+        (payload.effective_media_file_id != null &&
+          payload.effective_media_file_id !== current.mediaFileId) ||
+        (payload.effective_virtual_uri != null &&
+          payload.effective_virtual_uri !== current.effectiveVirtualUri);
+      applyCommittedSource(
+        {
+          effectiveMediaFileId: payload.effective_media_file_id ?? null,
+          effectiveVirtualUri: payload.effective_virtual_uri ?? null,
+          inventoryStatus: payload.inventory_status ?? null,
+        },
+        payload.audio_tracks ?? [],
+      );
+      if (identityChanged) {
+        void refreshSubtitles(playbackPositionRef.current);
+      }
+    },
+    [applyCommittedSource, refreshSubtitles],
+  );
+
   useEffect(() => {
     if (!session.sessionId || !session.mediaFileId || session.loading || session.replacing) {
       return;
@@ -1123,6 +1166,7 @@ function WatchPagePlayer({
         onMinimize={onMinimize}
         onEnded={handleEnded}
         onRefreshSubtitles={session.refreshSubtitles}
+        onSourceCommitted={handleSourceCommitted}
         audioTracks={audioTracks}
         activeAudioIndex={session.audioTrackIndex}
         onAudioSelect={handleSwitchAudio}

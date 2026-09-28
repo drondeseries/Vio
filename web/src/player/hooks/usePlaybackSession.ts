@@ -200,6 +200,27 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * for another target and replaces the menu wholesale.
    */
   applyAudioInventory: (tracks: PlayerAudioTrack[], fileId?: number | null) => void;
+  /**
+   * Adopts the effective version a transport just committed to, and that
+   * release's declared audio inventory, from the realtime `source_committed`
+   * event.
+   *
+   * A serve-layer rotation moves the live source without a plan rebuild, so
+   * nothing else updates `mediaFileId`/`effectiveVirtualUri`; this is what lets
+   * the version and audio menus follow the streamed release. A changed identity
+   * replaces the audio inventory wholesale — including with an empty list — so
+   * the previous release's tracks are never shown under the new one. The plan
+   * and its revisions are untouched, so the stream does not reload; the
+   * existing inventory poll upgrades the declared list to probe evidence.
+   */
+  applyCommittedSource: (
+    source: {
+      effectiveMediaFileId?: number | null;
+      effectiveVirtualUri?: string | null;
+      inventoryStatus?: string | null;
+    },
+    audioTracks: PlayerAudioTrack[],
+  ) => void;
   /** Keeps transport state current for output-capability replans. */
   updatePlaybackState: (positionSeconds: number, playing: boolean) => void;
   /**
@@ -1701,6 +1722,44 @@ export function usePlaybackSession(
     });
   }, []);
 
+  const applyCommittedSource = useCallback(
+    (
+      source: {
+        effectiveMediaFileId?: number | null;
+        effectiveVirtualUri?: string | null;
+        inventoryStatus?: string | null;
+      },
+      audioTracks: PlayerAudioTrack[],
+    ) => {
+      setState((current) => {
+        const nextFileId = source.effectiveMediaFileId ?? current.mediaFileId;
+        const nextUri = source.effectiveVirtualUri ?? current.effectiveVirtualUri;
+        const identityChanged =
+          nextFileId !== current.mediaFileId || nextUri !== current.effectiveVirtualUri;
+        const richer = audioTracks.length > current.planAudioTracks.length;
+        if (!identityChanged && !richer) return current;
+        return {
+          ...current,
+          mediaFileId: nextFileId,
+          effectiveVirtualUri: nextUri,
+          // A moved effective source replaces the menu wholesale, including
+          // with an empty list, so the previous release's tracks are never
+          // shown under the new one. A same-source push only accepts a richer
+          // probed list.
+          planAudioTracks:
+            identityChanged || richer
+              ? audioTracks.map((track) => ({ ...track }))
+              : current.planAudioTracks,
+          // Declared metadata stays provisional; a verified push clears the
+          // marker just like the inventory poll does.
+          audioInventoryProvisional:
+            source.inventoryStatus === "verified" ? false : current.audioInventoryProvisional,
+        };
+      });
+    },
+    [],
+  );
+
   const updatePlaybackState = useCallback((positionSeconds: number, playing: boolean) => {
     if (Number.isFinite(positionSeconds) && positionSeconds >= 0) {
       const isUninitializedPlayerZero =
@@ -1852,6 +1911,7 @@ export function usePlaybackSession(
     refreshSubtitles,
     applySubtitleTrack,
     applyAudioInventory,
+    applyCommittedSource,
     updatePlaybackState,
     reportFirstFrame,
     reportEvent,
