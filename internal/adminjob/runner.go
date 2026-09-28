@@ -59,6 +59,7 @@ type Runner struct {
 	storageTransition          storageTransitionExecutor
 	storageTransitionCommitted func(context.Context) error
 	virtualRefresh             VirtualCandidatesRefreshExecutor
+	virtualIdentityBackfill    VirtualIdentityBackfillExecutor
 	realtimeHub                *notifications.Hub
 	pollInterval               time.Duration
 	cleanupInterval            time.Duration
@@ -221,6 +222,7 @@ func (r *Runner) runNext() {
 		JobTypeTemplateBundleApply,
 		JobTypeStorageTransition,
 		JobTypeVirtualCandidatesRefresh,
+		JobTypeVirtualIdentityBackfill,
 	})
 	cancel()
 	if err != nil {
@@ -251,6 +253,7 @@ func (r *Runner) runNext() {
 		imageCacheCleanup: r.imageCacheCleanup, templateBundleApply: r.templateBundleApply, storageTransition: r.storageTransition,
 		storageTransitionCommitted: r.storageTransitionCommitted,
 		virtualRefresh:             r.virtualRefresh,
+		virtualIdentityBackfill:    r.virtualIdentityBackfill,
 		realtimeHub:                r.realtimeHub, heartbeatInterval: r.heartbeatInterval, retention: r.retention, cancelRegistry: r.cancelRegistry,
 		storageRestart: r.storageRestart, stop: r.stop,
 	}
@@ -308,6 +311,8 @@ func (r *Runner) runNext() {
 		r.executeStorageTransition(job)
 	case JobTypeVirtualCandidatesRefresh:
 		r.executeVirtualCandidatesRefresh(job)
+	case JobTypeVirtualIdentityBackfill:
+		r.executeVirtualIdentityBackfill(job)
 	default:
 		r.failJob(job.ID, 0, 0, "Admin job failed", "unsupported admin job type")
 	}
@@ -1197,6 +1202,102 @@ func (r *Runner) executeVirtualCandidatesRefresh(job *models.AdminJob) {
 		ExpiresAt:       time.Now().UTC().Add(r.retention),
 	}); err != nil {
 		slog.Warn("admin jobs: failed to complete virtual candidates refresh", "job_id", job.ID, "error", err)
+		return
+	}
+	r.publishJobByID(ctx, notifications.TypeJobCompleted, job.ID)
+}
+
+// executeVirtualIdentityBackfill runs the one-shot resumable identity backfill.
+// The executor loops over pages of legacy rows and owns its degradation: a
+// provider that cannot be reached for one candidate group is counted and
+// skipped, so any error it returns is a genuine pipeline failure. The durable
+// cursor it reports is persisted with every progress tick, so a requeued claim
+// resumes after the last fully-processed page.
+func (r *Runner) executeVirtualIdentityBackfill(job *models.AdminJob) {
+	if r.virtualIdentityBackfill == nil {
+		r.failJob(job.ID, 0, 0, "Virtual identity backfill failed", "virtual identity backfill executor is not configured")
+		return
+	}
+
+	var req VirtualIdentityBackfillRequest
+	if len(job.RequestPayload) > 0 {
+		if err := json.Unmarshal(job.RequestPayload, &req); err != nil {
+			r.failJob(job.ID, 0, 0, "Virtual identity backfill failed", fmt.Sprintf("invalid virtual identity backfill payload: %v", err))
+			return
+		}
+	}
+	// The resume cursor is whatever the last claim persisted. A fresh job
+	// carries no result payload and starts at zero.
+	var resume VirtualIdentityBackfillResume
+	if len(job.ResultPayload) > 0 {
+		if err := json.Unmarshal(job.ResultPayload, &resume); err != nil {
+			slog.Warn("admin jobs: ignoring unreadable virtual identity backfill cursor", "job_id", job.ID, "error", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.executionContext(), virtualIdentityBackfillTimeout)
+	defer cancel()
+
+	go func() {
+		ticker := time.NewTicker(r.heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				current, err := r.repo.GetByID(ctx, job.ID)
+				if err == nil && (current.CancelRequested || current.ClaimGeneration != job.ClaimGeneration) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	unregisterCancel := r.cancelRegistry.Register(job.ID, cancel)
+	defer unregisterCancel()
+
+	heartbeatStop := make(chan struct{})
+	go r.heartbeatLoop(ctx, job.ID, heartbeatStop)
+	defer close(heartbeatStop)
+
+	progress := func(current, total, cursor int, message string) {
+		// Persist the cursor with the progress so a stale recovery resumes here.
+		if err := r.repo.UpdateProgressResult(ctx, job.ID, current, total, message, VirtualIdentityBackfillResume{Cursor: cursor}); err != nil {
+			slog.Warn("admin jobs: failed to update virtual identity backfill progress", "job_id", job.ID, "error", err)
+			return
+		}
+		r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
+	}
+
+	result, err := r.virtualIdentityBackfill.Execute(ctx, req, resume, progress)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			r.cancelJob(job.ID, 0, 0, "Virtual identity backfill canceled")
+			return
+		}
+		msg := err.Error()
+		if ctx.Err() != nil {
+			msg = fmt.Sprintf("timed out after %s: %s", virtualIdentityBackfillTimeout, msg)
+		}
+		r.failJob(job.ID, 0, 0, "Virtual identity backfill failed", msg)
+		return
+	}
+
+	progressCurrent := 0
+	progressTotal := 0
+	if result != nil {
+		progressCurrent = result.RowsScanned
+		progressTotal = result.RowsTotal
+	}
+	if err := r.repo.Complete(ctx, job.ID, CompleteJobInput{
+		ResultPayload:   result,
+		Message:         "Virtual identity backfill completed",
+		ProgressCurrent: progressCurrent,
+		ProgressTotal:   progressTotal,
+		ExpiresAt:       time.Now().UTC().Add(r.retention),
+	}); err != nil {
+		slog.Warn("admin jobs: failed to complete virtual identity backfill", "job_id", job.ID, "error", err)
 		return
 	}
 	r.publishJobByID(ctx, notifications.TypeJobCompleted, job.ID)

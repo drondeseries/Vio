@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
@@ -565,6 +566,11 @@ type virtualPrefetchTask struct {
 	userID     int
 	profileID  string
 	key        string
+	// generation is the write generation captured at admission. The detached
+	// prefetch uses it for its cache warm so a prefetch that started before a
+	// foreground start cannot overwrite the newer listing when it finishes
+	// later.
+	generation uint64
 }
 
 // virtualPrefetchKey is the equivalence key for prefetch deduplication. Two
@@ -620,6 +626,7 @@ func (h *PlaybackHandler) PrefetchVirtualPlayback(ctx context.Context, files []*
 			userID:     userID,
 			profileID:  profileID,
 			key:        key,
+			generation: nextVirtualCacheGeneration(),
 		}
 		select {
 		case h.prefetchQueue <- task:
@@ -727,7 +734,7 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 	// device-neutral candidate set in the handler cache, so the first click
 	// skips the provider round-trip. The resolve below is then served from the
 	// resolver cache. Both are best-effort and metadata-only.
-	h.warmVirtualPlaybackListing(prefetchCtx, &task.file, task.neutralURI, task.userID, task.profileID)
+	h.warmVirtualPlaybackListing(prefetchCtx, &task.file, task.neutralURI, task.userID, task.profileID, task.generation)
 	if h.VirtualPlaybackResolver != nil {
 		_, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(
 			prefetchCtx, task.neutralURI, task.userID, task.profileID, task.file.VirtualOwnerInstallationID,
@@ -795,7 +802,7 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 // provider errors. Only the metadata cache is warmed here; the sticky pin is
 // deliberately not set, because a candidate that has never delivered bytes is
 // not yet evidence it should steer starts.
-func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *models.MediaFile, neutralURI string, userID int, profileID string) {
+func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *models.MediaFile, neutralURI string, userID int, profileID string, generation uint64) {
 	if h == nil || file == nil || neutralURI == "" {
 		return
 	}
@@ -822,10 +829,10 @@ func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *
 	if len(filtered) == 0 {
 		return
 	}
-	h.BestResultCache.setWithDetails(
+	h.BestResultCache.setWithDetailsAt(
 		bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID),
 		file.ContentID, neutralURI, file.VirtualOwnerInstallationID,
-		filtered, time.Now(),
+		filtered, time.Now(), generation,
 	)
 }
 
@@ -850,6 +857,19 @@ const (
 	defaultBestResultCacheEntries = 512
 )
 
+// virtualCacheGeneration is the process-wide monotonic generation source for
+// the best-result cache and the sticky pin. Each resolve (and each prefetch
+// task) captures a generation before it starts work and passes it to its cache
+// and pin writes; a write whose generation is older than the entry already
+// stored is refused, so a slow resolve cannot overwrite the result of a newer
+// one that finished first. The counter is process-local and never persisted,
+// exactly like the caches it fences.
+var virtualCacheGeneration atomic.Uint64
+
+func nextVirtualCacheGeneration() uint64 {
+	return virtualCacheGeneration.Add(1)
+}
+
 // VirtualBestResultCache remembers which result= URI worked for a content+profile
 // pair. On replay it skips the list+resolve+probe path entirely, jumping
 // directly to the known-good provider-neutral URI.
@@ -866,6 +886,9 @@ type bestResultCacheEntry struct {
 	ownerInstallationID int
 	streams             []VirtualPlaybackStream
 	expiresAt           time.Time
+	// generation is the write generation that produced this entry. A later
+	// writer carrying an older generation must not replace it.
+	generation uint64
 }
 
 // NewVirtualBestResultCache returns an initialized cache. Zero or negative ttl
@@ -969,8 +992,18 @@ func (c *VirtualBestResultCache) set(key string, streams []VirtualPlaybackStream
 }
 
 func (c *VirtualBestResultCache) setWithDetails(key, contentID, neutralURI string, ownerInstallationID int, streams []VirtualPlaybackStream, now time.Time) {
+	c.setWithDetailsAt(key, contentID, neutralURI, ownerInstallationID, streams, now, nextVirtualCacheGeneration())
+}
+
+// setWithDetailsAt is setWithDetails with an explicit write generation. It
+// refuses to replace an entry written by a newer generation, so a slow resolve
+// or detached prefetch that finishes after a newer one cannot overwrite it.
+func (c *VirtualBestResultCache) setWithDetailsAt(key, contentID, neutralURI string, ownerInstallationID int, streams []VirtualPlaybackStream, now time.Time, generation uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if existing, ok := c.entries[key]; ok && existing.generation > generation {
+		return
+	}
 	for k, entry := range c.entries {
 		if !now.Before(entry.expiresAt) {
 			delete(c.entries, k)
@@ -992,6 +1025,7 @@ func (c *VirtualBestResultCache) setWithDetails(key, contentID, neutralURI strin
 		ownerInstallationID: ownerInstallationID,
 		streams:             streams,
 		expiresAt:           now.Add(c.ttl),
+		generation:          generation,
 	}
 }
 
@@ -1123,6 +1157,12 @@ type resolvedVirtualPlaybackSource struct {
 	// many?") is answerable without a second resolve.
 	CandidateRank  int
 	CandidateCount int
+	// IdentityRematched is true when the resolver reported that the requested
+	// pin's result id was absent from a fresh listing but the same durable
+	// identity was found under a new result id. The candidate is then the same
+	// release re-identified, not a substitution, and a rotation that requires
+	// release continuity may accept it.
+	IdentityRematched bool
 }
 
 // virtualProbeIdentity is the durable provider identity of the candidate a
@@ -1480,6 +1520,39 @@ func clearVirtualCandidateDeclaredMetadata(file *models.MediaFile) {
 	file.ProbeUpdatedAt = nil
 }
 
+// withResolvedCandidate stamps the resolver's actual result identity onto a
+// resolved virtual source. The struct's Provider* fields and IdentityRematched
+// are the resolver's own evidence about the candidate it returned, kept
+// separate from the transient File identity, which is seeded from the requested
+// row and therefore cannot by itself prove what was served.
+func withResolvedCandidate(src *resolvedVirtualPlaybackSource, id virtualProbeIdentity, rematched bool) *resolvedVirtualPlaybackSource {
+	if src == nil {
+		return nil
+	}
+	src.ProviderVideoHash = id.VideoHash
+	src.ProviderGUID = id.GUID
+	src.ProviderReleaseName = id.ReleaseName
+	src.ProviderReleaseSize = id.ReleaseSize
+	src.IdentityRematched = rematched
+	return src
+}
+
+// rehydratedMatchesPersistedIdentity reports whether a rehydration resolve is
+// the same release as the session anchor row, judged by the durable identity
+// tiers in the same precedence resolvedMatchesPersistedIdentity uses. It is the
+// rehydration counterpart of the transport anchor's same-release assertion: a
+// resolve with no usable identity tier can never confirm the release, so an
+// unprovable rotation is refused instead of silently swapping releases.
+func rehydratedMatchesPersistedIdentity(resolved resolvedVirtualPlaybackSource, row *models.MediaFile) bool {
+	identity, ok := persistedVirtualIdentity(row)
+	if !ok {
+		return false
+	}
+	want := resolver.PersistedDedupKey(identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize)
+	got := resolver.PersistedDedupKey(resolved.ProviderVideoHash, resolved.ProviderGUID, resolved.ProviderReleaseName, resolved.ProviderReleaseSize)
+	return want != "" && want == got
+}
+
 // resolveRehydratedVirtualSourceV3 resolves the session-bound virtual source for
 // a replan rehydration. When the pinned candidate is absent from the provider's
 // current list the resolver refuses with ErrSessionBoundCandidateAbsent; this
@@ -1509,13 +1582,30 @@ func (h *PlaybackHandler) resolveRehydratedVirtualSourceV3(
 	}
 	rotatedOpts := opts
 	rotatedOpts.rotateCandidates = true
-	rotated, rotateErr := h.resolveVirtualPlaybackSource(r, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, true, rotatedOpts)
+	// Thread the anchor's durable identity so the resolver can re-identify a
+	// renumbered same-release candidate rather than mistake it for a sibling.
+	// A row with no durable identity is unchanged and the assertion below then
+	// refuses any rotation it cannot prove is the same release, exactly as the
+	// transport anchor does.
+	retryReq := r.WithContext(virtualResolveContextWithPersistedIdentity(r.Context(), pinnedFile))
+	rotated, rotateErr := h.resolveVirtualPlaybackSource(retryReq, pinnedFile, profileID, false, excludedCandidateIDs, preferredCandidateID, qualityPreference, bandwidthCapKbps, true, rotatedOpts)
 	if rotateErr != nil {
 		slog.WarnContext(r.Context(), "virtual replan candidate rotation failed",
 			"component", "api", "session_anchor", pinnedFile.FilePath,
 			"status", "rotation_failed", "old_candidate_id", virtualResultCandidateID(pinnedFile.FilePath),
 			"error", logredact.SanitizeURLError(rotateErr))
 		return rotated, rotateErr
+	}
+	// Same-release assertion, mirroring the transport anchor refusal. A
+	// rotation that resolves a genuinely different release must not anchor the
+	// rehydrated plan on sibling bytes; return the original absent/marked-failed
+	// cause so the caller keeps its terminal/rotation policy.
+	if !rotated.IdentityRematched && !rehydratedMatchesPersistedIdentity(rotated, pinnedFile) {
+		slog.WarnContext(r.Context(), "virtual replan candidate rotation resolved a different release; refusing a silent release swap",
+			"component", "api", "session_anchor", pinnedFile.FilePath,
+			"status", "rotation_refused", "old_candidate_id", virtualResultCandidateID(pinnedFile.FilePath),
+			"new_candidate_id", virtualResultCandidateID(rotated.URI))
+		return resolved, err
 	}
 	slog.InfoContext(r.Context(), "virtual replan rotated an absent session-bound candidate",
 		"component", "api", "session_anchor", pinnedFile.FilePath,
@@ -1600,6 +1690,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if h.VirtualPlaybackResolver == nil {
 		return resolvedVirtualPlaybackSource{}, errors.New("virtual playback resolver is not configured")
 	}
+	// Capture one write generation for this resolve before any work starts.
+	// Every cache entry and sticky pin this resolve writes carries it, so a
+	// resolve that finishes late cannot overwrite a newer resolve's evidence.
+	generation := nextVirtualCacheGeneration()
 	// Split file_load_probe into its provider phases so a cold-start
 	// attribution is measured, not guessed. The deferred log runs on every
 	// return below, including the fast paths.
@@ -1674,7 +1768,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if storedState == virtualStoredURLUsable || trustedResume {
 			persistedResumeStored = stored
 			persistedResumeURI = file.FilePath
-			h.pinVirtualSticky(stickyKey, persistedResumeURI)
+			h.pinVirtualStickyAt(stickyKey, persistedResumeURI, generation)
 			pinnedURI = persistedResumeURI
 			if trustedResume {
 				slog.InfoContext(r.Context(), "virtual durable resume: keeping the persisted candidate inside the trust window",
@@ -1769,7 +1863,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if h.BestResultCache != nil && len(filtered) > 0 {
 				neutralURI := virtualPlaybackNeutralKey(file.FilePath)
 				cacheKey := bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint)
-				h.BestResultCache.setWithDetails(cacheKey, file.ContentID, neutralURI, file.VirtualOwnerInstallationID, filtered, time.Now())
+				h.BestResultCache.setWithDetailsAt(cacheKey, file.ContentID, neutralURI, file.VirtualOwnerInstallationID, filtered, time.Now(), generation)
 			}
 			if noResult {
 				if len(filtered) > 0 {
@@ -1935,7 +2029,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			transient := *file
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid
-			h.pinVirtualSticky(stickyKey, cand.URI)
+			h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
@@ -1975,7 +2069,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient := *file
 				transient.FilePath = cand.URI
 				transient.VirtualOwnerInstallationID = oid
-				h.pinVirtualSticky(stickyKey, cand.URI)
+				h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
 				mergeVirtualCandidateTracks(&transient, cand)
 				if !transient.HDR && cand.HDR != "" {
 					transient.HDR = true
@@ -2019,7 +2113,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient := *file
 				transient.FilePath = cand.URI
 				transient.VirtualOwnerInstallationID = oid
-				h.pinVirtualSticky(stickyKey, cand.URI)
+				h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
 				mergeVirtualCandidateTracks(&transient, cand)
 				if !transient.HDR && cand.HDR != "" {
 					transient.HDR = true
@@ -2039,6 +2133,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		// resolved source this iteration produces. It is what the probe
 		// adoption write persists.
 		var resolvedIdentity virtualProbeIdentity
+		resolvedRematched := false
 		trace.resolveRan = true
 		resolveStart := time.Now()
 		// probedCandidateID is the candidate this iteration asked the resolver
@@ -2094,6 +2189,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					ReleaseName: res.ProviderReleaseName,
 					ReleaseSize: res.ProviderReleaseSize,
 				}
+				resolvedRematched = res.IdentityRematched
 				resolvedID := res.CandidateID
 				if resolvedID == "" && res.URI != "" {
 					resolvedID = virtualResultCandidateID(res.URI)
@@ -2256,15 +2352,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			skipProbe = hasCompleteVideoEvidence && hasCompleteAudioEvidence && hasCompleteContainerEvidence
 		}
 		if skipProbe && !storedProbeMissing {
-			h.pinVirtualSticky(stickyKey, cand.URI)
+			h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			return &resolvedVirtualPlaybackSource{
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
-			}, nil
+			}, resolvedIdentity, resolvedRematched), nil
 		}
 		ev, _ := remuxMatches[origKey]
 		appliedRemux := false
@@ -2300,7 +2396,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			allowDefer = false
 		}
 		if allowDefer {
-			h.pinVirtualSticky(stickyKey, cand.URI)
+			h.pinVirtualStickyAt(stickyKey, cand.URI, generation)
 			// Resolution precedence: stored evidence wins; otherwise adopt
 			// the candidate's declared label; only when both are absent is
 			// the 1080p baseline assumed. Only the last case marks
@@ -2330,9 +2426,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					// to declared metadata; otherwise the row stays unprobed
 					// until the damper lapses.
 					h.recoverVirtualProbeFromCache(r.Context(), file, streamURL, probeTransient, cand, oid)
-					return &resolvedVirtualPlaybackSource{
+					return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 						URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, ResolutionAssumed: resolutionAssumed,
-					}, nil
+					}, resolvedIdentity, resolvedRematched), nil
 				}
 				probeCand := cand
 				expectedRuntimeMinutes := h.virtualExpectedRuntimeMinutes(r.Context(), file)
@@ -2360,9 +2456,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					h.probeVirtualCandidateForegroundFallback(r.Context(), stickyKey, file, streamURL, probeTransient, probeCand, expectedRuntimeMinutes, oid)
 				}
 			}
-			return &resolvedVirtualPlaybackSource{
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
-			}, nil
+			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 			// Resolution precedence: stored evidence wins; otherwise adopt
@@ -2381,9 +2477,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			return &resolvedVirtualPlaybackSource{
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
-			}, nil
+			}, resolvedIdentity, resolvedRematched), nil
 		}
 		probeKey := virtualProbeFailureKey(cand.URI, oid)
 		declaredFallback := func() (*resolvedVirtualPlaybackSource, error) {
@@ -2403,9 +2499,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			return &resolvedVirtualPlaybackSource{
+			return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed, AppliedRemux: appliedRemux, ResolutionAssumed: resolutionAssumed,
-			}, nil
+			}, resolvedIdentity, resolvedRematched), nil
 		}
 		if virtualProbeFailures.recent(probeKey) {
 			// A recent probe failure already consumed the probe budget. A
@@ -2447,9 +2543,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 				applyResolvedIdentity(cached, resolvedIdentity)
 				h.maybeTriggerSubtitleSearch(attemptCtx, cached, cand)
-				return &resolvedVirtualPlaybackSource{
+				return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 					URL: streamURL, URI: cand.URI, OwnerID: oid, File: cached, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,
-				}, nil
+				}, resolvedIdentity, resolvedRematched), nil
 			}
 		}
 		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
@@ -2478,9 +2574,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		mergeVirtualCandidateTracks(probed, cand)
 		applyResolvedIdentity(probed, resolvedIdentity)
 		h.maybeTriggerSubtitleSearch(probeCtx, probed, cand)
-		return &resolvedVirtualPlaybackSource{
+		return withResolvedCandidate(&resolvedVirtualPlaybackSource{
 			URL: streamURL, URI: cand.URI, OwnerID: oid, File: probed, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified, AppliedRemux: appliedRemux,
-		}, nil
+		}, resolvedIdentity, resolvedRematched), nil
 	}
 
 	var firstResolved *resolvedVirtualPlaybackSource
@@ -2573,7 +2669,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
 			// as sticky so rotation cannot churn future sessions.
-			h.pinVirtualSticky(stickyKey, candidate.URI)
+			h.pinVirtualStickyAt(stickyKey, candidate.URI, generation)
 			result.CandidateRank = i
 			result.CandidateCount = len(candidates)
 			return *result, nil
@@ -2948,7 +3044,10 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 // adoption (sibling owner, collection row, live failed verdict) matches no row
 // and leaves the track inventory and probe stamp untouched. Metadata-only
 // writers leave $22 false and keep the previous behavior: adoption is best-effort
-// while the metadata and stamp still apply.
+// while the metadata and stamp still apply. The one exception is a
+// provider-neutral row writing a candidate URI a sibling row already owns: the
+// top-level candidate-ownership fence refuses the whole write so its tracks and
+// stamp cannot describe bytes the row does not own.
 //
 // Adoption is additionally fenced on the candidate's own verdict. A failed_at
 // stamp committed after the handler's last verdict read (the serve layer and
@@ -3076,6 +3175,27 @@ WHERE id = $11
   AND probe_updated_at IS NOT DISTINCT FROM $15::timestamptz
   AND virtual_owner_installation_id IS NOT DISTINCT FROM $16
   AND media_folder_id IS NOT DISTINCT FROM $17
+  -- A provider-neutral row (the row file_path equals the neutral key of the
+  -- candidate URI) must not absorb evidence for a candidate a sibling row already
+  -- owns: the tracks and stamp would describe bytes this row does not own. The
+  -- file_path CASE below would skip the adoption, but a metadata-only write
+  -- would still land; fence the whole neutral-row write on the candidate URI
+  -- as well as the expected path. The comparison is against the actual row
+  -- file_path rather than the optional expected path, which is empty for a
+  -- write that does not constrain the row identity and would otherwise bypass
+  -- the fence. Non-neutral writes are unchanged.
+  AND (
+    NULLIF($18, '') IS NULL
+    OR NULLIF($19, '') IS NULL
+    OR media_files.file_path IS DISTINCT FROM $19
+    OR NOT EXISTS (
+      SELECT 1 FROM media_files neutral_owner
+      WHERE neutral_owner.id <> media_files.id
+        AND neutral_owner.file_path = $18
+        AND neutral_owner.virtual_owner_installation_id IS NOT DISTINCT FROM $16
+        AND neutral_owner.media_folder_id IS NOT DISTINCT FROM $17
+    )
+  )
   -- Mirrors the file_path CASE below: when a confirmed adoption is required,
   -- the row only matches if that adoption will actually happen, so the track
   -- inventory and probe stamp cannot land without the identity. Keep the two
@@ -4252,6 +4372,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	var resolvedExpiresAt *time.Time
 	var providerVideoHash, providerGUID, providerReleaseName string
 	var providerReleaseSize int64
+	var identityRematched bool
 	if h.VirtualMediaDetailedResolver != nil {
 		// When this candidate is the persisted row's own release, thread the
 		// durable identity and trust window so an absent same-identity candidate
@@ -4280,6 +4401,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		providerGUID = res.ProviderGUID
 		providerReleaseName = res.ProviderReleaseName
 		providerReleaseSize = res.ProviderReleaseSize
+		identityRematched = res.IdentityRematched
 		candidate.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
 		if res.URI != "" {
 			candidate.URI = res.URI
@@ -4311,7 +4433,8 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 		ResolvedURL: streamURL, ResolvedURLExpiresAt: resolvedExpiresAt,
 		ProviderVideoHash: providerVideoHash, ProviderGUID: providerGUID,
 		ProviderReleaseName: providerReleaseName, ProviderReleaseSize: providerReleaseSize,
-		RequestHeaders: cloneHeaderMap(candidate.RequestHeaders),
+		IdentityRematched: identityRematched,
+		RequestHeaders:    cloneHeaderMap(candidate.RequestHeaders),
 	}
 	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 		return &resolved, nil
@@ -5719,6 +5842,9 @@ func sanitizeTrackSlice(v any) any {
 type virtualStickyPin struct {
 	uri      string
 	pinnedAt time.Time
+	// generation is the write generation that produced this pin. A later
+	// writer carrying an older generation must not replace it.
+	generation uint64
 }
 
 // virtualStickyTTL bounds how long a pin can steer selection without being
@@ -5772,11 +5898,22 @@ func (h *PlaybackHandler) peekVirtualSticky(key string) string {
 // by one entry per distinct virtual content key; entries expire lazily on
 // access, so no sweeper goroutine is needed.
 func (h *PlaybackHandler) pinVirtualSticky(key, uri string) {
+	h.pinVirtualStickyAt(key, uri, nextVirtualCacheGeneration())
+}
+
+// pinVirtualStickyAt is pinVirtualSticky with an explicit write generation. It
+// refuses to replace a pin written by a newer generation, so a slow resolve
+// that finishes after a newer one cannot steer later starts onto stale
+// evidence. The generation is only an ordering token; it is never persisted.
+func (h *PlaybackHandler) pinVirtualStickyAt(key, uri string, generation uint64) {
 	if h == nil || key == "" || uri == "" {
 		return
 	}
 	h.virtualStickyMu.Lock()
 	defer h.virtualStickyMu.Unlock()
+	if existing, ok := h.virtualStickyPins[key]; ok && existing.generation > generation {
+		return
+	}
 	if h.virtualStickyPins == nil {
 		h.virtualStickyPins = make(map[string]virtualStickyPin)
 	}
@@ -5801,7 +5938,7 @@ func (h *PlaybackHandler) pinVirtualSticky(key, uri string) {
 		}
 		delete(h.virtualStickyPins, oldestKey)
 	}
-	h.virtualStickyPins[key] = virtualStickyPin{uri: uri, pinnedAt: now}
+	h.virtualStickyPins[key] = virtualStickyPin{uri: uri, pinnedAt: now, generation: generation}
 }
 
 // unpinVirtualSticky releases the pin for key when it still refers to uri,

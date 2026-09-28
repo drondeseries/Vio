@@ -309,6 +309,24 @@ func (r *Repository) GetActiveByType(ctx context.Context, jobType string) (*mode
 	))
 }
 
+// HasFinishedJobOfType reports whether a job of this kind has reached a
+// terminal state the operator did not ask to retry: completed, or canceled.
+// It is the one-shot gate for work that must not be re-queued on every process
+// start, such as the virtual identity backfill. A failed job is deliberately
+// not "finished": the next boot re-queues it and the durable cursor resumes.
+func (r *Repository) HasFinishedJobOfType(ctx context.Context, jobType string) (bool, error) {
+	var exists bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM admin_jobs WHERE job_type = $1 AND status IN ($2, $3)
+		)`,
+		jobType, StatusCompleted, StatusCancelled,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check finished admin job of type: %w", err)
+	}
+	return exists, nil
+}
+
 func (r *Repository) GetActiveLibraryRefreshByLibraryID(ctx context.Context, libraryID int) (*models.AdminJob, error) {
 	return scanAdminJob(r.pool.QueryRow(ctx, `
 		SELECT `+adminJobColumns+`
@@ -825,7 +843,7 @@ func (r *Repository) withClaim(job *models.AdminJob) *Repository {
 // command accepts. Each has a runner path that observes CancelRequested and a
 // durable terminal transition, so setting the intent is enough for a queued job
 // and a running one alike.
-var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh}
+var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh, JobTypeVirtualIdentityBackfill}
 
 func isCancellableJobType(jobType string) bool {
 	for _, candidate := range cancellableJobTypes {

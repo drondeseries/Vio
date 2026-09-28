@@ -240,7 +240,7 @@ func TestSubtitleDegradeInPlaceNeverResolvesProviderCandidate(t *testing.T) {
 
 	_, _ = handler.evaluateSubtitleDegradeInPlaceV3(
 		httptest.NewRequest(http.MethodPost, "/api/v1/playback/replan", nil),
-		session, record, playback.ReplanRequestV3{}, start, file, file,
+		session, record, playback.ReplanRequestV3{}, start, file, ProbeProvenance(""), file,
 		playback.PlannerSettingsV3{}, nil, nil,
 	)
 	if resolverCalled {

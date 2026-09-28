@@ -1029,6 +1029,17 @@ type PlanV3 struct {
 	// InventoryStatus indicates whether the track inventory is "declared"
 	// (placeholder from candidate metadata) or "verified" (probed by ffprobe).
 	InventoryStatus string `json:"inventory_status,omitempty"`
+	// InventoryProvenance qualifies InventoryStatus with the resolver's own
+	// provenance for a virtual source: "verified" (this resolve probed the
+	// served bytes), "declared" (provider metadata only), "pending" (a probe
+	// is deferred), or "failed" (a probe ran and failed, so declared metadata
+	// is served). It is empty for a non-virtual source. InventoryStatus is
+	// inferred from the row's probe stamp alone, which a stale stamp or a
+	// served declared fallback can make look "verified"; this field reports
+	// what the resolve that produced the plan actually did. Like the inventory
+	// fields beside it, it is a UI hint and is deliberately excluded from plan
+	// identity hashing; it never changes selection.
+	InventoryProvenance string `json:"inventory_provenance,omitempty"`
 	// InventoryURL is the relative URL clients can fetch (with ETag/If-None-Match)
 	// to retrieve refreshed audio and subtitle inventories without replanning.
 	InventoryURL string `json:"inventory_url,omitempty"`

@@ -281,6 +281,10 @@ interface VideoPlayerProps {
   audioTracks?: PlayerAudioTrack[];
   activeAudioIndex?: number;
   onAudioSelect?: (index: number, currentPosition: number) => void;
+  /** True while the server's audio inventory is declared, not probed. */
+  audioInventoryProvisional?: boolean;
+  /** True while the server's subtitle inventory is declared, not probed. */
+  subtitleInventoryProvisional?: boolean;
   onSubtitleChanged?: (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => void;
   onExit: (state?: PlaybackExitState) => void | Promise<void>;
   onMinimize?: (state?: PlaybackExitState) => void | Promise<void>;
@@ -453,6 +457,8 @@ export function VideoPlayer({
   audioTracks = [],
   activeAudioIndex = 0,
   onAudioSelect,
+  audioInventoryProvisional = false,
+  subtitleInventoryProvisional = false,
   onSubtitleChanged,
   onExit,
   onMinimize,
@@ -4478,6 +4484,7 @@ export function VideoPlayer({
           onSubtitleSelect={handleSubtitleSelect}
           subtitleDelayMs={subtitleDelayMs}
           onSubtitleDelayChange={setSubtitleDelayMs}
+          subtitleInventoryProvisional={subtitleInventoryProvisional}
           mediaFileId={activeFileId ?? undefined}
           playerConfig={playerConfig}
           onRefreshSubtitles={
@@ -4490,6 +4497,7 @@ export function VideoPlayer({
           activeAudioIndex={activeAudioIndex}
           onAudioSelect={onAudioSelect}
           trackMenusLocked={replacing || replanning}
+          audioInventoryProvisional={audioInventoryProvisional}
           qualityOptions={qualityOptions}
           activeQualityId={activeQualityId}
           isTranscoding={replanningQuality}

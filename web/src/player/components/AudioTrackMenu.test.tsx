@@ -208,4 +208,27 @@ describe("AudioTrackMenu", () => {
 
     expect(screen.getAllByRole("menuitem")).toHaveLength(2);
   });
+
+  it("marks the menu unverified while the inventory is provisional", () => {
+    render(
+      createElement(AudioTrackMenu, {
+        tracks: [{ title: "English", codec: "eac3", channels: 6 }],
+        activeIndex: 0,
+        onSelect: () => {},
+        currentPosition: 0,
+        open: true,
+        onOpenChange: () => {},
+        hideTrigger: true,
+        provisional: true,
+      }),
+    );
+
+    expect(screen.getByText("Unverified")).toBeTruthy();
+  });
+
+  it("hides the unverified marker once the inventory is verified", () => {
+    renderMenu([{ title: "English", codec: "eac3", channels: 6 }]);
+
+    expect(screen.queryByText("Unverified")).toBeNull();
+  });
 });

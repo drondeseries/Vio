@@ -116,6 +116,8 @@ function playbackSession(
     durationSeconds: 3600,
     subtitleUrls: [],
     planAudioTracks: [],
+    audioInventoryProvisional: false,
+    subtitleInventoryProvisional: false,
     qualityPreference: "original",
     shouldAutoPlay: true,
     loading: false,
@@ -458,6 +460,24 @@ describe("WatchPage audio menu", () => {
 
     const props = videoPlayerMock.mock.calls[0]?.[0] as { audioTracks?: unknown[] };
     expect(props.audioTracks).toEqual(versionWithTracks.audio_tracks);
+  });
+
+  it("forwards each inventory's provisional state to the player", () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        audioInventoryProvisional: true,
+        subtitleInventoryProvisional: false,
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    const props = videoPlayerMock.mock.calls[0]?.[0] as {
+      audioInventoryProvisional?: boolean;
+      subtitleInventoryProvisional?: boolean;
+    };
+    expect(props.audioInventoryProvisional).toBe(true);
+    expect(props.subtitleInventoryProvisional).toBe(false);
   });
 });
 

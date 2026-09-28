@@ -71,6 +71,8 @@ interface PlayerControlsProps {
   onSubtitleSelect: (index: number | null) => void;
   subtitleDelayMs: number;
   onSubtitleDelayChange: (ms: number) => void;
+  /** True while the server's subtitle inventory is declared, not probed. */
+  subtitleInventoryProvisional?: boolean;
   preferredSubtitleLanguage?: string | null;
   mediaFileId?: number;
   playerConfig?: PlayerConfig;
@@ -88,6 +90,8 @@ interface PlayerControlsProps {
    * menus shut so a pick cannot be read off that stale inventory.
    */
   trackMenusLocked?: boolean;
+  /** True while the server's audio inventory is declared, not probed. */
+  audioInventoryProvisional?: boolean;
   // Quality
   qualityOptions: QualityOption[];
   activeQualityId: string;
@@ -153,6 +157,7 @@ export function PlayerControls({
   onSubtitleSelect,
   subtitleDelayMs,
   onSubtitleDelayChange,
+  subtitleInventoryProvisional = false,
   preferredSubtitleLanguage,
   mediaFileId,
   playerConfig,
@@ -164,6 +169,7 @@ export function PlayerControls({
   activeAudioIndex,
   onAudioSelect,
   trackMenusLocked = false,
+  audioInventoryProvisional = false,
   qualityOptions,
   activeQualityId,
   isTranscoding,
@@ -348,6 +354,7 @@ export function PlayerControls({
               onSelect={onSubtitleSelect}
               delayMs={subtitleDelayMs}
               onDelayChange={onSubtitleDelayChange}
+              provisional={subtitleInventoryProvisional}
               mediaFileId={mediaFileId}
               playerConfig={playerConfig}
               onRefreshSubtitles={onRefreshSubtitles}
@@ -517,6 +524,7 @@ export function PlayerControls({
                   onSelect={onAudioSelect}
                   currentPosition={currentTime}
                   locked={trackMenusLocked}
+                  provisional={audioInventoryProvisional}
                 />
               )}
 
@@ -529,6 +537,7 @@ export function PlayerControls({
                 onSelect={onSubtitleSelect}
                 delayMs={subtitleDelayMs}
                 onDelayChange={onSubtitleDelayChange}
+                provisional={subtitleInventoryProvisional}
                 mediaFileId={mediaFileId}
                 playerConfig={playerConfig}
                 onRefreshSubtitles={onRefreshSubtitles}
@@ -717,6 +726,7 @@ export function PlayerControls({
           onOpenChange={setAudioOpen}
           hideTrigger
           locked={trackMenusLocked}
+          provisional={audioInventoryProvisional}
         />
       )}
       {compactControls && (

@@ -3534,8 +3534,36 @@ func main() {
 		adminJobRunner.SetCancelRegistry(adminJobCancelRegistry)
 		adminJobRunner.SetStorageTransitionExecutor(storageTransitionSvc)
 		adminJobRunner.SetStorageTransitionCommitted(deps.RequestServerRestart)
+		// The identity backfill is a one-shot resumable pass over legacy
+		// virtual rows. It is only meaningful when the core virtual library is
+		// active, and it owns the same admin-job runner as every other
+		// background pass.
+		var virtualIdentityBackfill *handlers.VirtualIdentityBackfillExecutor
+		if deps.VirtualLibraryService != nil && deps.FileRepo != nil {
+			virtualIdentityBackfill = &handlers.VirtualIdentityBackfillExecutor{
+				Lister: deps.VirtualLibraryService.ListStreams,
+				Store:  deps.FileRepo,
+				Jobs:   adminjob.NewRepository(deps.DB),
+				Logger: slog.Default(),
+			}
+			adminJobRunner.SetVirtualIdentityBackfillExecutor(virtualIdentityBackfill)
+		}
 		adminJobRunner.Start()
 		defer adminJobRunner.Stop()
+
+		// Queue the one-shot backfill after the runner is live. A job that has
+		// already finished (completed or canceled) is the one-shot gate; rows
+		// it could not match stay legacy and are not re-listed on every
+		// restart. A server with no admin account has no job owner and is
+		// skipped.
+		if virtualIdentityBackfill != nil {
+			var ownerUserID int
+			if err := deps.DB.QueryRow(appCtx, `SELECT COALESCE((SELECT id FROM users WHERE role = 'admin' AND enabled IS TRUE ORDER BY id ASC LIMIT 1), 0)`).Scan(&ownerUserID); err != nil {
+				slog.Warn("virtual identity backfill: resolve job owner failed", "error", err)
+			} else if err := virtualIdentityBackfill.EnsureBackfillJob(appCtx, ownerUserID); err != nil {
+				slog.Warn("virtual identity backfill: queue failed", "error", err)
+			}
+		}
 
 		// Start recommendation worker if enabled (reuse worker created above).
 		if recWorker != nil {

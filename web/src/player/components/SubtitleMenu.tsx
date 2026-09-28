@@ -13,6 +13,7 @@ import { getSubtitleFormatLabel, isSubtitleFormatLabel } from "../utils/subtitle
 import { dedupeSubtitleTracks } from "../utils/trackDedupe";
 import { isTranslatableSource } from "./subtitleTranslateRequest";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
+import { ProvisionalTrackBadge } from "./ProvisionalTrackBadge";
 
 interface SubtitleMenuProps {
   tracks: PlayerSubtitleInfo[];
@@ -34,6 +35,11 @@ interface SubtitleMenuProps {
    * pick cannot name a stale slot.
    */
   locked?: boolean;
+  /**
+   * True while the server's inventory is declared metadata rather than probe
+   * evidence, so the menu says so instead of presenting every row as final.
+   */
+  provisional?: boolean;
 }
 
 const DELAY_STEP_MS = 100;
@@ -66,6 +72,7 @@ export function SubtitleMenu({
   getSubtitleStartPosition,
   audioTracks,
   locked = false,
+  provisional = false,
 }: SubtitleMenuProps) {
   const [open, setOpen] = useState(false);
   // A replace or replan swaps the inventory out from under the menu. The open
@@ -231,14 +238,14 @@ export function SubtitleMenu({
           onClose={() => setOpen(false)}
           onKeyDown={handleMenuKeyDown}
         >
-          <div className="shrink-0 py-1">
+          <div className="flex shrink-0 items-center gap-2 py-1 pr-3">
             <button
               ref={(el) => {
                 menuItemsRef.current[0] = el;
               }}
               role="menuitem"
               type="button"
-              className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
+              className={`flex flex-1 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
                 activeIndex === null ? "bg-white/5 text-white" : "text-white/70"
               }`}
               onClick={() => handleSelect(null)}
@@ -248,6 +255,7 @@ export function SubtitleMenu({
               </span>
               Off
             </button>
+            {provisional && <ProvisionalTrackBadge />}
           </div>
           <div className="max-h-[60vh] overflow-y-auto py-1">
             {sortedTracks.map((track) => {

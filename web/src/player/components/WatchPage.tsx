@@ -1126,6 +1126,8 @@ function WatchPagePlayer({
         audioTracks={audioTracks}
         activeAudioIndex={session.audioTrackIndex}
         onAudioSelect={handleSwitchAudio}
+        audioInventoryProvisional={session.audioInventoryProvisional}
+        subtitleInventoryProvisional={session.subtitleInventoryProvisional}
         onSubtitleChanged={handleSubtitleChanged}
         onReturnFromPostRoll={onReturnFromPostRoll}
         watchTogetherRoomId={watchTogetherRoomId}

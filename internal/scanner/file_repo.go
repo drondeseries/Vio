@@ -1684,6 +1684,106 @@ func (r *FileRepository) ListVirtualCandidatesNeedingRefresh(ctx context.Context
 	return scanMediaFiles(rows)
 }
 
+// VirtualProviderIdentity is one virtual candidate's durable provider identity,
+// in the same tier order the resolver's dedup key uses. It is the payload the
+// identity backfill writes onto a legacy row.
+type VirtualProviderIdentity struct {
+	VideoHash   string
+	GUID        string
+	ReleaseName string
+	ReleaseSize int64
+}
+
+// ListVirtualIdentityBackfillRows returns one page of virtual candidate rows
+// that never carried provider identity: both provider_video_hash and
+// provider_guid are NULL or empty. Rows are ordered by id and keyset-paginated
+// on afterID so a resumed backfill picks up where it stopped.
+//
+// A row that already carries a hash or a GUID is never returned, so the page
+// shrinks as the backfill fills rows in and a resumed pass never reworks a row
+// that already has identity. A non-virtual row is likewise never returned.
+func (r *FileRepository) ListVirtualIdentityBackfillRows(ctx context.Context, afterID, limit int) ([]*models.MediaFile, error) {
+	if r == nil || r.pool == nil {
+		return nil, errors.New("file repository is not configured")
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+fileColumns+`
+		FROM media_files
+		WHERE (container = 'virtual' OR file_path LIKE 'virtual://%')
+		  AND virtual_owner_installation_id IS NOT NULL
+		  AND (provider_video_hash IS NULL OR provider_video_hash = '')
+		  AND (provider_guid IS NULL OR provider_guid = '')
+		  AND id > $1
+		ORDER BY id ASC
+		LIMIT $2`,
+		afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list virtual identity backfill rows: %w", err)
+	}
+	defer rows.Close()
+	return scanMediaFiles(rows)
+}
+
+// CountVirtualIdentityBackfillRows counts the virtual rows still missing
+// provider identity. It is the backfill's progress total and its one-shot gate:
+// zero means there is nothing left to backfill.
+func (r *FileRepository) CountVirtualIdentityBackfillRows(ctx context.Context) (int, error) {
+	if r == nil || r.pool == nil {
+		return 0, errors.New("file repository is not configured")
+	}
+	var count int
+	if err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM media_files
+		WHERE (container = 'virtual' OR file_path LIKE 'virtual://%')
+		  AND virtual_owner_installation_id IS NOT NULL
+		  AND (provider_video_hash IS NULL OR provider_video_hash = '')
+		  AND (provider_guid IS NULL OR provider_guid = '')`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count virtual identity backfill rows: %w", err)
+	}
+	return count, nil
+}
+
+// FillVirtualProviderIdentity writes a confidently matched candidate's durable
+// identity onto a legacy virtual row, filling only the tiers the row is
+// missing. An existing tier is never overwritten: the write is fenced to rows
+// that carry neither a hash nor a GUID, and each column keeps its stored value
+// via COALESCE. An identity with no usable tier is a no-op, so the caller can
+// never blank an existing value or invent identity from nothing.
+//
+// expectedFilePath is the listing identity the matcher inspected; a row that
+// rotated underneath performs no write, mirroring the other virtual-candidate
+// CAS writes. It reports whether a row was actually updated.
+func (r *FileRepository) FillVirtualProviderIdentity(ctx context.Context, fileID int, expectedFilePath string, identity VirtualProviderIdentity) (bool, error) {
+	if r == nil || r.pool == nil {
+		return false, errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || expectedFilePath == "" {
+		return false, nil
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE media_files
+		SET provider_video_hash = COALESCE(provider_video_hash, NULLIF($2, '')),
+		    provider_guid = COALESCE(provider_guid, NULLIF($3, '')),
+		    provider_release_name = COALESCE(provider_release_name, NULLIF($4, '')),
+		    provider_release_size = COALESCE(provider_release_size, NULLIF($5::bigint, 0))
+		WHERE id = $1
+		  AND file_path = $6
+		  AND (provider_video_hash IS NULL OR provider_video_hash = '')
+		  AND (provider_guid IS NULL OR provider_guid = '')
+		  AND (NULLIF($2, '') IS NOT NULL
+		       OR NULLIF($3, '') IS NOT NULL
+		       OR NULLIF($4, '') IS NOT NULL)`,
+		fileID, identity.VideoHash, identity.GUID, identity.ReleaseName, identity.ReleaseSize, expectedFilePath)
+	if err != nil {
+		return false, fmt.Errorf("fill virtual provider identity: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // VirtualCandidateDeliveryGrace is how long after a virtual candidate's last
 // successful delivery a later failure is forgiven (failed_at is not stamped).
 // A release that played recently should not be branded dead because the
