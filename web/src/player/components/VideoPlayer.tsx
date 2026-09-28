@@ -38,7 +38,7 @@ import type {
   PlaybackRealtimeEventEnvelope,
   PlaybackSourceCommittedPayload,
 } from "../realtime-protocol";
-import { resolvePendingSeekTime } from "../utils/pendingSeek";
+import { PENDING_SEEK_HOLD_TIMEOUT_MS, resolvePendingSeekTime } from "../utils/pendingSeek";
 import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
 import { resolveEffectiveVersion } from "../utils/resolveEffectiveVersion";
 import { HlsStartupGuard } from "../utils/hlsStartupGuard";
@@ -533,6 +533,15 @@ export function VideoPlayer({
   useEffect(() => {
     pendingSeekTimeRef.current = pendingSeekTime;
   }, [pendingSeekTime]);
+  // Clears a held seek and returns the scrubber to where the media actually is.
+  // Shared by the refused-replan rollback and the hold timeout below.
+  const rollbackPendingSeek = useCallback(() => {
+    pendingSeekTimeRef.current = null;
+    setPendingSeekTime(null);
+    setPendingSeekNonce(null);
+    const video = videoRef.current;
+    if (video) setCurrentTime(toMediaTime(video.currentTime, timelineOffsetRef.current));
+  }, []);
   const [duration, setDuration] = useState(propDuration ?? 0);
   const [buffered, setBuffered] = useState<TimeRanges | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1094,14 +1103,24 @@ export function VideoPlayer({
     // Only roll back when a seek reanchor is outstanding. A quality/track
     // refusal with no pending seek must not move the scrubber.
     if (replanError && pendingSeekNonce !== null) {
-      setPendingSeekTime(null);
-      setPendingSeekNonce(null);
-      if (videoRef.current) {
-        const nativeSeconds = videoRef.current.currentTime;
-        setCurrentTime(toMediaTime(nativeSeconds, timelineOffsetRef.current));
-      }
+      rollbackPendingSeek();
     }
-  }, [replanError, pendingSeekNonce]);
+  }, [replanError, pendingSeekNonce, rollbackPendingSeek]);
+
+  // A seek the server declines, or the element clamps, never reaches its
+  // requested position, so `onTimeUpdate` would hold the scrubber there
+  // forever while the media plays on elsewhere. Bound the hold: once no replan
+  // is in flight and the media still has not reached the target, treat the seek
+  // as declined and roll the scrubber back onto the element's real position,
+  // the same rollback a refused replan performs above.
+  useEffect(() => {
+    if (pendingSeekTime === null || replanning) return;
+    const timer = setTimeout(() => {
+      if (pendingSeekTimeRef.current === null) return;
+      rollbackPendingSeek();
+    }, PENDING_SEEK_HOLD_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [pendingSeekTime, replanning, rollbackPendingSeek]);
 
   // Firefox stalls on codec-copy remuxes it nominally accepts. Both fallbacks
   // report an honest classification and let the server pick the next route —
@@ -1211,13 +1230,13 @@ export function VideoPlayer({
 
   // A refused reanchor never reaches its target. Resume relative skips from
   // the surviving stream unless a newer seek has already replaced the target.
-  const releasePendingSeek = useCallback((seconds: number) => {
-    if (pendingSeekTimeRef.current !== seconds) return;
-    pendingSeekTimeRef.current = null;
-    setPendingSeekTime(null);
-    const video = videoRef.current;
-    if (video) setCurrentTime(toMediaTime(video.currentTime, timelineOffsetRef.current));
-  }, []);
+  const releasePendingSeek = useCallback(
+    (seconds: number) => {
+      if (pendingSeekTimeRef.current !== seconds) return;
+      rollbackPendingSeek();
+    },
+    [rollbackPendingSeek],
+  );
 
   // Ends an active room catch-up nudge; any seek or local stop returns the
   // element to 1x so a stale rate never survives a context change.
