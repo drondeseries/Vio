@@ -216,6 +216,113 @@ func TestRequeueLatestFailedOfTypeClearsExpiration(t *testing.T) {
 	}
 }
 
+// TestRequeueLatestFailedOfTypeDoesNotFlipAConcurrentlyClaimedJob pins that the
+// requeue cannot reach across a concurrent claim. The outer UPDATE reads the
+// failed target through a subquery under the statement snapshot and then waits
+// for the row lock; a claim that commits while it waits leaves the row running.
+// The subquery and the NOT EXISTS guard are uncorrelated subplans that the
+// executor evaluates once, before the row lock, and does not re-evaluate during
+// the EvalPlanQual recheck. Only a direct `status = 'failed'` predicate on the
+// locked row survives that recheck, so without it the requeue flips a running
+// job back to queued.
+func TestRequeueLatestFailedOfTypeDoesNotFlipAConcurrentlyClaimedJob(t *testing.T) {
+	r := lifecycleRepo(t)
+	userID := lifecycleUser(t, r, "requeue-claim-race")
+	job, err := r.Create(t.Context(), CreateJobInput{
+		JobType:         JobTypeVirtualIdentityBackfill,
+		CreatedByUserID: userID,
+		Message:         "queued",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = r.pool.Exec(context.Background(), "DELETE FROM admin_jobs WHERE id=$1", job.ID) })
+
+	if _, err := r.pool.Exec(t.Context(), `
+		UPDATE admin_jobs SET status = 'running', claim_generation = claim_generation + 1
+		WHERE id = $1`, job.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	if err := r.Fail(t.Context(), job.ID, FailJobInput{ErrorMessage: "partial run"}); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	// Hold the failed row locked from a separate connection so the requeue's
+	// statement snapshot still sees it as failed but its row lock waits.
+	holder, err := r.pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+	tx, err := holder.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	var lockedID string
+	if err := tx.QueryRow(t.Context(), `SELECT id FROM admin_jobs WHERE id = $1 FOR UPDATE`, job.ID).Scan(&lockedID); err != nil {
+		t.Fatalf("lock failed job: %v", err)
+	}
+
+	requeued := make(chan struct {
+		ok  bool
+		err error
+	}, 1)
+	go func() {
+		ok, err := r.RequeueLatestFailedOfType(t.Context(), JobTypeVirtualIdentityBackfill)
+		requeued <- struct {
+			ok  bool
+			err error
+		}{ok, err}
+	}()
+
+	// Wait on observable state: the requeue backend is blocked on a lock.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting bool
+		if err := r.pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND wait_event_type = 'Lock'
+				  AND query LIKE '%admin_jobs%'
+			)`).Scan(&waiting); err != nil {
+			t.Fatalf("inspect waiters: %v", err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("requeue never blocked on the held row lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The concurrent claim commits while the requeue waits on the lock.
+	if _, err := tx.Exec(t.Context(), `
+		UPDATE admin_jobs
+		SET status = 'running', claim_generation = claim_generation + 1
+		WHERE id = $1`, job.ID); err != nil {
+		t.Fatalf("claim job: %v", err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatalf("commit claim: %v", err)
+	}
+
+	result := <-requeued
+	if result.err != nil {
+		t.Fatalf("requeue: %v", result.err)
+	}
+	after, err := r.GetByID(t.Context(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != StatusRunning {
+		t.Fatalf("requeue changed a concurrently claimed job: status = %s, want %s", after.Status, StatusRunning)
+	}
+}
+
 type waitingRefresh struct{ started chan struct{} }
 
 func (e waitingRefresh) Execute(ctx context.Context, _ LibraryRefreshRequest, _ func(int, int, string)) (*LibraryRefreshResult, error) {
