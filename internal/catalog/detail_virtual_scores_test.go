@@ -2,7 +2,9 @@ package catalog
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -36,5 +38,93 @@ func TestAttachVirtualCandidateScoresWithoutSourceIsNoop(t *testing.T) {
 
 	if versions[0].FormatScore != nil {
 		t.Fatalf("score = %v, want nil when no source is wired", versions[0].FormatScore)
+	}
+}
+
+// TestAttachVirtualCandidateScoresTimesOutFailOpen pins the watch-response
+// guarantee: a score source that blocks (a cold virtual candidate cache waits
+// on a provider round-trip) must not hold the response. The lookup is bounded
+// by virtualScoreTimeout and the versions are served unannotated. The source
+// here deliberately ignores context cancellation, proving the fail-open does
+// not depend on a well-behaved scorer.
+func TestAttachVirtualCandidateScoresTimesOutFailOpen(t *testing.T) {
+	prev := virtualScoreTimeout
+	virtualScoreTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { virtualScoreTimeout = prev })
+
+	released := make(chan struct{})
+	svc := &DetailService{virtualScoreSource: func(_ context.Context, _ string, _ []*models.MediaFile) map[int]int {
+		<-released
+		return map[int]int{7: 850}
+	}}
+
+	versions := []FileVersion{{FileID: 7}}
+	start := time.Now()
+	svc.attachVirtualCandidateScores(context.Background(), "movie:heat", versions, []*models.MediaFile{{ID: 7}})
+	elapsed := time.Since(start)
+	close(released)
+
+	if elapsed > time.Second {
+		t.Fatalf("score lookup blocked for %v, want the short deadline to fail it open", elapsed)
+	}
+	if versions[0].FormatScore != nil {
+		t.Fatalf("score = %v, want nil when the lookup times out", versions[0].FormatScore)
+	}
+}
+
+// TestAttachVirtualCandidateScoresRecoversScorerPanic pins the other half of
+// the fail-open guarantee: the scorer runs on a background goroutine now, so a
+// panic there must be contained rather than crashing the process while the
+// watch response serves unannotated.
+func TestAttachVirtualCandidateScoresRecoversScorerPanic(t *testing.T) {
+	svc := &DetailService{virtualScoreSource: func(context.Context, string, []*models.MediaFile) map[int]int {
+		panic("scorer blew up")
+	}}
+
+	versions := []FileVersion{{FileID: 7}}
+	svc.attachVirtualCandidateScores(context.Background(), "movie:heat", versions, []*models.MediaFile{{ID: 7}})
+
+	if versions[0].FormatScore != nil {
+		t.Fatalf("score = %v, want nil after a scorer panic", versions[0].FormatScore)
+	}
+}
+
+// TestAttachVirtualCandidateScoresBoundsConcurrentScorers pins that a scorer
+// that ignores cancellation cannot strand an unbounded number of goroutines.
+// Every slot is filled with a scorer that never returns; the next lookup must
+// fail open without starting another scorer.
+func TestAttachVirtualCandidateScoresBoundsConcurrentScorers(t *testing.T) {
+	prev := virtualScoreTimeout
+	virtualScoreTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { virtualScoreTimeout = prev })
+
+	released := make(chan struct{})
+	var started atomic.Int64
+	svc := &DetailService{virtualScoreSource: func(_ context.Context, _ string, _ []*models.MediaFile) map[int]int {
+		started.Add(1)
+		<-released
+		return nil
+	}}
+	t.Cleanup(func() { close(released) })
+
+	for i := 0; i < virtualScoreConcurrency; i++ {
+		svc.attachVirtualCandidateScores(context.Background(), "movie:heat", []FileVersion{{FileID: 7}}, []*models.MediaFile{{ID: 7}})
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for started.Load() < int64(virtualScoreConcurrency) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := started.Load(); got != int64(virtualScoreConcurrency) {
+		t.Fatalf("scorers started = %d, want %d", got, virtualScoreConcurrency)
+	}
+
+	// Every slot is held, so this lookup must fail open without spawning.
+	versions := []FileVersion{{FileID: 7}}
+	svc.attachVirtualCandidateScores(context.Background(), "movie:heat", versions, []*models.MediaFile{{ID: 7}})
+	if versions[0].FormatScore != nil {
+		t.Fatalf("score = %v, want nil when every slot is held", versions[0].FormatScore)
+	}
+	if got := started.Load(); got != int64(virtualScoreConcurrency) {
+		t.Fatalf("scorers started = %d after saturation, want %d (no unbounded spawn)", got, virtualScoreConcurrency)
 	}
 }

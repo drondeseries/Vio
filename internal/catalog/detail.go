@@ -799,6 +799,13 @@ type DetailService struct {
 	// virtualScoreSource computes the custom-format score per virtual candidate
 	// file. Nil disables scoring; see SetVirtualCandidateScoreSource.
 	virtualScoreSource VirtualCandidateScoreSource
+	// virtualScoreSem bounds the number of virtual score lookups that may run
+	// at once. A scorer that ignores context cancellation can strand its
+	// goroutine indefinitely, so the cap also bounds how many such goroutines
+	// the watch path can accumulate. Lazily created by scoreVirtualCandidates;
+	// see virtualScoreConcurrency.
+	virtualScoreSem     chan struct{}
+	virtualScoreSemOnce sync.Once
 	// virtualRankingSource exposes the ranking that produced each virtual
 	// listing. Nil disables the projection; see SetVirtualRankingSource.
 	virtualRankingSource VirtualRankingSource
@@ -3242,10 +3249,23 @@ func (s *DetailService) newWatchDetail(
 	return detail
 }
 
+// virtualScoreTimeout bounds the virtual candidate score lookup that annotates
+// a watch response. The score is decoration: a cold candidate cache can make
+// the lookup wait on a provider round-trip, which must never hold the watch
+// response open. On timeout the versions are served unscored.
+var virtualScoreTimeout = 1500 * time.Millisecond
+
+// virtualScoreConcurrency bounds how many virtual score lookups run at once.
+// A scorer that ignores context cancellation can strand its goroutine
+// indefinitely, so this cap is also the most leaked goroutines the score path
+// can accumulate. When every slot is held the lookup fails open and the watch
+// response serves unannotated versions rather than waiting.
+const virtualScoreConcurrency = 8
+
 // attachVirtualCandidateScores stamps each virtual candidate version with the
 // custom-format score the virtual ranking assigned it, keyed by media-file ID.
-// Local files and unscored candidates keep a nil score, and a scorer miss
-// leaves the version unannotated rather than failing the watch response.
+// Local files and unscored candidates keep a nil score, and a scorer miss or
+// timeout leaves the version unannotated rather than failing the watch response.
 func (s *DetailService) attachVirtualCandidateScores(
 	ctx context.Context,
 	contentID string,
@@ -3255,7 +3275,7 @@ func (s *DetailService) attachVirtualCandidateScores(
 	if s.virtualScoreSource == nil || len(versions) == 0 {
 		return
 	}
-	scores := s.virtualScoreSource(ctx, contentID, files)
+	scores := s.scoreVirtualCandidates(ctx, contentID, files)
 	if len(scores) == 0 {
 		return
 	}
@@ -3263,6 +3283,53 @@ func (s *DetailService) attachVirtualCandidateScores(
 		if score, ok := scores[versions[i].FileID]; ok {
 			versions[i].FormatScore = intPtr(score)
 		}
+	}
+}
+
+// scoreVirtualCandidates runs the score source under a short deadline and
+// fails open. The source runs on its own goroutine so a scorer that ignores
+// context cancellation still cannot block the watch response; the buffered
+// channel lets that goroutine finish without leaking, and a recovered panic
+// yields no scores instead of taking the process down from a background
+// goroutine. A canceled or timed-out lookup also yields no scores, so the
+// caller leaves every version unannotated.
+//
+// A semaphore bounds in-flight scorer calls because a scorer that ignores
+// cancellation never returns and would otherwise strand one goroutine per
+// watch request. A slot is held for the life of the scorer call, not the
+// caller's wait, so a leaked scorer consumes its slot permanently and
+// eventually saturates the semaphore. Once saturated, later lookups find no
+// slot before the deadline and fail open without spawning another goroutine,
+// which bounds the leak. Acquiring a slot shares the response deadline
+// established for the lookup, so a caller never waits past virtualScoreTimeout.
+func (s *DetailService) scoreVirtualCandidates(ctx context.Context, contentID string, files []*models.MediaFile) map[int]int {
+	scoreCtx, cancel := context.WithTimeout(ctx, virtualScoreTimeout)
+	defer cancel()
+
+	s.virtualScoreSemOnce.Do(func() {
+		s.virtualScoreSem = make(chan struct{}, virtualScoreConcurrency)
+	})
+	select {
+	case s.virtualScoreSem <- struct{}{}:
+	case <-scoreCtx.Done():
+		return nil
+	}
+
+	done := make(chan map[int]int, 1)
+	go func() {
+		defer func() { <-s.virtualScoreSem }()
+		defer func() {
+			if recover() != nil {
+				done <- nil
+			}
+		}()
+		done <- s.virtualScoreSource(scoreCtx, contentID, files)
+	}()
+	select {
+	case scores := <-done:
+		return scores
+	case <-scoreCtx.Done():
+		return nil
 	}
 }
 

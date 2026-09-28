@@ -2,10 +2,12 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -289,6 +291,78 @@ func TestCandidateCacheRejectsSingleOversizedEntry(t *testing.T) {
 	}
 }
 
+// TestConcurrentForcedRefreshesJoinSingleFlight proves a batch of forced
+// lookups for one listing shares a single provider round-trip. The version
+// liveness check fans out per file, but every version of one item shares a
+// cache key, so without coalescing the batch would issue one re-list per file
+// and starve a concurrent playback start of provider capacity.
+func TestConcurrentForcedRefreshesJoinSingleFlight(t *testing.T) {
+	answer := &mutableStreams{}
+	answer.set([]StreamCandidate{{URL: "https://cdn.example/one.mkv", Name: "One.Release.1080p"}})
+	release := make(chan struct{})
+	firstHit := make(chan struct{})
+	var once sync.Once
+	var requests atomic.Int64
+	// The seed request answers immediately; every forced re-list blocks until
+	// the test releases it, so all callers are parked on the one flight when it
+	// is let through.
+	p := newCountingProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			writeStreams(w, answer.get())
+			return
+		}
+		once.Do(func() { close(firstHit) })
+		<-release
+		writeStreams(w, answer.get())
+	})
+	r := New(testConfig(p))
+	ctx := context.Background()
+
+	// Seed and age the entry so every forced lookup takes the fetch path.
+	if _, _, _, err := r.GetCandidates(ctx, "virtual://movie/tt1"); err != nil {
+		t.Fatalf("GetCandidates: %v", err)
+	}
+	mutateCacheEntry(t, r, "movie|tt1", func(entry *candidateCacheEntry) {
+		entry.fetchedAt = time.Now().Add(-freshServeFloor - time.Second)
+	})
+	answer.set([]StreamCandidate{{URL: "https://cdn.example/two.mkv", Name: "Two.Release.1080p"}})
+
+	const callers = 8
+	var wg sync.WaitGroup
+	results := make([][]StreamCandidate, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], _, _, errs[i] = r.GetCandidatesFresh(ctx, "virtual://movie/tt1")
+		}(i)
+	}
+
+	select {
+	case <-firstHit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider was never called")
+	}
+	// The flight is registered while the provider is held; releasing it now
+	// lets every caller either join the one fetch or, once it completes, read
+	// its fresh entry within the serve floor.
+	close(release)
+	wg.Wait()
+
+	if got := p.requests(); got != 2 {
+		t.Fatalf("provider requests = %d, want 2 (seed + one coalesced forced refresh)", got)
+	}
+	for i := range results {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: %v", i, errs[i])
+		}
+		if len(results[i]) != 1 || results[i][0].URL != "https://cdn.example/two.mkv" {
+			t.Fatalf("caller %d result = %+v, want the refreshed answer", i, results[i])
+		}
+	}
+}
+
 // TestConcurrentRequestsJoinSingleFlight proves two concurrent cold requests
 // share one provider round-trip: the provider is held open until both callers
 // are parked, then released, and must have seen exactly one request.
@@ -334,5 +408,74 @@ func TestConcurrentRequestsJoinSingleFlight(t *testing.T) {
 		if len(results[i]) != 1 || results[i][0].URL != answer[0].URL {
 			t.Fatalf("caller %d result = %+v, want %+v", i, results[i], answer)
 		}
+	}
+}
+
+// TestForcedRefreshFlightFailureReportsProviderError pins that a failed
+// in-flight re-list surfaces the provider error instead of silently serving
+// the stale positive entry the flight was trying to replace. The entry is
+// past its fresh-serve floor but inside stale grace, so a forced lookup joins
+// the flight rather than serving it directly.
+func TestForcedRefreshFlightFailureReportsProviderError(t *testing.T) {
+	answer := &mutableStreams{}
+	answer.set([]StreamCandidate{{URL: "https://cdn.example/one.mkv", Name: "One.Release.1080p"}})
+	var fail atomic.Bool
+	p := newCountingProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			http.Error(w, "provider down", http.StatusBadGateway)
+			return
+		}
+		writeStreams(w, answer.get())
+	})
+	r := New(testConfig(p))
+	ctx := context.Background()
+
+	if _, _, _, err := r.GetCandidates(ctx, "virtual://movie/tt1"); err != nil {
+		t.Fatalf("GetCandidates: %v", err)
+	}
+	mutateCacheEntry(t, r, "movie|tt1", func(entry *candidateCacheEntry) {
+		entry.fetchedAt = time.Now().Add(-freshServeFloor - time.Second)
+		entry.expiresAt = time.Now().Add(-time.Second)
+	})
+	fail.Store(true)
+
+	_, _, _, err := r.GetCandidatesFresh(ctx, "virtual://movie/tt1")
+	if err == nil {
+		t.Fatal("forced refresh after a provider failure returned nil; want the provider error")
+	}
+	if !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("error = %v, want ErrProviderUnavailable", err)
+	}
+}
+
+// TestForcedRefreshEmptyAnswerKeepsStalePositive pins the other half: a
+// successful empty provider answer deliberately preserves a still-servable
+// positive entry, so a concurrent waiter reuses it instead of reporting an
+// error or forcing another fetch. This guards the dedup behavior a fetchedAt
+// cutoff would break.
+func TestForcedRefreshEmptyAnswerKeepsStalePositive(t *testing.T) {
+	answer := &mutableStreams{}
+	answer.set([]StreamCandidate{{URL: "https://cdn.example/one.mkv", Name: "One.Release.1080p"}})
+	p := newCountingProvider(t, func(w http.ResponseWriter, r *http.Request) { writeStreams(w, answer.get()) })
+	r := New(testConfig(p))
+	ctx := context.Background()
+
+	if _, _, _, err := r.GetCandidates(ctx, "virtual://movie/tt1"); err != nil {
+		t.Fatalf("GetCandidates: %v", err)
+	}
+	mutateCacheEntry(t, r, "movie|tt1", func(entry *candidateCacheEntry) {
+		entry.fetchedAt = time.Now().Add(-freshServeFloor - time.Second)
+		entry.expiresAt = time.Now().Add(-time.Second)
+	})
+	// The provider now answers with nothing; the positive entry is still
+	// servable and the empty answer must not replace it.
+	answer.set(nil)
+
+	got, _, _, err := r.GetCandidatesFresh(ctx, "virtual://movie/tt1")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("forced refresh over an empty answer: count=%d err=%v, want the retained positive 1", len(got), err)
+	}
+	if got[0].URL != "https://cdn.example/one.mkv" {
+		t.Fatalf("URL = %q, want the retained positive entry", got[0].URL)
 	}
 }

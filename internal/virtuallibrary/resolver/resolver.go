@@ -183,7 +183,15 @@ type Resolver struct {
 	cacheGeneration uint64
 	cacheBytes      int64
 	refreshes       map[string]chan struct{}
-	syncFlights     map[string]chan struct{}
+	syncFlights     map[string]*candidateFlight
+}
+
+// candidateFlight tracks one in-flight provider fetch for a cache key. done
+// closes when the fetch returns; err carries the fetch's result and is set
+// before done closes, so a waiter that observes done also observes err.
+type candidateFlight struct {
+	done chan struct{}
+	err  error
 }
 
 // New builds a Resolver from a plain Config, clamping the cache TTL into its
@@ -1042,31 +1050,36 @@ func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, for
 		// The wait respects context cancellation so a canceled caller does not
 		// block for the full provider timeout.
 		if wait := r.joinFlight(cacheKey, config, generation, mediaType, mediaID); wait != nil {
-			select {
-			case <-wait:
-			case <-ctx.Done():
-				return nil, "", "", ctx.Err()
+			candidates, ok, err := r.awaitFlight(ctx, wait, cacheKey)
+			if err != nil {
+				return nil, "", "", err
 			}
-			r.cacheMu.Lock()
-			fresh, stillOK := r.cache[cacheKey]
-			r.cacheMu.Unlock()
-			if stillOK {
-				now := time.Now()
-				withinGrace := !now.After(fresh.expiresAt.Add(candidateStaleGrace))
-				switch {
-				case len(fresh.candidates) > 0 && withinGrace:
-					// Positive results stay servable through the same stale
-					// grace the direct tiers use.
-					return cloneCandidates(fresh.candidates), mediaType, mediaID, nil
-				case len(fresh.candidates) == 0 && now.Before(fresh.expiresAt):
-					// Negative-cache hit: the flight already proved the title
-					// is unavailable, so waiting callers must not re-pay the
-					// round-trip. Negatives never outlive their own short TTL.
-					return cloneCandidates(fresh.candidates), mediaType, mediaID, nil
-				}
+			if ok {
+				return candidates, mediaType, mediaID, nil
 			}
 			// Flight completed without a usable entry (expired, past grace,
 			// or absent); fall through to our own attempt.
+		}
+	}
+
+	// Forced lookups skip the cache tiers above, so without this they would
+	// bypass the keyed flight and pay one provider round-trip per call. A
+	// version liveness check fans out per file, but every version of one item
+	// shares a cache key: 40 files of one listing would issue 40 identical
+	// re-lists and starve a concurrent playback start of provider capacity.
+	// Joining the same keyed flight the non-forced path uses collapses them to
+	// one provider fetch per listing, with every caller served its result. The
+	// join respects context cancellation, so a caller bounded by its own
+	// per-file budget still returns when that budget fires.
+	if forceRefresh {
+		if wait := r.joinFlight(cacheKey, config, generation, mediaType, mediaID); wait != nil {
+			candidates, ok, err := r.awaitFlight(ctx, wait, cacheKey)
+			if err != nil {
+				return nil, "", "", err
+			}
+			if ok {
+				return candidates, mediaType, mediaID, nil
+			}
 		}
 	}
 
@@ -1110,47 +1123,96 @@ func (r *Resolver) servePositiveCachedCandidates(cacheKey string, generation uin
 	return candidates, true
 }
 
+// awaitFlight waits for an in-flight provider fetch, respecting the caller's
+// context, and serves the cache entry that flight wrote when it is usable: a
+// positive answer still inside stale grace, or a fresh negative. A flight that
+// failed reports its provider error before any cache inspection, so a waiter
+// does not mistake a stale positive entry the failed flight never replaced for
+// a successful result. It reports ok=false with a nil error when a successful
+// flight left no usable entry, so the caller can run its own fetch; a canceled
+// wait returns the context error so callers keep the bare cancellation they
+// saw before. It does not hold cacheMu across the wait.
+func (r *Resolver) awaitFlight(ctx context.Context, flight *candidateFlight, cacheKey string) ([]StreamCandidate, bool, error) {
+	select {
+	case <-flight.done:
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+	// The fetch result is published before done closes, so this read is
+	// ordered after the write. A failed flight must surface its error rather
+	// than let the cache inspection below return a stale positive entry as if
+	// the fetch had succeeded.
+	if flight.err != nil {
+		return nil, false, flight.err
+	}
+	r.cacheMu.Lock()
+	fresh, stillOK := r.cache[cacheKey]
+	r.cacheMu.Unlock()
+	if !stillOK {
+		return nil, false, nil
+	}
+	now := time.Now()
+	withinGrace := !now.After(fresh.expiresAt.Add(candidateStaleGrace))
+	switch {
+	case len(fresh.candidates) > 0 && withinGrace:
+		// Positive results stay servable through the same stale grace the
+		// direct tiers use. A successful empty answer deliberately preserves
+		// this entry, so the waiters reuse the concurrent result rather than
+		// forcing another fetch.
+		return cloneCandidates(fresh.candidates), true, nil
+	case len(fresh.candidates) == 0 && now.Before(fresh.expiresAt):
+		// Negative-cache hit: the flight already proved the title is
+		// unavailable, so waiting callers must not re-pay the round-trip.
+		// Negatives never outlive their own short TTL.
+		return cloneCandidates(fresh.candidates), true, nil
+	}
+	return nil, false, nil
+}
+
 // joinFlight registers this caller as a synchronous provider fetcher if no
-// other flight is active for the key. It returns a channel to wait on, or
-// nil if this caller should proceed directly (first-in wins). Callers must
-// NOT hold cacheMu.
-func (r *Resolver) joinFlight(cacheKey string, config Config, generation uint64, mediaType, mediaID string) <-chan struct{} {
+// other flight is active for the key. It returns the flight to wait on. The
+// fetch runs on a background goroutine and publishes its provider error on the
+// flight before closing it, so every waiter can distinguish a failed fetch
+// from a successful one. Callers must NOT hold cacheMu.
+func (r *Resolver) joinFlight(cacheKey string, config Config, generation uint64, mediaType, mediaID string) *candidateFlight {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	if r.refreshes == nil {
 		r.refreshes = make(map[string]chan struct{})
 	}
 	if r.syncFlights == nil {
-		r.syncFlights = make(map[string]chan struct{})
+		r.syncFlights = make(map[string]*candidateFlight)
 	}
 	if _, inflight := r.refreshes[cacheKey]; inflight {
-		ch, exists := r.syncFlights[cacheKey]
+		flight, exists := r.syncFlights[cacheKey]
 		if !exists {
-			ch = make(chan struct{})
-			r.syncFlights[cacheKey] = ch
+			flight = &candidateFlight{done: make(chan struct{})}
+			r.syncFlights[cacheKey] = flight
 		}
-		return ch
+		return flight
 	}
-	done := make(chan struct{})
-	r.refreshes[cacheKey] = done
-	r.syncFlights[cacheKey] = done
+	flight := &candidateFlight{done: make(chan struct{})}
+	r.refreshes[cacheKey] = flight.done
+	r.syncFlights[cacheKey] = flight
 	go func() {
 		defer func() {
 			r.cacheMu.Lock()
 			delete(r.refreshes, cacheKey)
 			delete(r.syncFlights, cacheKey)
 			r.cacheMu.Unlock()
-			close(done)
+			close(flight.done)
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), syncFetchTimeout)
 		defer cancel()
-		if _, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID); err != nil {
+		_, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID)
+		flight.err = err
+		if err != nil {
 			r.debugLog("synchronous candidate fetch failed", cacheKey, 0)
 			return
 		}
 		r.debugLog("synchronous candidate fetch complete", cacheKey, 0)
 	}()
-	return done
+	return flight
 }
 
 // startRefreshLocked launches exactly one background provider fetch per
@@ -1164,22 +1226,24 @@ func (r *Resolver) startRefreshLocked(cacheKey string, generation uint64, config
 		r.refreshes = make(map[string]chan struct{})
 	}
 	if r.syncFlights == nil {
-		r.syncFlights = make(map[string]chan struct{})
+		r.syncFlights = make(map[string]*candidateFlight)
 	}
-	done := make(chan struct{})
-	r.refreshes[cacheKey] = done
-	r.syncFlights[cacheKey] = done
+	flight := &candidateFlight{done: make(chan struct{})}
+	r.refreshes[cacheKey] = flight.done
+	r.syncFlights[cacheKey] = flight
 	go func() {
 		defer func() {
 			r.cacheMu.Lock()
 			delete(r.refreshes, cacheKey)
 			delete(r.syncFlights, cacheKey)
 			r.cacheMu.Unlock()
-			close(done)
+			close(flight.done)
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundRefreshTimeout)
 		defer cancel()
-		if _, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID); err != nil {
+		_, err := r.fetchProviderCandidates(ctx, config, generation, cacheKey, mediaType, mediaID)
+		flight.err = err
+		if err != nil {
 			r.debugLog("background candidate refresh failed", cacheKey, 0)
 			return
 		}
