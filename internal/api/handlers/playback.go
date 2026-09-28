@@ -439,6 +439,14 @@ type PlaybackHandler struct {
 	SettingsRepo       PlaybackSettingsReader     // optional; reads server settings (e.g., allow_4k_transcode)
 	FileVersionFetcher PlaybackFileVersionFetcher // optional; queries sibling file versions for 4K guard
 	ProbeEnsurer       PlaybackProbeEnsurer       // optional; repairs missing probe metadata on demand
+	// probeRefreshed memoizes start-path probe refreshes by file id so a burst
+	// of starts for one file schedules a single detached repair. probeStartBudget
+	// overrides the default bounded wait in tests. probeRefreshWG tracks the
+	// detached refreshes so tests can wait for them; production never waits.
+	probeRefreshMu   sync.Mutex
+	probeRefreshed   map[int]*playbackProbeRefresh
+	probeStartBudget time.Duration
+	probeRefreshWG   sync.WaitGroup
 	// CopySafetyRacer resolves an unknown H.264 copy-safety verdict behind an
 	// already-issued stream-copy plan. Optional: nil keeps unknown verdicts
 	// unknown and never withdraws a copy route.
@@ -855,6 +863,198 @@ func (h *PlaybackHandler) ensurePlaybackProbe(ctx context.Context, file *models.
 		return repaired
 	}
 	return file
+}
+
+// Start-path probe refresh bounds. ensurePlaybackProbeStart waits at most
+// playbackProbeStartBudgetDefault for an on-demand repair before serving the
+// row's known metadata.
+const (
+	// playbackProbeStartBudgetDefault is the most a start request waits for a
+	// probe repair that is not already cached. A cold probe on a remote library
+	// costs multi-second reads and used to run unbounded on the start path; the
+	// wait is capped so a slow probe can never hold the response for its full
+	// course, while a cheap cached repair still completes before planning.
+	playbackProbeStartBudgetDefault = 2 * time.Second
+	// playbackProbeRefreshTimeout bounds the detached repair the start schedules
+	// when the budget lapses. It sits above the ensurer's own probe deadline
+	// (10s) so an ordinary slow remote read still completes and persists.
+	playbackProbeRefreshTimeout = 30 * time.Second
+	// playbackProbePreparedTTL is how long a completed refresh suppresses a
+	// repeat schedule for the same unchanged file generation.
+	playbackProbePreparedTTL = 5 * time.Minute
+	// playbackProbePreparedMaxEntries bounds the refresh memo.
+	playbackProbePreparedMaxEntries = 4096
+)
+
+// playbackProbeRefresh records one start-path probe refresh: the file
+// generation it was prepared against and a channel closed when the repair
+// lands. done is immutable after construction: fresh entries carry an
+// already-closed channel and in-flight entries are closed exactly once by
+// finishPlaybackProbeRefresh, so readers never race a writer.
+type playbackProbeRefresh struct {
+	fingerprint string
+	preparedAt  time.Time
+	done        chan struct{}
+	// repaired is the ensurer's result, read under probeRefreshMu.
+	repaired *models.MediaFile
+}
+
+// playbackProbeFingerprint identifies the file generation and probe state a
+// refresh was prepared against. Probe repair rewrites ProbeUpdatedAt (and
+// ProbeSource), so the post-repair fingerprint differs and the next start
+// recognizes the repaired row as already prepared instead of re-queueing.
+func playbackProbeFingerprint(file *models.MediaFile) string {
+	if file == nil {
+		return ""
+	}
+	mtime := "none"
+	if file.FileModifiedAt != nil {
+		mtime = strconv.FormatInt(file.FileModifiedAt.UnixMicro(), 10)
+	}
+	probe := "none"
+	if file.ProbeUpdatedAt != nil {
+		probe = strconv.FormatInt(file.ProbeUpdatedAt.UnixMicro(), 10)
+	}
+	return fmt.Sprintf("%d:%d:%s:%s:%s", file.ID, file.FileSize, mtime, probe, strings.TrimSpace(file.ProbeSource))
+}
+
+// ensurePlaybackProbeStart is the playback-start probe. Unlike the synchronous
+// ensurePlaybackProbe, it bounds how long the request waits: on a remote
+// library the on-demand repair costs multi-second reads, and that cost sat
+// directly on the start path. The request waits a short budget so a fast or
+// already-cached probe can still heal the row before planning; when the budget
+// lapses, start is served from the metadata already on the row and the repair
+// finishes on a detached, bounded background refresh.
+//
+// The refresh is memoized per file generation, mirroring the catalog's watch
+// preparation: the first start for an unchanged file schedules one repair and
+// records the post-repair fingerprint when it lands, so repeated and concurrent
+// starts neither block on nor re-queue it. A failed repair drops the claim so a
+// later start retries; a client disconnect never cancels the repair.
+func (h *PlaybackHandler) ensurePlaybackProbeStart(ctx context.Context, file *models.MediaFile) *models.MediaFile {
+	if h == nil || h.ProbeEnsurer == nil || file == nil {
+		return file
+	}
+	entry, owner := h.claimPlaybackProbeRefresh(file)
+	if owner {
+		h.refreshPlaybackProbeAsync(ctx, entry, file)
+	} else {
+		select {
+		case <-entry.done:
+			// A refresh already landed for this generation before the request
+			// arrived; the row it read carries the repaired metadata.
+			return file
+		default:
+		}
+	}
+
+	timer := time.NewTimer(h.playbackProbeStartBudget())
+	defer timer.Stop()
+	select {
+	case <-entry.done:
+		// The repair landed within the budget; honor its result so planning
+		// sees the repaired metadata.
+		h.probeRefreshMu.Lock()
+		repaired := entry.repaired
+		h.probeRefreshMu.Unlock()
+		if repaired != nil {
+			return repaired
+		}
+		return file
+	case <-timer.C:
+		slog.DebugContext(ctx, "playback start served from known metadata; probe repair continues in background",
+			"component", "api", "file_id", file.ID, "path", file.FilePath)
+		return file
+	case <-ctx.Done():
+		// The viewer went away; the detached refresh still owns the repair.
+		return file
+	}
+}
+
+// claimPlaybackProbeRefresh returns the memo entry for a file and whether the
+// caller owns starting its refresh. A caller owns the refresh when the memo has
+// no unexpired entry for this file generation. A fresh entry carries a closed
+// done channel; an in-flight entry's channel closes when the repair lands.
+func (h *PlaybackHandler) claimPlaybackProbeRefresh(file *models.MediaFile) (*playbackProbeRefresh, bool) {
+	fingerprint := playbackProbeFingerprint(file)
+	now := time.Now()
+	h.probeRefreshMu.Lock()
+	defer h.probeRefreshMu.Unlock()
+	if h.probeRefreshed == nil {
+		h.probeRefreshed = make(map[int]*playbackProbeRefresh)
+	}
+	if existing, ok := h.probeRefreshed[file.ID]; ok {
+		if existing.fingerprint == fingerprint && now.Sub(existing.preparedAt) < playbackProbePreparedTTL {
+			return existing, false
+		}
+	}
+	if len(h.probeRefreshed) >= playbackProbePreparedMaxEntries {
+		for id, existing := range h.probeRefreshed {
+			if now.Sub(existing.preparedAt) >= playbackProbePreparedTTL {
+				delete(h.probeRefreshed, id)
+			}
+		}
+	}
+	entry := &playbackProbeRefresh{fingerprint: fingerprint, preparedAt: now, done: make(chan struct{})}
+	h.probeRefreshed[file.ID] = entry
+	return entry, true
+}
+
+// refreshPlaybackProbeAsync runs one probe repair on a detached goroutine. The
+// start has already been served from the row's known metadata once the budget
+// lapses, so the repair must outlive the request: a client that disconnects
+// while the probe runs must not cancel the repair the next start will read.
+// context.WithoutCancel keeps the request's logging and tracing values while
+// dropping its cancellation; playbackProbeRefreshTimeout guards a wedged
+// ensurer.
+func (h *PlaybackHandler) refreshPlaybackProbeAsync(ctx context.Context, entry *playbackProbeRefresh, file *models.MediaFile) {
+	// The request builds its response from this file, so hand the goroutine its
+	// own copy; probe repair must not race a live response.
+	snapshot := *file
+	base := context.WithoutCancel(ctx)
+	h.probeRefreshWG.Add(1)
+	go func() {
+		defer h.probeRefreshWG.Done()
+		refreshCtx, cancel := context.WithTimeout(base, playbackProbeRefreshTimeout)
+		defer cancel()
+		repaired, err := h.ProbeEnsurer.EnsureCopySafetyCached(refreshCtx, &snapshot)
+		if err != nil {
+			slog.WarnContext(refreshCtx, "playback probe refresh failed", "component", "api", "file_id", file.ID, "path", file.FilePath, "error", err)
+			// Fail open: the ensurer may return a file alongside its error, but
+			// a failed repair is not a repaired row.
+			repaired = nil
+		}
+		h.finishPlaybackProbeRefresh(entry, file.ID, repaired)
+	}()
+}
+
+// finishPlaybackProbeRefresh completes a refresh and closes its done channel,
+// waking every waiter. A landed repair records the post-repair fingerprint so
+// the next start of the unchanged repaired row is served without re-queueing. A
+// failed repair drops the claim instead, so a later start retries rather than
+// being suppressed for the TTL.
+func (h *PlaybackHandler) finishPlaybackProbeRefresh(entry *playbackProbeRefresh, fileID int, repaired *models.MediaFile) {
+	h.probeRefreshMu.Lock()
+	if repaired == nil {
+		if current, ok := h.probeRefreshed[fileID]; ok && current == entry {
+			delete(h.probeRefreshed, fileID)
+		}
+	} else {
+		entry.fingerprint = playbackProbeFingerprint(repaired)
+		entry.preparedAt = time.Now()
+		entry.repaired = repaired
+	}
+	h.probeRefreshMu.Unlock()
+	close(entry.done)
+}
+
+// playbackProbeStartBudget is the bounded request wait before failing open.
+// Tests set probeStartBudget directly to keep the bound short.
+func (h *PlaybackHandler) playbackProbeStartBudget() time.Duration {
+	if h.probeStartBudget > 0 {
+		return h.probeStartBudget
+	}
+	return playbackProbeStartBudgetDefault
 }
 
 // streamTokenParam is the query parameter that carries the signed stream token
