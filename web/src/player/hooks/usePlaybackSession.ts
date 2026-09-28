@@ -596,6 +596,10 @@ export function usePlaybackSession(
     retireSessionOnRefusal: boolean;
     resolve: (adopted: boolean) => void;
     planId: string;
+    // The live effective file the op was built against. A serve-layer rotation
+    // moves it without changing `plan_id`, so the plan-id check alone would
+    // replay a plan-bound op against another release's track ordinals.
+    mediaFileId: number | null;
   } | null>(null);
   const issueReplanRef = useRef<
     (options: ReplanOptions, retireSessionOnRefusal?: boolean) => Promise<boolean>
@@ -1299,6 +1303,7 @@ export function usePlaybackSession(
               retireSessionOnRefusal,
               resolve,
               planId: plan.plan_id,
+              mediaFileId: stateRef.current.mediaFileId,
             };
           });
         }
@@ -1433,15 +1438,20 @@ export function usePlaybackSession(
         const pendingReplan = pendingReplanRef.current;
         pendingReplanRef.current = null;
         if (pendingReplan?.loadSequence === loadSequenceRef.current) {
-          // The queued op was built against the plan its `planId` names. When
-          // the in-flight replan has replaced that plan, an op may only be
-          // replayed if it carries no plan-derived state: a seek target, a
-          // quality label and an output refresh are resolved against the live
-          // plan, either by this re-dispatch or by the server. A track
-          // selection bakes in a plan-derived ordinal, and a failure recovery
-          // bakes in the plan to exclude, so both are dropped once the plan
-          // identity they name is gone. The id is checked on every op.
-          const planStillCurrent = pendingReplan.planId === planRef.current?.plan_id;
+          // The queued op was built against the plan its `planId` names and the
+          // live source its `mediaFileId` names. When the in-flight replan has
+          // replaced that plan, an op may only be replayed if it carries no
+          // plan-derived state: a seek target, a quality label and an output
+          // refresh are resolved against the live plan, either by this
+          // re-dispatch or by the server. A track selection bakes in a
+          // plan-derived ordinal, and a failure recovery bakes in the plan to
+          // exclude, so both are dropped once the plan identity they name is
+          // gone. A rotation moves the effective source without changing the
+          // plan id, so the live file id is checked too: the plan-bound ordinal
+          // no longer names the same bytes once the transport rebinds.
+          const planStillCurrent =
+            pendingReplan.planId === planRef.current?.plan_id &&
+            pendingReplan.mediaFileId === stateRef.current.mediaFileId;
           const pendingIsPlanBound =
             pendingReplan.options.operation === "failure_recovery" ||
             pendingReplan.options.operation === "seek_failure_recovery" ||
@@ -1731,6 +1741,23 @@ export function usePlaybackSession(
       },
       audioTracks: PlayerAudioTrack[],
     ) => {
+      // A replacement start is rebuilding the session and its plan is the
+      // authority for identity and inventory. A rotation on the outgoing
+      // transport must not mutate the menus under the pending replacement, nor
+      // move the live identity the chained-switch completion compares against.
+      // Drop the push. When it actually moved the source, the queued
+      // chained-switch position was captured against the outgoing timeline, so
+      // discard it and let the chained switch seek from the live playhead.
+      if (switchingRef.current || stateRef.current.replacing) {
+        const current = stateRef.current;
+        const movedSource =
+          (source.effectiveMediaFileId != null &&
+            source.effectiveMediaFileId !== current.mediaFileId) ||
+          (source.effectiveVirtualUri != null &&
+            source.effectiveVirtualUri !== current.effectiveVirtualUri);
+        if (movedSource) pendingSwitchPositionRef.current = null;
+        return;
+      }
       setState((current) => {
         const nextFileId = source.effectiveMediaFileId ?? current.mediaFileId;
         const nextUri = source.effectiveVirtualUri ?? current.effectiveVirtualUri;
@@ -1847,7 +1874,10 @@ export function usePlaybackSession(
           pendingSwitchFileIdRef.current = null;
           pendingSwitchPositionRef.current = null;
           if (latest !== null && latest !== stateRef.current.mediaFileId) {
-            switchVersion(latest, latestPosition ?? currentPosition);
+            // A rotation during the switch clears the queued position (it was
+            // captured against the outgoing timeline), so fall back to the live
+            // playhead rather than the first click's stale closure position.
+            switchVersion(latest, latestPosition ?? playbackPositionRef.current);
           }
         }
       })();

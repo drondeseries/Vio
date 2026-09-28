@@ -1938,6 +1938,187 @@ describe("usePlaybackSession version switches", () => {
 
     unmount();
   });
+
+  it("ignores a committed source rotation while a version switch is replacing", async () => {
+    const planAudioTracks = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+      { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+    ];
+    const startBodies: Array<{ file_id: number }> = [];
+    let releaseSwitch: ((response: Response) => void) | undefined;
+    const switchResponse = new Promise<Response>((resolve) => {
+      releaseSwitch = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) {
+          // Hold the switch open so the rotation lands while it rebuilds.
+          return switchResponse;
+        }
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: planAudioTracks,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(99, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    expect(result.current.replacing).toBe(true);
+
+    // The outgoing transport rotates to another release while the switch is
+    // still in flight. Its identity and inventory must not be written under the
+    // pending switch.
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 8,
+          effectiveVirtualUri: "virtual://movie/x?result=B",
+          inventoryStatus: "declared",
+        },
+        [{ codec: "eac3", channels: 6, layout: "5.1", language: "deu", default: true }],
+      ),
+    );
+
+    expect(result.current.mediaFileId).toBe(7);
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=A");
+    expect(result.current.planAudioTracks).toEqual(planAudioTracks);
+
+    await act(async () => {
+      releaseSwitch?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-2",
+            plan_attempt_key: "v3:switch-2",
+            requested_media_file_id: 99,
+            effective_media_file_id: 99,
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await switchResponse;
+    });
+
+    // The switch's replacement plan is the authority once it lands.
+    await waitFor(() => expect(result.current.mediaFileId).toBe(99));
+    expect(result.current.effectiveVirtualUri).toBeNull();
+    expect(result.current.planAudioTracks).toEqual([]);
+
+    unmount();
+  });
+
+  it("seeks a chained switch from the live playhead after a rotation", async () => {
+    const startBodies: Array<{ file_id: number; start_position?: number }> = [];
+    let releaseFirstSwitch: ((response: Response) => void) | undefined;
+    const firstSwitchResponse = new Promise<Response>((resolve) => {
+      releaseFirstSwitch = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number; start_position?: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) return firstSwitchResponse;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: `session-${startBodies.length}`,
+            playback_plan: fixturePlanV3({
+              session_id: `session-${startBodies.length}`,
+              plan_id: `plan:switch-${startBodies.length}`,
+              requested_media_file_id: body.file_id,
+              effective_media_file_id: body.file_id,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(99, 15));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    // A second click queues a chained switch with the live position at click
+    // time.
+    act(() => result.current.switchVersion(123, 347));
+    expect(startBodies).toHaveLength(2);
+
+    // A rotation arrives while the first switch is in flight: the queued
+    // position was captured against the outgoing timeline and must be dropped.
+    act(() =>
+      result.current.applyCommittedSource(
+        { effectiveMediaFileId: 8, effectiveVirtualUri: null, inventoryStatus: "declared" },
+        [],
+      ),
+    );
+
+    await act(async () => {
+      releaseFirstSwitch?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-2",
+            requested_media_file_id: 99,
+            effective_media_file_id: 99,
+            // The server starts the replacement stream at the live playhead.
+            timeline: { ...fixturePlanV3().timeline, source_start_seconds: 500 },
+          }),
+        }),
+      );
+      await firstSwitchResponse;
+    });
+
+    await waitFor(() => expect(startBodies).toHaveLength(3));
+    expect(startBodies.map((body) => body.file_id)).toEqual([7, 99, 123]);
+    // The stale captured position (347) was discarded; the chained switch uses
+    // the live playhead seeded by the replacement plan.
+    expect(startBodies[2]?.start_position).toBe(500);
+
+    unmount();
+  });
 });
 
 describe("usePlaybackSession replans", () => {
@@ -2186,6 +2367,91 @@ describe("usePlaybackSession replans", () => {
 
     await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
     expect(replanBodies).toHaveLength(1);
+
+    unmount();
+  });
+
+  it("drops a queued plan-bound replan when a rotation moved the effective file", async () => {
+    const initialPlan = fixturePlanV3({
+      audio_tracks: [
+        { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+        { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+      ],
+    });
+    let releaseReplan: ((response: Response) => void) | undefined;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: initialPlan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return heldReplan;
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+
+    // Queue a plan-bound audio change (its ordinal was resolved off the plan's
+    // menu), then let a serve-layer rotation move the effective file while the
+    // replan is still in flight.
+    act(() => result.current.switchAudioTrack(1, 130));
+    expect(replanBodies).toHaveLength(1);
+    act(() =>
+      result.current.applyCommittedSource(
+        { effectiveMediaFileId: 8, effectiveVirtualUri: null, inventoryStatus: "declared" },
+        [],
+      ),
+    );
+    expect(result.current.mediaFileId).toBe(8);
+
+    // The in-flight replan is refused without replacing the plan, so the plan id
+    // still matches; only the moved effective file makes the queued ordinal
+    // stale. It must be dropped rather than replayed against the rotated source.
+    await act(async () => {
+      releaseReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "adaptation_unavailable",
+          terminal: {
+            reason: "video_conversion_unsupported",
+            message: "No executor can transcode this source.",
+            retryable: false,
+          },
+        }),
+      );
+      await heldReplan;
+    });
+
+    expect(replanBodies).toHaveLength(1);
+    expect(result.current.plan?.plan_id).toBe("plan:0123456789abcdef");
 
     unmount();
   });
