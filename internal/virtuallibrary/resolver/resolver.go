@@ -1042,31 +1042,36 @@ func (r *Resolver) getCandidatesRaw(ctx context.Context, virtualPath string, for
 		// The wait respects context cancellation so a canceled caller does not
 		// block for the full provider timeout.
 		if wait := r.joinFlight(cacheKey, config, generation, mediaType, mediaID); wait != nil {
-			select {
-			case <-wait:
-			case <-ctx.Done():
-				return nil, "", "", ctx.Err()
+			candidates, ok, err := r.awaitFlight(ctx, wait, cacheKey)
+			if err != nil {
+				return nil, "", "", err
 			}
-			r.cacheMu.Lock()
-			fresh, stillOK := r.cache[cacheKey]
-			r.cacheMu.Unlock()
-			if stillOK {
-				now := time.Now()
-				withinGrace := !now.After(fresh.expiresAt.Add(candidateStaleGrace))
-				switch {
-				case len(fresh.candidates) > 0 && withinGrace:
-					// Positive results stay servable through the same stale
-					// grace the direct tiers use.
-					return cloneCandidates(fresh.candidates), mediaType, mediaID, nil
-				case len(fresh.candidates) == 0 && now.Before(fresh.expiresAt):
-					// Negative-cache hit: the flight already proved the title
-					// is unavailable, so waiting callers must not re-pay the
-					// round-trip. Negatives never outlive their own short TTL.
-					return cloneCandidates(fresh.candidates), mediaType, mediaID, nil
-				}
+			if ok {
+				return candidates, mediaType, mediaID, nil
 			}
 			// Flight completed without a usable entry (expired, past grace,
 			// or absent); fall through to our own attempt.
+		}
+	}
+
+	// Forced lookups skip the cache tiers above, so without this they would
+	// bypass the keyed flight and pay one provider round-trip per call. A
+	// version liveness check fans out per file, but every version of one item
+	// shares a cache key: 40 files of one listing would issue 40 identical
+	// re-lists and starve a concurrent playback start of provider capacity.
+	// Joining the same keyed flight the non-forced path uses collapses them to
+	// one provider fetch per listing, with every caller served its result. The
+	// join respects context cancellation, so a caller bounded by its own
+	// per-file budget still returns when that budget fires.
+	if forceRefresh {
+		if wait := r.joinFlight(cacheKey, config, generation, mediaType, mediaID); wait != nil {
+			candidates, ok, err := r.awaitFlight(ctx, wait, cacheKey)
+			if err != nil {
+				return nil, "", "", err
+			}
+			if ok {
+				return candidates, mediaType, mediaID, nil
+			}
 		}
 	}
 
@@ -1108,6 +1113,41 @@ func (r *Resolver) servePositiveCachedCandidates(cacheKey string, generation uin
 	entry.lastAccess = now
 	r.cache[cacheKey] = entry
 	return candidates, true
+}
+
+// awaitFlight waits for an in-flight provider fetch, respecting the caller's
+// context, and serves the cache entry that flight wrote when it is usable: a
+// positive answer still inside stale grace, or a fresh negative. It reports
+// ok=false with a nil error when the flight left no usable entry, so the
+// caller can run its own fetch; a canceled wait returns the context error so
+// callers keep the bare cancellation they saw before. It does not hold
+// cacheMu across the wait.
+func (r *Resolver) awaitFlight(ctx context.Context, wait <-chan struct{}, cacheKey string) ([]StreamCandidate, bool, error) {
+	select {
+	case <-wait:
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+	r.cacheMu.Lock()
+	fresh, stillOK := r.cache[cacheKey]
+	r.cacheMu.Unlock()
+	if !stillOK {
+		return nil, false, nil
+	}
+	now := time.Now()
+	withinGrace := !now.After(fresh.expiresAt.Add(candidateStaleGrace))
+	switch {
+	case len(fresh.candidates) > 0 && withinGrace:
+		// Positive results stay servable through the same stale grace the
+		// direct tiers use.
+		return cloneCandidates(fresh.candidates), true, nil
+	case len(fresh.candidates) == 0 && now.Before(fresh.expiresAt):
+		// Negative-cache hit: the flight already proved the title is
+		// unavailable, so waiting callers must not re-pay the round-trip.
+		// Negatives never outlive their own short TTL.
+		return cloneCandidates(fresh.candidates), true, nil
+	}
+	return nil, false, nil
 }
 
 // joinFlight registers this caller as a synchronous provider fetcher if no
