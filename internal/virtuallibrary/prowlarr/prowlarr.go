@@ -243,6 +243,13 @@ type prowlarrRelease struct {
 	parsedCandidate *StreamCandidate    `json:"-"`
 	episodeKeys     []episodeReleaseKey `json:"-"`
 	normalizedTitle string              `json:"-"`
+	// normalizedYear is the year normalizeReleaseTitle extracted from Title.
+	// Persisted alongside normalizedTitle so the classifier's fallback never
+	// re-runs the normalization regexes per candidate/release pair.
+	normalizedYear int `json:"-"`
+	// nameKey is releaseNameKey(Title): the extension-stripped, lowercased,
+	// non-alphanumeric-free identity the exact-name confirmation matches on.
+	nameKey string `json:"-"`
 }
 
 func prepareProwlarrRelease(release *prowlarrRelease) {
@@ -253,7 +260,8 @@ func prepareProwlarrRelease(release *prowlarrRelease) {
 	parseStreamDetails(&candidate)
 	release.parsedCandidate = &candidate
 	release.episodeKeys = episodeReleaseKeys(release.Title)
-	release.normalizedTitle, _ = normalizeReleaseTitle(release.Title)
+	release.normalizedTitle, release.normalizedYear = normalizeReleaseTitle(release.Title)
+	release.nameKey = releaseNameKey(release.Title)
 }
 
 // prowlarrSearchClient holds a cached snapshot of Prowlarr's recent releases
@@ -276,7 +284,123 @@ type prowlarrSearchClient struct {
 	lastFetch      time.Time
 	lastErr        error
 	releases       []prowlarrRelease
-	indexFile      string
+	// releasesGeneration advances every time releases is replaced. It keys the
+	// cached classification index so repeated serves reuse one build and a
+	// refresh invalidates it without comparing slice backing arrays.
+	releasesGeneration uint64
+	classifyIndex      *prowlarrReleaseIndex
+	// classifyIndexGeneration is the releasesGeneration the cached index
+	// describes; a mismatch means it must be rebuilt.
+	classifyIndexGeneration uint64
+	indexFile               string
+}
+
+// prowlarrReleaseIndex is the read-only lookup the candidate classifier uses to
+// avoid the previous candidates x releases scan. Releases are grouped by their
+// exact release-name identity and by normalized title, so each candidate costs
+// an O(1) exact lookup plus a bounded fallback scan over releases that already
+// share its normalized title. identities mirrors the snapshot so the pair
+// predicate never re-runs a normalization regex.
+type prowlarrReleaseIndex struct {
+	// byNameKey maps a release identity to the smallest snapshot index carrying
+	// it, preserving the linear scan's first-match ordering.
+	byNameKey map[string]int
+	// byTitle lists snapshot indices sharing a normalized title, ascending, so
+	// the weak fallback can stop at its first size-corroborated match.
+	byTitle    map[string][]int
+	identities []releaseIdentity
+}
+
+// releaseIdentity is the reduced form both confirmation predicates compare:
+// the exact release-name key, the normalized title and year, and the size.
+type releaseIdentity struct {
+	nameKey string
+	title   string
+	year    int
+	size    int64
+}
+
+// releaseIdentityOf reduces a release to its comparison identity. It reuses the
+// fields prepareProwlarrRelease precomputes and only derives them for a release
+// built directly in a test, so a prepared snapshot never pays the regexes here.
+func releaseIdentityOf(release *prowlarrRelease) releaseIdentity {
+	if release == nil {
+		return releaseIdentity{}
+	}
+	identity := releaseIdentity{
+		nameKey: release.nameKey,
+		title:   release.normalizedTitle,
+		year:    release.normalizedYear,
+		size:    release.Size,
+	}
+	if identity.nameKey == "" && identity.title == "" && strings.TrimSpace(release.Title) != "" {
+		identity.title, identity.year = normalizeReleaseTitle(release.Title)
+		identity.nameKey = releaseNameKey(release.Title)
+	}
+	return identity
+}
+
+// candidateIdentity reduces a provider candidate the same way. The candidate
+// carries no precomputed fields, so this runs the regexes once per candidate
+// instead of once per candidate/release pair.
+func candidateIdentity(candidate StreamCandidate) releaseIdentity {
+	nameKey := candidateReleaseName(candidate)
+	if nameKey == "" {
+		return releaseIdentity{}
+	}
+	title, year := normalizeReleaseTitle(candidate.Title + " " + candidate.Name)
+	return releaseIdentity{nameKey: nameKey, title: title, year: year, size: candidate.FileSize}
+}
+
+// releaseIdentityMatchesCandidate is the pair predicate: exact release-name
+// identity first, then a normalized title+year match corroborated by compatible
+// sizes so a different quality tier is not treated as confirmed.
+func releaseIdentityMatchesCandidate(release, candidate releaseIdentity) bool {
+	if candidate.nameKey == "" {
+		return false
+	}
+	if release.nameKey != "" && release.nameKey == candidate.nameKey {
+		return true
+	}
+	if release.title == "" || release.title != candidate.title {
+		return false
+	}
+	if release.year != 0 && candidate.year != 0 && release.year != candidate.year {
+		return false
+	}
+	// A title-only fallback is too weak on its own: Prowlarr returns many
+	// quality tiers of the same movie. Require both sizes to corroborate the
+	// match rather than confirming whichever tier the provider happened to
+	// return. (AltMount's own classification may treat unknown sizes as
+	// neutral; here a false confirmation would reorder playback.)
+	if release.size <= 0 || candidate.size <= 0 {
+		return false
+	}
+	return releaseSizesMatch(release.size, candidate.size)
+}
+
+// buildProwlarrReleaseIndex reads the identity fields prepareProwlarrRelease
+// precomputes on each release, falling back to deriving them for an unprepared
+// release without mutating the shared snapshot.
+func buildProwlarrReleaseIndex(releases []prowlarrRelease) *prowlarrReleaseIndex {
+	index := &prowlarrReleaseIndex{
+		byNameKey:  make(map[string]int, len(releases)),
+		byTitle:    make(map[string][]int, len(releases)),
+		identities: make([]releaseIdentity, len(releases)),
+	}
+	for i := range releases {
+		identity := releaseIdentityOf(&releases[i])
+		index.identities[i] = identity
+		if identity.nameKey != "" {
+			if _, ok := index.byNameKey[identity.nameKey]; !ok {
+				index.byNameKey[identity.nameKey] = i
+			}
+		}
+		if identity.title != "" {
+			index.byTitle[identity.title] = append(index.byTitle[identity.title], i)
+		}
+	}
+	return index
 }
 
 func newProwlarrSearchClient(client *http.Client) *prowlarrSearchClient {
@@ -328,6 +452,7 @@ func (c *prowlarrSearchClient) Configure(baseURL, apiKey string, intervalMinutes
 	newTimeout := time.Duration(timeoutSeconds) * time.Second
 	if newURL != c.url || newKey != c.apiKey || newInterval != c.interval {
 		c.releases = nil
+		c.releasesGeneration++
 		c.lastFetch = time.Time{}
 		c.lastErr = nil
 	}
@@ -373,6 +498,7 @@ func (c *prowlarrSearchClient) ConfigureIndexFile(path string) error {
 		prepareProwlarrRelease(&releases[i])
 	}
 	c.releases = pruneProwlarrReleases(releases, time.Now())
+	c.releasesGeneration++
 	return nil
 }
 
@@ -590,6 +716,7 @@ func (c *prowlarrSearchClient) refresh(ctx context.Context) error {
 	c.mu.Lock()
 	merged := mergeProwlarrReleases(c.releases, releases, time.Now())
 	c.releases = merged
+	c.releasesGeneration++
 	c.lastFetch = time.Now()
 	c.lastErr = nil
 	indexFile := c.indexFile
@@ -820,38 +947,11 @@ func releaseSizesMatch(a, b int64) bool {
 // same release that Prowlarr already indexed. Exact release-name identity is
 // the primary signal; a normalized title+year match additionally requires
 // compatible sizes so a different quality tier is not treated as confirmed.
+//
+// It is the linear reference for releaseIdentityMatchesCandidate, which
+// ClassifyCandidates uses through its inverted index.
 func prowlarrReleaseConfirmsCandidate(release prowlarrRelease, candidate StreamCandidate) bool {
-	candidateKey := candidateReleaseName(candidate)
-	if candidateKey == "" {
-		return false
-	}
-	releaseKeyValue := releaseNameKey(release.Title)
-	if releaseKeyValue != "" && releaseKeyValue == candidateKey {
-		return true
-	}
-	if release.normalizedTitle == "" {
-		prepareProwlarrRelease(&release)
-	}
-	if release.normalizedTitle == "" {
-		return false
-	}
-	releaseTitle, releaseYear := normalizeReleaseTitle(release.Title)
-	candidateTitle, candidateYear := normalizeReleaseTitle(candidate.Title + " " + candidate.Name)
-	if releaseTitle == "" || releaseTitle != candidateTitle {
-		return false
-	}
-	if releaseYear != 0 && candidateYear != 0 && releaseYear != candidateYear {
-		return false
-	}
-	// A title-only fallback is too weak on its own: Prowlarr returns many
-	// quality tiers of the same movie. Require both sizes to corroborate the
-	// match rather than confirming whichever tier the provider happened to
-	// return. (AltMount's own classification may treat unknown sizes as
-	// neutral; here a false confirmation would reorder playback.)
-	if release.Size <= 0 || candidate.FileSize <= 0 {
-		return false
-	}
-	return releaseSizesMatch(release.Size, candidate.FileSize)
+	return releaseIdentityMatchesCandidate(releaseIdentityOf(&release), candidateIdentity(candidate))
 }
 
 // IndexerReleaseMatchesProvider reports whether a provider release (as named
@@ -881,35 +981,90 @@ func IndexerReleaseMatchesProvider(release SearchItem, providerReleaseName strin
 	return releaseSizesMatch(release.Size, providerSize)
 }
 
+// maxFallbackReleaseScan bounds the weak title fallback the classifier runs per
+// candidate. Exact release-name identity is resolved by map lookup and is never
+// capped; only a snapshot with an implausible number of same-titled releases can
+// reach this bound. The early exit is preserved: the scan stops at the first
+// size-corroborated match, or as soon as it passes an already-found exact match.
+const maxFallbackReleaseScan = 512
+
 // ClassifyCandidates sets SourceConfirmed on each candidate whose release the
 // cached Prowlarr snapshot already carries. This is the fallback signal used
 // when AltMount is not configured. The snapshot is a durable, operator-visible
 // record (persisted to the index file and refreshed by the scheduled monitor),
 // so this is not a live lookup and adds no provider round-trip to playback.
+//
+// The classifier runs on every list and resolve of the same cached listing, so
+// it must not be quadratic: candidates x releases with per-pair regexes made a
+// 500 x 20000 snapshot cost ~14s per call. It now snapshots the release slice
+// (the backing array is immutable once published, so no copy is needed), reuses
+// the identity fields prepareProwlarrRelease precomputes on every release, and
+// resolves each candidate through an inverted index. Exact release-name identity
+// is an O(1) map lookup; the weak title fallback scans only the releases sharing
+// the candidate's normalized title, bounded by maxFallbackReleaseScan.
+//
+// First-match ordering is preserved exactly: the match is the smallest snapshot
+// index satisfying either the exact-name or the weak-title predicate, and the
+// GUID is filled from that release only when the candidate carries none. A
+// candidate's existing (for example AltMount-namespaced) GUID is never
+// overwritten.
 func (c *prowlarrSearchClient) ClassifyCandidates(candidates []StreamCandidate) {
 	if c == nil || len(candidates) == 0 {
 		return
 	}
 	c.mu.Lock()
-	releases := append([]prowlarrRelease(nil), c.releases...)
+	// A shallow snapshot is safe: refresh and index load replace c.releases with
+	// a new slice and never mutate a published one in place.
+	releases := c.releases
+	index := c.classifyIndex
+	if index == nil || c.classifyIndexGeneration != c.releasesGeneration {
+		index = buildProwlarrReleaseIndex(releases)
+		c.classifyIndex = index
+		c.classifyIndexGeneration = c.releasesGeneration
+	}
 	c.mu.Unlock()
-	if len(releases) == 0 {
+	if len(releases) == 0 || index == nil {
 		return
 	}
 	for i := range candidates {
-		for j := range releases {
-			if prowlarrReleaseConfirmsCandidate(releases[j], candidates[i]) {
-				candidates[i].SourceConfirmed = true
-				// AltMount's release-scoped identity (namespaced) is
-				// authoritative for a candidate it already confirmed: Prowlarr
-				// corroborates the same release, it does not re-identify it.
-				// Overwriting would move the row's GUID to a different provider
-				// key and break re-matching. Only fill an empty GUID.
-				if strings.TrimSpace(candidates[i].SourceGUID) == "" && releases[j].GUID != "" {
-					candidates[i].SourceGUID = releases[j].GUID
+		identity := candidateIdentity(candidates[i])
+		if identity.nameKey == "" {
+			continue
+		}
+		// Find the earliest release satisfying either confirmation predicate,
+		// mirroring the linear first-match scan this replaced.
+		matchIndex := -1
+		if j, ok := index.byNameKey[identity.nameKey]; ok {
+			matchIndex = j
+		}
+		if matchIndex != 0 && identity.title != "" {
+			scanned := 0
+			for _, j := range index.byTitle[identity.title] {
+				// A weak match can only change the result when it precedes the
+				// exact match already found.
+				if matchIndex >= 0 && j >= matchIndex {
+					break
 				}
-				break
+				if scanned >= maxFallbackReleaseScan {
+					break
+				}
+				scanned++
+				if releaseIdentityMatchesCandidate(index.identities[j], identity) {
+					matchIndex = j
+					break
+				}
 			}
+		}
+		if matchIndex < 0 {
+			continue
+		}
+		candidates[i].SourceConfirmed = true
+		// AltMount's release-scoped identity (namespaced) is authoritative for a
+		// candidate it already confirmed: Prowlarr corroborates the same release,
+		// it does not re-identify it. Overwriting would move the row's GUID to a
+		// different provider key and break re-matching. Only fill an empty GUID.
+		if strings.TrimSpace(candidates[i].SourceGUID) == "" && releases[matchIndex].GUID != "" {
+			candidates[i].SourceGUID = releases[matchIndex].GUID
 		}
 	}
 }
