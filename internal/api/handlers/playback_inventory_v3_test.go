@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,6 +97,182 @@ func TestHandleGetPlaybackInventoryV3(t *testing.T) {
 	if rrCond.Body.Len() != 0 {
 		t.Fatalf("304 response body must be empty, got %d bytes", rrCond.Body.Len())
 	}
+}
+
+// TestPlaybackInventoryPublishesEffectiveVersionIdentity pins that the live
+// inventory response names the effective version the transport is bound to, so
+// a client polling it can re-key menus without waiting for a replan.
+func TestPlaybackInventoryPublishesEffectiveVersionIdentity(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	probedAt := time.Now()
+	file := &models.MediaFile{
+		ID:             100,
+		ContentID:      "movie-identity",
+		FilePath:       "/media/identity.mkv",
+		ProbeUpdatedAt: &probedAt,
+		AudioTracks:    []models.AudioTrack{{Index: 1, Codec: "aac", Language: "eng"}},
+	}
+	h := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
+
+	authCtx := apimw.SetClaims(context.Background(), &auth.Claims{UserID: 1, Role: "user", TokenType: auth.TokenTypeAccess})
+	authCtx = apimw.SetProfileID(authCtx, "profile-1")
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/playback/"+session.ID+"/inventory", nil).WithContext(authCtx)
+	rr := httptest.NewRecorder()
+	h.HandleGetPlaybackInventoryV3(rr, withPlaybackRouteParam(req, "session_id", session.ID))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+	var inv playback.PlaybackInventoryV3
+	if err := json.Unmarshal(rr.Body.Bytes(), &inv); err != nil {
+		t.Fatalf("unmarshal inventory: %v", err)
+	}
+	if inv.EffectiveMediaFileID != file.ID {
+		t.Fatalf("effective_media_file_id = %d, want %d", inv.EffectiveMediaFileID, file.ID)
+	}
+	if inv.EffectiveVirtualURI != "" {
+		t.Fatalf("effective_virtual_uri = %q, want empty for a local file", inv.EffectiveVirtualURI)
+	}
+}
+
+// TestPlaybackInventoryFollowsRotatedVirtualSource pins the failover case: after
+// a serve-layer rotation the session's binding names release B while the row the
+// session id was planned against is still release A. The response must name B
+// and publish B's own declared inventory — never A's tracks — even though B has
+// not been probed yet.
+func TestPlaybackInventoryFollowsRotatedVirtualSource(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	probedAt := time.Now()
+	releaseA := &models.MediaFile{
+		ID:             100,
+		ContentID:      "movie-rotation",
+		FilePath:       "virtual://movie/rotation?result=A",
+		ProbeUpdatedAt: &probedAt,
+		AudioTracks:    []models.AudioTrack{{Index: 1, Codec: "aac", Language: "eng"}},
+	}
+	// Release B is unprobed: it carries declared provider metadata only.
+	releaseB := &models.MediaFile{
+		ID:           200,
+		ContentID:    "movie-rotation",
+		FilePath:     "virtual://movie/rotation?result=B",
+		AudioTracks:  []models.AudioTrack{{Index: 1, Codec: "eac3", Language: "deu"}},
+		VideoTracks:  []models.VideoTrack{{Codec: "hevc", Width: 1920, Height: 1080}},
+		Resolution:   "1080p",
+		CodecVideo:   "hevc",
+		CodecAudio:   "eac3",
+		Container:    "mkv",
+		ProviderGUID: "guid-b",
+	}
+	h := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: releaseA})
+	h.VirtualFileLookup = func(_ context.Context, path string) (*models.MediaFile, error) {
+		if strings.TrimSpace(path) == releaseB.FilePath {
+			return releaseB, nil
+		}
+		return nil, nil
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, releaseB.FilePath, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	authCtx := apimw.SetClaims(context.Background(), &auth.Claims{UserID: 1, Role: "user", TokenType: auth.TokenTypeAccess})
+	authCtx = apimw.SetProfileID(authCtx, "profile-1")
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/playback/"+session.ID+"/inventory", nil).WithContext(authCtx)
+	rr := httptest.NewRecorder()
+	h.HandleGetPlaybackInventoryV3(rr, withPlaybackRouteParam(req, "session_id", session.ID))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+	var inv playback.PlaybackInventoryV3
+	if err := json.Unmarshal(rr.Body.Bytes(), &inv); err != nil {
+		t.Fatalf("unmarshal inventory: %v", err)
+	}
+	if inv.EffectiveMediaFileID != releaseB.ID {
+		t.Fatalf("effective_media_file_id = %d, want the rotated release %d", inv.EffectiveMediaFileID, releaseB.ID)
+	}
+	if inv.EffectiveVirtualURI != releaseB.FilePath {
+		t.Fatalf("effective_virtual_uri = %q, want %q", inv.EffectiveVirtualURI, releaseB.FilePath)
+	}
+	if inv.InventoryStatus != "declared" {
+		t.Fatalf("inventory_status = %q, want declared for an unprobed sibling", inv.InventoryStatus)
+	}
+	if len(inv.AudioTracks) != 1 || inv.AudioTracks[0].Language != "deu" {
+		t.Fatalf("audio tracks = %#v, want release B's deu track only", inv.AudioTracks)
+	}
+	for _, track := range inv.AudioTracks {
+		if track.Language == "eng" {
+			t.Fatal("the previous release's audio track leaked into the rotated inventory")
+		}
+	}
+}
+
+// TestPublishSourceCommittedEmitsEffectiveVersion proves the commit-time push
+// names the effective version and its declared inventory on the session's
+// realtime connection.
+func TestPublishSourceCommittedEmitsEffectiveVersion(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	file := &models.MediaFile{
+		ID:          100,
+		ContentID:   "movie-commit",
+		FilePath:    "virtual://movie/commit?result=A",
+		AudioTracks: []models.AudioTrack{{Index: 1, Codec: "aac", Language: "eng"}},
+	}
+	h := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := sessionMgr.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+
+	h.PublishSourceCommitted(context.Background(), session.ID)
+
+	if len(conn.messages) != 1 {
+		t.Fatalf("delivered %d events, want 1", len(conn.messages))
+	}
+	event, ok := conn.messages[0].(playback.EventEnvelope)
+	if !ok {
+		t.Fatalf("message type = %T, want playback.EventEnvelope", conn.messages[0])
+	}
+	if event.Name != playback.RealtimeEventSourceCommitted {
+		t.Fatalf("event name = %q, want %q", event.Name, playback.RealtimeEventSourceCommitted)
+	}
+	var payload playback.SourceCommittedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.SessionID != session.ID || payload.EffectiveMediaFileID != file.ID {
+		t.Fatalf("payload identity = %#v, want session %q file %d", payload, session.ID, file.ID)
+	}
+	if payload.EffectiveVirtualURI != file.FilePath {
+		t.Fatalf("payload effective_virtual_uri = %q, want %q", payload.EffectiveVirtualURI, file.FilePath)
+	}
+	if len(payload.AudioTracks) != 1 || payload.AudioTracks[0].Language != "eng" {
+		t.Fatalf("payload audio tracks = %#v, want the declared eng track", payload.AudioTracks)
+	}
+}
+
+type sourceCommittedTestConn struct {
+	messages []any
+}
+
+func (c *sourceCommittedTestConn) WriteJSON(v any) error {
+	c.messages = append(c.messages, v)
+	return nil
 }
 
 func TestComputeInventoryRevisionDeterministic(t *testing.T) {

@@ -2819,6 +2819,12 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	// retries that lose the idempotency race must not emit duplicate provider
 	// scrobbles or analysis work for the short-lived session they roll back.
 	h.raceCopySafetyV3(effectiveFile.ID, result.Plan)
+	// Publish the committed effective version and its declared inventory on the
+	// session's realtime channel. On a fresh start the plan response already
+	// carries this, but an attempt that replays a stored decision or a second
+	// consumer watching the same session can still learn it from here; a
+	// rotation is the case that depends on it.
+	h.PublishSourceCommitted(r.Context(), session.ID)
 	// The transport is committed above. Run the virtual subtitle and font warms
 	// detached from this start request: each resolves its own relay registration
 	// and demuxes the remote source, and running them on the response path let

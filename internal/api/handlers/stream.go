@@ -78,6 +78,11 @@ type StreamHandler struct {
 	// PlaybackHandler's); an aborted session's attempt row is marked stopped
 	// through it. May be nil (tests / minimal setups).
 	PlanStoreV3 playback.PlanStoreV3
+	// SourceCommittedNotifier publishes the effective version a serve-layer
+	// rotation just committed to, with its declared inventory, so a playing
+	// client can follow the streamed release before any replan. Optional: a nil
+	// notifier keeps the rotation commit but sends no event.
+	SourceCommittedNotifier sourceCommittedNotifier
 	// PlaybackConfig returns the current playback config; read it through
 	// ffmpegPath(). May be nil (tests).
 	PlaybackConfig func() config.PlaybackConfig
@@ -188,6 +193,14 @@ type virtualSessionSourceBinder interface {
 	SetVirtualSource(sessionID, virtualURI string, ownerInstallationID int) error
 }
 
+// sourceCommittedNotifier publishes the effective version a transport just
+// committed to, with its declared inventory, to the live session. The
+// PlaybackHandler implements it; a minimal/test setup without a notifier skips
+// the push while keeping the rotation commit itself.
+type sourceCommittedNotifier interface {
+	PublishSourceCommitted(ctx context.Context, sessionID string)
+}
+
 // commitRotatedVirtualSessionSource rebinds a live session to the candidate a
 // serve-layer rotation just resolved. The session id and account are unchanged:
 // only the pinned anchor moves, so the client-visible session identity survives
@@ -205,6 +218,14 @@ func (h *StreamHandler) commitRotatedVirtualSessionSource(ctx context.Context, s
 	if err := binder.SetVirtualSource(sessionID, resolved.URI, resolved.OwnerID); err != nil {
 		slog.WarnContext(ctx, "failed to rebind virtual session after candidate rotation",
 			"component", "api", "session", sessionID, "virtual_uri", resolved.URI, "error", err)
+		return
+	}
+	// Publish the new effective version the moment the binding moves, before
+	// any replan. The client re-keys its menus to the streamed release and the
+	// background probe's inventory poll upgrades the declared tracks when it
+	// lands, instead of the menus naming the previous release until then.
+	if h.SourceCommittedNotifier != nil {
+		h.SourceCommittedNotifier.PublishSourceCommitted(ctx, sessionID)
 	}
 }
 

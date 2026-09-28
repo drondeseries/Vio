@@ -98,6 +98,43 @@ func TestHandleStreamRotatesAbsentSessionPin(t *testing.T) {
 	}
 }
 
+// recordingSourceCommittedNotifier records the sessions a rotation published.
+type recordingSourceCommittedNotifier struct {
+	sessions []string
+}
+
+func (n *recordingSourceCommittedNotifier) PublishSourceCommitted(_ context.Context, sessionID string) {
+	n.sessions = append(n.sessions, sessionID)
+}
+
+// TestCommitRotatedVirtualSessionSourcePublishesCommittedSource pins the
+// commit-time publish: the moment a rotation moves the session binding, the
+// effective version is pushed to the session without waiting for a replan.
+func TestCommitRotatedVirtualSessionSourcePublishesCommittedSource(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 42, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{})
+	notifier := &recordingSourceCommittedNotifier{}
+	handler.SourceCommittedNotifier = notifier
+
+	const siblingURI = "virtual://movie/tt-rotated?result=sibling"
+	handler.commitRotatedVirtualSessionSource(context.Background(), session.ID, ResolvedVirtualMedia{URI: siblingURI, OwnerID: 5})
+
+	if len(notifier.sessions) != 1 || notifier.sessions[0] != session.ID {
+		t.Fatalf("published sessions = %v, want exactly [%s]", notifier.sessions, session.ID)
+	}
+	bound, err := sessionMgr.GetSession(session.ID)
+	if err != nil || bound == nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if bound.VirtualSourceURI != siblingURI {
+		t.Fatalf("session binding = %q, want %q", bound.VirtualSourceURI, siblingURI)
+	}
+}
+
 // TestHandleStreamDoesNotRotateOnProviderFailure proves the serve-layer retry is
 // narrowly scoped to the absent-pin cause: a generic provider resolve failure
 // must keep its 502 and must not spend a misleading rotation attempt.

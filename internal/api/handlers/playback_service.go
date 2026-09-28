@@ -19,6 +19,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
@@ -805,26 +806,6 @@ func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller Pla
 	if session.UserID != caller.UserID || (caller.ProfileID != "" && session.ProfileID != caller.ProfileID) {
 		return playback.PlaybackInventoryV3{}, playbackOperationError(http.StatusForbidden, "forbidden", "Session belongs to another profile")
 	}
-
-	file, err := h.fileResolver.GetByID(ctx, session.MediaFileID)
-	if err != nil || file == nil {
-		return playback.PlaybackInventoryV3{}, playbackOperationError(http.StatusNotFound, "not_found", "Media file not found")
-	}
-
-	// For virtual files, prefer the live catalog row matching the session's
-	// active candidate URI if it has completed background probing.
-	if isVirtualPlaybackFile(file) && h.VirtualFileLookup != nil {
-		candidateURI := strings.TrimSpace(session.VirtualSourceURI)
-		if candidateURI == "" {
-			candidateURI = file.FilePath
-		}
-		if probedRow, lookupErr := h.VirtualFileLookup(ctx, candidateURI); lookupErr == nil && probedRow != nil && probedRow.ProbeUpdatedAt != nil {
-			file = probedRow
-		} else {
-			file = bindSessionVirtualSourceWithTracks(ctx, file, session, h.fileResolver)
-		}
-	}
-
 	if h.PlanStoreV3 == nil {
 		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
 	}
@@ -838,14 +819,60 @@ func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller Pla
 	if record == nil {
 		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
 	}
-	clientFeatures := replanSubtitleFeaturesV3(record, record.NormalizedRequest.ClientFeatures)
+	inventory, invErr := h.playbackInventoryForSession(ctx, session, record)
+	if errors.Is(invErr, errPlaybackInventorySubtitlesUnavailable) {
+		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
+	}
+	return inventory, invErr
+}
+
+// errPlaybackInventorySubtitlesUnavailable marks a live-inventory read that
+// failed because the subtitle inventory dependency was unavailable. The v2 and
+// v1 readers map it to their own established problem shapes; the sentinel keeps
+// the shared resolver from picking one.
+var errPlaybackInventorySubtitlesUnavailable = errors.New("playback inventory subtitle load failed")
+
+// playbackInventoryForSession resolves the live inventory and the effective
+// version identity for an active session. Both the v2 and v3 readers call it so
+// they cannot disagree about which release is playing or which tracks it
+// publishes.
+//
+// The session's bound virtual source is authoritative at commit time: a
+// serve-layer rotation moves VirtualSourceURI to a live sibling before any plan
+// is rebuilt, so the catalog row that names that URI is the effective version
+// even when it is not probed yet. Its own declared (or empty) inventory is the
+// correct answer for that release, and the previous release's tracks are never
+// served under it.
+func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, session *playback.Session, record *playback.AttemptRecordV3) (playback.PlaybackInventoryV3, error) {
+	if h == nil || session == nil {
+		return playback.PlaybackInventoryV3{}, playbackSessionNotFoundOperationError()
+	}
+	file, err := h.fileResolver.GetByID(ctx, session.MediaFileID)
+	if err != nil || file == nil {
+		return playback.PlaybackInventoryV3{}, playbackOperationError(http.StatusNotFound, "not_found", "Media file not found")
+	}
+
+	effectiveVirtualURI := ""
+	if isVirtualPlaybackFile(file) {
+		candidateURI := strings.TrimSpace(session.VirtualSourceURI)
+		if candidateURI == "" {
+			candidateURI = strings.TrimSpace(file.FilePath)
+		}
+		effectiveVirtualURI = candidateURI
+		file = h.inventoryEffectiveFile(ctx, file, session, candidateURI)
+	}
+
+	var clientFeatures []string
+	if record != nil {
+		clientFeatures = replanSubtitleFeaturesV3(record, record.NormalizedRequest.ClientFeatures)
+	}
 
 	audioTracks := playback.AudioInventoryV3(file)
 	additional, subErr := h.downloadedSubtitleInventoryWithErrorV3(ctx, file)
 	if subErr != nil {
-		return playback.PlaybackInventoryV3{}, playbackStoreOperationError()
+		return playback.PlaybackInventoryV3{}, errPlaybackInventorySubtitlesUnavailable
 	}
-	subtitleInventory := playback.ScopeSubtitleInventoryV3(sessionID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
+	subtitleInventory := playback.ScopeSubtitleInventoryV3(session.ID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
 
 	status := string(ProbeProvenanceDeclared)
 	if file != nil && file.ProbeUpdatedAt != nil {
@@ -854,13 +881,103 @@ func (h *PlaybackHandler) GetPlaybackInventoryV2(ctx context.Context, caller Pla
 
 	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory)
 
+	effectiveFileID := 0
+	if file != nil {
+		effectiveFileID = file.ID
+	}
 	return playback.PlaybackInventoryV3{
-		SessionID:         sessionID,
-		InventoryRevision: revision,
-		InventoryStatus:   status,
-		AudioTracks:       audioTracks,
-		SubtitleInventory: subtitleInventory,
+		SessionID:             session.ID,
+		InventoryRevision:     revision,
+		InventoryStatus:       status,
+		AudioTracks:           audioTracks,
+		SubtitleInventory:     subtitleInventory,
+		EffectiveMediaFileID:  effectiveFileID,
+		EffectiveVirtualURI:   effectiveVirtualURI,
+		VirtualSourceRevision: session.VirtualSourceRevision,
 	}, nil
+}
+
+// inventoryEffectiveFile resolves the catalog row whose inventory describes the
+// release the session is actually bound to. The bound candidate URI wins: when
+// a row names it, that row speaks for the release (probed evidence if present,
+// its own declared metadata otherwise). Plan-time evidence is overlaid only
+// when it still matches that bound release. When no row names the bound release
+// and the loaded row is a different one, an identity-only copy with no tracks is
+// returned, so the previous release's inventory is never shown for it.
+func (h *PlaybackHandler) inventoryEffectiveFile(ctx context.Context, file *models.MediaFile, session *playback.Session, candidateURI string) *models.MediaFile {
+	if file == nil {
+		return nil
+	}
+	if candidateURI == "" {
+		return bindSessionVirtualSourceWithTracks(ctx, file, session, h.fileResolver)
+	}
+	base := file
+	if h.VirtualFileLookup != nil {
+		if row, err := h.VirtualFileLookup(ctx, candidateURI); err == nil && row != nil {
+			base = row
+		}
+	}
+	if base == file && strings.TrimSpace(file.FilePath) != candidateURI {
+		// No row names the bound release. Do not serve the loaded row's
+		// inventory under the bound identity.
+		placeholder := *file
+		placeholder.FilePath = candidateURI
+		placeholder.AudioTracks = nil
+		placeholder.SubtitleTracks = nil
+		placeholder.ExternalSubtitles = nil
+		placeholder.ProbeUpdatedAt = nil
+		base = &placeholder
+	}
+	return bindSessionVirtualSourceWithTracks(ctx, base, session, h.fileResolver)
+}
+
+// PublishSourceCommitted pushes the effective version and its declared
+// inventory to a live session the moment a transport commits to it. It is
+// invoked on the start commit and on a serve-layer rotation so a playing client
+// can follow the streamed version immediately, ahead of the background probe;
+// the existing inventory poll then upgrades the declared list to probe
+// evidence. Best-effort: a session without a realtime connection is a no-op.
+func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID string) {
+	if h == nil || h.RealtimeHub == nil || sessionID == "" {
+		return
+	}
+	session, err := h.sessionMgr.GetSession(sessionID)
+	if err != nil || session == nil {
+		return
+	}
+	// No live realtime connection: there is nothing to push and building the
+	// inventory would be a wasted catalog read on the start path.
+	if !session.HasRealtimeConnection {
+		return
+	}
+	var record *playback.AttemptRecordV3
+	if h.PlanStoreV3 != nil {
+		if loaded, loadErr := h.PlanStoreV3.GetAttempt(ctx, sessionID); loadErr == nil {
+			record = loaded
+		}
+	}
+	inventory, invErr := h.playbackInventoryForSession(ctx, session, record)
+	if invErr != nil {
+		slog.DebugContext(ctx, "source committed event skipped: inventory unavailable",
+			"component", "playback", "session", sessionID, "error", invErr)
+		return
+	}
+	event, err := playback.NewSourceCommittedEvent(sessionID, playback.SourceCommittedPayload{
+		EffectiveMediaFileID:  inventory.EffectiveMediaFileID,
+		EffectiveVirtualURI:   inventory.EffectiveVirtualURI,
+		VirtualSourceRevision: inventory.VirtualSourceRevision,
+		InventoryStatus:       inventory.InventoryStatus,
+		AudioTracks:           inventory.AudioTracks,
+	})
+	if err != nil {
+		slog.WarnContext(ctx, "failed to encode source committed realtime event",
+			"component", "playback", "session", sessionID, "error", err)
+		return
+	}
+	if err := h.RealtimeHub.Send(sessionID, event); err != nil && !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
+		slog.WarnContext(ctx, "failed to deliver source committed realtime event",
+			"component", "playback", "session", sessionID, "error", err)
+	}
 }
 
 // ReplanDigestV3 fingerprints the exact replan body so a reused request id with

@@ -1696,6 +1696,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 			streamHandler.TM = playbackHandler.TranscodeManager()
 			streamHandler.StreamDeny = playbackHandler.StreamDeny
 			streamHandler.PlanStoreV3 = playbackHandler.PlanStoreV3
+			// A serve-layer rotation publishes the new effective version on the
+			// session's realtime connection so the client follows the streamed
+			// release before any replan.
+			streamHandler.SourceCommittedNotifier = playbackHandler
 			if deps.Config != nil {
 				streamHandler.JWTSecret = deps.Config.Auth.JWTSecret
 			}

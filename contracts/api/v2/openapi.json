@@ -31093,6 +31093,13 @@
             },
             "type": "array"
           },
+          "effective_media_file_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "effective_virtual_uri": {
+            "type": "string"
+          },
           "inventory_revision": {
             "type": "string"
           },
@@ -31107,6 +31114,9 @@
               "$ref": "#/components/schemas/SubtitleInventoryItemV3"
             },
             "type": "array"
+          },
+          "virtual_source_revision": {
+            "type": "string"
           }
         },
         "required": [

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -48,46 +47,22 @@ func (h *PlaybackHandler) HandleGetPlaybackInventoryV3(w http.ResponseWriter, r 
 		return
 	}
 
-	file, err := h.fileResolver.GetByID(r.Context(), session.MediaFileID)
-	if err != nil || file == nil {
-		writeError(w, http.StatusNotFound, "not_found", "Media file not found")
-		return
-	}
-
-	// For virtual files, prefer the live catalog row matching the session's
-	// active candidate URI if it has completed background probing.
-	if isVirtualPlaybackFile(file) && h.VirtualFileLookup != nil {
-		candidateURI := strings.TrimSpace(session.VirtualSourceURI)
-		if candidateURI == "" {
-			candidateURI = file.FilePath
-		}
-		if probedRow, lookupErr := h.VirtualFileLookup(r.Context(), candidateURI); lookupErr == nil && probedRow != nil && probedRow.ProbeUpdatedAt != nil {
-			file = probedRow
-		} else {
-			file = bindSessionVirtualSourceWithTracks(r.Context(), file, session, h.fileResolver)
-		}
-	}
-
-	var clientFeatures []string
+	var record *playback.AttemptRecordV3
 	if h.PlanStoreV3 != nil {
-		if record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID); err == nil && record != nil {
-			clientFeatures = replanSubtitleFeaturesV3(record, record.NormalizedRequest.ClientFeatures)
+		if loaded, loadErr := h.PlanStoreV3.GetAttempt(r.Context(), sessionID); loadErr == nil {
+			record = loaded
 		}
 	}
-	audioTracks := playback.AudioInventoryV3(file)
-	additional, subErr := h.downloadedSubtitleInventoryWithErrorV3(r.Context(), file)
-	if subErr != nil {
-		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Failed to load subtitle inventory")
+	inventory, invErr := h.playbackInventoryForSession(r.Context(), session, record)
+	if invErr != nil {
+		if errors.Is(invErr, errPlaybackInventorySubtitlesUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Failed to load subtitle inventory")
+			return
+		}
+		writePlaybackOperationError(w, invErr)
 		return
 	}
-	subtitleInventory := playback.ScopeSubtitleInventoryV3(sessionID, file, playback.BuildSubtitleInventoryV3(file, additional), clientFeatures)
-
-	status := string(ProbeProvenanceDeclared)
-	if file != nil && file.ProbeUpdatedAt != nil {
-		status = string(ProbeProvenanceVerified)
-	}
-
-	revision := playback.ComputeInventoryRevisionV3(status, audioTracks, subtitleInventory)
+	revision := inventory.InventoryRevision
 	etag := fmt.Sprintf("%q", revision)
 
 	w.Header().Set("ETag", etag)
@@ -100,13 +75,5 @@ func (h *PlaybackHandler) HandleGetPlaybackInventoryV3(w http.ResponseWriter, r 
 		}
 	}
 
-	resp := playback.PlaybackInventoryV3{
-		SessionID:         sessionID,
-		InventoryRevision: revision,
-		InventoryStatus:   status,
-		AudioTracks:       audioTracks,
-		SubtitleInventory: subtitleInventory,
-	}
-
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, inventory)
 }

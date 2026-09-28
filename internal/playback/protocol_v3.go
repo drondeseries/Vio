@@ -77,8 +77,14 @@ const (
 	// of the WebVTT conversion, which cannot carry every SRT feature. Embedded
 	// SRT tracks keep their existing delivery. It exists only on /api/v2 (see
 	// NativeServerFeaturesV3).
-	FeatureSubripSidecarV3     = "subrip_sidecar_v1"
-	FeatureLiveInventoryV3     = "live_inventory_refresh_v1"
+	FeatureSubripSidecarV3 = "subrip_sidecar_v1"
+	FeatureLiveInventoryV3 = "live_inventory_refresh_v1"
+	// FeatureSourceCommittedV3 is the client's promise to handle the realtime
+	// source_committed event: re-key its version menu to the effective source
+	// the transport committed to and adopt the declared audio inventory without
+	// a replan. It only appears on /api/v2, like the other realtime-v3
+	// capabilities.
+	FeatureSourceCommittedV3   = "source_committed_event_v1"
 	PlanRecipeVersionV3        = "v3.4"
 	ClientDV7ToDV81V3          = "client_dv7_to_dv81"
 	ClientDV7ToHDR10V3         = "client_dv7_to_hdr10"
@@ -155,7 +161,7 @@ func ServerFeaturesV3() []string {
 // advertises and honors only on /api/v2. They postdate the /api/v1 freeze, so
 // the frozen surface neither advertises nor negotiates them.
 func NativeServerFeaturesV3() []string {
-	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3)
+	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3)
 }
 
 // WithoutFeatureV3 returns features with every spelling of feature removed.
@@ -1053,6 +1059,23 @@ type PlaybackInventoryV3 struct {
 	InventoryStatus   string                    `json:"inventory_status"`
 	AudioTracks       []AudioInventoryItemV3    `json:"audio_tracks"`
 	SubtitleInventory []SubtitleInventoryItemV3 `json:"subtitle_inventory"`
+	// EffectiveMediaFileID is the catalog row the transport is committed to.
+	// It moves when a serve-layer rotation rebinds the session to a sibling
+	// release, so a client polling this endpoint can follow the streamed
+	// version instead of the plan's stale identity. It equals the plan's
+	// effective_media_file_id on an un-rotated session.
+	EffectiveMediaFileID int `json:"effective_media_file_id,omitempty"`
+	// EffectiveVirtualURI is the provider-neutral candidate URI the session is
+	// bound to. Like the plan's effective_virtual_uri it lets a client re-key
+	// its version menu to the release actually being served; unlike the plan it
+	// is read from the live session, so it survives a rotation.
+	EffectiveVirtualURI string `json:"effective_virtual_uri,omitempty"`
+	// VirtualSourceRevision is the opaque media-generation revision the plan
+	// published for the bound candidate. A serve-layer rotation clears it (the
+	// new release is not probed yet), which is itself a signal that the
+	// inventory is declared rather than verified. Empty for a non-virtual
+	// source.
+	VirtualSourceRevision string `json:"virtual_source_revision,omitempty"`
 }
 
 type inventoryRevisionEnvelope struct {
