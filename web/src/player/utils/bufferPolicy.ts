@@ -39,6 +39,8 @@ export const MIN_BACK_BUFFER_SECONDS = 60;
 export const MAX_BACK_BUFFER_SECONDS = 120;
 /** Seconds past the buffered edge prefetch keeps in flight while playing. */
 export const HLS_PREFETCH_SECONDS = 30;
+/** hls.js's default `maxBufferSize`, in bytes. */
+export const HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES = 60 * 1000 * 1000;
 
 export interface HlsBufferPolicy {
   /** `maxBufferLength`/`maxMaxBufferLength`: forward buffer target in seconds. */
@@ -47,6 +49,8 @@ export interface HlsBufferPolicy {
   backBufferSeconds: number;
   /** Seconds past the buffered edge prefetch keeps in flight while stable. */
   prefetchSeconds: number;
+  /** Source bitrate the byte target is sized from; 0 when unknown. */
+  bitrateKbps: number;
 }
 
 /** Clamps an hls.js back-buffer request into the retention window. */
@@ -57,15 +61,35 @@ export function clampBackBufferSeconds(seconds: number): number {
 
 /** Resolves the hls.js buffer settings for a source's bitrate. */
 export function hlsBufferPolicy(bitrateKbps: number): HlsBufferPolicy {
+  const safeBitrateKbps = Number.isFinite(bitrateKbps) && bitrateKbps > 0 ? bitrateKbps : 0;
   const forwardBufferSeconds =
-    bitrateKbps >= HIGH_BITRATE_KBPS
+    safeBitrateKbps >= HIGH_BITRATE_KBPS
       ? HIGH_BITRATE_FORWARD_BUFFER_SECONDS
       : DEFAULT_FORWARD_BUFFER_SECONDS;
   return {
     forwardBufferSeconds,
     backBufferSeconds: clampBackBufferSeconds(forwardBufferSeconds),
     prefetchSeconds: Math.min(HLS_PREFETCH_SECONDS, forwardBufferSeconds),
+    bitrateKbps: safeBitrateKbps,
   };
+}
+
+/**
+ * The `maxBufferSize` byte ceiling that leaves `seconds` in control of hls.js's
+ * forward buffer. hls.js bounds loading at
+ *
+ *   min(max((8 * maxBufferSize) / levelBitrate, maxBufferLength), maxMaxBufferLength)
+ *
+ * so its default 60 MB byte target lets the buffer grow to roughly 60s at
+ * 8 Mbps even when `maxBufferLength` asks for a shorter paused/seeking window.
+ * Sizing the byte target to the window at the source bitrate stops the byte
+ * target from raising the limit past `seconds`. A zero or unknown bitrate
+ * returns 0, which cannot raise the limit and leaves the time target governing.
+ */
+export function maxBufferSizeBytes(seconds: number, bitrateKbps: number): number {
+  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+  if (!Number.isFinite(bitrateKbps) || bitrateKbps <= 0) return 0;
+  return Math.ceil((seconds * bitrateKbps * 1000) / 8);
 }
 
 /**

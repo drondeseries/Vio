@@ -46,6 +46,7 @@ import { isSafariBrowserV3, resolveHLSEngineV3 } from "../utils/hlsEngine";
 import {
   hlsBufferPolicy,
   isTimeBuffered,
+  maxBufferSizeBytes,
   prefetchBufferTargetSeconds,
 } from "../utils/bufferPolicy";
 import { isFirefoxUserAgent } from "../utils/browser";
@@ -2316,6 +2317,11 @@ export function VideoPlayer({
               // reloads the element or rebuilds the transport.
               backBufferLength: backBufferSeconds,
               maxBufferLength: initialBufferTarget,
+              // hls.js bounds loading by the byte target too: its default 60 MB
+              // `maxBufferSize` permits ~60s at 8 Mbps, which would overshoot
+              // the paused/seeking window even when `maxBufferLength` is lower.
+              // Size the byte target to the same window so the time target wins.
+              maxBufferSize: maxBufferSizeBytes(initialBufferTarget, bufferPolicy.bitrateKbps),
               // Keep the stable-play window as the ceiling so the play event can
               // raise `maxBufferLength` back to it without reloading the stream.
               maxMaxBufferLength: forwardBufferSeconds,
@@ -2532,6 +2538,13 @@ export function VideoPlayer({
       });
       if (hls.config.maxBufferLength !== target) {
         hls.config.maxBufferLength = target;
+      }
+      // Retarget the byte ceiling with the time target. hls.js takes the larger
+      // of the byte-derived and time targets, so leaving the byte target at its
+      // default would let paused or seeking loading run past the window.
+      const bytes = maxBufferSizeBytes(target, policy.bitrateKbps);
+      if (hls.config.maxBufferSize !== bytes) {
+        hls.config.maxBufferSize = bytes;
       }
     };
 

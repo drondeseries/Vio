@@ -10,6 +10,7 @@ import type {
   PlaybackRealtimeEventEnvelope,
 } from "../realtime-protocol";
 import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
+import { HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES } from "../utils/bufferPolicy";
 import { HLS_STARTUP_TIMEOUT_MS } from "../utils/hlsStartupGuard";
 import { VideoPlayer } from "./VideoPlayer";
 
@@ -2845,11 +2846,27 @@ describe("VideoPlayer HLS buffer policy", () => {
     backBufferLength: number;
     maxBufferLength: number;
     maxMaxBufferLength: number;
+    maxBufferSize?: number;
     startFragPrefetch: boolean;
   }
 
   function recordedConfig(): RecordedHlsConfig {
     return hlsJS.constructed.mock.calls[0]?.[0] as RecordedHlsConfig;
+  }
+
+  // hls.js stops loading once the forward buffer reaches
+  //   min(max((8 * maxBufferSize) / levelBitrate, maxBufferLength), maxMaxBufferLength)
+  // (base-stream-controller.ts `getMaxBufferLength`). Recomputing it here asserts
+  // the window the player actually reaches, not just the config it assigns. An
+  // unset `maxBufferSize` falls back to hls.js's 60 MB default so the test would
+  // catch a regression that drops the byte target.
+  function effectiveForwardBufferSeconds(
+    config: RecordedHlsConfig,
+    levelBitrateBps: number,
+  ): number {
+    const maxBufferSize = config.maxBufferSize ?? HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES;
+    const byByteTarget = levelBitrateBps > 0 ? (8 * maxBufferSize) / levelBitrateBps : 0;
+    return Math.min(Math.max(byByteTarget, config.maxBufferLength), config.maxMaxBufferLength);
   }
 
   it("bounds the hls.js back buffer instead of leaving it unbounded", async () => {
@@ -2922,6 +2939,42 @@ describe("VideoPlayer HLS buffer policy", () => {
     playing = false;
     fireEvent.pause(video);
     expect(config.maxBufferLength).toBe(30);
+  });
+
+  it("keeps paused and seeking loading inside the intended window at the source bitrate", async () => {
+    const levelBitrateBps = 8_000_000; // 8 Mbps
+    const { container } = renderPlayer({
+      plan: hlsPlan(8_000),
+      shouldAutoPlay: false,
+    });
+    await waitFor(() => expect(hlsJS.constructed).toHaveBeenCalledOnce());
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+
+    const config = recordedConfig();
+    let playing = false;
+    let seeking = false;
+    Object.defineProperty(video, "paused", { configurable: true, get: () => !playing });
+    Object.defineProperty(video, "seeking", { configurable: true, get: () => seeking });
+
+    // A paused start must not let the default byte target push loading to ~60s.
+    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
+
+    // Stable play fills toward the produced head, still bounded by the window.
+    playing = true;
+    fireEvent.play(video);
+    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(120);
+
+    // A seek drops the effective loading limit to the prefetch window.
+    seeking = true;
+    fireEvent.seeking(video);
+    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
+
+    // Pausing does the same without a seek.
+    seeking = false;
+    playing = false;
+    fireEvent.pause(video);
+    expect(effectiveForwardBufferSeconds(config, levelBitrateBps)).toBe(30);
   });
 });
 

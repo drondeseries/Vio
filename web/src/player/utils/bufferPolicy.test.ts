@@ -10,6 +10,7 @@ import {
   clampBackBufferSeconds,
   hlsBufferPolicy,
   isTimeBuffered,
+  maxBufferSizeBytes,
   prefetchBufferTargetSeconds,
 } from "./bufferPolicy";
 
@@ -52,6 +53,7 @@ describe("hlsBufferPolicy", () => {
       forwardBufferSeconds: HIGH_BITRATE_FORWARD_BUFFER_SECONDS,
       backBufferSeconds: HIGH_BITRATE_FORWARD_BUFFER_SECONDS,
       prefetchSeconds: HLS_PREFETCH_SECONDS,
+      bitrateKbps: 25_000,
     });
   });
 
@@ -60,6 +62,7 @@ describe("hlsBufferPolicy", () => {
       forwardBufferSeconds: DEFAULT_FORWARD_BUFFER_SECONDS,
       backBufferSeconds: DEFAULT_FORWARD_BUFFER_SECONDS,
       prefetchSeconds: HLS_PREFETCH_SECONDS,
+      bitrateKbps: 8_000,
     });
   });
 
@@ -70,6 +73,28 @@ describe("hlsBufferPolicy", () => {
       expect(policy.backBufferSeconds).toBeLessThanOrEqual(MAX_BACK_BUFFER_SECONDS);
       expect(policy.prefetchSeconds).toBeLessThanOrEqual(policy.forwardBufferSeconds);
     }
+  });
+});
+
+describe("maxBufferSizeBytes", () => {
+  it("sizes the byte target to the window at the source bitrate", () => {
+    // 30s at 8 Mbps: 30 * 8_000_000 / 8 = 30 MB.
+    expect(maxBufferSizeBytes(30, 8_000)).toBe(30_000_000);
+  });
+
+  it("rounds up to whole bytes", () => {
+    expect(maxBufferSizeBytes(1, 1_001)).toBe(125_125);
+  });
+
+  it("returns zero for an unknown bitrate so the time target governs", () => {
+    expect(maxBufferSizeBytes(30, 0)).toBe(0);
+    expect(maxBufferSizeBytes(30, Number.NaN)).toBe(0);
+    expect(maxBufferSizeBytes(30, -1)).toBe(0);
+  });
+
+  it("returns zero for a non-positive window", () => {
+    expect(maxBufferSizeBytes(0, 8_000)).toBe(0);
+    expect(maxBufferSizeBytes(Number.NaN, 8_000)).toBe(0);
   });
 });
 
