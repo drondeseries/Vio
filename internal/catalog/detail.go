@@ -3242,10 +3242,16 @@ func (s *DetailService) newWatchDetail(
 	return detail
 }
 
+// virtualScoreTimeout bounds the virtual candidate score lookup that annotates
+// a watch response. The score is decoration: a cold candidate cache can make
+// the lookup wait on a provider round-trip, which must never hold the watch
+// response open. On timeout the versions are served unscored.
+var virtualScoreTimeout = 1500 * time.Millisecond
+
 // attachVirtualCandidateScores stamps each virtual candidate version with the
 // custom-format score the virtual ranking assigned it, keyed by media-file ID.
-// Local files and unscored candidates keep a nil score, and a scorer miss
-// leaves the version unannotated rather than failing the watch response.
+// Local files and unscored candidates keep a nil score, and a scorer miss or
+// timeout leaves the version unannotated rather than failing the watch response.
 func (s *DetailService) attachVirtualCandidateScores(
 	ctx context.Context,
 	contentID string,
@@ -3255,7 +3261,7 @@ func (s *DetailService) attachVirtualCandidateScores(
 	if s.virtualScoreSource == nil || len(versions) == 0 {
 		return
 	}
-	scores := s.virtualScoreSource(ctx, contentID, files)
+	scores := s.scoreVirtualCandidates(ctx, contentID, files)
 	if len(scores) == 0 {
 		return
 	}
@@ -3263,6 +3269,33 @@ func (s *DetailService) attachVirtualCandidateScores(
 		if score, ok := scores[versions[i].FileID]; ok {
 			versions[i].FormatScore = intPtr(score)
 		}
+	}
+}
+
+// scoreVirtualCandidates runs the score source under a short deadline and
+// fails open. The source runs on its own goroutine so a scorer that ignores
+// context cancellation still cannot block the watch response; the buffered
+// channel lets that goroutine finish without leaking, and a recovered panic
+// yields no scores instead of taking the process down from a background
+// goroutine. A canceled or timed-out lookup also yields no scores, so the
+// caller leaves every version unannotated.
+func (s *DetailService) scoreVirtualCandidates(ctx context.Context, contentID string, files []*models.MediaFile) map[int]int {
+	scoreCtx, cancel := context.WithTimeout(ctx, virtualScoreTimeout)
+	defer cancel()
+	done := make(chan map[int]int, 1)
+	go func() {
+		defer func() {
+			if recover() != nil {
+				done <- nil
+			}
+		}()
+		done <- s.virtualScoreSource(scoreCtx, contentID, files)
+	}()
+	select {
+	case scores := <-done:
+		return scores
+	case <-scoreCtx.Done():
+		return nil
 	}
 }
 
