@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -407,5 +408,74 @@ func TestConcurrentRequestsJoinSingleFlight(t *testing.T) {
 		if len(results[i]) != 1 || results[i][0].URL != answer[0].URL {
 			t.Fatalf("caller %d result = %+v, want %+v", i, results[i], answer)
 		}
+	}
+}
+
+// TestForcedRefreshFlightFailureReportsProviderError pins that a failed
+// in-flight re-list surfaces the provider error instead of silently serving
+// the stale positive entry the flight was trying to replace. The entry is
+// past its fresh-serve floor but inside stale grace, so a forced lookup joins
+// the flight rather than serving it directly.
+func TestForcedRefreshFlightFailureReportsProviderError(t *testing.T) {
+	answer := &mutableStreams{}
+	answer.set([]StreamCandidate{{URL: "https://cdn.example/one.mkv", Name: "One.Release.1080p"}})
+	var fail atomic.Bool
+	p := newCountingProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			http.Error(w, "provider down", http.StatusBadGateway)
+			return
+		}
+		writeStreams(w, answer.get())
+	})
+	r := New(testConfig(p))
+	ctx := context.Background()
+
+	if _, _, _, err := r.GetCandidates(ctx, "virtual://movie/tt1"); err != nil {
+		t.Fatalf("GetCandidates: %v", err)
+	}
+	mutateCacheEntry(t, r, "movie|tt1", func(entry *candidateCacheEntry) {
+		entry.fetchedAt = time.Now().Add(-freshServeFloor - time.Second)
+		entry.expiresAt = time.Now().Add(-time.Second)
+	})
+	fail.Store(true)
+
+	_, _, _, err := r.GetCandidatesFresh(ctx, "virtual://movie/tt1")
+	if err == nil {
+		t.Fatal("forced refresh after a provider failure returned nil; want the provider error")
+	}
+	if !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("error = %v, want ErrProviderUnavailable", err)
+	}
+}
+
+// TestForcedRefreshEmptyAnswerKeepsStalePositive pins the other half: a
+// successful empty provider answer deliberately preserves a still-servable
+// positive entry, so a concurrent waiter reuses it instead of reporting an
+// error or forcing another fetch. This guards the dedup behavior a fetchedAt
+// cutoff would break.
+func TestForcedRefreshEmptyAnswerKeepsStalePositive(t *testing.T) {
+	answer := &mutableStreams{}
+	answer.set([]StreamCandidate{{URL: "https://cdn.example/one.mkv", Name: "One.Release.1080p"}})
+	p := newCountingProvider(t, func(w http.ResponseWriter, r *http.Request) { writeStreams(w, answer.get()) })
+	r := New(testConfig(p))
+	ctx := context.Background()
+
+	if _, _, _, err := r.GetCandidates(ctx, "virtual://movie/tt1"); err != nil {
+		t.Fatalf("GetCandidates: %v", err)
+	}
+	mutateCacheEntry(t, r, "movie|tt1", func(entry *candidateCacheEntry) {
+		entry.fetchedAt = time.Now().Add(-freshServeFloor - time.Second)
+		entry.expiresAt = time.Now().Add(-time.Second)
+	})
+	// The provider now answers with nothing; the positive entry is still
+	// servable and the empty answer must not replace it.
+	answer.set(nil)
+
+	got, _, _, err := r.GetCandidatesFresh(ctx, "virtual://movie/tt1")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("forced refresh over an empty answer: count=%d err=%v, want the retained positive 1", len(got), err)
+	}
+	if got[0].URL != "https://cdn.example/one.mkv" {
+		t.Fatalf("URL = %q, want the retained positive entry", got[0].URL)
 	}
 }
