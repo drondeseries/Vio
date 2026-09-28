@@ -130,10 +130,18 @@ function buildEffectiveVersionLabel(version: PlayerFileVersion): string | null {
  * row. Lookups keyed on `session.mediaFileId` then miss, so `activeVersion`
  * falls through to another release's first row and `isVirtualActiveFile`,
  * `selectedDuration` and `activeChapters` lose the live file's data. Resolve
- * the row for the live file — by the plan's published path when it has one,
- * otherwise by id — and merge it under the session's file id. The list is
- * returned unchanged when the live row is already present or cannot be
- * resolved.
+ * the row for the live file by the plan's published effective source first,
+ * otherwise by id, and re-key it under the session's file id, appending when
+ * the list carries none.
+ *
+ * When the list already carries the live file id, the resolved row must be that
+ * same file to replace it: a serve-layer rotation can move the effective source
+ * without changing the collapsed file id, leaving a row whose URI is stale.
+ * A path match that lands on a different catalog row (a virtual collapsed row
+ * resolved to a concrete candidate) is left alone — that row is already present
+ * and the menus resolve it by URI, while overwriting the live row would drop
+ * the requested row's identity that the substitution notice reads. The list is
+ * returned unchanged when the live row cannot be resolved.
  */
 export function mergeResolvedLiveVersion(
   versions: PlayerFileVersion[],
@@ -142,13 +150,26 @@ export function mergeResolvedLiveVersion(
   candidates: readonly PlayerFileVersion[],
 ): PlayerFileVersion[] {
   if (liveFileId == null) return versions;
-  if (versions.some((version) => version.file_id === liveFileId)) return versions;
   const liveIdentity = { ...identity, mediaFileId: liveFileId };
+  // Match the committed source by its published URI across both lists before
+  // falling back to the collapsed id: within a single list the id fallback
+  // would otherwise re-select the stale live row and hide the rotation.
+  const committedUri = identity.effectiveVirtualUri;
   const resolved =
+    (committedUri
+      ? (versions.find((version) => version.file_path === committedUri) ??
+        candidates.find((version) => version.file_path === committedUri))
+      : undefined) ??
     resolveEffectiveVersion(versions, liveIdentity) ??
     resolveEffectiveVersion(candidates, liveIdentity);
   if (!resolved) return versions;
-  return [...versions, { ...resolved, file_id: liveFileId }];
+  const index = versions.findIndex((version) => version.file_id === liveFileId);
+  if (index === -1) return [...versions, { ...resolved, file_id: liveFileId }];
+  if (resolved.file_id !== liveFileId) return versions;
+  if (versions[index] === resolved) return versions;
+  const next = versions.slice();
+  next[index] = { ...resolved, file_id: liveFileId };
+  return next;
 }
 
 /**

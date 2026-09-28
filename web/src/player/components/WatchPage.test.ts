@@ -1062,6 +1062,62 @@ describe("mergeResolvedLiveVersion", () => {
 
     expect(merged).toBe(list);
   });
+
+  it("replaces the live row when a same-file rotation changes its URI", () => {
+    const sourceA = "virtual://movie/x?result=A";
+    const sourceB = "virtual://movie/x?result=B";
+    const staleLiveRow: PlayerFileVersion = {
+      ...version,
+      file_id: 7,
+      file_path: sourceA,
+      duration: 3600,
+    };
+    const committedRow: PlayerFileVersion = {
+      ...candidate,
+      file_id: 7,
+      file_path: sourceB,
+      container: "virtual",
+      duration: 7200,
+    };
+
+    // The live file id is unchanged; only the committed source moved from A to
+    // B, so the row still carries A's path and duration.
+    const merged = mergeResolvedLiveVersion(
+      [staleLiveRow],
+      7,
+      { mediaFileId: 7, effectiveVirtualUri: sourceB },
+      [committedRow],
+    );
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({ file_id: 7, file_path: sourceB, duration: 7200 });
+  });
+
+  it("keeps the live row when the committed source is a different catalog row", () => {
+    const liveRow: PlayerFileVersion = {
+      ...version,
+      file_id: 7,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?result=all",
+    };
+    const committedRow: PlayerFileVersion = {
+      ...candidate,
+      file_id: 8,
+      file_path: "/media/Movies/Example (2024)/Example.1080p.mkv",
+    };
+    const list = [liveRow, committedRow];
+
+    // A virtual collapsed row keeps its identity; the concrete candidate is
+    // already in the list and resolved by URI.
+    const merged = mergeResolvedLiveVersion(
+      list,
+      7,
+      { mediaFileId: 7, effectiveVirtualUri: committedRow.file_path ?? null },
+      list,
+    );
+
+    expect(merged).toBe(list);
+  });
 });
 
 describe("WatchPage live session version re-keying", () => {
