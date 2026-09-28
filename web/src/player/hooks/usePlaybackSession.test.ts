@@ -1750,6 +1750,60 @@ describe("usePlaybackSession version switches", () => {
     unmount();
   });
 
+  it("bumps transportRevision when a version switch collapses to the playing effective file", async () => {
+    // A collapsed virtual row: the server resolves the newly requested catalog
+    // row (99) to the same concrete candidate (7) the outgoing plan already
+    // plays, so effective_media_file_id and stream.url are unchanged. The
+    // requested identity still changed, which means the mounted element holds
+    // the old session's stream; the transport revision must bump so the player
+    // tears it down and re-attaches.
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        startBodies.push(body);
+        const requested = (body.file_id as number) ?? 7;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: `session-${startBodies.length}`,
+            playback_plan: fixturePlanV3({
+              session_id: `session-${startBodies.length}`,
+              plan_id: `plan:switch-${startBodies.length}`,
+              requested_media_file_id: requested,
+              // The collapsed row resolves to the already-playing candidate.
+              effective_media_file_id: 7,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.transportRevision).toBe(1);
+
+    act(() => result.current.switchVersion(99, 0));
+    await waitFor(() => expect(result.current.plan?.requested_media_file_id).toBe(99));
+
+    expect(result.current.planRevision).toBe(2);
+    expect(result.current.mediaFileId).toBe(7);
+    expect(result.current.transportRevision).toBe(2);
+
+    unmount();
+  });
+
   it("coalesces a rapid second version click to the latest target", async () => {
     const startBodies: Array<{ file_id: number; start_position?: number }> = [];
     let releaseFirstSwitch: ((response: Response) => void) | undefined;
