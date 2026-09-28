@@ -3656,6 +3656,155 @@ describe("usePlaybackSession plan audio inventory", () => {
     expect(result.current.subtitleInventoryProvisional).toBe(true);
     unmount();
   });
+
+  it("upgrades a declared inventory with a shorter verified list", async () => {
+    const declared = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+      { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+    ];
+    // The probe found only one real track; the declared second was synthesized.
+    const verified = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              audio_tracks: declared,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.audioInventoryProvisional).toBe(true);
+
+    act(() => result.current.applyAudioInventory(verified));
+
+    expect(result.current.planAudioTracks).toEqual(verified);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    unmount();
+  });
+
+  it("marks a committed declared source provisional after a verified plan", async () => {
+    const verifiedTracks = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const declaredTracks = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+      { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "verified",
+              inventory_provenance: "verified",
+              audio_tracks: verifiedTracks,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.audioInventoryProvisional).toBe(false);
+
+    // A same-source committed push carries declared metadata; it must re-mark
+    // the menu provisional rather than rendering the list as final.
+    act(() =>
+      result.current.applyCommittedSource(
+        { effectiveMediaFileId: 7, effectiveVirtualUri: null, inventoryStatus: "declared" },
+        declaredTracks,
+      ),
+    );
+
+    expect(result.current.planAudioTracks).toEqual(declaredTracks);
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    unmount();
+  });
+
+  it("adopts a shorter verified committed source over a longer declared inventory", async () => {
+    const declared = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+      { codec: "ac3", channels: 6, layout: "5.1", language: "spa", default: false },
+    ];
+    const verified = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              audio_tracks: declared,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.audioInventoryProvisional).toBe(true);
+
+    act(() =>
+      result.current.applyCommittedSource(
+        { effectiveMediaFileId: 7, effectiveVirtualUri: null, inventoryStatus: "verified" },
+        verified,
+      ),
+    );
+
+    expect(result.current.planAudioTracks).toEqual(verified);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    unmount();
+  });
 });
 
 describe("usePlaybackSession effective virtual source", () => {

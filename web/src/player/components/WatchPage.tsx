@@ -660,9 +660,14 @@ function WatchPagePlayer({
           // list no richer than the plan's keeps the poll running so a later
           // probe can still expand it.
           const audioTargetChanged = version.file_id !== current.mediaFileId;
+          // A declared (provisional) list is upgraded by the catalog's probed
+          // list even when that list is shorter; an already-verified list still
+          // only accepts a strict superset so a poorer row cannot shrink it.
           if (
             nextAudioTracks.length > 0 &&
-            (audioTargetChanged || nextAudioTracks.length > current.planAudioTracks.length)
+            (audioTargetChanged ||
+              current.audioInventoryProvisional ||
+              nextAudioTracks.length > current.planAudioTracks.length)
           ) {
             applyAudioInventory(nextAudioTracks, version.file_id);
             audioComplete = true;
