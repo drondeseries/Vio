@@ -294,6 +294,10 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 	for _, id := range libraryViewOperationIDs {
 		profileToken[id] = true
 	}
+	// The episode release-timing capability rides the same viewer-access
+	// gate as every other profile-scoped read: a locked profile needs its
+	// proof token alongside the declared profile.
+	profileToken["getEpisodeReleaseCapability"] = true
 	for _, id := range homeOperationIDs {
 		profileToken[id] = true
 	}

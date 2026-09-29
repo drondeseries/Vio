@@ -33,6 +33,16 @@ vi.mock("@/hooks/useCarouselEmbla", () => ({
   }),
 }));
 
+// Capability gating: the carousel stands in for the resolved answer
+// (available) so the badge path is exercised without a QueryClient.
+vi.mock("@/hooks/queries/episodeRelease", async (importOriginal) => {
+  const original = (await importOriginal()) as typeof import("@/hooks/queries/episodeRelease");
+  return {
+    ...original,
+    useEpisodeReleaseCapability: () => ({ data: { available: true } }),
+  };
+});
+
 describe("EpisodeCarousel", () => {
   beforeEach(() => {
     capturedMenuProps.length = 0;
@@ -237,5 +247,47 @@ describe("EpisodeCarousel", () => {
       hasPartialProgress: true,
       quickActionMode: "watched",
     });
+  });
+
+  it("badges server-classified upcoming episodes and keeps navigation", () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <EpisodeCarousel
+          currentEpisodeNumber={1}
+          episodes={[
+            {
+              content_id: "ep-aired",
+              season_number: 2,
+              episode_number: 1,
+              title: "Remembrance Day",
+              overview: "",
+              air_date: "2022-02-18",
+              release_state: "released",
+              runtime: 60,
+              still_url: "https://stills.example/e1.jpg",
+              still_thumbhash: "",
+              files: [],
+            },
+            {
+              content_id: "ep-future",
+              season_number: 2,
+              episode_number: 3,
+              title: "Rabbits Don't Swim",
+              overview: "",
+              air_date: "2099-10-03",
+              release_state: "upcoming",
+              runtime: 60,
+              still_url: "https://stills.example/e3.jpg",
+              still_thumbhash: "",
+              files: [],
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(markup).toContain("Upcoming");
+    expect(markup).toContain("opacity-45");
+    expect(markup).toContain("/item/ep-future");
   });
 });

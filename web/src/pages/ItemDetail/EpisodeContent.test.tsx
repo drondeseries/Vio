@@ -72,6 +72,17 @@ vi.mock("@/hooks/queries/episodes", () => ({
   useSeasonEpisodes: mocks.useSeasonEpisodes,
 }));
 
+// Capability-gated upcoming badge: tests render without a QueryClient, so
+// the hook stands in for the resolved answer (available) like the quality
+// preference mock above.
+vi.mock("@/hooks/queries/episodeRelease", async (importOriginal) => {
+  const original = (await importOriginal()) as typeof import("@/hooks/queries/episodeRelease");
+  return {
+    ...original,
+    useEpisodeReleaseCapability: () => ({ data: { available: true } }),
+  };
+});
+
 vi.mock("@/hooks/useAuth", () => ({
   useAuth: mocks.useAuth,
   useOptionalAuth: mocks.useAuth,
@@ -651,5 +662,51 @@ describe("EpisodeContent", () => {
     expect(mocks.capturedActionBarProps.value).toMatchObject({
       playHref: "/watch/episode-1",
     });
+  });
+
+  it("keeps playHref for an upcoming episode with a play target", () => {
+    // Release timing is presentation only: the badge path must not touch
+    // Play eligibility. The hero badge itself renders inside the mocked
+    // DetailHero metadata slot, asserted via the metadata node below.
+    const markup = renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            air_date: "2099-10-03",
+            release_state: "upcoming",
+            versions: [],
+            playback_variants: [],
+            play_content_id: "virtual-episode-target-1",
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      playHref: "/watch/episode-1",
+    });
+    expect(markup).toContain("Upcoming");
+  });
+
+  it("renders no upcoming badge without release_state, even for a future air date", () => {
+    // Capability/field gating: a future air_date alone (older server, no
+    // release_state) keeps today's plain rendering.
+    const markup = renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/episode-1"]}>
+        <EpisodeContent
+          item={makeEpisodeItem({
+            air_date: "2099-10-03",
+            versions: [],
+            playback_variants: [],
+            play_content_id: "virtual-episode-target-1",
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      playHref: "/watch/episode-1",
+    });
+    expect(markup).not.toContain("Upcoming");
   });
 });

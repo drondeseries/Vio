@@ -269,12 +269,17 @@ type ItemDetail struct {
 	SeasonCount *int `json:"season_count,omitempty"`
 
 	// Season-specific.
-	SeriesID       string          `json:"series_id,omitempty"`
-	SeriesTitle    string          `json:"series_title,omitempty"`
-	SeasonNumber   *int            `json:"season_number,omitempty"`
-	EpisodeNumber  *int            `json:"episode_number,omitempty"`
-	EpisodeCount   *int            `json:"episode_count,omitempty"`
-	AirDate        *string         `json:"air_date,omitempty"`
+	SeriesID      string  `json:"series_id,omitempty"`
+	SeriesTitle   string  `json:"series_title,omitempty"`
+	SeasonNumber  *int    `json:"season_number,omitempty"`
+	EpisodeNumber *int    `json:"episode_number,omitempty"`
+	EpisodeCount  *int    `json:"episode_count,omitempty"`
+	AirDate       *string `json:"air_date,omitempty"`
+	// ReleaseState carries the episode release timing derived from AirDate
+	// (upcoming when the calendar date is after today UTC, released
+	// otherwise; empty when the air date is unknown). json:"-" because
+	// /api/v1 is frozen: apiv2 emits it under its own name.
+	ReleaseState   string          `json:"-"`
 	IsSpecials     bool            `json:"is_specials,omitempty"`
 	SeasonUserData *SeasonUserData `json:"user_data,omitempty"`
 	UserState      *ItemUserState  `json:"user_state,omitempty"`
@@ -778,6 +783,31 @@ type versionDefaults struct {
 }
 
 var ErrWatchTargetNotPlayable = errors.New("watch target is not directly playable")
+
+// Episode release states: release timing derived from an episode air date.
+// They mirror the v2 Episode contract values; unknown dates classify as ""
+// (absent) so missing metadata fails open for playback.
+const (
+	EpisodeReleaseUpcoming = "upcoming"
+	EpisodeReleaseReleased = "released"
+)
+
+// ReleaseStateForAirDate classifies a YYYY-MM-DD air date against today's
+// UTC calendar date. It is the single shared release-timing decision behind
+// the episode list shell, the episode detail, and the v2 renderer: one
+// parse, one boundary, no timezone conversion beyond the stored calendar
+// date. Unknown and malformed dates return "" (absent) so missing metadata
+// fails open for playback.
+func ReleaseStateForAirDate(airDate string) string {
+	day, err := time.Parse("2006-01-02", strings.TrimSpace(airDate))
+	if err != nil {
+		return ""
+	}
+	if day.After(time.Now().UTC().Truncate(24 * time.Hour)) {
+		return EpisodeReleaseUpcoming
+	}
+	return EpisodeReleaseReleased
+}
 
 // IsWatchTargetNotPlayable reports whether the error means the client sent a
 // valid content ID that is not directly playable.
@@ -3103,6 +3133,7 @@ func (s *DetailService) buildEpisodeDetail(ctx context.Context, episode *models.
 	if episode.AirDate != nil {
 		airDate := episode.AirDate.Format("2006-01-02")
 		detail.AirDate = &airDate
+		detail.ReleaseState = ReleaseStateForAirDate(airDate)
 	}
 	if episode.Title == "" {
 		detail.Title = fmt.Sprintf("Episode %d", episode.EpisodeNumber)
