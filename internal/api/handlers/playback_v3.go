@@ -9159,8 +9159,9 @@ func dropStaleTrackIdentityV3(ctx context.Context, kind string, fileID int, trac
 	if !playback.StaleTrackIdentityV3(kind, fileID, trackID) {
 		return false
 	}
-	slog.WarnContext(ctx, "stale "+kind+" track identity; discarding selection",
+	slog.WarnContext(ctx, "stale track identity; discarding selection",
 		"component", "playback",
+		"kind", kind,
 		"sent_track_id", trackID,
 		"current_file_id", fileID)
 	return true
