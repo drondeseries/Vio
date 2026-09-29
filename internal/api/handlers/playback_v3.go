@@ -6050,6 +6050,18 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		if transport != nil {
 			transport.rollback()
 		}
+		// The post-lock live-session check above is an early-out only: it holds
+		// no lock across BeginReplan or executeReplanV3, so a stop or idle reap
+		// can still land before execution reads the session. Persisting that
+		// session_expired through CompleteReplan would store it as the terminal
+		// decision and answer HTTP 200 — a response the web client does not
+		// rebuild from. Translate it to the same fast 404 and leave the lease to
+		// the deferred non-terminal ReleaseReplan, so no completed 200 terminal
+		// for a dead session is ever persisted. CompleteReplan stays the final
+		// compare-and-swap for every other terminal path.
+		if replanErr.reason == "session_expired" {
+			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
+		}
 		response := playback.NewTerminalResponseV3(replanErr.reason, replanErr.message, replanErr.retryable)
 		encoded, _ := json.Marshal(response)
 		terminalRecord := *record
