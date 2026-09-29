@@ -46,7 +46,7 @@ import { SyncScheduleField } from "@/components/collections/SyncScheduleField";
 import { TMDBListURLField } from "@/components/collections/TMDBListURLField";
 import { isValidTMDBListURL, parseTMDBListID } from "@/lib/tmdbList";
 
-export type TMDBSourceKind = "preset" | "collection" | "list" | "other";
+export type TMDBSourceKind = "preset" | "list" | "other";
 export type TMDBPreset =
   | "trending"
   | "popular"
@@ -259,13 +259,11 @@ export function parseTMDBPresetSourceConfig(
   // discover sources); their stored source is kept as-is.
   const mode = cfg?.mode;
   const sourceKind: TMDBSourceKind =
-    mode === "tmdb_collection"
-      ? "collection"
-      : mode === "tmdb_list"
-        ? "list"
-        : mode === undefined || mode === "" || mode === "tmdb_preset"
-          ? "preset"
-          : "other";
+    mode === "tmdb_list"
+      ? "list"
+      : mode === undefined || mode === "" || mode === "tmdb_preset"
+        ? "preset"
+        : "other";
   const collectionId =
     typeof cfg?.collection_id === "number"
       ? String(cfg.collection_id)
@@ -1633,7 +1631,6 @@ export function CollectionEditForm({
 
   const tmdbDefaults = parseTMDBPresetSourceConfig(collection);
   const [tmdbSourceKind, setTmdbSourceKind] = useState<TMDBSourceKind>(tmdbDefaults.sourceKind);
-  const [tmdbCollectionID, setTmdbCollectionID] = useState(tmdbDefaults.collectionId);
   const [tmdbPreset, setTmdbPreset] = useState<TMDBPreset>(tmdbDefaults.preset);
   const [tmdbTimeWindow, setTmdbTimeWindow] = useState<TMDBTimeWindow>(tmdbDefaults.timeWindow);
   const [tmdbMediaType, setTmdbMediaType] = useState<TMDBMediaType>(tmdbDefaults.mediaType);
@@ -1703,15 +1700,11 @@ export function CollectionEditForm({
         ...(parsedSourceLimit ? { limit: parsedSourceLimit } : {}),
       };
     } else if (isTMDBCollection) {
-      if (tmdbSourceKind === "collection") {
-        const parsedCollID = Number.parseInt(tmdbCollectionID, 10);
-        sourceConfig = {
-          mode: "tmdb_collection",
-          collection_id: Number.isFinite(parsedCollID) ? parsedCollID : tmdbCollectionID,
-          virtual_playback: virtualPlayback,
-          ...(parsedTmdbLimit ? { limit: parsedTmdbLimit } : {}),
-        };
-        sourceUrlValue = `tmdb://collection/${tmdbCollectionID}`;
+      if (tmdbSourceKind === "other") {
+        // Template-owned source (franchise, discover): keep the stored
+        // source untouched; only the other fields are patched.
+        sourceConfig = collection.source_config;
+        sourceUrlValue = undefined;
       } else if (tmdbSourceKind === "list") {
         const tmdbListSource = buildTMDBListSourceInput({ listUrl: tmdbListUrl, limit: tmdbLimit });
         sourceUrlValue = tmdbListSource.source_url;
@@ -1957,24 +1950,12 @@ export function CollectionEditForm({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="collection">TMDB Franchise Collection</SelectItem>
                   <SelectItem value="preset">Preset (Trending, Popular, Top Rated…)</SelectItem>
                   <SelectItem value="list">Public list (themoviedb.org URL)</SelectItem>
                 </SelectContent>
               </Select>
             </div>
-            {tmdbSourceKind === "collection" ? (
-              <div className="space-y-2">
-                <Label htmlFor="collection-tmdb-id">TMDB Collection ID</Label>
-                <Input
-                  id="collection-tmdb-id"
-                  type="number"
-                  value={tmdbCollectionID}
-                  onChange={(e) => setTmdbCollectionID(e.target.value)}
-                  placeholder="e.g. 645 for James Bond, 119 for Lord of the Rings"
-                />
-              </div>
-            ) : tmdbSourceKind === "list" ? (
+            {tmdbSourceKind === "list" ? (
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="md:col-span-2">
                   <TMDBListURLField

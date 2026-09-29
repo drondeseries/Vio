@@ -201,7 +201,7 @@ describe("AdminPlugins", () => {
         enabled: false,
         runtime: { resident: true, state: "failed", restart_count: 9 },
       }),
-    ).toMatchObject({ dotClass: "bg-muted-foreground", label: "Inactive" });
+    ).toMatchObject({ dotClass: "bg-muted-foreground", label: "Off" });
   });
 
   it("renders the resident runtime state on the installed card", () => {

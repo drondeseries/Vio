@@ -65,11 +65,17 @@ describe("PluginConfigForm secrets", () => {
       json_schema: JSON.stringify({ type: "object", properties: { token: { type: "string" } } }),
       required: false,
     };
-    const { container, rerender } = render(<PluginConfigForm schema={schema} onSave={vi.fn()} />);
+    const { container, rerender } = renderWithClient(
+      <PluginConfigForm schema={schema} onSave={vi.fn()} />,
+    );
     expect(screen.getByText("Account title")).toBeInTheDocument();
     expect(container.querySelector("fieldset")).toHaveClass("border");
 
-    rerender(<PluginConfigForm bare schema={schema} onSave={vi.fn()} />);
+    rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <PluginConfigForm bare schema={schema} onSave={vi.fn()} />
+      </QueryClientProvider>,
+    );
     expect(screen.queryByText("Account title")).not.toBeInTheDocument();
     expect(screen.queryByText("Account description")).not.toBeInTheDocument();
     expect(container.querySelector("fieldset")).not.toHaveClass("border");

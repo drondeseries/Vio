@@ -1340,7 +1340,9 @@ function EditUserForm({
       role,
       permissions,
       enabled,
-      access_group_id: accessGroupID,
+      // Admins are never grouped: promoting to admin clears the group, and
+      // the server rejects the combination (ErrAdminGrouped).
+      access_group_id: role === "admin" ? null : accessGroupID,
       max_profiles: maxProfiles,
       ...policyUpdateFields(policy),
     };
