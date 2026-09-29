@@ -238,11 +238,13 @@ jobs:
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: watch_party
+          # The name must contain "test": testdb.SetupPackage clones this
+          # database per test package and refuses a non-test base name.
+          POSTGRES_DB: watch_party_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d watch_party"
+          --health-cmd "pg_isready -U postgres -d watch_party_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -263,12 +265,12 @@ jobs:
       # defaults. Without this job those tests exist but never run.
       - name: Test Watch Party coordination against Postgres
         env:
-          SILO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/watch_party?sslmode=disable
+          SILO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/watch_party_test?sslmode=disable
         run: go test -race -count=1 ./internal/watchtogether/
 
       - name: Test history import cancellation and profile authorization against Postgres
         env:
-          SILO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/watch_party?sslmode=disable
+          SILO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/watch_party_test?sslmode=disable
         run: go test -race -count=1 -run '^(TestHistoryImportCancellation.*|TestQueue.*|TestHistoryImportV1ProfileAuthorization)$' ./migrations/ ./internal/historyimport/ ./internal/api/handlers/
 
       # 20260925144545 moves marker claims between rows that share a payload
@@ -277,7 +279,7 @@ jobs:
       # the original. make test-go has no database, so only this step runs it.
       - name: Test the marker claim migration against Postgres
         env:
-          SILO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/watch_party?sslmode=disable
+          SILO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/watch_party_test?sslmode=disable
         run: go test -race -count=1 -run '^TestMarkerContributionClaimsByTargetMigrationPostgres$' ./migrations/
 
       # Compiles every package on the way, so there is no separate build step.
