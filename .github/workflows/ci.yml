@@ -234,7 +234,10 @@ jobs:
     runs-on: ubuntu-latest
     services:
       watch-party-postgres:
-        image: postgres:17-alpine
+        # pgvector image, not stock postgres: testdb migrates the full
+        # schema, which needs the vector extension (same image as
+        # docker-compose.yml and the go-db-pins job).
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
