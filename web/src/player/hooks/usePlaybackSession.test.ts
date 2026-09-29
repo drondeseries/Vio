@@ -2644,9 +2644,11 @@ describe("usePlaybackSession replans", () => {
 describe("usePlaybackSession dead-session recovery", () => {
   // A plan the viewer has selections on, so the rebuild can be checked to carry
   // them rather than falling back to server defaults.
-  const selectedPlan = (sessionId: string) =>
+  const selectedPlan = (sessionId: string, mediaFileId = 7) =>
     fixturePlanV3({
       session_id: sessionId,
+      requested_media_file_id: mediaFileId,
+      effective_media_file_id: mediaFileId,
       selected_tracks: {
         audio: { id: "file:7:audio:1", index: 1 },
         subtitle: { id: "file:7:subtitle:2", index: 2 },
@@ -2721,6 +2723,70 @@ describe("usePlaybackSession dead-session recovery", () => {
       await Promise.resolve();
     });
     expect(startBodies).toHaveLength(2);
+
+    unmount();
+  });
+
+  it("rebuilds a reaped version-switch session with its explicit selection", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        startBodies.push(body);
+        const sessionId = `session-${startBodies.length}`;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: sessionId,
+            playback_plan: selectedPlan(sessionId, (body.file_id as number) ?? 7),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.includes("/replan")) {
+        return jsonResponse(
+          { error: "playback_session_not_found", message: "Playback session not found" },
+          { status: 404 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) {
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") {
+        return jsonResponse({ outcome: "stopped" });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    // The auto-selected initial start declares the server-owned choice.
+    expect(startBodies[0]).toMatchObject({ file_id: 7, file_selection: "auto" });
+
+    // A version switch starts explicit; the viewer picked version B.
+    act(() => result.current.switchVersion(99, 120));
+    await waitFor(() => expect(result.current.plan?.requested_media_file_id).toBe(99));
+    expect(startBodies[1]).toMatchObject({ file_id: 99, file_selection: "explicit" });
+
+    // B is reaped under the viewer. The rebuild must carry the switch's
+    // explicit selection, not revert to the mount-time auto choice; otherwise
+    // the server may silently substitute another edition for B.
+    await act(async () => {
+      await result.current.reanchorSeek(150);
+    });
+    await waitFor(() => expect(startBodies).toHaveLength(3));
+
+    const rebuild = startBodies[2]!;
+    expect(rebuild.file_id).toBe(99);
+    expect(rebuild.file_selection).toBe("explicit");
+    expect(result.current.error).toBeNull();
 
     unmount();
   });

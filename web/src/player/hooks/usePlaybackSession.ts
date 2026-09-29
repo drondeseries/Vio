@@ -1466,8 +1466,13 @@ export function usePlaybackSession(
             carriedAudioTrackId: plan.selected_tracks.audio?.id ?? null,
             carriedSubtitleTrackIndex: plan.selected_tracks.subtitle?.index ?? null,
             // Preserve the viewer's version choice; the server must not
-            // silently substitute another edition behind a rebuild.
-            fileSelection: explicitFileSelection ? "explicit" : "auto",
+            // silently substitute another edition behind a rebuild. Use the
+            // most recent start's selection (a version switch starts explicit)
+            // and fall back to the mount-time prop only if no start recorded
+            // one.
+            fileSelection:
+              retryTargetRef.current?.fileSelection ??
+              (explicitFileSelection ? "explicit" : "auto"),
             intentAt: null,
           });
           return false;
