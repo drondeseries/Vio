@@ -57,6 +57,30 @@ const schema: PluginConfigSchema = {
 };
 
 describe("PluginConfigForm secrets", () => {
+  it("leaves the title and border to the page panel when bare", () => {
+    const schema = {
+      key: "account",
+      title: "Account title",
+      description: "Account description",
+      json_schema: JSON.stringify({ type: "object", properties: { token: { type: "string" } } }),
+      required: false,
+    };
+    const { container, rerender } = renderWithClient(
+      <PluginConfigForm schema={schema} onSave={vi.fn()} />,
+    );
+    expect(screen.getByText("Account title")).toBeInTheDocument();
+    expect(container.querySelector("fieldset")).toHaveClass("border");
+
+    rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <PluginConfigForm bare schema={schema} onSave={vi.fn()} />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByText("Account title")).not.toBeInTheDocument();
+    expect(screen.queryByText("Account description")).not.toBeInTheDocument();
+    expect(container.querySelector("fieldset")).not.toHaveClass("border");
+  });
+
   it("derives a form when a plugin only supplies JSON Schema", () => {
     renderWithClient(
       <PluginConfigForm

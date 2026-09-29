@@ -42516,18 +42516,18 @@
       ],
       "section": "settings-branding",
       "release_flow": "browse_search",
-      "tier": 1,
-      "disposition": "ported",
-      "disposition_rule": "default_ported",
-      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
-      "owner": null,
+      "tier": 2,
+      "disposition": "removed",
+      "disposition_rule": "v1_scope_removals_table",
+      "disposition_rationale": "Listed in docs/architecture/v1-scope.md removals (\"The community theme catalog routes\"); v2 catalog operations removed pre-lock with the single-web-theme change, v1 routes unchanged on the bridge until the retirement tombstone. No v2 successor.",
+      "owner": "Quick104",
       "review_state": "ratified",
       "v2": {
-        "method": "GET",
-        "path": "/api/v2/theme/catalog",
-        "operation_id": "getThemeCatalog"
+        "method": null,
+        "path": null,
+        "operation_id": null
       },
-      "notes": "Implemented shared theme upstream/cache application methods and typed portable document envelopes; independently reviewed and accepted. Frozen v1 bytes, status/error codes, size caps and cache/stale headers retained. V2 validates document shape and rejects cap-sized possibly truncated reads. Approved HTTPS initial/redirect targets unchanged. Account-authenticated reads and acting-admin synchronous per-node refresh. Bundled web uses v2 and retains parser/CSS sanitization; no native or Jellyfin theme-catalog/download consumer. Capability GET /api/v2/theme/catalog/capabilities."
+      "notes": "Pre-lock removal with the single-web-theme change (#1534): the v2 theme catalog operations no longer exist, so these v1 rows have no v2 successor. The v1 routes stay unchanged on the bridge surface until the retirement tombstone. See the removals table in docs/architecture/v1-scope.md."
     },
     {
       "listener": "api",
@@ -42572,20 +42572,18 @@
       ],
       "section": "settings-branding",
       "release_flow": "core_admin",
-      "tier": 1,
-      "disposition": "ported",
-      "disposition_rule": "default_ported",
-      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
-      "owner": null,
+      "tier": 2,
+      "disposition": "removed",
+      "disposition_rule": "v1_scope_removals_table",
+      "disposition_rationale": "Listed in docs/architecture/v1-scope.md removals (\"The community theme catalog routes\"); v2 catalog operations removed pre-lock with the single-web-theme change, v1 routes unchanged on the bridge until the retirement tombstone. No v2 successor.",
+      "owner": "Quick104",
       "review_state": "ratified",
       "v2": {
-        "method": "POST",
-        "path": "/api/v2/theme/catalog/refresh",
-        "operation_id": "refreshThemeCatalog"
+        "method": null,
+        "path": null,
+        "operation_id": null
       },
-      "notes": "Implemented shared theme upstream/cache application methods and typed portable document envelopes; independently reviewed and accepted. Frozen v1 bytes, status/error codes, size caps and cache/stale headers retained. V2 validates document shape and rejects cap-sized possibly truncated reads. Approved HTTPS initial/redirect targets unchanged. Account-authenticated reads and acting-admin synchronous per-node refresh. Bundled web uses v2 and retains parser/CSS sanitization; no native or Jellyfin theme-catalog/download consumer. Capability GET /api/v2/theme/catalog/capabilities.",
-      "retry_safety": "natural_idempotent",
-      "retry_safety_note": "Resets a cache timestamp; converges."
+      "notes": "Pre-lock removal with the single-web-theme change (#1534): the v2 theme catalog operations no longer exist, so these v1 rows have no v2 successor. The v1 routes stay unchanged on the bridge surface until the retirement tombstone. See the removals table in docs/architecture/v1-scope.md."
     },
     {
       "listener": "api",
@@ -42629,18 +42627,18 @@
       ],
       "section": "settings-branding",
       "release_flow": "browse_search",
-      "tier": 1,
-      "disposition": "ported",
-      "disposition_rule": "default_ported",
-      "disposition_rationale": "No exclusion, removal, or ratified redesign applies; port to v2 in its section PR.",
-      "owner": null,
+      "tier": 2,
+      "disposition": "removed",
+      "disposition_rule": "v1_scope_removals_table",
+      "disposition_rationale": "Listed in docs/architecture/v1-scope.md removals (\"The community theme catalog routes\"); v2 catalog operations removed pre-lock with the single-web-theme change, v1 routes unchanged on the bridge until the retirement tombstone. No v2 successor.",
+      "owner": "Quick104",
       "review_state": "ratified",
       "v2": {
-        "method": "GET",
-        "path": "/api/v2/theme/download",
-        "operation_id": "downloadThemeFile"
+        "method": null,
+        "path": null,
+        "operation_id": null
       },
-      "notes": "Implemented shared theme upstream/cache application methods and typed portable document envelopes; independently reviewed and accepted. Frozen v1 bytes, status/error codes, size caps and cache/stale headers retained. V2 validates document shape and rejects cap-sized possibly truncated reads. Approved HTTPS initial/redirect targets unchanged. Account-authenticated reads and acting-admin synchronous per-node refresh. Bundled web uses v2 and retains parser/CSS sanitization; no native or Jellyfin theme-catalog/download consumer. Capability GET /api/v2/theme/catalog/capabilities."
+      "notes": "Pre-lock removal with the single-web-theme change (#1534): the v2 theme catalog operations no longer exist, so these v1 rows have no v2 successor. The v1 routes stay unchanged on the bridge surface until the retirement tombstone. See the removals table in docs/architecture/v1-scope.md."
     },
     {
       "listener": "api",

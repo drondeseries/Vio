@@ -186,6 +186,12 @@ v2 collections contract. It is advertised by `admin_item_materialize` on
 `POST /api/v1/admin/collections/{id}/materialize/{item_id}`. See
 [Admin item materialization](#admin-item-materialization).
 
+The document's `import_sources` lists the sources a new imported collection can come
+from (`mdblist`, `tmdb`, `tmdb_list`); it is empty when `imports` is false. Check for
+`tmdb_list` before calling `importTMDBListCollection` (`POST /api/v2/collections/import/tmdb-list`),
+which follows a public TMDB list. The administrator capability document
+(`getAdminCollectionCapabilities`) carries the same field for `importAdminTMDBList`.
+
 ## Library-scoped version lists
 
 `library_id` on `getCatalogItem`, `listCatalogItemVersions`, `listCatalogItemEpisodes`,
@@ -251,6 +257,12 @@ It accepts the browse source identifiers, `q`, `name_prefix`, `type`, rule
 `query_limit` for the complete result traversal. GET accepts the same rule groups
 as a JSON array in `groups` and expresses descending sort as `sort=-field`.
 Unknown rule fields and unsupported operators return `422`.
+
+`name_prefix` matches the start of the key title sorting uses: the sort title,
+or the title when no sort title is set. "The Hobbit" with sort title
+"Hobbit, The" matches `h`, not `t` or `the`. Jellyfin's `NameStartsWith`
+follows the same rule. The one exception is recently added TV, which also
+matches an episode's own title so episode cards can be found by name.
 
 Both operations return shared catalog cards, `page.next_cursor`, `page.has_more`,
 `total`, `total_exact`, and `window_cursor`. Send `next_cursor` unchanged for the
@@ -459,9 +471,16 @@ book libraries, never carry an advisory age, so the limit never hides them.
 
 - The limit only ever tightens. It is ANDed with `max_content_rating`, and a
   title must pass both.
-- A title with no advisory age is **not** hidden by the limit; the content-rating
-  ceiling alone decides it. `access.unrated_content` does not apply to the
-  advisory limit.
+- By default a title with no advisory age is **not** hidden by the limit; the
+  content-rating ceiling alone decides it. `access.unrated_content` does not
+  apply to the advisory limit.
+- A profile can instead require an advisory age with `require_advisory_age`
+  (boolean, default `false`). With it set, a title with no advisory age is
+  hidden too, so the profile sees only titles an advisory service rated at or
+  under the limit. It has no effect without `max_advisory_age`. On a large
+  library that has not been looked up yet, such a profile starts nearly empty
+  and fills in as ages arrive: the opposite of the default, where titles
+  disappear as ages arrive.
 - Because coverage grows as the provider enriches the library, the set of titles
   a limited profile sees can shrink over time, for example when a title a child
   could see gains an advisory age above the limit. `advisory_titles` on
@@ -470,14 +489,53 @@ book libraries, never carry an advisory age, so the limit never hides them.
 - Media-request discovery cannot apply the limit, because titles outside the
   library carry no advisory age.
 - Only a household manager (a server admin, or the primary profile) can set or
-  clear it; a restricted profile cannot change its own limit. Changing it bumps
-  the account's access policy revision, the same as changing
-  `max_content_rating`.
-- Detect support with `max_advisory_age_supported` on the `listProfiles`
-  response. The profile operations reject unknown members, so do not send
-  `max_advisory_age` to a server that does not report it.
+  clear either field; a restricted profile cannot change its own limit.
+  Changing either bumps the account's access policy revision, the same as
+  changing `max_content_rating`.
+- Detect support with `max_advisory_age_supported` and
+  `require_advisory_age_supported` on the `listProfiles` response. They are
+  separate because `require_advisory_age` arrived later, so a server can report
+  the first without the second. The profile operations reject unknown members,
+  so do not send either field to a server that does not report it.
 
 Frozen v1 responses do not expose these fields.
+
+## Rating sources
+
+The v2 item detail of a movie or series may carry `rating_sources`, a list of
+per-source ratings a metadata provider reported, such as the MDBList plugin's
+IMDb, Metacritic, Letterboxd and Roger Ebert scores. Each entry has:
+
+- `source`: one of `imdb`, `tmdb`, `rt_critic`, `rt_audience`, `metacritic`,
+  `metacritic_user`, `letterboxd`, `trakt`, `rogerebert`, `myanimelist` or
+  `mdblist` (MDBList's own aggregate). The list of sources can grow; ignore a
+  name you do not recognize.
+- `score`: the rating on a 0-100 scale, whatever scale the source uses itself.
+- `votes`: how many votes produced the score, omitted when the source does not
+  report it.
+
+Entries come in that fixed source order, at most one per source. The member is
+absent when no provider reported a source. It is detail-only: list and section
+cards do not carry it.
+
+The four `rating_imdb`, `rating_tmdb`, `rating_rt_critic` and
+`rating_rt_audience` members are unchanged, keep their own scales, and remain
+the only ratings browse can sort or filter by.
+
+Rating sources follow the same refresh and lock rules as those four members. A
+scheduled refresh only adds sources the item lacks, a manual refresh overwrites
+the sources the providers report, and locking the rating field freezes all of
+them. A refresh never removes a source a provider stopped reporting. Identify
+is the exception: it matches the item to a different title, so the sources the
+new match reports replace the stored set, and a source it does not report is
+removed.
+
+Plugins send them under `ratings.sources` in a metadata item, as
+`{"<source>": {"score": 0-100, "votes": n}}`. The server drops an unknown
+source name or a score outside 0-100, and drops a vote count that is not a
+whole, non-negative number while keeping its score.
+
+Frozen v1 responses do not expose this member.
 
 ## Local theme songs, V2
 

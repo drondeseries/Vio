@@ -16,6 +16,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/collage"
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/jackc/pgx/v5"
@@ -504,6 +505,14 @@ func (g *theatricalReleaseGate) skipTheatricalMovie(ctx context.Context, tmdbID 
 	return !released
 }
 
+// TMDBListFetcher abstracts TMDB's `/list/{id}` endpoint for public,
+// user-authored lists. Entries come back in list order, enriched with
+// external IDs like the other TMDB fetchers. A limit <= 0 reads the whole
+// list up to the fetcher's own cap.
+type TMDBListFetcher interface {
+	GetList(ctx context.Context, id, limit int) ([]TMDBCollectionEntry, error)
+}
+
 // TraktCollectionFetcher abstracts the Trakt discovery API.
 type TraktCollectionFetcher interface {
 	GetCollectionPreset(ctx context.Context, preset, mediaType string, limit int, accessToken string) ([]TraktCollectionEntry, error)
@@ -568,6 +577,10 @@ type LibraryCollectionService struct {
 	// theatrical-only (no Digital/Physical/TV release on TMDB yet) instead of
 	// materializing unplayable placeholders.
 	TMDBDigitalReleases TMDBDigitalReleaseChecker
+
+	// TMDBLists is nil when TMDB is not configured. It serves the `tmdb_list`
+	// source mode (public user-authored lists).
+	TMDBLists TMDBListFetcher
 
 	// TraktCollections is nil when Trakt collection discovery is not configured.
 	TraktCollections TraktCollectionFetcher
@@ -1166,6 +1179,8 @@ func (s *LibraryCollectionService) SyncCollectionWithOptions(ctx context.Context
 			return s.syncTMDBFranchiseCollection(ctx, collection, source, opts)
 		case "tmdb_discover":
 			return s.syncTMDBDiscoverCollection(ctx, collection, source, opts)
+		case "tmdb_list":
+			return s.syncTMDBListCollection(ctx, collection, source, opts)
 		case "trakt_preset":
 			return s.syncTraktPresetCollection(ctx, collection, source, opts)
 		case "trakt_list":
@@ -1183,9 +1198,9 @@ func (s *LibraryCollectionService) SyncCollectionWithOptions(ctx context.Context
 		// avoid duplicate history rows. The insert uses a detached context
 		// because the triggering context may already be done (e.g. the
 		// scheduler's per-collection timeout).
-		message := fmt.Sprintf("sync failed: %v", err)
+		message := fmt.Sprintf("sync failed: %v", logredact.SanitizeURLError(err))
 		if ctx.Err() != nil {
-			message = fmt.Sprintf("sync context ended: %v", err)
+			message = fmt.Sprintf("sync context ended: %v", logredact.SanitizeURLError(err))
 		}
 		if _, recordErr := s.recordFailedCollectionSync(context.WithoutCancel(reconciliationCtx), collection.ID, syncTimestamp(), message); recordErr != nil {
 			slog.ErrorContext(reconciliationCtx, "recording failed collection sync run",
@@ -1200,6 +1215,7 @@ func (s *LibraryCollectionService) SyncCollectionWithOptions(ctx context.Context
 			return run, fmt.Errorf("reconciling collection virtual items: %w", reconcileErr)
 		}
 	}
+
 	return run, err
 }
 
@@ -1215,9 +1231,9 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 	}
 
 	// Trim the entry list to the same fetch-multiplier bound used for TMDB and
-	// Trakt sources before building the external-ID batches. MDBList lists can
-	// return hundreds of entries; without this, the two GetByExternalIDs IN
-	// arrays balloon to the full list size even when the user's limit is small.
+	// Trakt sources. MDBList lists can hold thousands of entries; without this,
+	// the two GetByExternalIDs IN arrays balloon to the full list size even
+	// when the user's limit is small.
 	if fetchLimit := collectionutil.SourceFetchLimit(limit); fetchLimit > 0 && len(entries) > fetchLimit {
 		entries = entries[:fetchLimit]
 	}
@@ -2000,6 +2016,46 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 		"count", len(results),
 	)
 
+	return s.completeTMDBEntrySync(ctx, collection, cfg, results, cfg.Limit, startedAt, opts, "discover")
+}
+
+// syncTMDBListCollection populates a collection from a public, user-authored
+// TMDB list. The list comes from cfg.URL (a themoviedb.org list page URL),
+// falling back to the collection's source_url. Lists mix movies and shows and
+// are synced in list order.
+func (s *LibraryCollectionService) syncTMDBListCollection(ctx context.Context, collection *models.LibraryCollection, cfg libraryCollectionSourceConfig, opts SyncCollectionOptions) (*models.LibraryCollectionSyncRun, error) {
+	startedAt := syncTimestamp()
+
+	listURL := strings.TrimSpace(cfg.URL)
+	if listURL == "" {
+		listURL = strings.TrimSpace(collection.SourceURL)
+	}
+	listID, err := collectionutil.ParseTMDBListURL(listURL)
+	if err != nil {
+		return s.recordFailedCollectionSync(ctx, collection.ID, startedAt, "TMDB list sync: expected a URL like https://www.themoviedb.org/list/{id}")
+	}
+	if s.TMDBLists == nil {
+		return nil, fmt.Errorf("TMDB list sync requires configured TMDB access")
+	}
+
+	results, err := s.TMDBLists.GetList(ctx, listID, collectionutil.SourceFetchLimit(cfg.Limit))
+	if err != nil {
+		return nil, fmt.Errorf("fetching TMDB list %d: %w", listID, err)
+	}
+
+	slog.InfoContext(ctx, "TMDB list sync: fetched results", "component", "catalog",
+		"collection_id", collection.ID,
+		"tmdb_list_id", listID,
+		"count", len(results),
+	)
+
+	return s.completeTMDBEntrySync(ctx, collection, cfg, results, cfg.Limit, startedAt, opts, "list")
+}
+
+// completeTMDBEntrySync matches fetched TMDB entries against the collection's
+// libraries in source order and records the sync run. Shared by every TMDB
+// source mode; source names the mode in logs.
+func (s *LibraryCollectionService) completeTMDBEntrySync(ctx context.Context, collection *models.LibraryCollection, cfg libraryCollectionSourceConfig, results []TMDBCollectionEntry, limit *int, startedAt time.Time, opts SyncCollectionOptions, source string) (*models.LibraryCollectionSyncRun, error) {
 	matchedItems := make([]LibraryCollectionItemInput, 0, len(results))
 	seenContentIDs := make(map[string]int, len(results))
 	warnings := make([]string, 0)
@@ -2049,7 +2105,8 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 			}
 		}
 		if item == nil {
-			slog.DebugContext(ctx, "TMDB discover sync: no match", "component", "catalog",
+			slog.DebugContext(ctx, "TMDB sync: no match", "component", "catalog",
+				"source", source,
 				"rank", i+1,
 				"title", entry.Title,
 				"type", entry.MediaType,
@@ -2061,9 +2118,12 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 			continue
 		}
 		if firstRank, exists := seenContentIDs[item.ContentID]; exists {
-			slog.DebugContext(ctx, "TMDB discover sync: duplicate match skipped", "component", "catalog",
+			slog.DebugContext(ctx, "TMDB sync: duplicate match skipped", "component", "catalog",
+				"source", source,
 				"rank", i+1,
 				"title", entry.Title,
+				"type", entry.MediaType,
+				"tmdb_id", entry.ID,
 				"content_id", item.ContentID,
 				"first_rank", firstRank,
 			)
@@ -2073,20 +2133,28 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 		}
 		seenContentIDs[item.ContentID] = i + 1
 
+		slog.DebugContext(ctx, "TMDB sync: matched", "component", "catalog",
+			"source", source,
+			"rank", i+1,
+			"title", entry.Title,
+			"type", entry.MediaType,
+			"tmdb_id", entry.ID,
+			"content_id", item.ContentID,
+		)
 		matchedItems = append(matchedItems, LibraryCollectionItemInput{
 			MediaItemID: item.ContentID,
 			Position:    len(matchedItems),
 			SourceRank:  i + 1,
 		})
-		if collectionutil.ItemLimitReached(len(matchedItems), cfg.Limit) {
+		if collectionutil.ItemLimitReached(len(matchedItems), limit) {
 			limitReached = true
 			break
 		}
 	}
 
-	slog.InfoContext(ctx, "TMDB discover sync: complete", "component", "catalog",
+	slog.InfoContext(ctx, "TMDB sync: complete", "component", "catalog",
 		"collection_id", collection.ID,
-		"media_type", mediaType,
+		"source", source,
 		"matched", len(matchedItems),
 		"unmatched", unmatchedCount,
 		"duplicates", duplicateCount,

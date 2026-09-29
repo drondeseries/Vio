@@ -88,10 +88,10 @@ func StartReadyTranscode(ctx context.Context, pipeline *AutoTranscodePipeline, s
 func StartReconstructTranscode(ctx context.Context, pipeline *AutoTranscodePipeline, startup TranscodeStartup) (*TranscodeSession, error) {
 	if !pipeline.Enabled() {
 		if _, retryable := legacyStartupRetry(startup.LegacyRetry, pipeline.Current(), ""); !retryable {
-			return startup.start(ctx, pipeline.Current())
+			return startup.start(context.WithoutCancel(ctx), pipeline.Current())
 		}
 	}
-	return runTranscodeStartup(ctx, pipeline, startup, true)
+	return runTranscodeStartup(context.WithoutCancel(ctx), pipeline, startup, true)
 }
 
 func (startup TranscodeStartup) start(ctx context.Context, opts TranscodeOpts) (*TranscodeSession, error) {
@@ -111,14 +111,21 @@ func (startup TranscodeStartup) timeout() time.Duration {
 // runTranscodeStartup starts attempts until one produces a manifest. See
 // StartReconstructTranscode for the reconstruct rules.
 func runTranscodeStartup(ctx context.Context, pipeline *AutoTranscodePipeline, startup TranscodeStartup, reconstruct bool) (*TranscodeSession, error) {
+	// A fresh start stops waiting when its request ends: the caller holds the
+	// session lifecycle lock for the whole wait and discards the transport once
+	// its request is gone, so waiting on only delays the client's retry. A
+	// reconstruct serves every segment request waiting on it, so it outlives
+	// the one that triggered it — unless an overall startup budget bounds it,
+	// so a fallback chain cannot outlive the caller's request budget.
+	// Derived from the caller's ctx, so an explicit cancel still propagates.
+	waitCtx := ctx
 	if startup.Budget > 0 {
-		// One deadline bounds every attempt's spawn and manifest wait, so a
-		// fallback that spends a full per-attempt timeout on each path cannot
-		// outlive the caller's request budget. Derived from the caller's ctx,
-		// so an explicit cancel still propagates.
 		budgetCtx, cancel := context.WithTimeout(ctx, startup.Budget)
 		defer cancel()
 		ctx = budgetCtx
+		waitCtx = budgetCtx
+	} else if reconstruct {
+		waitCtx = context.WithoutCancel(ctx)
 	}
 	attempt := pipeline.Current()
 	legacyRetryUsed := false
@@ -135,7 +142,7 @@ func runTranscodeStartup(ctx context.Context, pipeline *AutoTranscodePipeline, s
 			return nil, err
 		}
 
-		_, err = session.WaitForGenerationManifestContext(ctx, startup.timeout())
+		_, err = session.WaitForGenerationManifestContext(waitCtx, startup.timeout())
 		if err == nil {
 			pipeline.RememberSuccess()
 			return session, nil
@@ -150,10 +157,19 @@ func runTranscodeStartup(ctx context.Context, pipeline *AutoTranscodePipeline, s
 			return nil, err
 		}
 		if ctx.Err() != nil {
-			// The overall budget ended during this attempt's wait. Report the
-			// budget cause so callers classify it as the request deadline, not
-			// as this attempt's unrelated per-attempt timeout.
-			err = ctx.Err()
+			// The overall budget ended during this attempt's wait (or the
+			// caller went away on a fresh start, where waitCtx is ctx).
+			// Either way this says nothing about the device, so the
+			// pipeline neither advances nor remembers a result. Report the
+			// budget/request cause so callers classify it as the request
+			// deadline, not as this attempt's unrelated per-attempt timeout.
+			// (A reconstruct whose shared lifetime outlives its trigger
+			// reports the per-attempt wait error below instead: the budget
+			// did not end, the trigger just left while others may wait.)
+			wasRunning := session.IsRunning()
+			failedDevice := session.Opts().HWDevice
+			_ = session.Close()
+			return nil, &TranscodeStartupError{Err: ctx.Err(), WasRunning: wasRunning, FailedDevice: failedDevice}
 		}
 
 		wasRunning := session.IsRunning()

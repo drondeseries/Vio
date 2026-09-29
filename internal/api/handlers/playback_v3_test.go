@@ -774,6 +774,20 @@ func (s *mutablePlaybackSettingsV3) Get(_ context.Context, key string) (string, 
 	return s.values[key], nil
 }
 
+func (s *mutablePlaybackSettingsV3) GetMany(ctx context.Context, keys ...string) (map[string]string, error) {
+	out := make(map[string]string, len(keys))
+	for _, key := range keys {
+		value, err := s.Get(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if value != "" {
+			out[key] = value
+		}
+	}
+	return out, nil
+}
+
 func TestPlannerSettingsV3ResultPreservesStoreFailure(t *testing.T) {
 	handler := &PlaybackHandler{SettingsRepo: &mutablePlaybackSettingsV3{err: context.DeadlineExceeded}}
 	_, err := handler.plannerSettingsV3Result(context.Background())
@@ -800,7 +814,7 @@ func TestPlannerSettingsV3ResultPreservesAllow4KStoreFailure(t *testing.T) {
 
 func TestPlannerSettingsV3ResultReadsPolicyKeysConcurrently(t *testing.T) {
 	store := &gatedPlaybackSettingsV3{
-		started: make(chan string, 4),
+		started: make(chan string, 5),
 		release: make(chan struct{}),
 	}
 	handler := &PlaybackHandler{SettingsRepo: store}
@@ -810,8 +824,8 @@ func TestPlannerSettingsV3ResultReadsPolicyKeysConcurrently(t *testing.T) {
 		result <- err
 	}()
 
-	started := make(map[string]bool, 4)
-	for len(started) < 4 {
+	started := make(map[string]bool, 5)
+	for len(started) < 5 {
 		select {
 		case key := <-store.started:
 			started[key] = true
@@ -828,6 +842,7 @@ func TestPlannerSettingsV3ResultReadsPolicyKeysConcurrently(t *testing.T) {
 		config.PlaybackTranscodeHardwareToneMapSettingKey,
 		config.PlaybackTranscodeSoftwareToneMapSettingKey,
 		config.PlaybackTranscodeVPPToneMapSettingKey,
+		config.PlaybackAllowHEVCEncodingSettingKey,
 	} {
 		if !started[key] {
 			t.Fatalf("settings read missing key %q", key)
@@ -5020,6 +5035,86 @@ func TestHandleReplanPlaybackV3PreservesOmittedSubtitleAndReportsUnavailableInFa
 	}
 	if record.NormalizedRequest.SubtitleTrackID != "" || record.NormalizedRequest.SubtitleTrackIndex != nil {
 		t.Fatalf("degraded fallback kept the durable subtitle selection: %#v", record.NormalizedRequest)
+	}
+}
+
+// TestHandleReplanPlaybackV3RemapsSubtitleAcrossFormatsInFallbackVersion
+// covers #1034 end to end: the 1080p fallback carries the selected English
+// subtitle as SRT where the 2160p source has ASS, and the quality change keeps
+// English subtitles on the fallback instead of ending the attempt.
+func TestHandleReplanPlaybackV3RemapsSubtitleAcrossFormatsInFallbackVersion(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	source.VideoTracks[0].Level = 51
+	source.VideoTracks[0].Width = 3840
+	source.VideoTracks[0].Height = 2160
+	source.VideoTracks[0].Bitrate = 32_000
+	source.ExternalSubtitles = []models.ExternalSubtitle{{Path: writePlaybackTestMediaFile(t, "movie.eng.ass"), Language: "eng", Format: "ass"}}
+	alternateValue := *source
+	alternate := &alternateValue
+	alternate.ID = 84
+	alternate.Resolution = "1080p"
+	alternate.Bitrate = 8_000
+	alternate.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	alternate.VideoTracks[0].Level = 41
+	alternate.VideoTracks[0].Width = 1920
+	alternate.VideoTracks[0].Height = 1080
+	alternate.VideoTracks[0].Bitrate = 8_000
+	alternate.ExternalSubtitles = []models.ExternalSubtitle{{Path: writePlaybackTestMediaFile(t, "movie.1080p.eng.srt"), Language: "eng", Format: "srt"}}
+
+	files := map[int]*models.MediaFile{source.ID: source, alternate.ID: alternate}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{source.ContentID: {source, alternate}}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	startRequest := v3HandlerStartRequest()
+	startRequest.QualityPreference = "auto"
+	startRequest.Capabilities.MaxResolution = "2160p"
+	startRequest.Capabilities.VideoDecode[0].Levels = []int{51}
+	startRequest.Capabilities.VideoDecode[0].MaxWidth = 3840
+	startRequest.Capabilities.VideoDecode[0].MaxHeight = 2160
+	startRequest.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	subtitleIndex := 0
+	startRequest.SubtitleTrackID = playback.TrackIDV3(source.ID, "subtitle", subtitleIndex)
+	startRequest.SubtitleTrackIndex = &subtitleIndex
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true, ASSStyling: true},
+	}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		Subtitles: playback.DeliverySubtitleCapabilitiesV3{SidecarText: true, ASSStyling: true},
+	}
+
+	startReq := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext())
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, startReq)
+	if startRR.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, body = %s", startRR.Code, startRR.Body.String())
+	}
+	var started playback.DecisionResponseV3
+	if err := json.Unmarshal(startRR.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start response: err=%v response=%#v", err, started)
+	}
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationQualityChangeV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID,
+		ReplanRequestID:   "subtitle-format-fallback-0001", FailedPlanID: started.PlaybackPlan.PlanID,
+		PlanAttemptID: "subtitle-format-attempt-0001", PlanAttemptKey: currentKey,
+		AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1, QualityPreference: "1080p",
+		SelectedTracks:        playback.SelectedTracksV3{Audio: started.PlaybackPlan.SelectedTracks.Audio},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("cross-format fallback terminal = %#v", response.Terminal)
+	}
+	selected := response.PlaybackPlan.SelectedTracks.Subtitle
+	if selected == nil || selected.ID != playback.TrackIDV3(alternate.ID, "subtitle", 0) {
+		t.Fatalf("fallback subtitle = %#v, want the 1080p English SRT", selected)
 	}
 }
 
@@ -10294,5 +10389,39 @@ func TestRemoteTranscodeRecipeCardV3RecordsNodeSoftwareDecode(t *testing.T) {
 		transcodenode.TranscodeStartResponse{HWAccel: "qsv"}, "")
 	if !card.SoftwareVideoDecode {
 		t.Fatal("a node that omits software_video_decode dropped the requested CPU decode")
+	}
+}
+
+func TestPlannerSettingsV3ReadsHEVCEncodingLive(t *testing.T) {
+	store := &mutablePlaybackSettingsV3{values: map[string]string{config.PlaybackAllowHEVCEncodingSettingKey: "true"}}
+	handler := &PlaybackHandler{SettingsRepo: store}
+	settings, err := handler.plannerSettingsV3Result(context.Background())
+	if err != nil || !settings.AllowHEVCEncoding {
+		t.Fatalf("HEVC enabled settings=%+v error=%v", settings, err)
+	}
+	store.mu.Lock()
+	store.values[config.PlaybackAllowHEVCEncodingSettingKey] = "false"
+	store.mu.Unlock()
+	settings, err = handler.plannerSettingsV3Result(context.Background())
+	if err != nil || settings.AllowHEVCEncoding {
+		t.Fatalf("HEVC disabled settings=%+v error=%v", settings, err)
+	}
+	store.getErrors = map[string]error{config.PlaybackAllowHEVCEncodingSettingKey: context.DeadlineExceeded}
+	_, err = handler.plannerSettingsV3Result(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("HEVC policy store failure=%v", err)
+	}
+}
+
+func TestHEVCEncodedPlanCarriesHVC1ToTransport(t *testing.T) {
+	plan := &playback.PlanV3{Delivery: playback.DeliveryTranscodeHLSV3}
+	plan.EffectiveRecipe.VideoCodec = "hevc"
+	plan.EffectiveRecipe.VideoSampleEntry = playback.VideoSampleEntryHVC1
+	if got := videoSampleEntryForPlanV3(plan); got != playback.VideoSampleEntryHVC1 {
+		t.Fatalf("HEVC transport sample entry=%q", got)
+	}
+	plan.EffectiveRecipe.VideoCodec = "h264"
+	if got := videoSampleEntryForPlanV3(plan); got != "" {
+		t.Fatalf("H264 carried HEVC tag=%q", got)
 	}
 }

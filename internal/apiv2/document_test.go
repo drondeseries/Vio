@@ -215,6 +215,8 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 
 		"refreshAdminEpisodeMarkers": true,
 		"redetectAdminEpisodeIntro":  true,
+		"redetectAdminItemMarkers":   true,
+		"getAdminMarkerCapabilities": true,
 		"createDownloads":            true,
 		"createDownloadSubscription": true,
 		"updateDownloadSubscription": true,
@@ -281,7 +283,6 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 	for _, id := range []string{"getOnboardingFlow", "getOnboardingState", "updateOnboardingProgress", "getOnboardingCapabilities"} {
 		profileToken[id] = true
 	}
-	profileToken["refreshThemeCatalog"] = true
 	for _, id := range historyImportOperationIDs {
 		profileToken[id] = true
 	}
@@ -314,7 +315,7 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 	for _, id := range personalCollectionOperationIDs {
 		profileToken[id] = true
 	}
-	for _, id := range []string{"addAdminCollectionItem", "applyAdminCollectionTemplateBundle", "createAdminCollection", "createAdminCollectionGroup", "deleteAdminCollection", "deleteAdminCollectionGroup", "deleteAdminCollectionImage", "getAdminCollection", "getAdminCollectionCapabilities", "getAdminCollectionGroup", "getAdminCollectionGroupOrder", "getAdminCollectionItems", "getAdminCollectionItemsOrder", "getAdminCollectionJob", "getAdminCollectionOrder", "getAdminGroupCollectionOrder", "importAdminMDBList", "importAdminTMDB", "importAdminTrakt", "listAdminCollectionGroups", "listAdminCollectionTemplateBundles", "listAdminCollectionTemplates", "listAdminCollections", "listAdminVirtualItems", "moveAndReorderAdminGroupCollections", "previewAdminCollection", "removeAdminCollectionItem", "reorderAdminCollectionGroups", "reorderAdminCollectionItems", "reorderAdminCollections", "startAdminCollectionTemplateBundleJob", "syncAdminCollection", "updateAdminCollection", "updateAdminCollectionGroup", "uploadAdminCollectionBackdrop", "uploadAdminCollectionPoster"} {
+	for _, id := range []string{"addAdminCollectionItem", "applyAdminCollectionTemplateBundle", "createAdminCollection", "createAdminCollectionGroup", "deleteAdminCollection", "deleteAdminCollectionGroup", "deleteAdminCollectionImage", "getAdminCollection", "getAdminCollectionCapabilities", "getAdminCollectionGroup", "getAdminCollectionGroupOrder", "getAdminCollectionItems", "getAdminCollectionItemsOrder", "getAdminCollectionJob", "getAdminCollectionOrder", "getAdminGroupCollectionOrder", "importAdminMDBList", "importAdminTMDB", "importAdminTMDBList", "importAdminTrakt", "listAdminCollectionGroups", "listAdminCollectionTemplateBundles", "listAdminCollectionTemplates", "listAdminCollections", "listAdminVirtualItems", "moveAndReorderAdminGroupCollections", "previewAdminCollection", "removeAdminCollectionItem", "reorderAdminCollectionGroups", "reorderAdminCollectionItems", "reorderAdminCollections", "startAdminCollectionTemplateBundleJob", "syncAdminCollection", "updateAdminCollection", "updateAdminCollectionGroup", "uploadAdminCollectionBackdrop", "uploadAdminCollectionPoster"} {
 		profileToken[id] = true
 	}
 	expect["createCollection"] = map[int]bool{http.StatusCreated: true, http.StatusOK: false}
@@ -378,7 +379,7 @@ func TestGeneratedDocumentStatuses(t *testing.T) {
 	expect["revokeAdminInvitation"] = map[int]bool{http.StatusNoContent: true}
 	expect["lookupInvitation"] = map[int]bool{http.StatusNotFound: true, http.StatusTooManyRequests: true, http.StatusInternalServerError: true}
 
-	for _, id := range []string{"listAdminAccessGroups", "createAdminAccessGroup", "deleteAdminAccessGroup", "getAdminAccessGroup", "updateAdminAccessGroup", "listAdminIPUsers", "createAdminUser", "getAdminAccountCapabilities", "deleteAdminUser", "getAdminUser", "updateAdminUser", "listAdminUserAPIKeys", "impersonateAdminUser", "listAdminUserIPs", "listAdminUserProfiles", "listAdminUserSettingValues", "deleteAdminUserSettingValue", "setAdminUserSettingValue"} {
+	for _, id := range []string{"listAdminAccessGroups", "createAdminAccessGroup", "deleteAdminAccessGroup", "getAdminAccessGroup", "updateAdminAccessGroup", "listAdminIPUsers", "createAdminUser", "getAdminAccountCapabilities", "deleteAdminUser", "getAdminUser", "updateAdminUser", "listAdminUserAPIKeys", "impersonateAdminUser", "transferAdminUserOwnership", "createAdminUserPasswordReset", "listAdminUserIPs", "listAdminUserProfiles", "listAdminUserSettingValues", "deleteAdminUserSettingValue", "setAdminUserSettingValue"} {
 		profileToken[id] = true
 	}
 	for _, id := range []string{createNotificationWebhookOperation, createNotificationServerChannelOperation, beginNotificationDiscordLinkOperation, testNotificationWebhookOperation, testNotificationServerChannelOperation, testAdminDiscordNotificationOperation, listNotificationWebPushOperation, listNotificationWebhooksOperation, listNotificationServerChannelsOperation, "getNotificationEmailPreferences", "updateNotificationEmailPreferences", "getNotificationDiscordPreferences", "updateNotificationDiscordPreferences", "registerAdminNotificationRelay", "clearAdminNotificationRelay", testAdminApplePushOperation, testAdminAndroidPushOperation, "getNotificationApplePushDisplay", "listNotifications", "getNotificationCapabilities", "getNotificationPreferences", "updateNotificationPreferences", "markNotificationsRead", "syncNotifications", "getNotificationUnreadCount", "getNotification", "markNotificationRead"} {
@@ -498,6 +499,7 @@ var libraryOperationIDs = []string{
 	"setRootOverride", "deleteRootOverride", "listSkippedRoots", "listStaleIds", "rematchStaleId", "listUnmatchedItems",
 	"confirmEmptyRootCleanup", "getMetadataMatchQueue", "retryMetadataMatchQueue", "cancelMetadataMatchQueue", "refreshLibraryMetadata",
 	"getLibraryProviders", "setLibraryProviders", "uploadLibraryPoster", "deleteLibraryPoster",
+	"getLibraryRealtimeMonitoring", "getLibraryCapabilities",
 }
 
 // libraryViewOperationIDs is every profile-scoped library read the
@@ -1245,6 +1247,7 @@ var personalCollectionOperationIDs = []string{
 	"getLibraryCollectionItems",
 	"importMDBListCollection",
 	"importTMDBCollection",
+	"importTMDBListCollection",
 	"importTraktCollection",
 	"listCollectionTemplates",
 	"listCollections",

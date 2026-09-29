@@ -3218,7 +3218,7 @@ func populateScanIdentity(
 		mf.EpisodeNumber = filenameHints.EpisodeNum
 	}
 	variantHints := naming.ParseVariantHints(filePath, folderType, assignment.LibraryRootPath)
-	if existing != nil && existing.EditionSource == "import" && existing.EditionKey != "" {
+	if existing != nil && existing.EditionSource == editionSourceImport && existing.EditionKey != "" {
 		variantHints = &naming.VariantHints{
 			EditionRaw:            existing.EditionRaw,
 			EditionKey:            existing.EditionKey,
@@ -3880,7 +3880,7 @@ func scanStateRootAssignmentChanged(existing *scanStateFile, assignment fileRoot
 	}
 
 	hints := naming.ParseVariantHints(existing.FilePath, libraryType, assignment.LibraryRootPath)
-	if existing.EditionSource == "import" && existing.EditionKey != "" {
+	if existing.EditionSource == editionSourceImport && existing.EditionKey != "" {
 		hints = &naming.VariantHints{
 			EditionRaw:            existing.EditionRaw,
 			EditionKey:            existing.EditionKey,
@@ -3950,7 +3950,7 @@ func rootAssignmentChanged(existing *models.MediaFile, assignment fileRootAssign
 	}
 
 	hints := naming.ParseVariantHints(existing.FilePath, libraryType, assignment.LibraryRootPath)
-	if existing.EditionSource == "import" && existing.EditionKey != "" {
+	if existing.EditionSource == editionSourceImport && existing.EditionKey != "" {
 		hints = &naming.VariantHints{
 			EditionRaw:            existing.EditionRaw,
 			EditionKey:            existing.EditionKey,

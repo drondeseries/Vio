@@ -962,3 +962,91 @@ func TestNextUpRepositoryHasNoPostgresUserStateSQL(t *testing.T) {
 		}
 	}
 }
+
+func TestDroppedSeriesSet(t *testing.T) {
+	t.Parallel()
+
+	dropped := []string{"series-dropped", "", "series-other"}
+	set := droppedSeriesSet(NextUpQuery{UserID: 7, ProfileID: "profile-1", droppedSeriesIDs: dropped})
+	if len(set) != 2 {
+		t.Fatalf("set = %v, want 2 entries (blank IDs skipped)", set)
+	}
+	for _, id := range []string{"series-dropped", "series-other"} {
+		if _, ok := set[id]; !ok {
+			t.Fatalf("set = %v, missing %q", set, id)
+		}
+	}
+
+	if got := droppedSeriesSet(NextUpQuery{UserID: 7, ProfileID: "profile-1"}); got != nil {
+		t.Fatalf("no drops must yield nil, got %v", got)
+	}
+	// Series-scoped lookups keep their own series: the exclusion applies to
+	// global lookups only.
+	scoped := droppedSeriesSet(NextUpQuery{UserID: 7, ProfileID: "profile-1", SeriesID: "series-dropped", droppedSeriesIDs: dropped})
+	if scoped != nil {
+		t.Fatalf("series-scoped query must not exclude drops, got %v", scoped)
+	}
+}
+
+func TestNextUpRepository_DroppedSeriesHiddenUntilWatchedAgain(t *testing.T) {
+	pool := newNextUpTestPool(t)
+	provider := pgstore.NewPostgresProvider(pool)
+	t.Run("postgres_state_postgres_catalog", func(t *testing.T) {
+		ctx := context.Background()
+		prefix := fmt.Sprintf("nextup-dropped-%d", time.Now().UnixNano())
+		seriesA, seriesB := prefix+"-series-a", prefix+"-series-b"
+
+		userID, profileID, folderID := seedNextUpTestOwner(t, ctx, pool, prefix)
+		t.Cleanup(func() {
+			_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id = ANY($1)`, []string{seriesA, seriesB})
+		})
+		seedNextUpSeries(t, ctx, pool, seriesA, prefix+" A")
+		seedNextUpSeries(t, ctx, pool, seriesB, prefix+" B")
+		episodes := []string{prefix + "-a1", prefix + "-a2", prefix + "-a3", prefix + "-b1", prefix + "-b2"}
+		seedNextUpEpisodes(t, ctx, pool, episodes, []string{seriesA, seriesA, seriesA, seriesB, seriesB}, []int{1, 2, 3, 1, 2})
+		seedNextUpFiles(t, ctx, pool, folderID, episodes)
+
+		watchedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
+		if _, err := pool.Exec(ctx, `
+		INSERT INTO user_watch_progress (user_id, profile_id, media_item_id, position_seconds, duration_seconds, completed, updated_at)
+		SELECT $1, $2, unnest($3::text[]), 0, 1800, TRUE, $4`,
+			userID, profileID, []string{episodes[0], episodes[3]}, watchedAt); err != nil {
+			t.Fatalf("seed progress: %v", err)
+		}
+
+		drops := NewDroppedSeriesRepo(pool)
+		if err := drops.Drop(ctx, userID, profileID, seriesA); err != nil {
+			t.Fatal(err)
+		}
+
+		repo := NewNextUpRepository(pool, provider)
+		global := NextUpQuery{UserID: userID, ProfileID: profileID, Limit: 20}
+		results, err := repo.ListNextUp(ctx, global)
+		if err != nil {
+			t.Fatalf("ListNextUp: %v", err)
+		}
+		assertNextUpContentIDs(t, results, episodes[4])
+
+		// The series' own detail tile still shows its next episode.
+		scoped := global
+		scoped.SeriesID = seriesA
+		results, err = repo.ListNextUp(ctx, scoped)
+		if err != nil {
+			t.Fatalf("ListNextUp scoped: %v", err)
+		}
+		assertNextUpContentIDs(t, results, episodes[1])
+
+		// Watching an episode after the drop undrops the series.
+		if _, err := pool.Exec(ctx, `
+		INSERT INTO user_watch_progress (user_id, profile_id, media_item_id, position_seconds, duration_seconds, completed, updated_at)
+		VALUES ($1, $2, $3, 0, 1800, TRUE, now() + interval '1 second')`,
+			userID, profileID, episodes[1]); err != nil {
+			t.Fatalf("seed newer progress: %v", err)
+		}
+		results, err = repo.ListNextUp(ctx, global)
+		if err != nil {
+			t.Fatalf("ListNextUp after watch: %v", err)
+		}
+		assertNextUpContentIDs(t, results, episodes[2], episodes[4])
+	})
+}

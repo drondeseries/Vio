@@ -288,6 +288,11 @@ type ItemDetail struct {
 	// movies/series, ordered for display (trailers first, official first).
 	Videos []ItemVideoInfo `json:"videos,omitempty"`
 
+	// Per-source ratings (IMDb, Metacritic, Letterboxd, ...) for movies and
+	// series, in display order. Kept out of this JSON contract because
+	// /api/v1 is frozen; apiv2 emits them as rating_sources.
+	RatingSources []ItemRatingSourceInfo `json:"-"`
+
 	// Local extras (scanner-discovered trailers, featurettes, deleted
 	// scenes, ...) playable via their own content_id through /watch.
 	Extras []ItemExtraInfo `json:"extras,omitempty"`
@@ -344,6 +349,14 @@ type ItemVideoInfo struct {
 	Name       string `json:"name,omitempty"`
 	Language   string `json:"language,omitempty"`
 	IsOfficial bool   `json:"is_official"`
+}
+
+// ItemRatingSourceInfo is one source's rating of an item on a 0-100 scale.
+// Votes is nil when the source did not report a count.
+type ItemRatingSourceInfo struct {
+	Source string
+	Score  float64
+	Votes  *int64
 }
 
 // ItemExtraInfo is the API shape of a local extra. ContentID is a playable
@@ -601,6 +614,7 @@ type VersionSubtitleTrack struct {
 	Language        string `json:"language,omitempty"`
 	Codec           string `json:"codec,omitempty"`
 	Title           string `json:"title,omitempty"`
+	TitleIsFallback bool   `json:"-"` // An external title filled from its file name.
 	EmbeddedTitle   string `json:"embedded_title,omitempty"`
 	Resolution      string `json:"resolution,omitempty"`
 	Forced          bool   `json:"forced"`
@@ -785,6 +799,7 @@ type DetailService struct {
 	}
 	fileFetcher       FileVersionFetcher
 	videoRepo         *VideoRepository
+	ratingSourceRepo  *RatingSourceRepository
 	extraRepo         *ExtraRepository
 	rootClaimRepo     *RootClaimRepository
 	groupClaimRepo    *GroupClaimRepository
@@ -840,16 +855,17 @@ func NewDetailService(
 	fileFetcher FileVersionFetcher,
 ) *DetailService {
 	return &DetailService{
-		itemRepo:       itemRepo,
-		episodeRepo:    episodeRepo,
-		seasonRepo:     seasonRepo,
-		personRepo:     personRepo,
-		itemLocRepo:    NewMediaItemLocalizationRepository(itemRepo.pool),
-		seasonLocRepo:  NewSeasonLocalizationRepository(itemRepo.pool),
-		episodeLocRepo: NewEpisodeLocalizationRepository(itemRepo.pool),
-		videoRepo:      NewVideoRepository(itemRepo.pool),
-		extraRepo:      NewExtraRepository(itemRepo.pool),
-		fileFetcher:    fileFetcher,
+		itemRepo:         itemRepo,
+		episodeRepo:      episodeRepo,
+		seasonRepo:       seasonRepo,
+		personRepo:       personRepo,
+		itemLocRepo:      NewMediaItemLocalizationRepository(itemRepo.pool),
+		seasonLocRepo:    NewSeasonLocalizationRepository(itemRepo.pool),
+		episodeLocRepo:   NewEpisodeLocalizationRepository(itemRepo.pool),
+		videoRepo:        NewVideoRepository(itemRepo.pool),
+		ratingSourceRepo: NewRatingSourceRepository(itemRepo.pool),
+		extraRepo:        NewExtraRepository(itemRepo.pool),
+		fileFetcher:      fileFetcher,
 	}
 }
 
@@ -1680,6 +1696,11 @@ type seriesDetailContext struct {
 	crewCredits []CrewCredit
 	versionPref versionDefaults
 	backdropURL string
+	// The viewer's audio and subtitle preferences depend only on the series
+	// and the library a file lives in, so a batch resolves them once per
+	// series (and library) instead of once per episode.
+	audio            *audioPrefResolver
+	subtitleDefaults map[int]subtitleDefaults
 }
 
 // buildSeriesDetailContext loads the parent series row, localizes it, fetches
@@ -1698,12 +1719,39 @@ func (s *DetailService) buildSeriesDetailContext(ctx context.Context, seriesID s
 	}
 	castCredits, crewCredits := s.fetchCredits(ctx, seriesID, filter)
 	return &seriesDetailContext{
-		series:      series,
-		castCredits: castCredits,
-		crewCredits: crewCredits,
-		versionPref: s.effectiveVersionDefaults(ctx, filter, seriesID),
-		backdropURL: s.PresignImageURL(ctx, series.BackdropPath, "backdrop", string(filter.ImageSize)),
+		series:           series,
+		castCredits:      castCredits,
+		crewCredits:      crewCredits,
+		versionPref:      s.effectiveVersionDefaults(ctx, filter, seriesID),
+		backdropURL:      s.PresignImageURL(ctx, series.BackdropPath, "backdrop", string(filter.ImageSize)),
+		audio:            s.newAudioPrefResolver(ctx, filter, seriesID),
+		subtitleDefaults: map[int]subtitleDefaults{},
 	}, nil
+}
+
+// episodeAudioResolver returns the series' shared audio resolver, or a fresh
+// one for an episode of another series.
+func (s *DetailService) episodeAudioResolver(ctx context.Context, seriesCtx *seriesDetailContext, filter AccessFilter, seriesID string) *audioPrefResolver {
+	if seriesID != seriesCtx.series.ContentID {
+		return s.newAudioPrefResolver(ctx, filter, seriesID)
+	}
+	return seriesCtx.audio
+}
+
+// episodeSubtitleDefaults memoizes effectiveSubtitleDefaults for the series by
+// the library that decides the settings scope. An episode of another series
+// resolves its own.
+func (s *DetailService) episodeSubtitleDefaults(ctx context.Context, seriesCtx *seriesDetailContext, filter AccessFilter, seriesID string, files []*models.MediaFile) subtitleDefaults {
+	if seriesID != seriesCtx.series.ContentID {
+		return s.effectiveSubtitleDefaults(ctx, filter, seriesID, files)
+	}
+	libraryID := preferredPlayableLibraryID(files, filter.SelectedFileID)
+	if defaults, ok := seriesCtx.subtitleDefaults[libraryID]; ok {
+		return defaults
+	}
+	defaults := s.effectiveSubtitleDefaults(ctx, filter, seriesID, files)
+	seriesCtx.subtitleDefaults[libraryID] = defaults
+	return defaults
 }
 
 // GetEpisodeDetailsForSeries returns ItemDetails for the requested episodes,
@@ -1865,10 +1913,17 @@ func (s *DetailService) GetItemDetailsByIDs(ctx context.Context, contentIDs []st
 		}
 	}
 	var videosByID map[string][]models.ItemVideo
+	var ratingSourcesByID map[string][]models.ItemRatingSource
 	var extrasByID map[string][]ExtraWithFile
 	if len(movieSeriesIDs) > 0 {
 		if s.videoRepo != nil {
 			videosByID, err = s.videoRepo.ListByContentIDs(ctx, movieSeriesIDs)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if s.ratingSourceRepo != nil {
+			ratingSourcesByID, err = s.ratingSourceRepo.ListByContentIDs(ctx, movieSeriesIDs)
 			if err != nil {
 				return nil, err
 			}
@@ -1923,6 +1978,10 @@ func (s *DetailService) GetItemDetailsByIDs(ctx context.Context, contentIDs []st
 				pf.haveVideos = true
 				pf.videos = videosByID[id]
 			}
+			if s.ratingSourceRepo != nil {
+				pf.haveRatingSources = true
+				pf.ratingSources = ratingSourcesByID[id]
+			}
 			if s.extraRepo != nil {
 				pf.haveExtras = true
 				pf.extras = extrasByID[id]
@@ -1966,6 +2025,35 @@ func (s *DetailService) fetchItemVideos(ctx context.Context, contentID string, p
 			Name:       v.Name,
 			Language:   v.Language,
 			IsOfficial: v.IsOfficial,
+		})
+	}
+	return infos
+}
+
+// fetchItemRatingSources returns the item's per-source ratings in API shape,
+// honoring a batch prefetch when present. Lookup failures degrade to no
+// sources.
+func (s *DetailService) fetchItemRatingSources(ctx context.Context, contentID string, pf *itemDetailPrefetch) []ItemRatingSourceInfo {
+	var sources []models.ItemRatingSource
+	if pf != nil && pf.haveRatingSources {
+		sources = pf.ratingSources
+	} else if s.ratingSourceRepo != nil {
+		fetched, err := s.ratingSourceRepo.GetByContentID(ctx, contentID)
+		if err != nil {
+			slog.WarnContext(ctx, "failed to fetch item rating sources", "content_id", contentID, "error", err)
+			return nil
+		}
+		sources = fetched
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	infos := make([]ItemRatingSourceInfo, 0, len(sources))
+	for _, source := range sources {
+		infos = append(infos, ItemRatingSourceInfo{
+			Source: source.Source,
+			Score:  source.Score,
+			Votes:  source.Votes,
 		})
 	}
 	return infos
@@ -2033,6 +2121,8 @@ type itemDetailPrefetch struct {
 	workSummary        *WorkSummary
 	haveVideos         bool
 	videos             []models.ItemVideo
+	haveRatingSources  bool
+	ratingSources      []models.ItemRatingSource
 	haveExtras         bool
 	extras             []ExtraWithFile
 }
@@ -2157,9 +2247,10 @@ func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.M
 		}
 	}
 
-	// Trailers/extras apply to movies and series only.
+	// Trailers, extras and per-source ratings apply to movies and series only.
 	if item.Type == "movie" || item.Type == "series" {
 		detail.Videos = s.fetchItemVideos(ctx, contentID, pf)
+		detail.RatingSources = s.fetchItemRatingSources(ctx, contentID, pf)
 		detail.Extras = s.fetchItemExtras(ctx, contentID, pf)
 	}
 
@@ -3026,21 +3117,25 @@ func (s *DetailService) buildEpisodeDetail(ctx context.Context, episode *models.
 	}
 	files = FilterMediaFilesByAccess(files, filter)
 	files = s.prepareBrowseFiles(ctx, files)
-	detail.Versions, detail.PlaybackVariants, detail.Subtitles, detail.Intro, detail.Credits, detail.Recap, detail.Preview = s.buildPlaybackInfo(
+	detail.Versions, detail.PlaybackVariants, detail.Subtitles, detail.Intro, detail.Credits, detail.Recap, detail.Preview = s.buildPlaybackInfoWith(
 		ctx,
 		files,
 		filter,
-		episode.SeriesID,
+		s.episodeAudioResolver(ctx, seriesCtx, filter, episode.SeriesID),
 	)
 	detail.OverlaySummary = overlays.BuildSummary(files)
-	s.effectiveSubtitleDefaults(ctx, filter, episode.SeriesID, files).applyToItemDetail(detail)
-	if seriesCtx.versionPref.HasAny {
-		if seriesCtx.versionPref.Resolution != "" {
-			detail.EffectiveVersionResolution = stringPtr(seriesCtx.versionPref.Resolution)
+	s.episodeSubtitleDefaults(ctx, seriesCtx, filter, episode.SeriesID, files).applyToItemDetail(detail)
+	versionPref := seriesCtx.versionPref
+	if episode.SeriesID != seriesCtx.series.ContentID {
+		versionPref = s.effectiveVersionDefaults(ctx, filter, episode.SeriesID)
+	}
+	if versionPref.HasAny {
+		if versionPref.Resolution != "" {
+			detail.EffectiveVersionResolution = stringPtr(versionPref.Resolution)
 		}
-		detail.EffectiveVersionHDR = boolPtr(seriesCtx.versionPref.HDR)
-		if seriesCtx.versionPref.CodecVideo != "" {
-			detail.EffectiveVersionCodecVideo = stringPtr(seriesCtx.versionPref.CodecVideo)
+		detail.EffectiveVersionHDR = boolPtr(versionPref.HDR)
+		if versionPref.CodecVideo != "" {
+			detail.EffectiveVersionCodecVideo = stringPtr(versionPref.CodecVideo)
 		}
 	}
 
@@ -3903,13 +3998,22 @@ func (s *DetailService) buildPlaybackInfo(
 	filter AccessFilter,
 	audioPreferenceContentID string,
 ) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
+	// Resolve the request-invariant audio preferences once; a multi-track item
+	// would otherwise re-query the profile/preference rows for every file.
+	return s.buildPlaybackInfoWith(ctx, files, filter, s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID))
+}
+
+// buildPlaybackInfoWith is buildPlaybackInfo with a caller-owned audio
+// resolver, so a batch over one series can share it across episodes.
+func (s *DetailService) buildPlaybackInfoWith(
+	ctx context.Context,
+	files []*models.MediaFile,
+	filter AccessFilter,
+	audioResolver *audioPrefResolver,
+) ([]FileVersion, []PlaybackVariant, []SubtitleInfo, *Marker, *Marker, *Marker, *Marker) {
 	versions := make([]FileVersion, 0, len(files))
 	subtitleSet := make(map[string]SubtitleInfo)
 	var firstIntro, firstCredits, firstRecap, firstPreview *Marker
-
-	// Resolve the request-invariant audio preferences once; a multi-track item
-	// would otherwise re-query the profile/preference rows for every file.
-	audioResolver := s.newAudioPrefResolver(ctx, filter, audioPreferenceContentID)
 
 	// Runtime fallbacks are request-invariant too. Every file in one call shares
 	// one item (movies, extras) and, for episode versions, one episode, so a
@@ -3920,7 +4024,6 @@ func (s *DetailService) buildPlaybackInfo(
 	// that ever mixes episodes still resolves each one correctly.
 	episodeDuration := make(map[string]int)
 	itemDuration := make(map[string]int)
-
 	for _, f := range files {
 		if f == nil {
 			continue
@@ -4596,6 +4699,7 @@ func buildVersionSubtitleTracks(file *models.MediaFile) []VersionSubtitleTrack {
 			Language:        sub.Language,
 			Codec:           sub.Format,
 			Title:           firstNonEmpty(sub.Title, filepath.Base(sub.Path)),
+			TitleIsFallback: strings.TrimSpace(sub.Title) == "",
 			EmbeddedTitle:   sub.EmbeddedTitle,
 			Resolution:      sub.Resolution,
 			Forced:          sub.Forced,

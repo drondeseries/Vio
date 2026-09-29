@@ -452,7 +452,7 @@ type PlaybackHandler struct {
 	// unknown and never withdraws a copy route.
 	CopySafetyRacer        PlaybackCopySafetyRacer
 	ChapterThumbnailQueuer PlaybackChapterThumbnailQueuer
-	IntroAnalyzer          IntroEpisodeAnalyzer
+	IntroAnalyzer          PlaybackEpisodeAnalyzer
 	IntroRepository        PlaybackIntroEligibilityChecker
 	MarkerRegistry         *markers.Registry
 	MarkerPopulation       MarkerPopulationService

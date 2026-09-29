@@ -340,6 +340,9 @@ type Dependencies struct {
 	// (*handlers.LibraryHandler).
 	LibraryAdmin LibraryAdminService
 	LibraryJobs  LibraryJobService
+	// LibraryMonitoring reads real-time library monitoring status
+	// (*librarymonitor.StatusReader).
+	LibraryMonitoring LibraryMonitoringService
 	// LibrarySections answers a library's sections to viewers
 	// (*handlers.SectionHandler).
 	LibrarySections LibrarySectionService
@@ -394,7 +397,7 @@ type Dependencies struct {
 	ThemeOverrides                     ThemeOverrideService
 	AdminInviteCodes                   AdminInviteCodeService
 	Invitations                        InvitationService
-	ThemeCatalog                       ThemeCatalogService
+	PasswordResets                     PasswordResetService
 	AdminSubtitleProviderConfiguration AdminSubtitleProviderConfigurationService
 	// PersonalCollections manages a profile's own collections and groups
 	// (*handlers.CollectionHandler).

@@ -124,10 +124,9 @@ func (r *Resolver) ReloadTrustedCIDRs(ctx context.Context, store SettingsStore) 
 	return nil
 }
 
-// requestScheme must run before Middleware replaces the transport peer address.
-// Proxies must preserve Host and overwrite X-Forwarded-Proto, never append it.
-// On a WebSocket upgrade, Traefik sends "wss" or "ws" instead of "https" or
-// "http"; those name the same transport security and are accepted there only.
+// WebSocket upgrades name the same transport security as their HTTP
+// counterparts: Traefik sends "wss"/"ws" instead of "https"/"http", accepted
+// there only.
 const (
 	schemeHTTP  = "http"
 	schemeHTTPS = "https"

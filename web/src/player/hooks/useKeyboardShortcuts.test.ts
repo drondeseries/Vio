@@ -8,9 +8,8 @@ import { KEYBOARD_SKIP_SECONDS, useKeyboardShortcuts } from "./useKeyboardShortc
 function renderShortcuts() {
   const video = { currentTime: 100, duration: 300, volume: 1, muted: false } as HTMLVideoElement;
   const videoRef = { current: video };
-  const containerRef = { current: null };
   const skip = { back: vi.fn(), forward: vi.fn() };
-  renderHook(() => useKeyboardShortcuts(videoRef, containerRef, vi.fn(), skip, vi.fn(), undefined));
+  renderHook(() => useKeyboardShortcuts(videoRef, vi.fn(), vi.fn(), skip, vi.fn(), vi.fn()));
   return { skip, video };
 }
 
@@ -33,10 +32,11 @@ describe("useKeyboardShortcuts", () => {
     renderHook(() =>
       useKeyboardShortcuts(
         { current: video },
-        { current: null },
+        vi.fn(),
         vi.fn(),
         { back: vi.fn(), forward: vi.fn() },
         toggleCaptions,
+        vi.fn(),
       ),
     );
 

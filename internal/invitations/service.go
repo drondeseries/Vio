@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/auth"
-	"github.com/Silo-Server/silo-server/internal/branding"
 	"github.com/Silo-Server/silo-server/internal/mail"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -29,6 +28,7 @@ const (
 var (
 	ErrInvalidEmail   = errors.New("invalid email address")
 	ErrRoleNotAllowed = errors.New("inviter may not grant this role")
+	ErrAdminGrouped   = errors.New("admin accounts cannot belong to an access group")
 	ErrEmailTaken     = errors.New("an account with this email already exists")
 	ErrSessionStart   = errors.New("invitation accepted but login failed")
 	ErrNoLinkBase     = errors.New("no external URL is configured for invitation links")
@@ -161,8 +161,14 @@ func (s *Service) send(ctx context.Context, input SendInput, sourceID *int64) (*
 	if role != roleUser && role != roleAdmin {
 		return nil, ErrRoleNotAllowed
 	}
-	if role == roleAdmin && inviter.Role != roleAdmin {
+	// Only the server Owner may grant the admin role.
+	if role == roleAdmin && (inviter.Role != roleAdmin || !inviter.IsOwner) {
 		return nil, ErrRoleNotAllowed
+	}
+	// Admins are never grouped; refuse here so the pending invitation does not
+	// advertise a group that accept would silently drop.
+	if role == roleAdmin && input.AccessGroupID != nil {
+		return nil, ErrAdminGrouped
 	}
 
 	// Refuse addresses that already have an account. The address is also the
@@ -334,27 +340,13 @@ func (s *Service) claimable(ctx context.Context, token string) (*models.Invitati
 
 // linkBase resolves the canonical externally reachable base URL for claim links.
 func (s *Service) linkBase(ctx context.Context) string {
-	if s.settings != nil {
-		if base, err := s.settings.Get(ctx, "server.public_url"); err == nil {
-			if base = strings.TrimRight(strings.TrimSpace(base), "/"); base != "" {
-				return base
-			}
-		}
-	}
-	return s.publicURL
+	return mail.AccountLinkBase(ctx, s.settings, s.publicURL)
 }
 
 // serverName reads the branded server name for email copy and the claim
 // screen, defaulting to "Vio".
 func (s *Service) serverName(ctx context.Context) string {
-	if s.settings != nil {
-		if name, err := s.settings.Get(ctx, branding.KeyServerName); err == nil {
-			if name = strings.TrimSpace(name); name != "" {
-				return name
-			}
-		}
-	}
-	return branding.DefaultServerName
+	return mail.ServerName(ctx, s.settings)
 }
 
 // profileNameFromEmail derives the default profile name from the address's

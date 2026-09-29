@@ -19,6 +19,7 @@ function library(overrides: Partial<Library> & Pick<Library, "id" | "name" | "ty
     chapter_thumbnails_supported: false,
     intro_detection_enabled: false,
     trailer_kinds: [],
+    realtime_monitoring: false,
     sort_order: 0,
     last_scanned_at: null,
     ...overrides,

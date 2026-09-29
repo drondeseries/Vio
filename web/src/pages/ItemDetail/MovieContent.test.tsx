@@ -41,6 +41,8 @@ const mocks = vi.hoisted(() => {
     useIsInWatchlist: vi.fn(),
     useToggleWatchlist: vi.fn(),
     useRefreshItemMetadata: vi.fn(),
+    useRedetectItemMarkers: vi.fn(),
+    useAdminMarkerCapabilities: vi.fn(),
     useWatchedStateMutation: vi.fn(),
     useRating: vi.fn(),
     useSetRating: vi.fn(),
@@ -70,8 +72,13 @@ vi.mock("@/hooks/queries/watchlist", () => ({
   useToggleWatchlist: mocks.useToggleWatchlist,
 }));
 
+vi.mock("@/hooks/queries/admin/markers", () => ({
+  useAdminMarkerCapabilities: mocks.useAdminMarkerCapabilities,
+}));
+
 vi.mock("@/hooks/queries/items", () => ({
   useRefreshItemMetadata: mocks.useRefreshItemMetadata,
+  useRedetectItemMarkers: mocks.useRedetectItemMarkers,
   useWatchedStateMutation: mocks.useWatchedStateMutation,
 }));
 
@@ -256,6 +263,8 @@ describe("MovieContent", () => {
     mocks.useIsInWatchlist.mockReturnValue({ data: false });
     mocks.useToggleWatchlist.mockReturnValue({ mutate: vi.fn() });
     mocks.useRefreshItemMetadata.mockReturnValue({ mutate: vi.fn(), isPending: false });
+    mocks.useRedetectItemMarkers.mockReturnValue({ mutate: vi.fn(), isPending: false });
+    mocks.useAdminMarkerCapabilities.mockReturnValue({ data: undefined });
     mocks.useWatchedStateMutation.mockReturnValue({ mutate: vi.fn(), isPending: false });
     mocks.useRating.mockReturnValue({ data: { rating: 4, rated_at: "2026-03-22T00:00:00Z" } });
     mocks.useSetRating.mockReturnValue({ mutate: vi.fn() });

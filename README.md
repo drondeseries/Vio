@@ -17,7 +17,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a>
-  · <a href="docs/wiki/index.md">Documentation</a>
+  · <a href="https://siloserver.org/docs">Documentation</a>
   · <a href="docs/release-versioning.md">Builds &amp; releases</a>
   · <a href="docs/silo-to-vio-migration.md">Migrating from Silo</a>
   · <a href="CONTRIBUTING.md">Contributing</a>

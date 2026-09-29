@@ -13,6 +13,15 @@ import (
 	"time"
 )
 
+// MDBListRequestTimeout bounds one MDBList fetch when the base client sets no
+// timeout of its own. http.DefaultClient never times out, so without it a
+// stalled mdblist.com response would hold a sync worker indefinitely.
+const MDBListRequestTimeout = 30 * time.Second
+
+// SyncTimeout bounds one scheduled collection sync end to end, so a single
+// slow source cannot hold a scheduler worker for the rest of the run.
+const SyncTimeout = 15 * time.Minute
+
 // ErrMDBListURL is returned when a caller-supplied list URL is not an
 // MDBList list page. Sync fetches that URL with the server's HTTP client, so
 // anything else is an SSRF primitive.

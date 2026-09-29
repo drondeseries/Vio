@@ -72,6 +72,10 @@ type ProcessRequest struct {
 	// metadata language actually re-fetches titles/overviews.
 	AdoptLanguage            bool
 	recordedStaleProviderIDs providerIDValueSet
+	// enrichmentOnly marks a bulk enrichment write: one enrichment provider's
+	// fields merged into an item that is already matched. See
+	// persistEnrichment for how it differs from a scheduled refresh.
+	enrichmentOnly bool
 }
 
 // ProcessResult is the output of MetadataService.Process().
@@ -280,7 +284,11 @@ type MetadataResult struct {
 	// AdvisorySource attributes AdvisoryAge; empty when AdvisoryAge is 0.
 	AdvisorySource string
 	Ratings        Ratings
-	People         []models.ItemPerson
+	// RatingSources holds per-source ratings on a 0-100 scale, keyed by the
+	// canonical source name (models.RatingSourceIMDB, ...). They merge one
+	// source at a time under FieldRating, like Ratings.
+	RatingSources map[string]RatingSource
+	People        []models.ItemPerson
 	// Images (S3 paths or URLs).
 	PosterPath        string
 	PosterThumbhash   string
@@ -325,6 +333,16 @@ type Ratings struct {
 	TMDB       float64
 	RTCritic   float64
 	RTAudience float64
+}
+
+// RatingSource is one source's rating of an item on a common 0-100 scale. It
+// persists as a media_item_rating_sources row.
+type RatingSource struct {
+	Score float64
+	// Votes is the number of votes behind Score, 0 when unknown.
+	Votes int64
+	// Provider is the slug of the metadata provider that reported the rating.
+	Provider string
 }
 
 // ImageRequest is passed to ImageProvider.GetImages().

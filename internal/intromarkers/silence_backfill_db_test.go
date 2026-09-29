@@ -21,6 +21,44 @@ import (
 // against Postgres: a file whose refinement found nothing better, and one whose
 // refinement failed, must both drop out of the next run until their inputs
 // change or the failure backoff elapses.
+func TestSilenceBackfillRevisitsLegacySilenceMarkersPostgres(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := database.RunMigrations(ctx, pool, migrations.FS, "sql"); err != nil {
+		t.Fatalf("migrate test database: %v", err)
+	}
+	fileIDs := seedSilenceBackfillFixture(t, pool)
+	legacy, current := fileIDs[0], fileIDs[1]
+	if _, err := pool.Exec(ctx, `UPDATE media_files SET intro_markers_algorithm = $2 WHERE id = $1`, legacy, legacyChapterSilenceAlgorithm); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE media_files SET intro_markers_algorithm = $2 WHERE id = $1`, current, ChapterSilenceAlgorithm); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := NewRepository(pool).ListChapterSilenceBackfillCandidates(ctx, 1_000_000, DefaultConfig("ffmpeg"), "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int
+	for _, candidate := range all {
+		if slices.Contains(fileIDs, candidate.FileID) {
+			got = append(got, candidate.FileID)
+		}
+	}
+	if want := []int{legacy, fileIDs[2]}; !slices.Equal(got, want) {
+		t.Fatalf("backfill = %v, want the legacy silence marker and the chapter marker %v", got, want)
+	}
+}
+
 func TestSilenceBackfillSkipsUnchangedAttemptsPostgres(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -222,4 +260,49 @@ func seedSilenceBackfillFixture(t *testing.T, pool *pgxpool.Pool) []int {
 		fileIDs = append(fileIDs, fileID)
 	}
 	return fileIDs
+}
+
+func TestSeasonStateRoundTripsAnalyzedAtPostgres(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := database.RunMigrations(ctx, pool, migrations.FS, "sql"); err != nil {
+		t.Fatalf("migrate test database: %v", err)
+	}
+	fileIDs := seedSilenceBackfillFixture(t, pool)
+	var state SeasonState
+	if err := pool.QueryRow(ctx, `
+		SELECT e.season_id, mf.media_folder_id
+		FROM media_files mf JOIN episodes e ON e.content_id = mf.episode_id
+		WHERE mf.id = $1`, fileIDs[0]).Scan(&state.SeasonID, &state.MediaFolderID); err != nil {
+		t.Fatal(err)
+	}
+	state.AnalysisGroupKey = "default|default|und"
+	state.InputSignature = "signature"
+	state.Status = seasonStatusPartial
+	state.LastError = "1 fingerprint extraction(s) failed"
+
+	repo := NewRepository(pool)
+	cfg := DefaultConfig("ffmpeg")
+	before := time.Now().Add(-time.Minute)
+	if err := repo.UpsertSeasonState(ctx, state, cfg.AnalysisConfigHash()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := repo.LoadSeasonState(ctx, state, cfg.AnalysisConfigHash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == nil || loaded.Status != seasonStatusPartial || loaded.AnalyzedAt.Before(before) {
+		t.Fatalf("loaded state = %+v, want partial with a fresh analyzed_at", loaded)
+	}
+	if !loaded.settled(time.Now()) || loaded.settled(time.Now().Add(partialSeasonRetryInterval)) {
+		t.Fatalf("partial state should hold for the retry interval and lapse after it: %+v", loaded)
+	}
 }

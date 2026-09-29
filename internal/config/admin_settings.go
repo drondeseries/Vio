@@ -66,6 +66,7 @@ const (
 // readers. Keep them here with the effective admin-setting defaults.
 const (
 	Allow4KTranscodeSettingKey               = "allow_4k_transcode"
+	PlaybackAllowHEVCEncodingSettingKey      = "playback.allow_hevc_encoding"
 	DownloadLocalTranscodeFallbackSettingKey = "download.local_transcode_fallback"
 )
 
@@ -86,6 +87,10 @@ const ArtworkStorageSweepCheckpointKey = "artwork.storage_sweep_checkpoint"
 // MetadataImageWorkersSettingKey sizes the artwork encode pool. 0 means one
 // worker per CPU core, resolved when the task runs.
 const MetadataImageWorkersSettingKey = "metadata.image_workers"
+
+// MarkersDetectionWorkersSettingKey sizes local intro detection: how many
+// seasons are analyzed at once and how many ffmpeg processes read audio.
+const MarkersDetectionWorkersSettingKey = "markers.detection_workers"
 
 // adminSettingDefaults is the effective value shown by the Admin UI when no
 // row exists in server_settings. Keep these values aligned with the runtime
@@ -125,6 +130,7 @@ var adminSettingDefaults = map[string]string{
 	"scanner.max_concurrent_scoped":        "2",
 	"scanner.file_removal_grace":           "24h",
 	"scanner.empty_trash_after_scan":       "true",
+	"scanner.realtime_monitoring":          "true",
 	"matcher.workers":                      "8",
 	"matcher.batch_size":                   "500",
 	"matcher.enable_tv_series_root_queue":  "true",
@@ -134,7 +140,10 @@ var adminSettingDefaults = map[string]string{
 	"artwork.local_path":                   "/var/lib/silo/artwork",
 	"markers.mode":                         "both",
 	"markers.lazy_playback":                "true",
+	MarkersDetectionWorkersSettingKey:      "1",
 	"markers.online_storage":               "stored",
+	"markers.detect_intros":                "true",
+	"markers.detect_credits":               "true",
 
 	"virtual_library.enabled":                        "true",
 	"virtual_library.manifest_url":                   "",
@@ -168,6 +177,7 @@ var adminSettingDefaults = map[string]string{
 	"playback.hw_accel":                              "auto",
 	"playback.software_fallback":                     "allow",
 	"playback.transcode_enabled":                     "true",
+	PlaybackAllowHEVCEncodingSettingKey:              "false",
 	PlaybackRoutingDirectPlayEgressSettingKey:        string(PlaybackEgressPreferProxy),
 	PlaybackRoutingRemuxExecutionSettingKey:          string(PlaybackExecutionPreferTranscode),
 	PlaybackRoutingRemuxEgressSettingKey:             string(PlaybackEgressPreferProxy),
@@ -280,6 +290,10 @@ var adminSettingDefaults = map[string]string{
 	"taskmanager.history_retention_days": "30",
 	"taskmanager.history_keep_per_task":  "1000",
 
+	// Off: server addresses non-admin users supply for history import and
+	// webhook sync must be on the public internet (historyimport).
+	"media_servers.allow_private_destinations": "false",
+
 	"opslog.capture_level":            "info",
 	"opslog.retention_days":           "7",
 	"opslog.cleanup_interval_minutes": "15",
@@ -288,6 +302,10 @@ var adminSettingDefaults = map[string]string{
 	"overlays.enabled":                "true",
 	"signup.enabled":                  "false",
 	SetupCompletedSettingKey:          "false",
+
+	// Self-service password reset from the sign-in page; an administrator
+	// opts in.
+	"password_reset.self_service_enabled": "false",
 
 	"catalog.search.provider":                             "postgres",
 	"catalog.search.meilisearch.index":                    "vio_media_items",
@@ -409,7 +427,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 	value := strings.TrimSpace(raw)
 
 	switch key {
-	case "metadata.cache_images", "playback.transcode_enabled",
+	case "metadata.cache_images", "playback.transcode_enabled", PlaybackAllowHEVCEncodingSettingKey,
 		chapterThumbnailSoftwareToneMapKey, PlaybackTranscodeHardwareToneMapSettingKey,
 		PlaybackTranscodeSoftwareToneMapSettingKey, PlaybackTranscodeVPPToneMapSettingKey,
 		CatalogScopeVersionsToLibrarySettingKey,
@@ -417,12 +435,13 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		"jellyfin_compat.enabled", "jellyfin_compat.web_enabled", "recommendations.enabled",
 		"subtitle_ai.enabled", "subtitle_ai.transcribe_enabled", "metadata_ai.enabled",
 		"download.enabled", "download.transcode_enabled", DownloadLocalTranscodeFallbackSettingKey,
-		"email.enabled", "signup.enabled", SetupCompletedSettingKey,
-		"scanner.empty_trash_after_scan", "matcher.enable_tv_series_root_queue",
+		"email.enabled", "signup.enabled", "password_reset.self_service_enabled", SetupCompletedSettingKey,
+		"scanner.empty_trash_after_scan", "scanner.realtime_monitoring", "matcher.enable_tv_series_root_queue",
 		"matcher.enable_tv_series_group_queue", "policy.editor_enabled",
 		"overlays.enabled", "notifications.release_events_enabled", "notifications.fanout_enabled",
 		"notifications.ui_enabled", "notifications.webhooks_enabled",
-		"notifications.webhooks.allow_private_destinations", "notifications.email_enabled",
+		"notifications.webhooks.allow_private_destinations", "media_servers.allow_private_destinations",
+		"notifications.email_enabled",
 		"notifications.email.allow_per_episode", "notifications.discord_enabled",
 		"notifications.discord.allow_per_episode", "notifications.server_channels_enabled",
 		"notifications.server_channels.mention_requesters", "notifications.web_push_enabled",
@@ -459,6 +478,8 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 100000)
 	case MetadataImageWorkersSettingKey:
 		return normalizeAdminInt(key, value, 0, 256)
+	case MarkersDetectionWorkersSettingKey:
+		return normalizeAdminInt(key, value, 1, 64)
 	case "playback.chapter_thumbnail_workers", "playback.chapter_thumbnail_node_capacity":
 		return normalizeAdminInt(key, value, 1, 1024)
 	case "playback.watched_threshold":
