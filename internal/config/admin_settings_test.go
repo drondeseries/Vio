@@ -596,6 +596,7 @@ func TestVirtualCandidateStoreWindowDefaultsAndBounds(t *testing.T) {
 			t.Errorf("VirtualCandidateStoreWindow(%q) = %v, want %v", tc.raw, got, tc.want)
 		}
 	}
+}
 
 func TestHEVCEncodingSettingDefaultAndValidation(t *testing.T) {
 	if got := EffectiveAdminSettings(nil)[PlaybackAllowHEVCEncodingSettingKey]; got != "false" {
