@@ -1251,6 +1251,13 @@ export interface ItemDetail {
   episode_number?: number | null;
   episode_count?: number | null;
   air_date?: string | null;
+  /**
+   * Episode release timing derived from air_date: "upcoming" when the
+   * calendar date is after today (UTC), "released" otherwise. Absent when
+   * the air date is unknown or the item is not an episode. Read
+   * `GET /api/v2/capabilities/episode-release` before branching on it.
+   */
+  release_state?: "upcoming" | "released";
   is_specials?: boolean;
   user_data?: ItemUserData;
   user_state?: MediaItemUserState;
@@ -1346,6 +1353,13 @@ export interface EpisodeListItem {
   title: string;
   overview: string;
   air_date: string | null;
+  /**
+   * Release timing derived from air_date: "upcoming" when the calendar date
+   * is after today (UTC), "released" otherwise; absent when the air date is
+   * unknown. Read `GET /api/v2/capabilities/episode-release` before
+   * branching on this field.
+   */
+  release_state?: "upcoming" | "released";
   runtime: number;
   imdb_id?: string;
   tmdb_id?: string;

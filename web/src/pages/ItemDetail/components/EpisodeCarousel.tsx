@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Play, ChevronLeft, ChevronRight } from "lucide-react";
+import { CalendarClock, Play, ChevronLeft, ChevronRight } from "lucide-react";
 import type { EpisodeListItem } from "@/api/types";
 import { WatchedCheckIndicator } from "@/components/CardWatchedBadge";
 import { toEpisodeUserState } from "@/components/episodeUserState";
@@ -12,6 +12,11 @@ import { useCarouselEmbla } from "@/hooks/useCarouselEmbla";
 import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import {
+  formatCalendarDate,
+  isUpcomingEpisode,
+  useEpisodeReleaseCapability,
+} from "@/hooks/queries/episodeRelease";
 import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 
 interface EpisodeCarouselProps {
@@ -30,6 +35,10 @@ export default function EpisodeCarousel({
   );
   const prefetchEpisodeDetail = usePrefetchCatalogItemDetail();
   const { quickActionMode } = useOverlayPrefs();
+  // Capability-gated upcoming treatment: older servers without release_state
+  // keep today's plain carousel rendering.
+  const { data: releaseCapability } = useEpisodeReleaseCapability();
+  const releaseSupported = releaseCapability?.available ?? false;
   const { emblaApi, emblaRef, canScrollPrev, canScrollNext, scrollPrev, scrollNext } =
     useCarouselEmbla({
       options: {
@@ -66,6 +75,7 @@ export default function EpisodeCarousel({
                 isCurrent={ep.episode_number === currentEpisodeNumber}
                 episodeLinkState={episodeLinkState}
                 quickActionMode={quickActionMode}
+                upcoming={isUpcomingEpisode(ep, releaseSupported)}
                 onPrefetch={() => prefetchEpisodeDetail(ep.content_id)}
               />
             ))}
@@ -92,12 +102,14 @@ function EpisodeCarouselCard({
   isCurrent,
   episodeLinkState,
   quickActionMode,
+  upcoming,
   onPrefetch,
 }: {
   ep: EpisodeListItem;
   isCurrent: boolean;
   episodeLinkState?: EpisodeNavigationState;
   quickActionMode: CardQuickActionMode;
+  upcoming: boolean;
   onPrefetch: () => void;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
@@ -148,13 +160,29 @@ function EpisodeCarouselCard({
                 <img
                   src={ep.still_url}
                   alt={episodeTitle}
-                  className="h-full w-full object-cover"
+                  className={cn("h-full w-full object-cover", upcoming && "opacity-45 saturate-50")}
                   loading="lazy"
                   decoding="async"
                 />
+              ) : upcoming ? (
+                <div className="bg-accent/30 flex h-full w-full items-center justify-center">
+                  <CalendarClock
+                    size={28}
+                    className="text-muted-foreground/50"
+                    aria-label="Upcoming"
+                  />
+                </div>
               ) : (
                 <div className="bg-accent/30 flex h-full w-full items-center justify-center">
                   <Play size={28} className="text-muted-foreground/30" />
+                </div>
+              )}
+              {upcoming && ep.still_url && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/35">
+                  <span className="metadata-badge gap-1">
+                    <CalendarClock className="size-3" aria-hidden="true" />
+                    Upcoming
+                  </span>
                 </div>
               )}
               {isCurrent && (
@@ -205,7 +233,13 @@ function EpisodeCarouselCard({
           >
             {episodeTitle}
           </p>
-          {ep.runtime > 0 && <p className="text-muted-foreground/70 text-xs">{ep.runtime}m</p>}
+          {upcoming ? (
+            <p className="text-muted-foreground/70 text-xs">
+              Upcoming{ep.air_date && ` · ${formatCalendarDate(ep.air_date)}`}
+            </p>
+          ) : (
+            ep.runtime > 0 && <p className="text-muted-foreground/70 text-xs">{ep.runtime}m</p>
+          )}
         </ViewTransitionLink>
       </div>
     </li>

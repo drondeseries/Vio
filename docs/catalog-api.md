@@ -407,6 +407,38 @@ Invalid booleans return `422 validation_failed`. The parameter does not apply
 to single-season or episode operations. Clients can use the capability to
 select text-only season lists; callers that omit it keep their existing behavior.
 
+## Episode release timing
+
+Episode rows (`listCatalogItemEpisodes`, `listSeasonEpisodes`) and episode
+details (`getCatalogItem` on an episode id) carry `release_state`:
+`upcoming` when the calendar `air_date` is after today (UTC), `released`
+otherwise, absent when the air date is unknown. The decision is one shared
+server-side classification (`catalog.ReleaseStateForAirDate`): no timezone
+conversion beyond the stored calendar date, and unknown or malformed dates
+fail open (absent) so missing metadata never bans playback.
+
+`GET /api/v2/capabilities/episode-release` is the feature-detection
+document for the member. Clients read it before branching on
+`release_state` and keep today's plain rendering when the capability is
+unavailable or the field is absent — an older server that omits the field
+must not gain the upcoming treatment. The release state is presentation
+timing only — it never gates playback. A future date with a playable file
+still plays; the badge says when it aired, not whether it is available.
+
+The bundled web client dims upcoming artwork, shows an `Upcoming · <date>`
+label in season lists, grids, the episode carousel, and the episode detail
+hero, and keeps detail navigation, Play eligibility, menus, and
+watched/progress state intact. Frozen v1 episode responses do not expose
+this field.
+
+Third-party Jellyfin clients need no change: `PremiereDate` already carries
+the air date, fileless episodes already map `LocationType: Virtual` with no
+`MediaSources` (so they show as unavailable), and no DTO field was added.
+First-party mobile clients need the same badge-or-plain rule when they adopt
+`release_state`: branch on the capability, never on client-side date
+inference; Play eligibility stays unchanged; unknown/absent states render
+as today.
+
 ## Collection membership titles
 
 `GET /api/v2/collections/{id}/items` and

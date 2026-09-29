@@ -48,6 +48,12 @@ import {
 } from "@/lib/permissions";
 import { formatRuntimeMinutes } from "@/lib/mediaFormat";
 import { useQualityPreference } from "@/hooks/queries/qualityPreference";
+import { CalendarClock } from "lucide-react";
+import {
+  formatCalendarDate,
+  isUpcomingEpisode,
+  useEpisodeReleaseCapability,
+} from "@/hooks/queries/episodeRelease";
 
 export default function EpisodeContent({ item }: { item: ItemDetail & { type: "episode" } }) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
@@ -212,6 +218,14 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
         }
       : null;
   const navigationState = location.state as EpisodeNavigationState | null;
+  // Release timing is presentation only: it never gates playback. A
+  // future-dated episode with a playable file still plays (the server's
+  // release gate remains the sole enforcer), so Play eligibility is
+  // unchanged; upcoming episodes only get a hero badge. The badge itself is
+  // capability-gated so older servers render as before. Unknown dates fail
+  // open (no badge, playable as before).
+  const { data: releaseCapability } = useEpisodeReleaseCapability();
+  const upcoming = isUpcomingEpisode(item, releaseCapability?.available ?? false);
   const isPlayable =
     (item.versions?.length ?? 0) > 0 ||
     (item.playback_variants?.length ?? 0) > 0 ||
@@ -317,19 +331,14 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
             <MetadataBadges
               duration={formatRuntimeMinutes(selectedMediaSummary.durationMinutes) || undefined}
             />
-            {item.air_date && (
-              <span className="metadata-badge">
-                {(() => {
-                  const d = new Date(item.air_date);
-                  return Number.isNaN(d.getTime())
-                    ? item.air_date
-                    : new Intl.DateTimeFormat(undefined, {
-                        year: "numeric",
-                        month: "short",
-                        day: "numeric",
-                      }).format(d);
-                })()}
+            {upcoming && (
+              <span className="metadata-badge gap-1">
+                <CalendarClock className="size-3" aria-hidden="true" />
+                Upcoming{item.air_date && ` · ${formatCalendarDate(item.air_date)}`}
               </span>
+            )}
+            {!upcoming && item.air_date && (
+              <span className="metadata-badge">{formatCalendarDate(item.air_date)}</span>
             )}
             <QualityBadges summary={selectedMediaSummary} />
           </div>

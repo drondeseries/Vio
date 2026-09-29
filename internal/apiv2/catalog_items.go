@@ -362,6 +362,7 @@ type CatalogItemDetail struct {
 	SeasonCount                     *int                                 `json:"season_count,omitempty"`
 	EpisodeCount                    *int                                 `json:"episode_count,omitempty"`
 	AirDate                         *string                              `json:"air_date,omitempty" doc:"Calendar date, YYYY-MM-DD"`
+	ReleaseState                    string                               `json:"release_state,omitempty" enum:"upcoming,released" doc:"Episode release timing derived from air_date: upcoming when the calendar date is after today (UTC), released otherwise; absent when the air date is unknown or the item is not an episode"`
 	IsSpecials                      bool                                 `json:"is_specials,omitempty"`
 	UserData                        *WatchRollup                         `json:"user_data,omitempty"`
 	UserRating                      *int                                 `json:"user_rating,omitempty"`
@@ -454,6 +455,7 @@ type Episode struct {
 	Title          string              `json:"title"`
 	Overview       string              `json:"overview,omitempty"`
 	AirDate        *string             `json:"air_date,omitempty" doc:"Calendar date, YYYY-MM-DD"`
+	ReleaseState   string              `json:"release_state,omitempty" enum:"upcoming,released" doc:"Release timing derived from air_date: upcoming when the calendar date is after today (UTC), released otherwise; absent when the air date is unknown"`
 	Runtime        int                 `json:"runtime" doc:"Minutes"`
 	ImdbID         string              `json:"imdb_id,omitempty"`
 	TmdbID         string              `json:"tmdb_id,omitempty"`
@@ -1246,7 +1248,7 @@ func catalogItemDetailOf(d *catalogpkg.ItemDetail) CatalogItemDetail {
 		SortTitle:   d.SortTitle, OriginalTitle: d.OriginalTitle, Tagline: d.Tagline, PendingTranslationLanguage: d.PendingTranslationLanguage,
 		ImdbID: d.ImdbID, TmdbID: d.TmdbID, TvdbID: d.TvdbID, Cast: NonNil(d.Cast), Crew: NonNil(d.Crew), Countries: d.Countries, LockedFields: d.LockedFields,
 		FirstAirDate: d.FirstAirDate, AirTime: d.AirTime, AirTimezone: d.AirTimezone, SeasonCount: d.SeasonCount, EpisodeCount: d.EpisodeCount,
-		AirDate: d.AirDate, IsSpecials: d.IsSpecials, UserData: watchRollupOf(d.SeasonUserData), UserRating: d.UserRating,
+		AirDate: d.AirDate, ReleaseState: d.ReleaseState, IsSpecials: d.IsSpecials, UserData: watchRollupOf(d.SeasonUserData), UserRating: d.UserRating,
 		Versions: fileVersionsOf(d.Versions), PlaybackVariants: playbackVariantsOf(d.PlaybackVariants), Videos: d.Videos, RatingSources: catalogRatingSourcesOf(d.RatingSources), Extras: d.Extras,
 		FolderPaths: d.FolderPaths, Subtitles: NonNil(d.Subtitles), Intro: d.Intro, Credits: d.Credits, Recap: d.Recap, Preview: d.Preview,
 		EffectiveVersionResolution: d.EffectiveVersionResolution,
@@ -1280,7 +1282,7 @@ func episodesOf(views []handlers.EpisodeView) []Episode {
 	out := make([]Episode, 0, len(views))
 	for _, e := range views {
 		ep := Episode{ContentID: e.ContentID, SeasonNumber: e.SeasonNumber, EpisodeNumber: e.EpisodeNumber, Title: e.Title, Overview: e.Overview,
-			AirDate: datePtr(e.AirDate), Runtime: e.Runtime, ImdbID: e.ImdbID, TmdbID: e.TmdbID, TvdbID: e.TvdbID, StillURL: e.StillURL, StillThumbhash: e.StillThumbhash,
+			AirDate: datePtr(e.AirDate), ReleaseState: handlers.EpisodeReleaseState(e.AirDate), Runtime: e.Runtime, ImdbID: e.ImdbID, TmdbID: e.TmdbID, TvdbID: e.TvdbID, StillURL: e.StillURL, StillThumbhash: e.StillThumbhash,
 			UserData: watchRollupOf(e.UserData), OverlaySummary: catalogOverlayOf(e.OverlaySummary)}
 		for _, f := range e.Files {
 			ep.Files = append(ep.Files, EpisodeFile{FileID: IDFromInt(int64(f.FileID)), Resolution: f.Resolution, CodecVideo: f.CodecVideo, HDR: f.HDR,
