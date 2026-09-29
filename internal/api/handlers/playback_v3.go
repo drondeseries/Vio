@@ -5911,10 +5911,9 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	// The store read is a single pooled query that releases its connection
 	// immediately and holds none of the replan locks, so it cannot invert the
 	// slot -> per-session mutex -> advisory-lock order below or starve a lock
-	// holder's inner queries. Cross-replica serialization is still enforced
-	// where it must be: BeginReplan's lease compare and CompleteReplan's
-	// compare-and-swap reject a plan built from a stale read rather than
-	// committing it.
+	// holder's inner queries. It is an early-out only: the attempt is re-read
+	// under those locks before any lease decision, and CompleteReplan's
+	// compare-and-swap remains the final authority.
 	record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
 	if err != nil {
 		// A store outage must read as retryable, not as the session being
@@ -5963,6 +5962,24 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
 	}
 	defer unlockStore()
+	// Re-read the attempt now that the replan locks are held. The fast 404 above
+	// deliberately reads before queueing on the capacity bound and the
+	// per-session locks, so a duplicate request that waited behind a completing
+	// sibling still holds the pre-lock snapshot here. Without this read,
+	// BeginReplan can return the sibling's ReplanLeaseCompletedV3 and the stale
+	// record makes the handler reject the replay as stale_playback_plan instead
+	// of returning the stored response; BeginReplan/CompleteReplan would also
+	// build on a stale base revision. The post-lock read is authoritative for
+	// both, and CompleteReplan stays the final compare-and-swap.
+	record, err = h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
+	if err != nil {
+		// Match the fast 404: a session that vanished while this request waited
+		// reads as gone, any other store failure as retryable.
+		if !errors.Is(err, playback.ErrSessionNotFound) {
+			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
+		}
+		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
+	}
 	digestBytes := sha256.Sum256(body)
 	digest := hex.EncodeToString(digestBytes[:])
 	lease, err := h.PlanStoreV3.BeginReplan(
