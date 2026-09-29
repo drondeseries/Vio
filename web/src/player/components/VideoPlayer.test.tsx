@@ -12,6 +12,7 @@ import type {
 import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
 import { HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES } from "../utils/bufferPolicy";
 import { HLS_STARTUP_TIMEOUT_MS } from "../utils/hlsStartupGuard";
+import { PENDING_SEEK_HOLD_TIMEOUT_MS } from "../utils/pendingSeek";
 import { VideoPlayer } from "./VideoPlayer";
 
 const realtimeOptions = vi.hoisted(() => ({
@@ -3983,6 +3984,119 @@ describe("VideoPlayer buffered-first seeking", () => {
 
     expect(onReanchorSeek).not.toHaveBeenCalled();
     expect(video.currentTime).toBe(150);
+  });
+});
+
+describe("VideoPlayer bounded pending seek", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    controls.current = null;
+    realtimeOptions.current = null;
+    hlsJS.supported = false;
+    hlsJS.constructed.mockClear();
+    playerSeek.mockClear();
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  function renderPendingSeek(position: number) {
+    const { container } = renderPlayer({
+      plan: directPlan,
+      onReanchorSeek: vi.fn(() => true),
+    });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: position,
+    });
+    return video;
+  }
+
+  function seekControls() {
+    return controls.current as unknown as {
+      currentTime: number;
+      onSeek: (seconds: number) => void;
+    };
+  }
+
+  it("rolls the scrubber back when a declined seek never reaches its target", async () => {
+    const video = renderPendingSeek(10);
+    fireFrameTimeUpdate(video);
+    await act(async () => {});
+    expect(seekControls().currentTime).toBe(10);
+
+    // A local seek the element never honors: the request is held, but the
+    // media stays where it was and no seeked/timeupdate ever lands on target.
+    act(() => seekControls().onSeek(150));
+    expect(seekControls().currentTime).toBe(150);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS);
+    });
+
+    expect(seekControls().currentTime).toBe(10);
+  });
+
+  it("leaves a seek that reaches its target before the bound alone", async () => {
+    const video = renderPendingSeek(10);
+    fireFrameTimeUpdate(video);
+    await act(async () => {});
+    expect(seekControls().currentTime).toBe(10);
+
+    act(() => seekControls().onSeek(150));
+    expect(seekControls().currentTime).toBe(150);
+
+    // The element actually reached the target.
+    video.currentTime = 150;
+    fireFrameTimeUpdate(video);
+    await act(async () => {});
+    expect(seekControls().currentTime).toBe(150);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS * 2);
+    });
+    expect(seekControls().currentTime).toBe(150);
+  });
+
+  it("restarts the hold bound when the viewer re-seeks to the same target", async () => {
+    const video = renderPendingSeek(10);
+    fireFrameTimeUpdate(video);
+    await act(async () => {});
+    expect(seekControls().currentTime).toBe(10);
+
+    act(() => seekControls().onSeek(150));
+    expect(seekControls().currentTime).toBe(150);
+
+    // The first attempt's window nearly elapses without the element reaching
+    // the target.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS - 1000);
+    });
+    expect(seekControls().currentTime).toBe(150);
+
+    // A second seek to the same target is a fresh attempt. It must get its own
+    // full window rather than inherit the first timer about to fire.
+    act(() => seekControls().onSeek(150));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000 + PENDING_SEEK_HOLD_TIMEOUT_MS / 2);
+    });
+    expect(seekControls().currentTime).toBe(150);
+
+    // Once the new bound elapses, the still-declined seek rolls back.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS);
+    });
+    expect(seekControls().currentTime).toBe(10);
   });
 });
 

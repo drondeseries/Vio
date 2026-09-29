@@ -1737,6 +1737,13 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if err := json.Unmarshal(body, &req); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid protocol v3 request body")
 	}
+	// A selected track identity can name the effective file of an earlier
+	// attempt, which virtual candidate rotation replaces. Drop it before the
+	// structural id/index check, mirroring the replan path's re-key-before-
+	// validation order: the start degrades to the default track pipeline
+	// instead of failing 400. NormalizeAndValidate applies the same drop as a
+	// second line of defense for callers that validate a copy (api/v2).
+	dropStaleRequestTrackIdentitiesV3(r.Context(), &req)
 	warnings, err := req.NormalizeAndValidate()
 	if err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", err.Error())
@@ -5897,18 +5904,16 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if err := preflightReq.Validate(); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
-	releaseSlot, err := h.acquireReplanSlotV3(r.Context())
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "replan_capacity_exhausted", "The server is replanning too many sessions; retry shortly")
-	}
-	defer releaseSlot()
-	unlockReplan := h.lockReplanV3(sessionID)
-	defer unlockReplan()
-	unlockStore, err := h.PlanStoreV3.AcquireSessionLock(r.Context(), sessionID)
-	if err != nil {
-		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
-	}
-	defer unlockStore()
+	// Resolve the cheap attempt/session lookups before queueing for a replan
+	// slot. A reaped in-memory session (or an expired attempt) must surface as
+	// a fast 404 instead of waiting behind the replan capacity bound;
+	// production saw an ~11s queue wait before the session_not_found verdict.
+	// The store read is a single pooled query that releases its connection
+	// immediately and holds none of the replan locks, so it cannot invert the
+	// slot -> per-session mutex -> advisory-lock order below or starve a lock
+	// holder's inner queries. It is an early-out only: the attempt is re-read
+	// under those locks before any lease decision, and CompleteReplan's
+	// compare-and-swap remains the final authority.
 	record, err := h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
 	if err != nil {
 		// A store outage must read as retryable, not as the session being
@@ -5942,6 +5947,46 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if err := req.Validate(); err != nil {
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusBadRequest, "bad_request", "Invalid replan request")
 	}
+	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
+		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
+	}
+	releaseSlot, err := h.acquireReplanSlotV3(r.Context())
+	if err != nil {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, "replan_capacity_exhausted", "The server is replanning too many sessions; retry shortly")
+	}
+	defer releaseSlot()
+	unlockReplan := h.lockReplanV3(sessionID)
+	defer unlockReplan()
+	unlockStore, err := h.PlanStoreV3.AcquireSessionLock(r.Context(), sessionID)
+	if err != nil {
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to serialize the replan request")
+	}
+	defer unlockStore()
+	// Re-read the attempt now that the replan locks are held. The fast 404 above
+	// deliberately reads before queueing on the capacity bound and the
+	// per-session locks, so a duplicate request that waited behind a completing
+	// sibling still holds the pre-lock snapshot here. Without this read,
+	// BeginReplan can return the sibling's ReplanLeaseCompletedV3 and the stale
+	// record makes the handler reject the replay as stale_playback_plan instead
+	// of returning the stored response; BeginReplan/CompleteReplan would also
+	// build on a stale base revision. The post-lock read is authoritative for
+	// both, and CompleteReplan stays the final compare-and-swap.
+	record, err = h.PlanStoreV3.GetAttempt(r.Context(), sessionID)
+	if err != nil {
+		// Match the fast 404: a session that vanished while this request waited
+		// reads as gone, any other store failure as retryable.
+		if !errors.Is(err, playback.ErrSessionNotFound) {
+			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to load the playback attempt")
+		}
+		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
+	}
+	// The durable attempt can outlive the in-memory session: a stop or an idle
+	// reap can land while this request waits on the replan slot and the
+	// per-session locks, between the pre-lock check and here. Re-check now so it
+	// reads as the fast 404; otherwise the request would reserve a replan lease
+	// and persist executeReplanV3's session_expired as a terminal 200, which the
+	// web client does not rebuild from. CompleteReplan stays the final
+	// compare-and-swap.
 	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
 		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 	}
@@ -6004,6 +6049,18 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	if replanErr != nil {
 		if transport != nil {
 			transport.rollback()
+		}
+		// The post-lock live-session check above is an early-out only: it holds
+		// no lock across BeginReplan or executeReplanV3, so a stop or idle reap
+		// can still land before execution reads the session. Persisting that
+		// session_expired through CompleteReplan would store it as the terminal
+		// decision and answer HTTP 200 — a response the web client does not
+		// rebuild from. Translate it to the same fast 404 and leave the lease to
+		// the deferred non-terminal ReleaseReplan, so no completed 200 terminal
+		// for a dead session is ever persisted. CompleteReplan stays the final
+		// compare-and-swap for every other terminal path.
+		if replanErr.reason == "session_expired" {
+			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 		}
 		response := playback.NewTerminalResponseV3(replanErr.reason, replanErr.message, replanErr.retryable)
 		encoded, _ := json.Marshal(response)
@@ -9091,25 +9148,51 @@ func (h *PlaybackHandler) startupRetryAllowedV3(opts playback.TranscodeOpts, ret
 	return true
 }
 
-// dropStaleAudioTrackIdentityV3 reports whether the request's audio track ID
-// embeds a file identity that no longer matches file. Virtual candidate
-// rotation replaces media_files rows whenever the provider surfaces a new
-// release, so a client replaying a cached selection would otherwise fail
-// playback outright; callers drop the selection and fall back to the
-// preferred-track pipeline instead.
-func dropStaleAudioTrackIdentityV3(ctx context.Context, file *models.MediaFile, trackID string) bool {
-	if file == nil || trackID == "" {
+// dropStaleTrackIdentityV3 reports whether trackID is a well-formed selected
+// identity of kind bound to a file other than fileID, and logs the discard.
+// Virtual candidate rotation replaces media_files rows whenever the provider
+// surfaces a new release, so a client replaying a cached selection would
+// otherwise fail playback outright; callers drop the selection and fall back to
+// the default/preferred-track pipeline instead. A malformed identity or one
+// bound to fileID itself is not stale.
+func dropStaleTrackIdentityV3(ctx context.Context, kind string, fileID int, trackID string) bool {
+	if !playback.StaleTrackIdentityV3(kind, fileID, trackID) {
 		return false
 	}
-	fileID, kind, _, ok := playback.ParseTrackIDV3(trackID)
-	if !ok || kind != "audio" || fileID == file.ID {
-		return false
-	}
-	slog.WarnContext(ctx, "stale audio track identity; discarding selection",
+	slog.WarnContext(ctx, "stale track identity; discarding selection",
 		"component", "playback",
+		"kind", kind,
 		"sent_track_id", trackID,
-		"current_file_id", file.ID)
+		"current_file_id", fileID)
 	return true
+}
+
+// dropStaleAudioTrackIdentityV3 reports whether the request's audio track ID
+// embeds a file identity that no longer matches file. Callers drop the
+// selection and fall back to the preferred-track pipeline instead.
+func dropStaleAudioTrackIdentityV3(ctx context.Context, file *models.MediaFile, trackID string) bool {
+	if file == nil {
+		return false
+	}
+	return dropStaleTrackIdentityV3(ctx, "audio", file.ID, trackID)
+}
+
+// dropStaleRequestTrackIdentitiesV3 drops the start request's selected audio
+// and subtitle identities when they name a file other than the requested file,
+// logging each discard. It runs before structural validation so a rotated-out
+// selection degrades instead of failing the start.
+func dropStaleRequestTrackIdentitiesV3(ctx context.Context, req *playback.StartRequestV3) {
+	if req == nil {
+		return
+	}
+	if dropStaleTrackIdentityV3(ctx, "audio", req.FileID, req.AudioTrackID) {
+		req.AudioTrackID = ""
+		req.AudioTrackIndex = nil
+	}
+	if dropStaleTrackIdentityV3(ctx, "subtitle", req.FileID, req.SubtitleTrackID) {
+		req.SubtitleTrackID = ""
+		req.SubtitleTrackIndex = nil
+	}
 }
 
 func resolveV3AudioIndex(file *models.MediaFile, trackID string, fallback *int) (int, error) {

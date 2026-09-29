@@ -223,6 +223,25 @@ func (f *failingCompletePlanStoreV3) CompleteReplan(context.Context, string, str
 	return fmt.Errorf("injected complete replan failure")
 }
 
+// staleFirstGetAttemptPlanStoreV3 models the fast-404 race window: the first
+// GetAttempt (taken before the replan locks) returns a snapshot from before a
+// concurrent replan completed, while every later read (the post-lock re-read)
+// observes the durable store.
+type staleFirstGetAttemptPlanStoreV3 struct {
+	playback.PlanStoreV3
+	stale     playback.AttemptRecordV3
+	firstRead bool
+}
+
+func (s *staleFirstGetAttemptPlanStoreV3) GetAttempt(ctx context.Context, sessionID string) (*playback.AttemptRecordV3, error) {
+	if !s.firstRead {
+		s.firstRead = true
+		stale := s.stale
+		return &stale, nil
+	}
+	return s.PlanStoreV3.GetAttempt(ctx, sessionID)
+}
+
 func TestShouldTryAlternateFileV3PinsOriginalQuality(t *testing.T) {
 	if shouldTryAlternateFileV3("original") || shouldTryAlternateFileV3(" ORIGINAL ") {
 		t.Fatal("original quality must pin the requested media file")
@@ -1723,6 +1742,93 @@ func TestHandleReplanPlaybackV3UpdatesSelectedAudioAndReplaysIdempotently(t *tes
 	handler.HandleReplanPlaybackV3(conflictRR, conflictReq)
 	if conflictRR.Code != http.StatusConflict || !strings.Contains(conflictRR.Body.String(), "idempotency_key_reused") {
 		t.Fatalf("conflict status = %d, body = %s", conflictRR.Code, conflictRR.Body.String())
+	}
+}
+
+// A duplicate replan that waited behind a completing sibling must replay the
+// stored decision. The fast 404 loads the attempt before queueing on the replan
+// locks, so its snapshot can predate the sibling's commit; the handler must
+// re-read the attempt under the locks and validate BeginReplan's completed lease
+// against that fresh record instead of rejecting it as stale_playback_plan.
+func TestHandleReplanPlaybackV3ReplaysCompletedLeaseFromPostLockRecord(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = append(file.AudioTracks, models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", Language: "spa"})
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.JWTSecret = "test-secret"
+	stubCopySeekAnchorV3(handler)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	startRequest := v3HandlerStartRequest()
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{Enabled: true, SupportedOnDevice: true}
+	startRequest.ClientFeatures = append(startRequest.ClientFeatures, playback.FeatureClientVideoTransforms)
+	delivery := startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	delivery.Transformations = []playback.TransformationV3{{Name: playback.ClientDV7ToDV81V3, Executor: playback.ExecutorClientV3, RecipeVersion: playback.ClientDVTransformVersionV3}}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = delivery
+	startBody := marshalV3StartRequest(t, startRequest)
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(startBody)).WithContext(newAuthorizedPlaybackContext()))
+	if startRR.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, body = %s", startRR.Code, startRR.Body.String())
+	}
+	var started playback.DecisionResponseV3
+	if err := json.Unmarshal(startRR.Body.Bytes(), &started); err != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start response: err=%v response=%#v", err, started)
+	}
+	// Snapshot the attempt as it stood before the replan: this is what the
+	// fast-404 read hands a duplicate that raced the sibling's commit.
+	store := handler.PlanStoreV3
+	preReplan, err := store.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audioIndex := 1
+	bandwidthEstimate := 3_500
+	bandwidthCap := 4_000
+	failedKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replan := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "completed-lease-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-completed-0001",
+		PlanAttemptKey:        failedKey,
+		AttemptedPlanKeys:     []string{failedKey},
+		AttemptCount:          1,
+		QualityPreference:     "original",
+		PositionSeconds:       12,
+		Metered:               true,
+		BandwidthEstimateKbps: &bandwidthEstimate,
+		BandwidthCapKbps:      &bandwidthCap,
+		SelectedTracks:        playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: playback.TrackIDV3(file.ID, "audio", audioIndex), Index: &audioIndex}},
+		Failure:               playback.FailureV3{Classification: "audio_renderer_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	first := postPlaybackReplanV3(t, handler, started.SessionID, replan)
+	if first.PlaybackPlan == nil {
+		t.Fatalf("first replan response = %#v", first)
+	}
+	// Install a store whose first read is the pre-replan snapshot. The duplicate
+	// request must re-read under the lock and replay the completed decision.
+	handler.PlanStoreV3 = &staleFirstGetAttemptPlanStoreV3{PlanStoreV3: store, stale: *preReplan}
+	body, err := json.Marshal(replan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/"+started.SessionID+"/replan", strings.NewReader(string(body))).WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", started.SessionID)
+	rr := httptest.NewRecorder()
+	handler.HandleReplanPlaybackV3(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("duplicate replan status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var replayed playback.DecisionResponseV3
+	if err := json.Unmarshal(rr.Body.Bytes(), &replayed); err != nil {
+		t.Fatal(err)
+	}
+	if replayed.PlaybackPlan == nil || replayed.PlaybackPlan.PlanID != first.PlaybackPlan.PlanID {
+		t.Fatalf("duplicate replan = %#v, want replay of plan %q", replayed, first.PlaybackPlan.PlanID)
 	}
 }
 

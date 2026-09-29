@@ -100,6 +100,66 @@ func TestStartRequestV3Validation(t *testing.T) {
 	}
 }
 
+// A selected identity can name the effective file of an earlier attempt, which
+// virtual candidate rotation replaces. Such a rotated-out identity is stale,
+// not malformed: it must be dropped before the file-bound id/index check so the
+// start degrades to the default track pipeline. A same-file id/index
+// disagreement is not stale and must still be rejected.
+func TestStartRequestV3DropsRotatedOutSelectedTrackIdentities(t *testing.T) {
+	index := 0
+	req := validStartRequestV3()
+	req.AudioTrackID = TrackIDV3(req.FileID+9999, "audio", index)
+	req.AudioTrackIndex = &index
+	req.SubtitleTrackID = TrackIDV3(req.FileID+9999, "subtitle", index)
+	req.SubtitleTrackIndex = &index
+
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("rotated-out track identity rejected instead of degrading: %v", err)
+	}
+	if req.AudioTrackID != "" || req.AudioTrackIndex != nil {
+		t.Fatalf("stale audio identity not dropped: id=%q index=%v", req.AudioTrackID, req.AudioTrackIndex)
+	}
+	if req.SubtitleTrackID != "" || req.SubtitleTrackIndex != nil {
+		t.Fatalf("stale subtitle identity not dropped: id=%q index=%v", req.SubtitleTrackID, req.SubtitleTrackIndex)
+	}
+
+	req = validStartRequestV3()
+	req.AudioTrackIndex = &index
+	req.AudioTrackID = TrackIDV3(req.FileID, "audio", index+1)
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("same-file mismatched audio id/index accepted")
+	}
+
+	req = validStartRequestV3()
+	req.SubtitleTrackIndex = &index
+	req.SubtitleTrackID = TrackIDV3(req.FileID, "subtitle", index+1)
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("same-file mismatched subtitle id/index accepted")
+	}
+}
+
+func TestDropStaleSelectedTrackIdentitiesV3(t *testing.T) {
+	req := validStartRequestV3()
+	req.AudioTrackID = TrackIDV3(req.FileID, "audio", 0)
+	req.SubtitleTrackID = TrackIDV3(req.FileID, "subtitle", 0)
+	if droppedAudio, droppedSubtitle := req.DropStaleSelectedTrackIdentitiesV3(); droppedAudio || droppedSubtitle {
+		t.Fatalf("matching identities reported stale: audio=%v subtitle=%v", droppedAudio, droppedSubtitle)
+	}
+
+	req = validStartRequestV3()
+	index := 0
+	req.AudioTrackID = TrackIDV3(req.FileID+1, "audio", index)
+	req.AudioTrackIndex = &index
+	req.SubtitleTrackID = TrackIDV3(req.FileID+1, "subtitle", index)
+	req.SubtitleTrackIndex = &index
+	if droppedAudio, droppedSubtitle := req.DropStaleSelectedTrackIdentitiesV3(); !droppedAudio || !droppedSubtitle {
+		t.Fatalf("rotated-out identities not reported stale: audio=%v subtitle=%v", droppedAudio, droppedSubtitle)
+	}
+	if req.AudioTrackID != "" || req.AudioTrackIndex != nil || req.SubtitleTrackID != "" || req.SubtitleTrackIndex != nil {
+		t.Fatalf("stale identities not cleared: %#v", req)
+	}
+}
+
 // An un-negotiated client transformation is unavailable for this session, not
 // a malformed request: strip it and warn instead of refusing the whole
 // delivery. Server transformations and the delivery's own flags are untouched.

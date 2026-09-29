@@ -6,6 +6,7 @@ import { hasSequencedProgress, stopSequencedSession } from "../session-mutations
 import {
   describePlanTerminal,
   describePlaybackTransportError,
+  isDeadPlaybackSessionError,
   type PlaybackPolicyErrorDescription,
 } from "../playback-errors";
 import { useCodecDetection } from "./useCodecDetection";
@@ -564,6 +565,13 @@ export function usePlaybackSession(
     carriedAudioTrackId: string | null;
   } | null>(null);
   const retryingRef = useRef(false);
+  // The dead session whose refused replan has already triggered one fresh
+  // start. A reaped session gets exactly one rebuild; the replacement start is
+  // a `start`, not a replan, so it cannot recursively trigger another. The key
+  // is the session id: recovering the replacement is a different id and is
+  // allowed, while a replan still refused for the session already rebuilt
+  // surfaces the error instead of starting again.
+  const recoveredDeadSessionRef = useRef<string | null>(null);
 
   // v3 identity. `playback_attempt_id` spans one whole attempt chain (a start
   // and every replan that follows it); `plan_attempt_id` identifies the single
@@ -734,6 +742,15 @@ export function usePlaybackSession(
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
       sessionIdRef.current = sessionId ?? null;
+      // A live plan means the dead session that forced a rebuild is behind us;
+      // a replacement that landed on a new id clears the one-recovery guard so
+      // that session can recover once in its turn.
+      if (
+        recoveredDeadSessionRef.current !== null &&
+        recoveredDeadSessionRef.current !== sessionId
+      ) {
+        recoveredDeadSessionRef.current = null;
+      }
       planRevisionRef.current += 1;
       // A failure recovery always prepares a fresh server generation, even when
       // the replacement plan reuses the same session-scoped URL and transport
@@ -937,7 +954,11 @@ export function usePlaybackSession(
     }) => {
       const previousState = stateRef.current;
       const previousSessionId = sessionIdRef.current;
-      const hasExistingSession = !!previousState.sessionId && !!previousState.streamUrl;
+      // The session id comes from the ref, not the (possibly stale) state
+      // snapshot: a recovery that retires a dead session before starting its
+      // replacement nulls the ref in the same tick, and the replacement must be
+      // treated as a fresh start rather than a replacement of the dead plan.
+      const hasExistingSession = !!previousSessionId && !!previousState.streamUrl;
       const loadSequence = ++loadSequenceRef.current;
       const previousAttempt = {
         playbackAttemptId: playbackAttemptIdRef.current,
@@ -1421,7 +1442,48 @@ export function usePlaybackSession(
         return adopted;
       } catch (err) {
         if (loadSequence !== loadSequenceRef.current) return false;
-        if (retireSessionOnRefusal) {
+        // A reaped or ended session cannot be replanned, and every retry against
+        // it answers the same way. Retire it and rebuild once from the position
+        // and selections the dead plan held, so the viewer keeps watching
+        // instead of being pinned to a session that no longer exists.
+        const deadSession = isDeadPlaybackSessionError(err);
+        if (deadSession && recoveredDeadSessionRef.current !== sessionId) {
+          recoveredDeadSessionRef.current = sessionId;
+          const restartPosition = playbackPositionRef.current;
+          // Clear the dead plan/session first: the replacement start must not
+          // race a replan built against the session that just died, and the
+          // player must stop driving its stream URL.
+          retireActiveSession(sessionId);
+          void loadSession({
+            preferredFileId: plan.requested_media_file_id,
+            position: restartPosition,
+            // The viewer was mid-playback; resume where the dead session left
+            // off rather than at the server's stored resume point.
+            forceStartPosition: true,
+            allowPreserveExistingSessionOnError: false,
+            replacementErrorMessage: "Failed to restart playback",
+            initialErrorMessage: "Failed to restart playback",
+            carriedAudioTrackId: plan.selected_tracks.audio?.id ?? null,
+            carriedSubtitleTrackIndex: plan.selected_tracks.subtitle?.index ?? null,
+            // Preserve the viewer's version choice; the server must not
+            // silently substitute another edition behind a rebuild. Use the
+            // most recent start's selection (a version switch starts explicit)
+            // and fall back to the mount-time prop only if no start recorded
+            // one.
+            fileSelection:
+              retryTargetRef.current?.fileSelection ??
+              (explicitFileSelection ? "explicit" : "auto"),
+            intentAt: null,
+          });
+          return false;
+        }
+        if (deadSession) {
+          // Already rebuilt once for this session. Retire the plan it left
+          // behind and fall through to surface the copy rather than starting
+          // again in a loop.
+          retireActiveSession(sessionId);
+        }
+        if (retireSessionOnRefusal && !deadSession) {
           console.error("Failed to refresh playback output", err);
           return false;
         }
@@ -1491,6 +1553,8 @@ export function usePlaybackSession(
       clientPlaybackContext,
       config,
       endAdoption,
+      explicitFileSelection,
+      loadSession,
       maxBitrateKbps,
       retireActiveSession,
     ],
