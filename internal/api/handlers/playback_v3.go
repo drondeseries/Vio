@@ -5980,6 +5980,16 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		}
 		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
 	}
+	// The durable attempt can outlive the in-memory session: a stop or an idle
+	// reap can land while this request waits on the replan slot and the
+	// per-session locks, between the pre-lock check and here. Re-check now so it
+	// reads as the fast 404; otherwise the request would reserve a replan lease
+	// and persist executeReplanV3's session_expired as a terminal 200, which the
+	// web client does not rebuild from. CompleteReplan stays the final
+	// compare-and-swap.
+	if _, err := h.sessionMgr.GetSession(sessionID); err != nil {
+		return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
+	}
 	digestBytes := sha256.Sum256(body)
 	digest := hex.EncodeToString(digestBytes[:])
 	lease, err := h.PlanStoreV3.BeginReplan(

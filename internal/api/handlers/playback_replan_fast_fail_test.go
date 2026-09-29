@@ -85,3 +85,122 @@ func TestHandleReplanPlaybackV3DeadSessionFailsFastWithoutReplanSlot(t *testing.
 	default:
 	}
 }
+
+// reapingAfterFirstGetAttemptPlanStoreV3 models a stop landing while a replan
+// request waits on the replan slot and the per-session locks: the pre-lock read
+// sees the session live, and the post-lock re-read reaps it from the in-memory
+// manager before the handler can reserve a replan lease. It counts the lease
+// mutations so a test can prove none happened.
+type reapingAfterFirstGetAttemptPlanStoreV3 struct {
+	playback.PlanStoreV3
+	reap                func()
+	reads               int
+	beginReplanCalls    int
+	completeReplanCalls int
+}
+
+func (s *reapingAfterFirstGetAttemptPlanStoreV3) GetAttempt(ctx context.Context, sessionID string) (*playback.AttemptRecordV3, error) {
+	record, err := s.PlanStoreV3.GetAttempt(ctx, sessionID)
+	s.reads++
+	if s.reads == 2 && s.reap != nil {
+		s.reap()
+	}
+	return record, err
+}
+
+func (s *reapingAfterFirstGetAttemptPlanStoreV3) BeginReplan(ctx context.Context, sessionID, replanRequestID, digest, baseReplanRequestID string, expiresAt time.Time) (playback.ReplanLeaseV3, error) {
+	s.beginReplanCalls++
+	return s.PlanStoreV3.BeginReplan(ctx, sessionID, replanRequestID, digest, baseReplanRequestID, expiresAt)
+}
+
+func (s *reapingAfterFirstGetAttemptPlanStoreV3) CompleteReplan(ctx context.Context, sessionID, requestID, leaseToken, baseReplanRequestID string, response json.RawMessage, record playback.AttemptRecordV3) error {
+	s.completeReplanCalls++
+	return s.PlanStoreV3.CompleteReplan(ctx, sessionID, requestID, leaseToken, baseReplanRequestID, response, record)
+}
+
+// A session reaped while the replan request waited for the locks must still
+// read as the fast 404 after the post-lock attempt re-read. Without the
+// post-lock live-session check the handler reserved a replan lease and
+// persisted executeReplanV3's session_expired as a terminal 200, which the web
+// client does not rebuild from.
+func TestHandleReplanPlaybackV3ReapedDuringLockWaitReturns404WithoutLease(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	file := v3HandlerFixtureFile(t)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+
+	live, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	sessionID := live.ID
+	const attemptID = "attempt-reaped-lock-wait-0001"
+	const failedPlanID = "plan-failed-0001"
+
+	// The durable attempt outlives the in-memory session, so only the
+	// live-session check can produce the 404. CurrentPlanID matches the replan's
+	// failed plan so, without that check, the request reaches executeReplanV3
+	// and persists its session_expired terminal as an HTTP 200.
+	if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+		SessionID:            sessionID,
+		PlaybackAttemptID:    attemptID,
+		UserID:               1,
+		ProfileID:            "profile-1",
+		CurrentPlanID:        failedPlanID,
+		RequestedMediaFileID: file.ID,
+		EffectiveMediaFileID: file.ID,
+		ExpiresAt:            time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("save attempt: %v", err)
+	}
+
+	// Reap the session on the post-lock attempt re-read, reproducing a stop
+	// that landed while this request queued behind the replan locks.
+	store := &reapingAfterFirstGetAttemptPlanStoreV3{
+		PlanStoreV3: handler.PlanStoreV3,
+		reap: func() {
+			if stopErr := manager.StopSession(sessionID); stopErr != nil {
+				t.Errorf("stop session: %v", stopErr)
+			}
+		},
+	}
+	handler.PlanStoreV3 = store
+
+	base := v3HandlerStartRequest()
+	replan := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     attemptID,
+		ReplanRequestID:       "replan-reaped-lock-wait-0001",
+		FailedPlanID:          failedPlanID,
+		PlanAttemptID:         "plan-attempt-0001",
+		PlanAttemptKey:        "v3:plan-attempt-key-0001",
+		AttemptCount:          1,
+		PositionSeconds:       1,
+		Failure:               playback.FailureV3{Classification: "transcode_start_failed"},
+		Capabilities:          base.Capabilities,
+		ClientPlaybackContext: base.ClientPlaybackContext,
+	}
+	body, err := json.Marshal(replan)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/"+sessionID+"/replan", strings.NewReader(string(body))).WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", sessionID)
+	rr := httptest.NewRecorder()
+
+	handler.HandleReplanPlaybackV3(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body = %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), playbackSessionNotFoundErrorCode) {
+		t.Fatalf("body = %s, want %s", rr.Body.String(), playbackSessionNotFoundErrorCode)
+	}
+	if store.beginReplanCalls != 0 {
+		t.Fatalf("BeginReplan called %d times, want 0: a reaped session must not reserve a replan lease", store.beginReplanCalls)
+	}
+	if store.completeReplanCalls != 0 {
+		t.Fatalf("CompleteReplan called %d times, want 0: a reaped session must not persist a terminal response", store.completeReplanCalls)
+	}
+}
