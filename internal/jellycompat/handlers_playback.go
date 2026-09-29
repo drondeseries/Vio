@@ -1970,9 +1970,11 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	// token of their own, so without a persisted recipe a node or central restart
 	// cannot rebuild ffmpeg and segment serves 404.
 	opts := playback.TranscodeOpts{
-		SessionID:                        upstreamSessionID,
-		InputPath:                        reqBody.InputPath,
-		CanonicalInputPath:               file.FilePath,
+		SessionID:          upstreamSessionID,
+		InputPath:          reqBody.InputPath,
+		CanonicalInputPath: file.FilePath,
+		// Keep the provider-neutral virtual source identity on the stored
+		// recipe so a node/central restart resolves the same release.
 		VirtualSourceOwnerInstallationID: source.VirtualSourceOwnerInstallationID,
 		SourceVideoCodec:                 reqBody.SourceVideoCodec,
 		SourceVideoProfile:               reqBody.SourceVideoProfile,
@@ -2000,6 +2002,9 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		// Record the decode path the node executed so a reconstruct keeps
 		// it; an older node omits the field.
 		SoftwareVideoDecode: reqBody.SoftwareVideoDecode || nodeResponse.SoftwareVideoDecode,
+	}
+	if isCompatVirtualSource(source) {
+		opts.CanonicalInputPath = source.VirtualSourceURI
 	}
 	toneMapRecipe.apply(&opts)
 	opts.HWAccel = strings.TrimSpace(nodeResponse.HWAccel)
@@ -2305,12 +2310,12 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		if req.MediaSourceID != "" && !mediaSourceIDsEqual(sourceID, req.MediaSourceID) {
 			continue
 		}
-		// Build the candidate source first so DV-strip evaluation runs against
-		// the fully negotiated (codec/container) route; virtual preparation
-		// then rebinds the same route to the resolved provider candidate.
-		source := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode, allowHEVCEncoding)
-		source = h.applyCompatDVStrip(r.Context(), routeItemID, playSessionID, source, profile, req, allow4KTranscode)
-
+		// The strip verdict belongs to this version's own route: evaluate it
+		// on the source this version negotiates, before any rebind. A later
+		// virtual preparation only rebinds a source the strip already
+		// evaluated, and re-running the strip on the rebound source would
+		// discard the verdict (the prepared version no longer matches the
+		// strip's HDR10-base conditions).
 		prepared := version
 		virtualURI := ""
 		virtualOwnerID := 0
@@ -2328,7 +2333,8 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 				continue
 			}
 		}
-		source = h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, prepared, profile, req, allow4KTranscode, virtualURI, virtualOwnerID)
+		source := h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, prepared, profile, req, allow4KTranscode, virtualURI, virtualOwnerID, allowHEVCEncoding)
+		source = h.applyCompatDVStrip(r.Context(), routeItemID, playSessionID, source, profile, req, allow4KTranscode)
 		// Resolve the client's subtitle selection against both the
 		// embedded/external tracks and any downloaded subtitles before
 		// advertising the streams, so the chosen subtitle is marked default and
