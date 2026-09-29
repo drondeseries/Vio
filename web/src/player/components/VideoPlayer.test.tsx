@@ -4066,6 +4066,38 @@ describe("VideoPlayer bounded pending seek", () => {
     });
     expect(seekControls().currentTime).toBe(150);
   });
+
+  it("restarts the hold bound when the viewer re-seeks to the same target", async () => {
+    const video = renderPendingSeek(10);
+    fireFrameTimeUpdate(video);
+    await act(async () => {});
+    expect(seekControls().currentTime).toBe(10);
+
+    act(() => seekControls().onSeek(150));
+    expect(seekControls().currentTime).toBe(150);
+
+    // The first attempt's window nearly elapses without the element reaching
+    // the target.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS - 1000);
+    });
+    expect(seekControls().currentTime).toBe(150);
+
+    // A second seek to the same target is a fresh attempt. It must get its own
+    // full window rather than inherit the first timer about to fire.
+    act(() => seekControls().onSeek(150));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000 + PENDING_SEEK_HOLD_TIMEOUT_MS / 2);
+    });
+    expect(seekControls().currentTime).toBe(150);
+
+    // Once the new bound elapses, the still-declined seek rolls back.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PENDING_SEEK_HOLD_TIMEOUT_MS);
+    });
+    expect(seekControls().currentTime).toBe(10);
+  });
 });
 
 describe("VideoPlayer version switch UX", () => {

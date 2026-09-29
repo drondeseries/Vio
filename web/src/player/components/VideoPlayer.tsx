@@ -526,6 +526,10 @@ export function VideoPlayer({
   const [pendingSeekTime, setPendingSeekTime] = useState<number | null>(null);
   const [pendingSeekNonce, setPendingSeekNonce] = useState<number | null>(null);
   const pendingSeekNonceRef = useRef(0);
+  // Counts every recorded seek attempt, including a repeated target. The hold
+  // timeout keys off it so a re-seek to the same position starts a fresh bound
+  // instead of inheriting the previous attempt's nearly-expired timer.
+  const [pendingSeekAttempt, setPendingSeekAttempt] = useState(0);
   // Mirror for synchronous readers (relative skips): a seek whose target the
   // element has not reached yet — including a reanchor still being replanned —
   // is the position playback is heading to, so the next skip starts there.
@@ -1120,7 +1124,7 @@ export function VideoPlayer({
       rollbackPendingSeek();
     }, PENDING_SEEK_HOLD_TIMEOUT_MS);
     return () => clearTimeout(timer);
-  }, [pendingSeekTime, replanning, rollbackPendingSeek]);
+  }, [pendingSeekAttempt, pendingSeekTime, replanning, rollbackPendingSeek]);
 
   // Firefox stalls on codec-copy remuxes it nominally accepts. Both fallbacks
   // report an honest classification and let the server pick the next route —
@@ -1226,6 +1230,9 @@ export function VideoPlayer({
   const rememberPendingSeek = useCallback((seconds: number) => {
     pendingSeekTimeRef.current = seconds;
     setPendingSeekTime(seconds);
+    // A repeated target does not change `pendingSeekTime`, so bump a generation
+    // the hold-timeout effect depends on: every attempt gets its own bound.
+    setPendingSeekAttempt((attempt) => attempt + 1);
   }, []);
 
   // A refused reanchor never reaches its target. Resume relative skips from
