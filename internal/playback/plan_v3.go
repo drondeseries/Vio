@@ -1131,7 +1131,13 @@ func selectTargetVideoCodecForV3(input PlannerInputV3, registry *TransformationR
 	for _, candidate := range preferences {
 		// H.264 is the universal floor: it never needs the client to declare
 		// hardware decode. HEVC and AV1 are upgrades gated on that claim.
+		// HEVC additionally needs the server opt-in on top of the client
+		// claim; the detailed output-capability check runs at plan time
+		// (see planVideoTranscodeV3), where the chosen quality is known.
 		if candidate.codec != TargetVideoCodecH264V3 && !containsFoldV3(declared, candidate.codec) {
+			continue
+		}
+		if candidate.codec == TargetVideoCodecHEVCV3 && !input.Settings.AllowHEVCEncoding {
 			continue
 		}
 		// AV1 has no validated software encoder in this pipeline; only take it
@@ -1214,6 +1220,14 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 	}
 	if !videoTranscodeOK {
 		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated video/AAC conversion toolchain is unavailable.", true)
+	}
+	// HEVC needs the server opt-in plus the detailed output-capability check:
+	// flat codec lists can describe source copy support without proving the
+	// fMP4 transcode decoder that will receive this recipe. Fall back to the
+	// H.264 floor when either fails.
+	if targetVideo.codec == TargetVideoCodecHEVCV3 &&
+		(!input.Settings.AllowHEVCEncoding || !hlsHEVCOutputSupportedV3(input.Request, quality, source)) {
+		targetVideo = targetVideoFloorV3
 	}
 	// A forced encode triggered by burn-in, HDR handling, or capability
 	// evidence must not inherit a source-preserving "original quality" bitrate:

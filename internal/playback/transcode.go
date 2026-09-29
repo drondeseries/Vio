@@ -1663,7 +1663,7 @@ func appendToneMapFilterArgs(args []string, opts TranscodeOpts) []string {
 		const download = ",hwdownload,format=nv12"
 		for i := start; i+1 < len(args); i++ {
 			switch args[i] {
-			case "-vf":
+			case "-vf": //nolint:goconst // FFmpeg flag stays inline with its -filter_complex twin below.
 				args[i+1] += download
 			case "-filter_complex":
 				args[i+1] = strings.TrimSuffix(args[i+1], "[vout]") + download + "[vout]"

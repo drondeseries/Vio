@@ -126,7 +126,7 @@ func creditsFingerprintKey() ArtifactKey {
 // lacked what they need, is analyzed again once they can run. It never
 // equals an intro analysis hash, so the two kinds keep separate season state.
 func CreditsAnalysisConfigHash(creditsTail bool) string {
-	tailHash := "none"
+	tailHash := "none" //nolint:goconst // Sentinel stays inline with its Sprintf use below.
 	if creditsTail {
 		tailHash = creditsTailKey().ConfigHash
 	}

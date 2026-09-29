@@ -453,9 +453,9 @@ type RunSummary struct {
 	SilenceRefinementErrors      int      `json:"silence_refinement_errors"`
 	EpisodeVersionMarkersCopied  int      `json:"episode_version_markers_copied"`
 	SilenceBackfillConsidered    int      `json:"silence_backfill_considered"`
-	DialogueRefinementsAttempted int      `json:"dialogue_refinements_attempted"`
-	DialogueRefinementsApplied   int      `json:"dialogue_refinements_applied"`
-	DialogueRefinementErrors     int      `json:"dialogue_refinement_errors"`
+	DialogueRefinementsAttempted int      `json:"dialogue_refinements_attempted"` //nolint:misspell // JSON key matches the persisted chromaprint:dialogue identifier.
+	DialogueRefinementsApplied   int      `json:"dialogue_refinements_applied"`   //nolint:misspell // JSON key matches the persisted chromaprint:dialogue identifier.
+	DialogueRefinementErrors     int      `json:"dialogue_refinement_errors"`     //nolint:misspell // JSON key matches the persisted chromaprint:dialogue identifier.
 	// Credits counters. Credits season groups and tail fingerprints are
 	// counted apart from the intro groups and fingerprints above.
 	CreditsSeasonGroupsConsidered int `json:"credits_season_groups_considered"`

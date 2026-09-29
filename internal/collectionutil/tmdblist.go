@@ -37,7 +37,7 @@ func ParseTMDBListURL(raw string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%w: %w", ErrTMDBListURL, err)
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+	if parsed.Scheme != "http" && parsed.Scheme != "https" { //nolint:goconst // Scheme literals stay inline with the mdblist.go twin check.
 		return 0, ErrTMDBListURL
 	}
 	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")

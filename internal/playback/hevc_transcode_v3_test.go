@@ -203,6 +203,7 @@ func hevcTranscodePlannerInputV3(allowHEVC, hlsHEVC, hevcAvailable bool) Planner
 	}
 	request := validStartRequestV3()
 	request.Capabilities.CodecsVideo = []string{"hevc"}
+	request.Capabilities.CodecsVideoHardware = []string{"hevc"}
 	request.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"Main"}, BitDepths: []int{8}, MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 10_000, Hardware: true}}
 	hls := request.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3]
 	hls.Containers = []string{"hls"}

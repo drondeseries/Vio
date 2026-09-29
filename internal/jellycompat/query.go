@@ -703,11 +703,11 @@ func sortKey(raw string) (string, bool) {
 func mapSortOrder(raw string, explicitSort bool) string {
 	switch raw = strings.TrimSpace(raw); {
 	case strings.EqualFold(raw, "Ascending"):
-		return "asc"
+		return "asc" //nolint:goconst // Sort direction stays inline with its Descending branch.
 	case strings.EqualFold(raw, "Descending"):
 		return catalog.BrowseOrderDescending
 	case explicitSort:
-		return "asc"
+		return "asc" //nolint:goconst // Sort direction stays inline with its Descending branch.
 	default:
 		return catalog.BrowseOrderDescending
 	}

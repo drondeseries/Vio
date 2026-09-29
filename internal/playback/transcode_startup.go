@@ -88,10 +88,10 @@ func StartReadyTranscode(ctx context.Context, pipeline *AutoTranscodePipeline, s
 func StartReconstructTranscode(ctx context.Context, pipeline *AutoTranscodePipeline, startup TranscodeStartup) (*TranscodeSession, error) {
 	if !pipeline.Enabled() {
 		if _, retryable := legacyStartupRetry(startup.LegacyRetry, pipeline.Current(), ""); !retryable {
-			return startup.start(ctx, pipeline.Current())
+			return startup.start(context.WithoutCancel(ctx), pipeline.Current())
 		}
 	}
-	return runTranscodeStartup(ctx, pipeline, startup, true)
+	return runTranscodeStartup(context.WithoutCancel(ctx), pipeline, startup, true)
 }
 
 func (startup TranscodeStartup) start(ctx context.Context, opts TranscodeOpts) (*TranscodeSession, error) {
@@ -115,17 +115,15 @@ func runTranscodeStartup(ctx context.Context, pipeline *AutoTranscodePipeline, s
 	// session lifecycle lock for the whole wait and discards the transport once
 	// its request is gone, so waiting on only delays the client's retry. A
 	// reconstruct serves every segment request waiting on it, so it outlives
-	// the one that triggered it — but the overall startup budget still bounds
-	// it, so a fallback chain cannot outlive the caller's request budget.
+	// the one that triggered it — unless an overall startup budget bounds it,
+	// so a fallback chain cannot outlive the caller's request budget.
 	// Derived from the caller's ctx, so an explicit cancel still propagates.
 	waitCtx := ctx
 	if startup.Budget > 0 {
 		budgetCtx, cancel := context.WithTimeout(ctx, startup.Budget)
 		defer cancel()
 		ctx = budgetCtx
-		if reconstruct {
-			waitCtx = context.WithoutCancel(budgetCtx)
-		}
+		waitCtx = budgetCtx
 	} else if reconstruct {
 		waitCtx = context.WithoutCancel(ctx)
 	}
@@ -158,16 +156,20 @@ func runTranscodeStartup(ctx context.Context, pipeline *AutoTranscodePipeline, s
 			_ = session.Close()
 			return nil, err
 		}
-		if waitCtx.Err() != nil {
-			// The requester left (fresh start) or the budget ended (either
-			// path). Either way this says nothing about the device, so the
+		if ctx.Err() != nil {
+			// The overall budget ended during this attempt's wait (or the
+			// caller went away on a fresh start, where waitCtx is ctx).
+			// Either way this says nothing about the device, so the
 			// pipeline neither advances nor remembers a result. Report the
-			// wait cause so callers classify it as the request deadline, not
-			// as this attempt's unrelated per-attempt timeout.
+			// budget/request cause so callers classify it as the request
+			// deadline, not as this attempt's unrelated per-attempt timeout.
+			// (A reconstruct whose shared lifetime outlives its trigger
+			// reports the per-attempt wait error below instead: the budget
+			// did not end, the trigger just left while others may wait.)
 			wasRunning := session.IsRunning()
 			failedDevice := session.Opts().HWDevice
 			_ = session.Close()
-			return nil, &TranscodeStartupError{Err: waitCtx.Err(), WasRunning: wasRunning, FailedDevice: failedDevice}
+			return nil, &TranscodeStartupError{Err: ctx.Err(), WasRunning: wasRunning, FailedDevice: failedDevice}
 		}
 
 		wasRunning := session.IsRunning()

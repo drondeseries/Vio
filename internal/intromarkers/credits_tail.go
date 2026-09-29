@@ -40,7 +40,7 @@ const (
 // allIntraVideoCodecs make every frame a keyframe, so a keyframes-only pass
 // would decode the whole tail. Their files are mostly masters and captures.
 var allIntraVideoCodecs = map[string]struct{}{
-	"prores": {}, "mjpeg": {}, "dnxhd": {}, "ffv1": {}, "rawvideo": {}, "v210": {}, "utvideo": {}, "huffyuv": {},
+	"prores": {}, "mjpeg": {}, "dnxhd": {}, "ffv1": {}, "rawvideo": {}, "v210": {}, "utvideo": {}, "huffyuv": {}, //nolint:goconst // Codec names stay inline in the set literal.
 }
 
 // creditsTailParams are the parameters that shape a credits tail payload.

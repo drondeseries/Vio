@@ -25,7 +25,7 @@ func targetCodecInputV3(hardware []string, hwAccel string, deliveryVideo []strin
 	if deliveryVideo != nil {
 		request.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3] = DeliveryCapabilityV3{VideoCodecs: deliveryVideo}
 	}
-	return PlannerInputV3{Request: request, Settings: PlannerSettingsV3{HWAccel: hwAccel}}
+	return PlannerInputV3{Request: request, Settings: PlannerSettingsV3{HWAccel: hwAccel, AllowHEVCEncoding: true}}
 }
 
 // TestSelectTargetVideoCodecV3Matrix is the client-capability to encoder
@@ -109,8 +109,9 @@ func TestSelectTargetVideoCodecV3Matrix(t *testing.T) {
 }
 
 // TestBuildFFmpegArgs_TargetCodecSelectsQSVEncoderAndPackaging pins the
-// per-codec encoder and HLS packaging: H.264 and HEVC stay in MPEG-TS, AV1
-// uses av1_qsv and fragmented MP4 because MPEG-TS has no AV1 stream type.
+// per-codec encoder and HLS packaging: H.264 stays in MPEG-TS, HEVC and AV1
+// use fragmented MP4 (HEVC for the negotiated hvc1 MSE recipe, AV1 because
+// MPEG-TS has no AV1 stream type).
 func TestBuildFFmpegArgs_TargetCodecSelectsQSVEncoderAndPackaging(t *testing.T) {
 	tests := []struct {
 		codec      string
@@ -119,7 +120,7 @@ func TestBuildFFmpegArgs_TargetCodecSelectsQSVEncoderAndPackaging(t *testing.T) 
 		wantSuffix string
 	}{
 		{codec: transcodeCodecH264, wantCase: "-c:v h264_qsv", wantType: "mpegts", wantSuffix: "seg_%05d.ts"},
-		{codec: transcodeCodecHEVC, wantCase: "-c:v hevc_qsv", wantType: "mpegts", wantSuffix: "seg_%05d.ts"},
+		{codec: transcodeCodecHEVC, wantCase: "-c:v hevc_qsv", wantType: "fmp4", wantSuffix: "seg_%05d.m4s"},
 		{codec: transcodeCodecAV1, wantCase: "-c:v av1_qsv", wantType: "fmp4", wantSuffix: "seg_%05d.m4s"},
 	}
 	for _, tt := range tests {
