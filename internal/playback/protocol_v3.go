@@ -1238,6 +1238,13 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	if err != nil {
 		return nil, err
 	}
+	// A selected track identity can name the effective file of an earlier
+	// attempt, which virtual candidate rotation may have replaced. Drop such a
+	// stale identity before the file-bound id/index check so the start degrades
+	// to the default track pipeline instead of failing 400; the replan path
+	// re-keys the equivalent identity before its own validation. A same-file
+	// id/index disagreement is not stale and is still rejected below.
+	r.DropStaleSelectedTrackIdentitiesV3()
 	if err := validateTrackPairV3(r.FileID, "audio", r.AudioTrackID, r.AudioTrackIndex); err != nil {
 		return nil, err
 	}
@@ -1762,6 +1769,42 @@ func validateTrackPairV3(fileID int, kind, id string, index *int) error {
 		return fmt.Errorf("%s track id and index disagree", kind)
 	}
 	return nil
+}
+
+// StaleTrackIdentityV3 reports whether a well-formed selected track identity of
+// kind is bound to a media file other than fileID. Virtual candidate rotation
+// replaces the media_files row under a cached selection, so a client replaying
+// an earlier plan can carry an identity minted against a rotated-out effective
+// file; that identity is stale, not malformed. A malformed identity, an
+// identity of another kind, or one bound to fileID itself is not stale.
+func StaleTrackIdentityV3(kind string, fileID int, trackID string) bool {
+	if fileID <= 0 || trackID == "" {
+		return false
+	}
+	embeddedFileID, embeddedKind, _, ok := ParseTrackIDV3(trackID)
+	return ok && embeddedKind == kind && embeddedFileID != fileID
+}
+
+// DropStaleSelectedTrackIdentitiesV3 clears the request's selected audio and
+// subtitle identities when they name a file other than the requested file, and
+// reports which kinds it cleared. A rotated-out selection degrades to the
+// default track pipeline instead of failing the whole start; a same-file
+// id/index disagreement is not stale and is left for the pair check to reject.
+func (r *StartRequestV3) DropStaleSelectedTrackIdentitiesV3() (droppedAudio, droppedSubtitle bool) {
+	if r == nil {
+		return false, false
+	}
+	if StaleTrackIdentityV3("audio", r.FileID, r.AudioTrackID) {
+		r.AudioTrackID = ""
+		r.AudioTrackIndex = nil
+		droppedAudio = true
+	}
+	if StaleTrackIdentityV3("subtitle", r.FileID, r.SubtitleTrackID) {
+		r.SubtitleTrackID = ""
+		r.SubtitleTrackIndex = nil
+		droppedSubtitle = true
+	}
+	return droppedAudio, droppedSubtitle
 }
 
 func validateOptionalBoundedIntV3(v *int, min, max int, name string) error {
