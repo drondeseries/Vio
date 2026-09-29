@@ -24,6 +24,11 @@ type NextUpQuery struct {
 	EnableResumable  bool       // include in-progress episodes
 	EnableRewatching bool       // accepted but deferred (no-op)
 	DateCutoff       *time.Time // only series with activity after this date
+
+	// droppedSeriesIDs are the profile's actively dropped series, which a
+	// global lookup excludes. ListNextUp loads them; a series-scoped lookup
+	// never excludes its own series.
+	droppedSeriesIDs []string
 }
 
 // NextUpResult is one row from the next-up query.
@@ -137,6 +142,13 @@ func (r *NextUpRepository) ListNextUp(ctx context.Context, q NextUpQuery) ([]Nex
 	if !ok {
 		return nil, fmt.Errorf("next up: user store %T does not implement userstore.NextUpStateStore", store)
 	}
+	if q.SeriesID == "" {
+		dropped, err := activeDroppedSeriesIDs(ctx, r.pool, q.UserID, q.ProfileID)
+		if err != nil {
+			return nil, err
+		}
+		q.droppedSeriesIDs = dropped
+	}
 
 	var results []NextUpResult
 	var anchors map[string]nextUpAnchor
@@ -248,6 +260,23 @@ func (r *NextUpRepository) listNextUpGlobal(
 	}
 }
 
+// droppedSeriesSet builds the exclusion set for global lookups. Nil when the
+// query is series-scoped or no series are dropped: dropped series never become
+// anchors in a global lookup, so they neither surface nor consume the walk's
+// series budget, while series-scoped lookups keep their own series.
+func droppedSeriesSet(q NextUpQuery) map[string]struct{} {
+	if q.SeriesID != "" || len(q.droppedSeriesIDs) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(q.droppedSeriesIDs))
+	for _, id := range q.droppedSeriesIDs {
+		if id != "" {
+			set[id] = struct{}{}
+		}
+	}
+	return set
+}
+
 // accumulateNextUpAnchors folds one state page into the per-series anchor map.
 // Entries older than the date cutoff stop contributing anchors; the exact
 // resolver owns per-series in-progress and successor state from here.
@@ -267,6 +296,7 @@ func (r *NextUpRepository) accumulateNextUpAnchors(
 	}
 
 	cutoffReached := false
+	dropped := droppedSeriesSet(q)
 	for _, entry := range page.Entries {
 		if q.DateCutoff != nil && entry.UpdatedAt.Before(*q.DateCutoff) {
 			cutoffReached = true
@@ -276,6 +306,9 @@ func (r *NextUpRepository) accumulateNextUpAnchors(
 		}
 		meta, ok := resolved[entry.MediaItemID]
 		if !ok {
+			continue
+		}
+		if _, isDropped := dropped[meta.SeriesID]; isDropped {
 			continue
 		}
 		candidate := nextUpAnchor{nextUpEpisode: meta, UpdatedAt: entry.UpdatedAt}
@@ -858,8 +891,12 @@ func (r *NextUpRepository) listResumableEpisodes(
 	}
 
 	results := make([]NextUpResult, 0, len(seriesIDs))
+	dropped := droppedSeriesSet(q)
 	for _, seriesID := range seriesIDs {
 		if q.SeriesID != "" && seriesID != q.SeriesID {
+			continue
+		}
+		if _, isDropped := dropped[seriesID]; isDropped {
 			continue
 		}
 		if q.SeriesID == "" && completed[seriesID] {

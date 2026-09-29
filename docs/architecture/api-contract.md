@@ -176,8 +176,8 @@ The finite `/debug/pprof/` route set on `operational_debug` and `/metrics` on
 `operational_metrics` are explicitly outside native migration decisions and
 native release-scenario catalogs. They are validated by the profiling,
 metrics-listener, and route-inventory suites and documented in
-[the profiling runbook](../operations/profiling.md) and
-[the monitoring runbook](../operations/monitoring.md). Each exclusion matches
+[Observability](observability.md#profiling-and-resource-boundaries) and its
+[deployment section](observability.md#deployment-and-retention). Each exclusion matches
 its exact listener, methods, and paths; it cannot hide a profiling or metrics
 path on a native listener or an unexpected route on an operational listener.
 The root listener's own `/metrics` row, which answers 404 so a disabled metrics
@@ -335,7 +335,9 @@ The foundation is `internal/apiv2`. These facts about it are not derivable from 
   then the profile, acting-admin, or permission gate. A gate's denial is re-rendered as the
   matching Problem Details document by switching on the v1 body's machine-readable `error` and
   `reason`; the decision itself is the v1 gate's, and a locked profile keeps its own
-  `profile_verification_required` type so clients still know to ask for the PIN. A gate the
+  `profile_verification_required` type so clients still know to ask for the PIN, and a session
+  holding a temporary password keeps `password_change_required` so clients route to the
+  password change. A gate the
   wiring lacks makes its operations fail closed with `503 dependency_unavailable`; it never
   removes them from the route table. Handlers read claims, profile, and viewer scope from the
   request context and never from headers. Every authenticated class guarantees non-nil
@@ -1818,10 +1820,16 @@ management surface and keeps its existing behavior.
 ### History imports
 
 Seven v2 operations list sources, list/create/read import runs, create/check a Plex
-PIN and perform Emby Connect login. These are account operations with an optional
-profile header; creating a run separately verifies ownership of the target profile
-before source authentication. Run lists use signed `(created_at, id)` cursors scoped
-to the account. A 202 response identifies the persisted run and its polling location.
+PIN and perform Emby Connect login. Source discovery and external sign-in are account
+operations. Run creation, listing, and reads enforce the acting profile: a secondary
+profile acts only for itself, while an admin or the primary profile with any required
+PIN verification may act for its household. Non-admin creation requires an acting
+profile. Target account ownership is checked before source authentication. Run lists
+use signed `(created_at, id)` cursors scoped to the account and acting profile.
+The retained v1 run handlers enforce the same rule as a critical bridge fix, preserving
+their existing envelopes, success statuses, and 50-run list cap. See
+[Personal history import acceptance and monitoring](../admin-api.md#personal-history-import-acceptance-and-monitoring).
+A 202 response identifies the persisted run and its polling location.
 Execution is dispatched within the server process; persistence of run status is not
 a durable job-dispatch guarantee.
 
@@ -1863,7 +1871,9 @@ rating run counters exist only on v2, as do the `import_ratings` and `export_rat
 capability flags, which v2 projects through its own `WatchProviderCapabilities` type. The
 frozen v1 provider, connection, and run responses omit all of them, and a v1 settings
 update ignores the toggles. See
-[watch-provider-rating-sync.md](watch-provider-rating-sync.md) for the sync rules.
+[watch-provider-rating-sync.md](watch-provider-rating-sync.md) for the sync rules. The
+dropped-show setting (`sync_dropped_enabled`) and `sync_dropped` capability are v2-only in
+the same way; see [dropped-shows.md](dropped-shows.md).
 
 ### Webhook connection management
 
@@ -1932,7 +1942,11 @@ canonical representation: `GET /collections/{id}`, `GET /collections/groups/{id}
 `GET /collections/{id}/items/order`. Paths in this section have the `/api/v2` prefix.
 Each response supplies a strong ETag bound to the representation, account, profile, and access
 scope. Canonical collection editors omit the volatile presigned poster URL; display listings
-continue to provide artwork. Ordering writes use PUT, group and collection partial edits use
+continue to provide artwork. Personal collection detail responses include the viewer's live
+`item_count`, so their ETag also binds that count. A catalog or watch-state change that changes
+the count invalidates an earlier tag at precondition evaluation, even without a collection edit.
+The stored collection revision continues to guard concurrent definition edits in the write
+transaction. Ordering writes use PUT, group and collection partial edits use
 PATCH, and a successful delete returns 204 without an ETag. Storage compares the version and advances it in the transaction that applies the write. Missing preconditions return 428; stale
 preconditions return 412 with the current authorized validator. Clients must not automatically retry or implicitly
 replace the observed validator with a wildcard. Web editors retain the observed validator and preserve drafts

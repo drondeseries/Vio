@@ -338,7 +338,7 @@ func (e *transportErrorV3) Error() string {
 func (h *PlaybackHandler) transformationRegistryV3(ctx context.Context) *playback.TransformationRegistryV3 {
 	h.v3RegistryMu.Lock()
 	defer h.v3RegistryMu.Unlock()
-	if h.v3Registry != nil {
+	if !h.v3Registry.NeedsRefresh(time.Now()) {
 		return h.v3Registry
 	}
 	probe := playback.ProbeTransformationRegistryWithToneMapV3Result
@@ -4561,7 +4561,7 @@ func (h *PlaybackHandler) startReadyLocalPlaybackTransportV3(ctx context.Context
 		}
 		return nil, &localTransportStartupFailureV3{cause: err, failedToStart: true}
 	}
-	if _, err := ts.WaitForManifest(playback.ManifestStartupTimeout); err != nil {
+	if _, err := ts.WaitForManifestContext(ctx, playback.ManifestStartupTimeout); err != nil {
 		slog.InfoContext(ctx, "playback transport startup timing",
 			logComponentKey, playbackLogValueV3,
 			requestIDLogKeyV3, chimw.GetReqID(ctx),
@@ -4763,6 +4763,13 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 	} else {
 		ts, startupFailure = h.startReadyLocalPlaybackTransportV3(r.Context(), opts)
 	}
+	if startupFailure != nil && !startupFailure.failedToStart && r.Context().Err() != nil {
+		// The client left while FFmpeg worked toward its first manifest. A
+		// retry would run for nobody while holding the session lifecycle
+		// lock, and the failure says nothing about the device.
+		unlock()
+		return preparedTransportV3{}, manifestStartupTransportErrorV3(startupFailure.wasRunning, startupFailure.cause)
+	}
 	if startupFailure != nil && startupFailure.failedToStart {
 		if softwareOpts, eligible := h.softwareToneMapRetryOptsV3(r.Context(), opts, result.FrozenSourceMetadata != nil); eligible {
 			slog.WarnContext(r.Context(), "hardware tone-map failed to start; retrying once in software",
@@ -4892,7 +4899,7 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 	previousTransportID := remoteTransportID(session)
 	return preparedTransportV3{
 		url:              url,
-		hwAccel:          ts.Opts().HWAccel,
+		hwAccel:          ts.Opts().EffectiveEncoderHWAccel(),
 		toneMapMode:      ts.Opts().ToneMapMode,
 		routingWorkload:  routingWorkloadV3(result),
 		routingExecution: noderouting.ExecutionAPI,
@@ -5130,8 +5137,8 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		card.RoutingEgress = string(noderouting.EgressProxy)
 		card.RoutingEgressNodeID = nodePlan.ProxyNode.ID
 	}
-	confirmedHWAccel := card.HWAccel
-	// Fork: keep the provider-neutral virtual source identity on the stored
+	confirmedHWAccel := card.EffectiveEncoderHWAccel()
+	// Keep the provider-neutral virtual source identity on the stored
 	// recipe so a node/central restart resolves the same release.
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), "virtual://") {
 		card.InputPath = file.FilePath
@@ -5243,6 +5250,9 @@ func remoteTranscodeRecipeCardV3(session *playback.Session, file *models.MediaFi
 	hw := firstNonEmptyHandlerV3(strings.TrimSpace(nodeResp.HWAccel), strings.TrimSpace(req.HWAccel))
 	card := playback.NewRecipeCard(session.UserID, session.ProfileID, file.ID, nodeURL, playback.TranscodeOpts{InputPath: req.InputPath, SessionID: session.ID, TranscodeTransportID: transportID, SourceVideoCodec: req.SourceVideoCodec, SourceVideoProfile: req.SourceVideoProfile, SourceVideoBitDepth: req.SourceVideoBitDepth, SourceAudioChannels: req.SourceAudioChannels, SourceFrameRate: req.SourceFrameRate, SourceHeight: req.SourceHeight, SoftwareVideoDecode: req.SoftwareVideoDecode || nodeResp.SoftwareVideoDecode, ToneMapPolicy: req.ToneMapPolicy, ToneMapMode: req.ToneMapMode, ToneMapSourceKind: req.ToneMapSourceKind, ToneMapFilter: toneMapFilter, ToneMapRecipeVersion: req.ToneMapRecipeVersion, ToneMapPreflightRequired: req.ToneMapPreflightRequired, ToneMapSourceRevision: req.ToneMapSourceRevision, VideoBitstreamFilter: req.VideoBitstreamFilter, VideoSampleEntry: req.VideoSampleEntry, SeekSeconds: req.SeekSeconds, StreamOriginSeconds: req.StreamOriginSeconds, CopySeekAnchorResolved: req.CopySeekAnchorResolved, StartSegmentNumber: req.StartSegmentNumber, TargetResolution: req.TargetResolution, TargetCodecVideo: req.TargetCodecVideo, TargetCodecAudio: req.TargetCodecAudio, TargetAudioChannels: req.TargetAudioChannels, TargetAudioBitrateKbps: req.TargetAudioBitrateKbps, TargetBitrateKbps: req.TargetBitrateKbps, SegmentDuration: req.SegmentDuration, HWAccel: hw, AudioTrackIndex: req.AudioTrackIndex, SubtitleTrackIndex: req.SubtitleTrackIndex, SubtitleBurnIn: req.SubtitleBurnIn, SubtitleCodec: req.SubtitleCodec, TotalDuration: req.TotalDuration, ThrottleSeconds: req.ThrottleSeconds})
 	card.ToneMapDVConfigPresent = req.ToneMapDVConfigPresent
+	if encoderHWAccel := strings.TrimSpace(nodeResp.EncoderHWAccel); encoderHWAccel != "" {
+		card.EncoderHWAccel = encoderHWAccel
+	}
 	card.ToneMapDVBLCompatIDPresent = req.ToneMapDVBLCompatIDPresent
 	card.ToneMapDVBLPresent = req.ToneMapDVBLPresent
 	card.ToneMapDVRPUPresent = req.ToneMapDVRPUPresent
@@ -9029,17 +9039,21 @@ func (h *PlaybackHandler) plannerSettingsV3(ctx context.Context) playback.Planne
 
 // plannerSettingsV3Result reads the live settings used for an actual planning
 // decision. Callers must not persist a policy terminal when the store is down.
-func (h *PlaybackHandler) plannerSettingsV3Result(ctx context.Context) (playback.PlannerSettingsV3, error) {
+func (h *PlaybackHandler) plannerSettingsV3Result(ctx context.Context) (settings playback.PlannerSettingsV3, err error) {
 	cfg := h.playbackConfig()
-	settings := playback.PlannerSettingsV3{TranscodeEnabled: cfg.TranscodeEnabled, HWAccel: cfg.HWAccel}
+	settings.TranscodeEnabled = cfg.TranscodeEnabled
+	settings.HWAccel = cfg.HWAccel
+	viewerTranscodeDisabled := h.viewerTranscodeDisabledV3(ctx)
+	defer func() { settings.ViewerTranscodeDisabled = <-viewerTranscodeDisabled }()
 	if h.SettingsRepo != nil {
-		var values [4]string
-		var errs [4]error
+		var values [5]string
+		var errs [5]error
 		keys := [...]string{
 			config.Allow4KTranscodeSettingKey,
 			config.PlaybackTranscodeHardwareToneMapSettingKey,
 			config.PlaybackTranscodeSoftwareToneMapSettingKey,
 			config.PlaybackTranscodeVPPToneMapSettingKey,
+			config.PlaybackAllowHEVCEncodingSettingKey,
 		}
 		var group sync.WaitGroup
 		group.Add(len(keys))
@@ -9062,10 +9076,14 @@ func (h *PlaybackHandler) plannerSettingsV3Result(ctx context.Context) (playback
 		if errs[3] != nil {
 			return settings, fmt.Errorf("load VPP tone-map setting: %w", errs[3])
 		}
+		if errs[4] != nil {
+			return settings, fmt.Errorf("load HEVC encoding setting: %w", errs[4])
+		}
 		settings.Allow4KTranscode = strings.EqualFold(values[0], "true")
 		settings.HardwareToneMapEnabled = strings.EqualFold(values[1], "true")
 		settings.SoftwareToneMapEnabled = strings.EqualFold(values[2], "true")
 		settings.VPPToneMapEnabled = strings.EqualFold(values[3], "true")
+		settings.AllowHEVCEncoding = strings.EqualFold(values[4], "true")
 	}
 	return settings, nil
 }
@@ -9110,6 +9128,31 @@ func dropStaleAudioTrackIdentityV3(ctx context.Context, file *models.MediaFile, 
 		"sent_track_id", trackID,
 		"current_file_id", file.ID)
 	return true
+}
+
+type viewerLimitsReaderV3 interface {
+	LimitsForUser(ctx context.Context, userID int) (playback.SessionLimits, error)
+}
+
+// viewerTranscodeDisabledV3 looks up, concurrently with the server settings,
+// whether the requesting account may start a video transcode. Admission is the
+// authority; a failed lookup only leaves the quality ladder advertised.
+func (h *PlaybackHandler) viewerTranscodeDisabledV3(ctx context.Context) <-chan bool {
+	result := make(chan bool, 1)
+	userID := apimw.GetUserID(ctx)
+	reader, ok := h.sessionMgr.(viewerLimitsReaderV3)
+	if userID <= 0 || !ok {
+		result <- false
+		return result
+	}
+	go func() {
+		limits, err := reader.LimitsForUser(ctx, userID)
+		if err != nil {
+			slog.WarnContext(ctx, "load viewer playback limits for planning", "component", "playback", "user_id", userID, "error", err)
+		}
+		result <- err == nil && limits.TranscodingDisabled
+	}()
+	return result
 }
 
 func resolveV3AudioIndex(file *models.MediaFile, trackID string, fallback *int) (int, error) {
@@ -9377,9 +9420,14 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 		return errSubtitleUnavailableInTargetV3
 	}
 	targetIndex := -1
+	// The selection's identity, for the cross-format fallback below. Downloaded
+	// subtitles carry no forced/SDH flags, so they only match exactly.
+	var wantLanguage, wantTitle string
+	var wantForced, wantHearingImpaired bool
 	switch sourceLocation.source {
 	case playback.SubtitleSourceExternalV3:
 		wanted := source.ExternalSubtitles[sourceLocation.offset]
+		wantLanguage, wantTitle, wantForced, wantHearingImpaired = wanted.Language, displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle), wanted.Forced, wanted.HearingImpaired
 		for candidateIndex, candidate := range target.ExternalSubtitles {
 			if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Format, wanted.Format) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
 				continue
@@ -9391,6 +9439,7 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 		}
 	case playback.SubtitleSourceEmbeddedV3:
 		wanted := source.SubtitleTracks[sourceLocation.offset]
+		wantLanguage, wantTitle, wantForced, wantHearingImpaired = wanted.Language, displayedSubtitleTitleV3(wanted.Title, wanted.EmbeddedTitle), wanted.Forced, wanted.HearingImpaired
 		for candidateIndex, candidate := range target.SubtitleTracks {
 			if !strings.EqualFold(candidate.Language, wanted.Language) || !strings.EqualFold(candidate.Codec, wanted.Codec) || candidate.Forced != wanted.Forced || candidate.HearingImpaired != wanted.HearingImpaired {
 				continue
@@ -9434,6 +9483,12 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 				}
 			}
 		}
+	}
+	if targetIndex < 0 && wantLanguage != "" {
+		// Editions often carry the same subtitle in different formats (PGS on
+		// an HDR remux, SRT on an SDR encode). Keep the viewer's language and
+		// forced/SDH variant in whatever format the effective file has.
+		targetIndex = subtitleVariantIndexV3(target, wantLanguage, wantTitle, wantForced, wantHearingImpaired)
 	}
 	if targetIndex < 0 {
 		// No equivalent track exists on the target version. Preserve the
@@ -9783,6 +9838,57 @@ func reapplyDeliveryDemotionsV3(start *playback.StartRequestV3, durable playback
 	}
 }
 
+// subtitleVariantIndexV3 returns the combined index of the one deliverable
+// external or embedded subtitle in file with the given language and forced/SDH
+// flags, whatever its format, or -1. Several such tracks (main dialog and
+// commentary, say) are narrowed by title; a match that stays ambiguous is not
+// treated as the same selection.
+// displayedSubtitleTitleV3 is the title the subtitle inventory shows a
+// viewer: the stored title, else the container's embedded one.
+func displayedSubtitleTitleV3(title, embeddedTitle string) string {
+	if strings.TrimSpace(title) != "" {
+		return title
+	}
+	return embeddedTitle
+}
+
+func subtitleVariantIndexV3(file *models.MediaFile, language, title string, forced, hearingImpaired bool) int {
+	type candidate struct {
+		index int
+		title string
+	}
+	var candidates []candidate
+	for i, track := range file.ExternalSubtitles {
+		// The policy burns in embedded bitmaps only and serves no external
+		// bitmap sidecar, so an external candidate must be text.
+		if strings.EqualFold(track.Language, language) && track.Forced == forced && track.HearingImpaired == hearingImpaired && playback.SubtitleFormatDeliverableV3(track.Format) && !playback.NeedsBurnIn(track.Format) {
+			candidates = append(candidates, candidate{index: i, title: displayedSubtitleTitleV3(track.Title, track.EmbeddedTitle)})
+		}
+	}
+	for i, track := range file.SubtitleTracks {
+		if strings.EqualFold(track.Language, language) && track.Forced == forced && track.HearingImpaired == hearingImpaired && playback.SubtitleFormatDeliverableV3(track.Codec) {
+			candidates = append(candidates, candidate{index: len(file.ExternalSubtitles) + i, title: displayedSubtitleTitleV3(track.Title, track.EmbeddedTitle)})
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0].index
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return -1
+	}
+	match := -1
+	for _, c := range candidates {
+		if strings.EqualFold(strings.TrimSpace(c.title), title) {
+			if match >= 0 {
+				return -1
+			}
+			match = c.index
+		}
+	}
+	return match
+}
+
 func sessionStartErrorV3(err error) *transportErrorV3 {
 	switch {
 	case errors.Is(err, playback.ErrTooManyStreams), errors.Is(err, playback.ErrTooManyTranscodes):
@@ -10074,8 +10180,16 @@ func videoBitstreamFilterForPlanV3(plan *playback.PlanV3) string {
 	return ""
 }
 
+const playbackVideoCodecHEVC = "hevc"
+
 func videoSampleEntryForPlanV3(plan *playback.PlanV3) string {
-	if plan == nil || plan.Delivery != playback.DeliveryRemuxHLSV3 {
+	if plan == nil {
+		return ""
+	}
+	if plan.Delivery == playback.DeliveryTranscodeHLSV3 && plan.EffectiveRecipe.VideoCodec == playbackVideoCodecHEVC && plan.EffectiveRecipe.VideoSampleEntry == playback.VideoSampleEntryHVC1 {
+		return playback.VideoSampleEntryHVC1
+	}
+	if plan.Delivery != playback.DeliveryRemuxHLSV3 {
 		return ""
 	}
 	if plan.EffectiveRecipe.VideoSampleEntry != "" {

@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import QRCode from "react-qr-code";
-import { Link, Navigate, useNavigate, useSearchParams } from "react-router";
+import { Link, Navigate, useSearchParams } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { sessionFromTokenPair } from "@/api/v2/account";
 import { v2, type V2Result } from "@/api/v2/request";
-import { listProfiles } from "@/hooks/queries/profiles";
-import { getBootstrapProfile, useAuth } from "@/hooks/useAuth";
+import { useAuth } from "@/hooks/useAuth";
+import { usePasswordResetAvailable } from "@/hooks/queries/passwordReset";
+import { CHANGE_PASSWORD_PATH, usePostSignInNavigation } from "@/hooks/usePostSignInNavigation";
 import { Button } from "@/components/ui/button";
 import { PasswordInput } from "@/components/PasswordInput";
 import { Input } from "@/components/ui/input";
@@ -82,14 +83,13 @@ export default function Login() {
     login,
     completeLogin,
     profile,
-    selectProfile,
     user,
+    pendingPasswordChange,
     loading,
     setupLoading,
     setupRequired,
     providers = [],
   } = useAuth();
-  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { serverName, loginSubtitle } = useServerBranding();
   // Always refetch on mount so a cached answer from before an admin closed
@@ -103,6 +103,7 @@ export default function Login() {
     signupStatusQuery.isSuccess &&
     signupStatusQuery.isFetchedAfterMount &&
     signupStatusQuery.data.enabled;
+  const { available: passwordResetAvailable } = usePasswordResetAvailable();
 
   useDocumentTitle("Sign In");
 
@@ -126,26 +127,7 @@ export default function Login() {
     credentialProviders[0]?.id ||
     "";
 
-  const navigateAfterLogin = useCallback(async () => {
-    if (redirectTarget) {
-      navigate(redirectTarget, { replace: true });
-      return;
-    }
-
-    try {
-      const profileList = await listProfiles();
-      const soleProfile = getBootstrapProfile(profileList.profiles ?? []);
-      if (soleProfile) {
-        selectProfile(soleProfile);
-        navigate("/");
-        return;
-      }
-    } catch {
-      navigate("/profiles");
-      return;
-    }
-    navigate("/profiles");
-  }, [navigate, redirectTarget, selectProfile]);
+  const navigateAfterLogin = usePostSignInNavigation(redirectTarget);
 
   useEffect(() => {
     if (!deviceSession) {
@@ -170,9 +152,10 @@ export default function Login() {
 
         if (result.status === "approved" && result.tokens) {
           shouldPollAgain = false;
-          completeLogin(sessionFromTokenPair(result.tokens));
+          const session = sessionFromTokenPair(result.tokens);
+          completeLogin(session);
           setDeviceStatusMessage("Signed in. Loading profiles...");
-          void navigateAfterLogin();
+          void navigateAfterLogin(session.user);
           return;
         }
 
@@ -234,13 +217,17 @@ export default function Login() {
   if (user) {
     return <Navigate to={redirectTarget || (profile ? "/" : "/profiles")} replace />;
   }
+  if (pendingPasswordChange) {
+    const redirect = redirectTarget ? `?redirect=${encodeURIComponent(redirectTarget)}` : "";
+    return <Navigate to={`${CHANGE_PASSWORD_PATH}${redirect}`} replace />;
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setSubmitting(true);
     try {
-      await login(username, password, selectedProvider || undefined);
-      await navigateAfterLogin();
+      const signedIn = await login(username, password, selectedProvider || undefined);
+      await navigateAfterLogin(signedIn);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Login failed");
     } finally {
@@ -265,6 +252,12 @@ export default function Login() {
   const signupHref = redirectTarget
     ? `/signup?redirect=${encodeURIComponent(redirectTarget)}`
     : "/signup";
+  // Only a local password can be reset here; an external provider owns its own.
+  const forgotPasswordShown =
+    passwordResetAvailable && (!selectedProvider || selectedProvider === "local");
+  const forgotPasswordHref = username.trim()
+    ? `/forgot-password?login=${encodeURIComponent(username.trim())}`
+    : "/forgot-password";
 
   return (
     <main className="auth-shell">
@@ -315,7 +308,17 @@ export default function Login() {
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="password">Password</Label>
+              <div className="flex items-baseline justify-between gap-2">
+                <Label htmlFor="password">Password</Label>
+                {forgotPasswordShown && (
+                  <Link
+                    to={forgotPasswordHref}
+                    className="text-muted-foreground hover:text-foreground text-xs underline-offset-4 hover:underline"
+                  >
+                    Forgot password?
+                  </Link>
+                )}
+              </div>
               <PasswordInput
                 id="password"
                 value={password}

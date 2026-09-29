@@ -13,6 +13,8 @@ import { NextEpisodeOverlay } from "./NextEpisodeOverlay";
 import { usePlaybackRealtime } from "../hooks/usePlaybackRealtime";
 import { useWatchProgress } from "../hooks/useWatchProgress";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
+import { usePlayerFullscreenRoot } from "../context/PlayerFullscreenContext";
+import { isPlayerFullscreen, toggleFullscreen } from "../utils/fullscreen";
 import { useIntroSkipPrompt } from "../hooks/useIntroSkipPrompt";
 import { useRemuxSeeking } from "../hooks/useRemuxSeeking";
 import { useSubtitleTracks } from "../hooks/useSubtitleTracks";
@@ -324,6 +326,10 @@ const ROOM_STALL_WINDOW_MS = 5 * 60_000;
 const LOWER_QUALITY_ACTION_LABEL = "Lower quality";
 const PLAYBACK_NOTICE_VISIBLE_MS = 8_000;
 const ROOM_RECONNECTING_MESSAGE = "Reconnecting to room. Controls are temporarily unavailable.";
+// The server returns a room to the lobby once its position is within two
+// seconds of the end of the file. A viewer this close to its own end when the
+// room leaves playback saw the item finish, allowing for trailing the room.
+const ROOM_ITEM_END_WINDOW_SECONDS = 5;
 // The server ends room sockets on a fixed lifetime and the client reconnects
 // in well under a second, so only a longer gap is worth a warning.
 const ROOM_RECONNECT_NOTICE_DELAY_MS = 2_000;
@@ -480,6 +486,7 @@ export function VideoPlayer({
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const fullscreenRootRef = usePlayerFullscreenRoot();
   const isMountedRef = useRef(true);
   const effectiveTransportRevision = transportRevision ?? planRevision;
   const hlsRef = useRef<HlsType | null>(null);
@@ -1452,9 +1459,10 @@ export function VideoPlayer({
     watchTogetherRoomId,
   ]);
 
-  // The host stopped playback: the room is still open, in the lobby, so
-  // everyone goes back to the room page rather than the hub. A room that was
-  // never playing (a stale lobby snapshot on first connect) is not a stop.
+  // The host stopped playback, or the item finished: the room is still open,
+  // in the lobby, so everyone goes back to the room page rather than the hub.
+  // A room that was never playing (a stale lobby snapshot on first connect)
+  // is not a stop.
   const wasRoomPlayingRef = useRef(false);
   useEffect(() => {
     const phase = watchTogether.room?.phase;
@@ -1473,7 +1481,10 @@ export function VideoPlayer({
     wasRoomPlayingRef.current = false;
     leaveInProgressRef.current = true;
     setIsLeaving(true);
-    showWatchTogetherNotice("The host stopped playback.", "info");
+    const finished =
+      durationRef.current > 0 &&
+      durationRef.current - currentTimeRef.current <= ROOM_ITEM_END_WINDOW_SECONDS;
+    showWatchTogetherNotice(finished ? "Playback finished." : "The host stopped playback.", "info");
     const exitState = buildExitState();
     void (async () => {
       try {
@@ -2649,9 +2660,21 @@ export function VideoPlayer({
     };
     const onProgress = () => setBuffered(video.buffered);
     const onVolumeChange = () => {
+      // A room seek pre-roll mutes the element for a moment. That mute is not
+      // the viewer's, so it is neither shown nor saved; a viewer unmuting
+      // meanwhile is kept for when the pre-roll ends.
+      let viewerMuted = video.muted;
+      const prerollMuted = watchTogetherSync.prerollMutedPreference();
+      if (prerollMuted !== null) {
+        if (!video.muted) {
+          watchTogetherSync.setPrerollMutedPreference(false);
+          video.muted = true;
+        }
+        viewerMuted = watchTogetherSync.prerollMutedPreference() ?? prerollMuted;
+      }
       setVolume(video.volume);
-      setMuted(video.muted);
-      persistVolume(video.volume, video.muted);
+      setMuted(viewerMuted);
+      persistVolume(video.volume, viewerMuted);
     };
     const onWaiting = () => {
       // Delay showing the spinner so brief buffering between segments
@@ -2783,21 +2806,36 @@ export function VideoPlayer({
     }
   }, []);
 
+  // Menus live inside the controls, so hiding the controls under an open menu
+  // leaves it inert (and Safari keeps painting its backdrop-filter surface).
+  const hasOpenPlayerMenu = useCallback(
+    () => containerRef.current?.querySelector('[role="menu"]') != null,
+    [],
+  );
+
   const resetControlsTimer = useCallback(() => {
     setControlsVisible(true);
     clearControlsTimer();
-    hideTimerRef.current = setTimeout(() => {
-      if (videoRef.current && !videoRef.current.paused) {
-        setControlsVisible(false);
-      }
-      hideTimerRef.current = null;
-    }, 3000);
-  }, [clearControlsTimer]);
+    const scheduleHide = () => {
+      hideTimerRef.current = setTimeout(() => {
+        if (hasOpenPlayerMenu()) {
+          scheduleHide();
+          return;
+        }
+        if (videoRef.current && !videoRef.current.paused) {
+          setControlsVisible(false);
+        }
+        hideTimerRef.current = null;
+      }, 3000);
+    };
+    scheduleHide();
+  }, [clearControlsTimer, hasOpenPlayerMenu]);
 
   const hideControlsOnMouseLeave = useCallback(() => {
+    if (hasOpenPlayerMenu()) return;
     clearControlsTimer();
     setControlsVisible(false);
-  }, [clearControlsTimer]);
+  }, [clearControlsTimer, hasOpenPlayerMenu]);
 
   // Show controls when paused, start hide timer when playing.
   useEffect(() => {
@@ -2943,18 +2981,12 @@ export function VideoPlayer({
 
   // -- Fullscreen tracking --
   useEffect(() => {
-    const video = videoRef.current as
-      | (HTMLVideoElement & {
-          webkitDisplayingFullscreen?: boolean;
-        })
-      | null;
+    const video = videoRef.current;
+    const onChange = () => setIsFullscreen(isPlayerFullscreen(video));
 
-    const onChange = () => {
-      const isDocFullscreen = !!document.fullscreenElement;
-      const isVideoFullscreen = !!video?.webkitDisplayingFullscreen;
-      setIsFullscreen(isDocFullscreen || isVideoFullscreen);
-    };
-
+    // A player mounted for the next episode can start inside a fullscreen
+    // host, so read the current state rather than waiting for a change.
+    onChange();
     document.addEventListener("fullscreenchange", onChange);
     video?.addEventListener("webkitbeginfullscreen", onChange);
     video?.addEventListener("webkitendfullscreen", onChange);
@@ -3472,35 +3504,8 @@ export function VideoPlayer({
   const handlePlayPause = useCallback(() => setPlayback("toggle"), [setPlayback]);
 
   const handleFullscreenToggle = useCallback(() => {
-    const video = videoRef.current as
-      | (HTMLVideoElement & {
-          webkitSupportsFullscreen?: boolean;
-          webkitDisplayingFullscreen?: boolean;
-          webkitEnterFullscreen?: () => void;
-          webkitExitFullscreen?: () => void;
-        })
-      | null;
-
-    if (document.fullscreenElement) {
-      document.exitFullscreen().catch(() => {});
-    } else if (video?.webkitDisplayingFullscreen) {
-      video.webkitExitFullscreen?.();
-    } else if (containerRef.current?.requestFullscreen) {
-      containerRef.current.requestFullscreen().catch(() => {
-        if (
-          video?.webkitSupportsFullscreen !== false &&
-          typeof video?.webkitEnterFullscreen === "function"
-        ) {
-          video.webkitEnterFullscreen();
-        }
-      });
-    } else if (
-      video?.webkitSupportsFullscreen !== false &&
-      typeof video?.webkitEnterFullscreen === "function"
-    ) {
-      video.webkitEnterFullscreen();
-    }
-  }, []);
+    toggleFullscreen(fullscreenRootRef?.current ?? containerRef.current, videoRef.current);
+  }, [fullscreenRootRef]);
 
   const handleSurfaceTap = useCallback(
     (event?: React.MouseEvent<HTMLElement>) => {
@@ -3824,26 +3829,43 @@ export function VideoPlayer({
     resetRoomCatchupRate,
   ]);
 
-  const handleVolumeChange = useCallback((v: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.volume = v;
-    if (v > 0 && video.muted) video.muted = false;
-  }, []);
+  const handleMutedChange = useCallback(
+    (m: boolean) => {
+      const video = videoRef.current;
+      if (!video) return;
+      // During a room seek pre-roll the element stays muted until it ends.
+      if (watchTogetherSync.setPrerollMutedPreference(m)) {
+        setMuted(m);
+        persistVolume(video.volume, m);
+        return;
+      }
+      video.muted = m;
+    },
+    [watchTogetherSync],
+  );
 
-  const handleMutedChange = useCallback((m: boolean) => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.muted = m;
-  }, []);
+  const handleVolumeChange = useCallback(
+    (v: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      video.volume = v;
+      if (v > 0 && video.muted) handleMutedChange(false);
+    },
+    [handleMutedChange],
+  );
+
+  const handleToggleMuted = useCallback(() => {
+    handleMutedChange(!muted);
+  }, [handleMutedChange, muted]);
 
   // -- Keyboard shortcuts --
   useKeyboardShortcuts(
     videoRef,
-    containerRef,
+    handleFullscreenToggle,
     handlePlayPause,
     skipActions,
     toggleCaptions,
+    handleToggleMuted,
     handleTogglePiP,
     displayMode === "foreground",
   );
@@ -4043,10 +4065,7 @@ export function VideoPlayer({
           if (nextVolume === null || !video) {
             throw new Error("missing_volume");
           }
-          video.volume = Math.min(1, Math.max(0, nextVolume));
-          if (video.volume > 0 && video.muted) {
-            video.muted = false;
-          }
+          handleVolumeChange(Math.min(1, Math.max(0, nextVolume)));
           return;
         }
         case "display_message":
@@ -4117,7 +4136,7 @@ export function VideoPlayer({
           throw new Error("unsupported");
       }
     },
-    [handleExit, onPlanInvalidated, performPlayerSeek],
+    [handleExit, handleVolumeChange, onPlanInvalidated, performPlayerSeek],
   );
 
   const realtime = usePlaybackRealtime({
