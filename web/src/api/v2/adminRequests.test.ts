@@ -208,7 +208,7 @@ describe("listAdminMediaRequestsV2 compatibility", () => {
     };
   }
   it("merges views newest-first and filters client-side", async () => {
-    vi.mocked(v2).mockImplementation((op, options) => {
+    vi.mocked(v2).mockImplementation((_op, options) => {
       const query = (options as { query: Record<string, unknown> }).query;
       const items =
         query.view === "needs_approval"
