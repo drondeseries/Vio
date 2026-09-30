@@ -751,6 +751,7 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
       backgroundColor: "#000000",
       backgroundStyle: "box",
       backgroundOpacity: 75,
+      textOpacity: 100,
       textOutline: false,
       textOutlineColor: "#000000",
       position: "bottom",

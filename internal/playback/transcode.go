@@ -2231,9 +2231,8 @@ func qsvScaleFilterWithMapMode(res, mapMode string) string {
 	case transcodeResolution328p:
 		return "scale_vaapi=w=-2:h=328:format=nv12," + hwmap + ",format=qsv"
 	default:
-		return "scale_vaapi=format=nv12," + hwmap + ",format=qsv"
+		return vaapiNV12Filter + "," + hwmap + ",format=qsv"
 	}
-	return vaapiNV12Filter + "," + hwmap + ",format=qsv"
 }
 
 // qsvToneMapScaleFilter maps VAAPI tone-map output with read/write access. The default
@@ -2310,9 +2309,8 @@ func vaapiScaleFilter(res string) string {
 	case transcodeResolution328p:
 		return "scale_vaapi=w=-2:h=328:format=nv12"
 	default:
-		return "scale_vaapi=format=nv12"
+		return vaapiNV12Filter
 	}
-	return vaapiNV12Filter
 }
 
 func vaapiSoftwareDecodeFilter(res string) string {

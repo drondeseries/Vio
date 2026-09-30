@@ -1231,6 +1231,7 @@
             "fontSize": "large",
             "fontFamily": "sans-serif",
             "fontColor": "#ffffff",
+            "textOpacity": 100,
             "backgroundColor": "#000000",
             "backgroundStyle": "box",
             "backgroundOpacity": 75,

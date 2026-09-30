@@ -10,6 +10,21 @@ import { api } from "@/api/client";
 import { V2ProblemError } from "@/api/v2/request";
 import { v2 } from "@/api/v2/request";
 import {
+  getAdminRequestSettingsV2,
+  putAdminRequestSettingsV2,
+  getAdminRequestUserLimitV2,
+  putAdminRequestUserLimitV2,
+  listAdminRequestIntegrationsV2,
+  saveAdminRequestIntegrationV2,
+  deleteAdminRequestIntegrationV2,
+  listAdminMediaRequestsV2,
+  approveAdminRequestV2,
+  declineAdminRequestV2,
+  retryAdminRequestV2,
+  loadAdminRequestIntegrationOptionsV2,
+} from "@/api/v2/adminRequests";
+
+import {
   browseDiscoverV2,
   cancelMediaRequestV2,
   createMediaRequestV2,
@@ -417,28 +432,6 @@ export function useRetryMediaRequest() {
       toast.error(err instanceof Error ? err.message : "Failed to retry request");
     },
   });
-}
-
-export function useCancelMediaRequest() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: ({ id, reason }: { id: string; reason?: string }) =>
-      api<MediaRequest>(`/requests/${encodeURIComponent(id)}/cancel`, {
-        method: "POST",
-        body: JSON.stringify({ reason }),
-      }),
-    onSuccess: () => {
-      toast.success("Request cancelled and removed");
-      invalidateRequestSurfaces(queryClient);
-    },
-    onError: (err) => {
-      toast.error(err instanceof Error ? err.message : "Failed to cancel request");
-    },
-  });
-}
-
-export function useDeleteMediaRequest() {
-  return useCancelMediaRequest();
 }
 
 export function useRequestSettings() {

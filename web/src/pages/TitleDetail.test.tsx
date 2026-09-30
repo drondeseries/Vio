@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
@@ -152,15 +153,21 @@ function LocationProbe() {
   return <p data-testid="location">{location.pathname}</p>;
 }
 
+// Vio's ActionBar calls admin hooks that need a QueryClient; upstream's
+// suite renders without one, so every render goes through a provider.
+const testQueryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
 function renderAt(path: string) {
   render(
-    <MemoryRouter initialEntries={[path]}>
-      <Routes>
-        <Route path="/title/:mediaType/:tmdbId" element={<TitleDetail />} />
-        <Route path="/requests/:mediaType/:tmdbId" element={<LegacyRequestDetailRedirect />} />
-        <Route path="/item/:id" element={<LocationProbe />} />
-      </Routes>
-    </MemoryRouter>,
+    <QueryClientProvider client={testQueryClient}>
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/title/:mediaType/:tmdbId" element={<TitleDetail />} />
+          <Route path="/requests/:mediaType/:tmdbId" element={<LegacyRequestDetailRedirect />} />
+          <Route path="/item/:id" element={<LocationProbe />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

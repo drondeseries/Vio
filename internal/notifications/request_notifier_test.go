@@ -99,7 +99,7 @@ func TestFulfilledCopyForFollowers(t *testing.T) {
 	if got := requestLine(follower); got != followedTitleAvailable {
 		t.Fatalf("follower email line = %q", got)
 	}
-	if got := discordEmbedAuthorLine(follower); got != "Now available on Silo" {
+	if got := discordEmbedAuthorLine(follower); got != "Now available on Vio" {
 		t.Fatalf("follower Discord author = %q", got)
 	}
 }

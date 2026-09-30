@@ -269,9 +269,11 @@ it("moves through the menu with ArrowUp/ArrowDown instead of changing the rating
 describe("ActionBar primary action", () => {
   function renderWithPrimary(overrides: Partial<ActionBarProps>) {
     return render(
-      <MemoryRouter>
-        <ActionBar {...overrides} />
-      </MemoryRouter>,
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ActionBar {...overrides} />
+        </MemoryRouter>
+      </QueryClientProvider>,
     );
   }
 

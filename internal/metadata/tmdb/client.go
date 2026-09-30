@@ -165,7 +165,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			// A 404 wraps ErrNotFound so callers can tell a missing title
 			// from TMDB being unreachable.
 			var notFound error

@@ -390,6 +390,8 @@ export const ADMIN_SETTINGS_GROUPS: AdminSettingsSearchGroup[] = [
           "Quality preset",
         ),
         icon: PlayCircle,
+      },
+      {
         id: "requests",
         label: "Requests",
         description:

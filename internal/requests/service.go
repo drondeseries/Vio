@@ -2333,13 +2333,7 @@ func (s *Service) submitClaimed(ctx context.Context, req Request, actor Viewer, 
 	s.populateRequesterIdentity(ctx, &req)
 	targets, msg, err := s.router.Fulfill(ctx, installationID, capabilityID, req, plan.want, conns)
 	if err != nil {
-		return s.markSubmissionFailed(ctx, req, actor, err)
-	}
-	// Fulfill is allowed to create virtual catalog rows before returning. Flush
-	// shared home-section membership now so Recently Added reflects the change
-	// on the user's next request instead of serving its five-minute warm entry.
-	if s.catalogChanged != nil {
-		s.catalogChanged()
+		return nil, err
 	}
 	// Fulfill is allowed to create virtual catalog rows before returning. Flush
 	// shared home-section membership now so Recently Added reflects the change
@@ -2775,7 +2769,7 @@ func (s *Service) markSubmissionFailed(ctx context.Context, claimed Request, act
 			// lease and another claim holds the request now.
 			return s.store.GetRequest(ctx, claimed.ID)
 		}
-		return nil, fmt.Errorf("submit request failed: %w; mark failed: %v", submitErr, err)
+		return nil, fmt.Errorf("submit request failed: %w; mark failed: %w", submitErr, err)
 	}
 	return failed, nil
 }

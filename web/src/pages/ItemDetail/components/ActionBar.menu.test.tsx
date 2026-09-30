@@ -244,7 +244,7 @@ describe("ActionBar watch together group", () => {
 
   it("offers Request Seasons only with the prop", async () => {
     const onRequestSeasons = vi.fn();
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <ActionBar contentId="series-1" onRequestSeasons={onRequestSeasons} />
       </MemoryRouter>,
