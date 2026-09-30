@@ -4017,6 +4017,58 @@ describe("usePlaybackSession plan audio inventory", () => {
     expect(result.current.subtitleUrls).toHaveLength(0);
     expect(result.current.subtitleInventoryProvisional).toBe(false);
 
+    // Stale A/B/A replay: delivering previously-seen inv:1 again is rejected.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:1",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [
+          {
+            track_id: "file:7:subtitle:0",
+            combined_index: 0,
+            source: "embedded",
+            codec: "subrip",
+            language: "eng",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+          },
+        ],
+      }),
+    );
+    expect(result.current.subtitleUrls).toHaveLength(0);
+
+    // Stale push naming another source identity (file 99) is rejected.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:3",
+        inventory_status: "verified",
+        effective_media_file_id: 99,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [
+          {
+            track_id: "file:99:subtitle:0",
+            combined_index: 0,
+            source: "embedded",
+            codec: "subrip",
+            language: "spa",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=99",
+          },
+        ],
+      }),
+    );
+    expect(result.current.subtitleUrls).toHaveLength(0);
+
     // Menu data only: the fold never hits the transport boundary for a replan.
     expect(
       fetchMock.mock.calls.filter(([input]) => String(input).includes("/replan")),

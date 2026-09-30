@@ -257,6 +257,11 @@ func (s *Monitor) ReleaseCached(releaseName string) (cached bool, known bool) {
 	if key == "" {
 		return false, false
 	}
+	// Check the authoritative configured AltMount snapshot first (e.g. loaded
+	// from disk on restart or refreshed from AltMount).
+	if completed, known := client.ReleaseCompleted(key); known && completed {
+		return true, true
+	}
 	m.mu.Lock()
 	_, cached = m.confirmedReleases[key]
 	m.mu.Unlock()
@@ -515,13 +520,17 @@ func (m *mediaMonitor) configureAltmount(baseURL, apiKey string, intervalMinutes
 	if m.altmount == nil {
 		m.altmount = altmount.New(nil)
 	}
+	// Invalidate the monitor's completion set on configuration change so
+	// state from another provider instance cannot be served as current.
+	m.confirmedReleases = make(map[string]struct{})
 	observer := m.confirmObserver
+	client := m.altmount
 	m.mu.Unlock()
-	m.altmount.Configure(baseURL, apiKey, intervalMinutes)
+	client.Configure(baseURL, apiKey, intervalMinutes)
 	// Re-apply a listener installed before the client existed; loading the
 	// persisted state must not drop it.
-	m.altmount.SetConfirmObserver(observer)
-	return m.altmount.ConfigureIndexFile(indexFile)
+	client.SetConfirmObserver(observer)
+	return client.ConfigureIndexFile(indexFile)
 }
 
 // altmountClient returns the AltMount state client, or a new empty one.

@@ -263,41 +263,49 @@ func (h *StreamHandler) afterVirtualSourceCommit(ctx context.Context, sessionID 
 // *playback.SessionManager implements it; the narrow interface keeps the
 // handoff optional for minimal/test managers.
 type virtualSessionGenerationBinder interface {
+	VirtualSourceBinding(sessionID string) (playback.VirtualSourceBindingSnapshot, error)
+	SetVirtualSourceIfBinding(sessionID string, expected playback.VirtualSourceBindingSnapshot, virtualURI string, ownerInstallationID int, effectiveMediaFileID int) (uint64, bool, error)
 	VirtualSourceGeneration(sessionID string) (uint64, error)
 	SetVirtualSourceIfGeneration(sessionID string, expectedGeneration uint64, virtualURI string, ownerInstallationID int) (uint64, bool, error)
 }
 
-// virtualSourceGeneration captures the session's candidate-binding generation
-// so a handoff that re-lists before committing can detect a newer binding move.
-// A manager without the surface reports false, and the handoff falls back to the
-// best-effort rotation commit.
-func (h *StreamHandler) virtualSourceGeneration(sessionID string) (uint64, bool) {
+func (h *StreamHandler) virtualSourceBinding(sessionID string) (playback.VirtualSourceBindingSnapshot, bool) {
 	if binder, ok := h.sessionMgr.(virtualSessionGenerationBinder); ok {
-		if generation, err := binder.VirtualSourceGeneration(sessionID); err == nil {
-			return generation, true
+		if snap, err := binder.VirtualSourceBinding(sessionID); err == nil {
+			return snap, true
 		}
 	}
-	return 0, false
+	return playback.VirtualSourceBindingSnapshot{}, false
 }
 
 // commitHandoffVirtualSessionSource rebinds a session to the cached copy of the
-// release it is already pinned to. When a binding generation was captured it is
+// release it is already pinned to. When a binding snapshot was captured it is
 // enforced, so a handoff that resolved its replacement before a newer binding
-// move is a benign no-op rather than a clobber. Without a generation-capable
-// manager it falls back to the best-effort rotation commit.
-func (h *StreamHandler) commitHandoffVirtualSessionSource(ctx context.Context, sessionID string, expectedGeneration uint64, expectedSet bool, resolved ResolvedVirtualMedia) bool {
+// move is a benign no-op rather than a clobber. It commits the new virtual URI,
+// owner, and effective media file ID atomically under the session manager lock.
+// Without a generation-capable manager it falls back to the best-effort rotation
+// commit.
+func (h *StreamHandler) commitHandoffVirtualSessionSource(ctx context.Context, sessionID string, expected playback.VirtualSourceBindingSnapshot, expectedSet bool, resolved ResolvedVirtualMedia) bool {
 	if h == nil || resolved.URI == "" {
 		return false
 	}
+	var effectiveFileID int
+	if pathResolver, ok := h.fileResolver.(interface {
+		GetByPath(context.Context, string) (*models.MediaFile, error)
+	}); ok {
+		if row, err := pathResolver.GetByPath(ctx, resolved.URI); err == nil && row != nil && row.ID > 0 {
+			effectiveFileID = row.ID
+		}
+	}
 	if binder, ok := h.sessionMgr.(virtualSessionGenerationBinder); ok && expectedSet {
-		if _, applied, err := binder.SetVirtualSourceIfGeneration(sessionID, expectedGeneration, resolved.URI, resolved.OwnerID); err != nil {
+		if _, applied, err := binder.SetVirtualSourceIfBinding(sessionID, expected, resolved.URI, resolved.OwnerID, effectiveFileID); err != nil {
 			slog.WarnContext(ctx, "cache handoff: failed to rebind virtual session",
 				"component", "api", "session", sessionID, "virtual_uri", resolved.URI, "error", err)
 			return false
 		} else if !applied {
 			return false
 		}
-		h.afterVirtualSourceCommit(ctx, sessionID, resolved)
+		h.publishSourceCommittedAsync(ctx, sessionID)
 		return true
 	}
 	h.commitRotatedVirtualSessionSource(ctx, sessionID, resolved)
@@ -343,48 +351,61 @@ const (
 // release. It is registered at serve start and removed when the transport ends,
 // so a later release-confirmation only reaches sessions still playing.
 type virtualCacheHandoffWaiter struct {
+	regID      uint64
 	sessionID  string
 	fileID     int
 	releaseKey string
 	ownerID    int
+	binding    playback.VirtualSourceBindingSnapshot
+	pinnedID   string
 }
 
 // virtualCacheHandoffRegistry indexes waiters by normalized release key. The
-// zero value is usable; the map is created lazily.
+// zero value is usable; the map is created lazily. Each registration receives a
+// unique registration ID so overlapping transports for the same session/release
+// do not overwrite each other or delete a newer request's waiter on cleanup.
 type virtualCacheHandoffRegistry struct {
 	mu        sync.Mutex
-	byRelease map[string]map[string]virtualCacheHandoffWaiter
+	byRelease map[string]map[uint64]virtualCacheHandoffWaiter
+	nextID    uint64
 }
 
-// register adds a waiter and returns a function that removes it. A waiter with
-// no session or release key is not registered and its release function is a
-// no-op.
+// register adds a waiter and returns a function that idempotently removes it.
+// A waiter with no session or release key is not registered and its release
+// function is a no-op.
 func (r *virtualCacheHandoffRegistry) register(w virtualCacheHandoffWaiter) func() {
 	if r == nil || w.sessionID == "" || w.releaseKey == "" {
 		return func() {}
 	}
 	r.mu.Lock()
 	if r.byRelease == nil {
-		r.byRelease = make(map[string]map[string]virtualCacheHandoffWaiter)
+		r.byRelease = make(map[string]map[uint64]virtualCacheHandoffWaiter)
 	}
+	r.nextID++
+	id := r.nextID
+	w.regID = id
 	sessions := r.byRelease[w.releaseKey]
 	if sessions == nil {
-		sessions = make(map[string]virtualCacheHandoffWaiter)
+		sessions = make(map[uint64]virtualCacheHandoffWaiter)
 		r.byRelease[w.releaseKey] = sessions
 	}
-	sessions[w.sessionID] = w
+	sessions[id] = w
 	r.mu.Unlock()
+
+	var once sync.Once
 	return func() {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		current := r.byRelease[w.releaseKey]
-		if current == nil {
-			return
-		}
-		delete(current, w.sessionID)
-		if len(current) == 0 {
-			delete(r.byRelease, w.releaseKey)
-		}
+		once.Do(func() {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			current := r.byRelease[w.releaseKey]
+			if current == nil {
+				return
+			}
+			delete(current, id)
+			if len(current) == 0 {
+				delete(r.byRelease, w.releaseKey)
+			}
+		})
 	}
 }
 
@@ -439,6 +460,11 @@ func sameVirtualReleaseCandidate(pinnedID, resolvedID string) bool {
 // generation is a benign no-op. The returned cleanup must be released by the
 // caller when non-nil.
 func (h *StreamHandler) handoffVirtualSessionToCached(ctx context.Context, session *playback.Session, file *models.MediaFile, cachedConfirmed bool) (ResolvedVirtualMedia, func(), bool, error) {
+	snap, snapSet := h.virtualSourceBinding(session.ID)
+	return h.handoffVirtualSessionToCachedWithSnapshot(ctx, session, file, snap, snapSet, cachedConfirmed)
+}
+
+func (h *StreamHandler) handoffVirtualSessionToCachedWithSnapshot(ctx context.Context, session *playback.Session, file *models.MediaFile, snap playback.VirtualSourceBindingSnapshot, snapSet bool, cachedConfirmed bool) (ResolvedVirtualMedia, func(), bool, error) {
 	if h == nil || session == nil || file == nil || !isVirtualPlaybackFile(file) || !hasVirtualMediaResolver(h) {
 		return ResolvedVirtualMedia{}, nil, false, nil
 	}
@@ -452,7 +478,6 @@ func (h *StreamHandler) handoffVirtualSessionToCached(ctx context.Context, sessi
 			return ResolvedVirtualMedia{}, nil, false, nil
 		}
 	}
-	generation, generationSet := h.virtualSourceGeneration(session.ID)
 	pinnedID := virtualResultCandidateID(file.FilePath)
 	// forceRefresh lists afresh so the provider reports its now-cached URL; a
 	// plain re-resolve could serve the stored (remote) URL again.
@@ -469,7 +494,7 @@ func (h *StreamHandler) handoffVirtualSessionToCached(ctx context.Context, sessi
 		}
 		return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff resolved candidate %q for pinned candidate %q; refusing a release swap", resolved.CandidateID, pinnedID)
 	}
-	if !h.commitHandoffVirtualSessionSource(ctx, session.ID, generation, generationSet, resolved) {
+	if !h.commitHandoffVirtualSessionSource(ctx, session.ID, snap, snapSet, resolved) {
 		if cleanup != nil {
 			cleanup()
 		}
@@ -508,12 +533,29 @@ func (h *StreamHandler) handoffConfirmedRelease(releaseKey string) {
 		if err != nil || session == nil {
 			continue
 		}
+		// Bound to the release that registered the waiter: if the session has
+		// moved to another candidate, was replaced, or replanned, its binding
+		// generation or identity will have changed. Refuse the handoff and do
+		// not attribute completion of releaseKey to this session.
+		currentBinding, hasBinder := h.virtualSourceBinding(waiter.sessionID)
+		if hasBinder {
+			if currentBinding.Generation != waiter.binding.Generation ||
+				strings.TrimSpace(currentBinding.VirtualURI) != strings.TrimSpace(waiter.binding.VirtualURI) ||
+				currentBinding.OwnerInstallationID != waiter.binding.OwnerInstallationID ||
+				(waiter.binding.EffectiveMediaFileID > 0 && currentBinding.EffectiveMediaFileID != waiter.binding.EffectiveMediaFileID) {
+				continue
+			}
+		}
 		file, err := h.fileResolver.GetByID(ctx, waiter.fileID)
 		if err != nil || file == nil {
 			continue
 		}
 		file = bindSessionVirtualSource(file, session)
-		resolved, cleanup, applied, handoffErr := h.handoffVirtualSessionToCached(ctx, session, file, true)
+		// Ensure the file's current pinned candidate still matches the waiter.
+		if waiter.pinnedID != "" && virtualResultCandidateID(file.FilePath) != waiter.pinnedID {
+			continue
+		}
+		resolved, cleanup, applied, handoffErr := h.handoffVirtualSessionToCachedWithSnapshot(ctx, session, file, waiter.binding, hasBinder, true)
 		if handoffErr != nil {
 			slog.WarnContext(ctx, "cache handoff failed for confirmed release",
 				"component", "api", "session", waiter.sessionID, "file_id", waiter.fileID,
@@ -552,11 +594,14 @@ func (h *StreamHandler) beginVirtualCacheHandoff(ctx context.Context, session *p
 		return func() {}
 	}
 	ownerID := effectiveVirtualOwner(resolved.OwnerID, file.VirtualOwnerInstallationID)
+	snap, _ := h.virtualSourceBinding(session.ID)
 	release := h.cacheWaiters.register(virtualCacheHandoffWaiter{
 		sessionID:  session.ID,
 		fileID:     file.ID,
 		releaseKey: releaseKey,
 		ownerID:    ownerID,
+		binding:    snap,
+		pinnedID:   virtualResultCandidateID(file.FilePath),
 	})
 	if h.VirtualReleaseCacheFiller == nil {
 		return release
@@ -564,7 +609,6 @@ func (h *StreamHandler) beginVirtualCacheHandoff(ctx context.Context, session *p
 	filler := h.VirtualReleaseCacheFiller
 	sessionID, fileID := session.ID, file.ID
 	virtualURI := resolved.URI
-	h.reportDownloadProgress(sessionID, fileID, releaseKey, playback.DownloadProgressPayload{State: playback.DownloadProgressStateQueued})
 	go func() {
 		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualCacheFillBudget)
 		defer cancel()

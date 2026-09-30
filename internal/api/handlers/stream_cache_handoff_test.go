@@ -284,3 +284,137 @@ func TestHandleVirtualReleaseConfirmedRebindsWaiter(t *testing.T) {
 		t.Fatalf("progress states = %v, want a completed event", states)
 	}
 }
+
+// TestHandoffVirtualSessionToCachedFencesReplacement proves that a stream replacement
+// (or rollback) advancing the generation while handoff is in flight safely refuses
+// the handoff, keeping the replacement's source and effective file ID intact.
+func TestHandoffVirtualSessionToCachedFencesReplacement(t *testing.T) {
+	handler, manager, session, file := newCacheHandoffFixture(t, "Movie.2024.1080p.WEB-DL")
+	handler.VirtualReleaseCacheStatus = func(context.Context, string, int) (bool, bool) { return true, true }
+
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		// A replacement commits mid-resolve, updating the effective media file and advancing the generation.
+		_, err := manager.ApplyReplacement(session.ID, playback.SessionReplacement{
+			EffectiveMediaFileID: 99,
+			StreamState: playback.SessionStreamState{
+				VirtualSourceURI:                 "virtual://movie/tt1?result=replacement-cand",
+				VirtualSourceOwnerInstallationID: 5,
+				VirtualSourceSet:                 true,
+				VirtualSourceOwnershipSet:        true,
+			},
+		})
+		if err != nil {
+			t.Fatalf("ApplyReplacement: %v", err)
+		}
+		return ResolvedVirtualMedia{
+			URL:                 "http://127.0.0.1:9/cached",
+			URI:                 file.FilePath,
+			CandidateID:         "cand-a",
+			OwnerID:             5,
+			ProviderReleaseName: file.ProviderReleaseName,
+		}, nil
+	})
+
+	_, cleanup, applied, err := handler.handoffVirtualSessionToCached(context.Background(), session, file, false)
+	if err != nil {
+		t.Fatalf("handoff error: %v", err)
+	}
+	if applied {
+		t.Fatal("handoff must be refused when replacement changed the generation mid-resolve")
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+
+	current, err := manager.GetSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if current.VirtualSourceURI != "virtual://movie/tt1?result=replacement-cand" {
+		t.Fatalf("binding clobbered = %q, want replacement URI", current.VirtualSourceURI)
+	}
+	if current.MediaFileID != 99 {
+		t.Fatalf("effective media file ID clobbered = %d, want 99", current.MediaFileID)
+	}
+}
+
+// TestHandleVirtualReleaseConfirmedRejectsWaitersWhenSessionMoved proves that when a
+// release confirmation arrives for release A, but the session has already moved to release B,
+// no handoff or completion event for A occurs.
+func TestHandleVirtualReleaseConfirmedRejectsWaitersWhenSessionMoved(t *testing.T) {
+	handler, manager, session, fileA := newCacheHandoffFixture(t, "Movie.2024.1080p.WEB-DL")
+	recorder := &cacheProgressRecorder{}
+	handler.DownloadProgress = recorder
+
+	resolveCalled := false
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		resolveCalled = true
+		return ResolvedVirtualMedia{}, nil
+	})
+
+	// Register waiter for release A.
+	releaseA := handler.beginVirtualCacheHandoff(context.Background(), session, fileA, ResolvedVirtualMedia{
+		URI:                 fileA.FilePath,
+		OwnerID:             5,
+		ProviderReleaseName: fileA.ProviderReleaseName,
+	})
+	defer releaseA()
+
+	// Session now rotates/switches to release B.
+	if err := manager.SetVirtualSource(session.ID, "virtual://movie/tt1?result=cand-b", 5); err != nil {
+		t.Fatalf("SetVirtualSource B: %v", err)
+	}
+
+	// Release A confirms completion.
+	handler.HandleVirtualReleaseConfirmed(altmount.ReleaseKey(fileA.ProviderReleaseName))
+
+	// Allow goroutine to run.
+	time.Sleep(100 * time.Millisecond)
+
+	if resolveCalled {
+		t.Fatal("resolve must not be called when session has moved away from release A")
+	}
+	states := recorder.states()
+	if len(states) > 0 {
+		t.Fatalf("states = %v, want no completion events for obsolete waiter", states)
+	}
+	current, _ := manager.GetSession(session.ID)
+	if current.VirtualSourceURI != "virtual://movie/tt1?result=cand-b" {
+		t.Fatalf("binding = %q, want release B intact", current.VirtualSourceURI)
+	}
+}
+
+// TestVirtualCacheHandoffRegistryOverlappingRegistrationsDoNotCancelEachOther proves
+// that multiple concurrent transports for the same session/release do not overwrite
+// each other's registrations, and ending one transport does not drop the other's waiter.
+func TestVirtualCacheHandoffRegistryOverlappingRegistrationsDoNotCancelEachOther(t *testing.T) {
+	reg := &virtualCacheHandoffRegistry{}
+	w1 := virtualCacheHandoffWaiter{sessionID: "sess-1", fileID: 10, releaseKey: "rel-a"}
+	w2 := virtualCacheHandoffWaiter{sessionID: "sess-1", fileID: 10, releaseKey: "rel-a"}
+
+	cleanup1 := reg.register(w1)
+	cleanup2 := reg.register(w2)
+
+	waiters := reg.forRelease("rel-a")
+	if len(waiters) != 2 {
+		t.Fatalf("waiters count = %d, want 2", len(waiters))
+	}
+
+	// Clean up request 1.
+	cleanup1()
+
+	// Waiter 2 must still remain!
+	waiters = reg.forRelease("rel-a")
+	if len(waiters) != 1 {
+		t.Fatalf("after cleanup1, waiters count = %d, want 1", len(waiters))
+	}
+
+	// Clean up request 2.
+	cleanup2()
+
+	// Now registry should be empty.
+	waiters = reg.forRelease("rel-a")
+	if len(waiters) != 0 {
+		t.Fatalf("after cleanup2, waiters count = %d, want 0", len(waiters))
+	}
+}

@@ -163,6 +163,7 @@ func (c *altmountStateClient) Configure(baseURL, apiKey string, intervalMinutes 
 		c.state = altmountStateSnapshot{}
 		c.lastFetch = time.Time{}
 		c.lastErr = nil
+		c.confirmedOnce = nil
 	}
 	c.url = newURL
 	c.apiKey = newKey
@@ -198,6 +199,25 @@ func (c *altmountStateClient) ConfigureIndexFile(path string) error {
 	}
 	c.state = pruneAltmountSnapshot(snapshot, time.Now())
 	return nil
+}
+
+// ReleaseCompleted reports whether AltMount's authoritative snapshot records
+// the release as completed. known is false when AltMount is unconfigured.
+func (c *altmountStateClient) ReleaseCompleted(releaseKey string) (completed bool, known bool) {
+	if c == nil {
+		return false, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.url == "" {
+		return false, false
+	}
+	key := ReleaseKey(releaseKey)
+	if key == "" {
+		return false, false
+	}
+	_, ok := c.state.Completed[key]
+	return ok, true
 }
 
 func (c *altmountStateClient) Stale() bool {

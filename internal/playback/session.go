@@ -1246,6 +1246,10 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		s.RoutingEgressNodeURL = state.RoutingEgressNodeURL
 	}
 	if state.VirtualSourceOwnershipSet || state.VirtualSourceSet {
+		if strings.TrimSpace(s.VirtualSourceURI) != strings.TrimSpace(state.VirtualSourceURI) ||
+			s.VirtualSourceOwnerInstallationID != state.VirtualSourceOwnerInstallationID {
+			s.virtualSourceGeneration++
+		}
 		s.VirtualSourceURI = state.VirtualSourceURI
 		s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
 		if state.VirtualSubtitleEvidenceSet {
@@ -1370,6 +1374,10 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.RoutingEgressNodeID = state.RoutingEgressNodeID
 	s.RoutingEgressNodeURL = state.RoutingEgressNodeURL
 	s.RequireMediaAuthorization = state.RequireMediaAuthorization
+	if strings.TrimSpace(s.VirtualSourceURI) != strings.TrimSpace(state.VirtualSourceURI) ||
+		s.VirtualSourceOwnerInstallationID != state.VirtualSourceOwnerInstallationID {
+		s.virtualSourceGeneration++
+	}
 	s.VirtualSourceURI = state.VirtualSourceURI
 	s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
 	s.VirtualSourceRevision = state.VirtualSourceRevision
@@ -1433,6 +1441,62 @@ func (m *SessionManager) setVirtualSourceLocked(s *Session, virtualURI string, o
 	s.streamRevision++
 	s.virtualSourceGeneration++
 	m.touchSessionLocked(s)
+}
+
+// VirtualSourceBindingSnapshot captures the full candidate-binding state under the session lock.
+type VirtualSourceBindingSnapshot struct {
+	VirtualURI           string
+	OwnerInstallationID  int
+	EffectiveMediaFileID int
+	Generation           uint64
+}
+
+// VirtualSourceBinding captures the session's candidate-binding identity and generation
+// atomically under the session manager lock.
+func (m *SessionManager) VirtualSourceBinding(sessionID string) (VirtualSourceBindingSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return VirtualSourceBindingSnapshot{}, ErrSessionNotFound
+	}
+	return VirtualSourceBindingSnapshot{
+		VirtualURI:           s.VirtualSourceURI,
+		OwnerInstallationID:  s.VirtualSourceOwnerInstallationID,
+		EffectiveMediaFileID: s.MediaFileID,
+		Generation:           s.virtualSourceGeneration,
+	}, nil
+}
+
+// SetVirtualSourceIfBinding applies the candidate handoff and updates the effective
+// media file ID atomically under the lock only while the session's binding generation,
+// virtual URI, owner, and effective file ID match the expected snapshot.
+func (m *SessionManager) SetVirtualSourceIfBinding(
+	sessionID string,
+	expected VirtualSourceBindingSnapshot,
+	virtualURI string,
+	ownerInstallationID int,
+	effectiveMediaFileID int,
+) (uint64, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return 0, false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != expected.Generation ||
+		strings.TrimSpace(s.VirtualSourceURI) != strings.TrimSpace(expected.VirtualURI) ||
+		s.VirtualSourceOwnerInstallationID != expected.OwnerInstallationID ||
+		(expected.EffectiveMediaFileID > 0 && s.MediaFileID != expected.EffectiveMediaFileID) {
+		return s.virtualSourceGeneration, false, nil
+	}
+	m.setVirtualSourceLocked(s, virtualURI, ownerInstallationID)
+	if effectiveMediaFileID > 0 {
+		s.MediaFileID = effectiveMediaFileID
+	}
+	return s.virtualSourceGeneration, true, nil
 }
 
 // VirtualSourceGeneration returns the session's current candidate-binding
@@ -1532,6 +1596,7 @@ func (m *SessionManager) applyReplacementLocked(
 	// an ID-less stop no longer applies.
 	s.StopReported = false
 	applySessionStreamStateLocked(s, replacement.StreamState)
+	s.virtualSourceGeneration++
 	if replacement.PositionSeconds != nil {
 		s.Position = *replacement.PositionSeconds
 		if !replacement.PreservePaused {
@@ -1561,6 +1626,7 @@ func (m *SessionManager) RollbackReplacement(sessionID string, rollback SessionR
 	// Rolling back a replacement is still an active play, not a stopped one.
 	s.StopReported = false
 	restoreSessionStreamStateLocked(s, rollback.previousStreamState)
+	s.virtualSourceGeneration++
 	if rollback.restoreProgress {
 		s.Position = rollback.previousPosition
 		s.IsPaused = rollback.previousPaused

@@ -3557,6 +3557,15 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 						)
 						break
 					}
+					if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
+						slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"remaining", remaining,
+						)
+						break
+					}
 				}
 				lastProbedInput = anchorInput
 				origin, startSegment, err = probeAnchor(ctx)

@@ -562,6 +562,7 @@ export function usePlaybackSession(
   // duplicate or stale revision as a no-op, so this gates repeat deliveries
   // without comparing plan identity (which a rotation can move).
   const inventoryRevisionRef = useRef<string | null>(null);
+  const appliedInventoryRevisionsRef = useRef<Set<string>>(new Set());
   // Latest-wins coalescing for version switches: while a switch is in flight,
   // a second click records the newest target here instead of being dropped, and
   // the completion handler starts the switch to it immediately.
@@ -1237,6 +1238,7 @@ export function usePlaybackSession(
     playbackPlayingRef.current = true;
     playbackStartedRef.current = false;
     inventoryRevisionRef.current = null;
+    appliedInventoryRevisionsRef.current.clear();
 
     void loadSession({
       preferredFileId: fileId,
@@ -1863,6 +1865,9 @@ export function usePlaybackSession(
         const nextUri = source.effectiveVirtualUri ?? current.effectiveVirtualUri;
         const identityChanged =
           nextFileId !== current.mediaFileId || nextUri !== current.effectiveVirtualUri;
+        if (identityChanged) {
+          appliedInventoryRevisionsRef.current.clear();
+        }
         // Only positive probe evidence clears the marker. A declared push after
         // a verified one marks the menu provisional again rather than rendering
         // the (possibly empty) declared list as final.
@@ -1976,12 +1981,25 @@ export function usePlaybackSession(
         if (movedSource) pendingSwitchPositionRef.current = null;
         return;
       }
+      const current = stateRef.current;
+      // Drop pushes that name an outdated source when the player has already
+      // moved to another effective file or virtual candidate.
+      if (
+        (payload.effective_media_file_id != null &&
+          current.mediaFileId != null &&
+          payload.effective_media_file_id !== current.mediaFileId) ||
+        (payload.effective_virtual_uri != null &&
+          current.effectiveVirtualUri != null &&
+          payload.effective_virtual_uri !== current.effectiveVirtualUri)
+      ) {
+        return;
+      }
       // A duplicate or out-of-order push names a revision already folded in;
       // the server documents it as a no-op. Checked after the switch guard so a
       // push dropped under a replacement still applies when it is re-delivered.
       if (
         payload.inventory_revision != null &&
-        payload.inventory_revision === inventoryRevisionRef.current
+        appliedInventoryRevisionsRef.current.has(payload.inventory_revision)
       ) {
         return;
       }
@@ -2011,6 +2029,7 @@ export function usePlaybackSession(
       }
       if (payload.inventory_revision != null) {
         inventoryRevisionRef.current = payload.inventory_revision;
+        appliedInventoryRevisionsRef.current.add(payload.inventory_revision);
       }
     },
     [applyCommittedSource, applySubtitleInventory],

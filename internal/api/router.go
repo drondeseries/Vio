@@ -1739,17 +1739,16 @@ func newChiRouter(deps Dependencies) chi.Router {
 					return nil
 				}
 				// Serving the addon URL is the fill: force a fresh provider
-				// listing so AltMount queues the pinned release for import. The
-				// resolver only exchanges stream JSON, never media bytes, so Vio
-				// never fetches or stores the release. The listing's stream URL
-				// is deliberately not handed to svc.Monitor.EnqueueRelease: that
+				// listing so AltMount receives the request. The resolver only
+				// exchanges stream JSON, never media bytes, so Vio never
+				// fetches or stores the release. The listing's stream URL is
+				// deliberately not handed to svc.Monitor.EnqueueRelease: that
 				// path is AltMount's SABnzbd addurl, which expects the indexer's
 				// NZB download URL, not the addon's stream URL, so enqueueing it
 				// would make the provider reject or mis-parse the fill.
 				if _, err := svc.Refresh(ctx, virtualURI); err != nil {
 					return err
 				}
-				report(playback.DownloadProgressPayload{State: playback.DownloadProgressStateDownloading})
 				return nil
 			})
 			// Install the completion observer last so the waiter registry is
