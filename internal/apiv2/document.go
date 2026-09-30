@@ -716,6 +716,7 @@ func registerAll(reg *Registry) {
 	registerSystem(reg)
 	registerServerIdentity(reg)
 	registerWatchlist(reg)
+	registerWatchlistTitles(reg)
 	registerWatch(reg)
 	registerMediaCandidates(reg)
 	registerVirtualLibraryCapabilities(reg)
