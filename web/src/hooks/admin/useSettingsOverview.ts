@@ -25,6 +25,7 @@ export const ADMIN_SETTINGS_PAGE_IDS = [
   "playback",
   "downloads",
   "streaming",
+  "requests",
   "providers",
   "watch-sync",
   "ai",

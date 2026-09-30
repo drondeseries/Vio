@@ -23,6 +23,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/ai/jobrunner"
 	"github.com/Silo-Server/silo-server/internal/ai/llm"
+	"github.com/Silo-Server/silo-server/internal/animeids"
 	"github.com/Silo-Server/silo-server/internal/api/handlers"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/apiv2"
@@ -94,7 +95,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	virtuallibrary "github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/watchstate"
-	watchtrakt "github.com/Silo-Server/silo-server/internal/watchsync/providers/trakt"
 	"github.com/Silo-Server/silo-server/internal/watchtogether"
 	"github.com/Silo-Server/silo-server/internal/webhooksync"
 )
@@ -909,6 +909,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 			mediarequests.NewCatalogPresence(itemRepo, providerIDRepo),
 		)
 		AttachRequestRouter(requestSvc, deps.PluginService, deps.VirtualLibraryService)
+		requestSvc.SetAnimeIndex(animeids.NewStore(deps.DB))
 		requestSvc.SetCatalogChangeNotifier(sections.InvalidateResolvedListCache)
 		requestSvc.SetVirtualMediaCleanup(func(ctx context.Context, req mediarequests.Request) error {
 			tvdbID := ""
@@ -2449,12 +2450,10 @@ func newChiRouter(deps Dependencies) chi.Router {
 				settings: settingsRepo,
 			}
 		}
-		if libraryCollectionService.TraktTokenResolver == nil && deps.DB != nil && settingsRepo != nil {
+		if tokens, ok := deps.WatchProviderService.(watchProviderAccessTokens); ok && libraryCollectionService.TraktTokenResolver == nil && deps.DB != nil {
 			libraryCollectionService.TraktTokenResolver = &traktCollectionTokenResolver{
-				pool:     deps.DB,
-				settings: settingsRepo,
-				cipher:   deps.SecretCipher,
-				provider: watchtrakt.NewProvider(nil, ""),
+				pool:   deps.DB,
+				tokens: tokens,
 			}
 		}
 		if libraryCollectionService.MDBListAPI == nil && deps.MDBListClient != nil {
@@ -2646,6 +2645,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 				subtitleSource = subtitleManager
 			}
 			downloadSvc.SetOfflineDeps(detailSvc, subtitleSource, nil)
+		}
+		if streamHandler != nil {
+			downloadSvc.SetSubtitleCache(streamHandler.SubtitleCache)
 		}
 		if deps.MarkerPopulation != nil {
 			downloadSvc.SetMarkerPopulation(deps.MarkerPopulation)

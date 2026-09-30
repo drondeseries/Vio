@@ -242,6 +242,22 @@ func (c *compositeRequestRouter) Validate(ctx context.Context, installationID in
 	return c.plugin.Validate(ctx, installationID, capabilityID, conn, siblings)
 }
 
+// RouterFeatures reads the optional request_router.v1 features the
+// capability's stored manifest declares, without launching the plugin.
+func (a PluginRequestRouterAdapter) RouterFeatures(ctx context.Context, installationID int, capabilityID string) (mediarequests.RouterFeatures, error) {
+	if a.Svc == nil {
+		return mediarequests.RouterFeatures{}, errors.New("request router plugin service is not configured")
+	}
+	descriptor, err := a.Svc.RequestRouterDescriptor(ctx, installationID, capabilityID)
+	if err != nil {
+		return mediarequests.RouterFeatures{}, err
+	}
+	return mediarequests.RouterFeatures{
+		SupportsSeasons:         descriptor.GetSupportsSeasons(),
+		ReportsDownloadProgress: descriptor.GetReportsDownloadProgress(),
+	}, nil
+}
+
 // AttachRequestRouter wires the router provider onto a requests service, combining
 // core virtual library routing (when active) and external plugin routing.
 func AttachRequestRouter(svc *mediarequests.Service, pluginService *plugins.Service, vlSvc ...*virtuallibrary.Service) {

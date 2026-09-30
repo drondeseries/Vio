@@ -292,6 +292,7 @@ describe("buildSettingsOverview groups", () => {
       "playback",
       "downloads",
       "streaming",
+      "requests",
       "providers",
       "watch-sync",
       "ai",
