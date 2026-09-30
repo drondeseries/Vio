@@ -90,6 +90,17 @@ vi.mock("@/hooks/queries/catalogRead", () => ({
   usePrefetchCatalogItemDetail: () => vi.fn(),
 }));
 
+// Capability-gated upcoming badge in the season grid: tests render without
+// a QueryClient in some cases, so the hook stands in for the resolved
+// answer (unavailable keeps today's plain rendering).
+vi.mock("@/hooks/queries/episodeRelease", async (importOriginal) => {
+  const original = (await importOriginal()) as typeof import("@/hooks/queries/episodeRelease");
+  return {
+    ...original,
+    useEpisodeReleaseCapability: () => ({ data: { available: false } }),
+  };
+});
+
 vi.mock("@/components/MediaItemMenu", () => ({
   default: (props: Record<string, unknown>) => {
     mocks.capturedMediaMenuProps.push(props);

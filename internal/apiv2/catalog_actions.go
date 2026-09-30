@@ -72,6 +72,21 @@ type TrailersCapability struct {
 	SupportedTypes  []string `json:"supported_types" doc:"Item types the action applies to; empty when not configured"`
 }
 
+// EpisodeReleaseCapability reports whether episode rows and details expose
+// release timing. It is the feature-detection document for the v2 Episode
+// release_state member: clients read it before branching on the field.
+type EpisodeReleaseCapability struct {
+	Capability
+}
+
+// EpisodeReleaseCapabilityOutput is the getEpisodeReleaseCapability response.
+type EpisodeReleaseCapabilityOutput struct {
+	Status       int
+	ETag         string `header:"ETag"`
+	CacheControl string `header:"Cache-Control"`
+	Body         EpisodeReleaseCapability
+}
+
 // TrailersCapabilityOutput is the getTrailersCapability response.
 type TrailersCapabilityOutput struct {
 	Status       int
@@ -254,6 +269,8 @@ const (
 func registerCatalogActions(reg *Registry) {
 	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/capabilities/trailers", "getTrailersCapability", "catalog",
 		"Whether this server offers the viewer-facing trailer fetch, its cooldown, and the statuses the action answers.")), reg.getTrailersCapability)
+	Register(reg, viewerOperation(humaOp(http.MethodGet, Prefix+"/capabilities/episode-release", "getEpisodeReleaseCapability", "catalog",
+		"Whether episode rows and details expose release timing (the v2 Episode release_state member).")), reg.getEpisodeReleaseCapability)
 	refresh := humaOp(http.MethodPost, Prefix+"/catalog/items/{id}/trailers/refresh", "refreshCatalogItemTrailers", "catalog",
 		"Ask the server to fetch a movie's or series' remote trailers; answers 202 when queued, 200 with the cooldown or disabled state otherwise.")
 	refresh.DefaultStatus = http.StatusAccepted
@@ -328,6 +345,17 @@ func (reg *Registry) getTrailersCapability(_ context.Context, _ *CapabilityInput
 	}
 	doc := TrailersCapability{Capability: Capability{State: state}, CooldownSeconds: view.CooldownSeconds, Statuses: view.Statuses, SupportedTypes: view.SupportedTypes}
 	return &TrailersCapabilityOutput{CacheControl: cacheControlPrivateNoCache, Body: doc}, nil
+}
+
+// getEpisodeReleaseCapability answers the Episode release_state feature
+// document. Release timing is computed inline from the stored air date on
+// every episode row, so the capability is always available when the catalog
+// read seam is wired: its state describes contract support, not data.
+func (reg *Registry) getEpisodeReleaseCapability(_ context.Context, _ *CapabilityInput) (*EpisodeReleaseCapabilityOutput, error) {
+	if reg.deps.CatalogItems == nil || reg.deps.CatalogAccess == nil {
+		return &EpisodeReleaseCapabilityOutput{Body: EpisodeReleaseCapability{Capability: Capability{State: StateNotConfigured}}}, nil
+	}
+	return &EpisodeReleaseCapabilityOutput{Body: EpisodeReleaseCapability{Capability: Capability{State: StateAvailable}}}, nil
 }
 
 func (reg *Registry) refreshCatalogItemTrailers(ctx context.Context, in *CatalogItemActionInput) (*TrailerRefreshOutput, error) {

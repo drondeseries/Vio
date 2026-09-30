@@ -384,6 +384,7 @@ HEAD /api/v2/branding/assets/{kind}	non-media
 GET /api/v2/calendar	non-media
 GET /api/v2/capabilities/downloads	non-media
 GET /api/v2/capabilities/ebooks	non-media
+GET /api/v2/capabilities/episode-release	non-media
 GET /api/v2/capabilities/metadata-ai	non-media
 GET /api/v2/capabilities/password-reset	non-media
 GET /api/v2/capabilities/trailers	non-media
@@ -1567,6 +1568,7 @@ HEAD /api/v2/branding/assets/{kind}	non-media
 GET /api/v2/calendar	non-media
 GET /api/v2/capabilities/downloads	non-media
 GET /api/v2/capabilities/ebooks	non-media
+GET /api/v2/capabilities/episode-release	non-media
 GET /api/v2/capabilities/metadata-ai	non-media
 GET /api/v2/capabilities/password-reset	non-media
 GET /api/v2/capabilities/trailers	non-media

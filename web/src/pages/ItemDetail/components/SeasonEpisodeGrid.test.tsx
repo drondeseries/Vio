@@ -20,6 +20,16 @@ vi.mock("@/hooks/queries/catalogRead", () => ({
   usePrefetchCatalogItemDetail: () => vi.fn(),
 }));
 
+// Capability gating: the grid stands in for the resolved answer (available)
+// so the badge path is exercised without a QueryClient.
+vi.mock("@/hooks/queries/episodeRelease", async (importOriginal) => {
+  const original = (await importOriginal()) as typeof import("@/hooks/queries/episodeRelease");
+  return {
+    ...original,
+    useEpisodeReleaseCapability: () => ({ data: { available: true } }),
+  };
+});
+
 describe("SeasonEpisodeGrid", () => {
   beforeEach(() => {
     capturedMenuProps.length = 0;
@@ -117,6 +127,48 @@ describe("SeasonEpisodeGrid", () => {
     expect(watchedIndicator.closest(".media-card-image")).toBeNull();
     expect(screen.getByText("Episode 2").parentElement).not.toContainElement(watchedIndicator);
     expect(screen.getAllByLabelText("Watched")).toHaveLength(1);
+  });
+  it("badges server-classified upcoming episodes and leaves released ones alone", () => {
+    render(
+      <MemoryRouter>
+        <SeasonEpisodeGrid
+          isLoading={false}
+          episodes={[
+            {
+              content_id: "ep-future",
+              season_number: 2,
+              episode_number: 3,
+              title: "Rabbits Don't Swim",
+              overview: "Not yet aired.",
+              air_date: "2099-10-03",
+              release_state: "upcoming",
+              runtime: 60,
+              still_url: "https://stills.example/e3.jpg",
+              still_thumbhash: "",
+              files: [],
+            },
+            {
+              content_id: "ep-aired",
+              season_number: 2,
+              episode_number: 1,
+              title: "Remembrance Day",
+              overview: "Aired.",
+              air_date: "2022-02-18",
+              release_state: "released",
+              runtime: 60,
+              still_url: "https://stills.example/e1.jpg",
+              still_thumbhash: "",
+              files: [],
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+
+    const upcomingBadges = screen.getAllByText("Upcoming", { exact: false });
+    // Artwork overlay badge plus the meta-line label ("Upcoming · Oct 3, 2099").
+    expect(upcomingBadges.length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("Remembrance Day")).toBeTruthy();
   });
   it("caps the grid at four rows and scrolls the rest", () => {
     render(

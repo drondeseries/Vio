@@ -1,9 +1,14 @@
 import ViewTransitionLink from "@/components/ViewTransitionLink";
-import { Play, Star } from "lucide-react";
+import { CalendarClock, Play, Star } from "lucide-react";
 import type { EpisodeListItem } from "@/api/types";
 import CardOverlays from "@/components/overlays/CardOverlays";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
 import { overlayDataFromEpisodeListItem } from "@/lib/overlays";
+import {
+  formatCalendarDate,
+  isUpcomingEpisode,
+  useEpisodeReleaseCapability,
+} from "@/hooks/queries/episodeRelease";
 
 interface EpisodeRowProps {
   episode: EpisodeListItem;
@@ -14,6 +19,10 @@ interface EpisodeRowProps {
 
 export default function EpisodeRow({ episode, rating, watched, progress }: EpisodeRowProps) {
   const { prefs: overlayPrefs } = useOverlayPrefs();
+  // Capability-gated upcoming treatment: an older server without
+  // release_state keeps today's plain row rendering.
+  const { data: releaseCapability } = useEpisodeReleaseCapability();
+  const releaseSupported = releaseCapability?.available ?? false;
   const watchedState = watched ?? episode.user_data?.played ?? false;
   const derivedProgress =
     progress ??
@@ -29,6 +38,12 @@ export default function EpisodeRow({ episode, rating, watched, progress }: Episo
     })();
 
   const hasProgress = derivedProgress != null && derivedProgress > 0 && derivedProgress < 100;
+
+  // Upcoming episodes stay browsable and playable per existing eligibility:
+  // release timing is presentation only (badge + dim), never a playback
+  // gate. The server's release_state classifies; unknown/absent states and
+  // older servers fail open to today's plain rendering.
+  const upcoming = isUpcomingEpisode(episode, releaseSupported);
 
   return (
     <ViewTransitionLink
@@ -48,13 +63,27 @@ export default function EpisodeRow({ episode, rating, watched, progress }: Episo
           <img
             src={episode.still_url}
             alt={episode.title || `Episode ${episode.episode_number}`}
-            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+            className={`h-full w-full object-cover transition-transform duration-300 ${
+              upcoming ? "opacity-45 saturate-50" : "group-hover:scale-[1.03]"
+            }`}
             loading="lazy"
             decoding="async"
           />
+        ) : upcoming ? (
+          <div className="text-muted-foreground/50 flex h-full w-full items-center justify-center">
+            <CalendarClock className="size-6" aria-label="Upcoming" />
+          </div>
         ) : (
           <div className="text-muted-foreground/50 flex h-full w-full items-center justify-center">
             <Play className="size-6" />
+          </div>
+        )}
+        {upcoming && episode.still_url && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/35">
+            <span className="metadata-badge gap-1">
+              <CalendarClock className="size-3" aria-hidden="true" />
+              Upcoming
+            </span>
           </div>
         )}
         {overlayPrefs && (
@@ -99,9 +128,15 @@ export default function EpisodeRow({ episode, rating, watched, progress }: Episo
           )}
         </div>
         <div className="text-muted-foreground text-xs">
-          {episode.air_date && <span>{episode.air_date}</span>}
-          {episode.air_date && episode.runtime > 0 && <span className="mx-1.5">&middot;</span>}
-          {episode.runtime > 0 && <span>{episode.runtime}m</span>}
+          {upcoming ? (
+            <span>Upcoming{episode.air_date && ` · ${formatCalendarDate(episode.air_date)}`}</span>
+          ) : (
+            <>
+              {episode.air_date && <span>{formatCalendarDate(episode.air_date)}</span>}
+              {episode.air_date && episode.runtime > 0 && <span className="mx-1.5">&middot;</span>}
+              {episode.runtime > 0 && <span>{episode.runtime}m</span>}
+            </>
+          )}
         </div>
       </div>
 

@@ -151,8 +151,62 @@ func TestListSeasonEpisodes(t *testing.T) {
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"episode_number":2`) {
 		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
+	// Season 1 fixture dates (2022-02-18) are released, so the rows carry
+	// release_state:"released".
+	if !strings.Contains(rec.Body.String(), `"release_state":"released"`) {
+		t.Fatalf("episode rows lack release_state: %s", rec.Body.String())
+	}
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/catalog/series/series:severance/seasons/9/episodes", "", viewerHeaders()), TypeNotFound)
 	requireProblem(t, do(t, h, http.MethodGet, "/api/v2/catalog/series/series:severance/seasons/x/episodes", "", viewerHeaders()), TypeValidationFailed)
+}
+
+// TestEpisodesOfCarriesReleaseState pins the v2 renderer: the release state
+// rides the view's air date, and unknown dates stay absent.
+func TestEpisodesOfCarriesReleaseState(t *testing.T) {
+	future := time.Now().UTC().Add(30 * 24 * time.Hour).Format("2006-01-02")
+	views := []handlers.EpisodeView{
+		{ContentID: "episode:future", SeasonNumber: 2, EpisodeNumber: 3, Title: "Future", AirDate: future, Runtime: 60},
+		{ContentID: "episode:unknown", SeasonNumber: 2, EpisodeNumber: 4, Title: "Unknown", Runtime: 60},
+	}
+	out := episodesOf(views)
+	if len(out) != 2 {
+		t.Fatalf("episodesOf returned %d rows, want 2", len(out))
+	}
+	if out[0].ReleaseState != "upcoming" {
+		t.Fatalf("future row release_state = %q, want upcoming", out[0].ReleaseState)
+	}
+	if out[1].ReleaseState != "" {
+		t.Fatalf("unknown-date row release_state = %q, want absent", out[1].ReleaseState)
+	}
+}
+
+// TestCatalogItemDetailOfCarriesEpisodeReleaseState pins the v2 detail
+// renderer: an episode detail carries its release state, and a non-episode
+// (or unknown date) leaves it absent.
+func TestCatalogItemDetailOfCarriesEpisodeReleaseState(t *testing.T) {
+	upcoming := catalogpkg.EpisodeReleaseUpcoming
+	air := time.Now().UTC().Add(30 * 24 * time.Hour).Format("2006-01-02")
+	out := catalogItemDetailOf(&catalogpkg.ItemDetail{
+		ContentID: "episode:future", Type: "episode", Title: "Future",
+		AirDate: &air, ReleaseState: upcoming,
+		Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{},
+		Genres: []string{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{},
+	})
+	if out.ReleaseState != "upcoming" {
+		t.Fatalf("episode detail release_state = %q, want upcoming", out.ReleaseState)
+	}
+	if out.AirDate == nil || *out.AirDate != air {
+		t.Fatalf("episode detail air_date = %v, want %s", out.AirDate, air)
+	}
+
+	movie := catalogItemDetailOf(&catalogpkg.ItemDetail{
+		ContentID: "movie:heat-1995", Type: "movie", Title: "Heat",
+		Cast: []catalogpkg.CastCredit{}, Crew: []catalogpkg.CrewCredit{},
+		Genres: []string{}, Versions: []catalogpkg.FileVersion{}, Subtitles: []catalogpkg.SubtitleInfo{},
+	})
+	if movie.ReleaseState != "" {
+		t.Fatalf("movie detail release_state = %q, want absent", movie.ReleaseState)
+	}
 }
 
 func TestTrailersCapabilityAndRefresh(t *testing.T) {

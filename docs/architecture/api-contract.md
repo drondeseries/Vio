@@ -1534,17 +1534,25 @@ over 100 rather than clamping; the episode, season, version, and manga-file list
 envelopes, `getSeriesSeason` answers the season itself, and `getCatalogItem` leaves `keywords`,
 `original_language`, and `status` empty because the detail service does not load them.
 
-**Section catalog-items (Phase 4), stage B.** Nine more profile-scoped operations under the
+**Section catalog-items (Phase 4), stage B.** Ten more profile-scoped operations under the
 `catalog` tag complete the section: `listSeasonEpisodes`, the capability documents
-`getTrailersCapability` (`/capabilities/trailers`) and `getMetadataAICapability`
-(`/capabilities/metadata-ai`), the actions `refreshCatalogItemTrailers` and
+`getTrailersCapability` (`/capabilities/trailers`), `getMetadataAICapability`
+(`/capabilities/metadata-ai`), and `getEpisodeReleaseCapability`
+(`/capabilities/episode-release`), the actions `refreshCatalogItemTrailers` and
 `translateCatalogItemDescription`, `listPeople`, `getPerson`, `refreshPerson`, and
 `getLiteraryWork`. The v1 handlers and these operations share the seams in
 `internal/api/handlers/catalog_actions_service.go`; `handlers.APIError` gained `RetryAfter` so
 both listeners render the per-user limiter's hint. Deliberate differences from v1, all recorded on
-the ledger rows: the two probes are typed `Capability` documents (`revision`, `state`, named
+the ledger rows: the three probes are typed `Capability` documents (`revision`, `state`, named
 fields) with `Cache-Control: private, no-cache`, and the two v1 registrations of
-`/metadata/ai/status` are one operation whose unwired answer is `not_configured`; the three
+`/metadata/ai/status` are one operation whose unwired answer is `not_configured`; episode rows
+(`listCatalogItemEpisodes`, `listSeasonEpisodes`) and episode details (`getCatalogItem` on an
+episode id) carry `release_state` (`upcoming` when the calendar `air_date` is after today UTC,
+`released` otherwise, absent when the air date is unknown) — a v2-only additive member with no
+v1 counterpart, so no new ledger row; clients detect it through `getEpisodeReleaseCapability`.
+The release state is presentation timing only: it never gates playback, which keeps its existing
+fail-open behavior for unknown dates. Unknown dates still classify as released-adjacent (no
+upcoming badge) rather than confidently upcoming; the three
 background actions keep their v1 `202` with a small body (trailer refresh still answers `200` for
 `cooldown` and `disabled`) and are classified as coalescing actions, not the 202 job-monitor
 contract; an unconfigured action is `409 capability_not_configured` rather than `503`; the trailer

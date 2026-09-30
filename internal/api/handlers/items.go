@@ -422,12 +422,18 @@ type episodeFileResponse struct {
 
 // episodeResponse is the shape of an episode in API responses.
 type episodeResponse struct {
-	ContentID      string                  `json:"content_id"`
-	SeasonNumber   int                     `json:"season_number"`
-	EpisodeNumber  int                     `json:"episode_number"`
-	Title          string                  `json:"title"`
-	Overview       string                  `json:"overview,omitempty"`
-	AirDate        string                  `json:"air_date,omitempty"`
+	ContentID     string `json:"content_id"`
+	SeasonNumber  int    `json:"season_number"`
+	EpisodeNumber int    `json:"episode_number"`
+	Title         string `json:"title"`
+	Overview      string `json:"overview,omitempty"`
+	AirDate       string `json:"air_date,omitempty"`
+	// ReleaseState is the release timing derived from AirDate by
+	// EpisodeReleaseState: upcoming when the calendar date is after today
+	// (UTC), released otherwise, absent when the air date is unknown. The
+	// v1 shape keeps no copy: the frozen contract is unchanged and v2
+	// carries the field under its own name.
+	ReleaseState   string                  `json:"-"`
 	Runtime        int                     `json:"runtime"`
 	ImdbID         string                  `json:"imdb_id,omitempty"`
 	TmdbID         string                  `json:"tmdb_id,omitempty"`
@@ -437,6 +443,24 @@ type episodeResponse struct {
 	UserData       *catalog.SeasonUserData `json:"user_data,omitempty"`
 	Files          []episodeFileResponse   `json:"files,omitempty"`
 	OverlaySummary *models.OverlaySummary  `json:"overlay_summary,omitempty"`
+}
+
+// Episode release states: release timing derived from an episode air date.
+// The values are part of the v2 Episode contract; unknown and malformed
+// dates classify as "" (absent) so unknown metadata fails open for playback.
+// The shared decision lives in catalog.ReleaseStateForAirDate; this is the
+// handlers-package alias so the v1 shell and the v2 renderer name one value.
+const (
+	EpisodeReleaseUpcoming = catalog.EpisodeReleaseUpcoming
+	EpisodeReleaseReleased = catalog.EpisodeReleaseReleased
+)
+
+// EpisodeReleaseState classifies a YYYY-MM-DD air date against today's UTC
+// calendar date. It is the single release-timing decision the episode list,
+// detail, and v2 renderer share: one parse, one boundary, no timezone
+// conversion beyond the stored calendar date.
+func EpisodeReleaseState(airDate string) string {
+	return catalog.ReleaseStateForAirDate(airDate)
 }
 
 type episodeImageFallback struct {
@@ -1177,6 +1201,7 @@ func episodeResponseShell(ep *models.Episode, fallback episodeImageFallback, siz
 
 	if ep.AirDate != nil {
 		resp.AirDate = ep.AirDate.Format("2006-01-02")
+		resp.ReleaseState = EpisodeReleaseState(resp.AirDate)
 	}
 
 	return resp, sizedCardPath(stillPath, artworkkey.ImageStill, size)

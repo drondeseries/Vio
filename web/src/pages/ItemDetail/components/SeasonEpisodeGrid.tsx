@@ -1,5 +1,5 @@
 import { useRef } from "react";
-import { Play } from "lucide-react";
+import { CalendarClock, Play } from "lucide-react";
 import type { EpisodeListItem } from "@/api/types";
 import { WatchedCheckIndicator } from "@/components/CardWatchedBadge";
 import { toEpisodeUserState } from "@/components/episodeUserState";
@@ -7,6 +7,11 @@ import MediaItemMenu from "@/components/MediaItemMenu";
 import CardOverlays from "@/components/overlays/CardOverlays";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import {
+  formatCalendarDate,
+  isUpcomingEpisode,
+  useEpisodeReleaseCapability,
+} from "@/hooks/queries/episodeRelease";
 import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
 import { useGridRowCap } from "@/hooks/useGridRowCap";
@@ -40,6 +45,9 @@ export default function SeasonEpisodeGrid({
   const { prefs: overlayPrefs, quickActionMode } = useOverlayPrefs();
   const prefetchEpisodeDetail = usePrefetchCatalogItemDetail();
   const setGridRef = useGridRowCap<HTMLDivElement>(VISIBLE_EPISODE_ROWS, episodes.length);
+  // Capability-gated upcoming treatment shared with the list rows.
+  const { data: releaseCapability } = useEpisodeReleaseCapability();
+  const releaseSupported = releaseCapability?.available ?? false;
 
   if (isLoading) {
     return <EpisodeGridSkeleton />;
@@ -67,6 +75,7 @@ export default function SeasonEpisodeGrid({
           episodeLinkState={episodeLinkState}
           overlayPrefs={overlayPrefs}
           quickActionMode={quickActionMode}
+          releaseSupported={releaseSupported}
           onPrefetch={() => prefetchEpisodeDetail(episode.content_id)}
         />
       ))}
@@ -79,12 +88,14 @@ function SeasonEpisodeCard({
   episodeLinkState,
   overlayPrefs,
   quickActionMode,
+  releaseSupported,
   onPrefetch,
 }: {
   episode: EpisodeListItem;
   episodeLinkState?: EpisodeNavigationState;
   overlayPrefs: CardOverlayPrefs | null;
   quickActionMode: CardQuickActionMode;
+  releaseSupported: boolean;
   onPrefetch: () => void;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
@@ -94,6 +105,9 @@ function SeasonEpisodeCard({
     (episode.user_data?.position_seconds ?? 0) > 0 &&
     (episode.user_data?.duration_seconds ?? 0) > 0;
   const episodeTitle = episode.title || `Episode ${episode.episode_number}`;
+  // Same upcoming treatment as the list rows: badge + dim only, never a
+  // playback gate. Navigation and watched state stay intact.
+  const upcoming = isUpcomingEpisode(episode, releaseSupported);
 
   return (
     <div ref={cardRef} className="group/card media-card media-card-longpress" {...prefetchHandlers}>
@@ -109,12 +123,30 @@ function SeasonEpisodeCard({
                 src={episode.still_url}
                 alt={episodeTitle}
                 decoding="async"
-                className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                className={`h-full w-full object-cover transition-transform duration-300 ${
+                  upcoming ? "opacity-45 saturate-50" : "group-hover:scale-[1.03]"
+                }`}
                 loading="lazy"
               />
+            ) : upcoming ? (
+              <div className="flex h-full w-full items-center justify-center">
+                <CalendarClock
+                  size={32}
+                  className="text-muted-foreground/50"
+                  aria-label="Upcoming"
+                />
+              </div>
             ) : (
               <div className="flex h-full w-full items-center justify-center">
                 <Play size={32} className="text-muted-foreground/30" />
+              </div>
+            )}
+            {upcoming && episode.still_url && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/35">
+                <span className="metadata-badge gap-1">
+                  <CalendarClock className="size-3" aria-hidden="true" />
+                  Upcoming
+                </span>
               </div>
             )}
             {overlayPrefs && (
@@ -170,15 +202,15 @@ function SeasonEpisodeCard({
         <p className="text-foreground truncate text-sm font-semibold">{episodeTitle}</p>
         <div className="mt-1.5 space-y-1">
           <div className="text-muted-foreground flex items-center gap-2 text-xs">
-            {episode.runtime > 0 && <span>{episode.runtime}m</span>}
-            {episode.air_date && (
+            {upcoming ? (
               <span>
-                {new Intl.DateTimeFormat(undefined, {
-                  month: "short",
-                  day: "numeric",
-                  year: "numeric",
-                }).format(new Date(episode.air_date))}
+                Upcoming{episode.air_date && ` · ${formatCalendarDate(episode.air_date)}`}
               </span>
+            ) : (
+              <>
+                {episode.runtime > 0 && <span>{episode.runtime}m</span>}
+                {episode.air_date && <span>{formatCalendarDate(episode.air_date)}</span>}
+              </>
             )}
           </div>
           {episode.overview && (

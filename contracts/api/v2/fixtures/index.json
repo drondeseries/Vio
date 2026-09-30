@@ -5744,6 +5744,44 @@
       "body_file": "get_effective_subtitle_appearance_ok.json"
     },
     {
+      "name": "get_episode_release_capability_authentication_required",
+      "operation_id": "getEpisodeReleaseCapability",
+      "scenario": "The episode release-timing capability document without a credential.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/capabilities/episode-release"
+      },
+      "expected_status": 401,
+      "response_headers": {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/problem+json"
+      },
+      "response_media_type": "application/problem+json",
+      "schema": "#/components/schemas/Problem",
+      "body_file": "get_episode_release_capability_authentication_required.json"
+    },
+    {
+      "name": "get_episode_release_capability_ok",
+      "operation_id": "getEpisodeReleaseCapability",
+      "scenario": "The episode release-timing capability document: episode rows and details expose release_state.",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/capabilities/episode-release",
+        "headers": {
+          "Authorization": "Bearer tok-member",
+          "X-Profile-Id": "p-owner"
+        }
+      },
+      "expected_status": 200,
+      "response_headers": {
+        "Cache-Control": "private, no-cache",
+        "Content-Type": "application/json"
+      },
+      "response_media_type": "application/json",
+      "schema": "#/components/schemas/EpisodeReleaseCapability",
+      "body_file": "get_episode_release_capability_ok.json"
+    },
+    {
       "name": "get_favorite_authentication_required",
       "operation_id": "getFavorite",
       "scenario": "A favorites read without a credential.",

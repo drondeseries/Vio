@@ -304,6 +304,10 @@ export function catalogItemDetailFromV2(item: CatalogItemDetailV2): ItemDetail {
     episode_number: item.episode_number ?? null,
     episode_count: item.episode_count ?? null,
     air_date: item.air_date ?? null,
+    release_state:
+      item.release_state === "upcoming" || item.release_state === "released"
+        ? item.release_state
+        : undefined,
     is_specials: item.is_specials,
     user_data: item.user_data ? watchRollupFromV2(item.user_data) : undefined,
     user_state: item.user_state,
@@ -352,6 +356,7 @@ export function episodeFromV2(episode: EpisodeV2): EpisodeListItem {
     title: episode.title,
     overview: episode.overview ?? "",
     air_date: episode.air_date ?? null,
+    release_state: episode.release_state ?? undefined,
     runtime: episode.runtime,
     imdb_id: episode.imdb_id,
     tmdb_id: episode.tmdb_id,

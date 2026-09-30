@@ -245,6 +245,7 @@ export const v2Operations = {
   "GET /api/v2/calendar": "getCalendar",
   "GET /api/v2/capabilities/downloads": "getDownloadCapability",
   "GET /api/v2/capabilities/ebooks": "getEbookCapability",
+  "GET /api/v2/capabilities/episode-release": "getEpisodeReleaseCapability",
   "GET /api/v2/capabilities/metadata-ai": "getMetadataAICapability",
   "GET /api/v2/capabilities/password-reset": "getPasswordResetCapability",
   "GET /api/v2/capabilities/trailers": "getTrailersCapability",
