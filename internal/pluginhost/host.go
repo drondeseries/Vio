@@ -16,7 +16,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
@@ -269,7 +268,7 @@ func (h *Host) Start(ctx context.Context, req StartRequest) (*Client, error) {
 		process.Kill()
 		return nil, fmt.Errorf("plugin runtime returned an empty manifest")
 	}
-	if !proto.Equal(req.Manifest, liveManifestResponse.GetManifest()) {
+	if !manifestsMatch(req.Manifest, liveManifestResponse.GetManifest()) {
 		_ = protocol.Close()
 		process.Kill()
 		return nil, fmt.Errorf("plugin runtime manifest does not match installed manifest")
