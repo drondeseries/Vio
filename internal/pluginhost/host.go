@@ -273,6 +273,10 @@ func (h *Host) Start(ctx context.Context, req StartRequest) (*Client, error) {
 		process.Kill()
 		return nil, fmt.Errorf("plugin runtime manifest does not match installed manifest")
 	}
+	if usesLegacyVirtualEncoding(liveManifestResponse.GetManifest()) {
+		h.logger.Warn("plugin uses the legacy virtual-stream manifest encoding; temporary compatibility was applied",
+			"plugin_id", req.Manifest.GetPluginId(), "installation_id", req.InstallationID)
+	}
 	configureCtx, configureCancel := ensureDeadline(ctx, DefaultControlTimeout)
 	defer configureCancel()
 

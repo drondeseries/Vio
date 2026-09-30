@@ -8,9 +8,10 @@ import (
 )
 
 // legacyVirtualStreamField is the CapabilityDescriptor field number the fork
-// assigned virtual_stream_provider before upstream claimed 11 for
-// network_access. The fork moved its descriptor to 13; binaries built
-// against the old SDK still emit it at 11.
+// assigned virtual_stream_provider before moving it to 13: upstream's
+// request-router seasons change assigned 11 to network_access_provider in
+// its own tree, colliding with the fork's earlier assignment. Binaries
+// built against the old fork SDK still emit the descriptor at 11.
 const legacyVirtualStreamField = 11
 
 // manifestsMatch reports whether the installed manifest and the live manifest
@@ -20,9 +21,11 @@ const legacyVirtualStreamField = 11
 // manifest (parsed from JSON, where the field name is unchanged) carries it
 // at field 13. Without the fold no pre-renumber binary can start —
 // host.Start would refuse the virtual-library plugin right after a server
-// upgrade. The fold only fills a missing typed descriptor from legacy
-// unknown bytes; every other field, including the binary checksum, still
-// compares strictly.
+// upgrade. The fold applies per capability and only when the legacy bytes
+// are unambiguous (exactly one well-formed bytes-typed field 11 and no
+// typed descriptor); duplicates, malformed data, and unrelated unknown
+// fields keep the strict verdict. Checksum and every other field always
+// compare strictly.
 func manifestsMatch(installed, live *pluginv1.PluginManifest) bool {
 	if proto.Equal(installed, live) {
 		return true
@@ -31,75 +34,105 @@ func manifestsMatch(installed, live *pluginv1.PluginManifest) bool {
 	if !ok {
 		return false
 	}
-	changed := false
+	folded := false
 	for _, c := range normalized.GetCapabilities() {
-		if c.GetVirtualStreamProvider() == nil {
-			if d := legacyVirtualStreamDescriptor(c); d != nil {
-				c.VirtualStreamProvider = d
-				changed = true
-			}
+		foldedLegacy, ok := foldLegacyVirtualDescriptor(c)
+		if !ok {
+			return false
 		}
+		folded = folded || foldedLegacy
 	}
-	if !changed {
+	if !folded {
 		return false
 	}
-	return proto.Equal(installed, stripLegacyVirtualUnknown(normalized))
+	return proto.Equal(installed, normalized)
 }
 
-// legacyVirtualStreamDescriptor parses unknown field 11 of a capability
-// descriptor as a VirtualStreamProviderDescriptor. It returns nil when the
-// field is absent or malformed.
-func legacyVirtualStreamDescriptor(c *pluginv1.CapabilityDescriptor) *pluginv1.VirtualStreamProviderDescriptor {
+// usesLegacyVirtualEncoding reports whether a live manifest carries the
+// pre-renumber field-11 virtual descriptor bytes, for a deprecation log on
+// compatibility-assisted starts.
+func usesLegacyVirtualEncoding(live *pluginv1.PluginManifest) bool {
+	for _, c := range live.GetCapabilities() {
+		if c.GetType() == "virtual_stream_provider.v1" &&
+			c.GetVirtualStreamProvider() == nil && hasLegacyVirtualBytes(c) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasLegacyVirtualBytes(c *pluginv1.CapabilityDescriptor) bool {
 	unknown := c.ProtoReflect().GetUnknown()
 	for len(unknown) > 0 {
 		num, typ, n := protowire.ConsumeTag(unknown)
 		if n < 0 {
-			return nil
+			return false
 		}
 		unknown = unknown[n:]
 		m := protowire.ConsumeFieldValue(num, typ, unknown)
 		if m < 0 {
-			return nil
+			return false
 		}
 		if num == legacyVirtualStreamField && typ == protowire.BytesType {
-			v, _ := protowire.ConsumeBytes(unknown[:m])
-			var d pluginv1.VirtualStreamProviderDescriptor
-			if err := proto.Unmarshal(v, &d); err == nil {
-				return &d
-			}
+			return true
 		}
 		unknown = unknown[m:]
 	}
-	return nil
+	return false
 }
 
-// stripLegacyVirtualUnknown drops unknown field 11 from every capability so
-// a folded live manifest compares byte-clean against the installed one.
-func stripLegacyVirtualUnknown(m *pluginv1.PluginManifest) *pluginv1.PluginManifest {
-	for _, c := range m.GetCapabilities() {
-		unknown := c.ProtoReflect().GetUnknown()
-		if len(unknown) == 0 {
-			continue
+// foldLegacyVirtualDescriptor fills a missing typed virtual_stream_provider
+// from exactly one well-formed legacy field-11 value, removing only those
+// bytes and leaving every other unknown field untouched. It reports whether
+// it folded, and false (refuse) on duplicates or malformed legacy data.
+func foldLegacyVirtualDescriptor(c *pluginv1.CapabilityDescriptor) (bool, bool) {
+	if c.GetVirtualStreamProvider() != nil {
+		return false, true
+	}
+	// Only virtual-stream capabilities fold: legacy bytes anywhere else
+	// stay significant for the strict comparison.
+	if c.GetType() != "virtual_stream_provider.v1" {
+		return false, true
+	}
+	unknown := c.ProtoReflect().GetUnknown()
+	var kept []byte
+	var folded *pluginv1.VirtualStreamProviderDescriptor
+	rest := unknown
+	for len(rest) > 0 {
+		num, typ, n := protowire.ConsumeTag(rest)
+		if n < 0 {
+			return false, false
 		}
-		var kept []byte
-		rest := unknown
-		for len(rest) > 0 {
-			num, typ, n := protowire.ConsumeTag(rest)
-			if n < 0 {
-				break
-			}
-			rest = rest[n:]
+		field := rest[:n]
+		rest = rest[n:]
+		if num != legacyVirtualStreamField || typ != protowire.BytesType {
 			m := protowire.ConsumeFieldValue(num, typ, rest)
 			if m < 0 {
-				break
+				return false, false
 			}
-			if num != legacyVirtualStreamField {
-				kept = protowire.AppendTag(kept, num, typ)
-				kept = append(kept, rest[:m]...)
-			}
+			kept = append(kept, field...)
+			kept = append(kept, rest[:m]...)
 			rest = rest[m:]
+			continue
 		}
-		c.ProtoReflect().SetUnknown(kept)
+		v, m := protowire.ConsumeBytes(rest)
+		if m < 0 {
+			return false, false
+		}
+		rest = rest[m:]
+		var d pluginv1.VirtualStreamProviderDescriptor
+		if err := proto.Unmarshal(v, &d); err != nil {
+			return false, false
+		}
+		if folded != nil {
+			return false, false
+		}
+		folded = &d
 	}
-	return m
+	if folded == nil {
+		return false, true
+	}
+	c.VirtualStreamProvider = folded
+	c.ProtoReflect().SetUnknown(kept)
+	return true, true
 }

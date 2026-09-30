@@ -89,3 +89,98 @@ func TestManifestsMatchStillRejectsTampering(t *testing.T) {
 		t.Fatal("malformed legacy bytes must still refuse the plugin")
 	}
 }
+
+func legacyBytes(t *testing.T, d *pluginv1.VirtualStreamProviderDescriptor) []byte {
+	t.Helper()
+	raw, err := proto.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := protowire.AppendTag(nil, legacyVirtualStreamField, protowire.BytesType)
+	return protowire.AppendBytes(out, raw)
+}
+
+func TestManifestsMatchRejectsDuplicateLegacyDescriptors(t *testing.T) {
+	installed := &pluginv1.PluginManifest{
+		PluginId: "old-plugin",
+		Checksum: "abc",
+		Capabilities: []*pluginv1.CapabilityDescriptor{
+			{
+				Type:                  "virtual_stream_provider.v1",
+				Id:                    "streams",
+				VirtualStreamProvider: &pluginv1.VirtualStreamProviderDescriptor{},
+			},
+		},
+	}
+	dup := append(legacyBytes(t, &pluginv1.VirtualStreamProviderDescriptor{}),
+		legacyBytes(t, &pluginv1.VirtualStreamProviderDescriptor{})...)
+	live := &pluginv1.PluginManifest{
+		PluginId: "old-plugin",
+		Checksum: "abc",
+		Capabilities: []*pluginv1.CapabilityDescriptor{
+			{Type: "virtual_stream_provider.v1", Id: "streams"},
+		},
+	}
+	live.GetCapabilities()[0].ProtoReflect().SetUnknown(dup)
+	if manifestsMatch(installed, live) {
+		t.Fatal("duplicate legacy descriptors must refuse, not fold the first")
+	}
+}
+
+func TestManifestsMatchKeepsUnrelatedLegacyBytesSignificant(t *testing.T) {
+	installed := &pluginv1.PluginManifest{
+		PluginId: "old-plugin",
+		Checksum: "abc",
+		Capabilities: []*pluginv1.CapabilityDescriptor{
+			{Type: "metadata_provider.v1", Id: "meta"},
+			{
+				Type:                  "virtual_stream_provider.v1",
+				Id:                    "streams",
+				VirtualStreamProvider: &pluginv1.VirtualStreamProviderDescriptor{},
+			},
+		},
+	}
+	live := &pluginv1.PluginManifest{
+		PluginId: "old-plugin",
+		Checksum: "abc",
+		Capabilities: []*pluginv1.CapabilityDescriptor{
+			{Type: "metadata_provider.v1", Id: "meta"},
+			{Type: "virtual_stream_provider.v1", Id: "streams"},
+		},
+	}
+	// Legacy bytes on an unrelated capability must not be swept away by a
+	// successful fold elsewhere.
+	stray := legacyBytes(t, &pluginv1.VirtualStreamProviderDescriptor{})
+	live.GetCapabilities()[0].ProtoReflect().SetUnknown(stray)
+	live.GetCapabilities()[1].ProtoReflect().SetUnknown(
+		legacyBytes(t, &pluginv1.VirtualStreamProviderDescriptor{}))
+	if manifestsMatch(installed, live) {
+		t.Fatal("legacy bytes on an unrelated capability must still mismatch")
+	}
+}
+
+func TestManifestsMatchDoesNotMutateInputs(t *testing.T) {
+	installed := &pluginv1.PluginManifest{
+		PluginId: "old-plugin",
+		Checksum: "abc",
+		Capabilities: []*pluginv1.CapabilityDescriptor{
+			{
+				Type:                  "virtual_stream_provider.v1",
+				Id:                    "streams",
+				VirtualStreamProvider: &pluginv1.VirtualStreamProviderDescriptor{},
+			},
+		},
+	}
+	live := &pluginv1.PluginManifest{
+		PluginId:     "old-plugin",
+		Version:      "1.0",
+		Checksum:     "abc",
+		Capabilities: []*pluginv1.CapabilityDescriptor{oldStyleCapability()},
+	}
+	beforeLive := proto.Clone(live).(*pluginv1.PluginManifest)
+	beforeInstalled := proto.Clone(installed).(*pluginv1.PluginManifest)
+	_ = manifestsMatch(installed, live)
+	if !proto.Equal(live, beforeLive) || !proto.Equal(installed, beforeInstalled) {
+		t.Fatal("manifestsMatch must not mutate its inputs")
+	}
+}
