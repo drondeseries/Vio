@@ -17,7 +17,7 @@ func oldStyleCapability() *pluginv1.CapabilityDescriptor {
 		panic(err)
 	}
 	capability := &pluginv1.CapabilityDescriptor{
-		Type: "virtual_stream_provider.v1",
+		Type: legacyVirtualStreamCapabilityType,
 		Id:   "streams",
 	}
 	var unknown []byte
@@ -34,7 +34,7 @@ func TestManifestsMatchFoldsLegacyVirtualDescriptor(t *testing.T) {
 		Checksum: "abc",
 		Capabilities: []*pluginv1.CapabilityDescriptor{
 			{
-				Type:                  "virtual_stream_provider.v1",
+				Type:                  legacyVirtualStreamCapabilityType,
 				Id:                    "streams",
 				VirtualStreamProvider: &pluginv1.VirtualStreamProviderDescriptor{},
 			},
@@ -60,7 +60,7 @@ func TestManifestsMatchStillRejectsTampering(t *testing.T) {
 		Checksum: "abc",
 		Capabilities: []*pluginv1.CapabilityDescriptor{
 			{
-				Type:                  "virtual_stream_provider.v1",
+				Type:                  legacyVirtualStreamCapabilityType,
 				Id:                    "streams",
 				VirtualStreamProvider: &pluginv1.VirtualStreamProviderDescriptor{},
 			},
@@ -79,7 +79,7 @@ func TestManifestsMatchStillRejectsTampering(t *testing.T) {
 		PluginId: "old-plugin",
 		Checksum: "abc",
 		Capabilities: []*pluginv1.CapabilityDescriptor{
-			{Type: "virtual_stream_provider.v1", Id: "streams"},
+			{Type: legacyVirtualStreamCapabilityType, Id: "streams"},
 		},
 	}
 	broken.GetCapabilities()[0].ProtoReflect().SetUnknown(
@@ -106,7 +106,7 @@ func TestManifestsMatchRejectsDuplicateLegacyDescriptors(t *testing.T) {
 		Checksum: "abc",
 		Capabilities: []*pluginv1.CapabilityDescriptor{
 			{
-				Type:                  "virtual_stream_provider.v1",
+				Type:                  legacyVirtualStreamCapabilityType,
 				Id:                    "streams",
 				VirtualStreamProvider: &pluginv1.VirtualStreamProviderDescriptor{},
 			},
@@ -118,7 +118,7 @@ func TestManifestsMatchRejectsDuplicateLegacyDescriptors(t *testing.T) {
 		PluginId: "old-plugin",
 		Checksum: "abc",
 		Capabilities: []*pluginv1.CapabilityDescriptor{
-			{Type: "virtual_stream_provider.v1", Id: "streams"},
+			{Type: legacyVirtualStreamCapabilityType, Id: "streams"},
 		},
 	}
 	live.GetCapabilities()[0].ProtoReflect().SetUnknown(dup)
@@ -134,7 +134,7 @@ func TestManifestsMatchKeepsUnrelatedLegacyBytesSignificant(t *testing.T) {
 		Capabilities: []*pluginv1.CapabilityDescriptor{
 			{Type: "metadata_provider.v1", Id: "meta"},
 			{
-				Type:                  "virtual_stream_provider.v1",
+				Type:                  legacyVirtualStreamCapabilityType,
 				Id:                    "streams",
 				VirtualStreamProvider: &pluginv1.VirtualStreamProviderDescriptor{},
 			},
@@ -145,7 +145,7 @@ func TestManifestsMatchKeepsUnrelatedLegacyBytesSignificant(t *testing.T) {
 		Checksum: "abc",
 		Capabilities: []*pluginv1.CapabilityDescriptor{
 			{Type: "metadata_provider.v1", Id: "meta"},
-			{Type: "virtual_stream_provider.v1", Id: "streams"},
+			{Type: legacyVirtualStreamCapabilityType, Id: "streams"},
 		},
 	}
 	// Legacy bytes on an unrelated capability must not be swept away by a
@@ -165,7 +165,7 @@ func TestManifestsMatchDoesNotMutateInputs(t *testing.T) {
 		Checksum: "abc",
 		Capabilities: []*pluginv1.CapabilityDescriptor{
 			{
-				Type:                  "virtual_stream_provider.v1",
+				Type:                  legacyVirtualStreamCapabilityType,
 				Id:                    "streams",
 				VirtualStreamProvider: &pluginv1.VirtualStreamProviderDescriptor{},
 			},

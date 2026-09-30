@@ -12,7 +12,10 @@ import (
 // request-router seasons change assigned 11 to network_access_provider in
 // its own tree, colliding with the fork's earlier assignment. Binaries
 // built against the old fork SDK still emit the descriptor at 11.
-const legacyVirtualStreamField = 11
+const (
+	legacyVirtualStreamField          = 11
+	legacyVirtualStreamCapabilityType = "virtual_stream_provider.v1"
+)
 
 // manifestsMatch reports whether the installed manifest and the live manifest
 // served by the plugin process describe the same plugin. It is proto.Equal
@@ -53,7 +56,7 @@ func manifestsMatch(installed, live *pluginv1.PluginManifest) bool {
 // compatibility-assisted starts.
 func usesLegacyVirtualEncoding(live *pluginv1.PluginManifest) bool {
 	for _, c := range live.GetCapabilities() {
-		if c.GetType() == "virtual_stream_provider.v1" &&
+		if c.GetType() == legacyVirtualStreamCapabilityType &&
 			c.GetVirtualStreamProvider() == nil && hasLegacyVirtualBytes(c) {
 			return true
 		}
@@ -91,7 +94,7 @@ func foldLegacyVirtualDescriptor(c *pluginv1.CapabilityDescriptor) (bool, bool) 
 	}
 	// Only virtual-stream capabilities fold: legacy bytes anywhere else
 	// stay significant for the strict comparison.
-	if c.GetType() != "virtual_stream_provider.v1" {
+	if c.GetType() != legacyVirtualStreamCapabilityType {
 		return false, true
 	}
 	unknown := c.ProtoReflect().GetUnknown()
