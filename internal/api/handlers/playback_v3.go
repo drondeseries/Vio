@@ -2434,7 +2434,7 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 		}
 		altResolved, altErr := h.resolveVirtualPlaybackSource(
 			walkReq, alternate, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, false,
-			virtualResolveOptionsV3{sessionBound: false},
+			virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true},
 		)
 		if altErr == nil && altResolved.File != nil {
 			slog.InfoContext(walkCtx, "virtual start fell back to an alternate version after a listing failure",
@@ -2475,7 +2475,7 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 	if !isVirtualPlaybackFile(alternate) {
 		return h.ensurePlaybackProbe(r.Context(), alternate), "", nil
 	}
-	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false})
+	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true})
 	if err != nil {
 		return nil, "", err
 	}
@@ -2827,6 +2827,24 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		return playback.DecisionResponseV3{}, sessionStartErrorV3(err)
 	}
 	abort := func() { _ = h.stopPlaybackSessionByID(context.WithoutCancel(r.Context()), session.ID, false) }
+	// Auto version fallback is negotiated once at start: an auto selection
+	// leaves it on (a dead source may fail over across versions), an explicit
+	// version pick turns it off (the viewer chose that release). The session
+	// records it so a later replan honors the same intent, and the viewer can
+	// flip it back on through the version menu's Auto entry.
+	if setter, ok := h.sessionMgr.(interface {
+		SetAutoFallback(sessionID string, enabled bool) error
+	}); ok {
+		autoFallback := req.AllowsAlternateVersions() && req.FileSelection != playback.FileSelectionExplicitV3
+		if err := setter.SetAutoFallback(session.ID, autoFallback); err != nil {
+			abort()
+			return playback.DecisionResponseV3{}, &transportErrorV3{
+				reason:  "internal_error",
+				message: "Failed to establish the version fallback policy.",
+				cause:   err,
+			}
+		}
+	}
 	if req.ProgressPersistence == playback.ProgressPersistenceClientV3 || !sessionOwnsResumeTimelineV3(effectiveFile) {
 		if err := h.sessionMgr.SetProgressPersistenceDisabled(session.ID, true); err != nil {
 			abort()
@@ -7471,7 +7489,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// so nothing needs the bypass; bypassing stamps here is what
 				// would let sequential rotations cycle A→B→C→A instead of
 				// terminating when every sibling is known-bad.
-				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI})
+				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true})
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true
@@ -7794,8 +7812,17 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// terminalAllowsAlternateFileV3: subtitle_conversion_unsupported is no
 		// longer in that set precisely so a subtitle problem cannot reach the
 		// sibling hunt.
-		replanFallbackAllowed := record.NormalizedRequest.AllowsAlternateVersions() &&
-			record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3 &&
+		// The session's negotiated auto-fallback flag is authoritative when set:
+		// an explicit start turns it off so a replan must not silently substitute
+		// another version, and the viewer re-selecting Auto turns it back on even
+		// for a session that started explicit. An unset flag (a reconstruction)
+		// keeps the original request's semantics.
+		autoFallback := record.NormalizedRequest.AllowsAlternateVersions() &&
+			record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3
+		if negotiated, ok := autoFallbackForSession(h.sessionMgr, session.ID); ok {
+			autoFallback = negotiated
+		}
+		replanFallbackAllowed := autoFallback &&
 			(replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
 				(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3))
 		subtitleOnlyAllowed := replanFallbackAllowed && subtitleOnlyTerminalV3(result.Terminal)
@@ -7859,6 +7886,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 						break
 					}
 					if alternate.ID == baseEffectiveFile.ID {
+						continue
+					}
+					if virtualCandidateVerdictActive(alternate.FailedAt, time.Now()) {
+						// AltMount indicted this version; never attempt it,
+						// however the pinned release failed. This mirrors the
+						// start-path fallback's authority rule.
 						continue
 					}
 					eval, err := h.evaluateReplanCandidateV3(r, session, record, req, baseStart, baseEffectiveFile, alternate, plannerRequestedFile, plannerSettings, plannerSettingsErr, attemptedKeys)
@@ -9067,6 +9100,19 @@ func audioOnlyTransportReasonV3(reason string) bool {
 	default:
 		return false
 	}
+}
+
+// autoFallbackForSession reads a session's negotiated auto-fallback flag. ok is
+// false when the manager does not expose it or the session never set it, so the
+// caller keeps its own default.
+func autoFallbackForSession(sessionMgr SessionManagerInterface, sessionID string) (enabled bool, ok bool) {
+	getter, ok := sessionMgr.(interface {
+		AutoFallback(sessionID string) (bool, bool)
+	})
+	if !ok {
+		return false, false
+	}
+	return getter.AutoFallback(sessionID)
 }
 
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {

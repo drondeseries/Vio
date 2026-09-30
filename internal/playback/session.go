@@ -150,6 +150,15 @@ type Session struct {
 	activeTransportCount       int
 	replacementPlayMethod      PlayMethod
 	streamRevision             uint64
+	// autoFallback and autoFallbackSet record whether this session may fail
+	// over to another media version when its source dies or is unplayable. It
+	// is set from the viewer's auto selection at start (an explicit pick turns
+	// it off) and may be flipped back on by a later auto re-selection. It never
+	// authorizes a healthy mid-play version switch: only a dead/unplayable
+	// source advances it. autoFallbackSet distinguishes an explicit "off" from
+	// a session that never negotiated the field.
+	autoFallback    bool
+	autoFallbackSet bool
 	// virtualSourceGeneration counts candidate-binding moves for this session.
 	// It is the fence a cache-handoff re-resolve captures before it lists
 	// afresh and passes back to SetVirtualSourceIfGeneration, so a handoff that
@@ -1511,6 +1520,36 @@ func (m *SessionManager) VirtualSourceGeneration(sessionID string) (uint64, erro
 		return 0, ErrSessionNotFound
 	}
 	return s.virtualSourceGeneration, nil
+}
+
+// SetAutoFallback records whether a session may fail over to another media
+// version when its source dies or is unplayable. It is negotiated at start from
+// the viewer's auto selection and re-negotiable when the viewer re-selects Auto.
+func (m *SessionManager) SetAutoFallback(sessionID string, enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.autoFallback = enabled
+	s.autoFallbackSet = true
+	return nil
+}
+
+// AutoFallback reports the session's negotiated auto-fallback state. ok is
+// false for a session that never set it (for example a reconstruction), so a
+// caller keeps its own conservative default instead of assuming a value.
+func (m *SessionManager) AutoFallback(sessionID string) (enabled bool, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, false
+	}
+	return s.autoFallback, s.autoFallbackSet
 }
 
 // SetVirtualSourceIfGeneration is the generation-fenced form of

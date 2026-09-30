@@ -15,6 +15,7 @@ vi.mock("@/api/client", () => ({
 
 import {
   VERSION_LIVENESS_BATCH_SIZE,
+  applyVersionAvailability,
   chunkVirtualFileIds,
   fetchVersionLiveness,
   mergeVersionLiveness,
@@ -241,5 +242,40 @@ describe("useVersionLiveness", () => {
 
     await waitFor(() => expect(result.current.get(1)).toBe(false));
     expect(mocks.api).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("applyVersionAvailability", () => {
+  it("stamps a reported verdict and clears a stale one", () => {
+    const versions = [
+      makeVersion({ file_id: 1 }),
+      makeVersion({ file_id: 2, available: false }),
+    ];
+
+    const next = applyVersionAvailability(
+      versions,
+      new Map([
+        [1, false],
+        [2, true],
+      ]),
+    );
+
+    expect(next[0]?.available).toBe(false);
+    expect(next[1]?.available).toBe(true);
+  });
+
+  it("leaves rows the check did not report, and their identity, untouched", () => {
+    const versions = [makeVersion({ file_id: 1 })];
+
+    const next = applyVersionAvailability(versions, new Map());
+
+    expect(next).toBe(versions);
+    expect(next[0]?.available).toBeUndefined();
+  });
+
+  it("keeps the list identity when nothing changed", () => {
+    const versions = [makeVersion({ file_id: 1, available: true })];
+
+    expect(applyVersionAvailability(versions, new Map([[1, true]]))).toBe(versions);
   });
 });

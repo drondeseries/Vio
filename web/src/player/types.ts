@@ -48,6 +48,14 @@ export interface PlayerFileVersion {
    *  the version is unscored (a local file, or no ranking ran). */
   format_score?: number;
   failed?: boolean;
+  /**
+   * The catalog's liveness verdict for this version, stamped from the server's
+   * `POST /catalog/versions/check` result before the rows reach the player.
+   * Absent means unknown (no result yet); `false` means the server's last check
+   * could not resolve the row, which the version menu warns about. It is never
+   * derived from the client's own playback failures.
+   */
+  available?: boolean;
   edition_key?: string;
   release_name?: string;
   /** Provider display label for a virtual candidate; the wire's release-name

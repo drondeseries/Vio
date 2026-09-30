@@ -221,6 +221,10 @@ interface VideoPlayerProps {
   activeVirtualUri?: string | null;
   chapters?: PlayerChapter[];
   onSwitchVersion?: (fileId: number, currentPosition: number) => void;
+  /** Arms automatic version fallback from the version menu's Auto entry. */
+  onSelectAutoVersion?: () => void;
+  /** Whether automatic version fallback is currently armed. */
+  autoFallback?: boolean;
   /** Re-lists the title's video candidates for the version menu. */
   onRefreshVersions?: () => Promise<void>;
   onCancelRefresh?: () => Promise<void> | void;
@@ -434,6 +438,8 @@ export function VideoPlayer({
   activeVirtualUri,
   chapters = [],
   onSwitchVersion,
+  onSelectAutoVersion,
+  autoFallback,
   onRefreshVersions,
   onCancelRefresh,
   subtitleUrls,
@@ -867,11 +873,10 @@ export function VideoPlayer({
             (v.file_id === pendingSwitchFileId && v.file_id !== effectiveFileId) ||
             (v.file_id === plan.requested_media_file_id && v.file_id !== effectiveFileId),
           failed: v.failed,
-          // The catalog's liveness flag is not part of `PlayerFileVersion`, but
-          // the watch-detail rows VideoPlayer receives carry it. Surface it so a
-          // version the media page hides as "Unavailable" is not selectable here
-          // with no warning.
-          unavailable: (v as PlayerFileVersion & { available?: boolean }).available === false,
+          // The catalog's liveness flag, stamped onto the row from the
+          // server's versions/check answer. Surface it so a version the media
+          // page hides as unavailable is not selectable here with no warning.
+          unavailable: v.available === false,
         };
       }),
     [versions, virtualRanking, effectiveFileId, plan.requested_media_file_id, pendingSwitchFileId],
@@ -4655,6 +4660,10 @@ export function VideoPlayer({
               ? (fileId) => onSwitchVersion(fileId, currentTime)
               : undefined
           }
+          onSelectAutoVersion={
+            onSelectAutoVersion && !watchTogetherRoomId ? () => onSelectAutoVersion() : undefined
+          }
+          autoFallback={autoFallback}
           onRefreshVersions={onRefreshVersions}
           onCancelRefresh={onCancelRefresh}
           onTogglePiP={handleTogglePiP}

@@ -6,7 +6,7 @@ import { useRedetectItemMarkers, useRefreshItemMetadata } from "@/hooks/queries/
 import { useAdminMarkerCapabilities } from "@/hooks/queries/admin/markers";
 import { useSimilarItems } from "@/hooks/queries/recommendations";
 import { useDeleteSubtitlePreference, useSetSubtitlePreference } from "@/hooks/queries/subtitles";
-import { useVersionLiveness } from "@/hooks/queries/versionLiveness";
+import { useVersionLiveness, applyVersionAvailability } from "@/hooks/queries/versionLiveness";
 import { useAuth } from "@/hooks/useAuth";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
@@ -125,14 +125,7 @@ export default function MovieContent({
   );
   const versionLiveness = useVersionLiveness(livenessVersions, true);
   const versionsWithLiveness = useMemo(
-    () =>
-      item.versions.map((version) => {
-        const available = versionLiveness.get(version.file_id);
-        if (available === undefined) {
-          return version;
-        }
-        return { ...version, available };
-      }),
+    () => applyVersionAvailability(item.versions, versionLiveness),
     [item.versions, versionLiveness],
   );
 

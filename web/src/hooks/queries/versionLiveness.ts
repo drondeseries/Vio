@@ -2,8 +2,21 @@ import { useQueries } from "@tanstack/react-query";
 import { useMemo } from "react";
 
 import { api } from "@/api/client";
-import type { FileVersion, VersionLivenessResponse } from "@/api/types";
+import type { VersionLivenessResponse } from "@/api/types";
 import { isVirtualFileVersion } from "@/pages/ItemDetail/components/versionFormatUtils";
+
+/**
+ * The minimal server-shaped fields the liveness check reads from a row. Both
+ * the item page's `FileVersion` and the player's `PlayerFileVersion` satisfy it,
+ * so one check serves every version list without either growing the other's
+ * required columns.
+ */
+export interface VersionLivenessCandidate {
+  file_id: number;
+  container?: string;
+  file_path?: string;
+  available?: boolean;
+}
 
 /** Maximum file_ids per versions/check request. */
 export const VERSION_LIVENESS_BATCH_SIZE = 40;
@@ -28,7 +41,7 @@ export async function fetchVersionLiveness(
  * VERSION_LIVENESS_BATCH_SIZE, each sorted ascending so the query key is
  * stable regardless of the order the caller passes versions in.
  */
-export function chunkVirtualFileIds(versions: FileVersion[]): number[][] {
+export function chunkVirtualFileIds(versions: VersionLivenessCandidate[]): number[][] {
   const fileIds = versions
     .filter((version) => isVirtualFileVersion(version))
     .map((version) => version.file_id)
@@ -54,7 +67,7 @@ export function chunkVirtualFileIds(versions: FileVersion[]): number[][] {
  * flag stays authoritative unless the backend reports them too.
  */
 export function mergeVersionLiveness(
-  versions: FileVersion[],
+  versions: VersionLivenessCandidate[],
   results: VersionLivenessResponse | undefined,
 ): Map<number, boolean> {
   const availability = new Map<number, boolean>();
@@ -80,7 +93,7 @@ export function mergeVersionLiveness(
  * sorted file_ids, so opening the version list repeatedly does not re-fetch.
  */
 export function useVersionLiveness(
-  versions: FileVersion[],
+  versions: VersionLivenessCandidate[],
   enabled: boolean,
 ): Map<number, boolean> {
   const chunks = useMemo(() => chunkVirtualFileIds(versions), [versions]);
@@ -105,4 +118,29 @@ export function useVersionLiveness(
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [versions, ...queryResults.map((query) => query.data)],
   );
+}
+
+/**
+ * Stamps the checked availability onto the rows themselves.
+ *
+ * The menu reads a row's health from `available`, so the verdict has to live on
+ * the row rather than in a side map the menu cannot see. Only a `file_id` the
+ * check actually reported is touched: an unreported row keeps its metadata
+ * flag and an unchanged row keeps its identity, so downstream memoization and
+ * active-source resolution are not invalidated by the liveness read.
+ */
+export function applyVersionAvailability<T extends VersionLivenessCandidate>(
+  versions: T[],
+  availability: Map<number, boolean>,
+): T[] {
+  let changed = false;
+  const next = versions.map((version) => {
+    const available = availability.get(version.file_id);
+    if (available === undefined || version.available === available) {
+      return version;
+    }
+    changed = true;
+    return { ...version, available };
+  });
+  return changed ? next : versions;
 }

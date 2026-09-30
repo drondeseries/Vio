@@ -472,6 +472,10 @@ function WatchPagePlayer({
     [session],
   );
 
+  const handleSelectAutoVersion = useCallback(() => {
+    session.selectAutoVersion();
+  }, [session]);
+
   /**
    * Manually re-lists the title's video candidates for the version menu.
    *
@@ -1185,6 +1189,8 @@ function WatchPagePlayer({
         activeVirtualUri={session.effectiveVirtualUri}
         chapters={activeChapters}
         onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}
+        onSelectAutoVersion={watchTogetherRoomId ? undefined : handleSelectAutoVersion}
+        autoFallback={session.autoFallback}
         onRefreshVersions={handleRefreshVersions}
         onCancelRefresh={handleCancelRefresh}
         subtitleUrls={playableSubtitles}

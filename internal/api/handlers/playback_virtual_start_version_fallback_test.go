@@ -61,6 +61,55 @@ func TestResolveVirtualPlaybackSourceUserRelinkBypassesFloor(t *testing.T) {
 	}
 }
 
+// TestResolveVirtualPlaybackSourceRecoveryBypassesFloor pins behavior 2: a
+// declared recovery — a candidate rotation or an automatic alternate-version
+// fallback — re-lists past the floor and hands the resolver a forced re-list,
+// while an ordinary automatic resolve stays on the floor.
+func TestResolveVirtualPlaybackSourceRecoveryBypassesFloor(t *testing.T) {
+	type resolveCall struct {
+		relist      bool
+		forceRelist bool
+	}
+	newHandler := func(seen *resolveCall) *PlaybackHandler {
+		return &PlaybackHandler{
+			VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(context.Context, string, int, string, int) (string, error) {
+				return "", errors.New("simple resolver must not be used when the detailed resolver is set")
+			}),
+			VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, uri string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+				seen.relist = virtuallibrary.ProviderOutageRelistFromContext(ctx)
+				seen.forceRelist = forceRefresh
+				return ResolvedVirtualMedia{URL: "https://cdn.example/x.mkv", URI: uri, CandidateID: "cand-x", OwnerID: 5}, nil
+			}),
+		}
+	}
+	file := &models.MediaFile{ID: 1, ContentID: "movie-recovery", FilePath: "virtual://movie/movie-recovery?result=A", VirtualOwnerInstallationID: 5}
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/playback/start", nil)
+
+	rotation := resolveCall{}
+	if _, err := newHandler(&rotation).resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "auto", 0, false, virtualResolveOptionsV3{rotateCandidates: true, sessionBound: false}); err != nil {
+		t.Fatalf("candidate rotation resolve: %v", err)
+	}
+	if !rotation.relist || !rotation.forceRelist {
+		t.Fatalf("candidate rotation = %+v, want an outage re-list with a forced provider re-list", rotation)
+	}
+
+	fallback := resolveCall{}
+	if _, err := newHandler(&fallback).resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "auto", 0, false, virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true}); err != nil {
+		t.Fatalf("alternate-version fallback resolve: %v", err)
+	}
+	if !fallback.relist || !fallback.forceRelist {
+		t.Fatalf("alternate-version fallback = %+v, want an outage re-list with a forced provider re-list", fallback)
+	}
+
+	auto := resolveCall{}
+	if _, err := newHandler(&auto).resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "auto", 0, false, virtualResolveOptionsV3{sessionBound: false}); err != nil {
+		t.Fatalf("automatic resolve: %v", err)
+	}
+	if auto.relist || auto.forceRelist {
+		t.Fatalf("ordinary automatic resolve = %+v, want it to stay on the floor", auto)
+	}
+}
+
 // TestResolveVirtualStartWithVersionFallbackSkipsAltMountFailedVersion pins
 // behavior 2: when the pinned release's listing fails on a fresh start, the
 // walk tries alternate versions and returns the first that resolves. A version

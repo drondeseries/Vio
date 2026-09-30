@@ -395,10 +395,11 @@ type PlaybackHandler struct {
 	// WatchTogetherAvailable is set when the room service and authenticated
 	// socket are wired, so capability discovery reflects their dependencies.
 	WatchTogetherAvailable bool
-	// progressSideEffectLocks serializes v2 progress side effects per session
-	// (see persistProgressV2). It is reference-counted and bounded: the entry
-	// is created on the first acquire for a session and deleted when the last
-	// in-flight holder releases, so the map tracks concurrent writers rather
+	// progressSideEffectLocks serializes per-session handler side effects (v2
+	// progress persistence and inventory-updated publishes; see persistProgressV2
+	// and publishInventoryUpdatedToSession). It is reference-counted and bounded:
+	// the entry is created on the first acquire for a session and deleted when the
+	// last in-flight holder releases, so the map tracks concurrent writers rather
 	// than every session the process has ever served. progressSideEffectLocksMu
 	// guards the map and each entry's refcount; the entry's own mutex is the
 	// per-session side-effect lock.

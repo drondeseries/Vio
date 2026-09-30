@@ -7,6 +7,7 @@ import { useVersionListRefresh, REFRESH_VERSIONS_ERROR } from "@/hooks/useVersio
 import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
 import { resolveActiveQualityOptionId } from "../playback-info";
+import { deriveVersionHealth } from "@/lib/versionHealth";
 import type { PlayerIndexerRelease, QualityOption } from "../types";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
 import { serverRankingFromVersions } from "@/pages/ItemDetail/components/versionFormatUtils";
@@ -54,6 +55,14 @@ interface QualityMenuProps {
   versionLocked?: boolean;
   onSwitchVersion?: (fileId: number) => void;
   /**
+   * Selects automatic version fallback. When provided, the version list shows
+   * an Auto row that arms fallback (and recovers a dead source). Omitted in
+   * surfaces that cannot toggle it.
+   */
+  onSelectAutoVersion?: () => void;
+  /** Whether automatic version fallback is currently armed. */
+  autoFallback?: boolean;
+  /**
    * Re-lists the title's video candidates. Resolves once the new list has been
    * applied upstream; rejecting means the list could not be refreshed and the
    * rows already on screen stay as they are.
@@ -80,6 +89,8 @@ export function QualityMenu({
   contentId,
   versionLocked,
   onSwitchVersion,
+  onSelectAutoVersion,
+  autoFallback,
   onRefreshVersions,
   onCancelRefresh,
 }: QualityMenuProps) {
@@ -197,12 +208,14 @@ export function QualityMenu({
   // order.
   const versionRowsRendered =
     !versionLocked && Boolean(versions && versions.length > 1 && onSwitchVersion);
+  const autoRowRendered = versionRowsRendered && Boolean(onSelectAutoVersion);
   const indexerRowsRendered = !versionLocked && visibleIndexerReleases.length > 0;
   // Mirrors the render condition of the Version/Quality header block: the
   // refresh action lives inside it, so it renders only when this is true.
   const menuBlockRendered = versionRowsRendered || indexerRowsRendered;
   const topRefreshRowIndex = 0;
-  const versionRowStart = onRefreshVersions ? 1 : 0;
+  const autoRowIndex = topRefreshRowIndex + (onRefreshVersions ? 1 : 0);
+  const versionRowStart = autoRowIndex + (autoRowRendered ? 1 : 0);
   const indexerRowStart = versionRowStart + (versionRowsRendered ? orderedVersions.length : 0);
   const bottomRefreshRowIndex =
     indexerRowStart + (indexerRowsRendered ? visibleIndexerReleases.length : 0);
@@ -260,6 +273,35 @@ export function QualityMenu({
                 )}
                 {versions && versions.length > 1 && onSwitchVersion && (
                   <>
+                    {autoRowRendered && (
+                      <button
+                        ref={(el) => {
+                          menuItemsRef.current[autoRowIndex] = el;
+                        }}
+                        role="menuitemradio"
+                        aria-checked={autoFallback === true}
+                        type="button"
+                        className={`flex w-full px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
+                          autoFallback ? "text-white" : "text-white/70"
+                        }`}
+                        onClick={() => {
+                          onSelectAutoVersion?.();
+                          setOpen(false);
+                        }}
+                      >
+                        <span className="flex min-w-0 items-center gap-2">
+                          <Check
+                            className={`h-4 w-4 shrink-0 ${autoFallback ? "opacity-100" : "opacity-0"}`}
+                          />
+                          <span className="min-w-0">
+                            <span className="block truncate">Auto</span>
+                            <span className="block truncate text-[11px] text-white/50">
+                              Best playable version; fall back if this one dies
+                            </span>
+                          </span>
+                        </span>
+                      </button>
+                    )}
                     <QualityRankingSummary
                       serverRanking={serverRanking}
                       userCriteria={userCriteria}
@@ -272,6 +314,7 @@ export function QualityMenu({
                     {orderedVersions.map((v, versionIndex) => {
                       const idx = versionRowStart + versionIndex;
                       const statusLabels = buildVersionStatusLabels(v);
+                      const health = versionHealthOf(v);
                       const hasFormatScore =
                         typeof v.formatScore === "number" && v.formatScore !== 0;
                       const detailLine = v.detail || v.releaseName;
@@ -322,10 +365,13 @@ export function QualityMenu({
                                 {statusLabels.map((status) => (
                                   <span
                                     key={status}
+                                    title={health && health.label === status ? health.title : undefined}
                                     className={`rounded border border-white/15 px-1.5 py-0.5 text-[10px] leading-none ${
-                                      status === "Failed"
+                                      health && health.label === status && health.tone === "danger"
                                         ? "border-red-500/30 bg-red-500/20 text-red-400"
-                                        : status === "Will retry on play"
+                                        : health &&
+                                            health.label === status &&
+                                            health.tone === "warn"
                                           ? "border-amber-500/30 bg-amber-500/15 text-amber-400"
                                           : "bg-white/10 text-white/70"
                                     }`}
@@ -432,13 +478,25 @@ export function buildVersionStatusLabels(version: VersionInfo): string[] {
   if (version.isRequestedSource && !version.isCurrentSource) {
     labels.push("Requested");
   }
-  if (version.failed) {
-    labels.push("Failed");
-  }
-  if (version.unavailable) {
-    labels.push("Will retry on play");
+  // One health badge, chosen by the server: a failed candidate takes precedence
+  // over the liveness verdict. Both come from server-published state only.
+  const health = versionHealthOf(version);
+  if (health) {
+    labels.push(health.label);
   }
   return labels;
+}
+
+/**
+ * Adapts the menu's `VersionInfo` onto the shared health derivation. The menu
+ * models the liveness verdict as `unavailable` (the inverse of the server's
+ * `available`), so map it back without inventing a second server flag.
+ */
+function versionHealthOf(version: VersionInfo) {
+  return deriveVersionHealth({
+    failed: version.failed,
+    available: version.unavailable === true ? false : undefined,
+  });
 }
 
 interface VersionRefreshRowProps {
