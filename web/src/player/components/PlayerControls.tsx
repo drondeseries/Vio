@@ -106,6 +106,10 @@ interface PlayerControlsProps {
   contentId?: string;
   versionLocked?: boolean;
   onSwitchVersion?: (fileId: number) => void;
+  /** Arms automatic version fallback from the version menu's Auto row. */
+  onSelectAutoVersion?: () => void;
+  /** Whether automatic version fallback is currently armed. */
+  autoFallback?: boolean;
   onRefreshVersions?: () => Promise<void>;
   onCancelRefresh?: () => Promise<void> | void;
   // PiP
@@ -180,6 +184,8 @@ export function PlayerControls({
   contentId,
   versionLocked,
   onSwitchVersion,
+  onSelectAutoVersion,
+  autoFallback,
   onRefreshVersions,
   onCancelRefresh,
   onTogglePiP,
@@ -375,6 +381,8 @@ export function PlayerControls({
               contentId={contentId}
               versionLocked={versionLocked}
               onSwitchVersion={onSwitchVersion}
+              onSelectAutoVersion={onSelectAutoVersion}
+              autoFallback={autoFallback}
               onRefreshVersions={onRefreshVersions}
               onCancelRefresh={onCancelRefresh}
             />
@@ -559,6 +567,8 @@ export function PlayerControls({
                 contentId={contentId}
                 versionLocked={versionLocked}
                 onSwitchVersion={onSwitchVersion}
+                onSelectAutoVersion={onSelectAutoVersion}
+                autoFallback={autoFallback}
                 onRefreshVersions={onRefreshVersions}
                 onCancelRefresh={onCancelRefresh}
               />

@@ -54,6 +54,14 @@ interface QualityMenuProps {
   versionLocked?: boolean;
   onSwitchVersion?: (fileId: number) => void;
   /**
+   * Selects automatic version fallback. When provided, the version list shows
+   * an Auto row that arms fallback (and recovers a dead source). Omitted in
+   * surfaces that cannot toggle it.
+   */
+  onSelectAutoVersion?: () => void;
+  /** Whether automatic version fallback is currently armed. */
+  autoFallback?: boolean;
+  /**
    * Re-lists the title's video candidates. Resolves once the new list has been
    * applied upstream; rejecting means the list could not be refreshed and the
    * rows already on screen stay as they are.
@@ -80,6 +88,8 @@ export function QualityMenu({
   contentId,
   versionLocked,
   onSwitchVersion,
+  onSelectAutoVersion,
+  autoFallback,
   onRefreshVersions,
   onCancelRefresh,
 }: QualityMenuProps) {
@@ -197,12 +207,14 @@ export function QualityMenu({
   // order.
   const versionRowsRendered =
     !versionLocked && Boolean(versions && versions.length > 1 && onSwitchVersion);
+  const autoRowRendered = versionRowsRendered && Boolean(onSelectAutoVersion);
   const indexerRowsRendered = !versionLocked && visibleIndexerReleases.length > 0;
   // Mirrors the render condition of the Version/Quality header block: the
   // refresh action lives inside it, so it renders only when this is true.
   const menuBlockRendered = versionRowsRendered || indexerRowsRendered;
   const topRefreshRowIndex = 0;
-  const versionRowStart = onRefreshVersions ? 1 : 0;
+  const autoRowIndex = topRefreshRowIndex + (onRefreshVersions ? 1 : 0);
+  const versionRowStart = autoRowIndex + (autoRowRendered ? 1 : 0);
   const indexerRowStart = versionRowStart + (versionRowsRendered ? orderedVersions.length : 0);
   const bottomRefreshRowIndex =
     indexerRowStart + (indexerRowsRendered ? visibleIndexerReleases.length : 0);
@@ -259,6 +271,35 @@ export function QualityMenu({
                 )}
                 {versions && versions.length > 1 && onSwitchVersion && (
                   <>
+                    {autoRowRendered && (
+                      <button
+                        ref={(el) => {
+                          menuItemsRef.current[autoRowIndex] = el;
+                        }}
+                        role="menuitemradio"
+                        aria-checked={autoFallback === true}
+                        type="button"
+                        className={`flex w-full px-3 py-2 text-left text-sm hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-none ${
+                          autoFallback ? "text-white" : "text-white/70"
+                        }`}
+                        onClick={() => {
+                          onSelectAutoVersion?.();
+                          setOpen(false);
+                        }}
+                      >
+                        <span className="flex min-w-0 items-center gap-2">
+                          <Check
+                            className={`h-4 w-4 shrink-0 ${autoFallback ? "opacity-100" : "opacity-0"}`}
+                          />
+                          <span className="min-w-0">
+                            <span className="block truncate">Auto</span>
+                            <span className="block truncate text-[11px] text-white/50">
+                              Best playable version; fall back if this one dies
+                            </span>
+                          </span>
+                        </span>
+                      </button>
+                    )}
                     <QualityRankingSummary
                       serverRanking={serverRanking}
                       userCriteria={userCriteria}

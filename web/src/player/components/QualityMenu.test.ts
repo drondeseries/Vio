@@ -75,6 +75,8 @@ function renderVersionMenu(
     onRefreshVersions?: () => Promise<void>;
     onCancelRefresh?: () => Promise<void> | void;
     onSwitchVersion?: (fileId: number) => void;
+    onSelectAutoVersion?: () => void;
+    autoFallback?: boolean;
     versions?: VersionInfo[];
     indexerReleases?: PlayerIndexerRelease[];
     contentId?: string;
@@ -94,6 +96,8 @@ function renderVersionMenu(
       indexerReleases: overrides.indexerReleases,
       contentId: overrides.contentId ?? "content-1",
       onSwitchVersion: overrides.onSwitchVersion ?? (() => {}),
+      onSelectAutoVersion: overrides.onSelectAutoVersion,
+      autoFallback: overrides.autoFallback,
       onRefreshVersions: overrides.onRefreshVersions,
       onCancelRefresh: overrides.onCancelRefresh,
     }),
@@ -640,5 +644,33 @@ describe("QualityMenu indexer releases", () => {
     });
     expect(screen.queryByText("Not downloaded")).not.toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /Request Movie/ })).not.toBeInTheDocument();
+  });
+});
+
+describe("QualityMenu automatic version fallback", () => {
+  it("renders no Auto row when fallback cannot be toggled", () => {
+    renderVersionMenu();
+    expect(screen.queryByRole("menuitemradio", { name: /Auto/ })).not.toBeInTheDocument();
+  });
+
+  it("arms automatic fallback from the Auto row", () => {
+    const onSelectAutoVersion = vi.fn();
+    renderVersionMenu({ onSelectAutoVersion, autoFallback: false });
+
+    const autoRow = screen.getByRole("menuitemradio", { name: /Auto/ });
+    expect(autoRow).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(autoRow);
+    expect(onSelectAutoVersion).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks Auto checked when armed and keeps the version rows selectable", () => {
+    renderVersionMenu({ onSelectAutoVersion: () => {}, autoFallback: true });
+
+    expect(screen.getByRole("menuitemradio", { name: /Auto/ })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("menuitem", { name: /1080p H264/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /2160p HEVC/ })).toBeInTheDocument();
   });
 });

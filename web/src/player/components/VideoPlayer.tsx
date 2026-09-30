@@ -221,6 +221,10 @@ interface VideoPlayerProps {
   activeVirtualUri?: string | null;
   chapters?: PlayerChapter[];
   onSwitchVersion?: (fileId: number, currentPosition: number) => void;
+  /** Arms automatic version fallback from the version menu's Auto entry. */
+  onSelectAutoVersion?: () => void;
+  /** Whether automatic version fallback is currently armed. */
+  autoFallback?: boolean;
   /** Re-lists the title's video candidates for the version menu. */
   onRefreshVersions?: () => Promise<void>;
   onCancelRefresh?: () => Promise<void> | void;
@@ -434,6 +438,8 @@ export function VideoPlayer({
   activeVirtualUri,
   chapters = [],
   onSwitchVersion,
+  onSelectAutoVersion,
+  autoFallback,
   onRefreshVersions,
   onCancelRefresh,
   subtitleUrls,
@@ -4655,6 +4661,10 @@ export function VideoPlayer({
               ? (fileId) => onSwitchVersion(fileId, currentTime)
               : undefined
           }
+          onSelectAutoVersion={
+            onSelectAutoVersion && !watchTogetherRoomId ? () => onSelectAutoVersion() : undefined
+          }
+          autoFallback={autoFallback}
           onRefreshVersions={onRefreshVersions}
           onCancelRefresh={onCancelRefresh}
           onTogglePiP={handleTogglePiP}
