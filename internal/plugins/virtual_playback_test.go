@@ -1632,9 +1632,8 @@ func TestStreamsFromVirtualResult_NumericResolution(t *testing.T) {
 	}
 }
 
-// TestConfiguredVirtualVariantsParityFixtures pins the current plugin
-// ConfiguredVirtualVariants outputs as deterministic fixtures (Oracle Phase 1
-// scope freeze for retiring com.drondeseries.vio-virtual-library).
+// TestConfiguredVirtualVariantsParityFixtures pins the virtual
+// ConfiguredVirtualVariants outputs as deterministic fixtures.
 //
 // The core Variants() cutover (Phase 4) must reproduce every pinned value:
 // profile order, labels, variant URIs, codecs, HDR, ownership, the
