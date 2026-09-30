@@ -63,6 +63,46 @@ func TestNewSourceCommittedEventEncodesEmptyAudioTracksAsArray(t *testing.T) {
 	}
 }
 
+// TestNewInventoryUpdatedEventMirrorsInventoryShape pins that the
+// inventory_updated payload serializes the full live inventory (audio,
+// subtitles, status and revision) and normalizes empty lists to arrays, so a
+// client can apply it with the same reducer as the inventory endpoint.
+func TestNewInventoryUpdatedEventMirrorsInventoryShape(t *testing.T) {
+	event, err := NewInventoryUpdatedEvent("session-1", PlaybackInventoryV3{
+		InventoryStatus:   "verified",
+		InventoryRevision: "inv:abc",
+	})
+	if err != nil {
+		t.Fatalf("NewInventoryUpdatedEvent() error = %v", err)
+	}
+	if event.Name != RealtimeEventInventoryUpdated {
+		t.Fatalf("event.Name = %q, want %q", event.Name, RealtimeEventInventoryUpdated)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(event.Payload, &raw); err != nil {
+		t.Fatalf("json.Unmarshal(payload): %v", err)
+	}
+	for _, field := range []string{"audio_tracks", "subtitle_inventory"} {
+		value, ok := raw[field]
+		if !ok {
+			t.Fatalf("%s is absent; want an explicit empty array", field)
+		}
+		if string(value) != "[]" {
+			t.Fatalf("%s = %s, want []", field, value)
+		}
+	}
+	var payload InventoryUpdatedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(payload): %v", err)
+	}
+	if payload.SessionID != "session-1" {
+		t.Fatalf("payload.SessionID = %q, want session-1", payload.SessionID)
+	}
+	if payload.InventoryStatus != "verified" || payload.InventoryRevision != "inv:abc" {
+		t.Fatalf("payload status/revision = %q/%q, want verified/inv:abc", payload.InventoryStatus, payload.InventoryRevision)
+	}
+}
+
 func TestNewMarkersUpdatedEvent(t *testing.T) {
 	event, err := NewMarkersUpdatedEvent(
 		"session-1",

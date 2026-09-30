@@ -1049,6 +1049,13 @@ func (h *PlaybackHandler) refreshPlaybackProbeAsync(ctx context.Context, entry *
 			repaired = nil
 		}
 		h.finishPlaybackProbeRefresh(entry, file.ID, repaired)
+		if repaired != nil {
+			// The probe upgraded this row's declared metadata to probe evidence.
+			// Push the verified inventory to any live session playing it so its
+			// track menu stops showing the plan's declared snapshot. The refresh
+			// context may be exhausted by now, so the publish bounds itself.
+			h.PublishInventoryUpdated(ctx, repaired.ID)
+		}
 	}()
 }
 

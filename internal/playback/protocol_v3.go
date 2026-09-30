@@ -84,7 +84,13 @@ const (
 	// the transport committed to and adopt the declared audio inventory without
 	// a replan. It only appears on /api/v2, like the other realtime-v3
 	// capabilities.
-	FeatureSourceCommittedV3   = "source_committed_event_v1"
+	FeatureSourceCommittedV3 = "source_committed_event_v1"
+	// FeatureInventoryUpdatedV3 is the client's promise to handle the realtime
+	// inventory_updated event: replace the declared track menu it took from
+	// source_committed or its plan with the probe-verified audio and subtitle
+	// inventory, gating on inventory_revision. It only appears on /api/v2, like
+	// the other realtime-v3 capabilities.
+	FeatureInventoryUpdatedV3  = "inventory_updated_event_v1"
 	PlanRecipeVersionV3        = "v3.4"
 	ClientDV7ToDV81V3          = "client_dv7_to_dv81"
 	ClientDV7ToHDR10V3         = "client_dv7_to_hdr10"
@@ -161,7 +167,7 @@ func ServerFeaturesV3() []string {
 // advertises and honors only on /api/v2. They postdate the /api/v1 freeze, so
 // the frozen surface neither advertises nor negotiates them.
 func NativeServerFeaturesV3() []string {
-	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3)
+	return append(ServerFeaturesV3(), FeatureSubripSidecarV3, FeatureLiveInventoryV3, FeatureSourceCommittedV3, FeatureInventoryUpdatedV3)
 }
 
 // WithoutFeatureV3 returns features with every spelling of feature removed.

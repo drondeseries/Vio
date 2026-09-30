@@ -266,6 +266,71 @@ func TestPublishSourceCommittedEmitsEffectiveVersion(t *testing.T) {
 	}
 }
 
+// TestPublishInventoryUpdatedEmitsVerifiedInventory proves the probe-persistence
+// push delivers the session's verified audio and subtitle inventory, with the
+// revision a client gates on, on the session's realtime connection.
+func TestPublishInventoryUpdatedEmitsVerifiedInventory(t *testing.T) {
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	probedAt := time.Now()
+	file := &models.MediaFile{
+		ID:             100,
+		ContentID:      "movie-inventory-update",
+		FilePath:       "/media/inventory-update.mkv",
+		ProbeUpdatedAt: &probedAt,
+		AudioTracks: []models.AudioTrack{
+			{Index: 1, Codec: "aac", Channels: 2, Language: "eng", Default: true},
+			{Index: 2, Codec: "ac3", Channels: 6, Language: "fre"},
+		},
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 3, Codec: "subrip", Language: "eng", Default: true},
+		},
+	}
+	h := NewPlaybackHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := sessionMgr.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+
+	h.PublishInventoryUpdated(context.Background(), file.ID)
+
+	if len(conn.messages) != 1 {
+		t.Fatalf("delivered %d events, want 1", len(conn.messages))
+	}
+	event, ok := conn.messages[0].(playback.EventEnvelope)
+	if !ok {
+		t.Fatalf("message type = %T, want playback.EventEnvelope", conn.messages[0])
+	}
+	if event.Name != playback.RealtimeEventInventoryUpdated {
+		t.Fatalf("event name = %q, want %q", event.Name, playback.RealtimeEventInventoryUpdated)
+	}
+	var payload playback.InventoryUpdatedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.SessionID != session.ID {
+		t.Fatalf("payload session = %q, want %q", payload.SessionID, session.ID)
+	}
+	if payload.InventoryStatus != "verified" || payload.InventoryRevision == "" {
+		t.Fatalf("payload status/revision = %q/%q, want verified and a non-empty revision", payload.InventoryStatus, payload.InventoryRevision)
+	}
+	if len(payload.AudioTracks) != 2 {
+		t.Fatalf("payload audio tracks = %v, want 2", payload.AudioTracks)
+	}
+	if len(payload.SubtitleInventory) != 1 {
+		t.Fatalf("payload subtitle inventory = %v, want 1", payload.SubtitleInventory)
+	}
+}
+
 type sourceCommittedTestConn struct {
 	messages []any
 }

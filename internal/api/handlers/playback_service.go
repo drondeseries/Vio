@@ -985,6 +985,90 @@ func (h *PlaybackHandler) PublishSourceCommitted(ctx context.Context, sessionID 
 	}
 }
 
+// mediaFileSessionLookup enumerates the live playback sessions associated with
+// a media file so a background probe can push an inventory upgrade to each of
+// them. *playback.SessionManager implements it; a manager that does not is a
+// no-op rather than an error.
+type mediaFileSessionLookup interface {
+	GetSessionsByMediaFileID(fileID int) []*playback.Session
+}
+
+// inventoryUpdatedPublishBudget bounds one inventory_updated fan-out so the
+// background probe that triggered it (a detached start-path repair or a
+// virtual-evidence worker) cannot be held up by a slow catalog or subtitle
+// read.
+const inventoryUpdatedPublishBudget = 3 * time.Second
+
+// PublishInventoryUpdated pushes the probe-verified track inventory to every
+// live realtime session currently playing fileID. It is invoked from the
+// background probe's persistence points — the local start-path repair and the
+// virtual evidence pipeline — after the evidence is committed, so a client can
+// replace the declared menu it took from source_committed or its plan without
+// waiting for the inventory poll or a replan.
+//
+// Advisory and best-effort. The event carries menu data only: it never touches
+// the executable recipe, plan generation, transport choice, or streamed bytes.
+// A session manager that cannot enumerate sessions by file, or a session
+// without a realtime connection, is a no-op. Only verified evidence is pushed;
+// a declared inventory is what the client already holds, so re-sending it would
+// be noise. The payload carries the session's inventory revision so a client
+// gates duplicates and out-of-order pushes.
+func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID int) {
+	if h == nil || h.RealtimeHub == nil || fileID <= 0 {
+		return
+	}
+	lookup, ok := h.sessionMgr.(mediaFileSessionLookup)
+	if !ok {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), inventoryUpdatedPublishBudget)
+	defer cancel()
+	for _, session := range lookup.GetSessionsByMediaFileID(fileID) {
+		if session == nil || session.ID == "" || !session.HasRealtimeConnection {
+			continue
+		}
+		h.publishInventoryUpdatedToSession(publishCtx, session)
+	}
+}
+
+// publishInventoryUpdatedToSession builds and delivers one inventory_updated
+// event from the session's live inventory. It re-resolves the effective release
+// through the same playbackInventoryForSession the inventory endpoint uses, so
+// a rotation, a re-probe, and a poll can never disagree about the tracks, the
+// effective identity, or the revision.
+func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session) {
+	var record *playback.AttemptRecordV3
+	if h.PlanStoreV3 != nil {
+		if loaded, err := h.PlanStoreV3.GetAttempt(ctx, session.ID); err == nil {
+			record = loaded
+		}
+	}
+	inventory, err := h.playbackInventoryForSession(ctx, session, record)
+	if err != nil {
+		slog.DebugContext(ctx, "inventory updated event skipped: inventory unavailable",
+			"component", "playback", "session", session.ID, "error", err)
+		return
+	}
+	if inventory.InventoryStatus != string(ProbeProvenanceVerified) {
+		// The probe has not upgraded this session's bound release, so the client
+		// already holds exactly this declared inventory.
+		return
+	}
+	event, err := playback.NewInventoryUpdatedEvent(session.ID, inventory)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to encode inventory updated realtime event",
+			"component", "playback", "session", session.ID, "error", err)
+		return
+	}
+	if err := h.RealtimeHub.Send(session.ID, event); err != nil && !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
+		slog.WarnContext(ctx, "failed to deliver inventory updated realtime event",
+			"component", "playback", "session", session.ID, "error", err)
+	}
+}
+
 // ReplanDigestV3 fingerprints the exact replan body so a reused request id with
 // different input is a detectable idempotency violation.
 func ReplanDigestV3(body []byte) string {

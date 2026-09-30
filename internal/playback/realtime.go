@@ -38,6 +38,15 @@ const (
 	// background ffprobe. The existing inventory poll and provenance upgrade
 	// then replace the declared list with probe evidence when it lands.
 	RealtimeEventSourceCommitted RealtimeEventName = "source_committed"
+	// RealtimeEventInventoryUpdated publishes the probe-verified audio and
+	// subtitle inventory of a live session once the background probe has
+	// persisted its evidence. source_committed carries the release's declared
+	// snapshot the moment a transport commits; this event is the upgrade that
+	// follows when the full probe lands, so a client can replace its declared
+	// track menu without waiting for the inventory poll or a replan. It is
+	// advisory menu data: it never carries an executable recipe and never
+	// changes plan generation, transport choice, or the streamed bytes.
+	RealtimeEventInventoryUpdated RealtimeEventName = "inventory_updated"
 	// RealtimeEventDownloadProgress reports a provider-side cache fill for a
 	// release a session is pinned to. It is best-effort telemetry: a client
 	// shows a "preparing" state from it, but losing the event must never stop
@@ -55,6 +64,7 @@ var supportedRealtimeEventNameSet = map[RealtimeEventName]struct{}{
 	RealtimeEventSubtitleTranslationDone:  {},
 	RealtimeEventSubtitleTranslationFail:  {},
 	RealtimeEventSourceCommitted:          {},
+	RealtimeEventInventoryUpdated:         {},
 	RealtimeEventDownloadProgress:         {},
 }
 
@@ -264,6 +274,20 @@ type SourceCommittedPayload struct {
 	AudioTracks []AudioInventoryItemV3 `json:"audio_tracks"`
 }
 
+// InventoryUpdatedPayload is the probe-verified track inventory of a live
+// playback session, pushed when the background probe persists evidence for the
+// release that session is bound to.
+//
+// Its wire shape is exactly the GET /api/v2/playback/{session_id}/inventory
+// body (PlaybackInventoryV3, embedded here so the two cannot drift apart). It
+// carries the session id, the audio and subtitle lists, and the inventory
+// status and revision. A client applies it with the same reducer it uses for an
+// inventory poll and gates on InventoryRevision: a duplicate push, or one that
+// names the revision the client already holds, is a no-op.
+type InventoryUpdatedPayload struct {
+	PlaybackInventoryV3
+}
+
 // NewEventEnvelope creates a validated realtime event envelope.
 func NewEventEnvelope(sessionID string, name RealtimeEventName, payload json.RawMessage) (EventEnvelope, error) {
 	normalizedPayload, err := normalizeJSONPayload(payload)
@@ -417,6 +441,28 @@ func NewSourceCommittedEvent(sessionID string, payload SourceCommittedPayload) (
 		return EventEnvelope{}, err
 	}
 	return NewEventEnvelope(sessionID, RealtimeEventSourceCommitted, raw)
+}
+
+// NewInventoryUpdatedEvent creates a validated inventory_updated event. The
+// session id must be non-empty; nil audio and subtitle slices are normalized to
+// empty arrays so the payload matches the inventory endpoint's shape and a
+// client can tell "this release has no such tracks" from a missing field.
+func NewInventoryUpdatedEvent(sessionID string, inventory PlaybackInventoryV3) (EventEnvelope, error) {
+	if sessionID == "" {
+		return EventEnvelope{}, ErrInvalidRealtimePayload
+	}
+	inventory.SessionID = sessionID
+	if inventory.AudioTracks == nil {
+		inventory.AudioTracks = []AudioInventoryItemV3{}
+	}
+	if inventory.SubtitleInventory == nil {
+		inventory.SubtitleInventory = []SubtitleInventoryItemV3{}
+	}
+	raw, err := json.Marshal(InventoryUpdatedPayload{PlaybackInventoryV3: inventory})
+	if err != nil {
+		return EventEnvelope{}, err
+	}
+	return NewEventEnvelope(sessionID, RealtimeEventInventoryUpdated, raw)
 }
 
 // DownloadProgressState is the lifecycle stage a download.progress event
