@@ -6,7 +6,6 @@ import {
   type Query,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { api } from "@/api/client";
 import { V2ProblemError } from "@/api/v2/request";
 import { v2 } from "@/api/v2/request";
 import {

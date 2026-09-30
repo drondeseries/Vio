@@ -2231,6 +2231,12 @@ func qsvScaleFilterWithMapMode(res, mapMode string) string {
 	case transcodeResolution328p:
 		return "scale_vaapi=w=-2:h=328:format=nv12," + hwmap + ",format=qsv"
 	default:
+		// The ladder fit can name an exact height (a 3840x1600 film at the
+		// 1080p class encodes 1920x800): scale it like a named rung instead
+		// of passing the source through at full size.
+		if height, ok := scaleTargetHeight(res); ok {
+			return fmt.Sprintf("scale_vaapi=w=-2:h=%d:format=nv12,", height) + hwmap + ",format=qsv"
+		}
 		return vaapiNV12Filter + "," + hwmap + ",format=qsv"
 	}
 }
@@ -2274,6 +2280,11 @@ func qsvVPPInputScaleFilter(res string) string {
 	case transcodeResolution328p:
 		return "vpp_qsv=w=-1:h=328:format=nv12"
 	default:
+		// Exact ladder-fit heights scale here too; width stays -1: the iHD
+		// driver rejects scale_qsv auto-width values below -1.
+		if height, ok := scaleTargetHeight(res); ok {
+			return fmt.Sprintf("vpp_qsv=w=-1:h=%d:format=nv12", height)
+		}
 		return "vpp_qsv=format=nv12"
 	}
 }
@@ -2309,6 +2320,10 @@ func vaapiScaleFilter(res string) string {
 	case transcodeResolution328p:
 		return "scale_vaapi=w=-2:h=328:format=nv12"
 	default:
+		// Exact ladder-fit heights (see qsvScaleFilterWithMapMode).
+		if height, ok := scaleTargetHeight(res); ok {
+			return fmt.Sprintf("scale_vaapi=w=-2:h=%d:format=nv12", height)
+		}
 		return vaapiNV12Filter
 	}
 }

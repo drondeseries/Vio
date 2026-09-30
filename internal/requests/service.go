@@ -2446,6 +2446,11 @@ func (s *Service) submitRouted(ctx context.Context, req Request, actor Viewer, f
 		}
 		targets = append(targets, tier...)
 	}
+	// As on the unrouted path: Fulfill may have registered virtual catalog
+	// rows, so flush shared home-section membership before recording.
+	if s.catalogChanged != nil {
+		s.catalogChanged()
+	}
 	return s.recordTargets(ctx, req, actor, plan, targets, connKind, decisions, failures)
 }
 

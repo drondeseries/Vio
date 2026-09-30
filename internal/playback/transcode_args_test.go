@@ -2260,3 +2260,62 @@ func TestVAAPIRateControlSmokeArgsAndForcedMode(t *testing.T) {
 		t.Fatal("a canceled start must stop instead of launching FFmpeg")
 	}
 }
+
+func TestHardwareScaleFiltersShareExactLadderHeights(t *testing.T) {
+	t.Parallel()
+
+	// The ladder fit names exact heights (a 3840x1600 film at the 1080p
+	// class encodes 1920x800): every hardware scaler must scale them, or
+	// the plan advertises a frame the encoder never produces.
+	for _, res := range []string{"800p", "540p", " 1080P "} {
+		if got := vaapiScaleFilter(res); !strings.Contains(got, "h=800") && !strings.Contains(got, "h=540") && !strings.Contains(got, "h=1080") {
+			t.Fatalf("vaapiScaleFilter(%q) = %q, want a scaled height", res, got)
+		}
+		if got := qsvScaleFilterWithMapMode(res, ""); !strings.Contains(got, "h=800") && !strings.Contains(got, "h=540") && !strings.Contains(got, "h=1080") {
+			t.Fatalf("qsvScaleFilterWithMapMode(%q) = %q, want a scaled height", res, got)
+		}
+		if got := qsvVPPInputScaleFilter(res); !strings.Contains(got, "h=800") && !strings.Contains(got, "h=540") && !strings.Contains(got, "h=1080") {
+			t.Fatalf("qsvVPPInputScaleFilter(%q) = %q, want a scaled height", res, got)
+		}
+	}
+	// VPP keeps Vio's iHD width constraint on exact heights too.
+	if got := qsvVPPInputScaleFilter("800p"); got != "vpp_qsv=w=-1:h=800:format=nv12" {
+		t.Fatalf("qsvVPPInputScaleFilter(800p) = %q, want w=-1 exact scaling", got)
+	}
+	if got := vaapiScaleFilter("800p"); got != "scale_vaapi=w=-2:h=800:format=nv12" {
+		t.Fatalf("vaapiScaleFilter(800p) = %q", got)
+	}
+	// Odd heights, which 4:2:0 output cannot take, and absurd ones leave
+	// the source unscaled, as unknown labels always have.
+	for _, res := range []string{"801p", "5000p", " UH D ", ""} {
+		if got := vaapiScaleFilter(res); got != vaapiNV12Filter {
+			t.Fatalf("vaapiScaleFilter(%q) = %q, want passthrough %q", res, got, vaapiNV12Filter)
+		}
+		if got := qsvVPPInputScaleFilter(res); got != "vpp_qsv=format=nv12" {
+			t.Fatalf("qsvVPPInputScaleFilter(%q) = %q, want passthrough", res, got)
+		}
+	}
+	// A 2160p target still never upscales a shorter source.
+	if got := vaapiScaleFilter("2160p"); !strings.Contains(got, "min(2160\\,ih)") {
+		t.Fatalf("vaapiScaleFilter(2160p) = %q, want the no-upscale clamp", got)
+	}
+}
+
+func TestScopeFilmAutoPlanScalesOnHardwareFilters(t *testing.T) {
+	t.Parallel()
+
+	// End to end for the reported mismatch: a scope film at auto must
+	// produce a label the hardware scalers actually scale.
+	source := SourceDescriptorV3{Width: 3840, Height: 1600, VideoCodec: "h264", BitrateKbps: 20000}
+	estimate := 9000 // 80% plans 7200 kbps: the 1080p class for this source.
+	quality := ResolveQualityPolicyV3(StartRequestV3{QualityPreference: "auto", BandwidthEstimateKbps: &estimate}, source)
+	if quality.Label != "800p" {
+		t.Fatalf("scope auto label = %q, want 800p", quality.Label)
+	}
+	if got := vaapiScaleFilter(quality.Label); !strings.Contains(got, "h=800") {
+		t.Fatalf("vaapiScaleFilter(%q) = %q, want 800p scaling", quality.Label, got)
+	}
+	if got := qsvVPPInputScaleFilter(quality.Label); !strings.Contains(got, "h=800") {
+		t.Fatalf("qsvVPPInputScaleFilter(%q) = %q, want 800p scaling", quality.Label, got)
+	}
+}

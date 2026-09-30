@@ -253,7 +253,7 @@ describe("AdminPluginDetail", () => {
 
     expect(screen.getByRole("heading", { level: 1, name: "MDBList Ratings" })).toBeInTheDocument();
     expect(screen.getByText("Version 0.1.0")).toBeInTheDocument();
-    expect(screen.getAllByText("Silo maintained").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Vio maintained").length).toBeGreaterThan(0);
     expect(screen.getByText("silo.mdblist")).toBeInTheDocument();
     expect(screen.getByText("AGPL-3.0-only")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "MDBList Account" })).toBeInTheDocument();
