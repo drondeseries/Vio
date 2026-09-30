@@ -2115,6 +2115,10 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	// no relay registration, no ffmpeg spawn.
 	if h.SubtitleCache != nil {
 		if cached, ok := h.SubtitleCache.LookupFontBundle(cacheKey); ok {
+			// A detached extraction can complete between requests; serving its
+			// cached bundle is confirmed recovery, so clear the throttle key
+			// and let a later regression warn again.
+			h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
 			writeFontBundleResponse(w, cached)
 			return
 		}
@@ -2198,18 +2202,22 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 		return
 	}
-	h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
 	if !ready {
 		// The extraction is still running detached. Hold the request only for
 		// fontBundleClientWait, then hand the client a distinguishable,
 		// uncacheable pending bundle so it falls back to default fonts
 		// immediately and re-fetches; the single-flighted extraction keeps
-		// running and lands in the cache for that next fetch.
+		// running and lands in the cache for that next fetch. A prior failure
+		// key stays set: recovery is not confirmed until a bundle is actually
+		// served, so a slow retry that fails still logs at debug.
 		slog.DebugContext(r.Context(), "subtitle font bundle extraction in flight; serving pending bundle",
 			"component", "api", "file_id", file.ID, "track", trackIndex)
 		writePendingFontBundleResponse(w)
 		return
 	}
+	// Recovery is confirmed by the completed bundle; only now clear the
+	// throttle key so a later regression warns again.
+	h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
 	writeFontBundleResponse(w, bundle)
 }
 
