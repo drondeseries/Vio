@@ -1517,6 +1517,14 @@ type virtualResolveOptionsV3 struct {
 	// refused (never swapped) when it is not. An auto selection leaves this
 	// false and keeps the ordinary fallback/substitution behavior.
 	explicitSelection bool
+	// bypassProviderFloor marks a deliberate recovery resolve — an automatic
+	// replan rotation or an alternate-version fallback — as a declared outage
+	// re-list: it re-lists past the fresh-serve floor and the 30s
+	// provider-failure fail-fast a recent background failure wrote, so recovery
+	// is not eaten by that backoff. Background liveness pollers and ordinary
+	// automatic resolves never set it and stay on the floor. The startup
+	// budgets still bound the recovery, and exhaustion keeps its honest cause.
+	bypassProviderFloor bool
 }
 
 // virtualCandidateRotationContextKeyV3 carries the rotation intent across the
@@ -1802,6 +1810,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	allowFailed := options.allowFailedCandidate
 	rotateCandidates := options.rotateCandidates
 	explicitSelection := options.explicitSelection
+	// providerRelist drives both the declared-outage cache bypass and the
+	// resolver's forced re-list. It must be true whenever a fresh provider
+	// listing is required past the floor: a forced relist or any declared
+	// recovery (see the attempt-context comment below).
+	providerRelist := forceRelist || rotateCandidates || options.bypassProviderFloor
 	if !isVirtualPlaybackFile(file) {
 		return resolvedVirtualPlaybackSource{File: file}, nil
 	}
@@ -2063,13 +2076,19 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// those early stages at half the cold budget, so the attempt is guaranteed
 	// at least that much time rather than being starved.
 	attemptCtx := coldCtx
-	// A deliberate user relink (force_relink) is the declared-outage recovery
-	// case the unbounded relist was built for: it re-lists past the fresh-serve
-	// floor and the provider-failure fail-fast, so a user "try again" is never
-	// blocked by the 30s backoff a background failure just wrote. Only an
-	// unbound relink qualifies; a session-bound rotation (a replan rehydration)
-	// is server-initiated and stays on the floor so it cannot hot-loop.
-	if forceRelist && !options.sessionBound {
+	// A declared recovery re-lists past the fresh-serve floor and the
+	// provider-failure fail-fast, so recovery is not blocked by the 30s backoff
+	// a recent background failure just wrote. Three cases qualify:
+	//   - a user relink (force_relink), unbound: the original outage recovery;
+	//   - a deliberate candidate rotation (rotateCandidates): a replan
+	//     rehydration or a decode-rejection rotation, which is server-initiated
+	//     recovery rather than a background poll;
+	//   - an explicit recovery resolve (bypassProviderFloor): the automatic
+	//     alternate-version fallback walk.
+	// Background liveness pollers and ordinary automatic resolves never set any
+	// of these and stay on the floor. The resolve's own startup budget still
+	// bounds every attempt.
+	if (forceRelist && !options.sessionBound) || options.rotateCandidates || options.bypassProviderFloor {
 		attemptCtx = virtuallibrary.WithProviderOutageRelist(attemptCtx)
 	}
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
@@ -2305,7 +2324,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				candidateCtx = virtualResolveContextWithPersistedTrust(attemptCtx, file, time.Now(), h.virtualCandidateTrustWindow())
 			}
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-				candidateCtx, cand.URI, oid, userID, profileID, forceRelist, excludedCandidateIDs, preferredCandidateID,
+				candidateCtx, cand.URI, oid, userID, profileID, providerRelist, excludedCandidateIDs, preferredCandidateID,
 			)
 			if err == nil {
 				streamURL = res.URL
@@ -4158,6 +4177,33 @@ func streamMatchesPersistedIdentity(stream VirtualPlaybackStream, identity virtu
 	return want != "" && want == got
 }
 
+// virtualPathOwnerRow returns the catalog row that already owns a virtual
+// candidate path within the same owner installation and library, when the
+// handler's file resolver can look a row up by path. The stale fallback uses it
+// to recognize a healthy substitute whose path belongs to an existing
+// alternate-version row: that substitute must rotate the session to the owning
+// row, not attempt an adoption the SQL sibling guard refuses. A resolver
+// without GetByPath reports no owner, leaving ordinary adoption behavior.
+func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, candidateURI string, ownerID, libraryID int) *models.MediaFile {
+	if h == nil || strings.TrimSpace(candidateURI) == "" {
+		return nil
+	}
+	pathResolver, ok := h.fileResolver.(interface {
+		GetByPath(context.Context, string) (*models.MediaFile, error)
+	})
+	if !ok {
+		return nil
+	}
+	row, err := pathResolver.GetByPath(ctx, candidateURI)
+	if err != nil || row == nil || row.ID <= 0 {
+		return nil
+	}
+	if row.VirtualOwnerInstallationID != ownerID || row.MediaFolderID != libraryID {
+		return nil
+	}
+	return row
+}
+
 // fallbackResolveStaleVirtualSource re-lists the provider's current candidates
 // and resolves the first healthy provider-neutral stream. It returns nil when
 // the original URI carried no stale result= pick, or when no substitute
@@ -4350,6 +4396,26 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 			// verdict, set only when the pinned release proved absent.
 			if !elig.allowsSibling() && !reconcileCollection {
 				return nil
+			}
+			// A substitute whose path is already owned by another row of this
+			// content is an existing alternate version, not a release to fold
+			// into this row: the CAS-fenced adoption below would collide with
+			// the sibling owner and be refused, which is exactly the dead-pin
+			// livelock this fallback exists to break. Rotate to the owning row
+			// instead — the session binds to the version that actually plays,
+			// and no catalog write is needed because the row already carries
+			// the identity. The AltMount veto is enforced upstream in
+			// resolveVirtualCandidateSource: an active failed_at on the
+			// requested or the resolved candidate refuses before this point.
+			if ownerRow := h.virtualPathOwnerRow(ctx, resolved.URI, effectiveVirtualOwner(stream.OwnerInstallationID, file.VirtualOwnerInstallationID), file.MediaFolderID); ownerRow != nil && ownerRow.ID != file.ID {
+				rotated := *resolved
+				rotatedRow := *ownerRow
+				rotatedRow.FilePath = resolved.URI
+				rotated.File = &rotatedRow
+				slog.InfoContext(ctx, "virtual stale fallback: rotated to an existing alternate version row",
+					"component", "api", "original", file.FilePath, "substitute", resolved.URI,
+					"original_file_id", file.ID, "substitute_file_id", ownerRow.ID)
+				return &rotated
 			}
 			if resolved.File != nil && resolved.Provenance == ProbeProvenanceVerified && h.VirtualFileSaver != nil {
 				// Persist the identity the resolver actually returned

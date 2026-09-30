@@ -168,7 +168,52 @@ type StreamHandler struct {
 	// must never clear it.
 	VirtualCandidateRecoveredMarker func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error
 	SubtitleBlobs                   subtitles.BlobStore // optional; backs downloaded subtitle reads
+	// fontExtractFailures throttles the repetitive "subtitle font extraction
+	// failed" warning to the first failure per file+track; repeats drop to
+	// debug. A successful extraction clears the key, so a later regression warns
+	// again. Font extraction never fails playback: the endpoint's 500
+	// (font_extract_failed) stays the client-visible signal and the debug line
+	// keeps the diagnostic trail.
+	fontExtractFailures fontExtractFailLog
+}
 
+// fontExtractFailLog throttles the subtitle-font extraction warning. See the
+// field doc on StreamHandler.fontExtractFailures.
+type fontExtractFailLog struct {
+	mu   sync.Mutex
+	seen map[string]struct{}
+}
+
+// failed logs the first failure for key at warn and repeats at debug.
+func (l *fontExtractFailLog) failed(ctx context.Context, key string, attrs ...any) {
+	l.mu.Lock()
+	if l.seen == nil {
+		l.seen = make(map[string]struct{})
+	}
+	_, repeat := l.seen[key]
+	if !repeat {
+		l.seen[key] = struct{}{}
+	}
+	l.mu.Unlock()
+	args := append([]any{virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI}, attrs...)
+	if repeat {
+		slog.DebugContext(ctx, "subtitle font extraction failed", args...)
+		return
+	}
+	slog.WarnContext(ctx, "subtitle font extraction failed", args...)
+}
+
+// recovered clears the throttle key after a successful extraction so a later
+// failure is reported at warn again.
+func (l *fontExtractFailLog) recovered(key string) {
+	l.mu.Lock()
+	delete(l.seen, key)
+	l.mu.Unlock()
+}
+
+// fontExtractFailureKey identifies an extraction target across retries.
+func fontExtractFailureKey(fileID, trackIndex int) string {
+	return strconv.Itoa(fileID) + ":" + strconv.Itoa(trackIndex)
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -1962,10 +2007,11 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	}
 	fonts, err := playback.ExtractAttachedSubtitleFonts(ctx, file.FilePath, h.ffmpegPath())
 	if err != nil {
-		slog.WarnContext(ctx, "subtitle font extraction failed", "component", "api",
+		h.fontExtractFailures.failed(ctx, fontExtractFailureKey(file.ID, trackIndex),
 			"file_id", file.ID, "track", trackIndex, "error", err)
 		return nil, apiError(http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 	}
+	h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
 	return playback.EncodeSubtitleFontBundle(fonts), nil
 }
 
@@ -2093,7 +2139,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 
 		fonts, extractErr := playback.ExtractAttachedSubtitleFonts(r.Context(), inputPath, h.ffmpegPath())
 		if extractErr != nil {
-			slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
+			h.fontExtractFailures.failed(r.Context(), fontExtractFailureKey(file.ID, trackIndex),
 				"file_id", file.ID,
 				"track", trackIndex,
 				"error", extractErr,
@@ -2101,6 +2147,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 			return
 		}
+		h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Cache-Control", "no-store")
@@ -2143,7 +2190,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusBadGateway, subtitleSourceUnavailableErrorCode, "Failed to resolve virtual source for the subtitle font bundle")
 			return
 		}
-		slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
+		h.fontExtractFailures.failed(r.Context(), fontExtractFailureKey(file.ID, trackIndex),
 			"file_id", file.ID,
 			"track", trackIndex,
 			"error", err,
@@ -2151,6 +2198,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 		return
 	}
+	h.fontExtractFailures.recovered(fontExtractFailureKey(file.ID, trackIndex))
 	if !ready {
 		// The extraction is still running detached. Hold the request only for
 		// fontBundleClientWait, then hand the client a distinguishable,

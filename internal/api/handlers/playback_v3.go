@@ -2434,7 +2434,7 @@ func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
 		}
 		altResolved, altErr := h.resolveVirtualPlaybackSource(
 			walkReq, alternate, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, false,
-			virtualResolveOptionsV3{sessionBound: false},
+			virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true},
 		)
 		if altErr == nil && altResolved.File != nil {
 			slog.InfoContext(walkCtx, "virtual start fell back to an alternate version after a listing failure",
@@ -2475,7 +2475,7 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 	if !isVirtualPlaybackFile(alternate) {
 		return h.ensurePlaybackProbe(r.Context(), alternate), "", nil
 	}
-	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false})
+	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0, false, virtualResolveOptionsV3{sessionBound: false, bypassProviderFloor: true})
 	if err != nil {
 		return nil, "", err
 	}
@@ -7489,7 +7489,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// so nothing needs the bypass; bypassing stamps here is what
 				// would let sequential rotations cycle A→B→C→A instead of
 				// terminating when every sibling is known-bad.
-				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI})
+				resolved, resolveErr := h.resolveRehydratedVirtualSourceV3(r, &pinnedFile, record.ProfileID, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps), virtualResolveOptionsV3{allowFailedCandidate: false, rotateCandidates: virtualDecodeRotation, sessionBound: true, sessionAnchorURI: session.VirtualSourceURI, bypassProviderFloor: true})
 				if resolveErr != nil {
 					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
 					virtualRehydrationFailed = true
