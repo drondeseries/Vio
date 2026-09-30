@@ -16,6 +16,52 @@ export function formatMediaType(mediaType: RequestMediaType): string {
   return mediaType === "series" ? "Series" : "Movie";
 }
 
+// Filter vocabularies and badge variants for the status/outcome-filtered
+// admin queue. Kept from the pre-#1632 lib: Vio's AdminRequests page still
+// filters by status/outcome while upstream moved to queue views.
+export const REQUEST_STATUSES: Array<MediaRequestStatus | "all"> = [
+  "all",
+  "pending",
+  "approved",
+  "queued",
+  "downloading",
+  "completed",
+];
+
+export const REQUEST_OUTCOMES: Array<MediaRequestOutcome | "all"> = [
+  "all",
+  "active",
+  "declined",
+  "cancelled",
+  "failed",
+];
+
+type BadgeVariant = "default" | "secondary" | "destructive" | "outline";
+
+export function requestStatusBadgeVariant(status?: MediaRequestStatus): BadgeVariant {
+  switch (status) {
+    case "completed":
+      return "default";
+    case "pending":
+      return "outline";
+    default:
+      return "secondary";
+  }
+}
+
+export function requestOutcomeBadgeVariant(outcome?: MediaRequestOutcome): BadgeVariant {
+  switch (outcome) {
+    case "failed":
+    case "declined":
+    case "cancelled":
+      return "destructive";
+    case "active":
+      return "secondary";
+    default:
+      return "outline";
+  }
+}
+
 export function formatRequestStatus(status?: MediaRequestStatus): string {
   switch (status) {
     case "pending":

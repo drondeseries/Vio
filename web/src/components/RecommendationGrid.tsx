@@ -18,7 +18,9 @@ interface RecommendationGridProps {
 interface RecommendationItemCardProps {
   itemId: string;
   showCaption: boolean;
-  className: string;
+  // Sized by the row's wrapper in the default grid; direct card users pass
+  // their own width classes.
+  className?: string;
   onTerminalError: (itemId: string) => void;
 }
 

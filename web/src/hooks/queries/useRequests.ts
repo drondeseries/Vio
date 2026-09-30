@@ -52,6 +52,7 @@ import type {
   RequestMediaPage,
   RequestSearchMediaType,
   RequestMediaType,
+  RequestUserLimit,
 } from "@/api/types";
 import { tmdbPageCount } from "@/lib/mediaRequests";
 import { adminKeys, requestKeys } from "./keys";
@@ -381,7 +382,7 @@ export function useMyMediaRequests(
 export function useAdminMediaRequests(params: RequestListParams = {}) {
   const key = listParamsKey(params);
   return useQuery({
-    queryKey: adminKeys.requests(key),
+    queryKey: adminKeys.requestQueue(key),
     queryFn: () => listAdminMediaRequestsV2(params),
     staleTime: 10_000,
   });
