@@ -205,17 +205,111 @@ func (s *Monitor) ConfigureAltmount(baseURL, apiKey string, intervalMinutes int,
 // push signal a cache handoff listens for so an in-session handoff can react to
 // a fill that finished during playback without polling the provider. A nil
 // callback clears it.
+//
+// The observer is also recorded internally so ReleaseCached can answer a
+// synchronous "is this pinned release already cached?" probe (the mid-play heal
+// path) from the same completion signal, without a provider round-trip.
 func (s *Monitor) SetReleaseConfirmedObserver(fn altmount.ReleaseConfirmationObserver) {
 	if s == nil || s.monitor == nil {
 		return
 	}
-	s.monitor.mu.Lock()
-	s.monitor.confirmObserver = fn
-	client := s.monitor.altmount
-	s.monitor.mu.Unlock()
-	if client != nil {
-		client.SetConfirmObserver(fn)
+	m := s.monitor
+	var installed altmount.ReleaseConfirmationObserver
+	if fn != nil {
+		installed = func(releaseKey string) {
+			if key := altmount.ReleaseKey(releaseKey); key != "" {
+				m.mu.Lock()
+				if m.confirmedReleases == nil {
+					m.confirmedReleases = make(map[string]struct{})
+				}
+				m.confirmedReleases[key] = struct{}{}
+				m.mu.Unlock()
+			}
+			// Fire the caller's listener outside the monitor lock: a handoff it
+			// triggers resolves and rebinds, and must never block completion
+			// bookkeeping or risk re-entering the observer under the lock.
+			fn(releaseKey)
+		}
 	}
+	m.mu.Lock()
+	m.confirmObserver = installed
+	client := m.altmount
+	m.mu.Unlock()
+	if client != nil {
+		client.SetConfirmObserver(installed)
+	}
+}
+
+// ReleaseCached reports whether AltMount has reported the named release
+// completed. known is false when no AltMount client is configured, so an
+// unconfigured provider is never mistaken for "not cached". It answers from the
+// recorded completion signal, so it is cheap and side-effect free.
+func (s *Monitor) ReleaseCached(releaseName string) (cached bool, known bool) {
+	if s == nil || s.monitor == nil {
+		return false, false
+	}
+	m := s.monitor
+	client := m.configuredAltmount()
+	if client == nil || client.URL() == "" {
+		return false, false
+	}
+	key := altmount.ReleaseKey(releaseName)
+	if key == "" {
+		return false, false
+	}
+	m.mu.Lock()
+	_, cached = m.confirmedReleases[key]
+	m.mu.Unlock()
+	return cached, true
+}
+
+// ProviderStale reports whether any configured virtual provider's cached state
+// has aged past its refresh interval. It is the read half of the stale-provider
+// seam the playback layer probes before a resolve, so a long-lived process does
+// not resolve against a stale AltMount completed/failed snapshot or Prowlarr
+// index.
+func (s *Monitor) ProviderStale() bool {
+	if s == nil || s.monitor == nil {
+		return false
+	}
+	m := s.monitor
+	m.mu.Lock()
+	altmountClient := m.altmount
+	prowlarrClient := m.prowlarr
+	m.mu.Unlock()
+	if altmountClient != nil && altmountClient.URL() != "" && altmountClient.Stale() {
+		return true
+	}
+	if prowlarrClient != nil && prowlarrClient.URL() != "" && prowlarrClient.Stale() {
+		return true
+	}
+	return false
+}
+
+// RefreshStaleProvider refreshes every configured virtual provider whose cached
+// state is stale, under the caller's budget. One unreachable provider never
+// blocks the other: both are attempted and their errors are joined.
+func (s *Monitor) RefreshStaleProvider(ctx context.Context) error {
+	if s == nil || s.monitor == nil {
+		return nil
+	}
+	m := s.monitor
+	m.mu.Lock()
+	altmountClient := m.altmount
+	prowlarrClient := m.prowlarr
+	m.mu.Unlock()
+	var errs []error
+	if altmountClient != nil && altmountClient.URL() != "" && altmountClient.Stale() {
+		if err := altmountClient.RefreshIfStale(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("refresh AltMount state: %w", err))
+		}
+	}
+	if prowlarrClient != nil && prowlarrClient.URL() != "" && prowlarrClient.Stale() {
+		if err := prowlarrClient.RefreshIfStale(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("refresh Prowlarr search: %w", err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // SearchMonitoredReleases performs an on-demand Prowlarr search for one
@@ -332,6 +426,12 @@ type mediaMonitor struct {
 	// a cache-handoff listener. It is kept here so a later reconfigure re-applies
 	// it to the (re)created client.
 	confirmObserver altmount.ReleaseConfirmationObserver
+	// confirmedReleases records the release keys AltMount has reported completed
+	// (the same normalized identity altmount.ReleaseKey produces). It is
+	// populated from the confirm observer the monitor installs, so a cache
+	// handoff probe can answer synchronously without a provider round-trip or a
+	// classifier side effect.
+	confirmedReleases map[string]struct{}
 	// cursor is the key of the last item whose evaluation completed in a
 	// partial pass. It is persisted with the queue so the next pass resumes
 	// instead of restarting from the front.

@@ -1408,6 +1408,18 @@ func newChiRouter(deps Dependencies) chi.Router {
 				return deps.VirtualLibraryService.Refresh(ctx, path)
 			})
 			playbackHandler.VirtualMediaDetailedResolver = newVirtualMediaDetailedResolver(deps.VirtualLibraryService)
+			// Expose the provider-staleness capability the resolve probes before
+			// it lists a provider. The monitor aggregates AltMount's
+			// completed/failed snapshot and Prowlarr's RSS index staleness; the
+			// wrapper puts it behind the resolve port so production exercises the
+			// bounded refresh seam instead of no-oping it.
+			if monitor := deps.VirtualLibraryService.Monitor; monitor != nil {
+				playbackHandler.VirtualMediaDetailedResolver = virtualProviderStaleResolver{
+					VirtualMediaDetailedResolver: playbackHandler.VirtualMediaDetailedResolver,
+					stale:                        monitor.ProviderStale,
+					refresh:                      monitor.RefreshStaleProvider,
+				}
+			}
 		}
 		playbackHandler.BestResultCache = handlers.NewVirtualBestResultCache(30*time.Minute, 512)
 		if deps.UserStoreProvider != nil {
@@ -1675,6 +1687,64 @@ func newChiRouter(deps Dependencies) chi.Router {
 			streamHandler.VirtualMediaResolver = playbackHandler.VirtualMediaResolver
 			streamHandler.VirtualMediaRefreshResolver = playbackHandler.VirtualMediaRefreshResolver
 			streamHandler.VirtualMediaDetailedResolver = playbackHandler.VirtualMediaDetailedResolver
+		}
+		if streamHandler != nil && deps.VirtualLibraryService != nil {
+			sh := streamHandler
+			svc := deps.VirtualLibraryService
+			// Cache handoff: AltMount's once-per-release completion signal drives
+			// an in-session rebind to the cached copy of the same release, and
+			// download.progress rides the playback realtime hub. Vio never
+			// fetches media: a fill only re-requests the provider's addon stream
+			// listing, which is what makes AltMount queue the release for import.
+			if deps.PlaybackRealtimeHub != nil {
+				sh.DownloadProgress = deps.PlaybackRealtimeHub
+			}
+			sh.VirtualReleaseCacheStatus = func(ctx context.Context, virtualURI string, ownerInstallationID int) (bool, bool) {
+				if deps.FileRepo == nil || svc.Monitor == nil {
+					return false, false
+				}
+				file, err := deps.FileRepo.GetByPath(ctx, virtualURI)
+				if err != nil || file == nil || strings.TrimSpace(file.ProviderReleaseName) == "" {
+					return false, false
+				}
+				return svc.Monitor.ReleaseCached(file.ProviderReleaseName)
+			}
+			sh.VirtualReleaseCacheFiller = handlers.VirtualReleaseCacheFillFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, report func(playback.DownloadProgressPayload)) error {
+				if deps.FileRepo == nil || svc.Monitor == nil {
+					return nil
+				}
+				file, err := deps.FileRepo.GetByPath(ctx, virtualURI)
+				if err != nil {
+					// Best-effort: a row that cannot be read or is unknown has
+					// no fill to start, and the session keeps streaming the
+					// provider source. A missing row is not a fill failure.
+					return nil //nolint:nilerr // deliberate best-effort on an unreadable/unknown row
+				}
+				if file == nil {
+					return nil
+				}
+				releaseName := strings.TrimSpace(file.ProviderReleaseName)
+				if releaseName == "" {
+					return nil
+				}
+				// The provider only fills a release it does not already hold;
+				// an unconfigured AltMount (known=false) has nothing to fill.
+				if cached, known := svc.Monitor.ReleaseCached(releaseName); !known || cached {
+					return nil
+				}
+				// Serving the addon URL is the fill: force a fresh provider
+				// listing so AltMount queues the pinned release for import. The
+				// resolver only exchanges stream JSON, never media bytes, so Vio
+				// never fetches or stores the release.
+				if _, err := svc.Refresh(ctx, virtualURI); err != nil {
+					return err
+				}
+				report(playback.DownloadProgressPayload{State: playback.DownloadProgressStateDownloading})
+				return nil
+			})
+			// Install the completion observer last so the waiter registry is
+			// already wired when the first confirmation can arrive.
+			svc.Monitor.SetReleaseConfirmedObserver(sh.HandleVirtualReleaseConfirmed)
 		}
 		if deps.DB != nil {
 			playbackHandler.PlanStoreV3 = planstore.NewPostgres(deps.DB)
@@ -5622,4 +5692,32 @@ func v2Dependencies(
 		out.CursorSecret = []byte(deps.Config.Auth.JWTSecret)
 	}
 	return out
+}
+
+// virtualProviderStaleResolver decorates a virtual resolve port with the
+// optional provider-staleness capability the playback resolve probes before it
+// lists a provider. The embedded resolve path is unchanged; Stale and
+// RefreshIfStale delegate to the core virtual library monitor, whose AltMount
+// and Prowlarr clients know when their cached state has aged out and can
+// refresh it under the resolve's bounded context. A port that does not carry
+// the capability is unaffected.
+type virtualProviderStaleResolver struct {
+	handlers.VirtualMediaDetailedResolver
+	stale   func() bool
+	refresh func(context.Context) error
+}
+
+// Stale reports whether any configured virtual provider's cached state is due
+// for a refresh.
+func (r virtualProviderStaleResolver) Stale() bool {
+	return r.stale != nil && r.stale()
+}
+
+// RefreshIfStale refreshes stale virtual provider state under ctx. A nil refresh
+// is a no-op so a partially wired resolver never panics.
+func (r virtualProviderStaleResolver) RefreshIfStale(ctx context.Context) error {
+	if r.refresh == nil {
+		return nil
+	}
+	return r.refresh(ctx)
 }
