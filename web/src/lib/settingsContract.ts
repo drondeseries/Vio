@@ -274,6 +274,8 @@ export const SETTING_KEYS = {
   REMUXDB_SUBMIT_ENABLED: "remuxdb.submit_enabled",
   /** RemuxDB API token */
   REMUXDB_TOKEN: "remuxdb.token",
+  /** Request titles I add to my watchlist */
+  REQUESTS_WATCHLIST_AUTO_REQUEST: "requests.watchlist_auto_request",
   /** Search scope */
   SEARCH_MEDIA_SCOPE: "search.media_scope",
   /** Match device caption settings */
@@ -1228,6 +1230,22 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     description: "API token for RemuxDB submissions.",
     category: "providers",
     control: "text",
+  },
+  "requests.watchlist_auto_request": {
+    key: "requests.watchlist_auto_request",
+    type: "boolean",
+    nullable: false,
+    persistence: "remote",
+    introducedIn: 15,
+    scopes: ["profile"],
+    scopeIntroducedIn: [15],
+    resolutionOrder: ["profile", "default"],
+    defaultValue: true,
+    label: "Request titles I add to my watchlist",
+    description:
+      "When you add a title that is not in the library to your watchlist, also request it.",
+    category: "requests",
+    control: "switch",
   },
   "search.media_scope": {
     key: "search.media_scope",

@@ -55,7 +55,7 @@ import type {
   RequestUserLimit,
 } from "@/api/types";
 import { tmdbPageCount } from "@/lib/mediaRequests";
-import { adminKeys, requestKeys } from "./keys";
+import { adminKeys, requestKeys, watchlistKeys } from "./keys";
 
 export const REQUESTS_STALE_TIME = 30_000;
 const DISCOVER_BRAND_STALE_TIME = 24 * 60 * 60 * 1000;
@@ -96,6 +96,8 @@ export function invalidateRequestSurfaces(queryClient: ReturnType<typeof useQuer
   // viewer-scoped search results when request eligibility changes.
   queryClient.invalidateQueries({ queryKey: requestKeys.all });
   queryClient.invalidateQueries({ queryKey: adminKeys.requestsRoot() });
+  // Watchlist titles outside the library carry their request state.
+  queryClient.invalidateQueries({ queryKey: watchlistKeys.titles() });
 }
 
 export function useRequestDiscovery() {

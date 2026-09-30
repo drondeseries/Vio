@@ -107,6 +107,8 @@ const (
 	RemuxdbSubmitEnabled = "remuxdb.submit_enabled"
 	// RemuxDB API token
 	RemuxdbToken = "remuxdb.token"
+	// Request titles I add to my watchlist
+	RequestsWatchlistAutoRequest = "requests.watchlist_auto_request"
 	// Search scope
 	SearchMediaScope = "search.media_scope"
 	// Match device caption settings
@@ -197,6 +199,7 @@ var Remote = []string{
 	RemuxdbEnabled,
 	RemuxdbSubmitEnabled,
 	RemuxdbToken,
+	RequestsWatchlistAutoRequest,
 	SearchMediaScope,
 	UiCardOverlays,
 	UiCardOverlaysEnabled,
