@@ -325,28 +325,35 @@ export async function listAdminMediaRequestsV2(
   const out: MediaRequest[] = [];
   const seen = new Set<string>();
   for (const view of views) {
+    // Collect up to wanted matches per view (not just until the global
+    // total fills): the pre-#1632 contract returns global newest-first,
+    // which needs every view's head before the final sort below.
+    let collected = 0;
     let cursor: string | undefined;
-    while (out.length < wanted) {
+    const seenCursors = new Set<string>();
+    while (collected < wanted) {
       const page = await listAdminRequestQueuePageV2(
         { view },
-        { limit: Math.min(50, wanted - out.length), cursor },
+        { limit: Math.min(50, wanted - collected), cursor },
       );
       for (const item of page.items) {
-        if (out.length >= wanted) break;
+        if (collected >= wanted) break;
         if (status !== undefined && item.status !== status) continue;
         if (outcome !== undefined && item.outcome !== outcome) continue;
         if (seen.has(item.id)) continue;
         seen.add(item.id);
         out.push(item);
+        collected += 1;
       }
       if (!page.nextCursor) break;
-      if (seen.has(page.nextCursor))
+      if (seenCursors.has(page.nextCursor))
         throw new Error("Incomplete request page. Reload to try again.");
+      seenCursors.add(page.nextCursor);
       cursor = page.nextCursor;
     }
-    if (out.length >= wanted) break;
   }
-  return out;
+  out.sort((a, b) => (b.created_at > a.created_at ? 1 : b.created_at < a.created_at ? -1 : 0));
+  return out.slice(0, wanted);
 }
 
 /** One page of the admin queue, newest request first. */

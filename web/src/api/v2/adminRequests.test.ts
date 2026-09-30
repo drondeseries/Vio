@@ -191,3 +191,47 @@ describe("admin request v2 adapter", () => {
     await expect(getAdminRequestIntegrationV2("a")).rejects.toThrow("Reload");
   });
 });
+
+describe("listAdminMediaRequestsV2 compatibility", () => {
+  function row(id: string, status: string, outcome: string, created_at: string) {
+    return {
+      id,
+      provider: "tmdb",
+      media_type: "movie",
+      tmdb_id: 1,
+      title: id,
+      status,
+      outcome,
+      created_at,
+      updated_at: created_at,
+      targets: [],
+    };
+  }
+  it("merges views newest-first and filters client-side", async () => {
+    vi.mocked(v2).mockImplementation((op, options) => {
+      const query = (options as { query: Record<string, unknown> }).query;
+      const items =
+        query.view === "needs_approval"
+          ? [row("old-pending", "pending", "active", "2026-01-01T00:00:00Z")]
+          : query.view === "in_progress"
+            ? [row("new-approved", "approved", "active", "2026-09-01T00:00:00Z")]
+            : [];
+      return Promise.resolve({ items, page: { has_more: false } }) as never;
+    });
+    vi.mocked(captureProfileRequestContext).mockReturnValue(authority as never);
+    vi.mocked(isProfileRequestContextCurrent).mockReturnValue(true);
+    const { listAdminMediaRequestsV2 } = await import("./adminRequests");
+    const all = await listAdminMediaRequestsV2({ limit: 100 });
+    expect(all.map((r) => r.id)).toEqual(["new-approved", "old-pending"]);
+    const pending = await listAdminMediaRequestsV2({ status: "pending" });
+    expect(pending.map((r) => r.id)).toEqual(["old-pending"]);
+    // A status filter fans out to its single view only.
+    expect(
+      vi
+        .mocked(v2)
+        .mock.calls.map(
+          ([, options]) => (options as { query: Record<string, unknown> }).query.view,
+        ),
+    ).toContain("needs_approval");
+  });
+});
