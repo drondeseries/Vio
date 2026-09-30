@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -42,6 +43,16 @@ const (
 	virtualProbeBudget                = 15 * time.Second
 	maxVirtualPlaybackPrefetchFiles   = 2
 	virtualPlaybackPrefetchBudget     = 20 * time.Second
+	// virtualAnchorWarmSeekSeconds is the early source position a prefetch
+	// probes to populate the copy-video seek-anchor cache. A prefetch request
+	// carries file IDs, not a resume position, so it warms an early GOP: the
+	// expensive probe is paid off the critical path and a first seek near the
+	// start is a cache hit. A deep seek later still re-probes.
+	virtualAnchorWarmSeekSeconds = 30.0
+	// virtualFirstBytesWarmBytes is the opening range a prefetch fetches from
+	// the resolved relay so the provider/CDN connection, DNS resolution, and
+	// first chunk are warm when the viewer clicks play.
+	virtualFirstBytesWarmBytes = 512 << 10
 	// virtualPrefetchQueueSize bounds pending prefetch work: how many distinct
 	// source/profile prefetches may wait for a worker. virtualPrefetchWorkers
 	// bounds active work. Together they bound the dedup map, whose entries exist
@@ -740,6 +751,10 @@ func (h *PlaybackHandler) prefetchOne(task virtualPrefetchTask) {
 			prefetchCtx, task.neutralURI, task.userID, task.profileID, task.file.VirtualOwnerInstallationID,
 		)
 	}
+	// Anchor and first-byte warm: resolve the relay input once and probe the
+	// seek anchor plus fetch the opening range, so the first play does not pay
+	// the probe and cold-connection cost on its critical path. Best-effort.
+	h.warmVirtualAnchor(prefetchCtx, &task.file, task.userID, task.profileID)
 
 	// Opportunistic pre-probe: when a prober is configured and the top-ranked
 	// candidate has no real probe evidence yet, probe it under the prefetch
@@ -834,6 +849,75 @@ func (h *PlaybackHandler) warmVirtualPlaybackListing(ctx context.Context, file *
 		file.ContentID, neutralURI, file.VirtualOwnerInstallationID,
 		filtered, time.Now(), generation,
 	)
+}
+
+// warmVirtualAnchor resolves the candidate's relay input and probes one
+// copy-video seek anchor, so a seek shortly after play is served from the
+// shared anchor cache instead of paying a synchronous FFmpeg probe. A prefetch
+// request has no resume position, so it warms an early GOP;
+// warmVirtualFirstBytes below covers the from-zero start path. Best-effort: a
+// missing resolver/relay, an expired context, or a probe failure is ignored.
+func (h *PlaybackHandler) warmVirtualAnchor(ctx context.Context, file *models.MediaFile, userID int, profileID string) {
+	if h == nil || file == nil || h.RemoteStreamRelay == nil {
+		return
+	}
+	if h.VirtualMediaResolver == nil && h.VirtualMediaDetailedResolver == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	res, cleanup, err := h.resolveVirtualInputURI(ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, false, nil, "")
+	if err != nil {
+		return
+	}
+	defer func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+	h.warmVirtualFirstBytes(ctx, res.URL)
+	// A stored URL that has already lapsed cannot seed a useful anchor; renew it
+	// in the background for the next play instead of probing a dead token.
+	if virtualResolvedURLExpired(res.ExpiresAt, time.Now()) {
+		h.fireExpiredVirtualRefresh(ctx, file, file.VirtualOwnerInstallationID, userID, profileID, res.ExpiresAt)
+		return
+	}
+	ffmpegPath := h.playbackConfig().FFmpegPath
+	requested := virtualAnchorWarmSeekSeconds
+	probe := func(probeCtx context.Context) (float64, int, error) {
+		if h.copySeekAnchor != nil {
+			return h.copySeekAnchor(probeCtx, ffmpegPath, res.URL, requested, playback.DefaultSegmentDuration)
+		}
+		return playback.ResolveCopySeekAnchorForSource(probeCtx, ffmpegPath, file.FilePath, res.URL, requested, playback.DefaultSegmentDuration)
+	}
+	if _, _, probeErr := probe(ctx); probeErr != nil {
+		slog.DebugContext(ctx, "virtual prefetch anchor warm skipped",
+			"component", "api", "file_id", file.ID, "virtual_uri", file.FilePath, "error", probeErr)
+	}
+}
+
+// warmVirtualFirstBytes fetches the opening range of the resolved relay URL so
+// the provider connection, DNS resolution, and first chunk are warm before
+// playback. The body is discarded; a non-HTTP URL or any error is ignored.
+func (h *PlaybackHandler) warmVirtualFirstBytes(ctx context.Context, rawURL string) {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(rawURL)), "http") {
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", virtualFirstBytesWarmBytes-1))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.CopyN(io.Discard, resp.Body, virtualFirstBytesWarmBytes)
 }
 
 func (h *PlaybackHandler) maxVirtualFailoverAttempts(ctx context.Context) int {

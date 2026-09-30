@@ -3274,6 +3274,21 @@ func copySeekAnchorRetryFits(ctx context.Context) (bool, time.Duration) {
 	return remaining > playback.CopySeekProbeTimeout+copySeekProbeRetryMargin, remaining
 }
 
+// copySeekAnchorRetryReserved reports whether the caller's remaining budget can
+// hold a retry reserved from the start of the copy-video seek-anchor
+// resolution: two full probes plus the scheduling margin. A caller that fails
+// this gate never plans a retry, so the deadline cannot truncate a second probe
+// mid-flight. It is the up-front reservation the in-loop copySeekAnchorRetryFits
+// gate then narrows to the single retry probe once the first attempt has run. A
+// caller with no deadline reserves the full probe cap and keeps the retry.
+func copySeekAnchorRetryReserved(ctx context.Context) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return time.Until(deadline) > playback.CopySeekProbeRetryBudget()+copySeekProbeRetryMargin
+}
+
 // waitCopySeekAnchorBackoff pauses before re-probing a candidate after a
 // transient provider (upstream 5xx) failure. It returns false when the wait or
 // its result cannot fit the caller's remaining budget, so the retry is skipped
@@ -3329,18 +3344,50 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// protocol it cannot open.
 			anchorInput := file.FilePath
 			releaseAnchor := func() {}
-			if isVirtualPlaybackFile(file) && h.RemoteStreamRelay != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil) {
+			virtualAnchor := isVirtualPlaybackFile(file) && h.RemoteStreamRelay != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil)
+			anchorExpiresAt := time.Time{}
+			// resolveAnchorInput resolves the candidate to a pinned-IP relay URL
+			// — the same resolution the transcode transport performs — and
+			// adopts the fresh registration. It runs again before a retry so the
+			// second probe carries a new relay token instead of replaying a
+			// token the provider already refused. The previous registration is
+			// released first so a retry cannot leak the entry it replaced.
+			resolveAnchorInput := func(resolveCtx context.Context) error {
+				res, cleanup, resolveErr := h.resolveVirtualAnchorURIWithRotationV3(resolveCtx, session, file)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				releaseAnchor()
+				anchorInput = res.URL
+				anchorExpiresAt = res.ExpiresAt
+				releaseAnchor = cleanup
+				return nil
+			}
+			if virtualAnchor {
 				// Route the anchor through the same absent-pin rotation policy as
 				// the serve layer and the replan rehydration: a provider that
 				// renumbered its result ids must not terminal a remux seek when a
 				// same-identity candidate is still listed. A different release is
 				// refused rather than silently anchored.
-				res, cleanup, resolveErr := h.resolveVirtualAnchorURIWithRotationV3(ctx, session, file)
-				if resolveErr != nil {
+				if resolveErr := resolveAnchorInput(ctx); resolveErr != nil {
 					return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: resolveErr}
 				}
-				anchorInput = res.URL
-				releaseAnchor = cleanup
+				// A stored URL that has already lapsed is renewed before the probe,
+				// bounded to virtualProbeBudget, so the seek does not fail on a
+				// dead token. Best-effort: a failed renewal keeps the existing
+				// registration and lets the probe/retry carry the verdict.
+				if virtualResolvedURLExpired(anchorExpiresAt, time.Now()) {
+					refreshCtx, refreshCancel := context.WithTimeout(ctx, virtualProbeBudget)
+					if resolveErr := resolveAnchorInput(refreshCtx); resolveErr != nil {
+						slog.WarnContext(ctx, "virtual seek anchor stored-url refresh failed; probing the existing registration",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"error", resolveErr,
+						)
+					}
+					refreshCancel()
+				}
 			}
 			// The stable source identity is the un-resolved file path: for a
 			// virtual file that is the provider-neutral URI, identical across
@@ -3364,23 +3411,55 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// the probe error, so failing fast on the first probe error is both
 			// cheaper and clearer. A caller with no deadline keeps the retry.
 			//
+			// The retry budget is reserved up front: a caller that cannot hold
+			// two full probes plus the scheduling margin never plans a retry, so
+			// a second probe cannot be started only to be truncated by the
+			// deadline.
+			//
 			// An upstream 5xx is a transient provider failure: it is retried the
 			// same way, but only after a short bounded backoff, so a provider
 			// that is already failing is not hammered by an immediate re-probe.
+			retryReserved := copySeekAnchorRetryReserved(ctx)
+			lastProbedInput := ""
 			var err error
 			for attempt := 1; attempt <= 2; attempt++ {
+				if attempt > 1 && virtualAnchor {
+					// A retry must probe fresh bytes: re-resolve the candidate
+					// and register a new relay entry so the same token is never
+					// probed twice. A re-resolve that yields the same input
+					// means no new token is available, so a second probe would
+					// repeat the request that just failed.
+					if resolveErr := resolveAnchorInput(ctx); resolveErr != nil {
+						slog.WarnContext(ctx, "virtual seek anchor re-resolve failed; skipping retry",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"error", resolveErr,
+						)
+						break
+					}
+					if anchorInput == lastProbedInput {
+						slog.WarnContext(ctx, "virtual seek anchor re-resolve returned the same relay token; skipping a duplicate probe",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+						)
+						break
+					}
+				}
+				lastProbedInput = anchorInput
 				origin, startSegment, err = probeAnchor(ctx)
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
 				}
 				fits, remaining := copySeekAnchorRetryFits(ctx)
-				if !fits {
+				if !fits || !retryReserved {
 					slog.WarnContext(ctx, "copy-video seek anchor retry skipped: insufficient remaining budget",
 						"component", "api",
 						"playback_session_id", session.ID,
 						"requested_seek_seconds", requested,
 						"remaining", remaining,
-						"required", playback.CopySeekProbeTimeout+copySeekProbeRetryMargin,
+						"required", playback.CopySeekProbeRetryBudget()+copySeekProbeRetryMargin,
 						"error", err,
 					)
 					break
