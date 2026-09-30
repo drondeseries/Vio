@@ -1856,8 +1856,12 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// earlier auto pick; only an explicit pick or a forced relink re-tries
 		// the known-bad candidate.
 		allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
-		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, virtualResolveOptionsV3{allowFailedCandidate: allowFailedCandidate, sessionBound: false, explicitSelection: req.FileSelection == playback.FileSelectionExplicitV3})
+		resolved, resolveErr := h.resolveVirtualStartWithVersionFallback(r, requestedFile, profileID, req, allowFailedCandidate, intOrZeroHandlerV3(req.BandwidthCapKbps))
 		if resolveErr != nil {
+			// A confirmed-dead pinned release is indicted here so a retry does
+			// not re-resolve it; an empty provider listing is not a verdict and
+			// is left unmarked.
+			h.stampStartVirtualCandidateFailed(r.Context(), requestedFile, resolveErr)
 			termFileID := requestedFile.ID
 			if requestedFile.EpisodeID != "" && h.VirtualEpisodeFileLookup != nil {
 				if dbFile, err := h.VirtualEpisodeFileLookup(r.Context(), requestedFile.EpisodeID); err == nil && dbFile != nil && dbFile.ID > 0 {
@@ -1869,7 +1873,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				}
 			}
 			req.FileID = termFileID
-			response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, termFileID, termFileID, playback.NewTerminalResponseV3("virtual_source_unavailable", "The virtual source could not be resolved for playback.", true))
+			response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, termFileID, termFileID, virtualStartUnresolvedTerminalV3(resolveErr))
 			if persistErr != nil {
 				return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
 			}
@@ -2011,12 +2015,23 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if effectiveFile.PresentationPartTotal > 1 && effectiveFile.PresentationPartIndex > 0 {
 		alternateBase = effectiveFile
 	}
+	// Split the planning bucket so a cold start can attribute a multi-second
+	// stall: the subtitle inventory read, the transformation registry /
+	// DV-RPU probe closure build, and the planner call itself (which lazily
+	// fetches node transformation and tone-map capabilities behind its own
+	// bounded planning timeout). The old single planning_ms mark folded all
+	// three together and could not say which one consumed the budget.
+	effectiveSubtitles := subtitleInventoryFor(effectiveFile)
+	timings.mark("subtitle_inventory")
+	transformationRegistry := h.transformationRegistryV3(r.Context())
+	dvrpuStrippable := h.lazyDVRPUStrippableV3(r.Context(), effectiveFile)
+	timings.mark("transform_registry")
 	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
 		Request: req, RequestedFile: requestedFile, EffectiveFile: effectiveFile,
 		ServerBitrateCapKbps: serverBitrateCapV3(r.Context()),
 		AudioTrackIndex:      audioIndex, Settings: settings,
-		Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(),
-		AdditionalSubtitles: subtitleInventoryFor(effectiveFile),
+		Registry: transformationRegistry, DVRPUStrippable: dvrpuStrippable, Now: time.Now(),
+		AdditionalSubtitles: effectiveSubtitles,
 		InventoryProvenance: string(resolutionProvenance),
 	})
 	timings.mark("planning")
@@ -2353,6 +2368,99 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	}
 	timings.mark("response_ready")
 	return response, nil
+}
+
+// resolveVirtualStartWithVersionFallback resolves the virtual source for a
+// fresh start. When the pinned release's listing fails and nothing is playing
+// yet, it walks the content's alternate versions/files — each with its own
+// listing attempt — and returns the first working candidate, so pressing play
+// lands on a playable version whenever one exists.
+//
+// The walk only runs for an eligible auto selection (the same gate the
+// planning-time alternate hunt uses) and never for an explicit user version
+// pick: the viewer chose that release and must not be silently moved off it.
+// A version the catalog already stamped failed (an AltMount SourceFailed
+// verdict) is skipped, never attempted. An empty provider listing stays
+// transient: it advances the walk without indicting the version, matching the
+// deliberate decision that a zero-count answer is a provider hiccup and not a
+// verdict about any release.
+//
+// The walk is bounded by the caller's startup budget (virtualStartupBudget),
+// and each resolve additionally bounds its own probe with virtualProbeBudget.
+// When no version resolves, the original listing failure is returned so the
+// caller reports the honest underlying cause (an edge 5xx, an empty listing,
+// or every version failed) instead of a generic error.
+func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
+	r *http.Request,
+	file *models.MediaFile,
+	profileID string,
+	req playback.StartRequestV3,
+	allowFailedCandidate bool,
+	bandwidthCapKbps int,
+) (resolvedVirtualPlaybackSource, error) {
+	resolved, resolveErr := h.resolveVirtualPlaybackSource(
+		r, file, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, req.ForceRelink,
+		virtualResolveOptionsV3{
+			allowFailedCandidate: allowFailedCandidate,
+			sessionBound:         false,
+			explicitSelection:    req.FileSelection == playback.FileSelectionExplicitV3,
+		},
+	)
+	if resolveErr == nil || !virtualStartVersionFallbackEligibleV3(req) || !virtualProviderListingOutage(resolveErr) {
+		return resolved, resolveErr
+	}
+	// One deadline owns the whole walk. resolveVirtualPlaybackSource re-bases
+	// its own cold path on r.Context() and context.WithTimeout keeps the
+	// earlier deadline, so this bounds every alternate without restarting the
+	// budget once per version.
+	walkCtx, cancel := context.WithTimeout(r.Context(), virtualStartupBudget)
+	defer cancel()
+	alternates, alternateErr := h.findAlternateFiles(walkCtx, file, alternateOrderingForClient(req.Capabilities))
+	if alternateErr != nil || len(alternates) == 0 {
+		return resolved, resolveErr
+	}
+	walkReq := r.WithContext(walkCtx)
+	for _, alternate := range alternates {
+		if alternate == nil || alternate.ID == file.ID || !isVirtualPlaybackFile(alternate) {
+			continue
+		}
+		if virtualCandidateVerdictActive(alternate.FailedAt, time.Now()) {
+			// The provider's AltMount verdict indicted this version; never
+			// attempt it, however the primary listing failed.
+			continue
+		}
+		if walkCtx.Err() != nil {
+			break
+		}
+		altResolved, altErr := h.resolveVirtualPlaybackSource(
+			walkReq, alternate, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, false,
+			virtualResolveOptionsV3{sessionBound: false},
+		)
+		if altErr == nil && altResolved.File != nil {
+			slog.InfoContext(walkCtx, "virtual start fell back to an alternate version after a listing failure",
+				logComponentKey, playbackLogValueV3,
+				"requested_file_id", file.ID, "alternate_file_id", alternate.ID,
+				"candidate_id", virtualResultCandidateID(altResolved.URI))
+			return altResolved, nil
+		}
+		if altErr != nil {
+			// A confirmed-dead version is indicted so a later start skips it;
+			// an empty listing or provider outage is transient and only
+			// advances the walk.
+			h.stampStartVirtualCandidateFailed(walkCtx, alternate, altErr)
+		}
+	}
+	return resolved, resolveErr
+}
+
+// virtualStartVersionFallbackEligibleV3 is the cross-version fallback gate,
+// mirroring the planning-time alternate hunt: the client must allow alternate
+// versions, the quality preference must not pin the exact release, and the
+// request must not be an explicit version pick the viewer chose.
+func virtualStartVersionFallbackEligibleV3(req playback.StartRequestV3) bool {
+	return req.AllowsAlternateVersions() &&
+		shouldTryAlternateFileV3(req.QualityPreference) &&
+		req.FileSelection != playback.FileSelectionExplicitV3
 }
 
 // prepareVirtualAlternateFileV3 resolves an alternate candidate row into the
@@ -3274,6 +3382,21 @@ func copySeekAnchorRetryFits(ctx context.Context) (bool, time.Duration) {
 	return remaining > playback.CopySeekProbeTimeout+copySeekProbeRetryMargin, remaining
 }
 
+// copySeekAnchorRetryReserved reports whether the caller's remaining budget can
+// hold a retry reserved from the start of the copy-video seek-anchor
+// resolution: two full probes plus the scheduling margin. A caller that fails
+// this gate never plans a retry, so the deadline cannot truncate a second probe
+// mid-flight. It is the up-front reservation the in-loop copySeekAnchorRetryFits
+// gate then narrows to the single retry probe once the first attempt has run. A
+// caller with no deadline reserves the full probe cap and keeps the retry.
+func copySeekAnchorRetryReserved(ctx context.Context) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return time.Until(deadline) > playback.CopySeekProbeRetryBudget()+copySeekProbeRetryMargin
+}
+
 // waitCopySeekAnchorBackoff pauses before re-probing a candidate after a
 // transient provider (upstream 5xx) failure. It returns false when the wait or
 // its result cannot fit the caller's remaining budget, so the retry is skipped
@@ -3329,18 +3452,50 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// protocol it cannot open.
 			anchorInput := file.FilePath
 			releaseAnchor := func() {}
-			if isVirtualPlaybackFile(file) && h.RemoteStreamRelay != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil) {
+			virtualAnchor := isVirtualPlaybackFile(file) && h.RemoteStreamRelay != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil)
+			anchorExpiresAt := time.Time{}
+			// resolveAnchorInput resolves the candidate to a pinned-IP relay URL
+			// — the same resolution the transcode transport performs — and
+			// adopts the fresh registration. It runs again before a retry so the
+			// second probe carries a new relay token instead of replaying a
+			// token the provider already refused. The previous registration is
+			// released first so a retry cannot leak the entry it replaced.
+			resolveAnchorInput := func(resolveCtx context.Context) error {
+				res, cleanup, resolveErr := h.resolveVirtualAnchorURIWithRotationV3(resolveCtx, session, file)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				releaseAnchor()
+				anchorInput = res.URL
+				anchorExpiresAt = res.ExpiresAt
+				releaseAnchor = cleanup
+				return nil
+			}
+			if virtualAnchor {
 				// Route the anchor through the same absent-pin rotation policy as
 				// the serve layer and the replan rehydration: a provider that
 				// renumbered its result ids must not terminal a remux seek when a
 				// same-identity candidate is still listed. A different release is
 				// refused rather than silently anchored.
-				res, cleanup, resolveErr := h.resolveVirtualAnchorURIWithRotationV3(ctx, session, file)
-				if resolveErr != nil {
+				if resolveErr := resolveAnchorInput(ctx); resolveErr != nil {
 					return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: resolveErr}
 				}
-				anchorInput = res.URL
-				releaseAnchor = cleanup
+				// A stored URL that has already lapsed is renewed before the probe,
+				// bounded to virtualProbeBudget, so the seek does not fail on a
+				// dead token. Best-effort: a failed renewal keeps the existing
+				// registration and lets the probe/retry carry the verdict.
+				if virtualResolvedURLExpired(anchorExpiresAt, time.Now()) {
+					refreshCtx, refreshCancel := context.WithTimeout(ctx, virtualProbeBudget)
+					if resolveErr := resolveAnchorInput(refreshCtx); resolveErr != nil {
+						slog.WarnContext(ctx, "virtual seek anchor stored-url refresh failed; probing the existing registration",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"error", resolveErr,
+						)
+					}
+					refreshCancel()
+				}
 			}
 			// The stable source identity is the un-resolved file path: for a
 			// virtual file that is the provider-neutral URI, identical across
@@ -3364,23 +3519,67 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// the probe error, so failing fast on the first probe error is both
 			// cheaper and clearer. A caller with no deadline keeps the retry.
 			//
+			// The retry budget is reserved up front: a caller that cannot hold
+			// two full probes plus the scheduling margin never plans a retry, so
+			// a second probe cannot be started only to be truncated by the
+			// deadline.
+			//
 			// An upstream 5xx is a transient provider failure: it is retried the
 			// same way, but only after a short bounded backoff, so a provider
 			// that is already failing is not hammered by an immediate re-probe.
+			retryReserved := copySeekAnchorRetryReserved(ctx)
+			lastProbedInput := ""
 			var err error
 			for attempt := 1; attempt <= 2; attempt++ {
+				if attempt > 1 && virtualAnchor {
+					// A retry must probe fresh bytes: re-resolve the candidate
+					// and register a new relay entry so the same token is never
+					// probed twice. The fresh-registration context bypasses the
+					// relay's content-key reuse, which would otherwise hand back
+					// the live token for an unchanged provider URL and suppress
+					// this retry before its second probe. A re-resolve that still
+					// yields the same input means no new token is available, so a
+					// second probe would repeat the request that just failed.
+					if resolveErr := resolveAnchorInput(withVirtualRelayFreshRegistration(ctx)); resolveErr != nil {
+						slog.WarnContext(ctx, "virtual seek anchor re-resolve failed; skipping retry",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"error", resolveErr,
+						)
+						break
+					}
+					if anchorInput == lastProbedInput {
+						slog.WarnContext(ctx, "virtual seek anchor re-resolve returned the same relay token; skipping a duplicate probe",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+						)
+						break
+					}
+					if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
+						slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
+							"component", "api",
+							"playback_session_id", session.ID,
+							"requested_seek_seconds", requested,
+							"remaining", remaining,
+						)
+						break
+					}
+				}
+				lastProbedInput = anchorInput
 				origin, startSegment, err = probeAnchor(ctx)
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
 				}
 				fits, remaining := copySeekAnchorRetryFits(ctx)
-				if !fits {
+				if !fits || !retryReserved {
 					slog.WarnContext(ctx, "copy-video seek anchor retry skipped: insufficient remaining budget",
 						"component", "api",
 						"playback_session_id", session.ID,
 						"requested_seek_seconds", requested,
 						"remaining", remaining,
-						"required", playback.CopySeekProbeTimeout+copySeekProbeRetryMargin,
+						"required", playback.CopySeekProbeRetryBudget()+copySeekProbeRetryMargin,
 						"error", err,
 					)
 					break
@@ -6083,7 +6282,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 			if errors.Is(err, playback.ErrReplanSupersededV3) {
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
 			}
-			if replanErr != nil && (replanErr.reason == string(noderouting.OutcomeCapacityUnavailable) || (replanErr.cause != nil && strings.Contains(replanErr.cause.Error(), string(noderouting.OutcomeCapacityUnavailable)))) {
+			if isRouteCapacityUnavailableError(replanErr) {
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 			}
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to persist the terminal replan decision")
@@ -6102,7 +6301,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 				slog.ErrorContext(r.Context(), "protocol v3 unapplied replacement transport cancellation failed", "session", sessionID, "error", rollbackErr)
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the unapplied replacement transport")
 			}
-			if strings.Contains(err.Error(), string(noderouting.OutcomeCapacityUnavailable)) {
+			if isRouteCapacityUnavailableError(err) {
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 			}
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the live replacement session")
@@ -6131,6 +6330,9 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		if errors.Is(err, playback.ErrReplanSupersededV3) {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
 		}
+		if isRouteCapacityUnavailableError(err) {
+			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
+		}
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the replacement plan")
 	}
 	leaseCompleted = true
@@ -6151,6 +6353,27 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 // adapter maps its status to the not-found problem.
 func replanSessionNotFoundV3() *PlaybackOperationError {
 	return playbackOperationError(http.StatusNotFound, playbackSessionNotFoundErrorCode, "Playback session not found")
+}
+
+// isRouteCapacityUnavailableError reports whether an error names route-capacity
+// exhaustion so the replan handler keeps the client-visible code retryable (503)
+// instead of collapsing it into a 500 internal_error. It matches the structured
+// transport reason on the error or its cause, and falls back to the sentinel
+// string the candidate-exhaustion join carries.
+func isRouteCapacityUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var transportErr *transportErrorV3
+	if errors.As(err, &transportErr) {
+		if transportErr.reason == string(noderouting.OutcomeCapacityUnavailable) {
+			return true
+		}
+		if transportErr.cause != nil && strings.Contains(transportErr.cause.Error(), string(noderouting.OutcomeCapacityUnavailable)) {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), string(noderouting.OutcomeCapacityUnavailable))
 }
 
 // rollbackFailedReplanV3 cancels a remotely admitted replacement before it
@@ -6307,6 +6530,25 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 					retryable: true,
 					cause:     joinedErr,
 				}
+			}
+		}
+	}
+
+	// Route-capacity exhaustion is an honest, retryable verdict: the selected
+	// workload has no route capacity right now, not a broken plan. Surface it
+	// even when another candidate failed at a higher-priority stage first (for
+	// example a canceled virtual re-resolve), because the client's correct
+	// response is to retry. Without this the final reason can be a masking
+	// transport error and the replan handler answers 500 internal_error
+	// instead of a retryable 503, which stranded the HLS fallback in the field.
+	for _, ce := range candidateErrs {
+		if ce != nil && ce.TransportErr != nil &&
+			ce.TransportErr.reason == string(noderouting.OutcomeCapacityUnavailable) {
+			return &transportErrorV3{
+				reason:    string(noderouting.OutcomeCapacityUnavailable),
+				message:   "The playback route capacity is temporarily unavailable; retry shortly",
+				retryable: true,
+				cause:     joinedErr,
 			}
 		}
 	}
@@ -7264,6 +7506,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if virtualRehydrationFailed && errors.Is(virtualRehydrationErr, context.DeadlineExceeded) {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
 			reason: "replan_virtual_input_timeout", message: "Virtual stream input resolution timed out during replan.", retryable: true, cause: virtualRehydrationErr,
+		}
+	}
+	// A canceled virtual re-resolve is not a verdict about the release: the
+	// provider call was interrupted (most often the client or the replan
+	// deadline gave up). Continuing into the alternate-version hunt would fold
+	// that cancellation into a candidate-exhaustion verdict and can surface as
+	// a 500 after a later route-capacity decision. Stop here with the same
+	// retryable timeout reason so the client retries the whole replan instead
+	// of being told its plan is broken. The check also catches a request whose
+	// context is already done even when the inner error is not wrapped.
+	if virtualRehydrationFailed &&
+		(errors.Is(virtualRehydrationErr, context.Canceled) || r.Context().Err() != nil) {
+		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
+			reason: "replan_virtual_input_timeout", message: "Virtual stream input resolution was interrupted during replan.", retryable: true, cause: virtualRehydrationErr,
 		}
 	}
 

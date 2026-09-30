@@ -118,7 +118,12 @@ describe("buildStartRequestV3", () => {
     expect(
       buildStartRequestV3({ ...startBase, extraClientFeatures: VIDEO_CLIENT_FEATURES_V3 })
         .client_features,
-    ).toEqual(["playback_plan_v3", "plan_invalidated_v1", "source_committed_event_v1"]);
+    ).toEqual([
+      "playback_plan_v3",
+      "plan_invalidated_v1",
+      "source_committed_event_v1",
+      "inventory_updated_event_v1",
+    ]);
     expect(buildStartRequestV3(startBase).client_features).toEqual(["playback_plan_v3"]);
   });
 
@@ -246,7 +251,12 @@ describe("buildReplanRequestV3", () => {
         operation: "failure_recovery",
         extraClientFeatures: VIDEO_CLIENT_FEATURES_V3,
       }).client_features,
-    ).toEqual(["playback_plan_v3", "plan_invalidated_v1", "source_committed_event_v1"]);
+    ).toEqual([
+      "playback_plan_v3",
+      "plan_invalidated_v1",
+      "source_committed_event_v1",
+      "inventory_updated_event_v1",
+    ]);
   });
 
   it("names a new audio track by index alone", () => {
@@ -3920,6 +3930,149 @@ describe("usePlaybackSession plan audio inventory", () => {
     expect(result.current.audioInventoryProvisional).toBe(false);
     // The subtitle list resolves through its own replan, not the audio poll.
     expect(result.current.subtitleInventoryProvisional).toBe(true);
+    unmount();
+  });
+
+  it("folds a verified live inventory update into both menus without a replan", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              inventory_status: "declared",
+              audio_tracks: [
+                { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    expect(result.current.subtitleInventoryProvisional).toBe(true);
+
+    const verifiedAudio = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+      { codec: "ac3", channels: 2, layout: "stereo", language: "spa", default: false },
+    ];
+
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:1",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [
+          {
+            track_id: "file:7:subtitle:0",
+            combined_index: 0,
+            source: "embedded",
+            codec: "subrip",
+            language: "eng",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+          },
+        ],
+      }),
+    );
+
+    expect(result.current.planAudioTracks).toEqual(verifiedAudio);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+    expect(result.current.subtitleUrls).toHaveLength(1);
+    expect(result.current.subtitleUrls[0]?.language).toBe("eng");
+
+    // A later verified revision that drops every subtitle clears the menu
+    // instead of leaving the lighter declared entry behind.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:2",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [],
+      }),
+    );
+    expect(result.current.subtitleUrls).toHaveLength(0);
+    expect(result.current.subtitleInventoryProvisional).toBe(false);
+
+    // Stale A/B/A replay: delivering previously-seen inv:1 again is rejected.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:1",
+        inventory_status: "verified",
+        effective_media_file_id: 7,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [
+          {
+            track_id: "file:7:subtitle:0",
+            combined_index: 0,
+            source: "embedded",
+            codec: "subrip",
+            language: "eng",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=7",
+          },
+        ],
+      }),
+    );
+    expect(result.current.subtitleUrls).toHaveLength(0);
+
+    // Stale push naming another source identity (file 99) is rejected.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:3",
+        inventory_status: "verified",
+        effective_media_file_id: 99,
+        audio_tracks: verifiedAudio,
+        subtitle_inventory: [
+          {
+            track_id: "file:99:subtitle:0",
+            combined_index: 0,
+            source: "embedded",
+            codec: "subrip",
+            language: "spa",
+            forced: false,
+            default: false,
+            hearing_impaired: false,
+            delivery: "sidecar",
+            url: "/stream/session-1/subtitles/0.vtt?file_id=99",
+          },
+        ],
+      }),
+    );
+    expect(result.current.subtitleUrls).toHaveLength(0);
+
+    // Menu data only: the fold never hits the transport boundary for a replan.
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("/replan")),
+    ).toHaveLength(0);
     unmount();
   });
 

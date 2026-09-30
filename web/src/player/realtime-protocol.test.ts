@@ -187,6 +187,87 @@ describe("realtime protocol", () => {
     expect(event).toBeNull();
   });
 
+  it("parses a live inventory update with both track lists", () => {
+    const payload = {
+      session_id: "session-1",
+      inventory_revision: "inv:abc",
+      inventory_status: "verified",
+      effective_media_file_id: 200,
+      effective_virtual_uri: "virtual://movie/x?result=B",
+      virtual_source_revision: "v3:abc",
+      audio_tracks: [{ index: 1, codec: "eac3", language: "deu", default: true }],
+      subtitle_inventory: [
+        {
+          track_id: "file:200:subtitle:0",
+          combined_index: 0,
+          source: "embedded",
+          codec: "subrip",
+          language: "eng",
+          forced: false,
+          default: true,
+          hearing_impaired: false,
+          delivery: "sidecar",
+          url: "/api/v2/stream/session-1/subtitles/0.vtt?file_id=200",
+        },
+      ],
+    };
+    const event = parsePlaybackRealtimeMessage(
+      JSON.stringify({
+        type: "event",
+        session_id: "session-1",
+        name: "inventory_updated",
+        payload,
+      }),
+    );
+
+    expect(event).toEqual({
+      type: "event",
+      session_id: "session-1",
+      name: "inventory_updated",
+      payload,
+    });
+  });
+
+  it("parses an inventory update that only carries the revision and status", () => {
+    const event = parsePlaybackRealtimeMessage(
+      JSON.stringify({
+        type: "event",
+        session_id: "session-1",
+        name: "inventory_updated",
+        payload: {
+          session_id: "session-1",
+          inventory_revision: "inv:1",
+          inventory_status: "declared",
+        },
+      }),
+    );
+
+    expect(event).toMatchObject({ type: "event", name: "inventory_updated" });
+  });
+
+  it("rejects an inventory update without a session id or with a malformed subtitle entry", () => {
+    expect(
+      parsePlaybackRealtimeMessage(
+        JSON.stringify({
+          type: "event",
+          session_id: "session-1",
+          name: "inventory_updated",
+          payload: { inventory_status: "verified" },
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      parsePlaybackRealtimeMessage(
+        JSON.stringify({
+          type: "event",
+          session_id: "session-1",
+          name: "inventory_updated",
+          payload: { session_id: "session-1", subtitle_inventory: [{ combined_index: 0 }] },
+        }),
+      ),
+    ).toBeNull();
+  });
+
   it("parses subtitle ready events", () => {
     const event = parsePlaybackRealtimeMessage(
       JSON.stringify({

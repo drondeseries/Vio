@@ -28,7 +28,8 @@ export type PlaybackRealtimeEventName =
   | "subtitle_translation_started"
   | "subtitle_translation_cues"
   | "subtitle_translation_completed"
-  | "subtitle_translation_failed";
+  | "subtitle_translation_failed"
+  | "inventory_updated";
 
 export interface PlaybackRealtimeCommandEnvelope {
   type: "command";
@@ -174,6 +175,34 @@ export interface PlaybackSourceCommittedPayload {
   audio_tracks?: AudioTrackV3[];
 }
 
+/**
+ * A live inventory revision for the session's effective source: the probed (or
+ * repaired) audio and subtitle lists, plus the identity they belong to.
+ *
+ * This mirrors the `PlaybackInventoryV3` body of
+ * `GET /api/v2/playback/{session_id}/inventory`, pushed over the realtime
+ * socket so a player replaces its declared menus without a poll or a replan.
+ * `inventory_status` says whether the list is "declared" (provider metadata) or
+ * "verified" (probed bytes); `inventory_revision` is the opaque revision the
+ * client would echo as an ETag when reading the endpoint directly. Every field
+ * beyond `session_id` is optional so an older or partial server still yields a
+ * usable event.
+ */
+export interface PlaybackInventoryUpdatedPayload {
+  session_id: string;
+  inventory_revision?: string;
+  inventory_status?: string;
+  /** See {@link PlaybackSourceCommittedPayload.audio_tracks}. */
+  audio_tracks?: AudioTrackV3[];
+  /** The complete, gap-free combined-ordinal subtitle list for the source. */
+  subtitle_inventory?: SubtitleInventoryItemV3[];
+  /** The catalog row the transport is committed to. See {@link PlaybackSourceCommittedPayload}. */
+  effective_media_file_id?: number;
+  /** The provider-neutral candidate URI the session is bound to. */
+  effective_virtual_uri?: string;
+  virtual_source_revision?: string;
+}
+
 export interface PlaybackRealtimeEventEnvelopeBase {
   type: "event";
   session_id: string;
@@ -211,6 +240,10 @@ export type PlaybackRealtimeEventEnvelope =
   | (PlaybackRealtimeEventEnvelopeBase & {
       name: "source_committed";
       payload: PlaybackSourceCommittedPayload;
+    })
+  | (PlaybackRealtimeEventEnvelopeBase & {
+      name: "inventory_updated";
+      payload: PlaybackInventoryUpdatedPayload;
     });
 
 export interface PlaybackRealtimeAckEnvelope {
@@ -472,6 +505,29 @@ function isSourceCommittedPayload(value: unknown): value is PlaybackSourceCommit
   );
 }
 
+/**
+ * Validates a live inventory push.
+ *
+ * Only `session_id` is required: the inventory lists are validated when
+ * present, and a malformed list is dropped at parse time so the client falls
+ * back to the inventory poll rather than rendering a partial menu.
+ */
+function isInventoryUpdatedPayload(value: unknown): value is PlaybackInventoryUpdatedPayload {
+  return (
+    isRecord(value) &&
+    typeof value.session_id === "string" &&
+    isOptionalString(value.inventory_revision) &&
+    isOptionalString(value.inventory_status) &&
+    isOptionalString(value.effective_virtual_uri) &&
+    isOptionalString(value.virtual_source_revision) &&
+    isOptionalNumber(value.effective_media_file_id) &&
+    (value.audio_tracks === undefined || Array.isArray(value.audio_tracks)) &&
+    (value.subtitle_inventory === undefined ||
+      (Array.isArray(value.subtitle_inventory) &&
+        value.subtitle_inventory.every(isSubtitleInventoryItem)))
+  );
+}
+
 export function parsePlaybackRealtimeMessage(
   data: string,
 ): PlaybackRealtimeCommandEnvelope | PlaybackRealtimeEventEnvelope | null {
@@ -572,6 +628,14 @@ export function parsePlaybackRealtimeMessage(
         };
       }
       if (value.name === "source_committed" && isSourceCommittedPayload(value.payload)) {
+        return {
+          type: "event",
+          session_id: value.session_id,
+          name: value.name,
+          payload: value.payload,
+        };
+      }
+      if (value.name === "inventory_updated" && isInventoryUpdatedPayload(value.payload)) {
         return {
           type: "event",
           session_id: value.session_id,

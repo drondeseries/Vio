@@ -481,6 +481,23 @@ func TestNormalizeAdminSettingCanonicalizesRedisURL(t *testing.T) {
 	}
 }
 
+// TestNormalizeAdminSettingCanonicalizesProwlarrURL proves the scheme-less
+// Prowlarr value that broke staleness refresh ("one.vio") is stored as an
+// http URL at save time, while a clearly malformed value is rejected.
+func TestNormalizeAdminSettingCanonicalizesProwlarrURL(t *testing.T) {
+	got, err := NormalizeAdminSetting("virtual_library.indexer_rss_url", "  one.vio  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://one.vio" {
+		t.Fatalf("normalized Prowlarr URL = %q, want http://one.vio", got)
+	}
+
+	if _, err := NormalizeAdminSetting("virtual_library.indexer_rss_url", "http://"); err == nil {
+		t.Fatal("expected an error for a malformed Prowlarr URL")
+	}
+}
+
 func TestNormalizeAdminSettingMaxVirtualFailoverAttempts(t *testing.T) {
 	got, err := NormalizeAdminSetting("playback.max_virtual_failover_attempts", " 10 ")
 	if err != nil {

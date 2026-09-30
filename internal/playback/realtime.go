@@ -38,6 +38,21 @@ const (
 	// background ffprobe. The existing inventory poll and provenance upgrade
 	// then replace the declared list with probe evidence when it lands.
 	RealtimeEventSourceCommitted RealtimeEventName = "source_committed"
+	// RealtimeEventInventoryUpdated publishes the probe-verified audio and
+	// subtitle inventory of a live session once the background probe has
+	// persisted its evidence. source_committed carries the release's declared
+	// snapshot the moment a transport commits; this event is the upgrade that
+	// follows when the full probe lands, so a client can replace its declared
+	// track menu without waiting for the inventory poll or a replan. It is
+	// advisory menu data: it never carries an executable recipe and never
+	// changes plan generation, transport choice, or the streamed bytes.
+	RealtimeEventInventoryUpdated RealtimeEventName = "inventory_updated"
+	// RealtimeEventDownloadProgress reports a provider-side cache fill for a
+	// release a session is pinned to. It is best-effort telemetry: a client
+	// shows a "preparing" state from it, but losing the event must never stop
+	// playback. The cached copy becoming servable is what drives the in-session
+	// handoff; the event only tells the client how far along the fill is.
+	RealtimeEventDownloadProgress RealtimeEventName = "download.progress"
 )
 
 var supportedRealtimeEventNameSet = map[RealtimeEventName]struct{}{
@@ -49,6 +64,8 @@ var supportedRealtimeEventNameSet = map[RealtimeEventName]struct{}{
 	RealtimeEventSubtitleTranslationDone:  {},
 	RealtimeEventSubtitleTranslationFail:  {},
 	RealtimeEventSourceCommitted:          {},
+	RealtimeEventInventoryUpdated:         {},
+	RealtimeEventDownloadProgress:         {},
 }
 
 // CommandName identifies a supported realtime command.
@@ -257,6 +274,20 @@ type SourceCommittedPayload struct {
 	AudioTracks []AudioInventoryItemV3 `json:"audio_tracks"`
 }
 
+// InventoryUpdatedPayload is the probe-verified track inventory of a live
+// playback session, pushed when the background probe persists evidence for the
+// release that session is bound to.
+//
+// Its wire shape is exactly the GET /api/v2/playback/{session_id}/inventory
+// body (PlaybackInventoryV3, embedded here so the two cannot drift apart). It
+// carries the session id, the audio and subtitle lists, and the inventory
+// status and revision. A client applies it with the same reducer it uses for an
+// inventory poll and gates on InventoryRevision: a duplicate push, or one that
+// names the revision the client already holds, is a no-op.
+type InventoryUpdatedPayload struct {
+	PlaybackInventoryV3
+}
+
 // NewEventEnvelope creates a validated realtime event envelope.
 func NewEventEnvelope(sessionID string, name RealtimeEventName, payload json.RawMessage) (EventEnvelope, error) {
 	normalizedPayload, err := normalizeJSONPayload(payload)
@@ -410,6 +441,93 @@ func NewSourceCommittedEvent(sessionID string, payload SourceCommittedPayload) (
 		return EventEnvelope{}, err
 	}
 	return NewEventEnvelope(sessionID, RealtimeEventSourceCommitted, raw)
+}
+
+// NewInventoryUpdatedEvent creates a validated inventory_updated event. The
+// session id must be non-empty; nil audio and subtitle slices are normalized to
+// empty arrays so the payload matches the inventory endpoint's shape and a
+// client can tell "this release has no such tracks" from a missing field.
+func NewInventoryUpdatedEvent(sessionID string, inventory PlaybackInventoryV3) (EventEnvelope, error) {
+	if sessionID == "" {
+		return EventEnvelope{}, ErrInvalidRealtimePayload
+	}
+	inventory.SessionID = sessionID
+	if inventory.AudioTracks == nil {
+		inventory.AudioTracks = []AudioInventoryItemV3{}
+	}
+	if inventory.SubtitleInventory == nil {
+		inventory.SubtitleInventory = []SubtitleInventoryItemV3{}
+	}
+	raw, err := json.Marshal(InventoryUpdatedPayload{PlaybackInventoryV3: inventory})
+	if err != nil {
+		return EventEnvelope{}, err
+	}
+	return NewEventEnvelope(sessionID, RealtimeEventInventoryUpdated, raw)
+}
+
+// DownloadProgressState is the lifecycle stage a download.progress event
+// reports for one cache fill.
+type DownloadProgressState string
+
+const (
+	// DownloadProgressStateQueued means the provider accepted the fill but has
+	// not reported bytes yet.
+	DownloadProgressStateQueued DownloadProgressState = "queued"
+	// DownloadProgressStateDownloading means the provider is fetching the
+	// release and reported byte progress.
+	DownloadProgressStateDownloading DownloadProgressState = "downloading"
+	// DownloadProgressStateCompleted means the provider finished the fill and
+	// the cached copy is servable.
+	DownloadProgressStateCompleted DownloadProgressState = "completed"
+	// DownloadProgressStateFailed means the fill could not start or aborted.
+	// It is retryable: the session keeps streaming the remote source.
+	DownloadProgressStateFailed DownloadProgressState = "failed"
+)
+
+// DownloadProgressPayload describes the cache-fill progress of one release a
+// playback session is pinned to. Bytes, TotalBytes and Percent are the
+// provider's reported counts; Percent is clamped to [0,100] and derived from
+// the byte counts when the caller leaves it zero. Message is an operator-safe
+// reason on a failed fill and never carries a provider URL.
+type DownloadProgressPayload struct {
+	SessionID  string                `json:"session_id"`
+	FileID     int                   `json:"file_id,omitempty"`
+	ReleaseID  string                `json:"release_id,omitempty"`
+	State      DownloadProgressState `json:"state"`
+	Percent    float64               `json:"percent"`
+	Bytes      int64                 `json:"bytes,omitempty"`
+	TotalBytes int64                 `json:"total_bytes,omitempty"`
+	Message    string                `json:"message,omitempty"`
+}
+
+// NewDownloadProgressEvent creates a validated download.progress event. An
+// empty state defaults to queued; a negative or over-100 percent is clamped,
+// and a zero percent with a known total is derived from the byte counts so
+// clients never have to duplicate the arithmetic.
+func NewDownloadProgressEvent(sessionID string, payload DownloadProgressPayload) (EventEnvelope, error) {
+	if sessionID == "" {
+		return EventEnvelope{}, ErrInvalidRealtimePayload
+	}
+	payload.SessionID = sessionID
+	if payload.State == "" {
+		payload.State = DownloadProgressStateQueued
+	}
+	if payload.Percent == 0 && payload.TotalBytes > 0 && payload.Bytes > 0 {
+		payload.Percent = float64(payload.Bytes) / float64(payload.TotalBytes) * 100
+	}
+	if payload.Percent < 0 {
+		payload.Percent = 0
+	} else if payload.Percent > 100 {
+		payload.Percent = 100
+	}
+	if payload.State == DownloadProgressStateCompleted {
+		payload.Percent = 100
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return EventEnvelope{}, err
+	}
+	return NewEventEnvelope(sessionID, RealtimeEventDownloadProgress, raw)
 }
 
 // ParseEventEnvelope decodes and validates a realtime event envelope.

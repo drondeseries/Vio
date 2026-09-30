@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -470,6 +471,11 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			attemptOpts.SourceVideoProfile = ""
 			attemptOpts.SourceVideoBitDepth = 0
 			attemptOpts.SourceAudioChannels = 0
+			// A lapsed stored URL is renewed in the background before the probe
+			// runs, so the probe is not spent on a dead token; probe failures
+			// already fall through to declared metadata, so this stays
+			// best-effort and never fails the fallback.
+			h.fireExpiredVirtualRefresh(startupCtx, file, ownerInstallationID, userID, profileID, resolvedMedia.ExpiresAt)
 			if probedFacts := h.probeVirtualFallbackSource(startupCtx, resolvedMedia, file); probedFacts != nil {
 				attemptOpts.SourceVideoCodec = probedFacts.CodecVideo
 				attemptOpts.SourceVideoProfile = virtualFallbackVideoProfile(probedFacts)
@@ -615,6 +621,136 @@ func (h *PlaybackHandler) probeVirtualFallbackSource(ctx context.Context, resolv
 	return probed
 }
 
+// fireExpiredVirtualRefresh renews a lapsed virtual candidate's stored URL in
+// the background so a probe or seek running next does not have to fail on a
+// dead token, and the renewed URL is persisted for the next request. The work
+// is detached from the caller (a client disconnect must not cancel it) and
+// bounded to virtualProbeBudget; it is best-effort and never fails the caller.
+// A non-forced resolution is deliberate: it re-lists and records the renewal
+// through the existing Phase-1 saver, and it never serves the expired URL.
+func (h *PlaybackHandler) fireExpiredVirtualRefresh(ctx context.Context, file *models.MediaFile, ownerInstallationID, userID int, profileID string, expiresAt time.Time) {
+	if h == nil || file == nil || !virtualResolvedURLExpired(expiresAt, time.Now()) {
+		return
+	}
+	bgCtx, cancel := h.virtualDetachedContext(ctx, virtualProbeBudget)
+	go func() {
+		defer cancel()
+		res, cleanup, err := h.resolveVirtualInputURI(bgCtx, file.FilePath, ownerInstallationID, userID, profileID, false, nil, "")
+		if cleanup != nil {
+			cleanup()
+		}
+		if err != nil {
+			slog.WarnContext(bgCtx, "virtual stored-url refresh failed",
+				"component", "api",
+				"file_id", file.ID,
+				"virtual_uri", file.FilePath,
+				"error", logredact.SanitizeURLError(err))
+			return
+		}
+		slog.InfoContext(bgCtx, "virtual stored-url refreshed ahead of playback",
+			"component", "api",
+			"file_id", file.ID,
+			"virtual_uri", file.FilePath,
+			"candidate_id", res.CandidateID)
+	}()
+}
+
+// virtualProviderStaleRefresher is an optional capability a virtual resolve
+// port may expose. It lets a play refresh provider-side cached state — the
+// AltMount completed/failed snapshot or the Prowlarr RSS index — that a
+// long-lived process has let go stale, before resolving against it.
+type virtualProviderStaleRefresher interface {
+	Stale() bool
+	RefreshIfStale(ctx context.Context) error
+}
+
+// refreshStaleVirtualProvider fires a single virtualProbeBudget-bounded
+// RefreshIfStale on any configured virtual resolve port that reports stale
+// provider state. It reports whether a refresh ran, so the caller can bypass
+// its own candidate caches, which would otherwise answer from the stale
+// listing the refresh just superseded. Ports that do not implement the
+// capability are unaffected.
+//
+// One deadline bounds every refresh in the pass: each port used to get its own
+// virtualProbeBudget, so four stale ports could consume four budgets (60s) of
+// the caller's startup or seek window before the stored-URL shortcut ran. One
+// adapter may also implement several of the port interfaces below; it is
+// refreshed once per pass, deduplicated by adapter identity, not once per
+// interface.
+func (h *PlaybackHandler) refreshStaleVirtualProvider(ctx context.Context) bool {
+	if h == nil {
+		return false
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, virtualProbeBudget)
+	defer cancel()
+	refreshed := false
+	observed := make(map[any]struct{}, 4)
+	for _, port := range []any{
+		h.VirtualPlaybackResolver,
+		h.VirtualPlaybackStreamLister,
+		h.VirtualMediaDetailedResolver,
+		h.VirtualMediaResolver,
+	} {
+		refresher, ok := port.(virtualProviderStaleRefresher)
+		if !ok || refresher == nil {
+			continue
+		}
+		if key, comparable := virtualRefresherDedupKey(port); comparable {
+			if _, seen := observed[key]; seen {
+				continue
+			}
+			observed[key] = struct{}{}
+		}
+		if !refresher.Stale() {
+			continue
+		}
+		if err := refresher.RefreshIfStale(refreshCtx); err != nil {
+			slog.WarnContext(ctx, "virtual provider stale refresh failed",
+				"component", "api", "error", logredact.SanitizeURLError(err))
+			continue
+		}
+		refreshed = true
+	}
+	return refreshed
+}
+
+// virtualRefresherDedupKey returns a dedup key for a virtual resolve port. The
+// same adapter may implement several of the interfaces refreshStaleVirtualProvider
+// scans; a comparable dynamic value (the usual pointer adapter) dedups by value,
+// so two interfaces backed by the same adapter collapse to one refresh.
+// Non-comparable implementations return comparable=false and are never wrongly
+// collapsed.
+func virtualRefresherDedupKey(port any) (key any, comparable bool) {
+	t := reflect.TypeOf(port)
+	if t == nil || !t.Comparable() {
+		return nil, false
+	}
+	return port, true
+}
+
+// virtualRelayFreshRegistrationContextKey marks a virtual resolve that must
+// register a new relay entry even when an equivalent live registration exists.
+// A bounded anchor retry sets it so its second probe presents a fresh token
+// instead of replaying the token the provider just refused; every other caller
+// keeps the content-key reuse that shares one upstream and one range-cache
+// scope.
+type virtualRelayFreshRegistrationContextKey struct{}
+
+func withVirtualRelayFreshRegistration(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, virtualRelayFreshRegistrationContextKey{}, true)
+}
+
+func virtualRelayFreshRegistrationRequested(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	requested, _ := ctx.Value(virtualRelayFreshRegistrationContextKey{}).(bool)
+	return requested
+}
+
 // virtualFallbackVideoProfile returns the probed primary video profile for
 // fallback session facts, or "" when the probe recorded none.
 func virtualFallbackVideoProfile(probed *models.MediaFile) string {
@@ -716,6 +852,13 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	rotationRequested := false
 	if len(rotateCandidates) > 0 {
 		rotationRequested = rotateCandidates[0]
+	}
+	// Opportunistic provider-staleness refresh: when the resolve port reports
+	// stale provider state, refresh it under a bounded context and bypass the
+	// stored-URL shortcut so this resolve cannot answer from the stale listing
+	// the refresh just superseded. A port without the capability is unaffected.
+	if h.refreshStaleVirtualProvider(ctx) {
+		forceRefresh = true
 	}
 	var res ResolvedVirtualMedia
 	var err error
@@ -852,9 +995,16 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	var relayURL string
 	var cleanup func()
 	effectiveOwner := effectiveVirtualOwner(res.OwnerID, ownerInstallationID)
-	if h.AllowPrivateStreams != nil && h.AllowPrivateStreams(effectiveOwner) {
+	insecure := h.AllowPrivateStreams != nil && h.AllowPrivateStreams(effectiveOwner)
+	fresh := virtualRelayFreshRegistrationRequested(ctx)
+	switch {
+	case insecure && fresh:
+		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterInsecureWithHeadersFresh(ctx, res.URL, res.RequestHeaders)
+	case insecure:
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterInsecureWithHeaders(ctx, res.URL, res.RequestHeaders)
-	} else {
+	case fresh:
+		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterWithHeadersFresh(ctx, res.URL, res.RequestHeaders)
+	default:
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterWithHeaders(ctx, res.URL, res.RequestHeaders)
 	}
 	if err != nil {

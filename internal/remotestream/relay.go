@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -210,22 +211,68 @@ func (c *relayRangeCache) put(key string, entry relayRangeCacheEntry) {
 
 // relayRangeCacheKey names one complete upstream range response for a source.
 // The exact Range header, the effective outbound-header identity, and the relay
-// registration are part of the key: a cache hit must answer the same request
+// content scope are part of the key: a cache hit must answer the same request
 // the upstream answered, under the same source URL (which carries provider
-// credentials) and the same forwarded headers, for the same registration
-// lifetime. The registration is the relay's generation/incarnation: a restart
-// or provider re-resolve registers a fresh token, so bytes cached for a
-// displaced generation are never replayed to its replacement even when the
-// upstream URL and Range are unchanged.
-func relayRangeCacheKey(target *url.URL, rangeHeader, headerIdentity, registration string) string {
-	if target == nil || registration == "" {
+// credentials) and the same forwarded headers. The scope is content-addressed
+// when the registration carries a content key, so a seek after a token rotation
+// for the same content still hits; a registration without one (unregistered
+// proxy traffic, or an entry seeded directly by a test) falls back to its token,
+// preserving the generation fence. The content key is a credential-free HMAC, so
+// the key never carries a credential.
+func relayRangeCacheKey(target *url.URL, rangeHeader, headerIdentity, scope string) string {
+	if target == nil || scope == "" {
 		return ""
 	}
 	rangeHeader = strings.TrimSpace(rangeHeader)
 	if rangeHeader == "" {
 		return ""
 	}
-	return registration + "\x00" + target.String() + "\x00" + rangeHeader + "\x00" + headerIdentity
+	return scope + "\x00" + target.String() + "\x00" + rangeHeader + "\x00" + headerIdentity
+}
+
+// relayContentKey derives a stable, credential-free identity for the bytes
+// behind a registration from the provider URL, the forwarded headers the relay
+// actually sends upstream, and the insecure flag. It is keyed with the relay's
+// per-process seal key, so the result never carries a provider credential, and
+// it is stable across token rotation for the same content. An empty result (a
+// nil source) disables content addressing so the caller falls back to the token.
+func (r *Relay) relayContentKey(source *url.URL, headers map[string]string, insecure bool) string {
+	if source == nil {
+		return ""
+	}
+	mac := hmac.New(sha256.New, r.sealKey[:])
+	mac.Write([]byte(source.String()))
+	mac.Write([]byte{0})
+	mac.Write([]byte(relayRegistrationHeaderIdentity(headers)))
+	mac.Write([]byte{0})
+	if insecure {
+		mac.Write([]byte{1})
+	} else {
+		mac.Write([]byte{0})
+	}
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// relayRegistrationHeaderIdentity hashes the registration headers the relay
+// forwards upstream and that can change the response: Referer, Origin and
+// User-Agent. Irrelevant headers (cookies, authorization) are excluded so two
+// registrations that differ only in a header the relay discards still share one
+// content key.
+func relayRegistrationHeaderIdentity(headers map[string]string) string {
+	picked := make([]string, 0, 6)
+	for _, name := range []string{headerOrigin, headerReferer, headerUserAgent} {
+		lowerName := strings.ToLower(name)
+		value := ""
+		for key, candidate := range headers {
+			if strings.ToLower(key) == lowerName {
+				value = candidate
+				break
+			}
+		}
+		picked = append(picked, lowerName, value)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(picked, "\x1f")))
+	return hex.EncodeToString(sum[:])
 }
 
 // relayRangeCacheHeaderIdentity hashes the effective outbound request headers
@@ -557,13 +604,17 @@ func relayCachedHeaders(response *http.Response) http.Header {
 // credential-free input URL while retaining Range support and applying the
 // same SSRF policy to the initial request and every redirect.
 type Relay struct {
-	once           sync.Once
-	mu             sync.Mutex
-	server         *http.Server
-	baseURL        string
-	startErr       error
-	closed         bool
-	entries        map[string]*relayEntry
+	once     sync.Once
+	mu       sync.Mutex
+	server   *http.Server
+	baseURL  string
+	startErr error
+	closed   bool
+	entries  map[string]*relayEntry
+	// content maps a credential-free content key to the live entry that holds
+	// it, so a re-registration of the same content shares one entry instead of
+	// minting a parallel upstream. See relayEntry.contentKey.
+	content        map[string]*relayEntry
 	client         *http.Client
 	insecureClient *http.Client
 	sealKey        [32]byte
@@ -574,17 +625,60 @@ type Relay struct {
 }
 
 type relayEntry struct {
-	source    *url.URL
-	baseName  string
+	source   *url.URL
+	baseName string
+	// token is the random opaque handle in the relay URL. It is recorded so a
+	// content-key reuse can return the same handle instead of minting a
+	// parallel one.
+	token string
+	// createdAt is the registration time. It bounds an entry that never had its
+	// expiresAt initialized (a directly seeded test entry) and breaks ties when
+	// eviction picks the least-recently-used entry.
 	createdAt time.Time
-	insecure  bool // private/local destinations explicitly allowed by admin
-	headers   map[string]string
+	// lastAccess is the most recent presentation of this token on the serve
+	// path. Capacity eviction drops the least-recently-used entry, so a burst
+	// of new registrations cannot evict a session that is still streaming.
+	lastAccess time.Time
+	// expiresAt is the sliding lifetime bound. A live presentation slides it
+	// forward, so an actively used session does not expire mid-play. A zero
+	// value falls back to createdAt + relayEntryLifetime.
+	expiresAt time.Time
+	// contentKey is a credential-free identity shared by registrations of the
+	// same provider URL, forwarded headers, and secure flag. The range cache is
+	// scoped by it and register reuses the live entry behind it, so a token
+	// rotation for the same content neither orphans cached bytes nor mints a
+	// parallel upstream. Empty means the token is the scope.
+	contentKey string
+	// refs counts the live registrations sharing this entry. release decrements
+	// it and the entry is dropped at zero; a fresh registration starts at one.
+	refs     int
+	insecure bool // private/local destinations explicitly allowed by admin
+	headers  map[string]string
 	// upstreamAuthRejected records that the upstream answered a proxied request
 	// with 401 or 403. The signed provider URL behind this registration is no
 	// longer authorized, so a restart must renew the provider listing instead of
 	// reusing the registration. It is monotonic for the entry's lifetime: a
 	// renewal registers a fresh entry with a fresh token.
 	upstreamAuthRejected bool
+}
+
+// expiry reports the instant this entry's lifetime ends. A registration sets
+// expiresAt and slides it on use; an entry seeded without one (tests, or a
+// future non-sliding path) uses the fixed createdAt bound.
+func (e *relayEntry) expiry() time.Time {
+	if !e.expiresAt.IsZero() {
+		return e.expiresAt
+	}
+	return e.createdAt.Add(relayEntryLifetime)
+}
+
+// lastUsed reports the instant for least-recently-used ordering: the most
+// recent serve-path presentation, or createdAt for an untouched entry.
+func (e *relayEntry) lastUsed() time.Time {
+	if !e.lastAccess.IsZero() {
+		return e.lastAccess
+	}
+	return e.createdAt
 }
 
 // ProxyError reports whether an upstream failure happened before any response
@@ -610,6 +704,7 @@ func NewRelay() *Relay {
 	transport := NewSafeTransport()
 	relay := &Relay{
 		entries:    make(map[string]*relayEntry),
+		content:    make(map[string]*relayEntry),
 		rangeCache: newRelayRangeCache(),
 		readAhead:  newReadAheadBudget(relayReadAheadBudgetBytes),
 		client: &http.Client{
@@ -664,6 +759,7 @@ func (r *Relay) Close(ctx context.Context) error {
 	}
 	r.closed = true
 	clear(r.entries)
+	clear(r.content)
 	server := r.server
 	client := r.client
 	insecureClient := r.insecureClient
@@ -686,24 +782,40 @@ func (r *Relay) Close(ctx context.Context) error {
 // idempotent release function. The provider URL never appears in the returned
 // value, transcode recipe, or FFmpeg command line.
 func (r *Relay) Register(ctx context.Context, source string) (string, func(), error) {
-	return r.register(ctx, source, false, nil)
+	return r.register(ctx, source, false, nil, true)
 }
 
 // RegisterInsecure registers a structurally valid source while allowing the
 // owning plugin's explicit private-host opt-in. FFmpeg still receives only a
 // loopback relay URL; the insecure transport is isolated to this entry.
 func (r *Relay) RegisterInsecure(ctx context.Context, source string) (string, func(), error) {
-	return r.register(ctx, source, true, nil)
+	return r.register(ctx, source, true, nil, true)
 }
 
 // RegisterWithHeaders registers a source with optional upstream request headers.
 func (r *Relay) RegisterWithHeaders(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
-	return r.register(ctx, source, false, headers)
+	return r.register(ctx, source, false, headers, true)
 }
 
 // RegisterInsecureWithHeaders registers an insecure source with optional upstream request headers.
 func (r *Relay) RegisterInsecureWithHeaders(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
-	return r.register(ctx, source, true, headers)
+	return r.register(ctx, source, true, headers, true)
+}
+
+// RegisterWithHeadersFresh registers a source with optional upstream request
+// headers, minting a fresh entry even when an equivalent live registration
+// exists. A bounded retry uses it to present new bytes to the upstream instead
+// of replaying the token the first attempt already used. Every other caller
+// keeps the content-key reuse that shares one upstream and one range-cache
+// scope.
+func (r *Relay) RegisterWithHeadersFresh(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
+	return r.register(ctx, source, false, headers, false)
+}
+
+// RegisterInsecureWithHeadersFresh is RegisterWithHeadersFresh for a
+// private-host source.
+func (r *Relay) RegisterInsecureWithHeadersFresh(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
+	return r.register(ctx, source, true, headers, false)
 }
 
 func cloneHeaderMap(in map[string]string) map[string]string {
@@ -717,7 +829,7 @@ func cloneHeaderMap(in map[string]string) map[string]string {
 	return out
 }
 
-func (r *Relay) register(ctx context.Context, source string, insecure bool, headers map[string]string) (string, func(), error) {
+func (r *Relay) register(ctx context.Context, source string, insecure bool, headers map[string]string, reuse bool) (string, func(), error) {
 	if r == nil {
 		return "", nil, errors.New("remote stream relay is not configured")
 	}
@@ -749,6 +861,7 @@ func (r *Relay) register(ctx context.Context, source string, insecure bool, head
 	token := hex.EncodeToString(tokenBytes)
 	baseName := safeRelayBaseName(sourceURL)
 
+	contentKey := r.relayContentKey(sourceURL, headers, insecure)
 	now := time.Now()
 	r.mu.Lock()
 	if r.startErr != nil {
@@ -760,47 +873,90 @@ func (r *Relay) register(ctx context.Context, source string, insecure bool, head
 		return "", nil, errors.New("remote stream relay is closed")
 	}
 	r.evictLocked(now)
-	// Bound the table by evicting the oldest registrations instead of refusing
-	// new ones: a hard capacity error would make every new virtual playback
-	// fail once the bound is reached. An evicted entry's stream gets a 404 on
-	// its next request and the client re-plans; a released entry is already
-	// gone, so the oldest remaining entries are the long-lived or leaked ones.
+	// The same content re-registered while the first registration is still live
+	// reuses that entry instead of minting a parallel upstream: a re-resolve for
+	// a seek or a reconnect shares one source, one range-cache scope, and one
+	// refcounted lifetime. Only a live, non-rejected entry is reused; a rejected
+	// or expired holder is superseded below. A force-fresh caller (a bounded
+	// retry that must present new bytes) skips this lookup and mints a new
+	// entry, superseding the old content mapping below.
+	if reuse && contentKey != "" {
+		if existing, ok := r.content[contentKey]; ok && existing != nil &&
+			r.entries[existing.token] == existing && !existing.upstreamAuthRejected &&
+			now.Before(existing.expiry()) {
+			existing.refs++
+			existing.lastAccess = now
+			existing.expiresAt = now.Add(relayEntryLifetime)
+			reuseURL := r.baseURL + "/source/" + existing.token + "/" + url.PathEscape(existing.baseName)
+			existingToken := existing.token
+			r.mu.Unlock()
+			return reuseURL, r.releaseFunc(existingToken), nil
+		}
+	}
+	// Bound the table by evicting the least-recently-used registrations instead
+	// of refusing new ones: a hard capacity error would make every new virtual
+	// playback fail once the bound is reached. An evicted entry's stream gets a
+	// 404 on its next request and the client re-plans; a released entry is
+	// already gone, so the coldest remaining entries are the long-lived or
+	// leaked ones.
 	r.evictOldestLocked(relayMaxEntries - 1)
-	r.entries[token] = &relayEntry{
-		source: sourceURL, baseName: baseName, createdAt: now, insecure: insecure, headers: cloneHeaderMap(headers),
+	entry := &relayEntry{
+		source: sourceURL, baseName: baseName, token: token,
+		createdAt: now, lastAccess: now, expiresAt: now.Add(relayEntryLifetime),
+		contentKey: contentKey, refs: 1, insecure: insecure, headers: cloneHeaderMap(headers),
+	}
+	r.entries[token] = entry
+	if contentKey != "" {
+		if r.content == nil {
+			r.content = make(map[string]*relayEntry)
+		}
+		// A prior holder of this content key (rejected or expired but not yet
+		// swept) must not later delete the new mapping when it is released.
+		if prior, ok := r.content[contentKey]; ok && prior != entry {
+			prior.contentKey = ""
+		}
+		r.content[contentKey] = entry
 	}
 	baseURL := r.baseURL
 	r.mu.Unlock()
 
+	return baseURL + "/source/" + token + "/" + url.PathEscape(baseName), r.releaseFunc(token), nil
+}
+
+// releaseFunc returns an idempotent release for one registration. Releasing
+// drops this registration's reference; the entry itself is removed only when
+// the last reference goes, so a shared content entry survives one caller's
+// early release.
+func (r *Relay) releaseFunc(token string) func() {
 	var releaseOnce sync.Once
-	release := func() {
+	return func() {
 		releaseOnce.Do(func() {
 			r.mu.Lock()
-			r.deleteEntryLocked(token)
+			r.releaseEntryLocked(token)
 			r.mu.Unlock()
 		})
 	}
-	return baseURL + "/source/" + token + "/" + url.PathEscape(baseName), release, nil
 }
 
 func (r *Relay) evictLocked(now time.Time) {
 	for token, entry := range r.entries {
-		if now.Sub(entry.createdAt) >= relayEntryLifetime {
+		if !now.Before(entry.expiry()) {
 			r.deleteEntryLocked(token)
 		}
 	}
 }
 
-// evictOldestLocked removes the oldest entries until at most limit remain.
-// register calls it with relayMaxEntries-1 so a new registration always fits.
-// Caller holds r.mu.
+// evictOldestLocked removes the least-recently-used entries until at most limit
+// remain. register calls it with relayMaxEntries-1 so a new registration always
+// fits. Recency, not creation order, decides: a session that keeps requesting
+// stays resident while idle registrations are dropped. Caller holds r.mu.
 func (r *Relay) evictOldestLocked(limit int) {
 	for len(r.entries) > limit {
 		oldestToken := ""
 		var oldest time.Time
 		for token, entry := range r.entries {
-			if oldestToken == "" || entry.createdAt.Before(oldest) {
-				oldestToken, oldest = token, entry.createdAt
+			if oldestToken == "" || entry.lastUsed().Before(oldest) {
+				oldestToken, oldest = token, entry.lastUsed()
 			}
 		}
 		if oldestToken == "" {
@@ -813,24 +969,52 @@ func (r *Relay) evictOldestLocked(limit int) {
 // entryForRequestLocked returns the live entry for a presented token. An entry
 // whose lifetime has elapsed is dropped and reported as absent, so expiry is
 // enforced when the token is presented rather than only when an unrelated
-// registration happens to run eviction. Caller holds r.mu.
+// registration happens to run eviction. A live presentation refreshes liveness:
+// the entry becomes the most recently used and, when it carries a sliding
+// expiresAt, its lifetime is extended so an actively played stream is not
+// dropped mid-play. An entry seeded without an explicit expiresAt (tests) keeps
+// its fixed createdAt bound. Caller holds r.mu.
 func (r *Relay) entryForRequestLocked(token string, now time.Time) (*relayEntry, bool) {
 	entry, ok := r.entries[token]
 	if !ok {
 		return nil, false
 	}
-	if now.Sub(entry.createdAt) >= relayEntryLifetime {
+	if !now.Before(entry.expiry()) {
 		r.deleteEntryLocked(token)
 		return nil, false
+	}
+	entry.lastAccess = now
+	if !entry.expiresAt.IsZero() {
+		entry.expiresAt = now.Add(relayEntryLifetime)
 	}
 	return entry, true
 }
 
 func (r *Relay) deleteEntryLocked(token string) {
-	if _, ok := r.entries[token]; !ok {
+	entry, ok := r.entries[token]
+	if !ok {
 		return
 	}
 	delete(r.entries, token)
+	if entry.contentKey != "" && r.content[entry.contentKey] == entry {
+		delete(r.content, entry.contentKey)
+	}
+}
+
+// releaseEntryLocked drops one registration's reference to an entry, removing
+// the entry only when the last reference is gone. A shared content entry is
+// therefore removed after its final holder releases, not the first. Caller
+// holds r.mu.
+func (r *Relay) releaseEntryLocked(token string) {
+	entry, ok := r.entries[token]
+	if !ok {
+		return
+	}
+	if entry.refs > 1 {
+		entry.refs--
+		return
+	}
+	r.deleteEntryLocked(token)
 }
 
 // RegistrationStatus is the live state of one relay registration, as reported
@@ -1064,13 +1248,23 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	// A complete, byte-bounded range response for a registered source may
 	// already be cached. Conditional requests and unregistered proxy traffic
 	// never use the cache; a hit is byte-exact and returns before any upstream
-	// round trip, which is what makes a fresh FFmpeg open+seek cheap.
+	// round trip, which is what makes a fresh FFmpeg open+seek cheap. The cache
+	// is scoped by the registration's content key when it has one, so a token
+	// rotation for the same content still hits; otherwise the token scopes it.
+	cacheScope := relayToken
+	if relayToken != "" {
+		r.mu.Lock()
+		if entry, ok := r.entries[relayToken]; ok && entry.contentKey != "" {
+			cacheScope = entry.contentKey
+		}
+		r.mu.Unlock()
+	}
 	cacheKey := ""
 	if request.Method == http.MethodGet && relayToken != "" &&
 		upstream.Header.Get("If-Range") == "" &&
 		upstream.Header.Get("If-None-Match") == "" &&
 		upstream.Header.Get("If-Modified-Since") == "" {
-		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"), relayRangeCacheHeaderIdentity(upstream.Header), relayToken)
+		cacheKey = relayRangeCacheKey(upstream.URL, upstream.Header.Get("Range"), relayRangeCacheHeaderIdentity(upstream.Header), cacheScope)
 		if entry, ok := r.rangeCache.get(cacheKey); ok {
 			for key, values := range entry.header {
 				for _, value := range values {
@@ -1556,10 +1750,28 @@ func (r *Relay) openReference(parentToken, opaque string, now time.Time) (string
 		return "", errors.New("invalid remote HLS reference token")
 	}
 	expiresAt := int64(binary.BigEndian.Uint64(plain[:8]))
-	if now.Unix() >= expiresAt {
+	if now.Unix() >= expiresAt && !r.parentLive(parentToken, now) {
 		return "", errors.New("expired remote HLS reference token")
 	}
 	return string(plain[8:]), nil
+}
+
+// parentLive reports whether parentToken names a live registration whose
+// session still holds it, and refreshes that entry's sliding lifetime as a side
+// effect. A sealed child reference is AEAD-bound to its parent token, so while
+// the parent session is live the child bytes stay authorized; accepting a
+// child whose seal-time TTL has passed lets a long playback outlive the TTL it
+// was sealed with instead of 404ing mid-segment. The parent token remains the
+// true authorization bound: once the parent is released or expires, the child
+// reference is refused.
+func (r *Relay) parentLive(parentToken string, now time.Time) bool {
+	if r == nil || parentToken == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.entryForRequestLocked(parentToken, now)
+	return ok
 }
 
 type relayResponseWriter struct {

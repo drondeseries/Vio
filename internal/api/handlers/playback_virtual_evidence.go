@@ -508,6 +508,9 @@ func (h *PlaybackHandler) persistVirtualEvidenceDirect(ctx context.Context, args
 				"component", "api", "file_id", args.FileID, "error", err)
 			return false
 		}
+		if result.MetadataUpdated {
+			h.PublishInventoryUpdated(writeCtx, args.FileID)
+		}
 		return result.MetadataUpdated
 	}
 	rows, err := h.VirtualFileSaver(writeCtx, args)
@@ -515,6 +518,9 @@ func (h *PlaybackHandler) persistVirtualEvidenceDirect(ctx context.Context, args
 		slog.WarnContext(ctx, "virtual probe evidence direct fallback failed",
 			"component", "api", "file_id", args.FileID, "error", err)
 		return false
+	}
+	if rows > 0 {
+		h.PublishInventoryUpdated(writeCtx, args.FileID)
 	}
 	return rows > 0
 }
@@ -630,6 +636,11 @@ func (h *PlaybackHandler) persistVirtualEvidenceTask(task *virtualEvidenceTask, 
 				lastErr = errVirtualEvidenceStale
 				goto terminal
 			}
+			// The row now carries the probe evidence. Push the verified inventory
+			// to any live session bound to it, so a menu stops showing the
+			// declared snapshot. The publish bounds its own context and is
+			// best-effort: a failure here never affects the committed write.
+			h.PublishInventoryUpdated(context.Background(), task.args.FileID)
 			return nil
 		}
 		lastErr = err

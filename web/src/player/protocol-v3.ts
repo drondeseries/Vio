@@ -146,6 +146,16 @@ export const FEATURE_PLAN_INVALIDATED_V3 = "plan_invalidated_v1";
  */
 export const FEATURE_SOURCE_COMMITTED_V3 = "source_committed_event_v1";
 
+/**
+ * The client handles the realtime `inventory_updated` event: it replaces the
+ * declared track menu it took from `source_committed` or its plan with the
+ * probe-verified audio and subtitle inventory, gating on `inventory_revision`
+ * so a duplicate or stale push is a no-op. It only appears on /api/v2. The
+ * event is advisory: a client that does not advertise the token ignores it and
+ * keeps polling.
+ */
+export const FEATURE_INVENTORY_UPDATED_V3 = "inventory_updated_event_v1";
+
 /** The `original` rung label, which always preserves the source. */
 export const QUALITY_ORIGINAL_V3 = "original";
 

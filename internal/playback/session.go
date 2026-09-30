@@ -150,6 +150,11 @@ type Session struct {
 	activeTransportCount       int
 	replacementPlayMethod      PlayMethod
 	streamRevision             uint64
+	// virtualSourceGeneration counts candidate-binding moves for this session.
+	// It is the fence a cache-handoff re-resolve captures before it lists
+	// afresh and passes back to SetVirtualSourceIfGeneration, so a handoff that
+	// started before a newer binding move is refused instead of clobbering it.
+	virtualSourceGeneration uint64
 	// remoteTransport marks a session whose media bytes are served by another
 	// node, so this server never sees the transport request that would
 	// otherwise keep it alive. See SetRemoteTransport.
@@ -1241,6 +1246,10 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		s.RoutingEgressNodeURL = state.RoutingEgressNodeURL
 	}
 	if state.VirtualSourceOwnershipSet || state.VirtualSourceSet {
+		if strings.TrimSpace(s.VirtualSourceURI) != strings.TrimSpace(state.VirtualSourceURI) ||
+			s.VirtualSourceOwnerInstallationID != state.VirtualSourceOwnerInstallationID {
+			s.virtualSourceGeneration++
+		}
 		s.VirtualSourceURI = state.VirtualSourceURI
 		s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
 		if state.VirtualSubtitleEvidenceSet {
@@ -1365,6 +1374,10 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.RoutingEgressNodeID = state.RoutingEgressNodeID
 	s.RoutingEgressNodeURL = state.RoutingEgressNodeURL
 	s.RequireMediaAuthorization = state.RequireMediaAuthorization
+	if strings.TrimSpace(s.VirtualSourceURI) != strings.TrimSpace(state.VirtualSourceURI) ||
+		s.VirtualSourceOwnerInstallationID != state.VirtualSourceOwnerInstallationID {
+		s.virtualSourceGeneration++
+	}
 	s.VirtualSourceURI = state.VirtualSourceURI
 	s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
 	s.VirtualSourceRevision = state.VirtualSourceRevision
@@ -1405,6 +1418,18 @@ func (m *SessionManager) SetVirtualSource(sessionID, virtualURI string, ownerIns
 	if !ok {
 		return ErrSessionNotFound
 	}
+	m.setVirtualSourceLocked(s, virtualURI, ownerInstallationID)
+	return nil
+}
+
+// setVirtualSourceLocked applies a candidate binding move and bumps both the
+// stream revision and the binding generation. The generation is what the
+// cache-handoff CAS reads, so every binding move — including a rotation — must
+// go through here to stay fenced.
+func (m *SessionManager) setVirtualSourceLocked(s *Session, virtualURI string, ownerInstallationID int) {
+	if s == nil {
+		return
+	}
 	trimmed := strings.TrimSpace(virtualURI)
 	if trimmed != strings.TrimSpace(s.VirtualSourceURI) {
 		// The evidence provenance anchor stays at the old candidate, which is
@@ -1414,8 +1439,99 @@ func (m *SessionManager) SetVirtualSource(sessionID, virtualURI string, ownerIns
 	s.VirtualSourceURI = trimmed
 	s.VirtualSourceOwnerInstallationID = ownerInstallationID
 	s.streamRevision++
+	s.virtualSourceGeneration++
 	m.touchSessionLocked(s)
-	return nil
+}
+
+// VirtualSourceBindingSnapshot captures the full candidate-binding state under the session lock.
+type VirtualSourceBindingSnapshot struct {
+	VirtualURI           string
+	OwnerInstallationID  int
+	EffectiveMediaFileID int
+	Generation           uint64
+}
+
+// VirtualSourceBinding captures the session's candidate-binding identity and generation
+// atomically under the session manager lock.
+func (m *SessionManager) VirtualSourceBinding(sessionID string) (VirtualSourceBindingSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return VirtualSourceBindingSnapshot{}, ErrSessionNotFound
+	}
+	return VirtualSourceBindingSnapshot{
+		VirtualURI:           s.VirtualSourceURI,
+		OwnerInstallationID:  s.VirtualSourceOwnerInstallationID,
+		EffectiveMediaFileID: s.MediaFileID,
+		Generation:           s.virtualSourceGeneration,
+	}, nil
+}
+
+// SetVirtualSourceIfBinding applies the candidate handoff and updates the effective
+// media file ID atomically under the lock only while the session's binding generation,
+// virtual URI, owner, and effective file ID match the expected snapshot.
+func (m *SessionManager) SetVirtualSourceIfBinding(
+	sessionID string,
+	expected VirtualSourceBindingSnapshot,
+	virtualURI string,
+	ownerInstallationID int,
+	effectiveMediaFileID int,
+) (uint64, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return 0, false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != expected.Generation ||
+		strings.TrimSpace(s.VirtualSourceURI) != strings.TrimSpace(expected.VirtualURI) ||
+		s.VirtualSourceOwnerInstallationID != expected.OwnerInstallationID ||
+		(expected.EffectiveMediaFileID > 0 && s.MediaFileID != expected.EffectiveMediaFileID) {
+		return s.virtualSourceGeneration, false, nil
+	}
+	m.setVirtualSourceLocked(s, virtualURI, ownerInstallationID)
+	if effectiveMediaFileID > 0 {
+		s.MediaFileID = effectiveMediaFileID
+	}
+	return s.virtualSourceGeneration, true, nil
+}
+
+// VirtualSourceGeneration returns the session's current candidate-binding
+// generation. A cache handoff captures it before re-listing and passes it to
+// SetVirtualSourceIfGeneration so a late handoff cannot clobber a newer binding.
+func (m *SessionManager) VirtualSourceGeneration(sessionID string) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return 0, ErrSessionNotFound
+	}
+	return s.virtualSourceGeneration, nil
+}
+
+// SetVirtualSourceIfGeneration is the generation-fenced form of
+// SetVirtualSource. It applies the binding move only while the session still
+// carries expectedGeneration, so a handoff whose replacement source was
+// resolved before a newer binding move is refused rather than silently
+// overriding it. It returns the generation after the attempt and whether it
+// applied; a false result with a nil error is a benign lost race.
+func (m *SessionManager) SetVirtualSourceIfGeneration(sessionID string, expectedGeneration uint64, virtualURI string, ownerInstallationID int) (uint64, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return 0, false, ErrSessionNotFound
+	}
+	if s.virtualSourceGeneration != expectedGeneration {
+		return s.virtualSourceGeneration, false, nil
+	}
+	m.setVirtualSourceLocked(s, virtualURI, ownerInstallationID)
+	return s.virtualSourceGeneration, true, nil
 }
 
 // ApplyReplacement atomically updates every live-session field owned by a
@@ -1480,6 +1596,7 @@ func (m *SessionManager) applyReplacementLocked(
 	// an ID-less stop no longer applies.
 	s.StopReported = false
 	applySessionStreamStateLocked(s, replacement.StreamState)
+	s.virtualSourceGeneration++
 	if replacement.PositionSeconds != nil {
 		s.Position = *replacement.PositionSeconds
 		if !replacement.PreservePaused {
@@ -1509,6 +1626,7 @@ func (m *SessionManager) RollbackReplacement(sessionID string, rollback SessionR
 	// Rolling back a replacement is still an active play, not a stopped one.
 	s.StopReported = false
 	restoreSessionStreamStateLocked(s, rollback.previousStreamState)
+	s.virtualSourceGeneration++
 	if rollback.restoreProgress {
 		s.Position = rollback.previousPosition
 		s.IsPaused = rollback.previousPaused

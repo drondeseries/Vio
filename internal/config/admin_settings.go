@@ -500,13 +500,15 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 	case "virtual_library.schedule_refresh_minutes":
 		return normalizeAdminInt(key, value, 30, 10080)
 	case "virtual_library.manifest_url", "virtual_library.tmdb_api_key",
-		"virtual_library.monitor_file", "virtual_library.indexer_rss_url",
+		"virtual_library.monitor_file",
 		"virtual_library.indexer_api_key", "virtual_library.altmount_url",
 		"virtual_library.altmount_api_key":
 		if len(value) > 4096 {
 			return "", fmt.Errorf("%s exceeds 4096 bytes", key)
 		}
 		return value, nil
+	case "virtual_library.indexer_rss_url":
+		return normalizeProwlarrBaseURL(value)
 	case "virtual_library.quality_preset", "virtual_library.custom_format_preset":
 		if value == "" {
 			return "custom", nil
@@ -812,6 +814,31 @@ func NormalizeRedisURL(raw string) (string, error) {
 	}
 	if _, err := redisv9.ParseURL(value); err != nil {
 		return "", fmt.Errorf("redis.url must be a valid redis://, rediss://, or unix:// URL: %w", err)
+	}
+	return value, nil
+}
+
+// normalizeProwlarrBaseURL canonicalizes virtual_library.indexer_rss_url. A
+// scheme-less value like "one.vio" is prepended with http:// so it becomes a
+// usable base URL instead of a value that fails every staleness refresh with
+// "expected the server base URL with a scheme". The runtime Prowlarr client
+// applies the stricter path/query shape check (see prowlarr.NormalizeBaseURL)
+// and leaves Prowlarr unconfigured, with a warning, when a value is still
+// unusable; this only guarantees a scheme and a host at save time.
+func normalizeProwlarrBaseURL(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	if len(value) > 4096 {
+		return "", fmt.Errorf("virtual_library.indexer_rss_url exceeds 4096 bytes")
+	}
+	if !strings.Contains(value, "://") {
+		value = "http://" + value
+	}
+	value = strings.TrimRight(value, "/")
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("virtual_library.indexer_rss_url must be a valid http(s) base URL, for example http://prowlarr:9696")
 	}
 	return value, nil
 }

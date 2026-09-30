@@ -200,6 +200,123 @@ func (s *Monitor) ConfigureAltmount(baseURL, apiKey string, intervalMinutes int,
 	return s.monitor.configureAltmount(baseURL, apiKey, intervalMinutes, indexFile)
 }
 
+// SetReleaseConfirmedObserver installs a callback invoked once per AltMount
+// release key when AltMount first reports that release completed. It is the
+// push signal a cache handoff listens for so an in-session handoff can react to
+// a fill that finished during playback without polling the provider. A nil
+// callback clears it.
+//
+// The observer is also recorded internally so ReleaseCached can answer a
+// synchronous "is this pinned release already cached?" probe (the mid-play heal
+// path) from the same completion signal, without a provider round-trip.
+func (s *Monitor) SetReleaseConfirmedObserver(fn altmount.ReleaseConfirmationObserver) {
+	if s == nil || s.monitor == nil {
+		return
+	}
+	m := s.monitor
+	var installed altmount.ReleaseConfirmationObserver
+	if fn != nil {
+		installed = func(releaseKey string) {
+			if key := altmount.ReleaseKey(releaseKey); key != "" {
+				m.mu.Lock()
+				if m.confirmedReleases == nil {
+					m.confirmedReleases = make(map[string]struct{})
+				}
+				m.confirmedReleases[key] = struct{}{}
+				m.mu.Unlock()
+			}
+			// Fire the caller's listener outside the monitor lock: a handoff it
+			// triggers resolves and rebinds, and must never block completion
+			// bookkeeping or risk re-entering the observer under the lock.
+			fn(releaseKey)
+		}
+	}
+	m.mu.Lock()
+	m.confirmObserver = installed
+	client := m.altmount
+	m.mu.Unlock()
+	if client != nil {
+		client.SetConfirmObserver(installed)
+	}
+}
+
+// ReleaseCached reports whether AltMount has reported the named release
+// completed. known is false when no AltMount client is configured, so an
+// unconfigured provider is never mistaken for "not cached". It answers from the
+// recorded completion signal, so it is cheap and side-effect free.
+func (s *Monitor) ReleaseCached(releaseName string) (cached bool, known bool) {
+	if s == nil || s.monitor == nil {
+		return false, false
+	}
+	m := s.monitor
+	client := m.configuredAltmount()
+	if client == nil || client.URL() == "" {
+		return false, false
+	}
+	key := altmount.ReleaseKey(releaseName)
+	if key == "" {
+		return false, false
+	}
+	// Check the authoritative configured AltMount snapshot first (e.g. loaded
+	// from disk on restart or refreshed from AltMount).
+	if completed, known := client.ReleaseCompleted(key); known && completed {
+		return true, true
+	}
+	m.mu.Lock()
+	_, cached = m.confirmedReleases[key]
+	m.mu.Unlock()
+	return cached, true
+}
+
+// ProviderStale reports whether any configured virtual provider's cached state
+// has aged past its refresh interval. It is the read half of the stale-provider
+// seam the playback layer probes before a resolve, so a long-lived process does
+// not resolve against a stale AltMount completed/failed snapshot or Prowlarr
+// index.
+func (s *Monitor) ProviderStale() bool {
+	if s == nil || s.monitor == nil {
+		return false
+	}
+	m := s.monitor
+	m.mu.Lock()
+	altmountClient := m.altmount
+	prowlarrClient := m.prowlarr
+	m.mu.Unlock()
+	if altmountClient != nil && altmountClient.URL() != "" && altmountClient.Stale() {
+		return true
+	}
+	if prowlarrClient != nil && prowlarrClient.URL() != "" && prowlarrClient.Stale() {
+		return true
+	}
+	return false
+}
+
+// RefreshStaleProvider refreshes every configured virtual provider whose cached
+// state is stale, under the caller's budget. One unreachable provider never
+// blocks the other: both are attempted and their errors are joined.
+func (s *Monitor) RefreshStaleProvider(ctx context.Context) error {
+	if s == nil || s.monitor == nil {
+		return nil
+	}
+	m := s.monitor
+	m.mu.Lock()
+	altmountClient := m.altmount
+	prowlarrClient := m.prowlarr
+	m.mu.Unlock()
+	var errs []error
+	if altmountClient != nil && altmountClient.URL() != "" && altmountClient.Stale() {
+		if err := altmountClient.RefreshIfStale(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("refresh AltMount state: %w", err))
+		}
+	}
+	if prowlarrClient != nil && prowlarrClient.URL() != "" && prowlarrClient.Stale() {
+		if err := prowlarrClient.RefreshIfStale(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("refresh Prowlarr search: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // SearchMonitoredReleases performs an on-demand Prowlarr search for one
 // monitored title. It returns an error when Prowlarr is unwired so the caller
 // can degrade to an altmount-only result instead of treating it as no match.
@@ -310,6 +427,16 @@ type mediaMonitor struct {
 	altmount     *altmountStateClient
 	registered   map[string]struct{}
 	releaseStore *release.ReleaseStore
+	// confirmObserver forwards AltMount's once-per-release completion signal to
+	// a cache-handoff listener. It is kept here so a later reconfigure re-applies
+	// it to the (re)created client.
+	confirmObserver altmount.ReleaseConfirmationObserver
+	// confirmedReleases records the release keys AltMount has reported completed
+	// (the same normalized identity altmount.ReleaseKey produces). It is
+	// populated from the confirm observer the monitor installs, so a cache
+	// handoff probe can answer synchronously without a provider round-trip or a
+	// classifier side effect.
+	confirmedReleases map[string]struct{}
 	// cursor is the key of the last item whose evaluation completed in a
 	// partial pass. It is persisted with the queue so the next pass resumes
 	// instead of restarting from the front.
@@ -353,6 +480,12 @@ func (m *mediaMonitor) prowlarrMatch(item monitoredMedia) bool {
 // configureProwlarr sets up the Prowlarr search client with the first
 // non-empty URL from the list. Multiple URLs / per-indexer discovery are
 // no longer needed — /api/v1/search covers all indexers in one request.
+//
+// The first URL is normalized before it is applied: a scheme-less value such as
+// "one.vio" becomes http://one.vio. An invalid URL (indexer path, query string,
+// malformed host) leaves Prowlarr unconfigured instead of storing a value that
+// would fail every staleness refresh, and the error is returned so the caller
+// logs it once at configuration time.
 func (m *mediaMonitor) configureProwlarr(urls, apiKey string, intervalMinutes, timeoutSeconds int, indexFile string) error {
 	firstURL := ""
 	for _, u := range strings.FieldsFunc(urls, func(r rune) bool { return r == '\n' || r == ',' }) {
@@ -362,13 +495,21 @@ func (m *mediaMonitor) configureProwlarr(urls, apiKey string, intervalMinutes, t
 			break
 		}
 	}
+	normalizedURL, normalizeErr := prowlarr.NormalizeBaseURL(firstURL)
+	if normalizeErr != nil {
+		normalizedURL = ""
+		m.logger.Warn("virtual library Prowlarr URL is invalid; Prowlarr stays unconfigured", "error", normalizeErr)
+	}
 	m.mu.Lock()
 	if m.prowlarr == nil {
 		m.prowlarr = prowlarr.NewSearchClient(nil)
 	}
 	m.mu.Unlock()
-	m.prowlarr.Configure(firstURL, apiKey, intervalMinutes, timeoutSeconds)
-	return m.prowlarr.ConfigureIndexFile(indexFile)
+	m.prowlarr.Configure(normalizedURL, apiKey, intervalMinutes, timeoutSeconds)
+	if indexErr := m.prowlarr.ConfigureIndexFile(indexFile); indexErr != nil {
+		return indexErr
+	}
+	return normalizeErr
 }
 
 // configureAltmount sets up the AltMount completed/failed state client. The
@@ -379,9 +520,17 @@ func (m *mediaMonitor) configureAltmount(baseURL, apiKey string, intervalMinutes
 	if m.altmount == nil {
 		m.altmount = altmount.New(nil)
 	}
+	// Invalidate the monitor's completion set on configuration change so
+	// state from another provider instance cannot be served as current.
+	m.confirmedReleases = make(map[string]struct{})
+	observer := m.confirmObserver
+	client := m.altmount
 	m.mu.Unlock()
-	m.altmount.Configure(baseURL, apiKey, intervalMinutes)
-	return m.altmount.ConfigureIndexFile(indexFile)
+	client.Configure(baseURL, apiKey, intervalMinutes)
+	// Re-apply a listener installed before the client existed; loading the
+	// persisted state must not drop it.
+	client.SetConfirmObserver(observer)
+	return client.ConfigureIndexFile(indexFile)
 }
 
 // altmountClient returns the AltMount state client, or a new empty one.

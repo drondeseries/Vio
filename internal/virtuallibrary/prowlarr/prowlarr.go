@@ -532,6 +532,29 @@ func validateProwlarrBaseURL(raw string) error {
 	return nil
 }
 
+// NormalizeBaseURL canonicalizes a configured Prowlarr server base URL. A
+// scheme-less value such as "one.vio" is a common admin input; prepending
+// http:// turns it into an address the search client can actually reach
+// instead of letting every staleness refresh fail with "expected the server
+// base URL with a scheme". Anything still invalid after the scheme is
+// prepended (an indexer path, a query string, a malformed host) is rejected so
+// the caller can leave Prowlarr unconfigured rather than fail resolves. An
+// empty value stays empty (Prowlarr unwired).
+func NormalizeBaseURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "http://" + trimmed
+	}
+	trimmed = strings.TrimRight(trimmed, "/")
+	if err := validateProwlarrBaseURL(trimmed); err != nil {
+		return "", err
+	}
+	return trimmed, nil
+}
+
 // hasIndexerPath reports whether the URL path is an indexer-scoped or newznab
 // proxy path rather than a plain base (or a reverse-proxy subpath). A trailing
 // numeric segment is Prowlarr's indexer id; "api", "newznab" and "torznab"
