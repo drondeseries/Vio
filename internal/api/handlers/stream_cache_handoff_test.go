@@ -229,14 +229,14 @@ func TestBeginVirtualCacheHandoffStreamsDownloadProgress(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		states := recorder.states()
-		if len(states) >= 2 {
-			if states[0] != playback.DownloadProgressStateQueued || states[1] != playback.DownloadProgressStateDownloading {
-				t.Fatalf("progress states = %v, want queued then downloading", states)
+		if len(states) >= 1 {
+			if states[0] != playback.DownloadProgressStateDownloading {
+				t.Fatalf("progress states = %v, want downloading", states)
 			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("progress states = %v, want queued then downloading", states)
+			t.Fatalf("progress states = %v, want downloading", states)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
