@@ -23059,6 +23059,8 @@ export interface components {
       /** Format: int64 */
       attempt_count: number;
       attempted_plan_keys: string[];
+      /** @description Re-negotiates the session's version-fallback intent. Set true when the viewer re-arms Auto mid-session; omitted leaves the start-time intent unchanged. Never authorizes a healthy mid-play switch. */
+      auto_fallback?: boolean;
       /** Format: int64 */
       bandwidth_cap_kbps?: number;
       /** Format: int64 */

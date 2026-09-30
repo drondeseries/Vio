@@ -1418,6 +1418,11 @@ export function usePlaybackSession(
         attemptedPlanKeys,
         attemptCount,
         metered: detectMeteredV3(),
+        // State the viewer's current Auto intent on every replan so the
+        // server's session flag cannot drift from the menu: a viewer who
+        // started on an explicit pick and later re-armed Auto must still
+        // rotate on a dead source.
+        autoFallback: autoFallbackRef.current,
         bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
         bandwidthCapKbps: maxBitrateKbps,
         clientCapabilities,

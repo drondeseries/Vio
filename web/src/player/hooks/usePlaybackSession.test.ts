@@ -259,6 +259,18 @@ describe("buildReplanRequestV3", () => {
     ]);
   });
 
+  it("re-arms the server's auto fallback when the viewer selects Auto", () => {
+    expect(
+      buildReplanRequestV3({ ...replanBase, operation: "failure_recovery", autoFallback: true }),
+    ).toMatchObject({ auto_fallback: true });
+  });
+
+  it("omits auto_fallback when the viewer's intent is unknown", () => {
+    expect(
+      buildReplanRequestV3({ ...replanBase, operation: "failure_recovery" }),
+    ).not.toHaveProperty("auto_fallback");
+  });
+
   it("names a new audio track by index alone", () => {
     // An empty id makes the server resolve the ordinal against the *effective*
     // file, which the client cannot name: it changes on a version fallback.
@@ -2180,6 +2192,81 @@ describe("usePlaybackSession version switches", () => {
     // The stale captured position (347) was discarded; the chained switch uses
     // the live playhead seeded by the replacement plan.
     expect(startBodies[2]?.start_position).toBe(500);
+
+    unmount();
+  });
+
+  it("carries a mid-session Auto re-arm onto the next failure recovery", async () => {
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({ session_id: "session-1" }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            session_id: "session-1",
+            plan_id: "plan:auto-replan-1",
+            plan_attempt_key: "v3:autoreplan0001",
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Started on an explicit pick, so the session begins with Auto disarmed.
+    const { result, unmount } = renderHook(
+      () =>
+        usePlaybackSession(
+          "request-1",
+          [],
+          [],
+          7,
+          0,
+          false,
+          "auto",
+          null,
+          undefined,
+          null,
+          undefined,
+          undefined,
+          true,
+        ),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.autoFallback).toBe(false);
+
+    // Re-arming Auto while a plan is live has no start request to carry the
+    // intent, so the next replan must state it or a dead-source recovery stays
+    // pinned to the explicit pick while the menu shows Auto.
+    act(() => result.current.selectAutoVersion());
+    expect(result.current.autoFallback).toBe(true);
+
+    act(() => result.current.recoverFromFailure({ classification: "decoder_failure" }, 120));
+    await waitFor(() => expect(replanBodies).toHaveLength(1));
+    expect(replanBodies[0]).toMatchObject({
+      operation: "failure_recovery",
+      auto_fallback: true,
+    });
 
     unmount();
   });

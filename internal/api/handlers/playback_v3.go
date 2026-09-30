@@ -6272,6 +6272,11 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	// fast on a genuinely stuck provider.
 	replanCtx, cancelReplan := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancelReplan()
+	// A viewer who re-armed Auto mid-session states it on the replan, so a
+	// later dead-source recovery rotates even though the session started
+	// explicit. Applying it before execution is what lets executeReplanV3's
+	// autoFallbackForSession read the same intent the client is showing.
+	h.renegotiateAutoFallbackV3(r.Context(), sessionID, req)
 	response, updated, transport, replanErr := h.executeReplanV3(r.WithContext(replanCtx), record, req)
 	if replanErr != nil {
 		if transport != nil {
@@ -9113,6 +9118,28 @@ func autoFallbackForSession(sessionMgr SessionManagerInterface, sessionID string
 		return false, false
 	}
 	return getter.AutoFallback(sessionID)
+}
+
+// renegotiateAutoFallbackV3 re-arms a session's auto-fallback flag from a
+// replan request. Clients that start on an explicit pick and later re-select
+// Auto from the version menu have no start request to carry the intent, so the
+// next replan states it here; without this the session stays pinned to the
+// explicit pick and a dead-source recovery refuses to rotate while the menu
+// shows Auto armed. An absent field leaves the start-time intent untouched, and
+// a manager that does not expose the setter keeps its prior behavior.
+func (h *PlaybackHandler) renegotiateAutoFallbackV3(ctx context.Context, sessionID string, req playback.ReplanRequestV3) {
+	if req.AutoFallback == nil {
+		return
+	}
+	setter, ok := h.sessionMgr.(interface {
+		SetAutoFallback(sessionID string, enabled bool) error
+	})
+	if !ok {
+		return
+	}
+	if err := setter.SetAutoFallback(sessionID, *req.AutoFallback); err != nil {
+		slog.WarnContext(ctx, "protocol v3 replan auto-fallback re-negotiation failed", "component", "api", "session", sessionID, "enabled", *req.AutoFallback, "error", err)
+	}
 }
 
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {

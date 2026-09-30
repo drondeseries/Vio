@@ -936,6 +936,15 @@ discard the viewer's requested quality unless the client explicitly asks it to.
 Clients should still send the current preference when they know it, so their
 intent remains explicit in diagnostics.
 
+**Re-negotiating auto fallback mid-session.** `auto_fallback` is an optional
+boolean on a replan. When present it replaces the session's version-fallback
+intent, which is what lets a viewer who started on an explicit pick re-arm Auto
+from the version menu and still have a later dead-source `failure_recovery`
+rotate instead of being pinned to the start-time choice. Omitting it leaves that
+intent unchanged, so clients that predate the field behave exactly as before.
+Auto fallback never authorizes a healthy mid-play version switch: only a dead or
+unplayable source advances it.
+
 For failure recovery, `attempted_plan_keys` is the loop guard. The client sends
 back every `plan_attempt_key` it has already tried for this attempt (up to 16);
 the server will not hand back a plan whose key is in that list. `attempt_count`

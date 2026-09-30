@@ -231,6 +231,7 @@ type PlaybackReplanBody struct {
 	QualityPreference     string                             `json:"quality_preference"`
 	PositionSeconds       float64                            `json:"position_seconds" minimum:"0"`
 	Metered               bool                               `json:"metered"`
+	AutoFallback          *bool                              `json:"auto_fallback,omitempty" nullable:"false" doc:"Re-negotiates the session's version-fallback intent. Set true when the viewer re-arms Auto mid-session; omitted leaves the start-time intent unchanged. Never authorizes a healthy mid-play switch."`
 	BandwidthEstimateKbps *int                               `json:"bandwidth_estimate_kbps,omitempty" nullable:"false"`
 	BandwidthCapKbps      *int                               `json:"bandwidth_cap_kbps,omitempty" nullable:"false"`
 	SelectedTracks        playback.SelectedTracksV3          `json:"selected_tracks"`
@@ -409,7 +410,7 @@ func registerPlaybackReplan(reg *Registry, op func(method, path, id string) Oper
 	})
 }
 func (in PlaybackReplanBody) domain() playback.ReplanRequestV3 {
-	return playback.ReplanRequestV3{ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, Operation: in.Operation, PlaybackAttemptID: in.PlaybackAttemptID, ReplanRequestID: in.ReplanRequestID, FailedPlanID: in.FailedPlanID, PlanAttemptID: in.PlanAttemptID, PlanAttemptKey: in.PlanAttemptKey, AttemptedPlanKeys: in.AttemptedPlanKeys, LocalMutations: in.LocalMutations, AttemptCount: in.AttemptCount, QualityPreference: in.QualityPreference, PositionSeconds: in.PositionSeconds, Metered: in.Metered, BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthCapKbps: in.BandwidthCapKbps, SelectedTracks: in.SelectedTracks, Failure: in.Failure, Capabilities: in.Capabilities, ClientPlaybackContext: in.ClientPlaybackContext}
+	return playback.ReplanRequestV3{ProtocolVersion: in.ProtocolVersion, ClientFeatures: in.ClientFeatures, Operation: in.Operation, PlaybackAttemptID: in.PlaybackAttemptID, ReplanRequestID: in.ReplanRequestID, FailedPlanID: in.FailedPlanID, PlanAttemptID: in.PlanAttemptID, PlanAttemptKey: in.PlanAttemptKey, AttemptedPlanKeys: in.AttemptedPlanKeys, LocalMutations: in.LocalMutations, AttemptCount: in.AttemptCount, QualityPreference: in.QualityPreference, PositionSeconds: in.PositionSeconds, Metered: in.Metered, AutoFallback: in.AutoFallback, BandwidthEstimateKbps: in.BandwidthEstimateKbps, BandwidthCapKbps: in.BandwidthCapKbps, SelectedTracks: in.SelectedTracks, Failure: in.Failure, Capabilities: in.Capabilities, ClientPlaybackContext: in.ClientPlaybackContext}
 }
 func registerPlaybackRouteEvents(reg *Registry, op func(method, path, id string) Operation) {
 	Register(reg, op(http.MethodPost, "/route-events", opReportPlaybackRouteEvent), func(ctx context.Context, in *PlaybackRouteEventInput) (*PlaybackRouteEventOutput, error) {
