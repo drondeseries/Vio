@@ -2266,16 +2266,21 @@ func TestHardwareScaleFiltersShareExactLadderHeights(t *testing.T) {
 
 	// The ladder fit names exact heights (a 3840x1600 film at the 1080p
 	// class encodes 1920x800): every hardware scaler must scale them, or
-	// the plan advertises a frame the encoder never produces.
-	for _, res := range []string{"800p", "540p", " 1080P "} {
-		if got := vaapiScaleFilter(res); !strings.Contains(got, "h=800") && !strings.Contains(got, "h=540") && !strings.Contains(got, "h=1080") {
-			t.Fatalf("vaapiScaleFilter(%q) = %q, want a scaled height", res, got)
+	// the plan advertises a frame the encoder never produces. Each input
+	// is checked against its own height.
+	for _, tc := range []struct{ res, height string }{
+		{"800p", "h=800"},
+		{"540p", "h=540"},
+		{" 1080P ", "h=1080"},
+	} {
+		if got := vaapiScaleFilter(tc.res); !strings.Contains(got, tc.height) {
+			t.Fatalf("vaapiScaleFilter(%q) = %q, want %s scaling", tc.res, got, tc.height)
 		}
-		if got := qsvScaleFilterWithMapMode(res, ""); !strings.Contains(got, "h=800") && !strings.Contains(got, "h=540") && !strings.Contains(got, "h=1080") {
-			t.Fatalf("qsvScaleFilterWithMapMode(%q) = %q, want a scaled height", res, got)
+		if got := qsvScaleFilterWithMapMode(tc.res, ""); !strings.Contains(got, tc.height) {
+			t.Fatalf("qsvScaleFilterWithMapMode(%q) = %q, want %s scaling", tc.res, got, tc.height)
 		}
-		if got := qsvVPPInputScaleFilter(res); !strings.Contains(got, "h=800") && !strings.Contains(got, "h=540") && !strings.Contains(got, "h=1080") {
-			t.Fatalf("qsvVPPInputScaleFilter(%q) = %q, want a scaled height", res, got)
+		if got := qsvVPPInputScaleFilter(tc.res); !strings.Contains(got, tc.height) {
+			t.Fatalf("qsvVPPInputScaleFilter(%q) = %q, want %s scaling", tc.res, got, tc.height)
 		}
 	}
 	// VPP keeps Vio's iHD width constraint on exact heights too.

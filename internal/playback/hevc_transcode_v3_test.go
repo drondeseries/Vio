@@ -47,26 +47,11 @@ func TestPlanPlaybackV3HEVCTranscodeSelectionAndFallbacks(t *testing.T) {
 	}
 }
 
-// A scaled encode never targets more than the source's own bits counted in
-// the output codec: a 3 Mbps HEVC source converted to 1080p HEVC stays at
-// 3 Mbps, while H.264 output may use the 5 Mbps H.264 equivalent. The HEVC
-// decoder is checked against the HEVC target, and a failed HEVC attempt falls
-// back to H.264 at the H.264 bitrate.
-// A server bitrate cap reserves the audio share before the HEVC decoder is
-// checked, so an HEVC-only client whose decoder takes the capped video rate
-// is not refused over the uncapped one.
-// A same-size conversion to HEVC is also capped at the source's bits counted
-// as HEVC: an 8 Mbps H.264 source that must be re-encoded for an HEVC-only
-// client with a 6 Mbps decoder gets a 4.8 Mbps HEVC stream.
-// H.264 stays the universal HLS output, but its bitrate stays within an
-// attested H.264 decoder's limit for the output size; HEVC output is checked
-// against its own decoder instead. The 5 Mbps limit still earns 1080p.
-// A scaled H.264 encode steps down to the tallest class an attested H.264
-// decoder takes, while HEVC output keeps the class its own decoder takes; the
-// H.264 fallback after a failed HEVC attempt uses the H.264 size.
-// A transcode never asks for more than the ladder's 2160p class. On the
-// original route a source taller than that is fitted into the 2160p box, as
-// the old resolution buckets did, instead of being encoded at its own height.
+// A failed HEVC attempt falls back to H.264 at the H.264 bitrate; H.264
+// stays the universal HLS output. (Upstream's exact rung-table tests for
+// source-bitrate bounds, decoder-bounded H.264 sizing and the 2160p cap do
+// not apply to Vio's retained planner; equivalent fork invariants are
+// follow-up work — see docs/architecture/fork-divergence.md.)
 func TestPlanPlaybackV3HEVCFailureFallsBackToH264(t *testing.T) {
 	input := hevcTranscodePlannerInputV3(true, true, true)
 	first := PlanPlaybackV3(input)
