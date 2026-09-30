@@ -2063,6 +2063,15 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// those early stages at half the cold budget, so the attempt is guaranteed
 	// at least that much time rather than being starved.
 	attemptCtx := coldCtx
+	// A deliberate user relink (force_relink) is the declared-outage recovery
+	// case the unbounded relist was built for: it re-lists past the fresh-serve
+	// floor and the provider-failure fail-fast, so a user "try again" is never
+	// blocked by the 30s backoff a background failure just wrote. Only an
+	// unbound relink qualifies; a session-bound rotation (a replan rehydration)
+	// is server-initiated and stays on the floor so it cannot hot-loop.
+	if forceRelist && !options.sessionBound {
+		attemptCtx = virtuallibrary.WithProviderOutageRelist(attemptCtx)
+	}
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
 	attemptCtx = withVirtualSessionBindingV3(attemptCtx, options.sessionBound)
 	// An auto-picked quality profile that matches no candidate degrades to the

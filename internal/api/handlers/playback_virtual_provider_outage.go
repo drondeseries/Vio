@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
@@ -185,6 +186,25 @@ func transportStartFailureV3(cause error, fallback *transportErrorV3) *transport
 		}
 	}
 	return fallback
+}
+
+// virtualStartUnresolvedTerminalV3 builds the honest terminal for a virtual
+// start whose listing failed on every version the fallback walk could try. A
+// provider request failure (the edge answered 5xx or the request timed out) is
+// the retryable provider_unavailable dependency condition; an empty provider
+// listing stays the retryable virtual_source_unavailable the start path already
+// used, with a message that names the empty answer; every other cause keeps the
+// generic resolve message so no verdict is fabricated from a failure the
+// classifier cannot name.
+func virtualStartUnresolvedTerminalV3(resolveErr error) playback.DecisionResponseV3 {
+	switch {
+	case errors.Is(resolveErr, resolver.ErrProviderUnavailable):
+		return playback.NewTerminalResponseV3(providerUnavailableReasonV3, "The virtual source provider is temporarily unavailable.", true)
+	case strings.Contains(strings.ToLower(fmt.Sprint(resolveErr)), "no streams available"):
+		return playback.NewTerminalResponseV3("virtual_source_unavailable", "The provider listed no streams for this title.", true)
+	default:
+		return playback.NewTerminalResponseV3("virtual_source_unavailable", "The virtual source could not be resolved for playback.", true)
+	}
 }
 
 // sleepWithContext waits for d or returns false when ctx is canceled first.

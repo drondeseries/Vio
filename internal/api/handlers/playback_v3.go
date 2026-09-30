@@ -1856,7 +1856,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		// earlier auto pick; only an explicit pick or a forced relink re-tries
 		// the known-bad candidate.
 		allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
-		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, virtualResolveOptionsV3{allowFailedCandidate: allowFailedCandidate, sessionBound: false, explicitSelection: req.FileSelection == playback.FileSelectionExplicitV3})
+		resolved, resolveErr := h.resolveVirtualStartWithVersionFallback(r, requestedFile, profileID, req, allowFailedCandidate, intOrZeroHandlerV3(req.BandwidthCapKbps))
 		if resolveErr != nil {
 			// A confirmed-dead pinned release is indicted here so a retry does
 			// not re-resolve it; an empty provider listing is not a verdict and
@@ -1873,7 +1873,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				}
 			}
 			req.FileID = termFileID
-			response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, termFileID, termFileID, playback.NewTerminalResponseV3("virtual_source_unavailable", "The virtual source could not be resolved for playback.", true))
+			response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, termFileID, termFileID, virtualStartUnresolvedTerminalV3(resolveErr))
 			if persistErr != nil {
 				return playback.DecisionResponseV3{}, playbackPersistenceOperationError(persistErr)
 			}
@@ -2368,6 +2368,99 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	}
 	timings.mark("response_ready")
 	return response, nil
+}
+
+// resolveVirtualStartWithVersionFallback resolves the virtual source for a
+// fresh start. When the pinned release's listing fails and nothing is playing
+// yet, it walks the content's alternate versions/files — each with its own
+// listing attempt — and returns the first working candidate, so pressing play
+// lands on a playable version whenever one exists.
+//
+// The walk only runs for an eligible auto selection (the same gate the
+// planning-time alternate hunt uses) and never for an explicit user version
+// pick: the viewer chose that release and must not be silently moved off it.
+// A version the catalog already stamped failed (an AltMount SourceFailed
+// verdict) is skipped, never attempted. An empty provider listing stays
+// transient: it advances the walk without indicting the version, matching the
+// deliberate decision that a zero-count answer is a provider hiccup and not a
+// verdict about any release.
+//
+// The walk is bounded by the caller's startup budget (virtualStartupBudget),
+// and each resolve additionally bounds its own probe with virtualProbeBudget.
+// When no version resolves, the original listing failure is returned so the
+// caller reports the honest underlying cause (an edge 5xx, an empty listing,
+// or every version failed) instead of a generic error.
+func (h *PlaybackHandler) resolveVirtualStartWithVersionFallback(
+	r *http.Request,
+	file *models.MediaFile,
+	profileID string,
+	req playback.StartRequestV3,
+	allowFailedCandidate bool,
+	bandwidthCapKbps int,
+) (resolvedVirtualPlaybackSource, error) {
+	resolved, resolveErr := h.resolveVirtualPlaybackSource(
+		r, file, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, req.ForceRelink,
+		virtualResolveOptionsV3{
+			allowFailedCandidate: allowFailedCandidate,
+			sessionBound:         false,
+			explicitSelection:    req.FileSelection == playback.FileSelectionExplicitV3,
+		},
+	)
+	if resolveErr == nil || !virtualStartVersionFallbackEligibleV3(req) || !virtualProviderListingOutage(resolveErr) {
+		return resolved, resolveErr
+	}
+	// One deadline owns the whole walk. resolveVirtualPlaybackSource re-bases
+	// its own cold path on r.Context() and context.WithTimeout keeps the
+	// earlier deadline, so this bounds every alternate without restarting the
+	// budget once per version.
+	walkCtx, cancel := context.WithTimeout(r.Context(), virtualStartupBudget)
+	defer cancel()
+	alternates, alternateErr := h.findAlternateFiles(walkCtx, file, alternateOrderingForClient(req.Capabilities))
+	if alternateErr != nil || len(alternates) == 0 {
+		return resolved, resolveErr
+	}
+	walkReq := r.WithContext(walkCtx)
+	for _, alternate := range alternates {
+		if alternate == nil || alternate.ID == file.ID || !isVirtualPlaybackFile(alternate) {
+			continue
+		}
+		if virtualCandidateVerdictActive(alternate.FailedAt, time.Now()) {
+			// The provider's AltMount verdict indicted this version; never
+			// attempt it, however the primary listing failed.
+			continue
+		}
+		if walkCtx.Err() != nil {
+			break
+		}
+		altResolved, altErr := h.resolveVirtualPlaybackSource(
+			walkReq, alternate, profileID, true, nil, "", req.QualityPreference, bandwidthCapKbps, false,
+			virtualResolveOptionsV3{sessionBound: false},
+		)
+		if altErr == nil && altResolved.File != nil {
+			slog.InfoContext(walkCtx, "virtual start fell back to an alternate version after a listing failure",
+				logComponentKey, playbackLogValueV3,
+				"requested_file_id", file.ID, "alternate_file_id", alternate.ID,
+				"candidate_id", virtualResultCandidateID(altResolved.URI))
+			return altResolved, nil
+		}
+		if altErr != nil {
+			// A confirmed-dead version is indicted so a later start skips it;
+			// an empty listing or provider outage is transient and only
+			// advances the walk.
+			h.stampStartVirtualCandidateFailed(walkCtx, alternate, altErr)
+		}
+	}
+	return resolved, resolveErr
+}
+
+// virtualStartVersionFallbackEligibleV3 is the cross-version fallback gate,
+// mirroring the planning-time alternate hunt: the client must allow alternate
+// versions, the quality preference must not pin the exact release, and the
+// request must not be an explicit version pick the viewer chose.
+func virtualStartVersionFallbackEligibleV3(req playback.StartRequestV3) bool {
+	return req.AllowsAlternateVersions() &&
+		shouldTryAlternateFileV3(req.QualityPreference) &&
+		req.FileSelection != playback.FileSelectionExplicitV3
 }
 
 // prepareVirtualAlternateFileV3 resolves an alternate candidate row into the

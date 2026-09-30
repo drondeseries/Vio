@@ -189,6 +189,14 @@ func providerOutageRelistFromContext(ctx context.Context) bool {
 	return relist
 }
 
+// ProviderOutageRelistFromContext is the exported read counterpart of
+// WithProviderOutageRelist, for callers in other packages (handler tests that
+// pin the user-relink seam). It reports whether ctx was marked as an outage
+// re-list.
+func ProviderOutageRelistFromContext(ctx context.Context) bool {
+	return providerOutageRelistFromContext(ctx)
+}
+
 // autoProfileFallbackContextKey marks a resolve whose quality profile was
 // selected by the server or the client's automatic best-match logic rather than
 // an explicit user version pick. A zero-match against an auto-picked profile
