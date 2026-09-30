@@ -1209,6 +1209,24 @@ func TestClassifyVirtualReplanExhaustionLimitProviderUnavailableIsNotCapacityV3(
 	}
 }
 
+// A route-capacity denial keeps the resolver's reason so the client and the
+// logs agree: the admission stage alone cannot distinguish a full route from a
+// concurrency limit.
+func TestClassifyVirtualReplanExhaustionRouteCapacityKeepsResolverReasonV3(t *testing.T) {
+	cause := errors.New("candidate 42 replacement admission denied: route_capacity_unavailable")
+	transportErr := classifyVirtualReplanExhaustionV3(nil, []*candidateErrorV3{{
+		Stage:   candidateStageAdmission,
+		Message: "candidate 42 replacement admission denied",
+		Err:     cause,
+	}})
+	if transportErr == nil {
+		t.Fatal("expected a transport error")
+	}
+	if transportErr.reason != "route_capacity_unavailable" || !transportErr.retryable {
+		t.Fatalf("classification = %#v, want retryable route_capacity_unavailable, not capacity_unavailable", transportErr)
+	}
+}
+
 func TestHandlePlaybackCapabilityV3AdvertisesTheFinalizedContract(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 

@@ -6457,8 +6457,16 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 				cause:     joinedErr,
 			}
 		case candidateStageAdmission:
+			// Surface the route-capacity reason the resolver named so the
+			// client and the logs agree: the candidate stage only says a
+			// remux route was unavailable, not why.
+			reason := "capacity_unavailable"
+			if cause := highestCandidate.Err; cause != nil &&
+				strings.Contains(cause.Error(), string(noderouting.OutcomeCapacityUnavailable)) {
+				reason = string(noderouting.OutcomeCapacityUnavailable)
+			}
 			return &transportErrorV3{
-				reason:    "capacity_unavailable",
+				reason:    reason,
 				message:   "No playback capacity is available for alternate versions.",
 				retryable: true,
 				cause:     joinedErr,

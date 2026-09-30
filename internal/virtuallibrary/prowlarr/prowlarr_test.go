@@ -365,6 +365,9 @@ func TestSearchURLRejectsMissingScheme(t *testing.T) {
 			if !strings.Contains(err.Error(), "scheme") {
 				t.Errorf("error %q does not name the missing scheme", err)
 			}
+			if c.Stale() {
+				t.Errorf("Stale() = true for scheme-less URL %q: a broken value must not mark the provider stale", base)
+			}
 		})
 	}
 }

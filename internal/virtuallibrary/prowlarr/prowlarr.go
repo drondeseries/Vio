@@ -668,7 +668,13 @@ func (c *prowlarrSearchClient) search(ctx context.Context, item monitoredMedia) 
 func (c *prowlarrSearchClient) Stale() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.url == "" || c.lastFetch.IsZero() || time.Since(c.lastFetch) >= c.interval
+	if strings.TrimSpace(c.url) == "" {
+		return false
+	}
+	if err := validateProwlarrBaseURL(c.url); err != nil {
+		return false
+	}
+	return c.lastFetch.IsZero() || time.Since(c.lastFetch) >= c.interval
 }
 
 func (c *prowlarrSearchClient) refreshIfStale(ctx context.Context) error {
