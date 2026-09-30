@@ -142,3 +142,18 @@ func (h *RealtimeHub) Send(sessionID string, message any) error {
 	lane.mu.Unlock()
 	return err
 }
+
+// PublishDownloadProgress builds and sends a download.progress event to the
+// active connection for a session. It is best-effort telemetry: a session with
+// no live connection (or a write failure) reports false and the caller keeps
+// playing. A malformed payload also reports false rather than panicking.
+func (h *RealtimeHub) PublishDownloadProgress(sessionID string, payload DownloadProgressPayload) bool {
+	if h == nil || sessionID == "" {
+		return false
+	}
+	event, err := NewDownloadProgressEvent(sessionID, payload)
+	if err != nil {
+		return false
+	}
+	return h.Send(sessionID, event) == nil
+}
