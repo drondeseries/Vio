@@ -38,6 +38,10 @@ import {
 } from "@/hooks/queries/settingValues";
 import { SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
 import { useWatchDetail } from "@/hooks/queries/items";
+import {
+  applyVersionAvailability,
+  useVersionLiveness,
+} from "@/hooks/queries/versionLiveness";
 import { catalogKeys } from "@/hooks/queries/keys";
 import { applyPlaybackProgressToCache } from "@/hooks/queries/playbackProgressCache";
 import { invalidatePlaybackSurfaceQueries } from "@/hooks/queries/playbackSurfaceRefresh";
@@ -599,6 +603,13 @@ function WatchPlaybackHostContent() {
   const isForeground = activeRequest != null && state.mode === "foreground";
   const requestKey = activeRequest?.requestKey ?? null;
 
+  // The watch detail carries the versions but not their liveness, so probe the
+  // server's catalog check here and stamp the verdict onto the rows the player
+  // menu renders. The check is a one-shot query cached for VERSION_LIVENESS_STALE_MS
+  // (the same read the item page already makes), not a poll: the server still
+  // drives any automatic re-listing after a dead source.
+  const versionLiveness = useVersionLiveness(activeItem?.versions ?? [], !!activeItem);
+
   const playerConfig = useMemo<PlayerConfig>(
     () => ({
       apiBaseUrl: "/api/v2",
@@ -1011,9 +1022,16 @@ function WatchPlaybackHostContent() {
     ?.value as string | undefined;
   const maxBitrateKbps = effectivePlaybackSettings?.[SETTING_KEYS.PLAYBACK_MAX_BITRATE_KBPS]
     ?.value as number | null | undefined;
+  // Stamp the server's liveness verdict on the rows before they become player
+  // props. The player's version menu reads a row's health from `available`; the
+  // watch detail does not carry it, so without this the menu shows no health.
+  const itemForPlayer: WatchDetail = {
+    ...activeItem,
+    versions: applyVersionAvailability(activeItem.versions, versionLiveness),
+  };
   const watchPageProps = buildWatchPageProps({
     request: activeRequest,
-    item: activeItem,
+    item: itemForPlayer,
     currentProfile,
     seriesEpisodes,
     // Passed through verbatim: "original" and "auto" are distinct wire values

@@ -7,6 +7,7 @@ import { useVersionListRefresh, REFRESH_VERSIONS_ERROR } from "@/hooks/useVersio
 import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
 import { resolveActiveQualityOptionId } from "../playback-info";
+import { deriveVersionHealth } from "@/lib/versionHealth";
 import type { PlayerIndexerRelease, QualityOption } from "../types";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
 import { serverRankingFromVersions } from "@/pages/ItemDetail/components/versionFormatUtils";
@@ -312,6 +313,7 @@ export function QualityMenu({
                     {orderedVersions.map((v, versionIndex) => {
                       const idx = versionRowStart + versionIndex;
                       const statusLabels = buildVersionStatusLabels(v);
+                      const health = versionHealthOf(v);
                       const hasFormatScore =
                         typeof v.formatScore === "number" && v.formatScore !== 0;
                       const detailLine = v.detail || v.releaseName;
@@ -362,10 +364,13 @@ export function QualityMenu({
                                 {statusLabels.map((status) => (
                                   <span
                                     key={status}
+                                    title={health && health.label === status ? health.title : undefined}
                                     className={`rounded border border-white/15 px-1.5 py-0.5 text-[10px] leading-none ${
-                                      status === "Failed"
+                                      health && health.label === status && health.tone === "danger"
                                         ? "border-red-500/30 bg-red-500/20 text-red-400"
-                                        : status === "Will retry on play"
+                                        : health &&
+                                            health.label === status &&
+                                            health.tone === "warn"
                                           ? "border-amber-500/30 bg-amber-500/15 text-amber-400"
                                           : "bg-white/10 text-white/70"
                                     }`}
@@ -472,13 +477,25 @@ export function buildVersionStatusLabels(version: VersionInfo): string[] {
   if (version.isRequestedSource && !version.isCurrentSource) {
     labels.push("Requested");
   }
-  if (version.failed) {
-    labels.push("Failed");
-  }
-  if (version.unavailable) {
-    labels.push("Will retry on play");
+  // One health badge, chosen by the server: a failed candidate takes precedence
+  // over the liveness verdict. Both come from server-published state only.
+  const health = versionHealthOf(version);
+  if (health) {
+    labels.push(health.label);
   }
   return labels;
+}
+
+/**
+ * Adapts the menu's `VersionInfo` onto the shared health derivation. The menu
+ * models the liveness verdict as `unavailable` (the inverse of the server's
+ * `available`), so map it back without inventing a second server flag.
+ */
+function versionHealthOf(version: VersionInfo) {
+  return deriveVersionHealth({
+    failed: version.failed,
+    available: version.unavailable === true ? false : undefined,
+  });
 }
 
 interface VersionRefreshRowProps {
