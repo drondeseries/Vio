@@ -227,6 +227,16 @@ func virtualStoredURLNeedsSignedRefresh(row *models.MediaFile, now time.Time) bo
 	return row != nil && row.ResolvedURLExpiresAt != nil && !now.Before(*row.ResolvedURLExpiresAt)
 }
 
+// virtualResolvedURLExpired reports whether a resolved virtual candidate's
+// stored URL has already lapsed. A zero expiry means the provider declared no
+// lifetime, so the URL never needs a pre-emptive refresh. It is the
+// resolved-URL counterpart of virtualStoredURLNeedsSignedRefresh: the row check
+// gates a relist, while this gate lets a probe or seek renew the URL in hand
+// before it spends its budget on a dead token.
+func virtualResolvedURLExpired(expiresAt time.Time, now time.Time) bool {
+	return !expiresAt.IsZero() && !now.Before(expiresAt)
+}
+
 // virtualResolveContextWithPersistedTrust threads the row's durable identity
 // and, when the row is inside the trust window, marks the resolve as allowed to
 // keep trusting that persisted same-identity candidate even when the provider's
