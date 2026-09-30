@@ -200,6 +200,24 @@ func (s *Monitor) ConfigureAltmount(baseURL, apiKey string, intervalMinutes int,
 	return s.monitor.configureAltmount(baseURL, apiKey, intervalMinutes, indexFile)
 }
 
+// SetReleaseConfirmedObserver installs a callback invoked once per AltMount
+// release key when AltMount first reports that release completed. It is the
+// push signal a cache handoff listens for so an in-session handoff can react to
+// a fill that finished during playback without polling the provider. A nil
+// callback clears it.
+func (s *Monitor) SetReleaseConfirmedObserver(fn altmount.ReleaseConfirmationObserver) {
+	if s == nil || s.monitor == nil {
+		return
+	}
+	s.monitor.mu.Lock()
+	s.monitor.confirmObserver = fn
+	client := s.monitor.altmount
+	s.monitor.mu.Unlock()
+	if client != nil {
+		client.SetConfirmObserver(fn)
+	}
+}
+
 // SearchMonitoredReleases performs an on-demand Prowlarr search for one
 // monitored title. It returns an error when Prowlarr is unwired so the caller
 // can degrade to an altmount-only result instead of treating it as no match.
@@ -310,6 +328,10 @@ type mediaMonitor struct {
 	altmount     *altmountStateClient
 	registered   map[string]struct{}
 	releaseStore *release.ReleaseStore
+	// confirmObserver forwards AltMount's once-per-release completion signal to
+	// a cache-handoff listener. It is kept here so a later reconfigure re-applies
+	// it to the (re)created client.
+	confirmObserver altmount.ReleaseConfirmationObserver
 	// cursor is the key of the last item whose evaluation completed in a
 	// partial pass. It is persisted with the queue so the next pass resumes
 	// instead of restarting from the front.
@@ -379,8 +401,12 @@ func (m *mediaMonitor) configureAltmount(baseURL, apiKey string, intervalMinutes
 	if m.altmount == nil {
 		m.altmount = altmount.New(nil)
 	}
+	observer := m.confirmObserver
 	m.mu.Unlock()
 	m.altmount.Configure(baseURL, apiKey, intervalMinutes)
+	// Re-apply a listener installed before the client existed; loading the
+	// persisted state must not drop it.
+	m.altmount.SetConfirmObserver(observer)
 	return m.altmount.ConfigureIndexFile(indexFile)
 }
 

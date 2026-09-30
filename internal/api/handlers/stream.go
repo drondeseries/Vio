@@ -32,6 +32,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/altmount"
 )
 
 const (
@@ -116,6 +117,23 @@ type StreamHandler struct {
 	// expired. Nil disables the refresh; the resolve still lists as before.
 	VirtualFileSaver         VirtualFileSaver
 	VirtualFileMetadataSaver VirtualFileMetadataSaver
+	// VirtualReleaseCacheStatus reports whether a pinned release already has a
+	// cached copy in AltMount. known=false, or a nil probe, preserves today's
+	// serve behavior: the session streams the provider source and no handoff is
+	// attempted.
+	VirtualReleaseCacheStatus VirtualReleaseCacheStatusFunc
+	// VirtualReleaseCacheFiller starts (or joins) a provider-side cache fill for
+	// an uncached pinned release. Pressing play on an uncached release calls it;
+	// the provider fetches the media, Vio only serves the addon URL. Nil
+	// disables play-triggered fills while leaving remote streaming intact.
+	VirtualReleaseCacheFiller VirtualReleaseCacheFillFunc
+	// DownloadProgress delivers download.progress events to a live session.
+	// *playback.RealtimeHub implements it. Nil disables the push.
+	DownloadProgress DownloadProgressPublisher
+	// cacheWaiters indexes the live sessions streaming an uncached pinned
+	// release, so the monitor's release-confirmed signal can hand each off to
+	// its cached copy. See HandleVirtualReleaseConfirmed.
+	cacheWaiters virtualCacheHandoffRegistry
 	// RemoteStreamRelay pins the resolved provider URL to a loopback relay
 	// so ffmpeg reads through it with a stable IP.
 	RemoteStreamRelay *remotestream.Relay
@@ -225,19 +243,338 @@ func (h *StreamHandler) commitRotatedVirtualSessionSource(ctx context.Context, s
 			"component", "api", "session", sessionID, "virtual_uri", resolved.URI, "error", err)
 		return
 	}
-	// Associate the session with the rotated release's catalog row before
-	// publishing. The plan's MediaFileID still names the release the plan was
-	// built with, so notifiers that look sessions up by the new file id (marker
-	// and subtitle events) would otherwise miss this session. The manager keeps
-	// RequestedMediaFileID untouched.
+	h.afterVirtualSourceCommit(ctx, sessionID, resolved)
+}
+
+// afterVirtualSourceCommit performs the bookkeeping shared by every binding
+// move: associate the session with the committed release's catalog row, then
+// publish the new effective version. The plan's MediaFileID still names the
+// release the plan was built with, so notifiers that look sessions up by the
+// new file id (marker and subtitle events) would otherwise miss this session.
+// The manager keeps RequestedMediaFileID untouched. The publish is detached: it
+// reads the catalog for the new release's declared inventory and must not delay
+// the media response that is about to serve.
+func (h *StreamHandler) afterVirtualSourceCommit(ctx context.Context, sessionID string, resolved ResolvedVirtualMedia) {
 	h.associateEffectiveMediaFile(ctx, sessionID, resolved.URI)
-	// Publish the new effective version the moment the binding moves, before
-	// any replan, so the client re-keys its menus to the streamed release while
-	// the background probe's inventory poll upgrades the declared tracks. The
-	// publish is detached: it reads the catalog for the new release's declared
-	// inventory, and that must not delay the media response that is about to
-	// serve.
 	h.publishSourceCommittedAsync(ctx, sessionID)
+}
+
+// virtualSessionGenerationBinder is the generation-fenced binding surface.
+// *playback.SessionManager implements it; the narrow interface keeps the
+// handoff optional for minimal/test managers.
+type virtualSessionGenerationBinder interface {
+	VirtualSourceGeneration(sessionID string) (uint64, error)
+	SetVirtualSourceIfGeneration(sessionID string, expectedGeneration uint64, virtualURI string, ownerInstallationID int) (uint64, bool, error)
+}
+
+// virtualSourceGeneration captures the session's candidate-binding generation
+// so a handoff that re-lists before committing can detect a newer binding move.
+// A manager without the surface reports false, and the handoff falls back to the
+// best-effort rotation commit.
+func (h *StreamHandler) virtualSourceGeneration(sessionID string) (uint64, bool) {
+	if binder, ok := h.sessionMgr.(virtualSessionGenerationBinder); ok {
+		if generation, err := binder.VirtualSourceGeneration(sessionID); err == nil {
+			return generation, true
+		}
+	}
+	return 0, false
+}
+
+// commitHandoffVirtualSessionSource rebinds a session to the cached copy of the
+// release it is already pinned to. When a binding generation was captured it is
+// enforced, so a handoff that resolved its replacement before a newer binding
+// move is a benign no-op rather than a clobber. Without a generation-capable
+// manager it falls back to the best-effort rotation commit.
+func (h *StreamHandler) commitHandoffVirtualSessionSource(ctx context.Context, sessionID string, expectedGeneration uint64, expectedSet bool, resolved ResolvedVirtualMedia) bool {
+	if h == nil || resolved.URI == "" {
+		return false
+	}
+	if binder, ok := h.sessionMgr.(virtualSessionGenerationBinder); ok && expectedSet {
+		if _, applied, err := binder.SetVirtualSourceIfGeneration(sessionID, expectedGeneration, resolved.URI, resolved.OwnerID); err != nil {
+			slog.WarnContext(ctx, "cache handoff: failed to rebind virtual session",
+				"component", "api", "session", sessionID, "virtual_uri", resolved.URI, "error", err)
+			return false
+		} else if !applied {
+			return false
+		}
+		h.afterVirtualSourceCommit(ctx, sessionID, resolved)
+		return true
+	}
+	h.commitRotatedVirtualSessionSource(ctx, sessionID, resolved)
+	return true
+}
+
+// VirtualReleaseCacheStatusFunc reports whether a release already has a cached
+// copy, looked up by its provider-neutral virtual URI. known=false means the
+// provider could not be consulted and the caller must not change behavior.
+type VirtualReleaseCacheStatusFunc func(ctx context.Context, virtualURI string, ownerInstallationID int) (cached bool, known bool)
+
+// VirtualReleaseCacheFillFunc starts (or joins) a provider-side cache fill for
+// one pinned release. The implementation resolves and requests the addon URL;
+// the handler never fetches media. report is called with progress until the fill
+// completes or fails and must remain safe to call after the fill returns.
+type VirtualReleaseCacheFillFunc func(ctx context.Context, virtualURI string, ownerInstallationID int, report func(playback.DownloadProgressPayload)) error
+
+// FillVirtualReleaseCache adapts the function to a nil-checkable value.
+func (f VirtualReleaseCacheFillFunc) FillVirtualReleaseCache(ctx context.Context, virtualURI string, ownerInstallationID int, report func(playback.DownloadProgressPayload)) error {
+	if f == nil {
+		return errors.New("virtual release cache filler is not configured")
+	}
+	return f(ctx, virtualURI, ownerInstallationID, report)
+}
+
+// DownloadProgressPublisher delivers download.progress events to a live
+// playback session. *playback.RealtimeHub implements it. Nil disables the push.
+type DownloadProgressPublisher interface {
+	PublishDownloadProgress(sessionID string, payload playback.DownloadProgressPayload) bool
+}
+
+const (
+	// virtualCacheFillBudget bounds a detached play-triggered cache fill so a
+	// provider that never finishes cannot hold the goroutine forever. A fill
+	// that outlives it is reported failed; playback already continued on the
+	// remote source.
+	virtualCacheFillBudget = 30 * time.Minute
+	// virtualCacheHandoffBudget bounds one release-confirmed handoff reaction.
+	virtualCacheHandoffBudget = 30 * time.Second
+)
+
+// virtualCacheHandoffWaiter is a live session streaming an uncached pinned
+// release. It is registered at serve start and removed when the transport ends,
+// so a later release-confirmation only reaches sessions still playing.
+type virtualCacheHandoffWaiter struct {
+	sessionID  string
+	fileID     int
+	releaseKey string
+	ownerID    int
+}
+
+// virtualCacheHandoffRegistry indexes waiters by normalized release key. The
+// zero value is usable; the map is created lazily.
+type virtualCacheHandoffRegistry struct {
+	mu        sync.Mutex
+	byRelease map[string]map[string]virtualCacheHandoffWaiter
+}
+
+// register adds a waiter and returns a function that removes it. A waiter with
+// no session or release key is not registered and its release function is a
+// no-op.
+func (r *virtualCacheHandoffRegistry) register(w virtualCacheHandoffWaiter) func() {
+	if r == nil || w.sessionID == "" || w.releaseKey == "" {
+		return func() {}
+	}
+	r.mu.Lock()
+	if r.byRelease == nil {
+		r.byRelease = make(map[string]map[string]virtualCacheHandoffWaiter)
+	}
+	sessions := r.byRelease[w.releaseKey]
+	if sessions == nil {
+		sessions = make(map[string]virtualCacheHandoffWaiter)
+		r.byRelease[w.releaseKey] = sessions
+	}
+	sessions[w.sessionID] = w
+	r.mu.Unlock()
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		current := r.byRelease[w.releaseKey]
+		if current == nil {
+			return
+		}
+		delete(current, w.sessionID)
+		if len(current) == 0 {
+			delete(r.byRelease, w.releaseKey)
+		}
+	}
+}
+
+// forRelease returns the waiters for a release key. The caller must not mutate
+// the returned slice.
+func (r *virtualCacheHandoffRegistry) forRelease(releaseKey string) []virtualCacheHandoffWaiter {
+	if r == nil || releaseKey == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sessions := r.byRelease[releaseKey]
+	if len(sessions) == 0 {
+		return nil
+	}
+	out := make([]virtualCacheHandoffWaiter, 0, len(sessions))
+	for _, w := range sessions {
+		out = append(out, w)
+	}
+	return out
+}
+
+// virtualHandoffReleaseKey returns the normalized release identity that keys the
+// cache-handoff registry for a serving session. A row without a persisted
+// release name cannot be matched to a provider completion signal, so it yields
+// "" and no handoff is attempted.
+func virtualHandoffReleaseKey(file *models.MediaFile, resolved ResolvedVirtualMedia) string {
+	if file != nil {
+		if key := altmount.ReleaseKey(file.ProviderReleaseName); key != "" {
+			return key
+		}
+	}
+	return altmount.ReleaseKey(resolved.ProviderReleaseName)
+}
+
+// sameVirtualReleaseCandidate reports whether a resolved candidate id names the
+// same release the session is pinned to. An empty id on either side cannot be
+// compared, so it is treated as the same release; the durable-identity checks
+// elsewhere remain responsible for the release invariant.
+func sameVirtualReleaseCandidate(pinnedID, resolvedID string) bool {
+	if pinnedID == "" || resolvedID == "" {
+		return true
+	}
+	return pinnedID == resolvedID
+}
+
+// handoffVirtualSessionToCached re-resolves the exact release a session is
+// pinned to and rebinds the session to the cached copy. cachedConfirmed lets the
+// release-confirmed path skip the status probe it already answered. A resolve
+// that names a different release is refused so a cache handoff can never
+// silently switch releases; a stale binding generation is a benign no-op. The
+// returned cleanup must be released by the caller when non-nil.
+func (h *StreamHandler) handoffVirtualSessionToCached(ctx context.Context, session *playback.Session, file *models.MediaFile, cachedConfirmed bool) (ResolvedVirtualMedia, func(), bool, error) {
+	if h == nil || session == nil || file == nil || !isVirtualPlaybackFile(file) || !hasVirtualMediaResolver(h) {
+		return ResolvedVirtualMedia{}, nil, false, nil
+	}
+	if !cachedConfirmed {
+		if h.VirtualReleaseCacheStatus == nil {
+			// Without a cache probe there is no way to tell the cached copy
+			// from the remote one, so today's behavior is preserved.
+			return ResolvedVirtualMedia{}, nil, false, nil
+		}
+		if cached, known := h.VirtualReleaseCacheStatus(ctx, file.FilePath, effectiveVirtualOwner(0, file.VirtualOwnerInstallationID)); !known || !cached {
+			return ResolvedVirtualMedia{}, nil, false, nil
+		}
+	}
+	generation, generationSet := h.virtualSourceGeneration(session.ID)
+	pinnedID := virtualResultCandidateID(file.FilePath)
+	// forceRefresh lists afresh so the provider reports its now-cached URL; a
+	// plain re-resolve could serve the stored (remote) URL again.
+	resolved, cleanup, err := h.resolveVirtualInputURIExcluding(ctx, file, session.UserID, session.ProfileID, true, nil, false)
+	if err != nil {
+		return ResolvedVirtualMedia{}, nil, false, err
+	}
+	if !sameVirtualReleaseCandidate(pinnedID, resolved.CandidateID) {
+		if cleanup != nil {
+			cleanup()
+		}
+		return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff resolved candidate %q for pinned candidate %q; refusing a release swap", resolved.CandidateID, pinnedID)
+	}
+	if !h.commitHandoffVirtualSessionSource(ctx, session.ID, generation, generationSet, resolved) {
+		if cleanup != nil {
+			cleanup()
+		}
+		return ResolvedVirtualMedia{}, nil, false, nil
+	}
+	return resolved, cleanup, true, nil
+}
+
+// HandleVirtualReleaseConfirmed reacts to AltMount first reporting a release
+// completed. It finds live sessions still streaming that release and hands each
+// off to the cached copy, preserving the session's virtual pin and stream
+// timeline. It matches the altmount.ReleaseConfirmationObserver signature so a
+// monitor can be wired to it directly. Best-effort and bounded: an unknown
+// release, a session that already moved on, or a resolve failure is logged and
+// never disrupts playback.
+func (h *StreamHandler) HandleVirtualReleaseConfirmed(releaseKey string) {
+	if h == nil || strings.TrimSpace(releaseKey) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), virtualCacheHandoffBudget)
+	defer cancel()
+	for _, waiter := range h.cacheWaiters.forRelease(releaseKey) {
+		session, err := h.sessionMgr.GetSession(waiter.sessionID)
+		if err != nil || session == nil {
+			continue
+		}
+		file, err := h.fileResolver.GetByID(ctx, waiter.fileID)
+		if err != nil || file == nil {
+			continue
+		}
+		file = bindSessionVirtualSource(file, session)
+		resolved, cleanup, applied, handoffErr := h.handoffVirtualSessionToCached(ctx, session, file, true)
+		if handoffErr != nil {
+			slog.WarnContext(ctx, "cache handoff failed for confirmed release",
+				"component", "api", "session", waiter.sessionID, "file_id", waiter.fileID,
+				"release_key", releaseKey, "status", "handoff_failed",
+				"error", logredact.SanitizeURLError(handoffErr))
+			continue
+		}
+		if applied {
+			if cleanup != nil {
+				cleanup()
+			}
+			h.reportDownloadProgress(waiter.sessionID, waiter.fileID, releaseKey, playback.DownloadProgressPayload{
+				State:   playback.DownloadProgressStateCompleted,
+				Message: "cached copy is now servable",
+			})
+			slog.InfoContext(ctx, "cache handoff rebound session to the cached copy",
+				"component", "api", "session", waiter.sessionID, "file_id", waiter.fileID,
+				"release_key", releaseKey, "status", "handed_off", "virtual_uri", resolved.URI)
+		}
+	}
+}
+
+// beginVirtualCacheHandoff registers a session streaming a pinned release for a
+// later release-confirmation handoff and, when a filler is wired, asks the
+// provider to start a cache fill while streaming download.progress. It returns a
+// release function the caller defers so the registration is dropped when the
+// transport ends. The fill is detached and bounded: the caller keeps streaming
+// the remote source and never blocks on it, and a fill that cannot start is
+// reported failed rather than hanging.
+func (h *StreamHandler) beginVirtualCacheHandoff(ctx context.Context, session *playback.Session, file *models.MediaFile, resolved ResolvedVirtualMedia) func() {
+	if h == nil || session == nil || file == nil {
+		return func() {}
+	}
+	releaseKey := virtualHandoffReleaseKey(file, resolved)
+	if releaseKey == "" {
+		return func() {}
+	}
+	ownerID := effectiveVirtualOwner(resolved.OwnerID, file.VirtualOwnerInstallationID)
+	release := h.cacheWaiters.register(virtualCacheHandoffWaiter{
+		sessionID:  session.ID,
+		fileID:     file.ID,
+		releaseKey: releaseKey,
+		ownerID:    ownerID,
+	})
+	if h.VirtualReleaseCacheFiller == nil {
+		return release
+	}
+	filler := h.VirtualReleaseCacheFiller
+	sessionID, fileID := session.ID, file.ID
+	virtualURI := resolved.URI
+	h.reportDownloadProgress(sessionID, fileID, releaseKey, playback.DownloadProgressPayload{State: playback.DownloadProgressStateQueued})
+	go func() {
+		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualCacheFillBudget)
+		defer cancel()
+		err := filler.FillVirtualReleaseCache(fillCtx, virtualURI, ownerID, func(progress playback.DownloadProgressPayload) {
+			h.reportDownloadProgress(sessionID, fileID, releaseKey, progress)
+		})
+		if err != nil {
+			h.reportDownloadProgress(sessionID, fileID, releaseKey, playback.DownloadProgressPayload{
+				State:   playback.DownloadProgressStateFailed,
+				Message: "cache fill could not start; continuing from the provider",
+			})
+		}
+	}()
+	return release
+}
+
+// reportDownloadProgress sends one download.progress event, best-effort.
+func (h *StreamHandler) reportDownloadProgress(sessionID string, fileID int, releaseKey string, progress playback.DownloadProgressPayload) {
+	if h == nil || h.DownloadProgress == nil || sessionID == "" {
+		return
+	}
+	progress.FileID = fileID
+	if progress.ReleaseID == "" {
+		progress.ReleaseID = releaseKey
+	}
+	h.DownloadProgress.PublishDownloadProgress(sessionID, progress)
 }
 
 // associateEffectiveMediaFile points the live session at the catalog row of the
@@ -676,6 +1013,9 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	inputPath := file.FilePath
 	deliveredPath := ""
 	releaseInput := func() {}
+	// releaseCacheHandoff drops the session's cache-handoff registration when
+	// the transport ends. It is a no-op for a non-virtual source.
+	releaseCacheHandoff := func() {}
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if resolveErr != nil && (errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) || errors.Is(resolveErr, ErrVirtualCandidateMarkedFailed)) {
@@ -726,7 +1066,13 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		inputPath = resolved.URL
 		deliveredPath = resolvedVirtualCandidatePath(resolved)
 		releaseInput = cleanup
+		// A pinned release streaming from the provider is a candidate for a
+		// cache handoff: pressing play asks the provider to fill its cache (Vio
+		// never fetches the media) and, when the fill completes, the session is
+		// rebound to the cached copy without changing the release.
+		releaseCacheHandoff = h.beginVirtualCacheHandoff(r.Context(), session, file, resolved)
 	}
+	defer releaseCacheHandoff()
 	defer func() {
 		if releaseInput != nil {
 			releaseInput()
@@ -790,48 +1136,75 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						releaseInput()
 						releaseInput = nil
 					}
-					// The pinned candidate served no bytes (corrupted NZB, dead
-					// provider URL). Mark it failed and re-resolve with it
-					// excluded so the next-ranked release is tried.
-					failedID := virtualResultCandidateID(deliveredPath)
-					if failedID != "" {
-						h.markVirtualCandidateFailed(r.Context(), file, failedID)
-					}
-					excluded := []string{failedID}
-					if failedID == "" {
-						excluded = nil
-					}
-					// The retry is only reached because this serve layer just
-					// indicted the delivered candidate (failedID non-empty) and
-					// excluded it; declare substitution so the resolver may
-					// serve a sibling. A retry with no indictment (failedID
-					// empty) keeps refusing.
-					refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded, failedID != "")
-					if refreshErr == nil {
-						expectedCandidateID := ""
-						if parsed, err := url.Parse(file.FilePath); err == nil {
-							expectedCandidateID = parsed.Query().Get("result")
-						}
-						// A failed pin this serve layer just marked is an
-						// intended substitution: the retry excluded that id, so
-						// it can only return a sibling. The guard exists to stop
-						// a *silent* swap of a live candidate, so it only applies
-						// when no failed candidate was identified.
-						if failedID == "" && expectedCandidateID != "" && refreshedMedia.CandidateID != "" && refreshedMedia.CandidateID != expectedCandidateID {
-							if refreshCleanup != nil {
-								refreshCleanup()
+					// A pinned release that already has a cached copy heals by
+					// handing off to it: the failed fetch was the remote
+					// provider, not the release, so the release is never
+					// indicted. This runs before the sibling-rotation path so a
+					// cache-aware heal never silently switches releases; when no
+					// cached copy exists the existing rotation is unchanged.
+					handoffAttempted := false
+					if healedResolved, healCleanup, healedOK, _ := h.handoffVirtualSessionToCached(r.Context(), session, file, false); healedOK {
+						handoffAttempted = true
+						healed := false
+						if healedURL, parseErr := url.Parse(healedResolved.URL); parseErr == nil && healedURL.Scheme == "http" {
+							healedHost := healedURL.Hostname()
+							if healedHost == "127.0.0.1" || healedHost == "::1" || healedHost == "[::1]" {
+								targetURL = healedURL
+								deliveredPath = resolvedVirtualCandidatePath(healedResolved)
+								releaseInput = healCleanup
+								lastProxyErr = nil
+								proxy.ServeHTTP(streamWriter, r)
+								healed = true
 							}
-							lastProxyErr = fmt.Errorf("refreshed candidate %q does not match pinned candidate %q", refreshedMedia.CandidateID, expectedCandidateID)
-						} else {
-							releaseInput = refreshCleanup
-							refreshedURL, parseErr := url.Parse(refreshedMedia.URL)
-							if parseErr == nil && refreshedURL.Scheme == "http" {
-								refreshedHost := refreshedURL.Hostname()
-								if refreshedHost == "127.0.0.1" || refreshedHost == "::1" || refreshedHost == "[::1]" {
-									targetURL = refreshedURL
-									deliveredPath = resolvedVirtualCandidatePath(refreshedMedia)
-									lastProxyErr = nil
-									proxy.ServeHTTP(streamWriter, r)
+						}
+						if !healed && healCleanup != nil {
+							healCleanup()
+						}
+					}
+					if !handoffAttempted {
+						// The pinned candidate served no bytes (corrupted NZB, dead
+						// provider URL). Mark it failed and re-resolve with it
+						// excluded so the next-ranked release is tried.
+						failedID := virtualResultCandidateID(deliveredPath)
+						if failedID != "" {
+							h.markVirtualCandidateFailed(r.Context(), file, failedID)
+						}
+						excluded := []string{failedID}
+						if failedID == "" {
+							excluded = nil
+						}
+						// The retry is only reached because this serve layer just
+						// indicted the delivered candidate (failedID non-empty) and
+						// excluded it; declare substitution so the resolver may
+						// serve a sibling. A retry with no indictment (failedID
+						// empty) keeps refusing.
+						refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded, failedID != "")
+						if refreshErr == nil {
+							expectedCandidateID := ""
+							if parsed, err := url.Parse(file.FilePath); err == nil {
+								expectedCandidateID = parsed.Query().Get("result")
+							}
+							// A failed pin this serve layer just marked is an
+							// intended substitution: the retry excluded that id, so
+							// it can only return a sibling. The guard exists to stop
+							// a *silent* swap of a live candidate, so it only applies
+							// when no failed candidate was identified.
+							if failedID == "" && expectedCandidateID != "" && refreshedMedia.CandidateID != "" && refreshedMedia.CandidateID != expectedCandidateID {
+								if refreshCleanup != nil {
+									refreshCleanup()
+								}
+								lastProxyErr = fmt.Errorf("refreshed candidate %q does not match pinned candidate %q", refreshedMedia.CandidateID, expectedCandidateID)
+							} else {
+								releaseInput = refreshCleanup
+								refreshedURL, parseErr := url.Parse(refreshedMedia.URL)
+								if parseErr == nil && refreshedURL.Scheme == "http" {
+									refreshedHost := refreshedURL.Hostname()
+									if refreshedHost == "127.0.0.1" || refreshedHost == "::1" || refreshedHost == "[::1]" {
+										targetURL = refreshedURL
+										deliveredPath = resolvedVirtualCandidatePath(refreshedMedia)
+										lastProxyErr = nil
+										proxy.ServeHTTP(streamWriter, r)
+									}
 								}
 							}
 						}
@@ -919,49 +1292,73 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// client that disconnected is not a candidate failure: the remux
 			// (and its provider fetch) already aborted on the request context.
 			if !isClientCancellation(r.Context(), remuxErr) && isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
-				failedID := virtualResultCandidateID(deliveredPath)
-				if failedID != "" {
-					h.markVirtualCandidateFailed(r.Context(), file, failedID)
-				}
 				if releaseInput != nil {
 					releaseInput()
 					releaseInput = nil
 				}
-				excluded := []string{failedID}
-				if failedID == "" {
-					excluded = nil
-				}
-				// The remux failed because this serve layer just indicted the
-				// delivered candidate; declare substitution so the resolver may
-				// serve a sibling release. A retry with no indictment keeps
-				// refusing.
-				retried, retryCleanup, retryErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded, failedID != "")
-				if retryErr == nil {
-					// Same pinned-candidate guard direct play has: a retry that
-					// resolved a different release than the session-bound pin
-					// must not silently swap the bytes mid-stream. A failed pin
-					// this serve layer just marked is an intended substitution
-					// (the retry excluded it, so it can only return a sibling),
-					// so the guard applies only when no failed candidate was
-					// identified.
-					expectedCandidateID := ""
-					if parsed, err := url.Parse(file.FilePath); err == nil {
-						expectedCandidateID = parsed.Query().Get("result")
-					}
-					if failedID == "" && expectedCandidateID != "" && retried.CandidateID != "" && retried.CandidateID != expectedCandidateID {
-						if retryCleanup != nil {
-							retryCleanup()
+				// Cache-aware heal first: a cached copy of the pinned release
+				// heals the failure without indicting the release. Only when no
+				// cached copy exists does the existing rotation-to-a-sibling
+				// path run, so a cache-aware heal never silently changes the
+				// release.
+				handled := false
+				if healedResolved, healCleanup, healedOK, _ := h.handoffVirtualSessionToCached(r.Context(), session, file, false); healedOK {
+					handled = true
+					if healedURL, parseErr := url.Parse(healedResolved.URL); parseErr == nil && healedURL.Scheme == "http" {
+						healedHost := healedURL.Hostname()
+						if healedHost == "127.0.0.1" || healedHost == "::1" || healedHost == "[::1]" {
+							inputPath = healedResolved.URL
+							deliveredPath = resolvedVirtualCandidatePath(healedResolved)
+							releaseInput = healCleanup
+							remuxErr = serveRemux()
+						} else if healCleanup != nil {
+							healCleanup()
 						}
-						remuxErr = fmt.Errorf("retried candidate %q does not match pinned candidate %q", retried.CandidateID, expectedCandidateID)
-					} else {
-						releaseInput = retryCleanup
-						retryURL, parseErr := url.Parse(retried.URL)
-						if parseErr == nil && retryURL.Scheme == "http" {
-							retryHost := retryURL.Hostname()
-							if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
-								inputPath = retried.URL
-								deliveredPath = resolvedVirtualCandidatePath(retried)
-								remuxErr = serveRemux()
+					} else if healCleanup != nil {
+						healCleanup()
+					}
+				}
+				if !handled {
+					failedID := virtualResultCandidateID(deliveredPath)
+					if failedID != "" {
+						h.markVirtualCandidateFailed(r.Context(), file, failedID)
+					}
+					excluded := []string{failedID}
+					if failedID == "" {
+						excluded = nil
+					}
+					// The remux failed because this serve layer just indicted the
+					// delivered candidate; declare substitution so the resolver may
+					// serve a sibling release. A retry with no indictment keeps
+					// refusing.
+					retried, retryCleanup, retryErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded, failedID != "")
+					if retryErr == nil {
+						// Same pinned-candidate guard direct play has: a retry that
+						// resolved a different release than the session-bound pin
+						// must not silently swap the bytes mid-stream. A failed pin
+						// this serve layer just marked is an intended substitution
+						// (the retry excluded it, so it can only return a sibling),
+						// so the guard applies only when no failed candidate was
+						// identified.
+						expectedCandidateID := ""
+						if parsed, err := url.Parse(file.FilePath); err == nil {
+							expectedCandidateID = parsed.Query().Get("result")
+						}
+						if failedID == "" && expectedCandidateID != "" && retried.CandidateID != "" && retried.CandidateID != expectedCandidateID {
+							if retryCleanup != nil {
+								retryCleanup()
+							}
+							remuxErr = fmt.Errorf("retried candidate %q does not match pinned candidate %q", retried.CandidateID, expectedCandidateID)
+						} else {
+							releaseInput = retryCleanup
+							retryURL, parseErr := url.Parse(retried.URL)
+							if parseErr == nil && retryURL.Scheme == "http" {
+								retryHost := retryURL.Hostname()
+								if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
+									inputPath = retried.URL
+									deliveredPath = resolvedVirtualCandidatePath(retried)
+									remuxErr = serveRemux()
+								}
 							}
 						}
 					}

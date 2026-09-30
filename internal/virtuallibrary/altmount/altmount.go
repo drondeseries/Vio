@@ -75,6 +75,29 @@ type altmountStateClient struct {
 	lastErr   error
 	state     altmountStateSnapshot
 	indexFile string
+	// confirmObserver is notified once per release key when AltMount first
+	// reports that release completed. It is the push signal a cache handoff
+	// listens for so it does not have to poll the provider.
+	confirmObserver ReleaseConfirmationObserver
+	// confirmedOnce records the release keys already reported to
+	// confirmObserver, so a steady completed state is announced once and not on
+	// every classification or refresh.
+	confirmedOnce map[string]struct{}
+}
+
+// ReleaseConfirmationObserver is notified once per release key when AltMount
+// first reports that release completed. The key is the same normalized release
+// identity classification matches on (see ReleaseKey). The callback runs inline
+// on the classification or refresh that discovered the transition, so it must
+// be quick and must not block; a listener that needs to do work should hand it
+// to a goroutine or a queue.
+type ReleaseConfirmationObserver func(releaseKey string)
+
+// ReleaseKey normalizes a release name to the comparable identity AltMount's
+// classification and history matching use. It is exported so a caller can key
+// a listener on the same identity without reimplementing the normalization.
+func ReleaseKey(value string) string {
+	return releaseNameKey(value)
 }
 
 // Client is the exported AltMount SABnzbd-history state client. It aliases
@@ -402,6 +425,7 @@ func (c *altmountStateClient) refresh(ctx context.Context) error {
 		return err
 	}
 	c.mu.Lock()
+	previousCompleted := c.state.Completed
 	merged := mergeAltmountSnapshots(c.state, incoming, time.Now())
 	c.state = merged
 	c.lastFetch = time.Now()
@@ -413,6 +437,10 @@ func (c *altmountStateClient) refresh(ctx context.Context) error {
 			return err
 		}
 	}
+	// Report the refresh's own uncached -> cached transitions. A serve may not
+	// happen for an already-playing session, so this is what lets a cache
+	// handoff react to a fill that completed during playback.
+	c.notifyConfirmed(newlyCompletedKeys(previousCompleted, merged.Completed)...)
 	return nil
 }
 
@@ -616,8 +644,27 @@ func (c *altmountStateClient) ClassifyCandidates(candidates []stream.StreamCandi
 	c.mu.Lock()
 	completed := c.state.Completed
 	failed := c.state.Failed
+	watchConfirmations := c.confirmObserver != nil
 	c.mu.Unlock()
+	confirmedKeys := make([]string, 0, len(candidates))
+	// The AltMount Stremio addon's "⚡ cached" badge is a free completion signal
+	// available even when the history API is unwired. The resolver applies it
+	// before classification on every serve; when a cache-handoff listener is
+	// installed, apply it here too so the badge-driven uncached -> cached
+	// transition is observed even though this classifier otherwise owns only the
+	// history state.
+	if watchConfirmations {
+		markAltmountBadgeCandidates(candidates)
+		for i := range candidates {
+			if candidates[i].SourceConfirmed {
+				if key := candidateReleaseName(candidates[i]); key != "" {
+					confirmedKeys = append(confirmedKeys, key)
+				}
+			}
+		}
+	}
 	if len(completed) == 0 && len(failed) == 0 {
+		c.notifyConfirmed(confirmedKeys...)
 		return
 	}
 	for i := range candidates {
@@ -628,12 +675,80 @@ func (c *altmountStateClient) ClassifyCandidates(candidates []stream.StreamCandi
 		if record, ok := completed[key]; ok && releaseSizesMatch(record.Size, candidates[i].FileSize) {
 			candidates[i].SourceConfirmed = true
 			adoptAltmountIdentity(&candidates[i], record)
+			confirmedKeys = append(confirmedKeys, key)
 			continue
 		}
 		if _, ok := failed[key]; ok {
 			candidates[i].SourceFailed = true
 		}
 	}
+	c.notifyConfirmed(confirmedKeys...)
+}
+
+// SetConfirmObserver installs (or clears, with nil) the callback invoked once
+// per release key when AltMount first reports that release completed. Clearing
+// the observer also resets the once-only bookkeeping so a later installation
+// starts fresh.
+func (c *altmountStateClient) SetConfirmObserver(fn ReleaseConfirmationObserver) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.confirmObserver = fn
+	if fn == nil {
+		c.confirmedOnce = nil
+	}
+	c.mu.Unlock()
+}
+
+// notifyConfirmed reports newly completed release keys to the observer exactly
+// once each. It is called with the client lock released and re-acquires it only
+// to update the once-only set, so a slow observer never blocks classification.
+func (c *altmountStateClient) notifyConfirmed(keys ...string) {
+	if c == nil || len(keys) == 0 {
+		return
+	}
+	c.mu.Lock()
+	observer := c.confirmObserver
+	if observer == nil {
+		c.mu.Unlock()
+		return
+	}
+	if c.confirmedOnce == nil {
+		c.confirmedOnce = make(map[string]struct{}, len(keys))
+	}
+	fresh := make([]string, 0, len(keys))
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, ok := c.confirmedOnce[key]; ok {
+			continue
+		}
+		c.confirmedOnce[key] = struct{}{}
+		fresh = append(fresh, key)
+	}
+	c.mu.Unlock()
+	for _, key := range fresh {
+		observer(key)
+	}
+}
+
+// newlyCompletedKeys returns the release keys present in current but absent
+// from previous, the uncached -> cached transition a refresh reports.
+func newlyCompletedKeys(previous, current map[string]altmountReleaseRecord) []string {
+	if len(current) == 0 {
+		return nil
+	}
+	fresh := make([]string, 0, len(current))
+	for key := range current {
+		if _, ok := previous[key]; ok {
+			continue
+		}
+		fresh = append(fresh, key)
+	}
+	return fresh
 }
 
 // altmountGUIDPrefix namespaces an AltMount release key used as a candidate's
