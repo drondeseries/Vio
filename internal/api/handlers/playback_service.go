@@ -464,7 +464,8 @@ type progressSideEffectLockEntry struct {
 	refs int
 }
 
-// progressSideEffectLock serializes progress side effects for one session.
+// progressSideEffectLock serializes per-session handler side effects (v2
+// progress persistence and inventory-updated publishes) for one session.
 //
 // The entry is reference-counted: the first acquire creates it, and the unlock
 // closure deletes it only when the last in-flight holder releases. The map is
@@ -1040,6 +1041,14 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 // a rotation, a re-probe, and a poll can never disagree about the tracks, the
 // effective identity, or the revision.
 func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, session *playback.Session) {
+	// Two background probes (a start-path repair and a virtual-evidence worker)
+	// can publish for the same session concurrently. Serialize the build and
+	// the send under the session's per-session lock so an older build cannot be
+	// delivered after a newer one for the same source identity: the revision is
+	// a content digest, so a replayed older revision is otherwise
+	// indistinguishable from a fresh state at the receiver.
+	release := h.progressSideEffectLock(session.ID)
+	defer release()
 	var record *playback.AttemptRecordV3
 	if h.PlanStoreV3 != nil {
 		if loaded, err := h.PlanStoreV3.GetAttempt(ctx, session.ID); err == nil {
