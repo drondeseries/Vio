@@ -36,6 +36,7 @@ import { preconnectToStreamOrigin } from "../stream-url";
 import { WatchTogetherPanel } from "./WatchTogetherPanel";
 import { readPlanInvalidatedPayload, VIDEO_PLAYBACK_COMMANDS } from "../realtime-protocol";
 import type {
+  PlaybackInventoryUpdatedPayload,
   PlaybackRealtimeCommandEnvelope,
   PlaybackRealtimeEventEnvelope,
   PlaybackSourceCommittedPayload,
@@ -276,6 +277,12 @@ interface VideoPlayerProps {
    * declared audio inventory, from the realtime `source_committed` event.
    */
   onSourceCommitted?: (payload: PlaybackSourceCommittedPayload) => void;
+  /**
+   * Adopts a live inventory revision from the realtime `inventory_updated`
+   * event: the committed identity, its audio list, and the complete subtitle
+   * inventory, folded into the menus without a replan.
+   */
+  onInventoryUpdated?: (payload: PlaybackInventoryUpdatedPayload) => void;
   audioTracks?: PlayerAudioTrack[];
   activeAudioIndex?: number;
   onAudioSelect?: (index: number, currentPosition: number) => void;
@@ -458,6 +465,7 @@ export function VideoPlayer({
   onRefreshSubtitles,
   onApplySubtitleTrack,
   onSourceCommitted,
+  onInventoryUpdated,
   audioTracks = [],
   activeAudioIndex = 0,
   onAudioSelect,
@@ -1823,6 +1831,16 @@ export function VideoPlayer({
           onSourceCommitted?.(event.payload);
           break;
         }
+        case "inventory_updated": {
+          // A live inventory revision — the probe landing, or a repaired list
+          // under the same source. Route it into the menus; the hook drops the
+          // push while a replacement switch owns the session, and treats a
+          // declared revision differently from verified probe evidence. A
+          // payload for another session is stale and ignored.
+          if (event.payload.session_id !== sessionId) break;
+          onInventoryUpdated?.(event.payload);
+          break;
+        }
         default:
           onRealtimeEvent?.(event);
       }
@@ -1832,6 +1850,7 @@ export function VideoPlayer({
       getSubtitleStartPosition,
       handleSubtitleSelect,
       onApplySubtitleTrack,
+      onInventoryUpdated,
       onRealtimeEvent,
       onRefreshSubtitles,
       onSourceCommitted,

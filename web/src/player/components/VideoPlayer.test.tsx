@@ -3285,6 +3285,42 @@ describe("VideoPlayer translation handoff", () => {
     expect(onSourceCommitted).not.toHaveBeenCalled();
   });
 
+  it("routes a live inventory update to the parent", () => {
+    const onInventoryUpdated = vi.fn();
+    renderPlayer({ onInventoryUpdated });
+    const payload = {
+      session_id: "session-1",
+      inventory_revision: "inv:abc",
+      inventory_status: "verified",
+      effective_media_file_id: 8,
+      audio_tracks: [{ language: "deu", codec: "eac3", default: true }],
+      subtitle_inventory: [],
+    };
+    act(() =>
+      realtimeOptions.current?.onEvent?.({
+        type: "event",
+        session_id: "session-1",
+        name: "inventory_updated",
+        payload,
+      }),
+    );
+    expect(onInventoryUpdated).toHaveBeenCalledExactlyOnceWith(payload);
+  });
+
+  it("ignores a live inventory update for another session", () => {
+    const onInventoryUpdated = vi.fn();
+    renderPlayer({ onInventoryUpdated });
+    act(() =>
+      realtimeOptions.current?.onEvent?.({
+        type: "event",
+        session_id: "other-session",
+        name: "inventory_updated",
+        payload: { session_id: "other-session", inventory_status: "verified" },
+      }),
+    );
+    expect(onInventoryUpdated).not.toHaveBeenCalled();
+  });
+
   it("reconciles a failure before the acceptance response and ignores stale job and session failures", async () => {
     playerV2Mock.mockResolvedValue({
       job: { status: "failed", error_message: "Source subtitle unavailable" },

@@ -145,6 +145,7 @@ function playbackSession(
     applySubtitleTrack: vi.fn(),
     applyAudioInventory: vi.fn(),
     applyCommittedSource: vi.fn(),
+    applyInventoryUpdate: vi.fn(),
     updatePlaybackState: vi.fn(),
     reportFirstFrame: vi.fn(),
     reportEvent: vi.fn(),
@@ -1252,6 +1253,62 @@ describe("WatchPage live inventory refresh", () => {
     const playerCalls = videoPlayerMock.mock.calls;
     const playerProps = playerCalls[playerCalls.length - 1]?.[0] as { streamUrl?: string };
     expect(playerProps.streamUrl).toBe("/stream/session-1");
+  });
+
+  it("polls a provisional audio inventory even for a local file", async () => {
+    const applyAudioInventory = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: [{ codec: "eac3", channels: 6, layout: "5.1", language: "eng" }],
+        subtitleUrls: [planSubtitle],
+        audioInventoryProvisional: true,
+        applyAudioInventory,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...version, audio_tracks: richerAudioTracks }],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [version] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    // The declared list is the reason to look, so a local (non-virtual) file
+    // must still reach the probe-persisted tracks.
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+    expect(applyAudioInventory).toHaveBeenCalledWith(richerAudioTracks, 7);
+  });
+
+  it("requests a subtitle replan for a provisional inventory even when entries are selectable", async () => {
+    const refreshSubtitles = vi.fn().mockResolvedValue(true);
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [planSubtitle],
+        subtitleInventoryProvisional: true,
+        refreshSubtitles,
+      }),
+    );
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [
+        {
+          ...virtualVersion,
+          subtitle_tracks: [{ index: 13, language: "en", codec: "ass", title: "English" }],
+        },
+      ],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    // A selectable-but-declared entry is not proof the probe landed; the menu
+    // must keep looking until a verified plan clears the badge.
+    expect(refreshSubtitles).toHaveBeenCalledTimes(1);
   });
 
   it("aborts an in-flight inventory read when the page unmounts", async () => {

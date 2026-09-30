@@ -597,7 +597,13 @@ function WatchPagePlayer({
         },
         payload.audio_tracks ?? [],
       );
-      if (identityChanged) {
+      // A moved identity needs the subtitle inventory re-read. So does a
+      // verified push against a still-declared subtitle menu: the probe landed
+      // under the same source, and without the replan the menu would keep its
+      // provisional badge and declared list forever.
+      const subtitlesDeclaredBehindVerified =
+        payload.inventory_status === "verified" && current.subtitleInventoryProvisional;
+      if (identityChanged || subtitlesDeclaredBehindVerified) {
         void refreshSubtitles(playbackPositionRef.current);
       }
     },
@@ -609,11 +615,18 @@ function WatchPagePlayer({
       return;
     }
 
-    const needsAudio = isVirtualActiveFile && session.planAudioTracks.length <= 1;
-    // Gate on what the menu can actually render, not on whether the plan
-    // published any entry: a non-selectable placeholder must not suppress the
-    // poll, or the probed embedded tracks never reach the menu.
-    const needsSubtitles = playableSubtitles.length === 0;
+    // A declared (or deferred/failed-probe) inventory is not the source's real
+    // tracks, so keep polling for probe evidence even when the list looks full
+    // or the file is not virtual. The virtual file's single synthesized entry
+    // is the other reason to keep looking.
+    const needsAudio =
+      session.audioInventoryProvisional ||
+      (isVirtualActiveFile && session.planAudioTracks.length <= 1);
+    // Gate on what the menu can actually render, and on whether it is still
+    // declared metadata, not on whether the plan published any entry: a
+    // non-selectable placeholder must not suppress the poll, and a provisional
+    // list must keep polling until a verified one clears the badge.
+    const needsSubtitles = playableSubtitles.length === 0 || session.subtitleInventoryProvisional;
     if (!needsAudio && !needsSubtitles) return;
 
     const mediaFileId = session.mediaFileId;
@@ -733,18 +746,22 @@ function WatchPagePlayer({
                       (candidate) => (candidate.subtitle_tracks?.length ?? 0) > 0,
                     )?.subtitle_tracks ?? [])
                 : resolvedSubtitleTracks;
-          if (
-            !hasSelectableSessionSubtitles(current.subtitleUrls) &&
-            nextSubtitleTracks.length > 0
-          ) {
-            // The catalog carries no playable URLs; a no-op track_change
-            // replan re-reads the plan's inventory (URLs included) without
-            // changing the A/V transport, so the stream keeps playing. Only
-            // treat the inventory as filled once a fresh plan actually lands:
-            // a transient replan failure must not end the retry budget.
+          const subtitleMenuIncomplete =
+            !hasSelectableSessionSubtitles(current.subtitleUrls) ||
+            current.subtitleInventoryProvisional;
+          if (subtitleMenuIncomplete && nextSubtitleTracks.length > 0) {
+            // The plan's inventory is empty or still declared; a no-op
+            // track_change replan re-reads it (URLs included) without changing
+            // the A/V transport, so the stream keeps playing. Only a plan that
+            // stops reporting a provisional inventory ends the retry budget: a
+            // replan that lands still-declared evidence leaves the poll running
+            // for the probe that clears the badge, and a transient replan
+            // failure does not spend the budget either.
             const filled = await refreshSubtitles(playbackPositionRef.current);
             if (cancelled) return;
-            if (filled || hasSelectableSessionSubtitles(sessionRef.current.subtitleUrls)) {
+            // A failed replan keeps the budget; a successful one ends it only
+            // once the adopted plan is no longer declared.
+            if (filled && !sessionRef.current.subtitleInventoryProvisional) {
               subtitlesComplete = true;
             }
           }
@@ -1224,6 +1241,7 @@ function WatchPagePlayer({
         onEnded={handleEnded}
         onRefreshSubtitles={session.refreshSubtitles}
         onSourceCommitted={handleSourceCommitted}
+        onInventoryUpdated={session.applyInventoryUpdate}
         audioTracks={audioTracks}
         activeAudioIndex={session.audioTrackIndex}
         onAudioSelect={handleSwitchAudio}

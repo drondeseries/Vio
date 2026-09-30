@@ -46,6 +46,7 @@ import {
   VIDEO_CLIENT_FEATURES_V3,
   type ReplanOptions,
 } from "../playback-session-wire-v3";
+import type { PlaybackInventoryUpdatedPayload } from "../realtime-protocol";
 import type {
   PlayerAudioTrack,
   PlayerFileVersion,
@@ -222,6 +223,17 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
     },
     audioTracks: PlayerAudioTrack[],
   ) => void;
+  /**
+   * Adopts a live inventory revision from the realtime `inventory_updated`
+   * event: the committed identity, its audio list, and the complete subtitle
+   * inventory in one fold.
+   *
+   * It obeys the same replacement-start guard as `applyCommittedSource` (a
+   * pending switch owns the menus), is status-aware so only verified data
+   * clears the provisional markers, and never bumps the plan or transport
+   * revisions, so the stream keeps playing.
+   */
+  applyInventoryUpdate: (payload: PlaybackInventoryUpdatedPayload) => void;
   /** Keeps transport state current for output-capability replans. */
   updatePlaybackState: (positionSeconds: number, playing: boolean) => void;
   /**
@@ -545,6 +557,11 @@ export function usePlaybackSession(
   const playbackPlayingRef = useRef(true);
   const playbackStartedRef = useRef(false);
   const switchingRef = useRef(false);
+  // The last live inventory revision folded into the menus. The server stamps
+  // every `inventory_updated` push with its inventory_revision and documents a
+  // duplicate or stale revision as a no-op, so this gates repeat deliveries
+  // without comparing plan identity (which a rotation can move).
+  const inventoryRevisionRef = useRef<string | null>(null);
   // Latest-wins coalescing for version switches: while a switch is in flight,
   // a second click records the newest target here instead of being dropped, and
   // the completion handler starts the switch to it immediately.
@@ -1219,6 +1236,7 @@ export function usePlaybackSession(
     awaitingInitialPlayerPositionRef.current = false;
     playbackPlayingRef.current = true;
     playbackStartedRef.current = false;
+    inventoryRevisionRef.current = null;
 
     void loadSession({
       preferredFileId: fileId,
@@ -1875,6 +1893,129 @@ export function usePlaybackSession(
     [],
   );
 
+  /**
+   * Replaces the plan's subtitle inventory with a server-pushed revision.
+   *
+   * Unlike {@link applySubtitleTrack}, which folds one ordinal into whatever
+   * the plan already carried, this adopts the whole authoritative list the
+   * live-inventory push carries, so a revision that drops, reorders, or empties
+   * the tracks renders exactly what the server published. Only positive probe
+   * evidence (`inventory_status: "verified"`) clears the provisional marker; a
+   * declared push after a verified one marks the menu provisional again rather
+   * than rendering the (possibly shorter) declared list as final. The plan
+   * object and its revisions are untouched, so the transport keeps playing.
+   */
+  const applySubtitleInventory = useCallback(
+    (
+      inventory: SubtitleInventoryItemV3[],
+      inventoryStatus?: string | null,
+      fileId?: number | null,
+    ) => {
+      const plan = planRef.current;
+      if (!plan) return;
+      const effectiveFileId = fileId ?? plan.effective_media_file_id;
+      const effectiveVirtualUri =
+        stateRef.current.effectiveVirtualUri ?? plan.effective_virtual_uri;
+      const verified = inventoryStatus === "verified";
+      const sameFile = effectiveFileId === plan.effective_media_file_id;
+      const provisional =
+        inventoryStatus == null ? stateRef.current.subtitleInventoryProvisional : !verified;
+      // A verified push is the probe landing: it replaces a declared list even
+      // when shorter. A same-source declared push only replaces when it is
+      // richer or the menu is still declared.
+      const replace =
+        !sameFile ||
+        verified ||
+        inventory.length > plan.subtitle.inventory.length ||
+        stateRef.current.subtitleInventoryProvisional;
+      const nextPlan: PlanV3 = {
+        ...plan,
+        effective_media_file_id: effectiveFileId,
+        effective_virtual_uri: effectiveVirtualUri,
+        subtitle: { ...plan.subtitle, inventory },
+      };
+      if (replace) planRef.current = nextPlan;
+      setState((current) => {
+        if (!replace) {
+          return provisional === current.subtitleInventoryProvisional
+            ? current
+            : { ...current, subtitleInventoryProvisional: provisional };
+        }
+        return {
+          ...current,
+          plan: nextPlan,
+          subtitleUrls: mapSubtitleInventory(inventory, effectiveFileId, config),
+          subtitleInventoryProvisional: provisional,
+        };
+      });
+    },
+    [config],
+  );
+
+  /**
+   * Folds a live inventory revision pushed over the realtime socket into the
+   * session's menus.
+   *
+   * A `source_committed` push re-keys the version and audio menus; this is the
+   * same fold with probe evidence attached: identity and audio through the
+   * status-aware {@link applyCommittedSource}, then the complete subtitle
+   * inventory. Both folds share the replacement-start guard — a pending switch
+   * owns the menus — and neither bumps the plan or transport revision.
+   */
+  const applyInventoryUpdate = useCallback(
+    (payload: PlaybackInventoryUpdatedPayload) => {
+      // Mirror applyCommittedSource's guard so a push landing mid-switch does
+      // not mutate the menus under the pending replacement.
+      if (switchingRef.current || stateRef.current.replacing) {
+        const current = stateRef.current;
+        const movedSource =
+          (payload.effective_media_file_id != null &&
+            payload.effective_media_file_id !== current.mediaFileId) ||
+          (payload.effective_virtual_uri != null &&
+            payload.effective_virtual_uri !== current.effectiveVirtualUri);
+        if (movedSource) pendingSwitchPositionRef.current = null;
+        return;
+      }
+      // A duplicate or out-of-order push names a revision already folded in;
+      // the server documents it as a no-op. Checked after the switch guard so a
+      // push dropped under a replacement still applies when it is re-delivered.
+      if (
+        payload.inventory_revision != null &&
+        payload.inventory_revision === inventoryRevisionRef.current
+      ) {
+        return;
+      }
+      const hasIdentity =
+        payload.effective_media_file_id != null || payload.effective_virtual_uri != null;
+      // Fold the audio list (and adopt the identity) exactly as a committed
+      // source does. An absent list with a moved identity still re-keys to an
+      // empty menu rather than leaving the outgoing release's tracks.
+      if (payload.audio_tracks !== undefined || hasIdentity) {
+        applyCommittedSource(
+          {
+            effectiveMediaFileId: payload.effective_media_file_id ?? null,
+            effectiveVirtualUri: payload.effective_virtual_uri ?? null,
+            inventoryStatus: payload.inventory_status ?? null,
+          },
+          payload.audio_tracks ?? [],
+        );
+      }
+      // An explicitly empty verified list is meaningful: the source has no
+      // subtitles, so it clears any declared placeholders and the badge.
+      if (payload.subtitle_inventory !== undefined) {
+        applySubtitleInventory(
+          payload.subtitle_inventory,
+          payload.inventory_status ?? null,
+          payload.effective_media_file_id ?? null,
+        );
+      }
+      if (payload.inventory_revision != null) {
+        inventoryRevisionRef.current = payload.inventory_revision;
+      }
+    },
+    [applyCommittedSource, applySubtitleInventory],
+  );
+
   const updatePlaybackState = useCallback((positionSeconds: number, playing: boolean) => {
     if (Number.isFinite(positionSeconds) && positionSeconds >= 0) {
       const isUninitializedPlayerZero =
@@ -2030,6 +2171,7 @@ export function usePlaybackSession(
     applySubtitleTrack,
     applyAudioInventory,
     applyCommittedSource,
+    applyInventoryUpdate,
     updatePlaybackState,
     reportFirstFrame,
     reportEvent,
