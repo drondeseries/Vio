@@ -24,6 +24,7 @@ import LibraryMetadataSettings from "./LibraryMetadataSettings";
 import StreamingSettings from "./StreamingSettings";
 import PlaybackSettings from "./PlaybackSettings";
 import DownloadsSettings from "./DownloadsSettings";
+import RequestsSettings from "./RequestsSettings";
 import ProvidersSettings from "./ProvidersSettings";
 import WatchSyncSettings from "./WatchSyncSettings";
 import AISettings from "./AISettings";
@@ -46,6 +47,7 @@ const SETTINGS_COMPONENTS: Record<string, ComponentType> = {
   streaming: StreamingSettings,
   playback: PlaybackSettings,
   downloads: DownloadsSettings,
+  requests: RequestsSettings,
   providers: ProvidersSettings,
   "watch-sync": WatchSyncSettings,
   ai: AISettings,

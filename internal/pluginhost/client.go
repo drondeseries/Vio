@@ -229,7 +229,7 @@ func (c *Client) HTTPRoutes(capabilityID string) (*HTTPRoutesClient, error) {
 }
 
 func (c *Client) VirtualStreamProvider(capabilityID string) (*VirtualStreamProviderClient, error) {
-	if err := c.requireCapability("virtual_stream_provider.v1", capabilityID); err != nil {
+	if err := c.requireCapability(legacyVirtualStreamCapabilityType, capabilityID); err != nil {
 		return nil, err
 	}
 	return &VirtualStreamProviderClient{

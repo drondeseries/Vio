@@ -96,7 +96,7 @@ import {
   REQUEST_STATUSES,
 } from "@/lib/mediaRequests";
 import { applyExclusivity } from "./requestExclusivity";
-import { supportedMediaTypesForConfig } from "./requestIntegrationMediaTypes";
+import { supportedMediaTypesForConfig } from "./admin-settings/requestIntegrationMediaTypes";
 
 type StatusFilter = MediaRequestStatus | "all";
 type OutcomeFilter = MediaRequestOutcome | "all";

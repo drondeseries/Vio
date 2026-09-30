@@ -72,7 +72,8 @@ describe("pluginPresentation", () => {
   });
 
   it("labels every tier and gives community and external plugins a notice", () => {
-    expect(sourceLabel("silo")).toBe("Silo maintained");
+    expect(sourceLabel("silo")).toBe("Vio maintained");
+    expect(sourceLabel("vio")).toBe("Vio maintained");
     expect(sourceLabel("approved_community")).toBe("Approved community");
     expect(sourceLabel("external")).toBe("External source");
     expect(tierNotice("silo")).toBeNull();

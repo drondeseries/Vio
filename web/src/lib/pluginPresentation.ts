@@ -20,8 +20,9 @@ export function pluginPagePath(
 /** The plugin's tier, shown on every plugin (1.0 plugin-management AC4). */
 export function sourceLabel(sourceKind: string): string {
   switch (sourceKind) {
+    case "vio":
     case "silo":
-      return "Silo maintained";
+      return "Vio maintained";
     case "approved_community":
       return "Approved community";
     default:
@@ -60,7 +61,7 @@ export function pluginDisplayName(pluginID: string, presentation?: PluginPresent
   if (displayName) return displayName;
 
   const derived = pluginID
-    .replace(/^silo[._-]?/, "")
+    .replace(/^(silo|vio)[._-]?/, "")
     .split(/[._-]+/)
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
