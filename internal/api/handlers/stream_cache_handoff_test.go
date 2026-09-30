@@ -134,6 +134,40 @@ func TestHandoffVirtualSessionToCachedRefusesReleaseSwap(t *testing.T) {
 	}
 }
 
+// TestHandoffVirtualSessionToCachedRefusesUnverifiablePin proves a session with
+// no concrete pinned candidate id is never handed off: a force-refresh resolve
+// ranks candidates anew, so committing one would silently substitute another
+// release under a neutral row's session binding.
+func TestHandoffVirtualSessionToCachedRefusesUnverifiablePin(t *testing.T) {
+	handler, manager, session, file := newCacheHandoffFixture(t, "Movie.2024.1080p.WEB-DL")
+	handler.VirtualReleaseCacheStatus = func(context.Context, string, int) (bool, bool) { return true, true }
+	const neutral = "virtual://movie/tt1"
+	file.FilePath = neutral
+	if err := manager.SetVirtualSource(session.ID, neutral, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		if !forceRefresh {
+			t.Error("cache handoff must list afresh")
+		}
+		return ResolvedVirtualMedia{
+			URL:                 "http://127.0.0.1:9/cached",
+			URI:                 neutral + "?result=cand-b",
+			CandidateID:         "cand-b",
+			OwnerID:             5,
+			ProviderReleaseName: "Another.Release.2020",
+		}, nil
+	})
+
+	if _, _, applied, err := handler.handoffVirtualSessionToCached(context.Background(), session, file, false); err == nil || applied {
+		t.Fatalf("unverifiable handoff applied=%v err=%v, want refused", applied, err)
+	}
+	current, _ := handler.sessionMgr.GetSession(session.ID)
+	if current.VirtualSourceURI != neutral {
+		t.Fatalf("binding moved to %q on a refused unverifiable handoff", current.VirtualSourceURI)
+	}
+}
+
 // TestHandoffVirtualSessionToCachedHonorsGenerationFence proves a binding move
 // that lands while the handoff is resolving leaves the newer binding in place.
 func TestHandoffVirtualSessionToCachedHonorsGenerationFence(t *testing.T) {

@@ -422,21 +422,22 @@ func virtualHandoffReleaseKey(file *models.MediaFile, resolved ResolvedVirtualMe
 
 // sameVirtualReleaseCandidate reports whether a resolved candidate id names the
 // same release the session is pinned to. An empty id on either side cannot be
-// compared, so it is treated as the same release; the durable-identity checks
-// elsewhere remain responsible for the release invariant.
+// compared, so it is not a match: a neutral row (no concrete pin) or a resolver
+// that reports no candidate id must not hand off, because a force-refresh
+// resolve ranks candidates anew and could substitute a ranked candidate from
+// another release under the session binding.
 func sameVirtualReleaseCandidate(pinnedID, resolvedID string) bool {
-	if pinnedID == "" || resolvedID == "" {
-		return true
-	}
-	return pinnedID == resolvedID
+	return pinnedID != "" && resolvedID != "" && pinnedID == resolvedID
 }
 
 // handoffVirtualSessionToCached re-resolves the exact release a session is
 // pinned to and rebinds the session to the cached copy. cachedConfirmed lets the
 // release-confirmed path skip the status probe it already answered. A resolve
 // that names a different release is refused so a cache handoff can never
-// silently switch releases; a stale binding generation is a benign no-op. The
-// returned cleanup must be released by the caller when non-nil.
+// silently switch releases, and a resolve that cannot be tied to a concrete
+// pinned candidate id is refused rather than trusted; a stale binding
+// generation is a benign no-op. The returned cleanup must be released by the
+// caller when non-nil.
 func (h *StreamHandler) handoffVirtualSessionToCached(ctx context.Context, session *playback.Session, file *models.MediaFile, cachedConfirmed bool) (ResolvedVirtualMedia, func(), bool, error) {
 	if h == nil || session == nil || file == nil || !isVirtualPlaybackFile(file) || !hasVirtualMediaResolver(h) {
 		return ResolvedVirtualMedia{}, nil, false, nil
@@ -462,6 +463,9 @@ func (h *StreamHandler) handoffVirtualSessionToCached(ctx context.Context, sessi
 	if !sameVirtualReleaseCandidate(pinnedID, resolved.CandidateID) {
 		if cleanup != nil {
 			cleanup()
+		}
+		if pinnedID == "" || resolved.CandidateID == "" {
+			return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff cannot verify the pinned release: pinned candidate %q, resolved candidate %q; refusing an unverifiable handoff", pinnedID, resolved.CandidateID)
 		}
 		return ResolvedVirtualMedia{}, nil, false, fmt.Errorf("cache handoff resolved candidate %q for pinned candidate %q; refusing a release swap", resolved.CandidateID, pinnedID)
 	}
