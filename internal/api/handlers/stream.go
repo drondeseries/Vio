@@ -890,9 +890,22 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	var relayURL string
 	var cleanup func()
 	ownerID := effectiveVirtualOwner(resolved.OwnerID, file.VirtualOwnerInstallationID)
-	if h.AllowPrivateStreams != nil && h.AllowPrivateStreams(ownerID) {
+	insecure := h.AllowPrivateStreams != nil && h.AllowPrivateStreams(ownerID)
+	// A serve-path retry that follows a transient relay/edge failure sets the
+	// fresh-registration marker (see withVirtualRelayFreshRegistration): it must
+	// present a newly minted relay entry instead of reusing the live token whose
+	// upstream just answered 502, mirroring the remux seek-anchor retry. Every
+	// other caller keeps the content-key reuse that shares one upstream and one
+	// range-cache scope.
+	fresh := virtualRelayFreshRegistrationRequested(ctx)
+	switch {
+	case insecure && fresh:
+		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterInsecureWithHeadersFresh(ctx, resolved.URL, resolved.RequestHeaders)
+	case insecure:
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterInsecureWithHeaders(ctx, resolved.URL, resolved.RequestHeaders)
-	} else {
+	case fresh:
+		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterWithHeadersFresh(ctx, resolved.URL, resolved.RequestHeaders)
+	default:
 		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterWithHeaders(ctx, resolved.URL, resolved.RequestHeaders)
 	}
 	if err != nil {
@@ -1201,7 +1214,13 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						// excluded it; declare substitution so the resolver may
 						// serve a sibling. A retry with no indictment (failedID
 						// empty) keeps refusing.
-						refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded, failedID != "")
+						// The retry re-resolves with a forced relist and, because
+						// the edge just failed, a fresh relay registration: a
+						// reused token would replay the registration whose
+						// upstream returned 502 instead of presenting newly
+						// resolved bytes, mirroring the remux seek-anchor retry.
+						retryCtx := withVirtualRelayFreshRegistration(r.Context())
+						refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURIExcluding(retryCtx, file, session.UserID, session.ProfileID, true, excluded, failedID != "")
 						if refreshErr == nil {
 							expectedCandidateID := ""
 							if parsed, err := url.Parse(file.FilePath); err == nil {

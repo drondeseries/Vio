@@ -368,3 +368,43 @@ func TestSearchURLRejectsMissingScheme(t *testing.T) {
 		})
 	}
 }
+
+// TestNormalizeBaseURL proves the config-time canonicalization: a scheme-less
+// host like "one.vio" becomes an http URL the search client can use, a working
+// URL is trimmed, and a still-invalid shape is rejected so the caller can leave
+// Prowlarr unconfigured instead of failing every staleness refresh.
+func TestNormalizeBaseURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{name: "scheme-less host", raw: "one.vio", want: "http://one.vio"},
+		{name: "scheme-less host and port", raw: "prowlarr:9696", want: "http://prowlarr:9696"},
+		{name: "already schemed", raw: "https://prowlarr.example.com", want: "https://prowlarr.example.com"},
+		{name: "trailing slash", raw: "http://prowlarr:9696/", want: "http://prowlarr:9696"},
+		{name: "reverse proxy base path", raw: "http://host/prowlarr", want: "http://host/prowlarr"},
+		{name: "empty", raw: "", want: ""},
+		{name: "indexer path", raw: "one.vio/1", wantErr: true},
+		{name: "search path", raw: "one.vio/api/v1/search", wantErr: true},
+		{name: "query string", raw: "one.vio?t=movie", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NormalizeBaseURL(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("NormalizeBaseURL(%q) = %q, want an error", tc.raw, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NormalizeBaseURL(%q): %v", tc.raw, err)
+			}
+			if got != tc.want {
+				t.Fatalf("NormalizeBaseURL(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}

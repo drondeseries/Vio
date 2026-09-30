@@ -1590,6 +1590,12 @@ func newChiRouter(deps Dependencies) chi.Router {
 			// uses, so the next replay is fast again instead of re-resolving on
 			// every start.
 			playbackHandler.VirtualCandidateClearFailedMarker = scanner.NewFileRepository(deps.DB).ClearVirtualCandidateFailed
+			// The start path indicts a confirmed-dead candidate through the same
+			// fenced failed_at stamp the serve layer and versions check use, so
+			// a retry rotates to a sibling or fails fast instead of re-resolving
+			// the release the provider just dropped. An empty provider listing
+			// is not a dead verdict and is never stamped.
+			playbackHandler.VirtualCandidateFailMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateFailed
 			playbackHandler.VirtualFileSaver = func(ctx context.Context, args models.VirtualFilePersistArgs) (int64, error) {
 				if deps.DB == nil {
 					return 0, nil

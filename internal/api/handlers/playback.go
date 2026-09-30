@@ -503,6 +503,16 @@ type PlaybackHandler struct {
 	// state observed before the delivering request, so a rotation or a newer
 	// failure is never cleared. Nil disables the clear.
 	VirtualCandidateRecoveredMarker func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error
+	// VirtualCandidateFailMarker stamps a virtual candidate row as known-bad
+	// after the start path resolved it and got a confirmed-dead verdict (the
+	// provider listed candidates and the pinned release is gone or unusable), so
+	// a retry within the verdict window rotates to a sibling or fails fast
+	// instead of re-resolving the same dead candidate. It mirrors
+	// StreamHandler.VirtualCandidateFailMarker and the versions check's
+	// stampVirtualCandidateFailed: the write is fenced on the candidate identity
+	// and observed failed_at, and an empty provider listing is deliberately NOT
+	// a dead verdict (see isVirtualCandidateDeadError). Nil disables the stamp.
+	VirtualCandidateFailMarker func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
 	// VirtualCandidateClearFailedMarker clears a virtual candidate's failed_at
 	// verdict after a successful same-identity re-resolve that the explicit
 	// retry (allowFailedCandidate) or stale-pin fall-through let through, so the

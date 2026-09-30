@@ -377,6 +377,40 @@ func (h *PlaybackHandler) clearVirtualCandidateVerdict(ctx context.Context, file
 		"component", "api", "status", "verdict_cleared", "file_id", file.ID, "candidate_uri", resolvedURI)
 }
 
+// stampStartVirtualCandidateFailed applies the start path's fenced failed_at
+// verdict for a confirmed-dead pinned candidate, so the next start rotates to a
+// sibling or fails fast instead of re-resolving the release the provider just
+// dropped. Only the code's own dead verdict counts (isVirtualCandidateDeadError)
+// plus an absent pin that carries durable identity; an empty provider listing
+// is a transient hiccup and is deliberately never stamped (the versions check
+// documents why: a 2.6s empty-listing burst once marked 50 of 57 rows dead).
+// Best-effort: a stamp failure does not change the resolve outcome the caller
+// already has. file is the catalog row the request pinned.
+func (h *PlaybackHandler) stampStartVirtualCandidateFailed(ctx context.Context, file *models.MediaFile, resolveErr error) {
+	if h == nil || h.VirtualCandidateFailMarker == nil || file == nil || file.FailedAt != nil || resolveErr == nil {
+		return
+	}
+	dead := isVirtualCandidateDeadError(resolveErr)
+	if !dead {
+		if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity &&
+			errors.Is(resolveErr, virtuallibrary.ErrSessionBoundCandidateAbsent) {
+			dead = true
+		}
+	}
+	if !dead {
+		return
+	}
+	stampCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := h.VirtualCandidateFailMarker(stampCtx, file.ID, file.FilePath, file.FailedAt); err != nil {
+		slog.WarnContext(ctx, "mark virtual playback candidate failed",
+			"component", "api", "file_id", file.ID, "candidate_uri", file.FilePath, "error", err)
+		return
+	}
+	slog.InfoContext(ctx, "virtual playback candidate indicted after a confirmed-dead resolve",
+		"component", "api", "status", "candidate_failed", "file_id", file.ID, "candidate_uri", file.FilePath)
+}
+
 // virtualFallbackEligibility is the explicit release-identity contract for the
 // stale-source fallback. The caller builds it from the resolve intent and the
 // anchored release so the fallback never infers session binding or rotation

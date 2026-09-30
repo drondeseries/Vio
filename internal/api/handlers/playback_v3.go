@@ -1858,6 +1858,10 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 		allowFailedCandidate := req.FileSelection == playback.FileSelectionExplicitV3 || req.ForceRelink
 		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps), req.ForceRelink, virtualResolveOptionsV3{allowFailedCandidate: allowFailedCandidate, sessionBound: false, explicitSelection: req.FileSelection == playback.FileSelectionExplicitV3})
 		if resolveErr != nil {
+			// A confirmed-dead pinned release is indicted here so a retry does
+			// not re-resolve it; an empty provider listing is not a verdict and
+			// is left unmarked.
+			h.stampStartVirtualCandidateFailed(r.Context(), requestedFile, resolveErr)
 			termFileID := requestedFile.ID
 			if requestedFile.EpisodeID != "" && h.VirtualEpisodeFileLookup != nil {
 				if dbFile, err := h.VirtualEpisodeFileLookup(r.Context(), requestedFile.EpisodeID); err == nil && dbFile != nil && dbFile.ID > 0 {
@@ -2011,12 +2015,23 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 	if effectiveFile.PresentationPartTotal > 1 && effectiveFile.PresentationPartIndex > 0 {
 		alternateBase = effectiveFile
 	}
+	// Split the planning bucket so a cold start can attribute a multi-second
+	// stall: the subtitle inventory read, the transformation registry /
+	// DV-RPU probe closure build, and the planner call itself (which lazily
+	// fetches node transformation and tone-map capabilities behind its own
+	// bounded planning timeout). The old single planning_ms mark folded all
+	// three together and could not say which one consumed the budget.
+	effectiveSubtitles := subtitleInventoryFor(effectiveFile)
+	timings.mark("subtitle_inventory")
+	transformationRegistry := h.transformationRegistryV3(r.Context())
+	dvrpuStrippable := h.lazyDVRPUStrippableV3(r.Context(), effectiveFile)
+	timings.mark("transform_registry")
 	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{
 		Request: req, RequestedFile: requestedFile, EffectiveFile: effectiveFile,
 		ServerBitrateCapKbps: serverBitrateCapV3(r.Context()),
 		AudioTrackIndex:      audioIndex, Settings: settings,
-		Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(),
-		AdditionalSubtitles: subtitleInventoryFor(effectiveFile),
+		Registry: transformationRegistry, DVRPUStrippable: dvrpuStrippable, Now: time.Now(),
+		AdditionalSubtitles: effectiveSubtitles,
 		InventoryProvenance: string(resolutionProvenance),
 	})
 	timings.mark("planning")
@@ -6165,7 +6180,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 			if errors.Is(err, playback.ErrReplanSupersededV3) {
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
 			}
-			if replanErr != nil && (replanErr.reason == string(noderouting.OutcomeCapacityUnavailable) || (replanErr.cause != nil && strings.Contains(replanErr.cause.Error(), string(noderouting.OutcomeCapacityUnavailable)))) {
+			if isRouteCapacityUnavailableError(replanErr) {
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 			}
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to persist the terminal replan decision")
@@ -6184,7 +6199,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 				slog.ErrorContext(r.Context(), "protocol v3 unapplied replacement transport cancellation failed", "session", sessionID, "error", rollbackErr)
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to cancel the unapplied replacement transport")
 			}
-			if strings.Contains(err.Error(), string(noderouting.OutcomeCapacityUnavailable)) {
+			if isRouteCapacityUnavailableError(err) {
 				return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
 			}
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the live replacement session")
@@ -6213,6 +6228,9 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		if errors.Is(err, playback.ErrReplanSupersededV3) {
 			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusConflict, "stale_playback_plan", "A newer replacement plan is already active")
 		}
+		if isRouteCapacityUnavailableError(err) {
+			return playback.DecisionResponseV3{}, playbackOperationError(http.StatusServiceUnavailable, string(noderouting.OutcomeCapacityUnavailable), "The playback route capacity is temporarily unavailable; retry shortly")
+		}
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the replacement plan")
 	}
 	leaseCompleted = true
@@ -6233,6 +6251,27 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 // adapter maps its status to the not-found problem.
 func replanSessionNotFoundV3() *PlaybackOperationError {
 	return playbackOperationError(http.StatusNotFound, playbackSessionNotFoundErrorCode, "Playback session not found")
+}
+
+// isRouteCapacityUnavailableError reports whether an error names route-capacity
+// exhaustion so the replan handler keeps the client-visible code retryable (503)
+// instead of collapsing it into a 500 internal_error. It matches the structured
+// transport reason on the error or its cause, and falls back to the sentinel
+// string the candidate-exhaustion join carries.
+func isRouteCapacityUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var transportErr *transportErrorV3
+	if errors.As(err, &transportErr) {
+		if transportErr.reason == string(noderouting.OutcomeCapacityUnavailable) {
+			return true
+		}
+		if transportErr.cause != nil && strings.Contains(transportErr.cause.Error(), string(noderouting.OutcomeCapacityUnavailable)) {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), string(noderouting.OutcomeCapacityUnavailable))
 }
 
 // rollbackFailedReplanV3 cancels a remotely admitted replacement before it
@@ -6389,6 +6428,25 @@ func classifyVirtualReplanExhaustionV3(initialVirtualErr error, candidateErrs []
 					retryable: true,
 					cause:     joinedErr,
 				}
+			}
+		}
+	}
+
+	// Route-capacity exhaustion is an honest, retryable verdict: the selected
+	// workload has no route capacity right now, not a broken plan. Surface it
+	// even when another candidate failed at a higher-priority stage first (for
+	// example a canceled virtual re-resolve), because the client's correct
+	// response is to retry. Without this the final reason can be a masking
+	// transport error and the replan handler answers 500 internal_error
+	// instead of a retryable 503, which stranded the HLS fallback in the field.
+	for _, ce := range candidateErrs {
+		if ce != nil && ce.TransportErr != nil &&
+			ce.TransportErr.reason == string(noderouting.OutcomeCapacityUnavailable) {
+			return &transportErrorV3{
+				reason:    string(noderouting.OutcomeCapacityUnavailable),
+				message:   "The playback route capacity is temporarily unavailable; retry shortly",
+				retryable: true,
+				cause:     joinedErr,
 			}
 		}
 	}
@@ -7346,6 +7404,20 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if virtualRehydrationFailed && errors.Is(virtualRehydrationErr, context.DeadlineExceeded) {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
 			reason: "replan_virtual_input_timeout", message: "Virtual stream input resolution timed out during replan.", retryable: true, cause: virtualRehydrationErr,
+		}
+	}
+	// A canceled virtual re-resolve is not a verdict about the release: the
+	// provider call was interrupted (most often the client or the replan
+	// deadline gave up). Continuing into the alternate-version hunt would fold
+	// that cancellation into a candidate-exhaustion verdict and can surface as
+	// a 500 after a later route-capacity decision. Stop here with the same
+	// retryable timeout reason so the client retries the whole replan instead
+	// of being told its plan is broken. The check also catches a request whose
+	// context is already done even when the inner error is not wrapped.
+	if virtualRehydrationFailed &&
+		(errors.Is(virtualRehydrationErr, context.Canceled) || r.Context().Err() != nil) {
+		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
+			reason: "replan_virtual_input_timeout", message: "Virtual stream input resolution was interrupted during replan.", retryable: true, cause: virtualRehydrationErr,
 		}
 	}
 

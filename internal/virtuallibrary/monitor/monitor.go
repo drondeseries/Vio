@@ -475,6 +475,12 @@ func (m *mediaMonitor) prowlarrMatch(item monitoredMedia) bool {
 // configureProwlarr sets up the Prowlarr search client with the first
 // non-empty URL from the list. Multiple URLs / per-indexer discovery are
 // no longer needed — /api/v1/search covers all indexers in one request.
+//
+// The first URL is normalized before it is applied: a scheme-less value such as
+// "one.vio" becomes http://one.vio. An invalid URL (indexer path, query string,
+// malformed host) leaves Prowlarr unconfigured instead of storing a value that
+// would fail every staleness refresh, and the error is returned so the caller
+// logs it once at configuration time.
 func (m *mediaMonitor) configureProwlarr(urls, apiKey string, intervalMinutes, timeoutSeconds int, indexFile string) error {
 	firstURL := ""
 	for _, u := range strings.FieldsFunc(urls, func(r rune) bool { return r == '\n' || r == ',' }) {
@@ -484,13 +490,21 @@ func (m *mediaMonitor) configureProwlarr(urls, apiKey string, intervalMinutes, t
 			break
 		}
 	}
+	normalizedURL, normalizeErr := prowlarr.NormalizeBaseURL(firstURL)
+	if normalizeErr != nil {
+		normalizedURL = ""
+		m.logger.Warn("virtual library Prowlarr URL is invalid; Prowlarr stays unconfigured", "error", normalizeErr)
+	}
 	m.mu.Lock()
 	if m.prowlarr == nil {
 		m.prowlarr = prowlarr.NewSearchClient(nil)
 	}
 	m.mu.Unlock()
-	m.prowlarr.Configure(firstURL, apiKey, intervalMinutes, timeoutSeconds)
-	return m.prowlarr.ConfigureIndexFile(indexFile)
+	m.prowlarr.Configure(normalizedURL, apiKey, intervalMinutes, timeoutSeconds)
+	if indexErr := m.prowlarr.ConfigureIndexFile(indexFile); indexErr != nil {
+		return indexErr
+	}
+	return normalizeErr
 }
 
 // configureAltmount sets up the AltMount completed/failed state client. The
