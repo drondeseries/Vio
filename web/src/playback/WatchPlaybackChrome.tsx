@@ -38,10 +38,7 @@ import {
 } from "@/hooks/queries/settingValues";
 import { SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
 import { useWatchDetail } from "@/hooks/queries/items";
-import {
-  applyVersionAvailability,
-  useVersionLiveness,
-} from "@/hooks/queries/versionLiveness";
+import { applyVersionAvailability, useVersionLiveness } from "@/hooks/queries/versionLiveness";
 import { catalogKeys } from "@/hooks/queries/keys";
 import { applyPlaybackProgressToCache } from "@/hooks/queries/playbackProgressCache";
 import { invalidatePlaybackSurfaceQueries } from "@/hooks/queries/playbackSurfaceRefresh";
@@ -1031,9 +1028,12 @@ function WatchPlaybackHostContent() {
   // Stamp the server's liveness verdict on the rows before they become player
   // props. The player's version menu reads a row's health from `available`; the
   // watch detail does not carry it, so without this the menu shows no health.
+  // Versions is absent until the detail read resolves (the room-exit tests
+  // render without one), so fall back to an empty list rather than mapping
+  // over undefined.
   const itemForPlayer: WatchDetail = {
     ...activeItem,
-    versions: applyVersionAvailability(activeItem.versions, versionLiveness),
+    versions: applyVersionAvailability(activeItem.versions ?? [], versionLiveness),
   };
   const watchPageProps = buildWatchPageProps({
     request: activeRequest,

@@ -365,7 +365,9 @@ export function QualityMenu({
                                 {statusLabels.map((status) => (
                                   <span
                                     key={status}
-                                    title={health && health.label === status ? health.title : undefined}
+                                    title={
+                                      health && health.label === status ? health.title : undefined
+                                    }
                                     className={`rounded border border-white/15 px-1.5 py-0.5 text-[10px] leading-none ${
                                       health && health.label === status && health.tone === "danger"
                                         ? "border-red-500/30 bg-red-500/20 text-red-400"
