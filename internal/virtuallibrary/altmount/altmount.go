@@ -865,16 +865,33 @@ func candidateReleaseName(candidate stream.StreamCandidate) string {
 		firstReleaseLine(candidate.Title),
 		firstReleaseLine(candidate.Name),
 	} {
-		if key := releaseNameKey(value); key != "" {
+		if key := releaseNameKey(stripAltmountCachedBadge(value)); key != "" {
 			return key
 		}
 	}
 	if parsed, err := url.Parse(strings.TrimSpace(candidate.URL)); err == nil {
-		if key := releaseNameKey(path.Base(parsed.Path)); key != "" {
+		if key := releaseNameKey(stripAltmountCachedBadge(path.Base(parsed.Path))); key != "" {
 			return key
 		}
 	}
 	return ""
+}
+
+// altmountBadgeStripPattern matches the AltMount completion badge in any case,
+// with its surrounding whitespace, so it can be removed before release-key
+// derivation.
+var altmountBadgeStripPattern = regexp.MustCompile(`(?i)\s*⚡\s*cached\s*`)
+
+// stripAltmountCachedBadge removes AltMount's completion badge from a display
+// value. The badge decorates the stream name with cache state; it is not part of
+// the release identity. Leaving it in the derived key makes a badge-only
+// confirmation miss the unbadged identity the row persisted, so the waiter is
+// never reached.
+func stripAltmountCachedBadge(value string) string {
+	if !strings.Contains(strings.ToLower(value), "cached") {
+		return value
+	}
+	return strings.TrimSpace(altmountBadgeStripPattern.ReplaceAllString(value, " "))
 }
 
 // releaseSizesMatch reports whether two byte sizes plausibly describe the same

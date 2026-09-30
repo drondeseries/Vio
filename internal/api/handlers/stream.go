@@ -481,10 +481,22 @@ func (h *StreamHandler) handoffVirtualSessionToCached(ctx context.Context, sessi
 // monitor can be wired to it directly. Best-effort and bounded: an unknown
 // release, a session that already moved on, or a resolve failure is logged and
 // never disrupts playback.
+//
+// The observer contract requires a quick, non-blocking callback (see
+// altmount.ReleaseConfirmationObserver): the caller is a classification or
+// refresh on the serve path. Every handoff resolves the cached copy under a
+// network budget, so the work is dispatched to its own goroutine and the
+// callback returns immediately.
 func (h *StreamHandler) HandleVirtualReleaseConfirmed(releaseKey string) {
 	if h == nil || strings.TrimSpace(releaseKey) == "" {
 		return
 	}
+	go h.handoffConfirmedRelease(releaseKey)
+}
+
+// handoffConfirmedRelease performs the bounded handoff work for one confirmed
+// release. It owns its context so the caller's return cannot cancel it.
+func (h *StreamHandler) handoffConfirmedRelease(releaseKey string) {
 	ctx, cancel := context.WithTimeout(context.Background(), virtualCacheHandoffBudget)
 	defer cancel()
 	for _, waiter := range h.cacheWaiters.forRelease(releaseKey) {
@@ -1144,7 +1156,6 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					// cached copy exists the existing rotation is unchanged.
 					handoffAttempted := false
 					if healedResolved, healCleanup, healedOK, _ := h.handoffVirtualSessionToCached(r.Context(), session, file, false); healedOK {
-						handoffAttempted = true
 						healed := false
 						if healedURL, parseErr := url.Parse(healedResolved.URL); parseErr == nil && healedURL.Scheme == "http" {
 							healedHost := healedURL.Hostname()
@@ -1154,10 +1165,18 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 								releaseInput = healCleanup
 								lastProxyErr = nil
 								proxy.ServeHTTP(streamWriter, r)
-								healed = true
+								// The heal is a handoff only when the retried
+								// stream actually delivered. A non-loopback
+								// target, a parse failure, or a second proxy
+								// error must fall through to failure marking and
+								// sibling rotation rather than answer 502 while a
+								// live sibling exists.
+								healed = lastProxyErr == nil
 							}
 						}
-						if !healed && healCleanup != nil {
+						if healed {
+							handoffAttempted = true
+						} else if healCleanup != nil {
 							healCleanup()
 						}
 					}
@@ -1303,7 +1322,6 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				// release.
 				handled := false
 				if healedResolved, healCleanup, healedOK, _ := h.handoffVirtualSessionToCached(r.Context(), session, file, false); healedOK {
-					handled = true
 					if healedURL, parseErr := url.Parse(healedResolved.URL); parseErr == nil && healedURL.Scheme == "http" {
 						healedHost := healedURL.Hostname()
 						if healedHost == "127.0.0.1" || healedHost == "::1" || healedHost == "[::1]" {
@@ -1311,6 +1329,14 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 							deliveredPath = resolvedVirtualCandidatePath(healedResolved)
 							releaseInput = healCleanup
 							remuxErr = serveRemux()
+							// Only a heal that actually delivered is handled;
+							// a cached retry that failed too falls through to
+							// failure marking and sibling rotation.
+							if remuxErr == nil {
+								handled = true
+							} else if healCleanup != nil {
+								healCleanup()
+							}
 						} else if healCleanup != nil {
 							healCleanup()
 						}

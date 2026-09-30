@@ -782,24 +782,40 @@ func (r *Relay) Close(ctx context.Context) error {
 // idempotent release function. The provider URL never appears in the returned
 // value, transcode recipe, or FFmpeg command line.
 func (r *Relay) Register(ctx context.Context, source string) (string, func(), error) {
-	return r.register(ctx, source, false, nil)
+	return r.register(ctx, source, false, nil, true)
 }
 
 // RegisterInsecure registers a structurally valid source while allowing the
 // owning plugin's explicit private-host opt-in. FFmpeg still receives only a
 // loopback relay URL; the insecure transport is isolated to this entry.
 func (r *Relay) RegisterInsecure(ctx context.Context, source string) (string, func(), error) {
-	return r.register(ctx, source, true, nil)
+	return r.register(ctx, source, true, nil, true)
 }
 
 // RegisterWithHeaders registers a source with optional upstream request headers.
 func (r *Relay) RegisterWithHeaders(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
-	return r.register(ctx, source, false, headers)
+	return r.register(ctx, source, false, headers, true)
 }
 
 // RegisterInsecureWithHeaders registers an insecure source with optional upstream request headers.
 func (r *Relay) RegisterInsecureWithHeaders(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
-	return r.register(ctx, source, true, headers)
+	return r.register(ctx, source, true, headers, true)
+}
+
+// RegisterWithHeadersFresh registers a source with optional upstream request
+// headers, minting a fresh entry even when an equivalent live registration
+// exists. A bounded retry uses it to present new bytes to the upstream instead
+// of replaying the token the first attempt already used. Every other caller
+// keeps the content-key reuse that shares one upstream and one range-cache
+// scope.
+func (r *Relay) RegisterWithHeadersFresh(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
+	return r.register(ctx, source, false, headers, false)
+}
+
+// RegisterInsecureWithHeadersFresh is RegisterWithHeadersFresh for a
+// private-host source.
+func (r *Relay) RegisterInsecureWithHeadersFresh(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
+	return r.register(ctx, source, true, headers, false)
 }
 
 func cloneHeaderMap(in map[string]string) map[string]string {
@@ -813,7 +829,7 @@ func cloneHeaderMap(in map[string]string) map[string]string {
 	return out
 }
 
-func (r *Relay) register(ctx context.Context, source string, insecure bool, headers map[string]string) (string, func(), error) {
+func (r *Relay) register(ctx context.Context, source string, insecure bool, headers map[string]string, reuse bool) (string, func(), error) {
 	if r == nil {
 		return "", nil, errors.New("remote stream relay is not configured")
 	}
@@ -861,8 +877,10 @@ func (r *Relay) register(ctx context.Context, source string, insecure bool, head
 	// reuses that entry instead of minting a parallel upstream: a re-resolve for
 	// a seek or a reconnect shares one source, one range-cache scope, and one
 	// refcounted lifetime. Only a live, non-rejected entry is reused; a rejected
-	// or expired holder is superseded below.
-	if contentKey != "" {
+	// or expired holder is superseded below. A force-fresh caller (a bounded
+	// retry that must present new bytes) skips this lookup and mints a new
+	// entry, superseding the old content mapping below.
+	if reuse && contentKey != "" {
 		if existing, ok := r.content[contentKey]; ok && existing != nil &&
 			r.entries[existing.token] == existing && !existing.upstreamAuthRejected &&
 			now.Before(existing.expiry()) {

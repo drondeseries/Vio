@@ -84,8 +84,19 @@ func TestClassifyCandidatesNotifiesBadgeConfirmation(t *testing.T) {
 	if !candidates[0].SourceConfirmed {
 		t.Fatal("badge candidate was not marked SourceConfirmed")
 	}
-	if keys := observer.snapshot(); len(keys) != 1 {
+	keys := observer.snapshot()
+	if len(keys) != 1 {
 		t.Fatalf("observer notifications = %v, want exactly one", keys)
+	}
+	// The badge is display decoration, not identity: a badge-only confirmation
+	// must key the same release as the unbadged name, or it can never match the
+	// identity the handoff waiter registered from the persisted row.
+	want := ReleaseKey("Movie.2024.2160p.REMUX")
+	if keys[0] != want {
+		t.Fatalf("badge notification key = %q, want the unbadged key %q", keys[0], want)
+	}
+	if got := candidateReleaseName(stream.StreamCandidate{Name: "Movie.2024.2160p.REMUX"}); got != want {
+		t.Fatalf("unbadged key = %q, want %q", got, want)
 	}
 }
 

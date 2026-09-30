@@ -234,6 +234,13 @@ func TestHandleVirtualReleaseConfirmedRebindsWaiter(t *testing.T) {
 
 	handler.HandleVirtualReleaseConfirmed(altmount.ReleaseKey(file.ProviderReleaseName))
 
+	// The handler dispatches the handoff asynchronously so the observer callback
+	// stays non-blocking; wait for the completion event before asserting.
+	waitForCondition(t, func() bool {
+		states := recorder.states()
+		return len(states) > 0 && states[len(states)-1] == playback.DownloadProgressStateCompleted
+	}, "release-confirmed handoff did not report completion")
+
 	current, _ := handler.sessionMgr.GetSession(session.ID)
 	if current.VirtualSourceURI != file.FilePath {
 		t.Fatalf("binding = %q, want the pinned URI", current.VirtualSourceURI)

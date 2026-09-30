@@ -373,6 +373,55 @@ func TestRelayCloseRevokesEntriesAndRejectsRegistrations(t *testing.T) {
 	}
 }
 
+// TestRelayFreshRegistrationBypassesContentReuse proves that re-registering
+// identical content reuses the live entry's token (one upstream, one range-cache
+// scope), while the force-fresh variant mints a new token so a bounded retry
+// presents new bytes. Both tokens stay live.
+func TestRelayFreshRegistrationBypassesContentReuse(t *testing.T) {
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+
+	source := "https://1.1.1.1/movie.mp4"
+	headers := map[string]string{"Referer": "https://example.test/"}
+	tokenOf := func(rawURL string) string {
+		t.Helper()
+		token, ok := relayTokenFromURL(rawURL)
+		if !ok {
+			t.Fatalf("relay URL %q has no token", rawURL)
+		}
+		return token
+	}
+
+	first, releaseFirst, err := relay.RegisterWithHeaders(context.Background(), source, headers)
+	if err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	defer releaseFirst()
+	reused, releaseReused, err := relay.RegisterWithHeaders(context.Background(), source, headers)
+	if err != nil {
+		t.Fatalf("reuse register: %v", err)
+	}
+	defer releaseReused()
+	if tokenOf(reused) != tokenOf(first) {
+		t.Fatalf("reuse token = %q, want the live token %q", tokenOf(reused), tokenOf(first))
+	}
+
+	fresh, releaseFresh, err := relay.RegisterWithHeadersFresh(context.Background(), source, headers)
+	if err != nil {
+		t.Fatalf("fresh register: %v", err)
+	}
+	defer releaseFresh()
+	if tokenOf(fresh) == tokenOf(first) {
+		t.Fatalf("fresh token = %q, want a token distinct from %q", tokenOf(fresh), tokenOf(first))
+	}
+	if got := relay.RegistrationStatus(first); got != RegistrationLive {
+		t.Fatalf("original registration status = %v, want live", got)
+	}
+	if got := relay.RegistrationStatus(fresh); got != RegistrationLive {
+		t.Fatalf("fresh registration status = %v, want live", got)
+	}
+}
+
 func relayResponse(request *http.Request, status int, contentType, body string) *http.Response {
 	return &http.Response{
 		StatusCode: status,

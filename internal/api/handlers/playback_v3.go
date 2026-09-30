@@ -3426,10 +3426,13 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				if attempt > 1 && virtualAnchor {
 					// A retry must probe fresh bytes: re-resolve the candidate
 					// and register a new relay entry so the same token is never
-					// probed twice. A re-resolve that yields the same input
-					// means no new token is available, so a second probe would
-					// repeat the request that just failed.
-					if resolveErr := resolveAnchorInput(ctx); resolveErr != nil {
+					// probed twice. The fresh-registration context bypasses the
+					// relay's content-key reuse, which would otherwise hand back
+					// the live token for an unchanged provider URL and suppress
+					// this retry before its second probe. A re-resolve that still
+					// yields the same input means no new token is available, so a
+					// second probe would repeat the request that just failed.
+					if resolveErr := resolveAnchorInput(withVirtualRelayFreshRegistration(ctx)); resolveErr != nil {
 						slog.WarnContext(ctx, "virtual seek anchor re-resolve failed; skipping retry",
 							"component", "api",
 							"playback_session_id", session.ID,
