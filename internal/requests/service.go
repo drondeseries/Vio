@@ -522,7 +522,7 @@ func (s *Service) resolveRouterConnections(ctx context.Context, fc *fulfillConte
 		}
 		conns = append(conns, ResolvedRouterConnection{ID: in.ID, BaseURL: in.BaseURL, APIKey: apiKey, Config: in.PluginConfig})
 	}
-	if len(conns) == 0 && s.hasDefaultVirtualRouter != nil && s.hasDefaultVirtualRouter() {
+	if len(conns) == 0 && s.hasActiveDefaultVirtualRouter() {
 		conns = []ResolvedRouterConnection{{
 			ID:      "core-virtual-library",
 			BaseURL: "virtual://streaming",
@@ -591,6 +591,12 @@ func routerConfiguredFor(fc *fulfillContext, mediaType MediaType) bool {
 		}
 	}
 	return false
+}
+
+// hasActiveDefaultVirtualRouter reports whether the implicit core virtual
+// router serves requests even with no integration row configured.
+func (s *Service) hasActiveDefaultVirtualRouter() bool {
+	return s.hasDefaultVirtualRouter != nil && s.hasDefaultVirtualRouter()
 }
 
 // skippedRouterConnection reports whether resolveRouterConnections leaves out
@@ -2214,7 +2220,7 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 		}
 		fc = built
 	}
-	if s.router == nil || !routerConfiguredFor(fc, req.MediaType) {
+	if s.router == nil || (!routerConfiguredFor(fc, req.MediaType) && !s.hasActiveDefaultVirtualRouter()) {
 		// No router serves this media type: the request stays approved and
 		// the reconcile pass completes it when the title reaches the library.
 		return &req, nil

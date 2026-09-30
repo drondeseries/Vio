@@ -806,3 +806,47 @@ func TestOutcomeReasonDatabase(t *testing.T) {
 		t.Fatalf("failed = %+v, want the error in last_error, not outcome_reason", failed)
 	}
 }
+
+func TestApproveSubmitsWithOnlyDefaultVirtualRouter(t *testing.T) {
+	// No integration row serves the media type, but the implicit core
+	// virtual router is active: approval must still submit instead of
+	// parking the request approved forever.
+	store := newFakeStore()
+	store.requests["r1"] = &Request{ID: "r1", MediaType: MediaTypeMovie, TMDBID: 550, Title: "T", Status: StatusPending, Outcome: OutcomeActive}
+	router := &fakeRouterProvider{}
+	svc := newTestService(store)
+	svc.SetRouterProvider(router)
+	svc.SetDefaultVirtualRouter(func() bool { return true })
+
+	req, err := svc.Approve(context.Background(), Viewer{UserID: 1, IsAdmin: true}, "r1")
+	if err != nil {
+		t.Fatalf("Approve returned error: %v", err)
+	}
+	if router.fulfillCalls != 1 {
+		t.Fatalf("fulfill calls = %d, want 1", router.fulfillCalls)
+	}
+	if req.Status == StatusPending {
+		t.Fatalf("request = %s/%s, want it submitted past pending", req.Status, req.Outcome)
+	}
+}
+
+func TestApproveWaitsForLibraryWithNoRouterAtAll(t *testing.T) {
+	// Neither integration rows nor the default virtual router: the
+	// request stays approved for the reconcile pass, as before.
+	store := newFakeStore()
+	store.requests["r1"] = &Request{ID: "r1", MediaType: MediaTypeMovie, TMDBID: 550, Title: "T", Status: StatusPending, Outcome: OutcomeActive}
+	router := &fakeRouterProvider{}
+	svc := newTestService(store)
+	svc.SetRouterProvider(router)
+
+	req, err := svc.Approve(context.Background(), Viewer{UserID: 1, IsAdmin: true}, "r1")
+	if err != nil {
+		t.Fatalf("Approve returned error: %v", err)
+	}
+	if router.fulfillCalls != 0 {
+		t.Fatalf("fulfill calls = %d, want 0", router.fulfillCalls)
+	}
+	if req.Status != StatusApproved || req.Outcome != OutcomeActive {
+		t.Fatalf("request = %s/%s, want approved/active", req.Status, req.Outcome)
+	}
+}
