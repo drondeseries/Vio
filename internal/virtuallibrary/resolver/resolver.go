@@ -1,7 +1,4 @@
-// Package resolver ports the Stremio manifest stream resolver from the
-// vio-virtual-library plugin (manifestStreamResolver in main.go, plus the
-// streamEndpointWithPolicy URL validation and ValidateConnection helper from
-// routing.go) into Vio core.
+// Package resolver implements the Stremio manifest stream resolver in Vio core.
 //
 // Scope: manifest fetch over HTTP, the candidate cache (positive entries with
 // TTL, negative caching of empty answers, the fresh-serve floor, stale grace

@@ -96,15 +96,11 @@ func (s *Service) AllowPrivateStreamsForProvenance(ctx context.Context, provenan
 }
 
 // ResolveVirtualPlaybackDetailedForProvenance resolves through the standard
-
-// ResolveVirtualPlaybackDetailedForProvenance resolves through the standard
 // installation dispatch, computing AllowInsecure (HTTP manifests) and
 // AllowPrivateStreams (private stream destinations) from explicit provenance
-// instead of unconditionally consulting the plugin installation config. This
-// is the core-path entry point retiring
-// com.drondeseries.vio-virtual-library: core rows must not depend on a plugin
-// installation's local-network opt-in, and a missing core opt-in must not be
-// rescued by a plugin's.
+// instead of unconditionally consulting the plugin installation config: core
+// rows must not depend on a plugin installation's local-network opt-in, and a
+// missing core opt-in must not be rescued by a plugin's.
 func (s *Service) ResolveVirtualPlaybackDetailedForProvenance(
 	ctx context.Context,
 	virtualPath string,

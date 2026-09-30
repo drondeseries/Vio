@@ -2796,11 +2796,10 @@ func main() {
 			virtualRegistrar.TMDBDigitalReleases = discoverAdapter
 			virtualRegistrar.EpisodeReleaseDates = discoverAdapter
 		}
-		// Virtual library core service (retires
-		// com.drondeseries.vio-virtual-library). Boot order per Oracle:
+		// Virtual library core service. Boot order:
 		// migrate -> validate -> activate. Migration never overwrites
-		// existing core settings; failure keeps the plugin installed and
-		// the core service unavailable (explicit, no silent fallback).
+		// existing core settings; failure keeps the core service
+		// unavailable (explicit, no silent fallback).
 		vlActive = false
 		vlSettings, vlErr := settingsRepo.GetAll(ctx)
 		if vlErr == nil {
