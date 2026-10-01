@@ -87,7 +87,7 @@ PostgreSQL with pgvector, and Redis.
 
 ```sh
 git clone https://github.com/kipsilabs/Vio.git
-cd vio-server
+cd Vio
 cp .env.example .env
 chmod 600 .env
 printf '\nPOSTGRES_PASSWORD=%s\nSECRET_KEY=%s\n' \
