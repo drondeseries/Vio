@@ -115,6 +115,14 @@ if grep -q '^\.github/workflows/docker\.yml merge=ours$' .gitattributes 2>/dev/n
 else
   reject "docker.yml merge=ours entry missing from .gitattributes"
 fi
+
+# 8. Audio selection: MULTi trackHasLanguage and MatchRank preserved.
+if grep -q 'trackHasLanguage' internal/playback/audio_select.go \
+  && grep -q 'MatchRank' internal/lang/lang.go; then
+  pass "audio selection MULTi trackHasLanguage and MatchRank preserved"
+else
+  reject "audio selection MULTi trackHasLanguage or MatchRank missing from internal/playback/audio_select.go or internal/lang/lang.go"
+fi
 # The merge driver itself is per-clone setup (see `make install-hooks`), not
 # committed content: fresh CI checkouts never have it. Report, don't fail —
 # verification must stay read-only and green on a clean clone.
