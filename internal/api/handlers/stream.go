@@ -186,53 +186,22 @@ type fontExtractFailLog struct {
 
 // failed logs the first failure for key at warn and repeats at debug.
 func (l *fontExtractFailLog) failed(ctx context.Context, key string, attrs ...any) {
-	l.failedWithKind(ctx, fontExtractFailKindExtraction, key, attrs...)
-}
-
-// Font-route failure kinds. Each gets its own log wording and its own slot in
-// the shared throttle key space, so a session-load failure does not suppress a
-// later preflight failure for the same target or vice versa.
-type fontExtractFailKind int
-
-const (
-	fontExtractFailKindExtraction fontExtractFailKind = iota
-	fontExtractFailKindLoad
-	fontExtractFailKindPreflight
-)
-
-func (k fontExtractFailKind) message() string {
-	switch k {
-	case fontExtractFailKindLoad:
-		return "subtitle font request failed: session_load"
-	case fontExtractFailKindPreflight:
-		return "subtitle font request failed: source_preflight"
-	default:
-		return "subtitle font extraction failed"
-	}
-}
-
-// failedWithKind is failed with a caller-chosen kind, so the font route's
-// non-extraction internal_error causes (session load, source preflight) log
-// under their own wording instead of claiming an extraction failure. The key
-// space is shared; each kind owns a distinct key prefix, so a target warns
-// once per cause and a kind cannot suppress another kind's report.
-func (l *fontExtractFailLog) failedWithKind(ctx context.Context, kind fontExtractFailKind, key string, attrs ...any) {
 	l.mu.Lock()
 	if l.seen == nil {
 		l.seen = make(map[string]struct{})
 	}
 	_, repeat := l.seen[key]
-	if !repeat {
-		l.seen[key] = struct{}{}
-	}
+	l.seen[key] = struct{}{}
 	l.mu.Unlock()
+	// The message wording is fixed so sloglint sees string literals; the
+	// cause attribute distinguishes the failure kinds, and the throttle key
+	// space gives each cause its own slot.
 	args := append([]any{virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI}, attrs...)
-	message := kind.message()
 	if repeat {
-		slog.DebugContext(ctx, message, args...)
+		slog.DebugContext(ctx, "subtitle font request failed", args...)
 		return
 	}
-	slog.WarnContext(ctx, message, args...)
+	slog.WarnContext(ctx, "subtitle font request failed", args...)
 }
 
 // recovered clears the throttle key after a successful extraction so a later
@@ -259,17 +228,8 @@ func (h *StreamHandler) logSubtitleFontInternalError(ctx context.Context, in Sub
 	if h == nil || err == nil {
 		return
 	}
-	var kind fontExtractFailKind
-	switch cause {
-	case "session_load":
-		kind = fontExtractFailKindLoad
-	case "source_preflight":
-		kind = fontExtractFailKindPreflight
-	default:
-		kind = fontExtractFailKindExtraction
-	}
 	if fileID > 0 {
-		h.fontExtractFailures.failedWithKind(ctx, kind, cause+"\x00"+fontExtractFailureKey(fileID, trackIndex),
+		h.fontExtractFailures.failed(ctx, cause+"\x00"+fontExtractFailureKey(fileID, trackIndex),
 			"file_id", fileID,
 			"track", trackIndex,
 			"cause", cause,
@@ -277,7 +237,7 @@ func (h *StreamHandler) logSubtitleFontInternalError(ctx context.Context, in Sub
 		)
 		return
 	}
-	h.fontExtractFailures.failedWithKind(ctx, kind, cause+"\x00session:"+in.SessionID+":track:"+in.Track,
+	h.fontExtractFailures.failed(ctx, cause+"\x00session:"+in.SessionID+":track:"+in.Track,
 		"session", in.SessionID,
 		"track", in.Track,
 		"cause", cause,
@@ -2067,18 +2027,11 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 		}
 		return nil, apiError(http.StatusNotFound, "not_found", err.Error())
 	}
-	// Validate the requested ordinal and codec before any 500-capable work. A
-	// non-ASS ordinal or one outside the embedded range is a client error no
-	// retry can satisfy, so it must not reach preflight or extraction (both of
-	// which can fail with an internal_error and, on a retrying client, mint a
-	// 500 storm for a request that is permanently unsatisfiable).
-	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
-	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
-		return nil, apiError(http.StatusNotFound, "not_found", "Embedded subtitle track not found")
-	}
-	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
-		return nil, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
-	}
+	// Source admission comes first: a missing local file must answer 404 and
+	// end the session regardless of the codec, and only a genuinely
+	// inaccessible file answers internal_error. (Virtual rows short-circuit
+	// preflight, so their codec refusal below still answers without any
+	// provider round-trip.)
 	if err := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(ctx, session)
@@ -2086,6 +2039,17 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 		}
 		h.logSubtitleFontInternalError(ctx, in, file.ID, trackIndex, "source_preflight", err)
 		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
+	}
+	// Validate the requested ordinal and codec before extraction. A non-ASS
+	// ordinal or one outside the embedded range is a client error no retry
+	// can satisfy; it answers 4xx here and never reaches the (500-capable)
+	// extraction.
+	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
+	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
+		return nil, apiError(http.StatusNotFound, "not_found", "Embedded subtitle track not found")
+	}
+	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
+		return nil, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
 	}
 
 	fonts, err := playback.ExtractAttachedSubtitleFonts(ctx, file.FilePath, h.ffmpegPath())
@@ -2175,19 +2139,11 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
-	// Validate the requested ordinal and codec before any 500-capable work, so
-	// a permanently unsatisfiable request (non-ASS ordinal, ordinal outside the
-	// embedded range) answers 4xx instead of a 500 a retrying client would
-	// re-issue. See SubtitleFonts for the same ordering.
-	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
-	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
-		writeError(w, http.StatusNotFound, "not_found", "Embedded subtitle track not found")
-		return
-	}
-	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
-		writeError(w, http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
-		return
-	}
+	// Source admission comes first (same ordering as SubtitleFonts): a
+	// missing local file answers 404 and ends the session regardless of the
+	// codec; a genuinely inaccessible file answers internal_error. Virtual
+	// rows short-circuit preflight, so their codec refusal below still
+	// answers without a provider round-trip.
 	if err := preflightPlaybackFile(r.Context(), file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(r.Context(), session)
@@ -2200,6 +2156,19 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 			Query:     r.URL.Query(),
 		}, file.ID, trackIndex, "source_preflight", err)
 		writePlaybackFilePreflightError(w, err)
+		return
+	}
+	// Validate the requested ordinal and codec before extraction, so a
+	// permanently unsatisfiable request (non-ASS ordinal, ordinal outside the
+	// embedded range) answers 4xx and never reaches the 500-capable
+	// extraction.
+	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
+	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
+		writeError(w, http.StatusNotFound, "not_found", "Embedded subtitle track not found")
+		return
+	}
+	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
+		writeError(w, http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
 		return
 	}
 

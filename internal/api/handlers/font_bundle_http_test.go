@@ -170,9 +170,9 @@ func TestHandleSubtitleFontsReturns500OnDefinitiveFailure(t *testing.T) {
 	}
 }
 
-// A non-ASS embedded ordinal must answer 400, not reach extraction (which can
-// 500). The client prefetch guards on codec, but a mistyped or hand-built URL
-// must not mint a 500 a retrying client re-issues.
+// A non-ASS embedded ordinal must answer 400, not reach extraction or the
+// cache paths. The client prefetch guards on codec, but a mistyped or
+// hand-built URL must not mint a 500 a retrying client re-issues.
 func TestHandleSubtitleFontsRejectsNonASSTrackBeforeExtraction(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script test helper is unix-only")
@@ -188,8 +188,9 @@ func TestHandleSubtitleFontsRejectsNonASSTrackBeforeExtraction(t *testing.T) {
 	}
 }
 
-// An ordinal outside the embedded range must answer 404 without touching the
-// source (which can 500 on a missing file).
+// An ordinal outside the embedded range must answer 404 without reaching the
+// extraction or cache paths (which can 500 on a missing file or bind a
+// shared flight for a request no retry can satisfy).
 func TestHandleSubtitleFontsRejectsOutOfRangeOrdinalBeforePreflight(t *testing.T) {
 	handler, session, _, _, _ := newFontBundleHTTPFixture(t, assTestTracks(), "fail")
 	recorder := httptest.NewRecorder()
