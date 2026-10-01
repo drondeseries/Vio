@@ -4177,31 +4177,217 @@ func streamMatchesPersistedIdentity(stream VirtualPlaybackStream, identity virtu
 	return want != "" && want == got
 }
 
+// virtualRecoveryRelistMax is the number of stale-source recovery re-lists one
+// provider listing may perform inside virtualRecoveryRelistWindow. The fallback
+// always lists the provider directly, so a provider whose listing keeps failing
+// would otherwise have its fail-fast backoff bypassed on every start and
+// recovery could poll it indefinitely. The bound is deliberately small:
+// recovery exists to break a stale pin, not to keep a dead provider hot. A
+// listing that answers clears the count.
+const virtualRecoveryRelistMax = 3
+
+// virtualRecoveryRelistWindow matches the resolver's provider failure backoff:
+// once exhausted, recovery stays on the floor for the same window the resolver
+// would have suppressed the provider for anyway.
+const virtualRecoveryRelistWindow = 30 * time.Second
+
+// virtualRecoveryRelistMaxEntries caps the process-wide recovery damper. Live
+// entries are bounded in practice by the providers failing inside one window.
+const virtualRecoveryRelistMaxEntries = 4096
+
+// virtualRecoveryRelistMark records how many recovery re-lists a provider
+// listing has performed inside the current window.
+type virtualRecoveryRelistMark struct {
+	relists   int
+	expiresAt time.Time
+}
+
+// virtualRecoveryRelistCache bounds stale-source recovery re-lists per provider
+// listing. It is package-level because the handler is shared across requests; a
+// mutex keeps concurrent starts safe and the map is pruned on write.
+type virtualRecoveryRelistCache struct {
+	mu    sync.Mutex
+	marks map[string]virtualRecoveryRelistMark
+	now   func() time.Time
+}
+
+func (c *virtualRecoveryRelistCache) clock() time.Time {
+	if c != nil && c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// allow records one recovery re-list for key and reports whether it is inside
+// the bound. The first virtualRecoveryRelistMax relists in a window are
+// admitted; a lapsed or absent window restarts the count. Denied calls do not
+// extend the window, so a steady retry rate settles at the bound instead of
+// holding recovery off forever.
+func (c *virtualRecoveryRelistCache) allow(key string) bool {
+	if c == nil || key == "" {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.clock()
+	if c.marks == nil {
+		c.marks = make(map[string]virtualRecoveryRelistMark)
+	}
+	mark, ok := c.marks[key]
+	if ok && now.Before(mark.expiresAt) {
+		if mark.relists >= virtualRecoveryRelistMax {
+			return false
+		}
+		mark.relists++
+		c.marks[key] = mark
+		return true
+	}
+	if len(c.marks) >= virtualRecoveryRelistMaxEntries {
+		for k, m := range c.marks {
+			if !now.Before(m.expiresAt) {
+				delete(c.marks, k)
+			}
+		}
+	}
+	c.marks[key] = virtualRecoveryRelistMark{relists: 1, expiresAt: now.Add(virtualRecoveryRelistWindow)}
+	return true
+}
+
+// clear drops key's budget after a listing that answered, so a provider that
+// recovered and later failed again starts from a full budget.
+func (c *virtualRecoveryRelistCache) clear(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.marks, key)
+	c.mu.Unlock()
+}
+
+// virtualRecoveryRelists is the process-wide stale-source recovery damper.
+// Tests may clear entries directly.
+var virtualRecoveryRelists = &virtualRecoveryRelistCache{marks: make(map[string]virtualRecoveryRelistMark)}
+
+// virtualRecoveryRelistKey names one provider listing for the recovery damper:
+// the provider-neutral virtual path plus the owning installation, matching the
+// identity the stale fallback lists under.
+func virtualRecoveryRelistKey(neutralKey string, ownerID int) string {
+	return neutralKey + "\x00" + strconv.Itoa(ownerID)
+}
+
+// errVirtualCandidateExcluded reports that a resolve returned a candidate the
+// durable recovery chain has indicted. Serving or adopting it would reopen the
+// A→B→C→A cycle the chain exists to stop.
+var errVirtualCandidateExcluded = errors.New("resolved candidate is excluded by the recovery chain")
+
+// virtualCandidateIDExcluded reports whether candidateURI's concrete result id
+// is in the exclusion chain. It is the free-function form used where only the
+// slice is available (resolveVirtualCandidateSource), so a resolver that
+// substitutes an excluded release is caught even when the caller already
+// filtered the listed streams.
+func virtualCandidateIDExcluded(candidateURI string, excluded []string) bool {
+	id := virtualResultCandidateID(candidateURI)
+	if id == "" {
+		return false
+	}
+	for _, e := range excluded {
+		if strings.TrimSpace(e) == id {
+			return true
+		}
+	}
+	return false
+}
+
 // virtualPathOwnerRow returns the catalog row that already owns a virtual
-// candidate path within the same owner installation and library, when the
-// handler's file resolver can look a row up by path. The stale fallback uses it
-// to recognize a healthy substitute whose path belongs to an existing
-// alternate-version row: that substitute must rotate the session to the owning
-// row, not attempt an adoption the SQL sibling guard refuses. A resolver
-// without GetByPath reports no owner, leaving ordinary adoption behavior.
-func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, candidateURI string, ownerID, libraryID int) *models.MediaFile {
-	if h == nil || strings.TrimSpace(candidateURI) == "" {
-		return nil
+// candidate path within the same owner installation, library, content, and
+// episode, when the handler's file resolver can look a row up by path. The
+// stale fallback uses it to recognize a healthy substitute whose path belongs
+// to an existing alternate-version row: that substitute must rotate the session
+// to the owning row, not attempt an adoption the SQL sibling guard refuses. A
+// resolver without GetByPath reports no owner, leaving ordinary adoption
+// behavior.
+//
+// Ownership is asserted beyond the installation and library: the row must name
+// the exact concrete path and carry this content's identity. A path collision
+// alone is not ownership — a provider renumbers result ids per listing, and
+// rotating to another content's or another episode's row would bind the session
+// to bytes the viewer never selected.
+//
+// A lookup error is not safe absence. It returns an error so the caller fails
+// closed instead of adopting a substitute whose owner is unknown. A nil row
+// with a nil error is a genuine not-found and the only safe absence; a row
+// without a usable id is treated as an unanswered lookup, not absence.
+func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.MediaFile, candidateURI string, ownerID, libraryID int) (*models.MediaFile, error) {
+	if h == nil || file == nil || strings.TrimSpace(candidateURI) == "" {
+		return nil, nil
 	}
 	pathResolver, ok := h.fileResolver.(interface {
 		GetByPath(context.Context, string) (*models.MediaFile, error)
 	})
 	if !ok {
-		return nil
+		// No path lookup capability: ownership cannot be asserted, so the
+		// caller keeps ordinary adoption behavior.
+		return nil, nil
 	}
 	row, err := pathResolver.GetByPath(ctx, candidateURI)
-	if err != nil || row == nil || row.ID <= 0 {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("virtual path owner lookup failed for %q: %w", candidateURI, err)
+	}
+	if row == nil {
+		return nil, nil
+	}
+	if row.ID <= 0 {
+		return nil, fmt.Errorf("virtual path owner lookup for %q returned an incomplete row", candidateURI)
 	}
 	if row.VirtualOwnerInstallationID != ownerID || row.MediaFolderID != libraryID {
-		return nil
+		return nil, nil
 	}
-	return row
+	if file.ContentID == "" || row.ContentID != file.ContentID {
+		return nil, nil
+	}
+	if row.EpisodeID != file.EpisodeID {
+		return nil, nil
+	}
+	if strings.TrimSpace(row.FilePath) != strings.TrimSpace(candidateURI) {
+		return nil, nil
+	}
+	return row, nil
+}
+
+// rotateVirtualSourceToOwnerRow returns the resolved source's file rebased on
+// the existing alternate-version row the fallback rotates to, with the freshly
+// probed track and stream evidence overlaid. Starting from the owning row keeps
+// its catalog identity and state (id, content, provider identity, verdict);
+// overlaying the probed evidence keeps the verified video/audio/subtitle tracks
+// the resolver just produced. Replacing the probed file wholesale with the
+// catalog row would strip that evidence while the source still reports
+// ProbeProvenanceVerified, so the plan would be built on an empty inventory.
+func rotateVirtualSourceToOwnerRow(probed *models.MediaFile, ownerRow *models.MediaFile, uri string) *models.MediaFile {
+	if ownerRow == nil {
+		return probed
+	}
+	rotated := *ownerRow
+	rotated.FilePath = uri
+	if probed != nil {
+		rotated.VideoTracks = probed.VideoTracks
+		rotated.AudioTracks = probed.AudioTracks
+		rotated.SubtitleTracks = probed.SubtitleTracks
+		rotated.ExternalSubtitles = probed.ExternalSubtitles
+		rotated.Chapters = probed.Chapters
+		rotated.Resolution = probed.Resolution
+		rotated.CodecVideo = probed.CodecVideo
+		rotated.CodecAudio = probed.CodecAudio
+		rotated.Container = probed.Container
+		rotated.HDR = probed.HDR
+		rotated.Bitrate = probed.Bitrate
+		rotated.Duration = probed.Duration
+		rotated.AudioChannels = probed.AudioChannels
+		rotated.FileSize = probed.FileSize
+		rotated.MultiplePPS = probed.MultiplePPS
+		rotated.MultiplePPSScanSize = probed.MultiplePPSScanSize
+		rotated.MultiplePPSScanMtime = probed.MultiplePPSScanMtime
+	}
+	return &rotated
 }
 
 // fallbackResolveStaleVirtualSource re-lists the provider's current candidates
@@ -4246,6 +4432,18 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		return nil
 	}
 	neutralKey := virtualPlaybackNeutralKey(file.FilePath)
+	// Bound repeated recovery re-lists per provider listing. The fallback lists
+	// the provider directly, so a provider whose listing keeps failing would
+	// otherwise have the resolver's provider fail-fast backoff bypassed on every
+	// start. A listing that answers clears the budget below, so only genuine
+	// listing failures accumulate; once exhausted the caller keeps its honest
+	// provider error until the window lapses.
+	recoveryKey := virtualRecoveryRelistKey(neutralKey, file.VirtualOwnerInstallationID)
+	if !virtualRecoveryRelists.allow(recoveryKey) {
+		slog.WarnContext(ctx, "virtual stale fallback: recovery re-list budget exhausted; staying on the provider floor",
+			"component", "api", "file_id", file.ID, "neutral_key", neutralKey)
+		return nil
+	}
 	listCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	streams, listErr := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
 		listCtx, neutralKey, userID, profileID, file.VirtualOwnerInstallationID,
@@ -4255,6 +4453,9 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		slog.ErrorContext(ctx, "virtual stale fallback: list failed", "component", "api", "neutral_key", neutralKey, "error", listErr)
 		return nil
 	}
+	// The provider answered, so recovery is no longer defeating a provider
+	// backoff; a later failure starts from a full budget.
+	virtualRecoveryRelists.clear(recoveryKey)
 	if len(streams) == 0 {
 		slog.ErrorContext(ctx, "virtual stale fallback: no streams listed", "component", "api", "neutral_key", neutralKey)
 		return nil
@@ -4329,7 +4530,7 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 				CodecAudio:          file.CodecAudio,
 				HDR:                 mediaFileHDRString(file),
 			}
-			resolved, err := h.resolveVirtualCandidateSource(ctx, file, sessionCandidate, userID, profileID, elig.allowFailed)
+			resolved, err := h.resolveVirtualCandidateSource(ctx, file, sessionCandidate, userID, profileID, elig.allowFailed, elig.excludedCandidateIDs)
 			switch {
 			case err == nil && (sessionID == "" || virtualResultCandidateID(resolved.URI) == sessionID):
 				// Reuse the session's own resolved URL: re-resolving the chosen
@@ -4384,8 +4585,19 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		if attempts > maxAttempts {
 			break
 		}
-		resolved, err := h.resolveVirtualCandidateSource(ctx, file, stream, userID, profileID, elig.allowFailed)
+		resolved, err := h.resolveVirtualCandidateSource(ctx, file, stream, userID, profileID, elig.allowFailed, elig.excludedCandidateIDs)
 		if err == nil {
+			// Validate the substitute the resolver actually returned, not just
+			// the listed stream. A dedup keeper or a fresh-selection
+			// fall-through can substitute a release the durable chain has
+			// already indicted; serving or adopting it would reopen the
+			// A→B→C→A cycle the chain exists to stop.
+			if virtualCandidateIDExcluded(resolved.URI, elig.excludedCandidateIDs) {
+				slog.WarnContext(ctx, "virtual stale fallback: refusing a substitute excluded by the recovery chain",
+					"component", "api", "file_id", file.ID, "candidate", stream.URI, "resolved", resolved.URI,
+					"candidate_id", virtualResultCandidateID(resolved.URI))
+				continue
+			}
 			slog.InfoContext(ctx, "virtual stale fallback: resolved substitute", "component", "api", "original", file.FilePath, "substitute", stream.URI)
 			// Persist the substitute's validated identity and probed metadata
 			// back to the catalog row in a single CAS-fenced save, replacing the
@@ -4407,11 +4619,29 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 			// the identity. The AltMount veto is enforced upstream in
 			// resolveVirtualCandidateSource: an active failed_at on the
 			// requested or the resolved candidate refuses before this point.
-			if ownerRow := h.virtualPathOwnerRow(ctx, resolved.URI, effectiveVirtualOwner(stream.OwnerInstallationID, file.VirtualOwnerInstallationID), file.MediaFolderID); ownerRow != nil && ownerRow.ID != file.ID {
+			if ownerRow, ownerErr := h.virtualPathOwnerRow(ctx, file, resolved.URI, effectiveVirtualOwner(stream.OwnerInstallationID, file.VirtualOwnerInstallationID), file.MediaFolderID); ownerErr != nil {
+				// The ownership question could not be answered: an unanswered
+				// lookup is not safe absence, so refuse the substitute rather
+				// than adopt a path whose owner is unknown.
+				slog.ErrorContext(ctx, "virtual stale fallback: refusing to substitute while the path owner is unknown",
+					"component", "api", "file_id", file.ID, "candidate", stream.URI, "resolved", resolved.URI, "error", ownerErr)
+				return nil
+			} else if ownerRow != nil && ownerRow.ID != file.ID {
+				// A substitute whose path is already owned by another row of
+				// this content is an existing alternate version, not a release
+				// to fold into this row: the CAS-fenced adoption below would
+				// collide with the sibling owner and be refused, which is
+				// exactly the dead-pin livelock this fallback exists to break.
+				// Rotate to the owning row instead — the session binds to the
+				// version that actually plays, and no catalog write is needed
+				// because the row already carries the identity. The AltMount
+				// veto is enforced upstream in resolveVirtualCandidateSource:
+				// an active failed_at on the requested or the resolved
+				// candidate refuses before this point. The owning row's catalog
+				// identity is kept and the freshly probed track/stream evidence
+				// is overlaid so the verified inventory is not lost.
 				rotated := *resolved
-				rotatedRow := *ownerRow
-				rotatedRow.FilePath = resolved.URI
-				rotated.File = &rotatedRow
+				rotated.File = rotateVirtualSourceToOwnerRow(resolved.File, ownerRow, resolved.URI)
 				slog.InfoContext(ctx, "virtual stale fallback: rotated to an existing alternate version row",
 					"component", "api", "original", file.FilePath, "substitute", resolved.URI,
 					"original_file_id", file.ID, "substitute_file_id", ownerRow.ID)
@@ -4534,6 +4764,12 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 
 // resolveVirtualCandidateSource resolves and probes a single virtual stream
 // candidate, returning a fully-probed source on success.
+//
+// excludedCandidateIDs is the durable recovery chain. It is threaded into the
+// detailed resolver so a pin whose variant dedup collapsed or a fresh-selection
+// fall-through cannot substitute an already-indicted release, and the resolved
+// identity is validated against it again here, because the resolver may return
+// a substitute the caller's listed-stream filter never saw.
 func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	ctx context.Context,
 	file *models.MediaFile,
@@ -4541,6 +4777,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	userID int,
 	profileID string,
 	allowFailed bool,
+	excludedCandidateIDs []string,
 ) (*resolvedVirtualPlaybackSource, error) {
 	ownerID := candidate.OwnerInstallationID
 	if ownerID <= 0 {
@@ -4552,6 +4789,12 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	// failure for that stream rather than silently resolving a different one
 	// while the caller persists this stream's URI.
 	ctx = withVirtualSessionBindingV3(ctx, true)
+	// An excluded candidate must never be contacted or served, matching the
+	// caller's listed-stream filter. This is the narrow check for a candidate
+	// the caller did not already filter (the session's own re-resolve).
+	if virtualCandidateIDExcluded(candidate.URI, excludedCandidateIDs) {
+		return nil, fmt.Errorf("%w: candidate %q", errVirtualCandidateExcluded, virtualResultCandidateID(candidate.URI))
+	}
 	// A stale-source fallback must never hand back a candidate the serve layer
 	// already marked failed. Check the candidate before contacting the provider
 	// and again on the identity the resolver actually returned, because a
@@ -4580,7 +4823,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 			)
 		}
 		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-			candidateCtx, candidate.URI, ownerID, userID, profileID, false, nil, "",
+			candidateCtx, candidate.URI, ownerID, userID, profileID, false, excludedCandidateIDs, "",
 		)
 		if err != nil {
 			return nil, err
@@ -4611,10 +4854,14 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	} else {
 		return nil, errors.New("virtual playback resolver is not configured")
 	}
-	// The resolver may have substituted a different release. The verdict is
-	// part of the release's identity, so re-check the identity that will be
-	// served and, if it wins, adopted. A failed substitute is refused here
-	// rather than persisted by the caller.
+	// The resolver may have substituted a different release. The exclusion and
+	// the verdict are both part of that release's identity, so re-check the
+	// identity that will be served and, if it wins, adopted. An excluded or
+	// failed substitute is refused here rather than served or persisted by the
+	// caller.
+	if virtualCandidateIDExcluded(candidate.URI, excludedCandidateIDs) {
+		return nil, fmt.Errorf("%w: resolved candidate %q", errVirtualCandidateExcluded, virtualResultCandidateID(candidate.URI))
+	}
 	if err := h.virtualCandidateVerdictError(ctx, candidate.URI, file, ownerID, allowFailed); err != nil {
 		return nil, err
 	}
