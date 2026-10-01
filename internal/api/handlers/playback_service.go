@@ -1035,6 +1035,27 @@ func (h *PlaybackHandler) PublishInventoryUpdated(ctx context.Context, fileID in
 	}
 }
 
+// virtualSourceGenerationReader is the optional session-manager capability the
+// inventory publisher fences on. A manager that does not expose it (a minimal
+// test manager) keeps the prior best-effort behavior.
+type virtualSourceGenerationReader interface {
+	VirtualSourceGeneration(sessionID string) (uint64, error)
+}
+
+// inventorySourceGeneration reads the session's current source-binding
+// generation and reports whether the manager can supply one.
+func (h *PlaybackHandler) inventorySourceGeneration(sessionID string) (uint64, bool) {
+	reader, ok := h.sessionMgr.(virtualSourceGenerationReader)
+	if !ok {
+		return 0, false
+	}
+	generation, err := reader.VirtualSourceGeneration(sessionID)
+	if err != nil {
+		return 0, false
+	}
+	return generation, true
+}
+
 // publishInventoryUpdatedToSession builds and delivers one inventory_updated
 // event from the session's live inventory. It re-resolves the effective release
 // through the same playbackInventoryForSession the inventory endpoint uses, so
@@ -1049,13 +1070,25 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 	// indistinguishable from a fresh state at the receiver.
 	release := h.progressSideEffectLock(session.ID)
 	defer release()
+	// The caller enumerated sessions before the lock was held, so the snapshot
+	// it passed can already name a superseded source binding. Capture the
+	// monotonic binding generation and re-read the live session under the lock,
+	// then re-check the generation before the send: a binding move that lands
+	// while the inventory is being resolved invalidates this build instead of
+	// delivering an older release's revision after a newer one. The move's own
+	// publish carries the current revision.
+	generation, hasGeneration := h.inventorySourceGeneration(session.ID)
+	live, err := h.sessionMgr.GetSession(session.ID)
+	if err != nil || live == nil {
+		return
+	}
 	var record *playback.AttemptRecordV3
 	if h.PlanStoreV3 != nil {
 		if loaded, err := h.PlanStoreV3.GetAttempt(ctx, session.ID); err == nil {
 			record = loaded
 		}
 	}
-	inventory, err := h.playbackInventoryForSession(ctx, session, record)
+	inventory, err := h.playbackInventoryForSession(ctx, live, record)
 	if err != nil {
 		slog.DebugContext(ctx, "inventory updated event skipped: inventory unavailable",
 			"component", "playback", "session", session.ID, "error", err)
@@ -1065,6 +1098,13 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 		// The probe has not upgraded this session's bound release, so the client
 		// already holds exactly this declared inventory.
 		return
+	}
+	if hasGeneration {
+		if current, ok := h.inventorySourceGeneration(session.ID); !ok || current != generation {
+			slog.DebugContext(ctx, "inventory updated event skipped: source binding moved while building",
+				"component", "playback", "session", session.ID, "built_generation", generation)
+			return
+		}
 	}
 	event, err := playback.NewInventoryUpdatedEvent(session.ID, inventory)
 	if err != nil {

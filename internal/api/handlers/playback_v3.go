@@ -6275,8 +6275,19 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	// A viewer who re-armed Auto mid-session states it on the replan, so a
 	// later dead-source recovery rotates even though the session started
 	// explicit. Applying it before execution is what lets executeReplanV3's
-	// autoFallbackForSession read the same intent the client is showing.
-	h.renegotiateAutoFallbackV3(r.Context(), sessionID, req)
+	// autoFallbackForSession read the same intent the client is showing; it is
+	// also written to the durable normalized request so a reconstructed session
+	// keeps the negotiated policy instead of reverting to the start request. A
+	// policy the session cannot adopt refuses the replan rather than continuing
+	// with a stale intent.
+	if err := h.renegotiateAutoFallbackV3(sessionID, record, req); err != nil {
+		slog.WarnContext(r.Context(), "protocol v3 replan auto-fallback re-negotiation failed",
+			"component", "api", "session", sessionID, "error", err)
+		if errors.Is(err, playback.ErrSessionNotFound) {
+			return playback.DecisionResponseV3{}, replanSessionNotFoundV3()
+		}
+		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to apply the version fallback policy")
+	}
 	response, updated, transport, replanErr := h.executeReplanV3(r.WithContext(replanCtx), record, req)
 	if replanErr != nil {
 		if transport != nil {
@@ -7821,12 +7832,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// an explicit start turns it off so a replan must not silently substitute
 		// another version, and the viewer re-selecting Auto turns it back on even
 		// for a session that started explicit. An unset flag (a reconstruction)
-		// keeps the original request's semantics.
-		autoFallback := record.NormalizedRequest.AllowsAlternateVersions() &&
-			record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3
-		if negotiated, ok := autoFallbackForSession(h.sessionMgr, session.ID); ok {
-			autoFallback = negotiated
-		}
+		// falls back to the durable normalized request, which a mid-session re-arm
+		// updates, so the reconstructed policy still matches the viewer's intent
+		// instead of the original start request.
+		autoFallback := resolveReplanAutoFallbackV3(h.sessionMgr, session.ID, record)
 		replanFallbackAllowed := autoFallback &&
 			(replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
 				(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3))
@@ -9120,25 +9129,72 @@ func autoFallbackForSession(sessionMgr SessionManagerInterface, sessionID string
 	return getter.AutoFallback(sessionID)
 }
 
-// renegotiateAutoFallbackV3 re-arms a session's auto-fallback flag from a
-// replan request. Clients that start on an explicit pick and later re-select
-// Auto from the version menu have no start request to carry the intent, so the
-// next replan states it here; without this the session stays pinned to the
-// explicit pick and a dead-source recovery refuses to rotate while the menu
-// shows Auto armed. An absent field leaves the start-time intent untouched, and
-// a manager that does not expose the setter keeps its prior behavior.
-func (h *PlaybackHandler) renegotiateAutoFallbackV3(ctx context.Context, sessionID string, req playback.ReplanRequestV3) {
+// resolveReplanAutoFallbackV3 resolves the attempt's effective version-fallback
+// policy for a replan. The live session flag wins while it is set (it carries a
+// mid-session re-arm); otherwise the durable normalized request is
+// authoritative, so a reconstructed session whose in-memory flag was lost with
+// the process keeps the negotiated policy instead of reverting to the start
+// request.
+func resolveReplanAutoFallbackV3(sessionMgr SessionManagerInterface, sessionID string, record *playback.AttemptRecordV3) bool {
+	autoFallback := false
+	if record != nil {
+		autoFallback = record.NormalizedRequest.AllowsAlternateVersions() &&
+			record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3
+	}
+	if negotiated, ok := autoFallbackForSession(sessionMgr, sessionID); ok {
+		autoFallback = negotiated
+	}
+	return autoFallback
+}
+
+// errAutoFallbackUnsupportedV3 reports a session manager that cannot negotiate
+// auto-fallback. The replan refuses rather than applying a policy the session
+// would not honor.
+var errAutoFallbackUnsupportedV3 = errors.New("session manager does not expose auto-fallback negotiation")
+
+// renegotiateAutoFallbackV3 applies a replan's auto-fallback intent to the live
+// session and the durable attempt record. Clients that start on an explicit
+// pick and later re-select Auto from the version menu have no start request to
+// carry the intent, so the next replan states it here. Recording it on the
+// durable normalized request as well is what lets a reconstructed session keep
+// the negotiated policy instead of reverting to the start request. A set
+// failure is returned to the caller so the replan fails closed: running with a
+// policy the session will not honor, or one that will not survive a
+// reconstruction, is worse than a retryable failure. An absent field leaves the
+// negotiated intent untouched.
+func (h *PlaybackHandler) renegotiateAutoFallbackV3(sessionID string, record *playback.AttemptRecordV3, req playback.ReplanRequestV3) error {
 	if req.AutoFallback == nil {
-		return
+		return nil
 	}
 	setter, ok := h.sessionMgr.(interface {
 		SetAutoFallback(sessionID string, enabled bool) error
 	})
 	if !ok {
-		return
+		return errAutoFallbackUnsupportedV3
 	}
 	if err := setter.SetAutoFallback(sessionID, *req.AutoFallback); err != nil {
-		slog.WarnContext(ctx, "protocol v3 replan auto-fallback re-negotiation failed", "component", "api", "session", sessionID, "enabled", *req.AutoFallback, "error", err)
+		return err
+	}
+	persistAutoFallbackPolicyV3(&record.NormalizedRequest, *req.AutoFallback)
+	return nil
+}
+
+// persistAutoFallbackPolicyV3 materializes a negotiated version-fallback policy
+// into the durable normalized request. The reconstruction read derives fallback
+// from the request's selection intent, so enabling clears an explicit pin and
+// disabling records one; the explicit boolean is written too, so a reader does
+// not have to infer it from the selection when a client sends an explicit
+// allow_alternate_versions.
+func persistAutoFallbackPolicyV3(req *playback.StartRequestV3, enabled bool) {
+	if req == nil {
+		return
+	}
+	allow := enabled
+	req.AllowAlternateVersions = &allow
+	if enabled {
+		req.FileSelection = playback.FileSelectionAutoV3
+	} else {
+		req.FileSelection = playback.FileSelectionExplicitV3
 	}
 }
 
