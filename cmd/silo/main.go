@@ -1579,7 +1579,6 @@ func main() {
 	var virtualRegistrar *catalog.VirtualMediaRegistrar
 	var vlSvc *virtuallibrary.Service
 	vlActive := false
-	var requestVirtualMetadataRefresh func(context.Context, string) error
 	pluginAutoUpdateDone := make(chan struct{})
 	var pluginAutoUpdater *plugins.AutoUpdateService
 	// Network access providers: ingress tokens issued per plugin start and the
@@ -1684,25 +1683,6 @@ func main() {
 			EventPublisher:  eventsHub,
 			LibraryLister:   pluginhost.NewLibraryLister(libDataSource),
 			CatalogPresence: catalogPresence,
-			VirtualCatalog: virtualCatalogHostAdapter{
-				registrar: pluginhost.VirtualCatalogRegistrarFunc(
-					func(ctx context.Context, installationID int, req catalog.VirtualMedia) (*catalog.VirtualMediaResult, error) {
-						result, err := virtualRegistrar.UpsertVirtualMedia(ctx, installationID, req)
-						if err != nil {
-							return nil, err
-						}
-						sections.InvalidateResolvedListCache()
-						if requestVirtualMetadataRefresh != nil {
-							if err := requestVirtualMetadataRefresh(ctx, result.MediaID); err != nil {
-								slog.WarnContext(ctx, "failed to queue virtual media metadata refresh", "component", "plugin-host", "content_id", result.MediaID, "error", err)
-							}
-						}
-						return result, nil
-					},
-				),
-				reconciler: virtualRegistrar,
-				overrides:  virtualRegistrar,
-			},
 			InstalledPlugins: pluginhost.InstalledPluginListerFunc(
 				func(ctx context.Context) ([]pluginhost.InstalledPluginRecord, error) {
 					installations, err := installationStore.List(ctx)
@@ -2024,9 +2004,6 @@ func main() {
 			personRepo,
 			deps.FileRepo, skippedRootRepo, staleIDRepo, rootClaimRepo,
 		)
-		requestVirtualMetadataRefresh = func(ctx context.Context, contentID string) error {
-			return metadataService.RequestStaleMetadataRefresh(ctx, metadata.RefreshTargetItem, contentID)
-		}
 		// Drop the resolved-chain cache whenever a plugin is installed, enabled,
 		// disabled, updated, or uninstalled. The installation-enabled check is
 		// served from the plugins service's in-memory cache (invalidated on the
@@ -4925,34 +4902,6 @@ func mapFolderTypeToMediaType(t string) string {
 	}
 }
 
-type virtualCatalogHostAdapter struct {
-	registrar  pluginhost.VirtualCatalogRegistrar
-	reconciler interface {
-		ReconcileVirtualMedia(context.Context, int, string, []string, []int) (catalog.VirtualReconcileResult, error)
-	}
-	overrides interface {
-		LookupReleaseOverrides(context.Context, []catalog.ReleaseIdentity) ([]catalog.ReleaseOverride, error)
-	}
-}
-
-func (a virtualCatalogHostAdapter) LookupReleaseOverrides(ctx context.Context, ids []catalog.ReleaseIdentity) ([]catalog.ReleaseOverride, error) {
-	if a.overrides == nil {
-		return nil, errors.New("release override reader is not configured")
-	}
-	return a.overrides.LookupReleaseOverrides(ctx, ids)
-}
-
-func (a virtualCatalogHostAdapter) UpsertVirtualMedia(ctx context.Context, installationID int, req catalog.VirtualMedia) (*catalog.VirtualMediaResult, error) {
-	return a.registrar.UpsertVirtualMedia(ctx, installationID, req)
-}
-
-func (a virtualCatalogHostAdapter) ReconcileVirtualMedia(ctx context.Context, installationID int, source string, keepIDs []string, libraryIDs []int) (catalog.VirtualReconcileResult, error) {
-	if a.reconciler == nil {
-		return catalog.VirtualReconcileResult{}, errors.New("virtual catalog reconciler is not configured")
-	}
-	return a.reconciler.ReconcileVirtualMedia(ctx, installationID, source, keepIDs, libraryIDs)
-}
-
 type scopeResolver interface {
 	Resolve(ctx context.Context, input access.ResolveInput) (access.Scope, error)
 }
@@ -5014,11 +4963,9 @@ func (r *vlPluginRetirer) Stop(installationID int) error {
 	return r.svc.Stop(installationID)
 }
 
+// ClearCaches is a documented no-op: virtual playback caches were retired
+// with the plugin RPCs, so there is nothing for retirement to flush.
 func (r *vlPluginRetirer) ClearCaches() {
-	if r.svc == nil {
-		return
-	}
-	r.svc.Clear()
 }
 
 func (r *vlPluginRetirer) DeleteInstallation(ctx context.Context, id int) error {
