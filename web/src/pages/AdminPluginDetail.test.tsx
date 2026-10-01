@@ -253,7 +253,7 @@ describe("AdminPluginDetail", () => {
 
     expect(screen.getByRole("heading", { level: 1, name: "MDBList Ratings" })).toBeInTheDocument();
     expect(screen.getByText("Version 0.1.0")).toBeInTheDocument();
-    expect(screen.getAllByText("Vio maintained").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Silo maintained").length).toBeGreaterThan(0);
     expect(screen.getByText("silo.mdblist")).toBeInTheDocument();
     expect(screen.getByText("AGPL-3.0-only")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "MDBList Account" })).toBeInTheDocument();
@@ -472,10 +472,14 @@ describe("AdminPluginDetail", () => {
     expect(screen.getByText(heading)).toBeInTheDocument();
   });
 
-  it("shows no tier notice for Silo's own plugins", () => {
-    renderPage();
-    expect(screen.queryByRole("note")).not.toBeInTheDocument();
-  });
+  it.each(["silo", "vio"] as const)(
+    "shows no tier notice for %s first-party plugins",
+    (sourceKind) => {
+      installationsQuery = query([makeInstallation({ source_kind: sourceKind })]);
+      renderPage();
+      expect(screen.queryByRole("note")).not.toBeInTheDocument();
+    },
+  );
 
   it("renders setup Markdown as text, never as HTML", () => {
     const { container } = renderPage();

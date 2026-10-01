@@ -379,7 +379,7 @@ function CatalogTab({
   const groups = CATALOG_GROUPS.map((group) => ({
     ...group,
     entries: visible
-      .filter((entry) => entry.source_kind === group.kind)
+      .filter((entry) => group.matches(entry.source_kind))
       .sort(
         (a, b) =>
           Number(installedIds.has(a.plugin_id)) - Number(installedIds.has(b.plugin_id)) ||

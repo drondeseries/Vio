@@ -22,7 +22,7 @@ export function sourceLabel(sourceKind: string): string {
   switch (sourceKind) {
     case "vio":
     case "silo":
-      return "Vio maintained";
+      return "Silo maintained";
     case "approved_community":
       return "Approved community";
     default:
@@ -36,6 +36,7 @@ export function sourceLabel(sourceKind: string): string {
  */
 export function tierNotice(sourceKind: string): string | null {
   switch (sourceKind) {
+    case "vio":
     case "silo":
       return null;
     case "approved_community":
@@ -50,10 +51,29 @@ export function configPanelId(key: string): string {
   return `config-${key}`;
 }
 
-export const CATALOG_GROUPS: { kind: PluginSourceKind; title: string }[] = [
-  { kind: "silo", title: "Made by Silo" },
-  { kind: "approved_community", title: "Approved community" },
-  { kind: "external", title: "Other sources" },
+export interface CatalogGroup {
+  kind: PluginSourceKind;
+  title: string;
+  matches: (sourceKind: string) => boolean;
+}
+
+export const CATALOG_GROUPS: readonly CatalogGroup[] = [
+  {
+    kind: "vio",
+    title: "Silo maintained",
+    matches: (sourceKind: string) => sourceKind === "vio" || sourceKind === "silo",
+  },
+  {
+    kind: "approved_community",
+    title: "Approved community",
+    matches: (sourceKind: string) => sourceKind === "approved_community",
+  },
+  {
+    kind: "external",
+    title: "Other sources",
+    matches: (sourceKind: string) =>
+      sourceKind !== "vio" && sourceKind !== "silo" && sourceKind !== "approved_community",
+  },
 ];
 
 export function pluginDisplayName(pluginID: string, presentation?: PluginPresentation): string {

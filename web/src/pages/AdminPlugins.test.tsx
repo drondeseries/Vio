@@ -499,9 +499,8 @@ describe("AdminPlugins", () => {
     expect(markup).toContain("Failed");
     expect(markup.match(/data-attention="true"/g)).toHaveLength(3);
     expect(markup).toContain('data-state="off"');
-    // Every tile states its tier (1.0 plugin management AC4). Vio brands
-    // the first-party tier as Vio maintained (see pluginPresentation).
-    expect(markup.match(/1\.0\.0, Vio maintained/g)).toHaveLength(5);
+    // Every tile states its tier (1.0 plugin management AC4).
+    expect(markup.match(/1\.0\.0, Silo maintained/g)).toHaveLength(5);
   });
 
   it("puts no controls on installed tiles", () => {
@@ -608,7 +607,7 @@ describe("AdminPlugins", () => {
       </MemoryRouter>,
     );
 
-    expect(markup).toContain("Made by Silo");
+    expect(markup).toContain("Silo maintained");
     expect(markup).toContain("Other sources");
     expect(markup).not.toContain("Approved community");
     // Uninstalled plugins come first within a group.
@@ -683,6 +682,54 @@ describe("AdminPlugins", () => {
 
     expect(markup).not.toContain("Ratings Source");
     expect(markup).toContain("No catalog plugins match");
+  });
+
+  it("renders 'vio' source_kind entries under Silo maintained alongside approved_community", () => {
+    const vioPlugin1: PluginCatalogEntry = {
+      ...makeCatalogEntry(1, { displayName: "TMDB Metadata" }),
+      source_kind: "vio",
+      plugin_id: "silo.tmdb",
+    };
+    const vioPlugin2: PluginCatalogEntry = {
+      ...makeCatalogEntry(2, { displayName: "TheIntroDB" }),
+      source_kind: "vio",
+      plugin_id: "silo.theintrodb",
+    };
+    const communityPlugin: PluginCatalogEntry = {
+      ...makeCatalogEntry(3, { displayName: "Requests Arr" }),
+      source_kind: "approved_community",
+      plugin_id: "silo.requests.arr",
+    };
+    useAdminPluginsMock.mockReturnValue({
+      repositories: [],
+      catalogSettings: undefined,
+      isLoading: false,
+      installations: [],
+      catalog: [vioPlugin1, vioPlugin2, communityPlugin],
+    });
+
+    const markup = renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/admin/plugins?tab=catalog"]}>
+        <AdminPlugins />
+      </MemoryRouter>,
+    );
+
+    // Both "Silo maintained" and "Approved community" groups must render
+    expect(markup).toContain("Silo maintained");
+    expect(markup).toContain("Approved community");
+
+    // Section-scoped placement: Vio plugins inside Silo maintained section, Community inside Approved community
+    const vioSection = markup.slice(
+      markup.indexOf('aria-label="Silo maintained"'),
+      markup.indexOf('aria-label="Approved community"'),
+    );
+    expect(vioSection).toContain("TMDB Metadata");
+    expect(vioSection).toContain("TheIntroDB");
+    expect(vioSection).not.toContain("Requests Arr");
+
+    const communitySection = markup.slice(markup.indexOf('aria-label="Approved community"'));
+    expect(communitySection).toContain("Requests Arr");
+    expect(communitySection).not.toContain("TMDB Metadata");
   });
 
   it.each([["silo.theintrodb"], ["silo.not-installed"]])(
