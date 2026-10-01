@@ -1266,9 +1266,13 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 			"component", "playback", "session", session.ID, "error", err)
 		return inventory.InventoryRevision, false
 	}
-	if err := h.RealtimeHub.Send(session.ID, event); err != nil && !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
-		slog.WarnContext(ctx, "failed to deliver inventory updated realtime event",
-			"component", "playback", "session", session.ID, "error", err)
+	if err := h.RealtimeHub.Send(session.ID, event); err != nil {
+		if !errors.Is(err, playback.ErrRealtimeConnectionNotFound) {
+			slog.WarnContext(ctx, "failed to deliver inventory updated realtime event",
+				"component", "playback", "session", session.ID, "error", err)
+		}
+		// A session without a realtime connection received nothing; do not
+		// count it as notified.
 		return inventory.InventoryRevision, false
 	}
 	return inventory.InventoryRevision, true
