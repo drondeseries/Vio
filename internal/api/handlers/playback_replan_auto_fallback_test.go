@@ -325,5 +325,3 @@ func TestHandleReplanPlaybackV3FailedReplanKeepsOriginalAutoFallbackPolicy(t *te
 		})
 	}
 }
-
-
