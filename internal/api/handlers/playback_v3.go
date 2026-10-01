@@ -6280,6 +6280,19 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 	// keeps the negotiated policy instead of reverting to the start request. A
 	// policy the session cannot adopt refuses the replan rather than continuing
 	// with a stale intent.
+	//
+	// The apply is speculative: executeReplanV3 may still fail, and the live
+	// flag is read mid-execution, so capture the prior policy first and restore
+	// both halves on every failure path below. Only a replacement plan that
+	// actually commits keeps the new policy, which is when live and durable
+	// already agree on it.
+	autoFallbackRollback := h.captureAutoFallbackRollbackV3(sessionID, record)
+	autoFallbackCommitted := false
+	defer func() {
+		if !autoFallbackCommitted {
+			autoFallbackRollback.restore()
+		}
+	}()
 	if err := h.renegotiateAutoFallbackV3(sessionID, record, req); err != nil {
 		slog.WarnContext(r.Context(), "protocol v3 replan auto-fallback re-negotiation failed",
 			"component", "api", "session", sessionID, "error", err)
@@ -6307,6 +6320,12 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		}
 		response := playback.NewTerminalResponseV3(replanErr.reason, replanErr.message, replanErr.retryable)
 		encoded, _ := json.Marshal(response)
+		// The failed replan did not adopt the stated policy, so the terminal
+		// record must persist the policy in force before it, not the one this
+		// request tried. Restore the durable half now, before the record is
+		// copied into the terminal decision; the deferred restore covers the
+		// live half and re-applies harmlessly.
+		autoFallbackRollback.restore()
 		terminalRecord := *record
 		terminalRecord.CurrentReplanRequestID = req.ReplanRequestID
 		if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, terminalRecord); err != nil {
@@ -6324,6 +6343,7 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		leaseCompleted = true
 		return response, nil
 	}
+
 	updated.CurrentReplanRequestID = req.ReplanRequestID
 	encoded, _ := json.Marshal(response)
 	var rollbackSession func() error
@@ -6370,6 +6390,11 @@ func (h *PlaybackHandler) replanPlaybackApplicationV3(r *http.Request, sessionID
 		return playback.DecisionResponseV3{}, playbackOperationError(http.StatusInternalServerError, "internal_error", "Failed to commit the replacement plan")
 	}
 	leaseCompleted = true
+	// The replacement plan is durable, so the speculative policy application is
+	// now the adopted policy: live and durable agree and the deferred rollback
+	// must not undo it. A later transport commit failure aborts the live session
+	// without reverting the durable plan.
+	autoFallbackCommitted = true
 	if transport != nil {
 		if commitErr := transport.commit(); commitErr != nil {
 			_ = h.abortPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID)
@@ -9177,6 +9202,61 @@ func (h *PlaybackHandler) renegotiateAutoFallbackV3(sessionID string, record *pl
 	}
 	persistAutoFallbackPolicyV3(&record.NormalizedRequest, *req.AutoFallback)
 	return nil
+}
+
+// autoFallbackRollbackV3 captures the auto-fallback policy in force before a
+// replan speculatively applies a new one. The handler applies the new intent to
+// the live session before executeReplanV3 so execution reads the same policy the
+// client is showing; if execution then fails, the speculative write must be
+// undone. Both halves are restored: the live session's boolean and set-bit (an
+// unset session must go back to reporting ok=false, not a spurious explicit
+// "off"), and the durable normalized request the record carries, so a terminal
+// failure does not persist the policy the failed replan never adopted.
+type autoFallbackRollbackV3 struct {
+	handler   *PlaybackHandler
+	sessionID string
+	record    *playback.AttemptRecordV3
+
+	enabled bool
+	set     bool
+
+	allowAlternate *bool
+	fileSelection  playback.FileSelectionV3
+}
+
+// captureAutoFallbackRollbackV3 snapshots the live and durable policy so a
+// later failure can restore it. Call it before renegotiateAutoFallbackV3.
+func (h *PlaybackHandler) captureAutoFallbackRollbackV3(sessionID string, record *playback.AttemptRecordV3) autoFallbackRollbackV3 {
+	rollback := autoFallbackRollbackV3{handler: h, sessionID: sessionID, record: record}
+	rollback.enabled, rollback.set = autoFallbackForSession(h.sessionMgr, sessionID)
+	if record != nil {
+		if record.NormalizedRequest.AllowAlternateVersions != nil {
+			allow := *record.NormalizedRequest.AllowAlternateVersions
+			rollback.allowAlternate = &allow
+		}
+		rollback.fileSelection = record.NormalizedRequest.FileSelection
+	}
+	return rollback
+}
+
+// restore puts the captured policy back. The live restore tolerates a session
+// that vanished while the replan ran (session_expired) — there is nothing left
+// to restore on in that case. The durable restore always applies, because the
+// record is a local snapshot the caller may still persist.
+func (rb autoFallbackRollbackV3) restore() {
+	if rb.record != nil {
+		rb.record.NormalizedRequest.AllowAlternateVersions = rb.allowAlternate
+		rb.record.NormalizedRequest.FileSelection = rb.fileSelection
+	}
+	restorer, ok := rb.handler.sessionMgr.(interface {
+		RestoreAutoFallback(sessionID string, enabled bool, set bool) error
+	})
+	if !ok {
+		return
+	}
+	if err := restorer.RestoreAutoFallback(rb.sessionID, rb.enabled, rb.set); err != nil && !errors.Is(err, playback.ErrSessionNotFound) {
+		slog.Warn("protocol v3 replan auto-fallback rollback failed", "component", "api", "session", rb.sessionID, "error", err)
+	}
 }
 
 // persistAutoFallbackPolicyV3 materializes a negotiated version-fallback policy

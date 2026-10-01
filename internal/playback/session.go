@@ -1538,6 +1538,26 @@ func (m *SessionManager) SetAutoFallback(sessionID string, enabled bool) error {
 	return nil
 }
 
+// RestoreAutoFallback returns a session's auto-fallback state to a value
+// captured by AutoFallback before a speculative renegotiation. It restores both
+// the boolean and the set-bit, so a session that had never negotiated the field
+// goes back to reporting ok=false rather than a spurious explicit "off". A
+// failed replan that applied a new policy before execution must roll back to
+// exactly the prior state, not just the boolean, or a later replan would treat
+// an unset session as having explicitly disabled fallback.
+func (m *SessionManager) RestoreAutoFallback(sessionID string, enabled bool, set bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.autoFallback = enabled
+	s.autoFallbackSet = set
+	return nil
+}
+
 // AutoFallback reports the session's negotiated auto-fallback state. ok is
 // false for a session that never set it (for example a reconstruction), so a
 // caller keeps its own conservative default instead of assuming a value.

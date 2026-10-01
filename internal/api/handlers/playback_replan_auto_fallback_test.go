@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
@@ -199,3 +200,130 @@ func TestHandleReplanPlaybackV3FailsClosedWhenAutoFallbackSetFails(t *testing.T)
 		t.Fatalf("durable policy changed despite the refusal: %#v", record.NormalizedRequest)
 	}
 }
+
+// failingReplanFileResolverV3 refuses every file load, so executeReplanV3 fails
+// with source_unavailable — a terminal the handler persists while the live
+// session is still intact. That is the state a failed replan must leave the
+// auto-fallback policy in: exactly as it was before the request applied its
+// speculative re-negotiation.
+type failingReplanFileResolverV3 struct{}
+
+func (failingReplanFileResolverV3) GetByID(context.Context, int) (*models.MediaFile, error) {
+	return nil, errors.New("resolver unavailable")
+}
+
+// TestHandleReplanPlaybackV3FailedReplanKeepsOriginalAutoFallbackPolicy drives a
+// replan that renegotiates auto-fallback to enabled and then fails during
+// execution. The failed replan must not leave the speculative policy behind:
+// the live session flag (value and set-bit) and the durable normalized request
+// must both read exactly as they did before the request.
+func TestHandleReplanPlaybackV3FailedReplanKeepsOriginalAutoFallbackPolicy(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+
+	for _, test := range []struct {
+		name string
+		// original is nil for a session that never negotiated the field, so the
+		// set-bit stays false; otherwise it is the explicit starting value.
+		original *bool
+	}{
+		{name: "unset session goes back to unset"},
+		{name: "explicit off stays explicitly off", original: boolPtr(false)},
+		{name: "explicit on stays explicitly on", original: boolPtr(true)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := playback.NewSessionManager(0, 0)
+			handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+
+			live, err := manager.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+			if err != nil {
+				t.Fatalf("start session: %v", err)
+			}
+			if test.original != nil {
+				if err := manager.SetAutoFallback(live.ID, *test.original); err != nil {
+					t.Fatalf("seed auto-fallback: %v", err)
+				}
+			}
+			wantEnabled, wantSet := false, false
+			if test.original != nil {
+				wantEnabled, wantSet = *test.original, true
+			}
+
+			const attemptID = "attempt-failed-policy-0001"
+			const failedPlanID = "plan-failed-0001"
+			if err := handler.PlanStoreV3.SaveAttempt(context.Background(), playback.AttemptRecordV3{
+				SessionID:            live.ID,
+				PlaybackAttemptID:    attemptID,
+				UserID:               1,
+				ProfileID:            "profile-1",
+				CurrentPlanID:        failedPlanID,
+				RequestedMediaFileID: file.ID,
+				EffectiveMediaFileID: file.ID,
+				NormalizedRequest: playback.StartRequestV3{
+					FileSelection: playback.FileSelectionExplicitV3,
+					// An explicit pin of the original policy: absent here, so
+					// the durable record reads explicit + allows-alternates nil.
+				},
+				ExpiresAt: time.Now().Add(time.Hour),
+			}); err != nil {
+				t.Fatalf("save attempt: %v", err)
+			}
+
+			// Fail execution at the first source load, after the handler has
+			// already applied the speculative policy.
+			handler.fileResolver = failingReplanFileResolverV3{}
+
+			baseReq := v3HandlerStartRequest()
+			enabled := true
+			replan := playback.ReplanRequestV3{
+				ProtocolVersion:       playback.ProtocolV3,
+				Operation:             playback.ReplanOperationFailureRecoveryV3,
+				PlaybackAttemptID:     attemptID,
+				ReplanRequestID:       "replan-failed-policy-0001",
+				FailedPlanID:          failedPlanID,
+				PlanAttemptID:         "plan-attempt-0001",
+				PlanAttemptKey:        "v3:plan-attempt-key-0001",
+				AttemptCount:          1,
+				PositionSeconds:       1,
+				AutoFallback:          &enabled,
+				Failure:               playback.FailureV3{Classification: "transcode_start_failed"},
+				Capabilities:          baseReq.Capabilities,
+				ClientPlaybackContext: baseReq.ClientPlaybackContext,
+			}
+			body, err := json.Marshal(replan)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/"+live.ID+"/replan", strings.NewReader(string(body))).WithContext(newAuthorizedPlaybackContext())
+			req = withPlaybackRouteParam(req, "session_id", live.ID)
+			rr := httptest.NewRecorder()
+			handler.HandleReplanPlaybackV3(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 terminal; body = %s", rr.Code, rr.Body.String())
+			}
+			var response playback.DecisionResponseV3
+			if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.Terminal == nil {
+				t.Fatalf("response = %#v, want a terminal from the failed replan", response)
+			}
+
+			if gotEnabled, gotSet := manager.AutoFallback(live.ID); gotEnabled != wantEnabled || gotSet != wantSet {
+				t.Fatalf("live auto-fallback = (%v, %v), want (%v, %v): a failed replan must not keep the speculative policy",
+					gotEnabled, gotSet, wantEnabled, wantSet)
+			}
+
+			record, err := handler.PlanStoreV3.GetAttempt(context.Background(), live.ID)
+			if err != nil {
+				t.Fatalf("reload attempt: %v", err)
+			}
+			if record.NormalizedRequest.FileSelection != playback.FileSelectionExplicitV3 || record.NormalizedRequest.AllowAlternateVersions != nil {
+				t.Fatalf("durable policy = %#v, want the pre-replan explicit pin with no explicit allow flag", record.NormalizedRequest)
+			}
+		})
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
