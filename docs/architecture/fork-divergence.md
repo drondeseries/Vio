@@ -22,7 +22,7 @@ that before it ships.
 | Monitor registrar | Library-scoped registration, episode URIs, plugin-path fallbacks | `internal/virtuallibrary/registrar.go`, `monitor/monitor.go` | virtuallibrary suites |
 | Plugin SDK | Pinned to the fork (`drondeseries/silo-plugin-sdk` replace in `go.mod`) instead of upstream releases: carries upstream request-router seasons + download-progress plus the fork's virtual_stream contract, with the fork's `virtual_stream_provider` descriptor at field 13 (upstream claimed 11 after the fork). The legacy field-11 manifest compatibility bridge is removed. Virtual-library playback resolves through the core service; generic `virtual_stream_provider.v1` client support remains. | `go.mod`, `go.sum`, `internal/pluginhost/client.go`, `internal/api/requests_wiring.go` | SDK wire-compat test, requests suites |
 | V3 transcode planner | Vio's ladder/HEVC/output-check planner (`targetVideoSelectionV3`, `CappedRungHeightV3` shared with the virtual picker, QSV `-1` width, 2160p min-clamp, 420p/328p rungs) instead of upstream's shared-ladder rework (#1659: `bitrateLadder`, decoder-bounded H264, generalized `scaleTargetHeight` switches). Portable #1659 pieces taken: `scaleTargetHeight`/`vaapiNV12Filter` helpers, `softwareEncode` rename, server-cap audio reserve, `anchorRef` menu wiring, exact ladder-fit heights (`800p` bubbles, `heightLabel`) in the quality resolver. The hardware scalers (`vaapiScaleFilter`, `qsvScaleFilterWithMapMode`, `qsvVPPInputScaleFilter`) scale exact heights in their defaults — a plan/filer mismatch here encodes at source size while the plan advertises the fit, so any future filter must parse `scaleTargetHeight` too. Removed #1659 planner-behavior tests are replaced by Vio equivalents: `TestHardwareScaleFiltersShareExactLadderHeights`, `TestScopeFilmAutoPlanScalesOnHardwareFilters` plus the retained HEVC fallback/decoder tests in `hevc_transcode_v3_test.go`. | `internal/playback/plan_v3.go`, `internal/playback/transcode.go`, `internal/api/handlers/playback_virtual.go` | playback suites (Vio ladder/HEVC/output-check tests) |
-| Image builds | Decoupled `node-base` stage for BuildKit frontend pruning, unshadowed Go module layer caching, persisted Go compiler cache (`buildkit-cache-dance`), deduplicated `workflow_dispatch` frontend builds, base images pinned to patch/dated tags, and skipped image attestations | `Dockerfile`, `.github/workflows/docker.yml` | invariant script |
+| Image builds | Decoupled `node-base` stage for BuildKit frontend pruning, unshadowed Go module layer caching, persisted Go compiler cache (`buildkit-cache-dance`), deduplicated `workflow_dispatch` frontend builds, base images pinned to patch/dated tags, skipped image attestations, and publishing default-branch images as `:dev` with `:latest` reserved for stable releases or manual promotion | `Dockerfile`, `.github/workflows/docker.yml`, `docker-compose.yml`, `.env.example` | invariant script |
 
 ## Merge procedure
 
@@ -41,16 +41,17 @@ that before it ships.
    - `contracts/api/v2/*` and `web/src/api/v2/{operations,schema}.ts` churn:
      expected when upstream changes the contract. These are generated —
      resolve by regenerating (`make apiv2-*`), never by hand-editing.
-   - `Dockerfile` and `.github/workflows/docker.yml` hunks: upstream lacks the
+   - `Dockerfile`, `docker-compose.yml`, `.env.example`, and `.github/workflows/docker.yml` hunks: upstream lacks the
      decoupled `node-base` stage (which enables BuildKit frontend pruning when
      prebuilt assets are injected), shadows Go module layers with cache mounts,
-     lacks `buildkit-cache-dance` to persist Go compiler caches, and duplicates
-     manual frontend builds across runners. Do not let upstream merges
-     overwrite Vio's optimized build pipeline. Note that `.github/workflows/docker.yml`
-is preserved automatically via `.gitattributes` (`merge=ours`, configured by
-      `make install-hooks`), while `Dockerfile` hunks must be reviewed to keep
-      the decoupled `node-base` stage, unshadowed module layer caching, and the
-      pinned base image versions. Floating base image tags (`node:22-slim`,
+     lacks `buildkit-cache-dance` to persist Go compiler caches, duplicates
+     manual frontend builds across runners, and continuously overwrites the `:latest`
+     tag on every main branch commit. Do not let upstream merges
+     overwrite Vio's optimized build pipeline or revert `:dev` defaults to `:latest`. Note that `.github/workflows/docker.yml`
+     is preserved automatically via `.gitattributes` (`merge=ours`, configured by
+     `make install-hooks`), while `Dockerfile`, `docker-compose.yml`, and `.env.example` hunks must be reviewed to keep
+     the decoupled `node-base` stage, unshadowed module layer caching, the
+     pinned base image versions, and the `:dev` image tags. Floating base image tags (`node:22-slim`,
       `golang:1.26`, `debian:trixie-slim`) bump silently and invalidate the
       layer cache and the Go build cache, so the fork pins them to patch/dated
       tags and bumps them as a deliberate change. CI and

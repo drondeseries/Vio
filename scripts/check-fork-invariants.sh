@@ -98,6 +98,18 @@ grep -q 'frontend-dist-' .github/workflows/docker.yml \
   && pass "docker workflow deduplicated manual frontend builds" \
   || reject "docker workflow missing deduplicated manual frontend build artifact handoff"
 
+grep -q 'type=raw,value=dev' .github/workflows/docker.yml \
+  && pass "docker workflow publishes :dev for default branch" \
+  || reject "docker workflow missing :dev tag for default branch"
+
+grep -q 'ghcr.io/drondeseries/vio:dev' docker-compose.yml \
+  && pass "docker-compose defaults to vio:dev" \
+  || reject "docker-compose default image overwritten from vio:dev"
+
+grep -q 'ghcr.io/drondeseries/vio:dev' .env.example \
+  && pass ".env.example defaults to vio:dev" \
+  || reject ".env.example default image overwritten from vio:dev"
+
 if grep -q '^\.github/workflows/docker\.yml merge=ours$' .gitattributes 2>/dev/null; then
   pass "docker.yml merge=ours preserved in .gitattributes"
 else
