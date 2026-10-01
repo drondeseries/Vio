@@ -44,6 +44,7 @@ jobs:
       build_number: ${{ steps.identity.outputs.build_number }}
       built_at: ${{ steps.identity.outputs.built_at }}
       image_version: ${{ steps.identity.outputs.image_version }}
+      is_stable: ${{ steps.identity.outputs.is_stable }}
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'release' || (github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || github.event.workflow_run.head_branch == 'apiv2'))
     steps:
       - name: Resolve build identity
@@ -53,6 +54,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           TARGET_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [[ -z "$DEFAULT_BRANCH" ]]; then
@@ -62,13 +64,21 @@ jobs:
 
           build_number=""
           image_version="${GITHUB_SHA::7}"
+          is_stable="false"
           if [[ "$EVENT_NAME" == "release" ]]; then
+            if (( ${#RELEASE_TAG} > 128 )); then
+              echo "::error::Release tag exceeds Docker 128-character limit."
+              exit 1
+            fi
             core='(0|[1-9][0-9]*)'
             pre='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
             semver_regex="^v${core}\.${core}\.${core}(-${pre}(\.${pre})*)?$"
             if [[ ! "$RELEASE_TAG" =~ $semver_regex ]]; then
               echo "::error::Release tag must be valid SemVer vMAJOR.MINOR.PATCH[-PRERELEASE] without build metadata."
               exit 1
+            fi
+            if [[ "$RELEASE_TAG" != *-* && "$PRERELEASE" != "true" ]]; then
+              is_stable="true"
             fi
             image_version="$RELEASE_TAG"
           elif [[ "$TARGET_BRANCH" == "$DEFAULT_BRANCH" ]]; then
@@ -83,6 +93,7 @@ jobs:
           echo "build_number=${build_number}" >> "$GITHUB_OUTPUT"
           echo "built_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
           echo "image_version=${image_version}" >> "$GITHUB_OUTPUT"
+          echo "is_stable=${is_stable}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout for manual frontend build
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
@@ -285,7 +296,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           tags: |
             type=raw,value=dev,enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) }}
-            type=raw,value=latest,enable=${{ (github.event_name == 'release' && !github.event.release.prerelease) || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true) }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.is_stable == 'true' || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true) }}
             type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') }}
             type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && needs.prepare.outputs.build_number != '' }}
             type=raw,value=apiv2,enable=${{ github.event.workflow_run.head_branch == 'apiv2' || (github.event_name == 'workflow_dispatch' && github.ref_name == 'apiv2') }}
@@ -306,7 +317,7 @@ jobs:
           TARGET_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
           PUBLISH_LATEST: ${{ inputs.publish_latest }}
           EVENT_NAME: ${{ github.event_name }}
-          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          IS_STABLE: ${{ needs.prepare.outputs.is_stable }}
         run: |
           docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:${{ github.event.workflow_run.head_sha || github.sha }}"
           if [[ -n "${BUILD_NUMBER}" ]]; then
@@ -315,6 +326,6 @@ jobs:
           if [[ "${EVENT_NAME}" != "release" && "${TARGET_BRANCH}" == "${DEFAULT_BRANCH}" ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:dev"
           fi
-          if [[ "${EVENT_NAME}" == "release" && "${IS_PRERELEASE}" != "true" ]] || [[ "${PUBLISH_LATEST}" == "true" ]]; then
+          if [[ "${IS_STABLE}" == "true" || "${PUBLISH_LATEST}" == "true" ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:latest"
           fi
