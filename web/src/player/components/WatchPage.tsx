@@ -503,6 +503,11 @@ function WatchPagePlayer({
       queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
       staleTime: 0,
     });
+    // The refreshed list is the server's, but it carries no liveness verdict —
+    // the parent checks those separately. Re-stamp the parent's verdicts before
+    // the rows replace the list so the menu keeps its `available: false`
+    // warnings rather than dropping them until another projection fires.
+    const stamped = applyVersionAvailability(detail.versions, versionLiveness);
     // The refreshed list is the server's, but the live session may still be on
     // a source the re-list did not return (a rotation, or a candidate the
     // server resolved the collapsed row to). Re-key that committed source into
@@ -511,14 +516,14 @@ function WatchPagePlayer({
     const live = sessionRef.current;
     setPlaybackVersions(
       mergeResolvedLiveVersion(
-        detail.versions,
+        stamped,
         live.mediaFileId,
         { mediaFileId: live.mediaFileId, effectiveVirtualUri: live.effectiveVirtualUri },
         versions,
       ),
     );
     setIndexerReleaseRows(detail.indexer_releases ?? []);
-  }, [awaitAdminJob, contentId, fileId, libraryId, queryClient, versions]);
+  }, [awaitAdminJob, contentId, fileId, libraryId, queryClient, versionLiveness, versions]);
   const handleCancelRefresh = useCallback(async () => {
     await cancelVirtualCandidatesRefresh(contentId);
   }, [contentId]);
@@ -581,6 +586,7 @@ function WatchPagePlayer({
 
   const applyAudioInventory = session.applyAudioInventory;
   const refreshSubtitles = session.refreshSubtitles;
+  const applyInventoryUpdate = session.applyInventoryUpdate;
 
   /**
    * Follows the effective version a transport just committed to. The realtime
@@ -660,16 +666,63 @@ function WatchPagePlayer({
     let timer: number | null = null;
     let audioComplete = !needsAudio;
     let subtitlesComplete = !needsSubtitles;
+    // What every completed catalog read said about each menu. "empty" means the
+    // resolved row carried no tracks on every completed read; "nonempty" pins
+    // that at least one read carried some. Failed reads contribute nothing.
+    let audioEvidence: "none" | "empty" | "nonempty" = "none";
+    let subtitleEvidence: "none" | "empty" | "nonempty" = "none";
     // Absolute wall-clock deadline so an error loop that never completes a
     // fetch cannot poll past the safety window.
     const deadline = Date.now() + INVENTORY_REFRESH_DEADLINE_MS;
+
+    /**
+     * Closes out a still-declared inventory when the poll is out of attempts and
+     * every completed catalog read came back empty.
+     *
+     * A catalog row is probe-persisted evidence, so an empty result across the
+     * whole budget is the probe's answer: there are no further tracks to wait
+     * for. Fold that answer through the same path a verified realtime push uses
+     * — clearing the badge and dropping the declared placeholders — instead of
+     * stopping silently and leaving the menu frozen. A failed read never
+     * contributes evidence, so an unreachable catalog keeps the badge.
+     */
+    const finalizeProvisionalInventory = () => {
+      const current = sessionRef.current;
+      const clearAudio = current.audioInventoryProvisional && audioEvidence === "empty";
+      const clearSubtitles = current.subtitleInventoryProvisional && subtitleEvidence === "empty";
+      if (!clearAudio && !clearSubtitles) return;
+      applyInventoryUpdate({
+        session_id: sessionId,
+        inventory_status: "verified",
+        ...(clearAudio
+          ? {
+              audio_tracks: [],
+              effective_media_file_id: current.mediaFileId ?? undefined,
+              effective_virtual_uri: current.effectiveVirtualUri ?? undefined,
+            }
+          : {}),
+        ...(clearSubtitles
+          ? {
+              subtitle_inventory: [],
+              // Target the live source so the clear lands on the right row after
+              // a serve-layer rotation, not the plan's stale collapsed id.
+              effective_media_file_id: current.mediaFileId ?? undefined,
+              effective_virtual_uri: current.effectiveVirtualUri ?? undefined,
+            }
+          : {}),
+      });
+    };
 
     const scheduleNextPoll = () => {
       if (cancelled) return;
       const delay = inventoryPollDelayMs(scheduledAttempts, audioComplete && subtitlesComplete);
       if (delay === 0) return;
-      if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS) return;
-      if (Date.now() >= deadline) return;
+      // The budget is spent: finalize what the catalog authoritatively left
+      // empty before the poll stops for good.
+      if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
+        finalizeProvisionalInventory();
+        return;
+      }
       scheduledAttempts += 1;
       timer = window.setTimeout(() => void poll(), delay);
     };
@@ -717,6 +770,13 @@ function WatchPagePlayer({
         });
         if (version) {
           const nextAudioTracks = version.audio_tracks ?? [];
+          // Record what this read said so the finalize pass knows whether the
+          // still-declared menu was consistently empty or saw a richer list.
+          if (nextAudioTracks.length === 0) {
+            if (audioEvidence !== "nonempty") audioEvidence = "empty";
+          } else {
+            audioEvidence = "nonempty";
+          }
           // The menu may replace the plan's inventory when the poll resolved a
           // different file than the plan names (a virtual candidate vs. the
           // collapsed row). `applyAudioInventory` owns the replacement, but the
@@ -760,6 +820,11 @@ function WatchPagePlayer({
           const subtitleMenuIncomplete =
             !hasSelectableSessionSubtitles(current.subtitleUrls) ||
             current.subtitleInventoryProvisional;
+          if (nextSubtitleTracks.length === 0) {
+            if (subtitleEvidence !== "nonempty") subtitleEvidence = "empty";
+          } else {
+            subtitleEvidence = "nonempty";
+          }
           if (subtitleMenuIncomplete && nextSubtitleTracks.length > 0) {
             // The plan's inventory is empty or still declared; a no-op
             // track_change replan re-reads it (URLs included) without changing
@@ -792,20 +857,26 @@ function WatchPagePlayer({
     };
     // The track counts that gate the poll are read once when it starts. They
     // are deliberately not dependencies: filling the inventory in must not
-    // restart the attempt budget.
+    // restart the attempt budget. The provisional flags are different — a
+    // declared push after a verified one re-marks the menu, and the poll has to
+    // come back to clear it again, so a transition restarts (or single-shots)
+    // the poll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     applyAudioInventory,
+    applyInventoryUpdate,
     contentId,
     isVirtualActiveFile,
     libraryId,
     queryClient,
     refreshSubtitles,
+    session.audioInventoryProvisional,
     session.effectiveVirtualUri,
     session.loading,
     session.mediaFileId,
     session.replacing,
     session.sessionId,
+    session.subtitleInventoryProvisional,
   ]);
 
   /**
@@ -951,7 +1022,21 @@ function WatchPagePlayer({
           // parent's checked verdicts onto them before replacing the list so
           // the menu keeps its `available: false` warnings rather than dropping
           // them until another projection fires.
-          setPlaybackVersions(applyVersionAvailability(detail.versions, versionLiveness));
+          const stamped = applyVersionAvailability(detail.versions, versionLiveness);
+          // A serve-layer rotation during the disconnect can move the effective
+          // source without changing the collapsed file id. Re-key the committed
+          // live source into the fresh list the same way a manual refresh does,
+          // so `activeVersion` follows the rotation instead of falling through
+          // to the first row.
+          const live = sessionRef.current;
+          setPlaybackVersions(
+            mergeResolvedLiveVersion(
+              stamped,
+              live.mediaFileId,
+              { mediaFileId: live.mediaFileId, effectiveVirtualUri: live.effectiveVirtualUri },
+              versions,
+            ),
+          );
         }
       })
       .catch(() => {
@@ -972,6 +1057,7 @@ function WatchPagePlayer({
     session.replacing,
     session.sessionId,
     versionLiveness,
+    versions,
   ]);
 
   const handleRealtimeEvent = useCallback(
