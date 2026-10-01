@@ -5644,7 +5644,7 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		state.VirtualExternalSubtitles = file.ExternalSubtitles
 		state.VirtualAudioTracks = file.AudioTracks
 		state.VirtualSubtitleEvidenceURI = file.FilePath
-		state.VirtualSubtitleEvidenceSet = file != nil && file.ProbeUpdatedAt != nil
+		state.VirtualSubtitleEvidenceSet = file.ProbeUpdatedAt != nil
 	}
 	return state
 }
