@@ -186,14 +186,37 @@ type fontExtractFailLog struct {
 
 // failed logs the first failure for key at warn and repeats at debug.
 func (l *fontExtractFailLog) failed(ctx context.Context, key string, attrs ...any) {
-	l.failedWithMessage(ctx, "subtitle font extraction failed", key, attrs...)
+	l.failedWithKind(ctx, fontExtractFailKindExtraction, key, attrs...)
 }
 
-// failedWithMessage is failed with a caller-chosen message, so the font
-// route's non-extraction internal_error causes (session load, source
-// preflight) log under their own wording instead of claiming an extraction
-// failure. The throttle key space is shared, so a target warns once per cause.
-func (l *fontExtractFailLog) failedWithMessage(ctx context.Context, message, key string, attrs ...any) {
+// Font-route failure kinds. Each gets its own log wording and its own slot in
+// the shared throttle key space, so a session-load failure does not suppress a
+// later preflight failure for the same target or vice versa.
+type fontExtractFailKind int
+
+const (
+	fontExtractFailKindExtraction fontExtractFailKind = iota
+	fontExtractFailKindLoad
+	fontExtractFailKindPreflight
+)
+
+func (k fontExtractFailKind) message() string {
+	switch k {
+	case fontExtractFailKindLoad:
+		return "subtitle font request failed: session_load"
+	case fontExtractFailKindPreflight:
+		return "subtitle font request failed: source_preflight"
+	default:
+		return "subtitle font extraction failed"
+	}
+}
+
+// failedWithKind is failed with a caller-chosen kind, so the font route's
+// non-extraction internal_error causes (session load, source preflight) log
+// under their own wording instead of claiming an extraction failure. The key
+// space is shared; each kind owns a distinct key prefix, so a target warns
+// once per cause and a kind cannot suppress another kind's report.
+func (l *fontExtractFailLog) failedWithKind(ctx context.Context, kind fontExtractFailKind, key string, attrs ...any) {
 	l.mu.Lock()
 	if l.seen == nil {
 		l.seen = make(map[string]struct{})
@@ -204,6 +227,7 @@ func (l *fontExtractFailLog) failedWithMessage(ctx context.Context, message, key
 	}
 	l.mu.Unlock()
 	args := append([]any{virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI}, attrs...)
+	message := kind.message()
 	if repeat {
 		slog.DebugContext(ctx, message, args...)
 		return
@@ -235,9 +259,17 @@ func (h *StreamHandler) logSubtitleFontInternalError(ctx context.Context, in Sub
 	if h == nil || err == nil {
 		return
 	}
-	message := "subtitle font request failed: " + cause
+	var kind fontExtractFailKind
+	switch cause {
+	case "session_load":
+		kind = fontExtractFailKindLoad
+	case "source_preflight":
+		kind = fontExtractFailKindPreflight
+	default:
+		kind = fontExtractFailKindExtraction
+	}
 	if fileID > 0 {
-		h.fontExtractFailures.failedWithMessage(ctx, message, cause+"\x00"+fontExtractFailureKey(fileID, trackIndex),
+		h.fontExtractFailures.failedWithKind(ctx, kind, cause+"\x00"+fontExtractFailureKey(fileID, trackIndex),
 			"file_id", fileID,
 			"track", trackIndex,
 			"cause", cause,
@@ -245,7 +277,7 @@ func (h *StreamHandler) logSubtitleFontInternalError(ctx context.Context, in Sub
 		)
 		return
 	}
-	h.fontExtractFailures.failedWithMessage(ctx, message, cause+"\x00session:"+in.SessionID+":track:"+in.Track,
+	h.fontExtractFailures.failedWithKind(ctx, kind, cause+"\x00session:"+in.SessionID+":track:"+in.Track,
 		"session", in.SessionID,
 		"track", in.Track,
 		"cause", cause,
