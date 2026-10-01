@@ -2015,6 +2015,45 @@ describe("WatchPage live inventory refresh", () => {
   });
 });
 
+describe("WatchPage realtime reconnect reconcile", () => {
+  it("re-applies the parent's liveness verdicts to the fresh detail rows", async () => {
+    playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 7 }));
+    // Stable client: the default mock hands back a fresh object per render, which
+    // would re-fire the effect and mask the single reconcile read.
+    queryClientOverride.current = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    // The reconnect read returns the server rows as-is: no liveness on them.
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, available: undefined }],
+    });
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [{ ...virtualVersion, available: false }],
+        versionLiveness: new Map([[7, false]]),
+      }),
+    );
+
+    // The reconcile runs only once the player reports a live socket.
+    const connProps = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onRealtimeConnectionStateChange?: (state: "connected") => void;
+    };
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connected");
+    });
+
+    await waitFor(() => expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(
+        (videoPlayerMock.mock.calls.at(-1)?.[0] as { versions?: PlayerFileVersion[] })
+          .versions?.[0],
+      ).toMatchObject({ file_id: 7, available: false }),
+    );
+  });
+});
+
 describe("WatchPage chapter refresh", () => {
   it("fetches past a fresh chapterless cache entry and only then spends the repair attempt", async () => {
     playbackSessionMock.mockReturnValue(playbackSession({ subtitleUrls: [planSubtitle] }));

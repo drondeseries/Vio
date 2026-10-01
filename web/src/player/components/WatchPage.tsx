@@ -28,6 +28,7 @@ import {
 } from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
+import { applyVersionAvailability } from "@/hooks/queries/versionLiveness";
 import {
   awaitVirtualCandidatesRefresh,
   cancelVirtualCandidatesRefresh,
@@ -265,6 +266,11 @@ function WatchPartyPlaybackGate(props: WatchPageProps) {
 // sync effect a new identity on every render and loop it.
 const EMPTY_INDEXER_RELEASES: PlayerIndexerRelease[] = [];
 
+// The liveness verdicts are optional so WatchPage can render without the
+// item-page check (watch-party tests, standalone renders). An empty map leaves
+// every row's own metadata flag untouched.
+const EMPTY_VERSION_LIVENESS = new Map<number, boolean>();
+
 function WatchPagePlayer({
   contentId,
   title,
@@ -273,6 +279,7 @@ function WatchPagePlayer({
   fileId,
   libraryId,
   versions,
+  versionLiveness = EMPTY_VERSION_LIVENESS,
   playbackVariants = [],
   indexerReleases = EMPTY_INDEXER_RELEASES,
   virtualRanking,
@@ -928,10 +935,10 @@ function WatchPagePlayer({
     }
 
     let cancelled = false;
-    // Same key as the mounted `useWatchDetail` query, but always read fresh:
-    // a cached payload can predate the parent's liveness stamping, and the
-    // `setPlaybackVersions` below would then drop the `available: false`
-    // annotations until a later projection restores them.
+    // Same key as the mounted `useWatchDetail` query, but always read fresh: a
+    // cached payload can predate a server-side inventory change. The fresh rows
+    // carry no liveness, so the verdicts the parent stamped on its own copy are
+    // re-applied below before this list replaces them.
     void queryClient
       .fetchQuery({
         queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
@@ -940,7 +947,11 @@ function WatchPagePlayer({
       })
       .then((detail) => {
         if (!cancelled) {
-          setPlaybackVersions(detail.versions);
+          // The fresh server rows carry no liveness verdict; re-stamp the
+          // parent's checked verdicts onto them before replacing the list so
+          // the menu keeps its `available: false` warnings rather than dropping
+          // them until another projection fires.
+          setPlaybackVersions(applyVersionAvailability(detail.versions, versionLiveness));
         }
       })
       .catch(() => {
@@ -960,6 +971,7 @@ function WatchPagePlayer({
     session.mediaFileId,
     session.replacing,
     session.sessionId,
+    versionLiveness,
   ]);
 
   const handleRealtimeEvent = useCallback(

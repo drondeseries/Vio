@@ -1097,6 +1097,7 @@ function WatchPlaybackHostContent() {
       <Suspense fallback={isForeground || isPostRoll ? <PlaybackPreparingScreen /> : null}>
         <WatchPage
           {...watchPageProps}
+          versionLiveness={versionLiveness}
           maxBitrateKbps={maxBitrateKbps ?? null}
           introSkipMode={introSkipMode}
           autoSkipRecap={autoSkipRecap}

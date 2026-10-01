@@ -338,6 +338,14 @@ export interface WatchPageProps {
   fileId?: number;
   libraryId?: number;
   versions: PlayerFileVersion[];
+  /**
+   * The liveness verdicts the parent already stamped onto `versions`, from
+   * `POST /catalog/versions/check`. The watch detail does not carry them, so a
+   * fresh detail read (the realtime reconnect reconcile) has to re-apply the
+   * same map to keep the `available: false` / failed badges on the rows it
+   * replaces.
+   */
+  versionLiveness?: Map<number, boolean>;
   playbackVariants?: PlayerPlaybackVariant[];
   /**
    * Releases that exist on the indexers but are not downloaded on the provider.
