@@ -3196,6 +3196,38 @@ func (h *PlaybackHandler) revalidateVirtualCandidateBackground(
 	}()
 }
 
+// Refusal reasons for a required identity adoption that matched no row. The SQL
+// fence cannot report which predicate refused, so the caller classifies the
+// candidate against the fence's own precedence and carries the concrete cause
+// in VirtualFilePersistArgs.RefusalReason; the saver logs it instead of one
+// lumped bucket. Keeping them as named constants means the persist path and the
+// diagnosis cannot drift.
+const (
+	// virtualProbeRefusalSiblingOwner: another row of the same virtual owner and
+	// library already owns the candidate's concrete path.
+	virtualProbeRefusalSiblingOwner = "sibling_owner"
+	// virtualProbeRefusalFailedVerdict: the candidate identity carries a live
+	// failed_at verdict, so adoption is fenced even without a sibling owner.
+	virtualProbeRefusalFailedVerdict = "failed_verdict"
+	// virtualProbeRefusalCollectionRow: the row is collection-owned, so its path
+	// is owned by the collection sync and can never be adopted.
+	virtualProbeRefusalCollectionRow = "collection_row"
+	// virtualProbeRefusalCrossReleaseNoTarget: a cross-release candidate with no
+	// adoption target at all (a collection-owned row) is refused before enqueue.
+	virtualProbeRefusalCrossReleaseNoTarget = "cross_release_without_adopt_target"
+	// virtualProbeRefusalOwnerLookupFailed: the identity guard could not answer
+	// who owns the candidate path, so the write fails closed.
+	virtualProbeRefusalOwnerLookupFailed = "owner_lookup_failed"
+	// virtualProbeRefusalStaleSnapshot: none of the deterministic causes above
+	// applies, so the CAS snapshot no longer matches the row (a newer writer
+	// already committed it).
+	virtualProbeRefusalStaleSnapshot = "stale_snapshot"
+	// virtualProbeRefusalUnclassified is the neutral fallback for a required
+	// adoption the caller did not classify. It is deliberately not a claim about
+	// which predicate refused.
+	virtualProbeRefusalUnclassified = "adoption_fence"
+)
+
 // VirtualFileMetadataUpdateSQL persists a probed virtual inventory back to
 // media_files. It also stamps probe_source/probe_updated_at so the playback
 // probe gate can recognize the row as really probed and stop re-probing it on
@@ -3586,11 +3618,18 @@ func ExecVirtualFileMetadataUpdateResult(ctx context.Context, db VirtualFileMeta
 				// The atomic guard matched no row: the adoption was refused
 				// (sibling owner, collection row, live failed verdict) or the
 				// CAS snapshot was stale. Either way the validated identity
-				// was not adopted, and the tracks/stamp were not written.
+				// was not adopted, and the tracks/stamp were not written. The
+				// caller classifies the concrete cause against the fence's own
+				// precedence and carries it in RefusalReason; a caller that did
+				// not classify logs a neutral reason rather than a lumped claim.
+				reason := args.RefusalReason
+				if reason == "" {
+					reason = virtualProbeRefusalUnclassified
+				}
 				slog.WarnContext(ctx, "virtual probe evidence persist refused: required identity adoption matched no row",
 					"component", "api", "file_id", args.FileID, "adopt_path", args.AdoptPath,
 					"expected_path", args.ExpectedFilePath,
-					"reason", "sibling owner, collection row, live failed verdict, or stale snapshot")
+					"reason", reason)
 				return VirtualFileMetadataUpdateResult{}, fmt.Errorf("%w: candidate %s was not adopted", errVirtualAdoptIdentityNotPersisted, args.AdoptPath)
 			}
 			return VirtualFileMetadataUpdateResult{}, nil
@@ -3757,11 +3796,77 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 
 // virtualProbeEvidenceArgs builds the catalog write for one probe result. It
 // returns false when the write must be refused: nil inputs, a row without an id
-// or saver, or a cross-release candidate the row cannot adopt.
+// or saver, a cross-release candidate the row cannot adopt, or a candidate whose
+// path ownership the identity guard could not answer.
+//
+// When verified evidence arrives for a URI a sibling row verifiably owns, the
+// write rotates to that owner row instead of attempting a CAS adoption the SQL
+// sibling fence refuses (see virtualProbeEvidenceRotateTarget). That is the
+// background-probe fix: a probed candidate URI whose path already belongs to an
+// alternate-version row must bind the evidence to the version that actually
+// plays, not be dropped onto the pinned row forever.
 func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (models.VirtualFilePersistArgs, bool) {
 	if h == nil || h.VirtualFileSaver == nil || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
 		return models.VirtualFilePersistArgs{}, false
 	}
+	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(ctx, catalogFile, resolvedPath, probed)
+	if !ok {
+		return models.VirtualFilePersistArgs{}, false
+	}
+	return h.virtualProbeEvidenceArgsForRow(ctx, identityRow, resolvedPath, evidence, stampProbe)
+}
+
+// virtualProbeEvidenceRotateTarget resolves the row the evidence belongs to and
+// the evidence to write. It returns the requested row and the probed file
+// unchanged for every same-release or ordinary cross-release case. When the
+// candidate's concrete path is verifiably owned by a sibling row of this
+// content, it returns that owner row's catalog identity overlaid with the
+// freshly probed tracks (the rotateVirtualSourceToOwnerRow pattern), so the
+// write lands on the row that owns the bytes and the existing inventory_updated
+// publish carries the verified inventory to every menu bound to it.
+//
+// The owner question goes through virtualPathOwnerRow and nothing else: the
+// guard asserts ContentID, EpisodeID, owner installation, library and the exact
+// concrete path, and fails closed on a lookup error or an incomplete row. A
+// guard error, or a refusal to name an owner for a path a sibling actually
+// holds, keeps the previous behavior: the write is refused (or classified and
+// left to the SQL fence) rather than adopting bytes whose owner is unknown. The
+// refusal is logged with the concrete cause, never a lumped bucket.
+func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile) (*models.MediaFile, *models.MediaFile, bool) {
+	if !virtualProbeEvidenceRequiresAdoption(catalogFile, resolvedPath) {
+		return catalogFile, probed, true
+	}
+	ownerRow, ownerErr := h.virtualPathOwnerRow(ctx, catalogFile, resolvedPath, catalogFile.VirtualOwnerInstallationID, catalogFile.MediaFolderID)
+	if ownerErr != nil {
+		// An unanswered ownership question is not safe absence: fail closed
+		// rather than adopt or stamp bytes whose owner is unknown.
+		slog.WarnContext(ctx, "virtual probe evidence refused: candidate path ownership is unknown",
+			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
+			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
+			"reason", virtualProbeRefusalOwnerLookupFailed, "error", ownerErr)
+		return nil, nil, false
+	}
+	if ownerRow != nil && ownerRow.ID != catalogFile.ID {
+		// The candidate's path is an existing alternate version. Rotate the
+		// binding to its owner row: keep the owner's catalog identity and CAS
+		// snapshot (the current generation) and overlay the freshly probed
+		// tracks so the verified inventory is not lost. The write is then a
+		// same-release metadata update on a row that already owns the path, so
+		// the SQL adoption fence is not involved.
+		rotated := rotateVirtualSourceToOwnerRow(probed, ownerRow, resolvedPath)
+		slog.InfoContext(ctx, "virtual probe evidence rotated to the candidate's owner row",
+			"component", "api", "requested_file_id", catalogFile.ID, "owner_file_id", ownerRow.ID,
+			"candidate_uri", resolvedPath, "reason", "sibling_owner_rotation")
+		return rotated, rotated, true
+	}
+	return catalogFile, probed, true
+}
+
+// virtualProbeEvidenceArgsForRow builds the catalog write for one probe result
+// against the row the evidence belongs to. It returns false when the write must
+// be refused: a cross-release candidate the row cannot adopt (a collection-owned
+// row with no adoption target).
+func (h *PlaybackHandler) virtualProbeEvidenceArgsForRow(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (models.VirtualFilePersistArgs, bool) {
 	snap := snapshotVirtualRow(catalogFile)
 	expectedPath := catalogFile.FilePath
 	adoptPath := ""
@@ -3786,10 +3891,10 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogF
 		slog.WarnContext(ctx, "virtual probe evidence refused: candidate belongs to a different release and the row cannot adopt it",
 			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
 			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
-			"reason", "cross_release_without_adopt_target")
+			"reason", virtualProbeRefusalCrossReleaseNoTarget)
 		return models.VirtualFilePersistArgs{}, false
 	}
-	return models.VirtualFilePersistArgs{
+	args := models.VirtualFilePersistArgs{
 		FileID:           snap.FileID,
 		ExpectedFilePath: expectedPath,
 		VideoTracks:      marshalTracksJSON(sanitizeTrackSlice(probed.VideoTracks)),
@@ -3822,7 +3927,40 @@ func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogF
 		// when a sibling owns the target path or the candidate's verdict is
 		// live-failed. A same-release write keeps the metadata-only contract.
 		RequireAdopt: crossRelease,
-	}, true
+	}
+	if crossRelease {
+		args.RefusalReason = h.virtualProbeEvidenceRefusalReason(ctx, catalogFile, resolvedPath)
+	}
+	return args, true
+}
+
+// virtualProbeEvidenceRefusalReason classifies a required adoption that is
+// likely to be refused, mirroring the SQL fence's own predicate precedence so
+// the persist log names the concrete cause instead of a lumped bucket. It is
+// best-effort diagnosis: the saver only logs it when the write actually refuses,
+// and a wrong guess would only mislabel a log line, never a write.
+//
+//   - a sibling row of this owner and library already owns the candidate path
+//     (the identity guard declined to rotate to it) is sibling_owner;
+//   - otherwise a live failed_at verdict on the candidate identity is
+//     failed_verdict;
+//   - otherwise the only remaining fence cause is a stale CAS snapshot.
+func (h *PlaybackHandler) virtualProbeEvidenceRefusalReason(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string) string {
+	if catalogFile.ProbeSource == virtualCollectionProbeSource {
+		return virtualProbeRefusalCollectionRow
+	}
+	rawOwner, capable, lookupErr := h.virtualPathLookupRow(ctx, resolvedPath)
+	if lookupErr == nil && capable && rawOwner != nil && rawOwner.ID > 0 && rawOwner.ID != catalogFile.ID &&
+		rawOwner.VirtualOwnerInstallationID == catalogFile.VirtualOwnerInstallationID &&
+		rawOwner.MediaFolderID == catalogFile.MediaFolderID {
+		return virtualProbeRefusalSiblingOwner
+	}
+	if verdictErr := h.virtualCandidateVerdictError(ctx, resolvedPath, catalogFile, catalogFile.VirtualOwnerInstallationID, false); verdictErr != nil {
+		if errors.Is(verdictErr, ErrVirtualCandidateMarkedFailed) {
+			return virtualProbeRefusalFailedVerdict
+		}
+	}
+	return virtualProbeRefusalStaleSnapshot
 }
 
 // probeVirtualCandidateForegroundFallback probes the foreground request's own
@@ -4346,23 +4484,9 @@ func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.
 	if h == nil || file == nil || strings.TrimSpace(candidateURI) == "" {
 		return nil, nil
 	}
-	pathResolver, ok := h.fileResolver.(interface {
-		GetByPath(context.Context, string) (*models.MediaFile, error)
-	})
-	if !ok {
-		// No path lookup capability: ownership cannot be asserted, so the
-		// caller keeps ordinary adoption behavior.
-		return nil, nil
-	}
-	row, err := pathResolver.GetByPath(ctx, candidateURI)
-	if err != nil {
-		return nil, fmt.Errorf("virtual path owner lookup failed for %q: %w", candidateURI, err)
-	}
-	if row == nil {
-		return nil, nil
-	}
-	if row.ID <= 0 {
-		return nil, fmt.Errorf("virtual path owner lookup for %q returned an incomplete row", candidateURI)
+	row, capable, err := h.virtualPathLookupRow(ctx, candidateURI)
+	if !capable || err != nil || row == nil {
+		return nil, err
 	}
 	if row.VirtualOwnerInstallationID != ownerID || row.MediaFolderID != libraryID {
 		return nil, nil
@@ -4377,6 +4501,38 @@ func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.
 		return nil, nil
 	}
 	return row, nil
+}
+
+// virtualPathLookupRow is the raw exact-path lookup behind virtualPathOwnerRow
+// and the persist-path refusal classifier, so the ownership question and its
+// diagnosis can never disagree about what a path resolves to.
+//
+// capable is false when the resolver cannot look rows up by path; the caller
+// then cannot assert ownership and keeps its prior behavior. err is a
+// fail-closed lookup failure: a lookup error, or a non-nil row without a usable
+// id (an unanswered lookup, not safe absence). A nil row with a nil error is a
+// genuine not-found.
+func (h *PlaybackHandler) virtualPathLookupRow(ctx context.Context, candidateURI string) (row *models.MediaFile, capable bool, err error) {
+	if h == nil || strings.TrimSpace(candidateURI) == "" {
+		return nil, false, nil
+	}
+	pathResolver, ok := h.fileResolver.(interface {
+		GetByPath(context.Context, string) (*models.MediaFile, error)
+	})
+	if !ok {
+		return nil, false, nil
+	}
+	row, err = pathResolver.GetByPath(ctx, candidateURI)
+	if err != nil {
+		return nil, true, fmt.Errorf("virtual path owner lookup failed for %q: %w", candidateURI, err)
+	}
+	if row == nil {
+		return nil, true, nil
+	}
+	if row.ID <= 0 {
+		return nil, true, fmt.Errorf("virtual path owner lookup for %q returned an incomplete row", candidateURI)
+	}
+	return row, true, nil
 }
 
 // rotateVirtualSourceToOwnerRow returns the resolved source's file rebased on
