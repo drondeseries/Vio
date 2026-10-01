@@ -102,11 +102,11 @@ grep -q 'type=raw,value=dev' .github/workflows/docker.yml \
   && pass "docker workflow publishes :dev for default branch" \
   || reject "docker workflow missing :dev tag for default branch"
 
-grep -q 'ghcr.io/drondeseries/vio:dev' docker-compose.yml \
+grep -q 'ghcr.io/kipsilabs/vio:dev' docker-compose.yml \
   && pass "docker-compose defaults to vio:dev" \
   || reject "docker-compose default image overwritten from vio:dev"
 
-grep -q 'ghcr.io/drondeseries/vio:dev' .env.example \
+grep -q 'ghcr.io/kipsilabs/vio:dev' .env.example \
   && pass ".env.example defaults to vio:dev" \
   || reject ".env.example default image overwritten from vio:dev"
 
