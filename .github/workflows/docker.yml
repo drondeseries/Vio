@@ -63,6 +63,10 @@ jobs:
           build_number=""
           image_version="${GITHUB_SHA::7}"
           if [[ "$EVENT_NAME" == "release" ]]; then
+            if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              echo "::error::Release tag must start with vMAJOR.MINOR.PATCH."
+              exit 1
+            fi
             image_version="$RELEASE_TAG"
           elif [[ "$TARGET_BRANCH" == "$DEFAULT_BRANCH" ]]; then
             build_number=$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))
@@ -277,10 +281,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           tags: |
-            type=raw,value=dev,enable=${{ github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch) }}
+            type=raw,value=dev,enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) }}
             type=raw,value=latest,enable=${{ (github.event_name == 'release' && !github.event.release.prerelease) || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true) }}
-            type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && !contains(fromJSON('["latest","dev","apiv2"]'), github.event.release.tag_name) && !startsWith(github.event.release.tag_name, 'build-') }}
-            type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && needs.prepare.outputs.build_number != '' }}
+            type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v') }}
+            type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ github.event_name != 'release' && (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && needs.prepare.outputs.build_number != '' }}
             type=raw,value=apiv2,enable=${{ github.event.workflow_run.head_branch == 'apiv2' || (github.event_name == 'workflow_dispatch' && github.ref_name == 'apiv2') }}
             type=raw,value=${{ (github.event.workflow_run.head_sha || github.sha) }}
 
@@ -305,7 +309,7 @@ jobs:
           if [[ -n "${BUILD_NUMBER}" ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:build-${BUILD_NUMBER}"
           fi
-          if [[ "${TARGET_BRANCH}" == "${DEFAULT_BRANCH}" ]]; then
+          if [[ "${EVENT_NAME}" != "release" && "${TARGET_BRANCH}" == "${DEFAULT_BRANCH}" ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:dev"
           fi
           if [[ "${EVENT_NAME}" == "release" && "${IS_PRERELEASE}" != "true" ]] || [[ "${PUBLISH_LATEST}" == "true" ]]; then
