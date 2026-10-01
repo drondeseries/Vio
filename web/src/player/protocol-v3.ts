@@ -677,6 +677,19 @@ export interface PlanV3 {
    * stamp-derived `inventory_status`.
    */
   inventory_provenance?: string;
+  /**
+   * The catalog row the client asked for when the effective release differs
+   * from it. Absent when the effective row is the requested one. It lets the
+   * player render an honest substitution notice without first diffing ids.
+   */
+  substituted_from_file_id?: number;
+  /**
+   * The machine-readable cause of a substitution, present only with
+   * `substituted_from_file_id`: a dead release, a provider listing failure, a
+   * transport failure, or a decode rejection. Unknown values are treated as a
+   * generic substitution.
+   */
+  substitution_reason?: string;
 }
 
 export interface TerminalV3 {

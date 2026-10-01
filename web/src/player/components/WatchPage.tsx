@@ -180,6 +180,26 @@ export function mergeResolvedLiveVersion(
 }
 
 /**
+ * Turns the server's additive `substitution_reason` into the clause the notice
+ * leads with. An unknown or absent reason yields null so the caller falls back
+ * to the generic substitution copy rather than inventing a cause.
+ */
+function substitutionReasonPhrase(reason: string | undefined): string | null {
+  switch (reason) {
+    case "dead_release":
+      return "The selected version is no longer available";
+    case "listing_failed":
+      return "The provider couldn't list the selected version";
+    case "transport_failed":
+      return "The selected version wouldn't start";
+    case "decode_rejected":
+      return "This device can't decode the selected version";
+    default:
+      return null;
+  }
+}
+
+/**
  * WatchPage is the top-level player component.
  * Starts a playback session, then renders the VideoPlayer once the stream is ready.
  */
@@ -550,6 +570,15 @@ function WatchPagePlayer({
       ),
     );
   }, [session.effectiveVirtualUri, session.mediaFileId, versions]);
+
+  // Identity of the current substitution. The dismissal below is scoped to it:
+  // a later rotation to a different effective release re-shows the notice, and
+  // an explicit user switch (which changes the effective identity, and usually
+  // clears the substitution) moves the key too.
+  const substitutionKey = `${session.plan?.requested_media_file_id ?? ""}:${session.mediaFileId ?? ""}:${session.effectiveVirtualUri ?? ""}`;
+  useEffect(() => {
+    setVersionSwapNoticeDismissed(false);
+  }, [substitutionKey]);
 
   const handleEnded = useCallback(() => {
     onEnded?.({
@@ -1138,48 +1167,73 @@ function WatchPagePlayer({
   ) : null;
 
   // The server may substitute a different version (e.g. HDR→SDR) when the
-  // requested one is not playable on this device. Only the auto path allows
-  // that, so surface a dismissible notice when it happened.
+  // requested one is not playable on this device, and a serve-layer rotation can
+  // move the release mid-stream without publishing a new plan. Either way the
+  // client owes the viewer an honest, non-blocking notice saying what is playing
+  // instead of what they asked for.
   //
-  // A virtual requested row defeats the id comparison: the server collapses
-  // `effective_media_file_id` onto the requested id and publishes the concrete
-  // candidate as `effective_virtual_uri` instead. There the substitution is
-  // visible only by comparing the published candidate's path against the
-  // requested row's own path. When the requested row carries no path (older
-  // responses) the comparison says nothing, so the notice stays quiet rather
-  // than guess.
+  // The requested row is the plan's requested id (a serve-layer rotation never
+  // moves it). The effective release is the LIVE session identity first — it
+  // moves on a rotation — then the plan's. A virtual requested row defeats the
+  // id comparison: the server collapses `effective_media_file_id` onto the
+  // requested id and publishes the concrete candidate as `effective_virtual_uri`
+  // instead, so the candidate's path is compared against the requested row's
+  // own path. When the requested row carries no path (older responses) the
+  // comparison says nothing, so the notice stays quiet rather than guess.
+  //
+  // The server also publishes the substitution additively
+  // (`substituted_from_file_id` + `substitution_reason`), which is authoritative
+  // when present and lets the notice name the cause without re-deriving it.
   const plan = session.plan;
+  const requestedFileId = plan?.requested_media_file_id ?? fileId ?? null;
   const requestedVersion =
-    plan && playbackVersions.find((v) => v.file_id === plan.requested_media_file_id);
+    requestedFileId != null
+      ? playbackVersions.find((v) => v.file_id === requestedFileId)
+      : undefined;
+  // The live session moves the effective id on a rotation; otherwise the plan's
+  // effective id is the authority (the session id can lag, or equal the
+  // collapsed requested row). So the session id wins only once it has actually
+  // moved off the requested row.
+  const planEffectiveFileId = plan?.effective_media_file_id ?? null;
+  const sessionMediaFileId = session.mediaFileId;
+  const effectiveFileId =
+    sessionMediaFileId != null && sessionMediaFileId !== requestedFileId
+      ? sessionMediaFileId
+      : (planEffectiveFileId ?? sessionMediaFileId);
+  const effectiveVirtualUri = session.effectiveVirtualUri ?? plan?.effective_virtual_uri ?? null;
   const virtualSubstitution =
-    !!plan?.effective_virtual_uri &&
+    !!effectiveVirtualUri &&
     requestedVersion?.file_path !== undefined &&
-    requestedVersion.file_path !== plan.effective_virtual_uri;
+    requestedVersion.file_path !== effectiveVirtualUri;
   const versionWasSubstituted =
-    !!plan &&
-    (plan.requested_media_file_id !== plan.effective_media_file_id || virtualSubstitution);
+    (plan?.substituted_from_file_id != null && plan.substituted_from_file_id !== effectiveFileId) ||
+    (requestedFileId != null && effectiveFileId != null && requestedFileId !== effectiveFileId) ||
+    virtualSubstitution;
   // Name the row the plan actually landed on when we can resolve it, so the
   // notice says what is playing instead of only that something changed. The
-  // effective row is resolved through the plan's own ids/path, not the
-  // session's requested id, because the plan's effective id is the authority.
-  const effectiveVersionRow = plan
-    ? resolveEffectiveVersion(playbackVersions, {
-        // A published virtual URI is the sole identity of the effective
-        // candidate; the collapsed id names the neutral row, so falling back
-        // to it would label the wrong row. Only fall back to the id for
-        // ordinary files and older plans that publish no URI.
-        mediaFileId: plan.effective_virtual_uri ? null : plan.effective_media_file_id,
-        effectiveVirtualUri: plan.effective_virtual_uri ?? null,
-      })
-    : undefined;
+  // effective row is resolved through the effective identity, not the
+  // session's requested id, because the effective id is the authority.
+  const effectiveVersionRow = resolveEffectiveVersion(playbackVersions, {
+    // A published virtual URI is the sole identity of the effective candidate;
+    // the collapsed id names the neutral row, so falling back to it would label
+    // the wrong row. Only fall back to the id for ordinary files and older
+    // plans that publish no URI.
+    mediaFileId: effectiveVirtualUri ? null : effectiveFileId,
+    effectiveVirtualUri,
+  });
   const effectiveVersionLabel = effectiveVersionRow
     ? buildEffectiveVersionLabel(effectiveVersionRow)
     : null;
-  const substitutionCopy = effectiveVersionLabel
-    ? `The selected version wasn't available, so Vio is playing ${effectiveVersionLabel} instead.`
-    : "Playing a different version than selected — the requested version isn't playable on this device.";
+  const reasonPhrase = substitutionReasonPhrase(plan?.substitution_reason);
+  const substitutionCopy = reasonPhrase
+    ? effectiveVersionLabel
+      ? `${reasonPhrase}, so Vio is playing ${effectiveVersionLabel} instead.`
+      : `${reasonPhrase} — playing a different version.`
+    : effectiveVersionLabel
+      ? `The selected version wasn't available, so Vio is playing ${effectiveVersionLabel} instead.`
+      : "Playing a different version than selected — the requested version isn't playable on this device.";
   const versionSwapNotice =
-    versionWasSubstituted && !explicitFileSelection && !versionSwapNoticeDismissed ? (
+    versionWasSubstituted && !versionSwapNoticeDismissed ? (
       <div className="absolute top-[max(4.5rem,calc(env(safe-area-inset-top)+3.5rem))] left-1/2 z-50 -translate-x-1/2">
         <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/70 px-3 py-1.5 text-xs font-medium text-white/80 shadow-lg backdrop-blur">
           <span>{substitutionCopy}</span>

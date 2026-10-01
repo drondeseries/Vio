@@ -875,7 +875,9 @@ describe("WatchPage version switch feedback", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("does not show the version-swap notice when the selection was explicit", () => {
+  it("shows the version-swap notice when an explicit selection was substituted", () => {
+    // The original release was explicitly chosen and then replaced (a dead
+    // release, an undecodable one). The viewer must still be told.
     playbackSessionMock.mockReturnValue(
       playbackSession({
         plan: fixturePlanV3({ requested_media_file_id: 7, effective_media_file_id: 8 }),
@@ -885,10 +887,10 @@ describe("WatchPage version switch feedback", () => {
     render(createElement(WatchPage, { ...watchPageProps, explicitFileSelection: true }));
 
     expect(
-      screen.queryByText(
+      screen.getByText(
         "Playing a different version than selected — the requested version isn't playable on this device.",
       ),
-    ).not.toBeInTheDocument();
+    ).toBeInTheDocument();
   });
 
   it("does not show the version-swap notice when the plan kept the requested file", () => {
@@ -984,7 +986,10 @@ describe("WatchPage virtual version substitution notice", () => {
     expect(screen.queryByText(genericNotice)).not.toBeInTheDocument();
   });
 
-  it("does not fire for an explicit selection even when the virtual candidate differs", () => {
+  it("still surfaces the substitution for an explicit selection", () => {
+    // An explicit pick can still be substituted (a dead release, a device that
+    // cannot play it). The viewer chose that release, so honesty matters more:
+    // the notice must still render.
     const effectiveVirtualUri = candidateRow.file_path;
     playbackSessionMock.mockReturnValue(
       playbackSession({
@@ -1006,8 +1011,31 @@ describe("WatchPage virtual version substitution notice", () => {
       }),
     );
 
-    expect(screen.queryByText(labeledNotice)).not.toBeInTheDocument();
-    expect(screen.queryByText(genericNotice)).not.toBeInTheDocument();
+    expect(screen.getByText(labeledNotice)).toBeInTheDocument();
+  });
+
+  it("names the server's substitution reason when it is published", () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({
+          requested_media_file_id: 7,
+          effective_media_file_id: 8,
+          substituted_from_file_id: 7,
+          substitution_reason: "transport_failed",
+        }),
+      }),
+    );
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [version, { ...version, file_id: 8 }],
+      }),
+    );
+
+    expect(
+      screen.getByText("The selected version wouldn't start, so Vio is playing 1080p H264 instead."),
+    ).toBeInTheDocument();
   });
 });
 

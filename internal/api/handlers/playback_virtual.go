@@ -1275,6 +1275,13 @@ type resolvedVirtualPlaybackSource struct {
 	// many?") is answerable without a second resolve.
 	CandidateRank  int
 	CandidateCount int
+	// SubstitutedFromFileID names the catalog row the caller asked for when the
+	// resolver's candidate belongs to a different row. It is nonzero only for
+	// the alternate-version walk, which is the one fresh-start path that plans
+	// a release other than the requested one.
+	SubstitutedFromFileID int
+	// SubstitutionReason is the additive substitution cause for that case.
+	SubstitutionReason string
 	// IdentityRematched is true when the resolver reported that the requested
 	// pin's result id was absent from a fresh listing but the same durable
 	// identity was found under a new result id. The candidate is then the same
