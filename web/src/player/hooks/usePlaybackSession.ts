@@ -1261,6 +1261,9 @@ export function usePlaybackSession(
     playbackStartedRef.current = false;
     inventoryRevisionRef.current = null;
     appliedInventoryRevisionsRef.current.clear();
+    // A new request re-derives Auto intent from its own props: without this,
+    // the previous request's armed/disarmed state leaks into the new session.
+    setAutoFallback(allowAlternateVersions && !explicitFileSelection);
 
     void loadSession({
       preferredFileId: fileId,
@@ -1274,6 +1277,7 @@ export function usePlaybackSession(
       intentAt,
     });
   }, [
+    allowAlternateVersions,
     capabilityRequestKey,
     capabilitiesSettled,
     explicitFileSelection,
@@ -1284,6 +1288,7 @@ export function usePlaybackSession(
     loadSession,
     qualityPreference,
     requestKey,
+    setAutoFallback,
   ]);
 
   // Clean up session on unmount.
@@ -1514,12 +1519,12 @@ export function usePlaybackSession(
             carriedSubtitleTrackIndex: plan.selected_tracks.subtitle?.index ?? null,
             // Preserve the viewer's version choice; the server must not
             // silently substitute another edition behind a rebuild. Use the
-            // most recent start's selection (a version switch starts explicit)
-            // and fall back to the mount-time prop only if no start recorded
-            // one.
-            fileSelection:
-              retryTargetRef.current?.fileSelection ??
-              (explicitFileSelection ? "explicit" : "auto"),
+            // live Auto intent first (a mid-session re-arm never re-records
+            // the retry target), then the most recent start's selection.
+            fileSelection: autoFallbackRef.current
+              ? "auto"
+              : (retryTargetRef.current?.fileSelection ??
+                (explicitFileSelection ? "explicit" : "auto")),
             intentAt: null,
           });
           return false;
