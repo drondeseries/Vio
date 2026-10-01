@@ -1263,7 +1263,14 @@ export function usePlaybackSession(
     appliedInventoryRevisionsRef.current.clear();
     // A new request re-derives Auto intent from its own props: without this,
     // the previous request's armed/disarmed state leaks into the new session.
-    setAutoFallback(allowAlternateVersions && !explicitFileSelection);
+    // Inline (not setAutoFallback: that callback is declared below this
+    // effect and block-scoped use would trip TS2448).
+    autoFallbackRef.current = allowAlternateVersions && !explicitFileSelection;
+    setState((current) =>
+      current.autoFallback === autoFallbackRef.current
+        ? current
+        : { ...current, autoFallback: autoFallbackRef.current },
+    );
 
     void loadSession({
       preferredFileId: fileId,
@@ -1288,7 +1295,6 @@ export function usePlaybackSession(
     loadSession,
     qualityPreference,
     requestKey,
-    setAutoFallback,
   ]);
 
   // Clean up session on unmount.
