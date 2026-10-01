@@ -81,6 +81,18 @@ describe("useSubtitleFontPrefetch", () => {
     expect(loadSubtitleFontBundle).toHaveBeenCalledTimes(2);
   });
 
+  it("never prefetches a font bundle on a non-ASS codec", () => {
+    const urls = [
+      track({ index: 1, codec: "ass", font_bundle_url: "/fonts/ass" }),
+      track({ index: 2, codec: "srt", font_bundle_url: "/fonts/srt" }),
+      track({ index: 3, codec: "pgs", font_bundle_url: "/fonts/pgs" }),
+      track({ index: 4, codec: "subrip", font_bundle_url: "/fonts/subrip" }),
+    ];
+    renderHook(() => useSubtitleFontPrefetch(urls, undefined));
+    expect(loadSubtitleFontBundle).toHaveBeenCalledTimes(1);
+    expect(loadSubtitleFontBundle).toHaveBeenCalledWith("/fonts/ass");
+  });
+
   it("swallows a rejected font bundle fetch", async () => {
     const unhandled: unknown[] = [];
     const onUnhandled = (reason: unknown) => {

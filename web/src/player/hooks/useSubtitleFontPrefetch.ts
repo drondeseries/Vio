@@ -1,11 +1,17 @@
 import { useEffect, useMemo } from "react";
 import type { PlayerSubtitleInfo } from "../types";
 import { fontBundleCacheKey, loadSubtitleFontBundle } from "../utils/subtitleFonts";
+import { isASSCodec } from "../utils/subtitleCodecs";
 
 /**
  * Prefetches ASS font bundles when the plan is adopted or refreshed. Selection
  * then hits the in-memory font cache instead of waiting on a cold server
  * extraction. Purely a warm-up: errors are swallowed and never affect playback.
+ *
+ * Only ASS/SSA sidecar tracks are warmed: JASSUB is the sole consumer of a font
+ * bundle, and it renders only ASS/SSA. A font URL on another codec is a server
+ * contract violation, and requesting it is what flooded the fonts route with
+ * 400s/500s for combos the endpoint can never satisfy.
  *
  * Scoped to the effective release. A track names the media file whose inventory
  * assigned it (`media_file_id`); prefetching a track from another release spends
@@ -22,7 +28,11 @@ export function useSubtitleFontPrefetch(
   effectiveFileId?: number | null,
 ) {
   const fontUrls = useMemo(() => {
-    const candidates = subtitleUrls.filter((track) => track.font_bundle_url);
+    // JASSUB renders ASS/SSA only; a font bundle on any other codec is
+    // unreachable by the renderer.
+    const candidates = subtitleUrls.filter(
+      (track) => track.font_bundle_url && isASSCodec(track.codec),
+    );
     // Scope to the effective release when the list spans releases. A track
     // carries the media file whose inventory assigned it; tracks with no file
     // identity belong to the effective release by construction. When the
