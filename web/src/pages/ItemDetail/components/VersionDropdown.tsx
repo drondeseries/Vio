@@ -11,6 +11,7 @@ import { useWatchDetail } from "@/hooks/queries/items";
 import { useVersionListRefresh } from "@/hooks/useVersionListRefresh";
 import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, versionSortableFromFile } from "@/lib/qualityRanking";
+import { deriveVersionHealth } from "@/lib/versionHealth";
 import { videoRangeLabel } from "@/lib/videoRange";
 import DetailPopover from "./DetailPopover";
 import { sortPlaybackVariantsByEditionPreference } from "./versionRankingUtils";
@@ -260,6 +261,7 @@ function VersionDropdown({
               const detail = buildDetailLine(version);
               const rangeLabel = videoRangeLabel(version);
               const unavailable = isVersionUnavailable(version);
+              const health = deriveVersionHealth(version);
               const versionProfileLabel = profileLabelFromFilePath(version.file_path);
 
               return (
@@ -283,12 +285,17 @@ function VersionDropdown({
                             {rangeLabel}
                           </Badge>
                         ) : null}
-                        {unavailable ? (
+                        {health ? (
                           <Badge
                             variant="outline"
-                            className="border-amber-500/30 bg-amber-500/15 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-300"
+                            title={health.title}
+                            className={
+                              health.tone === "danger"
+                                ? "border-red-500/30 bg-red-500/15 px-1.5 py-0 text-[10px] font-medium text-red-600 dark:text-red-300"
+                                : "border-amber-500/30 bg-amber-500/15 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-300"
+                            }
                           >
-                            Will retry on play
+                            {health.label}
                           </Badge>
                         ) : null}
                         {typeof version.format_score === "number" && version.format_score !== 0 ? (

@@ -28,6 +28,7 @@ import {
 } from "../utils/resolveEffectiveVersion";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
+import { applyVersionAvailability } from "@/hooks/queries/versionLiveness";
 import {
   awaitVirtualCandidatesRefresh,
   cancelVirtualCandidatesRefresh,
@@ -265,6 +266,11 @@ function WatchPartyPlaybackGate(props: WatchPageProps) {
 // sync effect a new identity on every render and loop it.
 const EMPTY_INDEXER_RELEASES: PlayerIndexerRelease[] = [];
 
+// The liveness verdicts are optional so WatchPage can render without the
+// item-page check (watch-party tests, standalone renders). An empty map leaves
+// every row's own metadata flag untouched.
+const EMPTY_VERSION_LIVENESS = new Map<number, boolean>();
+
 function WatchPagePlayer({
   contentId,
   title,
@@ -273,6 +279,7 @@ function WatchPagePlayer({
   fileId,
   libraryId,
   versions,
+  versionLiveness = EMPTY_VERSION_LIVENESS,
   playbackVariants = [],
   indexerReleases = EMPTY_INDEXER_RELEASES,
   virtualRanking,
@@ -472,6 +479,10 @@ function WatchPagePlayer({
     [session],
   );
 
+  const handleSelectAutoVersion = useCallback(() => {
+    session.selectAutoVersion();
+  }, [session]);
+
   /**
    * Manually re-lists the title's video candidates for the version menu.
    *
@@ -492,6 +503,11 @@ function WatchPagePlayer({
       queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
       staleTime: 0,
     });
+    // The refreshed list is the server's, but it carries no liveness verdict —
+    // the parent checks those separately. Re-stamp the parent's verdicts before
+    // the rows replace the list so the menu keeps its `available: false`
+    // warnings rather than dropping them until another projection fires.
+    const stamped = applyVersionAvailability(detail.versions, versionLiveness);
     // The refreshed list is the server's, but the live session may still be on
     // a source the re-list did not return (a rotation, or a candidate the
     // server resolved the collapsed row to). Re-key that committed source into
@@ -500,14 +516,14 @@ function WatchPagePlayer({
     const live = sessionRef.current;
     setPlaybackVersions(
       mergeResolvedLiveVersion(
-        detail.versions,
+        stamped,
         live.mediaFileId,
         { mediaFileId: live.mediaFileId, effectiveVirtualUri: live.effectiveVirtualUri },
         versions,
       ),
     );
     setIndexerReleaseRows(detail.indexer_releases ?? []);
-  }, [awaitAdminJob, contentId, fileId, libraryId, queryClient, versions]);
+  }, [awaitAdminJob, contentId, fileId, libraryId, queryClient, versionLiveness, versions]);
   const handleCancelRefresh = useCallback(async () => {
     await cancelVirtualCandidatesRefresh(contentId);
   }, [contentId]);
@@ -570,6 +586,7 @@ function WatchPagePlayer({
 
   const applyAudioInventory = session.applyAudioInventory;
   const refreshSubtitles = session.refreshSubtitles;
+  const applyInventoryUpdate = session.applyInventoryUpdate;
 
   /**
    * Follows the effective version a transport just committed to. The realtime
@@ -657,8 +674,14 @@ function WatchPagePlayer({
       if (cancelled) return;
       const delay = inventoryPollDelayMs(scheduledAttempts, audioComplete && subtitlesComplete);
       if (delay === 0) return;
-      if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS) return;
-      if (Date.now() >= deadline) return;
+      // The budget is spent. A catalog read that came back empty is not proof
+      // the probe completed — an unprobed, slow, or failed probe also serves
+      // empty tracks — so the client must not promote the declared inventory to
+      // verified on its own. The badge and the server's declared state stay put
+      // until an authoritative payload carries `inventory_status: "verified"`.
+      if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
+        return;
+      }
       scheduledAttempts += 1;
       timer = window.setTimeout(() => void poll(), delay);
     };
@@ -781,20 +804,26 @@ function WatchPagePlayer({
     };
     // The track counts that gate the poll are read once when it starts. They
     // are deliberately not dependencies: filling the inventory in must not
-    // restart the attempt budget.
+    // restart the attempt budget. The provisional flags are different — a
+    // declared push after a verified one re-marks the menu, and the poll has to
+    // come back to clear it again, so a transition restarts (or single-shots)
+    // the poll.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     applyAudioInventory,
+    applyInventoryUpdate,
     contentId,
     isVirtualActiveFile,
     libraryId,
     queryClient,
     refreshSubtitles,
+    session.audioInventoryProvisional,
     session.effectiveVirtualUri,
     session.loading,
     session.mediaFileId,
     session.replacing,
     session.sessionId,
+    session.subtitleInventoryProvisional,
   ]);
 
   /**
@@ -924,17 +953,37 @@ function WatchPagePlayer({
     }
 
     let cancelled = false;
-    // Same key as the mounted `useWatchDetail` query so reconnecting does not
-    // issue a second fetch of the payload that query already holds.
+    // Same key as the mounted `useWatchDetail` query, but always read fresh: a
+    // cached payload can predate a server-side inventory change. The fresh rows
+    // carry no liveness, so the verdicts the parent stamped on its own copy are
+    // re-applied below before this list replaces them.
     void queryClient
       .fetchQuery({
         queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
         queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
-        staleTime: WATCH_DETAIL_STALE_TIME_MS,
+        staleTime: 0,
       })
       .then((detail) => {
         if (!cancelled) {
-          setPlaybackVersions(detail.versions);
+          // The fresh server rows carry no liveness verdict; re-stamp the
+          // parent's checked verdicts onto them before replacing the list so
+          // the menu keeps its `available: false` warnings rather than dropping
+          // them until another projection fires.
+          const stamped = applyVersionAvailability(detail.versions, versionLiveness);
+          // A serve-layer rotation during the disconnect can move the effective
+          // source without changing the collapsed file id. Re-key the committed
+          // live source into the fresh list the same way a manual refresh does,
+          // so `activeVersion` follows the rotation instead of falling through
+          // to the first row.
+          const live = sessionRef.current;
+          setPlaybackVersions(
+            mergeResolvedLiveVersion(
+              stamped,
+              live.mediaFileId,
+              { mediaFileId: live.mediaFileId, effectiveVirtualUri: live.effectiveVirtualUri },
+              versions,
+            ),
+          );
         }
       })
       .catch(() => {
@@ -954,6 +1003,8 @@ function WatchPagePlayer({
     session.mediaFileId,
     session.replacing,
     session.sessionId,
+    versionLiveness,
+    versions,
   ]);
 
   const handleRealtimeEvent = useCallback(
@@ -1185,6 +1236,8 @@ function WatchPagePlayer({
         activeVirtualUri={session.effectiveVirtualUri}
         chapters={activeChapters}
         onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}
+        onSelectAutoVersion={watchTogetherRoomId ? undefined : handleSelectAutoVersion}
+        autoFallback={session.autoFallback}
         onRefreshVersions={handleRefreshVersions}
         onCancelRefresh={handleCancelRefresh}
         subtitleUrls={playableSubtitles}

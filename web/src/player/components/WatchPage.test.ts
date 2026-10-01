@@ -124,6 +124,7 @@ function playbackSession(
     loading: false,
     replacing: false,
     replanning: false,
+    autoFallback: false,
     replanningQuality: false,
     pendingSwitchFileId: null,
     errorTitle: null,
@@ -134,6 +135,7 @@ function playbackSession(
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
     switchVersion: vi.fn(),
+    selectAutoVersion: vi.fn(),
     retryStart: vi.fn(),
     switchAudioTrack: vi.fn(),
     changeSubtitleTrack: vi.fn(),
@@ -680,6 +682,44 @@ describe("WatchPage version list refresh", () => {
       versions?: PlayerFileVersion[];
     };
     expect(after.versions).toEqual([firstVersion, secondVersion]);
+  });
+
+  it("re-stamps the parent's liveness verdicts onto the refreshed rows", async () => {
+    const refreshed: PlayerFileVersion = {
+      ...version,
+      file_id: 9,
+      resolution: "720p",
+      available: undefined,
+    };
+    awaitVirtualCandidatesRefreshMock.mockResolvedValueOnce(undefined);
+    fetchWatchDetailMock.mockResolvedValueOnce({
+      content_id: "content-1",
+      versions: [refreshed],
+      indexer_releases: [],
+    });
+    playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 7 }));
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [firstVersion, secondVersion],
+        versionLiveness: new Map([[9, false]]),
+      }),
+    );
+
+    const before = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onRefreshVersions?: () => Promise<void>;
+    };
+    await act(async () => {
+      await before.onRefreshVersions?.();
+    });
+
+    // The server's refreshed row carries no verdict; the parent checked it as
+    // dead, so the badge has to survive the manual refresh.
+    const after = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      versions?: PlayerFileVersion[];
+    };
+    expect(after.versions?.[0]).toMatchObject({ file_id: 9, available: false });
   });
 });
 
@@ -2010,6 +2050,204 @@ describe("WatchPage live inventory refresh", () => {
     });
 
     expect(fetchWatchDetailMock).not.toHaveBeenCalled();
+  });
+
+  it("retains a still-declared badge when the poll's reads stay empty", async () => {
+    const applyInventoryUpdate = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        planAudioTracks: richerAudioTracks,
+        audioInventoryProvisional: true,
+        subtitleUrls: [],
+        subtitleInventoryProvisional: true,
+        applyInventoryUpdate,
+      }),
+    );
+    // The catalog never gains tracks: the resolved row stays empty on every
+    // read. That is not proof the probe completed — an unprobed, slow, or
+    // failed probe also serves empty tracks — so the client must not promote
+    // the declared inventory to verified by itself.
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, audio_tracks: [], subtitle_tracks: [] }],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+    });
+
+    // The exhausted budget leaves the declared state and its badges untouched
+    // rather than manufacturing a verified empty inventory server-side.
+    expect(applyInventoryUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not clear a declared badge on a server payload that is not verified", async () => {
+    const applyInventoryUpdate = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        planAudioTracks: richerAudioTracks,
+        audioInventoryProvisional: true,
+        subtitleUrls: [],
+        subtitleInventoryProvisional: true,
+        applyInventoryUpdate,
+      }),
+    );
+    // A declared (or still-probing) read is empty, but carries no verified
+    // inventory_status. Only the server can certify the probe landed, so the
+    // poll must not read this as the probe's answer.
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [
+        {
+          ...virtualVersion,
+          audio_tracks: [],
+          subtitle_tracks: [],
+          inventory_status: "declared",
+          inventory_provenance: "declared",
+        },
+      ],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+    });
+
+    expect(applyInventoryUpdate).not.toHaveBeenCalled();
+  });
+
+  it("restarts the poll when a declared push re-marks a verified inventory", async () => {
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, audio_tracks: richerAudioTracks }],
+    });
+    // Stable callbacks across renders: a fresh mock identity would restart the
+    // effect for the wrong reason and hide whether the flag transition does.
+    const applyAudioInventory = vi.fn();
+    const applyInventoryUpdate = vi.fn();
+    const refreshSubtitles = vi.fn();
+    // Starts verified: nothing to poll for.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [planSubtitle],
+        applyAudioInventory,
+        applyInventoryUpdate,
+        refreshSubtitles,
+      }),
+    );
+
+    const view = render(
+      createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }),
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(fetchWatchDetailMock).not.toHaveBeenCalled();
+
+    // A declared push after the verified inventory re-marks the audio menu; the
+    // poll has to come back and look again rather than staying retired.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        planAudioTracks: richerAudioTracks,
+        subtitleUrls: [planSubtitle],
+        audioInventoryProvisional: true,
+        applyAudioInventory,
+        applyInventoryUpdate,
+        refreshSubtitles,
+      }),
+    );
+    view.rerender(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("WatchPage realtime reconnect reconcile", () => {
+  it("re-applies the parent's liveness verdicts to the fresh detail rows", async () => {
+    playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 7 }));
+    // Stable client: the default mock hands back a fresh object per render, which
+    // would re-fire the effect and mask the single reconcile read.
+    queryClientOverride.current = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    // The reconnect read returns the server rows as-is: no liveness on them.
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, available: undefined }],
+    });
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [{ ...virtualVersion, available: false }],
+        versionLiveness: new Map([[7, false]]),
+      }),
+    );
+
+    // The reconcile runs only once the player reports a live socket.
+    const connProps = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onRealtimeConnectionStateChange?: (state: "connected") => void;
+    };
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connected");
+    });
+
+    await waitFor(() => expect(fetchWatchDetailMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(
+        (videoPlayerMock.mock.calls.at(-1)?.[0] as { versions?: PlayerFileVersion[] })
+          .versions?.[0],
+      ).toMatchObject({ file_id: 7, available: false }),
+    );
+  });
+
+  it("re-keys a serve-layer rotation the fresh list omitted", async () => {
+    const mountedLiveRow: PlayerFileVersion = { ...virtualVersion, file_id: 7 };
+    // The socket moved the effective source during the disconnect; the session
+    // still reports the collapsed file id but a new virtual URI.
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ mediaFileId: 7, effectiveVirtualUri: "virtual://movie/x?result=A" }),
+    );
+    queryClientOverride.current = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    // The reconcile read no longer carries the live row: only the rotated
+    // candidate the menus have to follow.
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [{ ...virtualVersion, file_id: 9, file_path: "virtual://movie/x?result=A" }],
+    });
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [mountedLiveRow],
+      }),
+    );
+
+    await waitFor(() => expect(fetchWatchDetailMock).toHaveBeenCalledTimes(0));
+
+    const connProps = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+      onRealtimeConnectionStateChange?: (state: "connected") => void;
+    };
+    act(() => {
+      connProps.onRealtimeConnectionStateChange?.("connected");
+    });
+
+    // The fresh list dropped the live row again; only the reconcile's re-key
+    // puts it back so the menus keep resolving the committed source.
+    await waitFor(() => {
+      const props = videoPlayerMock.mock.calls.at(-1)?.[0] as {
+        versions?: PlayerFileVersion[];
+        activeFileId?: number | null;
+      };
+      expect(props.activeFileId).toBe(7);
+      expect(props.versions?.some((row) => row.file_id === 7)).toBe(true);
+    });
   });
 });
 

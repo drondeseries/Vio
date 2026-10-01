@@ -150,6 +150,15 @@ type Session struct {
 	activeTransportCount       int
 	replacementPlayMethod      PlayMethod
 	streamRevision             uint64
+	// autoFallback and autoFallbackSet record whether this session may fail
+	// over to another media version when its source dies or is unplayable. It
+	// is set from the viewer's auto selection at start (an explicit pick turns
+	// it off) and may be flipped back on by a later auto re-selection. It never
+	// authorizes a healthy mid-play version switch: only a dead/unplayable
+	// source advances it. autoFallbackSet distinguishes an explicit "off" from
+	// a session that never negotiated the field.
+	autoFallback    bool
+	autoFallbackSet bool
 	// virtualSourceGeneration counts candidate-binding moves for this session.
 	// It is the fence a cache-handoff re-resolve captures before it lists
 	// afresh and passes back to SetVirtualSourceIfGeneration, so a handoff that
@@ -1513,6 +1522,56 @@ func (m *SessionManager) VirtualSourceGeneration(sessionID string) (uint64, erro
 	return s.virtualSourceGeneration, nil
 }
 
+// SetAutoFallback records whether a session may fail over to another media
+// version when its source dies or is unplayable. It is negotiated at start from
+// the viewer's auto selection and re-negotiable when the viewer re-selects Auto.
+func (m *SessionManager) SetAutoFallback(sessionID string, enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.autoFallback = enabled
+	s.autoFallbackSet = true
+	return nil
+}
+
+// RestoreAutoFallback returns a session's auto-fallback state to a value
+// captured by AutoFallback before a speculative renegotiation. It restores both
+// the boolean and the set-bit, so a session that had never negotiated the field
+// goes back to reporting ok=false rather than a spurious explicit "off". A
+// failed replan that applied a new policy before execution must roll back to
+// exactly the prior state, not just the boolean, or a later replan would treat
+// an unset session as having explicitly disabled fallback.
+func (m *SessionManager) RestoreAutoFallback(sessionID string, enabled bool, set bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+	s.autoFallback = enabled
+	s.autoFallbackSet = set
+	return nil
+}
+
+// AutoFallback reports the session's negotiated auto-fallback state. ok is
+// false for a session that never set it (for example a reconstruction), so a
+// caller keeps its own conservative default instead of assuming a value.
+func (m *SessionManager) AutoFallback(sessionID string) (enabled bool, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return false, false
+	}
+	return s.autoFallback, s.autoFallbackSet
+}
+
 // SetVirtualSourceIfGeneration is the generation-fenced form of
 // SetVirtualSource. It applies the binding move only while the session still
 // carries expectedGeneration, so a handoff whose replacement source was
@@ -1986,6 +2045,25 @@ func (m *SessionManager) GetSession(sessionID string) (*Session, error) {
 	// Return a copy to avoid races.
 	cp := *s
 	return &cp, nil
+}
+
+// GetSessionWithSourceGeneration returns the session copy and, from the same
+// lock, the candidate-binding generation that copy carries. The generation is
+// read under the lock with the copy so a reader cannot pair a copy with a
+// generation that belongs to a different binding move: a caller that builds a
+// payload from the copy and later compares the generation gets a pairing that
+// was never torn.
+func (m *SessionManager) GetSessionWithSourceGeneration(sessionID string) (*Session, uint64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return nil, 0, ErrSessionNotFound
+	}
+
+	cp := *s
+	return &cp, cp.virtualSourceGeneration, nil
 }
 
 // GetUserSessions returns all active sessions for a user.

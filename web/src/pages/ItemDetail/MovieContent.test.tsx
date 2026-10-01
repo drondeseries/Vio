@@ -108,7 +108,8 @@ vi.mock("@/hooks/queries/qualityPreference", () => ({
   useQualityPreference: (fallback?: string | null) => fallback ?? null,
 }));
 
-vi.mock("@/hooks/queries/versionLiveness", () => ({
+vi.mock("@/hooks/queries/versionLiveness", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/queries/versionLiveness")>()),
   // These tests render without a QueryClient; the liveness check is a no-op
   // that leaves item metadata untouched.
   useVersionLiveness: (...args: unknown[]) => mocks.useVersionLiveness(...args),

@@ -120,6 +120,14 @@ interface PlaybackSessionState {
    * "Requested" optimistically, before the replacement plan lands.
    */
   pendingSwitchFileId: number | null;
+  /**
+   * Whether automatic version fallback is armed for this session. On by
+   * default for an auto start; the viewer can turn it off by picking an
+   * explicit version and back on through the version menu's Auto entry. It
+   * only authorizes a dead/unplayable source to move to another version, never
+   * a healthy mid-play switch.
+   */
+  autoFallback: boolean;
   errorTitle: string | null;
   error: string | null;
   /**
@@ -148,6 +156,13 @@ type StartRequestWithForceRelinkV3 = StartRequestV3 & { force_relink?: boolean }
 export interface UsePlaybackSessionResult extends PlaybackSessionState {
   /** Starts a fresh session against another file (edition/version switch). */
   switchVersion: (fileId: number, currentPosition: number) => void;
+  /**
+   * Arms automatic version fallback (the version menu's Auto entry). When the
+   * current source is already terminal, recovers immediately with an auto
+   * re-resolve; otherwise it only arms Auto for a later dead source. A healthy
+   * mid-play source is never switched.
+   */
+  selectAutoVersion: () => void;
   /**
    * Re-issues the start request for the file whose start was refused with a
    * retryable terminal, forcing a fresh release relist. No-op while a retry is
@@ -379,6 +394,7 @@ function planToSessionState(
   transportRevision: number,
   qualityPreference: string,
   shouldAutoPlay: boolean,
+  autoFallback: boolean,
   config: PlayerConfig,
 ): PlaybackSessionState {
   return {
@@ -412,6 +428,7 @@ function planToSessionState(
     loading: false,
     replacing: false,
     replanning: false,
+    autoFallback,
     replanningQuality: false,
     pendingSwitchFileId: null,
     errorTitle: null,
@@ -526,6 +543,7 @@ export function usePlaybackSession(
     loading: true,
     replacing: false,
     replanning: false,
+    autoFallback: allowAlternateVersions && !explicitFileSelection,
     replanningQuality: false,
     pendingSwitchFileId: null,
     errorTitle: null,
@@ -557,6 +575,9 @@ export function usePlaybackSession(
   const playbackPlayingRef = useRef(true);
   const playbackStartedRef = useRef(false);
   const switchingRef = useRef(false);
+  // Mirrors state.autoFallback so callbacks can read the armed state without
+  // depending on the rendered value.
+  const autoFallbackRef = useRef(allowAlternateVersions && !explicitFileSelection);
   // The last live inventory revision folded into the menus. The server stamps
   // every `inventory_updated` push with its inventory_revision and documents a
   // duplicate or stale revision as a no-op, so this gates repeat deliveries
@@ -798,6 +819,7 @@ export function usePlaybackSession(
           transportRevisionRef.current,
           qualityRef.current,
           playbackPlayingRef.current,
+          current.autoFallback,
           config,
         ),
         initialSubtitleErrorTitle:
@@ -1239,6 +1261,16 @@ export function usePlaybackSession(
     playbackStartedRef.current = false;
     inventoryRevisionRef.current = null;
     appliedInventoryRevisionsRef.current.clear();
+    // A new request re-derives Auto intent from its own props: without this,
+    // the previous request's armed/disarmed state leaks into the new session.
+    // Inline (not setAutoFallback: that callback is declared below this
+    // effect and block-scoped use would trip TS2448).
+    autoFallbackRef.current = allowAlternateVersions && !explicitFileSelection;
+    setState((current) =>
+      current.autoFallback === autoFallbackRef.current
+        ? current
+        : { ...current, autoFallback: autoFallbackRef.current },
+    );
 
     void loadSession({
       preferredFileId: fileId,
@@ -1252,6 +1284,7 @@ export function usePlaybackSession(
       intentAt,
     });
   }, [
+    allowAlternateVersions,
     capabilityRequestKey,
     capabilitiesSettled,
     explicitFileSelection,
@@ -1396,6 +1429,11 @@ export function usePlaybackSession(
         attemptedPlanKeys,
         attemptCount,
         metered: detectMeteredV3(),
+        // State the viewer's current Auto intent on every replan so the
+        // server's session flag cannot drift from the menu: a viewer who
+        // started on an explicit pick and later re-armed Auto must still
+        // rotate on a dead source.
+        autoFallback: autoFallbackRef.current,
         bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
         bandwidthCapKbps: maxBitrateKbps,
         clientCapabilities,
@@ -1487,12 +1525,12 @@ export function usePlaybackSession(
             carriedSubtitleTrackIndex: plan.selected_tracks.subtitle?.index ?? null,
             // Preserve the viewer's version choice; the server must not
             // silently substitute another edition behind a rebuild. Use the
-            // most recent start's selection (a version switch starts explicit)
-            // and fall back to the mount-time prop only if no start recorded
-            // one.
-            fileSelection:
-              retryTargetRef.current?.fileSelection ??
-              (explicitFileSelection ? "explicit" : "auto"),
+            // live Auto intent first (a mid-session re-arm never re-records
+            // the retry target), then the most recent start's selection.
+            fileSelection: autoFallbackRef.current
+              ? "auto"
+              : (retryTargetRef.current?.fileSelection ??
+                (explicitFileSelection ? "explicit" : "auto")),
             intentAt: null,
           });
           return false;
@@ -2069,10 +2107,20 @@ export function usePlaybackSession(
     );
   }, [reportEvent]);
 
+  const setAutoFallback = useCallback((enabled: boolean) => {
+    autoFallbackRef.current = enabled;
+    setState((current) =>
+      current.autoFallback === enabled ? current : { ...current, autoFallback: enabled },
+    );
+  }, []);
+
   const switchVersion = useCallback(
     (newFileId: number, currentPosition: number) => {
       if (!allowAlternateVersions) return;
       if (newFileId === stateRef.current.mediaFileId) return;
+      // The viewer picked a concrete version, so Auto is no longer armed: the
+      // server must not silently move off the chosen release.
+      setAutoFallback(false);
       if (switchingRef.current) {
         // A switch is already in flight. Remember the newest target and the
         // live position it was clicked at; the completion handler starts the
@@ -2130,7 +2178,7 @@ export function usePlaybackSession(
         }
       })();
     },
-    [allowAlternateVersions, loadSession],
+    [allowAlternateVersions, loadSession, setAutoFallback],
   );
 
   /**
@@ -2167,7 +2215,9 @@ export function usePlaybackSession(
       replacementErrorMessage: "Failed to retry playback",
       initialErrorMessage: "Failed to retry playback",
       carriedAudioTrackId: target.carriedAudioTrackId,
-      fileSelection: target.fileSelection,
+      // When Auto is armed the retry re-selects automatically, so the server
+      // may walk alternate versions instead of replaying the dead pin.
+      fileSelection: autoFallbackRef.current ? "auto" : target.fileSelection,
       forceRelink: true,
       intentAt: performance.now(),
     }).finally(() => {
@@ -2176,9 +2226,24 @@ export function usePlaybackSession(
     });
   }, [loadSession]);
 
+  /**
+   * The version menu's Auto entry. Arms automatic fallback and, when the
+   * current source is already terminal (no active plan), recovers immediately
+   * with an auto re-resolve. A healthy plan is left playing: Auto only ever
+   * fires on a dead/unplayable source.
+   */
+  const selectAutoVersion = useCallback(() => {
+    if (!allowAlternateVersions) return;
+    setAutoFallback(true);
+    if (!planRef.current) {
+      retryStart();
+    }
+  }, [allowAlternateVersions, retryStart, setAutoFallback]);
+
   return {
     ...state,
     switchVersion,
+    selectAutoVersion,
     retryStart,
     switchAudioTrack,
     changeSubtitleTrack,

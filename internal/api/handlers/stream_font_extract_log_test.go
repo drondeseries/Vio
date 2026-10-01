@@ -1,0 +1,133 @@
+package handlers
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestFontExtractFailLogThrottlesRepeats pins the font-extraction log throttle:
+// the first failure per file+track warns, repeats drop to debug, and a
+// successful extraction clears the key so a later regression warns again. The
+// extraction itself never fails playback — the endpoint 500 stays the signal.
+func TestFontExtractFailLogThrottlesRepeats(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	var l fontExtractFailLog
+	ctx := context.Background()
+	key := fontExtractFailureKey(7, 1)
+
+	l.failed(ctx, key, "file_id", 7, "track", 1)
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 1 {
+		t.Fatalf("warn count after first failure = %d, want 1\n%s", got, logs.String())
+	}
+
+	l.failed(ctx, key, "file_id", 7, "track", 1)
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 1 {
+		t.Fatalf("warn count after repeat = %d, want the repeat throttled\n%s", got, logs.String())
+	}
+	if got := strings.Count(logs.String(), `"level":"DEBUG"`); got != 1 {
+		t.Fatalf("debug count after repeat = %d, want 1\n%s", got, logs.String())
+	}
+
+	l.recovered(key)
+	l.failed(ctx, key, "file_id", 7, "track", 1)
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 2 {
+		t.Fatalf("warn count after recovery = %d, want the key to warn again\n%s", got, logs.String())
+	}
+}
+
+// TestHandleSubtitleFontsPendingKeepsFailureThrottleKey pins the ordering fix:
+// a request that serves a pending bundle (extraction still in flight) must not
+// clear a prior failure key, because recovery is not yet confirmed. A slow
+// retry that also fails must therefore stay throttled to debug.
+func TestHandleSubtitleFontsPendingKeepsFailureThrottleKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	restore := setFontBundleClientWait(50 * time.Millisecond)
+	defer restore()
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	handler, session, file, _, gatePath := newFontBundleHTTPFixture(t, assTestTracks(), "gate")
+	// Release the gated extraction before the test ends so the detached shell
+	// probe cannot spin forever against a removed temp dir.
+	defer func() { _ = os.WriteFile(gatePath, []byte("go"), 0o600) }()
+
+	key := fontExtractFailureKey(file.ID, 0)
+	// Simulate the prior failure the throttle already saw for this file+track.
+	handler.fontExtractFailures.failed(context.Background(), key, "file_id", file.ID, "track", 0)
+
+	recorder := httptest.NewRecorder()
+	handler.HandleSubtitleFonts(recorder, fontBundleHTTPRequest(session.ID, "0"))
+	if recorder.Code != http.StatusOK || strings.TrimSpace(recorder.Body.String()) != "[]" {
+		t.Fatalf("pending response = %d %q, want 200 empty bundle", recorder.Code, recorder.Body.String())
+	}
+
+	// The failure key must survive the pending response, so the next failure
+	// for the same target throttles to debug instead of warning again.
+	handler.fontExtractFailures.failed(context.Background(), key, "file_id", file.ID, "track", 0)
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 1 {
+		t.Fatalf("warn count after pending retry = %d, want the prior failure key kept\n%s", got, logs.String())
+	}
+}
+
+// TestHandleSubtitleFontsCacheHitClearsFailureThrottleKey pins the recovery
+// path: a detached extraction can commit between requests, so serving its
+// cached bundle must clear the failure key and let a later regression warn.
+func TestHandleSubtitleFontsCacheHitClearsFailureThrottleKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test helper is unix-only")
+	}
+	restore := setFontBundleClientWait(50 * time.Millisecond)
+	defer restore()
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	handler, session, file, _, gatePath := newFontBundleHTTPFixture(t, assTestTracks(), "gate")
+
+	// First request serves a pending bundle; release the gate and wait for the
+	// detached extraction to commit so the next request is a cache hit.
+	recorder := httptest.NewRecorder()
+	handler.HandleSubtitleFonts(recorder, fontBundleHTTPRequest(session.ID, "0"))
+	if err := os.WriteFile(gatePath, []byte("go"), 0o600); err != nil {
+		t.Fatalf("release gate: %v", err)
+	}
+	key := fontBundleCacheKey(file, "", handler.ffmpegPath())
+	if !pollHandlerFontBundle(t, handler.SubtitleCache, key) {
+		t.Fatal("detached extraction never committed to the cache")
+	}
+
+	// Seed a prior failure, then serve the cache hit: the hit is confirmed
+	// recovery, so the key clears and the next failure warns again.
+	logicalKey := fontExtractFailureKey(file.ID, 0)
+	handler.fontExtractFailures.failed(context.Background(), logicalKey, "file_id", file.ID, "track", 0)
+
+	hit := httptest.NewRecorder()
+	handler.HandleSubtitleFonts(hit, fontBundleHTTPRequest(session.ID, "0"))
+	if hit.Code != http.StatusOK {
+		t.Fatalf("cache-hit response = %d, want 200", hit.Code)
+	}
+
+	handler.fontExtractFailures.failed(context.Background(), logicalKey, "file_id", file.ID, "track", 0)
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 2 {
+		t.Fatalf("warn count after cache-hit recovery = %d, want the key cleared and warned again\n%s", got, logs.String())
+	}
+}

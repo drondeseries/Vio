@@ -48,6 +48,14 @@ export interface PlayerFileVersion {
    *  the version is unscored (a local file, or no ranking ran). */
   format_score?: number;
   failed?: boolean;
+  /**
+   * The catalog's liveness verdict for this version, stamped from the server's
+   * `POST /catalog/versions/check` result before the rows reach the player.
+   * Absent means unknown (no result yet); `false` means the server's last check
+   * could not resolve the row, which the version menu warns about. It is never
+   * derived from the client's own playback failures.
+   */
+  available?: boolean;
   edition_key?: string;
   release_name?: string;
   /** Provider display label for a virtual candidate; the wire's release-name
@@ -330,6 +338,14 @@ export interface WatchPageProps {
   fileId?: number;
   libraryId?: number;
   versions: PlayerFileVersion[];
+  /**
+   * The liveness verdicts the parent already stamped onto `versions`, from
+   * `POST /catalog/versions/check`. The watch detail does not carry them, so a
+   * fresh detail read (the realtime reconnect reconcile) has to re-apply the
+   * same map to keep the `available: false` / failed badges on the rows it
+   * replaces.
+   */
+  versionLiveness?: Map<number, boolean>;
   playbackVariants?: PlayerPlaybackVariant[];
   /**
    * Releases that exist on the indexers but are not downloaded on the provider.

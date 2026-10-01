@@ -142,7 +142,7 @@ func (h *PlaybackHandler) handleRealtimeClientMessage(ctx context.Context, sessi
 				ctx = context.Background()
 			}
 			publishCtx, cancel := context.WithTimeout(ctx, inventoryUpdatedPublishBudget)
-			h.publishInventoryUpdatedToSession(publishCtx, session)
+			h.publishInventoryUpdatedToSession(publishCtx, session, "", nil)
 			cancel()
 		}
 		return nil

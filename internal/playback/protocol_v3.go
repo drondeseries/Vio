@@ -709,11 +709,18 @@ type ReplanRequestV3 struct {
 	// LocalMutations reports client-applied local plan mutations (for example
 	// a PCM recovery route) so the server can fold them into the attempt key it
 	// computes for the failed plan. Clients never hash anything themselves.
-	LocalMutations        []string                  `json:"local_mutations,omitempty"`
-	AttemptCount          int                       `json:"attempt_count"`
-	QualityPreference     string                    `json:"quality_preference"`
-	PositionSeconds       float64                   `json:"position_seconds"`
-	Metered               bool                      `json:"metered"`
+	LocalMutations    []string `json:"local_mutations,omitempty"`
+	AttemptCount      int      `json:"attempt_count"`
+	QualityPreference string   `json:"quality_preference"`
+	PositionSeconds   float64  `json:"position_seconds"`
+	Metered           bool     `json:"metered"`
+	// AutoFallback re-negotiates the session's version-fallback intent. A
+	// viewer who re-arms Auto mid-session states it here so a later dead-source
+	// recovery rotates even though the session started on an explicit pick.
+	// Omitted leaves the start-time intent unchanged, so clients that predate
+	// the field keep their existing behavior. It never authorizes a healthy
+	// mid-play switch: only a dead or unplayable source advances it.
+	AutoFallback          *bool                     `json:"auto_fallback,omitempty"`
 	BandwidthEstimateKbps *int                      `json:"bandwidth_estimate_kbps,omitempty"`
 	BandwidthCapKbps      *int                      `json:"bandwidth_cap_kbps,omitempty"`
 	SelectedTracks        SelectedTracksV3          `json:"selected_tracks"`
