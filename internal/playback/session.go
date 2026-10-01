@@ -2027,6 +2027,25 @@ func (m *SessionManager) GetSession(sessionID string) (*Session, error) {
 	return &cp, nil
 }
 
+// GetSessionWithSourceGeneration returns the session copy and, from the same
+// lock, the candidate-binding generation that copy carries. The generation is
+// read under the lock with the copy so a reader cannot pair a copy with a
+// generation that belongs to a different binding move: a caller that builds a
+// payload from the copy and later compares the generation gets a pairing that
+// was never torn.
+func (m *SessionManager) GetSessionWithSourceGeneration(sessionID string) (*Session, uint64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return nil, 0, ErrSessionNotFound
+	}
+
+	cp := *s
+	return &cp, cp.virtualSourceGeneration, nil
+}
+
 // GetUserSessions returns all active sessions for a user.
 func (m *SessionManager) GetUserSessions(userID int) []*Session {
 	m.mu.RLock()

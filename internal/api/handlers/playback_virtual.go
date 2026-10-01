@@ -1810,17 +1810,32 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	allowFailed := options.allowFailedCandidate
 	rotateCandidates := options.rotateCandidates
 	explicitSelection := options.explicitSelection
-	// providerRelist drives both the declared-outage cache bypass and the
-	// resolver's forced re-list. It must be true whenever a fresh provider
-	// listing is required past the floor: a forced relist or any declared
-	// recovery (see the attempt-context comment below).
-	providerRelist := forceRelist || rotateCandidates || options.bypassProviderFloor
 	if !isVirtualPlaybackFile(file) {
 		return resolvedVirtualPlaybackSource{File: file}, nil
 	}
 	if h.VirtualPlaybackResolver == nil {
 		return resolvedVirtualPlaybackSource{}, errors.New("virtual playback resolver is not configured")
 	}
+	// A recovery bypass re-lists the provider past its failure floor. Bound it
+	// with the same per-provider damper the stale fallback uses, so repeated
+	// starts cannot keep a dead provider hot: once this (content, owner)
+	// listing's budget is spent the resolve honors the provider floor instead
+	// of bypassing it. A listing or resolve that answers clears the budget on
+	// the way out, so a recovered provider starts fresh.
+	bypassProviderFloor := options.bypassProviderFloor
+	if bypassProviderFloor {
+		recoveryKey := virtualRecoveryRelistKey(virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID)
+		if !virtualRecoveryRelists.allow(recoveryKey) {
+			slog.WarnContext(r.Context(), "virtual recovery re-list budget exhausted; honoring the provider floor",
+				"component", "api", "file_id", file.ID, "neutral_key", virtualPlaybackNeutralKey(file.FilePath))
+			bypassProviderFloor = false
+		}
+	}
+	// providerRelist drives both the declared-outage cache bypass and the
+	// resolver's forced re-list. It must be true whenever a fresh provider
+	// listing is required past the floor: a forced relist or any declared
+	// recovery (see the attempt-context comment below).
+	providerRelist := forceRelist || rotateCandidates || bypassProviderFloor
 	// Capture one write generation for this resolve before any work starts.
 	// Every cache entry and sticky pin this resolve writes carries it, so a
 	// resolve that finishes late cannot overwrite a newer resolve's evidence.
@@ -1971,6 +1986,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if len(streams) > maxVirtualPlaybackStreams {
 				streams = streams[:maxVirtualPlaybackStreams]
 			}
+			// The provider answered with candidates, so a recovery bypass is no
+			// longer defeating a provider fail-fast: clear this listing's
+			// budget so a later failure starts from a full window. An empty
+			// answer deliberately does not clear, so a provider that keeps
+			// answering [] still accumulates toward the bound.
+			virtualRecoveryRelists.clear(virtualRecoveryRelistKey(virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID))
 			// A selected result= URI is still an active catalog row referenced by
 			// the playback attempt. Refresh metadata in memory, but do not replace
 			// the candidate set while this request is using that row.
@@ -2088,7 +2109,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// Background liveness pollers and ordinary automatic resolves never set any
 	// of these and stay on the floor. The resolve's own startup budget still
 	// bounds every attempt.
-	if (forceRelist && !options.sessionBound) || options.rotateCandidates || options.bypassProviderFloor {
+	if (forceRelist && !options.sessionBound) || options.rotateCandidates || bypassProviderFloor {
 		attemptCtx = virtuallibrary.WithProviderOutageRelist(attemptCtx)
 	}
 	attemptCtx = withVirtualCandidateRotationV3(attemptCtx, rotateCandidates)
@@ -4178,12 +4199,16 @@ func streamMatchesPersistedIdentity(stream VirtualPlaybackStream, identity virtu
 }
 
 // virtualRecoveryRelistMax is the number of stale-source recovery re-lists one
-// provider listing may perform inside virtualRecoveryRelistWindow. The fallback
-// always lists the provider directly, so a provider whose listing keeps failing
-// would otherwise have its fail-fast backoff bypassed on every start and
-// recovery could poll it indefinitely. The bound is deliberately small:
-// recovery exists to break a stale pin, not to keep a dead provider hot. A
-// listing that answers clears the count.
+// provider listing may perform inside virtualRecoveryRelistWindow. Both the
+// stale fallback (which lists the provider directly) and the declared recovery
+// bypasses that re-list past the floor (the alternate-version walk, its
+// per-alternate prepare, and the replan rehydration) draw on this budget, so a
+// provider whose listing keeps failing cannot have its fail-fast backoff
+// bypassed on every start and recovery cannot poll it indefinitely. The bound
+// is deliberately small: recovery exists to break a stale pin, not to keep a
+// dead provider hot. A listing that answers with candidates clears the count;
+// an empty answer does not, so a provider that keeps answering [] still
+// accumulates toward the bound.
 const virtualRecoveryRelistMax = 3
 
 // virtualRecoveryRelistWindow matches the resolver's provider failure backoff:
@@ -4435,13 +4460,23 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 	// Bound repeated recovery re-lists per provider listing. The fallback lists
 	// the provider directly, so a provider whose listing keeps failing would
 	// otherwise have the resolver's provider fail-fast backoff bypassed on every
-	// start. A listing that answers clears the budget below, so only genuine
-	// listing failures accumulate; once exhausted the caller keeps its honest
-	// provider error until the window lapses.
+	// start. A listing that answers with candidates clears the budget below, so
+	// only genuine listing failures and empty answers accumulate; once
+	// exhausted the fallback surfaces the transient provider cause so the
+	// caller's bounded alternate walk can still reach a healthy sibling.
 	recoveryKey := virtualRecoveryRelistKey(neutralKey, file.VirtualOwnerInstallationID)
 	if !virtualRecoveryRelists.allow(recoveryKey) {
-		slog.WarnContext(ctx, "virtual stale fallback: recovery re-list budget exhausted; staying on the provider floor",
+		slog.WarnContext(ctx, "virtual stale fallback: recovery re-list budget exhausted; deferring to the bounded alternate walk",
 			"component", "api", "file_id", file.ID, "neutral_key", neutralKey)
+		// The provider has failed enough listings that recovery must stop
+		// re-listing it, but the pinned release must not be abandoned silently:
+		// surface the transient provider cause so the caller's bounded
+		// alternate-version walk can still reach a healthy sibling on another
+		// provider instead of leaving the viewer pinned to the dead release for
+		// the rest of the window.
+		if elig.anchorErr != nil {
+			*elig.anchorErr = fmt.Errorf("%w: stale-source recovery re-list budget exhausted", resolver.ErrProviderUnavailable)
+		}
 		return nil
 	}
 	listCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
@@ -4453,13 +4488,17 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 		slog.ErrorContext(ctx, "virtual stale fallback: list failed", "component", "api", "neutral_key", neutralKey, "error", listErr)
 		return nil
 	}
-	// The provider answered, so recovery is no longer defeating a provider
-	// backoff; a later failure starts from a full budget.
-	virtualRecoveryRelists.clear(recoveryKey)
 	if len(streams) == 0 {
+		// An empty answer is a provider hiccup, not a verdict: it must not
+		// clear the budget, so a provider that keeps answering [] still
+		// accumulates toward the bound instead of being re-listed on every
+		// press.
 		slog.ErrorContext(ctx, "virtual stale fallback: no streams listed", "component", "api", "neutral_key", neutralKey)
 		return nil
 	}
+	// The provider answered with candidates, so recovery is no longer defeating
+	// a provider backoff; a later failure starts from a full budget.
+	virtualRecoveryRelists.clear(recoveryKey)
 	if len(streams) > maxVirtualPlaybackStreams {
 		streams = streams[:maxVirtualPlaybackStreams]
 	}

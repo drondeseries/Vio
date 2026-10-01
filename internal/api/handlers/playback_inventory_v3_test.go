@@ -443,6 +443,26 @@ func (r *bindingMoveFileResolverV3) GetByID(ctx context.Context, id int) (*model
 	return r.FilePathResolver.GetByID(ctx, id)
 }
 
+// generationTearManager lands a binding move between the inventory publisher's
+// generation read and its session re-read, reproducing the exact tear the
+// atomic read closes: the generation is captured pre-move while the copy is
+// post-move. A manager without the atomic capability would drop the fresh build.
+type generationTearManager struct {
+	*playback.SessionManager
+	from string
+	to   string
+	once sync.Once
+}
+
+func (m *generationTearManager) GetSession(sessionID string) (*playback.Session, error) {
+	m.once.Do(func() {
+		if m.from != "" {
+			_ = m.SetVirtualSource(sessionID, m.to, 5)
+		}
+	})
+	return m.SessionManager.GetSession(sessionID)
+}
+
 // virtualProbedInventoryFile builds a probed virtual release with one audio
 // track whose language identifies the release in the published payload.
 func virtualProbedInventoryFile(uri, language string) *models.MediaFile {
@@ -552,6 +572,54 @@ func TestPublishInventoryUpdatedDropsBuildRacedByBindingMove(t *testing.T) {
 
 	if len(conn.messages) != 0 {
 		t.Fatalf("delivered %d events, want 0: the build raced a source-binding move", len(conn.messages))
+	}
+}
+
+// TestPublishInventoryUpdatedKeepsFreshBuildWhenReadGenerationLags pins finding
+// 4: the fence must pair the generation with the live copy the build actually
+// uses. A move that lands between a separately read generation and the session
+// re-read leaves the build using the current source; the fence must not drop
+// that payload on the strength of the older generation. The manager below
+// performs exactly that move when the generation is read.
+func TestPublishInventoryUpdatedKeepsFreshBuildWhenReadGenerationLags(t *testing.T) {
+	base := playback.NewSessionManager(0, 0)
+	session, err := base.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	releaseB := virtualProbedInventoryFile("virtual://movie/inventory-fence?result=B", "deu")
+	if err := base.SetVirtualSource(session.ID, "virtual://movie/inventory-fence?result=A", 5); err != nil {
+		t.Fatalf("SetVirtualSource A: %v", err)
+	}
+
+	// The manager moves the binding to the verified release B just before the
+	// session re-read, so a separately captured generation still names A's
+	// binding while the copy the build uses is B. The fresh build from B must
+	// not be dropped, and the atomic read that pairs copy and generation must
+	// see this tear and still deliver.
+	manager := &generationTearManager{SessionManager: base, from: "virtual://movie/inventory-fence?result=A", to: releaseB.FilePath}
+
+	h := NewPlaybackHandler(manager, testPlaybackFileResolver{file: releaseB})
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := base.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+
+	// A stale snapshot from before the binding moved, as PublishInventoryUpdated
+	// enumerates before taking the per-session lock.
+	stale := *session
+	stale.VirtualSourceURI = "virtual://movie/inventory-fence?result=A"
+
+	h.publishInventoryUpdatedToSession(context.Background(), &stale)
+
+	if len(conn.messages) != 1 {
+		t.Fatalf("delivered %d events, want 1: a payload built from the live binding must not be dropped by a lagging generation read", len(conn.messages))
 	}
 }
 

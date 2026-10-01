@@ -942,8 +942,10 @@ intent, which is what lets a viewer who started on an explicit pick re-arm Auto
 from the version menu and still have a later dead-source `failure_recovery`
 rotate instead of being pinned to the start-time choice. Omitting it leaves that
 intent unchanged, so clients that predate the field behave exactly as before.
-Auto fallback never authorizes a healthy mid-play version switch: only a dead or
-unplayable source advances it.
+The re-arm is committed with the replan: if the replan does not complete, the
+intent change is discarded rather than half-applied. Auto fallback never
+authorizes a healthy mid-play version switch: only a dead or unplayable source
+advances it.
 
 For failure recovery, `attempted_plan_keys` is the loop guard. The client sends
 back every `plan_attempt_key` it has already tried for this attempt (up to 16);

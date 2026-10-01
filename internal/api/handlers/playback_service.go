@@ -1059,6 +1059,29 @@ func (h *PlaybackHandler) inventorySourceGeneration(sessionID string) (uint64, b
 	return generation, true
 }
 
+// sessionWithSourceGenerationReader is the optional session-manager capability
+// that returns a session copy paired with its candidate-binding generation from
+// one lock. Both come from the same read, so a caller cannot compare a copy
+// against a generation that belongs to a different binding move.
+type sessionWithSourceGenerationReader interface {
+	GetSessionWithSourceGeneration(sessionID string) (*playback.Session, uint64, error)
+}
+
+// sessionWithSourceGeneration reads the live session and its binding generation
+// atomically. It reports false for a manager that does not expose the pairing
+// (a minimal test manager) so the caller keeps its prior best-effort behavior.
+func (h *PlaybackHandler) sessionWithSourceGeneration(sessionID string) (*playback.Session, uint64, bool) {
+	reader, ok := h.sessionMgr.(sessionWithSourceGenerationReader)
+	if !ok {
+		return nil, 0, false
+	}
+	session, generation, err := reader.GetSessionWithSourceGeneration(sessionID)
+	if err != nil || session == nil {
+		return nil, 0, false
+	}
+	return session, generation, true
+}
+
 // publishInventoryUpdatedToSession builds and delivers one inventory_updated
 // event from the session's live inventory. It re-resolves the effective release
 // through the same playbackInventoryForSession the inventory endpoint uses, so
@@ -1074,16 +1097,25 @@ func (h *PlaybackHandler) publishInventoryUpdatedToSession(ctx context.Context, 
 	release := h.progressSideEffectLock(session.ID)
 	defer release()
 	// The caller enumerated sessions before the lock was held, so the snapshot
-	// it passed can already name a superseded source binding. Capture the
-	// monotonic binding generation and re-read the live session under the lock,
-	// then re-check the generation before the send: a binding move that lands
-	// while the inventory is being resolved invalidates this build instead of
-	// delivering an older release's revision after a newer one. The move's own
-	// publish carries the current revision.
+	// it passed can already name a superseded source binding. Re-read the live
+	// session under the lock and take the binding generation from that same
+	// read, then re-check the generation before the send: a binding move that
+	// lands while the inventory is being resolved invalidates this build
+	// instead of delivering an older release's revision after a newer one. The
+	// move's own publish carries the current revision. Reading the generation
+	// with the copy (not separately afterwards) means a move that lands between
+	// the read and the comparison cannot make a payload built from the current
+	// source look stale: only a build whose live copy is genuinely superseded is
+	// dropped.
 	generation, hasGeneration := h.inventorySourceGeneration(session.ID)
 	live, err := h.sessionMgr.GetSession(session.ID)
 	if err != nil || live == nil {
 		return
+	}
+	if refreshed, gen, ok := h.sessionWithSourceGeneration(session.ID); ok {
+		live = refreshed
+		generation = gen
+		hasGeneration = true
 	}
 	var record *playback.AttemptRecordV3
 	if h.PlanStoreV3 != nil {

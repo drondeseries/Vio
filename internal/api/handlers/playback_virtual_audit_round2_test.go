@@ -8,6 +8,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 // erroringPathFileResolver implements the exact-path lookup seam and always
@@ -428,5 +429,63 @@ func TestFallbackRecoveryRelistBudgetClearsOnProviderAnswer(t *testing.T) {
 	}
 	if calls != 3+virtualRecoveryRelistMax {
 		t.Fatalf("provider listings = %d, want the cleared budget to grant %d more", calls, virtualRecoveryRelistMax)
+	}
+}
+
+// TestFallbackEmptyListingAccumulatesTowardBound pins the empty-answer fix: a
+// provider that keeps answering [] is a hiccup, not a recovery, so it must not
+// clear the budget. Each empty answer is admitted but the budget still
+// accumulates, so the (max+1)-th press stops listing instead of granting an
+// unbounded re-list per press.
+func TestFallbackEmptyListingAccumulatesTowardBound(t *testing.T) {
+	resetVirtualRecoveryRelists(t)
+	const neutral = "virtual://movie/tt-empty-answer"
+	file := &models.MediaFile{ID: 100, ContentID: "movie-empty-answer", FilePath: neutral + "?result=old", VirtualOwnerInstallationID: 5}
+	var calls int
+	h := &PlaybackHandler{
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			calls++
+			return nil, nil
+		}),
+	}
+	for i := 0; i < virtualRecoveryRelistMax+1; i++ {
+		if got := h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1", virtualFallbackEligibility{}); got != nil {
+			t.Fatalf("attempt %d returned %#v, want nil", i, got)
+		}
+	}
+	if calls != virtualRecoveryRelistMax {
+		t.Fatalf("provider listings = %d, want exactly %d: empty answers must accumulate toward the bound", calls, virtualRecoveryRelistMax)
+	}
+}
+
+// TestFallbackBudgetExhaustionSurfacesTransientCause pins finding 3: when the
+// re-list budget is spent, the fallback must not silently abandon a session
+// that has no anchor callback (a serve-layer re-resolve, where anchorErr is
+// nil). It records the transient provider cause on the eligibility so the
+// caller can preserve the retryable outcome instead of a misleading generic
+// failure.
+func TestFallbackBudgetExhaustionSurfacesTransientCause(t *testing.T) {
+	resetVirtualRecoveryRelists(t)
+	const (
+		neutral = "virtual://movie/tt-budget-cause"
+		oldURI  = neutral + "?result=old"
+	)
+	file := &models.MediaFile{ID: 100, ContentID: "movie-budget-cause", FilePath: oldURI, VirtualOwnerInstallationID: 5}
+	h := &PlaybackHandler{
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return nil, errors.New("provider listing failed")
+		}),
+	}
+	// Spend the budget.
+	for i := 0; i < virtualRecoveryRelistMax; i++ {
+		_ = h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1", virtualFallbackEligibility{})
+	}
+	var anchorErr error
+	elig := virtualFallbackEligibility{anchorErr: &anchorErr}
+	if got := h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1", elig); got != nil {
+		t.Fatalf("exhausted fallback = %#v, want nil", got)
+	}
+	if !errors.Is(anchorErr, resolver.ErrProviderUnavailable) {
+		t.Fatalf("anchor cause = %v, want the transient provider cause so the caller can still walk alternates", anchorErr)
 	}
 }
