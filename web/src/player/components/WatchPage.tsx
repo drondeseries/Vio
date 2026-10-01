@@ -928,13 +928,15 @@ function WatchPagePlayer({
     }
 
     let cancelled = false;
-    // Same key as the mounted `useWatchDetail` query so reconnecting does not
-    // issue a second fetch of the payload that query already holds.
+    // Same key as the mounted `useWatchDetail` query, but always read fresh:
+    // a cached payload can predate the parent's liveness stamping, and the
+    // `setPlaybackVersions` below would then drop the `available: false`
+    // annotations until a later projection restores them.
     void queryClient
       .fetchQuery({
         queryKey: itemKeys.watchDetail(contentId, fileId, libraryId),
         queryFn: () => fetchWatchDetail(contentId, fileId, libraryId),
-        staleTime: WATCH_DETAIL_STALE_TIME_MS,
+        staleTime: 0,
       })
       .then((detail) => {
         if (!cancelled) {
