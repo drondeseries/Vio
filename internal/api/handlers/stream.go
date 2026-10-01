@@ -186,6 +186,14 @@ type fontExtractFailLog struct {
 
 // failed logs the first failure for key at warn and repeats at debug.
 func (l *fontExtractFailLog) failed(ctx context.Context, key string, attrs ...any) {
+	l.failedWithMessage(ctx, "subtitle font extraction failed", key, attrs...)
+}
+
+// failedWithMessage is failed with a caller-chosen message, so the font
+// route's non-extraction internal_error causes (session load, source
+// preflight) log under their own wording instead of claiming an extraction
+// failure. The throttle key space is shared, so a target warns once per cause.
+func (l *fontExtractFailLog) failedWithMessage(ctx context.Context, message, key string, attrs ...any) {
 	l.mu.Lock()
 	if l.seen == nil {
 		l.seen = make(map[string]struct{})
@@ -197,10 +205,10 @@ func (l *fontExtractFailLog) failed(ctx context.Context, key string, attrs ...an
 	l.mu.Unlock()
 	args := append([]any{virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI}, attrs...)
 	if repeat {
-		slog.DebugContext(ctx, "subtitle font extraction failed", args...)
+		slog.DebugContext(ctx, message, args...)
 		return
 	}
-	slog.WarnContext(ctx, "subtitle font extraction failed", args...)
+	slog.WarnContext(ctx, message, args...)
 }
 
 // recovered clears the throttle key after a successful extraction so a later
@@ -214,6 +222,35 @@ func (l *fontExtractFailLog) recovered(key string) {
 // fontExtractFailureKey identifies an extraction target across retries.
 func fontExtractFailureKey(fileID, trackIndex int) string {
 	return strconv.Itoa(fileID) + ":" + strconv.Itoa(trackIndex)
+}
+
+// logSubtitleFontInternalError records the cause behind the font route's
+// internal_error returns. Neither the session-load nor the source-preflight
+// failure used to log anything, so a client that retried a broken font URL
+// produced a flood the v2 request log could only describe as a bare
+// internal_error. The extraction-failure throttle backs it: the first failure
+// per target warns with file_id+track (or session+track before the file
+// resolves) and repeats drop to debug. Status codes and bodies are unchanged.
+func (h *StreamHandler) logSubtitleFontInternalError(ctx context.Context, in SubtitleFontRequest, fileID, trackIndex int, cause string, err error) {
+	if h == nil || err == nil {
+		return
+	}
+	message := "subtitle font request failed: " + cause
+	if fileID > 0 {
+		h.fontExtractFailures.failedWithMessage(ctx, message, cause+"\x00"+fontExtractFailureKey(fileID, trackIndex),
+			"file_id", fileID,
+			"track", trackIndex,
+			"cause", cause,
+			"error", err,
+		)
+		return
+	}
+	h.fontExtractFailures.failedWithMessage(ctx, message, cause+"\x00session:"+in.SessionID+":track:"+in.Track,
+		"session", in.SessionID,
+		"track", in.Track,
+		"cause", cause,
+		"error", err,
+	)
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -1966,6 +2003,14 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	}
 	session, claims, err := h.loadSidecarSession(ctx, in.Query.Get(streamTokenParam), in.SessionID, userID)
 	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status >= http.StatusInternalServerError {
+			cause := apiErr.cause
+			if cause == nil {
+				cause = apiErr
+			}
+			h.logSubtitleFontInternalError(ctx, in, 0, -1, "session_load", cause)
+		}
 		return nil, err
 	}
 	attachPlaybackSession(ctx, session, claims)
@@ -1995,6 +2040,7 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 			h.abortPlaybackSession(ctx, session)
 			return nil, apiError(http.StatusNotFound, "not_found", "Source media file is missing")
 		}
+		h.logSubtitleFontInternalError(ctx, in, file.ID, trackIndex, "source_preflight", err)
 		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
 	}
 

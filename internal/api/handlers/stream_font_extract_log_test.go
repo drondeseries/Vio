@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -129,5 +130,66 @@ func TestHandleSubtitleFontsCacheHitClearsFailureThrottleKey(t *testing.T) {
 	handler.fontExtractFailures.failed(context.Background(), logicalKey, "file_id", file.ID, "track", 0)
 	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 2 {
 		t.Fatalf("warn count after cache-hit recovery = %d, want the key cleared and warned again\n%s", got, logs.String())
+	}
+}
+
+// TestSubtitleFontInternalErrorLogsCauseOnce pins the diagnostic gap: the font
+// route's internal_error returns (session load, source preflight) used to log
+// nothing, so a client retrying a broken font URL produced a flood the v2
+// request log described only as a bare internal_error. The first failure per
+// target now warns with file_id+track and the cause; repeats drop to debug.
+func TestSubtitleFontInternalErrorLogsCauseOnce(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	var handler StreamHandler
+	in := SubtitleFontRequest{SessionID: "sess-1", Track: "3"}
+	cause := errors.New("media file is gone")
+
+	handler.logSubtitleFontInternalError(context.Background(), in, 42, 3, "source_preflight", cause)
+	body := logs.String()
+	if got := strings.Count(body, `"level":"WARN"`); got != 1 {
+		t.Fatalf("warn count after first internal error = %d, want 1\n%s", got, body)
+	}
+	if !strings.Contains(body, `"file_id":42`) || !strings.Contains(body, `"track":3`) ||
+		!strings.Contains(body, `"cause":"source_preflight"`) ||
+		!strings.Contains(body, "media file is gone") {
+		t.Fatalf("first internal error missing file/track/cause: %s", body)
+	}
+
+	// A repeat of the same cause stays throttled to debug.
+	handler.logSubtitleFontInternalError(context.Background(), in, 42, 3, "source_preflight", cause)
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 1 {
+		t.Fatalf("repeat internal error warned again: %d warns\n%s", got, logs.String())
+	}
+	if got := strings.Count(logs.String(), `"level":"DEBUG"`); got != 1 {
+		t.Fatalf("repeat internal error debug count = %d, want 1", got)
+	}
+}
+
+// TestSubtitleFontInternalErrorLogsBeforeFileResolution pins the session-load
+// path: when the file id is not known yet, the log still carries the session
+// and track so a flood is diagnosable.
+func TestSubtitleFontInternalErrorLogsBeforeFileResolution(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	var handler StreamHandler
+	handler.logSubtitleFontInternalError(
+		context.Background(),
+		SubtitleFontRequest{SessionID: "sess-9", Track: "1"},
+		0, -1, "session_load", errors.New("reconstruct failed"),
+	)
+	body := logs.String()
+	if got := strings.Count(body, `"level":"WARN"`); got != 1 {
+		t.Fatalf("warn count = %d, want 1\n%s", got, body)
+	}
+	if !strings.Contains(body, `"session":"sess-9"`) || !strings.Contains(body, `"track":"1"`) ||
+		!strings.Contains(body, `"cause":"session_load"`) {
+		t.Fatalf("session-load internal error missing session/track/cause: %s", body)
 	}
 }
