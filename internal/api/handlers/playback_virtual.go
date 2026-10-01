@@ -3775,7 +3775,7 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, sna
 // every later play. Background and speculative callers pass false and are never
 // written directly, so the fallback cannot amplify load.
 func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe, foreground bool) {
-	args, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
+	args, originFileID, ok := h.virtualProbeEvidenceArgs(ctx, catalogFile, resolvedPath, probed, stampProbe)
 	if !ok {
 		return
 	}
@@ -3783,7 +3783,7 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 	// only to tie a rejection to the caller's request. Admission is explicit so
 	// the caller can distinguish an accepted, a coalesced (superseded but
 	// still represented) and a rejected (buffer full) write.
-	switch h.enqueueVirtualProbeEvidence(ctx, args) {
+	switch h.enqueueVirtualProbeEvidenceFor(ctx, args, originFileID) {
 	case virtualEvidenceRejected:
 		slog.ErrorContext(ctx, "virtual probe evidence persist rejected: evidence buffer full",
 			"component", "api", "file_id", args.FileID, "stamp_probe", args.StampProbe, "foreground", foreground)
@@ -3797,7 +3797,9 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 // virtualProbeEvidenceArgs builds the catalog write for one probe result. It
 // returns false when the write must be refused: nil inputs, a row without an id
 // or saver, a cross-release candidate the row cannot adopt, or a candidate whose
-// path ownership the identity guard could not answer.
+// path ownership the identity guard could not answer. The second return value is
+// the row the probe was requested for, so a caller can distinguish a write to
+// the requested row from a rotation onto a sibling owner.
 //
 // When verified evidence arrives for a URI a sibling row verifiably owns, the
 // write rotates to that owner row instead of attempting a CAS adoption the SQL
@@ -3805,15 +3807,19 @@ func (h *PlaybackHandler) persistVirtualProbeEvidence(ctx context.Context, catal
 // background-probe fix: a probed candidate URI whose path already belongs to an
 // alternate-version row must bind the evidence to the version that actually
 // plays, not be dropped onto the pinned row forever.
-func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (models.VirtualFilePersistArgs, bool) {
+func (h *PlaybackHandler) virtualProbeEvidenceArgs(ctx context.Context, catalogFile *models.MediaFile, resolvedPath string, probed *models.MediaFile, stampProbe bool) (models.VirtualFilePersistArgs, int, bool) {
 	if h == nil || h.VirtualFileSaver == nil || catalogFile == nil || probed == nil || catalogFile.ID <= 0 {
-		return models.VirtualFilePersistArgs{}, false
+		return models.VirtualFilePersistArgs{}, 0, false
 	}
 	identityRow, evidence, ok := h.virtualProbeEvidenceRotateTarget(ctx, catalogFile, resolvedPath, probed)
 	if !ok {
-		return models.VirtualFilePersistArgs{}, false
+		return models.VirtualFilePersistArgs{}, 0, false
 	}
-	return h.virtualProbeEvidenceArgsForRow(ctx, identityRow, resolvedPath, evidence, stampProbe)
+	args, ok := h.virtualProbeEvidenceArgsForRow(ctx, identityRow, resolvedPath, evidence, stampProbe)
+	if !ok {
+		return models.VirtualFilePersistArgs{}, 0, false
+	}
+	return args, catalogFile.ID, true
 }
 
 // virtualProbeEvidenceRotateTarget resolves the row the evidence belongs to and
@@ -3844,6 +3850,11 @@ func (h *PlaybackHandler) virtualProbeEvidenceRotateTarget(ctx context.Context, 
 			"component", "api", "file_id", catalogFile.ID, "candidate_uri", resolvedPath,
 			"row_path", catalogFile.FilePath, "probe_source", catalogFile.ProbeSource,
 			"reason", virtualProbeRefusalOwnerLookupFailed, "error", ownerErr)
+		// The catalog write is correctly blocked, but the live session must not
+		// stay stale: serve the probed tracks in memory to sessions bound to
+		// this row's exact candidate. The publish is best-effort and writes
+		// nothing to the catalog.
+		h.publishRefusedProbeInventory(ctx, catalogFile.ID, resolvedPath, probed)
 		return nil, nil, false
 	}
 	if ownerRow != nil && ownerRow.ID != catalogFile.ID {
@@ -4016,7 +4027,7 @@ func (h *PlaybackHandler) probeVirtualCandidateForegroundFallback(
 		probed.Duration = probeTransient.Duration
 	}
 	mergeVirtualCandidateTracks(probed, probeCand)
-	args, ok := h.virtualProbeEvidenceArgs(requestCtx, catalogFile, probeCand.URI, probed, true)
+	args, _, ok := h.virtualProbeEvidenceArgs(requestCtx, catalogFile, probeCand.URI, probed, true)
 	if !ok {
 		return
 	}
@@ -4509,9 +4520,19 @@ func (h *PlaybackHandler) virtualPathOwnerRow(ctx context.Context, file *models.
 //
 // capable is false when the resolver cannot look rows up by path; the caller
 // then cannot assert ownership and keeps its prior behavior. err is a
-// fail-closed lookup failure: a lookup error, or a non-nil row without a usable
-// id (an unanswered lookup, not safe absence). A nil row with a nil error is a
-// genuine not-found.
+// fail-closed lookup failure: a real lookup error, or a non-nil row without a
+// usable id (an unanswered lookup, not safe absence). A nil row with a nil
+// error is a genuine not-found.
+//
+// A not-found sentinel (scanner.ErrFileNotFound or ErrVirtualCandidateNotFound)
+// is a genuine absence, not an unanswered question: a row stores the neutral
+// URI while a probed candidate carries a concrete ?result= pick, so the exact
+// path lookup misses by design and must not be read as "ownership unknown". The
+// caller then treats the path as unowned and proceeds (adopting or stamping the
+// requested row) instead of refusing the write forever. Only a real read error
+// stays fail-closed; the production resolver wraps GetByPath's not-found into
+// ErrVirtualCandidateNotFound, and a bare scanner.ErrFileNotFound is equally
+// absent.
 func (h *PlaybackHandler) virtualPathLookupRow(ctx context.Context, candidateURI string) (row *models.MediaFile, capable bool, err error) {
 	if h == nil || strings.TrimSpace(candidateURI) == "" {
 		return nil, false, nil
@@ -4524,6 +4545,10 @@ func (h *PlaybackHandler) virtualPathLookupRow(ctx context.Context, candidateURI
 	}
 	row, err = pathResolver.GetByPath(ctx, candidateURI)
 	if err != nil {
+		if isVirtualCandidateNotFound(err) {
+			// No row owns the exact path: safe absence, not a lookup failure.
+			return nil, true, nil
+		}
 		return nil, true, fmt.Errorf("virtual path owner lookup failed for %q: %w", candidateURI, err)
 	}
 	if row == nil {

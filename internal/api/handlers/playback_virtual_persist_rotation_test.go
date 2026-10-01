@@ -11,7 +11,24 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/scanner"
 )
+
+// pathLookupFileResolver resolves rows by id and returns a fixed error from the
+// exact-path lookup, so tests can distinguish "no row owns this path" (a
+// not-found sentinel) from "the lookup could not be answered" (a real error).
+type pathLookupFileResolver struct {
+	files   map[int]*models.MediaFile
+	pathErr error
+}
+
+func (r pathLookupFileResolver) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	return r.files[id], nil
+}
+
+func (r pathLookupFileResolver) GetByPath(context.Context, string) (*models.MediaFile, error) {
+	return nil, r.pathErr
+}
 
 // persistRotationResolver resolves rows both by id (the inventory build) and by
 // exact path (the identity guard's ownership lookup), so one resolver serves the
@@ -322,5 +339,220 @@ func TestVirtualProbeEvidenceRefusalReasonSplit(t *testing.T) {
 	}
 	if got := plain.virtualProbeEvidenceRefusalReason(context.Background(), pinnedRow, uri); got != virtualProbeRefusalStaleSnapshot {
 		t.Fatalf("stale-snapshot reason = %q, want %q", got, virtualProbeRefusalStaleSnapshot)
+	}
+}
+
+// TestVirtualPathLookupRowTreatsNotFoundAsAbsence pins the defect-2 fix: a
+// resolved candidate URI whose row stores the neutral path misses the exact
+// lookup by design, and the production resolver reports that as a not-found
+// sentinel. That is safe absence, not an unanswered ownership question, so the
+// guard must not fail closed on it.
+func TestVirtualPathLookupRowTreatsNotFoundAsAbsence(t *testing.T) {
+	const uri = "virtual://movie/tt-absent?result=pick"
+	for _, sentinel := range []error{scanner.ErrFileNotFound, ErrVirtualCandidateNotFound} {
+		h := &PlaybackHandler{fileResolver: pathLookupFileResolver{pathErr: sentinel}}
+		row, capable, err := h.virtualPathLookupRow(context.Background(), uri)
+		if !capable {
+			t.Fatalf("lookup of %v reported not capable, want capable", sentinel)
+		}
+		if err != nil {
+			t.Fatalf("lookup of %v returned error %v, want safe absence", sentinel, err)
+		}
+		if row != nil {
+			t.Fatalf("lookup of %v returned a row, want nil", sentinel)
+		}
+	}
+}
+
+// TestPersistProbeEvidenceRetriesAfterPathNotFound pins the strand remedy: when
+// the candidate's exact path has no owner yet, the persisted write is admitted
+// against the requested row (retried on the next evidence arrival) instead of
+// being terminally refused as owner_lookup_failed.
+func TestPersistProbeEvidenceRetriesAfterPathNotFound(t *testing.T) {
+	logs := captureHandlerLogs(t)
+	const (
+		neutral   = "virtual://movie/tt-absent-owner"
+		pinnedURI = neutral + "?result=pinned"
+		candURI   = neutral + "?result=candidate"
+		content   = "movie-absent-owner"
+	)
+	pinnedRow := &models.MediaFile{
+		ID: 910, ContentID: content, FilePath: pinnedURI,
+		MediaFolderID: 9, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
+		UpdatedAt: time.Now().UTC(),
+	}
+	saver := &persistRotationEvidenceSaver{result: VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}}
+	h := NewPlaybackHandler(playback.NewSessionManager(0, 0), pathLookupFileResolver{
+		files:   map[int]*models.MediaFile{pinnedRow.ID: pinnedRow},
+		pathErr: scanner.ErrFileNotFound,
+	})
+	h.VirtualFileMetadataSaver = saver.save
+	h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil }
+
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, candURI, probedDualAudioFile(), true, true)
+	h.stopVirtualEvidence()
+
+	calls := saver.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("persist writes = %d, want 1: a not-found path must be retried, not refused", len(calls))
+	}
+	if calls[0].FileID != pinnedRow.ID {
+		t.Fatalf("write file_id = %d, want the requested row %d", calls[0].FileID, pinnedRow.ID)
+	}
+	if logText := logs.String(); strings.Contains(logText, `"reason":"`+virtualProbeRefusalOwnerLookupFailed+`"`) {
+		t.Fatalf("a not-found path was refused as owner_lookup_failed:\n%s", logText)
+	}
+}
+
+// TestPersistProbeEvidenceRefusedOwnershipServesLiveSessionInMemory pins the
+// fail-closed fallback: when the ownership lookup genuinely cannot be answered,
+// the catalog write stays blocked but the live session bound to the requested
+// row's candidate still receives the probed tracks in memory, so the menu does
+// not stay stale.
+func TestPersistProbeEvidenceRefusedOwnershipServesLiveSessionInMemory(t *testing.T) {
+	logs := captureHandlerLogs(t)
+	const (
+		neutral   = "virtual://movie/tt-refused-owner"
+		pinnedURI = neutral + "?result=pinned"
+		candURI   = neutral + "?result=candidate"
+		content   = "movie-refused-owner"
+	)
+	pinnedRow := &models.MediaFile{
+		ID: 920, ContentID: content, FilePath: pinnedURI,
+		MediaFolderID: 9, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", pinnedRow.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	// The serve layer binds a rotated session to the candidate it plays.
+	if err := sessionMgr.SetEffectiveMediaFileID(session.ID, pinnedRow.ID); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, candURI, 5); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	h := NewPlaybackHandler(sessionMgr, pathLookupFileResolver{
+		files:   map[int]*models.MediaFile{pinnedRow.ID: pinnedRow},
+		pathErr: errors.New("catalog unavailable"),
+	})
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := sessionMgr.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+	saver := &persistRotationEvidenceSaver{result: VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}}
+	h.VirtualFileMetadataSaver = saver.save
+	h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil }
+
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, candURI, probedDualAudioFile(), true, true)
+	h.stopVirtualEvidence()
+
+	if calls := saver.recorded(); len(calls) != 0 {
+		t.Fatalf("guard refusal still wrote %+v, want no catalog write", calls)
+	}
+	if !strings.Contains(logs.String(), `"reason":"`+virtualProbeRefusalOwnerLookupFailed+`"`) {
+		t.Fatalf("guard refusal did not log owner_lookup_failed:\n%s", logs.String())
+	}
+	if len(conn.messages) != 1 {
+		t.Fatalf("delivered %d events, want 1 in-memory inventory_updated", len(conn.messages))
+	}
+	event, ok := conn.messages[0].(playback.EventEnvelope)
+	if !ok {
+		t.Fatalf("message type = %T, want playback.EventEnvelope", conn.messages[0])
+	}
+	if event.Name != playback.RealtimeEventInventoryUpdated {
+		t.Fatalf("event name = %q, want %q", event.Name, playback.RealtimeEventInventoryUpdated)
+	}
+	var payload playback.InventoryUpdatedPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.InventoryStatus != string(ProbeProvenanceVerified) {
+		t.Fatalf("inventory status = %q, want verified", payload.InventoryStatus)
+	}
+	if len(payload.AudioTracks) != 2 {
+		t.Fatalf("payload audio tracks = %#v, want the probed dual audio inventory", payload.AudioTracks)
+	}
+	if len(payload.SubtitleInventory) == 0 {
+		t.Fatalf("payload subtitle inventory = %#v, want the probed subtitle", payload.SubtitleInventory)
+	}
+}
+
+// TestPersistProbeEvidenceRotationDeliveryLoggedOnce pins the defect-1
+// observability fix: a rotated write publishes exactly one inventory_updated to
+// the owner row's session and logs the delivery with both ends of the rotation,
+// so a live run can confirm the publish instead of inferring it.
+func TestPersistProbeEvidenceRotationDeliveryLoggedOnce(t *testing.T) {
+	logs := captureHandlerLogs(t)
+	const (
+		neutral   = "virtual://movie/tt-rotation-log"
+		pinnedURI = neutral + "?result=pinned"
+		ownerURI  = neutral + "?result=owner"
+		content   = "movie-rotation-log"
+	)
+	probedAt := time.Now().UTC()
+	ownerRow := &models.MediaFile{
+		ID: 932, ContentID: content, FilePath: ownerURI,
+		MediaFolderID: 9, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
+		ProbeUpdatedAt: &probedAt,
+		AudioTracks:    probedDualAudioFile().AudioTracks,
+		SubtitleTracks: probedDualAudioFile().SubtitleTracks,
+	}
+	pinnedRow := &models.MediaFile{
+		ID: 931, ContentID: content, FilePath: pinnedURI,
+		MediaFolderID: 9, VirtualOwnerInstallationID: 5, ProbeSource: "virtual",
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", pinnedRow.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetEffectiveMediaFileID(session.ID, ownerRow.ID); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID: %v", err)
+	}
+	h := NewPlaybackHandler(sessionMgr, persistRotationResolver{
+		files:  map[int]*models.MediaFile{pinnedRow.ID: pinnedRow, ownerRow.ID: ownerRow},
+		byPath: map[string]*models.MediaFile{ownerURI: ownerRow},
+	})
+	h.RealtimeHub = playback.NewRealtimeHub()
+	if err := sessionMgr.SetRealtimeConnection(session.ID, true); err != nil {
+		t.Fatalf("SetRealtimeConnection: %v", err)
+	}
+	conn := &sourceCommittedTestConn{}
+	registration := h.RealtimeHub.Register(session.ID, conn)
+	if registration == nil {
+		t.Fatal("expected a realtime registration")
+	}
+	defer h.RealtimeHub.Unregister(registration)
+	saver := &persistRotationEvidenceSaver{result: VirtualFileMetadataUpdateResult{MetadataUpdated: true, RowsAffected: 1}}
+	h.VirtualFileMetadataSaver = saver.save
+	h.VirtualFileSaver = func(context.Context, models.VirtualFilePersistArgs) (int64, error) { return 1, nil }
+
+	h.persistVirtualProbeEvidence(context.Background(), pinnedRow, ownerURI, probedDualAudioFile(), true, false)
+	h.stopVirtualEvidence()
+
+	if len(conn.messages) != 1 {
+		t.Fatalf("delivered %d events, want exactly 1 (no double-publish)", len(conn.messages))
+	}
+	logText := logs.String()
+	if !strings.Contains(logText, "virtual probe evidence inventory delivered") {
+		t.Fatalf("rotation delivery was not logged:\n%s", logText)
+	}
+	if !strings.Contains(logText, `"rotated_from_file_id":931`) {
+		t.Fatalf("delivery log omitted the rotated-from row:\n%s", logText)
+	}
+	if !strings.Contains(logText, `"file_id":932`) {
+		t.Fatalf("delivery log omitted the owner row:\n%s", logText)
+	}
+	if !strings.Contains(logText, `"sessions_notified":1`) {
+		t.Fatalf("delivery log omitted the session count:\n%s", logText)
 	}
 }
