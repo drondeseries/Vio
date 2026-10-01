@@ -2035,6 +2035,18 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 		}
 		return nil, apiError(http.StatusNotFound, "not_found", err.Error())
 	}
+	// Validate the requested ordinal and codec before any 500-capable work. A
+	// non-ASS ordinal or one outside the embedded range is a client error no
+	// retry can satisfy, so it must not reach preflight or extraction (both of
+	// which can fail with an internal_error and, on a retrying client, mint a
+	// 500 storm for a request that is permanently unsatisfiable).
+	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
+	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
+		return nil, apiError(http.StatusNotFound, "not_found", "Embedded subtitle track not found")
+	}
+	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
+		return nil, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
+	}
 	if err := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(ctx, session)
@@ -2044,13 +2056,6 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
 	}
 
-	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
-	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
-		return nil, apiError(http.StatusNotFound, "not_found", "Embedded subtitle track not found")
-	}
-	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
-		return nil, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
-	}
 	fonts, err := playback.ExtractAttachedSubtitleFonts(ctx, file.FilePath, h.ffmpegPath())
 	if err != nil {
 		h.fontExtractFailures.failed(ctx, fontExtractFailureKey(file.ID, trackIndex),
@@ -2083,6 +2088,18 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 
 	session, claims, err := h.loadSidecarSession(r.Context(), r.URL.Query().Get(streamTokenParam), sessionID, userID)
 	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status >= http.StatusInternalServerError {
+			cause := apiErr.cause
+			if cause == nil {
+				cause = apiErr
+			}
+			h.logSubtitleFontInternalError(r.Context(), SubtitleFontRequest{
+				SessionID: sessionID,
+				Track:     chi.URLParam(r, "track"),
+				Query:     r.URL.Query(),
+			}, 0, -1, "session_load", cause)
+		}
 		writeAPIError(w, err)
 		return
 	}
@@ -2126,14 +2143,10 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
-	if err := preflightPlaybackFile(r.Context(), file, h.MissingMarker, h.EventsHub); err != nil {
-		if isPlaybackFileMissing(err) {
-			h.abortPlaybackSession(r.Context(), session)
-		}
-		writePlaybackFilePreflightError(w, err)
-		return
-	}
-
+	// Validate the requested ordinal and codec before any 500-capable work, so
+	// a permanently unsatisfiable request (non-ASS ordinal, ordinal outside the
+	// embedded range) answers 4xx instead of a 500 a retrying client would
+	// re-issue. See SubtitleFonts for the same ordering.
 	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
 	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
 		writeError(w, http.StatusNotFound, "not_found", "Embedded subtitle track not found")
@@ -2141,6 +2154,20 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	}
 	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
 		writeError(w, http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
+		return
+	}
+	if err := preflightPlaybackFile(r.Context(), file, h.MissingMarker, h.EventsHub); err != nil {
+		if isPlaybackFileMissing(err) {
+			h.abortPlaybackSession(r.Context(), session)
+			writePlaybackFilePreflightError(w, err)
+			return
+		}
+		h.logSubtitleFontInternalError(r.Context(), SubtitleFontRequest{
+			SessionID: sessionID,
+			Track:     trackParam,
+			Query:     r.URL.Query(),
+		}, file.ID, trackIndex, "source_preflight", err)
+		writePlaybackFilePreflightError(w, err)
 		return
 	}
 
