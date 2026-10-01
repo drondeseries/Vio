@@ -2052,7 +2052,7 @@ describe("WatchPage live inventory refresh", () => {
     expect(fetchWatchDetailMock).not.toHaveBeenCalled();
   });
 
-  it("clears a still-declared badge when the poll's reads stay empty", async () => {
+  it("retains a still-declared badge when the poll's reads stay empty", async () => {
     const applyInventoryUpdate = vi.fn();
     playbackSessionMock.mockReturnValue(
       playbackSession({
@@ -2065,7 +2065,9 @@ describe("WatchPage live inventory refresh", () => {
       }),
     );
     // The catalog never gains tracks: the resolved row stays empty on every
-    // read, which is the probe's answer that there is nothing to wait for.
+    // read. That is not proof the probe completed — an unprobed, slow, or
+    // failed probe also serves empty tracks — so the client must not promote
+    // the declared inventory to verified by itself.
     fetchWatchDetailMock.mockResolvedValue({
       versions: [{ ...virtualVersion, audio_tracks: [], subtitle_tracks: [] }],
     });
@@ -2076,16 +2078,45 @@ describe("WatchPage live inventory refresh", () => {
       await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
     });
 
-    // The exhausted budget folds the authoritative empties in so the badges
-    // clear instead of staying frozen; the stream is untouched.
-    expect(applyInventoryUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({
-        session_id: "session-1",
-        inventory_status: "verified",
-        audio_tracks: [],
-        subtitle_inventory: [],
+    // The exhausted budget leaves the declared state and its badges untouched
+    // rather than manufacturing a verified empty inventory server-side.
+    expect(applyInventoryUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not clear a declared badge on a server payload that is not verified", async () => {
+    const applyInventoryUpdate = vi.fn();
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        mediaFileId: 7,
+        planAudioTracks: richerAudioTracks,
+        audioInventoryProvisional: true,
+        subtitleUrls: [],
+        subtitleInventoryProvisional: true,
+        applyInventoryUpdate,
       }),
     );
+    // A declared (or still-probing) read is empty, but carries no verified
+    // inventory_status. Only the server can certify the probe landed, so the
+    // poll must not read this as the probe's answer.
+    fetchWatchDetailMock.mockResolvedValue({
+      versions: [
+        {
+          ...virtualVersion,
+          audio_tracks: [],
+          subtitle_tracks: [],
+          inventory_status: "declared",
+          inventory_provenance: "declared",
+        },
+      ],
+    });
+
+    render(createElement(WatchPage, { ...watchPageProps, versions: [virtualVersion] }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(INVENTORY_REFRESH_INTERVAL_MS * 10);
+    });
+
+    expect(applyInventoryUpdate).not.toHaveBeenCalled();
   });
 
   it("restarts the poll when a declared push re-marks a verified inventory", async () => {

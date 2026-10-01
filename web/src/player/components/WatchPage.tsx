@@ -666,61 +666,20 @@ function WatchPagePlayer({
     let timer: number | null = null;
     let audioComplete = !needsAudio;
     let subtitlesComplete = !needsSubtitles;
-    // What every completed catalog read said about each menu. "empty" means the
-    // resolved row carried no tracks on every completed read; "nonempty" pins
-    // that at least one read carried some. Failed reads contribute nothing.
-    let audioEvidence: "none" | "empty" | "nonempty" = "none";
-    let subtitleEvidence: "none" | "empty" | "nonempty" = "none";
     // Absolute wall-clock deadline so an error loop that never completes a
     // fetch cannot poll past the safety window.
     const deadline = Date.now() + INVENTORY_REFRESH_DEADLINE_MS;
-
-    /**
-     * Closes out a still-declared inventory when the poll is out of attempts and
-     * every completed catalog read came back empty.
-     *
-     * A catalog row is probe-persisted evidence, so an empty result across the
-     * whole budget is the probe's answer: there are no further tracks to wait
-     * for. Fold that answer through the same path a verified realtime push uses
-     * — clearing the badge and dropping the declared placeholders — instead of
-     * stopping silently and leaving the menu frozen. A failed read never
-     * contributes evidence, so an unreachable catalog keeps the badge.
-     */
-    const finalizeProvisionalInventory = () => {
-      const current = sessionRef.current;
-      const clearAudio = current.audioInventoryProvisional && audioEvidence === "empty";
-      const clearSubtitles = current.subtitleInventoryProvisional && subtitleEvidence === "empty";
-      if (!clearAudio && !clearSubtitles) return;
-      applyInventoryUpdate({
-        session_id: sessionId,
-        inventory_status: "verified",
-        ...(clearAudio
-          ? {
-              audio_tracks: [],
-              effective_media_file_id: current.mediaFileId ?? undefined,
-              effective_virtual_uri: current.effectiveVirtualUri ?? undefined,
-            }
-          : {}),
-        ...(clearSubtitles
-          ? {
-              subtitle_inventory: [],
-              // Target the live source so the clear lands on the right row after
-              // a serve-layer rotation, not the plan's stale collapsed id.
-              effective_media_file_id: current.mediaFileId ?? undefined,
-              effective_virtual_uri: current.effectiveVirtualUri ?? undefined,
-            }
-          : {}),
-      });
-    };
 
     const scheduleNextPoll = () => {
       if (cancelled) return;
       const delay = inventoryPollDelayMs(scheduledAttempts, audioComplete && subtitlesComplete);
       if (delay === 0) return;
-      // The budget is spent: finalize what the catalog authoritatively left
-      // empty before the poll stops for good.
+      // The budget is spent. A catalog read that came back empty is not proof
+      // the probe completed — an unprobed, slow, or failed probe also serves
+      // empty tracks — so the client must not promote the declared inventory to
+      // verified on its own. The badge and the server's declared state stay put
+      // until an authoritative payload carries `inventory_status: "verified"`.
       if (completedAttempts >= INVENTORY_REFRESH_MAX_ATTEMPTS || Date.now() >= deadline) {
-        finalizeProvisionalInventory();
         return;
       }
       scheduledAttempts += 1;
@@ -770,13 +729,6 @@ function WatchPagePlayer({
         });
         if (version) {
           const nextAudioTracks = version.audio_tracks ?? [];
-          // Record what this read said so the finalize pass knows whether the
-          // still-declared menu was consistently empty or saw a richer list.
-          if (nextAudioTracks.length === 0) {
-            if (audioEvidence !== "nonempty") audioEvidence = "empty";
-          } else {
-            audioEvidence = "nonempty";
-          }
           // The menu may replace the plan's inventory when the poll resolved a
           // different file than the plan names (a virtual candidate vs. the
           // collapsed row). `applyAudioInventory` owns the replacement, but the
@@ -820,11 +772,6 @@ function WatchPagePlayer({
           const subtitleMenuIncomplete =
             !hasSelectableSessionSubtitles(current.subtitleUrls) ||
             current.subtitleInventoryProvisional;
-          if (nextSubtitleTracks.length === 0) {
-            if (subtitleEvidence !== "nonempty") subtitleEvidence = "empty";
-          } else {
-            subtitleEvidence = "nonempty";
-          }
           if (subtitleMenuIncomplete && nextSubtitleTracks.length > 0) {
             // The plan's inventory is empty or still declared; a no-op
             // track_change replan re-reads it (URLs included) without changing
