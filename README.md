@@ -102,8 +102,8 @@ docker compose up -d
 
 Open <http://localhost:8090> and complete onboarding.
 
-The published image is `ghcr.io/drondeseries/vio-server:latest` (override with
-`VIO_IMAGE` to pin a tag). Server data lives under `/opt/vio` by default;
+The published developmental image is `ghcr.io/drondeseries/vio:dev` (override with
+`VIO_IMAGE` to pin a tag or use `:latest` for releases). Server data lives under `/opt/vio` by default;
 set `VIO_DATA_ROOT` in `.env` to relocate it. When running from source, the
 server binary is `./vio`.
 

@@ -434,8 +434,10 @@ func installErrorAdapter() {
 			// Huma here, which would otherwise reduce it to the fixed 500
 			// envelope with the cause discarded. Record it so the request log
 			// carries the actual failure under the same request ID.
-			for _, err := range errs {
-				noteOperationError(ctx.Context(), err)
+			if status >= 500 {
+				for _, err := range errs {
+					noteOperationError(ctx.Context(), err)
+				}
 			}
 		}
 		return fromHumaError(requestID, status, msg, errs, limit)

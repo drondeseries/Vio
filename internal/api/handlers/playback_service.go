@@ -848,6 +848,9 @@ func (h *PlaybackHandler) playbackInventoryForSession(ctx context.Context, sessi
 	if h == nil || session == nil {
 		return playback.PlaybackInventoryV3{}, playbackSessionNotFoundOperationError()
 	}
+	if h.fileResolver == nil {
+		return playback.PlaybackInventoryV3{}, errors.New("file resolver not configured")
+	}
 	file, err := h.fileResolver.GetByID(ctx, session.MediaFileID)
 	if err != nil || file == nil {
 		return playback.PlaybackInventoryV3{}, playbackOperationError(http.StatusNotFound, "not_found", "Media file not found")

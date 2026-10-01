@@ -932,6 +932,26 @@ func playbackProbeFingerprint(file *models.MediaFile) string {
 	return fmt.Sprintf("%d:%d:%s:%s:%s", file.ID, file.FileSize, mtime, probe, strings.TrimSpace(file.ProbeSource))
 }
 
+// isPlaybackPlanSafe reports whether a media file has sufficient metadata to
+// form a validated playback plan without blocking playback start on probe repair.
+// A video file must carry proven video evidence AND known audio evidence (or a
+// verified probe stamp proving absence of audio). An audio-only file must carry
+// a proven audio codec.
+func isPlaybackPlanSafe(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	if file.IsAudioOnly() {
+		return strings.TrimSpace(file.CodecAudio) != "" && (len(file.AudioTracks) > 0 || file.Duration > 0)
+	}
+	if !playback.VirtualRouteVideoMetadataCompleteV3(file) {
+		return false
+	}
+	hasAudioEvidence := (len(file.AudioTracks) > 0 && strings.TrimSpace(file.AudioTracks[0].Codec) != "") ||
+		strings.TrimSpace(file.CodecAudio) != ""
+	return hasAudioEvidence || file.ProbeUpdatedAt != nil
+}
+
 // ensurePlaybackProbeStart is the playback-start probe. Unlike the synchronous
 // ensurePlaybackProbe, it bounds how long the request waits: on a remote
 // library the on-demand repair costs multi-second reads, and that cost sat
@@ -954,11 +974,44 @@ func (h *PlaybackHandler) ensurePlaybackProbeStart(ctx context.Context, file *mo
 		// A refresh is already in flight for this generation, or the memo
 		// refused admission. Either way this caller is a joiner: the helper's
 		// contract is that concurrent starts do not block on the refresh, so
-		// serve the row's known metadata. The owner's repair persists (or a
-		// later start retries), and the next start reads the repaired rows.
+		// serve the row's known metadata. If the repair already landed, honor
+		// it immediately without waiting.
+		if entry != nil {
+			select {
+			case <-entry.done:
+				h.probeRefreshMu.Lock()
+				repaired := entry.repaired
+				h.probeRefreshMu.Unlock()
+				if repaired != nil {
+					return repaired
+				}
+			default:
+			}
+		}
 		return file
 	}
 	h.refreshPlaybackProbeAsync(ctx, entry, file)
+
+	// If repair already completed synchronously (or landed immediately):
+	select {
+	case <-entry.done:
+		h.probeRefreshMu.Lock()
+		repaired := entry.repaired
+		h.probeRefreshMu.Unlock()
+		if repaired != nil {
+			return repaired
+		}
+		return file
+	default:
+	}
+
+	// When stored metadata already supports a safe playback decision, do not
+	// block playback start on the probe repair budget: serve known metadata
+	// immediately while repair finishes in the background and notifies the
+	// live playback session.
+	if isPlaybackPlanSafe(file) {
+		return file
+	}
 
 	timer := time.NewTimer(h.playbackProbeStartBudget())
 	defer timer.Stop()
