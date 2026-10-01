@@ -427,7 +427,7 @@ func (c *sourceCommittedTestConn) WriteJSON(v any) error {
 }
 
 // bindingMoveFileResolverV3 fires a source-binding move on the first file load,
-// modelling a rotation that lands while an inventory build is resolving.
+// modeling a rotation that lands while an inventory build is resolving.
 type bindingMoveFileResolverV3 struct {
 	FilePathResolver
 	move func()

@@ -118,7 +118,7 @@ func TestRenegotiateAutoFallbackV3FailsClosed(t *testing.T) {
 }
 
 // autoFallbackSetFailManager is a session manager whose auto-fallback set always
-// fails, modelling a session that cannot adopt the negotiated policy.
+// fails, modeling a session that cannot adopt the negotiated policy.
 type autoFallbackSetFailManager struct {
 	*playback.SessionManager
 }
