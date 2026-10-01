@@ -5,7 +5,15 @@ on:
     workflows: [CI]
     types: [completed]
     branches: [main, apiv2]
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      publish_latest:
+        description: "Also tag and push as :latest (default false)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: docker-${{ github.event.workflow_run.head_branch || github.ref_name }}
@@ -36,7 +44,7 @@ jobs:
       build_number: ${{ steps.identity.outputs.build_number }}
       built_at: ${{ steps.identity.outputs.built_at }}
       image_version: ${{ steps.identity.outputs.image_version }}
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || github.event.workflow_run.head_branch == 'apiv2'))
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'release' || (github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || github.event.workflow_run.head_branch == 'apiv2'))
     steps:
       - name: Resolve build identity
         id: identity
@@ -52,7 +60,9 @@ jobs:
 
           build_number=""
           image_version="${GITHUB_SHA::7}"
-          if [[ "$TARGET_BRANCH" == "$DEFAULT_BRANCH" ]]; then
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            image_version="${{ github.event.release.tag_name }}"
+          elif [[ "$TARGET_BRANCH" == "$DEFAULT_BRANCH" ]]; then
             build_number=$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))
             if (( build_number <= 0 )); then
               echo "::error::Build number must be positive."
@@ -66,19 +76,19 @@ jobs:
           echo "image_version=${image_version}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout for manual frontend build
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
 
       - name: Set up pnpm for manual frontend build
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         uses: pnpm/action-setup@v4
         with:
           package_json_file: web/package.json
 
       - name: Set up Node.js for manual frontend build
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         uses: actions/setup-node@v5
         with:
           node-version: "22"
@@ -86,12 +96,12 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
 
       - name: Build frontend for manual builds
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         working-directory: web
         run: pnpm install --frozen-lockfile && pnpm run build
 
       - name: Upload frontend bundle for manual builds
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist-${{ github.sha }}
@@ -138,7 +148,7 @@ jobs:
 
       - name: Download frontend bundle for manual builds
         uses: actions/download-artifact@v4
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         with:
           name: frontend-dist-${{ github.sha }}
           path: web/dist
@@ -265,8 +275,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           tags: |
-            type=raw,value=latest,enable=${{ github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch) }}
-            type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch) }}
+            type=raw,value=dev,enable=${{ github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch) }}
+            type=raw,value=latest,enable=${{ (github.event_name == 'release' && !github.event.release.prerelease) || (github.event_name == 'workflow_dispatch' && inputs.publish_latest == true) }}
+            type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
+            type=raw,value=build-${{ needs.prepare.outputs.build_number }},enable=${{ (github.event.workflow_run.head_branch == github.event.repository.default_branch || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)) && needs.prepare.outputs.build_number != '' }}
             type=raw,value=apiv2,enable=${{ github.event.workflow_run.head_branch == 'apiv2' || (github.event_name == 'workflow_dispatch' && github.ref_name == 'apiv2') }}
             type=raw,value=${{ (github.event.workflow_run.head_sha || github.sha) }}
 
@@ -282,8 +294,17 @@ jobs:
         env:
           BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PUBLISH_LATEST: ${{ inputs.publish_latest }}
+          EVENT_NAME: ${{ github.event_name }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:${{ github.event.workflow_run.head_sha || github.sha }}"
-          if [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" || "${{ github.event.workflow_run.head_branch }}" == "${DEFAULT_BRANCH}" ]]; then
+          if [[ -n "${BUILD_NUMBER}" ]]; then
             docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:build-${BUILD_NUMBER}"
+          fi
+          if [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" || "${{ github.event.workflow_run.head_branch }}" == "${DEFAULT_BRANCH}" ]]; then
+            docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:dev"
+          fi
+          if [[ "${EVENT_NAME}" == "release" && "${IS_PRERELEASE}" != "true" ]] || [[ "${PUBLISH_LATEST}" == "true" ]]; then
+            docker buildx imagetools inspect "${REGISTRY}/${IMAGE_LC}:latest"
           fi
