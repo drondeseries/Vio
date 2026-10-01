@@ -52,6 +52,7 @@ export function configPanelId(key: string): string {
 
 export const CATALOG_GROUPS: { kind: PluginSourceKind; title: string }[] = [
   { kind: "silo", title: "Made by Silo" },
+  { kind: "vio", title: "Vio maintained" },
   { kind: "approved_community", title: "Approved community" },
   { kind: "external", title: "Other sources" },
 ];
