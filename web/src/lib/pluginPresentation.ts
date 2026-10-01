@@ -36,6 +36,7 @@ export function sourceLabel(sourceKind: string): string {
  */
 export function tierNotice(sourceKind: string): string | null {
   switch (sourceKind) {
+    case "vio":
     case "silo":
       return null;
     case "approved_community":
