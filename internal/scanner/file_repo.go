@@ -1581,11 +1581,40 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 		if _, err := tx.Exec(ctx, `
 			DELETE FROM media_files
 			WHERE id = ANY($1::bigint[])
-			  AND last_delivered_at IS NULL
+			  AND `+virtualCandidateRetentionSQL("$2"), stale, windowSeconds); err != nil {
+			return fmt.Errorf("delete stale virtual candidates: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit virtual candidate replacement: %w", err)
+	}
+	return nil
+}
+
+// virtualCandidateRetentionSQL returns the SQL predicate that protects a stale
+// or dead virtual-candidate row from deletion. windowArg names the placeholder
+// carrying the candidate store window in seconds. The re-list sweep in
+// ReplaceVirtualCandidates and the dead-candidate prune in
+// PruneDeadVirtualCandidates share it, so the two retention rules can never
+// drift apart. The predicate assumes the row under test is media_files.id.
+//
+// A row is retained when any of these hold:
+//   - it delivered media bytes (last_delivered_at not null): "once worked" is
+//     stronger evidence than "recently listed";
+//   - it is still inside the candidate store window (a positive window keeps a
+//     listed candidate trusted for replay even after a re-list drops it);
+//   - it is some user's last-played file (user_watch_progress.last_file_id);
+//   - a live playback attempt's effective_media_file_id points at it (the
+//     FK is ON DELETE CASCADE, so deleting the row would destroy live session
+//     state; the FK's key-share lock serializes this against a new insert);
+//   - an open ABS-compatible session references it (ON DELETE SET NULL, so
+//     deleting the row would silently strip a live session's file identity).
+func virtualCandidateRetentionSQL(windowArg string) string {
+	return `last_delivered_at IS NULL
 			  -- Keep a candidate inside the candidate store window: it is still
 			  -- trusted for replay even though this listing dropped it. Zero
 			  -- seconds disables the clause (updated_at is never in the future).
-			  AND updated_at < NOW() - make_interval(secs => $2)
+			  AND updated_at < NOW() - make_interval(secs => ` + windowArg + `)
 			  AND NOT EXISTS (
 				SELECT 1 FROM user_watch_progress p
 				WHERE p.last_file_id = media_files.id
@@ -1613,14 +1642,50 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				SELECT 1 FROM abs_playback_sessions s
 				WHERE s.media_file_id = media_files.id
 				  AND s.closed_at IS NULL
-			  )`, stale, windowSeconds); err != nil {
-			return fmt.Errorf("delete stale virtual candidates: %w", err)
-		}
+			  )`
+}
+
+// virtualCandidateWindowSeconds returns the configured candidate store window
+// in seconds, or zero when the window is disabled (nil reader or non-positive
+// value). The retention predicate treats zero as "no window protection".
+func (r *FileRepository) virtualCandidateWindowSeconds() float64 {
+	if r == nil || r.virtualCandidateStoreWindow == nil {
+		return 0
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit virtual candidate replacement: %w", err)
+	if window := r.virtualCandidateStoreWindow(); window > 0 {
+		return window.Seconds()
 	}
-	return nil
+	return 0
+}
+
+// PruneDeadAbsentVirtualCandidates deletes the named virtual candidate rows
+// unless the candidate retention rule protects them. ids are candidate rows the
+// refresh has already proven both absent from the fresh listing and dead (a
+// failed_at verdict or an AltMount failed verdict); this method re-applies the
+// same retention predicate the re-list sweep uses, so a last-played, delivered,
+// in-window, or live-session row is never deleted even when dead and absent.
+// Passing the caller's evidence rather than re-deriving it keeps the "when in
+// doubt, keep" rule in one place: a missed prune is a cosmetic leftover, a
+// wrong prune is data loss.
+//
+// Rows that are not virtual candidates (the provider-neutral source row, a
+// local file) are ignored. It returns the number of rows actually deleted.
+func (r *FileRepository) PruneDeadAbsentVirtualCandidates(ctx context.Context, ids []int) (int, error) {
+	if r == nil || r.pool == nil {
+		return 0, errors.New("file repository is not configured")
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM media_files
+		WHERE id = ANY($1::bigint[])
+		  AND (container = 'virtual' OR file_path LIKE 'virtual://%')
+		  AND `+virtualCandidateRetentionSQL("$2"), ids, r.virtualCandidateWindowSeconds())
+	if err != nil {
+		return 0, fmt.Errorf("prune dead virtual candidates: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 func virtualCandidateGroup(raw string) (string, bool) {

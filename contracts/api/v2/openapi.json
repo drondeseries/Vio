@@ -43099,6 +43099,9 @@
           "indexer_search": {
             "type": "boolean"
           },
+          "refresh_prunes_dead_candidates": {
+            "type": "boolean"
+          },
           "revision": {
             "description": "Opaque revision of this document",
             "type": "string"
@@ -43117,6 +43120,7 @@
         "required": [
           "indexer_search",
           "indexer_request",
+          "refresh_prunes_dead_candidates",
           "revision",
           "state",
           "allowed"

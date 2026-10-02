@@ -10,18 +10,22 @@ import (
 type fakeVirtualLibraryStatus struct {
 	search  bool
 	request bool
+	prune   bool
 }
 
 func (f fakeVirtualLibraryStatus) IndexerCapabilities() (bool, bool) { return f.search, f.request }
+func (f fakeVirtualLibraryStatus) RefreshPrunesDeadCandidates() bool { return f.prune }
 
 func TestVirtualLibraryCapabilities(t *testing.T) {
-	cases := []struct {
+	type wantCase = struct {
 		name    string
 		deps    func() Dependencies
 		want    string
 		search  bool
 		request bool
-	}{
+		prune   bool
+	}
+	cases := []wantCase{
 		{
 			name: "unwired is not_configured",
 			deps: func() Dependencies { return pilotDeps(nil, nil) },
@@ -40,10 +44,10 @@ func TestVirtualLibraryCapabilities(t *testing.T) {
 			name: "both wired",
 			deps: func() Dependencies {
 				deps := pilotDeps(nil, nil)
-				deps.VirtualLibraryStatus = fakeVirtualLibraryStatus{search: true, request: true}
+				deps.VirtualLibraryStatus = fakeVirtualLibraryStatus{search: true, request: true, prune: true}
 				return deps
 			},
-			want: StateAvailable, search: true, request: true,
+			want: StateAvailable, search: true, request: true, prune: true,
 		},
 	}
 	for _, tc := range cases {
@@ -54,10 +58,11 @@ func TestVirtualLibraryCapabilities(t *testing.T) {
 				t.Fatalf("status = %d; body %s", rec.Code, rec.Body.String())
 			}
 			var body struct {
-				State          string `json:"state"`
-				IndexerSearch  bool   `json:"indexer_search"`
-				IndexerRequest bool   `json:"indexer_request"`
-				Revision       string `json:"revision"`
+				State                       string `json:"state"`
+				IndexerSearch               bool   `json:"indexer_search"`
+				IndexerRequest              bool   `json:"indexer_request"`
+				RefreshPrunesDeadCandidates bool   `json:"refresh_prunes_dead_candidates"`
+				Revision                    string `json:"revision"`
 			}
 			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 				t.Fatal(err)
@@ -67,6 +72,9 @@ func TestVirtualLibraryCapabilities(t *testing.T) {
 			}
 			if body.IndexerSearch != tc.search || body.IndexerRequest != tc.request {
 				t.Fatalf("flags = %+v", body)
+			}
+			if body.RefreshPrunesDeadCandidates != tc.prune {
+				t.Fatalf("refresh_prunes_dead_candidates = %v want %v", body.RefreshPrunesDeadCandidates, tc.prune)
 			}
 			if body.Revision == "" {
 				t.Fatal("capability document has no revision")
