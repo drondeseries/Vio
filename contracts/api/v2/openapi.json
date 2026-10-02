@@ -195804,7 +195804,7 @@
           {
             "description": "The stable device identifier used to resolve playback preferences",
             "in": "header",
-            "name": "X-Silo-Device-Id",
+            "name": "X-Vio-Device-Id",
             "schema": {
               "description": "The stable device identifier used to resolve playback preferences",
               "examples": [
