@@ -1034,7 +1034,9 @@ describe("WatchPage virtual version substitution notice", () => {
     );
 
     expect(
-      screen.getByText("The selected version wouldn't start, so Vio is playing 1080p H264 instead."),
+      screen.getByText(
+        "The selected version wouldn't start, so Vio is playing 1080p H264 instead.",
+      ),
     ).toBeInTheDocument();
   });
 });
