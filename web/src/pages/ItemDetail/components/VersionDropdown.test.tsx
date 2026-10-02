@@ -533,6 +533,37 @@ describe("VersionDropdown rich row content", () => {
     expect(dialog.getByText(/Ranking: score ↓/)).toBeInTheDocument();
     expect(dialog.getByText(/4K\+HDR/)).toBeInTheDocument();
   });
+
+  it("falls back to the watch detail's tracks when the catalog row omits them", () => {
+    watchDetailMock.current = {
+      versions: [
+        {
+          file_id: 2,
+          audio_tracks: [{ language: "eng" }, { language: "fra" }],
+          subtitle_tracks: [{ language: "deu" }],
+        },
+      ],
+    };
+    const dialog = openPicker(
+      [
+        makeVersion({ file_id: 1, resolution: "2160p" }),
+        // The catalog FileVersion omits the track inventories the watch detail
+        // carries; a release label keeps the row's detail section visible.
+        makeVersion({
+          file_id: 2,
+          resolution: "1080p",
+          edition_raw: "Movie.2026.1080p.WEB-DL",
+        }),
+      ],
+      { contentId: "movie-1" },
+    );
+
+    // The lazy watch detail still supplies the badges for the row that lacks
+    // its own tracks, matching the in-player menu.
+    expect(dialog.getByText("English")).toBeInTheDocument();
+    expect(dialog.getByText("French")).toBeInTheDocument();
+    expect(dialog.getByText("German")).toBeInTheDocument();
+  });
 });
 
 describe("VersionDropdown raw provider ids", () => {
