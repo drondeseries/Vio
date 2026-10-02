@@ -151,7 +151,7 @@ describe("replaced values", () => {
     ).toBe("Replaces app default: 0 milliseconds");
     expect(
       replacesText(replacedValue(profile!, SETTING_KEYS.PLAYBACK_SUBTITLE_MODE, profileEntries)),
-    ).toBe("Replaces app default: Auto");
+    ).toBe("Replaces app default: Off");
     expect(replacesText(replacedValue(shield!, "unknown.key", profileEntries))).toBe(
       "Replaces the app default",
     );
