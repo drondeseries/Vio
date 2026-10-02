@@ -171,7 +171,11 @@ type StreamHandler struct {
 	// fontExtractFailures throttles the repetitive "subtitle font extraction
 	// failed" warning to the first failure per file+track; repeats drop to
 	// debug. A successful extraction clears the key, so a later regression warns
-	// again. Font extraction never fails playback: the endpoint's 500
+	// again. The key space is the target identity (file_id+track, or
+	// session+track before the file resolves), so recovery and failure always
+	// address the same slot; the retained map is capped with TTL and
+	// count-based eviction (see fontExtractFailLog). Font extraction never
+	// fails playback: the endpoint's 500
 	// (font_extract_failed) stays the client-visible signal and the debug line
 	// keeps the diagnostic trail.
 	fontExtractFailures fontExtractFailLog
@@ -179,32 +183,96 @@ type StreamHandler struct {
 
 // fontExtractFailLog throttles the subtitle-font extraction warning. See the
 // field doc on StreamHandler.fontExtractFailures.
+//
+// Retention is bounded two ways so unique keys — pre-resolution session+track
+// pairs above all, since session IDs are unbounded over the process lifetime —
+// cannot grow the map without bound: an entry expires (and the next failure
+// for it warns again) after fontExtractFailLogTTL, and the map evicts the
+// oldest entries once it reaches fontExtractFailLogMaxEntries. A failed or
+// abandoned target may never reach a success path that clears its key, so
+// cleanup-on-success alone would leak those entries.
 type fontExtractFailLog struct {
 	mu   sync.Mutex
-	seen map[string]struct{}
+	seen map[string]time.Time
+	// now is the clock used for TTL checks and eviction ordering; nil uses
+	// time.Now. Tests inject a monotonic fake.
+	now func() time.Time
+}
+
+const (
+	// fontExtractFailLogMaxEntries caps the throttle map. Eviction is by
+	// oldest insertion, so a live target keeps its slot while it keeps
+	// failing inside the TTL; an evicted target merely warns again on its
+	// next failure — diagnostics only, never correctness.
+	fontExtractFailLogMaxEntries = 512
+	// fontExtractFailLogTTL bounds how long one failure can stay throttled,
+	// so an unrecovered failure cannot suppress warnings forever.
+	fontExtractFailLogTTL = time.Hour
+)
+
+func (l *fontExtractFailLog) clock() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
 }
 
 // failed logs the first failure for key at warn and repeats at debug.
 func (l *fontExtractFailLog) failed(ctx context.Context, key string, attrs ...any) {
 	l.mu.Lock()
+	now := l.clock()
 	if l.seen == nil {
-		l.seen = make(map[string]struct{})
+		l.seen = make(map[string]time.Time)
 	}
-	_, repeat := l.seen[key]
+	at, repeat := l.seen[key]
+	if repeat && now.Sub(at) >= fontExtractFailLogTTL {
+		// The entry expired: a target that kept failing silently for the TTL
+		// re-warns once instead of staying throttled forever.
+		repeat = false
+	}
 	if !repeat {
-		l.seen[key] = struct{}{}
+		l.evictLocked(now)
+		l.seen[key] = now
 	}
 	l.mu.Unlock()
+	// The message wording is fixed so sloglint sees string literals; the
+	// cause attribute distinguishes the failure kinds, and the throttle key
+	// space gives each cause its own slot.
 	args := append([]any{virtualEvidenceLogKeyComponent, virtualEvidenceLogValueAPI}, attrs...)
 	if repeat {
-		slog.DebugContext(ctx, "subtitle font extraction failed", args...)
+		slog.DebugContext(ctx, "subtitle font request failed", args...)
 		return
 	}
-	slog.WarnContext(ctx, "subtitle font extraction failed", args...)
+	slog.WarnContext(ctx, "subtitle font request failed", args...)
+}
+
+// evictLocked makes room when the map is full: it drops expired entries
+// first, then the oldest ones, so the map never grows past
+// fontExtractFailLogMaxEntries no matter how many unique session/track
+// failures arrive.
+func (l *fontExtractFailLog) evictLocked(now time.Time) {
+	for len(l.seen) >= fontExtractFailLogMaxEntries {
+		oldestAt := now
+		oldestKey := ""
+		for key, at := range l.seen {
+			if now.Sub(at) >= fontExtractFailLogTTL {
+				delete(l.seen, key)
+				continue
+			}
+			if oldestKey == "" || at.Before(oldestAt) {
+				oldestAt, oldestKey = at, key
+			}
+		}
+		if oldestKey != "" {
+			delete(l.seen, oldestKey)
+		}
+	}
 }
 
 // recovered clears the throttle key after a successful extraction so a later
-// failure is reported at warn again.
+// failure is reported at warn again. The key must be the same one the failure
+// inserted — success and failure both build it with fontExtractFailureKey, so
+// failure → recovery → failure warns again.
 func (l *fontExtractFailLog) recovered(key string) {
 	l.mu.Lock()
 	delete(l.seen, key)
@@ -214,6 +282,48 @@ func (l *fontExtractFailLog) recovered(key string) {
 // fontExtractFailureKey identifies an extraction target across retries.
 func fontExtractFailureKey(fileID, trackIndex int) string {
 	return strconv.Itoa(fileID) + ":" + strconv.Itoa(trackIndex)
+}
+
+// logSubtitleFontInternalError records the cause behind the font route's
+// internal_error returns. Neither the session-load nor the source-preflight
+// failure used to log anything, so a client that retried a broken font URL
+// produced a flood the v2 request log could only describe as a bare
+// internal_error. The extraction-failure throttle backs it: the first failure
+// per target warns with file_id+track (or session+track before the file
+// resolves) and repeats drop to debug. Status codes and bodies are unchanged.
+//
+// The throttle key is the target identity alone — file_id+track, or
+// session+track before the file resolves. The cause travels as an attribute:
+// recovery clears exactly the key a failure inserted, so failure →
+// recovery → failure warns again regardless of which causes were involved.
+// The session path keys on the parsed track index (normalized) rather than the
+// raw request string when it can, keeping the keyspace bounded.
+func (h *StreamHandler) logSubtitleFontInternalError(ctx context.Context, in SubtitleFontRequest, fileID, trackIndex int, cause string, err error) {
+	if h == nil || err == nil {
+		return
+	}
+	if fileID > 0 {
+		h.fontExtractFailures.failed(ctx, fontExtractFailureKey(fileID, trackIndex),
+			"file_id", fileID,
+			"track", trackIndex,
+			"cause", cause,
+			"error", err,
+		)
+		return
+	}
+	// The file (and its track list) is not known yet, so the raw request
+	// track is the only identity available. Parsing it here, when it parses,
+	// normalizes the key against what the file-side path would later use.
+	rawTrack := in.Track
+	if parsed, _, parseErr := playback.ParseSubtitleTrackParam(rawTrack); parseErr == nil {
+		rawTrack = strconv.Itoa(parsed)
+	}
+	h.fontExtractFailures.failed(ctx, "session:"+in.SessionID+":track:"+rawTrack,
+		"session", in.SessionID,
+		"track", in.Track,
+		"cause", cause,
+		"error", err,
+	)
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -1978,6 +2088,14 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	}
 	session, claims, err := h.loadSidecarSession(ctx, in.Query.Get(streamTokenParam), in.SessionID, userID)
 	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status >= http.StatusInternalServerError {
+			cause := apiErr.cause
+			if cause == nil {
+				cause = apiErr
+			}
+			h.logSubtitleFontInternalError(ctx, in, 0, -1, "session_load", cause)
+		}
 		return nil, err
 	}
 	attachPlaybackSession(ctx, session, claims)
@@ -2002,14 +2120,23 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 		}
 		return nil, apiError(http.StatusNotFound, "not_found", err.Error())
 	}
+	// Source admission comes first: a missing local file must answer 404 and
+	// end the session regardless of the codec, and only a genuinely
+	// inaccessible file answers internal_error. (Virtual rows short-circuit
+	// preflight, so their codec refusal below still answers without any
+	// provider round-trip.)
 	if err := preflightPlaybackFile(ctx, file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(ctx, session)
 			return nil, apiError(http.StatusNotFound, "not_found", "Source media file is missing")
 		}
+		h.logSubtitleFontInternalError(ctx, in, file.ID, trackIndex, "source_preflight", err)
 		return nil, apiError(http.StatusInternalServerError, "internal_error", "Failed to access source media file")
 	}
-
+	// Validate the requested ordinal and codec before extraction. A non-ASS
+	// ordinal or one outside the embedded range is a client error no retry
+	// can satisfy; it answers 4xx here and never reaches the (500-capable)
+	// extraction.
 	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
 	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
 		return nil, apiError(http.StatusNotFound, "not_found", "Embedded subtitle track not found")
@@ -2017,6 +2144,7 @@ func (h *StreamHandler) SubtitleFonts(ctx context.Context, in SubtitleFontReques
 	if !playback.IsASS(file.SubtitleTracks[embeddedIndex].Codec) {
 		return nil, apiError(http.StatusBadRequest, "bad_request", "Subtitle font bundles are only available for ASS/SSA tracks")
 	}
+
 	fonts, err := playback.ExtractAttachedSubtitleFonts(ctx, file.FilePath, h.ffmpegPath())
 	if err != nil {
 		h.fontExtractFailures.failed(ctx, fontExtractFailureKey(file.ID, trackIndex),
@@ -2049,6 +2177,18 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 
 	session, claims, err := h.loadSidecarSession(r.Context(), r.URL.Query().Get(streamTokenParam), sessionID, userID)
 	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status >= http.StatusInternalServerError {
+			cause := apiErr.cause
+			if cause == nil {
+				cause = apiErr
+			}
+			h.logSubtitleFontInternalError(r.Context(), SubtitleFontRequest{
+				SessionID: sessionID,
+				Track:     chi.URLParam(r, "track"),
+				Query:     r.URL.Query(),
+			}, 0, -1, "session_load", cause)
+		}
 		writeAPIError(w, err)
 		return
 	}
@@ -2092,14 +2232,29 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
+	// Source admission comes first (same ordering as SubtitleFonts): a
+	// missing local file answers 404 and ends the session regardless of the
+	// codec; a genuinely inaccessible file answers internal_error. Virtual
+	// rows short-circuit preflight, so their codec refusal below still
+	// answers without a provider round-trip.
 	if err := preflightPlaybackFile(r.Context(), file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(r.Context(), session)
+			writePlaybackFilePreflightError(w, err)
+			return
 		}
+		h.logSubtitleFontInternalError(r.Context(), SubtitleFontRequest{
+			SessionID: sessionID,
+			Track:     trackParam,
+			Query:     r.URL.Query(),
+		}, file.ID, trackIndex, "source_preflight", err)
 		writePlaybackFilePreflightError(w, err)
 		return
 	}
-
+	// Validate the requested ordinal and codec before extraction, so a
+	// permanently unsatisfiable request (non-ASS ordinal, ordinal outside the
+	// embedded range) answers 4xx and never reaches the 500-capable
+	// extraction.
 	embeddedIndex := trackIndex - len(file.ExternalSubtitles)
 	if embeddedIndex < 0 || embeddedIndex >= len(file.SubtitleTracks) {
 		writeError(w, http.StatusNotFound, "not_found", "Embedded subtitle track not found")

@@ -874,6 +874,63 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
     }
   });
 
+  it("caps a persistently 500ing text fetch at the shared attempt ceiling", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 500 } as unknown as Response);
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      // A 500 is retried with backoff, but the shared ceiling (3 windowed + 1
+      // whole-track) stops the loop instead of re-fetching the same failing URL
+      // for the life of the mount.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      expect(state).toHaveBeenLastCalledWith("error");
+      expect(fetch).toHaveBeenCalledTimes(4);
+      // Terminal: later timeupdate/seek events do not revive the loop.
+      await act(async () => {
+        videoRef.current!.currentTime = 590;
+        videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      expect(fetch).toHaveBeenCalledTimes(4);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops at a definitive 4xx instead of trying the whole-track fallback", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    vi.mocked(fetch).mockResolvedValue({ ok: false, status: 415 } as unknown as Response);
+    const videoRef = makeVideoRef(1);
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      // The URL can never satisfy this request, so neither another window nor
+      // the param-less whole-track URL is attempted.
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(state).toHaveBeenLastCalledWith("error");
+      expect(constructorOpts).toHaveLength(0);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("bounds a stalled window refresh at the stall timeout and recovers", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});

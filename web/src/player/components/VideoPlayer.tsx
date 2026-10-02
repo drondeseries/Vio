@@ -3186,8 +3186,10 @@ export function VideoPlayer({
   // Prefetch ASS font bundles at plan adoption so a later track selection hits
   // the in-memory font cache instead of a cold server extraction. Purely a
   // warm-up: errors are swallowed and never affect playback. Mirrors the
-  // useASSSubtitles gating — the hook itself no-ops without font inventory.
-  useSubtitleFontPrefetch(subtitleUrls);
+  // useASSSubtitles gating — the hook itself no-ops without font inventory —
+  // and is scoped to the effective release so a list spanning versions never
+  // warms a font bundle the active renderer cannot reach.
+  useSubtitleFontPrefetch(subtitleUrls, effectiveFileId);
   const subtitleLoadState = isASSActive ? assSubtitleState : textSubtitleState;
 
   // -- Authoritative subtitle track selection --
