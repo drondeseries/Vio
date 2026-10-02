@@ -125,7 +125,7 @@ function decodeFontBundleItems(payload: unknown): SubtitleFontBundleItem[] {
  * font-less file stays cacheable and does not carry it. Pending bundles are also
  * served with `Cache-Control: no-store`; either signal marks the response.
  */
-export const FONT_BUNDLE_PENDING_HEADER = "X-Silo-Font-Bundle-Pending";
+export const FONT_BUNDLE_PENDING_HEADER = "X-Vio-Font-Bundle-Pending";
 
 function isPendingFontBundleResponse(response: Response): boolean {
   const marker = response.headers?.get?.(FONT_BUNDLE_PENDING_HEADER);

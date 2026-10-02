@@ -117151,6 +117151,7 @@ export interface operations {
       200: {
         headers: {
           "Cache-Control"?: string;
+          "X-Vio-Font-Bundle-Pending"?: string;
           [name: string]: unknown;
         };
         content: {

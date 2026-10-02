@@ -134,7 +134,7 @@ function pendingHeaderFontBundleResponse(): Response {
   return {
     ok: true,
     status: 200,
-    headers: responseHeaders({ "X-Silo-Font-Bundle-Pending": "true" }),
+    headers: responseHeaders({ "X-Vio-Font-Bundle-Pending": "true" }),
     json: vi.fn().mockResolvedValue([]),
   } as unknown as Response;
 }
