@@ -37,6 +37,7 @@ import {
 } from "@/components/realtimeEventsContext";
 import {
   createCatalogInvalidationScheduler,
+  invalidateAccessDependentState,
   invalidateCatalogState,
   scheduleProgressHomeRefresh,
   userStateChangeAffectsSectionMembership,
@@ -100,6 +101,12 @@ const REQUEST_STATE_QUERIES: QueryFilters[] = [
 function isRequestNotification(notification: Pick<AppNotification, "type">) {
   return notification.type?.startsWith("request.") ?? false;
 }
+
+/**
+ * Close code the server ends the events socket with after an access_changed
+ * frame. The client refetches access-dependent data and reconnects at once.
+ */
+export const EVENTS_ACCESS_CHANGED_CLOSE_CODE = 4001;
 
 function buildEventsUrl(location: Pick<Location, "protocol" | "host">) {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -425,7 +432,7 @@ function handleUserStateEvent(
 
 export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
-  const { user, profile } = useAuth();
+  const { user, profile, refreshAccount } = useAuth();
   const actingAdmin = useIsActingAdmin();
   const pageActivity = usePageActivity();
   const location = useLocation();
@@ -864,6 +871,19 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
 
       activeSocket = socket;
       socketRef.current = socket;
+      // The server sends access_changed and then closes with
+      // EVENTS_ACCESS_CHANGED_CLOSE_CODE; whichever arrives first refreshes.
+      let accessChangeHandled = false;
+      const handleAccessChanged = () => {
+        if (accessChangeHandled) return;
+        accessChangeHandled = true;
+        invalidateAccessDependentState(queryClient, {
+          allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
+        });
+        void refreshAccount().catch(() => {});
+        // The new access applies to the next ticket, so reconnect at once.
+        nextReconnectDelayRef.current = 0;
+      };
 
       socket.onopen = () => {
         if (closedByEffect || socketRef.current !== socket || !authorityActive()) {
@@ -920,6 +940,9 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
           case "event":
             handleEvent(message, authority, refreshSessions, adminRefresh.schedule);
             return;
+          case "access_changed":
+            handleAccessChanged();
+            return;
           case "error":
             return;
         }
@@ -932,9 +955,16 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
         setConnectionState("disconnected");
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event: CloseEvent) => {
         if (socketRef.current !== socket) {
           return;
+        }
+        if (
+          event.code === EVENTS_ACCESS_CHANGED_CLOSE_CODE &&
+          !closedByEffect &&
+          authorityActive()
+        ) {
+          handleAccessChanged();
         }
         socketRef.current = null;
         activeSocket = null;
@@ -980,6 +1010,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     renderedAuthority?.profileToken,
     pageActivity.canApplyRealtimeUpdates,
     queryClient,
+    refreshAccount,
     sendSubscribe,
   ]);
 

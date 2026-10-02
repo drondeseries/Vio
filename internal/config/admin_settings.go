@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/models"
 	redisv9 "github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 )
@@ -61,6 +62,45 @@ const (
 	AccessUnratedContentHide  = "hide"
 	AccessUnratedContentAllow = "allow"
 )
+
+// CatalogExtraRatingSourcesSettingKey lists, comma-separated, the rating
+// sources clients show in addition to IMDb and TMDB, which are always shown:
+// sources metadata plugins declare, such as rt_critic. Empty, the
+// default, shows only IMDb and TMDB, because the owners of the other scores
+// restrict how others may display them. See internal/ratingsources.
+const CatalogExtraRatingSourcesSettingKey = "catalog.extra_rating_sources"
+
+// ParseRatingSourceList splits a CatalogExtraRatingSourcesSettingKey value
+// into source names, dropping blanks, duplicates, and malformed names.
+func ParseRatingSourceList(raw string) []string {
+	sources, _ := splitRatingSourceList(raw)
+	return sources
+}
+
+// splitRatingSourceList splits a comma-separated list of rating source names
+// into trimmed, lowercased, deduplicated names, skipping blanks. Malformed
+// names are left out; the first one is returned so a save can refuse it.
+func splitRatingSourceList(raw string) (sources []string, malformed string) {
+	seen := map[string]struct{}{}
+	for _, entry := range strings.Split(raw, ",") {
+		source := strings.ToLower(strings.TrimSpace(entry))
+		if source == "" {
+			continue
+		}
+		if !models.ValidRatingSourceID(source) {
+			if malformed == "" {
+				malformed = source
+			}
+			continue
+		}
+		if _, dup := seen[source]; dup {
+			continue
+		}
+		seen[source] = struct{}{}
+		sources = append(sources, source)
+	}
+	return sources, malformed
+}
 
 // Shared server-setting keys used by playback and prepared-download policy
 // readers. Keep them here with the effective admin-setting defaults.
@@ -198,6 +238,7 @@ var adminSettingDefaults = map[string]string{
 	PlaybackTranscodeVPPToneMapSettingKey:            "false",
 	CatalogScopeVersionsToLibrarySettingKey:          "false",
 	AccessUnratedContentSettingKey:                   AccessUnratedContentHide,
+	CatalogExtraRatingSourcesSettingKey:              "",
 	"playback.watched_threshold":                     "90",
 	"playback.min_resume_threshold":                  "5",
 	"playback.max_virtual_failover_attempts":         "5",
@@ -240,6 +281,9 @@ var adminSettingDefaults = map[string]string{
 	"subtitle_ai.live_asr_chunk_seconds":  "30",
 	"subtitle_ai.transcribe_quota_jobs":   "0",
 	"subtitle_ai.transcribe_quota_period": "day",
+	"subtitles.auto_sync":                 "true",
+	"subtitles.sync_execution":            "prefer_transcode_nodes",
+	"subtitles.sync_node_capacity":        "1",
 	"metadata_ai.enabled":                 "false",
 	"metadata_ai.on_view":                 "off",
 
@@ -438,7 +482,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		CatalogScopeVersionsToLibrarySettingKey,
 		Allow4KTranscodeSettingKey, "enable_transcode_throttle", "audiobookshelf_compat.enabled",
 		"jellyfin_compat.enabled", "jellyfin_compat.web_enabled", "recommendations.enabled",
-		"subtitle_ai.enabled", "subtitle_ai.transcribe_enabled", "metadata_ai.enabled",
+		"subtitle_ai.enabled", "subtitle_ai.transcribe_enabled", "metadata_ai.enabled", "subtitles.auto_sync",
 		"download.enabled", "download.transcode_enabled", DownloadLocalTranscodeFallbackSettingKey,
 		"email.enabled", "signup.enabled", "password_reset.self_service_enabled", SetupCompletedSettingKey,
 		"scanner.empty_trash_after_scan", "scanner.realtime_monitoring", "matcher.enable_tv_series_root_queue",
@@ -464,6 +508,9 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 	case AccessUnratedContentSettingKey:
 		return normalizeAdminEnum(key, value, AccessUnratedContentHide, AccessUnratedContentAllow)
 
+	case CatalogExtraRatingSourcesSettingKey:
+		return normalizeRatingSourceList(key, value)
+
 	case "artwork.storage_backend":
 		return normalizeAdminEnum(key, value, "auto", "local", "s3")
 	case "artwork.local_path":
@@ -485,7 +532,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 0, 256)
 	case MarkersDetectionWorkersSettingKey:
 		return normalizeAdminInt(key, value, 1, 64)
-	case "playback.chapter_thumbnail_workers", "playback.chapter_thumbnail_node_capacity":
+	case "playback.chapter_thumbnail_workers", "playback.chapter_thumbnail_node_capacity", "subtitles.sync_node_capacity":
 		return normalizeAdminInt(key, value, 1, 1024)
 	case "playback.watched_threshold":
 		return normalizeAdminInt(key, value, 1, 100)
@@ -641,7 +688,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminEnum(key, value,
 			string(PlaybackEgressPreferProxy), string(PlaybackEgressProxyOnly),
 			string(PlaybackEgressPreferAPI), string(PlaybackEgressAPIOnly))
-	case "playback.chapter_thumbnail_execution":
+	case "playback.chapter_thumbnail_execution", "subtitles.sync_execution":
 		return normalizeAdminEnum(key, value, "local", "prefer_transcode_nodes", "transcode_nodes_only")
 	case "playback.chapter_thumbnail_hdr_policy":
 		return normalizeAdminEnum(key, value, "disabled", "best_effort")
@@ -916,6 +963,19 @@ func ValidateArtworkStorageSettings(effective map[string]string) error {
 		return fmt.Errorf("artwork.storage_backend s3 requires s3.public_bucket")
 	}
 	return nil
+}
+
+// normalizeRatingSourceList canonicalizes a comma-separated list of rating
+// source names: trimmed, lowercased, and deduplicated. A name that is not a
+// well-formed source name is an error rather than silently dropped. A
+// well-formed name no enabled plugin declares is kept but shows nothing (see
+// ratingsources.Build).
+func normalizeRatingSourceList(key, value string) (string, error) {
+	sources, malformed := splitRatingSourceList(value)
+	if malformed != "" {
+		return "", fmt.Errorf("%s: %q is not a rating source name", key, malformed)
+	}
+	return strings.Join(sources, ","), nil
 }
 
 func normalizeAdminEnum(key, value string, allowed ...string) (string, error) {
