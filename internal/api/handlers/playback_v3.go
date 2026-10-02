@@ -3206,6 +3206,10 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 		policy.RemuxEgress = config.PlaybackEgressAPIOnly
 		policy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
 		policy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+	} else if isVirtualPlaybackFile(file) || strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), virtualPlaybackPrefix) {
+		policy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		policy.RemuxEgress = config.PlaybackEgressAPIOnly
+		policy.DirectPlayEgress = config.PlaybackEgressAPIOnly
 	}
 	timeline, timelineErr := h.prepareTransportTimelineV3(r.Context(), session, file, result)
 	if timelineErr != nil {
@@ -4137,11 +4141,10 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *p
 	}, nil
 }
 
-// Virtual sources resolve through the integrated server and relay. Dedicated
-// nodes cannot resolve their provider-neutral virtual:// identity or access
-// the central server's relay, so they must never be selected for playback.
+// Virtual sources resolve through the integrated server and relay before
+// remote transcode dispatch, allowing pooled transcode nodes to serve them.
 func shouldUsePooledPlaybackNodeV3(file *models.MediaFile) bool {
-	return !isVirtualPlaybackFile(file)
+	return file != nil
 }
 
 // planIdentityProxyV3 selects the proxy node that will serve a direct-play or
@@ -5422,7 +5425,48 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 			hwAccel = playback.HWAccelNone
 		}
 	}
-	req := transcodenode.TranscodeStartRequest{SessionID: transportID, InputPath: file.FilePath, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SourceFrameRate: result.SourceFrameRate, SourceHeight: result.SourceHeight, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, HWAccel: hwAccel, AudioTrackIndex: audioStreamOrdinalV3(file, plannedAudioTrackIndexV3(result, session.AudioTrackIndex)), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, TotalDuration: sourceMetadata.DurationSeconds, RequireReady: true}
+	inputPath := file.FilePath
+	var virtualCleanup func()
+	if isVirtualPlaybackFile(file) || strings.HasPrefix(strings.ToLower(strings.TrimSpace(file.FilePath)), virtualPlaybackPrefix) {
+		ownerInstallationID := file.VirtualOwnerInstallationID
+		userID, profileID := 0, ""
+		if session != nil {
+			ownerInstallationID = effectiveVirtualOwner(file.VirtualOwnerInstallationID, session.VirtualSourceOwnerInstallationID)
+			userID, profileID = session.UserID, session.ProfileID
+		}
+		resolveCtx := virtualResolveContextWithPersistedIdentity(r.Context(), file)
+		if h.tm != nil && h.tm.ResolveInput != nil {
+			var resolveErr error
+			inputPath, virtualCleanup, resolveErr = h.tm.ResolveInput(resolveCtx, file.ID, ownerInstallationID, userID, profileID, file.FilePath)
+			if resolveErr != nil {
+				return preparedTransportV3{}, &transportErrorV3{
+					reason:    transcodeStartFailedReasonV3,
+					message:   "Failed to resolve virtual media for remote transcode.",
+					retryable: true,
+					cause:     resolveErr,
+				}
+			}
+		} else {
+			res, cleanup, resolveErr := h.ResolveVirtualTransportInput(resolveCtx, file.FilePath, ownerInstallationID, userID, profileID)
+			if resolveErr != nil {
+				return preparedTransportV3{}, &transportErrorV3{
+					reason:    transcodeStartFailedReasonV3,
+					message:   "Failed to resolve virtual media for remote transcode.",
+					retryable: true,
+					cause:     resolveErr,
+				}
+			}
+			inputPath = res.URL
+			virtualCleanup = cleanup
+		}
+	}
+	cleanupOnFailure := func() {
+		if virtualCleanup != nil {
+			virtualCleanup()
+			virtualCleanup = nil
+		}
+	}
+	req := transcodenode.TranscodeStartRequest{SessionID: transportID, InputPath: inputPath, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SourceFrameRate: result.SourceFrameRate, SourceHeight: result.SourceHeight, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, HWAccel: hwAccel, AudioTrackIndex: audioStreamOrdinalV3(file, plannedAudioTrackIndexV3(result, session.AudioTrackIndex)), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, TotalDuration: sourceMetadata.DurationSeconds, RequireReady: true}
 	req.ThrottleSeconds = playback.ConfiguredTranscodeThrottleSeconds(r.Context(), h.SettingsRepo)
 	if strings.EqualFold(videoCodec, "copy") {
 		req.CopyFMP4RecipeVersion = playback.CopyFMP4RecipeVersion
@@ -5459,6 +5503,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		"outcome", remoteOutcome,
 	)
 	if err != nil {
+		cleanupOnFailure()
 		if req.ToneMapMode != "" && (errors.Is(err, tonemap.ErrSourceRevisionChanged) ||
 			errors.Is(err, tonemap.ErrSourcePreflightRejected) ||
 			errors.Is(err, playback.ErrToneMapSourceValidationUnavailable) ||
@@ -5473,10 +5518,12 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		return preparedTransportV3{}, &transportErrorV3{reason: "transcode_node_unavailable", message: "The selected transcode node is unavailable.", retryable: true, cause: err}
 	}
 	if status != http.StatusAccepted {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node rejected the playback transport.", retryable: true}
 	}
 	if err := transcodenode.ValidateAudioRecipeAttestation(req, nodeResp); err != nil {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		// A node that cannot confirm the audio adaptation recipe is an audio
 		// failure, not a video one. The distinct reason keeps the start/replan
@@ -5486,14 +5533,17 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		return preparedTransportV3{}, &transportErrorV3{reason: audioAdaptationFailedReasonV3, message: "The selected transcode node did not confirm the audio recipe.", retryable: true, cause: err}
 	}
 	if err := transcodenode.ValidateCopyFMP4RecipeAttestation(req, nodeResp); err != nil {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the copy-video recipe.", retryable: true, cause: err}
 	}
 	if err := transcodenode.ValidateThrottleAttestation(req, nodeResp); err != nil {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the throttle policy.", retryable: true, cause: err}
 	}
 	if req.ToneMapMode != "" && nodeResp.ToneMapMode != req.ToneMapMode {
+		cleanupOnFailure()
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the tone-map recipe.", retryable: true}
 	}
@@ -5564,6 +5614,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		h.applyRemoteTransportMarkV3(r.Context(), session.ID, servedByProxy)
 	}
 	rollbackTransport := func(requireCancellation bool) error {
+		cleanupOnFailure()
 		if committed {
 			return nil
 		}

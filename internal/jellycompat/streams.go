@@ -765,12 +765,16 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 
 	requiresAudioBoost := method == string(playback.PlayRemux) && source.TranscodeAudio && compatSourceAudioChannels(*source) > 0
 	routingPolicy := h.playbackRoutingPolicy()
-	if isCompatVirtualSource(*source) {
+	if !shouldUseCompatNodePool(*source, file) {
 		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
 		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
 		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
 		routingPolicy.VideoTranscodeExecution = config.PlaybackExecutionAPIOnly
 		routingPolicy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
+	} else if isCompatVirtualSource(*source) || isCompatVirtualFile(file) {
+		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
 	}
 	decision := h.resolveCompatIdentityRouteWithPolicy(r.Context(), playSession.UpstreamSessionID, method, source.Version.Bitrate, requiresAudioBoost, routingPolicy)
 	if !decision.Selected() {
@@ -1053,12 +1057,16 @@ func (h *PlaybackHandler) HandleMasterManifest(w http.ResponseWriter, r *http.Re
 	localRouteSelected := false
 	localRoutingWorkload := noderouting.Workload("")
 	routingPolicy := h.playbackRoutingPolicy()
-	if isCompatVirtualSource(*source) {
+	if !shouldUseCompatNodePool(*source, file) {
 		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
 		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
 		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
 		routingPolicy.VideoTranscodeExecution = config.PlaybackExecutionAPIOnly
 		routingPolicy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
+	} else if isCompatVirtualSource(*source) || isCompatVirtualFile(file) {
+		routingPolicy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+		routingPolicy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		routingPolicy.RemuxEgress = config.PlaybackEgressAPIOnly
 	}
 	var lastPreparationErr error
 	for attempts := 0; attempts < 32; attempts++ {

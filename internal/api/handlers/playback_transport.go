@@ -1025,8 +1025,8 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 // their existing public error envelopes while executing identical transport
 // startup and response parsing.
 func (h *PlaybackHandler) startRemotePlaybackTransport(ctx context.Context, nodeURL string, request transcodenode.TranscodeStartRequest) (transcodenode.TranscodeStartResponse, int, error) {
-	if strings.HasPrefix(strings.ToLower(request.InputPath), virtualPlaybackPrefix) {
-		return transcodenode.TranscodeStartResponse{}, 0, errors.New("virtual sources require an integrated transcode transport")
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(request.InputPath)), virtualPlaybackPrefix) {
+		return transcodenode.TranscodeStartResponse{}, 0, errors.New("unresolved virtual sources require an integrated transcode transport")
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
