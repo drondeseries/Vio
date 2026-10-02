@@ -47,9 +47,7 @@ const FETCH_MAX_RETRYABLE_FAILURES = 12;
 
 /** True for statuses the server marks retry-after-backoff rather than failed. */
 function isRetryableSubtitleStatus(status: number): boolean {
-  return (
-    status === 408 || status === 429 || status === 502 || status === 503 || status === 504
-  );
+  return status === 408 || status === 429 || status === 502 || status === 503 || status === 504;
 }
 
 /**
