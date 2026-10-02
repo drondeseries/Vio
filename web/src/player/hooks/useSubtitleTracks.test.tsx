@@ -423,6 +423,38 @@ describe("useSubtitleTracks", () => {
     }
   });
 
+  it("keeps retrying explicitly-retryable 503s past the terminal ceiling", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValue({ ok: false, status: 503 } as unknown as Response);
+    const { videoRef, unmount } = renderTracks({ origin: 0, durationRef: { current: 7200 } });
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // Four failures would have spent the terminal budget; retryable statuses
+      // ride their own generous budget, so attempts 5 and 6 still fetch on the
+      // 40s/60s backoff rungs instead of latching terminal.
+      let attempts = 1;
+      for (const delay of [5000, 10000, 20000, 40000, 60000]) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(delay - 1);
+          videoRef.current!.dispatchEvent(new Event("timeupdate"));
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(attempts);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(++attempts);
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(6);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("recovers only on a track rebuild after the consecutive-failure ceiling latches terminal", async () => {
     vi.useFakeTimers();
     const error = vi.spyOn(console, "error").mockImplementation(() => {});

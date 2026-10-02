@@ -64,6 +64,16 @@ const ASS_RETRY_BACKOFF_MS = 5_000;
 // playback re-anchors; this counter does not reset on a seek. Once it is spent
 // the pipeline latches terminal.
 const ASS_TEXT_MAX_FAILURES = 4;
+// Generous ceiling for explicitly-retryable TEXT failures (502/503/504/429/
+// 408) on the same backoff loop. A transient upstream flap must not spend the
+// 4-deep terminal budget above, but a source that never recovers still
+// terminates instead of polling forever.
+const ASS_RETRYABLE_TEXT_MAX_FAILURES = 12;
+
+/** True for statuses the server marks retry-after-backoff rather than failed. */
+function isRetryableSubtitleStatus(status: number): boolean {
+  return status === 408 || status === 429 || status === 502 || status === 503 || status === 504;
+}
 
 /** A non-OK subtitle response, carrying the status so the retry policy can
  * distinguish a definitive 4xx from a possibly-transient failure. */
@@ -307,6 +317,11 @@ export function useASSSubtitles(
     // resets so a new position gets a fair try), this is the backstop that
     // stops a release erroring every request from being re-fetched forever.
     let textFailures = 0;
+    // Consecutive explicitly-retryable TEXT failures (502/503/504/429/408)
+    // since the last successful load. Same backoff loop on a separate generous
+    // budget so a transient upstream flap does not spend the terminal budget
+    // and wedge the mount on "Retrying…".
+    let retryableTextFailures = 0;
     let busy = false;
     // Newest seek target queued while an attempt is in flight.
     let pendingStart: number | null = null;
@@ -571,6 +586,7 @@ export function useASSSubtitles(
         // error starts fresh.
         windowFailures = 0;
         textFailures = 0;
+        retryableTextFailures = 0;
         onLoadStateRef.current?.("ready");
       }
     }
@@ -617,10 +633,26 @@ export function useASSSubtitles(
         console.error("[useASSSubtitles] Unable to load subtitles:", err);
         onLoadStateRef.current?.("error");
         // Count every genuine failure (a 4xx, 5xx, stall, or network error)
-        // against the shared ceiling before deciding the next step.
-        textFailures += 1;
-        if (wholeTrack) {
+        // against the shared ceiling before deciding the next step — except
+        // explicitly-retryable statuses, which ride the same backoff loop on
+        // a separate generous budget so a transient upstream flap does not
+        // spend the terminal budget and wedge the mount on "Retrying…".
+        const retryableFailure =
+          err instanceof SubtitleFetchError && isRetryableSubtitleStatus(err.status);
+        if (retryableFailure) {
+          retryableTextFailures += 1;
+          if (retryableTextFailures >= ASS_RETRYABLE_TEXT_MAX_FAILURES) {
+            terminal = true;
+            return;
+          }
+        } else {
+          retryableTextFailures = 0;
+          textFailures += 1;
+        }
+        if (wholeTrack && !retryableFailure) {
           // The whole-track fallback failed too: terminal, no retry loop.
+          // A retryable whole-track failure falls through to the backoff
+          // retry below so a flap recovers instead of wedging the mount.
           terminal = true;
           return;
         }

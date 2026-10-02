@@ -134,7 +134,7 @@ function pendingHeaderFontBundleResponse(): Response {
   return {
     ok: true,
     status: 200,
-    headers: responseHeaders({ "X-Silo-Font-Bundle-Pending": "true" }),
+    headers: responseHeaders({ "X-Vio-Font-Bundle-Pending": "true" }),
     json: vi.fn().mockResolvedValue([]),
   } as unknown as Response;
 }
@@ -899,6 +899,36 @@ describe("useASSSubtitles bounded retry/watchdog policy", () => {
         await vi.advanceTimersByTimeAsync(10 * 60_000);
       });
       expect(fetch).toHaveBeenCalledTimes(4);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers after retryable 503s past the shared attempt ceiling", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const state = vi.fn();
+    // Five 503s would have spent the 4-deep terminal ceiling; retryable
+    // statuses ride their own generous budget, so the 6th attempt still
+    // fetches and the track recovers instead of latching terminal.
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValueOnce({ ok: false, status: 503 } as unknown as Response)
+      .mockResolvedValue(mockFetchResponse("[Script Info]"));
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(videoRef, [germanTrack], 6, false, 0, 0, state),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+      });
+      expect(state).toHaveBeenLastCalledWith("ready");
     } finally {
       unmount();
       error.mockRestore();
