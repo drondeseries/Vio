@@ -114,8 +114,35 @@ func TestLoadIntegrationOptionsChecksKeyAndPassesAddressThrough(t *testing.T) {
 	}
 }
 
+func TestLoadIntegrationOptionsAllowsVirtualRouterWithoutAPIKey(t *testing.T) {
+	install := 0
+	router := &fakeRouterProvider{}
+	service := newTestService(newFakeStore())
+	service.SetRouterProvider(router)
+	_, err := service.LoadIntegrationOptions(context.Background(), Viewer{UserID: 1, IsAdmin: true}, Integration{
+		ID: "new", CapabilityID: VirtualLibraryRequestsCapability, InstallationID: &install, BaseURL: "virtual://streaming", APIKeyRef: "",
+	})
+	if err != nil {
+		t.Fatalf("LoadIntegrationOptions: %v", err)
+	}
+	if router.gotOptionsConn.BaseURL != "virtual://streaming" {
+		t.Fatalf("got BaseURL %q, want virtual://streaming", router.gotOptionsConn.BaseURL)
+	}
+}
+
 func TestNormalizeIntegrationBaseURL(t *testing.T) {
-	for _, bad := range []string{"", "ftp://10.0.0.5", "http://", "http://user:pw@10.0.0.5:8989", "http://10.0.0.5:8989/?a=1", "http://10.0.0.5:8989/#x"} {
+	for _, bad := range []string{
+		"",
+		"ftp://10.0.0.5",
+		"http://",
+		"http://user:pw@10.0.0.5:8989",
+		"http://10.0.0.5:8989/?a=1",
+		"http://10.0.0.5:8989/#x",
+		"virtual://",
+		"virtual://user:pw@streaming",
+		"virtual://streaming/?a=1",
+		"virtual://streaming/#x",
+	} {
 		if got, err := normalizeIntegrationBaseURL(bad); err == nil {
 			t.Errorf("normalizeIntegrationBaseURL(%q) = %q, want an error", bad, got)
 		}
@@ -126,6 +153,11 @@ func TestNormalizeIntegrationBaseURL(t *testing.T) {
 		"https://sonarr.lan/sonarr/": "https://sonarr.lan/sonarr",
 		"HTTP://sonarr.lan:8989":     "http://sonarr.lan:8989",
 		"  http://[::1]:8989  ":      "http://[::1]:8989",
+		"virtual://streaming":        "virtual://streaming",
+		"virtual://streaming/":       "virtual://streaming",
+		"  virtual://streaming  ":    "virtual://streaming",
+		"VIRTUAL://streaming":        "virtual://streaming",
+		"virtual://core/path/":       "virtual://core/path",
 	} {
 		got, err := normalizeIntegrationBaseURL(in)
 		if err != nil || got != want {
@@ -173,9 +205,16 @@ func TestNormalizeIntegrationBaseURLRefusesAsFieldError(t *testing.T) {
 	if got, err := NormalizeIntegrationBaseURL("10.0.0.5:8989/"); err != nil || got != "http://10.0.0.5:8989" {
 		t.Fatalf("NormalizeIntegrationBaseURL = %q, %v", got, err)
 	}
+	if got, err := NormalizeIntegrationBaseURL("virtual://streaming/"); err != nil || got != "virtual://streaming" {
+		t.Fatalf("NormalizeIntegrationBaseURL(virtual) = %q, %v", got, err)
+	}
 	_, err := NormalizeIntegrationBaseURL("ftp://10.0.0.5")
 	var ve *ValidationError
 	if !errors.As(err, &ve) || ve.FieldErrors["base_url"] != integrationAddressMessage {
 		t.Fatalf("err = %v, want base_url field error", err)
+	}
+	_, err = NormalizeIntegrationBaseURL("virtual://")
+	if !errors.As(err, &ve) || ve.FieldErrors["base_url"] != integrationAddressMessage {
+		t.Fatalf("err = %v, want base_url field error for virtual://", err)
 	}
 }

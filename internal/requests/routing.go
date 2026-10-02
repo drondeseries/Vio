@@ -352,7 +352,7 @@ func routedConnection(fc *fulfillContext, d RouteDecision, mediaType MediaType, 
 		return ResolvedRouterConnection{}, 0, "", fmt.Errorf("route %q sends to %q, which is disabled", d.RouteName, in.Name)
 	case in.InstallationID == nil || in.CapabilityID == "":
 		return ResolvedRouterConnection{}, 0, "", fmt.Errorf("%s (route %q)", msgRouterUnbound, d.RouteName)
-	case strings.TrimSpace(in.APIKeyRef) == "":
+	case strings.TrimSpace(in.APIKeyRef) == "" && !isVirtualIntegration(in.InstallationID, in.CapabilityID):
 		return ResolvedRouterConnection{}, 0, "", fmt.Errorf("%s (route %q)", msgRouterNoKey, d.RouteName)
 	case !integrationSupportsMediaType(*in, mediaType):
 		// The server's media types can change after a route points at it.
@@ -374,10 +374,18 @@ func routedConnection(fc *fulfillContext, d RouteDecision, mediaType MediaType, 
 	// The server's own 4K flag must not follow an HD copy there.
 	config[configIs4K] = q == Quality2160p
 	config[configAnimeEnabled] = false
+	apiKey := strings.TrimSpace(in.APIKeyRef)
+	if apiKey == "" && isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+		apiKey = VirtualLibraryAPIKey
+	}
+	baseURL := in.BaseURL
+	if strings.TrimSpace(baseURL) == "" && isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+		baseURL = VirtualLibraryBaseURL
+	}
 	return ResolvedRouterConnection{
 		ID:      in.ID,
-		BaseURL: in.BaseURL,
-		APIKey:  strings.TrimSpace(in.APIKeyRef),
+		BaseURL: baseURL,
+		APIKey:  apiKey,
 		Config:  config,
 	}, *in.InstallationID, in.CapabilityID, nil
 }
