@@ -3688,12 +3688,34 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 						break
 					}
 					if anchorInput == lastProbedInput {
-						slog.WarnContext(ctx, "virtual seek anchor re-resolve returned the same relay token; skipping a duplicate probe",
-							"component", "api",
-							"playback_session_id", session.ID,
-							"requested_seek_seconds", requested,
-						)
-						break
+						// The re-resolve handed back the token that just 5xxed:
+						// probing it again repeats a known failure. On a
+						// transient provider error, walk to an alternate
+						// same-identity candidate once instead of giving up;
+						// anything else (or no alternate) keeps the terminal.
+						if playback.IsTransientProviderError(err) {
+							if rotated, cleanup, rotErr := h.resolveVirtualAnchorURIExcludingFailedV3(ctx, session, file, virtualResultCandidateID(file.FilePath)); rotErr == nil {
+								releaseAnchor()
+								anchorInput = rotated.URL
+								anchorExpiresAt = rotated.ExpiresAt
+								releaseAnchor = cleanup
+							} else {
+								slog.WarnContext(ctx, "virtual seek anchor re-resolve returned the same relay token; skipping a duplicate probe",
+									"component", "api",
+									"playback_session_id", session.ID,
+									"requested_seek_seconds", requested,
+									"rotation_error", rotErr,
+								)
+								break
+							}
+						} else {
+							slog.WarnContext(ctx, "virtual seek anchor re-resolve returned the same relay token; skipping a duplicate probe",
+								"component", "api",
+								"playback_session_id", session.ID,
+								"requested_seek_seconds", requested,
+							)
+							break
+						}
 					}
 					if fits, remaining := copySeekAnchorRetryFits(ctx); !fits {
 						slog.WarnContext(ctx, "copy-video seek anchor retry skipped after re-resolve: insufficient remaining budget",
@@ -3706,12 +3728,20 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					}
 				}
 				lastProbedInput = anchorInput
+				probeStarted := time.Now()
 				origin, startSegment, err = probeAnchor(ctx)
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
 				}
 				fits, remaining := copySeekAnchorRetryFits(ctx)
-				if !fits || !retryReserved {
+				// A fast transient failure (relay 5xx in milliseconds, not a
+				// consumed 15s probe) leaves room for a full second probe:
+				// gate the retry on the single-probe fit rather than the
+				// up-front two-probe reservation, which a slow resolve may
+				// already have spent. Slow failures keep the conservative
+				// gate so a truncated second probe cannot mask the error.
+				fastTransient := playback.IsTransientProviderError(err) && time.Since(probeStarted) < playback.CopySeekProbeTimeout
+				if !fits || (!retryReserved && !fastTransient) {
 					slog.WarnContext(ctx, "copy-video seek anchor retry skipped: insufficient remaining budget",
 						"component", "api",
 						"playback_session_id", session.ID,
