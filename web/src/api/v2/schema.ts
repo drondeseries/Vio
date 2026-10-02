@@ -27620,6 +27620,7 @@ export interface components {
       allowed: boolean;
       indexer_request: boolean;
       indexer_search: boolean;
+      refresh_prunes_dead_candidates: boolean;
       /** @description Opaque revision of this document */
       revision: string;
       /**
