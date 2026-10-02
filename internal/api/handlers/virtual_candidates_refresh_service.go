@@ -56,7 +56,7 @@ func providerUnavailableError(err error) error {
 func refreshProviderCause(err error) string {
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
-		root := error(urlErr.Err)
+		root := urlErr.Err
 		seen := map[error]bool{}
 		for root != nil && !seen[root] {
 			seen[root] = true
