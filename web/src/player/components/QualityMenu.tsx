@@ -8,6 +8,7 @@ import { useVersionSortPreference } from "@/hooks/useVersionSortPreference";
 import { sortVersionsByCriteria, type VersionSortable } from "@/lib/qualityRanking";
 import { resolveActiveQualityOptionId } from "../playback-info";
 import { deriveVersionHealth } from "@/lib/versionHealth";
+import type { EffectiveRecipeV3 } from "../protocol-v3";
 import type { PlayerIndexerRelease, QualityOption } from "../types";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
 import { serverRankingFromVersions } from "@/pages/ItemDetail/components/versionFormatUtils";
@@ -44,6 +45,8 @@ export interface VersionInfo {
 interface QualityMenuProps {
   options: QualityOption[];
   activeId: string;
+  /** The plan's effective recipe, which shows when a bitrate cap reduced the source. */
+  deliveredRecipe?: EffectiveRecipeV3;
   isTranscoding: boolean;
   error: string | null;
   onSelect: (id: string) => void;
@@ -81,6 +84,7 @@ export { REFRESH_VERSIONS_ERROR };
 export function QualityMenu({
   options,
   activeId,
+  deliveredRecipe,
   isTranscoding,
   error,
   onSelect,
@@ -197,7 +201,7 @@ export function QualityMenu({
 
   if (options.length === 0) return null;
 
-  const resolvedActiveId = resolveActiveQualityOptionId(options, activeId);
+  const resolvedActiveId = resolveActiveQualityOptionId(options, activeId, deliveredRecipe);
   const activeOption = options.find((option) => option.id === resolvedActiveId);
   // Explicit roving-focus slots per group. Mixing a render-time counter with the
   // refresh rows' commit-time `ref` increments let one overwrite another; naming

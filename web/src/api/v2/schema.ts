@@ -3195,6 +3195,40 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/admin/rating-sources": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** List the external rating sources an administrator can show on title pages, including sources metadata plugins declare. */
+    get: operations["listAdminRatingSources"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/rating-sources/capabilities": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Discover the rating source support in this build, such as sources metadata plugins declare. Support does not promise that any plugin declares a source. */
+    get: operations["getAdminRatingSourceCapabilities"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/admin/recommendations/status": {
     parameters: {
       query?: never;
@@ -3487,6 +3521,23 @@ export interface paths {
     get: operations["getAdminRequestUserLimit"];
     /** Manage media requests and their configuration. */
     put: operations["updateAdminRequestUserLimit"];
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/request-users/{user_id}/usage": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Report an account's effective request policy and quota use. */
+    get: operations["getAdminRequestUserUsage"];
+    put?: never;
     post?: never;
     delete?: never;
     options?: never;
@@ -4584,6 +4635,80 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/admin/users/{id}/devices": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * List an account's devices.
+     * @description Every device the account's apps registered and every device holding saved per-device settings, most recently seen first. The collection is bounded by the account's devices and is not paginated.
+     */
+    get: operations["listAdminUserDevices"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/users/{id}/download-subscriptions": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** List an account's series download monitors. */
+    get: operations["listAdminUserDownloadSubscriptions"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/users/{id}/downloads": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * List an account's managed device downloads.
+     * @description Every managed (device) download row of the account in every status, newest first. Ephemeral web downloads are not listed. A row the app never reported on stays ready.
+     */
+    get: operations["listAdminUserDownloads"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/users/{id}/downloads/summary": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Total an account's managed device downloads. */
+    get: operations["getAdminUserDownloadSummary"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/admin/users/{id}/impersonate": {
     parameters: {
       query?: never;
@@ -4701,6 +4826,23 @@ export interface paths {
      * @description Only the server Owner may call this, from a signed-in session: an API key or an impersonation session is refused with 403, like any caller that is not the Owner. The previous Owner stays an admin.
      */
     post: operations["transferAdminUserOwnership"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/admin/users/{id}/watch-summary": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Total an account's finalized plays over recent days. */
+    get: operations["getAdminUserWatchSummary"];
+    put?: never;
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -5334,6 +5476,23 @@ export interface paths {
     };
     /** Discover whether the sign-in page may offer self-service password reset. */
     get: operations["getPasswordResetCapability"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/capabilities/ratings": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Whether item detail carries the ratings list, and the rating sources title pages and cards show. */
+    get: operations["getRatingsCapability"];
     put?: never;
     post?: never;
     delete?: never;
@@ -9917,6 +10076,64 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/subtitles/stored/{id}/sync": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read a stored subtitle's timing and latest sync job. Requires file access. */
+    get: operations["getStoredSubtitleSync"];
+    put?: never;
+    /**
+     * Align a stored subtitle to its file's audio.
+     * @description Starts a sync job, or returns the subtitle's active one. A request repeated after that job finished starts another job; it aligns the same stored bytes against cached speech, so it reaches the same timing. Requires file access and downloading-account or effective administrator authority, because the resulting timing applies to everyone watching the file. A synced job stores a timing correction that every delivery path applies; no_match leaves the timing unchanged and means the subtitle most likely belongs to another release. Poll the job through the read operation or the stored subtitle list.
+     */
+    post: operations["syncStoredSubtitle"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/subtitles/stored/{id}/timing": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    /**
+     * Replace a stored subtitle's timing correction.
+     * @description Sets the correction every delivery path applies: original time t plays at t * scale + offset_ms. Send {offset_ms: 0, scale: 1} to restore the original timing. Requires If-Match with the validator from getViewerSubtitleMetadata, file access, and downloading-account or effective administrator authority. The stored bytes never change.
+     */
+    put: operations["setStoredSubtitleTiming"];
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v2/subtitles/sync/status": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read whether stored subtitles can be synced to their file's audio, and whether new ones are synced automatically. */
+    get: operations["getSubtitleSyncStatus"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/subtitles/upload": {
     parameters: {
       query?: never;
@@ -11036,6 +11253,10 @@ export interface components {
     };
     AdminAccountCapabilitiesOutputBody: {
       access_groups: boolean;
+      /** @description Whether listAdminUserDevices can list an account's registered devices */
+      account_devices: boolean;
+      /** @description Whether listAdminUserDownloads, getAdminUserDownloadSummary and listAdminUserDownloadSubscriptions are available */
+      account_downloads: boolean;
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
       available: boolean;
@@ -11048,6 +11269,8 @@ export interface components {
       password_reset_email: boolean;
       /** @description Whether createAdminUserPasswordReset can return a link to share; needs the server's public URL */
       password_reset_link: boolean;
+      /** @description Whether getAdminRequestUserUsage can report an account's request quota use */
+      request_usage: boolean;
       /** @description Opaque revision of this document */
       revision: string;
       /**
@@ -11055,6 +11278,8 @@ export interface components {
        * @enum {string}
        */
       state: "available" | "disabled" | "not_configured" | "unsupported";
+      /** @description Whether getAdminUserWatchSummary can total an account's finalized plays */
+      watch_summary: boolean;
     };
     AdminAccountCreateBody: {
       /**
@@ -11103,6 +11328,11 @@ export interface components {
        * @example 1
        */
       id: string;
+      /**
+       * Format: date-time
+       * @description Latest time any device reported this profile; null when no device has
+       */
+      last_seen_at: string | null;
       name: string;
     };
     AdminAccountSettingsOutputBody: {
@@ -13854,6 +14084,11 @@ export interface components {
        */
       ended_at: string;
       /**
+       * Format: int64
+       * @description Episode number; null when not an episode
+       */
+      episode_number: number | null;
+      /**
        * @description Opaque identifier
        * @example 1
        */
@@ -13868,6 +14103,13 @@ export interface components {
       profile_id: string;
       /** @description Profile display name at the time of playback; the profile id when none was recorded */
       profile_name: string;
+      /**
+       * Format: int64
+       * @description Episode season; null when not an episode
+       */
+      season_number: number | null;
+      /** @description Series title for an episode; empty otherwise */
+      series_title: string;
       /** @description Playback session identifier; unique per attempt */
       session_id: string;
       /**
@@ -14772,6 +15014,43 @@ export interface components {
       restart_required: boolean;
       status: string;
     };
+    AdminRatingSource: {
+      /** @description True for IMDb and TMDB, which always show; every other source shows only once catalog.extra_rating_sources lists it */
+      always_shown: boolean;
+      /**
+       * @description The source's name in full
+       * @example Rotten Tomatoes critics
+       */
+      label: string;
+      /**
+       * @description The plain-text mark clients show next to its score
+       * @example RT
+       */
+      name: string;
+      /**
+       * @description The metadata providers that declare the source, such as "NFO Files and MDBList"; absent for Silo's own sources
+       * @example Kinopoisk
+       */
+      provider?: string;
+      /**
+       * @description Source name, the value catalog.extra_rating_sources lists
+       * @example rt_critic
+       */
+      source: string;
+    };
+    AdminRatingSourceCapabilities: {
+      /** @description Whether the current principal may use the capability */
+      allowed: boolean;
+      /** @description listAdminRatingSources lists IMDb, TMDB and the sources enabled metadata plugins declare, and title pages show a declared source once catalog.extra_rating_sources names it */
+      plugin_declared_sources: boolean;
+      /** @description Opaque revision of this document */
+      revision: string;
+      /**
+       * @description Support and configuration state, not health
+       * @enum {string}
+       */
+      state: "available" | "disabled" | "not_configured" | "unsupported";
+    };
     AdminRecommendationJobStatus: {
       /** Format: int64 */
       count: number;
@@ -15254,6 +15533,33 @@ export interface components {
       user_id: string;
       /** Format: int64 */
       window_days: number | null;
+    };
+    AdminRequestUserUsage: {
+      /** @description Whether this account may request now (not blocked by its switch, group, or an old block) */
+      allowed: boolean;
+      auto_approve: boolean;
+      /**
+       * Format: int64
+       * @description Quota; meaningless when unlimited
+       */
+      max_requests: number;
+      /** Format: int64 */
+      remaining: number;
+      /** @description Server-wide requests switch */
+      requests_enabled: boolean;
+      unlimited: boolean;
+      /**
+       * Format: int64
+       * @description Requests in the window; 0 when unlimited (not counted)
+       */
+      used: number;
+      /** Format: int64 */
+      window_days: number;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      window_start: string;
     };
     AdminResourceAttribution: {
       cgroup_cpu?: components["schemas"]["AdminCgroupCPUStats"];
@@ -16584,6 +16890,207 @@ export interface components {
       /** @description Cursor state; absent for bounded unpaginated collections */
       page?: components["schemas"]["PageInfo"];
     };
+    AdminUserDevice: {
+      device_id: string;
+      device_name: string;
+      device_platform: string;
+      /**
+       * Format: date-time
+       * @description Latest registration by the app; null when the device is known only from saved settings
+       */
+      last_seen_at: string | null;
+      /**
+       * Format: date-time
+       * @description Latest of registration and saved-setting writes
+       */
+      last_updated: string | null;
+      /**
+       * Format: int64
+       * @description Saved per-device settings across profiles
+       */
+      override_count: number;
+      profiles: components["schemas"]["AdminUserDeviceProfile"][];
+    };
+    AdminUserDeviceProfile: {
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision, or null
+       */
+      last_seen_at: string | null;
+      /** Format: int64 */
+      override_count: number;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      profile_id: string;
+      /** @description Empty when the profile no longer exists */
+      profile_name: string;
+    };
+    AdminUserDownload: {
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      batch_id?: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision, or null
+       */
+      completed_at: string | null;
+      /** @description Movie, or the series for an episode */
+      content_id: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      created_at: string;
+      delivery_format: string;
+      device_id: string;
+      effective_quality: string;
+      /** @description Null unless episode_id resolves to a catalog episode */
+      episode: {
+        /** Format: int64 */
+        episode_number: number;
+        /** Format: int64 */
+        season_number: number;
+        /** @description Empty when unknown */
+        title: string;
+      } | null;
+      episode_id?: string;
+      /** Format: int64 */
+      file_size: number;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      id: string;
+      /** @description Catalog type of content_id (movie, series, …); empty when unknown */
+      media_type: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      profile_id: string;
+      quality: string;
+      /** @description preparing, ready, downloading, completed, failed or revoked. More values may be added */
+      status: string;
+      /**
+       * Format: date-time
+       * @description Latest accepted client status report; null when the app never reported
+       */
+      status_event_at: string | null;
+      /** Format: int64 */
+      target_bitrate_kbps: number;
+      /** @description Catalog title of content_id; empty when the item left the catalog */
+      title: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      updated_at: string;
+    };
+    AdminUserDownloadEpisode: {
+      /** Format: int64 */
+      episode_number: number;
+      /** Format: int64 */
+      season_number: number;
+      /** @description Empty when unknown */
+      title: string;
+    };
+    AdminUserDownloadSubscription: {
+      active: boolean;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      created_at: string;
+      delete_watched: boolean;
+      device_id: string;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      id: string;
+      /**
+       * Format: int64
+       * @description preparing, ready or downloading rows for the series
+       */
+      in_progress: number;
+      /**
+       * Format: int64
+       * @description 0 means no limit
+       */
+      max_storage_bytes: number;
+      /** @description all, future, latest_season or specific_seasons. More values may be added */
+      mode: string;
+      /**
+       * Format: int64
+       * @description This device and profile's completed rows for the series
+       */
+      on_device: number;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      profile_id: string;
+      /**
+       * Format: int64
+       * @description Episodes the user deleted from the monitored series (download_subscription_exclusions)
+       */
+      removed_episodes: number;
+      /** @description Monitored seasons for specific_seasons; empty otherwise */
+      season_numbers: number[];
+      series_id: string;
+      /** @description Empty when the series left the catalog */
+      series_title: string;
+      /**
+       * Format: int64
+       * @description First kept season for latest_season
+       */
+      target_season: number | null;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      updated_at: string;
+    };
+    AdminUserDownloadSummary: {
+      /**
+       * Format: int64
+       * @description Rows the app reported as completed
+       */
+      completed: number;
+      /**
+       * Format: int64
+       * @description Distinct devices with a non-revoked row
+       */
+      devices: number;
+      /** Format: int64 */
+      failed: number;
+      /**
+       * Format: int64
+       * @description preparing, ready or downloading
+       */
+      in_progress: number;
+      /**
+       * Format: int64
+       * @description Active series monitors
+       */
+      monitored_series: number;
+      /** Format: int64 */
+      revoked: number;
+      /**
+       * Format: int64
+       * @description Managed rows that are not revoked
+       */
+      total: number;
+      /**
+       * Format: int64
+       * @description file_size summed over non-revoked rows
+       */
+      total_bytes: number;
+    };
     AdminUserIP: {
       client_ip: string;
       /**
@@ -16596,8 +17103,41 @@ export interface components {
        * @description RFC 3339 instant in UTC with millisecond precision
        */
       last_seen: string;
+      /**
+       * @description Address class: private, loopback and link-local addresses are local, everything else remote. Request logs do not record the network-access route, so a provider path from a private address reads as local here.
+       * @enum {string}
+       */
+      location: "local" | "remote";
       /** Format: int64 */
       request_count: number;
+    };
+    AdminUserWatchSummary: {
+      /** Format: int64 */
+      completed_plays: number;
+      /**
+       * Format: int64
+       * @example 30
+       */
+      days: number;
+      /**
+       * Format: date-time
+       * @description Latest ended_at in the window; null when none
+       */
+      last_played_at: string | null;
+      /**
+       * Format: int64
+       * @description Finalized playback attempts that ended in the window
+       */
+      plays: number;
+      /** @description Echoes the profile filter; absent for the whole account */
+      profile_id?: string;
+      /**
+       * Format: date-time
+       * @description Start of the window: now minus days
+       */
+      since: string;
+      /** Format: double */
+      watched_seconds: number;
     };
     AdminVirtualItem: {
       /** Format: int64 */
@@ -17268,9 +17808,15 @@ export interface components {
       progress_updated_at?: string;
       /** Format: double */
       rating_imdb?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes audience score, 0-100. Absent unless an administrator shows rt_audience (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_audience?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes critic score, 0-100. Absent unless an administrator shows rt_critic (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_critic?: number;
       /** Format: double */
       rating_tmdb?: number;
@@ -17439,14 +17985,22 @@ export interface components {
       progress_updated_at?: string;
       /** Format: double */
       rating_imdb?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes audience score, 0-100. Absent unless an administrator shows rt_audience (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_audience?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes critic score, 0-100. Absent unless an administrator shows rt_critic (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_critic?: number;
-      /** @description Per-source ratings on a 0-100 scale for movies and series, in display order; absent when no provider reported any */
+      /** @description Per-source ratings on a 0-100 scale for movies and series; absent when there are none. Only the sources clients show, in the same order as ratings, except for a viewer who curates the item's metadata, who gets every stored source. Title pages render ratings, not this list. */
       rating_sources?: components["schemas"]["CatalogRatingSource"][];
       /** Format: double */
       rating_tmdb?: number;
+      /** @description The external ratings a title page shows, in display order: IMDb and TMDB, plus the sources an administrator turned on. Render every entry as its name and display text. Empty, never null */
+      ratings: components["schemas"]["CatalogRating"][];
       recap?: components["schemas"]["Marker"];
       /**
        * @description Calendar date, YYYY-MM-DD
@@ -17658,13 +18212,35 @@ export interface components {
       /** @description Scalar or array, as the operator requires */
       value: unknown;
     };
+    CatalogRating: {
+      /**
+       * @description The score on the source's own scale, formatted for display
+       * @example 8.5
+       */
+      display: string;
+      /**
+       * @description The source's name as a plain-text mark, shown next to the score
+       * @example IMDb
+       */
+      name: string;
+      /**
+       * Format: double
+       * @description Score on a 0-100 scale
+       */
+      score: number;
+      /**
+       * @description Rating source: imdb, tmdb, or a name a metadata plugin declared, such as rt_critic. Clients may use it to pick a source's mark and should fall back to name for one they do not recognize.
+       * @example imdb
+       */
+      source: string;
+    };
     CatalogRatingSource: {
       /**
        * Format: double
        * @description Score on a 0-100 scale
        */
       score: number;
-      /** @description Rating source: imdb, tmdb, rt_critic, rt_audience, metacritic, metacritic_user, letterboxd, trakt, rogerebert, myanimelist, or mdblist. Clients should ignore names they do not recognize. */
+      /** @description Rating source: imdb, tmdb, or a name a metadata plugin declared, such as rt_critic. Clients should ignore names they do not recognize. */
       source: string;
       /**
        * Format: int64
@@ -17973,6 +18549,12 @@ export interface components {
       /** @description Cursor state; absent for bounded unpaginated collections */
       page?: components["schemas"]["PageInfo"];
     };
+    CollectionAdminRatingSource: {
+      /** @description The page's items; empty, never null */
+      items: components["schemas"]["AdminRatingSource"][];
+      /** @description Cursor state; absent for bounded unpaginated collections */
+      page?: components["schemas"]["PageInfo"];
+    };
     CollectionAdminRequestIntegration: {
       /** @description The page's items; empty, never null */
       items: components["schemas"]["AdminRequestIntegration"][];
@@ -18012,6 +18594,24 @@ export interface components {
     CollectionAdminUnmatchedFile: {
       /** @description The page's items; empty, never null */
       items: components["schemas"]["AdminUnmatchedFile"][];
+      /** @description Cursor state; absent for bounded unpaginated collections */
+      page?: components["schemas"]["PageInfo"];
+    };
+    CollectionAdminUserDevice: {
+      /** @description The page's items; empty, never null */
+      items: components["schemas"]["AdminUserDevice"][];
+      /** @description Cursor state; absent for bounded unpaginated collections */
+      page?: components["schemas"]["PageInfo"];
+    };
+    CollectionAdminUserDownload: {
+      /** @description The page's items; empty, never null */
+      items: components["schemas"]["AdminUserDownload"][];
+      /** @description Cursor state; absent for bounded unpaginated collections */
+      page?: components["schemas"]["PageInfo"];
+    };
+    CollectionAdminUserDownloadSubscription: {
+      /** @description The page's items; empty, never null */
+      items: components["schemas"]["AdminUserDownloadSubscription"][];
       /** @description Cursor state; absent for bounded unpaginated collections */
       page?: components["schemas"]["PageInfo"];
     };
@@ -20007,9 +20607,15 @@ export interface components {
       progress_updated_at?: string;
       /** Format: double */
       rating_imdb?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes audience score, 0-100. Absent unless an administrator shows rt_audience (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_audience?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes critic score, 0-100. Absent unless an administrator shows rt_critic (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_critic?: number;
       /** Format: double */
       rating_tmdb?: number;
@@ -22435,6 +23041,7 @@ export interface components {
       format: string;
       hearing_impaired: boolean;
       language: string;
+      revision?: string;
       title?: string;
     };
     OnboardingCapabilitiesOutputBody: {
@@ -24526,6 +25133,31 @@ export interface components {
        */
       rating: number;
     };
+    RatingsCapability: {
+      /** @description Whether the current principal may use the capability */
+      allowed: boolean;
+      /** @description Opaque revision of this document */
+      revision: string;
+      /** @description The rating sources title pages and cards show, in display order: imdb and tmdb, then each source a metadata plugin declares and an administrator turned on. A card or detail carries rating_rt_critic or rating_rt_audience only when its source is listed. Empty, never null */
+      sources: components["schemas"]["RatingsCapabilitySource"][];
+      /**
+       * @description Support and configuration state, not health
+       * @enum {string}
+       */
+      state: "available" | "disabled" | "not_configured" | "unsupported";
+    };
+    RatingsCapabilitySource: {
+      /**
+       * @description The source's plain-text mark
+       * @example IMDb
+       */
+      name: string;
+      /**
+       * @description Rating source name, as in CatalogRating.source
+       * @example imdb
+       */
+      source: string;
+    };
     RatingSet: {
       /**
        * Format: int64
@@ -25971,6 +26603,8 @@ export interface components {
       release_name: string;
       /** Format: double */
       score: number;
+      sync?: components["schemas"]["SubtitleSyncJob"];
+      timing: components["schemas"]["SubtitleTiming"];
     };
     StoredSubtitles: {
       subtitles: components["schemas"]["StoredSubtitle"][];
@@ -26272,6 +26906,62 @@ export interface components {
     SubtitleSearchResults: {
       results: components["schemas"]["SubtitleSearchResult"][];
       warnings: string[];
+    };
+    SubtitleSyncJob: {
+      /** Format: double */
+      confidence: number | null;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      created_at: string;
+      /**
+       * Format: date-time
+       * @description RFC 3339 instant in UTC with millisecond precision
+       */
+      finished_at: string | null;
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      id: string;
+      result?: components["schemas"]["SubtitleTiming"];
+      /** @enum {string} */
+      status: "pending" | "running" | "synced" | "already_synced" | "no_match" | "failed";
+      /**
+       * @description Opaque identifier
+       * @example 1
+       */
+      subtitle_id: string;
+      /** @enum {string} */
+      trigger: "auto" | "manual";
+    };
+    SubtitleSyncReadOutputBody: {
+      subtitle: components["schemas"]["StoredSubtitle"];
+    };
+    SubtitleSyncRequestOutputBody: {
+      job: components["schemas"]["SubtitleSyncJob"];
+    };
+    SubtitleSyncStatus: {
+      /** @description Whether the current principal may use the capability */
+      allowed: boolean;
+      auto_sync: boolean;
+      /** @description Opaque revision of this document */
+      revision: string;
+      /**
+       * @description Support and configuration state, not health
+       * @enum {string}
+       */
+      state: "available" | "disabled" | "not_configured" | "unsupported";
+    };
+    SubtitleTiming: {
+      /** Format: int64 */
+      offset_ms: number;
+      /** Format: double */
+      scale: number;
+    };
+    SubtitleTimingOutputBody: {
+      subtitle: components["schemas"]["StoredSubtitle"];
     };
     SubtitleTrackSignature: {
       /** @example subrip */
@@ -27961,9 +28651,15 @@ export interface components {
       progress_updated_at?: string;
       /** Format: double */
       rating_imdb?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes audience score, 0-100. Absent unless an administrator shows rt_audience (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_audience?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes critic score, 0-100. Absent unless an administrator shows rt_critic (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_critic?: number;
       /** Format: double */
       rating_tmdb?: number;
@@ -28118,9 +28814,15 @@ export interface components {
       progress_updated_at?: string;
       /** Format: double */
       rating_imdb?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes audience score, 0-100. Absent unless an administrator shows rt_audience (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_audience?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Rotten Tomatoes critic score, 0-100. Absent unless an administrator shows rt_critic (see getRatingsCapability); a viewer who curates the item's metadata gets it on item detail regardless
+       */
       rating_rt_critic?: number;
       /** Format: double */
       rating_tmdb?: number;
@@ -52801,6 +53503,8 @@ export interface operations {
         completed?: "all" | "true" | "false";
         /** @description Opaque cursor from page.next_cursor */
         cursor?: string;
+        /** @description Only attempts that ended at or after this instant */
+        ended_after?: string;
         /** @description Page size; default 50, maximum 200 */
         limit?: number;
         /** @description Only attempts of this catalog item */
@@ -58226,6 +58930,244 @@ export interface operations {
       };
     };
   };
+  listAdminRatingSources: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CollectionAdminRatingSource"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getAdminRatingSourceCapabilities: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminRatingSourceCapabilities"];
+        };
+      };
+      /** @description The representation named by If-None-Match is current; no body. */
+      304: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   getAdminRecommendationsStatus: {
     parameters: {
       query?: never;
@@ -61735,6 +62677,115 @@ export interface operations {
       };
       /** @description Precondition Required */
       428: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getAdminRequestUserUsage: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        user_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminRequestUserUsage"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
         headers: {
           [name: string]: unknown;
         };
@@ -71646,6 +72697,464 @@ export interface operations {
       };
     };
   };
+  listAdminUserDevices: {
+    parameters: {
+      query?: never;
+      header?: {
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CollectionAdminUserDevice"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  listAdminUserDownloadSubscriptions: {
+    parameters: {
+      query?: {
+        /** @description Opaque cursor from page.next_cursor */
+        cursor?: string;
+        /** @description Only rows of this device */
+        device_id?: string;
+        /** @description Page size; default 50, maximum 200 */
+        limit?: number;
+        /** @description Only rows of this household profile */
+        profile_id?: string;
+      };
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CollectionAdminUserDownloadSubscription"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  listAdminUserDownloads: {
+    parameters: {
+      query?: {
+        /** @description Opaque cursor from page.next_cursor */
+        cursor?: string;
+        /** @description Only rows of this device */
+        device_id?: string;
+        /** @description Page size; default 50, maximum 200 */
+        limit?: number;
+        /** @description Only rows of this household profile */
+        profile_id?: string;
+      };
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["CollectionAdminUserDownload"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getAdminUserDownloadSummary: {
+    parameters: {
+      query?: never;
+      header?: {
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminUserDownloadSummary"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   impersonateAdminUser: {
     parameters: {
       query?: never;
@@ -72545,6 +74054,120 @@ export interface operations {
           [name: string]: unknown;
         };
         content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getAdminUserWatchSummary: {
+    parameters: {
+      query?: {
+        /** @description Window length in days, ending now */
+        days?: number;
+        /** @description Only attempts by this household profile */
+        profile_id?: string;
+      };
+      header?: {
+        /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AdminUserWatchSummary"];
+        };
       };
       /** @description Bad Request */
       400: {
@@ -76958,6 +78581,138 @@ export interface operations {
       };
       /** @description Unprocessable Entity */
       422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getRatingsCapability: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["RatingsCapability"];
+        };
+      };
+      /** @description The representation named by If-None-Match is current; no body. */
+      304: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
         headers: {
           [name: string]: unknown;
         };
@@ -88291,6 +90046,7 @@ export interface operations {
     parameters: {
       query?: never;
       header: {
+        "If-None-Match"?: string;
         /** @description The household profile acting for this request; it must belong to the authenticated account. */
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
@@ -88327,6 +90083,21 @@ export interface operations {
           "text/x-ass": string;
           "text/x-ssa": string;
         };
+      };
+      /** @description Representation not modified. */
+      304: {
+        headers: {
+          "Accept-Ranges"?: string;
+          "Cache-Control"?: string;
+          "Content-Disposition"?: string;
+          "Content-Length"?: string;
+          "Content-Range"?: string;
+          ETag?: string;
+          "Last-Modified"?: string;
+          Location?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
       };
       /** @description Invalid subtitle reference. */
       400: {
@@ -104174,6 +105945,7 @@ export interface operations {
         "X-Client-Build"?: string;
         "X-Client-Channel"?: string;
         "X-Client-Model"?: string;
+        /** @description App name; when non-blank, the X-Client-* headers supply the whole client identity and X-Silo-Client* is ignored */
         "X-Client-Name"?: string;
         "X-Client-OS-Version"?: string;
         "X-Client-Platform"?: string;
@@ -104183,6 +105955,22 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
+        /** @description App name the first-party clients send on every request; when non-blank and X-Client-Name is absent or blank, the X-Silo-Client* headers supply the client identity */
+        "X-Silo-Client"?: string;
+        /** @description Opaque build identifier paired with X-Silo-Client */
+        "X-Silo-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Silo-Client */
+        "X-Silo-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Silo-Client */
+        "X-Silo-Client-Version"?: string;
+        /** @description App name first-party Vio clients send */
+        "X-Vio-Client"?: string;
+        /** @description Opaque build identifier paired with X-Vio-Client */
+        "X-Vio-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Vio-Client */
+        "X-Vio-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Vio-Client */
+        "X-Vio-Client-Version"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -104445,6 +106233,7 @@ export interface operations {
         "X-Client-Build"?: string;
         "X-Client-Channel"?: string;
         "X-Client-Model"?: string;
+        /** @description App name; when non-blank, the X-Client-* headers supply the whole client identity and X-Silo-Client* is ignored */
         "X-Client-Name"?: string;
         "X-Client-OS-Version"?: string;
         "X-Client-Platform"?: string;
@@ -104454,6 +106243,22 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
+        /** @description App name the first-party clients send on every request; when non-blank and X-Client-Name is absent or blank, the X-Silo-Client* headers supply the client identity */
+        "X-Silo-Client"?: string;
+        /** @description Opaque build identifier paired with X-Silo-Client */
+        "X-Silo-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Silo-Client */
+        "X-Silo-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Silo-Client */
+        "X-Silo-Client-Version"?: string;
+        /** @description App name first-party Vio clients send */
+        "X-Vio-Client"?: string;
+        /** @description Opaque build identifier paired with X-Vio-Client */
+        "X-Vio-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Vio-Client */
+        "X-Vio-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Vio-Client */
+        "X-Vio-Client-Version"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -104603,6 +106408,7 @@ export interface operations {
         "X-Client-Build"?: string;
         "X-Client-Channel"?: string;
         "X-Client-Model"?: string;
+        /** @description App name; when non-blank, the X-Client-* headers supply the whole client identity and X-Silo-Client* is ignored */
         "X-Client-Name"?: string;
         "X-Client-OS-Version"?: string;
         "X-Client-Platform"?: string;
@@ -104612,6 +106418,22 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
+        /** @description App name the first-party clients send on every request; when non-blank and X-Client-Name is absent or blank, the X-Silo-Client* headers supply the client identity */
+        "X-Silo-Client"?: string;
+        /** @description Opaque build identifier paired with X-Silo-Client */
+        "X-Silo-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Silo-Client */
+        "X-Silo-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Silo-Client */
+        "X-Silo-Client-Version"?: string;
+        /** @description App name first-party Vio clients send */
+        "X-Vio-Client"?: string;
+        /** @description Opaque build identifier paired with X-Vio-Client */
+        "X-Vio-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Vio-Client */
+        "X-Vio-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Vio-Client */
+        "X-Vio-Client-Version"?: string;
       };
       path: {
         /** @description Opaque identifier */
@@ -104893,6 +106715,7 @@ export interface operations {
         "X-Client-Build"?: string;
         "X-Client-Channel"?: string;
         "X-Client-Model"?: string;
+        /** @description App name; when non-blank, the X-Client-* headers supply the whole client identity and X-Silo-Client* is ignored */
         "X-Client-Name"?: string;
         "X-Client-OS-Version"?: string;
         "X-Client-Platform"?: string;
@@ -104902,6 +106725,22 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
+        /** @description App name the first-party clients send on every request; when non-blank and X-Client-Name is absent or blank, the X-Silo-Client* headers supply the client identity */
+        "X-Silo-Client"?: string;
+        /** @description Opaque build identifier paired with X-Silo-Client */
+        "X-Silo-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Silo-Client */
+        "X-Silo-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Silo-Client */
+        "X-Silo-Client-Version"?: string;
+        /** @description App name first-party Vio clients send */
+        "X-Vio-Client"?: string;
+        /** @description Opaque build identifier paired with X-Vio-Client */
+        "X-Vio-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Vio-Client */
+        "X-Vio-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Vio-Client */
+        "X-Vio-Client-Version"?: string;
       };
       path?: never;
       cookie?: never;
@@ -105408,6 +107247,7 @@ export interface operations {
         "X-Client-Build"?: string;
         "X-Client-Channel"?: string;
         "X-Client-Model"?: string;
+        /** @description App name; when non-blank, the X-Client-* headers supply the whole client identity and X-Silo-Client* is ignored */
         "X-Client-Name"?: string;
         "X-Client-OS-Version"?: string;
         "X-Client-Platform"?: string;
@@ -105417,6 +107257,22 @@ export interface operations {
         "X-Profile-Id": string;
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
+        /** @description App name the first-party clients send on every request; when non-blank and X-Client-Name is absent or blank, the X-Silo-Client* headers supply the client identity */
+        "X-Silo-Client"?: string;
+        /** @description Opaque build identifier paired with X-Silo-Client */
+        "X-Silo-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Silo-Client */
+        "X-Silo-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Silo-Client */
+        "X-Silo-Client-Version"?: string;
+        /** @description App name first-party Vio clients send */
+        "X-Vio-Client"?: string;
+        /** @description Opaque build identifier paired with X-Vio-Client */
+        "X-Vio-Client-Build"?: string;
+        /** @description Opaque distribution channel paired with X-Vio-Client */
+        "X-Vio-Client-Channel"?: string;
+        /** @description Marketing version paired with X-Vio-Client */
+        "X-Vio-Client-Version"?: string;
       };
       path?: never;
       cookie?: never;
@@ -117258,6 +119114,522 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["StoredSubtitle"];
+        };
+      };
+      /** @description The representation named by If-None-Match is current; no body. */
+      304: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getStoredSubtitleSync: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name a profile of the authenticated account. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["SubtitleSyncReadOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  syncStoredSubtitle: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional. When present, it must name a profile of the authenticated account. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Accepted */
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["SubtitleSyncRequestOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  setStoredSubtitleTiming: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The resource's current ETag, or "*" to overwrite deliberately. A missing field is 428 precondition_required; a stale tag is 412 precondition_failed with the current ETag. */
+        "If-Match": string;
+        /** @description Optional second precondition, evaluated after If-Match succeeds: "*" or any tag matching the current representation is 412 precondition_failed with the current ETag. */
+        "If-None-Match"?: string;
+        /** @description Optional. When present, it must name a profile of the authenticated account. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path: {
+        /** @description Opaque identifier */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SubtitleTiming"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["SubtitleTimingOutputBody"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Failed */
+      412: {
+        headers: {
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Precondition Required */
+      428: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  getSubtitleSyncStatus: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description Optional first precondition, evaluated before If-None-Match: a tag that does not match the current representation is 412 precondition_failed. */
+        "If-Match"?: string;
+        "If-None-Match"?: string;
+        /** @description Optional. When present, it must name a profile of the authenticated account. */
+        "X-Profile-Id"?: string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          "Cache-Control"?: string;
+          /** @description The strong, opaque validator of the representation; send it back in If-Match on a guarded mutation or If-None-Match on a conditional read. */
+          ETag?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["SubtitleSyncStatus"];
         };
       };
       /** @description The representation named by If-None-Match is current; no body. */

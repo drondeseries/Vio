@@ -45,6 +45,7 @@ const FETCH_MAX_CONSECUTIVE_FAILURES = 4;
  */
 interface SubtitleTrackCarryover {
   url: string | null;
+  cueRevision: number;
   cues: ParsedCue[];
   coverageStart: number;
   windowEnd: number;
@@ -155,6 +156,10 @@ export function useSubtitleTracks(
   // can suppress the refresh -> replan -> 409 cycle that a new plan id would
   // otherwise re-arm.
   sourceGeneration = 0,
+  // Bumped when the server retimed the active track's content (subtitle sync
+  // or a timing reset) behind an unchanged URL. Changing it refetches the cues
+  // instead of restoring the carried-over ones.
+  cueRevision = 0,
 ): string[] {
   const [activeCueTexts, setActiveCueTexts] = useState<string[]>([]);
   const onLoadStateRef = useRef(onLoadState);
@@ -242,13 +247,11 @@ export function useSubtitleTracks(
     // every restored cue, including cues newly visible after an origin change.
     const carried = carryoverRef.current;
     carryoverRef.current = null;
-    // Carry cues over only when the URL AND the source generation are the same:
-    // a rebuild caused by a genuine source change must refetch rather than
-    // replay the rotated source's old cues. A stream-reload rebuild keeps both.
     const restored =
       carried &&
       carried.url === activeUrl &&
       carried.sourceGeneration === sourceGeneration &&
+      carried.cueRevision === cueRevision &&
       !activeIsLive
         ? carried
         : null;
@@ -562,6 +565,7 @@ export function useSubtitleTracks(
       {
         carryoverRef.current = {
           url: activeUrl,
+          cueRevision,
           cues: Array.from(sourceCues.values()),
           coverageStart,
           windowEnd,
@@ -595,6 +599,7 @@ export function useSubtitleTracks(
     liveTrackKey,
     streamGeneration,
     sourceGeneration,
+    cueRevision,
     videoRef,
   ]);
 

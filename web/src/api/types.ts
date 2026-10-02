@@ -1,5 +1,6 @@
 import { getDefaultQuerySortOrder, normalizeQuerySortField } from "@/lib/querySortOptions";
 import type { SchemaOption } from "@/components/admin/plugins/schemaFormUtils";
+import type { components as V2Components } from "@/api/v2/schema";
 
 // Auth
 export interface LoginRequest {
@@ -1181,6 +1182,13 @@ export interface ItemExtra {
   file_id?: number;
 }
 
+/**
+ * One external rating as the server builds it for a title page: IMDb and
+ * TMDB, plus the sources an administrator turned on. `display` is already
+ * formatted on the source's own scale ("8.5", "93%").
+ */
+export type DisplayRating = V2Components["schemas"]["CatalogRating"];
+
 export interface ItemDetail {
   themes?: {
     owner_id: string;
@@ -1220,6 +1228,8 @@ export interface ItemDetail {
   rating_tmdb: number | null;
   rating_rt_critic: number | null;
   rating_rt_audience: number | null;
+  /** The external ratings the title page shows, chosen and formatted by the server. */
+  ratings: DisplayRating[];
   imdb_id: string;
   tmdb_id: string;
   tvdb_id: string;
@@ -3275,12 +3285,22 @@ export interface EventsErrorMessage {
   message: string;
 }
 
+/**
+ * The access the connection was opened under changed (access group,
+ * permissions, playback quality, role, or profile verification). The server
+ * closes the socket right after it with EVENTS_ACCESS_CHANGED_CLOSE_CODE.
+ */
+export interface EventsAccessChangedMessage {
+  type: "access_changed";
+}
+
 export type EventsStreamMessage =
   | EventsHelloMessage
   | EventsSubscribedMessage
   | EventsSnapshotMessage
   | EventsEventMessage
-  | EventsErrorMessage;
+  | EventsErrorMessage
+  | EventsAccessChangedMessage;
 
 export type AdminLogStreamMessage =
   | AdminLogSnapshotMessage

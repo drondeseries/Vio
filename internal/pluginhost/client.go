@@ -83,16 +83,21 @@ type HTTPRoutesClient struct {
 	timeout time.Duration
 }
 
-type VirtualStreamProviderClient struct {
-	client  pluginv1.VirtualStreamProviderClient
-	timeout time.Duration
-}
-
 type WatchSyncProviderClient struct {
 	client              pluginv1.WatchSyncProviderClient
 	deviceAuthorization pluginv1.WatchSyncDeviceAuthorizationServiceClient
 	timeout             time.Duration
 }
+
+// NetworkAccessProviderClient drives one network_access_provider.v1 instance.
+type NetworkAccessProviderClient struct {
+	ingressToken string
+	client       pluginv1.NetworkAccessProviderClient
+	timeout      time.Duration
+}
+
+// IngressToken identifies the process that answers these provider RPCs.
+func (c *NetworkAccessProviderClient) IngressToken() string { return c.ingressToken }
 
 func newClient(installationID int, rpc *sdkruntime.Client, manifest *pluginv1.PluginManifest, startSeq uint64) *Client {
 	capabilities := make(map[string]*pluginv1.CapabilityDescriptor, len(manifest.GetCapabilities()))
@@ -174,7 +179,7 @@ func (c *Client) ScheduledTask(capabilityID string) (*ScheduledTaskClient, error
 	}
 	return &ScheduledTaskClient{
 		client:  c.rpc.ScheduledTask(),
-		timeout: DefaultScheduledTaskTimeout,
+		timeout: DefaultControlTimeout,
 	}, nil
 }
 
@@ -228,30 +233,6 @@ func (c *Client) HTTPRoutes(capabilityID string) (*HTTPRoutesClient, error) {
 	}, nil
 }
 
-func (c *Client) VirtualStreamProvider(capabilityID string) (*VirtualStreamProviderClient, error) {
-	if err := c.requireCapability("virtual_stream_provider.v1", capabilityID); err != nil {
-		return nil, err
-	}
-	return &VirtualStreamProviderClient{
-		client:  c.rpc.VirtualStreamProvider(),
-		timeout: DefaultVirtualStreamTimeout,
-	}, nil
-}
-
-func NewHTTPRoutesClientForTest(client pluginv1.HttpRoutesClient, timeout time.Duration) *HTTPRoutesClient {
-	if timeout <= 0 {
-		timeout = DefaultRouteTimeout
-	}
-	return &HTTPRoutesClient{client: client, timeout: timeout}
-}
-
-func NewVirtualStreamProviderClientForTest(client pluginv1.VirtualStreamProviderClient, timeout time.Duration) *VirtualStreamProviderClient {
-	if timeout <= 0 {
-		timeout = DefaultVirtualStreamTimeout
-	}
-	return &VirtualStreamProviderClient{client: client, timeout: timeout}
-}
-
 func (c *Client) WatchSyncProvider(capabilityID string) (*WatchSyncProviderClient, error) {
 	if err := c.requireCapability("watch_sync_provider.v1", capabilityID); err != nil {
 		return nil, err
@@ -260,6 +241,19 @@ func (c *Client) WatchSyncProvider(capabilityID string) (*WatchSyncProviderClien
 		client:              c.rpc.WatchSyncProvider(),
 		deviceAuthorization: c.rpc.WatchSyncDeviceAuthorization(),
 		timeout:             DefaultWatchSyncTimeout,
+	}, nil
+}
+
+// NetworkAccessProvider returns the typed client for the plugin's
+// network_access_provider.v1 capability.
+func (c *Client) NetworkAccessProvider(capabilityID string) (*NetworkAccessProviderClient, error) {
+	if err := c.requireCapability("network_access_provider.v1", capabilityID); err != nil {
+		return nil, err
+	}
+	return &NetworkAccessProviderClient{
+		client:       c.rpc.NetworkAccessProvider(),
+		ingressToken: c.ingressToken,
+		timeout:      DefaultNetworkAccessTimeout,
 	}, nil
 }
 
@@ -440,18 +434,6 @@ func (c *HTTPRoutesClient) Handle(ctx context.Context, req *pluginv1.HandleHTTPR
 	return c.client.Handle(callCtx, req)
 }
 
-func (c *VirtualStreamProviderClient) ResolveVirtualStream(ctx context.Context, req *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
-	callCtx, cancel := ensureDeadline(ctx, c.timeout)
-	defer cancel()
-	return c.client.ResolveVirtualStream(callCtx, req)
-}
-
-func (c *VirtualStreamProviderClient) ListVirtualStreamProfiles(ctx context.Context, req *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
-	callCtx, cancel := ensureDeadline(ctx, c.timeout)
-	defer cancel()
-	return c.client.ListVirtualStreamProfiles(callCtx, req)
-}
-
 func (c *WatchSyncProviderClient) ExchangeAPIKey(ctx context.Context, req *pluginv1.WatchSyncExchangeAPIKeyRequest) (*pluginv1.WatchSyncCredentialResponse, error) {
 	callCtx, cancel := ensureDeadline(ctx, c.timeout)
 	defer cancel()
@@ -492,6 +474,24 @@ func (c *WatchSyncProviderClient) ListRemoteState(ctx context.Context, req *plug
 	callCtx, cancel := ensureDeadline(ctx, c.timeout)
 	defer cancel()
 	return c.client.ListRemoteState(callCtx, req)
+}
+
+func (c *NetworkAccessProviderClient) Connect(ctx context.Context, req *pluginv1.NetworkAccessConnectRequest) (*pluginv1.NetworkAccessStatus, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Connect(callCtx, req)
+}
+
+func (c *NetworkAccessProviderClient) Disconnect(ctx context.Context, req *pluginv1.NetworkAccessDisconnectRequest) (*pluginv1.NetworkAccessStatus, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.Disconnect(callCtx, req)
+}
+
+func (c *NetworkAccessProviderClient) GetStatus(ctx context.Context, req *pluginv1.NetworkAccessGetStatusRequest) (*pluginv1.NetworkAccessStatus, error) {
+	callCtx, cancel := ensureDeadline(ctx, c.timeout)
+	defer cancel()
+	return c.client.GetStatus(callCtx, req)
 }
 
 func ensureDeadline(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
