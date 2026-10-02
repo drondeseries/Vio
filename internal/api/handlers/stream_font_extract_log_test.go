@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -45,6 +46,91 @@ func TestFontExtractFailLogThrottlesRepeats(t *testing.T) {
 	l.failed(ctx, key, "file_id", 7, "track", 1)
 	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 2 {
 		t.Fatalf("warn count after recovery = %d, want the key to warn again\n%s", got, logs.String())
+	}
+}
+
+// TestFontExtractFailLogRetentionBounded pins the process-lifetime bound: every
+// failure for a unique key must not grow the throttle map beyond
+// fontExtractFailLogMaxEntries. Before the cap this leaked one entry per
+// unique session/track for as long as the process ran.
+func TestFontExtractFailLogRetentionBounded(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	var l fontExtractFailLog
+	ctx := context.Background()
+	unique := fontExtractFailLogMaxEntries * 4
+	for i := range unique {
+		l.failed(ctx, fmt.Sprintf("session:sess-%d:track:%d", i, i%9), "session", fmt.Sprintf("sess-%d", i), "track", i%9)
+	}
+	l.mu.Lock()
+	size := len(l.seen)
+	l.mu.Unlock()
+	if size != fontExtractFailLogMaxEntries {
+		t.Fatalf("throttle map size = %d, want capped at %d", size, fontExtractFailLogMaxEntries)
+	}
+	// The very first key was evicted long ago, so failing it again must warn
+	// (its old entry is gone) rather than stay throttled as a repeat.
+	warnsBefore := strings.Count(logs.String(), `"level":"WARN"`)
+	l.failed(ctx, "session:sess-0:track:0", "session", "sess-0", "track", 0)
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != warnsBefore+1 {
+		t.Fatalf("warn count delta after eviction = %d, want the evicted key to warn again\nlogs tail: %s", got-warnsBefore, logs.String()[max(0, len(logs.String())-2000):])
+	}
+	if got := len(l.seen); got > fontExtractFailLogMaxEntries {
+		t.Fatalf("throttle map size after re-failure = %d, want <= %d", got, fontExtractFailLogMaxEntries)
+	}
+}
+
+// TestFontExtractFailLogExpiredTTLWarnsAgain pins the TTL: an entry that never
+// sees a success path (failed or abandoned session) expires after
+// fontExtractFailLogTTL, so the target's next failure warns again instead of
+// staying throttled to debug forever.
+func TestFontExtractFailLogExpiredTTLWarnsAgain(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	current := time.Now()
+	var l fontExtractFailLog
+	l.now = func() time.Time { return current }
+	ctx := context.Background()
+	key := fontExtractFailureKey(11, 2)
+
+	l.failed(ctx, key, "file_id", 11, "track", 2)
+	l.failed(ctx, key, "file_id", 11, "track", 2) // throttled to debug
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 1 {
+		t.Fatalf("warn count before TTL = %d, want 1\n%s", got, logs.String())
+	}
+
+	current = current.Add(fontExtractFailLogTTL)
+	l.failed(ctx, key, "file_id", 11, "track", 2)
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 2 {
+		t.Fatalf("warn count after TTL expiry = %d, want the expired entry to warn again\n%s", got, logs.String())
+	}
+}
+
+// TestFontExtractFailLogRecoveryMatchesFailure pins the identity fix: the key
+// recovered() clears is the key failed() inserted (cause travels as an
+// attribute now), so failure → recovery → failure warns again even when the
+// two failures carry different causes.
+func TestFontExtractFailLogRecoveryMatchesFailure(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	var l fontExtractFailLog
+	ctx := context.Background()
+	key := fontExtractFailureKey(42, 3)
+
+	l.failed(ctx, key, "file_id", 42, "track", 3, "cause", "session_load", "error", errors.New("load"))
+	l.recovered(key)
+	l.failed(ctx, key, "file_id", 42, "track", 3, "cause", "source_preflight", "error", errors.New("preflight"))
+	if got := strings.Count(logs.String(), `"level":"WARN"`); got != 2 {
+		t.Fatalf("warn count after failure → recovery → failure = %d, want 2\n%s", got, logs.String())
 	}
 }
 
