@@ -1018,6 +1018,20 @@ type PlanV3 struct {
 	DecisionReason       string                 `json:"decision_reason"`
 	RequestedMediaFileID int                    `json:"requested_media_file_id"`
 	EffectiveMediaFileID int                    `json:"effective_media_file_id"`
+	// SubstitutedFromFileID names the catalog row the client asked for when the
+	// effective release differs from it; it is the requested row id and is
+	// omitted when the effective row is the requested one. It exists so a
+	// client can surface an honest substitution notice without first diffing
+	// the requested/effective ids, and carries SubstitutionReason alongside.
+	// UI-only, like the inventory hints below: it is set after plan identity is
+	// finalized and is deliberately excluded from plan identity hashing.
+	SubstitutedFromFileID int `json:"substituted_from_file_id,omitempty"`
+	// SubstitutionReason is the machine-readable cause of a version
+	// substitution, present only with SubstitutedFromFileID: a dead release, a
+	// provider listing failure, a transport failure, or a decode rejection.
+	// The set is additive; clients treat an unknown value as a generic
+	// substitution rather than failing to render.
+	SubstitutionReason string `json:"substitution_reason,omitempty"`
 	// EffectiveVirtualURI is the provider-neutral virtual:// candidate URI the
 	// planner selected and probed when it substituted a real candidate for a
 	// neutral catalog row. UI-only: clients use it to keep the version menu in

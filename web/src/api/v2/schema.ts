@@ -28591,6 +28591,7 @@ export interface components {
       allowed: boolean;
       indexer_request: boolean;
       indexer_search: boolean;
+      refresh_prunes_dead_candidates: boolean;
       /** @description Opaque revision of this document */
       revision: string;
       /**
@@ -120308,6 +120309,7 @@ export interface operations {
       200: {
         headers: {
           "Cache-Control"?: string;
+          "X-Vio-Font-Bundle-Pending"?: string;
           [name: string]: unknown;
         };
         content: {

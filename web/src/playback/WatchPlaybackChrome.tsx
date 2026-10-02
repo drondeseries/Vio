@@ -38,7 +38,8 @@ import {
 } from "@/hooks/queries/settingValues";
 import { SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
 import { useWatchDetail } from "@/hooks/queries/items";
-import { applyVersionAvailability, useVersionLiveness } from "@/hooks/queries/versionLiveness";
+import { useVersionLiveness } from "@/hooks/queries/versionLiveness";
+import { useStampedVersions } from "./useStampedVersions";
 import { catalogKeys } from "@/hooks/queries/keys";
 import { applyPlaybackProgressToCache } from "@/hooks/queries/playbackProgressCache";
 import { invalidatePlaybackSurfaceQueries } from "@/hooks/queries/playbackSurfaceRefresh";
@@ -606,6 +607,7 @@ function WatchPlaybackHostContent() {
   // (the same read the item page already makes), not a poll: the server still
   // drives any automatic re-listing after a dead source.
   const versionLiveness = useVersionLiveness(activeItem?.versions ?? [], !!activeItem);
+  const stampedVersions = useStampedVersions(activeItem?.versions, versionLiveness);
 
   const playerConfig = useMemo<PlayerConfig>(
     () => ({
@@ -1026,14 +1028,15 @@ function WatchPlaybackHostContent() {
   const maxBitrateKbps = effectivePlaybackSettings?.[SETTING_KEYS.PLAYBACK_MAX_BITRATE_KBPS]
     ?.value as number | null | undefined;
   // Stamp the server's liveness verdict on the rows before they become player
-  // props. The player's version menu reads a row's health from `available`; the
-  // watch detail does not carry it, so without this the menu shows no health.
-  // Versions is absent until the detail read resolves (the room-exit tests
-  // render without one), so fall back to an empty list rather than mapping
-  // over undefined.
+  // props (memoized above so the identity only moves with the rows or the
+  // verdicts). The player's version menu reads a row's health from
+  // `available`; the watch detail does not carry it, so without this the menu
+  // shows no health. Versions is absent until the detail read resolves (the
+  // room-exit tests render without one), so fall back to an empty list rather
+  // than mapping over undefined.
   const itemForPlayer: WatchDetail = {
     ...activeItem,
-    versions: applyVersionAvailability(activeItem.versions ?? [], versionLiveness),
+    versions: stampedVersions,
   };
   const watchPageProps = buildWatchPageProps({
     request: activeRequest,

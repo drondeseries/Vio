@@ -1275,6 +1275,13 @@ type resolvedVirtualPlaybackSource struct {
 	// many?") is answerable without a second resolve.
 	CandidateRank  int
 	CandidateCount int
+	// SubstitutedFromFileID names the catalog row the caller asked for when the
+	// resolver's candidate belongs to a different row. It is nonzero only for
+	// the alternate-version walk, which is the one fresh-start path that plans
+	// a release other than the requested one.
+	SubstitutedFromFileID int
+	// SubstitutionReason is the additive substitution cause for that case.
+	SubstitutionReason string
 	// IdentityRematched is true when the resolver reported that the requested
 	// pin's result id was absent from a fresh listing but the same durable
 	// identity was found under a new result id. The candidate is then the same
@@ -1798,6 +1805,50 @@ func (h *PlaybackHandler) resolveVirtualAnchorURIWithRotationV3(
 	slog.InfoContext(ctx, "virtual transport anchor rotated an absent session-bound candidate",
 		"component", "api", "session_anchor", file.FilePath,
 		"status", "rotated", "old_candidate_id", pinnedID,
+		"new_candidate_id", virtualResultCandidateID(rotated.URI), "virtual_uri", rotated.URI)
+	return rotated, rotatedCleanup, nil
+}
+
+// resolveVirtualAnchorURIExcludingFailedV3 re-resolves the session-bound
+// candidate while excluding one failed result id, so a seek-anchor retry
+// whose relay token 5xxes can walk to an alternate candidate instead of
+// re-probing the token that just failed. Only a same-identity candidate is
+// accepted: like resolveVirtualAnchorURIWithRotationV3 it refuses a silent
+// swap to a different release, so the anchored bytes stay the planned
+// release under a new result id.
+func (h *PlaybackHandler) resolveVirtualAnchorURIExcludingFailedV3(
+	ctx context.Context,
+	session *playback.Session,
+	file *models.MediaFile,
+	excludeResultID string,
+) (ResolvedVirtualMedia, func(), error) {
+	if strings.TrimSpace(excludeResultID) == "" {
+		return ResolvedVirtualMedia{}, nil, errors.New("virtual anchor rotation needs a failed candidate to exclude")
+	}
+	// Thread the durable identity explicitly, mirroring the absent-pin
+	// rotation: the retry relists, so the stored-row lookup that normally
+	// carries the identity is bypassed.
+	retryCtx := virtualResolveContextWithPersistedIdentity(ctx, file)
+	rotated, rotatedCleanup, rotateErr := h.resolveVirtualInputURI(
+		retryCtx, file.FilePath, file.VirtualOwnerInstallationID,
+		session.UserID, session.ProfileID, true, []string{excludeResultID}, "", true,
+	)
+	if rotateErr != nil {
+		return rotated, rotatedCleanup, rotateErr
+	}
+	if !rotated.IdentityRematched && !resolvedMatchesPersistedIdentity(rotated, file) {
+		if rotatedCleanup != nil {
+			rotatedCleanup()
+		}
+		slog.WarnContext(ctx, "virtual transport anchor rotation resolved a different release; refusing a silent anchor swap",
+			"component", "api", "session_anchor", file.FilePath,
+			"status", "rotation_refused", "excluded_candidate_id", excludeResultID,
+			"new_candidate_id", virtualResultCandidateID(rotated.URI))
+		return ResolvedVirtualMedia{}, nil, errors.New("virtual anchor rotation found no same-identity alternate")
+	}
+	slog.InfoContext(ctx, "virtual transport anchor rotated past a failed candidate",
+		"component", "api", "session_anchor", file.FilePath,
+		"status", "rotated", "excluded_candidate_id", excludeResultID,
 		"new_candidate_id", virtualResultCandidateID(rotated.URI), "virtual_uri", rotated.URI)
 	return rotated, rotatedCleanup, nil
 }

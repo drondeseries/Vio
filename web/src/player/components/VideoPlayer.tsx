@@ -124,12 +124,12 @@ import {
   setWatchTogetherGuestControl,
 } from "@/lib/watchTogetherActions";
 import { versionSortableFromFile } from "@/lib/qualityRanking";
-import { videoRangeLabel } from "@/lib/videoRange";
 import {
-  collectLanguageLabels,
-  formatVersionDetail,
-  prettifyReleaseName,
+  audioLanguageLabels,
+  buildQualitySummary,
+  buildVersionDetailLine,
   profileLabelFromFilePath,
+  subtitleLanguageLabels,
 } from "@/pages/ItemDetail/components/versionFormatUtils";
 import { toast } from "sonner";
 
@@ -866,39 +866,17 @@ export function VideoPlayer({
   const versionStatus = useMemo(
     () =>
       versions.map((v) => {
-        // Compact audio languages for the version switcher so a
-        // MULTI/French track set is recognizable before playback. A MULTi
-        // track advertises its full languages[] list; fall back to the
-        // single language field when the list is absent. Labels resolve
-        // through the same formatter as the item page, so raw ISO codes
-        // render as "English/French" rather than "en/fr".
-        const audioLanguageLabels = collectLanguageLabels(
-          (v.audio_tracks ?? []).flatMap((track) => {
-            const languages = track.languages?.filter((l) => l?.trim());
-            return languages && languages.length > 0 ? languages : [track.language?.trim()];
-          }),
-        );
-        const range = videoRangeLabel(v);
-        const audioPart = v.codec_audio ? ` ${v.codec_audio.toUpperCase()}` : "";
-        const releaseLabel = v.release_name ?? v.file_name;
         return {
           fileId: v.file_id,
-          // The same shape as the item-page picker's summary (resolution, video
-          // codec, dynamic range, audio codec); language sets move to badges so
-          // they are not shown twice.
-          label: `${v.resolution} ${v.codec_video.toUpperCase()}${range ? ` ${range}` : ""}${audioPart}`,
-          releaseName: prettifyReleaseName(releaseLabel),
+          // The shared one-line quality summary, identical to the item-page
+          // picker's for the same version fields.
+          label: buildQualitySummary(v),
+          releaseName: buildVersionDetailLine(v),
           // Same release + structured size + source hint the item-page picker
           // shows, so the two version menus stay equal in information.
-          detail: formatVersionDetail({
-            label: releaseLabel,
-            fileSize: v.file_size,
-            scanText: [v.file_name, v.edition_raw, v.release_name].filter(Boolean).join(" "),
-          }),
-          audioLanguages: audioLanguageLabels,
-          subtitleLanguages: collectLanguageLabels(
-            (v.subtitle_tracks ?? []).map((track) => track.language ?? ""),
-          ),
+          detail: buildVersionDetailLine(v),
+          audioLanguages: audioLanguageLabels(v.audio_tracks),
+          subtitleLanguages: subtitleLanguageLabels(v.subtitle_tracks),
           profileLabel: profileLabelFromFilePath(v.file_path),
           filePath: v.file_path,
           // The server publishes the ranking on the watch detail, not per file.
@@ -3195,8 +3173,10 @@ export function VideoPlayer({
   // Prefetch ASS font bundles at plan adoption so a later track selection hits
   // the in-memory font cache instead of a cold server extraction. Purely a
   // warm-up: errors are swallowed and never affect playback. Mirrors the
-  // useASSSubtitles gating — the hook itself no-ops without font inventory.
-  useSubtitleFontPrefetch(subtitleUrls);
+  // useASSSubtitles gating — the hook itself no-ops without font inventory —
+  // and is scoped to the effective release so a list spanning versions never
+  // warms a font bundle the active renderer cannot reach.
+  useSubtitleFontPrefetch(subtitleUrls, effectiveFileId);
   const subtitleLoadState = isASSActive ? assSubtitleState : textSubtitleState;
 
   // -- Authoritative subtitle track selection --

@@ -195,7 +195,7 @@ describe("PreferencesTab levels", () => {
     renderTab("?tab=preferences&level=profile.p1");
     const profile = levelCard("All devices · Main");
     expect(within(profile).getByText("Subtitles").parentElement).toHaveTextContent(
-      "Replaces app default: Auto",
+      "Replaces app default: Off",
     );
   });
 
@@ -253,7 +253,7 @@ describe("PreferencesTab levels", () => {
     await u.click(screen.getByRole("button", { name: "Remove Subtitles" }));
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog).toHaveTextContent("Go back to the app default?");
-    expect(dialog).toHaveTextContent("Subtitles goes back to the app default, Auto, for Main.");
+    expect(dialog).toHaveTextContent("Subtitles goes back to the app default, Off, for Main.");
     await u.click(within(dialog).getByRole("button", { name: "Use app default" }));
     expect(mocks.deleteMutate.mock.calls[0]?.[0]).toMatchObject({
       key: SUBTITLES,

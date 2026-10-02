@@ -268,6 +268,12 @@ func TestAdminRequestOptionsNormalizesBaseURL(t *testing.T) {
 	if f.probedBaseURL != "http://10.0.0.5:8989" {
 		t.Fatalf("probed base URL = %q", f.probedBaseURL)
 	}
+	if rec := do(t, h, http.MethodPost, path, `{"base_url":"virtual://streaming/","api_key_ref":"k"}`, actingRequestAdmin); rec.Code != 200 {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	if f.probedBaseURL != "virtual://streaming" {
+		t.Fatalf("probed base URL = %q, want virtual://streaming", f.probedBaseURL)
+	}
 	f.probedBaseURL = "unset"
 	rec := do(t, h, http.MethodPost, path, `{"base_url":"ftp://10.0.0.5","api_key_ref":"k"}`, actingRequestAdmin)
 	requireProblem(t, rec, TypeValidationFailed)
@@ -286,14 +292,19 @@ func TestAdminRequestIntegrationSaveNormalizesBaseURL(t *testing.T) {
 	if created.Code != 201 || !strings.Contains(created.Body.String(), `"base_url":"http://10.0.0.5:8989"`) {
 		t.Fatal(created.Code, created.Body.String())
 	}
+	virtualBody := strings.Replace(requestIntegrationBody, `"https://router.example.test"`, `"virtual://streaming/"`, 1)
+	createdVirtual := do(t, h, http.MethodPost, Prefix+"/admin/request-integrations", virtualBody, actingRequestAdmin)
+	if createdVirtual.Code != 201 || !strings.Contains(createdVirtual.Body.String(), `"base_url":"virtual://streaming"`) {
+		t.Fatal(createdVirtual.Code, createdVirtual.Body.String())
+	}
 	bad := strings.Replace(requestIntegrationBody, `"https://router.example.test"`, `"ftp://10.0.0.5"`, 1)
 	refused := do(t, h, http.MethodPost, Prefix+"/admin/request-integrations", bad, actingRequestAdmin)
 	requireProblem(t, refused, TypeValidationFailed)
 	if !strings.Contains(refused.Body.String(), `"body.base_url"`) {
 		t.Fatal(refused.Body.String())
 	}
-	if f.writes != 1 {
-		t.Fatalf("writes = %d, want only the valid create", f.writes)
+	if f.writes != 2 {
+		t.Fatalf("writes = %d, want only the valid creates", f.writes)
 	}
 }
 func TestAdminRequestLimitsModerationAndOptions(t *testing.T) {

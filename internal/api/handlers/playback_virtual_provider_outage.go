@@ -207,6 +207,23 @@ func virtualStartUnresolvedTerminalV3(resolveErr error) playback.DecisionRespons
 	}
 }
 
+// virtualSubstitutionReasonV3 classifies why a fresh start resolved to a
+// release other than the one the viewer requested, into the additive
+// substitution_reason wire value. A transient provider-listing outage and a
+// confirmed-dead pin are both listing failures; every other cause is left
+// unknown rather than guessed from a message.
+func virtualSubstitutionReasonV3(resolveErr error) string {
+	switch {
+	case errors.Is(resolveErr, ErrVirtualCandidateMarkedFailed):
+		// The requested release is confirmed dead, not merely unreachable.
+		return substitutionReasonDeadReleaseV3
+	case virtualProviderListingOutage(resolveErr):
+		return substitutionReasonListingFailedV3
+	default:
+		return substitutionReasonUnknownV3
+	}
+}
+
 // sleepWithContext waits for d or returns false when ctx is canceled first.
 func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {

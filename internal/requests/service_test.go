@@ -4058,6 +4058,98 @@ func TestSubmitApprovedSkipsConnectionWithEmptyKey(t *testing.T) {
 	}
 }
 
+func TestSubmitApprovedUsesVirtualRouterConnectionWithoutAPIKey(t *testing.T) {
+	store := newFakeStore()
+	install := 0
+	virt := Integration{
+		ID:             "virt-1",
+		Name:           "Virtual Library",
+		Enabled:        true,
+		CapabilityID:   VirtualLibraryRequestsCapability,
+		InstallationID: &install,
+		BaseURL:        "virtual://streaming",
+		APIKeyRef:      "",
+	}
+	store.integrations = []Integration{virt}
+	router := &fakeRouterProvider{
+		targetsOverride: []RouterTarget{
+			{Quality: Quality1080p, ConnectionID: "virt-1", ExternalID: "v-1", Status: StatusQueued},
+		},
+	}
+	svc := newTestService(store)
+	svc.SetRouterProvider(router)
+
+	req := Request{ID: "r1", MediaType: MediaTypeMovie, Status: StatusApproved, Outcome: OutcomeActive, RequestedByUserID: 7}
+	store.requests["r1"] = &req
+	got, err := svc.submitApprovedRequest(context.Background(), req, Viewer{UserID: 7, IsAdmin: true}, nil)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if got.Outcome != OutcomeActive || got.LastError != "" {
+		t.Fatalf("request = %+v, want active without error", got)
+	}
+	if router.fulfillCalls != 1 {
+		t.Fatalf("fulfill calls = %d, want 1", router.fulfillCalls)
+	}
+	if len(router.gotConns) != 1 {
+		t.Fatalf("got %d conns, want 1", len(router.gotConns))
+	}
+	if router.gotConns[0].APIKey != "core-managed" {
+		t.Fatalf("conn APIKey = %q, want core-managed", router.gotConns[0].APIKey)
+	}
+	if router.gotConns[0].BaseURL != "virtual://streaming" {
+		t.Fatalf("conn BaseURL = %q, want virtual://streaming", router.gotConns[0].BaseURL)
+	}
+}
+
+func TestRoutedConnectionAllowsVirtualRouterWithoutAPIKey(t *testing.T) {
+	install := 0
+	fc := &fulfillContext{integrations: []Integration{{
+		ID:             "virt-1",
+		Name:           "Virtual Library",
+		Enabled:        true,
+		CapabilityID:   VirtualLibraryRequestsCapability,
+		InstallationID: &install,
+		BaseURL:        "",
+		APIKeyRef:      "",
+	}}}
+	conn, installID, capID, err := routedConnection(fc, RouteDecision{RouteName: "Virtual Route", IntegrationID: "virt-1"}, MediaTypeMovie, Quality1080p)
+	if err != nil {
+		t.Fatalf("routedConnection: %v", err)
+	}
+	if installID != 0 || capID != VirtualLibraryRequestsCapability {
+		t.Fatalf("installID=%d, capID=%q", installID, capID)
+	}
+	if conn.APIKey != "core-managed" {
+		t.Fatalf("APIKey = %q, want core-managed", conn.APIKey)
+	}
+	if conn.BaseURL != "virtual://streaming" {
+		t.Fatalf("BaseURL = %q, want virtual://streaming", conn.BaseURL)
+	}
+}
+
+func TestCreateIntegrationDefaultsVirtualRouterFields(t *testing.T) {
+	store := newFakeStore()
+	svc := newTestService(store)
+	install := 0
+	created, err := svc.CreateIntegration(context.Background(), Viewer{UserID: 1, IsAdmin: true}, Integration{
+		Name:           "Virtual Library",
+		CapabilityID:   VirtualLibraryRequestsCapability,
+		InstallationID: &install,
+		BaseURL:        "",
+		APIKeyRef:      "",
+	})
+	if err != nil {
+		t.Fatalf("CreateIntegration: %v", err)
+	}
+	if created.BaseURL != "virtual://streaming" {
+		t.Fatalf("created.BaseURL = %q, want virtual://streaming", created.BaseURL)
+	}
+	if created.APIKeyRef != "core-managed" {
+		t.Fatalf("created.APIKeyRef = %q, want core-managed", created.APIKeyRef)
+	}
+}
+
 func TestSubmitApprovedSkipsUnknownQuality(t *testing.T) {
 	store := newFakeStore()
 	store.integrations = []Integration{routerInst("router-1")}

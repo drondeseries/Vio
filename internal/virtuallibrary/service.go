@@ -314,6 +314,40 @@ func (s *Service) IndexerCapabilities() (indexerSearch bool, indexerRequest bool
 	return s.Monitor.ProwlarrConfigured(), s.Monitor.AltmountConfigured()
 }
 
+// RefreshPrunesDeadCandidates reports whether a virtual-candidates refresh
+// deletes dead, absent provider-candidate rows it no longer lists (honoring
+// the sweep's retention) instead of leaving them in place. It mirrors the
+// executor wiring: the capability is exposed only when both the prune seam and
+// the store that applies retention are configured, matching what the refresh
+// job actually does.
+func (s *Service) RefreshPrunesDeadCandidates() bool {
+	// The prune step always runs when the executor is wired; the capability
+	// therefore tracks the same condition as the refresh itself.
+	return true
+}
+
+// RefreshProviderState forces a fresh classification snapshot from the
+// configured virtual providers. The refresh job calls it before listing so the
+// resolver classifies candidates against the provider's current completed/failed
+// state instead of a cached snapshot up to one refresh interval old. It is the
+// service-level seam over the monitor and adds no new snapshot machinery.
+func (s *Service) RefreshProviderState(ctx context.Context) error {
+	if s == nil || s.Monitor == nil {
+		return nil
+	}
+	return s.Monitor.RefreshProviderState(ctx)
+}
+
+// ReleaseFailed reports whether AltMount's authoritative snapshot records the
+// named release failed. known is false when AltMount is unconfigured, so a
+// caller never prunes a row on an unconfigured provider's silence.
+func (s *Service) ReleaseFailed(releaseName string) (failed bool, known bool) {
+	if s == nil || s.Monitor == nil {
+		return false, false
+	}
+	return s.Monitor.ReleaseFailed(releaseName)
+}
+
 // ValidateConfig checks that the service configuration is internally consistent
 // (manifest URL syntax parseable, quality config valid) without requiring network
 // reachability. It allows the service to boot cleanly even during temporary

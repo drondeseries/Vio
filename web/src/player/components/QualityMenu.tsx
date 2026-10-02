@@ -11,7 +11,12 @@ import { deriveVersionHealth } from "@/lib/versionHealth";
 import type { EffectiveRecipeV3 } from "../protocol-v3";
 import type { PlayerIndexerRelease, QualityOption } from "../types";
 import { PlayerMenuSurface } from "./PlayerMenuSurface";
-import { serverRankingFromVersions } from "@/pages/ItemDetail/components/versionFormatUtils";
+import {
+  formatScoreBadgeLabel,
+  formatScoreTitle,
+  hasFormatScore,
+  serverRankingFromVersions,
+} from "@/pages/ItemDetail/components/versionFormatUtils";
 
 export interface VersionInfo {
   fileId: number;
@@ -319,13 +324,15 @@ export function QualityMenu({
                       const idx = versionRowStart + versionIndex;
                       const statusLabels = buildVersionStatusLabels(v);
                       const health = versionHealthOf(v);
-                      const hasFormatScore =
-                        typeof v.formatScore === "number" && v.formatScore !== 0;
+                      const hasScore = hasFormatScore(v.formatScore);
+                      // One detail derivation for both lists; `detail` carries the
+                      // shared release+size+hint line, and `releaseName` is only a
+                      // fallback for callers that supply no detail at all.
                       const detailLine = v.detail || v.releaseName;
                       const audioLanguages = v.audioLanguages ?? [];
                       const subtitleLanguages = v.subtitleLanguages ?? [];
                       const hasBadges =
-                        hasFormatScore ||
+                        hasScore ||
                         statusLabels.length > 0 ||
                         audioLanguages.length > 0 ||
                         subtitleLanguages.length > 0;
@@ -356,14 +363,12 @@ export function QualityMenu({
                             </span>
                             {hasBadges && (
                               <span className="flex flex-wrap gap-1">
-                                {hasFormatScore && (
+                                {hasScore && (
                                   <span
                                     className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/60"
-                                    title={`Format score ${v.formatScore}${
-                                      v.profileLabel ? ` · ${v.profileLabel}` : ""
-                                    }`}
+                                    title={formatScoreTitle(v.formatScore!, v.profileLabel)}
                                   >
-                                    ★ {v.formatScore}
+                                    {formatScoreBadgeLabel(v.formatScore!)}
                                   </span>
                                 )}
                                 {statusLabels.map((status) => (

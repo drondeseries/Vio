@@ -28,6 +28,27 @@ const FETCH_STALL_TIMEOUT_MS = 60_000;
 // persistently failing extraction doesn't turn timeupdate into a fetch storm.
 const FETCH_RETRY_BACKOFF_MS = 5_000;
 const FETCH_RETRY_MAX_BACKOFF_MS = 60_000;
+// Consecutive window failures tolerated before the fetcher stops scheduling
+// retries for this track mount — the same terminal-after-budget policy the
+// ASS path (useASSSubtitles) applies to its text fetches. Without it a source
+// that fails every extraction (dead provider relay, broken file) keeps one
+// ffmpeg spawn alive per backoff window for as long as playback runs. A
+// successful window fetch resets the counter; a superseded (seek-replaced)
+// fetch never counts.
+const FETCH_MAX_CONSECUTIVE_FAILURES = 4;
+// Consecutive explicitly-retryable failures tolerated before the fetcher goes
+// terminal for this mount. The server marks 408/429/5xx (except 501/505/506,
+// which signal unimplemented paths rather than transient strain) as
+// retry-after-backoff: burning the 4-deep terminal budget on them turns a
+// seconds-long upstream flap into a permanently stuck "Retrying…". These keep
+// the same backoff loop on a separate, generous budget so a flap recovers
+// while a truly dead source still terminates instead of polling forever.
+const FETCH_MAX_RETRYABLE_FAILURES = 12;
+
+/** True for statuses the server marks retry-after-backoff rather than failed. */
+function isRetryableSubtitleStatus(status: number): boolean {
+  return status === 408 || status === 429 || status === 502 || status === 503 || status === 504;
+}
 
 /**
  * Cues (in source time) and window coverage snapshotted from a track that is
@@ -279,6 +300,19 @@ export function useSubtitleTracks(
     // rotated under this plan and the URL is stale, so the failure branch must
     // not schedule a backoff retry of a URL that can never succeed.
     let sourceChangedSignaled = false;
+    // Consecutive window failures since the last success (seeks superseding a
+    // fetch do not count). Once it reaches FETCH_MAX_CONSECUTIVE_FAILURES the
+    // fetcher stops scheduling retries for this mount — same terminal-budget
+    // policy as useASSSubtitles — and a later successful fetch resets it.
+    let consecutiveFailures = 0;
+    // Consecutive explicitly-retryable failures (502/503/504/429/408) since
+    // the last success. These ride the same backoff loop on their own generous
+    // budget so a transient upstream flap does not spend the terminal budget.
+    let retryableFailures = 0;
+    // HTTP status of the latest window attempt (0 when the fetch never got a
+    // response: network error or stall). Read by the failure branch to route
+    // retryable statuses away from the terminal budget.
+    let lastResponseStatus = 0;
 
     function handleCueChange() {
       const active = track.activeCues;
@@ -352,10 +386,12 @@ export function useSubtitleTracks(
 
       const url = appendPosition(activeUrl, seekStart);
       let succeeded = false;
+      lastResponseStatus = 0;
       try {
         armStallTimer();
         const resp = await fetch(url, { signal: controller.signal });
         if (!resp.ok || !resp.body) {
+          lastResponseStatus = resp.status;
           if (await isSubtitleSourceChanged(resp)) {
             sourceChangedSignaled = true;
             // One signal per source generation: the refresh replan adopts a new
@@ -423,6 +459,8 @@ export function useSubtitleTracks(
           onLoadStateRef.current?.("ready");
           hasFetched = true;
           retryDelay = 0;
+          consecutiveFailures = 0;
+          retryableFailures = 0;
           lastFetchFailureAt = 0;
           // Commit coverage only after the whole window streamed in. A
           // failed or stalled fetch must leave the range uncovered, or the
@@ -447,11 +485,30 @@ export function useSubtitleTracks(
           if (!sourceChangedSignaled) {
             lastFetchFailureAt = Date.now();
             onLoadStateRef.current?.("error");
-            retryDelay = Math.min(
-              retryDelay ? retryDelay * 2 : FETCH_RETRY_BACKOFF_MS,
-              FETCH_RETRY_MAX_BACKOFF_MS,
-            );
-            retryTimer = setTimeout(maybeFetch, retryDelay);
+            if (isRetryableSubtitleStatus(lastResponseStatus)) {
+              // Explicitly retryable (upstream flap, rate limit): same backoff
+              // loop, but on its own generous budget so a seconds-long outage
+              // does not spend the terminal budget and wedge the mount on
+              // "Retrying…".
+              retryableFailures += 1;
+              if (retryableFailures >= FETCH_MAX_RETRYABLE_FAILURES) {
+                consecutiveFailures = FETCH_MAX_CONSECUTIVE_FAILURES;
+              }
+            } else {
+              retryableFailures = 0;
+              consecutiveFailures += 1;
+            }
+            // On the final failure the budget is spent: schedule no retry and
+            // let the spent-budget gate in maybeFetch hold the mount terminal.
+            // A later track rebuild (stream restart, source refresh) starts a
+            // fresh budget.
+            if (consecutiveFailures < FETCH_MAX_CONSECUTIVE_FAILURES) {
+              retryDelay = Math.min(
+                retryDelay ? retryDelay * 2 : FETCH_RETRY_BACKOFF_MS,
+                FETCH_RETRY_MAX_BACKOFF_MS,
+              );
+              retryTimer = setTimeout(maybeFetch, retryDelay);
+            }
           }
         }
       }
@@ -487,6 +544,14 @@ export function useSubtitleTracks(
         return;
       }
       if (lastFetchFailureAt > 0 && Date.now() - lastFetchFailureAt < retryDelay) return;
+      if (consecutiveFailures >= FETCH_MAX_CONSECUTIVE_FAILURES) {
+        // The failure budget is spent: the backoff retry and the
+        // window-coverage path stop scheduling new fetches. A seek outside an
+        // in-flight fetch's range still supersedes it (handled above), and a
+        // track rebuild (stream restart, source refresh) starts a fresh budget
+        // for its own mount.
+        return;
+      }
       if (!hasFetched) {
         fetchWindow(Math.max(0, mediaTime - SEEK_BACKOFF), true);
         return;

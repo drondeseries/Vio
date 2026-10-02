@@ -220,6 +220,30 @@ func (c *altmountStateClient) ReleaseCompleted(releaseKey string) (completed boo
 	return ok, true
 }
 
+// ReleaseFailed reports whether AltMount's authoritative snapshot records the
+// release as failed. known is false when AltMount is unconfigured or the key is
+// empty, so an unconfigured provider is never mistaken for "not failed". It
+// answers from the cached completed/failed snapshot without a network call, and
+// mirrors ReleaseCompleted. It is the read half of the failed verdict that lets
+// a caller holding a persisted candidate row (not just a freshly listed
+// candidate) ask whether the source of truth has branded its release dead.
+func (c *altmountStateClient) ReleaseFailed(releaseKey string) (failed bool, known bool) {
+	if c == nil {
+		return false, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.url == "" {
+		return false, false
+	}
+	key := ReleaseKey(releaseKey)
+	if key == "" {
+		return false, false
+	}
+	_, ok := c.state.Failed[key]
+	return ok, true
+}
+
 func (c *altmountStateClient) Stale() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

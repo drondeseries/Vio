@@ -13,6 +13,10 @@ import type { PlayerSubtitleInfo, VideoFitMode } from "../types";
 import { HLS_DEFAULT_MAX_BUFFER_SIZE_BYTES } from "../utils/bufferPolicy";
 import { HLS_STARTUP_TIMEOUT_MS } from "../utils/hlsStartupGuard";
 import { PENDING_SEEK_HOLD_TIMEOUT_MS } from "../utils/pendingSeek";
+import {
+  buildQualitySummary,
+  buildVersionDetailLine,
+} from "@/pages/ItemDetail/components/versionFormatUtils";
 import { VideoPlayer } from "./VideoPlayer";
 
 const realtimeOptions = vi.hoisted(() => ({
@@ -4415,6 +4419,55 @@ describe("VideoPlayer version switch UX", () => {
 
     // A version with no server score carries no badge value.
     expect(props.versions?.find((v) => v.fileId === 7)?.formatScore).toBeUndefined();
+  });
+
+  it("builds each version row's label and detail from the shared builders", () => {
+    const versionWithHints = {
+      ...versionB,
+      resolution: "2160p",
+      codec_video: "hevc",
+      codec_audio: "TrueHD Atmos",
+      hdr: true,
+      file_size: 50_570_000_000,
+      edition_raw: "Movie.2026.2160p.Remux.50.53GB",
+      audio_tracks: [{ languages: ["en", "fr"] }],
+      subtitle_tracks: [{ language: "deu" }],
+    };
+    renderPlayer({ versions: [versionA, versionWithHints], activeFileId: 7 });
+
+    const props = controls.current as unknown as {
+      versions?: Array<{
+        fileId: number;
+        label: string;
+        releaseName?: string;
+        detail?: string;
+        audioLanguages?: string[];
+        subtitleLanguages?: string[];
+      }>;
+    };
+    const row = props.versions?.find((v) => v.fileId === 99);
+    // The in-player label is the shared one-line summary, not the old inline
+    // template string, so it matches the item-page picker for the same fields.
+    expect(row?.label).toBe(buildQualitySummary(versionWithHints));
+    expect(row?.detail).toBe(buildVersionDetailLine(versionWithHints));
+    expect(row?.releaseName).toBe(buildVersionDetailLine(versionWithHints));
+    expect(row?.label).toContain("Atmos");
+    expect(row?.label).toContain("HEVC");
+    expect(row?.audioLanguages).toEqual(["English", "French"]);
+    expect(row?.subtitleLanguages).toEqual(["German"]);
+  });
+
+  it("labels a bare More-results row through the shared summary", () => {
+    const moreResults = {
+      ...versionB,
+      file_id: 101,
+      container: "virtual",
+      file_path: "virtual://movie/tt1?results=all",
+    };
+    renderPlayer({ versions: [versionA, moreResults], activeFileId: 7 });
+
+    const props = controls.current as unknown as { versions?: Array<{ label: string }> };
+    expect(props.versions?.find((v) => v.label === "More results…")).toBeDefined();
   });
 
   it("shows the quality ellipsis only for quality replans, not track changes", async () => {
