@@ -48,7 +48,11 @@ const certificationHydrationConcurrency = 8
 
 // VirtualLibraryRequestsCapability is the request_router.v1 capability sub-id
 // served by the core virtual library (installation 0), not by a plugin.
-const VirtualLibraryRequestsCapability = "virtual-library-requests"
+const (
+	VirtualLibraryRequestsCapability = "virtual-library-requests"
+	VirtualLibraryBaseURL            = "virtual://streaming"
+	VirtualLibraryAPIKey             = "core-managed"
+)
 
 type EntitlementResolver interface {
 	// MaxPlaybackQuality returns the requester's effective playback-quality
@@ -514,21 +518,29 @@ func (s *Service) resolveRouterConnections(ctx context.Context, fc *fulfillConte
 		// in.APIKeyRef was decrypted by the repo on read; empty means unconfigured.
 		apiKey := strings.TrimSpace(in.APIKeyRef)
 		if apiKey == "" {
-			slog.WarnContext(ctx, "requests: skipping router connection with no api key", "component", "requests", "connection_id", in.ID)
-			continue
+			if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+				apiKey = VirtualLibraryAPIKey
+			} else {
+				slog.WarnContext(ctx, "requests: skipping router connection with no api key", "component", "requests", "connection_id", in.ID)
+				continue
+			}
+		}
+		baseURL := in.BaseURL
+		if isVirtualIntegration(in.InstallationID, in.CapabilityID) && strings.TrimSpace(baseURL) == "" {
+			baseURL = VirtualLibraryBaseURL
 		}
 		// Lock on the first SUCCESSFULLY resolved connection so a skipped
 		// bad-key connection never pins the installation/capability.
 		if !chosen {
 			installationID, capabilityID, chosen = *in.InstallationID, in.CapabilityID, true
 		}
-		conns = append(conns, ResolvedRouterConnection{ID: in.ID, BaseURL: in.BaseURL, APIKey: apiKey, Config: in.PluginConfig})
+		conns = append(conns, ResolvedRouterConnection{ID: in.ID, BaseURL: baseURL, APIKey: apiKey, Config: in.PluginConfig})
 	}
 	if len(conns) == 0 && s.hasActiveDefaultVirtualRouter() {
 		conns = []ResolvedRouterConnection{{
 			ID:      "core-virtual-library",
-			BaseURL: "virtual://streaming",
-			APIKey:  "core-managed",
+			BaseURL: VirtualLibraryBaseURL,
+			APIKey:  VirtualLibraryAPIKey,
 			Config:  map[string]any{},
 		}}
 		return conns, 0, VirtualLibraryRequestsCapability, nil
@@ -555,7 +567,7 @@ func unusableRouterMessage(fc *fulfillContext, mediaType MediaType) string {
 			// plugin install and were never re-bound.
 			return msgRouterUnbound
 		}
-		if strings.TrimSpace(in.APIKeyRef) == "" {
+		if strings.TrimSpace(in.APIKeyRef) == "" && !isVirtualIntegration(in.InstallationID, in.CapabilityID) {
 			return msgRouterNoKey
 		}
 	}
@@ -607,6 +619,9 @@ func (s *Service) hasActiveDefaultVirtualRouter() bool {
 func skippedRouterConnection(fc *fulfillContext, mediaType MediaType) bool {
 	for _, in := range fc.integrations {
 		if eligibleRouterConnection(in, mediaType) && strings.TrimSpace(in.APIKeyRef) == "" {
+			if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+				continue
+			}
 			return true
 		}
 	}
@@ -1528,6 +1543,14 @@ func (s *Service) CreateIntegration(ctx context.Context, viewer Viewer, in Integ
 		return nil, err
 	}
 	in.ID = id
+	if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+		if strings.TrimSpace(in.BaseURL) == "" {
+			in.BaseURL = VirtualLibraryBaseURL
+		}
+		if strings.TrimSpace(in.APIKeyRef) == "" {
+			in.APIKeyRef = VirtualLibraryAPIKey
+		}
+	}
 	if err := validateInstance(&in); err != nil {
 		return nil, err
 	}
@@ -1543,6 +1566,14 @@ func (s *Service) UpdateIntegration(ctx context.Context, viewer Viewer, in Integ
 	}
 	if strings.TrimSpace(in.ID) == "" {
 		return nil, fmt.Errorf("%w: integration id required", ErrInvalidInput)
+	}
+	if isVirtualIntegration(in.InstallationID, in.CapabilityID) {
+		if strings.TrimSpace(in.BaseURL) == "" {
+			in.BaseURL = VirtualLibraryBaseURL
+		}
+		if strings.TrimSpace(in.APIKeyRef) == "" {
+			in.APIKeyRef = VirtualLibraryAPIKey
+		}
 	}
 	if err := validateInstance(&in); err != nil {
 		return nil, err
@@ -1561,6 +1592,10 @@ func (s *Service) UpdateIntegration(ctx context.Context, viewer Viewer, in Integ
 // sub-id is only ever served by it, never by a plugin.
 func isVirtualRouterTarget(installationID int, capabilityID string) bool {
 	return installationID <= 0 || capabilityID == VirtualLibraryRequestsCapability
+}
+
+func isVirtualIntegration(installationID *int, capabilityID string) bool {
+	return capabilityID == VirtualLibraryRequestsCapability || (installationID != nil && *installationID <= 0)
 }
 
 func (s *Service) virtualRouterAvailable() bool {
@@ -1726,13 +1761,20 @@ func (s *Service) LoadIntegrationOptions(ctx context.Context, viewer Viewer, int
 	// address is passed as given: the v2 adapter normalizes it first, and the
 	// frozen v1 route keeps sending what the client submitted.
 	apiKey := strings.TrimSpace(integration.APIKeyRef)
-	if apiKey == "" {
+	if apiKey == "" && !isVirtualIntegration(integration.InstallationID, integration.CapabilityID) {
 		return nil, probeValidation(&ValidationError{FieldErrors: map[string]string{fieldAPIKey: integrationKeyMissing}})
+	}
+	if apiKey == "" && isVirtualIntegration(integration.InstallationID, integration.CapabilityID) {
+		apiKey = VirtualLibraryAPIKey
 	}
 	if s.router == nil || integration.InstallationID == nil {
 		return nil, fmt.Errorf("no fulfillment backend configured")
 	}
-	conn := ResolvedRouterConnection{ID: integration.ID, BaseURL: integration.BaseURL, APIKey: apiKey, Config: integration.PluginConfig}
+	baseURL := integration.BaseURL
+	if strings.TrimSpace(baseURL) == "" && isVirtualIntegration(integration.InstallationID, integration.CapabilityID) {
+		baseURL = VirtualLibraryBaseURL
+	}
+	conn := ResolvedRouterConnection{ID: integration.ID, BaseURL: baseURL, APIKey: apiKey, Config: integration.PluginConfig}
 	options, err := s.router.ListConfigOptions(ctx, *integration.InstallationID, integration.CapabilityID, conn)
 	if err != nil {
 		return nil, classifyIntegrationError(err, integration.CapabilityID)

@@ -65,7 +65,7 @@ func (e *IntegrationUnreachableError) Unwrap() []error {
 
 // normalizeIntegrationBaseURL turns what an admin typed into the address the
 // plugin is given: http:// is assumed when no scheme is given, and a trailing
-// slash is dropped. It refuses anything that is not a plain http(s) address.
+// slash is dropped. It refuses anything that is not a plain http(s) or virtual address.
 func normalizeIntegrationBaseURL(raw string) (string, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -76,9 +76,9 @@ func normalizeIntegrationBaseURL(raw string) (string, error) {
 	}
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Host == "" || parsed.Hostname() == "" ||
-		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "virtual") ||
 		parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
-		return "", fmt.Errorf("%w: base_url must be an http or https address", ErrInvalidInput)
+		return "", fmt.Errorf("%w: base_url must be an http, https, or virtual address", ErrInvalidInput)
 	}
 	return parsed.Scheme + "://" + parsed.Host + strings.TrimRight(parsed.EscapedPath(), "/"), nil
 }
