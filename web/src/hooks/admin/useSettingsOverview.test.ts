@@ -288,6 +288,7 @@ describe("buildSettingsOverview groups", () => {
       "infrastructure",
       "appearance",
       "security",
+      "sign-in",
       "library",
       "playback",
       "downloads",
