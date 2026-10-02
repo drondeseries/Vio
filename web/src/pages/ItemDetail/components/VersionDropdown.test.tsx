@@ -161,11 +161,11 @@ describe("VersionDropdown Refresh List", () => {
     }
 
     await act(async () => {
-      reject(new Error("network"));
+      reject(new Error("provider unreachable"));
       await Promise.resolve();
     });
 
-    expect(await screen.findAllByText(REFRESH_VERSIONS_ERROR)).toHaveLength(2);
+    expect(await screen.findAllByText("provider unreachable")).toHaveLength(2);
     // The known versions stay on screen next to the failure; both controls
     // unlock together.
     expect(dialog.getByRole("button", { name: /2160p/ })).toBeInTheDocument();
@@ -173,6 +173,26 @@ describe("VersionDropdown Refresh List", () => {
     for (const row of dialog.getAllByRole("button", { name: /Refresh List/ })) {
       expect(row).not.toBeDisabled();
     }
+  });
+
+  it("falls back to the generic copy when the failure carries no message", async () => {
+    let reject: (error: unknown) => void = () => {};
+    const onRefreshVersions = vi.fn(
+      () =>
+        new Promise<void>((_resolve, rej) => {
+          reject = rej;
+        }),
+    );
+    const dialog = openPicker(versions, { onRefreshVersions });
+
+    fireEvent.click(dialog.getAllByRole("button", { name: /Refresh List/ })[0]!);
+
+    await act(async () => {
+      reject(new Error(""));
+      await Promise.resolve();
+    });
+
+    expect(await screen.findAllByText(REFRESH_VERSIONS_ERROR)).toHaveLength(2);
   });
 
   it("omits both rows when no refresh handler is wired", () => {

@@ -553,12 +553,12 @@ describe("QualityMenu version list refresh", () => {
   });
 
   it("keeps the version rows, shows the message on both rows, and unlocks them after a failure", async () => {
-    const onRefreshVersions = vi.fn().mockRejectedValue(new Error("network"));
+    const onRefreshVersions = vi.fn().mockRejectedValue(new Error("provider unreachable"));
     renderVersionMenu({ onRefreshVersions });
 
     fireEvent.click(screen.getAllByRole("menuitem", { name: /Refresh List/ })[0]!);
 
-    expect(await screen.findAllByText(REFRESH_VERSIONS_ERROR)).toHaveLength(2);
+    expect(await screen.findAllByText("provider unreachable")).toHaveLength(2);
     // The known candidates stay on screen next to the failure.
     expect(screen.getByRole("menuitem", { name: /1080p H264/ })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /2160p HEVC/ })).toBeInTheDocument();
