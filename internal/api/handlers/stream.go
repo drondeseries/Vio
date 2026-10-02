@@ -2864,6 +2864,15 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			panic(http.ErrAbortHandler)
 		}
 		if !virtualActive || !playback.IsSubtitleStreamMapError(extractErr) {
+			if playback.IsSubtitleUpstreamError(extractErr) {
+				// The relay input 5xxed under ffmpeg: the extraction command
+				// is fine and a retry may succeed once the upstream settles.
+				// Answer retryable rather than failed so the client keeps its
+				// backoff loop instead of spending its terminal budget.
+				clearSubtitleCoverageHeaders(w.Header())
+				writeSubtitleSourceUnavailable(w)
+				return
+			}
 			clearSubtitleCoverageHeaders(w.Header())
 			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
 			return
@@ -2906,6 +2915,11 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			}
 			if playback.IsSubtitleStreamMapError(retryErr) {
 				writeSubtitleSourceChanged(w)
+				return
+			}
+			if playback.IsSubtitleUpstreamError(retryErr) {
+				clearSubtitleCoverageHeaders(w.Header())
+				writeSubtitleSourceUnavailable(w)
 				return
 			}
 			clearSubtitleCoverageHeaders(w.Header())
