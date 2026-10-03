@@ -128578,7 +128578,7 @@ export interface operations {
         /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
         "X-Profile-Token"?: string;
         /** @description The stable device identifier used to resolve playback preferences */
-        "X-Silo-Device-Id"?: string;
+        "X-Vio-Device-Id"?: string;
       };
       path: {
         /** @description A movie or episode */
