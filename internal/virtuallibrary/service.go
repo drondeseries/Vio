@@ -369,8 +369,19 @@ func (s *Service) ValidateConfig() error {
 	if !strings.HasSuffix(parsed.Path, "/manifest.json") {
 		return fmt.Errorf("manifest URL must end in /manifest.json")
 	}
-	if err := s.cfg.Quality.Validate(); err != nil {
+	// Regex-uncompilable custom formats are isolated, not fatal: the
+	// broken rule keeps its source pattern but never matches, while the
+	// library stays up. Every structural problem still fails activation.
+	// Skipped names and pattern-free reasons are warned so the operator
+	// fixes the pattern; settings save rejects bad patterns up front
+	// instead.
+	skipped, err := s.cfg.Quality.ValidateLenient()
+	if err != nil {
 		return fmt.Errorf("validate virtual library quality config: %w", err)
+	}
+	for _, skip := range skipped {
+		slog.Warn("virtual library custom format skipped: invalid regex",
+			"component", "virtuallibrary", "format", skip.Name, "reason", skip.Reason)
 	}
 	return nil
 }
