@@ -608,7 +608,7 @@ func (c *altmountStateClient) fetchQueueSnapshot(ctx context.Context) (altmountS
 	if err != nil {
 		return altmountStateSnapshot{}, errors.New("AltMount queue request failed")
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return altmountStateSnapshot{}, fmt.Errorf("AltMount queue returned status %d", resp.StatusCode)
 	}
