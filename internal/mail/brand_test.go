@@ -69,7 +69,7 @@ func TestBrandLoaderDefaults(t *testing.T) {
 	var nilLoader *BrandLoader
 	for _, loader := range []*BrandLoader{nilLoader, NewBrandLoader(nil)} {
 		brand := loader.Load(context.Background())
-		if brand.Name != "Silo" || brand.AccentColor != "" || !bytes.Equal(brand.logo.png, defaultWordmarkPNG) {
+		if brand.Name != "Vio" || brand.AccentColor != "" || !bytes.Equal(brand.logo.png, defaultWordmarkPNG) {
 			t.Fatalf("want default brand, got name=%q accent=%q", brand.Name, brand.AccentColor)
 		}
 	}

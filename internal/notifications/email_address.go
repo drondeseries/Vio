@@ -160,10 +160,10 @@ func composeVerificationEmail(brand mail.Brand, profileName, verifyURL string) e
 		"This address was entered as the notification destination for %s on a Vio server.", who)))
 	body.WriteString(mail.EmailParagraph("To confirm and start receiving notifications here:"))
 	body.WriteString(mail.EmailButton(brand, "Confirm this address", verifyURL))
-	body.WriteString(fmt.Sprintf(
+	fmt.Fprintf(&body,
 		`<p style="margin:20px 0 0;font:400 12px/1.7 %s;color:%s;">Or paste this link into your browser:<br>`+
 			`<span style="font:400 12px/1.7 %s;word-break:break-all;">%s</span></p>`,
-		mail.EmailFont, mail.EmailColorMuted, mail.EmailFontMono, html.EscapeString(verifyURL)))
+		mail.EmailFont, mail.EmailColorMuted, mail.EmailFontMono, html.EscapeString(verifyURL))
 
 	return emailContent{
 		Subject: "Confirm your Vio notification address",
