@@ -28599,6 +28599,7 @@ export interface components {
        * @enum {string}
        */
       state: "available" | "disabled" | "not_configured" | "unsupported";
+      wait_for_imports: boolean;
     };
     VirtualReleaseRequest: {
       message?: string;

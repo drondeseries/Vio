@@ -1338,12 +1338,20 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var lastProxyErr error
+			// relayNotFound captures a relay-own 404 (unknown/expired token —
+			// upstream 404s arrive collapsed as 502, so a 404 here always
+			// means our registration lapsed, never a dead release).
+			relayNotFound := false
 			proxy := &httputil.ReverseProxy{
 				Rewrite: func(pr *httputil.ProxyRequest) {
 					pr.Out.URL = targetURL
 					pr.Out.Host = targetURL.Host
 				},
 				ModifyResponse: func(res *http.Response) error {
+					if res.StatusCode == http.StatusNotFound {
+						relayNotFound = true
+						return fmt.Errorf("relay token not found")
+					}
 					if res.StatusCode >= http.StatusInternalServerError {
 						return fmt.Errorf("relay returned HTTP %d", res.StatusCode)
 					}
@@ -1397,6 +1405,60 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 					if !handoffAttempted {
+						// The pinned candidate served no bytes. Before
+						// indicting it, one same-release retry covers a
+						// lapsed relay registration: re-resolve mints a
+						// fresh token (no backoff needed — the token, not
+						// time, is the fix). Serving bytes heals without
+						// indictment; anything else falls through to the
+						// existing mark-and-rotate path unchanged.
+						// (Transient 5xx flaps are already retried once at
+						// the relay open phase; retrying them again here
+						// would break the pinned single-relist and
+						// rotation-declaration contracts, so they proceed
+						// straight to indictment and sibling rotation.)
+						if retrySameRelease := relayNotFound; retrySameRelease {
+							sameRetryCtx := withVirtualRelayFreshRegistration(r.Context())
+							sameMedia, sameCleanup, sameErr := h.resolveVirtualInputURIExcluding(sameRetryCtx, file, session.UserID, session.ProfileID, true, nil, false)
+							sameID := ""
+							if sameErr == nil {
+								sameID = sameMedia.CandidateID
+								if sameID == "" {
+									if parsed, err := url.Parse(sameMedia.URI); err == nil {
+										sameID = parsed.Query().Get("result")
+									}
+								}
+							}
+							var expectedID string
+							if parsed, err := url.Parse(file.FilePath); err == nil {
+								expectedID = parsed.Query().Get("result")
+							}
+							if sameErr == nil && (expectedID == "" || sameID == expectedID) {
+								if sameURL, parseErr := url.Parse(sameMedia.URL); parseErr == nil && sameURL.Scheme == "http" {
+									if sameHost := sameURL.Hostname(); sameHost == "127.0.0.1" || sameHost == "::1" || sameHost == "[::1]" {
+										targetURL = sameURL
+										deliveredPath = resolvedVirtualCandidatePath(sameMedia)
+										releaseInput = sameCleanup
+										sameCleanup = nil
+										lastProxyErr = nil
+										relayNotFound = false
+										proxy.ServeHTTP(streamWriter, r)
+									}
+								}
+							}
+							if sameCleanup != nil {
+								sameCleanup()
+							}
+						}
+						if lastProxyErr == nil {
+							// The same-release retry healed: skip indictment
+							// and sibling rotation entirely — the pin just
+							// served bytes. Mirrors the success tail below.
+							if virtualCandidateDeliveryEvidence(streamWriter.StatusCode(), streamWriter.BytesWritten()) {
+								h.clearVirtualCandidateRecovered(r.Context(), file, deliveredPath, virtualObservedFailedAt)
+							}
+							return
+						}
 						// The pinned candidate served no bytes (corrupted NZB, dead
 						// provider URL). Mark it failed and re-resolve with it
 						// excluded so the next-ranked release is tried.
@@ -2871,11 +2933,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 			panic(http.ErrAbortHandler)
 		}
 		if !virtualActive || !playback.IsSubtitleStreamMapError(extractErr) {
-			if playback.IsSubtitleUpstreamError(extractErr) {
-				// The relay input 5xxed under ffmpeg: the extraction command
-				// is fine and a retry may succeed once the upstream settles.
-				// Answer retryable rather than failed so the client keeps its
-				// backoff loop instead of spending its terminal budget.
+			if playback.IsSubtitleUpstreamError(extractErr) || isRelayTokenNotFoundError(extractErr, opts.InputPath) {
+				// The relay input 5xxed under ffmpeg, or our relay token
+				// lapsed mid-flight: the extraction command is fine and a
+				// retry (which re-resolves a fresh token) may succeed.
+				// Answer retryable rather than failed so the client keeps
+				// its backoff loop instead of spending its terminal budget.
 				clearSubtitleCoverageHeaders(w.Header())
 				writeSubtitleSourceUnavailable(w)
 				return
@@ -2924,7 +2987,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 				writeSubtitleSourceChanged(w)
 				return
 			}
-			if playback.IsSubtitleUpstreamError(retryErr) {
+			if playback.IsSubtitleUpstreamError(retryErr) || isRelayTokenNotFoundError(retryErr, opts.InputPath) {
 				clearSubtitleCoverageHeaders(w.Header())
 				writeSubtitleSourceUnavailable(w)
 				return
@@ -3234,6 +3297,28 @@ func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, request
 		"codec", liveTrack.Codec,
 		"language", liveTrack.Language)
 	return true, nil
+}
+
+// isRelayTokenNotFoundError reports whether an ffmpeg extraction failure is
+// a relay-own 404: the relay URL (always loopback) answered 404, which means
+// our registration lapsed (LRU eviction, 24h expiry) — never a dead release,
+// because upstream 404s arrive collapsed as 502. Callers answer retryable so
+// the client's next fetch re-resolves a fresh token instead of spending the
+// terminal budget on our bookkeeping.
+func isRelayTokenNotFoundError(err error, inputPath string) bool {
+	if err == nil {
+		return false
+	}
+	parsed, parseErr := url.Parse(strings.TrimSpace(inputPath))
+	if parseErr != nil || parsed == nil {
+		return false
+	}
+	switch parsed.Hostname() {
+	case "127.0.0.1", "::1":
+	default:
+		return false
+	}
+	return strings.Contains(err.Error(), "Server returned 404")
 }
 
 // clearSubtitleCoverageHeaders removes the bounded-window markers before an

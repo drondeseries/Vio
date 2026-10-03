@@ -61,6 +61,11 @@ const (
 	maxRewrittenPlaylistBytes = 8 << 20
 	maxPlaylistRefs           = 8192
 	remoteFirstByteTimeout    = 30 * time.Second
+	// relayUpstreamOpenRetryBackoff spaces the relay's single open-phase
+	// retry (dial error, timeout, upstream 5xx before any byte flows). One
+	// short pause rides out a momentary flap without stalling a genuinely
+	// dead upstream, which fails again immediately after.
+	relayUpstreamOpenRetryBackoff = 500 * time.Millisecond
 	// remoteBodyIdleTimeout bounds how long a read from the upstream remote
 	// body may pause before the relay gives up on it. Set generously enough
 	// to tolerate transient Usenet provider latency and Altmount reader timeouts.
@@ -1155,10 +1160,34 @@ func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 	}
 	if proxyErr != nil {
 		if !tracked.wroteHeader {
-			http.Error(w, "remote stream unavailable", http.StatusBadGateway)
+			// Preserve the upstream 5xx instead of collapsing everything to
+			// 502: a transient 503 and a dead URL must be distinguishable
+			// downstream (retry vs indict). Upstream 4xx stays collapsed on
+			// purpose — a dead/auth URL keeps failing closed the same way
+			// for rotation.
+			status := http.StatusBadGateway
+			var upstreamErr *upstreamStatusError
+			if errors.As(proxyErr, &upstreamErr) && upstreamErr.status >= 500 && upstreamErr.status <= 599 {
+				status = upstreamErr.status
+			}
+			http.Error(w, "remote stream unavailable", status)
 			return
 		}
 		panic(http.ErrAbortHandler)
+	}
+}
+
+// sleepRelayUpstreamRetry pauses for the open-phase retry, reporting false
+// when the client is already gone (in which case the caller returns the
+// failure immediately instead of sleeping out a dead request).
+func sleepRelayUpstreamRetry(ctx context.Context) bool {
+	timer := time.NewTimer(relayUpstreamOpenRetryBackoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -1279,27 +1308,51 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	// Measure the request send time and the response receive time on the
 	// cache's clock so the entry's corrected age, its expiry and every later
 	// lookup use one time source (injectable in tests).
+	//
+	// The open phase (dial through response headers) gets exactly one retry:
+	// a flap at open (dial error, timeout, upstream 5xx) is the transient
+	// failure this relay otherwise amplifies into a hard 502, while anything
+	// past the first byte is never retried (a partial body cannot be resumed
+	// without range gymnastics). Upstream 4xx, auth rejections, and manifest
+	// paths never retry: those are verdicts, not flaps.
+	var response *http.Response
 	requestSentAt := r.rangeCache.clock()
-	response, err := client.Do(upstream)
-	if err != nil {
-		return errors.New("remote stream request failed")
+	for attempt := 0; ; attempt++ {
+		response, err = client.Do(upstream)
+		if err != nil {
+			if attempt > 0 || !sleepRelayUpstreamRetry(request.Context()) {
+				return errors.New("remote stream request failed")
+			}
+			continue
+		}
+		// An upstream 401/403 means the provider URL behind this registration is no
+		// longer authorized. Record it so a later restart renews the provider
+		// listing instead of reusing a registration that will keep refusing.
+		if relayToken != "" &&
+			(response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
+			r.markUpstreamAuthRejected(relayToken)
+		}
+		// Detect upstream sources that ignore Range headers: when we ask for a
+		// byte range but get back 200 OK (full file), strip Accept-Ranges from
+		// the response so clients don't assume range support and fail on seek.
+		hadRange := upstream.Header.Get("Range") != ""
+		if hadRange && response.StatusCode == http.StatusOK && relayToken != "" {
+			response.Header.Del(headerAcceptRanges)
+		}
+		if response.StatusCode >= 500 && attempt == 0 && sleepRelayUpstreamRetry(request.Context()) {
+			// Retryable open-phase 5xx: close without draining. The
+			// connection just served a 5xx, so connection-reuse hygiene is
+			// worthless here — and draining a hanging body would wait out
+			// the full drain cap before the retry even starts. The final
+			// failure path below keeps its bounded drain.
+			// 4xx (including 416) never retries: those are verdicts.
+			_ = response.Body.Close()
+			continue
+		}
+		break
 	}
 	responseReceivedAt := r.rangeCache.clock()
 	defer func() { _ = response.Body.Close() }()
-	// An upstream 401/403 means the provider URL behind this registration is no
-	// longer authorized. Record it so a later restart renews the provider
-	// listing instead of reusing a registration that will keep refusing.
-	if relayToken != "" &&
-		(response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
-		r.markUpstreamAuthRejected(relayToken)
-	}
-	// Detect upstream sources that ignore Range headers: when we ask for a
-	// byte range but get back 200 OK (full file), strip Accept-Ranges from
-	// the response so clients don't assume range support and fail on seek.
-	hadRange := upstream.Header.Get("Range") != ""
-	if hadRange && response.StatusCode == http.StatusOK && relayToken != "" {
-		response.Header.Del(headerAcceptRanges)
-	}
 	if response.StatusCode >= 400 && response.StatusCode != http.StatusRequestedRangeNotSatisfiable {
 		drainCtx, drainCancel := context.WithTimeout(request.Context(), 1*time.Second)
 		defer drainCancel()
@@ -1308,6 +1361,9 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		})
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		stopTimer()
+		if response.StatusCode >= 500 {
+			return &upstreamStatusError{status: response.StatusCode}
+		}
 		return fmt.Errorf("remote stream returned HTTP %d", response.StatusCode)
 	}
 	if isDASHManifestResponse(response, nil) {
@@ -1433,6 +1489,24 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		return nil
 	}
 	return errors.New("read remote media stream")
+}
+
+// upstreamStatusError carries an upstream 5xx through the relay so the
+// handler answers the upstream status instead of collapsing everything to
+// 502. The message keeps the historical "remote stream returned HTTP %d"
+// text so log-based checks still match; only handle() branches on the
+// status. Upstream 4xx stays a plain error (collapsed to 502 downstream) so
+// dead/auth URLs keep failing closed the same way for rotation.
+type upstreamStatusError struct {
+	status int
+}
+
+func (e *upstreamStatusError) Error() string {
+	status := 0
+	if e != nil {
+		status = e.status
+	}
+	return fmt.Sprintf("remote stream returned HTTP %d", status)
 }
 
 type remoteBodyChunk struct {
