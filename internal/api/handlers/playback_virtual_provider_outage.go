@@ -134,6 +134,11 @@ const virtualPendingHoldCap = 10 * time.Second
 // instead of waiting away the retry budget.
 const virtualPendingHoldReserve = 15 * time.Second
 
+// virtualPendingLoopPause spaces startup-loop retries of a pending release
+// so a lapsed input hold (low remaining budget) cannot spin fresh provider
+// listings with no sleep.
+const virtualPendingLoopPause = 1 * time.Second
+
 // waitVirtualPendingHold pauses for an in-flight import, bounded by the hold
 // cap and the caller's remaining budget. It reports whether the caller should
 // re-list: false when the pause would consume the room for the retry resolve,

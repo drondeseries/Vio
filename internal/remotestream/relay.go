@@ -1314,11 +1314,20 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	// failure this relay otherwise amplifies into a hard 502, while anything
 	// past the first byte is never retried (a partial body cannot be resumed
 	// without range gymnastics). Upstream 4xx, auth rejections, and manifest
-	// paths never retry: those are verdicts, not flaps.
+	// verdicts below never retry: those are verdicts, not flaps. (A 5xx
+	// opening a manifest playlist does retry once — harmless and bounded,
+	// and a genuinely broken manifest fails again immediately.)
 	var response *http.Response
 	requestSentAt := r.rangeCache.clock()
 	for attempt := 0; ; attempt++ {
-		response, err = client.Do(upstream)
+		// Clone per iteration: client.Do (via redirect handling) may mutate
+		// the request URL, so retrying with the same *http.Request could
+		// replay a mutated URL. GET/HEAD with no body makes the clone cheap.
+		// requestSentAt tracks the attempt that served the bytes, so a
+		// retried entry's age excludes the backoff sleep.
+		requestSentAt = r.rangeCache.clock()
+		attemptUpstream := upstream.Clone(request.Context())
+		response, err = client.Do(attemptUpstream)
 		if err != nil {
 			if attempt > 0 || !sleepRelayUpstreamRetry(request.Context()) {
 				return errors.New("remote stream request failed")

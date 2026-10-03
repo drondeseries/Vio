@@ -396,6 +396,14 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 						file.FilePath = neutralPath
 					}
 				}
+				// Pause before the fresh retry: the input resolver already
+				// held once, but a lapsed hold (low remaining budget) would
+				// otherwise spin this loop with no sleep, hammering the
+				// provider with fresh listings. One second per attempt is
+				// negligible against the hold cap and bounds the spin.
+				if !sleepWithContext(resolveStartupCtx, virtualPendingLoopPause) {
+					break
+				}
 				continue
 			}
 			failedID := resolvedMedia.CandidateID
@@ -956,9 +964,12 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 			// A release AltMount is actively fetching is worth waiting for,
 			// not skipping: hold briefly for the import, then re-list once
 			// (forced, so a flip to completed is picked up) and take whatever
-			// that answer is. A lapsed hold degrades to the pending error,
-			// which callers handle like any unresolvable release — except
-			// the startup loop, which must not indict it (see below).
+			// that answer is. The retry carries the caller's exclusions and
+			// rotation intent unchanged (no outage marker: a progressing
+			// download is not an outage, so outage budgets must not move).
+			// A lapsed hold degrades to the pending error, which callers
+			// handle like any unresolvable release — except the startup
+			// loop, which must not indict it (see below).
 			if errors.Is(err, virtuallibrary.ErrProviderPending) && waitVirtualPendingHold(ctx) {
 				res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
 					ctx, virtualURI, ownerInstallationID, userID, profileID, true, excludedCandidateIDs, preferredCandidateID,

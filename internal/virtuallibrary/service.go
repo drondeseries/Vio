@@ -329,9 +329,13 @@ func (s *Service) RefreshPrunesDeadCandidates() bool {
 // WaitForImports reports whether playback waits (bounded) for a release
 // AltMount is actively fetching instead of skipping it. It mirrors the
 // hold wiring: the wait runs when the AltMount queue state is available to
-// classify a release as downloading.
+// classify a release as downloading. False when AltMount is unconfigured,
+// so the capability never promises a wait the resolver cannot classify for.
 func (s *Service) WaitForImports() bool {
-	return true
+	if s == nil || s.Monitor == nil {
+		return false
+	}
+	return s.Monitor.AltmountConfigured()
 }
 
 // RefreshProviderState forces a fresh classification snapshot from the

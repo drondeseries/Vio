@@ -534,10 +534,9 @@ func (c *altmountStateClient) refresh(ctx context.Context) error {
 	c.mu.Lock()
 	previousCompleted := c.state.Completed
 	merged := mergeAltmountSnapshots(c.state, incoming, time.Now())
-	c.state = merged
-	c.lastFetch = time.Now()
-	c.lastErr = nil
-	indexFile := c.indexFile
+	// Carry the existing in-flight map through the history merge (which only
+	// covers terminal states); prune below applies its short retention.
+	merged.Downloading = c.state.Downloading
 	c.mu.Unlock()
 	// In-flight slots are best-effort: an AltMount without queue support (or
 	// a transient queue failure) must not disturb the history state that
@@ -548,27 +547,15 @@ func (c *altmountStateClient) refresh(ctx context.Context) error {
 		slog.WarnContext(ctx, "AltMount queue request failed; keeping history state",
 			"component", "altmount", "error", queueErr)
 	} else {
-		c.mu.Lock()
-		merged := c.state
-		if merged.Downloading == nil {
-			merged.Downloading = map[string]altmountReleaseRecord{}
-		} else {
-			for key := range merged.Downloading {
-				delete(merged.Downloading, key)
-			}
-		}
-		for key, record := range queueSnapshot.Downloading {
-			merged.Downloading[key] = record
-		}
-		c.state = pruneAltmountSnapshot(merged, time.Now())
-		merged = c.state
-		c.mu.Unlock()
-		if indexFile != "" {
-			if err := saveAltmountState(indexFile, merged); err != nil {
-				return err
-			}
-		}
+		merged.Downloading = queueSnapshot.Downloading
 	}
+	merged = pruneAltmountSnapshot(merged, time.Now())
+	c.mu.Lock()
+	c.state = merged
+	c.lastFetch = time.Now()
+	c.lastErr = nil
+	indexFile := c.indexFile
+	c.mu.Unlock()
 	if indexFile != "" {
 		if err := saveAltmountState(indexFile, merged); err != nil {
 			return err
@@ -1115,7 +1102,50 @@ func (c *altmountStateClient) Validate(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse AltMount history: %w", err)
 	}
-	return fmt.Sprintf("AltMount history OK: %d completed, %d failed releases", len(snapshot.Completed), len(snapshot.Failed)), nil
+	status := fmt.Sprintf("AltMount history OK: %d completed, %d failed releases", len(snapshot.Completed), len(snapshot.Failed))
+	// Probe queue reachability best-effort: the pending verdict needs it, but
+	// an AltMount without queue support (or a transient failure) must not
+	// fail validation that history already passed.
+	if queueStatus, queueErr := c.validateQueue(ctx, key); queueErr != nil {
+		status += "; queue unavailable"
+	} else {
+		status += "; " + queueStatus
+	}
+	return status, nil
+}
+
+// validateQueue probes the SABnzbd queue endpoint for TestConnection. It
+// reports reachability only and never fails validation: history already
+// passed, and older AltMount builds may not serve the queue mode.
+func (c *altmountStateClient) validateQueue(ctx context.Context, apiKey string) (string, error) {
+	queueURL, err := c.queueURL()
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, queueURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	if apiKey != "" {
+		q := req.URL.Query()
+		q.Set("apikey", apiKey)
+		req.URL.RawQuery = q.Encode()
+	}
+	validateClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := validateClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("AltMount queue returned HTTP %d", resp.StatusCode)
+	}
+	snapshot, err := parseAltmountQueue(io.LimitReader(resp.Body, maxAltmountBodyBytes+1), time.Now())
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("queue OK: %d downloading", len(snapshot.Downloading)), nil
 }
 
 // --- Release-identity and HTTP helpers ported verbatim with the AltMount
@@ -1139,7 +1169,7 @@ func releaseNameKey(value string) string {
 	if idx := strings.IndexAny(value, "?#"); idx != -1 {
 		value = value[:idx]
 	}
-	for _, ext := range []string{".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".webm"} {
+	for _, ext := range []string{".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".webm", ".nzb"} {
 		value = strings.TrimSuffix(value, ext)
 	}
 	return prowlarrCleanPattern.ReplaceAllString(value, "")

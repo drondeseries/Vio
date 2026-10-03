@@ -322,13 +322,22 @@ func (e *VirtualCandidatesRefreshExecutor) Execute(ctx context.Context, req admi
 
 	// Count freshly listed candidates AltMount is still fetching: these are
 	// the releases playback will wait for rather than skip. Best-effort and
-	// informational only.
+	// informational only. Counted per release, not per variant: one release
+	// with several result= variants is one pending release.
 	if e.ReleaseDownloading != nil {
+		seen := make(map[string]struct{})
 		for _, stream := range streams {
-			if name := strings.TrimSpace(stream.ProviderReleaseName); name != "" {
-				if downloading, known := e.ReleaseDownloading(name); known && downloading {
-					result.PendingCandidates++
-				}
+			name := strings.TrimSpace(stream.ProviderReleaseName)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			if downloading, known := e.ReleaseDownloading(name); known && downloading {
+				result.PendingCandidates++
 			}
 		}
 	}

@@ -165,3 +165,29 @@ func TestParseAltmountQueueRecordsDownloading(t *testing.T) {
 		t.Fatal("downloading release missing from snapshot")
 	}
 }
+
+// TestQueueFilenameMatchesBadgedProviderCandidate proves a queue slot filed
+// under its NZB name classifies a provider candidate carrying the same
+// release with badge/size lines as pending: both sides reduce to the same
+// release key despite extensions, badges, and multiline display text.
+func TestQueueFilenameMatchesBadgedProviderCandidate(t *testing.T) {
+	payload := `{"queue":{"slots":[` +
+		`{"filename": "My.Movie.2024.1080p.WEB-DL.x264-GRP.nzb", "status": "Downloading", "mbleft": "100", "timeleft": "0:01:00"}` +
+		`]}}`
+	snapshot, err := parseAltmountQueue(strings.NewReader(payload), time.Now())
+	if err != nil {
+		t.Fatalf("parseAltmountQueue: %v", err)
+	}
+	client := newAltmountStateClient(nil)
+	client.state = snapshot
+	candidates := []stream.StreamCandidate{{
+		Name: "My.Movie.2024.1080p.WEB-DL.x264-GRP\n1.2 GB\n⚡ cached",
+	}}
+	client.ClassifyCandidates(candidates)
+	if !candidates[0].SourcePending {
+		t.Fatal("badged provider candidate was not marked pending from its queue filename")
+	}
+	if candidates[0].SourceFailed {
+		t.Fatal("pending candidate must never be marked failed")
+	}
+}

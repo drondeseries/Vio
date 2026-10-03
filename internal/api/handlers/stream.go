@@ -1498,6 +1498,16 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 								}
 								lastProxyErr = fmt.Errorf("refreshed candidate %q does not match pinned candidate %q", refreshedMedia.CandidateID, expectedCandidateID)
 							} else {
+								// Release any adopted registration first: the
+								// same-release retry above may hold one, and
+								// overwriting it would leak it until LRU/24h
+								// expiry. The original flow always arrives
+								// with nil here (released at failure entry),
+								// so this is a no-op there.
+								if releaseInput != nil {
+									releaseInput()
+									releaseInput = nil
+								}
 								releaseInput = refreshCleanup
 								refreshedURL, parseErr := url.Parse(refreshedMedia.URL)
 								if parseErr == nil && refreshedURL.Scheme == "http" {
