@@ -150,6 +150,102 @@ interface PlaybackSessionErrorState {
   retryable?: boolean;
 }
 
+/**
+ * A realtime push held back while a start, switch, or replan owns the session.
+ *
+ * Arrival order is preserved so a flush never replays a newer source commit
+ * before an older inventory revision. Each entry carries the adoption
+ * generation and the session/plan identities it arrived under, so the flush
+ * decides against the adoption that actually won rather than the rendered state,
+ * which still describes the outgoing source at a settle path.
+ */
+interface DeferredPushBase {
+  /** Local, monotonically increasing arrival order. */
+  seq: number;
+  /** The adoption generation (`loadSequence`) that owned the session. */
+  generation: number;
+  /** The session id at arrival. */
+  sessionId: string | null;
+  /**
+   * The effective identity of the plan in force at arrival. A deferred push is
+   * captured while its own plan is being replaced, so this describes the
+   * outgoing source; it disambiguates a stale push that names outgoing
+   * candidates the settled plan cannot (two virtual candidates share a file).
+   */
+  plan: { fileId: number | null; uri: string | null };
+  identity: { fileId: number | null; uri: string | null };
+}
+
+type DeferredPush =
+  | (DeferredPushBase & {
+      kind: "source";
+      source: {
+        effectiveMediaFileId?: number | null;
+        effectiveVirtualUri?: string | null;
+        inventoryStatus?: string | null;
+      };
+      audioTracks: PlayerAudioTrack[];
+    })
+  | (DeferredPushBase & { kind: "inventory"; payload: PlaybackInventoryUpdatedPayload });
+
+type DeferredPushInput =
+  | {
+      kind: "source";
+      identity: DeferredPushBase["identity"];
+      source: {
+        effectiveMediaFileId?: number | null;
+        effectiveVirtualUri?: string | null;
+        inventoryStatus?: string | null;
+      };
+      audioTracks: PlayerAudioTrack[];
+    }
+  | {
+      kind: "inventory";
+      identity: DeferredPushBase["identity"];
+      payload: PlaybackInventoryUpdatedPayload;
+    };
+
+/**
+ * Whether a held-back push's identity is vouched for by the settled plan.
+ *
+ * The plan is the adoption that won; the rendered session state still names the
+ * outgoing source here, so it must not be consulted. A push that names no
+ * identity cannot be tied to any source and is rejected, as is a candidate the
+ * plan contradicts: two virtual candidates can share one file id, so file
+ * equality alone never proves ownership.
+ */
+function deferredIdentityMatchesPlan(
+  identity: { fileId: number | null; uri: string | null },
+  plan: PlanV3,
+): boolean {
+  const { fileId, uri } = identity;
+  const planFileId = plan.effective_media_file_id;
+  const planUri = plan.effective_virtual_uri ?? null;
+  if (fileId == null && uri == null) return false;
+  if (fileId != null && fileId !== planFileId) return false;
+  if (uri != null && planUri != null && uri !== planUri) return false;
+  // A file-only push cannot be distinguished from another candidate that shares
+  // the file when the settled plan names a concrete candidate URI.
+  if (uri == null && planUri != null) return false;
+  return true;
+}
+
+/**
+ * Whether a held-back push's identity names the source the session was leaving.
+ *
+ * Only meaningful when the settled plan cannot name the candidate it adopted
+ * (the v2 wire omits `effective_virtual_uri`): there a push naming the outgoing
+ * candidate is a stale carrier, while one naming a different candidate may be
+ * the incoming source the deferral exists to carry. When the plan does name a
+ * candidate, {@link deferredIdentityMatchesPlan} already distinguishes them.
+ */
+function deferredIdentityIsOutgoing(
+  identity: { fileId: number | null; uri: string | null },
+  outgoing: { fileId: number | null; uri: string | null },
+): boolean {
+  return identity.uri != null && identity.uri === outgoing.uri;
+}
+
 /** A start body plus the optional force-relink flag the retry path adds. */
 type StartRequestWithForceRelinkV3 = StartRequestV3 & { force_relink?: boolean };
 
@@ -214,9 +310,14 @@ export interface UsePlaybackSessionResult extends PlaybackSessionState {
    * request no richer than the current inventory is ignored. When `fileId`
    * names a different file — a poll that resolved the effective virtual
    * candidate while the plan still names the collapsed row — the inventory is
-   * for another target and replaces the menu wholesale.
+   * for another target and replaces the menu wholesale, and `effectiveVirtualUri`
+   * re-keys the live identity so the version menu follows that candidate too.
    */
-  applyAudioInventory: (tracks: PlayerAudioTrack[], fileId?: number | null) => void;
+  applyAudioInventory: (
+    tracks: PlayerAudioTrack[],
+    fileId?: number | null,
+    effectiveVirtualUri?: string | null,
+  ) => void;
   /**
    * Adopts the effective version a transport just committed to, and that
    * release's declared audio inventory, from the realtime `source_committed`
@@ -584,6 +685,39 @@ export function usePlaybackSession(
   // without comparing plan identity (which a rotation can move).
   const inventoryRevisionRef = useRef<string | null>(null);
   const appliedInventoryRevisionsRef = useRef<Set<string>>(new Set());
+  // Identity-carrying pushes dropped while a start/switch/replan owns the
+  // session. Applying them immediately would mutate the menus under the pending
+  // replacement, but discarding them loses the only carrier of the incoming
+  // source's virtual identity: the v2 wire omits `effective_virtual_uri`, so the
+  // replacement plan may not name the candidate the push does. They are held in
+  // one arrival-ordered queue and replayed once that operation settles and the
+  // settled plan can vouch for the source. The order matters: a source commit
+  // and an inventory revision for the same source must fold in the order the
+  // server sent them, so a newer source is never overwritten by an older
+  // inventory and vice versa.
+  const deferredPushesRef = useRef<DeferredPush[]>([]);
+  const deferredPushSeqRef = useRef(0);
+  const deferredFlushTimerRef = useRef<number | null>(null);
+  // Late-bound sink: the flusher is defined later in the render, after the
+  // fold callbacks it closes over, so the interval reads it through this ref.
+  const flushDeferredPushesRef = useRef<() => void>(() => {});
+  // A bounded retry cadence so a push dropped while a start/switch/replan owns
+  // the session is still folded in when that operation settles without a signal
+  // this hook observes. The settle paths call the flusher directly; this is the
+  // backstop for the fast pending/declared start.
+  useEffect(() => {
+    deferredFlushTimerRef.current = window.setInterval(() => {
+      if (deferredPushesRef.current.length > 0) {
+        flushDeferredPushesRef.current();
+      }
+    }, 2_000);
+    return () => {
+      if (deferredFlushTimerRef.current !== null) {
+        window.clearInterval(deferredFlushTimerRef.current);
+        deferredFlushTimerRef.current = null;
+      }
+    };
+  }, []);
   // Latest-wins coalescing for version switches: while a switch is in flight,
   // a second click records the newest target here instead of being dropped, and
   // the completion handler starts the switch to it immediately.
@@ -908,6 +1042,7 @@ export function usePlaybackSession(
       planRef.current = null;
       sessionIdRef.current = null;
       planAttemptIdRef.current = randomUUID();
+      deferredPushesRef.current = [];
       setState((current) => {
         if (current.sessionId !== expectedSessionId) return current;
         return {
@@ -1042,6 +1177,7 @@ export function usePlaybackSession(
         planRef.current = null;
         sessionIdRef.current = null;
         planAttemptIdRef.current = randomUUID();
+        deferredPushesRef.current = [];
         setState((current) => ({
           ...current,
           plan: null,
@@ -1226,6 +1362,10 @@ export function usePlaybackSession(
         retirePreviousSession(nextError);
       } finally {
         endAdoption(loadSequence);
+        // A push deferred while this start/replan owned the session has waited
+        // long enough: fold it in now that the sequence has no adoption left in
+        // flight, so the incoming identity follows the plan that won.
+        flushDeferredPushesRef.current();
       }
     },
     [
@@ -1261,6 +1401,7 @@ export function usePlaybackSession(
     playbackStartedRef.current = false;
     inventoryRevisionRef.current = null;
     appliedInventoryRevisionsRef.current.clear();
+    deferredPushesRef.current = [];
     // A new request re-derives Auto intent from its own props: without this,
     // the previous request's armed/disarmed state leaks into the new session.
     // Inline (not setAutoFallback: that callback is declared below this
@@ -1602,6 +1743,10 @@ export function usePlaybackSession(
         // Last: a queued replan dispatched just above has already counted
         // itself in, so waiters are not woken between the two links of a chain.
         endAdoption(loadSequence);
+        // Fold any push deferred while this replan owned the session. When a
+        // queued replan was just dispatched this is a no-op (the guard sees it
+        // in flight) and that link's own settle path flushes instead.
+        flushDeferredPushesRef.current();
       }
     },
     [
@@ -1847,32 +1992,63 @@ export function usePlaybackSession(
    * authoritative, so a poorer catalog row never overwrites it. When `fileId`
    * names another file (a poll that resolved the effective virtual candidate
    * while the plan names the collapsed row) the inventory belongs to a different
-   * target, so it replaces the menu even when it is not larger. The plan object
-   * and its revisions are untouched, so menus re-render while the transport
-   * keeps playing.
+   * target, so it replaces the menu even when it is not larger, and the live
+   * identity is re-keyed to that file and resolved virtual URI so the version
+   * menu follows the same source the inventory does. The plan object and its
+   * revisions are untouched, so menus re-render while the transport keeps
+   * playing.
    */
-  const applyAudioInventory = useCallback((tracks: PlayerAudioTrack[], fileId?: number | null) => {
-    if (tracks.length === 0) return;
-    setState((current) => {
-      const sameFile = fileId == null || fileId === current.mediaFileId;
-      if (
-        sameFile &&
-        !current.audioInventoryProvisional &&
-        tracks.length <= current.planAudioTracks.length
-      ) {
-        return current;
-      }
-      return {
-        ...current,
-        planAudioTracks: tracks.map((track) => ({ ...track })),
-        // Catalog tracks are probe-persisted, so folding them in is the probed
-        // evidence the provisional marker was waiting for.
-        audioInventoryProvisional: false,
-      };
-    });
-  }, []);
+  const applyAudioInventory = useCallback(
+    (tracks: PlayerAudioTrack[], fileId?: number | null, effectiveVirtualUri?: string | null) => {
+      setState((current) => {
+        const sameFile = fileId == null || fileId === current.mediaFileId;
+        const nextFileId = sameFile ? current.mediaFileId : (fileId ?? current.mediaFileId);
+        // Keep the current URI when the caller names no candidate: an ordinary
+        // version switch moves by id alone and must not clear a rotation's
+        // effective candidate under it. A virtual poll always names the resolved
+        // path, so a moved candidate re-keys here.
+        const nextUri =
+          effectiveVirtualUri === undefined
+            ? current.effectiveVirtualUri
+            : (effectiveVirtualUri ?? null);
+        const identityChanged =
+          nextFileId !== current.mediaFileId || nextUri !== current.effectiveVirtualUri;
+        // A candidate URI that moved under the same file id is an authoritative
+        // identity update even when the catalog list is the same length or
+        // empty: the live source changed, so the menu must follow it. Only a
+        // same-identity list is held to the enrichment guard.
+        if (!identityChanged) {
+          if (tracks.length === 0) return current;
+          if (
+            !current.audioInventoryProvisional &&
+            tracks.length <= current.planAudioTracks.length
+          ) {
+            return current;
+          }
+        }
+        if (identityChanged) {
+          // The revision set is scoped to the plan identity; a moved live
+          // identity means a stale re-delivery of an earlier revision must not
+          // be treated as already folded.
+          appliedInventoryRevisionsRef.current.clear();
+        }
+        return {
+          ...current,
+          mediaFileId: nextFileId,
+          effectiveVirtualUri: nextUri,
+          planAudioTracks: tracks.map((track) => ({ ...track })),
+          // Catalog tracks are probe-persisted, so a non-empty fold is the probed
+          // evidence the provisional marker was waiting for. An empty list on a
+          // moved identity carries no evidence, so the menu stays marked rather
+          // than claiming a verified empty inventory.
+          audioInventoryProvisional: tracks.length === 0,
+        };
+      });
+    },
+    [],
+  );
 
-  const applyCommittedSource = useCallback(
+  const foldCommittedSource = useCallback(
     (
       source: {
         effectiveMediaFileId?: number | null;
@@ -1881,23 +2057,6 @@ export function usePlaybackSession(
       },
       audioTracks: PlayerAudioTrack[],
     ) => {
-      // A replacement start is rebuilding the session and its plan is the
-      // authority for identity and inventory. A rotation on the outgoing
-      // transport must not mutate the menus under the pending replacement, nor
-      // move the live identity the chained-switch completion compares against.
-      // Drop the push. When it actually moved the source, the queued
-      // chained-switch position was captured against the outgoing timeline, so
-      // discard it and let the chained switch seek from the live playhead.
-      if (switchingRef.current || stateRef.current.replacing) {
-        const current = stateRef.current;
-        const movedSource =
-          (source.effectiveMediaFileId != null &&
-            source.effectiveMediaFileId !== current.mediaFileId) ||
-          (source.effectiveVirtualUri != null &&
-            source.effectiveVirtualUri !== current.effectiveVirtualUri);
-        if (movedSource) pendingSwitchPositionRef.current = null;
-        return;
-      }
       setState((current) => {
         const nextFileId = source.effectiveMediaFileId ?? current.mediaFileId;
         const nextUri = source.effectiveVirtualUri ?? current.effectiveVirtualUri;
@@ -1934,6 +2093,82 @@ export function usePlaybackSession(
       });
     },
     [],
+  );
+
+  /**
+   * Captures a push that arrived while a start/switch/replan owned the session.
+   *
+   * The entry records the adoption generation and the session/plan identities
+   * in force at arrival, so the flush can tell which adoption it belongs to
+   * without reading the outgoing rendered state.
+   */
+  const captureDeferredPush = useCallback((input: DeferredPushInput) => {
+    const currentPlan = planRef.current;
+    const base: DeferredPushBase = {
+      seq: deferredPushSeqRef.current++,
+      generation: loadSequenceRef.current,
+      sessionId: sessionIdRef.current,
+      plan: {
+        fileId: currentPlan?.effective_media_file_id ?? null,
+        uri: currentPlan?.effective_virtual_uri ?? null,
+      },
+      identity: input.identity,
+    };
+    deferredPushesRef.current.push(
+      input.kind === "source"
+        ? {
+            ...base,
+            kind: "source",
+            source: input.source,
+            audioTracks: input.audioTracks,
+          }
+        : { ...base, kind: "inventory", payload: input.payload },
+    );
+  }, []);
+
+  const applyCommittedSource = useCallback(
+    (
+      source: {
+        effectiveMediaFileId?: number | null;
+        effectiveVirtualUri?: string | null;
+        inventoryStatus?: string | null;
+      },
+      audioTracks: PlayerAudioTrack[],
+      identity?: { fileId: number | null; uri: string | null },
+    ) => {
+      // A replacement start is rebuilding the session and its plan is the
+      // authority for identity and inventory. A rotation on the outgoing
+      // transport must not mutate the menus under the pending replacement, nor
+      // move the live identity the chained-switch completion compares against.
+      // Defer the push instead of discarding it: for a fast pending/declared
+      // start the replacement plan may not name the candidate this push does
+      // (the v2 wire omits `effective_virtual_uri`), so this is the only
+      // carrier of the incoming source identity. When it actually moved the
+      // source, the queued chained-switch position was captured against the
+      // outgoing timeline, so discard that position and let the chained switch
+      // seek from the live playhead.
+      const currentState = stateRef.current;
+      if (switchingRef.current || currentState.replacing) {
+        const movedSource =
+          (source.effectiveMediaFileId != null &&
+            source.effectiveMediaFileId !== currentState.mediaFileId) ||
+          (source.effectiveVirtualUri != null &&
+            source.effectiveVirtualUri !== currentState.effectiveVirtualUri);
+        if (movedSource) pendingSwitchPositionRef.current = null;
+        captureDeferredPush({
+          kind: "source",
+          source,
+          audioTracks,
+          identity: identity ?? {
+            fileId: source.effectiveMediaFileId ?? null,
+            uri: source.effectiveVirtualUri ?? null,
+          },
+        });
+        return;
+      }
+      foldCommittedSource(source, audioTracks);
+    },
+    [captureDeferredPush, foldCommittedSource],
   );
 
   /**
@@ -1996,45 +2231,17 @@ export function usePlaybackSession(
   );
 
   /**
-   * Folds a live inventory revision pushed over the realtime socket into the
-   * session's menus.
+   * The shared inventory fold used by both a direct push and the deferred
+   * flush.
    *
-   * A `source_committed` push re-keys the version and audio menus; this is the
-   * same fold with probe evidence attached: identity and audio through the
-   * status-aware {@link applyCommittedSource}, then the complete subtitle
-   * inventory. Both folds share the replacement-start guard — a pending switch
-   * owns the menus — and neither bumps the plan or transport revision.
+   * Callers have already cleared the switch/replan/source guards, so this only
+   * performs the revision gate — a duplicate or out-of-order revision names one
+   * already folded in and is a documented no-op — then folds the audio list
+   * (with the identity it carries) and the complete subtitle inventory without
+   * bumping the plan or transport revisions.
    */
-  const applyInventoryUpdate = useCallback(
+  const foldInventoryUpdate = useCallback(
     (payload: PlaybackInventoryUpdatedPayload) => {
-      // Mirror applyCommittedSource's guard so a push landing mid-switch does
-      // not mutate the menus under the pending replacement.
-      if (switchingRef.current || stateRef.current.replacing) {
-        const current = stateRef.current;
-        const movedSource =
-          (payload.effective_media_file_id != null &&
-            payload.effective_media_file_id !== current.mediaFileId) ||
-          (payload.effective_virtual_uri != null &&
-            payload.effective_virtual_uri !== current.effectiveVirtualUri);
-        if (movedSource) pendingSwitchPositionRef.current = null;
-        return;
-      }
-      const current = stateRef.current;
-      // Drop pushes that name an outdated source when the player has already
-      // moved to another effective file or virtual candidate.
-      if (
-        (payload.effective_media_file_id != null &&
-          current.mediaFileId != null &&
-          payload.effective_media_file_id !== current.mediaFileId) ||
-        (payload.effective_virtual_uri != null &&
-          current.effectiveVirtualUri != null &&
-          payload.effective_virtual_uri !== current.effectiveVirtualUri)
-      ) {
-        return;
-      }
-      // A duplicate or out-of-order push names a revision already folded in;
-      // the server documents it as a no-op. Checked after the switch guard so a
-      // push dropped under a replacement still applies when it is re-delivered.
       if (
         payload.inventory_revision != null &&
         appliedInventoryRevisionsRef.current.has(payload.inventory_revision)
@@ -2043,11 +2250,8 @@ export function usePlaybackSession(
       }
       const hasIdentity =
         payload.effective_media_file_id != null || payload.effective_virtual_uri != null;
-      // Fold the audio list (and adopt the identity) exactly as a committed
-      // source does. An absent list with a moved identity still re-keys to an
-      // empty menu rather than leaving the outgoing release's tracks.
       if (payload.audio_tracks !== undefined || hasIdentity) {
-        applyCommittedSource(
+        foldCommittedSource(
           {
             effectiveMediaFileId: payload.effective_media_file_id ?? null,
             effectiveVirtualUri: payload.effective_virtual_uri ?? null,
@@ -2056,8 +2260,6 @@ export function usePlaybackSession(
           payload.audio_tracks ?? [],
         );
       }
-      // An explicitly empty verified list is meaningful: the source has no
-      // subtitles, so it clears any declared placeholders and the badge.
       if (payload.subtitle_inventory !== undefined) {
         applySubtitleInventory(
           payload.subtitle_inventory,
@@ -2070,8 +2272,130 @@ export function usePlaybackSession(
         appliedInventoryRevisionsRef.current.add(payload.inventory_revision);
       }
     },
-    [applyCommittedSource, applySubtitleInventory],
+    [foldCommittedSource, applySubtitleInventory],
   );
+
+  /**
+   * Folds a live inventory revision pushed over the realtime socket into the
+   * session's menus.
+   *
+   * A `source_committed` push re-keys the version and audio menus; this is the
+   * same fold with probe evidence attached: identity and audio, then the
+   * complete subtitle inventory. It shares the replacement-start guard with
+   * {@link applyCommittedSource} — a pending switch owns the menus — and neither
+   * bumps the plan or transport revision.
+   */
+  const applyInventoryUpdate = useCallback(
+    (payload: PlaybackInventoryUpdatedPayload) => {
+      const identity = {
+        fileId: payload.effective_media_file_id ?? null,
+        uri: payload.effective_virtual_uri ?? null,
+      };
+      // Mirror applyCommittedSource's guard so a push landing mid-switch does
+      // not mutate the menus under the pending replacement.
+      if (switchingRef.current || stateRef.current.replacing) {
+        const current = stateRef.current;
+        const movedSource =
+          (payload.effective_media_file_id != null &&
+            payload.effective_media_file_id !== current.mediaFileId) ||
+          (payload.effective_virtual_uri != null &&
+            payload.effective_virtual_uri !== current.effectiveVirtualUri);
+        if (movedSource) pendingSwitchPositionRef.current = null;
+        captureDeferredPush({ kind: "inventory", payload, identity });
+        return;
+      }
+      const current = stateRef.current;
+      // A push that names another source than the player is on is normally a
+      // stale delivery. While a replan is in flight it may instead be the
+      // replacement plan's new identity arriving ahead of the response, so
+      // defer it and let the flush decide once the plan settles; the revision
+      // gate then drops it when it was stale after all.
+      if (
+        (payload.effective_media_file_id != null &&
+          current.mediaFileId != null &&
+          payload.effective_media_file_id !== current.mediaFileId) ||
+        (payload.effective_virtual_uri != null &&
+          current.effectiveVirtualUri != null &&
+          payload.effective_virtual_uri !== current.effectiveVirtualUri)
+      ) {
+        if (replanInFlightRef.current) {
+          captureDeferredPush({ kind: "inventory", payload, identity });
+        }
+        return;
+      }
+      foldInventoryUpdate(payload);
+    },
+    [captureDeferredPush, foldInventoryUpdate],
+  );
+
+  /**
+   * Applies identity-carrying pushes that were deferred while a
+   * start/switch/replan owned the session.
+   *
+   * Called from each operation's settle path and from an interval fallback, so
+   * a push dropped during a fast pending/declared start is folded in the moment
+   * the replacement plan lands rather than being lost. The queue is replayed in
+   * arrival order. The settled plan is the adoption that won: a push captured
+   * under another adoption generation, session, or already-replaced plan is
+   * dropped, and an identity the plan contradicts (including a candidate the
+   * plan cannot disambiguate from a same-file sibling) is dropped. A stale
+   * inventory revision still marks itself folded so a later re-delivery does
+   * not re-open the menus.
+   */
+  const flushDeferredPushes = useCallback(() => {
+    // A start/replan owns the session while its adoption is in flight, and a
+    // version switch sets `switchingRef` before it retires the outgoing plan.
+    // The rendered `replacing` flag is stale at a settle path (it is set through
+    // state), so the in-flight adoption count is the reliable signal here.
+    const adoptionInFlight = adoptionsInFlightRef.current.has(loadSequenceRef.current);
+    if (switchingRef.current || replanInFlightRef.current || adoptionInFlight) {
+      return;
+    }
+    const plan = planRef.current;
+    if (!plan) {
+      deferredPushesRef.current = [];
+      return;
+    }
+    const queue = deferredPushesRef.current.slice().sort((a, b) => a.seq - b.seq);
+    if (queue.length === 0) return;
+    deferredPushesRef.current = [];
+    for (const entry of queue) {
+      // Only the adoption that won may be mutated. The rendered state still
+      // describes the outgoing source here, so it is deliberately not consulted.
+      if (entry.generation !== loadSequenceRef.current) continue;
+      // A session change is normally foreign, but the replacement this entry
+      // was queued behind adopts a new session id; an entry captured with an
+      // outgoing plan was carried across exactly that adoption and is allowed
+      // through to the identity checks below.
+      const capturedDuringReplacement = entry.plan.fileId != null || entry.plan.uri != null;
+      if (
+        entry.sessionId != null &&
+        entry.sessionId !== sessionIdRef.current &&
+        !capturedDuringReplacement
+      ) {
+        continue;
+      }
+      // The pending replacement owns its incoming identity: a push that only
+      // names the outgoing candidate is a stale carrier, even when its file id
+      // matches the settled plan (two virtual candidates share a file).
+      if (deferredIdentityIsOutgoing(entry.identity, entry.plan)) continue;
+      if (!deferredIdentityMatchesPlan(entry.identity, plan)) {
+        // The settled plan is authoritative and its own inventory is on screen;
+        // mark a stale revision as folded so a re-delivery is a no-op.
+        if (entry.kind === "inventory" && entry.payload.inventory_revision != null) {
+          inventoryRevisionRef.current = entry.payload.inventory_revision;
+          appliedInventoryRevisionsRef.current.add(entry.payload.inventory_revision);
+        }
+        continue;
+      }
+      if (entry.kind === "source") {
+        foldCommittedSource(entry.source, entry.audioTracks);
+      } else {
+        foldInventoryUpdate(entry.payload);
+      }
+    }
+  }, [foldCommittedSource, foldInventoryUpdate]);
+  flushDeferredPushesRef.current = flushDeferredPushes;
 
   const updatePlaybackState = useCallback((positionSeconds: number, playing: boolean) => {
     if (Number.isFinite(positionSeconds) && positionSeconds >= 0) {
@@ -2165,6 +2489,10 @@ export function usePlaybackSession(
           });
         } finally {
           switchingRef.current = false;
+          // A source push that landed while this switch owned the session was
+          // held back; now that the replacement plan has settled, fold it in if
+          // it still names the file that won.
+          flushDeferredPushesRef.current();
           const latest = pendingSwitchFileIdRef.current;
           const latestPosition = pendingSwitchPositionRef.current;
           pendingSwitchFileIdRef.current = null;

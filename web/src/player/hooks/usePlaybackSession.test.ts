@@ -3652,6 +3652,106 @@ describe("usePlaybackSession plan audio inventory", () => {
     unmount();
   });
 
+  it("re-keys an unchanged-length candidate when only its URI moved under the same file", async () => {
+    const planAudioTracks = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    // The rotation landed on another candidate of the same resolved row: the
+    // file id is unchanged and the catalogue list is the same length, so only
+    // the URI distinguishes the new source.
+    const sameLength = [
+      { codec: "ac3", channels: 2, layout: "stereo", language: "spa", default: true },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 8,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: planAudioTracks,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 8, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    const planRevision = result.current.planRevision;
+    const transportRevision = result.current.transportRevision;
+
+    act(() => result.current.applyAudioInventory(sameLength, 8, "virtual://movie/x?result=B"));
+
+    expect(result.current.mediaFileId).toBe(8);
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual(sameLength);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    // Menu data only: the transport must not reload.
+    expect(result.current.planRevision).toBe(planRevision);
+    expect(result.current.transportRevision).toBe(transportRevision);
+    unmount();
+  });
+
+  it("re-keys a moved candidate with an empty list without claiming a verified inventory", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 8,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              inventory_status: "declared",
+              audio_tracks: [
+                { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 8, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.audioInventoryProvisional).toBe(true);
+
+    act(() => result.current.applyAudioInventory([], 8, "virtual://movie/x?result=B"));
+
+    // The identity moved and the previous release's tracks are gone, but an
+    // empty list is not probe evidence: the menu stays marked.
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual([]);
+    expect(result.current.audioInventoryProvisional).toBe(true);
+    unmount();
+  });
+
   it("keeps the superset guard when the poll names the plan's own file", async () => {
     const planAudioTracks = [
       { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
@@ -4495,6 +4595,724 @@ describe("usePlaybackSession retryable terminals", () => {
     expect(result.current.plan).toBeNull();
     expect(result.current.retrying).toBe(false);
     expect(startCount).toBe(2);
+    unmount();
+  });
+});
+
+describe("usePlaybackSession deferred identity pushes", () => {
+  it("re-keys the live identity when a poll resolves another effective source", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              audio_tracks: [
+                { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    const transportRevision = result.current.transportRevision;
+
+    // A poll resolved the effective virtual candidate while the plan still
+    // names the collapsed row. The inventory and the version identity must
+    // move together.
+    act(() =>
+      result.current.applyAudioInventory(
+        [{ codec: "ac3", channels: 2, layout: "stereo", language: "spa", default: true }],
+        8,
+        "virtual://movie/x?result=B",
+      ),
+    );
+
+    expect(result.current.mediaFileId).toBe(8);
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual([
+      { codec: "ac3", channels: 2, layout: "stereo", language: "spa", default: true },
+    ]);
+    expect(result.current.audioInventoryProvisional).toBe(false);
+    // Menu data only: the transport must not reload.
+    expect(result.current.transportRevision).toBe(transportRevision);
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/playback/start")),
+    ).toHaveLength(1);
+    unmount();
+  });
+
+  it("preserves the live virtual URI when an ordinary version poll moves by id alone", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: [
+                { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+              ],
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() =>
+      result.current.applyAudioInventory(
+        [{ codec: "ac3", channels: 6, layout: "5.1", language: "fra", default: true }],
+        8,
+      ),
+    );
+
+    // The id moved but no candidate was named, so the rotation's effective URI
+    // must not be cleared under the new file.
+    expect(result.current.mediaFileId).toBe(8);
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=A");
+    unmount();
+  });
+
+  it("applies a source commit deferred by a version switch once it settles", async () => {
+    const planAudioTracks = [
+      { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+    ];
+    const rotatedTracks = [
+      { codec: "ac3", channels: 2, layout: "stereo", language: "deu", default: true },
+    ];
+    const startBodies: Array<{ file_id: number }> = [];
+    let releaseSwitch: ((response: Response) => void) | undefined;
+    const switchResponse = new Promise<Response>((resolve) => {
+      releaseSwitch = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) {
+          // Hold the switch open so the push lands while it rebuilds.
+          return switchResponse;
+        }
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: planAudioTracks,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    // Switch to the very file the rotation will name. The v2 wire omits the
+    // candidate URI, so only the deferred push can re-key the version menu.
+    act(() => result.current.switchVersion(8, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    expect(result.current.replacing).toBe(true);
+
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 8,
+          effectiveVirtualUri: "virtual://movie/x?result=B",
+          inventoryStatus: "verified",
+        },
+        rotatedTracks,
+      ),
+    );
+    // Under the pending switch the menus stay on the outgoing identity.
+    expect(result.current.mediaFileId).toBe(7);
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=A");
+
+    await act(async () => {
+      releaseSwitch?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-2",
+            plan_attempt_key: "v3:switch-2",
+            requested_media_file_id: 8,
+            effective_media_file_id: 8,
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await switchResponse;
+    });
+
+    // The replacement plan names file 8, so the deferred commit is the
+    // carrier that re-keys the candidate URI and its declared inventory.
+    await waitFor(() => expect(result.current.mediaFileId).toBe(8));
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual(rotatedTracks);
+    unmount();
+  });
+
+  it("drops a source commit deferred by a switch when it names another file", async () => {
+    const startBodies: Array<{ file_id: number }> = [];
+    let releaseSwitch: ((response: Response) => void) | undefined;
+    const switchResponse = new Promise<Response>((resolve) => {
+      releaseSwitch = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) return switchResponse;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(8, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    expect(result.current.replacing).toBe(true);
+
+    // A stale rotation names file 9, which the switch never lands on. It must
+    // not be replayed against the replacement plan.
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 9,
+          effectiveVirtualUri: "virtual://movie/x?result=C",
+          inventoryStatus: "verified",
+        },
+        [{ codec: "ac3", channels: 2, layout: "stereo", language: "ita", default: true }],
+      ),
+    );
+
+    await act(async () => {
+      releaseSwitch?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-2",
+            plan_attempt_key: "v3:switch-2",
+            requested_media_file_id: 8,
+            effective_media_file_id: 8,
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await switchResponse;
+    });
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(8));
+    expect(result.current.effectiveVirtualUri).toBeNull();
+    expect(result.current.planAudioTracks).toEqual([]);
+    unmount();
+  });
+});
+
+describe("usePlaybackSession deferred push authority", () => {
+  const outgoingAudio = [
+    { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+  ];
+  const rotatedAudio = [
+    { codec: "ac3", channels: 2, layout: "stereo", language: "deu", default: true },
+  ];
+  const collisionAudio = [
+    { codec: "ac3", channels: 2, layout: "stereo", language: "fra", default: true },
+  ];
+
+  it("rejects an outgoing source commit even when it matches the outgoing rendered file", async () => {
+    const startBodies: Array<{ file_id: number }> = [];
+    let releaseSwitch: ((response: Response) => void) | undefined;
+    const switchResponse = new Promise<Response>((resolve) => {
+      releaseSwitch = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) return switchResponse;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: outgoingAudio,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(8, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+
+    // The push names the OUTGOING source (file 7, candidate A). The rendered
+    // state still says file 7 at a settle path, so matching it there would let
+    // this stale carrier survive; it must be rejected against the settled plan.
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 7,
+          effectiveVirtualUri: "virtual://movie/x?result=A",
+          inventoryStatus: "verified",
+        },
+        rotatedAudio,
+      ),
+    );
+
+    await act(async () => {
+      releaseSwitch?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-2",
+            plan_attempt_key: "v3:switch-2",
+            requested_media_file_id: 8,
+            effective_media_file_id: 8,
+            effective_virtual_uri: "virtual://movie/x?result=B",
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await switchResponse;
+    });
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(8));
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    // The outgoing release's tracks must not be folded under the settled plan.
+    expect(result.current.planAudioTracks).toEqual([]);
+    unmount();
+  });
+
+  it("rejects a same-file candidate collision the settled plan cannot vouch for", async () => {
+    let releaseReplan: ((response: Response) => void) | undefined;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 8,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: outgoingAudio,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) return heldReplan;
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 8, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(result.current.replanning).toBe(true));
+
+    // Candidate C rides the same collapsed file id (8) as the settled plan's B.
+    // File equality alone would accept it; the plan names B, so C is stale. It
+    // arrives as an inventory revision, the path that defers under a replan.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:collision",
+        inventory_status: "verified",
+        effective_media_file_id: 8,
+        effective_virtual_uri: "virtual://movie/x?result=C",
+        audio_tracks: collisionAudio,
+      }),
+    );
+
+    await act(async () => {
+      releaseReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:collision0001",
+            plan_attempt_key: "v3:collision0001",
+            effective_media_file_id: 8,
+            effective_virtual_uri: "virtual://movie/x?result=B",
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await heldReplan;
+    });
+
+    await waitFor(() =>
+      expect(result.current.plan?.effective_virtual_uri).toBe("virtual://movie/x?result=B"),
+    );
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual([]);
+    unmount();
+  });
+
+  it("replays an older inventory before a newer source commit in arrival order", async () => {
+    const startBodies: Array<{ file_id: number }> = [];
+    let releaseSwitch: ((response: Response) => void) | undefined;
+    const switchResponse = new Promise<Response>((resolve) => {
+      releaseSwitch = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) return switchResponse;
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: outgoingAudio,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(8, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+
+    // Older inventory revision for candidate C arrives first, then the newer
+    // source commit for candidate B. The settled plan names file 8 with no
+    // candidate URI, so both pass the identity gate; only arrival order decides
+    // which one wins, and the newer source must.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:older",
+        inventory_status: "verified",
+        effective_media_file_id: 8,
+        effective_virtual_uri: "virtual://movie/x?result=C",
+        audio_tracks: collisionAudio,
+      }),
+    );
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 8,
+          effectiveVirtualUri: "virtual://movie/x?result=B",
+          inventoryStatus: "verified",
+        },
+        rotatedAudio,
+      ),
+    );
+
+    await act(async () => {
+      releaseSwitch?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-order",
+            plan_attempt_key: "v3:switch-order",
+            requested_media_file_id: 8,
+            effective_media_file_id: 8,
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await switchResponse;
+    });
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(8));
+    // The newer source commit wins; the older inventory must not overwrite it.
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual(rotatedAudio);
+    unmount();
+  });
+
+  it("folds a source push deferred by a replan once the replacement plan adopts it", async () => {
+    let releaseReplan: ((response: Response) => void) | undefined;
+    const heldReplan = new Promise<Response>((resolve) => {
+      releaseReplan = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: outgoingAudio,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) return heldReplan;
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => {
+      void result.current.refreshSubtitles(120);
+    });
+    await waitFor(() => expect(result.current.replanning).toBe(true));
+
+    // The push names the replacement plan's incoming identity, which is only
+    // knowable once the plan settles; it must be held, not dropped.
+    act(() =>
+      result.current.applyInventoryUpdate({
+        session_id: "session-1",
+        inventory_revision: "inv:deferred",
+        inventory_status: "verified",
+        effective_media_file_id: 8,
+        effective_virtual_uri: "virtual://movie/x?result=B",
+        audio_tracks: rotatedAudio,
+      }),
+    );
+
+    await act(async () => {
+      releaseReplan?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: "plan:deferred00001",
+            plan_attempt_key: "v3:deferred00001",
+            effective_media_file_id: 8,
+            effective_virtual_uri: "virtual://movie/x?result=B",
+            audio_tracks: [],
+          }),
+        }),
+      );
+      await heldReplan;
+    });
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(8));
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=B");
+    expect(result.current.planAudioTracks).toEqual(rotatedAudio);
+    unmount();
+  });
+
+  it("clears a deferred push when a new request retires the session", async () => {
+    const startBodies: Array<{ file_id: number }> = [];
+    const switchResponse = new Promise<Response>(() => {
+      // Hold the pending switch open forever; the new request retires it before
+      // its replacement ever lands.
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) return switchResponse;
+        if (startBodies.length === 3) {
+          return jsonResponse(
+            {
+              protocol_version: 3,
+              server_features: ["playback_plan_v3"],
+              outcome: "playable",
+              session_id: "session-3",
+              playback_plan: fixturePlanV3({
+                session_id: "session-3",
+                plan_id: "plan:episode-two",
+                plan_attempt_key: "v3:episode-two",
+                effective_media_file_id: 9,
+                effective_virtual_uri: "virtual://movie/x?result=D",
+                audio_tracks: [],
+              }),
+            },
+            { status: 201 },
+          );
+        }
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: fixturePlanV3({
+              effective_media_file_id: 7,
+              effective_virtual_uri: "virtual://movie/x?result=A",
+              audio_tracks: outgoingAudio,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, rerender, unmount } = renderHook(
+      ({ requestKey, fileId }: { requestKey: string; fileId: number }) =>
+        usePlaybackSession(requestKey, [], [], fileId, 0, false, "auto"),
+      { wrapper, initialProps: { requestKey: "episode-1", fileId: 7 } },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(8, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+
+    act(() =>
+      result.current.applyCommittedSource(
+        {
+          effectiveMediaFileId: 8,
+          effectiveVirtualUri: "virtual://movie/x?result=B",
+          inventoryStatus: "verified",
+        },
+        rotatedAudio,
+      ),
+    );
+
+    // A new request retires the pending switch; its deferred push must not leak
+    // into the replacement session.
+    rerender({ requestKey: "episode-2", fileId: 9 });
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(9));
+    expect(result.current.effectiveVirtualUri).toBe("virtual://movie/x?result=D");
+    expect(result.current.planAudioTracks).toEqual([]);
     unmount();
   });
 });
