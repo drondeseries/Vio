@@ -504,3 +504,211 @@ func TestConfigureIndexFileMissingIsNotError(t *testing.T) {
 		t.Fatalf("ConfigureIndexFile on a missing file: %v", err)
 	}
 }
+
+// TestExpiredSlotStaysRetiredAcrossRefreshes proves Blocker 1-revive: once a
+// stuck slot crosses its pending window, later successful refreshes that keep
+// reporting it must not reset its FirstSeenAt and cycle it back to pending. The
+// expired observation is retained (out of the effective pending verdict) so the
+// fold has the original timestamps to compare against.
+func TestExpiredSlotStaysRetiredAcrossRefreshes(t *testing.T) {
+	release := "Stuck.Release.2024"
+	server := &mutableAltmountServer{}
+	server.set(
+		historyPayload(""),
+		altmountQueuePayload(`{"filename": "`+release+`.nzb", "status": "Downloading", "mbleft": "100", "timeleft": "0:05:00"}`),
+	)
+	srv := httptest.NewServer(server)
+	defer srv.Close()
+
+	client := New(nil)
+	client.Configure(srv.URL, "", 15)
+	key := ReleaseKey(release)
+	firstSeen := time.Now().Add(-downloadingRetention - time.Minute).Unix()
+	client.mu.Lock()
+	client.state = altmountStateSnapshot{
+		Completed: map[string]altmountReleaseRecord{},
+		Failed:    map[string]altmountReleaseRecord{},
+		Downloading: map[string]altmountReleaseRecord{
+			key: {
+				CompletedAt:    time.Now().Unix(),
+				FirstSeenAt:    firstSeen,
+				LastProgressAt: time.Now().Add(-downloadingNoProgressRetention - time.Minute).Unix(),
+				SizeLeft:       100,
+				ETASeconds:     300,
+			},
+		},
+	}
+	client.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		if err := client.Refresh(context.Background()); err != nil {
+			t.Fatalf("refresh %d: %v", i, err)
+		}
+		if downloading, known := client.ReleaseDownloading(release); !known || downloading {
+			t.Fatalf("refresh %d: slot = (%v, %v), want expired (false, true)", i, downloading, known)
+		}
+		client.mu.Lock()
+		_, pending := client.state.Downloading[key]
+		retained, retainedOK := client.state.ExpiredDownloading[key]
+		client.mu.Unlock()
+		if pending {
+			t.Fatalf("refresh %d: expired slot re-entered the pending map", i)
+		}
+		if !retainedOK {
+			t.Fatalf("refresh %d: expired slot identity was dropped, so the next refresh can revive it", i)
+		}
+		if retained.FirstSeenAt != firstSeen {
+			t.Fatalf("refresh %d: FirstSeenAt = %d, want the original %d", i, retained.FirstSeenAt, firstSeen)
+		}
+	}
+}
+
+// TestExpiredSlotRetainedAcrossRestart proves the retained expired observation
+// is persisted and reloaded, so a restart followed by a still-present slot
+// cannot restart the release's clocks and cycle it back to pending. This is the
+// restart half of Blocker 1-revive.
+func TestExpiredSlotRetainedAcrossRestart(t *testing.T) {
+	release := "Stuck.Release.2024"
+	key := ReleaseKey(release)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "altmount-state.json")
+	firstSeen := time.Now().Add(-downloadingRetention - time.Minute).Unix()
+	snapshot := altmountStateSnapshot{
+		Completed: map[string]altmountReleaseRecord{},
+		Failed:    map[string]altmountReleaseRecord{},
+		ExpiredDownloading: map[string]altmountReleaseRecord{
+			key: {
+				CompletedAt: time.Now().Unix(),
+				FirstSeenAt: firstSeen,
+				SizeLeft:    104857600,
+				ETASeconds:  300,
+			},
+		},
+	}
+	if err := saveAltmountState(path, snapshot); err != nil {
+		t.Fatalf("saveAltmountState: %v", err)
+	}
+
+	server := &mutableAltmountServer{}
+	server.set(
+		historyPayload(""),
+		altmountQueuePayload(`{"filename": "`+release+`.nzb", "status": "Downloading", "mbleft": "100", "timeleft": "0:05:00"}`),
+	)
+	srv := httptest.NewServer(server)
+	defer srv.Close()
+
+	client := New(nil)
+	client.Configure(srv.URL, "", 15)
+	if err := client.ConfigureIndexFile(path); err != nil {
+		t.Fatalf("ConfigureIndexFile: %v", err)
+	}
+	client.mu.Lock()
+	_, reloaded := client.state.ExpiredDownloading[key]
+	client.mu.Unlock()
+	if !reloaded {
+		t.Fatal("expired observation did not survive the restart")
+	}
+
+	if err := client.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if downloading, known := client.ReleaseDownloading(release); !known || downloading {
+		t.Fatalf("slot after restart = (%v, %v), want expired (false, true)", downloading, known)
+	}
+	client.mu.Lock()
+	retained, retainedOK := client.state.ExpiredDownloading[key]
+	_, pending := client.state.Downloading[key]
+	client.mu.Unlock()
+	if pending {
+		t.Fatal("expired slot re-entered the pending map after restart")
+	}
+	if !retainedOK {
+		t.Fatal("expired slot identity was dropped after restart")
+	}
+	if retained.FirstSeenAt != firstSeen {
+		t.Fatalf("FirstSeenAt = %d, want the original %d", retained.FirstSeenAt, firstSeen)
+	}
+}
+
+// TestExpiredObservationClearsOnDisappearance proves a retained expired
+// observation ends when the queue stops reporting the slot: retention is not
+// permanent, and a slot that truly leaves clears from both maps.
+func TestExpiredObservationClearsOnDisappearance(t *testing.T) {
+	release := "Stuck.Release.2024"
+	server := &mutableAltmountServer{}
+	server.set(historyPayload(""), altmountQueuePayload(""))
+	srv := httptest.NewServer(server)
+	defer srv.Close()
+
+	client := New(nil)
+	client.Configure(srv.URL, "", 15)
+	key := ReleaseKey(release)
+	client.mu.Lock()
+	client.state = altmountStateSnapshot{
+		Completed: map[string]altmountReleaseRecord{},
+		Failed:    map[string]altmountReleaseRecord{},
+		ExpiredDownloading: map[string]altmountReleaseRecord{
+			key: {
+				CompletedAt: time.Now().Add(-downloadingRetention - time.Minute).Unix(),
+				FirstSeenAt: time.Now().Add(-2 * downloadingRetention).Unix(),
+			},
+		},
+	}
+	client.mu.Unlock()
+
+	if err := client.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	client.mu.Lock()
+	_, pending := client.state.Downloading[key]
+	_, retained := client.state.ExpiredDownloading[key]
+	client.mu.Unlock()
+	if pending || retained {
+		t.Fatalf("disappeared slot still retained: pending=%v expired=%v", pending, retained)
+	}
+}
+
+// TestExpiredObservationClearsOnTerminalReconcile proves a retained expired
+// observation ends when the release reconciles to a terminal verdict, even
+// while the queue still reports the slot. The terminal verdict is authoritative
+// and the identity is no longer needed.
+func TestExpiredObservationClearsOnTerminalReconcile(t *testing.T) {
+	release := "Stuck.Release.2024"
+	server := &mutableAltmountServer{}
+	server.set(
+		historyPayload(`{"name":"`+release+`","nzb_name":"`+release+`.nzb","status":"Completed","storage":"/downloads/`+release+`","bytes":1000,"completetime":`+fmt.Sprint(time.Now().Unix())+`}`),
+		altmountQueuePayload(`{"filename": "`+release+`.nzb", "status": "Downloading", "mbleft": "100", "timeleft": "0:05:00"}`),
+	)
+	srv := httptest.NewServer(server)
+	defer srv.Close()
+
+	client := New(nil)
+	client.Configure(srv.URL, "", 15)
+	key := ReleaseKey(release)
+	client.mu.Lock()
+	client.state = altmountStateSnapshot{
+		Completed: map[string]altmountReleaseRecord{},
+		Failed:    map[string]altmountReleaseRecord{},
+		ExpiredDownloading: map[string]altmountReleaseRecord{
+			key: {
+				CompletedAt: time.Now().Add(-downloadingRetention - time.Minute).Unix(),
+				FirstSeenAt: time.Now().Add(-2 * downloadingRetention).Unix(),
+			},
+		},
+	}
+	client.mu.Unlock()
+
+	if err := client.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if completed, known := client.ReleaseCompleted(release); !known || !completed {
+		t.Fatalf("ReleaseCompleted = (%v, %v), want (true, true)", completed, known)
+	}
+	client.mu.Lock()
+	_, pending := client.state.Downloading[key]
+	_, retained := client.state.ExpiredDownloading[key]
+	client.mu.Unlock()
+	if pending || retained {
+		t.Fatalf("terminally reconciled slot still retained: pending=%v expired=%v", pending, retained)
+	}
+}

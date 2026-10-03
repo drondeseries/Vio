@@ -51,8 +51,10 @@ const (
 	// bounded by downloadingRetention instead.
 	downloadingNoProgressRetention = 15 * time.Minute
 	// altmountQueueBudget bounds the best-effort queue enrichment so a slow or
-	// unsupported queue endpoint can never delay history publication or extend
-	// a refresh. History is published before the queue is fetched.
+	// unsupported queue endpoint can never delay history publication. History
+	// is published before the queue is fetched, but the refresh itself still
+	// waits up to this budget for the queue response plus the final persistence
+	// before it returns.
 	altmountQueueBudget = 5 * time.Second
 	// altmountCachedBadge is the prefix AltMount's own Stremio addon puts on
 	// stream names for releases already imported and still fresh. It is a
@@ -97,11 +99,20 @@ type altmountStateSnapshot struct {
 	Completed map[string]altmountReleaseRecord `json:"completed"`
 	Failed    map[string]altmountReleaseRecord `json:"failed"`
 	// Downloading holds releases AltMount is actively fetching (SABnzbd queue,
-	// not history). A downloading release is neither dead nor ready: it is
-	// the pending state between listed and failed. Entries are transient —
-	// pruned after downloadingRetention — because a slot that stops appearing
-	// finished, failed (history then carries the verdict), or stalled.
+	// not history) that are still inside their pending window. A downloading
+	// release is neither dead nor ready: it is the pending state between
+	// listed and failed.
 	Downloading map[string]altmountReleaseRecord `json:"downloading,omitempty"`
+	// ExpiredDownloading retains the identity and timestamps of in-flight
+	// observations that outlived their pending window while the queue kept
+	// reporting the slot. They never make a release pending, but dropping them
+	// would let the next successful refresh see the still-present slot as new
+	// and restart its FirstSeenAt/LastProgressAt, so a permanently stuck slot
+	// could cycle back to pending forever. Entries leave when the queue stops
+	// reporting the slot (disappearance) or the release reconciles to a
+	// terminal verdict, and the map is persisted so a restart keeps folding
+	// against them instead of reopening the same hole.
+	ExpiredDownloading map[string]altmountReleaseRecord `json:"expired_downloading,omitempty"`
 }
 
 // altmountStateClient caches which releases AltMount reports as completed
@@ -620,25 +631,29 @@ func (c *altmountStateClient) refresh(ctx context.Context) error {
 	c.mu.Lock()
 	previousCompleted := c.state.Completed
 	previousDownloading := c.state.Downloading
+	previousExpired := c.state.ExpiredDownloading
 	merged := mergeAltmountSnapshots(c.state, incoming, time.Now())
-	// Carry the existing in-flight map through the history merge (which only
-	// covers terminal states); the bounded queue enrichment below refreshes it,
-	// and prune drops anything past its pending window even when the queue
-	// fetch never arrives.
+	// Carry the existing in-flight and expired-observation maps through the
+	// history merge (which only covers terminal states); the bounded queue
+	// enrichment below refreshes them. prune moves a slot that crossed its
+	// pending window into ExpiredDownloading rather than dropping it, so the
+	// identity survives the publish even when the queue fetch never arrives.
 	merged.Downloading = previousDownloading
+	merged.ExpiredDownloading = previousExpired
 	c.mu.Unlock()
 
 	// Publish the terminal history state in memory before touching the queue.
 	// Completion and failure visibility must not wait on the best-effort queue
 	// endpoint: the merged snapshot becomes current here, and the queue only
-	// refines the in-flight map afterward. This also keeps one slow or
-	// unsupported queue endpoint from extending the refresh itself.
+	// refines the in-flight map afterward. History visibility still leads, but
+	// the refresh itself does wait for the bounded queue step plus persistence.
 	published := c.publishSnapshot(merged, previousCompleted)
 
 	// In-flight slots are best-effort enrichment over the history state: an
 	// AltMount without queue support (or a transient queue failure) must not
 	// disturb the history state that classification already runs on. The queue
-	// fetch is bounded by its own budget so it can never hold the refresh open.
+	// fetch is bounded by its own budget so a slow endpoint cannot hold the
+	// refresh open beyond that budget.
 	queueCtx, cancel := context.WithTimeout(ctx, altmountQueueBudget)
 	queueSnapshot, queueErr := c.fetchQueueSnapshot(queueCtx)
 	cancel()
@@ -657,13 +672,17 @@ func (c *altmountStateClient) refresh(ctx context.Context) error {
 		return nil
 	}
 	c.mu.Lock()
-	// Fold against the pre-prune map: the in-memory publish may have already
-	// pruned an expired slot, and folding against that would reset its
-	// FirstSeenAt and revive it. previousDownloading still holds the original
-	// timestamps, so a slot the queue keeps reporting but that is past its
-	// lifetime stays retired.
+	// Fold against the union of still-pending and already-expired observations:
+	// the in-memory publish may have already moved an expired slot out of the
+	// Downloading map, and folding only against the pending map would reset its
+	// FirstSeenAt and revive it. The union still holds the original timestamps,
+	// so a slot the queue keeps reporting but that is past its lifetime stays
+	// retired. reconcile then drops both maps for any slot that disappeared
+	// from the queue or reconciled to a terminal verdict.
 	current := c.state
-	current.Downloading = observeAltmountQueue(previousDownloading, queueSnapshot.Downloading, time.Now())
+	prior := mergeAltmountDownloading(previousDownloading, previousExpired)
+	observed := observeAltmountQueue(prior, queueSnapshot.Downloading, time.Now())
+	current.Downloading, current.ExpiredDownloading = reconcileAltmountDownloading(observed, current.Completed, current.Failed, time.Now())
 	c.mu.Unlock()
 	// Re-publish with the refined in-flight map and write the final snapshot to
 	// disk exactly once. The terminal map is unchanged, so passing it as its own
@@ -999,11 +1018,19 @@ func mergeAltmountSnapshots(existing, incoming altmountStateSnapshot, now time.T
 	return pruneAltmountSnapshot(merged, now)
 }
 
+// pruneAltmountSnapshot drops terminal records past their retention and
+// partitions the in-flight map by pending window. A Downloading record that has
+// expired is not discarded: its identity and timestamps move to
+// ExpiredDownloading so the next successful refresh folds the still-present
+// slot against them instead of restarting its clocks. Expired observations are
+// only cleared by reconcileAltmountDownloading (disappearance or a terminal
+// verdict), never by pruning.
 func pruneAltmountSnapshot(snapshot altmountStateSnapshot, now time.Time) altmountStateSnapshot {
 	pruned := altmountStateSnapshot{
-		Completed:   map[string]altmountReleaseRecord{},
-		Failed:      map[string]altmountReleaseRecord{},
-		Downloading: map[string]altmountReleaseRecord{},
+		Completed:          map[string]altmountReleaseRecord{},
+		Failed:             map[string]altmountReleaseRecord{},
+		Downloading:        map[string]altmountReleaseRecord{},
+		ExpiredDownloading: map[string]altmountReleaseRecord{},
 	}
 	cutoff := now.Add(-altmountStateRetention).Unix()
 	for key, record := range snapshot.Completed {
@@ -1020,15 +1047,68 @@ func pruneAltmountSnapshot(snapshot altmountStateSnapshot, now time.Time) altmou
 	}
 	// Downloading records use CompletedAt as their last-observed time,
 	// FirstSeenAt for absolute lifetime, and LastProgressAt for the frozen
-	// progress bound. Pruning drops a record as soon as any bound trips, so a
-	// permanently stuck slot is retired even while the queue keeps reporting it.
+	// progress bound. An expired record is retained as an observation, not a
+	// pending verdict, so a permanently stuck slot stops holding playback while
+	// still remembering where it began.
 	for key, record := range snapshot.Downloading {
 		if altmountDownloadingExpired(record, now) {
+			pruned.ExpiredDownloading[key] = record
 			continue
 		}
 		pruned.Downloading[key] = record
 	}
+	// Carry previously retained observations forward. A key with a pending
+	// record is already accounted for and must not also appear as expired.
+	for key, record := range snapshot.ExpiredDownloading {
+		if _, ok := pruned.Downloading[key]; ok {
+			continue
+		}
+		if _, ok := pruned.ExpiredDownloading[key]; ok {
+			continue
+		}
+		pruned.ExpiredDownloading[key] = record
+	}
 	return pruned
+}
+
+// mergeAltmountDownloading unions the pending and retained-expired in-flight
+// observations, preferring the pending entry for a key present in both. The
+// fold in observeAltmountQueue needs the original timestamps from either map;
+// without the expired half, a refresh that already published (and moved an
+// expired slot) would treat the still-reported slot as new.
+func mergeAltmountDownloading(pending, expired map[string]altmountReleaseRecord) map[string]altmountReleaseRecord {
+	merged := make(map[string]altmountReleaseRecord, len(pending)+len(expired))
+	for key, record := range expired {
+		merged[key] = record
+	}
+	for key, record := range pending {
+		merged[key] = record
+	}
+	return merged
+}
+
+// reconcileAltmountDownloading classifies the folded queue observations into
+// pending and retained-expired maps. A slot that reconciled to a terminal
+// verdict is dropped from both. Slots absent from observed have disappeared
+// from the queue and are cleared by omission, which is how retention ends for a
+// release that neither completes nor fails.
+func reconcileAltmountDownloading(observed map[string]altmountReleaseRecord, completed, failed map[string]altmountReleaseRecord, now time.Time) (pending, expired map[string]altmountReleaseRecord) {
+	pending = make(map[string]altmountReleaseRecord, len(observed))
+	expired = make(map[string]altmountReleaseRecord)
+	for key, record := range observed {
+		if _, ok := completed[key]; ok {
+			continue
+		}
+		if _, ok := failed[key]; ok {
+			continue
+		}
+		if altmountDownloadingExpired(record, now) {
+			expired[key] = record
+			continue
+		}
+		pending[key] = record
+	}
+	return pending, expired
 }
 
 func saveAltmountState(path string, snapshot altmountStateSnapshot) error {
@@ -1040,6 +1120,9 @@ func saveAltmountState(path string, snapshot altmountStateSnapshot) error {
 	}
 	if snapshot.Downloading == nil {
 		snapshot.Downloading = map[string]altmountReleaseRecord{}
+	}
+	if snapshot.ExpiredDownloading == nil {
+		snapshot.ExpiredDownloading = map[string]altmountReleaseRecord{}
 	}
 	data, err := json.Marshal(snapshot)
 	if err != nil {
