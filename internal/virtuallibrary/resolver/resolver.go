@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary/stream"
@@ -536,6 +537,18 @@ func candidateDedupName(candidate StreamCandidate) string {
 		urlPathBase(candidate.URL),
 	} {
 		if key := releaseNameKey(trimPerFileIndex(value)); key != "" {
+			return key
+		}
+	}
+	// Last resort: the first description line, where Stremio addons that
+	// format Name/Title as display labels keep the real release name.
+	// Guarded: a bare spec line ("1080p", a size, an emoji row) must never
+	// become identity — it would collide across unrelated releases. Release
+	// names all but always carry digits (season/episode/resolution/year),
+	// so demand length plus a digit; anything else falls back to no
+	// identity, exactly as before.
+	if line := firstReleaseLine(candidate.Description); len(line) >= 12 && strings.IndexFunc(line, unicode.IsDigit) >= 0 {
+		if key := releaseNameKey(line); key != "" {
 			return key
 		}
 	}

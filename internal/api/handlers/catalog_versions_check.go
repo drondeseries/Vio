@@ -44,6 +44,77 @@ type versionCheckResponse struct {
 	Results []versionCheckResult `json:"results"`
 }
 
+// versionCheckOutcome is one file's liveness verdict before stamps are
+// applied. Resolution and classification run concurrently per file, but
+// stamps apply only after the whole batch is judged (see
+// gateVersionCheckStamps): one volatile listing must never mass-tag
+// versions as dead.
+type versionCheckOutcome struct {
+	fileID int
+	// file is the resolved row, carried so the deferred stamp can fence on
+	// its identity and observed verdict. Nil when the file was not found.
+	file *models.MediaFile
+	// available is the per-file answer: durable state when the round is
+	// ambiguous or gated, live resolution otherwise.
+	available bool
+	// stamp is true when this round found the pin dead.
+	stamp bool
+	// durableAlive mirrors the row's pre-round failed_at (true when the row
+	// carried no verdict): the answer to report when stamping is gated off.
+	durableAlive bool
+	// checked is true when the file got a provider resolution attempt, the
+	// only outcomes that speak to listing health. Denied, unknown, local,
+	// and unwired files report without resolving and stay out of the gate
+	// denominator.
+	checked bool
+}
+
+const (
+	// minVersionCheckStampQuorum is the minimum dead-pin count that can trip
+	// the batch gate. Below it every stamp applies: a lone genuinely-dead
+	// pin (the common single-file check) must still be recorded.
+	minVersionCheckStampQuorum = 4
+	// versionCheckStampDisagreementRate is the dead-pin fraction above which
+	// the listing itself is distrusted instead of the pins. Past it the
+	// round reports durable state and stamps nothing: a renumber storm or a
+	// degraded partial listing disagrees with everything at once, and that
+	// pattern means the observation is bad, not forty releases at once.
+	versionCheckStampDisagreementRate = 0.5
+)
+
+// gateVersionCheckStamps decides which outcomes may stamp. It returns the
+// file IDs to stamp; availability in the returned outcomes already reflects
+// the decision (durable state when gated, live resolution otherwise).
+func gateVersionCheckStamps(outcomes []versionCheckOutcome) ([]versionCheckOutcome, []int) {
+	dead, checked := 0, 0
+	for _, outcome := range outcomes {
+		if !outcome.checked {
+			continue
+		}
+		checked++
+		if outcome.stamp {
+			dead++
+		}
+	}
+	gated := checked > 0 && dead >= minVersionCheckStampQuorum &&
+		float64(dead)/float64(checked) > versionCheckStampDisagreementRate
+	final := make([]versionCheckOutcome, 0, len(outcomes))
+	var toStamp []int
+	for _, outcome := range outcomes {
+		if gated && outcome.stamp {
+			// Listing untrustworthy this round: report the durable signal
+			// and stamp nothing.
+			outcome.available = outcome.durableAlive
+			outcome.stamp = false
+		}
+		if outcome.stamp {
+			toStamp = append(toStamp, outcome.fileID)
+		}
+		final = append(final, outcome)
+	}
+	return final, toStamp
+}
+
 // HandleCheckVersions implements POST /catalog/versions/check: a batched
 // liveness probe for the media page's version list. Each file is tested
 // cheaply — virtual rows resolve their pinned ?result= candidate through the
@@ -65,7 +136,7 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	ctx, cancel := context.WithTimeout(r.Context(), versionCheckOverallBudget)
 	defer cancel()
 
-	results := make([]versionCheckResult, 0, len(req.FileIDs))
+	outcomes := make([]versionCheckOutcome, 0, len(req.FileIDs))
 	var mu sync.Mutex
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(versionCheckConcurrency)
@@ -75,9 +146,9 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 		}
 		id := id
 		eg.Go(func() error {
-			available := h.checkVersion(egCtx, id)
+			outcome := h.checkVersion(egCtx, id)
 			mu.Lock()
-			results = append(results, versionCheckResult{FileID: id, Available: available})
+			outcomes = append(outcomes, outcome)
 			mu.Unlock()
 			return nil
 		})
@@ -85,6 +156,21 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 	// Per-file failures are folded into the availability verdict; the batch
 	// itself never fails on one file.
 	_ = eg.Wait()
+
+	// Stamps apply only after the whole batch is judged: one volatile
+	// listing disagreeing with everything must not mass-tag versions.
+	final, toStamp := gateVersionCheckStamps(outcomes)
+	stampByID := make(map[int]struct{}, len(toStamp))
+	for _, id := range toStamp {
+		stampByID[id] = struct{}{}
+	}
+	results := make([]versionCheckResult, 0, len(final))
+	for _, outcome := range final {
+		if _, ok := stampByID[outcome.fileID]; ok {
+			h.stampVirtualCandidateFailed(ctx, outcome.fileID, outcome.file)
+		}
+		results = append(results, versionCheckResult{FileID: outcome.fileID, Available: outcome.available})
+	}
 
 	writeJSON(w, http.StatusOK, versionCheckResponse{Results: results})
 }
@@ -99,26 +185,31 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 // Ambiguous provider errors (timeout, network, resolver not configured) leave
 // the stamp unchanged and report the row's current computed availability, so
 // a provider outage cannot mass-tag versions as dead.
-func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) bool {
+func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) versionCheckOutcome {
+	outcome := versionCheckOutcome{fileID: fileID}
 	if h == nil || h.FileResolver == nil {
-		return false
+		return outcome
 	}
 	file, err := h.FileResolver.GetByID(ctx, fileID)
 	if err != nil || file == nil {
-		return false
+		return outcome
 	}
+	outcome.file = file
+	outcome.durableAlive = file.FailedAt == nil
 	if !h.fileAccessible(ctx, file) {
 		// Denied by the profile's catalog/library access policy: report the
 		// same shape as an unknown ID and never resolve or stamp.
-		return false
+		return outcome
 	}
 	if !isVirtualPlaybackFile(file) {
-		return file.MissingSince == nil
+		outcome.available = file.MissingSince == nil
+		return outcome
 	}
 	if h.VirtualResolver == nil {
 		// No provider resolver wired (playback disabled): report the durable
 		// stamp only, never stamp anything.
-		return file.FailedAt == nil
+		outcome.available = outcome.durableAlive
+		return outcome
 	}
 
 	perFileCtx, cancel := context.WithTimeout(ctx, versionCheckPerFileBudget)
@@ -144,6 +235,7 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 		// for an absent pin. A successful resolution counts when it named the
 		// requested candidate, or when the durable identity proves it is the
 		// same release under a renumbered result id (IdentityRematched).
+		outcome.checked = true
 		if resolvedIdentityMatches(resolved, requestedCandidateID) || resolvedMatchesPersistedIdentity(resolved, file) {
 			// A healthy liveness observation for the same identity clears a
 			// stale failed_at so the auto-pick considers the release again.
@@ -158,45 +250,54 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 					h.VirtualFileMetadataSaver, h.VirtualFileSaver,
 				)
 			}
-			return true
+			outcome.available = true
+			return outcome
 		}
 		if requestedCandidateID == "" {
 			// The row carries no concrete pin (profile-neutral row): any
 			// resolution of its identity is listing evidence. Report live.
 			h.clearVirtualCandidateIfFailed(ctx, fileID, file)
-			return true
+			outcome.available = true
+			return outcome
 		}
 		// The provider answered with a different candidate and the row's
 		// durable identity does not match it: the requested release is
-		// genuinely gone. Stamp it (fenced) so the auto-pick skips it. A row
-		// with no durable identity is indistinguishable from a renumbered
+		// genuinely gone. Record the stamp for the batch gate; a row with
+		// no durable identity is indistinguishable from a renumbered
 		// listing, so it is left alone (ambiguous) rather than mass-stamped.
 		if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity {
-			h.stampVirtualCandidateFailed(ctx, fileID, file)
+			outcome.stamp = true
 		}
-		return false
+		outcome.available = false
+		return outcome
 	}
 	if isVirtualCandidateDeadError(err) {
 		// Confirmed dead pin: the provider listed but the pinned candidate is
-		// gone or unusable. Stamp it so the auto-pick skips it. The stamp is
-		// fenced the same way: a candidate rotated while resolution was in
-		// flight is never mis-marked.
-		h.stampVirtualCandidateFailed(ctx, fileID, file)
-		return false
+		// gone or unusable. Record the stamp for the batch gate; the write
+		// itself is fenced the same way, so a candidate rotated while
+		// resolution was in flight is never mis-marked.
+		outcome.checked = true
+		outcome.stamp = true
+		outcome.available = false
+		return outcome
 	}
 	if _, hasIdentity := persistedVirtualIdentity(file); hasIdentity &&
 		errors.Is(err, virtuallibrary.ErrSessionBoundCandidateAbsent) {
 		// The provider listed, the row carries a durable identity, and the
 		// resolver still refused because no listed candidate re-identified the
 		// same release. That is a confirmed absence, not a renumbered listing:
-		// stamp it. Without identity the sentinel is ambiguous and is left
-		// alone below.
-		h.stampVirtualCandidateFailed(ctx, fileID, file)
-		return false
+		// record the stamp for the batch gate. Without identity the sentinel
+		// is ambiguous and is left alone below.
+		outcome.checked = true
+		outcome.stamp = true
+		outcome.available = false
+		return outcome
 	}
 	// Ambiguous (provider down, timeout, identity-less absence): do not stamp.
 	// Report the current durable signal so an outage cannot mass-tag versions.
-	return file.FailedAt == nil
+	outcome.checked = true
+	outcome.available = outcome.durableAlive
+	return outcome
 }
 
 // stampVirtualCandidateFailed applies the fenced failed_at verdict the check

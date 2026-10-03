@@ -966,3 +966,44 @@ func TestCatalogVersionsCheckIdentityVerdicts(t *testing.T) {
 		}
 	})
 }
+
+// TestGateVersionCheckStampsSkipsMassDisagreement proves one volatile
+// listing disagreeing with everything stamps nothing: past the quorum and
+// the disagreement rate the round reports durable state instead of
+// mass-tagging versions as dead.
+func TestGateVersionCheckStampsSkipsMassDisagreement(t *testing.T) {
+	outcomes := make([]versionCheckOutcome, 0, 8)
+	for i := 1; i <= 8; i++ {
+		outcomes = append(outcomes, versionCheckOutcome{
+			fileID: i, available: false, stamp: true, durableAlive: true, checked: true,
+		})
+	}
+	final, toStamp := gateVersionCheckStamps(outcomes)
+	if len(toStamp) != 0 {
+		t.Fatalf("stamped %v on a unanimous-disagreement round, want none", toStamp)
+	}
+	for _, outcome := range final {
+		if !outcome.available {
+			t.Fatalf("file %d reported unavailable on a gated round, want durable state", outcome.fileID)
+		}
+		if outcome.stamp {
+			t.Fatalf("file %d still marked for stamping on a gated round", outcome.fileID)
+		}
+	}
+}
+
+// TestGateVersionCheckStampsAppliesLoneVerdicts proves small numbers of
+// disagreements still stamp: a lone genuinely-dead pin (the common
+// single-file check) records its verdict, and a below-quorum batch is
+// unaffected by the gate.
+func TestGateVersionCheckStampsAppliesLoneVerdicts(t *testing.T) {
+	outcomes := []versionCheckOutcome{
+		{fileID: 1, available: false, stamp: true, durableAlive: true, checked: true},
+		{fileID: 2, available: true, checked: true},
+		{fileID: 3, available: true, checked: true},
+	}
+	_, toStamp := gateVersionCheckStamps(outcomes)
+	if len(toStamp) != 1 || toStamp[0] != 1 {
+		t.Fatalf("stamped %v, want exactly [1]", toStamp)
+	}
+}
