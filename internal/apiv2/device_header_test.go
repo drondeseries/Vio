@@ -115,3 +115,29 @@ func TestDeviceHeaderGuardCoversEveryOperation(t *testing.T) {
 		}
 	}
 }
+
+// The legacy X-Silo-Client-Family spelling is promoted to X-Vio-Client-Family
+// before binding, like the legacy device header. Canonical wins when both are
+// present; an invalid legacy value is left for the operation's own enum
+// validation.
+func TestClientFamilyHeaderPromotesLegacySpelling(t *testing.T) {
+	promote := func(headers map[string]string) string {
+		rr := httptest.NewRequest(http.MethodGet, Prefix+"/system/info", nil)
+		for k, v := range headers {
+			rr.Header.Set(k, v)
+		}
+		rejectMalformedDeviceHeader(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("X-Promoted-Family", req.Header.Get(clientFamilyHeader))
+		})).ServeHTTP(httptest.NewRecorder(), rr)
+		return rr.Header.Get(clientFamilyHeader)
+	}
+	if got := promote(map[string]string{"X-Silo-Client-Family": "tv"}); got != "tv" {
+		t.Fatalf("legacy-only not promoted: %q", got)
+	}
+	if got := promote(map[string]string{"X-Vio-Client-Family": "mobile", "X-Silo-Client-Family": "tv"}); got != "mobile" {
+		t.Fatalf("canonical must win: %q", got)
+	}
+	if got := promote(map[string]string{"X-Silo-Client-Family": "not-a-family"}); got != "not-a-family" {
+		t.Fatalf("invalid legacy must pass through to operation validation: %q", got)
+	}
+}
