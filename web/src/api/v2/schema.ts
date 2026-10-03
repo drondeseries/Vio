@@ -5531,7 +5531,7 @@ export interface paths {
     put?: never;
     /**
      * Redeem the one-time code an OAuth callback issued for the token pair.
-     * @description A code is valid for 60 seconds and redeems once. The login session opens at redemption, so a code that is never redeemed leaves no session. Redeeming a used code again revokes the session its redemption opened. A native code needs the code_verifier of its S256 challenge. A web code takes none and redeems only in the browser the callback answered, which holds the silo_oauth_complete cookie, so a code passed to another browser cannot sign that browser in.
+     * @description A code is valid for 60 seconds and redeems once. The login session opens at redemption, so a code that is never redeemed leaves no session. Redeeming a used code again revokes the session its redemption opened. A native code needs the code_verifier of its S256 challenge. A web code takes none and redeems only in the browser the callback answered, which holds the vio_oauth_complete cookie, so a code passed to another browser cannot sign that browser in.
      */
     post: operations["completeOAuthLogin"];
     delete?: never;
@@ -79729,7 +79729,7 @@ export interface operations {
       path?: never;
       cookie?: {
         /** @description Completion cookie the callback set in the browser it sent to the web completion page (HttpOnly, path-scoped to this operation, two minutes). The browser sends it by itself; a web code redeemed without it, or with another browser's, is 400 invalid_grant and stays redeemable. Native codes ignore it */
-        silo_oauth_complete?: string;
+        vio_oauth_complete?: string;
       };
     };
     requestBody: {

@@ -317,7 +317,7 @@ A code proves its client before reuse or expiry is looked at, so a code that
 reaches the wrong client cannot even trigger the reuse revocation. A native
 code needs the app's `code_verifier` (Native apps). A web code is bound to the
 browser the callback answered: the callback sets the completion cookie
-`silo_oauth_complete` (256 random bits; HttpOnly, SameSite=Lax, Secure on an
+`vio_oauth_complete` (256 random bits; HttpOnly, SameSite=Lax, Secure on an
 https public URL, two minutes) on the complete path of each API version, the
 code stores its SHA-256, and a redemption without the matching cookie is
 refused with `invalid_grant` and leaves the code redeemable. Without it, an
