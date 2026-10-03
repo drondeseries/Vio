@@ -120,7 +120,17 @@ type altmountStateSnapshot struct {
 // monitor task, never on the playback path, and persists to disk so a restart
 // keeps the known-good signal.
 type altmountStateClient struct {
-	mu        sync.Mutex
+	mu sync.Mutex
+	// refreshMu serializes whole refresh cycles, including the best-effort
+	// queue enrichment and the state-file write. Without it, two concurrent
+	// refreshes can both merge against the same prior snapshot and then
+	// publish in completion order, so a slower, older refresh overwrites a
+	// newer completion; persistence, which sits outside any order fence,
+	// then writes the stale snapshot to disk. mu still guards the published
+	// snapshot, so readers (ReleaseCompleted/ReleaseFailed/Downloading and
+	// ClassifyCandidates) keep seeing the early history publication and are
+	// never blocked by a refresh in flight.
+	refreshMu sync.Mutex
 	url       string
 	apiKey    string
 	interval  time.Duration
@@ -137,6 +147,17 @@ type altmountStateClient struct {
 	// confirmObserver, so a steady completed state is announced once and not on
 	// every classification or refresh.
 	confirmedOnce map[string]struct{}
+	// refreshHistoryBuiltHook, when non-nil, runs after a refresh has computed
+	// its merged history snapshot and before it publishes it. It is nil in
+	// production; a test uses it to hold one refresh in the build window so a
+	// competing refresh can be proven to serialize behind it rather than
+	// overwrite it. The callback must not call back into the client.
+	refreshHistoryBuiltHook func()
+	// refreshPublishedHook, when non-nil, runs after a refresh writes its final
+	// snapshot to the state file. It is nil in production; a test uses it to
+	// order the disk writes of two concurrent refreshes deterministically. The
+	// callback must not call back into the client.
+	refreshPublishedHook func()
 }
 
 // ReleaseConfirmationObserver is notified once per release key when AltMount
@@ -577,11 +598,26 @@ func redactAltmountSecret(value, key, downloadURL string) string {
 
 // Refresh performs a history fetch now and persists the merged snapshot.
 // It is the exported form of the ported refresh step; HTTP logic is identical.
+//
+// Refreshes are serialized end to end, so a forced refresh never interleaves
+// with a scheduled one and the in-memory publish, the queue enrichment, and
+// the state-file write always happen in one order.
 func (c *altmountStateClient) Refresh(ctx context.Context) error {
 	return c.refresh(ctx)
 }
 
 func (c *altmountStateClient) refresh(ctx context.Context) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	return c.refreshHistory(ctx)
+}
+
+// refreshHistory runs one refresh cycle with the serialization lock already
+// held: fetch history, publish it in memory, enrich with the bounded queue
+// fetch, then persist. Keeping the whole cycle under refreshMu is what stops
+// concurrent refreshes from publishing in completion order; mu is released
+// between the phases so readers are never blocked by the network work.
+func (c *altmountStateClient) refreshHistory(ctx context.Context) error {
 	historyURL, err := c.historyURL()
 	if err != nil {
 		c.mu.Lock()
@@ -640,7 +676,14 @@ func (c *altmountStateClient) refresh(ctx context.Context) error {
 	// identity survives the publish even when the queue fetch never arrives.
 	merged.Downloading = previousDownloading
 	merged.ExpiredDownloading = previousExpired
+	builtHook := c.refreshHistoryBuiltHook
 	c.mu.Unlock()
+	if builtHook != nil {
+		// Test-only seam: pause after the merged snapshot is built and before
+		// it is published, so a competing refresh can be observed serializing
+		// behind the whole cycle rather than racing this build.
+		builtHook()
+	}
 
 	// Publish the terminal history state in memory before touching the queue.
 	// Completion and failure visibility must not wait on the best-effort queue
@@ -666,6 +709,7 @@ func (c *altmountStateClient) refresh(ctx context.Context) error {
 		if err := c.persistState(published); err != nil {
 			return err
 		}
+		c.runRefreshPublishedHook()
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
@@ -688,7 +732,23 @@ func (c *altmountStateClient) refresh(ctx context.Context) error {
 	// disk exactly once. The terminal map is unchanged, so passing it as its own
 	// previous set reports no duplicate completion.
 	final := c.publishSnapshot(current, current.Completed)
-	return c.persistState(final)
+	if err := c.persistState(final); err != nil {
+		return err
+	}
+	c.runRefreshPublishedHook()
+	return nil
+}
+
+// runRefreshPublishedHook invokes the test-only post-persist seam, if set. The
+// callback runs with refreshMu held and outside c.mu, so a test can order two
+// refreshes' writes without deadlocking the reader lock.
+func (c *altmountStateClient) runRefreshPublishedHook() {
+	c.mu.Lock()
+	hook := c.refreshPublishedHook
+	c.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 }
 
 // publishSnapshot makes snapshot the client's current state and reports the
