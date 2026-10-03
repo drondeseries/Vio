@@ -65,6 +65,18 @@ const (
 	// retry (dial error, timeout, upstream 5xx before any byte flows). One
 	// short pause rides out a momentary flap without stalling a genuinely
 	// dead upstream, which fails again immediately after.
+	//
+	// Budget shape: the worst case per request is two relay opens (one retry)
+	// times the serve layer's one same-release retry, so at most two opens
+	// each up to (open latency + this backoff), plus one resolve. That stack
+	// is what must stay inside the caller's budget. Two things keep it there:
+	// this backoff is small next to the tightest outer virtual budget
+	// (virtualProbeBudget 15s) and the server write deadline, and
+	// sleepRelayUpstreamRetry skips the pause whenever the caller's remaining
+	// deadline cannot absorb it, so a path that does attach a 15s probe
+	// context never pays the backoff past its budget. The boundary is
+	// measured by TestRelaySlowOpenSkipsRetryInsideCallerBudget and
+	// TestRelayOpenRetryFitsCallerBudget in relay_fault_injection_test.go.
 	relayUpstreamOpenRetryBackoff = 500 * time.Millisecond
 	// remoteBodyIdleTimeout bounds how long a read from the upstream remote
 	// body may pause before the relay gives up on it. Set generously enough
@@ -1039,6 +1051,24 @@ const (
 	RegistrationAuthRejected
 )
 
+// ActiveRegistrations reports how many live registrations this relay currently
+// holds. It exists so a caller (or a test) can assert a retry released every
+// registration it adopted instead of leaking entries until LRU/24h expiry. It
+// also drops any entry whose lifetime has already elapsed, so the count is the
+// live working set, not a stale high-water mark. A nil relay reports zero.
+func (r *Relay) ActiveRegistrations() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return 0
+	}
+	r.evictLocked(time.Now())
+	return len(r.entries)
+}
+
 // RegistrationStatus reports whether rawURL still names a live relay
 // registration. It lets a caller holding a previously registered relay URL
 // decide between reuse, renewal, and a fresh resolve without a provider call:
@@ -1170,6 +1200,13 @@ func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 			if errors.As(proxyErr, &upstreamErr) && upstreamErr.status >= 500 && upstreamErr.status <= 599 {
 				status = upstreamErr.status
 			}
+			// Mark a transport-temporary exhaustion (5xx after the retry, or
+			// an unreachable upstream) so the serve layer knows the failure is
+			// availability-shaped and must not stamp a durable dead-candidate
+			// verdict. A 4xx or a post-first-byte failure never carries it.
+			if errors.Is(proxyErr, errRelayTemporaryFailure) {
+				w.Header().Set(relayTemporaryFailureHeader, "1")
+			}
 			http.Error(w, "remote stream unavailable", status)
 			return
 		}
@@ -1178,9 +1215,14 @@ func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 }
 
 // sleepRelayUpstreamRetry pauses for the open-phase retry, reporting false
-// when the client is already gone (in which case the caller returns the
-// failure immediately instead of sleeping out a dead request).
+// when the client is already gone or the caller's remaining budget cannot
+// absorb the pause (in which case the caller returns the failure immediately
+// instead of sleeping out a dead request or a retry the deadline will cut
+// short).
 func sleepRelayUpstreamRetry(ctx context.Context) bool {
+	if !relayOpenRetryFitsBudget(ctx) {
+		return false
+	}
 	timer := time.NewTimer(relayUpstreamOpenRetryBackoff)
 	defer timer.Stop()
 	select {
@@ -1189,6 +1231,40 @@ func sleepRelayUpstreamRetry(ctx context.Context) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+// relayOpenRetryFitsBudget reports whether the caller's remaining deadline can
+// absorb the retry backoff. A caller with no deadline retries (the request
+// context bounds the attempt); a caller whose deadline is already inside the
+// backoff window does not, because the pause would consume the budget the
+// second attempt needs. This aligns the relay's open-phase retry with the
+// caller's budget instead of burning a fixed 500ms the caller cannot spare.
+func relayOpenRetryFitsBudget(ctx context.Context) bool {
+	if ctx == nil {
+		return true
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return time.Until(deadline) > relayUpstreamOpenRetryBackoff
+}
+
+// relayTemporaryFailureHeader marks a relay-generated error response as
+// transport-temporary: the upstream was still answering 5xx or could not be
+// reached at all before any response byte. The serve-layer proxy reads it to
+// decide that an exhausted retry must not be turned into a durable
+// dead-candidate stamp. A committed partial body or an upstream 4xx never
+// carries it, so a real verdict stays a verdict. It is advisory and internal:
+// the relay's only outbound consumer is the loopback relay path.
+const relayTemporaryFailureHeader = "X-Silo-Relay-Temporary"
+
+// RelayTemporaryFailure reports whether a relay error response carried the
+// transport-temporary marker emitted by relayTemporaryFailureHeader. Callers
+// that did not receive a relay-generated response (a nil response, or one with
+// no header) get false.
+func RelayTemporaryFailure(response *http.Response) bool {
+	return response != nil && response.Header.Get(relayTemporaryFailureHeader) != ""
 }
 
 // Proxy streams one validated provider response through Silo. Only media-safe
@@ -1329,10 +1405,14 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		attemptUpstream := upstream.Clone(request.Context())
 		response, err = client.Do(attemptUpstream)
 		if err != nil {
-			if attempt > 0 || !sleepRelayUpstreamRetry(request.Context()) {
-				return errors.New("remote stream request failed")
+			if attempt == 0 && sleepRelayUpstreamRetry(request.Context()) {
+				continue
 			}
-			continue
+			// The upstream could not be reached at all before any byte flowed
+			// (dial failure, connection reset, timeout). An exhausted retry of
+			// a transport error is not a verdict about the release; mark it
+			// temporary so the serve layer does not indict the candidate.
+			return &relayTemporaryFailureError{err: errors.New("remote stream request failed")}
 		}
 		// An upstream 401/403 means the provider URL behind this registration is no
 		// longer authorized. Record it so a later restart renews the provider
@@ -1371,7 +1451,10 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		stopTimer()
 		if response.StatusCode >= 500 {
-			return &upstreamStatusError{status: response.StatusCode}
+			// An exhausted open-phase 5xx retry is a transport signal, not a
+			// durable verdict: mark it temporary so the serve layer can
+			// rotate without stamping the pinned release dead.
+			return &relayTemporaryFailureError{err: &upstreamStatusError{status: response.StatusCode}}
 		}
 		return fmt.Errorf("remote stream returned HTTP %d", response.StatusCode)
 	}
@@ -1516,6 +1599,33 @@ func (e *upstreamStatusError) Error() string {
 		status = e.status
 	}
 	return fmt.Sprintf("remote stream returned HTTP %d", status)
+}
+
+// errRelayTemporaryFailure marks an upstream failure that exhausted the
+// open-phase retry while still transport-temporary: the upstream answered 5xx
+// on both attempts, or could not be reached at all. Two such failures half a
+// second apart are indistinguishable from a provider outage, so a caller must
+// not turn this shape into a durable dead-candidate verdict. The concrete
+// cause (upstreamStatusError, or the dial/read failure) is wrapped alongside
+// it so the status and the message survive, and errors.Is still identifies the
+// temporary shape after any wrapping.
+var errRelayTemporaryFailure = errors.New("relay upstream temporarily unavailable")
+
+// relayTemporaryFailureError wraps an exhausted open-phase retry in the
+// temporary-failure sentinel.
+type relayTemporaryFailureError struct {
+	err error
+}
+
+func (e *relayTemporaryFailureError) Error() string {
+	if e == nil || e.err == nil {
+		return errRelayTemporaryFailure.Error()
+	}
+	return e.err.Error()
+}
+
+func (e *relayTemporaryFailureError) Unwrap() []error {
+	return []error{errRelayTemporaryFailure, e.err}
 }
 
 type remoteBodyChunk struct {

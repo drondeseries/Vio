@@ -1093,9 +1093,9 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	// A serve-path retry that follows a transient relay/edge failure sets the
 	// fresh-registration marker (see withVirtualRelayFreshRegistration): it must
 	// present a newly minted relay entry instead of reusing the live token whose
-	// upstream just answered 502, mirroring the remux seek-anchor retry. Every
-	// other caller keeps the content-key reuse that shares one upstream and one
-	// range-cache scope.
+	// upstream just answered 5xx/502/503, mirroring the remux seek-anchor retry.
+	// Every other caller keeps the content-key reuse that shares one upstream
+	// and one range-cache scope.
 	fresh := virtualRelayFreshRegistrationRequested(ctx)
 	switch {
 	case insecure && fresh:
@@ -1342,6 +1342,13 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			// upstream 404s arrive collapsed as 502, so a 404 here always
 			// means our registration lapsed, never a dead release).
 			relayNotFound := false
+			// relayTemporary captures a relay error response that marks the
+			// upstream failure as transport-temporary (5xx after the relay's
+			// open retry, or an unreachable upstream). Such a failure is
+			// availability-shaped, so it must not stamp a durable
+			// dead-candidate verdict; the pinned release may still rotate for
+			// this attempt when a sibling exists.
+			relayTemporary := false
 			proxy := &httputil.ReverseProxy{
 				Rewrite: func(pr *httputil.ProxyRequest) {
 					pr.Out.URL = targetURL
@@ -1353,6 +1360,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						return fmt.Errorf("relay token not found")
 					}
 					if res.StatusCode >= http.StatusInternalServerError {
+						relayTemporary = remotestream.RelayTemporaryFailure(res)
 						return fmt.Errorf("relay returned HTTP %d", res.StatusCode)
 					}
 					return nil
@@ -1388,13 +1396,14 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 								deliveredPath = resolvedVirtualCandidatePath(healedResolved)
 								releaseInput = healCleanup
 								lastProxyErr = nil
+								relayTemporary = false
 								proxy.ServeHTTP(streamWriter, r)
 								// The heal is a handoff only when the retried
 								// stream actually delivered. A non-loopback
 								// target, a parse failure, or a second proxy
 								// error must fall through to failure marking and
-								// sibling rotation rather than answer 502 while a
-								// live sibling exists.
+								// sibling rotation rather than answer 5xx/502/503
+								// while a live sibling exists.
 								healed = lastProxyErr == nil
 							}
 						}
@@ -1416,8 +1425,9 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						// the relay open phase; retrying them again here
 						// would break the pinned single-relist and
 						// rotation-declaration contracts, so they proceed
-						// straight to indictment and sibling rotation.)
-						if retrySameRelease := relayNotFound; retrySameRelease {
+						// to bounded rotation with the durable stamp
+						// suppressed below.)
+						if relayNotFound {
 							sameRetryCtx := withVirtualRelayFreshRegistration(r.Context())
 							sameMedia, sameCleanup, sameErr := h.resolveVirtualInputURIExcluding(sameRetryCtx, file, session.UserID, session.ProfileID, true, nil, false)
 							sameID := ""
@@ -1442,6 +1452,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 										sameCleanup = nil
 										lastProxyErr = nil
 										relayNotFound = false
+										relayTemporary = false
 										proxy.ServeHTTP(streamWriter, r)
 									}
 								}
@@ -1460,26 +1471,45 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 							return
 						}
 						// The pinned candidate served no bytes (corrupted NZB, dead
-						// provider URL). Mark it failed and re-resolve with it
-						// excluded so the next-ranked release is tried.
+						// provider URL), or a transport-temporary upstream failure
+						// exhausted both attempts. Re-resolve with the failed
+						// candidate excluded so the next-ranked release is tried.
+						//
+						// A transport-temporary relay failure (upstream 5xx after
+						// the relay's own open retry, or an unreachable upstream)
+						// is a provider-availability event, not a verdict about
+						// the release: two 503s half a second apart cannot
+						// distinguish an outage from a dead release, so the
+						// durable dead-candidate stamp is suppressed. The
+						// bounded rotation below still runs — the exclusion and
+						// relist let a same-release sibling serve this attempt —
+						// but nothing is persisted, so the pin stays eligible
+						// for the next auto-pick.
 						failedID := virtualResultCandidateID(deliveredPath)
-						if failedID != "" {
+						if failedID != "" && !relayTemporary {
 							h.markVirtualCandidateFailed(r.Context(), file, failedID)
 						}
 						excluded := []string{failedID}
 						if failedID == "" {
 							excluded = nil
 						}
-						// The retry is only reached because this serve layer just
-						// indicted the delivered candidate (failedID non-empty) and
-						// excluded it; declare substitution so the resolver may
-						// serve a sibling. A retry with no indictment (failedID
-						// empty) keeps refusing.
-						// The retry re-resolves with a forced relist and, because
-						// the edge just failed, a fresh relay registration: a
-						// reused token would replay the registration whose
-						// upstream returned 502 instead of presenting newly
-						// resolved bytes, mirroring the remux seek-anchor retry.
+						// Re-resolve with the failed candidate excluded so the
+						// next-ranked release can serve this attempt. The
+						// exclusion is normally the serve layer's own
+						// indictment of the delivered candidate; for a
+						// transport-temporary failure it is a bounded,
+						// non-durable rotation (the stamp above was skipped),
+						// so the resolver may serve a same-release sibling
+						// without anything being persisted. Declare
+						// substitution in either case: a retry with no
+						// identified candidate (failedID empty) keeps
+						// refusing, so a live pin is never swapped blindly.
+						// The retry re-resolves with a forced relist and,
+						// because the edge just failed, a fresh relay
+						// registration: a reused token would replay the
+						// registration whose upstream returned 5xx/502/503
+						// instead of presenting newly resolved bytes, mirroring
+						// the remux seek-anchor retry.
 						retryCtx := withVirtualRelayFreshRegistration(r.Context())
 						refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURIExcluding(retryCtx, file, session.UserID, session.ProfileID, true, excluded, failedID != "")
 						if refreshErr == nil {
@@ -1516,6 +1546,13 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 										targetURL = refreshedURL
 										deliveredPath = resolvedVirtualCandidatePath(refreshedMedia)
 										lastProxyErr = nil
+										// The rotated attempt has its own
+										// disposition: the first attempt's
+										// temporary/not-found marker must not
+										// decide whether this sibling's own
+										// verdict is stamped.
+										relayTemporary = false
+										relayNotFound = false
 										proxy.ServeHTTP(streamWriter, r)
 									}
 								}
