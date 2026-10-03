@@ -44330,12 +44330,16 @@
               "unsupported"
             ],
             "type": "string"
+          },
+          "wait_for_imports": {
+            "type": "boolean"
           }
         },
         "required": [
           "indexer_search",
           "indexer_request",
           "refresh_prunes_dead_candidates",
+          "wait_for_imports",
           "revision",
           "state",
           "allowed"

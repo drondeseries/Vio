@@ -1377,8 +1377,9 @@ func newChiRouter(deps Dependencies) chi.Router {
 							EpisodeFiles: deps.FileRepo.GetByEpisodeID,
 						}
 						virtualRefreshExecutor = &handlers.VirtualCandidatesRefreshExecutor{
-							Refresh:           virtualCandidatesRefresh,
-							ProviderRefresher: deps.VirtualLibraryService,
+							Refresh:            virtualCandidatesRefresh,
+							ProviderRefresher:  deps.VirtualLibraryService,
+							ReleaseDownloading: deps.VirtualLibraryService.ReleaseDownloading,
 							Pruner: &handlers.CandidateDeadPruner{
 								ContentFiles:   deps.FileRepo.GetByContentID,
 								EpisodeFiles:   deps.FileRepo.GetByEpisodeID,
