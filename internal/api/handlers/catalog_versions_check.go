@@ -17,6 +17,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/virtuallibrary"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/resolver"
 )
 
 const (
@@ -274,6 +275,20 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) v
 		outcome.available = false
 		return outcome
 	}
+	if isVirtualProviderListingTemporaryError(err) {
+		// Transport-temporary: the provider's listing request failed, timed
+		// out, or answered 5xx. That is availability-shaped and says nothing
+		// about the pinned release, so this must be classified BEFORE the
+		// string-based confirmed-dead classifier and before any
+		// identity-grounded absent-pin branch. A joined error can carry both a
+		// transient listing cause and a "no matching candidate" fallback text
+		// (or an absent-pin sentinel); letting either be read as a verdict is
+		// what let a provider flap indict a pin the liveness check then
+		// reported dead.
+		outcome.checked = true
+		outcome.available = outcome.durableAlive
+		return outcome
+	}
 	if isVirtualCandidateDeadError(err) {
 		// Confirmed dead pin: the provider listed but the pinned candidate is
 		// gone or unusable. Record the stamp for the batch gate; the write
@@ -398,6 +413,67 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 	return catalog.FileAllowedByAccess(file, filter)
 }
 
+// isVirtualProviderListingTemporaryError reports whether a resolution failure
+// is transport-temporary / availability-shaped rather than a verdict about the
+// pinned release: the provider listing could not be produced (request failed,
+// timed out, or answered 5xx), the release is still being fetched, or the
+// trusted persisted candidate was absent from a listing the resolver refused to
+// substitute from. None of these may indict a pin; the caller reports durable
+// state instead.
+//
+// This is deliberately checked BEFORE the string-based
+// isVirtualCandidateDeadError: a joined error can carry both a transient
+// listing cause and a "no matching candidate" fallback text, and the transient
+// cause must win. Every typed sentinel from internal/virtuallibrary and
+// internal/virtuallibrary/resolver is matched with errors.Is so a rename of the
+// human text cannot silently re-open the indictment; the provider-neutral
+// strings below cover a wrapped RPC failure the core path does not type.
+func isVirtualProviderListingTemporaryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, resolver.ErrProviderUnavailable) ||
+		errors.Is(err, virtuallibrary.ErrProviderPending) ||
+		errors.Is(err, virtuallibrary.ErrPersistedCandidateTrusted) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "request failed") ||
+		strings.Contains(msg, "resolver is not installed") ||
+		strings.Contains(msg, "load owning virtual stream provider") ||
+		strings.Contains(msg, "no streams available") ||
+		strings.Contains(msg, "provider unavailable") ||
+		strings.Contains(msg, "failed recently") ||
+		strings.Contains(msg, "bad gateway") ||
+		strings.Contains(msg, "service unavailable") ||
+		strings.Contains(msg, "temporarily unavailable") ||
+		containsProvider5xxStatus(msg)
+}
+
+// containsProvider5xxStatus reports whether an error message names an HTTP 5xx
+// provider status ("... returned status 503", "... HTTP 503"). A listing that
+// failed with a raw 5xx is transport-temporary even when the surrounding text
+// also carries a fallback "no matching candidate", so the dead-pin classifier
+// must defer to it.
+func containsProvider5xxStatus(msg string) bool {
+	if strings.Contains(msg, " 5xx") {
+		return true
+	}
+	for _, marker := range []string{"status 5", "http 5"} {
+		idx := strings.Index(msg, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := msg[idx+len(marker):]
+		if len(rest) >= 2 && rest[0] >= '0' && rest[0] <= '9' && rest[1] >= '0' && rest[1] <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
 // isVirtualCandidateDeadError classifies a resolution failure as a confirmed
 // dead pin: the provider answered, listed candidates, and the pinned candidate
 // is no longer among them or is unusable. Provider-down/timeout errors do not
@@ -406,7 +482,10 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 // internal/plugins/virtual_playback.go). A joined error that also carries a
 // provider RPC failure ("request failed") is ambiguous even when a fallback
 // provider reported no matching candidate: the owner provider that owns the pin
-// may simply be down.
+// may simply be down. A transport-temporary cause always wins over the
+// dead-pin strings, so a listing failure joined with a "no matching candidate"
+// fallback text is never read as a verdict (see
+// isVirtualProviderListingTemporaryError).
 //
 // An EMPTY listing ("no streams available from provider") is deliberately NOT
 // classified as dead. A zero-count answer is a provider hiccup that proves
@@ -414,16 +493,10 @@ func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *model
 // empty listing for a title whose releases are all still offered. Stamping pins
 // on it is how a 2.6 s burst marked 50 of 57 rows failed in the incident.
 func isVirtualCandidateDeadError(err error) bool {
-	if err == nil {
+	if err == nil || isVirtualProviderListingTemporaryError(err) {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "request failed") ||
-		strings.Contains(msg, "resolver is not installed") ||
-		strings.Contains(msg, "load owning virtual stream provider") ||
-		strings.Contains(msg, "no streams available") {
-		return false
-	}
 	return strings.Contains(msg, "no matching candidate") ||
 		strings.Contains(msg, "no usable stream")
 }
