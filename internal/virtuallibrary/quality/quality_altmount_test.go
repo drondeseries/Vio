@@ -204,3 +204,45 @@ func TestSortCandidatesForProfileLanguageAndChannels(t *testing.T) {
 		t.Fatalf("expected candidate 1 (PT-BR) to sort ahead of candidate 0 (ENG), got candidate %d", candidates[0].OriginalIndex)
 	}
 }
+
+// TestValidateLenientSkipsBadRegex proves one uncompilable custom format no
+// longer fails the whole config: the bad pattern is cleared (so it never
+// matches), its name reported, the good format still compiled, and structural
+// problems still error.
+func TestValidateLenientSkipsBadRegex(t *testing.T) {
+	qc := QualityConfig{CustomFormats: []CustomFormat{
+		{Name: "Good", Pattern: `\b1080p\b`, PatternType: "regex", Enabled: true},
+		{Name: "Bad", Pattern: `(?:(?<=^)MULTI)`, PatternType: "regex", Enabled: true},
+	}}
+	if err := qc.Validate(); err == nil {
+		t.Fatal("strict Validate must still fail on the bad pattern")
+	}
+	skipped, err := qc.ValidateLenient()
+	if err != nil {
+		t.Fatalf("ValidateLenient: %v", err)
+	}
+	if len(skipped) != 1 || skipped[0] != "Bad" {
+		t.Fatalf("skipped = %v, want [Bad]", skipped)
+	}
+	if got := qc.CustomFormats[1].EffectivePattern(); got != "" {
+		t.Fatalf("bad pattern not cleared: %q", got)
+	}
+	if qc.CustomFormats[0].Compiled() == nil {
+		t.Fatal("good format lost its compiled matcher")
+	}
+}
+
+// TestValidateLenientKeepsStructuralErrors proves leniency covers only
+// regex compilability: duplicate names, empty patterns, and bad types still
+// fail activation the same way.
+func TestValidateLenientKeepsStructuralErrors(t *testing.T) {
+	for name, formats := range map[string][]CustomFormat{
+		"duplicate": {{Name: "X", Pattern: "x"}, {Name: "X", Pattern: "y"}},
+		"empty":     {{Name: "X", Pattern: "   "}},
+	} {
+		qc := QualityConfig{CustomFormats: formats}
+		if _, err := qc.ValidateLenient(); err == nil {
+			t.Fatalf("%s: expected a structural error", name)
+		}
+	}
+}

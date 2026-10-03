@@ -401,6 +401,24 @@ func decodeQualityProfiles(raw any) ([]QualityProfile, error) {
 }
 
 func (q *QualityConfig) Validate() error {
+	return q.validate(false, nil)
+}
+
+// ValidateLenient validates like Validate but isolates regex-uncompilable
+// custom formats instead of failing: a bad pattern is cleared (so it never
+// matches) and its name returned, while every structural problem still
+// errors. Boot activation uses this so one broken custom format cannot take
+// down the whole virtual library; settings save uses strict Validate so the
+// operator fixes the pattern before persisting it.
+func (q *QualityConfig) ValidateLenient() ([]string, error) {
+	skipped := []string{}
+	if err := q.validate(true, &skipped); err != nil {
+		return skipped, err
+	}
+	return skipped, nil
+}
+
+func (q *QualityConfig) validate(isolateBadPatterns bool, skipped *[]string) error {
 	if len(q.CustomFormats) > maxCustomFormats {
 		return fmt.Errorf("maximum %d custom formats allowed", maxCustomFormats)
 	}
@@ -446,6 +464,17 @@ func (q *QualityConfig) Validate() error {
 		}
 		compiled, err := compileFormatRegex(pattern)
 		if err != nil {
+			if isolateBadPatterns && skipped != nil {
+				// Clear both pattern fields: EffectivePattern prefers
+				// Pattern, and an empty effective pattern never matches, so
+				// the broken rule is inert without losing its row for a
+				// later fix. The caller warns with the skipped names.
+				*skipped = append(*skipped, format.Name)
+				format.Pattern = ""
+				format.Regex = ""
+				format.match = nil
+				continue
+			}
 			return fmt.Errorf("invalid regex in custom format %s: %w", format.Name, err)
 		}
 		format.match = compiled

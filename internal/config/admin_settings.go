@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/virtuallibrary/quality"
 	redisv9 "github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 )
@@ -700,9 +701,28 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 			return "", fmt.Errorf("%s exceeds 64 bytes", key)
 		}
 		return value, nil
-	case "virtual_library.quality_profiles", "virtual_library.custom_formats":
+	case "virtual_library.quality_profiles":
 		if len(value) > 65536 {
 			return "", fmt.Errorf("%s exceeds 65536 bytes", key)
+		}
+		return value, nil
+	case "virtual_library.custom_formats":
+		if len(value) > 65536 {
+			return "", fmt.Errorf("%s exceeds 65536 bytes", key)
+		}
+		// Reject uncompilable patterns at save time with a field error, so
+		// the operator fixes the regex before persisting it instead of
+		// discovering a dormant virtual library after the next restart.
+		// Boot activation stays lenient (skips bad formats) for rows
+		// written by other means; Validate here is deliberately strict.
+		if strings.TrimSpace(value) != "" {
+			var formats []quality.CustomFormat
+			if err := json.Unmarshal([]byte(value), &formats); err != nil {
+				return "", fmt.Errorf("%s is not valid JSON: %w", key, err)
+			}
+			if err := (&quality.QualityConfig{CustomFormats: formats}).Validate(); err != nil {
+				return "", fmt.Errorf("%s invalid: %w", key, err)
+			}
 		}
 		return value, nil
 	case "transcode_throttle_seconds":
