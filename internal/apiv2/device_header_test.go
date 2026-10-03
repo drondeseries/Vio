@@ -76,6 +76,27 @@ func TestDeviceHeaderGuardRefusesRepeatedAndMalformedValues(t *testing.T) {
 	}
 }
 
+// The legacy X-Silo-Device-Id spelling is accepted on ingest (see
+// rejectMalformedDeviceHeader): a request carrying only the legacy spelling
+// has it promoted to X-Vio-Device-Id before the operation binds it.
+func TestDeviceHeaderGuardPromotesLegacySpelling(t *testing.T) {
+	svc := &fakeDownloadCreation{row: &downloads.Download{ID: "entry", ContentID: "movie", MediaFileID: 42, Revision: 1, CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}}
+	deps := pilotDeps(nil, nil)
+	deps.DownloadCreation = svc
+	h := newTestHandler(t, deps)
+	body := `{"content_id":"movie","media_file_id":"42","expected_revision":0}`
+	r := httptest.NewRequest(http.MethodPost, Prefix+"/downloads", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+memberToken)
+	r.Header.Set("X-Profile-Id", "p-owner")
+	r.Header.Set("X-Silo-Device-Id", "legacy-tv-1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusAccepted || svc.req.DeviceID != "legacy-tv-1" {
+		t.Fatalf("legacy header: %d %s %q", rec.Code, rec.Body.String(), svc.req.DeviceID)
+	}
+}
+
 // The guard runs for every v2 operation, including ones that never bind the
 // header, and its refusal is a problem document with the request id.
 func TestDeviceHeaderGuardCoversEveryOperation(t *testing.T) {
