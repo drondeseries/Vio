@@ -33,6 +33,7 @@ import {
   awaitVirtualCandidatesRefresh,
   cancelVirtualCandidatesRefresh,
 } from "@/api/v2/mediaCandidates";
+import { transientTrickplayError, useWatchTrickplay } from "@/hooks/queries/trickplay";
 import { itemKeys } from "@/hooks/queries/keys";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
@@ -469,8 +470,8 @@ function WatchPagePlayer({
   // probed tracks only when the plan publishes none (old plans, audiobooks).
   const audioTracks = useMemo(
     () =>
-      session.planAudioTracks.length > 0
-        ? session.planAudioTracks
+      (session.planAudioTracks?.length ?? 0) > 0
+        ? (session.planAudioTracks ?? [])
         : (activeVersion?.audio_tracks ?? []),
     [activeVersion, session.planAudioTracks],
   );
@@ -552,6 +553,53 @@ function WatchPagePlayer({
     () => playbackVersions.find((version) => version.file_id === session.mediaFileId),
     [playbackVersions, session.mediaFileId],
   );
+  const trickplayAvailable = activePlaybackVersion?.trickplay_available === true;
+  const trickplayQuery = useWatchTrickplay(
+    contentId,
+    session.mediaFileId ?? undefined,
+    trickplayAvailable,
+  );
+  // A failed refresh retains query data. A terminal response withdraws the
+  // cached previews; transient failures keep them until the query recovers.
+  const trickplay =
+    trickplayAvailable && (!trickplayQuery.isError || transientTrickplayError(trickplayQuery.error))
+      ? (trickplayQuery.data ?? null)
+      : null;
+  const refetchTrickplay = trickplayQuery.refetch;
+  const lastTrickplayRefresh = useRef<{ fileId: number | null; at: number } | null>(null);
+  const trickplayRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    lastTrickplayRefresh.current = null;
+    return () => {
+      if (trickplayRefreshTimer.current !== null) clearTimeout(trickplayRefreshTimer.current);
+      trickplayRefreshTimer.current = null;
+    };
+  }, [session.mediaFileId, trickplayAvailable]);
+  useEffect(() => {
+    // The query owns retry and polling delays after a manifest request fails.
+    if (trickplayQuery.isError && trickplayRefreshTimer.current !== null) {
+      clearTimeout(trickplayRefreshTimer.current);
+      trickplayRefreshTimer.current = null;
+    }
+  }, [trickplayQuery.isError]);
+  const handleTrickplayError = useCallback(() => {
+    if (trickplayQuery.isError) return;
+    const now = Date.now();
+    const previous = lastTrickplayRefresh.current;
+    const refresh = () => {
+      trickplayRefreshTimer.current = null;
+      lastTrickplayRefresh.current = { fileId: session.mediaFileId, at: Date.now() };
+      void refetchTrickplay({ cancelRefetch: false });
+    };
+    if (previous?.fileId === session.mediaFileId && now - previous.at < 60_000) {
+      if (trickplayRefreshTimer.current === null) {
+        trickplayRefreshTimer.current = setTimeout(refresh, 60_000 - (now - previous.at));
+      }
+      return;
+    }
+    if (trickplayRefreshTimer.current !== null) clearTimeout(trickplayRefreshTimer.current);
+    refresh();
+  }, [refetchTrickplay, session.mediaFileId, trickplayQuery.isError]);
 
   // Re-key the live session file into the version list whenever it changes.
   // A start or switch can target a file the current list does not carry, which
@@ -1289,6 +1337,9 @@ function WatchPagePlayer({
         activeFileId={session.mediaFileId}
         activeVirtualUri={session.effectiveVirtualUri}
         chapters={activeChapters}
+        trickplay={trickplay}
+        trickplayUpdatedAt={trickplayQuery.dataUpdatedAt}
+        onTrickplayError={handleTrickplayError}
         onSwitchVersion={watchTogetherRoomId ? undefined : handleSwitchVersion}
         onSelectAutoVersion={watchTogetherRoomId ? undefined : handleSelectAutoVersion}
         autoFallback={session.autoFallback}

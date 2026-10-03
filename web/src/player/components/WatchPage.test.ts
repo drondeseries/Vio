@@ -30,6 +30,7 @@ const queryClientOverride = vi.hoisted(() => ({ current: null as unknown }));
 const roomConnectionMock = vi.hoisted(() => vi.fn());
 const playbackCapabilitiesMock = vi.hoisted(() => vi.fn());
 const startPlaybackMock = vi.hoisted(() => vi.fn());
+const trickplayRefetchMock = vi.hoisted(() => vi.fn());
 vi.mock("../start-v2", () => ({ playbackCapabilitiesV2: playbackCapabilitiesMock }));
 
 vi.mock("../hooks/usePlaybackSession", () => ({
@@ -64,6 +65,7 @@ vi.mock("@tanstack/react-query", async (importOriginal) => {
   return {
     ...actual,
     useQueryClient: () => queryClientOverride.current ?? { fetchQuery: fetchQueryMock },
+    useQuery: () => ({ data: undefined, refetch: trickplayRefetchMock }),
   };
 });
 vi.mock("@/playback/watchPlaybackContext", () => ({
@@ -167,6 +169,7 @@ beforeEach(() => {
   startPlaybackMock.mockReset();
   playbackSessionMock.mockReset();
   videoPlayerMock.mockReset();
+  trickplayRefetchMock.mockReset();
   toastErrorMock.mockReset();
   fetchWatchDetailMock.mockReset();
   awaitVirtualCandidatesRefreshMock.mockReset();
@@ -2473,4 +2476,21 @@ describe("Watch Party source fallback", () => {
     view.rerender(createElement(WatchPage, props));
     expect(fallbackSource).toHaveBeenCalledTimes(1);
   });
+});
+
+it("bounds sheet error refreshes and lets a changed file refresh independently", () => {
+  playbackSessionMock.mockReturnValue(playbackSession());
+  const view = render(createElement(WatchPage, watchPageProps));
+  const refresh = () => videoPlayerMock.mock.calls.at(-1)?.[0].onTrickplayError();
+  refresh();
+  for (let attempt = 0; attempt < 20; attempt++) refresh();
+  expect(trickplayRefetchMock).toHaveBeenCalledTimes(1);
+  playbackSessionMock.mockReturnValue(playbackSession({ mediaFileId: 8 }));
+  view.rerender(createElement(WatchPage, watchPageProps));
+  refresh();
+  expect(trickplayRefetchMock).toHaveBeenCalledTimes(2);
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_001);
+  refresh();
+  expect(trickplayRefetchMock).toHaveBeenCalledTimes(3);
+  clock.mockRestore();
 });
