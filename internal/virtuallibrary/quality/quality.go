@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"regexp/syntax"
 	"sort"
 	"strings"
 
@@ -404,21 +405,43 @@ func (q *QualityConfig) Validate() error {
 	return q.validate(false, nil)
 }
 
+// SkippedFormat names a custom format isolated during lenient validation
+// along with a pattern-free compile-failure reason for diagnostics. Reason
+// never carries the user-supplied pattern text.
+type SkippedFormat struct {
+	Name   string
+	Reason string
+}
+
 // ValidateLenient validates like Validate but isolates regex-uncompilable
-// custom formats instead of failing: a bad pattern is cleared (so it never
-// matches) and its name returned, while every structural problem still
-// errors. Boot activation uses this so one broken custom format cannot take
-// down the whole virtual library; settings save uses strict Validate so the
-// operator fixes the pattern before persisting it.
-func (q *QualityConfig) ValidateLenient() ([]string, error) {
-	skipped := []string{}
+// custom formats instead of failing: the broken rule keeps its source
+// pattern (so a later fix or strict Validate still sees it), its compiled
+// matcher is cleared so it never matches, and its name plus reason are
+// returned. Every structural problem still errors. ValidateLenient is
+// stable under repetition: revalidating the same config succeeds with the
+// same skip report. Boot activation uses this so one broken custom format
+// cannot take down the whole virtual library; settings save uses strict
+// Validate so the operator fixes the pattern before persisting it.
+func (q *QualityConfig) ValidateLenient() ([]SkippedFormat, error) {
+	skipped := []SkippedFormat{}
 	if err := q.validate(true, &skipped); err != nil {
 		return skipped, err
 	}
 	return skipped, nil
 }
 
-func (q *QualityConfig) validate(isolateBadPatterns bool, skipped *[]string) error {
+// regexFailureReason summarizes a compile failure without echoing the
+// pattern: Go's syntax errors embed the offending expression, which must
+// not reach logs.
+func regexFailureReason(err error) string {
+	var syntaxErr *syntax.Error
+	if errors.As(err, &syntaxErr) {
+		return "invalid regex: " + syntaxErr.Code.String()
+	}
+	return "invalid regex: uncompilable pattern"
+}
+
+func (q *QualityConfig) validate(isolateBadPatterns bool, skipped *[]SkippedFormat) error {
 	if len(q.CustomFormats) > maxCustomFormats {
 		return fmt.Errorf("maximum %d custom formats allowed", maxCustomFormats)
 	}
@@ -465,13 +488,13 @@ func (q *QualityConfig) validate(isolateBadPatterns bool, skipped *[]string) err
 		compiled, err := compileFormatRegex(pattern)
 		if err != nil {
 			if isolateBadPatterns && skipped != nil {
-				// Clear both pattern fields: EffectivePattern prefers
-				// Pattern, and an empty effective pattern never matches, so
-				// the broken rule is inert without losing its row for a
-				// later fix. The caller warns with the skipped names.
-				*skipped = append(*skipped, format.Name)
-				format.Pattern = ""
-				format.Regex = ""
+				// Keep the source pattern intact so repetition is stable
+				// and strict Validate still sees the original text; only
+				// the compiled matcher is cleared. formatMatchesText
+				// recompiles on a nil matcher and returns false before
+				// applying Invert, so the broken rule contributes neither
+				// score nor rejection. The caller warns with name+reason.
+				*skipped = append(*skipped, SkippedFormat{Name: format.Name, Reason: regexFailureReason(err)})
 				format.match = nil
 				continue
 			}
