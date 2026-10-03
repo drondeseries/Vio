@@ -79,6 +79,9 @@ const (
 	// round reports durable state and stamps nothing: a renumber storm or a
 	// degraded partial listing disagrees with everything at once, and that
 	// pattern means the observation is bad, not forty releases at once.
+	// The comparison is strictly past the rate: an exact-half split still
+	// stamps, deciding ties in favor of recording genuinely-dead pins
+	// rather than protecting against a volatile listing.
 	versionCheckStampDisagreementRate = 0.5
 )
 
