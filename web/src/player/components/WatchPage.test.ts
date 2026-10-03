@@ -1470,7 +1470,13 @@ describe("WatchPage live inventory refresh", () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
 
-    expect(applyAudioInventory).toHaveBeenCalledWith(richerAudioTracks, 8);
+    // The candidate's probed inventory is adopted, and its path re-keys the
+    // live identity so the version menu follows the same source.
+    expect(applyAudioInventory).toHaveBeenCalledWith(
+      richerAudioTracks,
+      8,
+      "/media/Movies/Example (2024)/Example.1080p.mkv",
+    );
     expect(refreshSubtitles).toHaveBeenCalledTimes(1);
   });
 

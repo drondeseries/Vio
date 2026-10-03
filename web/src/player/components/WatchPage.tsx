@@ -813,6 +813,12 @@ function WatchPagePlayer({
           // list no richer than the plan's keeps the poll running so a later
           // probe can still expand it.
           const audioTargetChanged = version.file_id !== current.mediaFileId;
+          // A serve-layer rotation moves the resolved candidate while the
+          // collapsed id stays put, so the version identity has to follow the
+          // same source the inventory does. Only a virtual source carries a
+          // candidate URI; an ordinary version switch moves by id alone and
+          // must leave `effectiveVirtualUri` untouched.
+          const resolvedVirtualUri = isVirtualActiveFile ? version.file_path : undefined;
           // A declared (provisional) list is upgraded by the catalog's probed
           // list even when that list is shorter; an already-verified list still
           // only accepts a strict superset so a poorer row cannot shrink it.
@@ -822,7 +828,11 @@ function WatchPagePlayer({
               current.audioInventoryProvisional ||
               nextAudioTracks.length > current.planAudioTracks.length)
           ) {
-            applyAudioInventory(nextAudioTracks, version.file_id);
+            if (resolvedVirtualUri) {
+              applyAudioInventory(nextAudioTracks, version.file_id, resolvedVirtualUri);
+            } else {
+              applyAudioInventory(nextAudioTracks, version.file_id);
+            }
             audioComplete = true;
           }
           const resolvedSubtitleTracks = version.subtitle_tracks ?? [];
