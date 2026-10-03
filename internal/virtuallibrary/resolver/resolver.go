@@ -829,6 +829,14 @@ func dedupeCandidates(candidates []StreamCandidate) ([]StreamCandidate, map[stri
 			keep[existing] = false
 			keyKeeper[key] = i
 			keep[i] = true
+		} else if !candidate.SourcePending && candidates[existing].SourcePending {
+			// A pending duplicate never displaces a ready keeper, and a ready
+			// duplicate displaces a pending keeper: the kept variant must be
+			// the one playable now, not the one still fetching. Both-pending
+			// keeps the first, preserving determinism.
+			keep[existing] = false
+			keyKeeper[key] = i
+			keep[i] = true
 		}
 	}
 	// Build the dropped -> keeper map before compacting: the compaction below
@@ -866,21 +874,29 @@ func dedupeCandidates(candidates []StreamCandidate) ([]StreamCandidate, map[stri
 }
 
 // stablePartitionCandidates drops known-dead candidates and stably moves
-// confirmed ones to the front, returning the possibly-shortened slice.
+// confirmed ones to the front, pending ones next, returning the
+// possibly-shortened slice. Pending is never dropped: it is the waitable
+// middle between ready and unknown.
 func stablePartitionCandidates(candidates []StreamCandidate) []StreamCandidate {
 	kept := candidates[:0]
 	confirmed := 0
+	pending := 0
 	for _, candidate := range candidates {
 		if candidate.SourceFailed {
 			continue
 		}
 		if candidate.SourceConfirmed {
 			confirmed++
+		} else if candidate.SourcePending {
+			pending++
 		}
 		kept = append(kept, candidate)
 	}
 	candidates = kept
-	if confirmed == 0 || confirmed == len(candidates) {
+	if confirmed == 0 && pending == 0 {
+		return candidates
+	}
+	if confirmed == len(candidates) {
 		return candidates
 	}
 	ordered := make([]StreamCandidate, 0, len(candidates))
@@ -890,7 +906,12 @@ func stablePartitionCandidates(candidates []StreamCandidate) []StreamCandidate {
 		}
 	}
 	for _, candidate := range candidates {
-		if !candidate.SourceConfirmed {
+		if !candidate.SourceConfirmed && candidate.SourcePending {
+			ordered = append(ordered, candidate)
+		}
+	}
+	for _, candidate := range candidates {
+		if !candidate.SourceConfirmed && !candidate.SourcePending {
 			ordered = append(ordered, candidate)
 		}
 	}

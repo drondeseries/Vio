@@ -123,3 +123,45 @@ func TestClassifyCandidatesNeverOverwritesDeclaredIdentity(t *testing.T) {
 		t.Fatalf("videoHash = %q, want the declared hash preserved", got.BehaviorHints.VideoHash)
 	}
 }
+
+// TestParseAltmountQueueRecordsDownloading proves active-progress queue slots
+// land in the Downloading map with sizes and ETA, while paused slots and
+// nameless slots are left out. A downloading release is pending: neither dead
+// nor ready.
+func TestParseAltmountQueueRecordsDownloading(t *testing.T) {
+	payload := `{"queue":{"slots":[` +
+		`{"filename": "My.Movie.2024.1080p.WEB-DL.x264-GRP.nzb", "status": "Downloading", "mbleft": "400.5", "timeleft": "0:05:00"},` +
+		`{"filename": "Queued.Movie.2024.1080p.WEB-DL.x264-GRP.nzb", "status": "Queued"},` +
+		`{"filename": "Paused.Movie.2024.1080p.WEB-DL.x264-GRP.nzb", "status": "Paused", "mbleft": "100"},` +
+		`{"filename": "", "status": "Downloading"},` +
+		`{"filename": "Other.Movie.2024.1080p.WEB-DL.x264-GRP.nzb", "status": "Complete"}` +
+		`]}}`
+	snapshot, err := parseAltmountQueue(strings.NewReader(payload), time.Now())
+	if err != nil {
+		t.Fatalf("parseAltmountQueue: %v", err)
+	}
+	if len(snapshot.Downloading) == 0 {
+		t.Fatal("downloading snapshot is empty")
+	}
+	if len(snapshot.Completed) != 0 || len(snapshot.Failed) != 0 {
+		t.Fatal("queue parse must not populate terminal maps")
+	}
+	var downloading int
+	for key, record := range snapshot.Downloading {
+		if strings.Contains(key, "pausedmovie") || strings.Contains(key, "othermovie") {
+			t.Fatalf("non-progress slot keyed as downloading: %q", key)
+		}
+		if strings.Contains(key, "mymovie") {
+			downloading++
+			if record.SizeLeft != int64(400.5*1024*1024) {
+				t.Fatalf("size left = %d, want 400.5 MiB in bytes", record.SizeLeft)
+			}
+			if record.ETASeconds != 300 {
+				t.Fatalf("eta = %d, want 300s for 0:05:00", record.ETASeconds)
+			}
+		}
+	}
+	if downloading == 0 {
+		t.Fatal("downloading release missing from snapshot")
+	}
+}

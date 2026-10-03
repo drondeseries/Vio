@@ -384,6 +384,20 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		)
 		if resolveErr != nil {
 			lastErr = resolveErr
+			// A pending release (AltMount actively fetching) is never
+			// indicted: it is neither dead nor ready, so excluding it and
+			// scrubbing it from the best-result cache would be the skip this
+			// hold exists to prevent. Retry it fresh instead; the loop's own
+			// attempt bound still terminates a release that never completes.
+			if errors.Is(resolveErr, virtuallibrary.ErrProviderPending) {
+				if targetURI == canonicalPath {
+					canonicalPath = neutralPath
+					if file != nil {
+						file.FilePath = neutralPath
+					}
+				}
+				continue
+			}
 			failedID := resolvedMedia.CandidateID
 			if failedID == "" {
 				if parsed, err := url.Parse(targetURI); err == nil {
@@ -939,6 +953,17 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 					retryCtx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh || relist, excludedCandidateIDs, preferredCandidateID,
 				)
 			})
+			// A release AltMount is actively fetching is worth waiting for,
+			// not skipping: hold briefly for the import, then re-list once
+			// (forced, so a flip to completed is picked up) and take whatever
+			// that answer is. A lapsed hold degrades to the pending error,
+			// which callers handle like any unresolvable release — except
+			// the startup loop, which must not indict it (see below).
+			if errors.Is(err, virtuallibrary.ErrProviderPending) && waitVirtualPendingHold(ctx) {
+				res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+					ctx, virtualURI, ownerInstallationID, userID, profileID, true, excludedCandidateIDs, preferredCandidateID,
+				)
+			}
 			if err == nil && res.IdentityRematched && storedRow != nil {
 				// The pinned id was absent but the same release re-identified
 				// under a new id. Adopt it through the Phase-1 CAS/fence write

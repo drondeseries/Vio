@@ -326,6 +326,14 @@ func (s *Service) RefreshPrunesDeadCandidates() bool {
 	return true
 }
 
+// WaitForImports reports whether playback waits (bounded) for a release
+// AltMount is actively fetching instead of skipping it. It mirrors the
+// hold wiring: the wait runs when the AltMount queue state is available to
+// classify a release as downloading.
+func (s *Service) WaitForImports() bool {
+	return true
+}
+
 // RefreshProviderState forces a fresh classification snapshot from the
 // configured virtual providers. The refresh job calls it before listing so the
 // resolver classifies candidates against the provider's current completed/failed
@@ -346,6 +354,17 @@ func (s *Service) ReleaseFailed(releaseName string) (failed bool, known bool) {
 		return false, false
 	}
 	return s.Monitor.ReleaseFailed(releaseName)
+}
+
+// ReleaseDownloading reports whether AltMount's authoritative snapshot
+// records the named release as actively fetching. known is false when
+// AltMount is unconfigured. A downloading release is pending: neither dead
+// nor ready.
+func (s *Service) ReleaseDownloading(releaseName string) (downloading bool, known bool) {
+	if s == nil || s.Monitor == nil {
+		return false, false
+	}
+	return s.Monitor.ReleaseDownloading(releaseName)
 }
 
 // ValidateConfig checks that the service configuration is internally consistent
