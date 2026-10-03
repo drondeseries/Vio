@@ -470,8 +470,8 @@ function WatchPagePlayer({
   // probed tracks only when the plan publishes none (old plans, audiobooks).
   const audioTracks = useMemo(
     () =>
-      session.planAudioTracks.length > 0
-        ? session.planAudioTracks
+      (session.planAudioTracks?.length ?? 0) > 0
+        ? (session.planAudioTracks ?? [])
         : (activeVersion?.audio_tracks ?? []),
     [activeVersion, session.planAudioTracks],
   );

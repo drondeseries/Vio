@@ -96,24 +96,37 @@ function playbackSession(
   return {
     plan: fixturePlanV3(),
     planRevision: 1,
+    transportRevision: 1,
     streamUrl: "/stream/session-1",
     sessionId: "session-1",
     playbackAttemptId: "attempt-1",
     mediaFileId: 7,
+    effectiveVirtualUri: null,
     initialPosition: 0,
     audioTrackIndex: 0,
     durationSeconds: 3600,
     subtitleUrls: [],
+    planAudioTracks: [],
+    audioInventoryProvisional: false,
+    subtitleInventoryProvisional: false,
     qualityPreference: "original",
     shouldAutoPlay: true,
     loading: false,
     replacing: false,
     replanning: false,
+    autoFallback: false,
+    replanningQuality: false,
+    pendingSwitchFileId: null,
     errorTitle: null,
     error: null,
+    errorReason: null,
+    errorRetryable: false,
+    retrying: false,
     initialSubtitleErrorTitle: null,
     initialSubtitleError: null,
     switchVersion: vi.fn(),
+    selectAutoVersion: vi.fn(),
+    retryStart: vi.fn(),
     switchAudioTrack: vi.fn(),
     changeSubtitleTrack: vi.fn(),
     changeQuality: vi.fn(),
@@ -122,6 +135,9 @@ function playbackSession(
     reanchorSeek: vi.fn().mockResolvedValue(true),
     refreshSubtitles: vi.fn(),
     applySubtitleTrack: vi.fn(),
+    applyAudioInventory: vi.fn(),
+    applyCommittedSource: vi.fn(),
+    applyInventoryUpdate: vi.fn(),
     updatePlaybackState: vi.fn(),
     reportFirstFrame: vi.fn(),
     reportEvent: vi.fn(),
@@ -373,7 +389,26 @@ it("keeps sheet recovery inside the manifest Retry-After delay", async () => {
   );
   vi.stubGlobal("fetch", request);
   roomConnectionMock.mockReturnValue({ room: null });
-  playbackSessionMock.mockReturnValue(playbackSession());
+  // A complete menu inventory keeps the live-inventory poll idle so the only
+  // fetches in this timing test are the trickplay manifest requests.
+  playbackSessionMock.mockReturnValue(
+    playbackSession({
+      planAudioTracks: [
+        { codec: "eac3", channels: 6, layout: "5.1", language: "eng", default: true },
+        { codec: "ac3", channels: 6, layout: "5.1", language: "spa", index: 9 },
+      ],
+      subtitleUrls: [
+        {
+          index: 0,
+          language: "en",
+          codec: "srt",
+          label: "English",
+          source: "embedded",
+          url: "/subs/en.vtt",
+        },
+      ],
+    }),
+  );
   showSeekBar.value = true;
   const client = new QueryClient();
   const key = itemKeys.watchTrickplay(watchPageProps.contentId, version.file_id);

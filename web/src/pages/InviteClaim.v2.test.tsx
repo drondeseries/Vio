@@ -270,12 +270,12 @@ it("keeps a link invitation in the browser on Android", async () => {
   try {
     mount();
     await screen.findByLabelText("Password", { exact: true });
-    expect(screen.getByRole("link", { name: /Open in the Silo app/ })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Open in the Vio app/ })).toBeInTheDocument();
     cleanup();
     lookup = async () => json(linkInvitation);
     mount();
     expect(await screen.findByLabelText("Email")).not.toBeDisabled();
-    expect(screen.queryByRole("link", { name: /Open in the Silo app/ })).toBeNull();
+    expect(screen.queryByRole("link", { name: /Open in the Vio app/ })).toBeNull();
   } finally {
     agent.mockRestore();
   }

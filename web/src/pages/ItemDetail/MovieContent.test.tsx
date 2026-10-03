@@ -42,6 +42,9 @@ const mocks = vi.hoisted(() => {
     useToggleWatchlist: vi.fn(),
     useRefreshItemMetadata: vi.fn(),
     useRedetectItemMarkers: vi.fn(),
+    useItemFiles: vi.fn(),
+    useSearchItemMatchCandidates: vi.fn(),
+    useSplitItem: vi.fn(),
     useAdminMarkerCapabilities: vi.fn(),
     useLibraryCapabilities: vi.fn(),
     useWatchedStateMutation: vi.fn(),
@@ -84,6 +87,9 @@ vi.mock("@/hooks/queries/admin/libraries", () => ({
 vi.mock("@/hooks/queries/items", () => ({
   useRefreshItemMetadata: mocks.useRefreshItemMetadata,
   useRedetectItemMarkers: mocks.useRedetectItemMarkers,
+  useItemFiles: mocks.useItemFiles,
+  useSearchItemMatchCandidates: mocks.useSearchItemMatchCandidates,
+  useSplitItem: mocks.useSplitItem,
   useWatchedStateMutation: mocks.useWatchedStateMutation,
 }));
 
@@ -271,6 +277,14 @@ describe("MovieContent", () => {
     mocks.useToggleWatchlist.mockReturnValue({ mutate: vi.fn() });
     mocks.useRefreshItemMetadata.mockReturnValue({ mutate: vi.fn(), isPending: false });
     mocks.useRedetectItemMarkers.mockReturnValue({ mutate: vi.fn(), isPending: false });
+    mocks.useItemFiles.mockReturnValue({ data: undefined, isLoading: false });
+    mocks.useSearchItemMatchCandidates.mockReturnValue({
+      mutate: vi.fn(),
+      isPending: false,
+      isSuccess: false,
+      data: undefined,
+    });
+    mocks.useSplitItem.mockReturnValue({ mutate: vi.fn(), isPending: false });
     mocks.useAdminMarkerCapabilities.mockReturnValue({ data: undefined });
     mocks.useLibraryCapabilities.mockReturnValue({ data: undefined });
     mocks.useWatchedStateMutation.mockReturnValue({ mutate: vi.fn(), isPending: false });

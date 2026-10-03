@@ -166,7 +166,7 @@ describe("PluginConfigForm secrets", () => {
 
   it("sends an emptied field as an explicit clear so the stored value goes", async () => {
     const onSave = vi.fn();
-    render(
+    renderWithClient(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
@@ -246,7 +246,7 @@ describe("PluginConfigForm secrets", () => {
 
   it("reports each edit and staged secret removal as the entry it would save", async () => {
     const onDraftChange = vi.fn();
-    render(
+    renderWithClient(
       <PluginConfigForm
         schema={schema}
         value={{ region: "us-east" }}
