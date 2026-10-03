@@ -384,10 +384,25 @@ func (h *PlaybackHandler) clearVirtualCandidateVerdict(ctx context.Context, file
 // plus an absent pin that carries durable identity; an empty provider listing
 // is a transient hiccup and is deliberately never stamped (the versions check
 // documents why: a 2.6s empty-listing burst once marked 50 of 57 rows dead).
+// Any transport-temporary cause in the chain short-circuits the whole verdict
+// before the absent-pin branch is consulted, so a joined outage+absent shape
+// cannot smuggle a durable indictment past the transient guard.
 // Best-effort: a stamp failure does not change the resolve outcome the caller
 // already has. file is the catalog row the request pinned.
 func (h *PlaybackHandler) stampStartVirtualCandidateFailed(ctx context.Context, file *models.MediaFile, resolveErr error) {
 	if h == nil || h.VirtualCandidateFailMarker == nil || file == nil || file.FailedAt != nil || resolveErr == nil {
+		return
+	}
+	// Transport-temporary shapes (provider outage, deadline, pending release,
+	// empty listing) are availability-shaped and say nothing about the pinned
+	// release, so they must be classified BEFORE either dead-verdict branch. A
+	// joined error can carry both a transient listing cause and an absent-pin
+	// sentinel (for example errors.Join(resolver.ErrProviderUnavailable,
+	// virtuallibrary.ErrSessionBoundCandidateAbsent)); letting the identity
+	// branch read the absent sentinel as a verdict is what let a provider flap
+	// durably indict a pin. This mirrors the pre-verdict guard in
+	// checkVersion (catalog_versions_check.go).
+	if isVirtualProviderListingTemporaryError(resolveErr) {
 		return
 	}
 	dead := isVirtualCandidateDeadError(resolveErr)
